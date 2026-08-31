@@ -2042,7 +2042,7 @@ mod tests {
     use arrow::{array::AsArray, datatypes::Float32Type};
     use arrow_array::{
         Array, ArrayRef, ArrowPrimitiveType, FixedSizeListArray, Float32Array, Int64Array,
-        ListArray, RecordBatch, RecordBatchIterator, UInt64Array,
+        ListArray, PrimitiveArray, RecordBatch, RecordBatchIterator, UInt64Array,
     };
     use arrow_buffer::OffsetBuffer;
     use arrow_schema::{DataType, Field, Schema, SchemaRef};
@@ -2075,6 +2075,7 @@ mod tests {
     use lance_core::cache::{CacheBackend, CacheCodecImpl, LanceCache};
     use lance_core::utils::tempfile::TempStrDir;
     use lance_core::{ROW_ID, Result};
+    use lance_datagen::{Dimension, RowCount, Seed, array, gen_batch};
     use lance_encoding::decoder::DecoderPlugins;
     use lance_file::reader::{FileReader, FileReaderOptions};
     use lance_index::IndexType;
@@ -2105,13 +2106,22 @@ mod tests {
     use lance_linalg::kernels::normalize_fsl;
     use lance_table::format::IndexMetadata;
     use lance_testing::datagen::{generate_random_array, generate_random_array_with_range};
-    use rand::distr::uniform::SampleUniform;
+    use rand::distr::{Distribution, StandardUniform, uniform::SampleUniform};
     use rand::{Rng, SeedableRng, rngs::StdRng};
     use rstest::rstest;
     use uuid::Uuid;
 
     const NUM_ROWS: usize = 512;
     const DIM: usize = 32;
+    // 8-bit PQ needs at least 256 training vectors; 320 leaves a stable margin
+    // while 20 neighbors provide a useful recall oracle.
+    const PQ_MATRIX_NUM_ROWS: usize = 320;
+    const PQ_MATRIX_K: usize = 20;
+    // An 8-bit PQ codebook has 256 centroids, so this is the smallest valid
+    // training fixture shared by the 8-bit and 4-bit runtime cases.
+    const LIGHTWEIGHT_PQ_ROWS: usize = 256;
+    const LIGHTWEIGHT_PQ_PARTITIONS: usize = 2;
+    const LIGHTWEIGHT_PQ_SUB_VECTORS: usize = 4;
 
     lance_testing::define_stage_event_progress!(RecordingProgress, IndexBuildProgress, Result<()>);
 
@@ -2577,12 +2587,183 @@ mod tests {
 
     fn lightweight_pq_params() -> PQBuildParams {
         PQBuildParams {
-            num_sub_vectors: 4,
+            num_sub_vectors: LIGHTWEIGHT_PQ_SUB_VECTORS,
             num_bits: 4,
             max_iters: 2,
             sample_rate: 16,
             ..Default::default()
         }
+    }
+
+    fn lightweight_pq_params_with_bits(num_bits: usize) -> PQBuildParams {
+        let num_sub_vectors = if num_bits == 4 {
+            // M4 is only a 2-byte code, so random KMeans/HNSW can leave recall near
+            // the threshold. M32 restores the original 4-bit test capacity.
+            DIM
+        } else {
+            LIGHTWEIGHT_PQ_SUB_VECTORS
+        };
+        PQBuildParams {
+            num_sub_vectors,
+            num_bits,
+            max_iters: 2,
+            sample_rate: 16,
+            ..Default::default()
+        }
+    }
+
+    fn lightweight_hnsw_params() -> HnswBuildParams {
+        HnswBuildParams::default()
+            .max_level(2)
+            .num_edges(4)
+            .ef_construction(16)
+    }
+
+    fn make_seeded_vector_batch(num_rows: usize) -> (RecordBatch, SchemaRef) {
+        let batch = lance_datagen::gen_batch()
+            .with_seed(lance_datagen::Seed::from(42))
+            .col("id", lance_datagen::array::step::<UInt64Type>())
+            .col(
+                "vector",
+                lance_datagen::array::rand_vec::<Float32Type>((DIM as u32).into()),
+            )
+            .into_batch_rows(lance_datagen::RowCount::from(num_rows as u64))
+            .unwrap();
+        let schema = batch.schema();
+        (batch, schema)
+    }
+
+    async fn search_lightweight_pq_index(
+        dataset: &Dataset,
+        query: &dyn Array,
+        k: usize,
+        num_partitions: usize,
+        refine_factor: u32,
+        ef: usize,
+    ) -> RecordBatch {
+        dataset
+            .scan()
+            .nearest("vector", query, k)
+            .unwrap()
+            .minimum_nprobes(num_partitions)
+            .ef(ef)
+            .refine(refine_factor)
+            .with_row_id()
+            .try_into_batch()
+            .await
+            .unwrap()
+    }
+
+    async fn assert_lightweight_pq_index(
+        distance_type: DistanceType,
+        num_bits: usize,
+        use_hnsw: bool,
+    ) {
+        const INDEX_NAME: &str = "test_index";
+        const K: usize = 10;
+
+        let test_dir = TempStrDir::default();
+        let (batch, schema) = make_seeded_vector_batch(LIGHTWEIGHT_PQ_ROWS);
+        let vectors = batch["vector"].as_fixed_size_list().clone();
+        let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let mut dataset = Dataset::write(batches, test_dir.as_str(), None)
+            .await
+            .unwrap();
+
+        let mut ivf_params = IvfBuildParams::new(LIGHTWEIGHT_PQ_PARTITIONS);
+        ivf_params.max_iters = 2;
+        ivf_params.sample_rate = 16;
+        let pq_params = lightweight_pq_params_with_bits(num_bits);
+        let expected_num_sub_vectors = pq_params.num_sub_vectors;
+        let params = if use_hnsw {
+            VectorIndexParams::with_ivf_hnsw_pq_params(
+                distance_type,
+                ivf_params,
+                lightweight_hnsw_params(),
+                pq_params,
+            )
+        } else {
+            VectorIndexParams::with_ivf_pq_params(distance_type, ivf_params, pq_params)
+        };
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some(INDEX_NAME.to_owned()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let stats_json = dataset.index_statistics(INDEX_NAME).await.unwrap();
+        let stats: serde_json::Value = serde_json::from_str(&stats_json).unwrap();
+        let expected_index_type = if use_hnsw { "IVF_HNSW_PQ" } else { "IVF_PQ" };
+        let expected_sub_index = if use_hnsw { "HNSW" } else { "PQ" };
+        assert_eq!(stats["index_type"], expected_index_type);
+        assert_eq!(
+            stats["indices"][0]["num_partitions"],
+            LIGHTWEIGHT_PQ_PARTITIONS
+        );
+        assert_eq!(
+            stats["indices"][0]["sub_index"]["index_type"],
+            expected_sub_index
+        );
+        assert_eq!(stats["indices"][0]["sub_index"]["nbits"], num_bits);
+        assert_eq!(
+            stats["indices"][0]["sub_index"]["num_sub_vectors"],
+            expected_num_sub_vectors
+        );
+        if use_hnsw {
+            let hnsw_params = &stats["indices"][0]["sub_index"]["params"];
+            assert_eq!(hnsw_params["max_level"], 2);
+            assert_eq!(hnsw_params["m"], 4);
+            assert_eq!(hnsw_params["ef_construction"], 16);
+        }
+
+        let query = vectors.value(0);
+        let ground_truth = ground_truth(&dataset, "vector", query.as_ref(), K, distance_type).await;
+        let before_reopen = search_lightweight_pq_index(
+            &dataset,
+            query.as_ref(),
+            K,
+            LIGHTWEIGHT_PQ_PARTITIONS,
+            4,
+            64,
+        )
+        .await;
+        assert_eq!(before_reopen.num_rows(), K);
+        let row_ids = before_reopen[ROW_ID].as_primitive::<UInt64Type>().values();
+        assert_eq!(row_ids.iter().copied().collect::<HashSet<_>>().len(), K);
+        let distances = before_reopen[DIST_COL]
+            .as_primitive::<Float32Type>()
+            .values();
+        assert!(distances.iter().all(|distance| distance.is_finite()));
+        assert!(distances.windows(2).all(|pair| pair[0] <= pair[1]));
+        let recall = row_ids
+            .iter()
+            .filter(|row_id| ground_truth.contains(row_id))
+            .count() as f32
+            / K as f32;
+        assert_ge!(recall, 0.5, "recall: {recall}");
+
+        drop(dataset);
+        let reopened = Dataset::open(test_dir.as_str()).await.unwrap();
+        let reopened_stats: serde_json::Value =
+            serde_json::from_str(&reopened.index_statistics(INDEX_NAME).await.unwrap()).unwrap();
+        assert_eq!(reopened_stats, stats);
+        assert_eq!(
+            search_lightweight_pq_index(
+                &reopened,
+                query.as_ref(),
+                K,
+                LIGHTWEIGHT_PQ_PARTITIONS,
+                4,
+                64,
+            )
+            .await,
+            before_reopen
+        );
     }
 
     async fn load_vector_index_context(
@@ -3017,10 +3198,19 @@ mod tests {
         schema: Arc<Schema>,
         batches: Vec<RecordBatch>,
     ) -> Dataset {
+        write_dataset_from_batches_with_max_rows(test_uri, schema, batches, 500).await
+    }
+
+    async fn write_dataset_from_batches_with_max_rows(
+        test_uri: &str,
+        schema: Arc<Schema>,
+        batches: Vec<RecordBatch>,
+        max_rows_per_file: usize,
+    ) -> Dataset {
         let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
 
         let write_params = WriteParams {
-            max_rows_per_file: 500,
+            max_rows_per_file,
             mode: WriteMode::Overwrite,
             ..Default::default()
         };
@@ -3033,6 +3223,30 @@ mod tests {
     async fn prepare_global_ivf_pq(
         dataset: &Dataset,
         vector_column: &str,
+    ) -> (IvfBuildParams, PQBuildParams) {
+        prepare_ivf_pq(
+            dataset,
+            vector_column,
+            TWO_FRAG_DIM,
+            TWO_FRAG_NUM_PARTITIONS,
+            TWO_FRAG_NUM_SUBVECTORS,
+            TWO_FRAG_NUM_BITS,
+            TWO_FRAG_MAX_ITERS,
+            TWO_FRAG_SAMPLE_RATE,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn prepare_ivf_pq(
+        dataset: &Dataset,
+        vector_column: &str,
+        expected_dimension: usize,
+        num_partitions: usize,
+        num_sub_vectors: usize,
+        num_bits: usize,
+        max_iters: u32,
+        sample_rate: usize,
     ) -> (IvfBuildParams, PQBuildParams) {
         let batch = dataset
             .scan()
@@ -3047,39 +3261,33 @@ mod tests {
             .as_fixed_size_list();
 
         let dim = vectors.value_length() as usize;
-        assert_eq!(dim, TWO_FRAG_DIM, "unexpected vector dimension");
+        assert_eq!(dim, expected_dimension, "unexpected vector dimension");
 
         let values = vectors.values().as_primitive::<Float32Type>();
 
-        let kmeans_params = KMeansParams::new(None, TWO_FRAG_MAX_ITERS, 1, DistanceType::L2);
-        let kmeans = train_kmeans::<Float32Type>(
-            values,
-            kmeans_params,
-            dim,
-            TWO_FRAG_NUM_PARTITIONS,
-            TWO_FRAG_SAMPLE_RATE,
-        )
-        .unwrap();
+        let kmeans_params = KMeansParams::new(None, max_iters, 1, DistanceType::L2);
+        let kmeans =
+            train_kmeans::<Float32Type>(values, kmeans_params, dim, num_partitions, sample_rate)
+                .unwrap();
 
         let centroids_flat = kmeans.centroids.as_primitive::<Float32Type>().clone();
         let centroids_fsl =
             Arc::new(FixedSizeListArray::try_new_from_values(centroids_flat, dim as i32).unwrap());
         let mut ivf_params =
-            IvfBuildParams::try_with_centroids(TWO_FRAG_NUM_PARTITIONS, centroids_fsl).unwrap();
-        ivf_params.max_iters = TWO_FRAG_MAX_ITERS as usize;
-        ivf_params.sample_rate = TWO_FRAG_SAMPLE_RATE;
+            IvfBuildParams::try_with_centroids(num_partitions, centroids_fsl).unwrap();
+        ivf_params.max_iters = max_iters as usize;
+        ivf_params.sample_rate = sample_rate;
 
-        let mut pq_train_params = PQBuildParams::new(TWO_FRAG_NUM_SUBVECTORS, TWO_FRAG_NUM_BITS);
-        pq_train_params.max_iters = TWO_FRAG_MAX_ITERS as usize;
-        pq_train_params.sample_rate = TWO_FRAG_SAMPLE_RATE;
+        let mut pq_train_params = PQBuildParams::new(num_sub_vectors, num_bits);
+        pq_train_params.max_iters = max_iters as usize;
+        pq_train_params.sample_rate = sample_rate;
 
         let pq = pq_train_params.build(vectors, DistanceType::L2).unwrap();
         let codebook_flat = pq.codebook.values().as_primitive::<Float32Type>().clone();
         let pq_codebook: ArrayRef = Arc::new(codebook_flat);
-        let mut pq_params =
-            PQBuildParams::with_codebook(TWO_FRAG_NUM_SUBVECTORS, TWO_FRAG_NUM_BITS, pq_codebook);
-        pq_params.max_iters = TWO_FRAG_MAX_ITERS as usize;
-        pq_params.sample_rate = TWO_FRAG_SAMPLE_RATE;
+        let mut pq_params = PQBuildParams::with_codebook(num_sub_vectors, num_bits, pq_codebook);
+        pq_params.max_iters = max_iters as usize;
+        pq_params.sample_rate = sample_rate;
 
         (ivf_params, pq_params)
     }
@@ -3818,9 +4026,21 @@ mod tests {
     async fn test_merge_existing_hnsw_segments_rebuilds_graph(#[case] expected_index_type: &str) {
         let test_dir = TempStrDir::default();
         let base_uri = test_dir.as_str();
-        let (schema, batches) = make_two_fragment_batches();
+        let (schema, batches, max_rows_per_file) = if expected_index_type == "IVF_HNSW_PQ" {
+            let (batch, schema) = make_seeded_vector_batch(LIGHTWEIGHT_PQ_ROWS * 2);
+            (schema, vec![batch], LIGHTWEIGHT_PQ_ROWS)
+        } else {
+            let (schema, batches) = make_two_fragment_batches();
+            (schema, batches, 500)
+        };
         let dataset_uri = format!("{}/merge_hnsw_rebuilds_graph", base_uri);
-        let mut dataset = write_dataset_from_batches(&dataset_uri, schema, batches).await;
+        let mut dataset = write_dataset_from_batches_with_max_rows(
+            &dataset_uri,
+            schema,
+            batches,
+            max_rows_per_file,
+        )
+        .await;
 
         let fragments = dataset.get_fragments();
         assert!(fragments.len() >= 2);
@@ -3831,11 +4051,21 @@ mod tests {
                 HnswBuildParams::default(),
             ),
             "IVF_HNSW_PQ" => {
-                let (ivf_params, pq_params) = prepare_global_ivf_pq(&dataset, "vector").await;
+                let (ivf_params, pq_params) = prepare_ivf_pq(
+                    &dataset,
+                    "vector",
+                    DIM,
+                    LIGHTWEIGHT_PQ_PARTITIONS,
+                    LIGHTWEIGHT_PQ_SUB_VECTORS,
+                    8,
+                    2,
+                    16,
+                )
+                .await;
                 VectorIndexParams::with_ivf_hnsw_pq_params(
                     DistanceType::L2,
                     ivf_params,
-                    HnswBuildParams::default(),
+                    lightweight_hnsw_params(),
                     pq_params,
                 )
             }
@@ -4165,6 +4395,126 @@ mod tests {
         }
     }
 
+    fn pq_matrix_batch<T>() -> RecordBatch
+    where
+        T: ArrowPrimitiveType + 'static,
+        T::Native: Copy + 'static,
+        PrimitiveArray<T>: From<Vec<T::Native>> + 'static,
+        StandardUniform: Distribution<T::Native>,
+    {
+        gen_batch()
+            .with_seed(Seed(42))
+            .col("id", array::step::<UInt64Type>())
+            .col("vector", array::rand_vec::<T>(Dimension::from(DIM as u32)))
+            .into_batch_rows(RowCount::from(PQ_MATRIX_NUM_ROWS as u64))
+            .unwrap()
+    }
+
+    fn pq_matrix_params(
+        nlist: usize,
+        distance_type: DistanceType,
+        version: IndexFileVersion,
+    ) -> VectorIndexParams {
+        let mut ivf_params = IvfBuildParams::new(nlist);
+        ivf_params.max_iters = 2;
+        ivf_params.sample_rate = PQ_MATRIX_NUM_ROWS;
+        let pq_params = PQBuildParams {
+            num_sub_vectors: 4,
+            num_bits: 8,
+            max_iters: 2,
+            sample_rate: 1,
+            ..Default::default()
+        };
+        let mut params =
+            VectorIndexParams::with_ivf_pq_params(distance_type, ivf_params, pq_params);
+        params.version(version);
+        params
+    }
+
+    async fn test_pq_matrix_case(
+        nlist: usize,
+        distance_type: DistanceType,
+        version: IndexFileVersion,
+    ) {
+        const INDEX_NAME: &str = "pq_matrix";
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let batch = pq_matrix_batch::<Float32Type>();
+        let schema = batch.schema();
+        let query = batch["vector"].as_fixed_size_list().value(0);
+        let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let mut dataset = Dataset::write(batches, test_uri, None).await.unwrap();
+        let params = pq_matrix_params(nlist, distance_type, version.clone());
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some(INDEX_NAME.to_string()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let stats: serde_json::Value =
+            serde_json::from_str(&dataset.index_statistics(INDEX_NAME).await.unwrap()).unwrap();
+        assert_eq!(stats["index_type"], "IVF_PQ");
+        let indices = stats["indices"].as_array().unwrap();
+        assert_eq!(indices.len(), 1);
+        let index = &indices[0];
+        assert_eq!(index["index_type"], "IVF_PQ");
+        assert_eq!(index["metric_type"], distance_type.to_string());
+        assert_eq!(index["num_partitions"], nlist);
+        assert_eq!(index["sub_index"]["index_type"], "PQ");
+        assert_eq!(
+            index["index_file_version"],
+            match version {
+                IndexFileVersion::Legacy => "Legacy",
+                IndexFileVersion::V3 => "V3",
+            }
+        );
+
+        drop(dataset);
+        let dataset = Dataset::open(test_uri).await.unwrap();
+        let ground_truth = ground_truth(
+            &dataset,
+            "vector",
+            query.as_ref(),
+            PQ_MATRIX_K,
+            distance_type,
+        )
+        .await;
+        let result = dataset
+            .scan()
+            .nearest("vector", query.as_primitive::<Float32Type>(), PQ_MATRIX_K)
+            .unwrap()
+            .nprobes(nlist)
+            .with_row_id()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        assert_eq!(result.num_rows(), PQ_MATRIX_K);
+        let row_ids = result[ROW_ID].as_primitive::<UInt64Type>().values();
+        assert_eq!(
+            row_ids.iter().copied().collect::<HashSet<_>>().len(),
+            PQ_MATRIX_K
+        );
+        let distances = result[DIST_COL].as_primitive::<Float32Type>().values();
+        assert!(distances.iter().all(|distance| distance.is_finite()));
+        assert!(
+            distances.windows(2).all(|pair| pair[0] <= pair[1]),
+            "distances are not sorted: {distances:?}"
+        );
+        let recall = row_ids
+            .iter()
+            .filter(|row_id| ground_truth.contains(row_id))
+            .count() as f32
+            / PQ_MATRIX_K as f32;
+        assert_ge!(recall, 0.5, "recall: {recall}, row_ids: {row_ids:?}");
+    }
+
     async fn test_index_impl<T: ArrowPrimitiveType>(
         params: VectorIndexParams,
         nlist: usize,
@@ -4458,78 +4808,75 @@ mod tests {
     }
 
     #[rstest]
-    #[case(4, DistanceType::L2, 0.9)]
-    #[case(4, DistanceType::Cosine, 0.9)]
-    #[case(4, DistanceType::Dot, 0.85)]
+    #[case::l2(4, DistanceType::L2)]
+    #[case::cosine(4, DistanceType::Cosine)]
+    #[case::dot(4, DistanceType::Dot)]
     #[tokio::test]
-    async fn test_build_ivf_pq(
-        #[case] nlist: usize,
-        #[case] distance_type: DistanceType,
-        #[case] recall_requirement: f32,
-    ) {
-        let ivf_params = IvfBuildParams::new(nlist);
-        let pq_params = PQBuildParams::default();
-        let params = VectorIndexParams::with_ivf_pq_params(distance_type, ivf_params, pq_params)
-            .version(crate::index::vector::IndexFileVersion::Legacy)
-            .clone();
-        test_index(params.clone(), nlist, recall_requirement, None).await;
-        if distance_type == DistanceType::Cosine {
-            test_index_multivec(params.clone(), nlist, recall_requirement).await;
-        }
-        test_distance_range(Some(params.clone()), nlist).await;
-        // PQ performs worse on farther vectors, so if we delete the many nearest vectors, the recall will be lower
-        // lower the recall requirement in remap case for PQ, because it deletes half of the vectors
-        test_remap(params, nlist, recall_requirement * 0.9).await;
+    async fn test_build_ivf_pq(#[case] nlist: usize, #[case] distance_type: DistanceType) {
+        test_pq_matrix_case(nlist, distance_type, IndexFileVersion::Legacy).await;
     }
 
     #[rstest]
-    #[case(1, DistanceType::L2, 0.9)]
-    #[case(1, DistanceType::Cosine, 0.9)]
-    #[case(1, DistanceType::Dot, 0.85)]
-    #[case(4, DistanceType::L2, 0.9)]
-    #[case(4, DistanceType::Cosine, 0.9)]
-    #[case(4, DistanceType::Dot, 0.85)]
+    #[case::l2_nlist1(1, DistanceType::L2)]
+    #[case::cosine_nlist1(1, DistanceType::Cosine)]
+    #[case::dot_nlist1(1, DistanceType::Dot)]
+    #[case::l2_nlist4(4, DistanceType::L2)]
+    #[case::cosine_nlist4(4, DistanceType::Cosine)]
+    #[case::dot_nlist4(4, DistanceType::Dot)]
     #[tokio::test]
-    async fn test_build_ivf_pq_v3(
-        #[case] nlist: usize,
-        #[case] distance_type: DistanceType,
-        #[case] recall_requirement: f32,
-    ) {
-        let ivf_params = IvfBuildParams::new(nlist);
-        let pq_params = PQBuildParams::default();
-        let params = VectorIndexParams::with_ivf_pq_params(distance_type, ivf_params, pq_params);
-        test_index(params.clone(), nlist, recall_requirement, None).await;
-        if distance_type == DistanceType::Cosine {
-            test_index_multivec(params.clone(), nlist, recall_requirement).await;
-        }
-        test_distance_range(Some(params.clone()), nlist).await;
-        // PQ performs worse on farther vectors, so if we delete the many nearest vectors, the recall will be lower
-        // lower the recall requirement in remap case for PQ, because it deletes half of the vectors
-        test_remap(params.clone(), nlist, recall_requirement * 0.9).await;
+    async fn test_build_ivf_pq_v3(#[case] nlist: usize, #[case] distance_type: DistanceType) {
+        test_pq_matrix_case(nlist, distance_type, IndexFileVersion::V3).await;
+    }
+
+    #[rstest]
+    #[case::legacy(IndexFileVersion::Legacy)]
+    #[case::v3(IndexFileVersion::V3)]
+    #[tokio::test]
+    async fn test_ivf_pq_distance_range(#[case] version: IndexFileVersion) {
+        let params = pq_matrix_params(1, DistanceType::L2, version);
+        test_distance_range(Some(params), 1).await;
+    }
+
+    #[rstest]
+    #[case::legacy(IndexFileVersion::Legacy)]
+    #[case::v3(IndexFileVersion::V3)]
+    #[tokio::test]
+    async fn test_ivf_pq_f64_smoke(#[case] version: IndexFileVersion) {
+        let test_dir = TempStrDir::default();
+        let batch = pq_matrix_batch::<Float64Type>();
+        let schema = batch.schema();
+        let vectors = Arc::new(batch["vector"].as_fixed_size_list().clone());
+        let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let mut dataset = Dataset::write(batches, test_dir.as_str(), None)
+            .await
+            .unwrap();
+        let params = pq_matrix_params(1, DistanceType::L2, version);
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, true)
+            .await
+            .unwrap();
+        test_recall::<Float64Type>(params, 1, 0.5, "vector", &dataset, vectors).await;
+    }
+
+    #[tokio::test]
+    async fn test_legacy_ivf_pq_cosine_multivec_smoke() {
+        let params = pq_matrix_params(1, DistanceType::Cosine, IndexFileVersion::Legacy);
+        test_index_multivec_impl::<Float32Type>(params, 1, 0.5, 0.0..1.0).await;
+    }
+
+    #[tokio::test]
+    async fn test_ivf_pq_delete_all_rows_lifecycle() {
+        let params = pq_matrix_params(1, DistanceType::L2, IndexFileVersion::V3);
         test_delete_all_rows(params).await;
     }
 
     #[rstest]
-    // Temporarily disable recall checks for 4-bit PQ.
-    #[case(4, DistanceType::L2, 0.0)]
-    #[case(4, DistanceType::Cosine, 0.0)]
-    #[case(4, DistanceType::Dot, 0.0)]
+    #[case::l2(DistanceType::L2)]
+    #[case::cosine(DistanceType::Cosine)]
+    #[case::dot(DistanceType::Dot)]
     #[tokio::test]
-    async fn test_build_ivf_pq_4bit(
-        #[case] nlist: usize,
-        #[case] distance_type: DistanceType,
-        #[case] recall_requirement: f32,
-    ) {
-        let ivf_params = IvfBuildParams::new(nlist);
-        let pq_params = PQBuildParams::new(32, 4);
-        let params = VectorIndexParams::with_ivf_pq_params(distance_type, ivf_params, pq_params);
-        test_index(params.clone(), nlist, recall_requirement, None).await;
-        if distance_type == DistanceType::Cosine {
-            test_index_multivec(params.clone(), nlist, recall_requirement).await;
-        }
-        // PQ performs worse on farther vectors, so if we delete the many nearest vectors, the recall will be lower
-        // lower the recall requirement in remap case for PQ, because it deletes half of the vectors
-        test_remap(params, nlist, recall_requirement * 0.9).await;
+    async fn test_build_ivf_pq_4bit(#[case] distance_type: DistanceType) {
+        assert_lightweight_pq_index(distance_type, 4, false).await;
     }
 
     #[rstest]
@@ -4754,57 +5101,84 @@ mod tests {
     }
 
     #[rstest]
-    #[case(4, DistanceType::L2, 0.9)]
-    #[case(4, DistanceType::Cosine, 0.9)]
-    #[case(4, DistanceType::Dot, 0.85)]
+    #[case::l2(DistanceType::L2)]
+    #[case::cosine(DistanceType::Cosine)]
+    #[case::dot(DistanceType::Dot)]
     #[tokio::test]
-    async fn test_create_ivf_hnsw_pq(
-        #[case] nlist: usize,
-        #[case] distance_type: DistanceType,
-        #[case] recall_requirement: f32,
-    ) {
-        let ivf_params = IvfBuildParams::new(nlist);
-        let pq_params = PQBuildParams::default();
-        let hnsw_params = HnswBuildParams::default();
-        let params = VectorIndexParams::with_ivf_hnsw_pq_params(
-            distance_type,
-            ivf_params,
-            hnsw_params,
-            pq_params,
-        );
-        test_index(params.clone(), nlist, recall_requirement, None).await;
-        if distance_type == DistanceType::Cosine {
-            test_index_multivec(params.clone(), nlist, recall_requirement).await;
-        }
-        // PQ performs worse on farther vectors, so if we delete the many nearest vectors, the recall will be lower
-        // lower the recall requirement in remap case for PQ, because it deletes half of the vectors
-        test_remap(params, nlist, recall_requirement * 0.9).await;
+    async fn test_create_ivf_hnsw_pq(#[case] distance_type: DistanceType) {
+        assert_lightweight_pq_index(distance_type, 8, true).await;
     }
 
     #[rstest]
-    // Temporarily disable recall checks for 4-bit PQ.
-    #[case(4, DistanceType::L2, 0.0)]
-    #[case(4, DistanceType::Cosine, 0.0)]
-    #[case(4, DistanceType::Dot, 0.0)]
+    #[case::l2(DistanceType::L2)]
+    #[case::cosine(DistanceType::Cosine)]
+    #[case::dot(DistanceType::Dot)]
     #[tokio::test]
-    async fn test_create_ivf_hnsw_pq_4bit(
-        #[case] nlist: usize,
-        #[case] distance_type: DistanceType,
-        #[case] recall_requirement: f32,
-    ) {
-        let ivf_params = IvfBuildParams::new(nlist);
-        let pq_params = PQBuildParams::new(32, 4);
-        let hnsw_params = HnswBuildParams::default();
+    async fn test_create_ivf_hnsw_pq_4bit(#[case] distance_type: DistanceType) {
+        assert_lightweight_pq_index(distance_type, 4, true).await;
+    }
+
+    #[tokio::test]
+    async fn test_create_ivf_hnsw_pq_multivec() {
+        const NUM_ROWS: usize = 64;
+        const K: usize = 10;
+
+        let test_dir = TempStrDir::default();
+        let batch = lance_datagen::gen_batch()
+            .with_seed(lance_datagen::Seed::from(42))
+            .col("id", lance_datagen::array::step::<UInt64Type>())
+            .col(
+                "vector",
+                lance_datagen::array::cycle_vec_var(
+                    lance_datagen::array::rand_vec::<Float32Type>((DIM as u32).into()),
+                    3_u32.into(),
+                    4_u32.into(),
+                ),
+            )
+            .into_batch_rows(lance_datagen::RowCount::from(NUM_ROWS as u64))
+            .unwrap();
+        let vectors = batch["vector"].as_list::<i32>().clone();
+        let schema = batch.schema();
+        let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let mut dataset = Dataset::write(batches, test_dir.as_str(), None)
+            .await
+            .unwrap();
+
+        let mut ivf_params = IvfBuildParams::new(1);
+        ivf_params.max_iters = 2;
+        ivf_params.sample_rate = 16;
         let params = VectorIndexParams::with_ivf_hnsw_pq_params(
-            distance_type,
+            DistanceType::Cosine,
             ivf_params,
-            hnsw_params,
-            pq_params,
+            lightweight_hnsw_params(),
+            lightweight_pq_params(),
         );
-        test_index(params.clone(), nlist, recall_requirement, None).await;
-        if distance_type == DistanceType::Cosine {
-            test_index_multivec(params, nlist, recall_requirement).await;
-        }
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, true)
+            .await
+            .unwrap();
+
+        let query = vectors.value(0);
+        // Three vectors per query amplify the internal candidate k. This
+        // bounded budget covers all 64 * 3 vector entries in the fixture.
+        let result = search_lightweight_pq_index(&dataset, query.as_ref(), K, 1, 2, 256).await;
+        assert_eq!(result.num_rows(), K);
+        let row_ids = result[ROW_ID].as_primitive::<UInt64Type>().values();
+        assert_eq!(row_ids.iter().copied().collect::<HashSet<_>>().len(), K);
+        let distances = result[DIST_COL].as_primitive::<Float32Type>().values();
+        assert!(distances.iter().all(|distance| distance.is_finite()));
+        assert!(distances.windows(2).all(|pair| pair[0] <= pair[1]));
+
+        let ground_truth = multivec_ground_truth(&vectors, query.as_ref(), K, DistanceType::Cosine)
+            .into_iter()
+            .map(|(_, row_id)| row_id)
+            .collect::<HashSet<_>>();
+        let recall = row_ids
+            .iter()
+            .filter(|row_id| ground_truth.contains(row_id))
+            .count() as f32
+            / K as f32;
+        assert_ge!(recall, 0.5, "recall: {recall}");
     }
 
     // `lance-index` keeps these crate-private; spelling them out here also pins
@@ -5087,6 +5461,8 @@ mod tests {
             .as_primitive::<UInt64Type>()
             .values()
             .to_vec();
+        assert_eq!(row_ids.len(), k);
+        assert_eq!(row_ids.iter().copied().collect::<HashSet<_>>().len(), k);
         let dists = result[DIST_COL]
             .as_primitive::<Float32Type>()
             .values()
@@ -5226,12 +5602,46 @@ mod tests {
         let test_dir = TempStrDir::default();
         let test_uri = test_dir.as_str();
 
-        let nlist = 500;
-        let (mut dataset, _) = generate_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await;
+        let num_rows = 32;
+        let num_partitions = num_rows + 2;
+        let mut vector_values = vec![0.0; num_rows * DIM];
+        for row in 0..num_rows {
+            vector_values[row * DIM + row] = 1.0;
+        }
+        let one_hot_vectors = Arc::new(
+            FixedSizeListArray::try_new_from_values(
+                Float32Array::from(vector_values.clone()),
+                DIM as i32,
+            )
+            .unwrap(),
+        );
+        let batch = gen_batch()
+            .col("id", array::step::<UInt64Type>())
+            .col("vector", array::jitter_centroids(one_hot_vectors, 0.0))
+            .into_batch_rows(RowCount::from(num_rows as u64))
+            .unwrap();
+        let schema = batch.schema();
+        let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let mut dataset = Dataset::write(batches, test_uri, None).await.unwrap();
 
-        let ivf_params = IvfBuildParams::new(nlist);
+        // Keep partition 0 empty: stats previously failed when the first partition was empty.
+        let mut centroid_values = Vec::with_capacity(num_partitions * DIM);
+        centroid_values.extend(std::iter::repeat_n(2.0, DIM));
+        centroid_values.extend(vector_values);
+        centroid_values.extend(std::iter::repeat_n(-2.0, DIM));
+        let centroids = Arc::new(
+            FixedSizeListArray::try_new_from_values(
+                Float32Array::from(centroid_values),
+                DIM as i32,
+            )
+            .unwrap(),
+        );
+        let ivf_params = IvfBuildParams::try_with_centroids(num_partitions, centroids).unwrap();
         let sq_params = SQBuildParams::default();
-        let hnsw_params = HnswBuildParams::default();
+        let hnsw_params = HnswBuildParams::default()
+            .max_level(1)
+            .num_edges(4)
+            .ef_construction(4);
         let params = VectorIndexParams::with_ivf_hnsw_sq_params(
             DistanceType::L2,
             ivf_params,
@@ -5254,14 +5664,25 @@ mod tests {
         let stats: serde_json::Value = serde_json::from_str(stats.as_str()).unwrap();
 
         assert_eq!(stats["index_type"].as_str().unwrap(), "IVF_HNSW_SQ");
-        for index in stats["indices"].as_array().unwrap() {
-            assert_eq!(index["index_type"].as_str().unwrap(), "IVF_HNSW_SQ");
-            assert_eq!(
-                index["num_partitions"].as_number().unwrap(),
-                &serde_json::Number::from(nlist)
-            );
-            assert_eq!(index["sub_index"]["index_type"].as_str().unwrap(), "HNSW");
-        }
+        let indices = stats["indices"].as_array().unwrap();
+        assert_eq!(indices.len(), 1);
+        let index = &indices[0];
+        assert_eq!(index["index_type"].as_str().unwrap(), "IVF_HNSW_SQ");
+        assert_eq!(
+            index["num_partitions"].as_number().unwrap(),
+            &serde_json::Number::from(num_partitions)
+        );
+        assert_eq!(index["sub_index"]["index_type"].as_str().unwrap(), "HNSW");
+        let partition_sizes = index["partitions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|partition| partition["size"].as_u64().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(partition_sizes.len(), num_partitions);
+        assert_eq!(partition_sizes.iter().sum::<u64>(), num_rows as u64);
+        assert_eq!(partition_sizes[0], 0);
+        assert!(partition_sizes.contains(&0));
     }
 
     async fn test_distance_range(params: Option<VectorIndexParams>, nlist: usize) {
