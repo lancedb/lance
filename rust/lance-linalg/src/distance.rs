@@ -635,12 +635,21 @@ mod tests {
             );
         }
 
-        // A sliced query reads through `values()`, which has to follow the
-        // slice: the window here holds no nulls while the full buffer does, and
-        // its two elements must be the ones the slice selects.
+        // A sliced query reads through `values()`, which has to follow the slice:
+        // the window here holds no nulls while the full buffer does. The L2
+        // distances are asserted literally rather than against a second call,
+        // since computing the expected values by the same route would hide a bug
+        // that transformed both alike. Query [3, 4] against [[1, 2], [3, 4]]
+        // gives (3-1)^2 + (4-2)^2 = 8 and 0.
         let sliced = Int8Array::from(vec![None, Some(3_i8), Some(4), None]).slice(1, 2);
         let query: Arc<dyn Array> = Arc::new(sliced);
-        for dt in [DistanceType::L2, DistanceType::Cosine, DistanceType::Dot] {
+        let got = DistanceType::L2.arrow_batch_func()(query.as_ref(), &targets).unwrap();
+        assert_eq!(
+            got.values(),
+            &[8.0_f32, 0.0],
+            "L2 did not follow the query slice"
+        );
+        for dt in [DistanceType::Cosine, DistanceType::Dot] {
             let got = dt.arrow_batch_func()(query.as_ref(), &targets).unwrap();
             let want =
                 dt.arrow_batch_func()(Arc::new(Int8Array::from(vec![3_i8, 4])).as_ref(), &targets)

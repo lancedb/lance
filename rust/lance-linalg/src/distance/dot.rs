@@ -812,13 +812,15 @@ where
 ///
 /// # Panics
 ///
-/// Panics if the length of `from` is not equal to the dimension (value length) of `to`.
+/// With debug assertions on, panics if the length of `from` is not equal to the
+/// dimension (value length) of `to`, unless one of the errors above is returned
+/// first.
 pub fn dot_distance_arrow_batch(
     from: &dyn Array,
     to: &FixedSizeListArray,
 ) -> Result<Arc<Float32Array>> {
-    // The dimension check lives in `do_dot_distance_arrow_batch`, which every
-    // arm below reaches. Asserting here too made this the one metric of the
+    // The dimension check lives in `do_dot_distance_arrow_batch`, which the four
+    // typed arms reach. Asserting here as well made this the one metric of the
     // three that panicked on an input that is both a length mismatch and a null
     // query, where l2 and cosine returned the error.
     match *from.data_type() {
