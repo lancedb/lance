@@ -78,7 +78,7 @@ use log::info;
 use object_store::path::Path;
 use prost::Message;
 use roaring::RoaringBitmap;
-use tokio::sync::{OnceCell, Semaphore};
+use tokio::sync::{OnceCell, OwnedSemaphorePermit, Semaphore};
 use tracing::{Level, instrument, span};
 
 use crate::Dataset;
@@ -267,6 +267,9 @@ pub struct IvfIndexBuilder<S: IvfSubIndex, Q: Quantization> {
 
 type BuildStream<S, Q> =
     Pin<Box<dyn Stream<Item = Result<Budgeted<PartitionBuildResult<S, Q>>>> + Send>>;
+
+type FreshWindowBuildStream<S, Q> =
+    Pin<Box<dyn Stream<Item = Result<(PartitionBuildResult<S, Q>, OwnedSemaphorePermit)>> + Send>>;
 
 struct PartitionBuildResult<S: IvfSubIndex, Q: Quantization> {
     partition_id: usize,
@@ -1256,15 +1259,29 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                         }
                         admission.reconcile(decoded_bytes);
 
-                        let builds = stream::iter(inputs.into_iter().map(|input| {
+                        // Each concurrently polled window owns a small FIFO entry
+                        // budget. With at most `concurrency` active window streams,
+                        // their combined active/completed results remain bounded by
+                        // `max_entries`, while a later window cannot consume every
+                        // slot needed for the oldest window to make ordered progress.
+                        let window_entry_limit = max_entries.div_ceil(concurrency);
+                        let entry_permits = Arc::new(Semaphore::new(window_entry_limit));
+                        let builds = stream::iter(inputs.into_iter().map(move |input| {
                             let quantizer = quantizer.clone();
                             let sub_index_params = sub_index_params.clone();
                             let column = column.clone();
                             let frag_reuse_index = frag_reuse_index.clone();
                             let cpu_permits = cpu_permits.clone();
+                            let entry_permits = entry_permits.clone();
                             async move {
                                 let partition_id = input.partition_id;
                                 let loss = input.loss;
+                                let entry_permit =
+                                    entry_permits.acquire_owned().await.map_err(|_| {
+                                        Error::internal(
+                                            "partition build entry semaphore was closed",
+                                        )
+                                    })?;
                                 let _cpu_permit = cpu_permits.acquire_owned().await.map_err(|_| {
                                     Error::internal("partition build CPU semaphore was closed")
                                 })?;
@@ -1288,18 +1305,18 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                                     Ok(Some((storage, sub_index, loss)))
                                 })
                                 .await?;
-                                Ok::<PartitionBuildResult<S, Q>, Error>(PartitionBuildResult {
-                                    partition_id,
-                                    built,
-                                })
+                                Ok::<_, Error>((
+                                    PartitionBuildResult {
+                                        partition_id,
+                                        built,
+                                    },
+                                    entry_permit,
+                                ))
                             }
                         }))
                         .buffer_unordered(concurrency)
-                        .try_collect::<Vec<_>>()
-                        .await?;
-                        let mut builds = builds;
-                        builds.sort_unstable_by_key(|result| result.partition_id);
-                        Ok((builds, admission))
+                        .boxed();
+                        Ok::<(FreshWindowBuildStream<S, Q>, _), Error>((builds, admission))
                     },
                 );
                 Ok(Some((job, next_partition_id)))
@@ -1311,19 +1328,26 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             jobs,
             concurrency,
             PARTITION_BUILD_BUDGET_BYTES,
-            max_entries,
+            // One admission entry per outstanding window. Together with each
+            // window's entry limit above, this bounds partition results by
+            // `max_entries` even after an inner stream has finished.
+            concurrency,
         )?;
         Ok(windows
             .map_ok(|window| {
-                let Budgeted { value, _permit } = window;
-                stream::iter(value.into_iter().map(move |value| {
-                    Ok(Budgeted {
-                        value,
-                        _permit: _permit.clone(),
-                    })
-                }))
+                let Budgeted {
+                    value: builds,
+                    _permit,
+                    _entry_permit,
+                } = window;
+                debug_assert!(_entry_permit.is_none());
+                builds.map_ok(move |(value, entry_permit)| Budgeted {
+                    value,
+                    _permit: _permit.clone(),
+                    _entry_permit: Some(entry_permit),
+                })
             })
-            .try_flatten()
+            .try_flatten_unordered(Some(concurrency))
             .boxed())
     }
 
@@ -1514,6 +1538,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 let Budgeted {
                     value: PartitionBuildResult { built: part, .. },
                     _permit,
+                    _entry_permit,
                 } = result;
                 let completed_partitions = partition_id + 1;
                 progress

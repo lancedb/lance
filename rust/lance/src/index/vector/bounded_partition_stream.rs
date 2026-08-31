@@ -13,6 +13,7 @@ use futures::stream::FuturesUnordered;
 use futures::task::AtomicWaker;
 use futures::{Stream, StreamExt};
 use lance_core::{Error, Result};
+use tokio::sync::OwnedSemaphorePermit;
 
 /// Work admitted to [`BoundedPartitionStream`].
 type WeightedJobStarter<T> = Box<
@@ -59,6 +60,7 @@ impl<T> WeightedJob<T> {
 pub(super) struct Budgeted<T> {
     pub(super) value: T,
     pub(super) _permit: Option<Arc<AdmissionPermit>>,
+    pub(super) _entry_permit: Option<OwnedSemaphorePermit>,
 }
 
 impl<T> Budgeted<T> {
@@ -66,6 +68,7 @@ impl<T> Budgeted<T> {
         Self {
             value,
             _permit: None,
+            _entry_permit: None,
         }
     }
 }
@@ -322,6 +325,7 @@ where
                     future.await.map(|(value, permit)| Budgeted {
                         value,
                         _permit: Some(Arc::new(permit)),
+                        _entry_permit: None,
                     })
                 }));
                 continue;
@@ -358,8 +362,8 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
-    use futures::StreamExt;
     use futures::stream;
+    use futures::{StreamExt, TryStreamExt};
 
     use super::*;
 
@@ -493,6 +497,79 @@ mod tests {
         assert_eq!(current_entries, 2);
         assert_eq!(peak_entries, 2);
         drop((first, second));
+    }
+
+    #[tokio::test]
+    async fn expanded_window_results_respect_partition_entry_cap() {
+        struct ResidentResult(usize, Arc<AtomicUsize>);
+
+        impl ResidentResult {
+            fn new(value: usize, resident: Arc<AtomicUsize>) -> Self {
+                resident.fetch_add(1, Ordering::AcqRel);
+                Self(value, resident)
+            }
+        }
+
+        impl Drop for ResidentResult {
+            fn drop(&mut self) {
+                self.1.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+
+        let resident = Arc::new(AtomicUsize::new(0));
+        let partition_entries = Arc::new(tokio::sync::Semaphore::new(1));
+        let resident_for_job = resident.clone();
+        let entries_for_job = partition_entries.clone();
+        let jobs = vec![Ok(WeightedJob::with_permit(
+            1,
+            move |admission| async move {
+                let builds = stream::iter((0..8).map(move |value| {
+                    let resident = resident_for_job.clone();
+                    let partition_entries = entries_for_job.clone();
+                    async move {
+                        let entry_permit = partition_entries.acquire_owned().await.unwrap();
+                        Ok::<_, Error>((ResidentResult::new(value, resident), entry_permit))
+                    }
+                }))
+                .buffer_unordered(8)
+                .boxed();
+                Ok((builds, admission))
+            },
+        ))];
+        let windows = BoundedPartitionStream::try_new(stream::iter(jobs), 1, 1, 1).unwrap();
+        let mut output = windows
+            .map_ok(|window| {
+                let Budgeted {
+                    value: builds,
+                    _permit,
+                    _entry_permit,
+                } = window;
+                assert!(_entry_permit.is_none());
+                builds.map_ok(move |(value, entry_permit)| Budgeted {
+                    value,
+                    _permit: _permit.clone(),
+                    _entry_permit: Some(entry_permit),
+                })
+            })
+            .try_flatten_unordered(Some(1))
+            .boxed();
+
+        let first = output.next().await.unwrap().unwrap();
+        assert!(first.value.0 < 8);
+        assert_eq!(resident.load(Ordering::Acquire), 1);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), output.next())
+                .await
+                .is_err()
+        );
+
+        drop(first);
+        while let Some(result) = output.next().await {
+            let result = result.unwrap();
+            assert_eq!(resident.load(Ordering::Acquire), 1);
+            drop(result);
+        }
+        assert_eq!(resident.load(Ordering::Acquire), 0);
     }
 
     #[tokio::test]
