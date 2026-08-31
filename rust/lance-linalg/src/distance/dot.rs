@@ -806,8 +806,9 @@ where
 ///
 /// # Errors
 ///
-/// Returns `ArrowError::InvalidArgumentError` if `from` is an `Int8` array
-/// containing nulls: a null query element has no distance to compute.
+/// Returns an error if `from` is an `Int8` array containing nulls, since a null
+/// query element has no distance to compute. The unsupported-type and downcast
+/// paths return errors of their own; this list is not exhaustive.
 ///
 /// # Panics
 ///
@@ -816,9 +817,10 @@ pub fn dot_distance_arrow_batch(
     from: &dyn Array,
     to: &FixedSizeListArray,
 ) -> Result<Arc<Float32Array>> {
-    let dimension = to.value_length() as usize;
-    debug_assert_eq!(from.len(), dimension);
-
+    // The dimension check lives in `do_dot_distance_arrow_batch`, which every
+    // arm below reaches. Asserting here too made this the one metric of the
+    // three that panicked on an input that is both a length mismatch and a null
+    // query, where l2 and cosine returned the error.
     match *from.data_type() {
         DataType::Float16 => do_dot_distance_arrow_batch::<Float16Type>(from.as_primitive(), to),
         DataType::Float32 => do_dot_distance_arrow_batch::<Float32Type>(from.as_primitive(), to),

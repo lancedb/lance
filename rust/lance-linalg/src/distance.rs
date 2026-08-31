@@ -30,9 +30,10 @@ pub mod norm_l2;
 
 /// Widens an `Int8` query vector to `f32`, rejecting nulls.
 ///
-/// The three `_arrow_batch` entry points take the query as a `&dyn Array` and
-/// widen an `Int8` one element at a time. A null element has no distance to
-/// compute, and what this replaced was an `unwrap`.
+/// The three `_arrow_batch` entry points take the query as a `&dyn Array`, so an
+/// `Int8` one has to be widened before it reaches a kernel. A null element has no
+/// distance to compute, and the widening this replaced resolved it with an
+/// `unwrap`.
 fn int8_query_to_f32(query: &PrimitiveArray<Int8Type>) -> Result<Float32Array> {
     if query.null_count() > 0 {
         return Err(ArrowError::InvalidArgumentError(format!(
@@ -615,7 +616,8 @@ mod tests {
         for dt in [DistanceType::L2, DistanceType::Cosine, DistanceType::Dot] {
             let err = dt.arrow_batch_func()(query.as_ref(), &targets).unwrap_err();
             assert!(
-                matches!(&err, ArrowError::InvalidArgumentError(m) if m.contains("must not contain nulls")),
+                matches!(&err, ArrowError::InvalidArgumentError(m)
+                    if m.contains("Int8 query vector `from`") && m.contains("found 1 in 2 values")),
                 "{dt} accepted a null Int8 query element, got: {err}"
             );
         }
@@ -643,11 +645,7 @@ mod tests {
             let want =
                 dt.arrow_batch_func()(Arc::new(Int8Array::from(vec![3_i8, 4])).as_ref(), &targets)
                     .unwrap();
-            assert_eq!(
-                got.values(),
-                want.values(),
-                "{dt} did not follow the query slice"
-            );
+            assert_eq!(got, want, "{dt} did not follow the query slice");
         }
     }
 

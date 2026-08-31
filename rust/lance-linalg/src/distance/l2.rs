@@ -971,8 +971,9 @@ where
 ///
 /// # Errors
 ///
-/// Returns `ArrowError::InvalidArgumentError` if `from` is an `Int8` array
-/// containing nulls: a null query element has no distance to compute.
+/// Returns an error if `from` is an `Int8` array containing nulls, since a null
+/// query element has no distance to compute. The unsupported-type and downcast
+/// paths return errors of their own; this list is not exhaustive.
 ///
 /// # Panics
 ///
