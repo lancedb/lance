@@ -978,7 +978,7 @@ where
 /// # Panics
 ///
 /// Panics if the length of `from` is not equal to the dimension (value length)
-/// of `to`, unless one of the errors above is returned first.
+/// of `to`.
 pub fn l2_distance_arrow_batch(
     from: &dyn Array,
     to: &FixedSizeListArray,
