@@ -26,9 +26,9 @@ pub mod l2;
 pub mod l2_u8;
 pub mod norm_l2;
 
-// `#[track_caller]` on both helpers is load-bearing. They are called from the
-// l2 and dot families only, and without it every panic from them reports this
-// file, which the shared use makes ambiguous between 20 call sites. See #8863.
+// `#[track_caller]` on both helpers is load-bearing: without it a length-contract
+// panic reports this file rather than the distance function the caller reached.
+// See #8863.
 #[inline]
 #[track_caller]
 fn assert_equal_lengths(left_len: usize, right_len: usize) {
@@ -38,7 +38,6 @@ fn assert_equal_lengths(left_len: usize, right_len: usize) {
     );
 }
 
-// `#[track_caller]` here for the same reason as above.
 #[inline]
 #[track_caller]
 fn assert_batch_layout(vector_len: usize, batch_len: usize, dimension: usize) {
