@@ -261,7 +261,7 @@ class ZonemapBloomfilterIndex(DatasetUpgradeDowngradeTest):
 
     def skip_downgrade(self, version: str) -> bool:
         # In 0.X the zonemap index did not properly handle NULL in filters
-        return version.startswith("0.")
+        return super().skip_downgrade(version) or version.startswith("0.")
 
 
 @compat_test(min_version="0.36.0")
@@ -376,7 +376,7 @@ class FtsIndex(DatasetUpgradeDowngradeTest):
         ds.optimize.compact_files()
 
     def skip_downgrade(self, version: str) -> bool:
-        return version.startswith("0.")
+        return super().skip_downgrade(version) or version.startswith("0.")
 
     def current_env(self, method_name: str) -> dict[str, str]:
         if method_name == "create":

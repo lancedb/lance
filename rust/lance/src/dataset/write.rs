@@ -29,6 +29,7 @@ use lance_io::traits::Writer;
 use lance_table::format::{BasePath, DataFile, Fragment, IndexMetadata};
 use lance_table::io::commit::{CommitHandler, commit_handler_from_url};
 use lance_table::io::manifest::ManifestDescribing;
+use lance_table::transaction::{Operation, canonicalize_stable_field_ids};
 use object_store::path::Path;
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
@@ -1527,9 +1528,23 @@ pub(super) fn prepare_write_schema(
         && matches!(params.mode, WriteMode::Overwrite)
         && dataset.manifest.uses_stable_field_ids()
     {
-        let mut schema = normalized_converted_schema;
-        schema.try_reassign_field_ids(Some(dataset.manifest.max_field_id()))?;
-        schema
+        // Uncommitted fragment APIs return files without the schema used to
+        // write them, so their mappings must already use commit-time IDs.
+        let mut operation = Operation::Overwrite {
+            fragments: Vec::new(),
+            schema: normalized_converted_schema,
+            config_upsert_values: None,
+            initial_bases: None,
+        };
+        canonicalize_stable_field_ids(Some(&dataset.manifest), &mut operation)?;
+        match operation {
+            Operation::Overwrite { schema, .. } => schema,
+            _ => {
+                return Err(Error::internal(
+                    "Stable field-ID canonicalization changed an Overwrite operation",
+                ));
+            }
+        }
     } else {
         normalized_converted_schema
     };

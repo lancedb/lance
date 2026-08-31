@@ -715,8 +715,8 @@ impl Schema {
 
     /// Replace every field ID with a fresh checked allocation.
     ///
-    /// The first assigned ID is one greater than `max_existing_id`. This is used
-    /// when an operation replaces the complete schema identity, such as overwrite.
+    /// The first assigned ID is one greater than `max_existing_id`. Use this when
+    /// every input field must receive a new identity.
     pub fn try_reassign_field_ids(&mut self, max_existing_id: Option<i32>) -> Result<()> {
         let field_count = self.fields_pre_order().count() as i64;
         let first_id = i64::from(max_existing_id.unwrap_or(-1)) + 1;
