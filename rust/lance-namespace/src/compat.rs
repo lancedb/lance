@@ -3,41 +3,33 @@
 
 //! Deserialization shims that keep older SDK builds working against current native code.
 
-use serde::Deserialize;
-use serde::de::{Deserializer, Error as _};
-
+use crate::error::NamespaceError;
 use crate::models::MergeInsertIntoTableRequest;
 
-/// A [`MergeInsertIntoTableRequest`] whose `on` field also accepts a bare string.
+/// Deserialize a [`MergeInsertIntoTableRequest`] whose `on` field may be a bare string.
 ///
 /// Java and Python SDK requests reach the Rust implementations as JSON across JNI and
 /// pyo3, so a jar or wheel built against lance-namespace 0.11 or earlier sends
-/// `"on": "id"` where the current model expects `"on": ["id"]`. Deserializing through
-/// this type promotes a scalar to a one-element list so those callers keep working.
+/// `"on": "id"` where the current model expects `"on": ["id"]`. A scalar is promoted to
+/// a one-element list so those callers keep working.
 ///
 /// This is inbound only. A Java namespace implementation called *from* Rust still needs
 /// a jar matching the current model.
-#[derive(Debug, Clone)]
-pub struct LenientMergeInsertIntoTableRequest(MergeInsertIntoTableRequest);
-
-impl From<LenientMergeInsertIntoTableRequest> for MergeInsertIntoTableRequest {
-    fn from(request: LenientMergeInsertIntoTableRequest) -> Self {
-        request.0
+pub fn merge_insert_request_from_json(
+    mut value: serde_json::Value,
+) -> crate::Result<MergeInsertIntoTableRequest> {
+    if let Some(on) = value.get_mut("on")
+        && let Some(column) = on.as_str()
+    {
+        *on = serde_json::json!([column]);
     }
-}
 
-impl<'de> Deserialize<'de> for LenientMergeInsertIntoTableRequest {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let mut value = serde_json::Value::deserialize(deserializer)?;
-        if let Some(on) = value.get_mut("on")
-            && let Some(column) = on.as_str()
-        {
-            *on = serde_json::json!([column]);
+    serde_json::from_value(value).map_err(|e| {
+        NamespaceError::InvalidInput {
+            message: format!("Failed to parse merge_insert_into_table request: {}", e),
         }
-        serde_json::from_value(value)
-            .map(Self)
-            .map_err(D::Error::custom)
-    }
+        .into()
+    })
 }
 
 #[cfg(test)]
@@ -45,9 +37,7 @@ mod tests {
     use super::*;
 
     fn parse(json: &str) -> MergeInsertIntoTableRequest {
-        serde_json::from_str::<LenientMergeInsertIntoTableRequest>(json)
-            .unwrap()
-            .into()
+        merge_insert_request_from_json(serde_json::from_str(json).unwrap()).unwrap()
     }
 
     #[test]
@@ -73,8 +63,7 @@ mod tests {
     #[test]
     fn a_non_string_non_list_on_is_still_rejected() {
         let error =
-            serde_json::from_str::<LenientMergeInsertIntoTableRequest>(r#"{"id": ["t"], "on": 7}"#)
-                .unwrap_err();
+            merge_insert_request_from_json(serde_json::json!({"id": ["t"], "on": 7})).unwrap_err();
         assert!(
             error.to_string().contains("invalid type"),
             "unexpected error: {error}"

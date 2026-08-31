@@ -27,8 +27,6 @@ pub use namespace::LanceNamespace;
 // Re-export error types
 pub use error::{ErrorCode, NamespaceError, Result as NamespaceResult};
 
-pub use compat::LenientMergeInsertIntoTableRequest;
-
 // Re-export reqwest client for convenience
 pub use lance_namespace_reqwest_client as reqwest_client;
 
