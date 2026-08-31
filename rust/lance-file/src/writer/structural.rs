@@ -173,7 +173,7 @@ impl StructuralFileSink {
         self.column_metadata = vec![initial_column_metadata(); num_columns as usize];
     }
 
-    pub fn initialize_with_external_metadata(
+    pub(crate) fn initialize_with_external_metadata(
         &mut self,
         column_metadata: Vec<pbfile::ColumnMetadata>,
     ) {
@@ -249,6 +249,9 @@ impl StructuralFileSink {
         while let Some(encoding_task) = encoding_tasks.next().await {
             self.write_page(encoding_task?).await?;
         }
+        // Reaps any upload that has already failed so the error is attributed to
+        // this batch. This does not wait for in-flight uploads; see
+        // `ObjectWriter::poll_flush`.
         self.writer.flush().await?;
         Ok(())
     }
@@ -343,7 +346,7 @@ impl StructuralFileSink {
         Ok(start)
     }
 
-    pub async fn write_external_buffer(&mut self, bytes: &[u8]) -> Result<(u64, u64)> {
+    pub(crate) async fn write_external_buffer(&mut self, bytes: &[u8]) -> Result<(u64, u64)> {
         const ZERO_PADDING: [u8; PAGE_BUFFER_ALIGNMENT] = [0; PAGE_BUFFER_ALIGNMENT];
         let position = self.tell().await?;
         let padding = (PAGE_BUFFER_ALIGNMENT - position as usize % PAGE_BUFFER_ALIGNMENT)
@@ -697,7 +700,13 @@ impl EncodingPipeline {
         self.schema_metadata.insert(key.into(), value.into());
     }
 
-    pub fn initialize_with_external_metadata(&mut self, schema: Schema, rows_written: u64) {
+    pub(crate) fn initialize_with_external_metadata(
+        &mut self,
+        mut schema: Schema,
+        rows_written: u64,
+    ) {
+        self.schema_metadata
+            .extend(std::mem::take(&mut schema.metadata));
         self.schema = Some(schema);
         self.rows_written = rows_written;
     }

@@ -17,6 +17,7 @@ use lance_arrow::{RecordBatchExt, SchemaExt, interleave_batches};
 use lance_core::{
     Error, Result,
     cache::LanceCache,
+    utils::parse::str_is_truthy,
     utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu},
 };
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
@@ -318,7 +319,7 @@ pub fn create_ivf_shuffler(
     progress: Option<Arc<dyn crate::progress::IndexBuildProgress>>,
 ) -> Box<dyn Shuffler> {
     let use_legacy = std::env::var("LANCE_LEGACY_SHUFFLER")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .map(|v| str_is_truthy(&v))
         .unwrap_or(false);
     if use_legacy {
         let mut shuffler =
@@ -912,6 +913,32 @@ mod tests {
 
         // Out of range partition returns None
         assert!(reader.read_partition(3).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_two_file_shuffler_empty_first_batch() {
+        let dir = TempStrDir::default();
+        let output_dir = Path::from(dir.as_ref());
+        let empty_batch = make_batch(&[], &[], None);
+        let data_batch = make_batch(&[1, 0, 1], &[10, 20, 30], None);
+
+        let shuffler = TwoFileShuffler::new(output_dir, 2);
+        let stream = batches_to_stream(vec![empty_batch, data_batch]);
+        let reader = shuffler.shuffle(stream).await.unwrap();
+
+        assert_eq!(reader.partition_size(0).unwrap(), 1);
+        assert_eq!(reader.partition_size(1).unwrap(), 2);
+
+        let expected_schema = ArrowSchema::new(vec![Field::new("val", DataType::Int32, false)]);
+        let p0 = collect_partition(reader.as_ref(), 0).await.unwrap();
+        assert_eq!(p0.schema().as_ref(), &expected_schema);
+        let p0_values: &Int32Array = p0["val"].as_primitive();
+        assert_eq!(p0_values.values(), &[20]);
+
+        let p1 = collect_partition(reader.as_ref(), 1).await.unwrap();
+        assert_eq!(p1.schema().as_ref(), &expected_schema);
+        let p1_values: &Int32Array = p1["val"].as_primitive();
+        assert_eq!(p1_values.values(), &[10, 30]);
     }
 
     #[tokio::test]
