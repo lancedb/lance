@@ -833,7 +833,11 @@ class LanceFragment(pa.dataset.Fragment):
         left_on: str = "_rowid",
         right_on: Optional[str] = None,
         schema=None,
-    ) -> Tuple[FragmentMetadata, List[int]]:
+        with_offsets: bool = False,
+    ) -> Union[
+        Tuple[FragmentMetadata, List[int]],
+        Tuple[FragmentMetadata, List[int], bytes],
+    ]:
         """
         Update existing columns in this fragment.
 
@@ -859,6 +863,14 @@ class LanceFragment(pa.dataset.Fragment):
             The name of the column in data_obj to join on. If None, defaults to left_on.
         schema: pa.Schema, optional
             The schema of the data. If not specified, the schema will be inferred.
+        with_offsets: bool, default False
+            If True, also return the physical row offsets (0-based within this
+            fragment) that matched the join, serialized in the portable
+            RoaringBitmap format. Pass them to
+            :class:`LanceOperation.Update <lance.LanceOperation.Update>` as
+            ``updated_fragment_offsets`` with ``update_mode="rewrite_columns"``
+            so a commit over stable row ids refreshes row-level version
+            metadata for the matched rows only.
 
         Returns
         -------
@@ -866,6 +878,10 @@ class LanceFragment(pa.dataset.Fragment):
             A tuple of:
             - FragmentMetadata: The updated fragment metadata
             - List[int]: The list of field IDs that were modified
+
+            When ``with_offsets`` is True, the tuple has a third element:
+            - bytes: The matched physical row offsets as portable
+              RoaringBitmap bytes
 
         Examples
         --------
@@ -922,9 +938,11 @@ class LanceFragment(pa.dataset.Fragment):
             right_on = left_on
 
         reader = _coerce_reader(data_obj, schema)
-        metadata, fields_modified = self._fragment.update_columns(
+        metadata, fields_modified, matched_offsets = self._fragment.update_columns(
             reader, left_on, right_on
         )
+        if with_offsets:
+            return metadata, fields_modified, matched_offsets
         return metadata, fields_modified
 
     def merge_columns(

@@ -363,15 +363,26 @@ impl FileFragment {
         reader: PyArrowType<ArrowArrayStreamReader>,
         left_on: String,
         right_on: String,
-    ) -> PyResult<(PyLance<Fragment>, Vec<u32>)> {
+    ) -> PyResult<(PyLance<Fragment>, Vec<u32>, Vec<u8>)> {
         let mut fragment = self.fragment.clone();
-        let (updated_fragment, fields_modified) = rt()
+        let result = rt()
             .spawn(None, async move {
-                fragment.update_columns(reader.0, &left_on, &right_on).await
+                fragment
+                    .update_columns_with_offsets(reader.0, &left_on, &right_on)
+                    .await
             })?
             .infer_error()?;
 
-        Ok((PyLance(updated_fragment), fields_modified))
+        let mut matched_offsets = Vec::with_capacity(result.matched_offsets.serialized_size());
+        result
+            .matched_offsets
+            .serialize_into(&mut matched_offsets)
+            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+        Ok((
+            PyLance(result.fragment),
+            result.fields_modified,
+            matched_offsets,
+        ))
     }
 
     fn delete(&self, predicate: &str) -> PyResult<Option<Self>> {

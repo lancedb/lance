@@ -833,6 +833,50 @@ def test_fragment_update_columns_partial_update(tmp_path):
     assert result["city"] == ["NYC", "LA", "SF"]  # Unchanged
 
 
+def test_fragment_update_columns_with_offsets_rewrite_columns(tmp_path):
+    """update_columns(with_offsets=True) returns matched row offsets that a
+    rewrite_columns commit uses to refresh row version metadata for the
+    matched rows only."""
+    data = pa.table(
+        {
+            "id": list(range(8)),
+            "value": [i * 10 for i in range(8)],
+        }
+    )
+    dataset_uri = tmp_path / "test_dataset_update_columns_with_offsets"
+    dataset = lance.write_dataset(
+        data, dataset_uri, max_rows_per_file=4, enable_stable_row_ids=True
+    )
+    assert len(dataset.get_fragments()) == 2
+
+    # Update two rows of the second fragment, joining on a user column.
+    fragment = dataset.get_fragments()[1]
+    update_data = pa.table({"id": [5, 7], "value": [500, 700]})
+    updated_fragment, fields_modified, matched_offsets = fragment.update_columns(
+        update_data, left_on="id", with_offsets=True
+    )
+    assert isinstance(matched_offsets, bytes)
+    assert len(matched_offsets) > 0
+
+    op = LanceOperation.Update(
+        updated_fragments=[updated_fragment],
+        fields_modified=fields_modified,
+        update_mode="rewrite_columns",
+        updated_fragment_offsets={updated_fragment.id: matched_offsets},
+    )
+    updated_dataset = lance.LanceDataset.commit(
+        str(dataset_uri), op, read_version=dataset.version
+    )
+
+    result = updated_dataset.to_table(
+        columns=["id", "value", "_row_last_updated_at_version"]
+    ).sort_by("id")
+    assert result["value"].to_pylist() == [0, 10, 20, 30, 40, 500, 60, 700]
+    # Only the matched rows carry the commit's version.
+    versions = result["_row_last_updated_at_version"].to_pylist()
+    assert versions == [1, 1, 1, 1, 1, 2, 1, 2]
+
+
 def test_fragment_update_columns_no_match(tmp_path):
     """Test update when no rows match the join condition."""
     # Create initial dataset
