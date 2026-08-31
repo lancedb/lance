@@ -109,5 +109,5 @@ fn downstream_futures_fit_default_recursion_limit(
     scanner: &LsmScanner,
     keys: &[ScalarValue],
 ) {
-    let _ = require_send(app_layer(planner, scanner, keys));
+    std::mem::drop(require_send(app_layer(planner, scanner, keys)));
 }
