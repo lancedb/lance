@@ -1479,14 +1479,7 @@ mod tests {
     }
 
     /// A mismatch has to stop at the boundary rather than reach a kernel that
-    /// takes one length and reads both vectors with it. The lengths are 16 and 15
-    /// so a dispatch tier with wide loops enters one.
-    ///
-    /// Which construct reports the mismatch depends on the build. Where no SIMD
-    /// arm is compiled or dispatched, these calls reach `cosine_scalar` and
-    /// `dot` rejects the pair first with the same message: for f16 and bf16 that
-    /// is any build without `fp16kernels`, and for f32 and f64 any host below the
-    /// `Avx` tier.
+    /// takes one length and reads both vectors with it.
     #[test]
     fn cosine_rejects_mismatched_lengths() {
         let long_f32 = [1.0f32; 16];
