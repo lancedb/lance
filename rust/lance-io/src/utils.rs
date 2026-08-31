@@ -33,8 +33,7 @@ pub fn read_range_in_chunks(
     reader: &dyn Reader,
     range: Range<usize>,
     chunk_size: usize,
-) -> impl Stream<Item = object_store::Result<Bytes>> + Send + '_ {
-    debug_assert!(chunk_size > 0, "chunk_size must be positive");
+) -> impl Stream<Item = object_store::Result<Bytes>> + '_ {
     let end = range.end;
     let chunk_ranges = range
         .step_by(chunk_size)
@@ -329,7 +328,6 @@ mod tests {
             CloudObjectReader::new(store.inner, path, 4096, None, DEFAULT_DOWNLOAD_RETRY_COUNT)
                 .unwrap();
         let actual: BytesWrapper = read_struct(&object_reader, pos).await.unwrap();
-        assert_eq!(message.0.len(), actual.0.len());
         assert_eq!(message, actual);
     }
 
