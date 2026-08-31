@@ -774,7 +774,7 @@ impl IntoJava for &DataFile {
 
 impl IntoJava for &BlobReuseIndex {
     fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
-        let sources = export_vec(env, &self.sources)?;
+        let sources = export_vec(env, self.sources())?;
         Ok(env.new_object(
             BLOB_REUSE_INDEX_CLASS,
             BLOB_REUSE_INDEX_CONSTRUCTOR_SIG,
@@ -1090,7 +1090,7 @@ impl FromJObjectWithEnv<BlobReuseIndex> for JObject<'_> {
         let sources = import_vec_from_method(env, self, "getSources", |env, value| {
             value.extract_object(env)
         })?;
-        Ok(BlobReuseIndex { sources })
+        Ok(BlobReuseIndex::new(sources))
     }
 }
 

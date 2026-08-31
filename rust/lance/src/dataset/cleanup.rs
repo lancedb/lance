@@ -417,6 +417,35 @@ impl<'a> CleanupOperation<'a> {
 }
 
 impl<'a> CleanupTask<'a> {
+    fn current_data_dir_for_base(
+        &self,
+        manifest: &Manifest,
+        base_id: Option<u32>,
+    ) -> Result<Option<Path>> {
+        let Some(base_id) = base_id else {
+            return Ok(Some(self.dataset.data_dir()));
+        };
+        let base_path = manifest.base_paths.get(&base_id).ok_or_else(|| {
+            Error::corrupt_file_named(
+                "manifest",
+                format!("BlobReuseIndex references missing base id {base_id}"),
+            )
+        })?;
+        let registry = self.dataset.session.store_registry();
+        let store_params = self.dataset.store_params_for_base(Some(base_path));
+        let store_prefix = registry
+            .calculate_object_store_prefix(&base_path.path, store_params.storage_options())?;
+        if store_prefix != self.dataset.object_store.store_prefix {
+            return Ok(None);
+        }
+        let mut data_dir = base_path.extract_path(registry)?;
+        if base_path.is_dataset_root {
+            data_dir = data_dir.join(crate::dataset::DATA_DIR);
+        }
+        let is_current = data_dir.prefix_match(&self.dataset.data_dir()).is_some();
+        Ok(is_current.then_some(data_dir))
+    }
+
     fn new(dataset: &'a Dataset, policy: CleanupPolicy, action: CleanupAction) -> Self {
         let track_removed_manifests = policy.clean_referenced_branches;
         let include_referenced_branches = action.candidate_file_limit().is_some();
@@ -628,22 +657,14 @@ impl<'a> CleanupTask<'a> {
                 let relative_data_path = remove_prefix(&full_data_path, &self.dataset.base);
                 referenced_files.data_paths.insert(relative_data_path);
                 if let Some(index) = &file.blob_reuse_index {
-                    for source in &index.sources {
+                    for source in index.sources() {
                         let effective_base_id = source.base_id.or(file.base_id);
-                        let source_is_current = effective_base_id.is_none()
-                            || effective_base_id.is_some_and(|base_id| {
-                                manifest
-                                    .base_paths
-                                    .get(&base_id)
-                                    .is_some_and(|base| base.path == self.dataset.uri)
-                            });
-                        if source_is_current {
+                        if let Some(source_data_dir) =
+                            self.current_data_dir_for_base(manifest, effective_base_id)?
+                        {
                             for physical_id in &source.physical_ids {
-                                let full_blob_path = blob_path(
-                                    &self.dataset.data_dir(),
-                                    &source.blob_dir,
-                                    *physical_id,
-                                );
+                                let full_blob_path =
+                                    blob_path(&source_data_dir, &source.blob_dir, *physical_id);
                                 referenced_files
                                     .blob_paths
                                     .insert(remove_prefix(&full_blob_path, &self.dataset.base));
@@ -1283,22 +1304,14 @@ impl<'a> CleanupTask<'a> {
                     }
                 }
                 if let Some(index) = &file.blob_reuse_index {
-                    for source in &index.sources {
+                    for source in index.sources() {
                         let effective_base_id = source.base_id.or(file.base_id);
-                        let Some(base_id) = effective_base_id else {
-                            continue;
-                        };
-                        if manifest
-                            .base_paths
-                            .get(&base_id)
-                            .is_some_and(|base| base.path == self.dataset.uri)
+                        if let Some(source_data_dir) =
+                            self.current_data_dir_for_base(&manifest, effective_base_id)?
                         {
                             for physical_id in &source.physical_ids {
-                                let path = blob_path(
-                                    &self.dataset.data_dir(),
-                                    &source.blob_dir,
-                                    *physical_id,
-                                );
+                                let path =
+                                    blob_path(&source_data_dir, &source.blob_dir, *physical_id);
                                 let relative_path = remove_prefix(&path, &self.dataset.base);
                                 inspection.verified_files.blob_paths.remove(&relative_path);
                                 inspection.referenced_files.blob_paths.insert(relative_path);

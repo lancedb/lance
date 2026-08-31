@@ -2145,12 +2145,14 @@ impl CompactionTask {
     /// the read version for this task (the same version from which the
     /// compaction was planned).
     pub async fn execute(&self, dataset: &Dataset) -> Result<RewriteResult> {
+        let mut options = self.options.clone();
+        options.validate()?;
         let dataset = if dataset.manifest.version == self.read_version {
             Cow::Borrowed(dataset)
         } else {
             Cow::Owned(dataset.checkout_version(self.read_version).await?)
         };
-        rewrite_files(dataset, self.task.clone(), &self.options).await
+        rewrite_files(dataset, self.task.clone(), &options).await
     }
 }
 
@@ -8146,6 +8148,38 @@ mod tests {
         assert!(error.contains("blob_repack_active_ratio_threshold"));
     }
 
+    #[tokio::test]
+    async fn compaction_task_execute_validates_options() {
+        let test_dir = TempStrDir::default();
+        let batch = RecordBatch::try_from_iter(vec![(
+            "id",
+            Arc::new(Int32Array::from(vec![1])) as ArrayRef,
+        )])
+        .unwrap();
+        let dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
+            &test_dir,
+            None,
+        )
+        .await
+        .unwrap();
+        let task = CompactionTask {
+            task: TaskData { fragments: vec![] },
+            read_version: dataset.version().version,
+            options: CompactionOptions {
+                blob_repack_active_ratio_threshold: 2.0,
+                ..Default::default()
+            },
+        };
+
+        let error = task.execute(&dataset).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("blob_repack_active_ratio_threshold")
+        );
+    }
+
     #[test]
     fn test_from_dataset_config_unknown_compaction_key() {
         // Unknown keys should be ignored (with a warning) for forwards compatibility
@@ -9315,16 +9349,16 @@ mod tests {
             .blob_reuse_index
             .as_ref()
             .expect("packed and dedicated blobs should be reused");
-        assert_eq!(reuse_index.sources.len(), 2);
+        assert_eq!(reuse_index.sources().len(), 2);
         assert_eq!(
             reuse_index
-                .sources
+                .sources()
                 .iter()
                 .map(|source| source.blob_dir.clone())
                 .collect::<HashSet<_>>(),
             HashSet::from([packed_source_dir.clone(), dedicated_source_dir.clone()])
         );
-        assert!(reuse_index.sources.iter().all(|source| {
+        assert!(reuse_index.sources().iter().all(|source| {
             source.base_id.is_none()
                 && source.local_ids.len() == 1
                 && source.physical_ids.len() == 1
@@ -9390,7 +9424,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             shallow_deep_index
-                .sources
+                .sources()
                 .iter()
                 .map(|source| source.blob_dir.clone())
                 .collect::<HashSet<_>>(),
@@ -9401,7 +9435,7 @@ mod tests {
         );
         assert!(
             shallow_deep_index
-                .sources
+                .sources()
                 .iter()
                 .all(|source| source.base_id.is_none())
         );
@@ -9454,10 +9488,10 @@ mod tests {
             .blob_reuse_index
             .as_ref()
             .unwrap();
-        assert_eq!(recompacted_index.sources.len(), 2);
+        assert_eq!(recompacted_index.sources().len(), 2);
         assert_eq!(
             recompacted_index
-                .sources
+                .sources()
                 .iter()
                 .map(|source| source.blob_dir.clone())
                 .collect::<HashSet<_>>(),
@@ -9481,7 +9515,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             cloned_index
-                .sources
+                .sources()
                 .iter()
                 .map(|source| source.blob_dir.clone())
                 .collect::<HashSet<_>>(),
@@ -9492,13 +9526,101 @@ mod tests {
         );
         assert!(
             cloned_index
-                .sources
+                .sources()
                 .iter()
                 .all(|source| source.base_id.is_none())
         );
         let mut cloned_values = read_blob_bytes_by_index(&Arc::new(cloned), "blob").await;
         cloned_values.sort_by_key(|(id, _)| *id);
         assert_eq!(cloned_values, blob_values);
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_retains_blob_reuse_source_through_primary_data_alias() {
+        use crate::BlobArrayBuilder;
+        use lance_arrow::BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY;
+        use lance_core::utils::tempfile::TempDir;
+        use lance_table::format::BasePath;
+
+        let test_dir = TempDir::default();
+        let data_uri = format!("file://{}/data", test_dir.std_path().display());
+        let mut blob_builder = BlobArrayBuilder::new(2);
+        blob_builder.push_bytes(b"first dedicated payload").unwrap();
+        blob_builder
+            .push_bytes(b"second dedicated payload")
+            .unwrap();
+        let mut blob_field = crate::blob_field("blob", false);
+        let mut metadata = blob_field.metadata().clone();
+        metadata.insert(
+            BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY.to_string(),
+            "1".to_string(),
+        );
+        blob_field = blob_field.with_metadata(metadata);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            blob_field,
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![0, 1])),
+                blob_builder.finish().unwrap(),
+            ],
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &test_dir.path_str(),
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                max_rows_per_file: 1,
+                initial_bases: Some(vec![BasePath {
+                    id: 7,
+                    name: Some("primary-data-alias".to_string()),
+                    path: data_uri,
+                    is_dataset_root: false,
+                }]),
+                target_bases: Some(vec![7]),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 1024,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        let output_file = &dataset.manifest.fragments[0].files[0];
+        assert_eq!(output_file.base_id, None);
+        assert!(
+            output_file
+                .blob_reuse_index
+                .as_ref()
+                .unwrap()
+                .sources()
+                .iter()
+                .all(|source| source.base_id == Some(7))
+        );
+
+        dataset
+            .cleanup_old_versions(chrono::Duration::zero(), Some(true), None)
+            .await
+            .unwrap();
+        let values = read_blob_bytes_by_index(&Arc::new(dataset), "blob").await;
+        assert_eq!(
+            values,
+            vec![
+                (0, Some(b"first dedicated payload".to_vec())),
+                (1, Some(b"second dedicated payload".to_vec())),
+            ]
+        );
     }
 
     #[rstest]

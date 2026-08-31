@@ -183,6 +183,64 @@ pub(crate) fn deep_clone_blob_dir(base_id: Option<u32>, blob_dir: &str) -> Strin
     }
 }
 
+pub(crate) type BlobSourceKey = (Option<u32>, String);
+
+pub(crate) fn deep_clone_blob_dirs(manifest: &Manifest) -> HashMap<BlobSourceKey, String> {
+    let mut occupied = manifest
+        .fragments
+        .iter()
+        .flat_map(|fragment| fragment.referenced_lance_files())
+        .filter_map(|data_file| {
+            data_file
+                .path
+                .rsplit('/')
+                .next()
+                .and_then(|name| name.strip_suffix(".lance"))
+                .map(str::to_string)
+        })
+        .collect::<HashSet<_>>();
+    let mut blob_dirs = HashMap::new();
+    for data_file in manifest
+        .fragments
+        .iter()
+        .flat_map(|fragment| fragment.referenced_lance_files())
+    {
+        let Some(index) = &data_file.blob_reuse_index else {
+            continue;
+        };
+        for source in index.sources() {
+            let effective_base_id = source.base_id.or(data_file.base_id);
+            let key = (effective_base_id, source.blob_dir.clone());
+            if blob_dirs.contains_key(&key) {
+                continue;
+            }
+            let candidate = deep_clone_blob_dir(effective_base_id, &source.blob_dir);
+            let mut target = candidate.clone();
+            let mut suffix = 1_u32;
+            while !occupied.insert(target.clone()) {
+                target = format!("{candidate}_{suffix}");
+                suffix += 1;
+            }
+            blob_dirs.insert(key, target);
+        }
+    }
+    blob_dirs
+}
+
+fn field_contains_blob_v2(field: &lance_core::datatypes::Field) -> bool {
+    field.is_blob_v2() || field.children.iter().any(field_contains_blob_v2)
+}
+
+fn data_file_has_blob_v2(manifest: &Manifest, data_file: &DataFile) -> bool {
+    data_file.blob_reuse_index.is_some()
+        || data_file
+            .fields
+            .iter()
+            .filter(|field_id| **field_id >= 0)
+            .filter_map(|field_id| manifest.schema.field_by_id(*field_id))
+            .any(field_contains_blob_v2)
+}
+
 fn parse_deep_clone_stream_concurrency(value: &str) -> Result<usize> {
     value
         .parse::<NonZero<usize>>()
@@ -3445,17 +3503,27 @@ impl Dataset {
     /// Collect source paths and their target-relative paths for a deep clone.
     async fn collect_paths(&self) -> Result<Vec<(Arc<ObjectStore>, Path, String)>> {
         let mut file_paths = Vec::new();
-        let mut seen = HashSet::new();
+        let mut target_sources: HashMap<String, (String, String)> = HashMap::new();
+        let blob_dirs = deep_clone_blob_dirs(&self.manifest);
         let mut push_path =
             |source_store: Arc<ObjectStore>, source_path: Path, target_relative_path: String| {
-                let store_id = Arc::as_ptr(&source_store) as usize;
-                if seen.insert((
-                    store_id,
-                    source_path.to_string(),
-                    target_relative_path.clone(),
-                )) {
-                    file_paths.push((source_store, source_path, target_relative_path));
+                let source_identity = (source_store.store_prefix.clone(), source_path.to_string());
+                if let Some(previous) = target_sources.get(&target_relative_path) {
+                    if previous != &source_identity {
+                        return Err(Error::invalid_input(format!(
+                            "Deep clone target path '{}' maps to both '{}:{}' and '{}:{}'",
+                            target_relative_path,
+                            previous.0,
+                            previous.1,
+                            source_identity.0,
+                            source_identity.1
+                        )));
+                    }
+                    return Ok(());
                 }
+                target_sources.insert(target_relative_path.clone(), source_identity);
+                file_paths.push((source_store, source_path, target_relative_path));
+                Ok(())
             };
         for fragment in self.manifest.fragments.iter() {
             if let Some(RowIdMeta::External(external_file)) = &fragment.row_id_meta {
@@ -3471,7 +3539,7 @@ impl Dataset {
                     data_store.clone(),
                     data_dir.clone().join(data_file.path.as_str()),
                     format!("{}/{}", DATA_DIR, data_file.path),
-                );
+                )?;
 
                 let data_file_key = data_file
                     .path
@@ -3480,53 +3548,61 @@ impl Dataset {
                     .unwrap_or(data_file.path.as_str())
                     .strip_suffix(".lance")
                     .unwrap_or(data_file.path.as_str());
-                let source_blob_dir = data_dir.join(data_file_key);
-                let mut sidecars = data_store.read_dir_all(&source_blob_dir, None);
-                loop {
-                    match sidecars.next().await {
-                        Some(Ok(meta)) => {
-                            let relative = Path::from_iter(
-                                meta.location
-                                    .prefix_match(&source_blob_dir)
-                                    .ok_or_else(|| {
-                                        Error::internal(format!(
-                                            "Blob sidecar path '{}' is outside source directory '{}'",
-                                            meta.location, source_blob_dir
-                                        ))
-                                    })?,
-                            );
-                            push_path(
-                                data_store.clone(),
-                                meta.location,
-                                Path::from_iter(
-                                    Path::from(DATA_DIR)
-                                        .join(data_file_key)
-                                        .parts()
-                                        .chain(relative.parts()),
-                                )
-                                .to_string(),
-                            );
+                if data_file_has_blob_v2(&self.manifest, data_file) {
+                    let source_blob_dir = data_dir.join(data_file_key);
+                    let mut sidecars = data_store.read_dir_all(&source_blob_dir, None);
+                    loop {
+                        match sidecars.next().await {
+                            Some(Ok(meta)) => {
+                                let relative = Path::from_iter(
+                                    meta.location
+                                        .prefix_match(&source_blob_dir)
+                                        .ok_or_else(|| {
+                                            Error::internal(format!(
+                                                "Blob sidecar path '{}' is outside source directory '{}'",
+                                                meta.location, source_blob_dir
+                                            ))
+                                        })?,
+                                );
+                                push_path(
+                                    data_store.clone(),
+                                    meta.location,
+                                    Path::from_iter(
+                                        Path::from(DATA_DIR)
+                                            .join(data_file_key)
+                                            .parts()
+                                            .chain(relative.parts()),
+                                    )
+                                    .to_string(),
+                                )?;
+                            }
+                            Some(Err(error)) if error.is_not_found() => break,
+                            Some(Err(error)) => return Err(error),
+                            None => break,
                         }
-                        Some(Err(error)) if error.is_not_found() => break,
-                        Some(Err(error)) => return Err(error),
-                        None => break,
                     }
                 }
 
                 if let Some(index) = &data_file.blob_reuse_index {
-                    for source in &index.sources {
+                    for source in index.sources() {
                         let effective_base_id = source.base_id.or(data_file.base_id);
                         let source_store = self.object_store(effective_base_id).await?;
                         let source_data_dir = self.data_file_dir_for_base(effective_base_id)?;
-                        let target_blob_dir =
-                            deep_clone_blob_dir(effective_base_id, &source.blob_dir);
+                        let target_blob_dir = blob_dirs
+                            .get(&(effective_base_id, source.blob_dir.clone()))
+                            .ok_or_else(|| {
+                                Error::internal(format!(
+                                    "Missing deep clone target for BlobReuseIndex source {:?}:{}",
+                                    effective_base_id, source.blob_dir
+                                ))
+                            })?;
                         for physical_id in &source.physical_ids {
                             push_path(
                                 source_store.clone(),
                                 blob_path(&source_data_dir, &source.blob_dir, *physical_id),
-                                blob_path(&Path::from(DATA_DIR), &target_blob_dir, *physical_id)
+                                blob_path(&Path::from(DATA_DIR), target_blob_dir, *physical_id)
                                     .to_string(),
-                            );
+                            )?;
                         }
                     }
                 }
@@ -3539,7 +3615,7 @@ impl Dataset {
                     deletion_store,
                     base_root.join(relative_path.as_str()),
                     relative_path,
-                );
+                )?;
             }
         }
 
@@ -3560,7 +3636,7 @@ impl Dataset {
                         index_store.clone(),
                         meta.location,
                         format!("{}/{}/{}", INDICES_DIR, index.uuid, filename),
-                    );
+                    )?;
                 }
             }
         }

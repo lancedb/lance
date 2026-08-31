@@ -914,7 +914,7 @@ impl FromPyObject<'_, '_> for PyLance<DataFile> {
                     physical_ids: source.getattr("physical_ids")?.extract()?,
                 });
             }
-            Some(Arc::new(BlobReuseIndex { sources }))
+            Some(Arc::new(BlobReuseIndex::new(sources)))
         };
         Ok(Self(DataFile {
             path: ob.getattr("path")?.extract()?,
@@ -943,7 +943,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&DataFile> {
         let file_size_bytes = self.0.file_size_bytes.get().map(u64::from);
         let blob_reuse_index = if let Some(index) = &self.0.blob_reuse_index {
             let sources = index
-                .sources
+                .sources()
                 .iter()
                 .map(|source| {
                     let value = PyDict::new(py);

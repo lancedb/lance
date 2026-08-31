@@ -205,16 +205,29 @@ impl Manifest {
     /// Validate that every external base referenced by a Blob reuse index is
     /// declared by this manifest.
     pub fn validate_blob_reuse_indices(&self) -> Result<()> {
+        let mut physical_files = HashMap::new();
         for data_file in self
             .fragments
             .iter()
             .flat_map(|fragment| fragment.referenced_lance_files())
         {
+            if let Some(previous) =
+                physical_files.insert((data_file.base_id, data_file.path.as_str()), data_file)
+                && !previous.has_same_blob_reuse_index(data_file)
+            {
+                return Err(Error::corrupt_file_named(
+                    "manifest",
+                    format!(
+                        "Data file '{}' at base {:?} has conflicting BlobReuseIndex definitions",
+                        data_file.path, data_file.base_id
+                    ),
+                ));
+            }
             let Some(index) = &data_file.blob_reuse_index else {
                 continue;
             };
             index.validate(data_file.base_id)?;
-            for source in &index.sources {
+            for source in index.sources() {
                 if let Some(base_id) = source.base_id.or(data_file.base_id)
                     && !self.base_paths.contains_key(&base_id)
                 {
@@ -1197,14 +1210,13 @@ mod tests {
         )]);
         let schema = Schema::try_from(&arrow_schema).unwrap();
         let mut fragment = Fragment::with_file_legacy(0, "file.lance", &schema, Some(1));
-        fragment.files[0].blob_reuse_index = Some(Arc::new(BlobReuseIndex {
-            sources: vec![BlobReuseSource {
+        fragment.files[0].blob_reuse_index =
+            Some(Arc::new(BlobReuseIndex::new(vec![BlobReuseSource {
                 base_id: Some(42),
                 blob_dir: "source.blob".to_string(),
                 local_ids: vec![1],
                 physical_ids: vec![1],
-            }],
-        }));
+            }])));
         let mut manifest = Manifest::new(
             schema,
             Arc::new(vec![fragment]),
@@ -1222,6 +1234,37 @@ mod tests {
         manifest.validate_blob_reuse_indices().unwrap();
     }
 
+    #[test]
+    fn blob_reuse_index_must_be_consistent_for_physical_data_file() {
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new(
+            "a",
+            arrow_schema::DataType::Int64,
+            false,
+        )]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+        let make_fragment = |id, physical_id| {
+            let mut fragment = Fragment::with_file_legacy(id, "same.lance", &schema, Some(1));
+            fragment.files[0].blob_reuse_index =
+                Some(Arc::new(BlobReuseIndex::new(vec![BlobReuseSource {
+                    base_id: None,
+                    blob_dir: "source.blob".to_string(),
+                    local_ids: vec![1],
+                    physical_ids: vec![physical_id],
+                }])));
+            fragment
+        };
+        let fragments = vec![make_fragment(0, 1), make_fragment(1, 2)];
+        let manifest = Manifest::new(
+            schema,
+            Arc::new(fragments),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+
+        let error = manifest.validate_blob_reuse_indices().unwrap_err();
+        assert!(error.to_string().contains("conflicting BlobReuseIndex"));
+    }
+
     /// A shallow clone points every local file at the parent through `base_id`.
     /// An overlay's data file lives in the parent too, so it needs the same
     /// stamp; without it the clone looks for the overlay under its own root.
@@ -1235,14 +1278,13 @@ mod tests {
         let schema = Schema::try_from(&arrow_schema).unwrap();
 
         let mut fragment = Fragment::with_file_legacy(0, "base.lance", &schema, Some(10));
-        fragment.files[0].blob_reuse_index = Some(Arc::new(BlobReuseIndex {
-            sources: vec![BlobReuseSource {
+        fragment.files[0].blob_reuse_index =
+            Some(Arc::new(BlobReuseIndex::new(vec![BlobReuseSource {
                 base_id: None,
                 blob_dir: "source.blob".to_string(),
                 local_ids: vec![1],
                 physical_ids: vec![2],
-            }],
-        }));
+            }])));
         fragment.overlays = vec![DataOverlayFile {
             data_file: DataFile::new_legacy_from_fields("overlay.lance", vec![0], None),
             coverage: OverlayCoverage::Shared(Arc::new(RoaringBitmap::from_iter([0_u32]))),

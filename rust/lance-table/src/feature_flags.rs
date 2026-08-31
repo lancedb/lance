@@ -419,14 +419,12 @@ mod tests {
 
         let mut manifest = empty_manifest();
         let mut data_file = DataFile::new_legacy_from_fields("file.lance", vec![0], None);
-        data_file.blob_reuse_index = Some(Arc::new(BlobReuseIndex {
-            sources: vec![BlobReuseSource {
-                base_id: None,
-                blob_dir: "source.blob".to_string(),
-                local_ids: vec![1],
-                physical_ids: vec![2],
-            }],
-        }));
+        data_file.blob_reuse_index = Some(Arc::new(BlobReuseIndex::new(vec![BlobReuseSource {
+            base_id: None,
+            blob_dir: "source.blob".to_string(),
+            local_ids: vec![1],
+            physical_ids: vec![2],
+        }])));
         let mut fragment = Fragment::new(0);
         fragment.files.push(data_file);
         manifest.fragments = Arc::new(vec![fragment]);
@@ -459,14 +457,12 @@ mod tests {
 
         let mut manifest = empty_manifest();
         let mut data_file = DataFile::new_legacy_from_fields("file.lance", vec![0], None);
-        data_file.blob_reuse_index = Some(Arc::new(BlobReuseIndex {
-            sources: vec![BlobReuseSource {
-                base_id: None,
-                blob_dir: "source.blob".to_string(),
-                local_ids: vec![1],
-                physical_ids: vec![1],
-            }],
-        }));
+        data_file.blob_reuse_index = Some(Arc::new(BlobReuseIndex::new(vec![BlobReuseSource {
+            base_id: None,
+            blob_dir: "source.blob".to_string(),
+            local_ids: vec![1],
+            physical_ids: vec![1],
+        }])));
         let mut fragment = Fragment::new(0);
         fragment.files.push(data_file);
         manifest.fragments = Arc::new(vec![fragment]);

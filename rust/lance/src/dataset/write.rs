@@ -4418,14 +4418,12 @@ mod tests {
         object_store.put(&reused_blob_path, b"live").await.unwrap();
 
         let mut output_file = DataFile::new_unstarted("output.lance", ConcreteFileVersion::V2_2);
-        output_file.blob_reuse_index = Some(Arc::new(BlobReuseIndex {
-            sources: vec![BlobReuseSource {
-                base_id: None,
-                blob_dir: "source".to_string(),
-                local_ids: vec![1],
-                physical_ids: vec![2],
-            }],
-        }));
+        output_file.blob_reuse_index = Some(Arc::new(BlobReuseIndex::new(vec![BlobReuseSource {
+            base_id: None,
+            blob_dir: "source".to_string(),
+            local_ids: vec![1],
+            physical_ids: vec![2],
+        }])));
         let fragments = vec![Fragment {
             id: 0,
             files: vec![output_file],

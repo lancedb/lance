@@ -1276,9 +1276,9 @@ impl BlobPreprocessor {
         if self.reuse_sources.is_empty() {
             Ok(None)
         } else {
-            Ok(Some(Arc::new(BlobReuseIndex {
-                sources: std::mem::take(&mut self.reuse_sources),
-            })))
+            Ok(Some(Arc::new(BlobReuseIndex::new(std::mem::take(
+                &mut self.reuse_sources,
+            )))))
         }
     }
 }
@@ -7825,9 +7825,9 @@ mod tests {
         );
 
         let index = preprocessor.finish().await.unwrap().unwrap();
-        assert_eq!(index.sources.len(), 1);
-        assert_eq!(index.sources[0].local_ids, vec![1, 2, 3]);
-        assert_eq!(index.sources[0].physical_ids, vec![9, 10, 11]);
+        assert_eq!(index.sources().len(), 1);
+        assert_eq!(index.sources()[0].local_ids, vec![1, 2, 3]);
+        assert_eq!(index.sources()[0].physical_ids, vec![9, 10, 11]);
     }
 
     async fn try_preprocess_kind_with_blob_metadata(
