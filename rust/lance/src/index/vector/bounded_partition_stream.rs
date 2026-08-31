@@ -15,19 +15,39 @@ use futures::{Stream, StreamExt};
 use lance_core::{Error, Result};
 
 /// Work admitted to [`BoundedPartitionStream`].
+type WeightedJobStarter<T> = Box<
+    dyn FnOnce(AdmissionPermit) -> BoxFuture<'static, Result<(T, AdmissionPermit)>>
+        + Send
+        + 'static,
+>;
+
 pub(super) struct WeightedJob<T> {
     weight_bytes: usize,
-    future: BoxFuture<'static, Result<T>>,
+    start: WeightedJobStarter<T>,
 }
 
 impl<T> WeightedJob<T> {
+    #[cfg(test)]
     pub(super) fn new(
         weight_bytes: usize,
         future: impl Future<Output = Result<T>> + Send + 'static,
     ) -> Self {
         Self {
             weight_bytes,
-            future: Box::pin(future),
+            start: Box::new(move |permit| {
+                Box::pin(async move { future.await.map(|value| (value, permit)) })
+            }),
+        }
+    }
+
+    pub(super) fn with_permit<F, Fut>(weight_bytes: usize, start: F) -> Self
+    where
+        F: FnOnce(AdmissionPermit) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<(T, AdmissionPermit)>> + Send + 'static,
+    {
+        Self {
+            weight_bytes,
+            start: Box::new(move |permit| Box::pin(start(permit))),
         }
     }
 }
@@ -38,7 +58,7 @@ impl<T> WeightedJob<T> {
 /// an earlier partition to finish.
 pub(super) struct Budgeted<T> {
     pub(super) value: T,
-    pub(super) _permit: Option<AdmissionPermit>,
+    pub(super) _permit: Option<Arc<AdmissionPermit>>,
 }
 
 impl<T> Budgeted<T> {
@@ -107,6 +127,41 @@ impl<T> OrderedPartitionResults<T> {
 pub(super) struct AdmissionPermit {
     budget: Arc<Budget>,
     charged_bytes: usize,
+}
+
+impl AdmissionPermit {
+    /// Reconcile the pre-decode admission charge to the materialized size.
+    ///
+    /// Oversized values remain charged at the cap. Estimates are conservative,
+    /// so this normally releases capacity; an underestimate is still reflected
+    /// in the budget to prevent admitting additional work against stale usage.
+    pub(super) fn reconcile(&mut self, actual_bytes: usize) {
+        let charged_bytes = actual_bytes.min(self.budget.max_bytes);
+        match charged_bytes.cmp(&self.charged_bytes) {
+            std::cmp::Ordering::Less => {
+                self.budget
+                    .current_bytes
+                    .fetch_sub(self.charged_bytes - charged_bytes, Ordering::AcqRel);
+            }
+            std::cmp::Ordering::Greater => {
+                let additional_bytes = charged_bytes - self.charged_bytes;
+                let current_bytes = self
+                    .budget
+                    .current_bytes
+                    .fetch_add(additional_bytes, Ordering::AcqRel)
+                    + additional_bytes;
+                #[cfg(not(test))]
+                let _ = current_bytes;
+                #[cfg(test)]
+                self.budget
+                    .peak_bytes
+                    .fetch_max(current_bytes, Ordering::AcqRel);
+            }
+            std::cmp::Ordering::Equal => {}
+        }
+        self.charged_bytes = charged_bytes;
+        self.budget.waker.wake();
+    }
 }
 
 impl Drop for AdmissionPermit {
@@ -262,10 +317,11 @@ where
                     break;
                 }
                 let permit = self.budget.admit(job.weight_bytes);
+                let future = (job.start)(permit);
                 self.in_flight.push(Box::pin(async move {
-                    job.future.await.map(|value| Budgeted {
+                    future.await.map(|(value, permit)| Budgeted {
                         value,
-                        _permit: Some(permit),
+                        _permit: Some(Arc::new(permit)),
                     })
                 }));
                 continue;
@@ -378,6 +434,65 @@ mod tests {
         assert_eq!(current_entries, 1);
         drop(oversized);
         assert_eq!(output.next().await.unwrap().unwrap().value, 2);
+    }
+
+    #[tokio::test]
+    async fn oversized_materialization_starts_only_after_exclusive_admission() {
+        let oversized_materialized = Arc::new(AtomicBool::new(false));
+        let marker = oversized_materialized.clone();
+        let jobs = vec![
+            Ok(WeightedJob::new(2, async { Ok(0) })),
+            Ok(WeightedJob::with_permit(
+                20,
+                move |mut admission| async move {
+                    marker.store(true, Ordering::Release);
+                    admission.reconcile(20);
+                    Ok((1, admission))
+                },
+            )),
+        ];
+        let mut output = BoundedPartitionStream::try_new(stream::iter(jobs), 2, 8, 2).unwrap();
+
+        let first = output.next().await.unwrap().unwrap();
+        assert_eq!(first.value, 0);
+        assert!(!oversized_materialized.load(Ordering::Acquire));
+
+        drop(first);
+        let oversized = output.next().await.unwrap().unwrap();
+        assert_eq!(oversized.value, 1);
+        assert!(oversized_materialized.load(Ordering::Acquire));
+        let (current_bytes, peak_bytes, current_entries, _) = output.stats();
+        assert_eq!(current_bytes, 8);
+        assert_eq!(peak_bytes, 8);
+        assert_eq!(current_entries, 1);
+    }
+
+    #[tokio::test]
+    async fn actual_size_reconciliation_releases_admission_capacity() {
+        let jobs = vec![
+            Ok(WeightedJob::with_permit(8, |mut admission| async move {
+                admission.reconcile(2);
+                Ok((0, admission))
+            })),
+            Ok(WeightedJob::new(6, async { Ok(1) })),
+        ];
+        let mut output = BoundedPartitionStream::try_new(stream::iter(jobs), 2, 8, 2).unwrap();
+
+        let first = output.next().await.unwrap().unwrap();
+        assert_eq!(first.value, 0);
+        let (current_bytes, peak_bytes, current_entries, peak_entries) = output.stats();
+        assert_eq!(current_bytes, 2);
+        assert_eq!(peak_bytes, 8);
+        assert_eq!(current_entries, 1);
+        assert_eq!(peak_entries, 1);
+
+        let second = output.next().await.unwrap().unwrap();
+        assert_eq!(second.value, 1);
+        let (current_bytes, _, current_entries, peak_entries) = output.stats();
+        assert_eq!(current_bytes, 8);
+        assert_eq!(current_entries, 2);
+        assert_eq!(peak_entries, 2);
+        drop((first, second));
     }
 
     #[tokio::test]

@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use lance_core::utils::row_addr_remap::RowAddrRemap;
-use std::collections::{HashSet, VecDeque};
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::{collections::HashMap, pin::Pin};
 
@@ -45,8 +45,7 @@ use lance_index::vector::shared::{SupportedIvfIndexType, write_unified_ivf_and_i
 use lance_index::vector::storage::STORAGE_METADATA_KEY;
 use lance_index::vector::transform::Flatten;
 use lance_index::vector::v3::shuffler::{
-    DEFAULT_PARTITION_WINDOW_BYTES, EmptyReader, IvfShufflerReader, ShufflePartition,
-    create_ivf_shuffler,
+    DEFAULT_PARTITION_WINDOW_BYTES, EmptyReader, IvfShufflerReader, create_ivf_shuffler,
 };
 use lance_index::vector::v3::subindex::SubIndexType;
 use lance_index::vector::{LOSS_METADATA_KEY, PART_ID_COLUMN, PQ_CODE_COLUMN, VectorIndex};
@@ -79,7 +78,7 @@ use log::info;
 use object_store::path::Path;
 use prost::Message;
 use roaring::RoaringBitmap;
-use tokio::sync::OnceCell;
+use tokio::sync::{OnceCell, Semaphore};
 use tracing::{Level, instrument, span};
 
 use crate::Dataset;
@@ -274,18 +273,10 @@ struct PartitionBuildResult<S: IvfSubIndex, Q: Quantization> {
     built: Option<(Q::Storage, S, f64)>,
 }
 
-struct FreshPartitionReadState {
-    reader: Arc<dyn ShuffleReader>,
-    num_partitions: usize,
-    next_window_partition_id: usize,
-    pending: VecDeque<ShufflePartition>,
-}
-
 struct FreshPartitionInput {
     partition_id: usize,
     batches: Vec<RecordBatch>,
     loss: f64,
-    decoded_bytes: usize,
 }
 
 type UnindexedStream = Box<dyn Stream<Item = Result<RecordBatch>> + Send + Unpin + 'static>;
@@ -1164,138 +1155,176 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         column: String,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
     ) -> Result<BuildStream<S, Q>> {
-        let state = FreshPartitionReadState {
-            reader,
-            num_partitions,
-            next_window_partition_id: 0,
-            pending: VecDeque::new(),
-        };
-        let partition_inputs = stream::try_unfold(state, |mut state| async move {
-            if state.pending.is_empty() {
-                if state.next_window_partition_id == state.num_partitions {
-                    return Ok(None);
-                }
-                let window = state
-                    .reader
-                    .read_partition_window(
-                        state.next_window_partition_id,
-                        DEFAULT_PARTITION_WINDOW_BYTES,
-                    )
-                    .await?;
-                if window.partition_range.start != state.next_window_partition_id
-                    || window.partition_range.end <= window.partition_range.start
-                    || window.partition_range.end > state.num_partitions
-                    || window.partitions.len() != window.partition_range.len()
-                {
-                    return Err(Error::internal(format!(
-                        "shuffle reader returned invalid partition window {:?} with {} entries; expected a non-empty window starting at {} within {} partitions",
-                        window.partition_range,
-                        window.partitions.len(),
-                        state.next_window_partition_id,
-                        state.num_partitions
-                    )));
-                }
-                for (expected_partition_id, partition) in
-                    window.partition_range.clone().zip(&window.partitions)
-                {
-                    if partition.partition_id != expected_partition_id {
-                        return Err(Error::internal(format!(
-                            "shuffle reader window {:?} returned partition id {} at position {}",
-                            window.partition_range,
-                            partition.partition_id,
-                            expected_partition_id - window.partition_range.start
-                        )));
-                    }
-                }
-                state.next_window_partition_id = window.partition_range.end;
-                state.pending = window.partitions.into();
-            }
-
-            let mut partition = state.pending.pop_front().ok_or_else(|| {
-                Error::internal("validated shuffle partition window contained no entries")
-            })?;
-            let mut batches = Vec::new();
-            let mut loss = 0.0;
-            let mut decoded_bytes = 0usize;
-            if let Some(mut data) = partition.data.take() {
-                while let Some(batch) = data.try_next().await? {
-                    loss += batch
-                        .metadata()
-                        .get(LOSS_METADATA_KEY)
-                        .map(|value| value.parse::<f64>().unwrap_or(0.0))
-                        .unwrap_or(0.0);
-                    let batch = batch.drop_column(PART_ID_COLUMN)?;
-                    decoded_bytes =
-                        batch
-                            .columns()
-                            .iter()
-                            .try_fold(decoded_bytes, |total, array| {
-                                total
-                                    .checked_add(array.get_array_memory_size())
-                                    .ok_or_else(|| {
-                                        Error::internal(format!(
-                                            "decoded byte count overflow for partition {}",
-                                            partition.partition_id
-                                        ))
-                                    })
-                            })?;
-                    batches.push(batch);
-                }
-            }
-            Ok(Some((
-                FreshPartitionInput {
-                    partition_id: partition.partition_id,
-                    batches,
-                    loss,
-                    decoded_bytes,
-                },
-                state,
-            )))
-        });
-
-        let jobs = partition_inputs
-            .map_ok(move |input| {
-                let quantizer = quantizer.clone();
-                let sub_index_params = sub_index_params.clone();
-                let column = column.clone();
-                let frag_reuse_index = frag_reuse_index.clone();
-                WeightedJob::new(input.decoded_bytes, async move {
-                    let partition_id = input.partition_id;
-                    let loss = input.loss;
-                    let built = spawn_cpu(move || -> Result<Option<(Q::Storage, S, f64)>> {
-                        let num_rows: usize =
-                            input.batches.iter().map(|batch| batch.num_rows()).sum();
-                        if num_rows == 0 {
-                            return Ok(None);
-                        }
-                        let (storage, sub_index) = Self::build_index(
-                            distance_type,
-                            quantizer,
-                            sub_index_params,
-                            input.batches,
-                            column,
-                            frag_reuse_index,
-                        )?;
-                        Ok(Some((storage, sub_index, loss)))
-                    })
-                    .await?;
-                    Ok(PartitionBuildResult {
-                        partition_id,
-                        built,
-                    })
-                })
-            })
-            .boxed();
-
         let concurrency = get_num_compute_intensive_cpus().max(1);
         let max_entries = concurrency.saturating_mul(PARTITION_BUILD_ENTRIES_PER_WORKER);
-        Ok(BoundedPartitionStream::try_new(
+        let cpu_permits = Arc::new(Semaphore::new(concurrency));
+        let jobs = stream::try_unfold(0usize, move |next_partition_id| {
+            let reader = reader.clone();
+            let quantizer = quantizer.clone();
+            let sub_index_params = sub_index_params.clone();
+            let column = column.clone();
+            let frag_reuse_index = frag_reuse_index.clone();
+            let cpu_permits = cpu_permits.clone();
+            async move {
+                if next_partition_id == num_partitions {
+                    return Ok(None);
+                }
+                let plan = reader.plan_partition_window(
+                    next_partition_id,
+                    DEFAULT_PARTITION_WINDOW_BYTES,
+                )?;
+                if plan.partition_range.start != next_partition_id
+                    || plan.partition_range.end <= plan.partition_range.start
+                    || plan.partition_range.end > num_partitions
+                {
+                    return Err(Error::internal(format!(
+                        "shuffle reader planned invalid partition window {:?}; expected a non-empty window starting at {} within {} partitions",
+                        plan.partition_range, next_partition_id, num_partitions
+                    )));
+                }
+                let next_partition_id = plan.partition_range.end;
+                let planned_range = plan.partition_range;
+                let job = WeightedJob::with_permit(
+                    plan.estimated_decoded_bytes,
+                    move |mut admission| async move {
+                        let mut window = reader
+                            .read_partition_window(
+                                planned_range.start,
+                                DEFAULT_PARTITION_WINDOW_BYTES,
+                            )
+                            .await?;
+                        if window.partition_range != planned_range
+                            || window.partitions.len() != planned_range.len()
+                        {
+                            return Err(Error::internal(format!(
+                                "shuffle reader returned partition window {:?} with {} entries after planning {:?}",
+                                window.partition_range,
+                                window.partitions.len(),
+                                planned_range
+                            )));
+                        }
+                        for (expected_partition_id, partition) in
+                            planned_range.clone().zip(&window.partitions)
+                        {
+                            if partition.partition_id != expected_partition_id {
+                                return Err(Error::internal(format!(
+                                    "shuffle reader window {:?} returned partition id {} at position {}",
+                                    planned_range,
+                                    partition.partition_id,
+                                    expected_partition_id - planned_range.start
+                                )));
+                            }
+                        }
+
+                        let count_stream_bytes = window.materialized_decoded_bytes.is_none();
+                        let mut decoded_bytes =
+                            window.materialized_decoded_bytes.unwrap_or_default();
+                        let mut inputs = Vec::with_capacity(window.partitions.len());
+                        for mut partition in window.partitions.drain(..) {
+                            let mut batches = Vec::new();
+                            let mut loss = 0.0;
+                            if let Some(mut data) = partition.data.take() {
+                                while let Some(batch) = data.try_next().await? {
+                                    loss += batch
+                                        .metadata()
+                                        .get(LOSS_METADATA_KEY)
+                                        .map(|value| value.parse::<f64>().unwrap_or(0.0))
+                                        .unwrap_or(0.0);
+                                    if count_stream_bytes {
+                                        decoded_bytes = batch.columns().iter().try_fold(
+                                            decoded_bytes,
+                                            |total, array| {
+                                                total
+                                                    .checked_add(array.get_array_memory_size())
+                                                    .ok_or_else(|| {
+                                                        Error::internal(format!(
+                                                            "decoded byte count overflow for partition {}",
+                                                            partition.partition_id
+                                                        ))
+                                                    })
+                                            },
+                                        )?;
+                                    }
+                                    batches.push(batch.drop_column(PART_ID_COLUMN)?);
+                                }
+                            }
+                            inputs.push(FreshPartitionInput {
+                                partition_id: partition.partition_id,
+                                batches,
+                                loss,
+                            });
+                        }
+                        admission.reconcile(decoded_bytes);
+
+                        let builds = stream::iter(inputs.into_iter().map(|input| {
+                            let quantizer = quantizer.clone();
+                            let sub_index_params = sub_index_params.clone();
+                            let column = column.clone();
+                            let frag_reuse_index = frag_reuse_index.clone();
+                            let cpu_permits = cpu_permits.clone();
+                            async move {
+                                let partition_id = input.partition_id;
+                                let loss = input.loss;
+                                let _cpu_permit = cpu_permits.acquire_owned().await.map_err(|_| {
+                                    Error::internal("partition build CPU semaphore was closed")
+                                })?;
+                                let built = spawn_cpu(move || -> Result<_> {
+                                    let num_rows = input
+                                        .batches
+                                        .iter()
+                                        .map(|batch| batch.num_rows())
+                                        .sum::<usize>();
+                                    if num_rows == 0 {
+                                        return Ok(None);
+                                    }
+                                    let (storage, sub_index) = Self::build_index(
+                                        distance_type,
+                                        quantizer,
+                                        sub_index_params,
+                                        input.batches,
+                                        column,
+                                        frag_reuse_index,
+                                    )?;
+                                    Ok(Some((storage, sub_index, loss)))
+                                })
+                                .await?;
+                                Ok::<PartitionBuildResult<S, Q>, Error>(PartitionBuildResult {
+                                    partition_id,
+                                    built,
+                                })
+                            }
+                        }))
+                        .buffer_unordered(concurrency)
+                        .try_collect::<Vec<_>>()
+                        .await?;
+                        let mut builds = builds;
+                        builds.sort_unstable_by_key(|result| result.partition_id);
+                        Ok((builds, admission))
+                    },
+                );
+                Ok(Some((job, next_partition_id)))
+            }
+        })
+        .boxed();
+
+        let windows = BoundedPartitionStream::try_new(
             jobs,
             concurrency,
             PARTITION_BUILD_BUDGET_BYTES,
             max_entries,
-        )?
-        .boxed())
+        )?;
+        Ok(windows
+            .map_ok(|window| {
+                let Budgeted { value, _permit } = window;
+                stream::iter(value.into_iter().map(move |value| {
+                    Ok(Budgeted {
+                        value,
+                        _permit: _permit.clone(),
+                    })
+                }))
+            })
+            .try_flatten()
+            .boxed())
     }
 
     #[instrument(name = "build_index", level = "debug", skip_all)]

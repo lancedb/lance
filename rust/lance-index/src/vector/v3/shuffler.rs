@@ -51,6 +51,17 @@ pub struct ShufflePartitionWindow {
     pub partition_range: Range<usize>,
     /// One entry per partition in `partition_range`, including empty ones.
     pub partitions: Vec<ShufflePartition>,
+    /// Decoded bytes already materialized by the reader, counted once per
+    /// backing Arrow allocation. `None` means the returned streams are lazy.
+    pub materialized_decoded_bytes: Option<usize>,
+}
+
+/// Metadata-only plan for a contiguous shuffle partition window.
+pub struct ShufflePartitionWindowPlan {
+    /// Half-open partition range that the subsequent read will return.
+    pub partition_range: Range<usize>,
+    /// Conservative decoded-memory admission charge for the read.
+    pub estimated_decoded_bytes: usize,
 }
 
 #[async_trait::async_trait]
@@ -63,6 +74,33 @@ pub trait ShuffleReader: Send + Sync {
         &self,
         partition_id: usize,
     ) -> Result<Option<Box<dyn RecordBatchStream + Unpin + 'static>>>;
+
+    /// Plan a partition window without reading or decoding partition data.
+    ///
+    /// Readers without a decoded-size estimate use an oversized admission
+    /// charge for non-empty partitions so the read runs exclusively.
+    fn plan_partition_window(
+        &self,
+        start_partition_id: usize,
+        max_decoded_bytes: usize,
+    ) -> Result<ShufflePartitionWindowPlan> {
+        if max_decoded_bytes == 0 {
+            return Err(Error::invalid_input(
+                "max_decoded_bytes must be greater than 0",
+            ));
+        }
+        let end = start_partition_id.checked_add(1).ok_or_else(|| {
+            Error::invalid_input(format!(
+                "start_partition_id={} cannot be advanced",
+                start_partition_id
+            ))
+        })?;
+        let partition_rows = self.partition_size(start_partition_id)?;
+        Ok(ShufflePartitionWindowPlan {
+            partition_range: start_partition_id..end,
+            estimated_decoded_bytes: if partition_rows == 0 { 0 } else { usize::MAX },
+        })
+    }
 
     /// Read a contiguous partition window starting at `start_partition_id`.
     ///
@@ -96,6 +134,7 @@ pub trait ShuffleReader: Send + Sync {
                 partition_id: start_partition_id,
                 data,
             }],
+            materialized_decoded_bytes: None,
         })
     }
 
@@ -1160,6 +1199,7 @@ impl<'a> ShuffleOffsetsValidator<'a> {
 /// keeps window planning bounded when one is present without claiming an exact
 /// decoded size for values that have no fixed Arrow stride.
 const VARIABLE_WIDTH_ROW_ESTIMATE_BYTES: usize = 64;
+const WINDOW_ADMISSION_FIXED_HEADROOM_BYTES: usize = 1024 * 1024;
 
 fn estimate_decoded_row_bytes(schema: &Schema) -> Result<usize> {
     let mut row_bytes = 0usize;
@@ -1249,6 +1289,42 @@ fn plan_partition_window_end(
     Ok(end_partition_id)
 }
 
+fn conservative_window_admission_bytes(
+    partition_counts: &[u64],
+    partition_range: Range<usize>,
+    estimated_row_bytes: usize,
+) -> Result<usize> {
+    let rows = partition_counts[partition_range]
+        .iter()
+        .try_fold(0usize, |total, count| {
+            let count = usize::try_from(*count).map_err(|_| {
+                Error::invalid_input(format!(
+                    "partition row count {} cannot be represented as usize",
+                    count
+                ))
+            })?;
+            total
+                .checked_add(count)
+                .ok_or_else(|| Error::invalid_input("partition window row count overflows usize"))
+        })?;
+    if rows == 0 {
+        return Ok(0);
+    }
+    let value_bytes = rows.checked_mul(estimated_row_bytes).ok_or_else(|| {
+        Error::invalid_input(format!(
+            "decoded byte estimate overflows for {} rows at {} bytes per row",
+            rows, estimated_row_bytes
+        ))
+    })?;
+    // Arrow buffers and batch/array allocations add a small amount beyond the
+    // fixed-width values. Reserve 25% plus fixed headroom before decoding; the
+    // charge is reconciled to the allocation-backed size immediately after.
+    value_bytes
+        .checked_add(value_bytes / 4)
+        .and_then(|bytes| bytes.checked_add(WINDOW_ADMISSION_FIXED_HEADROOM_BYTES))
+        .ok_or_else(|| Error::invalid_input("partition window admission estimate overflows usize"))
+}
+
 type PartitionWindowReadPlan = (Vec<Range<u64>>, Vec<Vec<usize>>);
 
 fn preloaded_window_ranges(
@@ -1302,7 +1378,7 @@ async fn split_partition_window_stream<S>(
     mut stream: S,
     window_len: usize,
     group_partition_counts: &[Vec<usize>],
-) -> Result<Vec<Vec<RecordBatch>>>
+) -> Result<(Vec<Vec<RecordBatch>>, usize)>
 where
     S: Stream<Item = Result<RecordBatch>> + Unpin,
 {
@@ -1320,9 +1396,21 @@ where
     let mut current_segment = segments.next();
     let mut segment_rows_read = 0usize;
     let mut actual_rows = 0usize;
+    let mut materialized_decoded_bytes = 0usize;
     let mut partition_batches = vec![Vec::new(); window_len];
 
     while let Some(batch) = stream.try_next().await? {
+        materialized_decoded_bytes =
+            batch
+                .columns()
+                .iter()
+                .try_fold(materialized_decoded_bytes, |total, array| {
+                    total
+                        .checked_add(array.get_array_memory_size())
+                        .ok_or_else(|| {
+                            Error::internal("decoded partition window byte count overflows usize")
+                        })
+                })?;
         let mut batch_offset = 0usize;
         while batch_offset < batch.num_rows() {
             let Some((partition_offset, segment_rows)) = current_segment else {
@@ -1361,7 +1449,7 @@ where
             ),
         ));
     }
-    Ok(partition_batches)
+    Ok((partition_batches, materialized_decoded_bytes))
 }
 
 #[async_trait::async_trait]
@@ -1398,6 +1486,43 @@ impl ShuffleReader for TwoFileShuffleReader {
         ))))
     }
 
+    fn plan_partition_window(
+        &self,
+        start_partition_id: usize,
+        max_decoded_bytes: usize,
+    ) -> Result<ShufflePartitionWindowPlan> {
+        if start_partition_id >= self.num_partitions {
+            return Err(Error::invalid_input(format!(
+                "start_partition_id={} is out of range [0, {})",
+                start_partition_id, self.num_partitions
+            )));
+        }
+        let end_partition_id = match &self.offsets {
+            ShuffleOffsets::Preloaded(_) => plan_partition_window_end(
+                &self.partition_counts,
+                start_partition_id,
+                self.estimated_row_bytes,
+                max_decoded_bytes,
+            )?,
+            ShuffleOffsets::OnDemand(_) => start_partition_id.checked_add(1).ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "start_partition_id={} cannot be advanced",
+                    start_partition_id
+                ))
+            })?,
+        };
+        let partition_range = start_partition_id..end_partition_id;
+        let estimated_decoded_bytes = conservative_window_admission_bytes(
+            &self.partition_counts,
+            partition_range.clone(),
+            self.estimated_row_bytes,
+        )?;
+        Ok(ShufflePartitionWindowPlan {
+            partition_range,
+            estimated_decoded_bytes,
+        })
+    }
+
     async fn read_partition_window(
         &self,
         start_partition_id: usize,
@@ -1425,16 +1550,13 @@ impl ShuffleReader for TwoFileShuffleReader {
                     partition_id: start_partition_id,
                     data,
                 }],
+                materialized_decoded_bytes: None,
             });
         };
 
-        let end_partition_id = plan_partition_window_end(
-            &self.partition_counts,
-            start_partition_id,
-            self.estimated_row_bytes,
-            max_decoded_bytes,
-        )?;
-        let partition_range = start_partition_id..end_partition_id;
+        let partition_range = self
+            .plan_partition_window(start_partition_id, max_decoded_bytes)?
+            .partition_range;
         let (ranges, group_partition_counts) = preloaded_window_ranges(
             offsets,
             self.num_batches,
@@ -1444,8 +1566,8 @@ impl ShuffleReader for TwoFileShuffleReader {
         let schema: Schema = self.file_reader.schema().as_ref().into();
         let schema = Arc::new(schema);
 
-        let partition_batches = if ranges.is_empty() {
-            vec![Vec::new(); partition_range.len()]
+        let (partition_batches, materialized_decoded_bytes) = if ranges.is_empty() {
+            (vec![Vec::new(); partition_range.len()], 0)
         } else {
             let stream = self
                 .file_reader
@@ -1480,6 +1602,7 @@ impl ShuffleReader for TwoFileShuffleReader {
         Ok(ShufflePartitionWindow {
             partition_range,
             partitions,
+            materialized_decoded_bytes: Some(materialized_decoded_bytes),
         })
     }
 
@@ -1866,14 +1989,19 @@ mod tests {
         // into a singleton window.
         let mut next_partition_id = 0;
         let mut ranges = Vec::new();
+        let mut admission_bytes = Vec::new();
         let mut window_values = vec![Vec::new(); num_partitions];
         while next_partition_id < num_partitions {
+            let plan = reader.plan_partition_window(next_partition_id, 12).unwrap();
             let window = reader
                 .read_partition_window(next_partition_id, 12)
                 .await
                 .unwrap();
+            assert_eq!(window.partition_range, plan.partition_range);
+            assert!(window.materialized_decoded_bytes.is_some());
             assert_eq!(window.partitions.len(), window.partition_range.len());
             ranges.push(window.partition_range.clone());
+            admission_bytes.push(plan.estimated_decoded_bytes);
             next_partition_id = window.partition_range.end;
             for partition in window.partitions {
                 if let Some(stream) = partition.data {
@@ -1883,6 +2011,8 @@ mod tests {
         }
 
         assert_eq!(ranges, vec![0..2, 2..3, 3..6]);
+        assert!(admission_bytes[1] > admission_bytes[0]);
+        assert!(admission_bytes[1] > admission_bytes[2]);
         assert_eq!(window_values, singleton_values);
         assert_eq!(window_values[0], Vec::<i32>::new());
         assert_eq!(window_values[2].len(), 10);
