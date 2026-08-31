@@ -500,6 +500,36 @@ impl UpdateCriteria {
     }
 }
 
+/// Execution-time options for scalar index searches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SearchOptions {
+    /// Preserve rows where the query evaluates to NULL.
+    ///
+    /// Callers may disable this only when NULL rows cannot affect the final
+    /// result, such as a top-level filter whose NULL results will be discarded.
+    track_nulls: bool,
+}
+
+impl Default for SearchOptions {
+    fn default() -> Self {
+        Self { track_nulls: true }
+    }
+}
+
+impl SearchOptions {
+    /// Configure whether searches preserve rows where the query evaluates to
+    /// NULL. When disabled, implementations return only TRUE rows.
+    pub fn with_track_nulls(mut self, track_nulls: bool) -> Self {
+        self.track_nulls = track_nulls;
+        self
+    }
+
+    /// Whether searches preserve rows where the query evaluates to NULL.
+    pub fn track_nulls(&self) -> bool {
+        self.track_nulls
+    }
+}
+
 /// A trait for a scalar index, a structure that can determine row ids that satisfy scalar queries
 #[async_trait]
 pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
@@ -511,6 +541,20 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
         query: &dyn AnyQuery,
         metrics: &dyn MetricsCollector,
     ) -> Result<SearchResult>;
+
+    /// Search the scalar index with execution-time options.
+    ///
+    /// Index implementations that do not need the options can rely on this
+    /// default implementation. The default preserves the behavior of
+    /// [`Self::search`].
+    async fn search_with_options(
+        &self,
+        query: &dyn AnyQuery,
+        _options: SearchOptions,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<SearchResult> {
+        self.search(query, metrics).await
+    }
 
     /// Returns true if this index reports matches as physical row addresses
     /// (`fragment_id << 32 | offset`) rather than row ids

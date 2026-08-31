@@ -42,6 +42,7 @@ use crate::{
 
 use lance_arrow::BLOB_META_KEY;
 use lance_core::datatypes::{BLOB_DESC_FIELD, Field};
+use lance_core::utils::parse::str_is_truthy;
 use lance_core::{Error, Result};
 
 /// Field-to-column composition for the `pb::ArrayEncoding` grammar.
@@ -159,7 +160,7 @@ impl FieldEncodingStrategy for ArrayFieldEncodingStrategy {
                     let field_metadata = &field.metadata;
                     if field_metadata
                         .get(PACKED_STRUCT_LEGACY_META_KEY)
-                        .map(|v| v == "true")
+                        .map(|v| str_is_truthy(v))
                         .unwrap_or(field_metadata.contains_key(PACKED_STRUCT_META_KEY))
                     {
                         Ok(Box::new(PrimitiveFieldEncoder::try_new(
