@@ -208,20 +208,6 @@ pub const DEFAULT_INDEX_CACHE_SIZE: usize = 6 * 1024 * 1024 * 1024;
 // smaller.
 pub const DEFAULT_METADATA_CACHE_SIZE: usize = 1024 * 1024 * 1024;
 
-/// Mixed-version compatibility policy for stable-field-ID activation.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum StableFieldIdMigrationMode {
-    /// Require both new readers and new writers. This is the safe default when
-    /// pre-gate binaries may still access the dataset.
-    #[default]
-    ReadersAndWriters,
-    /// Require new writers while allowing legacy readers.
-    ///
-    /// Use only after every pre-gate writer has been retired. Older binaries do
-    /// not universally check writer feature flags on every commit path.
-    WritersOnly,
-}
-
 /// Lance Dataset
 #[derive(Clone)]
 pub struct Dataset {
@@ -3267,29 +3253,19 @@ impl Dataset {
     /// The activation commit records the current maximum referenced field ID as
     /// a persistent high-water mark. Later schema changes allocate above it even
     /// after fields and their files are dropped. New datasets already use this
-    /// contract by default with reader and writer gates. `ReadersAndWriters`
-    /// can add a fail-closed reader gate to a writer-only activated dataset.
-    /// Activation and reader gating are one-way and idempotent.
+    /// contract by default. Activation is one-way and idempotent. Before
+    /// migrating, ensure that every writer accessing the dataset understands
+    /// the stable field-ID writer feature flag.
     ///
     /// ```
     /// # use lance::{Dataset, Result};
-    /// # use lance::dataset::StableFieldIdMigrationMode;
     /// # async fn activate(dataset: &mut Dataset) -> Result<()> {
-    /// dataset
-    ///     .migrate_to_stable_field_ids(StableFieldIdMigrationMode::ReadersAndWriters)
-    ///     .await?;
+    /// dataset.migrate_to_stable_field_ids().await?;
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn migrate_to_stable_field_ids(
-        &mut self,
-        mode: StableFieldIdMigrationMode,
-    ) -> Result<()> {
-        let require_reader = matches!(mode, StableFieldIdMigrationMode::ReadersAndWriters);
-        let reader_already_required = self.manifest.reader_feature_flags
-            & lance_table::feature_flags::FLAG_STABLE_FIELD_IDS
-            != 0;
-        if self.manifest.uses_stable_field_ids() && (!require_reader || reader_already_required) {
+    pub async fn migrate_to_stable_field_ids(&mut self) -> Result<()> {
+        if self.manifest.uses_stable_field_ids() {
             return Ok(());
         }
 
@@ -3306,7 +3282,7 @@ impl Dataset {
         );
         let new_ds = CommitBuilder::new(Arc::new(self.clone()))
             .with_max_retries(0)
-            .with_stable_field_id_migration_activation(require_reader)
+            .with_stable_field_id_migration_activation()
             .execute(transaction)
             .await?;
         *self = new_ds;
@@ -4130,9 +4106,8 @@ pub(crate) struct ManifestWriteConfig {
     /// It bypasses the "cannot enable stable row ids on existing dataset" guard and
     /// sets `manifest.next_row_id` to the provided value before activating the flag.
     migration_next_row_id: Option<u64>, // default None
-    /// When `Some`, this commit activates stable field IDs. `true` also sets
-    /// the reader feature bit for fail-closed mixed-version safety.
-    stable_field_id_migration_requires_reader: Option<bool>,
+    /// Whether this commit activates stable field IDs.
+    activate_stable_field_ids: bool,
 }
 
 impl Default for ManifestWriteConfig {
@@ -4145,7 +4120,7 @@ impl Default for ManifestWriteConfig {
             use_legacy_format: None,
             storage_format: None,
             migration_next_row_id: None,
-            stable_field_id_migration_requires_reader: None,
+            activate_stable_field_ids: false,
         }
     }
 }
@@ -4174,8 +4149,7 @@ impl ManifestWriteConfig {
             storage_format: self.storage_format.clone(),
             disable_transaction_file: self.disable_transaction_file,
             migration_next_row_id: self.migration_next_row_id,
-            stable_field_id_migration_requires_reader: self
-                .stable_field_id_migration_requires_reader,
+            activate_stable_field_ids: self.activate_stable_field_ids,
         }
     }
 }

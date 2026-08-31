@@ -126,9 +126,6 @@ impl Transaction {
             };
             manifest.max_allocated_field_id =
                 Some(restored_max_field_id.max(current_manifest.max_field_id()));
-            if current_manifest.reader_feature_flags & FLAG_STABLE_FIELD_IDS != 0 {
-                manifest.reader_feature_flags |= FLAG_STABLE_FIELD_IDS;
-            }
             manifest.writer_feature_flags |= FLAG_STABLE_FIELD_IDS;
         }
         // Row ids are a high-water mark like fragment ids: rewinding hands old ids to new rows.
@@ -1308,24 +1305,16 @@ impl Transaction {
 
         if current_manifest.is_none() {
             manifest.activate_stable_field_ids();
-            manifest.reader_feature_flags |= FLAG_STABLE_FIELD_IDS;
             manifest.writer_feature_flags |= FLAG_STABLE_FIELD_IDS;
         }
 
-        if let Some(require_reader) = config.stable_field_id_migration_requires_reader {
+        if config.activate_stable_field_ids {
             let already_active = current_manifest
                 .map(|manifest| manifest.uses_stable_field_ids())
                 .unwrap_or(false);
-            if already_active {
-                if require_reader {
-                    manifest.reader_feature_flags |= FLAG_STABLE_FIELD_IDS;
-                }
-            } else {
+            if !already_active {
                 manifest.activate_stable_field_ids();
                 manifest.writer_feature_flags |= FLAG_STABLE_FIELD_IDS;
-                if require_reader {
-                    manifest.reader_feature_flags |= FLAG_STABLE_FIELD_IDS;
-                }
             }
         }
 
@@ -1637,7 +1626,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(manifest.max_allocated_field_id, Some(0));
-        assert_ne!(manifest.reader_feature_flags & FLAG_STABLE_FIELD_IDS, 0);
+        assert_eq!(manifest.reader_feature_flags & FLAG_STABLE_FIELD_IDS, 0);
         assert_ne!(manifest.writer_feature_flags & FLAG_STABLE_FIELD_IDS, 0);
     }
 
@@ -1656,7 +1645,7 @@ mod tests {
         );
         let mut config = default_build_config();
         config.auto_set_feature_flags = false;
-        config.stable_field_id_migration_requires_reader = Some(false);
+        config.activate_stable_field_ids = true;
 
         let (activated, _) = transaction
             .build_manifest(Some(&manifest), vec![], "txn", &config)

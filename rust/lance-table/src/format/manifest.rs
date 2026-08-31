@@ -226,8 +226,7 @@ impl Manifest {
             index_section: None, // Caller should update index if they want to keep them.
             timestamp_nanos: 0,  // This will be set on commit
             tag: None,
-            reader_feature_flags: previous.reader_feature_flags
-                & (STICKY_PAIRED_FLAGS | FLAG_STABLE_FIELD_IDS),
+            reader_feature_flags: previous.reader_feature_flags & STICKY_PAIRED_FLAGS,
             writer_feature_flags: previous.writer_feature_flags
                 & (STICKY_PAIRED_FLAGS | FLAG_STABLE_FIELD_IDS),
             max_fragment_id: previous.max_fragment_id,
@@ -296,7 +295,7 @@ impl Manifest {
             // Sticky capabilities are also retained because the clone keeps the
             // source file identities that require them.
             reader_feature_flags: self.reader_feature_flags
-                & (FLAG_COVERED_INDEX_METADATA | STICKY_PAIRED_FLAGS | FLAG_STABLE_FIELD_IDS),
+                & (FLAG_COVERED_INDEX_METADATA | STICKY_PAIRED_FLAGS),
             writer_feature_flags: self.writer_feature_flags
                 & (FLAG_COVERED_INDEX_METADATA | STICKY_PAIRED_FLAGS | FLAG_STABLE_FIELD_IDS),
             max_fragment_id: self.max_fragment_id,
@@ -755,9 +754,8 @@ pub struct ManifestBuildConfig {
     /// It bypasses the "cannot enable stable row ids on existing dataset" guard and
     /// sets `manifest.next_row_id` to the provided value before activating the flag.
     pub migration_next_row_id: Option<u64>,
-    /// When `Some`, atomically activates stable field IDs. The boolean controls
-    /// whether the feature is also required of readers; writers are always gated.
-    pub stable_field_id_migration_requires_reader: Option<bool>,
+    /// Whether this commit atomically activates stable field IDs.
+    pub activate_stable_field_ids: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1665,7 +1663,6 @@ mod tests {
         );
         manifest.activate_stable_field_ids();
         manifest.max_allocated_field_id = Some(43);
-        manifest.reader_feature_flags |= FLAG_STABLE_FIELD_IDS;
         manifest.writer_feature_flags |= FLAG_STABLE_FIELD_IDS;
 
         assert_eq!(manifest.max_referenced_field_id(), 0);
@@ -1674,7 +1671,7 @@ mod tests {
         let recovered = Manifest::try_from(pb::Manifest::from(&manifest)).unwrap();
         assert_eq!(recovered.max_allocated_field_id, Some(43));
         assert_eq!(recovered.max_field_id(), 43);
-        assert_ne!(recovered.reader_feature_flags & FLAG_STABLE_FIELD_IDS, 0);
+        assert_eq!(recovered.reader_feature_flags & FLAG_STABLE_FIELD_IDS, 0);
         assert_ne!(recovered.writer_feature_flags & FLAG_STABLE_FIELD_IDS, 0);
     }
 
@@ -1693,7 +1690,6 @@ mod tests {
             HashMap::new(),
         );
         manifest.max_allocated_field_id = Some(41);
-        manifest.reader_feature_flags |= FLAG_STABLE_FIELD_IDS;
         manifest.writer_feature_flags |= FLAG_STABLE_FIELD_IDS;
 
         let cloned = manifest.shallow_clone(
@@ -1705,7 +1701,7 @@ mod tests {
         );
 
         assert_eq!(cloned.max_allocated_field_id, Some(41));
-        assert_ne!(cloned.reader_feature_flags & FLAG_STABLE_FIELD_IDS, 0);
+        assert_eq!(cloned.reader_feature_flags & FLAG_STABLE_FIELD_IDS, 0);
         assert_ne!(cloned.writer_feature_flags & FLAG_STABLE_FIELD_IDS, 0);
     }
 

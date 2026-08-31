@@ -184,16 +184,8 @@ class UpgradeDowngradeTest:
         """Return True to skip the old-version read after current-version writes."""
         return False
 
-    def expect_read_after_current_write_failure(self, version: str) -> bool:
-        """Return True when the old reader must reject current-version data."""
-        return False
-
     def skip_write_after_current_write(self, version: str) -> bool:
         """Return True to skip the old-version write after current-version writes."""
-        return False
-
-    def expect_write_after_current_write_failure(self, version: str) -> bool:
-        """Return True when the old writer must reject current-version data."""
         return False
 
     def skip_downgrade(self, version: str) -> bool:
@@ -212,15 +204,10 @@ class UpgradeDowngradeTest:
 class DatasetUpgradeDowngradeTest(UpgradeDowngradeTest):
     """Compatibility contract for new datasets with stable field IDs."""
 
-    def expect_read_after_current_write_failure(self, version: str) -> bool:
-        # Every released version selected by this suite predates the reader
-        # feature bit. Once a supporting release enters the matrix this fails
-        # visibly, instead of silently skipping a valid reader combination.
-        return True
-
-    def expect_write_after_current_write_failure(self, version: str) -> bool:
-        # Opening the dataset must fail before an old writer can enter a commit
-        # path that does not enforce unknown writer feature flags.
+    def skip_write_after_current_write(self, version: str) -> bool:
+        # Older readers remain compatible. Older writers are outside the
+        # contract because released commit paths do not all enforce unknown
+        # writer flags.
         return True
 
 
@@ -402,31 +389,9 @@ def test_func({sig_params}):
     # Old version: verify can read
     venv = venv_factory.get_venv(version)
     if not obj.skip_read_after_current_write(version):
-        if obj.expect_read_after_current_write_failure(version):
-            with pytest.raises(
-                RuntimeError,
-                match="cannot be read by this version|Flags",
-            ):
-                venv.execute_method(
-                    obj, "check_read", obj.compat_env(version, "check_read")
-                )
-        else:
-            venv.execute_method(
-                obj, "check_read", obj.compat_env(version, "check_read")
-            )
+        venv.execute_method(obj, "check_read", obj.compat_env(version, "check_read"))
     if not obj.skip_write_after_current_write(version):
-        if obj.expect_write_after_current_write_failure(version):
-            with pytest.raises(
-                RuntimeError,
-                match="cannot be (?:read|written) by this version|Flags",
-            ):
-                venv.execute_method(
-                    obj, "check_write", obj.compat_env(version, "check_write")
-                )
-        else:
-            venv.execute_method(
-                obj, "check_write", obj.compat_env(version, "check_write")
-            )
+        venv.execute_method(obj, "check_write", obj.compat_env(version, "check_write"))
 '''
     else:  # upgrade_downgrade
         func_body = f'''

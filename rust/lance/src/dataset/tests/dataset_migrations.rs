@@ -6,9 +6,7 @@ use std::sync::Arc;
 use std::vec;
 
 use crate::dataset::optimize::{CompactionOptions, compact_files};
-use crate::dataset::{
-    ColumnAlteration, InsertBuilder, NewColumnTransform, StableFieldIdMigrationMode,
-};
+use crate::dataset::{ColumnAlteration, InsertBuilder, NewColumnTransform};
 use crate::index::DatasetIndexExt;
 use crate::utils::test::copy_test_data_to_tmp;
 use crate::{Dataset, Result};
@@ -348,10 +346,7 @@ async fn test_stable_field_id_migration_repairs_legacy_schema_before_activation(
     let test_dir = copy_test_data_to_tmp("v0.10.5/corrupt_schema").unwrap();
     let mut dataset = Dataset::open(&test_dir.path_str()).await.unwrap();
 
-    dataset
-        .migrate_to_stable_field_ids(StableFieldIdMigrationMode::WritersOnly)
-        .await
-        .unwrap();
+    dataset.migrate_to_stable_field_ids().await.unwrap();
 
     dataset.validate().await.unwrap();
     assert!(dataset.manifest.uses_stable_field_ids());
@@ -364,16 +359,9 @@ async fn test_stable_field_id_migration_repairs_legacy_schema_before_activation(
         0
     );
 
-    let writer_only_version = dataset.version().version;
-    dataset
-        .migrate_to_stable_field_ids(StableFieldIdMigrationMode::ReadersAndWriters)
-        .await
-        .unwrap();
-    assert_eq!(dataset.version().version, writer_only_version + 1);
-    assert_ne!(
-        dataset.manifest.reader_feature_flags & FLAG_STABLE_FIELD_IDS,
-        0
-    );
+    let activation_version = dataset.version().version;
+    dataset.migrate_to_stable_field_ids().await.unwrap();
+    assert_eq!(dataset.version().version, activation_version);
 }
 
 #[tokio::test]
@@ -696,7 +684,7 @@ async fn test_new_datasets_use_stable_field_ids_and_migration_is_idempotent() {
     let mut dataset = make_simple_dataset(source_uri.as_str(), 10).await;
     assert!(dataset.manifest.uses_stable_field_ids());
     assert_eq!(dataset.manifest.max_allocated_field_id, Some(0));
-    assert_ne!(
+    assert_eq!(
         dataset.manifest.reader_feature_flags & FLAG_STABLE_FIELD_IDS,
         0
     );
@@ -706,26 +694,14 @@ async fn test_new_datasets_use_stable_field_ids_and_migration_is_idempotent() {
     );
     let created_version = dataset.version().version;
 
-    dataset
-        .migrate_to_stable_field_ids(StableFieldIdMigrationMode::ReadersAndWriters)
-        .await
-        .unwrap();
+    dataset.migrate_to_stable_field_ids().await.unwrap();
     assert_eq!(dataset.version().version, created_version);
-    assert_ne!(
+    assert_eq!(
         dataset.manifest.reader_feature_flags & FLAG_STABLE_FIELD_IDS,
         0
     );
 
-    dataset
-        .migrate_to_stable_field_ids(StableFieldIdMigrationMode::ReadersAndWriters)
-        .await
-        .unwrap();
-    assert_eq!(dataset.version().version, created_version);
-
-    dataset
-        .migrate_to_stable_field_ids(StableFieldIdMigrationMode::WritersOnly)
-        .await
-        .unwrap();
+    dataset.migrate_to_stable_field_ids().await.unwrap();
     assert_eq!(dataset.version().version, created_version);
 }
 
@@ -760,10 +736,7 @@ async fn test_shallow_clone_preserves_stable_field_id_state() {
     let source_uri = TempStrDir::default();
     let clone_uri = TempStrDir::default();
     let mut dataset = make_simple_dataset(source_uri.as_str(), 10).await;
-    dataset
-        .migrate_to_stable_field_ids(StableFieldIdMigrationMode::ReadersAndWriters)
-        .await
-        .unwrap();
+    dataset.migrate_to_stable_field_ids().await.unwrap();
 
     let cloned = dataset
         .shallow_clone(clone_uri.as_str(), dataset.version().version, None)
@@ -774,7 +747,7 @@ async fn test_shallow_clone_preserves_stable_field_id_state() {
         cloned.manifest.max_allocated_field_id,
         dataset.manifest.max_allocated_field_id
     );
-    assert_ne!(
+    assert_eq!(
         cloned.manifest.reader_feature_flags & FLAG_STABLE_FIELD_IDS,
         0
     );
@@ -788,10 +761,7 @@ async fn test_shallow_clone_preserves_stable_field_id_state() {
 async fn test_overwrite_preserves_compatible_stable_field_identities() {
     let source_uri = TempStrDir::default();
     let mut dataset = make_simple_dataset(source_uri.as_str(), 10).await;
-    dataset
-        .migrate_to_stable_field_ids(StableFieldIdMigrationMode::ReadersAndWriters)
-        .await
-        .unwrap();
+    dataset.migrate_to_stable_field_ids().await.unwrap();
 
     let schema = Arc::new(ArrowSchema::new(vec![
         ArrowField::new("id", DataType::Int64, false),
@@ -825,10 +795,7 @@ async fn test_overwrite_preserves_compatible_stable_field_identities() {
 async fn test_stable_field_id_rename_and_nullability_preserve_identity() {
     let source_uri = TempStrDir::default();
     let mut dataset = make_simple_dataset(source_uri.as_str(), 10).await;
-    dataset
-        .migrate_to_stable_field_ids(StableFieldIdMigrationMode::ReadersAndWriters)
-        .await
-        .unwrap();
+    dataset.migrate_to_stable_field_ids().await.unwrap();
 
     dataset
         .alter_columns(&[ColumnAlteration::new("id".to_string())

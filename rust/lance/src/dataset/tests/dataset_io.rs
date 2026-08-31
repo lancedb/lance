@@ -1323,10 +1323,7 @@ async fn test_write_manifest(
         manifest.data_storage_format.version.to_manifest_string(),
         "stable" | "next"
     ));
-    assert_eq!(
-        manifest.reader_feature_flags,
-        feature_flags::FLAG_STABLE_FIELD_IDS
-    );
+    assert_eq!(manifest.reader_feature_flags, 0);
     assert_eq!(
         manifest.writer_feature_flags,
         feature_flags::FLAG_STABLE_FIELD_IDS
@@ -1355,7 +1352,7 @@ async fn test_write_manifest(
     );
     assert_eq!(
         manifest.reader_feature_flags,
-        feature_flags::FLAG_DELETION_FILES | feature_flags::FLAG_STABLE_FIELD_IDS
+        feature_flags::FLAG_DELETION_FILES
     );
 
     // Write with custom manifest
@@ -1376,7 +1373,7 @@ async fn test_write_manifest(
             storage_format: None,
             disable_transaction_file: false,
             migration_next_row_id: None,
-            stable_field_id_migration_requires_reader: None,
+            activate_stable_field_ids: false,
         },
         dataset.manifest_location.naming_scheme,
         None,
@@ -3541,7 +3538,7 @@ async fn write_manifest_file_rejects_a_nullable_primary_key() {
             storage_format: None,
             disable_transaction_file: false,
             migration_next_row_id: None,
-            stable_field_id_migration_requires_reader: None,
+            activate_stable_field_ids: false,
         },
         dataset.manifest_location.naming_scheme,
         None,

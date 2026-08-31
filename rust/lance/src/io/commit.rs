@@ -497,7 +497,6 @@ async fn do_commit_new_dataset(
     if !manifest.uses_stable_field_ids() {
         fix_schema(&mut manifest)?;
         manifest.activate_stable_field_ids();
-        manifest.reader_feature_flags |= lance_table::feature_flags::FLAG_STABLE_FIELD_IDS;
         manifest.writer_feature_flags |= lance_table::feature_flags::FLAG_STABLE_FIELD_IDS;
     }
 

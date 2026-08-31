@@ -54,9 +54,8 @@ pub const FLAG_COVERED_INDEX_METADATA: u64 = 1 << 7;
 /// different exact versions.
 pub const FLAG_MIXED_DATA_FILE_VERSIONS: u64 = 1 << 8;
 /// Field IDs are allocated from a persistent high-water mark and are never reused.
-///
-/// This is always a writer requirement. It is also a reader requirement when an
-/// activation chooses fail-closed compatibility with pre-gate binaries.
+/// Writers must understand this allocation contract. It does not change how
+/// readers interpret the schema or data files.
 pub const FLAG_STABLE_FIELD_IDS: u64 = 1 << 9;
 /// The first bit that is unknown as a feature flag
 pub const FLAG_UNKNOWN: u64 = 1 << 10;
@@ -91,14 +90,6 @@ pub fn apply_feature_flags(
     let covered_index_metadata = (manifest.reader_feature_flags | manifest.writer_feature_flags)
         & FLAG_COVERED_INDEX_METADATA;
     let sticky_paired_flags = validated_sticky_paired_flags(manifest)?;
-    let stable_field_ids_reader = if manifest.max_allocated_field_id.is_some()
-        && manifest.reader_feature_flags & FLAG_STABLE_FIELD_IDS != 0
-    {
-        FLAG_STABLE_FIELD_IDS
-    } else {
-        0
-    };
-
     // Reset flags
     manifest.reader_feature_flags = 0;
     manifest.writer_feature_flags = 0;
@@ -159,7 +150,6 @@ pub fn apply_feature_flags(
 
     if manifest.max_allocated_field_id.is_some() {
         manifest.writer_feature_flags |= FLAG_STABLE_FIELD_IDS;
-        manifest.reader_feature_flags |= stable_field_ids_reader;
     }
 
     manifest.reader_feature_flags |= covered_index_metadata;
@@ -290,16 +280,21 @@ pub fn validate_paired_feature_flags(manifest: &Manifest) -> Result<()> {
 /// Refuse a manifest whose stable-field-ID marker and required flags disagree.
 ///
 /// The high-water mark is the activation marker and the writer bit keeps
-/// pre-feature writers away. The reader bit is optional deployment policy, but
-/// it cannot be set on a legacy manifest.
+/// pre-feature writers away. Stable field IDs do not require reader support.
 pub fn validate_stable_field_id_flags(manifest: &Manifest) -> Result<()> {
     let activated = manifest.max_allocated_field_id.is_some();
     let reader = manifest.reader_feature_flags & FLAG_STABLE_FIELD_IDS != 0;
     let writer = manifest.writer_feature_flags & FLAG_STABLE_FIELD_IDS != 0;
-    if activated != writer || (reader && !activated) {
+    if activated != writer {
         return Err(Error::corrupt_file_named(
             "manifest",
-            "Manifest stable-field-ID high-water mark and reader/writer feature flags disagree",
+            "Manifest stable-field-ID high-water mark and writer feature flag disagree",
+        ));
+    }
+    if reader {
+        return Err(Error::corrupt_file_named(
+            "manifest",
+            "Stable field IDs are a writer-only feature and must not set the reader feature flag",
         ));
     }
     Ok(())
@@ -581,7 +576,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_feature_flags_preserves_fail_closed_stable_field_id_gate() {
+    fn apply_feature_flags_clears_stable_field_id_reader_gate() {
         let mut manifest = empty_manifest();
         manifest.activate_stable_field_ids();
         manifest.reader_feature_flags |= FLAG_STABLE_FIELD_IDS;
@@ -590,7 +585,7 @@ mod tests {
         apply_feature_flags(&mut manifest, false, false).unwrap();
         apply_feature_flags(&mut manifest, false, false).unwrap();
 
-        assert_ne!(manifest.reader_feature_flags & FLAG_STABLE_FIELD_IDS, 0);
+        assert_eq!(manifest.reader_feature_flags & FLAG_STABLE_FIELD_IDS, 0);
         assert_ne!(manifest.writer_feature_flags & FLAG_STABLE_FIELD_IDS, 0);
     }
 
@@ -610,7 +605,7 @@ mod tests {
         validate_stable_field_id_flags(&writer_only).unwrap();
 
         writer_only.reader_feature_flags |= FLAG_STABLE_FIELD_IDS;
-        validate_stable_field_id_flags(&writer_only).unwrap();
+        assert!(validate_stable_field_id_flags(&writer_only).is_err());
     }
 
     fn empty_manifest() -> Manifest {

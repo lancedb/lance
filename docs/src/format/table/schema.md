@@ -237,12 +237,11 @@ maximum non-negative ID referenced by the canonical manifest schema, base data f
 files. Activation provides a forward guarantee only; it cannot reconstruct identities that were
 dropped or reused in older snapshots.
 
-New datasets activate this contract in their initial manifest and require both readers and writers
-to understand it. The reader gate is required because older Lance versions do not enforce unknown
-writer feature flags on every mutation path; allowing them to open the dataset could let a legacy
-commit clear the writer gate and resume reusable allocation. Existing legacy datasets remain
-unchanged until an explicit migration commit. Controlled deployments may use writer-only migration
-only after every pre-gate writer has been retired.
+New datasets activate this contract in their initial manifest. The corresponding feature flag is a
+writer requirement because stable field IDs change allocation but not how readers interpret schema
+or data files. Existing legacy datasets remain unchanged until an explicit migration commit. Before
+activation, operators must ensure that every writer accessing the dataset understands and preserves
+the stable field-ID contract.
 
 Activation is one-way within a branch ancestry. After migration, restore cannot target a version
 from before activation because that version does not carry the high-water mark needed to preserve
