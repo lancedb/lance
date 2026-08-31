@@ -270,6 +270,26 @@ type BuildStream<S, Q> =
 
 type FreshWindowBuildStream<S, Q> =
     Pin<Box<dyn Stream<Item = Result<(PartitionBuildResult<S, Q>, OwnedSemaphorePermit)>> + Send>>;
+type PartitionInputAdmissionStream<T> =
+    Pin<Box<dyn Stream<Item = Result<(T, OwnedSemaphorePermit)>> + Send>>;
+
+fn admit_partition_inputs<T: Send + 'static>(
+    inputs: Vec<T>,
+    entry_permits: Arc<Semaphore>,
+) -> PartitionInputAdmissionStream<T> {
+    stream::iter(inputs)
+        .then(move |input| {
+            let entry_permits = entry_permits.clone();
+            async move {
+                let entry_permit = entry_permits
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| Error::internal("partition build entry semaphore was closed"))?;
+                Ok((input, entry_permit))
+            }
+        })
+        .boxed()
+}
 
 struct PartitionBuildResult<S: IvfSubIndex, Q: Quantization> {
     partition_id: usize,
@@ -1266,56 +1286,53 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                         // slot needed for the oldest window to make ordered progress.
                         let window_entry_limit = max_entries.div_ceil(concurrency);
                         let entry_permits = Arc::new(Semaphore::new(window_entry_limit));
-                        let builds = stream::iter(inputs.into_iter().map(move |input| {
-                            let quantizer = quantizer.clone();
-                            let sub_index_params = sub_index_params.clone();
-                            let column = column.clone();
-                            let frag_reuse_index = frag_reuse_index.clone();
-                            let cpu_permits = cpu_permits.clone();
-                            let entry_permits = entry_permits.clone();
-                            async move {
-                                let partition_id = input.partition_id;
-                                let loss = input.loss;
-                                let entry_permit =
-                                    entry_permits.acquire_owned().await.map_err(|_| {
-                                        Error::internal(
-                                            "partition build entry semaphore was closed",
-                                        )
-                                    })?;
-                                let _cpu_permit = cpu_permits.acquire_owned().await.map_err(|_| {
-                                    Error::internal("partition build CPU semaphore was closed")
-                                })?;
-                                let built = spawn_cpu(move || -> Result<_> {
-                                    let num_rows = input
-                                        .batches
-                                        .iter()
-                                        .map(|batch| batch.num_rows())
-                                        .sum::<usize>();
-                                    if num_rows == 0 {
-                                        return Ok(None);
-                                    }
-                                    let (storage, sub_index) = Self::build_index(
-                                        distance_type,
-                                        quantizer,
-                                        sub_index_params,
-                                        input.batches,
-                                        column,
-                                        frag_reuse_index,
-                                    )?;
-                                    Ok(Some((storage, sub_index, loss)))
-                                })
-                                .await?;
-                                Ok::<_, Error>((
-                                    PartitionBuildResult {
-                                        partition_id,
-                                        built,
-                                    },
-                                    entry_permit,
-                                ))
-                            }
-                        }))
-                        .buffer_unordered(concurrency)
-                        .boxed();
+                        let builds = admit_partition_inputs(inputs, entry_permits)
+                            .map_ok(move |(input, entry_permit)| {
+                                let quantizer = quantizer.clone();
+                                let sub_index_params = sub_index_params.clone();
+                                let column = column.clone();
+                                let frag_reuse_index = frag_reuse_index.clone();
+                                let cpu_permits = cpu_permits.clone();
+                                async move {
+                                    let partition_id = input.partition_id;
+                                    let loss = input.loss;
+                                    let _cpu_permit =
+                                        cpu_permits.acquire_owned().await.map_err(|_| {
+                                            Error::internal(
+                                                "partition build CPU semaphore was closed",
+                                            )
+                                        })?;
+                                    let built = spawn_cpu(move || -> Result<_> {
+                                        let num_rows = input
+                                            .batches
+                                            .iter()
+                                            .map(|batch| batch.num_rows())
+                                            .sum::<usize>();
+                                        if num_rows == 0 {
+                                            return Ok(None);
+                                        }
+                                        let (storage, sub_index) = Self::build_index(
+                                            distance_type,
+                                            quantizer,
+                                            sub_index_params,
+                                            input.batches,
+                                            column,
+                                            frag_reuse_index,
+                                        )?;
+                                        Ok(Some((storage, sub_index, loss)))
+                                    })
+                                    .await?;
+                                    Ok::<_, Error>((
+                                        PartitionBuildResult {
+                                            partition_id,
+                                            built,
+                                        },
+                                        entry_permit,
+                                    ))
+                                }
+                            })
+                            .try_buffer_unordered(concurrency)
+                            .boxed();
                         Ok::<(FreshWindowBuildStream<S, Q>, _), Error>((builds, admission))
                     },
                 );
@@ -2664,6 +2681,46 @@ mod tests {
     // Helper to read centroid i from a FixedSizeListArray as a Vec<f32>
     fn centroid_values(arr: &FixedSizeListArray, i: usize) -> Vec<f32> {
         arr.value(i).as_primitive::<Float32Type>().values().to_vec()
+    }
+
+    #[tokio::test]
+    async fn partition_entry_admission_preserves_input_order() {
+        let entry_permits = Arc::new(Semaphore::new(1));
+        let held_permit = entry_permits.clone().acquire_owned().await.unwrap();
+        let mut admitted = admit_partition_inputs(vec![0, 1, 2], entry_permits);
+
+        let first = admitted.next();
+        tokio::pin!(first);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), &mut first)
+                .await
+                .is_err()
+        );
+
+        drop(held_permit);
+        let (partition_id, first_permit) =
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut first)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        assert_eq!(partition_id, 0);
+
+        let second = admitted.next();
+        tokio::pin!(second);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), &mut second)
+                .await
+                .is_err()
+        );
+        drop(first_permit);
+        let (partition_id, _second_permit) =
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut second)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        assert_eq!(partition_id, 1);
     }
 
     #[test]
