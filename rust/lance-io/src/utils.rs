@@ -28,7 +28,9 @@ pub const METADATA_READ_CHUNK_SIZE: usize = 16 * 1024 * 1024;
 
 /// Read `range` from `reader` as `chunk_size`-sized concurrent range requests,
 /// yielding the chunks in file order. Concurrency is bounded by
-/// [`Reader::io_parallelism`].
+/// [`Reader::io_parallelism`], clamped to at least 1: a `buffered(0)` window
+/// never polls its input, so an unvalidated reader value (e.g.
+/// `LANCE_URING_IO_PARALLELISM=0`) would hang the read.
 pub fn read_range_in_chunks(
     reader: &dyn Reader,
     range: Range<usize>,
@@ -39,7 +41,7 @@ pub fn read_range_in_chunks(
         .step_by(chunk_size)
         .map(move |start| start..min(start + chunk_size, end));
     futures::stream::iter(chunk_ranges.map(|chunk| reader.get_range(chunk)))
-        .buffered(reader.io_parallelism())
+        .buffered(reader.io_parallelism().max(1))
 }
 
 /// Read a protobuf message at file position 'pos'.
@@ -307,6 +309,32 @@ mod tests {
             assembled.extend_from_slice(&chunk);
         }
         assert_eq!(assembled.as_ref(), &data[range]);
+    }
+
+    #[tokio::test]
+    async fn test_read_range_in_chunks_zero_parallelism_reader() {
+        // A reader advertising io_parallelism 0 (e.g. LANCE_URING_IO_PARALLELISM=0)
+        // must not hang the chunked read: the window is clamped to at least 1.
+        let store = ObjectStore::memory();
+        let path = Path::from("/zero_parallelism");
+        let data: Vec<u8> = (0..4096).map(|i| (i % 249) as u8).collect();
+        store.put(&path, &data).await.unwrap();
+        let reader =
+            CloudObjectReader::new(store.inner, path, 1024, None, DEFAULT_DOWNLOAD_RETRY_COUNT)
+                .unwrap()
+                .with_io_parallelism(0);
+
+        let assembled = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut buf = BytesMut::new();
+            let mut chunks = read_range_in_chunks(&reader, 0..data.len(), 1024);
+            while let Some(chunk) = chunks.try_next().await.unwrap() {
+                buf.extend_from_slice(&chunk);
+            }
+            buf
+        })
+        .await
+        .expect("chunked read with a zero-parallelism reader must not hang");
+        assert_eq!(assembled.as_ref(), &data[..]);
     }
 
     #[tokio::test]
