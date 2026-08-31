@@ -363,6 +363,7 @@ async fn do_commit_new_dataset(
     let mut transaction = transaction.clone();
     canonicalize_stable_field_ids(None, &mut transaction.operation)?;
     let transaction = &transaction;
+    validate_operation(None, &transaction.operation)?;
     let pb_transaction = pb::Transaction::from(transaction);
     let inline_transaction = pb_transaction.encoded_len() <= MAX_INLINE_TRANSACTION_BYTES;
     // Classified from the operation itself. Reading it back off the inline
@@ -1992,7 +1993,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn raw_arrow_merge_retry_matches_single_attempt_ids() {
+    async fn raw_arrow_merge_retry_rebinds_after_allocator_advance() {
         let tmp = TempStrDir::default();
         let uri = tmp.as_str();
         let dataset = Dataset::write(
@@ -2008,6 +2009,7 @@ mod tests {
 
         let mut foreign_manifest = dataset.manifest.as_ref().clone();
         foreign_manifest.max_fragment_id = Some(foreign_manifest.max_fragment_id.unwrap_or(0) + 1);
+        foreign_manifest.max_allocated_field_id = Some(foreign_manifest.max_field_id() + 1);
         let foreign_transaction = Transaction::new(
             dataset.version().version,
             Operation::ReserveFragments { num_fragments: 1 },
@@ -2059,7 +2061,7 @@ mod tests {
             unreachable!();
         };
         assert_eq!(committed.schema(), &expected_schema);
-        assert_eq!(committed.schema().field("new_column").unwrap().id, 1);
+        assert_eq!(committed.schema().field("new_column").unwrap().id, 2);
         assert_eq!(
             committed.manifest.fragments[0].files[1].fields,
             expected_fragments[0].files[1].fields
