@@ -12,7 +12,7 @@ use super::{
     transaction::{Operation, Transaction},
     write::cleanup_data_fragments,
 };
-use crate::index::DatasetIndexExt;
+use crate::index::load_all_indices;
 use crate::{Error, Result, io::exec::Planner};
 use arrow::compute::CastOptions;
 use arrow::compute::can_cast_types;
@@ -23,6 +23,7 @@ use datafusion::execution::SendableRecordBatchStream;
 use futures::stream::{StreamExt, TryStreamExt};
 use lance_arrow::SchemaExt;
 use lance_core::datatypes::{Field, Schema};
+use lance_core::utils::parse::str_is_truthy;
 use lance_datafusion::utils::StreamingWriteSource;
 use lance_encoding::constants::{PACKED_STRUCT_LEGACY_META_KEY, PACKED_STRUCT_META_KEY};
 #[cfg(test)]
@@ -165,7 +166,7 @@ impl ArrowFieldExt for ArrowField {
         let metadata = self.metadata();
         metadata
             .get(PACKED_STRUCT_LEGACY_META_KEY)
-            .map(|v| v == "true")
+            .map(|v| str_is_truthy(v))
             .unwrap_or(metadata.contains_key(PACKED_STRUCT_META_KEY))
     }
 }
@@ -790,15 +791,19 @@ pub(super) async fn alter_columns(
     }
 
     new_schema.validate()?;
+    new_schema.verify_primary_key()?;
 
     // If any column being cast has an attached index, fail fast. Cast operations
     // rewrite the underlying column data and silently invalidate any index on the
     // affected column(s). The current behavior is to drop such indices without
     // warning, which has caused production incidents where vector search silently
     // regressed to brute-force scan. We require users to explicitly drop the
-    // index before altering the column type, so the action is never silent.
+    // index before altering the column type, so the action is never silent. That
+    // includes an index this build has no reader for: the cast reassigns the
+    // field id, so carrying it forward is impossible and staying quiet about it
+    // is the silent drop this guard exists to abolish.
     if !cast_fields.is_empty() {
-        let indices = dataset.load_indices().await?;
+        let indices = load_all_indices(dataset).await?;
         let affected: Vec<&lance_table::format::IndexMetadata> = indices
             .iter()
             .filter(|idx| {
@@ -1013,6 +1018,8 @@ fn exclude(source: &Schema, other: &Schema, version: &ConcreteFileVersion) -> Re
 #[cfg(test)]
 mod test {
     use std::{collections::HashMap, fs, num::NonZero, path::Path as StdPath, sync::Mutex};
+
+    use crate::index::DatasetIndexExt;
 
     #[test]
     fn test_merge_introduces_required_field() {
@@ -4100,5 +4107,53 @@ mod test {
         .with_metadata(packed_meta);
         let field4 = ArrowField::new("test", DataType::Struct(vec![conflict_field].into()), false);
         assert!(check_field_conflict(&field1, &field4, &ConcreteFileVersion::V2_2).is_err());
+    }
+
+    /// Table creation rejects a nullable primary key; altering one afterwards
+    /// reached the same state without passing that check.
+    #[tokio::test]
+    async fn test_alter_columns_cannot_make_a_primary_key_nullable() -> Result<()> {
+        let pk = ArrowField::new("id", DataType::Int32, false).with_metadata(
+            [(
+                "lance-schema:unenforced-primary-key:position".to_string(),
+                "1".to_string(),
+            )]
+            .into(),
+        );
+        let schema = Arc::new(ArrowSchema::new(vec![
+            pk,
+            ArrowField::new("value", DataType::Int32, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(Int32Array::from(vec![10, 20])),
+            ],
+        )?;
+        let test_dir = TempStrDir::default();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &test_dir,
+            None,
+        )
+        .await?;
+
+        let err = dataset
+            .alter_columns(&[ColumnAlteration::new("id".into()).set_nullable(true)])
+            .await
+            .expect_err("making a primary key nullable must be rejected");
+        assert!(
+            err.to_string().contains("must not be nullable"),
+            "unexpected error: {err}"
+        );
+
+        // Specific to the key: other columns may still be altered.
+        dataset
+            .alter_columns(&[ColumnAlteration::new("value".into()).rename("val".into())])
+            .await?;
+        assert!(!dataset.schema().unenforced_primary_key()[0].nullable);
+
+        Ok(())
     }
 }

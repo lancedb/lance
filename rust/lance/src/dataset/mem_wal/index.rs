@@ -50,6 +50,7 @@ pub type RowPosition = u64;
 // Re-export public types used externally
 pub use btree::{BTreeIndexConfig, BTreeMemIndex};
 pub use fts::{FtsIndexConfig, FtsMemIndex, FtsQueryExpr, SearchOptions};
+pub(crate) use fts::{QueryLocalFtsIndex, QueryLocalFtsStats};
 pub use hnsw::{HnswIndexConfig, HnswMemIndex};
 pub use pk_key::encode_pk_tuple;
 

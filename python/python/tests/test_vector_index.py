@@ -568,6 +568,42 @@ def test_torch_index_with_nans(tmp_path, index_file_version):
     validate_vector_index(dataset, "vector", sample_size=16)
 
 
+def test_torch_index_nan_init_centroid(tmp_path):
+    """A NaN vector must never seed a centroid.
+
+    `vector is not null` does not exclude NaN, so sampling could pick one; with
+    a single partition that left every residual NaN and the index build failed.
+    """
+    torch = pytest.importorskip("torch")
+    from lance.torch.data import LanceDataset as TorchDataset
+    from lance.vector import _sample_init_centroids
+
+    # Only the last 8 rows are finite, so any sample that keeps NaN rows seeds
+    # the centroid with one.
+    mat = np.full((32, 8), np.nan, dtype=np.float32)
+    mat[24:] = np.random.randn(8, 8).astype(np.float32)
+    dataset = lance.write_dataset(vec_to_table(data=mat), tmp_path)
+    assert dataset.to_table()["vector"].null_count == 0
+
+    ds = TorchDataset(dataset, batch_size=1, columns=["vector"], samples=32)
+    centroids = _sample_init_centroids(ds, 4, filter_nan=True)
+    assert centroids.shape[0] == 4
+    assert torch.isfinite(centroids).all()
+
+
+def test_torch_index_all_nan_rejected(tmp_path):
+    pytest.importorskip("torch")
+    from lance.torch.data import LanceDataset as TorchDataset
+    from lance.vector import _sample_init_centroids
+
+    mat = np.full((16, 8), np.nan, dtype=np.float32)
+    dataset = lance.write_dataset(vec_to_table(data=mat), tmp_path)
+
+    ds = TorchDataset(dataset, batch_size=1, columns=["vector"], samples=16)
+    with pytest.raises(ValueError, match="all null or non-finite"):
+        _sample_init_centroids(ds, 1, filter_nan=True)
+
+
 def test_index_with_no_centroid_movement(tmp_path):
     torch = pytest.importorskip("torch")
 
@@ -1366,6 +1402,57 @@ def test_multivec_ann(indexed_multivec_dataset: lance.LanceDataset):
         indexed_multivec_dataset.to_table(
             nearest={"column": "vector", "q": query, "k": 100}
         )
+
+
+def test_multivec_search_paths(tmp_path: Path):
+    vector_type = pa.list_(pa.list_(pa.float32(), 2))
+    query = np.array([[1.0, 0.0], [0.0, 1.0]], dtype=np.float32)
+    uri = tmp_path / "multivec_distance.lance"
+
+    indexed_rows = pa.table(
+        {
+            "id": pa.array([0, 1], type=pa.int32()),
+            "vector": pa.array(
+                [
+                    [[1.0, 0.0], [0.0, 1.0]],
+                    [[1.0, 0.0], [1.0, 0.0]],
+                ],
+                type=vector_type,
+            ),
+        }
+    )
+    dataset = lance.write_dataset(indexed_rows, uri)
+    dataset = dataset.create_index(
+        "vector",
+        index_type="IVF_FLAT",
+        metric="cosine",
+        num_partitions=1,
+    )
+
+    unindexed_rows = pa.table(
+        {
+            "id": pa.array([2, 3], type=pa.int32()),
+            "vector": pa.array(
+                [
+                    [[1.0, 0.0], [0.0, 1.0]],
+                    [[-1.0, 0.0], [0.0, -1.0]],
+                ],
+                type=vector_type,
+            ),
+        }
+    )
+    dataset = lance.write_dataset(unindexed_rows, uri, mode="append")
+
+    nearest = {"column": "vector", "q": query, "k": 4, "metric": "cosine"}
+    flat = dataset.to_table(columns=["id"], nearest={**nearest, "use_index": False})
+    mixed = dataset.to_table(columns=["id"], nearest=nearest)
+
+    dataset.optimize.optimize_indices()
+    fully_indexed = dataset.to_table(columns=["id"], nearest=nearest, fast_search=True)
+
+    for result in [flat, mixed, fully_indexed]:
+        assert result["id"].to_pylist() == [0, 2, 1, 3]
+        np.testing.assert_allclose(result["_distance"].to_numpy(), [0.0, 0.0, 1.0, 2.0])
 
 
 def test_pre_populated_ivf_centroids(dataset, tmp_path: Path):
