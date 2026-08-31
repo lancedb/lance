@@ -731,13 +731,28 @@ mod tests {
         DistTableBackend::Avx2
     )]
     #[case::avx2_tier(SimdSupport::Avx2, true, false, true, DistTableBackend::Avx2)]
+    // The tier alone must not authorize the AVX2 kernel: it is
+    // `#[target_feature(enable = "avx2")]` and called from an `unsafe` block that
+    // has only the detected feature to stand on.
+    #[case::avx2_tier_without_the_feature(
+        SimdSupport::Avx2,
+        false,
+        false,
+        false,
+        DistTableBackend::Scalar
+    )]
     // Without AVX2 there is nothing to fall back to.
     #[case::avx512_no_avx2(SimdSupport::Avx512, false, false, false, DistTableBackend::Scalar)]
     // `Avx` and `AvxFma` lack the integer ops the AVX2 inner uses.
     #[case::avx_fma(SimdSupport::AvxFma, false, false, false, DistTableBackend::Scalar)]
     #[case::avx(SimdSupport::Avx, false, false, false, DistTableBackend::Scalar)]
+    #[case::sse(SimdSupport::Sse, false, false, false, DistTableBackend::Scalar)]
     #[case::none(SimdSupport::None, false, false, false, DistTableBackend::Scalar)]
     #[case::neon(SimdSupport::Neon, false, false, false, DistTableBackend::Neon)]
+    // loongarch64 has LSX and LASX kernels elsewhere in this crate but none for
+    // this table, so both tiers belong on the scalar route.
+    #[case::lsx(SimdSupport::Lsx, false, false, false, DistTableBackend::Scalar)]
+    #[case::lasx(SimdSupport::Lasx, false, false, false, DistTableBackend::Scalar)]
     fn dist_table_backend_follows_the_tier_ladder(
         #[case] support: SimdSupport,
         #[case] avx512_kernel: bool,
