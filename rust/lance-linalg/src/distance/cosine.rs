@@ -1372,8 +1372,8 @@ where
 ///
 /// With debug assertions on, panics if the length of `from` is not equal to the
 /// dimension (value length) of `to`, unless one of the errors above is returned
-/// first. Unlike the l2 and dot equivalents, cosine has no always-on layout
-/// assert, so without them a mismatch can read past the shorter vector instead.
+/// first. Without them the mismatch is not reliably caught, since cosine has no
+/// always-on layout assert of its own, unlike the l2 and dot equivalents.
 pub fn cosine_distance_arrow_batch(
     from: &dyn Array,
     to: &FixedSizeListArray,
