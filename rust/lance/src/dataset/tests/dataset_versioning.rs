@@ -15,6 +15,8 @@ use lance_table::io::commit::ManifestNamingScheme;
 use crate::dataset::write::{CommitBuilder, WriteMode, WriteParams};
 use arrow_array::RecordBatch;
 use arrow_array::RecordBatchReader;
+use arrow_array::cast::AsArray;
+use arrow_array::types::UInt64Type;
 use arrow_array::{RecordBatchIterator, UInt32Array, types::Int32Type};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use lance_core::utils::tempfile::{TempDir, TempStdDir, TempStrDir};
@@ -300,6 +302,94 @@ async fn test_stale_checks_cover_fast_successor_and_latest_version(
     );
     assert!(historical.is_stale().await.unwrap());
     assert!(historical.has_successor_version().await.unwrap());
+}
+
+/// All row ids visible in `dataset`, in scan order.
+async fn scan_row_ids(dataset: &Dataset) -> Vec<u64> {
+    let batch = dataset
+        .scan()
+        .with_row_id()
+        .project(&["i"])
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    batch["_rowid"]
+        .as_primitive::<UInt64Type>()
+        .values()
+        .to_vec()
+}
+
+fn u32_batch(values: std::ops::Range<u32>) -> RecordBatch {
+    arrow_array::record_batch!(("i", UInt32, values.collect::<Vec<u32>>())).unwrap()
+}
+
+/// Restoring past activation would turn stable row ids off, putting row
+/// addresses back into a namespace this table has already issued ids from.
+#[tokio::test]
+async fn test_restore_rejects_crossing_stable_id_activation() {
+    let test_uri = TempStrDir::default();
+    let batch = u32_batch(0..10);
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+        test_uri.as_str(),
+        None,
+    )
+    .await
+    .unwrap();
+    dataset.migrate_to_stable_row_ids().await.unwrap();
+
+    let mut restored = dataset.checkout_version(1).await.unwrap();
+    let err = restored.restore().await.unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("stable row ids were enabled after"),
+        "{err}"
+    );
+}
+
+/// A restore must not rewind the row-id high-water mark, or the next append reuses old ids.
+#[tokio::test]
+async fn test_restore_preserves_row_id_high_water_mark() {
+    let test_uri = TempStrDir::default();
+    let write = |values: std::ops::Range<u32>, mode| {
+        let uri = test_uri.as_str().to_string();
+        async move {
+            let batch = u32_batch(values);
+            Dataset::write(
+                RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+                &uri,
+                Some(WriteParams {
+                    mode,
+                    enable_stable_row_ids: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap()
+        }
+    };
+
+    write(0..10, WriteMode::Create).await;
+    let appended = write(10..20, WriteMode::Append).await;
+    let mark = appended.manifest.next_row_id;
+
+    let mut restored = appended.checkout_version(1).await.unwrap();
+    restored.restore().await.unwrap();
+    assert!(
+        restored.manifest.next_row_id >= mark,
+        "restore rewound the row id high-water mark: {} < {mark}",
+        restored.manifest.next_row_id
+    );
+
+    // The rows appended after the restore must not reuse the dropped rows' ids.
+    let reused = write(20..30, WriteMode::Append).await;
+    let ids = scan_row_ids(&reused).await;
+    assert_eq!(
+        ids.iter().filter(|id| **id >= mark).count(),
+        10,
+        "appended rows did not all take fresh ids past {mark}: {ids:?}"
+    );
 }
 
 #[rstest]
