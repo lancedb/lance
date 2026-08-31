@@ -13,6 +13,7 @@
 use crate::feature_flags::{
     FLAG_COVERED_INDEX_METADATA, FLAG_STABLE_FIELD_IDS, FLAG_STABLE_ROW_IDS, apply_feature_flags,
     ensure_can_read_manifest, ensure_can_write_manifest, inherit_sticky_feature_flags,
+    validate_stable_field_id_flags,
 };
 use crate::format::overlay::TOMBSTONE_FIELD_ID;
 use crate::format::{

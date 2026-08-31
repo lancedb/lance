@@ -3541,6 +3541,7 @@ async fn write_manifest_file_rejects_a_nullable_primary_key() {
             storage_format: None,
             disable_transaction_file: false,
             migration_next_row_id: None,
+            stable_field_id_migration_requires_reader: None,
         },
         dataset.manifest_location.naming_scheme,
         None,

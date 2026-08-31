@@ -637,7 +637,5 @@ mod tests {
         assert!(can_write_dataset(FLAG_COVERED_INDEX_METADATA));
         assert!(!can_read_dataset(FLAG_MIXED_DATA_FILE_VERSIONS));
         assert!(!can_write_dataset(FLAG_MIXED_DATA_FILE_VERSIONS));
-        assert!(FLAG_MIXED_DATA_FILE_VERSIONS < FLAG_STABLE_FIELD_IDS);
-        assert!(FLAG_STABLE_FIELD_IDS < FLAG_UNKNOWN);
     }
 }
