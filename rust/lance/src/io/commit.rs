@@ -1314,6 +1314,7 @@ async fn record_successful_commit(
         let key = IndexMetadataKey {
             version: manifest.version,
             store_identity: &dataset.object_store.store_prefix,
+            e_tag: location.e_tag.as_deref(),
         };
         dataset
             .index_cache
