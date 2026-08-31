@@ -197,6 +197,8 @@ pub struct GroupInputWithLayout {
 /// Keep Roaring only when its serialized representation is substantially
 /// smaller than either rank-friendly representation. This preserves compact
 /// run containers while avoiding Roaring's linear word scan for dense rank.
+/// Binary-copy compaction creates these runs with `RoaringTreemap::insert_range`,
+/// and serialization preserves them without an explicit `optimize()` call.
 const ROARING_SIZE_ADVANTAGE_FOR_RANK: usize = 4;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -418,7 +420,7 @@ impl GroupRemap {
         for &(frag_id, physical_rows) in &old_frags {
             if !seen_frag_ids.insert(frag_id) {
                 return Err(Error::invalid_input(format!(
-                    "rewrite group contains old fragment {frag_id} more than once"
+                    "rewrite group {group_idx} contains old fragment {frag_id} more than once"
                 )));
             }
             let bitmap = per_frag.remove(&frag_id).unwrap_or_default();
@@ -426,7 +428,7 @@ impl GroupRemap {
                 && bitmap.max().is_some_and(|offset| offset >= physical_rows)
             {
                 return Err(Error::invalid_input(format!(
-                    "rewrite group contains a row offset outside old fragment {frag_id} with physical_rows={physical_rows}"
+                    "rewrite group {group_idx} contains a row offset outside old fragment {frag_id} with physical_rows={physical_rows}"
                 )));
             }
             let num_rewritten_rows = bitmap.len();
@@ -445,7 +447,7 @@ impl GroupRemap {
         // Rewritten old row addresses must reference only listed old fragments.
         if !per_frag.is_empty() {
             return Err(Error::invalid_input(format!(
-                "compaction rewritten old row addresses reference fragments {:?} not in the rewrite group's old fragments {:?}",
+                "compaction rewrite group {group_idx} references rewritten old row addresses from fragments {:?} not in its old fragments {:?}",
                 per_frag.keys().collect::<Vec<_>>(),
                 old_frags,
             )));
@@ -456,7 +458,7 @@ impl GroupRemap {
         let total_rewritten_old_rows = rewritten_old_row_addrs.len();
         if total_new_rows != total_rewritten_old_rows {
             return Err(Error::invalid_input(format!(
-                "compaction rewrote {total_rewritten_old_rows} old rows from fragments {:?} but the new fragments hold {total_new_rows} rows",
+                "compaction rewrite group {group_idx} rewrote {total_rewritten_old_rows} old rows from fragments {:?} but the new fragments hold {total_new_rows} rows",
                 old_frags,
             )));
         }
@@ -509,7 +511,7 @@ impl CompactRemapStep {
             for (frag_id, frag) in group_frags {
                 if frags.insert(frag_id, frag).is_some() {
                     return Err(Error::invalid_input(format!(
-                        "old fragment {frag_id} appears in more than one rewrite group"
+                        "old fragment {frag_id} appears in more than one rewrite group, including group {gi}"
                     )));
                 }
             }
@@ -530,7 +532,7 @@ impl CompactRemapStep {
             for (frag_id, frag) in group_frags {
                 if frags.insert(frag_id, frag).is_some() {
                     return Err(Error::invalid_input(format!(
-                        "old fragment {frag_id} appears in more than one rewrite group"
+                        "old fragment {frag_id} appears in more than one rewrite group, including group {gi}"
                     )));
                 }
             }
@@ -718,13 +720,12 @@ impl CompactRowAddrRemap {
     }
 
     fn fully_deleted_fragments(&self) -> Option<RoaringBitmap> {
-        match self.steps.as_slice() {
-            [] => Some(RoaringBitmap::new()),
-            [step] => step.fully_deleted_fragments(),
-            // Determining whether every baseline fragment is ultimately
-            // deleted requires composing fragment domains across steps.
-            _ => None,
-        }
+        self.steps
+            .iter()
+            .try_fold(RoaringBitmap::new(), |mut deleted, step| {
+                deleted |= step.fully_deleted_fragments()?;
+                Some(deleted)
+            })
     }
 }
 
@@ -740,6 +741,64 @@ mod tests {
 
     fn addr(frag: u32, offset: u32) -> u64 {
         u64::from(RowAddress::new_from_parts(frag, offset))
+    }
+
+    #[derive(Clone, Copy)]
+    enum ExpectedRankedOffsets {
+        Sparse,
+        Dense,
+        Roaring,
+    }
+
+    fn assert_layout_matches_legacy(
+        frag_id: u32,
+        physical_rows: u32,
+        rewritten_old_row_addrs: RoaringTreemap,
+        new_frags: Vec<(u32, u32)>,
+        expected_representation: ExpectedRankedOffsets,
+    ) {
+        let rewritten_addrs = rewritten_old_row_addrs.iter().collect::<Vec<_>>();
+        let new_addrs = new_frags
+            .iter()
+            .flat_map(|(new_frag_id, rows)| (0..*rows).map(|offset| addr(*new_frag_id, offset)))
+            .collect::<Vec<_>>();
+        assert_eq!(rewritten_addrs.len(), new_addrs.len());
+        let expected_moved = rewritten_addrs
+            .iter()
+            .copied()
+            .zip(new_addrs)
+            .collect::<HashMap<_, _>>();
+
+        let remap = RowAddrRemap::compact_with_layout([GroupInputWithLayout {
+            rewritten_old_row_addrs,
+            old_frags: vec![(frag_id, physical_rows)],
+            new_frags,
+        }])
+        .unwrap();
+
+        let RowAddrRemap::Compact(compact) = &remap else {
+            panic!("compact_with_layout must produce a compact remap");
+        };
+        let RemapStep::Compact(step) = &compact.steps[0] else {
+            panic!("compact_with_layout must produce a compact step");
+        };
+        let offsets = &step.frags[&frag_id].rewritten_offsets;
+        assert!(match expected_representation {
+            ExpectedRankedOffsets::Sparse => matches!(offsets, RankedOffsets::Sparse(_)),
+            ExpectedRankedOffsets::Dense => matches!(offsets, RankedOffsets::Dense(_)),
+            ExpectedRankedOffsets::Roaring => matches!(offsets, RankedOffsets::Roaring(_)),
+        });
+
+        for offset in 0..physical_rows {
+            let old_addr = addr(frag_id, offset);
+            assert_eq!(
+                remap.get(old_addr),
+                Some(expected_moved.get(&old_addr).copied()),
+                "mismatch at ({frag_id}, {offset})"
+            );
+        }
+        assert_eq!(remap.get(addr(frag_id, physical_rows)), None);
+        assert_eq!(remap.get(addr(frag_id + 1, 0)), None);
     }
 
     #[test]
@@ -781,13 +840,56 @@ mod tests {
     fn test_run_compressed_ranked_offsets() {
         let mut rewritten = RoaringBitmap::new();
         rewritten.insert_range(100..9_900);
-        rewritten.optimize();
         let offsets = RankedOffsets::try_new(rewritten, Some(10_000)).unwrap();
         assert!(matches!(offsets, RankedOffsets::Roaring(_)));
         assert_eq!(offsets.rank_if_present(99), None);
         assert_eq!(offsets.rank_if_present(100), Some(0));
         assert_eq!(offsets.rank_if_present(9_899), Some(9_799));
         assert_eq!(offsets.rank_if_present(9_900), None);
+    }
+
+    #[test]
+    fn test_compact_with_layout_matches_legacy_across_rank_representations() {
+        assert_layout_matches_legacy(
+            1,
+            10_000,
+            RoaringTreemap::from_iter(
+                [1u32, 63, 511, 9_999]
+                    .into_iter()
+                    .map(|offset| addr(1, offset)),
+            ),
+            vec![(10, 2), (11, 2)],
+            ExpectedRankedOffsets::Sparse,
+        );
+
+        let dense = (0..1_024u32)
+            .filter(|offset| offset % 10 != 0)
+            .map(|offset| addr(2, offset))
+            .collect::<RoaringTreemap>();
+        let dense_rows = u32::try_from(dense.len()).unwrap();
+        assert_layout_matches_legacy(
+            2,
+            1_024,
+            dense,
+            vec![(20, 400), (21, dense_rows - 400)],
+            ExpectedRankedOffsets::Dense,
+        );
+
+        // Binary-copy compaction captures complete fragment ranges with
+        // `RoaringTreemap::insert_range`, then persists that bitmap. The
+        // serialized round trip retains run containers without `optimize()`.
+        let mut captured = RoaringTreemap::new();
+        captured.insert_range(addr(3, 100)..addr(3, 9_900));
+        let mut serialized = Vec::with_capacity(captured.serialized_size());
+        captured.serialize_into(&mut serialized).unwrap();
+        let persisted = RoaringTreemap::deserialize_from(std::io::Cursor::new(serialized)).unwrap();
+        assert_layout_matches_legacy(
+            3,
+            10_000,
+            persisted,
+            vec![(31, 5_000), (30, 4_800)],
+            ExpectedRankedOffsets::Roaring,
+        );
     }
 
     #[test]
@@ -834,13 +936,21 @@ mod tests {
 
     #[test]
     fn test_fragment_sets() {
-        // No rewritten rows at all: every covered fragment is fully deleted.
-        let dead = RowAddrRemap::compact([GroupInput {
+        // Each deferred version deletes a different covered fragment. The
+        // chain must retain the flat direct map's union semantics.
+        let first_dead = RowAddrRemap::compact([GroupInput {
             rewritten_old_row_addrs: RoaringTreemap::new(),
-            old_frag_ids: vec![3, 7],
+            old_frag_ids: vec![3],
             new_frags: vec![],
         }])
         .unwrap();
+        let second_dead = RowAddrRemap::compact([GroupInput {
+            rewritten_old_row_addrs: RoaringTreemap::new(),
+            old_frag_ids: vec![7],
+            new_frags: vec![],
+        }])
+        .unwrap();
+        let dead = RowAddrRemap::chained([first_dead.clone(), second_dead]);
         assert_eq!(
             dead.fully_deleted_fragments(),
             Some(RoaringBitmap::from_iter([3u32, 7u32]))
@@ -862,6 +972,11 @@ mod tests {
         assert_eq!(
             alive.affected_fragments(),
             RoaringBitmap::from_iter([0u32, 1u32])
+        );
+        assert!(
+            RowAddrRemap::chained([first_dead, alive])
+                .fully_deleted_fragments()
+                .is_none()
         );
     }
 

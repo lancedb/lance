@@ -340,21 +340,6 @@ impl CompactFragReuseIndex {
                     .iter()
                     .map(|frag| fragment_layout(frag, "old", version_idx, group_idx))
                     .collect::<Result<Vec<_>>>()?;
-                for (frag_id, bitmap) in changed_row_addrs.bitmaps() {
-                    let Some((_, physical_rows)) = old_frags
-                        .iter()
-                        .find(|(old_frag_id, _)| *old_frag_id == frag_id)
-                    else {
-                        return Err(Error::index(format!(
-                            "FRI version {version_idx}, group {group_idx} contains changed rows for old fragment {frag_id} that is not in its fragment layout"
-                        )));
-                    };
-                    if bitmap.max().is_some_and(|offset| offset >= *physical_rows) {
-                        return Err(Error::index(format!(
-                            "FRI version {version_idx}, group {group_idx} contains a changed row offset outside old fragment {frag_id} with physical_rows={physical_rows}"
-                        )));
-                    }
-                }
                 let new_frags = group
                     .new_frags
                     .iter()
@@ -366,7 +351,12 @@ impl CompactFragReuseIndex {
                     new_frags,
                 });
             }
-            version_remaps.push(RowAddrRemap::compact_with_layout(groups)?);
+            let remap = RowAddrRemap::compact_with_layout(groups).map_err(|error| {
+                Error::index(format!(
+                    "failed to build compact remap for FRI version {version_idx}: {error}"
+                ))
+            })?;
+            version_remaps.push(remap);
         }
 
         Ok(Self {
@@ -558,6 +548,7 @@ fn fragment_layout(
 mod tests {
 
     use super::*;
+    use rstest::rstest;
 
     fn addr(fragment_id: u32, offset: u32) -> u64 {
         u64::from(lance_core::utils::address::RowAddress::new_from_parts(
@@ -665,7 +656,54 @@ mod tests {
                 }],
             }],
         };
-        assert!(CompactFragReuseIndex::try_new(Uuid::new_v4(), details).is_err());
+        let error = CompactFragReuseIndex::try_new(Uuid::new_v4(), details).unwrap_err();
+        assert!(matches!(error, Error::Index { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("failed to deserialize changed row addresses for FRI version 0, group 0"),
+            "{error}"
+        );
+    }
+
+    #[rstest]
+    #[case::unknown_fragment(
+        vec![addr(2, 0)],
+        vec![digest(1, 1)],
+        "from fragments [2] not in its old fragments"
+    )]
+    #[case::offset_out_of_range(
+        vec![addr(1, 1)],
+        vec![digest(1, 1)],
+        "row offset outside old fragment 1 with physical_rows=1"
+    )]
+    #[case::duplicate_old_fragment(
+        vec![addr(1, 0)],
+        vec![digest(1, 1), digest(1, 1)],
+        "old fragment 1 more than once"
+    )]
+    fn test_compact_fri_preserves_layout_validation(
+        #[case] changed_addrs: Vec<u64>,
+        #[case] old_frags: Vec<FragDigest>,
+        #[case] expected_message: &str,
+    ) {
+        let details = FragReuseIndexDetails {
+            versions: vec![FragReuseVersion {
+                dataset_version: 1,
+                groups: vec![FragReuseGroup {
+                    changed_row_addrs: serialize_changed(changed_addrs),
+                    old_frags,
+                    new_frags: vec![digest(10, 1)],
+                }],
+            }],
+        };
+
+        let error = CompactFragReuseIndex::try_new(Uuid::new_v4(), details).unwrap_err();
+        assert!(matches!(error, Error::Index { .. }));
+        let message = error.to_string();
+        assert!(message.contains("FRI version 0"), "{message}");
+        assert!(message.contains("rewrite group 0"), "{message}");
+        assert!(message.contains(expected_message), "{message}");
     }
 
     #[tokio::test]

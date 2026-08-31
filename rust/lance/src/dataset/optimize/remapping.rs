@@ -203,7 +203,7 @@ pub fn transpose_row_ids_from_digest(
 /// If the frag reuse index does not exist, the operation fails with [Error::NotSupported]
 /// If the frag reuse index exists but is empty, the operation succeeds without a commit.
 async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
-    let indices = dataset.load_indices().await.unwrap();
+    let indices = dataset.load_indices().await?;
     let frag_reuse_index_meta = match indices.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME) {
         None => Err(Error::not_supported_source(
             "Fragment reuse index not found, cannot remap an index post compaction".into(),
@@ -211,13 +211,9 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
         Some(frag_reuse_index_meta) => Ok(frag_reuse_index_meta),
     }?;
 
-    let frag_reuse_details = load_frag_reuse_index_details(dataset, frag_reuse_index_meta)
-        .await
-        .unwrap();
+    let frag_reuse_details = load_frag_reuse_index_details(dataset, frag_reuse_index_meta).await?;
     let frag_reuse_index =
-        open_frag_reuse_index(frag_reuse_index_meta.uuid, frag_reuse_details.as_ref())
-            .await
-            .unwrap();
+        open_frag_reuse_index(frag_reuse_index_meta.uuid, frag_reuse_details.as_ref()).await?;
 
     if frag_reuse_index.is_empty() {
         return Ok(());
@@ -450,7 +446,7 @@ mod tests {
 
     #[test]
     fn test_compact_matches_transpose() {
-        use lance_core::utils::row_addr_remap::GroupInput;
+        use lance_core::utils::row_addr_remap::GroupInputWithLayout;
         // Ascending old fragments (compaction's scan order), with deletions.
         let old = vec![
             FragDigest {
@@ -501,9 +497,12 @@ mod tests {
         ];
 
         let expected = transpose_row_ids_from_digest(addrs.clone(), &old, &new);
-        let compact = RowAddrRemap::compact([GroupInput {
+        let compact = RowAddrRemap::compact_with_layout([GroupInputWithLayout {
             rewritten_old_row_addrs: addrs,
-            old_frag_ids: old.iter().map(|f| f.id as u32).collect(),
+            old_frags: old
+                .iter()
+                .map(|f| (f.id as u32, f.physical_rows as u32))
+                .collect(),
             new_frags: new
                 .iter()
                 .map(|f| (f.id as u32, f.physical_rows as u32))
