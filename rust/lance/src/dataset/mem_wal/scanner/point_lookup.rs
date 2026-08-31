@@ -1054,6 +1054,7 @@ mod tests {
     use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, StringArray};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use datafusion::physical_plan::displayable;
+    use rstest::rstest;
     use std::collections::HashMap;
     use uuid::Uuid;
 
@@ -1564,6 +1565,89 @@ mod tests {
                 .is_none(),
             "absent key must miss"
         );
+    }
+
+    /// The writer's own read at [`MemTableVisibility::Indexed`] resolves a row
+    /// whose WAL append is still outstanding, while the default `Published`
+    /// bound does not. The projection selects which read path runs: the fast
+    /// BTree probe, or the `MemTableScanner` plan fallback (a system column in
+    /// the output disqualifies the probe). Both must resolve the key alike.
+    #[rstest]
+    #[case::fast_btree_probe(None)]
+    #[case::scanner_fallback(Some(vec![
+        "id".to_string(),
+        "name".to_string(),
+        "_rowid".to_string(),
+    ]))]
+    #[tokio::test]
+    async fn test_indexed_visibility_reads_the_undurable_prefix(
+        #[case] projection: Option<Vec<String>>,
+    ) {
+        use crate::dataset::mem_wal::index::MemTableVisibility;
+        use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
+        use crate::dataset::mem_wal::wal::WriterCursors;
+        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
+
+        let schema = create_pk_schema();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp_dir.path().to_str().unwrap());
+
+        let batch_store = Arc::new(BatchStore::with_capacity(16));
+        let mut index_store = IndexStore::new();
+        index_store.enable_pk_index(&[("id".to_string(), 0)]);
+        // A writer whose durability cursor never advances: the batch indexes,
+        // but its append stays outstanding, so it never publishes.
+        index_store.set_durability(Arc::new(WriterCursors::new(true)), 0);
+
+        let batch = create_test_batch(&schema, &[1], "pending");
+        let (bp, off, _) = batch_store.append(batch.clone()).unwrap();
+        index_store
+            .insert_with_batch_position(&batch, off, Some(bp))
+            .unwrap();
+        assert_eq!(index_store.indexed_count(), 1);
+        assert_eq!(index_store.visible_count(), 0, "the append is outstanding");
+        let index_store = Arc::new(index_store);
+
+        let shard_id = Uuid::new_v4();
+        let collector = LsmDataSourceCollector::without_base_table(base_uri, vec![])
+            .with_in_memory_memtables(
+                shard_id,
+                InMemoryMemTables {
+                    active: InMemoryMemTableRef {
+                        batch_store,
+                        index_store,
+                        schema: schema.clone(),
+                        generation: 1,
+                    },
+                    frozen: vec![],
+                },
+            );
+        let planner = LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema);
+        let key = [ScalarValue::Int32(Some(1))];
+
+        assert!(
+            planner
+                .lookup(&key, projection.as_deref())
+                .await
+                .unwrap()
+                .is_none(),
+            "a row whose append is outstanding must stay invisible at Published"
+        );
+
+        let planner = planner.with_visibility(MemTableVisibility::Indexed);
+        let hit = planner
+            .lookup(&key, projection.as_deref())
+            .await
+            .unwrap()
+            .expect("the writer must read its own indexed prefix");
+        assert_eq!(hit.num_rows(), 1);
+        let name = hit
+            .column_by_name("name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(name.value(0), "pending_1");
     }
 
     #[tokio::test]
