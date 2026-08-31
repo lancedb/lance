@@ -1,0 +1,792 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
+//! Serializable contracts for distributed index segment merges.
+//!
+//! ```text
+//! coordinator                worker(s)                    coordinator
+//! plan_index_segment_merge   execute_index_merge_task     commit_index_merge_results
+//!        |                          |                             |
+//!   IndexMergePlan  --------->  IndexMergeTask  ---------> IndexMergeResult
+//! ```
+//!
+//! The plan pins what the round needs to prove it still describes the data
+//! it was planned against: read version, exact source UUIDs, each source's
+//! base-aware location and claimed coverage, and the model fingerprint.
+//! Workers reopen at the pinned version and revalidate. The commit
+//! compare-and-swaps the exact source set, so a plan is safe to publish late.
+//!
+//! Every type carries [`INDEX_MERGE_CONTRACT_VERSION`] so version skew
+//! between a driver and its executors fails loudly.
+//!
+//! Coverage travels as a sorted `Vec<u32>` rather than a serialized
+//! [`RoaringBitmap`]: these artifacts cross language boundaries as JSON,
+//! where a legible fragment id list is worth more than compression.
+
+use std::collections::HashSet;
+use std::sync::Arc;
+
+use lance_table::format::{IndexFile, IndexMetadata};
+use roaring::RoaringBitmap;
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+use crate::{Error, Result};
+
+/// Version of the plan/task/result contract.
+///
+/// Bump when a field changes meaning or a new field becomes required. Worker
+/// and commit reject unrecognized versions, so a driver running an older
+/// Lance than its executors fails loudly.
+pub const INDEX_MERGE_CONTRACT_VERSION: u32 = 1;
+
+/// Transaction property marking a `CreateIndex` commit whose `removed_indices`
+/// are an exact compare-and-swap source set.
+///
+/// The conflict resolver's finish step re-validates such removals against the
+/// manifest each commit attempt publishes onto, failing with a re-plan request
+/// when any source moved. Without the property a `CreateIndex` keeps its
+/// historical prune-and-proceed behavior.
+pub(crate) const EXACT_SOURCE_CAS_PROPERTY: &str = "lance.index.merge.exact_source_cas";
+
+/// Identity of the index model every segment in one merge must share.
+///
+/// Derived from [`IndexMetadata`] alone so planning stays one manifest read.
+/// Deeper checks (IVF centroids, quantizer codebooks) belong at the worker,
+/// where the merge already parses every shard's metadata at no extra I/O.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexMergeFingerprint {
+    /// `index_details.type_url`, which names the index family.
+    pub index_type_url: String,
+    /// On-disk format version within that family.
+    pub index_version: i32,
+    /// Full field declaration, keyed columns first.
+    pub fields: Vec<i32>,
+    /// Suffix of [`Self::fields`] the index carries but is not keyed on.
+    pub covering_fields: Vec<i32>,
+}
+
+impl IndexMergeFingerprint {
+    /// Read the fingerprint off a segment.
+    ///
+    /// Fails on a segment without index details or without exactly one keyed
+    /// field, because neither can be merged: the merge dispatches on the detail
+    /// type and every downstream check compares a single keyed column.
+    pub fn try_from_metadata(segment: &IndexMetadata) -> Result<Self> {
+        let details = segment.index_details.as_ref().ok_or_else(|| {
+            Error::invalid_input(format!(
+                "index segment {} of '{}' has no index details, so its type cannot be \
+                 proven mergeable; rebuild the index first",
+                segment.uuid, segment.name
+            ))
+        })?;
+        if segment.keyed_field().is_none() {
+            return Err(Error::invalid_input(format!(
+                "index segment {} of '{}' is not keyed on a single field (fields {:?}, \
+                 carried {:?}); merging requires a single keyed field",
+                segment.uuid, segment.name, segment.fields, segment.covering_fields
+            )));
+        }
+        Ok(Self {
+            index_type_url: details.type_url.clone(),
+            index_version: segment.index_version,
+            fields: segment.fields.clone(),
+            covering_fields: segment.covering_fields.clone(),
+        })
+    }
+
+    /// The single column the index is keyed on.
+    pub fn keyed_field(&self) -> Option<i32> {
+        let keyed = self.fields.len().saturating_sub(self.covering_fields.len());
+        match self.fields.get(..keyed) {
+            Some([only]) => Some(*only),
+            _ => None,
+        }
+    }
+
+    /// Reject a segment whose model differs from this fingerprint.
+    ///
+    /// `context` names where the segment came from so the message points at the
+    /// actor that must act: the plan, a worker's snapshot, or the commit.
+    pub fn check(&self, segment: &IndexMetadata, context: &str) -> Result<()> {
+        let observed = Self::try_from_metadata(segment)?;
+        if observed != *self {
+            return Err(Error::invalid_input(format!(
+                "{context}: segment {} no longer matches the planned index model \
+                 (expected {self:?}, found {observed:?}); re-plan the merge",
+                segment.uuid
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// One file of a merged segment.
+///
+/// Mirrors [`IndexFile`], which is not serializable and lives in a crate that
+/// should not gain a wire format for this contract's sake.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexMergeFile {
+    /// Path relative to the segment directory.
+    pub path: String,
+    /// Size of the file in bytes.
+    pub size_bytes: u64,
+}
+
+impl From<&IndexFile> for IndexMergeFile {
+    fn from(file: &IndexFile) -> Self {
+        Self {
+            path: file.path.clone(),
+            size_bytes: file.size_bytes,
+        }
+    }
+}
+
+impl From<&IndexMergeFile> for IndexFile {
+    fn from(file: &IndexMergeFile) -> Self {
+        Self {
+            path: file.path.clone(),
+            size_bytes: file.size_bytes,
+        }
+    }
+}
+
+/// One source segment of a merge, with everything needed to find it again.
+///
+/// [`Self::store_prefix`] and [`Self::path`] together are the base-aware
+/// location. A shallow clone resolves imported segments under the base
+/// dataset's index directory, not the clone's, so a UUID alone would not
+/// locate exactly the segments a clone did not rewrite.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexMergeSource {
+    /// Physical segment id.
+    pub uuid: Uuid,
+    /// Dataset version this segment was built at.
+    pub dataset_version: u64,
+    /// Manifest base path id, or `None` when the segment lives in this dataset.
+    pub base_id: Option<u32>,
+    /// Identity of the object store holding the segment.
+    pub store_prefix: String,
+    /// Directory holding the segment's files, within `store_prefix`.
+    pub path: String,
+    /// Fragments this segment claimed at the plan's read version, sorted.
+    pub fragment_ids: Vec<u32>,
+}
+
+impl IndexMergeSource {
+    /// Reject a segment whose recorded provenance no longer holds.
+    ///
+    /// Coverage is the field that moves: an indexed-field `Update` or an
+    /// in-place `Merge` prunes fragments out of the segments they invalidate,
+    /// so a coverage change is precisely the signal that this merge's inputs
+    /// describe data that no longer exists.
+    pub fn check(&self, segment: &IndexMetadata, context: &str) -> Result<()> {
+        if segment.dataset_version != self.dataset_version {
+            return Err(Error::invalid_input(format!(
+                "{context}: segment {} was planned at dataset version {} but is now \
+                 recorded at version {}; re-plan the merge",
+                self.uuid, self.dataset_version, segment.dataset_version
+            )));
+        }
+        if segment.base_id != self.base_id {
+            return Err(Error::invalid_input(format!(
+                "{context}: segment {} was planned under base {:?} but is now under \
+                 base {:?}; re-plan the merge",
+                self.uuid, self.base_id, segment.base_id
+            )));
+        }
+        let observed = fragment_ids(segment.fragment_bitmap.as_ref());
+        if observed != self.fragment_ids {
+            return Err(Error::invalid_input(format!(
+                "{context}: segment {} covered fragments {:?} when the merge was planned \
+                 but now covers {:?}; a concurrent update pruned its coverage, so the \
+                 merged output would republish stale entries. Re-plan the merge.",
+                self.uuid, self.fragment_ids, observed
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// One independent unit of distributed merge work.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexMergeTask {
+    /// Contract version, see [`INDEX_MERGE_CONTRACT_VERSION`].
+    pub contract_version: u32,
+    /// Plan this task belongs to.
+    pub plan_id: Uuid,
+    /// Position of this task within its plan.
+    pub task_id: u32,
+    /// Segments to merge, in merge order.
+    pub sources: Vec<IndexMergeSource>,
+}
+
+impl IndexMergeTask {
+    /// Union of the coverage this task's sources claimed, sorted.
+    pub fn coverage(&self) -> Vec<u32> {
+        let mut coverage = self
+            .sources
+            .iter()
+            .flat_map(|source| source.fragment_ids.iter().copied())
+            .collect::<Vec<_>>();
+        coverage.sort_unstable();
+        coverage.dedup();
+        coverage
+    }
+}
+
+/// A coordinator's plan for merging one logical index's segments.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexMergePlan {
+    /// Contract version, see [`INDEX_MERGE_CONTRACT_VERSION`].
+    pub contract_version: u32,
+    /// Identity of this planning round, echoed by every task and result.
+    pub plan_id: Uuid,
+    /// Logical index being merged.
+    pub index_name: String,
+    /// Dataset version the plan was built against. Workers reopen here.
+    pub read_version: u64,
+    /// Model every source and every output must match.
+    pub fingerprint: IndexMergeFingerprint,
+    /// Every segment the logical index had at [`Self::read_version`], planned or
+    /// not. Recorded so a caller can tell a stale plan from a fresh one without
+    /// re-reading the manifest.
+    pub source_frontier: Vec<Uuid>,
+    /// Union of the coverage of all planned sources, sorted.
+    pub expected_coverage: Vec<u32>,
+    /// Independent units of work. Their coverage sets are disjoint.
+    pub tasks: Vec<IndexMergeTask>,
+}
+
+impl IndexMergePlan {
+    /// Reject an artifact written against a contract this build cannot read.
+    pub fn check_contract_version(contract_version: u32, context: &str) -> Result<()> {
+        if contract_version != INDEX_MERGE_CONTRACT_VERSION {
+            return Err(Error::invalid_input(format!(
+                "{context}: index merge contract version {contract_version} is not \
+                 supported by this build, which speaks version {INDEX_MERGE_CONTRACT_VERSION}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Reject a plan whose declared coverage drifted from its tasks, which can
+    /// only happen through a forged or corrupted plan artifact.
+    pub fn check_expected_coverage(&self) -> Result<()> {
+        let mut union: Vec<u32> = self.tasks.iter().flat_map(|task| task.coverage()).collect();
+        union.sort_unstable();
+        union.dedup();
+        if union != self.expected_coverage {
+            return Err(Error::invalid_input(format!(
+                "index merge plan {}: expected_coverage {:?} does not match the union \
+                 of its task coverages {:?}",
+                self.plan_id, self.expected_coverage, union
+            )));
+        }
+        Ok(())
+    }
+
+    /// Look up one task by id.
+    pub fn task(&self, task_id: u32) -> Result<&IndexMergeTask> {
+        self.tasks
+            .iter()
+            .find(|task| task.task_id == task_id)
+            .ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "index merge plan {} has no task {} (it has {} tasks)",
+                    self.plan_id,
+                    task_id,
+                    self.tasks.len()
+                ))
+            })
+    }
+}
+
+/// What one worker attempt produced.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexMergeOutput {
+    /// Physical id of the merged segment.
+    pub uuid: Uuid,
+    /// Dataset version the merged segment claims.
+    pub dataset_version: u64,
+    /// On-disk format version of the merged segment.
+    pub index_version: i32,
+    /// `index_details.type_url` of the merged segment.
+    pub index_type_url: String,
+    /// Encoded `index_details` payload of the merged segment.
+    pub index_details: Vec<u8>,
+    /// Fragments the merged segment covers, sorted.
+    pub fragment_ids: Vec<u32>,
+    /// Files the worker wrote, relative to the segment directory.
+    pub files: Vec<IndexMergeFile>,
+}
+
+/// One worker attempt's report, sufficient on its own to commit the segment.
+///
+/// Carries the exact source UUIDs rather than leaving the commit to re-derive
+/// removals from the coordinator's current coverage, which is what let a merge
+/// planned at version V silently re-add a fragment that was invalidated at V+1.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexMergeResult {
+    /// Contract version, see [`INDEX_MERGE_CONTRACT_VERSION`].
+    pub contract_version: u32,
+    /// Plan this result belongs to.
+    pub plan_id: Uuid,
+    /// Task this result answers.
+    pub task_id: u32,
+    /// Identity of this attempt. Two attempts of the same task differ here.
+    pub attempt_id: Uuid,
+    /// Dataset version the worker merged at, always the plan's read version.
+    pub read_version: u64,
+    /// Model the worker validated its sources against.
+    pub fingerprint: IndexMergeFingerprint,
+    /// Sources the worker actually merged, as it observed them.
+    pub sources: Vec<IndexMergeSource>,
+    /// The merged segment.
+    pub output: IndexMergeOutput,
+}
+
+impl IndexMergeResult {
+    /// Rebuild the segment metadata to commit from this report.
+    pub fn output_metadata(&self, index_name: &str) -> IndexMetadata {
+        IndexMetadata {
+            uuid: self.output.uuid,
+            name: index_name.to_owned(),
+            fields: self.fingerprint.fields.clone(),
+            covering_fields: self.fingerprint.covering_fields.clone(),
+            dataset_version: self.output.dataset_version,
+            fragment_bitmap: Some(self.output.fragment_ids.iter().copied().collect()),
+            index_details: Some(Arc::new(prost_types::Any {
+                type_url: self.output.index_type_url.clone(),
+                value: self.output.index_details.clone(),
+            })),
+            index_version: self.output.index_version,
+            created_at: Some(chrono::Utc::now()),
+            // The merged files were written into this dataset's index directory
+            // even when some sources were imported from a base.
+            base_id: None,
+            files: Some(self.output.files.iter().map(IndexFile::from).collect()),
+        }
+    }
+
+    /// Reject a report that does not answer the task it claims to.
+    pub fn check_against(&self, plan: &IndexMergePlan) -> Result<()> {
+        IndexMergePlan::check_contract_version(self.contract_version, "index merge result")?;
+        if self.plan_id != plan.plan_id {
+            return Err(Error::invalid_input(format!(
+                "index merge result for task {} belongs to plan {} but was submitted \
+                 against plan {}",
+                self.task_id, self.plan_id, plan.plan_id
+            )));
+        }
+        if self.read_version != plan.read_version {
+            return Err(Error::invalid_input(format!(
+                "index merge result for task {} was produced at dataset version {} but \
+                 the plan pinned version {}",
+                self.task_id, self.read_version, plan.read_version
+            )));
+        }
+        if self.fingerprint != plan.fingerprint {
+            return Err(Error::invalid_input(format!(
+                "index merge result for task {} reports index model {:?} but the plan \
+                 pinned {:?}",
+                self.task_id, self.fingerprint, plan.fingerprint
+            )));
+        }
+        let task = plan.task(self.task_id)?;
+        if self.sources != task.sources {
+            return Err(Error::invalid_input(format!(
+                "index merge result for task {} merged sources {:?} but the plan assigned {:?}",
+                self.task_id,
+                self.sources.iter().map(|s| s.uuid).collect::<Vec<_>>(),
+                task.sources.iter().map(|s| s.uuid).collect::<Vec<_>>()
+            )));
+        }
+        // A merged segment must claim exactly what its inputs claimed. Claiming
+        // less orphans fragments from the index, and claiming more would index rows
+        // this merge never read.
+        let expected = task.coverage();
+        if self.output.fragment_ids != expected {
+            return Err(Error::invalid_input(format!(
+                "index merge result for task {} covers fragments {:?} but its sources \
+                 covered {:?}",
+                self.task_id, self.output.fragment_ids, expected
+            )));
+        }
+        if self.output.index_type_url != plan.fingerprint.index_type_url {
+            return Err(Error::invalid_input(format!(
+                "index merge result for task {} produced index type '{}' but the plan \
+                 pinned '{}'",
+                self.task_id, self.output.index_type_url, plan.fingerprint.index_type_url
+            )));
+        }
+        // The merge stamps its output with the oldest source's dataset version, so
+        // staleness validation treats the merged coverage as no fresher than its
+        // oldest input. A report claiming anything else misdescribes the segment.
+        let expected_dataset_version = task
+            .sources
+            .iter()
+            .map(|source| source.dataset_version)
+            .min()
+            .unwrap_or(plan.read_version);
+        if self.output.dataset_version != expected_dataset_version {
+            return Err(Error::invalid_input(format!(
+                "index merge result for task {} claims dataset version {} for its output \
+                 but its oldest source was built at version {}",
+                self.task_id, self.output.dataset_version, expected_dataset_version
+            )));
+        }
+        if self.output.index_version != plan.fingerprint.index_version {
+            return Err(Error::invalid_input(format!(
+                "index merge result for task {} produced index format version {} but the \
+                 plan pinned version {}",
+                self.task_id, self.output.index_version, plan.fingerprint.index_version
+            )));
+        }
+        if self.output.files.is_empty() {
+            return Err(Error::invalid_input(format!(
+                "index merge result for task {} reports no files for output {}; a merged \
+                 segment without files is not readable",
+                self.task_id, self.output.uuid
+            )));
+        }
+        // A fresh merge output can never reuse a planned id. Publishing a segment
+        // under a source's id makes the manifest drop that source everywhere it
+        // appears, even in a task this round never touched.
+        if plan.source_frontier.contains(&self.output.uuid)
+            || plan
+                .tasks
+                .iter()
+                .flat_map(|task| task.sources.iter())
+                .any(|source| source.uuid == self.output.uuid)
+        {
+            return Err(Error::invalid_input(format!(
+                "index merge result for task {} names output {} which is already a \
+                 source segment of the plan; merge outputs must use fresh ids",
+                self.task_id, self.output.uuid
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Reject output ids that could alias another segment.
+///
+/// Manifest construction drops any existing entry whose id a new segment
+/// reuses, and cleanup deletes losing attempts by id, so an aliased id either
+/// silently removes coverage or deletes just-published files. Every id in the
+/// round, winner or loser, must be globally fresh.
+pub(crate) fn check_output_identity(
+    winners: &[IndexMergeResult],
+    orphaned: &[IndexMergeResult],
+    live_segment_ids: &HashSet<Uuid>,
+) -> Result<()> {
+    let mut seen: HashSet<Uuid> = HashSet::with_capacity(winners.len() + orphaned.len());
+    for result in winners.iter().chain(orphaned) {
+        if !seen.insert(result.output.uuid) {
+            return Err(Error::invalid_input(format!(
+                "index merge results name output {} more than once across attempts; \
+                 conflicting reports cannot be reconciled, resubmit the genuine ones",
+                result.output.uuid
+            )));
+        }
+        if live_segment_ids.contains(&result.output.uuid) {
+            return Err(Error::invalid_input(format!(
+                "index merge result for task {} names output {} which is already a \
+                 committed segment; merge outputs must use fresh ids, so this round was \
+                 either already committed or the report is forged. Re-plan the merge.",
+                result.task_id, result.output.uuid
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Sorted fragment ids of a coverage bitmap, empty when coverage is unknown.
+pub(crate) fn fragment_ids(bitmap: Option<&RoaringBitmap>) -> Vec<u32> {
+    bitmap
+        .map(|bitmap| bitmap.iter().collect())
+        .unwrap_or_default()
+}
+
+/// Keep one result per task, deterministically.
+///
+/// Attempts of one task merged the same sources at the same pinned version,
+/// so their outputs are interchangeable and the lowest attempt id wins, making
+/// the winner a pure function of the reports. Identical re-deliveries of one
+/// attempt are dropped, but one attempt id carrying two different payloads is
+/// an error: neither report can be trusted. Returns winners in task order.
+pub(crate) fn reconcile_attempts(
+    results: Vec<IndexMergeResult>,
+) -> Result<(Vec<IndexMergeResult>, Vec<IndexMergeResult>)> {
+    let mut distinct: Vec<IndexMergeResult> = Vec::with_capacity(results.len());
+    for result in results {
+        match distinct
+            .iter()
+            .find(|prior| prior.task_id == result.task_id && prior.attempt_id == result.attempt_id)
+        {
+            Some(prior) if *prior == result => continue,
+            Some(_) => {
+                return Err(Error::invalid_input(format!(
+                    "index merge results carry two different payloads for attempt {} of \
+                     task {}; conflicting reports cannot be reconciled, resubmit the \
+                     genuine one",
+                    result.attempt_id, result.task_id
+                )));
+            }
+            None => distinct.push(result),
+        }
+    }
+    let mut winners: Vec<IndexMergeResult> = Vec::with_capacity(distinct.len());
+    let mut orphaned = Vec::new();
+    for result in distinct {
+        match winners
+            .iter_mut()
+            .find(|winner| winner.task_id == result.task_id)
+        {
+            None => winners.push(result),
+            Some(winner) => {
+                if result.attempt_id < winner.attempt_id {
+                    orphaned.push(std::mem::replace(winner, result));
+                } else {
+                    orphaned.push(result);
+                }
+            }
+        }
+    }
+    winners.sort_by_key(|result| result.task_id);
+    Ok((winners, orphaned))
+}
+
+/// Reject a set of results that cannot be committed as one round.
+///
+/// A subset of the plan's tasks is allowed: tasks are disjoint by construction,
+/// so committing the merges that succeeded is safe and lets a round survive a
+/// worker failure. What is never allowed is two winners covering the same
+/// fragment, which would leave the index double-counting rows.
+pub(crate) fn check_disjoint_outputs(results: &[IndexMergeResult]) -> Result<()> {
+    let mut seen = HashSet::new();
+    for result in results {
+        for fragment_id in &result.output.fragment_ids {
+            if !seen.insert(*fragment_id) {
+                return Err(Error::invalid_input(format!(
+                    "index merge results overlap on fragment {fragment_id}; tasks of one \
+                     plan must cover disjoint fragments"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rstest::rstest;
+
+    fn result(task_id: u32, attempt_id: Uuid, output: Uuid) -> IndexMergeResult {
+        IndexMergeResult {
+            contract_version: INDEX_MERGE_CONTRACT_VERSION,
+            plan_id: Uuid::nil(),
+            task_id,
+            attempt_id,
+            read_version: 7,
+            fingerprint: IndexMergeFingerprint {
+                index_type_url: "example.VectorIndexDetails".to_owned(),
+                index_version: 3,
+                fields: vec![1],
+                covering_fields: vec![],
+            },
+            sources: vec![],
+            output: IndexMergeOutput {
+                uuid: output,
+                dataset_version: 7,
+                index_version: 3,
+                index_type_url: "example.VectorIndexDetails".to_owned(),
+                index_details: vec![],
+                fragment_ids: vec![task_id],
+                files: vec![],
+            },
+        }
+    }
+
+    fn uuid(byte: u8) -> Uuid {
+        Uuid::from_bytes([byte; 16])
+    }
+
+    /// Reconciliation has to be a pure function of the reports, or two
+    /// coordinators replaying the same round would publish different segments.
+    #[rstest]
+    #[case::single_attempt(vec![(0, 1, 10)], vec![10], vec![])]
+    #[case::duplicate_delivery(vec![(0, 1, 10), (0, 1, 10)], vec![10], vec![])]
+    #[case::lowest_attempt_wins(vec![(0, 2, 20), (0, 1, 10)], vec![10], vec![20])]
+    #[case::lowest_attempt_wins_reordered(vec![(0, 1, 10), (0, 2, 20)], vec![10], vec![20])]
+    #[case::three_attempts(vec![(0, 3, 30), (0, 1, 10), (0, 2, 20)], vec![10], vec![30, 20])]
+    #[case::distinct_tasks(vec![(1, 9, 90), (0, 1, 10)], vec![10, 90], vec![])]
+    fn test_reconcile_attempts(
+        #[case] reports: Vec<(u32, u8, u8)>,
+        #[case] expected_winners: Vec<u8>,
+        #[case] expected_orphans: Vec<u8>,
+    ) {
+        let (winners, orphaned) = reconcile_attempts(
+            reports
+                .into_iter()
+                .map(|(task, attempt, output)| result(task, uuid(attempt), uuid(output)))
+                .collect(),
+        )
+        .unwrap();
+        assert_eq!(
+            winners
+                .iter()
+                .map(|result| result.output.uuid)
+                .collect::<Vec<_>>(),
+            expected_winners.into_iter().map(uuid).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            orphaned
+                .iter()
+                .map(|result| result.output.uuid)
+                .collect::<Vec<_>>(),
+            expected_orphans.into_iter().map(uuid).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_check_disjoint_outputs_rejects_overlap() {
+        let mut first = result(0, uuid(1), uuid(10));
+        let mut second = result(1, uuid(2), uuid(20));
+        first.output.fragment_ids = vec![1, 2];
+        second.output.fragment_ids = vec![2, 3];
+        let err = check_disjoint_outputs(&[first, second]).unwrap_err();
+        assert!(
+            err.to_string().contains("overlap on fragment 2"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// One attempt id carrying two different payloads is unresolvable, even
+    /// when its earlier report was already displaced by a lower attempt.
+    #[test]
+    fn test_reconcile_attempts_rejects_conflicting_payloads() {
+        let err = reconcile_attempts(vec![
+            result(0, uuid(1), uuid(10)),
+            result(0, uuid(1), uuid(11)),
+        ])
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("two different payloads"),
+            "unexpected error: {err}"
+        );
+
+        let err = reconcile_attempts(vec![
+            result(0, uuid(2), uuid(20)),
+            result(0, uuid(1), uuid(10)),
+            result(0, uuid(2), uuid(21)),
+        ])
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("two different payloads"),
+            "a displaced attempt must still veto a differing re-report: {err}"
+        );
+    }
+
+    /// Output ids must be globally fresh: reusing another attempt's id would
+    /// make cleanup delete a published segment, and reusing a live segment's id
+    /// would make the manifest drop that segment.
+    #[test]
+    fn test_check_output_identity() {
+        let live = [uuid(50)].into_iter().collect::<HashSet<_>>();
+        check_output_identity(
+            &[result(0, uuid(1), uuid(10))],
+            &[result(1, uuid(2), uuid(20))],
+            &live,
+        )
+        .unwrap();
+
+        let err = check_output_identity(
+            &[result(0, uuid(1), uuid(10))],
+            &[result(0, uuid(2), uuid(10))],
+            &live,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("more than once across attempts"),
+            "unexpected error: {err}"
+        );
+
+        let err = check_output_identity(&[result(0, uuid(1), uuid(50))], &[], &live).unwrap_err();
+        assert!(
+            err.to_string().contains("already a committed segment"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// A plan whose declared coverage drifted from its tasks is corrupted
+    /// and must not commit.
+    #[test]
+    fn test_check_expected_coverage_rejects_drift() {
+        let source = |id: u8, fragment_ids: Vec<u32>| IndexMergeSource {
+            uuid: uuid(id),
+            dataset_version: 7,
+            base_id: None,
+            store_prefix: "memory".to_owned(),
+            path: "indices".to_owned(),
+            fragment_ids,
+        };
+        let mut plan = IndexMergePlan {
+            contract_version: INDEX_MERGE_CONTRACT_VERSION,
+            plan_id: Uuid::nil(),
+            index_name: "vector_idx".to_owned(),
+            read_version: 7,
+            fingerprint: IndexMergeFingerprint::default(),
+            source_frontier: vec![uuid(1), uuid(2)],
+            expected_coverage: vec![0, 1, 2],
+            tasks: vec![IndexMergeTask {
+                contract_version: INDEX_MERGE_CONTRACT_VERSION,
+                plan_id: Uuid::nil(),
+                task_id: 0,
+                sources: vec![source(1, vec![0, 1]), source(2, vec![2])],
+            }],
+        };
+        plan.check_expected_coverage().unwrap();
+
+        plan.expected_coverage = vec![0, 1];
+        let err = plan.check_expected_coverage().unwrap_err();
+        assert!(
+            err.to_string().contains("does not match the union"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_contract_version_mismatch_is_rejected() {
+        let err = IndexMergePlan::check_contract_version(
+            INDEX_MERGE_CONTRACT_VERSION + 1,
+            "index merge plan",
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("is not supported by this build"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[rstest]
+    #[case::not_covered(vec![7], vec![], Some(7))]
+    #[case::covered(vec![7, 11], vec![11], Some(7))]
+    #[case::composite(vec![7, 11], vec![], None)]
+    #[case::no_fields(vec![], vec![], None)]
+    fn test_fingerprint_keyed_field(
+        #[case] fields: Vec<i32>,
+        #[case] covering_fields: Vec<i32>,
+        #[case] expected: Option<i32>,
+    ) {
+        let fingerprint = IndexMergeFingerprint {
+            index_type_url: "example.Details".to_owned(),
+            index_version: 1,
+            fields,
+            covering_fields,
+        };
+        assert_eq!(fingerprint.keyed_field(), expected);
+    }
+}

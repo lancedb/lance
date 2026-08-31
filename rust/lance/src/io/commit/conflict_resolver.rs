@@ -735,9 +735,21 @@ impl<'a> TransactionRebase<'a> {
                                 .any(|created_index| created_index.name == new_index.name)
                         });
 
+                    // An exact-source commit re-proves its removal set, output
+                    // freshness, and coverage disjointness in the finish step,
+                    // so a same-name commit in its window is not a conflict.
+                    let exact_source_cas = self
+                        .transaction
+                        .transaction_properties
+                        .as_ref()
+                        .is_some_and(|properties| {
+                            properties.contains_key(
+                                crate::index::segment_merge::EXACT_SOURCE_CAS_PROPERTY,
+                            )
+                        });
                     if (self_has_frag_reuse && other_has_frag_reuse)
                         || (self_has_mem_wal && other_has_mem_wal)
-                        || has_regular_name_conflict
+                        || (has_regular_name_conflict && !exact_source_cas)
                     {
                         Err(self.retryable_conflict_err(other_transaction, other_version))
                     } else {
@@ -2047,6 +2059,82 @@ impl<'a> TransactionRebase<'a> {
             ..
         } = &mut self.transaction.operation
         {
+            // An exact-source commit is a compare-and-swap on its removal set, and
+            // this is the last point that sees the manifest the current attempt
+            // publishes onto. Per-operation checks cannot express it (a rebased
+            // `Merge` shows no evidence an indexed column was rewritten in place),
+            // so re-prove every removed source here, on every attempt.
+            let exact_source_cas = self
+                .transaction
+                .transaction_properties
+                .as_ref()
+                .is_some_and(|properties| {
+                    properties.contains_key(crate::index::segment_merge::EXACT_SOURCE_CAS_PROPERTY)
+                });
+            if exact_source_cas {
+                let live = dataset.load_indices().await?;
+                for removed in removed_indices.iter() {
+                    let current = live.iter().find(|segment| segment.uuid == removed.uuid);
+                    let unchanged = current.is_some_and(|segment| {
+                        segment.fragment_bitmap == removed.fragment_bitmap
+                            && segment.dataset_version == removed.dataset_version
+                            && segment.base_id == removed.base_id
+                    });
+                    if !unchanged {
+                        return Err(Error::invalid_input(format!(
+                            "commit_index_merge_results: source segment {} of index '{}' \
+                             changed while the commit was in flight; a concurrent commit \
+                             replaced or pruned it, so this merge would republish stale \
+                             entries. Re-plan the merge.",
+                            removed.uuid, removed.name
+                        )));
+                    }
+                }
+                // Manifest construction drops any existing entry, in any index,
+                // whose id a new segment reuses, so output freshness must also be
+                // re-proven against the manifest this attempt publishes onto.
+                let removed_ids = removed_indices
+                    .iter()
+                    .map(|segment| segment.uuid)
+                    .collect::<std::collections::HashSet<_>>();
+                for new_index in new_indices.iter() {
+                    if !removed_ids.contains(&new_index.uuid)
+                        && live.iter().any(|segment| segment.uuid == new_index.uuid)
+                    {
+                        return Err(Error::invalid_input(format!(
+                            "commit_index_merge_results: output segment {} of index '{}' \
+                             is already a committed segment; publishing it would silently \
+                             drop that segment. Re-plan the merge.",
+                            new_index.uuid, new_index.name
+                        )));
+                    }
+                }
+                // The name-conflict rule is waived for this commit, so coverage
+                // overlap with same-name segments that landed in the window
+                // must be re-proven here as well.
+                for new_index in new_indices.iter() {
+                    let Some(new_bitmap) = new_index.fragment_bitmap.as_ref() else {
+                        continue;
+                    };
+                    for segment in live.iter() {
+                        if segment.name == new_index.name
+                            && !removed_ids.contains(&segment.uuid)
+                            && segment
+                                .fragment_bitmap
+                                .as_ref()
+                                .is_some_and(|bitmap| !bitmap.is_disjoint(new_bitmap))
+                        {
+                            return Err(Error::invalid_input(format!(
+                                "commit_index_merge_results: output segment {} of index \
+                                 '{}' overlaps segment {} committed while the merge was \
+                                 in flight. Re-plan the merge.",
+                                new_index.uuid, new_index.name, segment.uuid
+                            )));
+                        }
+                    }
+                }
+            }
+
             // Handle FRAG_REUSE_INDEX rebasing
             let has_frag_reuse = new_indices
                 .iter()

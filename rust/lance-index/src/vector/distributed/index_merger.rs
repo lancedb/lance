@@ -69,6 +69,11 @@ static PARTITION_PREFETCH_WINDOW_COUNT: LazyLock<usize> = LazyLock::new(|| {
         .unwrap_or(DEFAULT_PARTITION_PREFETCH_WINDOW_COUNT)
 });
 
+/// Rows per decoded batch when scanning a segment's row id column. Together
+/// with the constant size row digest this keeps admission memory independent
+/// of how many rows the segment holds.
+const ROW_ID_READ_BATCH_SIZE: u32 = 64 * 1024;
+
 /// Strict bitwise equality check for FixedSizeListArray values.
 /// Returns true only if length, value_length and all underlying primitive values are equal.
 fn fixed_size_list_equal(a: &FixedSizeListArray, b: &FixedSizeListArray) -> bool {
@@ -224,6 +229,132 @@ async fn open_sibling_index_reader(
         )
         .await?,
     ))
+}
+
+/// Open a segment directory's auxiliary file for metadata or column reads.
+async fn open_aux_reader(
+    object_store: &lance_io::object_store::ObjectStore,
+    segment_dir: &object_store::path::Path,
+) -> Result<V2Reader> {
+    let sched = ScanScheduler::new(
+        Arc::new(object_store.clone()),
+        SchedulerConfig::max_bandwidth(object_store),
+    );
+    let aux_path = segment_dir.clone().join(INDEX_AUXILIARY_FILE_NAME);
+    let fh = sched
+        .open_file(&aux_path, &CachedFileSize::unknown())
+        .await?;
+    V2Reader::try_open(
+        fh,
+        None,
+        Arc::default(),
+        &lance_core::cache::LanceCache::no_cache(),
+        V2ReaderOptions::default(),
+    )
+    .await
+}
+
+/// Order independent multiset digest of a segment's stored row ids.
+///
+/// Two independently prefixed std hash lanes accumulate by wrapping addition,
+/// so the digest ignores read order and batch boundaries, and disjoint
+/// segments combine by [`Self::merge`]. Never persist it: both sides are
+/// computed in one process, which makes the unversioned std hasher safe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RowIdentityDigest {
+    lanes: [u64; 2],
+}
+
+impl RowIdentityDigest {
+    /// Fold one row id into the digest.
+    pub fn insert(&mut self, row_id: u64) {
+        self.lanes[0] = self.lanes[0].wrapping_add(row_id_lane_hash(0, row_id));
+        self.lanes[1] = self.lanes[1].wrapping_add(row_id_lane_hash(1, row_id));
+    }
+
+    /// Combine with the digest of another segment's row ids.
+    pub fn merge(&mut self, other: &Self) {
+        self.lanes[0] = self.lanes[0].wrapping_add(other.lanes[0]);
+        self.lanes[1] = self.lanes[1].wrapping_add(other.lanes[1]);
+    }
+}
+
+/// Hash one row id into a digest lane, keyed by the lane's prefix.
+fn row_id_lane_hash(lane: u64, row_id: u64) -> u64 {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+    lane.hash(&mut hasher);
+    row_id.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Durable row identity of a segment: its stored row count and a digest of
+/// the row ids it holds.
+#[derive(Debug, Clone, Copy)]
+pub struct SegmentRowIdentity {
+    /// Rows the storage actually holds.
+    pub num_rows: u64,
+    /// Order independent digest of the stored row ids.
+    pub digest: RowIdentityDigest,
+}
+
+/// Read a segment's durable row identity from its auxiliary file.
+///
+/// The stored row ids prove which rows a segment holds. They are digested as
+/// opaque u64 identities, never decoded into fragments, so physical
+/// addresses, stable row ids, and pre remap addresses validate identically.
+pub async fn read_segment_row_ids(
+    object_store: &lance_io::object_store::ObjectStore,
+    segment_dir: &object_store::path::Path,
+) -> Result<SegmentRowIdentity> {
+    use lance_core::ROW_ID;
+
+    let reader = open_aux_reader(object_store, segment_dir).await?;
+    let file_schema = reader.schema().clone();
+    let column = file_schema
+        .fields
+        .iter()
+        .position(|field| field.name == ROW_ID)
+        .ok_or_else(|| {
+            Error::index(format!(
+                "segment {segment_dir} stores no {ROW_ID} column, so its row provenance \
+                 cannot be proven"
+            ))
+        })?;
+    let projected = file_schema.project(&[ROW_ID])?;
+    let projection = lance_file::reader::ReaderProjection {
+        schema: Arc::new(projected),
+        column_indices: vec![column as u32],
+    };
+    let mut stream = reader
+        .read_stream_projected(
+            lance_io::ReadBatchParams::RangeFull,
+            ROW_ID_READ_BATCH_SIZE,
+            4,
+            projection,
+            lance_encoding::decoder::FilterExpression::no_filter(),
+        )
+        .await?;
+    let mut digest = RowIdentityDigest::default();
+    let mut num_rows = 0u64;
+    while let Some(batch) = stream.next().await {
+        let batch = batch?;
+        let row_ids = batch
+            .column(0)
+            .as_primitive_opt::<arrow_array::types::UInt64Type>()
+            .ok_or_else(|| {
+                Error::index(format!(
+                    "segment {segment_dir} stores a non u64 {ROW_ID} column ({})",
+                    batch.column(0).data_type()
+                ))
+            })?;
+        num_rows += row_ids.len() as u64;
+        for row_id in row_ids.values() {
+            digest.insert(*row_id);
+        }
+    }
+    Ok(SegmentRowIdentity { num_rows, digest })
 }
 
 /// Initialize schema-level metadata on a writer for a given storage.
@@ -524,6 +655,14 @@ struct ShardInfo {
     lengths: Vec<u32>,
     partition_offsets: Vec<usize>,
     total_rows: usize,
+    /// IVF_RQ only: this shard's RaBitQ codes are in the packed SIMD-block
+    /// layout and must be unpacked to row-major before the merge re-packs the
+    /// concatenated partition. Row-major shards leave this false.
+    unpack_rq_codes: bool,
+    /// PQ-backed only: this shard's PQ codes are column-major (a prior merge's
+    /// output) and must be transposed to row-major before the merge
+    /// re-transposes the concatenated partition. Row-major shards leave this false.
+    untranspose_pq_codes: bool,
 }
 
 #[derive(Debug)]
@@ -533,6 +672,8 @@ struct ShardWindowReadJob {
     window_total_rows: usize,
     start_offset: usize,
     end_offset: usize,
+    unpack_rq_codes: bool,
+    untranspose_pq_codes: bool,
 }
 
 #[derive(Debug)]
@@ -651,6 +792,8 @@ async fn read_partition_window(
                 window_total_rows,
                 start_offset,
                 end_offset,
+                unpack_rq_codes: shard.unpack_rq_codes,
+                untranspose_pq_codes: shard.untranspose_pq_codes,
             }
         })
         .collect();
@@ -758,6 +901,22 @@ async fn read_shard_window_partitions(
         )));
     }
 
+    // Restore row-major per shard, before the merge stage concatenates
+    // partitions across shards and applies the query-optimized layout once
+    // (see the `layout` module docs).
+    if shard_job.unpack_rq_codes {
+        super::layout::restore_partition_layout(
+            &mut per_partition_batches,
+            super::layout::unpack_rq_partition,
+        )?;
+    }
+    if shard_job.untranspose_pq_codes {
+        super::layout::restore_partition_layout(
+            &mut per_partition_batches,
+            super::layout::untranspose_pq_partition,
+        )?;
+    }
+
     Ok(per_partition_batches)
 }
 
@@ -768,10 +927,15 @@ async fn read_shard_window_partitions(
 /// corresponding auxiliary files here. The merge writes one unified
 /// `auxiliary.idx` into `target_dir`.
 ///
-/// Supports IVF_FLAT, IVF_PQ, IVF_SQ, IVF_HNSW_FLAT, IVF_HNSW_PQ, and
-/// IVF_HNSW_SQ storage types. For PQ and SQ, this assumes all selected source
-/// segments share the same quantizer/codebook and distance type; it reuses the
-/// first encountered metadata.
+/// Supports IVF_FLAT, IVF_PQ, IVF_RQ, IVF_SQ, IVF_HNSW_FLAT, IVF_HNSW_PQ, and
+/// IVF_HNSW_SQ storage types. The merged artifact carries a single metadata
+/// scope, so every source segment must share one quantizer model and distance
+/// type. A mismatched PQ codebook, RaBitQ rotation, or scalar quantizer is
+/// rejected rather than silently decoded against the first segment's model.
+///
+/// In practice IVF_SQ is unmergeable: each SQ segment trains bounds from its
+/// own fragment sample and `SQBuildParams` cannot pin a shared model. SQ
+/// segments can still be committed and queried side by side.
 pub async fn merge_partial_vector_auxiliary_files(
     object_store: &lance_io::object_store::ObjectStore,
     aux_paths: &[object_store::path::Path],
@@ -877,21 +1041,16 @@ pub async fn merge_partial_vector_auxiliary_files(
                     .get(INDEX_METADATA_SCHEMA_KEY)
             {
                 let idx_meta: IndexMetaSchema = serde_json::from_str(idx_meta_json)?;
-                detected_index_type = Some(match idx_meta.index_type.as_str() {
-                    "IVF_FLAT" => SupportedIvfIndexType::IvfFlat,
-                    "IVF_PQ" => SupportedIvfIndexType::IvfPq,
-                    "IVF_SQ" => SupportedIvfIndexType::IvfSq,
-                    "IVF_RQ" => SupportedIvfIndexType::IvfRq,
-                    "IVF_HNSW_FLAT" => SupportedIvfIndexType::IvfHnswFlat,
-                    "IVF_HNSW_PQ" => SupportedIvfIndexType::IvfHnswPq,
-                    "IVF_HNSW_SQ" => SupportedIvfIndexType::IvfHnswSq,
-                    other => {
-                        return Err(Error::index(format!(
-                            "Unsupported index type in shard index.idx: {}",
-                            other
-                        )));
-                    }
-                });
+                detected_index_type = Some(
+                    SupportedIvfIndexType::from_index_type_str(&idx_meta.index_type).ok_or_else(
+                        || {
+                            Error::index(format!(
+                                "Unsupported index type in shard index.idx: {}",
+                                idx_meta.index_type
+                            ))
+                        },
+                    )?,
+                );
             }
             // Fallback: infer from auxiliary schema
             if detected_index_type.is_none() {
@@ -956,6 +1115,11 @@ pub async fn merge_partial_vector_auxiliary_files(
         // Preserve the historical fallback while keeping the writer boundary exact.
         let fv = format_version.unwrap_or(ConcreteFileVersion::V2_0);
 
+        // Captured per shard, not from the shared first-shard metadata, so a
+        // mix of query-optimized and row-major shards merges correctly.
+        let mut shard_unpack_rq_codes = false;
+        let mut shard_untranspose_pq_codes = false;
+
         match idx_type {
             SupportedIvfIndexType::IvfSq => {
                 // Handle Scalar Quantization (SQ) storage for IVF_SQ
@@ -1005,8 +1169,29 @@ pub async fn merge_partial_vector_auxiliary_files(
                     return Err(Error::index("Dimension mismatch across shards".to_string()));
                 }
 
-                if sq_meta.is_none() {
-                    sq_meta = Some(sq_meta_parsed.clone());
+                // Every shard's codes are decoded with one metadata blob. A shard
+                // trained on a different value range would be dequantized against the
+                // first shard's bounds, silently corrupting distances. Fail closed.
+                match sq_meta.as_ref() {
+                    None => sq_meta = Some(sq_meta_parsed.clone()),
+                    Some(expected) if *expected != sq_meta_parsed => {
+                        return Err(Error::index(format!(
+                            "Distributed SQ merge: source shard {} was trained with a different \
+                             scalar quantizer (dim {}, num_bits {}, bounds {:?}) than the first \
+                             shard (dim {}, num_bits {}, bounds {:?}); merging would decode it \
+                             against the wrong bounds. IVF_SQ segments cannot be merged \
+                             physically: commit them side by side and let the query fan out, \
+                             or rebuild the index as a single segment",
+                            idx,
+                            sq_meta_parsed.dim,
+                            sq_meta_parsed.num_bits,
+                            sq_meta_parsed.bounds,
+                            expected.dim,
+                            expected.num_bits,
+                            expected.bounds,
+                        )));
+                    }
+                    Some(_) => {}
                 }
                 if v2w_opt.is_none() {
                     let w =
@@ -1060,12 +1245,6 @@ pub async fn merge_partial_vector_auxiliary_files(
                     rq_meta_parsed.parse_buffer(rotate_mat_bytes)?;
                 }
                 validate_rq_num_bits(rq_meta_parsed.num_bits)?;
-                if rq_meta_parsed.packed {
-                    return Err(Error::index(format!(
-                        "Distributed RQ merge: source shard {idx} stores packed RQ codes; expected row-major distributed shard"
-                    )));
-                }
-
                 let d0 = rq_meta_parsed.rotated_dim();
                 if d0 == 0 {
                     return Err(Error::index(
@@ -1095,6 +1274,7 @@ pub async fn merge_partial_vector_auxiliary_files(
                         rq_meta_parsed.rotation_type
                     )));
                 }
+                shard_unpack_rq_codes = rq_meta_parsed.packed;
                 if let Some(existing_rq) = rq_meta.as_ref() {
                     match (&existing_rq.rotate_mat, &rq_meta_parsed.rotate_mat) {
                         (Some(reference), Some(candidate)) => {
@@ -1161,11 +1341,6 @@ pub async fn merge_partial_vector_auxiliary_files(
                 };
                 let mut pm: ProductQuantizationMetadata = serde_json::from_str(&pm_json)
                     .map_err(|e| Error::index(format!("PQ metadata parse error: {}", e)))?;
-                if pm.transposed {
-                    return Err(Error::index(format!(
-                        "Distributed PQ merge: source shard {idx} stores transposed PQ codes; expected row-major distributed shard"
-                    )));
-                }
                 // Load codebook from global buffer if not present
                 if pm.codebook.is_none() {
                     let tensor_bytes = reader
@@ -1211,6 +1386,7 @@ pub async fn merge_partial_vector_auxiliary_files(
                         current_cb,
                     )?;
                 }
+                shard_untranspose_pq_codes = pm.transposed;
                 if pq_meta.is_none() {
                     pq_meta = Some(pm.clone());
                 }
@@ -1320,11 +1496,6 @@ pub async fn merge_partial_vector_auxiliary_files(
                 };
                 let mut pm: ProductQuantizationMetadata = serde_json::from_str(&pm_json)
                     .map_err(|e| Error::index(format!("PQ metadata parse error: {}", e)))?;
-                if pm.transposed {
-                    return Err(Error::index(format!(
-                        "Distributed PQ merge: source shard {idx} stores transposed PQ codes; expected row-major distributed shard"
-                    )));
-                }
                 if pm.codebook.is_none() {
                     let tensor_bytes = reader
                         .read_global_buffer(pm.codebook_position as u32)
@@ -1369,6 +1540,7 @@ pub async fn merge_partial_vector_auxiliary_files(
                         current_cb,
                     )?;
                 }
+                shard_untranspose_pq_codes = pm.transposed;
                 if pq_meta.is_none() {
                     pq_meta = Some(pm.clone());
                 }
@@ -1423,8 +1595,29 @@ pub async fn merge_partial_vector_auxiliary_files(
                 {
                     return Err(Error::index("Dimension mismatch across shards".to_string()));
                 }
-                if sq_meta.is_none() {
-                    sq_meta = Some(sq_meta_parsed.clone());
+                // Every shard's codes are decoded with one metadata blob. A shard
+                // trained on a different value range would be dequantized against the
+                // first shard's bounds, silently corrupting distances. Fail closed.
+                match sq_meta.as_ref() {
+                    None => sq_meta = Some(sq_meta_parsed.clone()),
+                    Some(expected) if *expected != sq_meta_parsed => {
+                        return Err(Error::index(format!(
+                            "Distributed SQ merge: source shard {} was trained with a different \
+                             scalar quantizer (dim {}, num_bits {}, bounds {:?}) than the first \
+                             shard (dim {}, num_bits {}, bounds {:?}); merging would decode it \
+                             against the wrong bounds. IVF_SQ segments cannot be merged \
+                             physically: commit them side by side and let the query fan out, \
+                             or rebuild the index as a single segment",
+                            idx,
+                            sq_meta_parsed.dim,
+                            sq_meta_parsed.num_bits,
+                            sq_meta_parsed.bounds,
+                            expected.dim,
+                            expected.num_bits,
+                            expected.bounds,
+                        )));
+                    }
+                    Some(_) => {}
                 }
                 if v2w_opt.is_none() {
                     let w =
@@ -1453,6 +1646,8 @@ pub async fn merge_partial_vector_auxiliary_files(
             lengths,
             partition_offsets,
             total_rows: running_offset,
+            unpack_rq_codes: shard_unpack_rq_codes,
+            untranspose_pq_codes: shard_untranspose_pq_codes,
         });
         progress
             .stage_progress("read_shard_metadata", idx as u64 + 1)
@@ -1812,6 +2007,77 @@ mod tests {
         Ok(total_rows)
     }
 
+    /// Row identity must accumulate correctly across the bounded read batches
+    /// that keep admission memory independent of segment size.
+    #[tokio::test]
+    async fn test_read_segment_row_ids_spans_multiple_bounded_batches() {
+        let object_store = ObjectStore::memory();
+        let segment_dir = Path::from("index/uuid");
+        let aux_path = segment_dir.clone().join(INDEX_AUXILIARY_FILE_NAME);
+
+        let total_rows = 3 * ROW_ID_READ_BATCH_SIZE + 17;
+        let base_row_id = 5u64;
+        write_flat_partial_aux(
+            &object_store,
+            &aux_path,
+            1,
+            &[total_rows],
+            base_row_id,
+            DistanceType::L2,
+            ConcreteFileVersion::V2_1,
+        )
+        .await
+        .unwrap();
+
+        let identity = read_segment_row_ids(&object_store, &segment_dir)
+            .await
+            .unwrap();
+        assert_eq!(identity.num_rows, total_rows as u64);
+        let mut expected = RowIdentityDigest::default();
+        for row_id in base_row_id..base_row_id + total_rows as u64 {
+            expected.insert(row_id);
+        }
+        assert_eq!(identity.digest, expected);
+    }
+
+    /// The digest must not depend on insertion order or batch boundaries, must
+    /// merge additively across segments, must expose any changed id, and must
+    /// catch a duplicated id that preserves the count and the distinct id set.
+    #[test]
+    fn test_row_identity_digest_is_order_independent() {
+        let mut forward = RowIdentityDigest::default();
+        let mut backward = RowIdentityDigest::default();
+        for row_id in 0u64..1000 {
+            forward.insert(row_id);
+            backward.insert(999 - row_id);
+        }
+        assert_eq!(forward, backward);
+
+        let mut first_half = RowIdentityDigest::default();
+        let mut second_half = RowIdentityDigest::default();
+        for row_id in 0u64..500 {
+            first_half.insert(row_id);
+        }
+        for row_id in 500u64..1000 {
+            second_half.insert(row_id);
+        }
+        let mut merged = first_half;
+        merged.merge(&second_half);
+        assert_eq!(merged, forward);
+
+        let mut swapped_one = RowIdentityDigest::default();
+        for row_id in 0u64..1000 {
+            swapped_one.insert(if row_id == 800 { 1800 } else { row_id });
+        }
+        assert_ne!(swapped_one, forward);
+
+        let mut duplicated = RowIdentityDigest::default();
+        for row_id in 0u64..1000 {
+            duplicated.insert(if row_id == 800 { 799 } else { row_id });
+        }
+        assert_ne!(duplicated, forward);
+    }
+
     #[tokio::test]
     async fn test_merge_ivf_flat_success_basic() {
         let object_store = ObjectStore::memory();
@@ -2156,7 +2422,8 @@ mod tests {
         // Distance type metadata for this shard.
         v2w.add_schema_metadata(DISTANCE_TYPE_KEY, distance_type.to_string());
 
-        // PQ metadata with codebook stored in a global buffer.
+        // PQ metadata with codebook stored in a global buffer. The codes
+        // below are written row-major, so the layout flag must say so.
         let mut pq_meta = ProductQuantizationMetadata {
             codebook_position: 0,
             nbits,
@@ -2312,12 +2579,16 @@ mod tests {
             }
         }
 
+        let row_major_codes =
+            FixedSizeListArray::try_new_from_values(UInt8Array::from(codes), num_bytes as i32)?;
+        let rq_codes = if metadata.packed {
+            pack_codes(&row_major_codes)
+        } else {
+            row_major_codes
+        };
         let mut columns: Vec<Arc<dyn Array>> = vec![
             Arc::new(UInt64Array::from(row_ids)),
-            Arc::new(FixedSizeListArray::try_new_from_values(
-                UInt8Array::from(codes),
-                num_bytes as i32,
-            )?),
+            Arc::new(rq_codes),
             Arc::new(Float32Array::from(add_factors)),
             Arc::new(Float32Array::from(scale_factors)),
         ];
@@ -2472,7 +2743,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_merge_ivf_pq_rejects_transposed_source_shard() {
+    async fn test_merge_ivf_pq_accepts_transposed_source_shard() {
         let object_store = ObjectStore::memory();
         let index_dir = Path::from("index/uuid_pq_transposed");
 
@@ -2511,24 +2782,13 @@ mod tests {
             crate::progress::noop_progress(),
         )
         .await;
-        match res {
-            Err(Error::Index { message, .. }) => {
-                assert!(
-                    message.contains("source shard 0"),
-                    "unexpected message: {}",
-                    message
-                );
-                assert!(
-                    message.contains("transposed PQ codes"),
-                    "unexpected message: {}",
-                    message
-                );
-            }
-            other => panic!(
-                "expected Error::Index for transposed PQ source shard, got {:?}",
-                other
-            ),
-        }
+        res.unwrap();
+        assert!(
+            object_store
+                .exists(&index_dir.join(INDEX_AUXILIARY_FILE_NAME))
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -2668,13 +2928,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_merge_ivf_rq_rejects_packed_source_shard() {
+    async fn test_merge_ivf_rq_accepts_packed_source_shard() {
         let object_store = ObjectStore::memory();
         let index_dir = Path::from("index/uuid_rq_packed");
 
         let partial0 = index_dir.clone().join("partial_0");
         let aux0 = partial0.clone().join(INDEX_AUXILIARY_FILE_NAME);
-        let lengths = vec![2_u32, 1_u32];
+        let lengths = vec![64_u32];
 
         let rq_meta = RabitQuantizationMetadata {
             rotate_mat: None,
@@ -2705,24 +2965,13 @@ mod tests {
             crate::progress::noop_progress(),
         )
         .await;
-        match res {
-            Err(Error::Index { message, .. }) => {
-                assert!(
-                    message.contains("source shard 0"),
-                    "unexpected message: {}",
-                    message
-                );
-                assert!(
-                    message.contains("packed RQ codes"),
-                    "unexpected message: {}",
-                    message
-                );
-            }
-            other => panic!(
-                "expected Error::Index for packed RQ source shard, got {:?}",
-                other
-            ),
-        }
+        res.unwrap();
+        assert!(
+            object_store
+                .exists(&index_dir.join(INDEX_AUXILIARY_FILE_NAME))
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]

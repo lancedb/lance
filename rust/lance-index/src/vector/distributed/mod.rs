@@ -4,4 +4,5 @@
 //! Distributed vector index building
 
 pub mod index_merger;
+mod layout;
 pub use index_merger::*;

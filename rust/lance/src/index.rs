@@ -61,6 +61,7 @@ use lance_io::utils::{
 use lance_table::format::{DataFile, Fragment, SelfDescribingFileReader};
 use lance_table::format::{IndexFile, IndexMetadata, list_index_files_with_sizes};
 use lance_table::io::manifest::read_manifest_indexes;
+use object_store::path::Path;
 use roaring::RoaringBitmap;
 use scalar::index_matches_criteria;
 use serde_json::json;
@@ -82,6 +83,7 @@ pub mod mem_wal;
 pub mod prefilter;
 pub mod scalar;
 pub(crate) mod scalar_logical;
+pub mod segment_merge;
 pub mod vector;
 
 use self::append::merge_indices;
@@ -95,11 +97,725 @@ use crate::index::frag_reuse::{load_frag_reuse_index_details, open_frag_reuse_in
 use crate::index::mem_wal::open_mem_wal_index;
 pub use crate::index::prefilter::{FilterLoader, PreFilter};
 use crate::index::scalar::{IndexDetails, fetch_index_details, load_training_data};
+pub use crate::index::segment_merge::{
+    INDEX_MERGE_CONTRACT_VERSION, IndexMergeFile, IndexMergeFingerprint, IndexMergeOutput,
+    IndexMergePlan, IndexMergeResult, IndexMergeSource, IndexMergeTask,
+};
 pub use crate::index::vector::{LogicalIvfView, LogicalVectorIndex};
 use crate::session::index_caches::{FragReuseIndexKey, IndexMetadataKey, write_index_identity};
 use crate::{Error, Result, dataset::Dataset};
 pub use create::CreateIndexBuilder;
 pub use lance_index::IndexDescription;
+
+/// Directory holding one segment's files, resolved through its base path.
+///
+/// Segments a shallow clone imported carry `base_id` and live under the base
+/// dataset's index directory, so resolving them under the current dataset
+/// would make them unreadable.
+async fn segment_files_dir(dataset: &Dataset, segment: &IndexMetadata) -> Result<(String, Path)> {
+    let store = dataset.object_store_for_index(segment).await?;
+    let dir = dataset
+        .indice_files_dir(segment)?
+        .join(segment.uuid.to_string());
+    Ok((store.store_prefix.clone(), dir))
+}
+
+/// Record where a segment lives and what it claimed, for a merge plan.
+async fn describe_merge_source(
+    dataset: &Dataset,
+    segment: &IndexMetadata,
+) -> Result<IndexMergeSource> {
+    let (store_prefix, dir) = segment_files_dir(dataset, segment).await?;
+    Ok(IndexMergeSource {
+        uuid: segment.uuid,
+        dataset_version: segment.dataset_version,
+        base_id: segment.base_id,
+        store_prefix,
+        path: dir.to_string(),
+        fragment_ids: segment_merge::fragment_ids(segment.fragment_bitmap.as_ref()),
+    })
+}
+
+/// Resolve one task's sources against a snapshot, rejecting anything that drifted.
+///
+/// The returned segments are in the task's order, which the merge relies on: the
+/// first shard supplies the IVF model the rest are checked against.
+async fn resolve_merge_sources(
+    dataset: &Dataset,
+    plan: &IndexMergePlan,
+    task: &IndexMergeTask,
+) -> Result<Vec<IndexMetadata>> {
+    if task.sources.len() < 2 {
+        return Err(Error::invalid_input(format!(
+            "index merge task {} has {} sources; a merge task must have at least two",
+            task.task_id,
+            task.sources.len()
+        )));
+    }
+    let available = dataset.load_indices_by_name(&plan.index_name).await?;
+    let by_uuid = available
+        .iter()
+        .map(|segment| (segment.uuid, segment))
+        .collect::<HashMap<_, _>>();
+
+    let mut segments = Vec::with_capacity(task.sources.len());
+    let mut coverage = RoaringBitmap::new();
+    for source in &task.sources {
+        let context = format!("index merge task {}", task.task_id);
+        let Some(segment) = by_uuid.get(&source.uuid) else {
+            return Err(Error::invalid_input(format!(
+                "{context}: source segment {} is not part of index '{}' at dataset version {}",
+                source.uuid, plan.index_name, plan.read_version
+            )));
+        };
+        source.check(segment, &context)?;
+        plan.fingerprint.check(segment, &context)?;
+
+        let (store_prefix, dir) = segment_files_dir(dataset, segment).await?;
+        if store_prefix != source.store_prefix || dir.to_string() != source.path {
+            return Err(Error::invalid_input(format!(
+                "{context}: source segment {} was planned at {}/{} but resolves to {}/{} \
+                 on this worker; re-plan the merge",
+                source.uuid, source.store_prefix, source.path, store_prefix, dir
+            )));
+        }
+
+        let segment_coverage = segment.fragment_bitmap.clone().unwrap_or_default();
+        if !segment_coverage.is_disjoint(&coverage) {
+            return Err(Error::invalid_input(format!(
+                "{context}: source segment {} overlaps an earlier source on fragments {:?}; \
+                 a merge task's sources must be disjoint",
+                source.uuid,
+                (&segment_coverage & &coverage).iter().collect::<Vec<_>>()
+            )));
+        }
+        coverage |= segment_coverage;
+        segments.push((*segment).clone());
+    }
+    Ok(segments)
+}
+
+/// Base-aware source directories for a vector segment merge.
+///
+/// The merge reads every shard through one object store, so cross-store
+/// sources are rejected up front rather than failing later as a missing file.
+/// A different base in the same store, the shallow-clone case, resolves fine.
+async fn resolve_vector_source_dirs(
+    dataset: &Dataset,
+    segments: &[IndexMetadata],
+) -> Result<Vec<Path>> {
+    let mut dirs = Vec::with_capacity(segments.len());
+    for segment in segments {
+        let (store_prefix, dir) = segment_files_dir(dataset, segment).await?;
+        if store_prefix != dataset.object_store.store_prefix {
+            return Err(Error::not_supported(format!(
+                "merge_existing_index_segments: segment {} lives in object store '{}' but \
+                 this dataset writes to '{}'; merging segments across object stores is not \
+                 supported",
+                segment.uuid, store_prefix, dataset.object_store.store_prefix
+            )));
+        }
+        dirs.push(dir);
+    }
+    Ok(dirs)
+}
+
+/// Derive a vector segment's query model from its durable files.
+///
+/// Reads the metric, compression, and graph config the files actually declare,
+/// so the commit can fence a worker output against its sources rather than
+/// trusting the worker's own report.
+async fn durable_vector_model(
+    dataset: &Dataset,
+    segment: &IndexMetadata,
+) -> Result<lance_index::pb::VectorIndexDetails> {
+    let details =
+        crate::index::vector::details::infer_vector_index_details(dataset, segment).await?;
+    details
+        .to_msg::<lance_index::pb::VectorIndexDetails>()
+        .map_err(|err| Error::index(err.to_string()))
+}
+
+/// Verify a winning attempt's reported files against the object store.
+///
+/// The report is untrusted worker input whose file list becomes durable
+/// manifest metadata, so the store is the truth: the listing must match the
+/// report exactly and every file must decode as a Lance file.
+async fn validate_merge_output_files(
+    dataset: &Dataset,
+    index_name: &str,
+    result: &IndexMergeResult,
+    source_segments: &[IndexMetadata],
+) -> Result<()> {
+    let dir = dataset.indices_dir().join(result.output.uuid.to_string());
+    let mut listed = match list_index_files_with_sizes(&dataset.object_store, &dir).await {
+        Ok(files) => files,
+        Err(Error::NotFound { .. }) => Vec::new(),
+        Err(err) => return Err(err),
+    };
+    listed.sort_by(|a, b| a.path.cmp(&b.path));
+    let mut reported = result
+        .output
+        .files
+        .iter()
+        .map(IndexFile::from)
+        .collect::<Vec<_>>();
+    reported.sort_by(|a, b| a.path.cmp(&b.path));
+    if listed != reported {
+        return Err(Error::invalid_input(format!(
+            "index merge result for task {} reports files {:?} for output {} but the \
+             store holds {:?}; the report does not describe the written segment, so \
+             re-run the task",
+            result.task_id,
+            reported
+                .iter()
+                .map(|file| (file.path.as_str(), file.size_bytes))
+                .collect::<Vec<_>>(),
+            result.output.uuid,
+            listed
+                .iter()
+                .map(|file| (file.path.as_str(), file.size_bytes))
+                .collect::<Vec<_>>(),
+        )));
+    }
+    let scan_scheduler = ScanScheduler::new(
+        dataset.object_store.clone(),
+        SchedulerConfig::max_bandwidth(&dataset.object_store),
+    );
+    let vector_plan = result
+        .fingerprint
+        .index_type_url
+        .ends_with("VectorIndexDetails");
+    // Planning is vector only, so a non vector fingerprint can only reach the
+    // commit through a forged or version skewed contract. Fail closed instead
+    // of skipping the vector admission checks below.
+    if !vector_plan {
+        return Err(Error::invalid_input(format!(
+            "index merge result for task {} targets a non vector index ({}), \
+             distributed merge currently supports vector indexes",
+            result.task_id, result.fingerprint.index_type_url
+        )));
+    }
+    // The production open starts at the index file, so a segment without one
+    // is never readable and its family fallback cannot fail closed.
+    if vector_plan && !listed.iter().any(|file| file.path == INDEX_FILE_NAME) {
+        return Err(Error::invalid_input(format!(
+            "index merge result for task {} reports no {} for output {}; the segment \
+             would never be readable, re-run the task",
+            result.task_id, INDEX_FILE_NAME, result.output.uuid
+        )));
+    }
+    for file in &listed {
+        let path = dir.clone().join(file.path.as_str());
+        // A fabricated report can list real sizes for garbage bytes, so decode
+        // the file metadata rather than probing the trailing magic.
+        let decoded = match scan_scheduler
+            .open_file_with_priority(&path, 0, &CachedFileSize::new(file.size_bytes))
+            .await
+        {
+            Ok(file_scheduler) => {
+                lance_file::reader::FileReader::read_all_metadata(&file_scheduler).await
+            }
+            Err(err) => Err(err),
+        };
+        if let Err(err) = decoded {
+            return Err(Error::invalid_input(format!(
+                "index merge output file {} of task {} is not a readable Lance index \
+                 file ({}); re-run the task",
+                path, result.task_id, err
+            )));
+        }
+    }
+    // Metadata strings are forgeable, so the segment must open through the
+    // production vector index reader before it may replace readable sources.
+    // The open runs on a handle with fresh session caches: a uuid opened
+    // earlier in this session must not validate against remembered state
+    // instead of the bytes on the store.
+    if vector_plan {
+        let session = Arc::new(crate::session::Session::default());
+        let mut validation_dataset = dataset.clone();
+        validation_dataset.index_cache = Arc::new(session.index_cache.for_dataset(dataset.uri()));
+        validation_dataset.metadata_cache =
+            Arc::new(session.metadata_cache.for_dataset(dataset.uri()));
+        validation_dataset.session = session;
+        let keyed_field = result.fingerprint.keyed_field().ok_or_else(|| {
+            Error::invalid_input(format!(
+                "index merge result for task {} has no keyed field in its fingerprint",
+                result.task_id
+            ))
+        })?;
+        let column = dataset.schema().field_path(keyed_field)?;
+        let output_meta = result.output_metadata(index_name);
+        open_vector_index_from_meta(
+            &validation_dataset,
+            &column,
+            &output_meta,
+            &NoOpMetricsCollector,
+        )
+        .await
+        .map_err(|err| {
+            Error::invalid_input(format!(
+                "index merge output {} of task {} does not open as its declared \
+                 vector index ({}); re-run the task",
+                result.output.uuid, result.task_id, err
+            ))
+        })?;
+
+        // The scanner routes ANN queries on the committed metric without
+        // re-opening the index, so the output's durable model must match the
+        // sources, not merely its own reported details. Build hints are not
+        // part of the query model and stay unchecked. Sources are committed,
+        // so the first one's durable model is the trusted reference.
+        let output_model = durable_vector_model(&validation_dataset, &output_meta)
+            .await
+            .map_err(|err| {
+                Error::invalid_input(format!(
+                    "index merge output {} of task {} has unreadable durable index model \
+                     ({}); re-run the task",
+                    result.output.uuid, result.task_id, err
+                ))
+            })?;
+        if let Some(reference) = source_segments.first() {
+            let source_model = durable_vector_model(&validation_dataset, reference)
+                .await
+                .map_err(|err| {
+                    Error::invalid_input(format!(
+                        "source segment {} of task {} has unreadable durable index \
+                             model ({}); re-plan the merge",
+                        reference.uuid, result.task_id, err
+                    ))
+                })?;
+            if output_model.metric_type != source_model.metric_type
+                || output_model.compression != source_model.compression
+                || output_model.hnsw_index_config != source_model.hnsw_index_config
+            {
+                return Err(Error::invalid_input(format!(
+                    "index merge output {} of task {} carries an index model its sources do \
+                     not (output metric {} compression {:?} hnsw {:?}, source metric {} \
+                     compression {:?} hnsw {:?}); the output does not come from this task. \
+                     Re-plan the merge.",
+                    result.output.uuid,
+                    result.task_id,
+                    output_model.metric_type,
+                    output_model.compression,
+                    output_model.hnsw_index_config,
+                    source_model.metric_type,
+                    source_model.compression,
+                    source_model.hnsw_index_config,
+                )));
+            }
+        }
+
+        // The report's own details are persisted verbatim into the manifest, so
+        // when populated they must equal the durable model the scanner would
+        // otherwise re-derive. Empty details are re-derived from the files,
+        // already fenced to the sources above.
+        if !result.output.index_details.is_empty() {
+            use prost::Message;
+            let reported =
+                lance_index::pb::VectorIndexDetails::decode(result.output.index_details.as_slice())
+                    .map_err(|err| {
+                        Error::invalid_input(format!(
+                            "index merge result for task {} carries undecodable vector index \
+                             details ({}); re-run the task",
+                            result.task_id, err
+                        ))
+                    })?;
+            if reported.metric_type != output_model.metric_type
+                || reported.compression != output_model.compression
+                || reported.hnsw_index_config != output_model.hnsw_index_config
+            {
+                return Err(Error::invalid_input(format!(
+                    "index merge result for task {} declares an index model its durable \
+                     files do not carry (reported metric {} compression {:?} hnsw {:?}, \
+                     durable metric {} compression {:?} hnsw {:?}); re-run the task",
+                    result.task_id,
+                    reported.metric_type,
+                    reported.compression,
+                    reported.hnsw_index_config,
+                    output_model.metric_type,
+                    output_model.compression,
+                    output_model.hnsw_index_config,
+                )));
+            }
+        }
+
+        // Openability is not provenance: the task binding is untrusted, so
+        // the output must hold exactly the rows its claimed sources hold.
+        // Row ids are digested as opaque u64 identities, never decoded into
+        // fragments, so physical addresses, stable row ids, and pre remap
+        // addresses all validate the same way.
+        let output_rows = lance_index::vector::distributed::index_merger::read_segment_row_ids(
+            &dataset.object_store,
+            &dir,
+        )
+        .await
+        .map_err(|err| {
+            Error::invalid_input(format!(
+                "index merge output {} of task {} has unreadable row ids ({}); \
+                 re-run the task",
+                result.output.uuid, result.task_id, err
+            ))
+        })?;
+        let source_dirs = resolve_vector_source_dirs(dataset, source_segments).await?;
+        let mut expected_rows = 0u64;
+        let mut expected_digest =
+            lance_index::vector::distributed::index_merger::RowIdentityDigest::default();
+        for (segment, source_dir) in source_segments.iter().zip(&source_dirs) {
+            let source_rows = lance_index::vector::distributed::index_merger::read_segment_row_ids(
+                &dataset.object_store,
+                source_dir,
+            )
+            .await
+            .map_err(|err| {
+                Error::invalid_input(format!(
+                    "source segment {} of task {} has unreadable row ids ({}); \
+                         re-plan the merge",
+                    segment.uuid, result.task_id, err
+                ))
+            })?;
+            expected_rows += source_rows.num_rows;
+            expected_digest.merge(&source_rows.digest);
+        }
+        if output_rows.num_rows != expected_rows {
+            return Err(Error::invalid_input(format!(
+                "index merge output {} of task {} does not hold the rows of its claimed \
+                 sources ({} stored, {} expected); the output does not come from this \
+                 task. Re-plan the merge.",
+                result.output.uuid, result.task_id, output_rows.num_rows, expected_rows
+            )));
+        }
+        if output_rows.digest != expected_digest {
+            return Err(Error::invalid_input(format!(
+                "index merge output {} of task {} does not hold the exact rows of its \
+                 claimed sources (stored digest {:?}, expected {:?}); the output does \
+                 not come from this task. Re-plan the merge.",
+                result.output.uuid, result.task_id, output_rows.digest, expected_digest
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Open a vector index segment from its metadata rather than a manifest lookup.
+///
+/// The commit path validates worker-built segments before they exist in any
+/// manifest, so the production open must be reachable without `load_index`.
+async fn open_vector_index_from_meta(
+    dataset: &Dataset,
+    column: &str,
+    index_meta: &IndexMetadata,
+    metrics: &dyn MetricsCollector,
+) -> Result<Arc<dyn VectorIndex>> {
+    {
+        let self_ = dataset;
+        let uuid = &index_meta.uuid;
+        let frag_reuse_uuid = self_.frag_reuse_index_uuid().await;
+        let object_store = self_.object_store_for_index(index_meta).await?;
+
+        // Check sized cache first (v2+ indices with serializable state).
+        let state_key = IvfIndexStateCacheKey::new(uuid, frag_reuse_uuid.as_ref());
+        if let Some(entry) = self_.index_cache.get_with_key(&state_key).await {
+            log::debug!("Found IvfIndexState in cache uuid: {}", uuid);
+            let partition_cache = self_.index_cache.for_index(uuid, frag_reuse_uuid.as_ref());
+            let frag_reuse_index = self_.open_frag_reuse_index(metrics).await?;
+            return entry
+                .0
+                .reconstruct(
+                    object_store,
+                    self_.metadata_cache.as_ref(),
+                    partition_cache,
+                    frag_reuse_index,
+                )
+                .await;
+        }
+
+        // Fallback: in-memory cache for legacy indices.
+        let cache_key = LegacyVectorIndexCacheKey::new(uuid, frag_reuse_uuid.as_ref());
+        if let Some(cached) = self_.index_cache.get_with_key(&cache_key).await {
+            return Ok(cached.0.clone());
+        }
+
+        let frag_reuse_index = self_.open_frag_reuse_index(metrics).await?;
+        let index_dir = self_.indice_files_dir(index_meta)?;
+        let index_file = index_dir
+            .clone()
+            .join(uuid.to_string())
+            .join(INDEX_FILE_NAME);
+        let file_sizes = index_meta.file_size_map();
+        let reader: Arc<dyn Reader> = vector::open_index_file(
+            object_store.as_ref(),
+            &index_file,
+            INDEX_FILE_NAME,
+            &file_sizes,
+        )
+        .await?
+        .into();
+
+        let tailing_bytes = read_last_block(reader.as_ref()).await?;
+        let (major_version, minor_version) = read_version(&tailing_bytes)?;
+
+        // Namespace the index cache by the UUID of the index. v2+ partition
+        // entries are store-free and remain reusable across object-store
+        // generations alongside their serializable state.
+        let index_cache = self_.index_cache.for_index(uuid, frag_reuse_uuid.as_ref());
+
+        // Extract the cacheable state before type-erasing to Arc<dyn VectorIndex>.
+        fn wrap_ivf<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
+            ivf: IVFIndex<S, Q>,
+        ) -> (Arc<dyn VectorIndex>, Option<IvfStateEntryBox>) {
+            let entry = ivf.to_state_entry();
+            (Arc::new(ivf), Some(entry))
+        }
+
+        // the index file is in lance format since version (0,2)
+        // TODO: we need to change the legacy IVF_PQ to be in lance format
+        let result: Result<(Arc<dyn VectorIndex>, Option<IvfStateEntryBox>)> = match (
+            major_version,
+            minor_version,
+        ) {
+            (0, 1) | (0, 0) => {
+                info!(target: TRACE_IO_EVENTS, index_uuid=%uuid, r#type=IO_TYPE_OPEN_VECTOR, version="0.1", index_type="IVF_PQ");
+                let proto = open_index_proto(reader.as_ref()).await?;
+                match &proto.implementation {
+                    Some(Implementation::VectorIndex(vector_index)) => {
+                        let dataset = Arc::new(self_.clone());
+                        let idx = vector::open_vector_index(
+                            dataset,
+                            uuid,
+                            vector_index,
+                            reader,
+                            frag_reuse_index,
+                        )
+                        .await?;
+                        Ok((idx, None::<IvfStateEntryBox>))
+                    }
+                    None => Err(Error::internal(
+                        "Index proto was missing implementation field",
+                    )),
+                }
+            }
+
+            (0, 2) => {
+                info!(target: TRACE_IO_EVENTS, index_uuid=%uuid, r#type=IO_TYPE_OPEN_VECTOR, version="0.2", index_type="IVF_PQ");
+                let reader = V1FileReader::try_new_self_described_from_reader(
+                    reader.clone(),
+                    Some(&self_.metadata_cache.file_metadata_cache(&index_file)),
+                )
+                .await?;
+                let idx = vector::open_vector_index_v2(
+                    Arc::new(self_.clone()),
+                    column,
+                    uuid,
+                    reader,
+                    frag_reuse_index,
+                )
+                .await?;
+                Ok((idx, None::<IvfStateEntryBox>))
+            }
+
+            (0, 3) | (2, _) => {
+                let scheduler = ScanScheduler::new(
+                    object_store.clone(),
+                    SchedulerConfig::max_bandwidth(&object_store),
+                );
+                let cached_size = file_sizes
+                    .get(INDEX_FILE_NAME)
+                    .map(|&size| CachedFileSize::new(size))
+                    .unwrap_or_else(CachedFileSize::unknown);
+                let file = scheduler.open_file(&index_file, &cached_size).await?;
+                let reader = lance_file::reader::FileReader::try_open(
+                    file,
+                    None,
+                    Default::default(),
+                    &self_.metadata_cache.file_metadata_cache(&index_file),
+                    FileReaderOptions::default(),
+                )
+                .await?;
+                let index_metadata = reader
+                    .schema()
+                    .metadata
+                    .get(INDEX_METADATA_SCHEMA_KEY)
+                    .ok_or(Error::index("Index Metadata not found".to_owned()))?;
+                let index_metadata: lance_index::IndexMetadata =
+                    serde_json::from_str(index_metadata)?;
+
+                // Resolve the column name and field
+                let (field_path, field) = resolve_index_column(self_.schema(), index_meta, column)?;
+
+                let (_, element_type) = get_vector_type(self_.schema(), &field_path)?;
+
+                info!(target: TRACE_IO_EVENTS, index_uuid=%uuid, r#type=IO_TYPE_OPEN_VECTOR, version="0.3", index_type=index_metadata.index_type);
+
+                match index_metadata.index_type.as_str() {
+                    "IVF_FLAT" => match element_type {
+                        DataType::Float16 | DataType::Float32 | DataType::Float64 => {
+                            let ivf = IVFIndex::<FlatIndex, FlatQuantizer>::try_new(
+                                object_store.clone(),
+                                index_dir,
+                                uuid.to_owned(),
+                                frag_reuse_index,
+                                self_.metadata_cache.as_ref(),
+                                index_cache,
+                                file_sizes,
+                            )
+                            .await?;
+                            Ok(wrap_ivf(ivf))
+                        }
+                        DataType::UInt8 => {
+                            let ivf = IVFIndex::<FlatIndex, FlatBinQuantizer>::try_new(
+                                object_store.clone(),
+                                index_dir,
+                                uuid.to_owned(),
+                                frag_reuse_index,
+                                self_.metadata_cache.as_ref(),
+                                index_cache,
+                                file_sizes,
+                            )
+                            .await?;
+                            Ok(wrap_ivf(ivf))
+                        }
+                        _ => Err(Error::index(format!(
+                            "the field type {} is not supported for FLAT index",
+                            field.data_type()
+                        ))),
+                    },
+
+                    "IVF_PQ" => {
+                        let ivf = IVFIndex::<FlatIndex, ProductQuantizer>::try_new(
+                            object_store.clone(),
+                            index_dir,
+                            uuid.to_owned(),
+                            frag_reuse_index,
+                            self_.metadata_cache.as_ref(),
+                            index_cache,
+                            file_sizes,
+                        )
+                        .await?;
+                        Ok(wrap_ivf(ivf))
+                    }
+
+                    "IVF_SQ" => {
+                        let ivf = IVFIndex::<FlatIndex, ScalarQuantizer>::try_new(
+                            object_store.clone(),
+                            index_dir,
+                            uuid.to_owned(),
+                            frag_reuse_index,
+                            self_.metadata_cache.as_ref(),
+                            index_cache,
+                            file_sizes,
+                        )
+                        .await?;
+                        Ok(wrap_ivf(ivf))
+                    }
+
+                    "IVF_RQ" => {
+                        let ivf = IVFIndex::<FlatIndex, RabitQuantizer>::try_new(
+                            object_store.clone(),
+                            index_dir,
+                            uuid.to_owned(),
+                            frag_reuse_index,
+                            self_.metadata_cache.as_ref(),
+                            index_cache,
+                            file_sizes,
+                        )
+                        .await?;
+                        Ok(wrap_ivf(ivf))
+                    }
+
+                    "IVF_HNSW_FLAT" => match element_type {
+                        DataType::UInt8 => {
+                            let ivf = IVFIndex::<HNSW, FlatBinQuantizer>::try_new(
+                                object_store.clone(),
+                                index_dir,
+                                uuid.to_owned(),
+                                frag_reuse_index,
+                                self_.metadata_cache.as_ref(),
+                                index_cache,
+                                file_sizes,
+                            )
+                            .await?;
+                            Ok(wrap_ivf(ivf))
+                        }
+                        _ => {
+                            let ivf = IVFIndex::<HNSW, FlatQuantizer>::try_new(
+                                object_store.clone(),
+                                index_dir,
+                                uuid.to_owned(),
+                                frag_reuse_index,
+                                self_.metadata_cache.as_ref(),
+                                index_cache,
+                                file_sizes,
+                            )
+                            .await?;
+                            Ok(wrap_ivf(ivf))
+                        }
+                    },
+
+                    "IVF_HNSW_SQ" => {
+                        let ivf = IVFIndex::<HNSW, ScalarQuantizer>::try_new(
+                            object_store.clone(),
+                            index_dir,
+                            uuid.to_owned(),
+                            frag_reuse_index,
+                            self_.metadata_cache.as_ref(),
+                            index_cache,
+                            file_sizes,
+                        )
+                        .await?;
+                        Ok(wrap_ivf(ivf))
+                    }
+
+                    "IVF_HNSW_PQ" => {
+                        let ivf = IVFIndex::<HNSW, ProductQuantizer>::try_new(
+                            object_store.clone(),
+                            index_dir,
+                            uuid.to_owned(),
+                            frag_reuse_index,
+                            self_.metadata_cache.as_ref(),
+                            index_cache,
+                            file_sizes,
+                        )
+                        .await?;
+                        Ok(wrap_ivf(ivf))
+                    }
+
+                    _ => Err(Error::index(format!(
+                        "Unsupported index type: {}",
+                        index_metadata.index_type
+                    ))),
+                }
+            }
+
+            _ => Err(Error::index(
+                "unsupported index version (maybe need to upgrade your lance version)".to_owned(),
+            )),
+        };
+        let (index, ivf_entry) = result?;
+        metrics.record_index_load();
+        // Attribute the one-time index-open I/O (file footers, IVF centroids,
+        // quantization metadata) to this query's metrics. This runs only on a
+        // real open, cache hits return earlier, so a warm query reports zero
+        // index-open I/O.
+        if let Some(io_stats) = metrics.io_stats()
+            && let Some(open_stats) = index.open_io_stats()
+        {
+            io_stats.add_scan_stats(&open_stats);
+        }
+        if let Some(ivf_entry) = ivf_entry {
+            self_
+                .index_cache
+                .insert_with_key(&state_key, Arc::new(ivf_entry))
+                .await;
+        } else {
+            self_
+                .index_cache
+                .insert_with_key(&cache_key, Arc::new(CachedLegacyVectorIndex(index.clone())))
+                .await;
+        }
+        Ok(index)
+    }
+}
 
 fn validate_segment_metadata(index_name: &str, segments: &[IndexMetadata]) -> Result<()> {
     if segments.is_empty() {
@@ -211,12 +927,11 @@ fn fragment_field_files<'a>(
         .collect()
 }
 
-/// Resolve the field ids a segment's staleness check must consider: the subtree of
-/// every field the segment declares, keyed and carried alike (see
-/// [`IndexSegment::fields`] and [`IndexSegment::covering_fields`]). A covered
-/// segment's carried columns can go stale independently of its keyed column, so
-/// checking only the keyed subtree would leave a fragment covered after a carried
-/// column was rewritten, and the segment would answer with the obsolete value.
+/// Resolve the field ids a segment's staleness check must consider: the
+/// subtree of every declared field, keyed and carried alike. Carried columns
+/// go stale independently of the keyed column, so checking only the keyed
+/// subtree would leave a fragment covered after a carried column was
+/// rewritten, and the segment would answer with the obsolete value.
 fn segment_indexed_field_ids(dataset: &Dataset, segment: &IndexSegment) -> Result<HashSet<i32>> {
     let mut indexed_field_ids = HashSet::new();
     for field_id in segment.fields() {
@@ -314,13 +1029,10 @@ pub(crate) async fn build_index_metadata_from_segments(
 
     let mut seen_segment_ids = HashSet::with_capacity(segments.len());
     let mut covered_fragments = RoaringBitmap::new();
-    // One logical index needs one declaration. The per-segment rules below only
-    // pin the *keyed* field and its count, so segments that disagree on the
-    // carried columns -- `fields = [k, a]` beside `fields = [k]`, say -- each pass
-    // individually. Committing that pair produces an index whose own description
-    // path refuses it: `IndexDescriptionImpl::try_new` requires `fields` to be
-    // identical across segments, so `describe_indices` would error on metadata
-    // this function just wrote. Same rule, and same reason, as
+    // One logical index needs one declaration. The per-segment rules below
+    // pin only the keyed field and its count, so segments disagreeing on
+    // carried columns each pass individually while `IndexDescriptionImpl`
+    // would refuse the committed pair. Same rule, and same reason, as
     // `merge_existing_index_segments`.
     let expected_fields = segments[0].fields().to_vec();
     let expected_covering_fields = segments[0].covering_fields().to_vec();
@@ -1883,6 +2595,373 @@ impl DatasetIndexExt for Dataset {
         ))
     }
 
+    async fn plan_index_segment_merge(
+        &self,
+        index_name: &str,
+        segments_per_task: usize,
+        max_segments_to_merge: Option<usize>,
+    ) -> Result<IndexMergePlan> {
+        if segments_per_task < 2 {
+            return Err(Error::invalid_input(format!(
+                "plan_index_segment_merge requires segments_per_task >= 2, got {}",
+                segments_per_task
+            )));
+        }
+
+        let all_segments = self.load_indices_by_name(index_name).await?;
+        if all_segments.is_empty() {
+            return Err(Error::index_not_found(format!("name={}", index_name)));
+        }
+
+        // The distributed contract admits results through vector specific checks
+        // (production open, model fence, row identity), so planning any other
+        // index family would commit outputs those checks never see.
+        if let Some(non_vector) = all_segments
+            .iter()
+            .find(|segment| !segment_has_vector_details(segment))
+        {
+            return Err(Error::not_supported(format!(
+                "plan_index_segment_merge currently supports vector indexes, segment {} \
+                 of index {} has type {}",
+                non_vector.uuid,
+                index_name,
+                non_vector
+                    .index_details
+                    .as_ref()
+                    .map(|details| details.type_url.as_str())
+                    .unwrap_or("unknown (no index details)")
+            )));
+        }
+
+        // Reject missing coverage across the whole segment set before bounding to a
+        // suffix: `commit_index_merge_results` cannot compare-and-swap a segment whose
+        // coverage it cannot read, so its failure would be guaranteed.
+        if let Some(legacy) = all_segments
+            .iter()
+            .find(|segment| segment.fragment_bitmap.is_none())
+        {
+            return Err(Error::invalid_input(format!(
+                "plan_index_segment_merge: segment {} of index {} has no fragment coverage \
+                 (legacy index format); merging requires fragment coverage, rebuild the index first",
+                legacy.uuid, index_name
+            )));
+        }
+
+        let source_frontier = all_segments
+            .iter()
+            .map(|segment| segment.uuid)
+            .collect::<Vec<_>>();
+
+        // Judge coverage against fragments that still exist. A segment whose fragments
+        // were all compacted away is dormant and merging it would resurrect stale
+        // vectors, but its raw bitmap still names the removed fragments.
+        let mut segments: Vec<IndexMetadata> = all_segments
+            .into_iter()
+            .filter(|segment| {
+                let keep = segment
+                    .effective_fragment_bitmap(&self.fragment_bitmap)
+                    .is_none_or(|bitmap| !bitmap.is_empty());
+                if !keep {
+                    log::debug!(
+                        "plan_index_segment_merge: skipping dormant segment {} whose fragment coverage no longer exists",
+                        segment.uuid
+                    );
+                }
+                keep
+            })
+            .collect();
+        if let Some(max_segments) = max_segments_to_merge {
+            segments = segments.split_off(segments.len().saturating_sub(max_segments));
+        }
+
+        let plan_id = Uuid::new_v4();
+        if segments.len() < 2 {
+            return Ok(IndexMergePlan {
+                contract_version: INDEX_MERGE_CONTRACT_VERSION,
+                plan_id,
+                index_name: index_name.to_owned(),
+                read_version: self.manifest.version,
+                // Nothing qualifies, so there is no model to pin. Report the
+                // leftover segment's fingerprint, if any, purely for legibility.
+                fingerprint: segments
+                    .first()
+                    .and_then(|segment| IndexMergeFingerprint::try_from_metadata(segment).ok())
+                    .unwrap_or_default(),
+                source_frontier,
+                expected_coverage: Vec::new(),
+                tasks: Vec::new(),
+            });
+        }
+
+        // Match `merge_existing_index_segments` exactly: it compares the keyed field
+        // and requires identical carried columns, not whole-`fields` equality. The
+        // fingerprint lets a worker prove its snapshot still matches the planned model.
+        let fingerprint = IndexMergeFingerprint::try_from_metadata(&segments[0])?;
+        for segment in &segments[1..] {
+            fingerprint.check(segment, "plan_index_segment_merge")?;
+        }
+
+        let mut chunks: Vec<Vec<IndexMetadata>> = segments
+            .chunks(segments_per_task)
+            .map(|chunk| chunk.to_vec())
+            .collect();
+        // A trailing group of one cannot merge alone. Folding it into the previous
+        // task can erase all parallelism (k=32, N=33 collapses to one 33-input task),
+        // so borrow one segment back instead, keeping both tasks within the bound.
+        // Only k=2 leaves no room to borrow and needs a task of three.
+        if chunks.len() > 1
+            && let Some(mut leftover) = chunks.pop_if(|task| task.len() == 1)
+        {
+            if segments_per_task >= 3 {
+                // A chunk produced by chunks() is never empty, so the previous
+                // task always has a segment to give back.
+                if let Some(borrowed) = chunks.last_mut().and_then(Vec::pop) {
+                    leftover.insert(0, borrowed);
+                }
+                chunks.push(leftover);
+            } else if let Some(previous_task) = chunks.last_mut() {
+                previous_task.extend(leftover);
+            } else {
+                // Unreachable: chunks.len() > 1 held before the pop above. Keep
+                // the leftover rather than dropping planned segments.
+                chunks.push(leftover);
+            }
+        }
+
+        let mut tasks = Vec::with_capacity(chunks.len());
+        let mut expected_coverage = RoaringBitmap::new();
+        for (task_id, chunk) in chunks.into_iter().enumerate() {
+            let mut sources = Vec::with_capacity(chunk.len());
+            for segment in &chunk {
+                let source = describe_merge_source(self, segment).await?;
+                expected_coverage.extend(source.fragment_ids.iter().copied());
+                sources.push(source);
+            }
+            tasks.push(IndexMergeTask {
+                contract_version: INDEX_MERGE_CONTRACT_VERSION,
+                plan_id,
+                task_id: task_id as u32,
+                sources,
+            });
+        }
+
+        Ok(IndexMergePlan {
+            contract_version: INDEX_MERGE_CONTRACT_VERSION,
+            plan_id,
+            index_name: index_name.to_owned(),
+            read_version: self.manifest.version,
+            fingerprint,
+            source_frontier,
+            expected_coverage: expected_coverage.into_iter().collect(),
+            tasks,
+        })
+    }
+
+    async fn execute_index_merge_task(
+        &self,
+        plan: &IndexMergePlan,
+        task_id: u32,
+    ) -> Result<IndexMergeResult> {
+        IndexMergePlan::check_contract_version(plan.contract_version, "index merge plan")?;
+        let task = plan.task(task_id)?;
+        IndexMergePlan::check_contract_version(task.contract_version, "index merge task")?;
+
+        // A worker is handed a plan, not a snapshot. Validating at whatever version
+        // this handle sits at could accept a source whose coverage was pruned after
+        // planning and then merge the pre-pruning contents anyway.
+        let pinned;
+        let snapshot = if self.manifest.version == plan.read_version {
+            self
+        } else {
+            pinned = self.checkout_version(plan.read_version).await?;
+            &pinned
+        };
+
+        let segments = resolve_merge_sources(snapshot, plan, task).await?;
+        let merged = snapshot.merge_existing_index_segments(segments).await?;
+        let details = merged.index_details.as_ref().ok_or_else(|| {
+            Error::internal(format!(
+                "index merge task {task_id} produced segment {} without index details",
+                merged.uuid
+            ))
+        })?;
+
+        Ok(IndexMergeResult {
+            contract_version: INDEX_MERGE_CONTRACT_VERSION,
+            plan_id: plan.plan_id,
+            task_id,
+            attempt_id: Uuid::new_v4(),
+            read_version: plan.read_version,
+            fingerprint: plan.fingerprint.clone(),
+            sources: task.sources.clone(),
+            output: IndexMergeOutput {
+                uuid: merged.uuid,
+                dataset_version: merged.dataset_version,
+                index_version: merged.index_version,
+                index_type_url: details.type_url.clone(),
+                index_details: details.value.clone(),
+                fragment_ids: segment_merge::fragment_ids(merged.fragment_bitmap.as_ref()),
+                files: merged
+                    .files
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .map(IndexMergeFile::from)
+                    .collect(),
+            },
+        })
+    }
+
+    async fn commit_index_merge_results(
+        &mut self,
+        plan: &IndexMergePlan,
+        results: Vec<IndexMergeResult>,
+    ) -> Result<()> {
+        IndexMergePlan::check_contract_version(plan.contract_version, "index merge plan")?;
+        for task in &plan.tasks {
+            IndexMergePlan::check_contract_version(task.contract_version, "index merge task")?;
+        }
+        plan.check_expected_coverage()?;
+        if results.is_empty() {
+            return Err(Error::invalid_input(
+                "commit_index_merge_results requires at least one merge result".to_owned(),
+            ));
+        }
+        for result in &results {
+            result.check_against(plan)?;
+        }
+
+        let (results, orphaned) = segment_merge::reconcile_attempts(results)?;
+        segment_merge::check_disjoint_outputs(&results)?;
+
+        // Refresh before validating. The natural flow plans and commits through one
+        // handle still sitting at the plan's read version, and a compare-and-swap
+        // against that snapshot would compare the plan with itself.
+        self.checkout_latest().await?;
+
+        // Every output id, losers included, must be globally fresh. Manifest
+        // construction drops any existing segment with a reused id, so a
+        // collision silently removes coverage from whichever index held it.
+        let live_segment_ids = self
+            .load_indices()
+            .await?
+            .iter()
+            .map(|segment| segment.uuid)
+            .collect::<HashSet<_>>();
+        segment_merge::check_output_identity(&results, &orphaned, &live_segment_ids)?;
+
+        // Compare-and-swap the exact source set. Re-deriving replacements from
+        // current coverage would let a merge planned at V republish entries an
+        // indexed-field Update invalidated at V+1, suppressing the flat fallback
+        // that should answer for that fragment.
+        let current = self.load_indices_by_name(&plan.index_name).await?;
+        let current_by_uuid = current
+            .iter()
+            .map(|segment| (segment.uuid, segment))
+            .collect::<HashMap<_, _>>();
+        let mut replaced = Vec::new();
+        let mut replaced_uuids = HashSet::new();
+        for result in &results {
+            let context = format!("commit_index_merge_results (task {})", result.task_id);
+            for source in &result.sources {
+                let Some(segment) = current_by_uuid.get(&source.uuid) else {
+                    return Err(Error::invalid_input(format!(
+                        "commit_index_merge_results: source segment {} of task {} of index \
+                         '{}' is no longer part of the index; a concurrent commit replaced \
+                         or pruned it, so this merge would republish stale entries. Re-plan \
+                         the merge.",
+                        source.uuid, result.task_id, plan.index_name
+                    )));
+                };
+                source.check(segment, &context)?;
+                plan.fingerprint.check(segment, &context)?;
+                if replaced_uuids.insert(source.uuid) {
+                    replaced.push((*segment).clone());
+                }
+            }
+        }
+
+        for result in &results {
+            let sources = result
+                .sources
+                .iter()
+                .map(|source| {
+                    current_by_uuid
+                        .get(&source.uuid)
+                        .map(|segment| (*segment).clone())
+                        .ok_or_else(|| {
+                            Error::invalid_input(format!(
+                                "commit_index_merge_results: source segment {} vanished \
+                                 during validation; re-plan the merge",
+                                source.uuid
+                            ))
+                        })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            validate_merge_output_files(self, &plan.index_name, result, &sources).await?;
+        }
+
+        let new_indices = results
+            .iter()
+            .map(|result| result.output_metadata(&plan.index_name))
+            .collect::<Vec<_>>();
+        validate_segment_metadata(&plan.index_name, &new_indices)?;
+        validate_segment_index_details(&plan.index_name, &new_indices)?;
+        for segment in &new_indices {
+            segment.validate_covering_fields()?;
+        }
+
+        // Segments outside this round keep answering for their own fragments. An output
+        // reaching into one of them would double-count rows, so refuse rather than let
+        // the merge silently widen.
+        let merged_coverage = new_indices
+            .iter()
+            .filter_map(|segment| segment.fragment_bitmap.as_ref())
+            .fold(RoaringBitmap::new(), |coverage, bitmap| coverage | bitmap);
+        for segment in &current {
+            if replaced_uuids.contains(&segment.uuid) {
+                continue;
+            }
+            if let Some(bitmap) = &segment.fragment_bitmap
+                && !bitmap.is_disjoint(&merged_coverage)
+            {
+                return Err(Error::invalid_input(format!(
+                    "commit_index_merge_results: merged segments would overlap untouched \
+                     segment {} of index '{}' on fragments {:?}; re-plan the merge",
+                    segment.uuid,
+                    plan.index_name,
+                    (bitmap & &merged_coverage).iter().collect::<Vec<_>>()
+                )));
+            }
+        }
+
+        // The plan's version is the content snapshot the merged data was read
+        // at, and MemWAL catch-up derives from the declared read version, so
+        // the refreshed coordinator version must not stand in for it. Same-name
+        // commits in the replayed window are not conflicts for this commit: the
+        // exact-source property waives that rule and re-proves safety instead.
+        let transaction = TransactionBuilder::new(
+            plan.read_version,
+            Operation::CreateIndex {
+                new_indices,
+                removed_indices: replaced,
+            },
+        )
+        .transaction_properties(Some(Arc::new(HashMap::from([(
+            segment_merge::EXACT_SOURCE_CAS_PROPERTY.to_owned(),
+            "true".to_owned(),
+        )]))))
+        .build();
+        self.apply_commit(transaction, &Default::default(), &Default::default())
+            .await?;
+
+        // Losing attempts' files stay in place. Their ids are worker input, so
+        // deleting by id could destroy a directory this commit never owned.
+        // Unreachable from any manifest, they are reclaimed by
+        // `cleanup_old_versions` like any other uncommitted index directory.
+        Ok(())
+    }
+
     async fn merge_existing_index_segments(
         &self,
         mut source_segments: Vec<IndexMetadata>,
@@ -1973,9 +3052,11 @@ impl DatasetIndexExt for Dataset {
         };
 
         let mut merged_segment = if all_vector {
+            let source_dirs = resolve_vector_source_dirs(self, &source_segments).await?;
             crate::index::vector::ivf::merge_segments(
                 self.object_store.as_ref(),
                 &self.indices_dir(),
+                &source_dirs,
                 source_segments,
             )
             .await?
@@ -3008,312 +4089,11 @@ impl DatasetIndexInternalExt for Dataset {
         uuid: &Uuid,
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn VectorIndex>> {
-        let frag_reuse_uuid = self.frag_reuse_index_uuid().await;
         let index_meta = self
             .load_index(uuid)
             .await?
             .ok_or_else(|| Error::index(format!("Index with id {} does not exist", uuid)))?;
-        let object_store = self.object_store_for_index(&index_meta).await?;
-
-        // Check sized cache first (v2+ indices with serializable state).
-        let state_key = IvfIndexStateCacheKey::new(uuid, frag_reuse_uuid.as_ref());
-        if let Some(entry) = self.index_cache.get_with_key(&state_key).await {
-            log::debug!("Found IvfIndexState in cache uuid: {}", uuid);
-            let partition_cache = self.index_cache.for_index(uuid, frag_reuse_uuid.as_ref());
-            let frag_reuse_index = self.open_frag_reuse_index(metrics).await?;
-            return entry
-                .0
-                .reconstruct(
-                    object_store,
-                    self.metadata_cache.as_ref(),
-                    partition_cache,
-                    frag_reuse_index,
-                )
-                .await;
-        }
-
-        // Fallback: in-memory cache for legacy indices.
-        let cache_key = LegacyVectorIndexCacheKey::new(uuid, frag_reuse_uuid.as_ref());
-        if let Some(cached) = self.index_cache.get_with_key(&cache_key).await {
-            return Ok(cached.0.clone());
-        }
-
-        let frag_reuse_index = self.open_frag_reuse_index(metrics).await?;
-        let index_dir = self.indice_files_dir(&index_meta)?;
-        let index_file = index_dir
-            .clone()
-            .join(uuid.to_string())
-            .join(INDEX_FILE_NAME);
-        let file_sizes = index_meta.file_size_map();
-        let reader: Arc<dyn Reader> = vector::open_index_file(
-            object_store.as_ref(),
-            &index_file,
-            INDEX_FILE_NAME,
-            &file_sizes,
-        )
-        .await?
-        .into();
-
-        let tailing_bytes = read_last_block(reader.as_ref()).await?;
-        let (major_version, minor_version) = read_version(&tailing_bytes)?;
-
-        // Namespace the index cache by the UUID of the index. v2+ partition
-        // entries are store-free and remain reusable across object-store
-        // generations alongside their serializable state.
-        let index_cache = self.index_cache.for_index(uuid, frag_reuse_uuid.as_ref());
-
-        // Extract the cacheable state before type-erasing to Arc<dyn VectorIndex>.
-        fn wrap_ivf<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
-            ivf: IVFIndex<S, Q>,
-        ) -> (Arc<dyn VectorIndex>, Option<IvfStateEntryBox>) {
-            let entry = ivf.to_state_entry();
-            (Arc::new(ivf), Some(entry))
-        }
-
-        // the index file is in lance format since version (0,2)
-        // TODO: we need to change the legacy IVF_PQ to be in lance format
-        let result: Result<(Arc<dyn VectorIndex>, Option<IvfStateEntryBox>)> = match (
-            major_version,
-            minor_version,
-        ) {
-            (0, 1) | (0, 0) => {
-                info!(target: TRACE_IO_EVENTS, index_uuid=%uuid, r#type=IO_TYPE_OPEN_VECTOR, version="0.1", index_type="IVF_PQ");
-                let proto = open_index_proto(reader.as_ref()).await?;
-                match &proto.implementation {
-                    Some(Implementation::VectorIndex(vector_index)) => {
-                        let dataset = Arc::new(self.clone());
-                        let idx = vector::open_vector_index(
-                            dataset,
-                            uuid,
-                            vector_index,
-                            reader,
-                            frag_reuse_index,
-                        )
-                        .await?;
-                        Ok((idx, None::<IvfStateEntryBox>))
-                    }
-                    None => Err(Error::internal(
-                        "Index proto was missing implementation field",
-                    )),
-                }
-            }
-
-            (0, 2) => {
-                info!(target: TRACE_IO_EVENTS, index_uuid=%uuid, r#type=IO_TYPE_OPEN_VECTOR, version="0.2", index_type="IVF_PQ");
-                let reader = V1FileReader::try_new_self_described_from_reader(
-                    reader.clone(),
-                    Some(&self.metadata_cache.file_metadata_cache(&index_file)),
-                )
-                .await?;
-                let idx = vector::open_vector_index_v2(
-                    Arc::new(self.clone()),
-                    column,
-                    uuid,
-                    reader,
-                    frag_reuse_index,
-                )
-                .await?;
-                Ok((idx, None::<IvfStateEntryBox>))
-            }
-
-            (0, 3) | (2, _) => {
-                let scheduler = ScanScheduler::new(
-                    object_store.clone(),
-                    SchedulerConfig::max_bandwidth(&object_store),
-                );
-                let cached_size = file_sizes
-                    .get(INDEX_FILE_NAME)
-                    .map(|&size| CachedFileSize::new(size))
-                    .unwrap_or_else(CachedFileSize::unknown);
-                let file = scheduler.open_file(&index_file, &cached_size).await?;
-                let reader = lance_file::reader::FileReader::try_open(
-                    file,
-                    None,
-                    Default::default(),
-                    &self.metadata_cache.file_metadata_cache(&index_file),
-                    FileReaderOptions::default(),
-                )
-                .await?;
-                let index_metadata = reader
-                    .schema()
-                    .metadata
-                    .get(INDEX_METADATA_SCHEMA_KEY)
-                    .ok_or(Error::index("Index Metadata not found".to_owned()))?;
-                let index_metadata: lance_index::IndexMetadata =
-                    serde_json::from_str(index_metadata)?;
-
-                // Resolve the column name and field
-                let (field_path, field) = resolve_index_column(self.schema(), &index_meta, column)?;
-
-                let (_, element_type) = get_vector_type(self.schema(), &field_path)?;
-
-                info!(target: TRACE_IO_EVENTS, index_uuid=%uuid, r#type=IO_TYPE_OPEN_VECTOR, version="0.3", index_type=index_metadata.index_type);
-
-                match index_metadata.index_type.as_str() {
-                    "IVF_FLAT" => match element_type {
-                        DataType::Float16 | DataType::Float32 | DataType::Float64 => {
-                            let ivf = IVFIndex::<FlatIndex, FlatQuantizer>::try_new(
-                                object_store.clone(),
-                                index_dir,
-                                uuid.to_owned(),
-                                frag_reuse_index,
-                                self.metadata_cache.as_ref(),
-                                index_cache,
-                                file_sizes,
-                            )
-                            .await?;
-                            Ok(wrap_ivf(ivf))
-                        }
-                        DataType::UInt8 => {
-                            let ivf = IVFIndex::<FlatIndex, FlatBinQuantizer>::try_new(
-                                object_store.clone(),
-                                index_dir,
-                                uuid.to_owned(),
-                                frag_reuse_index,
-                                self.metadata_cache.as_ref(),
-                                index_cache,
-                                file_sizes,
-                            )
-                            .await?;
-                            Ok(wrap_ivf(ivf))
-                        }
-                        _ => Err(Error::index(format!(
-                            "the field type {} is not supported for FLAT index",
-                            field.data_type()
-                        ))),
-                    },
-
-                    "IVF_PQ" => {
-                        let ivf = IVFIndex::<FlatIndex, ProductQuantizer>::try_new(
-                            object_store.clone(),
-                            index_dir,
-                            uuid.to_owned(),
-                            frag_reuse_index,
-                            self.metadata_cache.as_ref(),
-                            index_cache,
-                            file_sizes,
-                        )
-                        .await?;
-                        Ok(wrap_ivf(ivf))
-                    }
-
-                    "IVF_SQ" => {
-                        let ivf = IVFIndex::<FlatIndex, ScalarQuantizer>::try_new(
-                            object_store.clone(),
-                            index_dir,
-                            uuid.to_owned(),
-                            frag_reuse_index,
-                            self.metadata_cache.as_ref(),
-                            index_cache,
-                            file_sizes,
-                        )
-                        .await?;
-                        Ok(wrap_ivf(ivf))
-                    }
-
-                    "IVF_RQ" => {
-                        let ivf = IVFIndex::<FlatIndex, RabitQuantizer>::try_new(
-                            object_store.clone(),
-                            index_dir,
-                            uuid.to_owned(),
-                            frag_reuse_index,
-                            self.metadata_cache.as_ref(),
-                            index_cache,
-                            file_sizes,
-                        )
-                        .await?;
-                        Ok(wrap_ivf(ivf))
-                    }
-
-                    "IVF_HNSW_FLAT" => match element_type {
-                        DataType::UInt8 => {
-                            let ivf = IVFIndex::<HNSW, FlatBinQuantizer>::try_new(
-                                object_store.clone(),
-                                index_dir,
-                                uuid.to_owned(),
-                                frag_reuse_index,
-                                self.metadata_cache.as_ref(),
-                                index_cache,
-                                file_sizes,
-                            )
-                            .await?;
-                            Ok(wrap_ivf(ivf))
-                        }
-                        _ => {
-                            let ivf = IVFIndex::<HNSW, FlatQuantizer>::try_new(
-                                object_store.clone(),
-                                index_dir,
-                                uuid.to_owned(),
-                                frag_reuse_index,
-                                self.metadata_cache.as_ref(),
-                                index_cache,
-                                file_sizes,
-                            )
-                            .await?;
-                            Ok(wrap_ivf(ivf))
-                        }
-                    },
-
-                    "IVF_HNSW_SQ" => {
-                        let ivf = IVFIndex::<HNSW, ScalarQuantizer>::try_new(
-                            object_store.clone(),
-                            index_dir,
-                            uuid.to_owned(),
-                            frag_reuse_index,
-                            self.metadata_cache.as_ref(),
-                            index_cache,
-                            file_sizes,
-                        )
-                        .await?;
-                        Ok(wrap_ivf(ivf))
-                    }
-
-                    "IVF_HNSW_PQ" => {
-                        let ivf = IVFIndex::<HNSW, ProductQuantizer>::try_new(
-                            object_store.clone(),
-                            index_dir,
-                            uuid.to_owned(),
-                            frag_reuse_index,
-                            self.metadata_cache.as_ref(),
-                            index_cache,
-                            file_sizes,
-                        )
-                        .await?;
-                        Ok(wrap_ivf(ivf))
-                    }
-
-                    _ => Err(Error::index(format!(
-                        "Unsupported index type: {}",
-                        index_metadata.index_type
-                    ))),
-                }
-            }
-
-            _ => Err(Error::index(
-                "unsupported index version (maybe need to upgrade your lance version)".to_owned(),
-            )),
-        };
-        let (index, ivf_entry) = result?;
-        metrics.record_index_load();
-        // Attribute the one-time index-open I/O (file footers, IVF centroids,
-        // quantization metadata) to this query's metrics.  This runs only on a
-        // real open; cache hits return earlier, so a warm query reports zero
-        // index-open I/O.
-        if let Some(io_stats) = metrics.io_stats()
-            && let Some(open_stats) = index.open_io_stats()
-        {
-            io_stats.add_scan_stats(&open_stats);
-        }
-        if let Some(ivf_entry) = ivf_entry {
-            self.index_cache
-                .insert_with_key(&state_key, Arc::new(ivf_entry))
-                .await;
-        } else {
-            self.index_cache
-                .insert_with_key(&cache_key, Arc::new(CachedLegacyVectorIndex(index.clone())))
-                .await;
-        }
-        Ok(index)
+        open_vector_index_from_meta(self, column, &index_meta, metrics).await
     }
 
     async fn open_logical_vector_index(
@@ -3829,6 +4609,14 @@ mod tests {
             requests,
             ..Default::default()
         }
+    }
+
+    /// Segment ids of each planned task, in plan order.
+    fn planned_uuids(plan: &IndexMergePlan) -> Vec<Vec<Uuid>> {
+        plan.tasks
+            .iter()
+            .map(|task| task.sources.iter().map(|source| source.uuid).collect())
+            .collect()
     }
 
     fn segment_from_metadata(metadata: &IndexMetadata) -> IndexSegment {
@@ -8824,6 +9612,2286 @@ mod tests {
                 .all(|idx| idx.files.as_ref().is_some_and(|files| !files.is_empty())),
             "committed segment metadata should capture on-disk file info"
         );
+    }
+
+    #[tokio::test]
+    async fn test_plan_index_segment_merge_groups_segments() {
+        use lance_datagen::{BatchCount, RowCount, array};
+
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<arrow_array::types::Int32Type>())
+            .col(
+                "vector",
+                array::rand_vec::<arrow_array::types::Float32Type>(8.into()),
+            )
+            .into_reader_rows(RowCount::from(50), BatchCount::from(5));
+
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 10,
+                max_rows_per_group: 10,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let field_id = dataset.schema().field("vector").unwrap().id;
+        let mut segments = Vec::new();
+        for fragment_id in 0..5_u32 {
+            segments.push(
+                write_vector_segment_metadata(
+                    &dataset,
+                    "vector_idx",
+                    field_id,
+                    Uuid::new_v4(),
+                    [fragment_id],
+                    format!("seg{}", fragment_id).as_bytes(),
+                )
+                .await,
+            );
+        }
+        // Two commits so the last two segments are unambiguously the newest.
+        dataset
+            .commit_existing_index_segments(
+                "vector_idx",
+                "vector",
+                segments[..3]
+                    .iter()
+                    .map(segment_from_metadata)
+                    .collect::<Vec<_>>(),
+            )
+            .await
+            .unwrap();
+        dataset
+            .commit_existing_index_segments(
+                "vector_idx",
+                "vector",
+                segments[3..]
+                    .iter()
+                    .map(segment_from_metadata)
+                    .collect::<Vec<_>>(),
+            )
+            .await
+            .unwrap();
+
+        let plan = dataset
+            .plan_index_segment_merge("vector_idx", 2, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            planned_uuids(&plan)
+                .iter()
+                .map(Vec::len)
+                .collect::<Vec<_>>(),
+            vec![2, 3],
+            "a leftover group of one segment should fold into the previous task"
+        );
+        assert_eq!(plan.read_version, dataset.manifest.version);
+        assert_eq!(
+            plan.source_frontier.iter().copied().collect::<HashSet<_>>(),
+            segments
+                .iter()
+                .map(|segment| segment.uuid)
+                .collect::<HashSet<_>>(),
+            "the frontier should name every segment of the logical index"
+        );
+        assert_eq!(
+            planned_uuids(&plan)
+                .into_iter()
+                .flatten()
+                .collect::<HashSet<_>>(),
+            segments
+                .iter()
+                .map(|segment| segment.uuid)
+                .collect::<HashSet<_>>(),
+            "a full plan should cover every segment exactly once"
+        );
+        assert_eq!(
+            plan.expected_coverage,
+            (0..5_u32).collect::<Vec<_>>(),
+            "the plan should pin the coverage it was built against"
+        );
+
+        let newest_two = dataset
+            .plan_index_segment_merge("vector_idx", 2, Some(2))
+            .await
+            .unwrap();
+        assert_eq!(newest_two.tasks.len(), 1);
+        assert_eq!(
+            planned_uuids(&newest_two)[0]
+                .iter()
+                .copied()
+                .collect::<HashSet<_>>(),
+            segments[3..]
+                .iter()
+                .map(|segment| segment.uuid)
+                .collect::<HashSet<_>>(),
+            "max_segments_to_merge should take the newest segments"
+        );
+
+        assert!(
+            dataset
+                .plan_index_segment_merge("vector_idx", 2, Some(1))
+                .await
+                .unwrap()
+                .tasks
+                .is_empty(),
+            "fewer than two qualifying segments should produce an empty plan"
+        );
+        assert!(
+            dataset
+                .plan_index_segment_merge("vector_idx", 2, Some(0))
+                .await
+                .unwrap()
+                .tasks
+                .is_empty(),
+            "a zero bound should plan nothing, mirroring OptimizeOptions::append"
+        );
+
+        let wider_plan = dataset
+            .plan_index_segment_merge("vector_idx", 3, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            planned_uuids(&wider_plan)
+                .iter()
+                .map(Vec::len)
+                .collect::<Vec<_>>(),
+            vec![3, 2],
+            "a trailing group of two should not fold"
+        );
+
+        let err = dataset
+            .plan_index_segment_merge("vector_idx", 1, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "segments_per_task below 2 should be invalid input, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("segments_per_task >= 2"),
+            "unexpected error: {err}"
+        );
+
+        let err = dataset
+            .plan_index_segment_merge("missing_idx", 2, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::IndexNotFound { .. }),
+            "unknown index name should be not found, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("missing_idx"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// The distributed contract admits results through vector specific checks,
+    /// so planning must reject any other index family instead of producing
+    /// tasks whose outputs those checks never see.
+    #[tokio::test]
+    async fn test_plan_index_segment_merge_rejects_non_vector_index() {
+        use lance_datagen::{BatchCount, RowCount, array};
+        use lance_index::scalar::ScalarIndexParams;
+
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<arrow_array::types::Int32Type>())
+            .into_reader_rows(RowCount::from(50), BatchCount::from(2));
+        let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::BTree,
+                Some("id_idx".to_string()),
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+
+        let error = dataset
+            .plan_index_segment_merge("id_idx", 2, None)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("supports vector indexes"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// A leftover singleton must not collapse the plan's parallelism. For k>=3 the
+    /// planner borrows one segment back from the previous task, keeping both tasks
+    /// within the bound. Only k=2 has nothing to borrow and must emit a task of three.
+    #[tokio::test]
+    async fn test_plan_index_segment_merge_preserves_parallelism_on_leftover() {
+        use lance_datagen::{BatchCount, RowCount, array};
+
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<arrow_array::types::Int32Type>())
+            .col(
+                "vector",
+                array::rand_vec::<arrow_array::types::Float32Type>(8.into()),
+            )
+            .into_reader_rows(RowCount::from(50), BatchCount::from(5));
+
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 10,
+                max_rows_per_group: 10,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let field_id = dataset.schema().field("vector").unwrap().id;
+        let mut segments = Vec::new();
+        for fragment_id in 0..5_u32 {
+            segments.push(
+                write_vector_segment_metadata(
+                    &dataset,
+                    "vector_idx",
+                    field_id,
+                    Uuid::new_v4(),
+                    [fragment_id],
+                    format!("seg{}", fragment_id).as_bytes(),
+                )
+                .await,
+            );
+        }
+        dataset
+            .commit_existing_index_segments(
+                "vector_idx",
+                "vector",
+                segments
+                    .iter()
+                    .map(segment_from_metadata)
+                    .collect::<Vec<_>>(),
+            )
+            .await
+            .unwrap();
+
+        // N=5, k=4 chunks to [4, 1]. Borrowing one back yields [3, 2]: two mergeable
+        // tasks, neither above the bound. Folding would have produced a single [5].
+        let plan_k4 = dataset
+            .plan_index_segment_merge("vector_idx", 4, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            planned_uuids(&plan_k4)
+                .iter()
+                .map(Vec::len)
+                .collect::<Vec<_>>(),
+            vec![3, 2],
+            "a leftover singleton must borrow from the previous task, not collapse it"
+        );
+
+        // N=5, k=3 chunks to [3, 2] with no leftover, so nothing is redistributed.
+        let plan_k3 = dataset
+            .plan_index_segment_merge("vector_idx", 3, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            planned_uuids(&plan_k3)
+                .iter()
+                .map(Vec::len)
+                .collect::<Vec<_>>(),
+            vec![3, 2]
+        );
+
+        // k=2 is the one case with nothing to borrow: [2, 2, 1] must fold to [2, 3].
+        let plan_k2 = dataset
+            .plan_index_segment_merge("vector_idx", 2, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            planned_uuids(&plan_k2)
+                .iter()
+                .map(Vec::len)
+                .collect::<Vec<_>>(),
+            vec![2, 3],
+            "k=2 leaves no room to borrow, so a three-input task is expected"
+        );
+
+        // Whatever the shape, every segment must appear exactly once.
+        for plan in [&plan_k4, &plan_k3, &plan_k2] {
+            let uuids = planned_uuids(plan)
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
+            assert_eq!(
+                uuids.iter().copied().collect::<HashSet<_>>(),
+                segments
+                    .iter()
+                    .map(|segment| segment.uuid)
+                    .collect::<HashSet<_>>(),
+            );
+            assert_eq!(uuids.len(), segments.len());
+        }
+    }
+
+    /// A legacy manifest can hold a segment without fragment coverage, and
+    /// planning must reject it up front, or workers would finish a round the
+    /// commit must then refuse.
+    #[tokio::test]
+    async fn test_plan_index_segment_merge_rejects_legacy_manifest_without_coverage() {
+        use crate::dataset::{ManifestWriteConfig, write_manifest_file};
+
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let mut dataset = write_merge_test_dataset(test_uri, 2, false).await;
+        let field_id = dataset.schema().field("vector").unwrap().id;
+        let old = write_vector_segment_metadata(
+            &dataset,
+            "vector_idx",
+            field_id,
+            Uuid::new_v4(),
+            [0_u32],
+            b"old",
+        )
+        .await;
+        let new = write_vector_segment_metadata(
+            &dataset,
+            "vector_idx",
+            field_id,
+            Uuid::new_v4(),
+            [1_u32],
+            b"new",
+        )
+        .await;
+        dataset
+            .commit_existing_index_segments(
+                "vector_idx",
+                "vector",
+                vec![segment_from_metadata(&old), segment_from_metadata(&new)],
+            )
+            .await
+            .unwrap();
+
+        // Strip the oldest segment's coverage and publish the manifest
+        // directly at the next version with no transaction file, as a very
+        // old Lance writer left it. Commits cannot produce this state because
+        // `migrate_indices` recalculates any missing bitmap.
+        let mut indices = dataset.load_indices_by_name("vector_idx").await.unwrap();
+        indices
+            .iter_mut()
+            .find(|segment| segment.uuid == old.uuid)
+            .unwrap()
+            .fragment_bitmap = None;
+        let mut manifest = (*dataset.manifest).clone();
+        manifest.version += 1;
+        write_manifest_file(
+            dataset.object_store.as_ref(),
+            dataset.commit_handler.as_ref(),
+            &dataset.base,
+            &mut manifest,
+            Some(indices),
+            &ManifestWriteConfig::default(),
+            dataset.manifest_location.naming_scheme,
+            None,
+        )
+        .await
+        .unwrap();
+        dataset.checkout_latest().await.unwrap();
+        let ordered = dataset.load_indices_by_name("vector_idx").await.unwrap();
+        assert_eq!(
+            ordered.last().unwrap().uuid,
+            new.uuid,
+            "the intact segment must be the newest, or Some(1) would select the stripped one and this test pins nothing"
+        );
+
+        // The bound selects only the intact newest segment, yet planning must
+        // still fail: the guard runs over the whole set before the bound. If
+        // the guard were missing or ran after the bound, this call would
+        // return an empty plan instead of an error.
+        let err = dataset
+            .plan_index_segment_merge("vector_idx", 2, Some(1))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("has no fragment coverage"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// The planner skips segments with no effective coverage. The companion
+    /// rejection of a `None` bitmap cannot be built through a commit, because
+    /// `migrate_indices` backfills missing bitmaps. It needs a raw manifest
+    /// write and lives in
+    /// `test_plan_index_segment_merge_rejects_legacy_manifest_without_coverage`.
+    #[tokio::test]
+    async fn test_plan_index_segment_merge_coverage_edge_cases() {
+        use crate::dataset::transaction::{Operation, Transaction};
+        use lance_datagen::{BatchCount, RowCount, array};
+
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<arrow_array::types::Int32Type>())
+            .col(
+                "vector",
+                array::rand_vec::<arrow_array::types::Float32Type>(8.into()),
+            )
+            .into_reader_rows(RowCount::from(30), BatchCount::from(3));
+
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 10,
+                max_rows_per_group: 10,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let field_id = dataset.schema().field("vector").unwrap().id;
+        let seg0 = write_vector_segment_metadata(
+            &dataset,
+            "vector_idx",
+            field_id,
+            Uuid::new_v4(),
+            [0_u32],
+            b"seg0",
+        )
+        .await;
+        let seg1 = write_vector_segment_metadata(
+            &dataset,
+            "vector_idx",
+            field_id,
+            Uuid::new_v4(),
+            [1_u32],
+            b"seg1",
+        )
+        .await;
+        let deferred = write_vector_segment_metadata(
+            &dataset,
+            "vector_idx",
+            field_id,
+            Uuid::new_v4(),
+            [],
+            b"deferred",
+        )
+        .await;
+        // Dormant: a non-empty bitmap naming only a fragment the dataset no longer
+        // has. Filtering on the raw bitmap would plan this segment and resurrect
+        // stale vectors, only `effective_fragment_bitmap` sees it covers nothing.
+        let dormant = write_vector_segment_metadata(
+            &dataset,
+            "vector_idx",
+            field_id,
+            Uuid::new_v4(),
+            [9_999_u32],
+            b"dormant",
+        )
+        .await;
+        assert!(
+            dormant
+                .fragment_bitmap
+                .as_ref()
+                .is_some_and(|bitmap| !bitmap.is_empty()),
+            "the dormant segment must have a non-empty RAW bitmap, or it would be \
+             indistinguishable from the deferred case and prove nothing"
+        );
+
+        let transaction = Transaction::new(
+            dataset.manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![seg0.clone(), seg1.clone(), deferred, dormant.clone()],
+                removed_indices: vec![],
+            },
+            None,
+        );
+        dataset
+            .apply_commit(transaction, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+
+        let plan = dataset
+            .plan_index_segment_merge("vector_idx", 2, None)
+            .await
+            .unwrap();
+        assert_eq!(plan.tasks.len(), 1);
+        assert_eq!(
+            planned_uuids(&plan)[0]
+                .iter()
+                .copied()
+                .collect::<HashSet<_>>(),
+            HashSet::from([seg0.uuid, seg1.uuid]),
+            "segments with no effective coverage should be skipped"
+        );
+        assert!(
+            !planned_uuids(&plan)
+                .into_iter()
+                .flatten()
+                .any(|uuid| uuid == dormant.uuid),
+            "a segment whose coverage names only removed fragments must never be planned"
+        );
+        assert!(
+            plan.source_frontier.contains(&dormant.uuid),
+            "the frontier records every segment, dormant ones included, so a caller can \
+             tell a stale plan from a fresh one"
+        );
+
+        // Looping over a plan that has nothing to do is the natural caller
+        // mistake, so asking for a task it does not have must say exactly that.
+        let empty_plan = dataset
+            .plan_index_segment_merge("vector_idx", 2, Some(1))
+            .await
+            .unwrap();
+        assert!(empty_plan.tasks.is_empty());
+        let err = dataset
+            .execute_index_merge_task(&empty_plan, 0)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("has no task 0 (it has 0 tasks)"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// A dataset with `fragments` single-row-group fragments, an `id` column and
+    /// an 8-dimensional `vector` column.
+    async fn write_merge_test_dataset(uri: &str, fragments: u64, stable_row_ids: bool) -> Dataset {
+        use lance_datagen::{BatchCount, RowCount, array};
+
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<arrow_array::types::Int32Type>())
+            .col(
+                "vector",
+                array::rand_vec::<arrow_array::types::Float32Type>(8.into()),
+            )
+            .into_reader_rows(RowCount::from(10 * fragments), BatchCount::from(1));
+
+        Dataset::write(
+            reader,
+            uri,
+            Some(WriteParams {
+                max_rows_per_file: 10,
+                max_rows_per_group: 10,
+                enable_stable_row_ids: stable_row_ids,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// Which parts of a fabricated merge output exist on the store.
+    #[derive(Clone, Copy)]
+    enum StubShape {
+        /// Index file with the vector header plus a parseable auxiliary file.
+        Complete,
+        /// Index file without the vector header, auxiliary file present.
+        HeaderlessIndex,
+        /// Index file with a forged header and no auxiliary file.
+        ForgedHeaderOnly,
+        /// Auxiliary file only, no index file at all.
+        AuxOnly,
+    }
+
+    /// Write a fabricated merge output and return its reported file list.
+    ///
+    /// Every shape is rejected by the commit: it opens each winner through the
+    /// production vector index reader, which no metadata fabrication survives.
+    /// Tests whose commit must succeed use [`DatasetIndexExt::execute_index_merge_task`].
+    async fn write_stub_output_shape(
+        dataset: &Dataset,
+        output_uuid: Uuid,
+        shape: StubShape,
+    ) -> Vec<IndexMergeFile> {
+        use lance_file::version::ConcreteFileVersion;
+        use lance_file::writer::FileWriterOptions;
+        use lance_index::vector::DISTANCE_TYPE_KEY;
+        use lance_index::vector::ivf::storage::IVF_METADATA_KEY;
+        use prost::Message;
+
+        let dir = dataset.indices_dir().join(output_uuid.to_string());
+        let arrow_schema = Schema::new(vec![Field::new("stub", DataType::Int32, false)]);
+        let batch = RecordBatch::try_new(
+            Arc::new(arrow_schema.clone()),
+            vec![Arc::new(Int32Array::from(vec![1]))],
+        )
+        .unwrap();
+        let lance_schema = lance_core::datatypes::Schema::try_from(&arrow_schema).unwrap();
+
+        let mut files = Vec::new();
+        if !matches!(shape, StubShape::AuxOnly) {
+            let index_path = dir.clone().join(INDEX_FILE_NAME);
+            let writer = dataset.object_store.create(&index_path).await.unwrap();
+            let mut file_writer = lance_file::versions::create_writer(
+                ConcreteFileVersion::V2_1,
+                writer,
+                lance_schema.clone(),
+                FileWriterOptions::default(),
+            )
+            .unwrap();
+            file_writer.write_batch(&batch).await.unwrap();
+            if !matches!(shape, StubShape::HeaderlessIndex) {
+                file_writer.add_schema_metadata(
+                    INDEX_METADATA_SCHEMA_KEY,
+                    serde_json::to_string(&lance_index::IndexMetadata {
+                        index_type: "IVF_FLAT".to_owned(),
+                        distance_type: "l2".to_owned(),
+                    })
+                    .unwrap(),
+                );
+            }
+            file_writer.finish().await.unwrap();
+            files.push(IndexMergeFile {
+                path: INDEX_FILE_NAME.to_string(),
+                size_bytes: dataset.object_store.size(&index_path).await.unwrap(),
+            });
+        }
+
+        if !matches!(shape, StubShape::ForgedHeaderOnly) {
+            let aux_path = dir.join(lance_index::INDEX_AUXILIARY_FILE_NAME);
+            let writer = dataset.object_store.create(&aux_path).await.unwrap();
+            let mut aux_writer = lance_file::versions::create_writer(
+                ConcreteFileVersion::V2_1,
+                writer,
+                lance_schema,
+                FileWriterOptions::default(),
+            )
+            .unwrap();
+            aux_writer.write_batch(&batch).await.unwrap();
+            aux_writer.add_schema_metadata(DISTANCE_TYPE_KEY, "l2");
+            let ivf_pos = aux_writer
+                .add_global_buffer(
+                    lance_index::pb::Ivf {
+                        lengths: vec![1],
+                        ..Default::default()
+                    }
+                    .encode_to_vec()
+                    .into(),
+                )
+                .await
+                .unwrap();
+            aux_writer.add_schema_metadata(IVF_METADATA_KEY, ivf_pos.to_string());
+            aux_writer.finish().await.unwrap();
+            files.push(IndexMergeFile {
+                path: lance_index::INDEX_AUXILIARY_FILE_NAME.to_string(),
+                size_bytes: dataset.object_store.size(&aux_path).await.unwrap(),
+            });
+        }
+        files.sort_by(|a, b| a.path.cmp(&b.path));
+        files
+    }
+
+    /// The richest fabrication shape, for tests rejected before file checks.
+    async fn write_stub_output_file(dataset: &Dataset, output_uuid: Uuid) -> Vec<IndexMergeFile> {
+        write_stub_output_shape(dataset, output_uuid, StubShape::Complete).await
+    }
+
+    /// Report shape for stubs the commit rejects before file verification.
+    fn unwritten_stub_files() -> Vec<IndexMergeFile> {
+        vec![IndexMergeFile {
+            path: INDEX_FILE_NAME.to_string(),
+            size_bytes: 0,
+        }]
+    }
+
+    /// A worker report for `task_id` that never ran a merge, for tests the
+    /// commit rejects before or during file verification.
+    fn stub_merge_result(
+        plan: &IndexMergePlan,
+        task_id: u32,
+        output_uuid: Uuid,
+        output_files: Vec<IndexMergeFile>,
+        attempt_id: Uuid,
+    ) -> IndexMergeResult {
+        let task = plan.task(task_id).unwrap();
+        IndexMergeResult {
+            contract_version: INDEX_MERGE_CONTRACT_VERSION,
+            plan_id: plan.plan_id,
+            task_id,
+            attempt_id,
+            read_version: plan.read_version,
+            fingerprint: plan.fingerprint.clone(),
+            sources: task.sources.clone(),
+            output: IndexMergeOutput {
+                uuid: output_uuid,
+                dataset_version: task
+                    .sources
+                    .iter()
+                    .map(|source| source.dataset_version)
+                    .min()
+                    .unwrap_or(plan.read_version),
+                index_version: plan.fingerprint.index_version,
+                index_type_url: plan.fingerprint.index_type_url.clone(),
+                index_details: vector_index_details_default().value,
+                fragment_ids: task.coverage(),
+                files: output_files,
+            },
+        }
+    }
+
+    /// How a concurrent writer invalidates entries a planned merge would
+    /// republish. Both shapes prune index coverage for the mutated fragment.
+    #[derive(Debug, Clone, Copy)]
+    enum ConcurrentMutation {
+        /// `Operation::Update` naming the indexed field in `fields_modified`.
+        IndexedFieldUpdate,
+        /// `Operation::Merge` rewriting the indexed field's backing file in place.
+        InPlaceMerge,
+    }
+
+    /// Apply `mutation` to fragment 0, invalidating the indexed column there.
+    async fn apply_concurrent_mutation(
+        dataset: &mut Dataset,
+        mutation: ConcurrentMutation,
+        field_id: i32,
+    ) {
+        use crate::dataset::transaction::{Operation, Transaction};
+
+        let fragments = dataset
+            .get_fragments()
+            .iter()
+            .map(|fragment| fragment.metadata().clone())
+            .collect::<Vec<_>>();
+        let operation = match mutation {
+            ConcurrentMutation::IndexedFieldUpdate => Operation::Update {
+                removed_fragment_ids: vec![],
+                updated_fragments: vec![fragments[0].clone()],
+                new_fragments: vec![],
+                fields_modified: vec![field_id as u32],
+                compacted_sstables: vec![],
+                fields_for_preserving_frag_bitmap: vec![],
+                update_mode: None,
+                inserted_rows_filter: None,
+                updated_fragment_offsets: None,
+            },
+            ConcurrentMutation::InPlaceMerge => {
+                let mut rewritten = fragments.clone();
+                for file in &mut rewritten[0].files {
+                    // A rewritten backing file is exactly what
+                    // `prune_merge_rewritten_fields_from_indices` looks for.
+                    file.path = format!("rewritten-{}", file.path);
+                }
+                Operation::Merge {
+                    fragments: rewritten,
+                    schema: dataset.schema().clone(),
+                    preserves_nullability: true,
+                }
+            }
+        };
+        let transaction = Transaction::new(dataset.manifest.version, operation, None);
+        dataset
+            .apply_commit(transaction, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+    }
+
+    /// A merge planned at version V must not be publishable after a concurrent
+    /// writer invalidates a source: `CreateIndex` does not prune coverage, so the
+    /// stale segment would suppress the flat fallback and silently serve
+    /// pre-mutation vectors. The `stale_handle` variant only fails because the
+    /// commit refreshes to the live manifest before its compare-and-swap.
+    #[rstest]
+    #[case::update_drops_source(
+        ConcurrentMutation::IndexedFieldUpdate,
+        vec![0_u32],
+        "is no longer part of the index"
+    )]
+    #[case::update_prunes_source_coverage(
+        ConcurrentMutation::IndexedFieldUpdate,
+        vec![0_u32, 1_u32],
+        "now covers"
+    )]
+    #[case::in_place_merge_prunes_source_coverage(
+        ConcurrentMutation::InPlaceMerge,
+        vec![0_u32, 1_u32],
+        "now covers"
+    )]
+    #[tokio::test]
+    async fn test_commit_index_merge_results_rejects_concurrent_indexed_field_mutation(
+        #[case] mutation: ConcurrentMutation,
+        #[case] first_source_coverage: Vec<u32>,
+        #[case] expected_message: &str,
+        #[values(false, true)] stale_handle: bool,
+    ) {
+        let test_dir = tempfile::tempdir().unwrap();
+        let mut dataset =
+            write_merge_test_dataset(test_dir.path().to_str().unwrap(), 3, false).await;
+        let field_id = dataset.schema().field("vector").unwrap().id;
+
+        let first = write_vector_segment_metadata(
+            &dataset,
+            "vector_idx",
+            field_id,
+            Uuid::new_v4(),
+            first_source_coverage.clone(),
+            b"first",
+        )
+        .await;
+        let second = write_vector_segment_metadata(
+            &dataset,
+            "vector_idx",
+            field_id,
+            Uuid::new_v4(),
+            [2_u32],
+            b"second",
+        )
+        .await;
+        dataset
+            .commit_existing_index_segments(
+                "vector_idx",
+                "vector",
+                vec![
+                    segment_from_metadata(&first),
+                    segment_from_metadata(&second),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let plan = dataset
+            .plan_index_segment_merge("vector_idx", 2, None)
+            .await
+            .unwrap();
+        assert_eq!(plan.tasks.len(), 1);
+        let result = stub_merge_result(
+            &plan,
+            0,
+            Uuid::new_v4(),
+            unwritten_stub_files(),
+            Uuid::new_v4(),
+        );
+
+        if stale_handle {
+            let mut writer = dataset.clone();
+            apply_concurrent_mutation(&mut writer, mutation, field_id).await;
+        } else {
+            apply_concurrent_mutation(&mut dataset, mutation, field_id).await;
+        }
+
+        let err = dataset
+            .commit_index_merge_results(&plan, vec![result])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "a stale source frontier should be invalid input, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains(expected_message),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.to_string().contains("Re-plan the merge"),
+            "the error must tell the caller to re-plan, got: {err}"
+        );
+
+        // The index must be left exactly as the mutation left it. A merged
+        // segment slipping in here is the bug this test exists for.
+        let after = dataset.load_indices_by_name("vector_idx").await.unwrap();
+        assert!(
+            after
+                .iter()
+                .all(|segment| segment.uuid == first.uuid || segment.uuid == second.uuid),
+            "the rejected merge must not have published a segment"
+        );
+    }
+
+    /// The same round replayed twice, plus one worker that never reported.
+    ///
+    /// Duplicate attempts reconcile to the lowest attempt id, so any replay
+    /// publishes the same segment, losing files stay for manifest-aware
+    /// cleanup, and reported tasks commit without waiting for the missing one.
+    #[tokio::test]
+    async fn test_commit_index_merge_results_reconciles_attempts_and_commits_partial_round() {
+        let test_dir = tempfile::tempdir().unwrap();
+        let (mut dataset, segments) =
+            write_committed_segment_fixture(test_dir.path().to_str().unwrap(), 4).await;
+
+        let plan = dataset
+            .plan_index_segment_merge("vector_idx", 2, None)
+            .await
+            .unwrap();
+        assert_eq!(plan.tasks.len(), 2);
+
+        // Two real attempts of task 0, reported out of order. Task 1's worker
+        // died. The lowest attempt id wins, so compute which attempt that is.
+        let first = dataset.execute_index_merge_task(&plan, 0).await.unwrap();
+        let second = dataset.execute_index_merge_task(&plan, 0).await.unwrap();
+        let (winner, loser) = if first.attempt_id < second.attempt_id {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        let winning_output = winner.output.uuid;
+        let losing_output = loser.output.uuid;
+        let results = vec![loser, winner];
+
+        dataset
+            .commit_index_merge_results(&plan, results)
+            .await
+            .unwrap();
+
+        let after = dataset.load_indices_by_name("vector_idx").await.unwrap();
+        let after_uuids = after
+            .iter()
+            .map(|segment| segment.uuid)
+            .collect::<HashSet<_>>();
+        assert!(
+            after_uuids.contains(&winning_output),
+            "the lowest attempt id must win, deterministically"
+        );
+        assert!(
+            !after_uuids.contains(&losing_output),
+            "only one attempt of a task may be published"
+        );
+        assert_eq!(
+            after_uuids.len(),
+            3,
+            "task 0's two sources are replaced by one segment and task 1's two sources \
+             stay untouched, so a partial round leaves three segments"
+        );
+        for segment in &segments[2..] {
+            assert!(
+                after_uuids.contains(&segment.uuid),
+                "the tasks that did not report must keep their sources"
+            );
+        }
+
+        // Loser ids are worker input with no ownership proof, so the commit
+        // must not delete by id. The unreferenced directory is left for
+        // `cleanup_old_versions` to reclaim.
+        assert!(
+            dataset
+                .object_store
+                .exists(
+                    &dataset
+                        .indices_dir()
+                        .join(losing_output.to_string())
+                        .join(INDEX_FILE_NAME)
+                )
+                .await
+                .unwrap(),
+            "the commit must not delete the losing attempt's files"
+        );
+        assert!(
+            dataset
+                .object_store
+                .exists(
+                    &dataset
+                        .indices_dir()
+                        .join(winning_output.to_string())
+                        .join(INDEX_FILE_NAME)
+                )
+                .await
+                .unwrap(),
+            "the published segment's files must survive"
+        );
+
+        // The dead worker reports late against the same plan and commits as a
+        // second batch. The replay of the first batch's CreateIndex is not a
+        // conflict because the exact-source property waives the same-name rule
+        // and the finish step re-proves the batch's sources instead.
+        let late = dataset.execute_index_merge_task(&plan, 1).await.unwrap();
+        let late_output = late.output.uuid;
+        dataset
+            .commit_index_merge_results(&plan, vec![late])
+            .await
+            .unwrap();
+        let after = dataset.load_indices_by_name("vector_idx").await.unwrap();
+        let after_uuids = after
+            .iter()
+            .map(|segment| segment.uuid)
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            after_uuids,
+            [winning_output, late_output]
+                .into_iter()
+                .collect::<HashSet<_>>(),
+            "both batches of one round must end up published"
+        );
+    }
+
+    /// One committed single-fragment segment per fragment, the shape the
+    /// identity and verification regressions below start from.
+    async fn write_committed_segment_fixture(
+        uri: &str,
+        fragments: u32,
+    ) -> (Dataset, Vec<IndexMetadata>) {
+        write_committed_segment_fixture_rows(uri, fragments, false).await
+    }
+
+    /// The committed segment fixture with a caller-chosen row id mode, since
+    /// commit validation must accept genuine merges in both modes.
+    async fn write_committed_segment_fixture_rows(
+        uri: &str,
+        fragments: u32,
+        stable_row_ids: bool,
+    ) -> (Dataset, Vec<IndexMetadata>) {
+        use crate::index::vector::VectorIndexParams;
+        use lance_index::vector::ivf::IvfBuildParams;
+
+        let mut dataset = write_merge_test_dataset(uri, fragments as u64, stable_row_ids).await;
+        // One shared zero centroid keeps independently built shards merge
+        // compatible without kmeans nondeterminism.
+        let centroids = Arc::new(
+            FixedSizeListArray::try_new_from_values(Float32Array::from(vec![0.0f32; 8]), 8)
+                .unwrap(),
+        );
+        let ivf_params = IvfBuildParams::try_with_centroids(1, centroids).unwrap();
+        let params = VectorIndexParams::with_ivf_flat_params(
+            lance_linalg::distance::MetricType::L2,
+            ivf_params,
+        );
+        let mut segments = Vec::new();
+        for fragment_id in 0..fragments {
+            let mut builder = dataset.create_index_builder(&["vector"], IndexType::Vector, &params);
+            builder = builder
+                .name("vector_idx".to_string())
+                .fragments(vec![fragment_id]);
+            segments.push(builder.execute_uncommitted().await.unwrap());
+        }
+        dataset
+            .commit_existing_index_segments(
+                "vector_idx",
+                "vector",
+                segments
+                    .iter()
+                    .map(segment_from_metadata)
+                    .collect::<Vec<_>>(),
+            )
+            .await
+            .unwrap();
+        (dataset, segments)
+    }
+
+    /// A same-name index commit touching none of the planned sources must not
+    /// fail the round. Delta segments land continuously while workers merge, and
+    /// the compare-and-swap proves them compatible: the exact-source property
+    /// waives the resolver's same-index-name rule that would brick the round.
+    /// The transaction must still declare the plan's version, the content
+    /// snapshot MemWAL catch-up derives from.
+    #[tokio::test]
+    async fn test_commit_index_merge_results_survives_unrelated_same_name_commit() {
+        let test_dir = tempfile::tempdir().unwrap();
+        let (mut dataset, segments) =
+            write_committed_segment_fixture(test_dir.path().to_str().unwrap(), 4).await;
+        let field_id = dataset.schema().field("vector").unwrap().id;
+
+        // Plan only the newest two segments, leaving the oldest two available
+        // for a concurrent writer.
+        let plan = dataset
+            .plan_index_segment_merge("vector_idx", 2, Some(2))
+            .await
+            .unwrap();
+        assert_eq!(plan.tasks.len(), 1);
+        let planned = plan
+            .task(0)
+            .unwrap()
+            .sources
+            .iter()
+            .map(|source| source.uuid)
+            .collect::<HashSet<_>>();
+        assert!(!planned.contains(&segments[0].uuid));
+        assert!(!planned.contains(&segments[1].uuid));
+
+        // While workers run, another writer folds the two unplanned segments
+        // into one, a same-name CreateIndex that touches no planned source.
+        let combined = write_vector_segment_metadata(
+            &dataset,
+            "vector_idx",
+            field_id,
+            Uuid::new_v4(),
+            [0_u32, 1_u32],
+            b"combined",
+        )
+        .await;
+        dataset
+            .commit_existing_index_segments(
+                "vector_idx",
+                "vector",
+                vec![segment_from_metadata(&combined)],
+            )
+            .await
+            .unwrap();
+
+        let result = dataset.execute_index_merge_task(&plan, 0).await.unwrap();
+        let output = result.output.uuid;
+        dataset
+            .commit_index_merge_results(&plan, vec![result])
+            .await
+            .unwrap();
+
+        let after = dataset.load_indices_by_name("vector_idx").await.unwrap();
+        let after_uuids = after
+            .iter()
+            .map(|segment| segment.uuid)
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            after_uuids,
+            [combined.uuid, output].into_iter().collect::<HashSet<_>>(),
+            "the concurrent delta and the merged round must both survive"
+        );
+        let coverage = after
+            .iter()
+            .filter_map(|segment| segment.fragment_bitmap.as_ref())
+            .fold(RoaringBitmap::new(), |coverage, bitmap| coverage | bitmap);
+        assert_eq!(
+            coverage.iter().collect::<Vec<_>>(),
+            vec![0, 1, 2, 3],
+            "index coverage must stay complete"
+        );
+
+        let committed = dataset.read_transaction().await.unwrap().unwrap();
+        assert_eq!(
+            committed.read_version, plan.read_version,
+            "the commit must declare the plan's content snapshot, which MemWAL \
+             catch-up derives generations from"
+        );
+    }
+
+    /// A decodable but generic Lance table must not replace readable sources.
+    ///
+    /// A missing vector index header fails the production open at query time,
+    /// and a header alone is a forgeable string, so the commit must also parse
+    /// the segment the way the merge reads a shard. Both fabrications are
+    /// rejected before publication.
+    #[rstest]
+    #[case::headerless(
+        StubShape::HeaderlessIndex,
+        "does not open as its declared vector index"
+    )]
+    #[case::forged_header_without_index_content(
+        StubShape::ForgedHeaderOnly,
+        "does not open as its declared vector index"
+    )]
+    #[case::forged_header_and_auxiliary(
+        StubShape::Complete,
+        "does not open as its declared vector index"
+    )]
+    #[case::auxiliary_only(StubShape::AuxOnly, "reports no index")]
+    #[tokio::test]
+    async fn test_commit_index_merge_results_rejects_generic_lance_file(
+        #[case] shape: StubShape,
+        #[case] expected_message: &str,
+    ) {
+        let test_dir = tempfile::tempdir().unwrap();
+        let (mut dataset, segments) =
+            write_committed_segment_fixture(test_dir.path().to_str().unwrap(), 3).await;
+
+        let plan = dataset
+            .plan_index_segment_merge("vector_idx", 3, None)
+            .await
+            .unwrap();
+        let output = Uuid::new_v4();
+        let files = write_stub_output_shape(&dataset, output, shape).await;
+        let result = stub_merge_result(&plan, 0, output, files, Uuid::new_v4());
+
+        let err = dataset
+            .commit_index_merge_results(&plan, vec![result])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "a fabricated output must be invalid input, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains(expected_message),
+            "unexpected error: {err}"
+        );
+        let after = dataset.load_indices_by_name("vector_idx").await.unwrap();
+        assert_eq!(
+            after.len(),
+            segments.len(),
+            "a rejected round must not publish a segment"
+        );
+    }
+
+    /// An output id that reuses a planned or committed segment id is rejected.
+    ///
+    /// Manifest construction drops any existing entry whose id a new segment
+    /// reuses, so an aliased id would silently remove another segment's coverage.
+    #[tokio::test]
+    async fn test_commit_index_merge_results_rejects_aliased_output_id() {
+        let test_dir = tempfile::tempdir().unwrap();
+        let (mut dataset, segments) =
+            write_committed_segment_fixture(test_dir.path().to_str().unwrap(), 4).await;
+        let field_id = dataset.schema().field("vector").unwrap().id;
+
+        let plan = dataset
+            .plan_index_segment_merge("vector_idx", 2, None)
+            .await
+            .unwrap();
+        assert_eq!(plan.tasks.len(), 2);
+
+        let untouched = plan.task(1).unwrap().sources[0].uuid;
+        let aliased =
+            stub_merge_result(&plan, 0, untouched, unwritten_stub_files(), Uuid::new_v4());
+        let err = dataset
+            .commit_index_merge_results(&plan, vec![aliased])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "an output aliasing a planned source must be invalid input, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("already a source segment"),
+            "unexpected error: {err}"
+        );
+
+        let other = write_vector_segment_metadata(
+            &dataset,
+            "other_idx",
+            field_id,
+            Uuid::new_v4(),
+            [0_u32],
+            b"other",
+        )
+        .await;
+        dataset
+            .commit_existing_index_segments(
+                "other_idx",
+                "vector",
+                vec![segment_from_metadata(&other)],
+            )
+            .await
+            .unwrap();
+        let plan = dataset
+            .plan_index_segment_merge("vector_idx", 2, None)
+            .await
+            .unwrap();
+        let foreign =
+            stub_merge_result(&plan, 0, other.uuid, unwritten_stub_files(), Uuid::new_v4());
+        let err = dataset
+            .commit_index_merge_results(&plan, vec![foreign])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "an output aliasing another index's segment must be invalid input, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("already a committed segment"),
+            "unexpected error: {err}"
+        );
+
+        let after = dataset.load_indices_by_name("vector_idx").await.unwrap();
+        let after_uuids = after
+            .iter()
+            .map(|segment| segment.uuid)
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            after_uuids,
+            segments
+                .iter()
+                .map(|segment| segment.uuid)
+                .collect::<HashSet<_>>(),
+            "a rejected alias must leave every segment exactly as committed"
+        );
+    }
+
+    /// Two attempts of one task naming the same output id cannot be reconciled.
+    ///
+    /// Cleanup deletes orphaned attempts by id, so accepting the pair would
+    /// publish a segment and then delete its files.
+    #[tokio::test]
+    async fn test_commit_index_merge_results_rejects_conflicting_attempt_outputs() {
+        let test_dir = tempfile::tempdir().unwrap();
+        let (mut dataset, segments) =
+            write_committed_segment_fixture(test_dir.path().to_str().unwrap(), 4).await;
+
+        let plan = dataset
+            .plan_index_segment_merge("vector_idx", 2, None)
+            .await
+            .unwrap();
+        let shared_output = Uuid::new_v4();
+        let shared_files = write_stub_output_file(&dataset, shared_output).await;
+        let results = vec![
+            stub_merge_result(
+                &plan,
+                0,
+                shared_output,
+                shared_files.clone(),
+                Uuid::from_bytes([2; 16]),
+            ),
+            stub_merge_result(
+                &plan,
+                0,
+                shared_output,
+                shared_files,
+                Uuid::from_bytes([1; 16]),
+            ),
+        ];
+
+        let err = dataset
+            .commit_index_merge_results(&plan, results)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "conflicting attempt outputs must be invalid input, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("more than once across attempts"),
+            "unexpected error: {err}"
+        );
+
+        assert!(
+            dataset
+                .object_store
+                .exists(
+                    &dataset
+                        .indices_dir()
+                        .join(shared_output.to_string())
+                        .join(INDEX_FILE_NAME)
+                )
+                .await
+                .unwrap(),
+            "a rejected round must not delete any reported files"
+        );
+        let after = dataset.load_indices_by_name("vector_idx").await.unwrap();
+        assert_eq!(
+            after.len(),
+            segments.len(),
+            "a rejected round must not publish a segment"
+        );
+    }
+
+    /// A report whose files the store cannot vouch for is rejected.
+    ///
+    /// A missing file, a disagreeing size, or bytes that do not decode as a
+    /// Lance file all mean the output is not the segment the report claims.
+    /// The undecodable case uses the exact 10 byte magic-suffixed fabrication
+    /// a tail probe would have accepted.
+    #[rstest]
+    #[case::missing_file(None, 100, "the report does not describe")]
+    #[case::size_mismatch(Some(b"mergedLANC".to_vec()), 99, "the report does not describe")]
+    #[case::undecodable_content(Some(b"mergedLANC".to_vec()), 10, "not a readable Lance index")]
+    #[tokio::test]
+    async fn test_commit_index_merge_results_rejects_unverifiable_output(
+        #[case] content: Option<Vec<u8>>,
+        #[case] reported_size: u64,
+        #[case] expected_message: &str,
+    ) {
+        let test_dir = tempfile::tempdir().unwrap();
+        let (mut dataset, segments) =
+            write_committed_segment_fixture(test_dir.path().to_str().unwrap(), 3).await;
+
+        let plan = dataset
+            .plan_index_segment_merge("vector_idx", 3, None)
+            .await
+            .unwrap();
+        assert_eq!(plan.tasks.len(), 1);
+        let output = Uuid::new_v4();
+        if let Some(content) = &content {
+            dataset
+                .object_store
+                .put(
+                    &dataset
+                        .indices_dir()
+                        .join(output.to_string())
+                        .join(INDEX_FILE_NAME),
+                    content,
+                )
+                .await
+                .unwrap();
+        }
+        let reported = vec![IndexMergeFile {
+            path: INDEX_FILE_NAME.to_string(),
+            size_bytes: reported_size,
+        }];
+        let result = stub_merge_result(&plan, 0, output, reported, Uuid::new_v4());
+
+        let err = dataset
+            .commit_index_merge_results(&plan, vec![result])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "an unverifiable output must be invalid input, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains(expected_message),
+            "unexpected error: {err}"
+        );
+        let after = dataset.load_indices_by_name("vector_idx").await.unwrap();
+        assert_eq!(
+            after.len(),
+            segments.len(),
+            "a rejected round must not publish a segment"
+        );
+    }
+
+    /// A mutation landing after the commit's validation but before the manifest
+    /// write must still fail. The resolver treats a rebased in-place `Merge` as
+    /// compatible with `CreateIndex`, so only the exact-source re-check in its
+    /// finish step catches this window, simulated by mutating between building
+    /// the transaction and committing it.
+    #[rstest]
+    #[case::indexed_field_update(ConcurrentMutation::IndexedFieldUpdate)]
+    #[case::in_place_merge(ConcurrentMutation::InPlaceMerge)]
+    #[tokio::test]
+    async fn test_commit_index_merge_results_rejects_mutation_in_commit_window(
+        #[case] mutation: ConcurrentMutation,
+    ) {
+        use crate::dataset::transaction::{Operation, TransactionBuilder};
+
+        let test_dir = tempfile::tempdir().unwrap();
+        let (mut dataset, _segments) =
+            write_committed_segment_fixture(test_dir.path().to_str().unwrap(), 3).await;
+        let field_id = dataset.schema().field("vector").unwrap().id;
+
+        let plan = dataset
+            .plan_index_segment_merge("vector_idx", 3, None)
+            .await
+            .unwrap();
+        assert_eq!(plan.tasks.len(), 1);
+        let result = stub_merge_result(
+            &plan,
+            0,
+            Uuid::new_v4(),
+            unwritten_stub_files(),
+            Uuid::new_v4(),
+        );
+
+        // The tail of `commit_index_merge_results` after its validation: the
+        // sources it saw, the output it built, and the exact-source property.
+        let planned = plan
+            .task(0)
+            .unwrap()
+            .sources
+            .iter()
+            .map(|source| source.uuid)
+            .collect::<HashSet<_>>();
+        let replaced = dataset
+            .load_indices_by_name("vector_idx")
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|segment| planned.contains(&segment.uuid))
+            .collect::<Vec<_>>();
+        let new_indices = vec![result.output_metadata("vector_idx")];
+        let transaction = TransactionBuilder::new(
+            plan.read_version,
+            Operation::CreateIndex {
+                new_indices,
+                removed_indices: replaced,
+            },
+        )
+        .transaction_properties(Some(Arc::new(HashMap::from([(
+            segment_merge::EXACT_SOURCE_CAS_PROPERTY.to_owned(),
+            "true".to_owned(),
+        )]))))
+        .build();
+
+        let mut writer = dataset.clone();
+        apply_concurrent_mutation(&mut writer, mutation, field_id).await;
+
+        let err = dataset
+            .apply_commit(transaction, &Default::default(), &Default::default())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "a mutation inside the commit window must be invalid input, got {err:?}"
+        );
+        assert!(
+            err.to_string()
+                .contains("changed while the commit was in flight"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.to_string().contains("Re-plan the merge"),
+            "the error must tell the caller to re-plan, got: {err}"
+        );
+
+        dataset.checkout_latest().await.unwrap();
+        let after = dataset.load_indices_by_name("vector_idx").await.unwrap();
+        assert!(
+            after
+                .iter()
+                .all(|segment| segment.uuid != result.output.uuid),
+            "the rejected merge must not have published a segment"
+        );
+    }
+
+    /// Validation must prove the bytes on the store, not session caches.
+    ///
+    /// A uuid opened earlier in the session leaves index state and file
+    /// metadata in caches, so a worker resubmitting that uuid with swapped
+    /// files could otherwise validate against remembered state.
+    #[tokio::test]
+    async fn test_commit_index_merge_results_revalidates_swapped_output_bytes() {
+        let test_dir = tempfile::tempdir().unwrap();
+        let (mut dataset, _segments) =
+            write_committed_segment_fixture(test_dir.path().to_str().unwrap(), 3).await;
+
+        let plan = dataset
+            .plan_index_segment_merge("vector_idx", 3, None)
+            .await
+            .unwrap();
+        let result = dataset.execute_index_merge_task(&plan, 0).await.unwrap();
+
+        // Warm the session caches with a successful open of the real output.
+        let output_meta = result.output_metadata("vector_idx");
+        open_vector_index_from_meta(&dataset, "vector", &output_meta, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+
+        // Swap the output files for decodable but headerless fabrications and
+        // resubmit the same uuid with the swapped sizes reported.
+        let swapped_files =
+            write_stub_output_shape(&dataset, result.output.uuid, StubShape::HeaderlessIndex).await;
+        let mut resubmitted = result;
+        resubmitted.attempt_id = Uuid::new_v4();
+        resubmitted.output.files = swapped_files;
+
+        let err = dataset
+            .commit_index_merge_results(&plan, vec![resubmitted])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "swapped output bytes must be invalid input, got {err:?}"
+        );
+        assert!(
+            err.to_string()
+                .contains("does not open as its declared vector index"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// A genuine output re-labeled to another task must not publish.
+    ///
+    /// The report's task binding is untrusted, so the commit binds the durable
+    /// row ids and row counts to the claimed task. With equal task sizes the
+    /// foreign row ids are caught, with unequal sizes the row count is.
+    #[rstest]
+    #[case::same_size_foreign_rows(4, "does not hold the exact rows of its claimed sources")]
+    #[case::wrong_row_count(5, "does not hold the rows of its claimed sources")]
+    #[tokio::test]
+    async fn test_commit_index_merge_results_rejects_cross_task_output_substitution(
+        #[case] fragments: u32,
+        #[case] expected_message: &str,
+    ) {
+        let test_dir = tempfile::tempdir().unwrap();
+        let (mut dataset, segments) =
+            write_committed_segment_fixture(test_dir.path().to_str().unwrap(), fragments).await;
+
+        let plan = dataset
+            .plan_index_segment_merge("vector_idx", 2, None)
+            .await
+            .unwrap();
+        assert_eq!(plan.tasks.len(), 2);
+        let last_task = plan.tasks.last().unwrap().task_id;
+        let genuine = dataset
+            .execute_index_merge_task(&plan, last_task)
+            .await
+            .unwrap();
+
+        let task0 = plan.task(0).unwrap();
+        let mut forged = genuine;
+        forged.task_id = 0;
+        forged.sources = task0.sources.clone();
+        forged.output.fragment_ids = task0.coverage();
+
+        let err = dataset
+            .commit_index_merge_results(&plan, vec![forged])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "a re-labeled output must be invalid input, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains(expected_message),
+            "unexpected error: {err}"
+        );
+        let after = dataset.load_indices_by_name("vector_idx").await.unwrap();
+        assert_eq!(
+            after.len(),
+            segments.len(),
+            "a rejected substitution must not publish or remove segments"
+        );
+    }
+
+    /// A genuine merge on a stable row id dataset must commit.
+    ///
+    /// Stable row ids are logical identifiers, so deriving fragments from
+    /// their high bits would reject every genuine output. The commit compares
+    /// row identity digests instead, which holds in both row id modes.
+    #[tokio::test]
+    async fn test_commit_index_merge_results_accepts_stable_row_ids() {
+        let test_dir = tempfile::tempdir().unwrap();
+        let (mut dataset, segments) =
+            write_committed_segment_fixture_rows(test_dir.path().to_str().unwrap(), 4, true).await;
+        assert!(dataset.manifest.uses_stable_row_ids());
+
+        let plan = dataset
+            .plan_index_segment_merge("vector_idx", 2, None)
+            .await
+            .unwrap();
+        assert_eq!(plan.tasks.len(), 2);
+        let mut results = Vec::new();
+        for task in &plan.tasks {
+            results.push(
+                dataset
+                    .execute_index_merge_task(&plan, task.task_id)
+                    .await
+                    .unwrap(),
+            );
+        }
+        dataset
+            .commit_index_merge_results(&plan, results)
+            .await
+            .unwrap();
+
+        let after = dataset.load_indices_by_name("vector_idx").await.unwrap();
+        assert_eq!(after.len(), 2, "two tasks publish two merged segments");
+        let coverage = after
+            .iter()
+            .filter_map(|segment| segment.fragment_bitmap.as_ref())
+            .fold(RoaringBitmap::new(), |coverage, bitmap| coverage | bitmap);
+        assert_eq!(
+            coverage.iter().collect::<Vec<_>>(),
+            (0..segments.len() as u32).collect::<Vec<_>>(),
+            "the merged segments must keep the sources' full coverage"
+        );
+
+        let query = Float32Array::from(vec![0.0f32; 8]);
+        let batch = dataset
+            .scan()
+            .nearest("vector", &query, 5)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(batch.num_rows(), 5, "the merged index must answer queries");
+    }
+
+    /// A genuine merge after a compaction with deferred index remap must commit.
+    ///
+    /// The frag reuse index remaps segment coverage to post compaction
+    /// fragment ids at load time while the auxiliary files keep the addresses
+    /// written before compaction, so decoding fragments out of the stored row
+    /// ids would reject every genuine output. The row identity digest is
+    /// remap agnostic because output and sources store the same addresses.
+    #[tokio::test]
+    async fn test_commit_index_merge_results_accepts_deferred_frag_reuse() {
+        use lance_index::vector::ivf::IvfBuildParams;
+
+        let test_dir = tempfile::tempdir().unwrap();
+        let mut dataset =
+            write_merge_test_dataset(test_dir.path().to_str().unwrap(), 4, false).await;
+        let centroids = Arc::new(
+            FixedSizeListArray::try_new_from_values(Float32Array::from(vec![0.0f32; 8]), 8)
+                .unwrap(),
+        );
+        let ivf_params = IvfBuildParams::try_with_centroids(1, centroids).unwrap();
+        let params = VectorIndexParams::with_ivf_flat_params(
+            lance_linalg::distance::MetricType::L2,
+            ivf_params,
+        );
+        let mut segments = Vec::new();
+        for fragment_ids in [vec![0_u32, 1], vec![2, 3]] {
+            let mut builder = dataset.create_index_builder(&["vector"], IndexType::Vector, &params);
+            builder = builder
+                .name("vector_idx".to_string())
+                .fragments(fragment_ids);
+            segments.push(builder.execute_uncommitted().await.unwrap());
+        }
+        dataset
+            .commit_existing_index_segments(
+                "vector_idx",
+                "vector",
+                segments
+                    .iter()
+                    .map(segment_from_metadata)
+                    .collect::<Vec<_>>(),
+            )
+            .await
+            .unwrap();
+
+        // Compaction groups match the segments' coverage, so each remapped
+        // bitmap stays a clean single fragment instead of a straddle heal.
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 20,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        let remapped = dataset.load_indices_by_name("vector_idx").await.unwrap();
+        assert_eq!(remapped.len(), 2);
+        for segment in &remapped {
+            let bitmap = segment.fragment_bitmap.as_ref().unwrap();
+            assert_eq!(bitmap.len(), 1, "each rewrite group maps to one fragment");
+            assert!(
+                bitmap.min().unwrap() >= 4,
+                "coverage must name post compaction fragments, got {bitmap:?}"
+            );
+        }
+
+        let plan = dataset
+            .plan_index_segment_merge("vector_idx", 2, None)
+            .await
+            .unwrap();
+        assert_eq!(plan.tasks.len(), 1);
+        let result = dataset.execute_index_merge_task(&plan, 0).await.unwrap();
+        dataset
+            .commit_index_merge_results(&plan, vec![result])
+            .await
+            .unwrap();
+
+        let after = dataset.load_indices_by_name("vector_idx").await.unwrap();
+        assert_eq!(after.len(), 1, "one task publishes one merged segment");
+        let coverage = after[0].fragment_bitmap.as_ref().unwrap();
+        assert_eq!(
+            coverage.len(),
+            2,
+            "the merged segment must keep both remapped fragments, got {coverage:?}"
+        );
+
+        let query = Float32Array::from(vec![0.0f32; 8]);
+        let batch = dataset
+            .scan()
+            .nearest("vector", &query, 5)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(batch.num_rows(), 5, "the merged index must answer queries");
+    }
+
+    /// An output whose durable files carry a different metric than its sources
+    /// must not publish, even with empty reported details.
+    ///
+    /// The scanner routes a metric-less ANN query on the committed segment's
+    /// own metric without re-opening it, so a worker that merges the genuine
+    /// rows but flips the distance string in the output files would silently
+    /// misroute queries. The commit fences the output's durable metric to its
+    /// sources, so this cannot land. Modeled by committing a genuine cosine
+    /// segment over the same rows as the L2 sources it claims.
+    #[tokio::test]
+    async fn test_commit_index_merge_results_rejects_output_metric_mismatch() {
+        use lance_index::vector::ivf::IvfBuildParams;
+
+        let test_dir = tempfile::tempdir().unwrap();
+        let (mut dataset, segments) =
+            write_committed_segment_fixture(test_dir.path().to_str().unwrap(), 3).await;
+
+        // A genuine cosine segment over the same three fragments: same rows,
+        // same row ids, but a metric the L2 sources do not carry.
+        let centroids = Arc::new(
+            FixedSizeListArray::try_new_from_values(Float32Array::from(vec![0.0f32; 8]), 8)
+                .unwrap(),
+        );
+        let ivf_params = IvfBuildParams::try_with_centroids(1, centroids).unwrap();
+        let cosine_params = VectorIndexParams::with_ivf_flat_params(
+            lance_linalg::distance::MetricType::Cosine,
+            ivf_params,
+        );
+        // A distinct name avoids the uniqueness check, only its files are used.
+        let cosine_segment = dataset
+            .create_index_builder(&["vector"], IndexType::Vector, &cosine_params)
+            .name("vector_idx_cosine".to_string())
+            .fragments(vec![0, 1, 2])
+            .execute_uncommitted()
+            .await
+            .unwrap();
+
+        let plan = dataset
+            .plan_index_segment_merge("vector_idx", 3, None)
+            .await
+            .unwrap();
+        assert_eq!(plan.tasks.len(), 1);
+        let genuine = dataset.execute_index_merge_task(&plan, 0).await.unwrap();
+
+        // Point the report at the cosine segment's genuine files while keeping
+        // the L2 task's sources and coverage.
+        let mut forged = genuine;
+        forged.output.uuid = cosine_segment.uuid;
+        forged.output.files = cosine_segment
+            .files
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(segment_merge::IndexMergeFile::from)
+            .collect();
+
+        let err = dataset
+            .commit_index_merge_results(&plan, vec![forged])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "an output metric mismatch must be invalid input, got {err:?}"
+        );
+        assert!(
+            err.to_string()
+                .contains("carries an index model its sources do not"),
+            "unexpected error: {err}"
+        );
+        let after = dataset.load_indices_by_name("vector_idx").await.unwrap();
+        assert_eq!(
+            after.len(),
+            segments.len(),
+            "a rejected report must not publish or remove segments"
+        );
+    }
+
+    /// A report whose populated details disagree with the durable files must
+    /// not publish.
+    ///
+    /// The report's details are persisted into the manifest and the scanner
+    /// trusts them for the metric without opening the index, so a report
+    /// relabeling genuine L2 bytes as cosine would silently misroute queries.
+    #[tokio::test]
+    async fn test_commit_index_merge_results_rejects_forged_index_details() {
+        use lance_index::pb::vector_index_details::{Compression, FlatCompression};
+        use prost::Message;
+
+        let test_dir = tempfile::tempdir().unwrap();
+        let (mut dataset, segments) =
+            write_committed_segment_fixture(test_dir.path().to_str().unwrap(), 3).await;
+
+        let plan = dataset
+            .plan_index_segment_merge("vector_idx", 3, None)
+            .await
+            .unwrap();
+        let genuine = dataset.execute_index_merge_task(&plan, 0).await.unwrap();
+
+        let mut forged = genuine;
+        forged.output.index_details = lance_index::pb::VectorIndexDetails {
+            metric_type: lance_index::pb::VectorMetricType::Cosine.into(),
+            compression: Some(Compression::Flat(FlatCompression {})),
+            ..Default::default()
+        }
+        .encode_to_vec();
+
+        let err = dataset
+            .commit_index_merge_results(&plan, vec![forged])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "forged details must be invalid input, got {err:?}"
+        );
+        assert!(
+            err.to_string()
+                .contains("declares an index model its durable files do not carry"),
+            "unexpected error: {err}"
+        );
+        let after = dataset.load_indices_by_name("vector_idx").await.unwrap();
+        assert_eq!(
+            after.len(),
+            segments.len(),
+            "a rejected report must not publish or remove segments"
+        );
+    }
+
+    /// An output id landing inside the commit window must also be re-proven
+    /// fresh at publication. Two exact-source commits for different index
+    /// names sharing one new id would otherwise both land, and the later
+    /// manifest silently drops the earlier index's segment.
+    #[tokio::test]
+    async fn test_exact_source_commit_rejects_output_id_taken_in_window() {
+        use crate::dataset::transaction::{Operation, TransactionBuilder};
+
+        let test_dir = tempfile::tempdir().unwrap();
+        let (mut dataset, _segments) =
+            write_committed_segment_fixture(test_dir.path().to_str().unwrap(), 3).await;
+        let field_id = dataset.schema().field("vector").unwrap().id;
+
+        let other = write_vector_segment_metadata(
+            &dataset,
+            "other_idx",
+            field_id,
+            Uuid::new_v4(),
+            [0_u32],
+            b"other",
+        )
+        .await;
+        dataset
+            .commit_existing_index_segments(
+                "other_idx",
+                "vector",
+                vec![segment_from_metadata(&other)],
+            )
+            .await
+            .unwrap();
+
+        // First round publishes `shared` under vector_idx.
+        let plan = dataset
+            .plan_index_segment_merge("vector_idx", 3, None)
+            .await
+            .unwrap();
+        let result = dataset.execute_index_merge_task(&plan, 0).await.unwrap();
+        let shared = result.output.uuid;
+        dataset
+            .commit_index_merge_results(&plan, vec![result])
+            .await
+            .unwrap();
+
+        // A second exact-source commit for other_idx reuses `shared` as its
+        // output id. Its pre-commit identity check never saw the first commit,
+        // so only the finish-step re-proof can reject it.
+        let removed = dataset
+            .load_indices_by_name("other_idx")
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|segment| segment.uuid == other.uuid)
+            .collect::<Vec<_>>();
+        let mut forged = removed[0].clone();
+        forged.uuid = shared;
+        let transaction = TransactionBuilder::new(
+            dataset.manifest.version - 1,
+            Operation::CreateIndex {
+                new_indices: vec![forged],
+                removed_indices: removed,
+            },
+        )
+        .transaction_properties(Some(Arc::new(HashMap::from([(
+            segment_merge::EXACT_SOURCE_CAS_PROPERTY.to_owned(),
+            "true".to_owned(),
+        )]))))
+        .build();
+        let err = dataset
+            .apply_commit(transaction, &Default::default(), &Default::default())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "a taken output id must be invalid input, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("is already a committed segment"),
+            "unexpected error: {err}"
+        );
+
+        dataset.checkout_latest().await.unwrap();
+        let after = dataset.load_indices_by_name("vector_idx").await.unwrap();
+        assert!(
+            after.iter().any(|segment| segment.uuid == shared),
+            "the first index's published segment must survive"
+        );
+    }
+
+    /// Imported shallow-clone segments live under the base dataset's index
+    /// directory, so a plan or merge resolving every UUID under the current
+    /// dataset would be non-executable for exactly those segments.
+    #[tokio::test]
+    async fn test_index_merge_sources_are_base_aware() {
+        let test_dir = tempfile::tempdir().unwrap();
+        let base_uri = test_dir.path().join("base");
+        let base_uri = base_uri.to_str().unwrap();
+        let mut source = write_merge_test_dataset(base_uri, 2, false).await;
+        let field_id = source.schema().field("vector").unwrap().id;
+
+        let imported = write_vector_segment_metadata(
+            &source,
+            "vector_idx",
+            field_id,
+            Uuid::new_v4(),
+            [0_u32],
+            b"imported",
+        )
+        .await;
+        source
+            .commit_existing_index_segments(
+                "vector_idx",
+                "vector",
+                vec![segment_from_metadata(&imported)],
+            )
+            .await
+            .unwrap();
+
+        let clone_uri = test_dir.path().join("clone");
+        let clone_uri = clone_uri.to_str().unwrap();
+        let version = source.version().version;
+        let mut cloned = source
+            .shallow_clone(clone_uri, version, None)
+            .await
+            .unwrap();
+        let cloned_imported = cloned
+            .load_indices_by_name("vector_idx")
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        assert!(
+            cloned_imported.base_id.is_some(),
+            "a shallow clone must import the segment by reference, or this test proves nothing"
+        );
+
+        // A second segment built locally in the clone, so the plan mixes bases.
+        let local = write_vector_segment_metadata(
+            &cloned,
+            "vector_idx",
+            field_id,
+            Uuid::new_v4(),
+            [1_u32],
+            b"local",
+        )
+        .await;
+        cloned
+            .commit_existing_index_segments(
+                "vector_idx",
+                "vector",
+                vec![segment_from_metadata(&local)],
+            )
+            .await
+            .unwrap();
+
+        let plan = cloned
+            .plan_index_segment_merge("vector_idx", 2, None)
+            .await
+            .unwrap();
+        assert_eq!(plan.tasks.len(), 1);
+        let sources = &plan.tasks[0].sources;
+        assert_eq!(sources.len(), 2);
+        let imported_source = sources
+            .iter()
+            .find(|source| source.uuid == cloned_imported.uuid)
+            .expect("the imported segment must be planned");
+        let local_source = sources
+            .iter()
+            .find(|source| source.uuid == local.uuid)
+            .expect("the locally built segment must be planned");
+        assert_eq!(imported_source.base_id, cloned_imported.base_id);
+        assert_eq!(local_source.base_id, None);
+        // Object store paths are rooted differently from filesystem paths, so
+        // compare the dataset directory each one resolves under.
+        assert!(
+            imported_source.path.contains("/base/_indices/"),
+            "the imported segment must resolve under the base dataset, got {}",
+            imported_source.path
+        );
+        assert!(
+            local_source.path.contains("/clone/_indices/"),
+            "the locally built segment must resolve under the clone, got {}",
+            local_source.path
+        );
+
+        // The merge itself must read each shard from the directory the plan
+        // recorded, not from the clone's index directory for both.
+        let dirs = resolve_vector_source_dirs(&cloned, &[cloned_imported.clone(), local.clone()])
+            .await
+            .unwrap();
+        assert_eq!(
+            dirs.iter().map(Path::to_string).collect::<Vec<_>>(),
+            vec![imported_source.path.clone(), local_source.path.clone()]
+        );
+
+        // And a worker validates those locations before writing anything.
+        resolve_merge_sources(&cloned, &plan, &plan.tasks[0])
+            .await
+            .expect("base-aware sources must validate on the worker");
+    }
+
+    /// A mixed-base round must survive execute and commit end to end. The
+    /// commit reads every source's row ids through its base-aware directory,
+    /// and imported segments the round does not touch must survive it, which
+    /// drives the untouched overlap checks against live imported segments.
+    #[tokio::test]
+    async fn test_index_merge_mixed_base_sources_execute_and_commit() {
+        use crate::index::vector::VectorIndexParams;
+        use lance_datagen::{BatchCount, RowCount, array};
+        use lance_index::vector::ivf::IvfBuildParams;
+
+        let test_dir = tempfile::tempdir().unwrap();
+        let base_uri = test_dir.path().join("base");
+        let base_uri = base_uri.to_str().unwrap();
+        let (mut source, base_segments) = write_committed_segment_fixture(base_uri, 3).await;
+
+        let clone_uri = test_dir.path().join("clone");
+        let clone_uri = clone_uri.to_str().unwrap();
+        let version = source.version().version;
+        source
+            .shallow_clone(clone_uri, version, None)
+            .await
+            .unwrap();
+
+        // A fourth fragment appended to the clone, indexed by a real segment
+        // built locally, so the plan mixes imported and local sources.
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<arrow_array::types::Int32Type>())
+            .col(
+                "vector",
+                array::rand_vec::<arrow_array::types::Float32Type>(8.into()),
+            )
+            .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+        let mut cloned = Dataset::write(
+            reader,
+            clone_uri,
+            Some(WriteParams {
+                max_rows_per_file: 10,
+                max_rows_per_group: 10,
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        // The same single zero centroid the fixture uses, so the locally
+        // built shard stays merge compatible with the imported ones.
+        let centroids = Arc::new(
+            FixedSizeListArray::try_new_from_values(Float32Array::from(vec![0.0f32; 8]), 8)
+                .unwrap(),
+        );
+        let ivf_params = IvfBuildParams::try_with_centroids(1, centroids).unwrap();
+        let params = VectorIndexParams::with_ivf_flat_params(
+            lance_linalg::distance::MetricType::L2,
+            ivf_params,
+        );
+        // Building under `vector_idx` would be rejected because the clone
+        // already imported that name. Only the built files are used, and the
+        // commit below publishes them under the logical `vector_idx` name.
+        let local = cloned
+            .create_index_builder(&["vector"], IndexType::Vector, &params)
+            .name("vector_idx_local".to_string())
+            .fragments(vec![3])
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        cloned
+            .commit_existing_index_segments(
+                "vector_idx",
+                "vector",
+                vec![segment_from_metadata(&local)],
+            )
+            .await
+            .unwrap();
+
+        // Bound the plan to the newest two segments so two imported segments
+        // stay outside the round and must survive the commit untouched.
+        let plan = cloned
+            .plan_index_segment_merge("vector_idx", 2, Some(2))
+            .await
+            .unwrap();
+        assert_eq!(plan.tasks.len(), 1);
+        let sources = &plan.tasks[0].sources;
+        assert_eq!(sources.len(), 2);
+        let imported_source = sources
+            .iter()
+            .find(|source| source.uuid == base_segments[2].uuid)
+            .expect("the newest base segment must be planned");
+        assert!(
+            imported_source.base_id.is_some(),
+            "the newest base segment must be planned as an imported source"
+        );
+        let local_source = sources
+            .iter()
+            .find(|source| source.uuid == local.uuid)
+            .expect("the locally built segment must be planned");
+        assert_eq!(
+            local_source.base_id, None,
+            "the locally built segment must be planned as a local source"
+        );
+
+        let result = cloned.execute_index_merge_task(&plan, 0).await.unwrap();
+        let output_uuid = result.output.uuid;
+
+        // The commit must read the imported source at the base-aware path the
+        // plan recorded, so corrupting the auxiliary file there has to fail
+        // the round. A commit that skipped imported sources would pass here.
+        // The original bytes come back after, so the same plan and result
+        // can then commit for real.
+        let base_aux = Path::parse(&imported_source.path)
+            .unwrap()
+            .join(lance_index::INDEX_AUXILIARY_FILE_NAME);
+        let genuine_bytes = cloned.object_store.read_one_all(&base_aux).await.unwrap();
+        cloned
+            .object_store
+            .put(&base_aux, b"garbage")
+            .await
+            .unwrap();
+        let err = cloned
+            .commit_index_merge_results(&plan, vec![result.clone()])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "an unreadable base-resident source must be invalid input, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("has unreadable row ids"),
+            "unexpected error: {err}"
+        );
+        cloned
+            .object_store
+            .put(&base_aux, genuine_bytes.as_ref())
+            .await
+            .unwrap();
+
+        cloned
+            .commit_index_merge_results(&plan, vec![result])
+            .await
+            .unwrap();
+
+        let after = cloned.load_indices_by_name("vector_idx").await.unwrap();
+        assert_eq!(
+            after.len(),
+            3,
+            "the merged segment replaces only its sources"
+        );
+        for untouched in &base_segments[..2] {
+            assert!(
+                after
+                    .iter()
+                    .any(|segment| segment.uuid == untouched.uuid && segment.base_id.is_some()),
+                "imported segment {} outside the round must survive as imported",
+                untouched.uuid
+            );
+        }
+        let merged = after
+            .iter()
+            .find(|segment| segment.uuid == output_uuid)
+            .expect("the merge output must be committed");
+        assert_eq!(
+            merged.base_id, None,
+            "the merge output is local to the clone"
+        );
+        assert_eq!(
+            merged
+                .fragment_bitmap
+                .as_ref()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![2, 3],
+            "the merged segment must keep exactly its sources' coverage"
+        );
+
+        let query = Float32Array::from(vec![0.0f32; 8]);
+        let batch = cloned
+            .scan()
+            .nearest("vector", &query, 5)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(batch.num_rows(), 5, "the merged index must answer queries");
     }
 
     #[tokio::test]
