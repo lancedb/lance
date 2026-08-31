@@ -4648,10 +4648,12 @@ async fn test_stale_append_vs_cast(#[case] tighten_first: bool, #[case] expect_c
     }
 }
 
-/// Recasting a nullable nested field still claims when its top-level parent is
-/// required: a stale append omits the new child id, and the reader cannot
-/// synthesize that child under a required parent. A nullable parent can mask
-/// the missing nullable child, so that append remains compatible.
+/// A nested cast assigns a new field id to the child. An append staged before
+/// the cast still writes the old id, and transaction rebasing does not rewrite
+/// its data through the cast. Under a required parent, accepting that append
+/// would make the replacement child unreadable, so it must conflict. Supporting
+/// that case requires smarter rebasing, not a file-format change. A nullable
+/// parent can mask the missing child, so that append remains compatible.
 #[rstest]
 #[case::nullable_child_required_parent_conflicts(false, true)]
 #[case::nullable_child_nullable_parent_commits(true, false)]
