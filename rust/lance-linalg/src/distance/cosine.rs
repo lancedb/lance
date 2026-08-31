@@ -1362,6 +1362,11 @@ where
 /// - `from`: the vector to compute distance from.
 /// - `to`: a list of vectors to compute distance to.
 ///
+/// # Errors
+///
+/// Returns `ArrowError::InvalidArgumentError` if `from` is an `Int8` array
+/// containing nulls: a null query element has no distance to compute.
+///
 /// # Panics
 ///
 /// Panics if the length of `from` is not equal to the dimension (value length) of `to`.

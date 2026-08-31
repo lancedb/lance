@@ -32,11 +32,11 @@ pub mod norm_l2;
 ///
 /// The three `_arrow_batch` entry points take the query as a `&dyn Array` and
 /// widen an `Int8` one element at a time. A null element has no distance to
-/// compute, and the only alternative to an error here is a panic.
+/// compute, and what this replaced was an `unwrap`.
 fn int8_query_to_f32(query: &PrimitiveArray<Int8Type>) -> Result<Float32Array> {
     if query.null_count() > 0 {
         return Err(ArrowError::InvalidArgumentError(format!(
-            "query vector must not contain nulls, found {} in {} values",
+            "Int8 query vector `from` must not contain nulls, found {} in {} values",
             query.null_count(),
             query.len()
         )));
@@ -638,7 +638,7 @@ mod tests {
         // its two elements must be the ones the slice selects.
         let sliced = Int8Array::from(vec![None, Some(3_i8), Some(4), None]).slice(1, 2);
         let query: Arc<dyn Array> = Arc::new(sliced);
-        for dt in [DistanceType::L2, DistanceType::Dot] {
+        for dt in [DistanceType::L2, DistanceType::Cosine, DistanceType::Dot] {
             let got = dt.arrow_batch_func()(query.as_ref(), &targets).unwrap();
             let want =
                 dt.arrow_batch_func()(Arc::new(Int8Array::from(vec![3_i8, 4])).as_ref(), &targets)
