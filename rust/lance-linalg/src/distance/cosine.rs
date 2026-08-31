@@ -1481,10 +1481,8 @@ mod tests {
     /// A mismatch has to stop at the boundary rather than reach a kernel that
     /// takes one length and reads both vectors with it.
     ///
-    /// The f32 and f64 cases assert both lengths rather than just `equal lengths`,
-    /// because `dot` carries that same message. Where a kernel hands `dot` only a
-    /// scalar tail the two lengths differ from these, and that is what separates
-    /// the entry assert from `dot`'s.
+    /// The f32 and f64 cases assert the two lengths as well as `equal lengths`,
+    /// because `dot` emits that same message on some paths.
     #[test]
     fn cosine_rejects_mismatched_lengths() {
         let long_f32 = [1.0f32; 16];
