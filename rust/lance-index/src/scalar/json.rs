@@ -242,6 +242,10 @@ impl ScalarIndex for JsonIndex {
         }
     }
 
+    fn requires_full_rebuild(&self) -> bool {
+        self.conversion == JsonIndexConversion::LegacyV0
+    }
+
     fn derive_index_params(&self) -> Result<super::ScalarIndexParams> {
         let target_params = self.target_index.derive_index_params()?;
         let target_data_type = self
@@ -1712,6 +1716,10 @@ mod tests {
         assert!(
             remapped.update_criteria().requires_old_data,
             "legacy maintenance must select a full rebuild"
+        );
+        assert!(
+            remapped.requires_full_rebuild(),
+            "legacy maintenance must replace every physical segment"
         );
 
         let (update_store, _update_dir) = local_json_index_store();
