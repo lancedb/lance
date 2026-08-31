@@ -25,15 +25,25 @@ fn required<'a, T>(value: Option<&'a T>, label: &str) -> Result<&'a T> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EncodingPosition {
-    Block,
+    OptionalPayloadBlock,
+    BufferBackedBlock,
     MiniBlock,
     PerValue,
 }
 
 impl EncodingPosition {
+    fn child(self) -> Self {
+        match self {
+            Self::OptionalPayloadBlock | Self::BufferBackedBlock => Self::BufferBackedBlock,
+            Self::MiniBlock => Self::MiniBlock,
+            Self::PerValue => Self::PerValue,
+        }
+    }
+
     fn name(self) -> &'static str {
         match self {
-            Self::Block => "block",
+            Self::OptionalPayloadBlock => "optional-payload block",
+            Self::BufferBackedBlock => "buffer-backed block",
             Self::MiniBlock => "mini-block",
             Self::PerValue => "per-value",
         }
@@ -52,69 +62,69 @@ fn validate_compressive_encoding(
         | Some(Compression::Constant(_)) => Ok(()),
         Some(Compression::Variable(variable)) => validate_compressive_encoding(
             required(variable.offsets.as_deref(), "variable offsets")?,
-            position,
+            position.child(),
         ),
         Some(Compression::OutOfLineBitpacking(bitpacking)) => validate_compressive_encoding(
             required(
                 bitpacking.values.as_deref(),
                 "out-of-line bitpacking values",
             )?,
-            position,
+            position.child(),
         ),
         Some(Compression::Fsst(fsst)) => validate_compressive_encoding(
             required(fsst.values.as_deref(), "FSST values")?,
-            position,
+            position.child(),
         ),
         Some(Compression::Dictionary(dictionary)) => {
             validate_compressive_encoding(
                 required(dictionary.indices.as_deref(), "dictionary indices")?,
-                position,
+                position.child(),
             )?;
             validate_compressive_encoding(
                 required(dictionary.items.as_deref(), "dictionary items")?,
-                position,
+                position.child(),
             )
         }
         Some(Compression::Rle(rle)) => {
             validate_compressive_encoding(
                 required(rle.values.as_deref(), "RLE values")?,
-                position,
+                position.child(),
             )?;
             validate_compressive_encoding(
                 required(rle.run_lengths.as_deref(), "RLE run lengths")?,
-                position,
+                position.child(),
             )
         }
         Some(Compression::ByteStreamSplit(split)) => validate_compressive_encoding(
             required(split.values.as_deref(), "byte-stream-split values")?,
-            position,
+            position.child(),
         ),
         Some(Compression::General(general)) => validate_compressive_encoding(
             required(general.values.as_deref(), "general-compression values")?,
-            position,
+            position.child(),
         ),
         Some(Compression::FixedSizeList(list)) => validate_compressive_encoding(
             required(list.values.as_deref(), "fixed-size-list values")?,
-            position,
+            position.child(),
         ),
         Some(Compression::PackedStruct(packed)) => validate_compressive_encoding(
             required(packed.values.as_deref(), "packed-struct values")?,
-            position,
+            position.child(),
         ),
         Some(Compression::VariablePackedStruct(packed)) => {
             for field in &packed.fields {
                 validate_compressive_encoding(
                     required(field.value.as_ref(), "variable packed-struct field")?,
-                    position,
+                    position.child(),
                 )?;
             }
             Ok(())
         }
-        Some(Compression::Range(_)) if position == EncodingPosition::Block => Ok(()),
-        Some(Compression::Delta(delta)) if position == EncodingPosition::Block => {
+        Some(Compression::Range(_)) if position == EncodingPosition::OptionalPayloadBlock => Ok(()),
+        Some(Compression::Delta(delta)) if position == EncodingPosition::OptionalPayloadBlock => {
             validate_compressive_encoding(
                 required(delta.deltas.as_deref(), "delta values")?,
-                EncodingPosition::Block,
+                EncodingPosition::OptionalPayloadBlock,
             )
         }
         Some(Compression::Range(_) | Compression::Delta(_)) => Err(Error::invalid_input_source(
@@ -136,7 +146,7 @@ fn validate_sparse_positions(positions: Option<&pb21::SparsePositionSet>) -> Res
     if let Some(Positions::Explicit(encoding)) =
         positions.and_then(|positions| positions.positions.as_ref())
     {
-        validate_compressive_encoding(encoding, EncodingPosition::Block)?;
+        validate_compressive_encoding(encoding, EncodingPosition::BufferBackedBlock)?;
     }
     Ok(())
 }
@@ -172,7 +182,7 @@ fn validate_sparse_layout(layout: &pb21::SparseLayout) -> Result<()> {
                     .as_ref()
                     .and_then(|counts| counts.counts.as_ref())
                 {
-                    validate_compressive_encoding(encoding, EncodingPosition::Block)?;
+                    validate_compressive_encoding(encoding, EncodingPosition::BufferBackedBlock)?;
                 }
                 validate_sparse_validity(list.validity.as_ref())?;
             }
@@ -198,17 +208,17 @@ fn validate_page_layout(layout: &pb21::PageLayout) -> Result<()> {
                 ));
             }
             if let Some(rep) = miniblock.rep_compression.as_ref() {
-                validate_compressive_encoding(rep, EncodingPosition::Block)?;
+                validate_compressive_encoding(rep, EncodingPosition::BufferBackedBlock)?;
             }
             if let Some(def) = miniblock.def_compression.as_ref() {
-                validate_compressive_encoding(def, EncodingPosition::Block)?;
+                validate_compressive_encoding(def, EncodingPosition::BufferBackedBlock)?;
             }
             validate_compressive_encoding(
                 required(miniblock.value_compression.as_ref(), "miniblock values")?,
                 EncodingPosition::MiniBlock,
             )?;
             if let Some(dictionary) = miniblock.dictionary.as_ref() {
-                validate_compressive_encoding(dictionary, EncodingPosition::Block)?;
+                validate_compressive_encoding(dictionary, EncodingPosition::BufferBackedBlock)?;
             }
             Ok(())
         }
@@ -218,10 +228,10 @@ fn validate_page_layout(layout: &pb21::PageLayout) -> Result<()> {
         ),
         Some(Layout::ConstantLayout(constant)) => {
             if let Some(rep) = constant.rep_compression.as_ref() {
-                validate_compressive_encoding(rep, EncodingPosition::Block)?;
+                validate_compressive_encoding(rep, EncodingPosition::BufferBackedBlock)?;
             }
             if let Some(def) = constant.def_compression.as_ref() {
-                validate_compressive_encoding(def, EncodingPosition::Block)?;
+                validate_compressive_encoding(def, EncodingPosition::BufferBackedBlock)?;
             }
             Ok(())
         }
@@ -343,8 +353,8 @@ pub fn finish_metadata_index(index: FileMetadataIndex) -> Result<FileMetadataInd
 mod grammar_tests {
     use super::*;
     use pb21::{
-        CompressiveEncoding, Dictionary, Flat, FullZipLayout, MiniBlockLayout, PageLayout, Rle,
-        compressive_encoding::Compression, page_layout::Layout,
+        CompressiveEncoding, Dictionary, FixedSizeList, Flat, FullZipLayout, MiniBlockLayout,
+        PageLayout, Rle, compressive_encoding::Compression, page_layout::Layout,
     };
 
     fn flat(bits_per_value: u64) -> CompressiveEncoding {
@@ -398,8 +408,48 @@ mod grammar_tests {
             }))),
         };
 
-        validate_compressive_encoding(&range, EncodingPosition::Block).unwrap();
-        validate_compressive_encoding(&delta, EncodingPosition::Block).unwrap();
+        validate_compressive_encoding(&range, EncodingPosition::OptionalPayloadBlock).unwrap();
+        validate_compressive_encoding(&delta, EncodingPosition::OptionalPayloadBlock).unwrap();
+    }
+
+    #[test]
+    fn rejects_metadata_only_codecs_in_buffer_backed_block_positions() {
+        let range = CompressiveEncoding {
+            compression: Some(Compression::Range(pb21::Range {
+                uncompressed_bits_per_value: 32,
+                start: 0,
+                step: 1,
+            })),
+        };
+        let delta = CompressiveEncoding {
+            compression: Some(Compression::Delta(Box::new(pb21::Delta {
+                uncompressed_bits_per_value: 32,
+                base: 0,
+                deltas: Some(Box::new(range.clone())),
+            }))),
+        };
+        let wrapped_range = CompressiveEncoding {
+            compression: Some(Compression::FixedSizeList(Box::new(FixedSizeList {
+                items_per_value: 1,
+                values: Some(Box::new(range.clone())),
+                has_validity: false,
+            }))),
+        };
+
+        for encoding in [range, delta, wrapped_range] {
+            let layout = PageLayout {
+                layout: Some(Layout::MiniBlockLayout(MiniBlockLayout {
+                    rep_compression: Some(encoding),
+                    value_compression: Some(flat(32)),
+                    has_large_chunk: true,
+                    ..Default::default()
+                })),
+            };
+
+            let error = validate_page_layout(&layout).unwrap_err();
+            assert!(matches!(&error, Error::InvalidInput { .. }));
+            assert!(error.to_string().contains("buffer-backed block positions"));
+        }
     }
 
     #[test]
