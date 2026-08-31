@@ -83,7 +83,6 @@ use crate::Dataset;
 use crate::dataset::ProjectionRequest;
 use crate::dataset::index::dataset_format_version;
 use crate::index::append::build_old_data_filter;
-use crate::index::vector::ivf::v2::PartitionEntry;
 use crate::index::vector::utils::infer_vector_dim;
 
 use super::v2::IVFIndex;
@@ -433,27 +432,23 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         log::info!("remap {} partitions", ivf.num_partitions());
         let existing_index = self.existing_indices[0].index.clone();
         let mapping = Arc::new(mapping.clone());
-        let build_iter =
-            (0..ivf.num_partitions()).map(move |part_id| {
-                let existing_index = existing_index.clone();
-                let mapping = mapping.clone();
-                async move {
-                    let ivf_index = existing_index
-                        .as_any()
-                        .downcast_ref::<IVFIndex<S, Q>>()
-                        .ok_or(Error::invalid_input("existing index is not IVF index"))?;
-                    let part = ivf_index
-                        .load_partition(part_id, false, &NoOpMetricsCollector)
-                        .await?;
-                    let part = part.as_any().downcast_ref::<PartitionEntry<S, Q>>().ok_or(
-                        Error::internal("failed to downcast partition entry".to_string()),
-                    )?;
+        let build_iter = (0..ivf.num_partitions()).map(move |part_id| {
+            let existing_index = existing_index.clone();
+            let mapping = mapping.clone();
+            async move {
+                let ivf_index = existing_index
+                    .as_any()
+                    .downcast_ref::<IVFIndex<S, Q>>()
+                    .ok_or(Error::invalid_input("existing index is not IVF index"))?;
+                let part = ivf_index
+                    .load_partition(part_id, false, &NoOpMetricsCollector)
+                    .await?;
 
-                    let storage = part.storage.remap(&mapping)?;
-                    let index = part.index.remap(&mapping, &storage)?;
-                    Result::Ok(Some((storage, index, 0.0)))
-                }
-            });
+                let storage = part.storage.remap(&mapping)?;
+                let index = part.index.remap(&mapping, &storage)?;
+                Result::Ok(Some((storage, index, 0.0)))
+            }
+        });
 
         let files = self
             .merge_partitions(
