@@ -117,6 +117,38 @@ fn radix_sort_positive_f32_indices(values: &mut [u64]) {
     pass(&scratch, values, 56);
 }
 
+/// Sort RQ threshold events without changing the existing equal-key behavior.
+///
+/// The quantizer updates its floating-point objective after every event, so the
+/// order chosen by the previous unstable comparison sort remains observable when
+/// thresholds tie. Radix sort the common unique-key case, but reconstruct the
+/// original event order and use the previous sort when duplicate keys are found.
+fn sort_ex_thresholds(values: &mut [u64]) {
+    radix_sort_positive_f32_indices(values);
+    let has_duplicate_keys = values
+        .windows(2)
+        .any(|pair| pair[0] >> u32::BITS == pair[1] >> u32::BITS);
+    if !has_duplicate_keys {
+        return;
+    }
+
+    // Events were originally emitted by index, then by increasing threshold.
+    values.sort_unstable_by_key(|value| (*value as u32, (value >> u32::BITS) as u32));
+    let mut comparison_thresholds = values
+        .iter()
+        .map(|value| {
+            (
+                f32::from_bits((value >> u32::BITS) as u32),
+                *value as u32 as usize,
+            )
+        })
+        .collect::<Vec<_>>();
+    comparison_thresholds.sort_unstable_by(|(left, _), (right, _)| left.total_cmp(right));
+    for (value, (threshold, idx)) in values.iter_mut().zip(comparison_thresholds) {
+        *value = ((threshold.to_bits() as u64) << u32::BITS) | idx as u64;
+    }
+}
+
 fn best_ex_rescale_factor(abs_normalized: &[f32], ex_bits: u8) -> f32 {
     let max_value = abs_normalized
         .iter()
@@ -160,7 +192,7 @@ fn best_ex_rescale_factor(abs_normalized: &[f32], ex_bits: u8) -> f32 {
         }
     }
 
-    radix_sort_positive_f32_indices(&mut thresholds);
+    sort_ex_thresholds(&mut thresholds);
 
     let mut best_inner_product = numerator / squared_denominator.sqrt();
     let mut best_t = t_start;
@@ -1023,6 +1055,25 @@ mod tests {
             let actual = best_ex_rescale_factor(&values, ex_bits);
             assert_eq!(actual.to_bits(), expected.to_bits(), "ex_bits={ex_bits}");
         }
+    }
+
+    #[test]
+    fn test_best_ex_rescale_factor_preserves_equal_threshold_order() {
+        let rotated = [0.75, 1.0, 0.0625, 0.5, 2.0 / 3.0, 0.75, 0.5, 2.0 / 3.0];
+        let norm = rotated
+            .iter()
+            .map(|value| value * value)
+            .sum::<f32>()
+            .sqrt();
+        let abs_normalized = rotated
+            .iter()
+            .map(|value| value.abs() / norm)
+            .collect::<Vec<_>>();
+
+        let expected = reference_best_ex_rescale_factor(&abs_normalized, 7);
+        let actual = best_ex_rescale_factor(&abs_normalized, 7);
+
+        assert_eq!(actual.to_bits(), expected.to_bits());
     }
 
     #[rstest]
