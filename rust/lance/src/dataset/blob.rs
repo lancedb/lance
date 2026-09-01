@@ -12,7 +12,8 @@ use std::{
 use arrow::array::AsArray;
 use arrow::datatypes::{UInt8Type, UInt32Type, UInt64Type};
 use arrow_array::{
-    Array, ArrayRef, GenericListArray, OffsetSizeTrait, RecordBatch, builder::LargeBinaryBuilder,
+    Array, ArrayRef, GenericListArray, OffsetSizeTrait, RecordBatch, UInt64Array,
+    builder::LargeBinaryBuilder,
 };
 use arrow_buffer::{ArrowNativeType, OffsetBuffer, ScalarBuffer};
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
@@ -1785,6 +1786,25 @@ impl BlobRangeRequest {
     }
 }
 
+/// One Blob v2 leaf selected from a nested list value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlobLeafRequest {
+    /// Physical row address containing the list value.
+    pub row: u64,
+    /// Zero-based index at each nested list level.
+    pub index_path: Vec<usize>,
+}
+
+impl BlobLeafRequest {
+    /// Create a request for one leaf inside a nested list value.
+    pub fn new(row: u64, index_path: impl Into<Vec<usize>>) -> Self {
+        Self {
+            row,
+            index_path: index_path.into(),
+        }
+    }
+}
+
 /// Bytes materialized for one request submitted through [`ReadBlobRangesBuilder`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReadBlobRange {
@@ -2885,6 +2905,69 @@ pub async fn take_blobs_by_addresses(
         .collect())
 }
 
+/// Take Blob v2 leaf handles from nested list values by row address.
+pub async fn take_blob_leaves_by_addresses(
+    dataset: &Arc<Dataset>,
+    requests: &[BlobLeafRequest],
+    column: &str,
+) -> Result<Vec<Option<BlobFile>>> {
+    let (blob_field_id, list_depth) = validate_blob_list_column(dataset, column)?;
+    if requests.is_empty() {
+        return Ok(Vec::new());
+    }
+    for (request_index, request) in requests.iter().enumerate() {
+        if request.index_path.len() != list_depth {
+            return Err(Error::invalid_input(format!(
+                "Blob leaf request {request_index} for column '{column}' has index path depth {}, expected {list_depth}",
+                request.index_path.len()
+            )));
+        }
+    }
+
+    let mut unique_row_addrs = Vec::new();
+    // Map each row address to its position in the deduplicated descriptor batch.
+    let mut row_positions = HashMap::new();
+    for request in requests {
+        row_positions.entry(request.row).or_insert_with(|| {
+            let position = unique_row_addrs.len();
+            unique_row_addrs.push(request.row);
+            position
+        });
+    }
+    let descriptions =
+        take_blob_descriptions_by_row_addresses(dataset, &unique_row_addrs, column).await?;
+    let container = leaf_descriptor_array(&descriptions, column)?;
+    let descriptor_values = blob_leaf_descriptor_values(container, list_depth, column)?;
+
+    let indices = requests
+        .iter()
+        .enumerate()
+        .map(|(request_index, request)| {
+            let row_index = row_positions.get(&request.row).copied().ok_or_else(|| {
+                Error::internal(format!(
+                    "Blob descriptor take omitted requested row address {}",
+                    request.row
+                ))
+            })?;
+            blob_leaf_index(
+                container,
+                row_index,
+                &request.index_path,
+                column,
+                request_index,
+            )
+            .map(|index| index.map(|index| index as u64))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let selected = arrow_select::take::take(descriptor_values, &UInt64Array::from(indices), None)?;
+    let selected = selected.as_struct();
+    let request_row_addrs = requests
+        .iter()
+        .map(|request| request.row)
+        .collect::<Vec<_>>();
+    collect_blob_v2_descriptor_files(dataset, blob_field_id, selected, &request_row_addrs).await
+}
+
 /// Validate that `column` exists and is a blob column, returning its field id.
 pub(super) fn validate_blob_column(dataset: &Arc<Dataset>, column: &str) -> Result<u32> {
     let schema = dataset.schema();
@@ -2897,6 +2980,32 @@ pub(super) fn validate_blob_column(dataset: &Arc<Dataset>, column: &str) -> Resu
         ));
     }
     Ok(blob_field.id as u32)
+}
+
+/// Validate a nested list container and return its Blob v2 leaf field id and depth.
+fn validate_blob_list_column(dataset: &Arc<Dataset>, column: &str) -> Result<(u32, usize)> {
+    let schema = dataset.schema();
+    let mut field = schema
+        .field(column)
+        .ok_or_else(|| Error::field_not_found(column, schema.field_paths()))?;
+    let mut list_depth = 0;
+    while matches!(
+        field.data_type(),
+        ArrowDataType::List(_) | ArrowDataType::LargeList(_)
+    ) {
+        field = field.children.first().ok_or_else(|| {
+            Error::invalid_input(format!(
+                "Blob list column '{column}' is missing its item field"
+            ))
+        })?;
+        list_depth += 1;
+    }
+    if list_depth == 0 || !field.is_blob_v2() {
+        return Err(Error::invalid_input(format!(
+            "the column '{column}' is not a list with Blob v2 leaf values"
+        )));
+    }
+    Ok((field.id as u32, list_depth))
 }
 
 /// Load blob descriptor rows for a stable-row-id selection.
@@ -3046,6 +3155,96 @@ fn leaf_descriptor_array<'a>(batch: &'a RecordBatch, column: &str) -> Result<&'a
             .as_ref();
     }
     Ok(current)
+}
+
+fn blob_leaf_descriptor_values<'a>(
+    mut current: &'a dyn Array,
+    list_depth: usize,
+    column: &str,
+) -> Result<&'a StructArray> {
+    for depth in 0..list_depth {
+        current = match current.data_type() {
+            ArrowDataType::List(_) => current.as_list::<i32>().values().as_ref(),
+            ArrowDataType::LargeList(_) => current.as_list::<i64>().values().as_ref(),
+            _ => {
+                return Err(Error::invalid_input(format!(
+                    "Blob list column '{column}' expected a list at depth {depth}, got {}",
+                    current.data_type()
+                )));
+            }
+        };
+    }
+    let descriptions = current
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .ok_or_else(|| {
+            Error::invalid_input(format!(
+                "Blob list column '{column}' expected Blob v2 descriptors after {list_depth} list levels, got {}",
+                current.data_type()
+            ))
+        })?;
+    if BlobV2Layout::classify(descriptions.fields()) != Some(BlobV2Layout::Descriptor) {
+        return Err(Error::invalid_input(format!(
+            "Blob list column '{column}' does not contain Blob v2 descriptors"
+        )));
+    }
+    Ok(descriptions)
+}
+
+fn blob_leaf_index(
+    mut current: &dyn Array,
+    mut current_index: usize,
+    index_path: &[usize],
+    column: &str,
+    request_index: usize,
+) -> Result<Option<usize>> {
+    for (depth, requested_index) in index_path.iter().copied().enumerate() {
+        if current_index >= current.len() {
+            return Err(Error::internal(format!(
+                "Blob leaf request {request_index} index {current_index} exceeded array length {} at depth {depth}",
+                current.len()
+            )));
+        }
+        if current.is_null(current_index) {
+            return Ok(None);
+        }
+        let (values, start, length): (&dyn Array, usize, usize) = match current.data_type() {
+            ArrowDataType::List(_) => {
+                let list = current.as_list::<i32>();
+                let offsets = list.value_offsets();
+                let start = offsets[current_index].as_usize();
+                let end = offsets[current_index + 1].as_usize();
+                (list.values().as_ref(), start, end - start)
+            }
+            ArrowDataType::LargeList(_) => {
+                let list = current.as_list::<i64>();
+                let offsets = list.value_offsets();
+                let start = offsets[current_index].as_usize();
+                let end = offsets[current_index + 1].as_usize();
+                (list.values().as_ref(), start, end - start)
+            }
+            _ => {
+                return Err(Error::invalid_input(format!(
+                    "Blob leaf request {request_index} for column '{column}' expected a list at depth {depth}, got {}",
+                    current.data_type()
+                )));
+            }
+        };
+        if requested_index >= length {
+            return Err(Error::invalid_input(format!(
+                "Blob leaf request {request_index} index {requested_index} is outside list length {length} at depth {depth} for column '{column}'"
+            )));
+        }
+        current = values;
+        current_index = start + requested_index;
+    }
+    if current_index >= current.len() {
+        return Err(Error::internal(format!(
+            "Blob leaf request {request_index} selected index {current_index} beyond descriptor length {}",
+            current.len()
+        )));
+    }
+    Ok(current.is_valid(current_index).then_some(current_index))
 }
 
 fn blob_descriptor_fields_match(
@@ -3850,7 +4049,7 @@ mod tests {
     };
     use lance_core::{
         datatypes::{BlobHandling, BlobKind},
-        utils::blob::blob_path,
+        utils::{address::RowAddress, blob::blob_path},
     };
     use lance_io::object_store::{
         ObjectStore, ObjectStoreParams, ObjectStoreRegistry, StorageOptionsAccessor,
@@ -3875,11 +4074,11 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        BlobEntry, BlobFile, BlobRangeRequest, BlobReadRange, BlobSource, ExternalBaseCandidate,
-        ExternalBaseResolver, ReadBlobsExecution, blob_version_from_descriptions,
-        collect_blob_files_v1, data_file_key_from_path, execute_blob_entries,
-        execute_blob_read_batches_stream, execute_blob_read_plan, plan_blob_read_batches,
-        plan_blob_read_plans,
+        BlobEntry, BlobFile, BlobLeafRequest, BlobRangeRequest, BlobReadRange, BlobSource,
+        ExternalBaseCandidate, ExternalBaseResolver, ReadBlobsExecution,
+        blob_version_from_descriptions, collect_blob_files_v1, data_file_key_from_path,
+        execute_blob_entries, execute_blob_read_batches_stream, execute_blob_read_plan,
+        plan_blob_read_batches, plan_blob_read_plans,
     };
     use crate::{
         Dataset,
@@ -5775,6 +5974,84 @@ mod tests {
         assert_eq!(kinds.value(2), BlobKind::Packed as u8);
         assert_eq!(kinds.value(3), BlobKind::Inline as u8);
 
+        let fragment_id = dataset.get_fragments()[0].id() as u32;
+        let row_addresses = (0..4)
+            .map(|offset| u64::from(RowAddress::new_from_parts(fragment_id, offset)))
+            .collect::<Vec<_>>();
+        let _ = dataset.object_store.io_stats_incremental();
+        let leaves = dataset
+            .take_blob_leaves_by_addresses(
+                &[
+                    BlobLeafRequest::new(row_addresses[0], vec![2]),
+                    BlobLeafRequest::new(row_addresses[0], vec![0]),
+                    BlobLeafRequest::new(row_addresses[0], vec![1]),
+                    BlobLeafRequest::new(row_addresses[3], vec![0]),
+                    BlobLeafRequest::new(row_addresses[2], vec![0]),
+                ],
+                "blobs",
+            )
+            .await
+            .unwrap();
+        let take_stats = dataset.object_store.io_stats_incremental();
+        assert!(
+            !take_stats
+                .requests
+                .iter()
+                .any(|request| request.path.as_ref().ends_with(".blob")),
+            "taking BlobFile handles must not read payload sidecars"
+        );
+        assert_eq!(leaves.len(), 5);
+        assert_eq!(
+            leaves[0].as_ref().unwrap().size(),
+            packed_payload.len() as u64
+        );
+        assert_eq!(leaves[1].as_ref().unwrap().size(), 5);
+        assert!(leaves[2].is_none());
+        assert_eq!(leaves[3].as_ref().unwrap().size(), 4);
+        assert!(leaves[4].is_none());
+
+        let selected = leaves[0].as_ref().unwrap().read_range(7..23).await.unwrap();
+        assert_eq!(selected.as_ref(), &packed_payload[7..23]);
+        let read_stats = dataset.object_store.io_stats_incremental();
+        let payload_ranges = read_stats
+            .requests
+            .iter()
+            .filter(|request| request.path.as_ref().ends_with(".blob"))
+            .filter_map(|request| request.range.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(payload_ranges.len(), 1);
+        assert_eq!(payload_ranges[0].end - payload_ranges[0].start, 16);
+
+        let out_of_bounds = dataset
+            .take_blob_leaves_by_addresses(
+                &[BlobLeafRequest::new(row_addresses[0], vec![3])],
+                "blobs",
+            )
+            .await
+            .unwrap_err();
+        assert!(out_of_bounds.to_string().contains("outside list length 3"));
+        let wrong_depth = dataset
+            .take_blob_leaves_by_addresses(
+                &[BlobLeafRequest::new(row_addresses[0], Vec::new())],
+                "blobs",
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            wrong_depth
+                .to_string()
+                .contains("index path depth 0, expected 1")
+        );
+        let invalid_empty = dataset
+            .take_blob_leaves_by_addresses(&[], "id")
+            .await
+            .unwrap_err();
+        assert!(
+            invalid_empty
+                .to_string()
+                .contains("not a list with Blob v2 leaf values")
+        );
+
         let filtered = dataset
             .scan()
             .project(&["blobs"])
@@ -5844,6 +6121,17 @@ mod tests {
                 );
             }
         }
+
+        let mut deleted_dataset = dataset.as_ref().clone();
+        deleted_dataset.delete("id = 0").await.unwrap();
+        let error = Arc::new(deleted_dataset)
+            .take_blob_leaves_by_addresses(
+                &[BlobLeafRequest::new(row_addresses[0], vec![0])],
+                "blobs",
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("must not target deleted rows"));
     }
 
     #[tokio::test]
@@ -5927,6 +6215,20 @@ mod tests {
         assert!(descriptors.is_valid(0));
         assert!(descriptors.is_null(1));
 
+        let fragment_id = dataset.get_fragments()[0].id() as u32;
+        let row_address = u64::from(RowAddress::first_row(fragment_id));
+        let leaves = dataset
+            .take_blob_leaves_by_addresses(
+                &[BlobLeafRequest::new(row_address, vec![0])],
+                "info.blobs",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            leaves[0].as_ref().unwrap().read().await.unwrap().as_ref(),
+            b"nested"
+        );
+
         let mut scanner = dataset.scan();
         scanner.blob_handling(BlobHandling::AllBinary);
         let bytes = scanner
@@ -5946,6 +6248,94 @@ mod tests {
         let values = lists.values().as_binary::<i64>();
         assert_eq!(values.value(0), b"nested");
         assert!(values.is_null(1));
+    }
+
+    #[tokio::test]
+    async fn test_take_blob_leaves_from_deeply_nested_lists() {
+        let test_dir = TempStrDir::default();
+        let mut blob_builder = BlobArrayBuilder::new(3);
+        blob_builder.push_bytes(b"first").unwrap();
+        blob_builder.push_bytes(b"second").unwrap();
+        blob_builder.push_bytes(b"third").unwrap();
+        let blob_values = blob_builder.finish().unwrap();
+
+        let blob_item = Arc::new(blob_field("item", true));
+        let inner_lists: ArrayRef = Arc::new(
+            arrow_array::ListArray::try_new(
+                blob_item.clone(),
+                arrow_buffer::OffsetBuffer::new(arrow_buffer::ScalarBuffer::from(vec![0i32, 2, 3])),
+                blob_values,
+                None,
+            )
+            .unwrap(),
+        );
+        let inner_group_item = Arc::new(Field::new("inner_group", DataType::List(blob_item), true));
+        let middle_lists: ArrayRef = Arc::new(
+            arrow_array::ListArray::try_new(
+                inner_group_item.clone(),
+                arrow_buffer::OffsetBuffer::new(arrow_buffer::ScalarBuffer::from(vec![0i32, 2])),
+                inner_lists,
+                None,
+            )
+            .unwrap(),
+        );
+        let middle_group_item = Arc::new(Field::new(
+            "middle_group",
+            DataType::List(inner_group_item),
+            true,
+        ));
+        let outer_list: ArrayRef = Arc::new(
+            arrow_array::LargeListArray::try_new(
+                middle_group_item.clone(),
+                arrow_buffer::OffsetBuffer::new(arrow_buffer::ScalarBuffer::from(vec![0i64, 1])),
+                middle_lists,
+                None,
+            )
+            .unwrap(),
+        );
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "groups",
+            DataType::LargeList(middle_group_item),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![outer_list]).unwrap();
+        let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+        let dataset = Arc::new(
+            Dataset::write(
+                reader,
+                &test_dir,
+                Some(WriteParams {
+                    data_storage_version: Some(LanceFileVersion::V2_2),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+
+        let fragment_id = dataset.get_fragments()[0].id() as u32;
+        let row_address = u64::from(RowAddress::first_row(fragment_id));
+        let leaves = dataset
+            .take_blob_leaves_by_addresses(
+                &[BlobLeafRequest::new(row_address, vec![0, 1, 0])],
+                "groups",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            leaves[0].as_ref().unwrap().read().await.unwrap().as_ref(),
+            b"third"
+        );
+
+        let wrong_depth = dataset
+            .take_blob_leaves_by_addresses(&[BlobLeafRequest::new(row_address, vec![0])], "groups")
+            .await
+            .unwrap_err();
+        assert!(
+            wrong_depth
+                .to_string()
+                .contains("index path depth 1, expected 3")
+        );
     }
 
     #[tokio::test]
