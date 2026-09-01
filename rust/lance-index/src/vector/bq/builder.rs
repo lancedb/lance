@@ -81,6 +81,42 @@ fn pack_sign_bits(codes: &mut [u8], rotated: &[f32]) {
 const EX_QUANTIZATION_EPSILON: f32 = 1.0e-5;
 const EX_TIGHT_START: [f32; 9] = [0.0, 0.15, 0.20, 0.52, 0.59, 0.71, 0.75, 0.77, 0.81];
 
+/// Sort packed `(positive_f32_bits, index)` values by their floating-point key.
+///
+/// All thresholds emitted by [`best_ex_rescale_factor`] are positive and finite,
+/// so their IEEE-754 bit patterns have the same order as the represented values.
+/// Four stable byte-wise passes avoid the comparison-heavy tuple sort on every
+/// vector while preserving the exact threshold order.
+fn radix_sort_positive_f32_indices(values: &mut [u64]) {
+    if values.len() < 2 {
+        return;
+    }
+
+    fn pass(source: &[u64], destination: &mut [u64], shift: u32) {
+        let mut offsets = [0usize; 256];
+        for &value in source {
+            offsets[((value >> shift) & 0xff) as usize] += 1;
+        }
+        let mut next_offset = 0;
+        for offset in &mut offsets {
+            let count = *offset;
+            *offset = next_offset;
+            next_offset += count;
+        }
+        for &value in source {
+            let bucket = ((value >> shift) & 0xff) as usize;
+            destination[offsets[bucket]] = value;
+            offsets[bucket] += 1;
+        }
+    }
+
+    let mut scratch = vec![0u64; values.len()];
+    pass(values, &mut scratch, 32);
+    pass(&scratch, values, 40);
+    pass(values, &mut scratch, 48);
+    pass(&scratch, values, 56);
+}
+
 fn best_ex_rescale_factor(abs_normalized: &[f32], ex_bits: u8) -> f32 {
     let max_value = abs_normalized
         .iter()
@@ -117,17 +153,20 @@ fn best_ex_rescale_factor(abs_normalized: &[f32], ex_bits: u8) -> f32 {
         while next <= max_code {
             let threshold = next as f32 / value;
             if threshold < t_end {
-                thresholds.push((threshold, idx));
+                debug_assert!(u32::try_from(idx).is_ok());
+                thresholds.push(((threshold.to_bits() as u64) << u32::BITS) | idx as u64);
             }
             next += 1;
         }
     }
 
-    thresholds.sort_unstable_by(|(left, _), (right, _)| left.total_cmp(right));
+    radix_sort_positive_f32_indices(&mut thresholds);
 
     let mut best_inner_product = numerator / squared_denominator.sqrt();
     let mut best_t = t_start;
-    for (threshold, idx) in thresholds {
+    for packed_threshold in thresholds {
+        let threshold = f32::from_bits((packed_threshold >> u32::BITS) as u32);
+        let idx = packed_threshold as u32 as usize;
         current_codes[idx] += 1;
         let updated = current_codes[idx];
         squared_denominator += (2 * updated) as f32;
@@ -891,6 +930,100 @@ mod tests {
     use rstest::rstest;
 
     use crate::vector::bq::storage::RABIT_BLOCKED_EX_CODE_COLUMN;
+
+    fn reference_best_ex_rescale_factor(abs_normalized: &[f32], ex_bits: u8) -> f32 {
+        let max_value = abs_normalized
+            .iter()
+            .copied()
+            .filter(|value| value.is_finite())
+            .fold(0.0f32, f32::max);
+        if max_value <= 0.0 {
+            return 0.0;
+        }
+
+        let max_code = (1usize << ex_bits) - 1;
+        let t_end = ((max_code + 10) as f32) / max_value;
+        let t_start = t_end * EX_TIGHT_START[ex_bits as usize];
+        let mut current_codes = Vec::with_capacity(abs_normalized.len());
+        let mut squared_denominator = abs_normalized.len() as f32 * 0.25;
+        let mut numerator = 0.0f32;
+        let mut thresholds = Vec::with_capacity(abs_normalized.len() * max_code);
+
+        for (idx, &value) in abs_normalized.iter().enumerate() {
+            if value <= 0.0 || !value.is_finite() {
+                current_codes.push(0usize);
+                continue;
+            }
+            let current = ((t_start * value) + EX_QUANTIZATION_EPSILON)
+                .floor()
+                .clamp(0.0, max_code as f32) as usize;
+            current_codes.push(current);
+            squared_denominator += (current * current + current) as f32;
+            numerator += (current as f32 + 0.5) * value;
+
+            for next in (current + 1)..=max_code {
+                let threshold = next as f32 / value;
+                if threshold < t_end {
+                    thresholds.push((threshold, idx));
+                }
+            }
+        }
+
+        thresholds.sort_unstable_by(|(left, _), (right, _)| left.total_cmp(right));
+        let mut best_inner_product = numerator / squared_denominator.sqrt();
+        let mut best_t = t_start;
+        for (threshold, idx) in thresholds {
+            current_codes[idx] += 1;
+            let updated = current_codes[idx];
+            squared_denominator += (2 * updated) as f32;
+            numerator += abs_normalized[idx];
+            let current_inner_product = numerator / squared_denominator.sqrt();
+            if current_inner_product > best_inner_product {
+                best_inner_product = current_inner_product;
+                best_t = threshold;
+            }
+        }
+        best_t
+    }
+
+    #[test]
+    fn test_radix_sort_positive_f32_indices_matches_float_order() {
+        let mut values = (0..4096u32)
+            .map(|idx| {
+                let key = ((idx.wrapping_mul(2654435761) % 997) + 1) as f32 / 37.0;
+                ((key.to_bits() as u64) << u32::BITS) | idx as u64
+            })
+            .collect::<Vec<_>>();
+        let mut expected = values.clone();
+        expected.sort_by_key(|value| *value >> u32::BITS);
+
+        radix_sort_positive_f32_indices(&mut values);
+
+        assert_eq!(values, expected);
+    }
+
+    #[test]
+    fn test_best_ex_rescale_factor_matches_comparison_sort() {
+        let mut values = (0..1536u32)
+            .map(|idx| {
+                let mixed = idx
+                    .wrapping_mul(747796405)
+                    .wrapping_add(2891336453)
+                    .rotate_right((idx % 31) + 1);
+                (mixed as f32 / u32::MAX as f32) * 0.1
+            })
+            .collect::<Vec<_>>();
+        values[0] = 0.0;
+        values[1] = f32::NAN;
+        values[2] = f32::INFINITY;
+        values[3] = values[4];
+
+        for ex_bits in 1..=8 {
+            let expected = reference_best_ex_rescale_factor(&values, ex_bits);
+            let actual = best_ex_rescale_factor(&values, ex_bits);
+            assert_eq!(actual.to_bits(), expected.to_bits(), "ex_bits={ex_bits}");
+        }
+    }
 
     #[rstest]
     #[case(8)]
