@@ -90,7 +90,10 @@ public class Dataset implements Closeable {
   private Session session;
   private boolean ownsSession = false;
 
-  /** Serializes create/merge index builds on this Dataset handle. */
+  /**
+   * Serializes create/merge index builds on this Dataset handle. Always acquire the lifecycle read
+   * lock first so a queued close cannot deadlock a reentrant read-lock owner.
+   */
   private final Object indexBuildLock = new Object();
 
   private final LockManager lockManager = new LockManager(this);
@@ -1235,9 +1238,9 @@ public class Dataset implements Closeable {
     if (ContextIndexBuildProgress.isActive(this)) {
       throw new IllegalStateException("Dataset is busy in an index progress callback");
     }
-    synchronized (indexBuildLock) {
-      try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
-        Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      synchronized (indexBuildLock) {
         if (progress == null) {
           return nativeCreateIndex(
               options.getColumns(),
@@ -1340,9 +1343,9 @@ public class Dataset implements Closeable {
     if (ContextIndexBuildProgress.isActive(this)) {
       throw new IllegalStateException("Dataset is busy in an index progress callback");
     }
-    synchronized (indexBuildLock) {
-      try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
-        Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      synchronized (indexBuildLock) {
         if (progress == null) {
           innerMergeIndexMetadata(indexUUID, indexType.getValue(), batchReadHead);
         } else {

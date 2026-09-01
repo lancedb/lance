@@ -15,6 +15,7 @@ package org.lance.index;
 
 import org.lance.Dataset;
 import org.lance.Fragment;
+import org.lance.LockManager;
 import org.lance.TestUtils;
 import org.lance.WriteParams;
 import org.lance.index.scalar.ScalarIndexParams;
@@ -923,6 +924,110 @@ public class ScalarIndexTest {
   }
 
   @Test
+  @Timeout(value = 10, unit = TimeUnit.SECONDS)
+  public void testCreateIndexReadOwnerDoesNotDeadlockBehindQueuedClose(@TempDir Path tempDir)
+      throws Exception {
+    RootAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+    Dataset dataset = null;
+    Thread readOwner = null;
+    Thread concurrentClose = null;
+    Thread queuedCreate = null;
+    CountDownLatch startOwnerCreate = new CountDownLatch(1);
+    try {
+      String datasetPath = tempDir.resolve("index_read_owner_queued_close").toString();
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      dataset = testDataset.write(1, 20);
+      Dataset activeDataset = dataset;
+      Fragment fragment = activeDataset.getFragments().get(0);
+      IndexOptions segmentOptions = createInvertedSegmentOptions(fragment.getId());
+
+      CountDownLatch outerReadAcquired = new CountDownLatch(1);
+      AtomicReference<Index> ownerResult = new AtomicReference<>();
+      AtomicReference<Throwable> ownerFailure = new AtomicReference<>();
+      AtomicReference<Throwable> closeFailure = new AtomicReference<>();
+      AtomicReference<Throwable> queuedCreateFailure = new AtomicReference<>();
+
+      readOwner =
+          new Thread(
+              () -> {
+                try (LockManager.ReadLock ignored = activeDataset.acquireReadLock()) {
+                  outerReadAcquired.countDown();
+                  if (!startOwnerCreate.await(5, TimeUnit.SECONDS)) {
+                    throw new IllegalStateException("Timed out before reentrant create");
+                  }
+                  ownerResult.set(activeDataset.createIndex(segmentOptions));
+                } catch (Throwable failure) {
+                  ownerFailure.set(failure);
+                }
+              },
+              "index-read-owner");
+      readOwner.setDaemon(true);
+      readOwner.start();
+      assertTrue(outerReadAcquired.await(2, TimeUnit.SECONDS), "Outer read lock was not acquired");
+
+      // Establish read owner -> queued close -> queued create before the read owner re-enters.
+      concurrentClose =
+          new Thread(
+              () -> {
+                try {
+                  activeDataset.close();
+                } catch (Throwable failure) {
+                  closeFailure.set(failure);
+                }
+              },
+              "queued-dataset-close");
+      concurrentClose.setDaemon(true);
+      concurrentClose.start();
+      awaitThreadBlocked(concurrentClose, "Concurrent close did not wait for the outer read lock");
+
+      queuedCreate =
+          new Thread(
+              () -> {
+                try {
+                  activeDataset.createIndex(segmentOptions);
+                } catch (Throwable failure) {
+                  queuedCreateFailure.set(failure);
+                }
+              },
+              "queued-index-create");
+      queuedCreate.setDaemon(true);
+      queuedCreate.start();
+      awaitThreadBlocked(queuedCreate, "Concurrent create did not wait behind queued close");
+
+      startOwnerCreate.countDown();
+      long deadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(3);
+      joinUntil(readOwner, deadlineNanos);
+      joinUntil(concurrentClose, deadlineNanos);
+      joinUntil(queuedCreate, deadlineNanos);
+
+      assertFalse(readOwner.isAlive(), "Read owner deadlocked while re-entering createIndex");
+      assertFalse(concurrentClose.isAlive(), "Concurrent close deadlocked");
+      assertFalse(queuedCreate.isAlive(), "Queued create deadlocked");
+      assertNull(ownerFailure.get(), "Read owner's createIndex failed");
+      assertNotNull(ownerResult.get(), "Read owner's createIndex did not return an index");
+      assertNull(closeFailure.get(), "Concurrent close failed");
+      assertTrue(
+          queuedCreateFailure.get() instanceof IllegalArgumentException,
+          "Create queued behind close should observe the closed Dataset: "
+              + queuedCreateFailure.get());
+    } finally {
+      startOwnerCreate.countDown();
+      boolean workersStopped =
+          (readOwner == null || !readOwner.isAlive())
+              && (concurrentClose == null || !concurrentClose.isAlive())
+              && (queuedCreate == null || !queuedCreate.isAlive());
+      if (workersStopped) {
+        if (dataset != null) {
+          dataset.close();
+        }
+        allocator.close();
+      }
+    }
+  }
+
+  @Test
   @Timeout(value = 5, unit = TimeUnit.SECONDS)
   public void testCreateInvertedIndexAllowsReadWithQueuedWriter(@TempDir Path tempDir)
       throws Exception {
@@ -1279,6 +1384,26 @@ public class ScalarIndexTest {
       }
     }
     return false;
+  }
+
+  private static void awaitThreadBlocked(Thread thread, String message)
+      throws InterruptedException {
+    long deadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+    while (System.nanoTime() < deadlineNanos) {
+      Thread.State state = thread.getState();
+      if (state == Thread.State.BLOCKED || state == Thread.State.WAITING) {
+        return;
+      }
+      Thread.sleep(10);
+    }
+    Assertions.fail(message + "; state=" + thread.getState());
+  }
+
+  private static void joinUntil(Thread thread, long deadlineNanos) throws InterruptedException {
+    long remainingNanos = deadlineNanos - System.nanoTime();
+    if (remainingNanos > 0) {
+      thread.join(Math.max(1, TimeUnit.NANOSECONDS.toMillis(remainingNanos)));
+    }
   }
 
   @Test
