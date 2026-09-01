@@ -102,9 +102,7 @@ use super::{
 use crate::Dataset;
 use crate::Result;
 use crate::dataset::utils::CapturedRowIds;
-use crate::index::{
-    DatasetIndexExt, DatasetIndexInternalExt, load_all_indices, unsupported_index_version,
-};
+use crate::index::{DatasetIndexExt, DatasetIndexInternalExt, index_is_usable, load_all_indices};
 use crate::io::commit::{DEFAULT_COMMIT_RETRY_TIMEOUT, commit_transaction, migrate_fragments};
 use arrow::array::AsArray;
 use arrow::datatypes::{UInt8Type, UInt32Type, UInt64Type};
@@ -569,12 +567,12 @@ impl CompactionOptions {
 /// - Compaction mode is not `Reencode`
 /// - Dataset storage format is non-legacy
 /// - Fragment list is non-empty
+/// - All data files share identical Lance file versions
 /// - No fragment has a deletion file
 ///   TODO: Need to support schema evolution case like add column and drop column
-/// - Every fragment has one complete data file matching the current schema mapping
-///
-/// Encoded schema, version, buffer, and footer compatibility is intentionally
-/// decided only by `lance_file::concat::concat_files` during execution.
+/// - All data files use an identical schema mapping (`fields`, `column_indices`) in dataset schema
+///   order
+/// - Input data files must not contain extra global buffers (beyond schema / file descriptor)
 async fn can_use_binary_copy(
     dataset: &Dataset,
     options: &CompactionOptions,
@@ -594,6 +592,9 @@ pub(super) async fn can_use_binary_copy_current(
     options: &CompactionOptions,
     fragments: &[Fragment],
 ) -> Result<bool> {
+    use lance_file::reader::FileReader as LFReader;
+    use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
+
     if matches!(options.compaction_mode(), CompactionMode::Reencode) {
         log::debug!("Binary copy disabled: compaction mode is Reencode");
         return Ok(false);
@@ -608,8 +609,8 @@ pub(super) async fn can_use_binary_copy_current(
         return Ok(false);
     }
 
-    if fragments.len() < 2 {
-        log::debug!("Binary copy disabled: compaction requires at least two complete input files");
+    if fragments.is_empty() {
+        log::debug!("Binary copy disabled: no fragments to compact");
         return Ok(false);
     }
 
@@ -620,9 +621,19 @@ pub(super) async fn can_use_binary_copy_current(
         );
         return Ok(false);
     }
+    let ref_fields = &fragments[0].files[0].fields;
+    let ref_cols = &fragments[0].files[0].column_indices;
     let version = dataset.manifest.data_storage_format.lance_file_format();
-    let (expected_fields, expected_columns) =
+    let (schema_fields, schema_column_indices) =
         lance_file::versions::data_file_columns(version, dataset.schema());
+    if ref_fields.as_ref() != schema_fields.as_slice()
+        || ref_cols.as_ref() != schema_column_indices.as_slice()
+    {
+        log::debug!(
+            "Binary copy disabled: data files do not use the dataset schema's physical column order"
+        );
+        return Ok(false);
+    }
     for fragment in fragments {
         if fragment.deletion_file.is_some() {
             log::debug!(
@@ -631,27 +642,41 @@ pub(super) async fn can_use_binary_copy_current(
             );
             return Ok(false);
         }
-        if !fragment.overlays.is_empty() {
-            log::debug!(
-                "Binary copy disabled: fragment {} has {} data overlays",
-                fragment.id,
-                fragment.overlays.len()
-            );
-            return Ok(false);
-        }
 
-        let [data_file] = fragment.files.as_slice() else {
-            log::debug!(
-                "Binary copy disabled: fragment {} has {} data files; complete-file concatenation requires one",
-                fragment.id,
-                fragment.files.len()
+        for data_file in &fragment.files {
+            if data_file.fields != *ref_fields || data_file.column_indices != *ref_cols {
+                return Ok(false);
+            }
+
+            // check file global buffer
+            let object_store = match data_file.base_id {
+                Some(base_id) => dataset.object_store(Some(base_id)).await?,
+                None => dataset.object_store.clone(),
+            };
+            let full_path = dataset
+                .data_file_dir(data_file)?
+                .clone()
+                .join(data_file.path.as_str());
+            let scan_scheduler = ScanScheduler::new(
+                object_store.clone(),
+                SchedulerConfig::max_bandwidth(&object_store),
             );
-            return Ok(false);
-        };
-        if data_file.fields.as_ref() != expected_fields.as_slice()
-            || data_file.column_indices.as_ref() != expected_columns.as_slice()
-        {
-            return Ok(false);
+            let file_scheduler = scan_scheduler
+                .open_file_with_priority(&full_path, 0, &data_file.file_size_bytes)
+                .await?;
+            let file_meta = LFReader::read_all_metadata(&file_scheduler).await?;
+            // Binary copy only preserves page and column-buffer bytes. The output file's footer
+            // (including global buffers) is re-generated, not copied from inputs.
+            //
+            // Therefore, we reject input files that contain any additional global buffers beyond
+            // the required schema / file descriptor global buffer (global buffer index 0).
+            if file_meta.file_buffers.len() > 1 {
+                log::debug!(
+                    "Binary copy disabled: data file has extra global buffers (len={})",
+                    file_meta.file_buffers.len()
+                );
+                return Ok(false);
+            }
         }
     }
 
@@ -2151,7 +2176,7 @@ async fn index_fragment_coverage(
 async fn unremappable_index_coverage(dataset: &Dataset) -> Result<Vec<(String, RoaringBitmap)>> {
     let mut coverage = Vec::new();
     for index in load_all_indices(dataset).await?.iter() {
-        if is_system_index(index) || unsupported_index_version(index).is_none() {
+        if index_is_usable(index) {
             continue;
         }
         coverage.push((
@@ -2305,7 +2330,7 @@ async fn rewrite_files(
             || load_indices_for_remapping(dataset.as_ref())
                 .await?
                 .is_some());
-    let mut new_fragments: Option<Vec<Fragment>> = None;
+    let mut new_fragments: Vec<Fragment>;
     let task_id = uuid::Uuid::new_v4();
     log::info!(
         "Compaction task {}: Begin compacting {} rows across {} fragments",
@@ -2314,7 +2339,7 @@ async fn rewrite_files(
         fragments.len()
     );
     let mode = options.compaction_mode();
-    let mut can_binary_copy = can_use_binary_copy(dataset.as_ref(), options, &fragments).await;
+    let can_binary_copy = can_use_binary_copy(dataset.as_ref(), options, &fragments).await;
     if !can_binary_copy && matches!(mode, CompactionMode::ForceBinaryCopy) {
         return Err(Error::not_supported_source(
             format!("compaction task {}: binary copy is not supported", task_id).into(),
@@ -2323,7 +2348,7 @@ async fn rewrite_files(
     let mut row_ids_rx: Option<std::sync::mpsc::Receiver<CapturedRowIds>> = None;
     let mut reader: Option<SendableRecordBatchStream> = None;
 
-    if !can_binary_copy || matches!(mode, CompactionMode::TryBinaryCopy) {
+    if !can_binary_copy {
         let (prepared_reader, rx_initial, has_blob_v2_columns) = prepare_reader(
             dataset.as_ref(),
             &fragments,
@@ -2444,40 +2469,22 @@ async fn rewrite_files(
 
     if can_binary_copy {
         let version = dataset.manifest.data_storage_format.lance_file_format();
-        match versions::rewrite_files_binary_copy(
+        new_fragments = versions::rewrite_files_binary_copy(
             version,
             dataset.as_ref(),
             &fragments,
             &params,
             options.binary_copy_read_batch_bytes,
         )
-        .await?
-        {
-            binary_copy::BinaryCopyOutcome::Written(fragments) => {
-                new_fragments = Some(fragments);
-                // A prepared try-mode fallback stream is not consumed on the
-                // binary path, so its row-id receiver must not be awaited.
-                row_ids_rx = None;
-            }
-            binary_copy::BinaryCopyOutcome::Unsupported(reason) => {
-                if matches!(mode, CompactionMode::ForceBinaryCopy) {
-                    return Err(Error::not_supported_source(
-                        format!(
-                            "compaction task {task_id}: binary copy is not supported: {reason}"
-                        )
-                        .into(),
-                    ));
-                }
-                log::debug!(
-                    "Compaction task {}: binary copy unsupported ({}); falling back to re-encoding",
-                    task_id,
-                    reason
-                );
-                can_binary_copy = false;
-            }
+        .await?;
+
+        if new_fragments.is_empty() && matches!(mode, CompactionMode::ForceBinaryCopy) {
+            return Err(Error::not_supported_source(
+                format!("compaction task {}: binary copy is not supported", task_id).into(),
+            ));
         }
 
-        if can_binary_copy && capture_row_addrs {
+        if capture_row_addrs {
             let (tx, rx) = std::sync::mpsc::channel();
             let mut addrs = RoaringTreemap::new();
             for frag in &fragments {
@@ -2495,8 +2502,7 @@ async fn rewrite_files(
             let _ = tx.send(captured);
             row_ids_rx = Some(rx);
         }
-    }
-    if !can_binary_copy {
+    } else {
         let (frags, _) = write_fragments_internal_with_file_row_counts(
             dataset.manifest.data_storage_format.lance_file_format(),
             Some(dataset.as_ref()),
@@ -2509,14 +2515,8 @@ async fn rewrite_files(
             Some(file_row_counts),
         )
         .await?;
-        new_fragments = Some(frags);
+        new_fragments = frags;
     }
-
-    let mut new_fragments = new_fragments.ok_or_else(|| {
-        Error::internal(format!(
-            "compaction task {task_id} did not select a binary-copy or re-encode output"
-        ))
-    })?;
 
     log::info!("Compaction task {}: file written", task_id);
 
@@ -2527,7 +2527,11 @@ async fn rewrite_files(
             let captured_ids = row_ids_rx
                 .try_recv()
                 .map_err(|err| Error::internal(format!("Failed to receive row ids: {}", err)))?;
-            let row_addrs = captured_ids.row_addrs(None).into_owned();
+            let mut row_addrs = captured_ids.row_addrs(None)?.into_owned();
+            // Compaction reads whole fragments, so the captured addresses are
+            // dense per-fragment ranges; run containers (standard roaring
+            // format) shrink the persisted blob from O(rows) to O(runs) bytes.
+            row_addrs.optimize();
             let mut serialized = Vec::with_capacity(row_addrs.serialized_size());
             row_addrs.serialize_into(&mut serialized)?;
             Ok(Some(serialized))
@@ -2883,7 +2887,19 @@ pub async fn commit_compaction(
                                         f.id
                                     ))
                                 })?;
-                                Ok((f.id as u32, physical_rows as u32))
+                                let fragment_id = u32::try_from(f.id).map_err(|_| {
+                                    Error::invalid_input(format!(
+                                        "compacted fragment id {} is outside the row-address range",
+                                        f.id
+                                    ))
+                                })?;
+                                let physical_rows = u32::try_from(physical_rows).map_err(|_| {
+                                    Error::invalid_input(format!(
+                                        "compacted fragment {} has physical_rows={} outside the row-address range",
+                                        f.id, physical_rows
+                                    ))
+                                })?;
+                                Ok((fragment_id, physical_rows))
                             })
                             .collect::<Result<Vec<_>>>()?;
 
@@ -2892,8 +2908,15 @@ pub async fn commit_compaction(
                             old_frag_ids: task
                                 .original_fragments
                                 .iter()
-                                .map(|f| f.id as u32)
-                                .collect(),
+                                .map(|f| {
+                                    u32::try_from(f.id).map_err(|_| {
+                                        Error::invalid_input(format!(
+                                            "compacted source fragment id {} is outside the row-address range",
+                                            f.id
+                                        ))
+                                    })
+                                })
+                                .collect::<Result<Vec<_>>>()?,
                             new_frags,
                         });
                     }
@@ -3055,8 +3078,8 @@ mod tests {
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::Dimension;
     use lance_file::version::LanceFileVersion;
+    use lance_index::frag_reuse::CompactFragReuseIndexHandle;
     use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
-    use lance_index::frag_reuse::FragReuseIndexHandle;
     use lance_index::scalar::{
         BuiltinIndexType, FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams,
     };
@@ -4141,6 +4164,18 @@ mod tests {
             let row_addrs =
                 RoaringTreemap::deserialize_from(&mut Cursor::new(row_addrs_bytes)).unwrap();
             assert_eq!(row_addrs.len(), 9_000);
+            // The captured addresses are contiguous per-fragment ranges, so the
+            // persisted blob must be run-optimized: O(fragments) bytes, not
+            // O(rows). Without run containers this serializes at ~2 bytes per
+            // address (~18 KB here), so under one byte per address proves the
+            // run form was written.
+            assert!(
+                row_addrs_bytes.len() < row_addrs.len() as usize,
+                "serialized row addrs ({} bytes for {} addresses) should be \
+                 run-optimized before persisting",
+                row_addrs_bytes.len(),
+                row_addrs.len()
+            );
         } else {
             // Simulate a stale worker result that captured row addresses before the
             // dataset no longer needed a remapper. Invalid bytes ensure the commit
@@ -4703,7 +4738,7 @@ mod tests {
             open_frag_reuse_index(frag_reuse_index_meta.uuid, frag_reuse_details.as_ref())
                 .await
                 .unwrap();
-        let stats = FragReuseIndexHandle(Arc::new(frag_reuse_index.clone()))
+        let stats = CompactFragReuseIndexHandle(Arc::new(frag_reuse_index.clone()))
             .statistics()
             .unwrap();
         assert_eq!(
@@ -10090,46 +10125,6 @@ mod tests {
             })
             .collect();
         assert_eq!(values, expected);
-    }
-
-    #[tokio::test]
-    async fn test_overlay_compaction_try_binary_copy_falls_back() {
-        let dataset = create_base_dataset("memory://").await;
-        let mut dataset = commit_n_overlays(dataset, 3).await;
-        let expected = id_val_map(&dataset).await;
-        let mut options = overlay_only_options(2);
-        options.compaction_mode = Some(CompactionMode::TryBinaryCopy);
-
-        compact_files(&mut dataset, options, None).await.unwrap();
-
-        assert_eq!(id_val_map(&dataset).await, expected);
-        let compacted = dataset
-            .get_fragments()
-            .into_iter()
-            .find(|fragment| fragment.id() != 1)
-            .unwrap();
-        assert!(compacted.metadata().overlays.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_overlay_compaction_force_binary_copy_errors() {
-        let dataset = create_base_dataset("memory://").await;
-        let mut dataset = commit_n_overlays(dataset, 3).await;
-        let expected = id_val_map(&dataset).await;
-        let mut options = overlay_only_options(2);
-        options.compaction_mode = Some(CompactionMode::ForceBinaryCopy);
-
-        let error = compact_files(&mut dataset, options, None)
-            .await
-            .unwrap_err();
-
-        assert!(matches!(error, Error::NotSupported { .. }));
-        assert!(error.to_string().contains("binary copy is not supported"));
-        assert_eq!(id_val_map(&dataset).await, expected);
-        assert_eq!(
-            dataset.get_fragment(0).unwrap().metadata().overlays.len(),
-            3
-        );
     }
 
     #[tokio::test]
