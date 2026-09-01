@@ -988,7 +988,7 @@ pub fn l2_distance_arrow_batch(
                 .collect(),
             &to.convert_to_floating_point()?,
         ),
-        _ => Err(Error::ComputeError(format!(
+        _ => Err(Error::InvalidArgumentError(format!(
             "Unsupported data type: {}",
             from.data_type()
         ))),
