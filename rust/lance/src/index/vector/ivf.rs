@@ -3026,10 +3026,9 @@ where
         let progress = progress.clone();
         tokio::spawn(async move {
             while let Some(iter) = progress_rx.recv().await {
-                if let Err(e) = progress.stage_progress("train_ivf", iter).await {
-                    warn!("Progress callback error during train_ivf: {e}");
-                }
+                progress.stage_progress("train_ivf", iter).await?;
             }
+            Result::Ok(())
         })
     };
 
@@ -3055,9 +3054,7 @@ where
         params.sample_rate,
     );
     drop(progress_tx);
-    if let Err(e) = progress_worker.await {
-        warn!("Progress worker join error during train_ivf: {e}");
-    }
+    progress_worker.await??;
     let kmeans = kmeans?;
     let training_data = FixedSizeListArray::try_new_from_values(
         Arc::new(data.clone()) as ArrayRef,
@@ -4361,10 +4358,9 @@ async fn train_streaming_coreset_ivf_model(
         let progress = progress.clone();
         tokio::spawn(async move {
             while let Some(iter) = progress_rx.recv().await {
-                if let Err(e) = progress.stage_progress("train_ivf", iter).await {
-                    warn!("Progress callback error during train_ivf: {e}");
-                }
+                progress.stage_progress("train_ivf", iter).await?;
             }
+            Result::Ok(())
         })
     };
 
@@ -4530,9 +4526,7 @@ async fn train_streaming_coreset_ivf_model(
 
     drop(progress_tx);
     drop(on_progress);
-    if let Err(e) = progress_worker.await {
-        warn!("Progress worker join error during train_ivf: {e}");
-    }
+    progress_worker.await??;
 
     info!(
         "Streaming coreset IVF sampled {} vectors total; max in-memory training vectors per step: {}; coreset vectors: {}",
@@ -4576,10 +4570,9 @@ async fn train_streaming_ivf_model(
         let progress = progress.clone();
         tokio::spawn(async move {
             while let Some(iter) = progress_rx.recv().await {
-                if let Err(e) = progress.stage_progress("train_ivf", iter).await {
-                    warn!("Progress callback error during train_ivf: {e}");
-                }
+                progress.stage_progress("train_ivf", iter).await?;
             }
+            Result::Ok(())
         })
     };
 
@@ -4642,9 +4635,7 @@ async fn train_streaming_ivf_model(
 
     drop(progress_tx);
     drop(on_progress);
-    if let Err(e) = progress_worker.await {
-        warn!("Progress worker join error during train_ivf: {e}");
-    }
+    progress_worker.await??;
 
     info!(
         "Streaming IVF training sampled {} vectors total; max in-memory training vectors per step: {}",
