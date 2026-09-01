@@ -114,7 +114,8 @@ use crate::io::exec::filtered_read::{
 };
 use crate::io::exec::fts::{
     BoostQueryExec, CompoundQueryExec, CrossColumnCompoundQueryExec, FlatMatchFilterExec,
-    FlatMatchQueryExec, FtsDocumentExec, MatchQueryExec, PhraseQueryExec, SharedFtsScorer,
+    FlatMatchQueryExec, FtsDocumentExec, HybridCompoundQueryExec, MatchQueryExec, PhraseQueryExec,
+    SharedFtsScorer,
 };
 use crate::io::exec::knn::MultivectorScoringExec;
 use crate::io::exec::scalar_index::{MaterializeIndexExec, ScalarIndexExec};
@@ -281,6 +282,76 @@ fn supports_compound_scorer(query: &FtsQuery) -> bool {
     }
     let columns = collect_fts_columns_in_order(query);
     !columns.is_empty() && (!matches!(query, FtsQuery::MultiMatch(_)) || columns.len() == 1)
+}
+
+fn supports_indexed_stats_residual_compound(query: &FtsQuery) -> bool {
+    match query {
+        FtsQuery::Match(query) => query.fuzziness == Some(0),
+        // MemWAL phrase matching currently collapses tokenizer position gaps.
+        // Keep phrase queries on the established fallback until it can retain
+        // those gaps exactly (notably when stop words are configured).
+        FtsQuery::Phrase(_) => false,
+        FtsQuery::Boost(query) => {
+            supports_indexed_stats_residual_compound(&query.positive)
+                && supports_indexed_stats_residual_compound(&query.negative)
+        }
+        FtsQuery::MultiMatch(query) => query
+            .match_queries
+            .iter()
+            .all(|query| query.fuzziness == Some(0)),
+        FtsQuery::Boolean(query) => query
+            .should
+            .iter()
+            .chain(&query.must)
+            .chain(&query.must_not)
+            .all(supports_indexed_stats_residual_compound),
+    }
+}
+
+const MAX_QUERY_LOCAL_RESIDUAL_ROWS: usize = 100_000;
+
+fn has_bounded_query_local_residual_rows(fragments: &[Fragment]) -> bool {
+    fragments
+        .iter()
+        .try_fold(0usize, |total, fragment| {
+            total.checked_add(fragment.physical_rows?)
+        })
+        .is_some_and(|total| total <= MAX_QUERY_LOCAL_RESIDUAL_ROWS)
+}
+
+fn has_complete_hybrid_fts_coverage(
+    segments: &[IndexMetadata],
+    residual_fragments: &[Fragment],
+    target_fragments: &[Fragment],
+) -> bool {
+    let Some(target) = target_fragments
+        .iter()
+        .map(|fragment| u32::try_from(fragment.id).ok())
+        .collect::<Option<RoaringBitmap>>()
+    else {
+        return false;
+    };
+    let Some(residual) = residual_fragments
+        .iter()
+        .map(|fragment| u32::try_from(fragment.id).ok())
+        .collect::<Option<RoaringBitmap>>()
+    else {
+        return false;
+    };
+    let mut indexed = RoaringBitmap::new();
+    for segment in segments {
+        let Some(coverage) = segment.fragment_bitmap.as_ref() else {
+            return false;
+        };
+        if !indexed.is_disjoint(coverage) {
+            return false;
+        }
+        indexed |= coverage;
+    }
+    if !indexed.is_subset(&target) || !indexed.is_disjoint(&residual) {
+        return false;
+    }
+    indexed | residual == target
 }
 
 fn validate_fts_query_contract(query: &FtsQuery) -> Result<()> {
@@ -4196,6 +4267,7 @@ impl Scanner {
         &self,
         query: &FtsQuery,
         params: &FtsSearchParams,
+        filter_plan: &ExprFilterPlan,
         prefilter_source: &PreFilterSource,
         document_granularity: DocumentGranularity,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
@@ -4220,6 +4292,21 @@ impl Scanner {
         }
         let mut phrase_columns = HashSet::new();
         collect_phrase_columns(query, &mut phrase_columns);
+        // Query-local residual scoring intentionally reuses committed-index
+        // BM25 statistics. Matching remains exact for the supported leaf
+        // shapes, but ranking is approximate until the appended rows are
+        // incorporated into a persistent index.
+        let allow_indexed_stats_residual = !cross_column
+            && !self.fast_search
+            && self.fragments.is_none()
+            && filter_plan.is_empty()
+            && self.external_row_mask.is_none()
+            && params.limit.is_some()
+            && document_granularity == DocumentGranularity::Row
+            && target_fragments
+                .iter()
+                .all(|fragment| fragment.deletion_file.is_none())
+            && supports_indexed_stats_residual_compound(query);
 
         let segment_groups = futures::future::try_join_all(columns.into_iter().map(|column| {
             let phrase_columns = &phrase_columns;
@@ -4243,8 +4330,12 @@ impl Scanner {
                 )
                 .await?;
                 let unindexed_fragments = self.retain_target_fragments(unindexed_fragments);
+                let has_bounded_residual = allow_indexed_stats_residual
+                    && has_bounded_query_local_residual_rows(&unindexed_fragments);
                 if !unindexed_fragments.is_empty()
                     && (!self.fast_search || unindexed_fragments.len() == target_fragments.len())
+                    && !(has_bounded_residual
+                        && unindexed_fragments.len() < target_fragments.len())
                 {
                     // Flat and posting-backed leaves do not share a document
                     // domain, so preserve the exact fallback for partial index
@@ -4254,10 +4345,6 @@ impl Scanner {
                     // indexed.
                     return Ok(None);
                 }
-                let unindexed_fragment_ids = unindexed_fragments
-                    .iter()
-                    .map(|fragment| fragment.id as u32)
-                    .collect::<RoaringBitmap>();
                 let segments = match overlay_plan {
                     FtsOverlayPlan::Unchanged(Some(segments)) => segments,
                     FtsOverlayPlan::Unchanged(None) => {
@@ -4271,6 +4358,23 @@ impl Scanner {
                     }
                     FtsOverlayPlan::RowLevel { .. } | FtsOverlayPlan::FullScan => return Ok(None),
                 };
+                if has_bounded_residual && !unindexed_fragments.is_empty() {
+                    if !has_complete_hybrid_fts_coverage(
+                        &segments,
+                        &unindexed_fragments,
+                        target_fragments,
+                    ) {
+                        return Ok(None);
+                    }
+                    if segments.is_empty() {
+                        return Err(Error::internal(
+                            "hybrid compound FTS requires one indexed segment",
+                        ));
+                    }
+                    // Preserve the established semantic mismatch error before
+                    // constructing query-local postings with the same tokenizer.
+                    load_segment_details(&self.dataset, &column, &segments).await?;
+                }
 
                 if cross_column {
                     let details = futures::future::try_join_all(
@@ -4306,7 +4410,7 @@ impl Scanner {
                     }
                 }
 
-                Ok(Some((column, segments, unindexed_fragment_ids)))
+                Ok(Some((column, segments, unindexed_fragments)))
             }
         }))
         .await?;
@@ -4315,9 +4419,43 @@ impl Scanner {
         };
 
         if !cross_column {
-            let (_, segments, _) = segment_groups.into_iter().next().ok_or_else(|| {
-                Error::internal("compound scorer requires one column".to_string())
-            })?;
+            let (column, segments, unindexed_fragments) =
+                segment_groups.into_iter().next().ok_or_else(|| {
+                    Error::internal("compound scorer requires one column".to_string())
+                })?;
+            if allow_indexed_stats_residual && !unindexed_fragments.is_empty() {
+                let resolved =
+                    resolve_fts_field(self.dataset.schema(), &column, document_granularity)?;
+                let scan_column = if resolved.has_lists() {
+                    resolved.root_column.clone()
+                } else {
+                    resolved.canonical_path.clone()
+                };
+                let scan_projection = self
+                    .dataset
+                    .empty_projection()
+                    .with_row_id()
+                    .union_columns(&[scan_column], OnMissing::Error)?;
+                let PlannedFilteredScan { plan, .. } = self
+                    .filtered_read(
+                        &ExprFilterPlan::default(),
+                        scan_projection,
+                        /* make_deletions_null */ false,
+                        Some(Arc::new(unindexed_fragments)),
+                        None,
+                        /* is_prefilter */ true,
+                        None,
+                    )
+                    .await?;
+                return Ok(Some(Arc::new(HybridCompoundQueryExec::new(
+                    self.dataset.clone(),
+                    query.clone(),
+                    params.clone(),
+                    column,
+                    segments,
+                    plan,
+                ))));
+            }
             return Ok(Some(Arc::new(
                 CompoundQueryExec::new_with_segments(
                     self.dataset.clone(),
@@ -4334,9 +4472,17 @@ impl Scanner {
         let Some((_, _, first_unindexed_fragments)) = coverage_groups.next() else {
             return Ok(None);
         };
-        if coverage_groups
-            .any(|(_, _, unindexed_fragments)| unindexed_fragments != first_unindexed_fragments)
-        {
+        let first_unindexed_fragment_ids = first_unindexed_fragments
+            .iter()
+            .map(|fragment| fragment.id as u32)
+            .collect::<RoaringBitmap>();
+        if coverage_groups.any(|(_, _, unindexed_fragments)| {
+            unindexed_fragments
+                .iter()
+                .map(|fragment| fragment.id as u32)
+                .collect::<RoaringBitmap>()
+                != first_unindexed_fragment_ids
+        }) {
             // The cross-column scorer builds one shared prefilter. If column
             // coverage differs, that prefilter's union can re-admit stale
             // postings from a fragment invalidated only for another column.
@@ -4348,7 +4494,6 @@ impl Scanner {
             .into_iter()
             .map(|(column, segments, _)| (column, segments))
             .collect();
-
         let exec = CrossColumnCompoundQueryExec::new_with_segments(
             self.dataset.clone(),
             query.clone(),
@@ -4371,7 +4516,13 @@ impl Scanner {
         if !document_granularity.is_list_element()
             && supports_compound_scorer(query)
             && let Some(plan) = self
-                .plan_compound_scorer(query, params, prefilter_source, document_granularity)
+                .plan_compound_scorer(
+                    query,
+                    params,
+                    filter_plan,
+                    prefilter_source,
+                    document_granularity,
+                )
                 .await?
         {
             return Ok(plan);
@@ -4441,6 +4592,7 @@ impl Scanner {
                                         .plan_compound_scorer(
                                             &child_query,
                                             params,
+                                            filter_plan,
                                             field_prefilter_source,
                                             document_granularity,
                                         )
@@ -5174,10 +5326,9 @@ impl Scanner {
             // from `covering_fields` either -- that is computed from a field older
             // writers drop, so it would widen to the carried columns exactly when the
             // declaration is lost.
-            else if let Some(index) = indices
-                .iter()
-                .find(|i| i.fields.first() == Some(&column_id))
-            {
+            else if let Some(index) = indices.iter().find(|i| {
+                i.fields.first() == Some(&column_id) && crate::index::index_type_is_known(i)
+            }) {
                 // Try to get metric type from index metadata first (fast path for newer indices)
                 let index_metric = if let Some(metric) =
                     crate::index::vector::details::metric_type_from_index_metadata(index)
@@ -7224,6 +7375,28 @@ mod test {
         let error = validate_fts_query_contract(&infinite_boost).unwrap_err();
         assert!(matches!(error, Error::InvalidInput { .. }));
         assert!(error.to_string().contains("BoostQuery negative_boost"));
+    }
+
+    #[test]
+    fn test_query_local_residual_row_bound() {
+        let fragment_with_rows = |id, physical_rows| {
+            let mut fragment = Fragment::new(id);
+            fragment.physical_rows = physical_rows;
+            fragment
+        };
+
+        assert!(has_bounded_query_local_residual_rows(&[
+            fragment_with_rows(0, Some(40_000)),
+            fragment_with_rows(1, Some(60_000)),
+        ]));
+        assert!(!has_bounded_query_local_residual_rows(&[
+            fragment_with_rows(0, Some(40_000)),
+            fragment_with_rows(1, Some(60_001)),
+        ]));
+        assert!(!has_bounded_query_local_residual_rows(&[
+            fragment_with_rows(0, Some(1)),
+            fragment_with_rows(1, None),
+        ]));
     }
 
     #[test]
