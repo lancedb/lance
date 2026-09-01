@@ -1975,12 +1975,7 @@ impl DatasetIndexExt for Dataset {
         };
 
         let mut merged_segment = if all_vector {
-            crate::index::vector::ivf::merge_segments(
-                self.object_store.as_ref(),
-                &self.indices_dir(),
-                source_segments,
-            )
-            .await?
+            crate::index::vector::ivf::merge_segments(self, source_segments).await?
         } else if all_inverted {
             crate::index::scalar::inverted::merge_segments(self, source_segments).await?
         } else if all_fmindex {
