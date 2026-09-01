@@ -44,8 +44,9 @@ use lance_core::{
     utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu},
 };
 use lance_datafusion::utils::{
-    DELTAS_SEARCHED_METRIC, ExecutionPlanMetricsSetExt, FIND_PARTITIONS_ELAPSED_METRIC,
-    PARTITIONS_RANKED_METRIC, PARTITIONS_SEARCHED_METRIC,
+    COARSE_QUANTIZER_REUSED_SEGMENTS_METRIC, DELTAS_SEARCHED_METRIC, ExecutionPlanMetricsSetExt,
+    FIND_PARTITIONS_CALLS_METRIC, FIND_PARTITIONS_ELAPSED_METRIC, PARTITIONS_RANKED_METRIC,
+    PARTITIONS_SEARCHED_METRIC, SHARED_COARSE_QUANTIZER_FAST_PATH_METRIC,
 };
 use lance_index::metrics::MetricsCollector;
 use lance_index::prefilter::PreFilter;
@@ -63,9 +64,10 @@ use tokio::sync::Notify;
 use uuid::Uuid;
 
 use crate::dataset::Dataset;
-use crate::index::DatasetIndexInternalExt;
 use crate::index::prefilter::{DatasetPreFilter, FilterLoader};
+use crate::index::vector::details::coarse_quantizer_fingerprint_from_metadata;
 use crate::index::vector::utils::{get_vector_type, validate_distance_type_for};
+use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
 use crate::{Error, Result};
 use lance_arrow::*;
 
@@ -86,6 +88,9 @@ pub struct AnnPartitionMetrics {
     partitions_ranked: Count,
     deltas_searched: Count,
     find_partitions_elapsed: Time,
+    find_partitions_calls: Count,
+    shared_coarse_quantizer_fast_path: Count,
+    coarse_quantizer_reused_segments: Count,
     baseline_metrics: BaselineMetrics,
 }
 
@@ -96,6 +101,11 @@ impl AnnPartitionMetrics {
             partitions_ranked: metrics.new_count(PARTITIONS_RANKED_METRIC, partition),
             deltas_searched: metrics.new_count(DELTAS_SEARCHED_METRIC, partition),
             find_partitions_elapsed: metrics.new_time(FIND_PARTITIONS_ELAPSED_METRIC, partition),
+            find_partitions_calls: metrics.new_count(FIND_PARTITIONS_CALLS_METRIC, partition),
+            shared_coarse_quantizer_fast_path: metrics
+                .new_count(SHARED_COARSE_QUANTIZER_FAST_PATH_METRIC, partition),
+            coarse_quantizer_reused_segments: metrics
+                .new_count(COARSE_QUANTIZER_REUSED_SEGMENTS_METRIC, partition),
             baseline_metrics: BaselineMetrics::new(metrics, partition),
         }
     }
@@ -137,6 +147,60 @@ fn normalize_query_for_index(index: &dyn VectorIndex, query: Query) -> DataFusio
         .0;
     query.key = key;
     Ok(query)
+}
+
+fn has_shared_coarse_quantizer(indices: &[IndexMetadata], index_uuids: &[Uuid]) -> bool {
+    if index_uuids.len() < 2 {
+        return false;
+    }
+
+    let mut expected = None;
+    for uuid in index_uuids {
+        let Some(index) = indices.iter().find(|index| index.uuid == *uuid) else {
+            return false;
+        };
+        let Some(fingerprint) = coarse_quantizer_fingerprint_from_metadata(index) else {
+            return false;
+        };
+        match &expected {
+            Some(expected) if expected != &fingerprint => return false,
+            None => expected = Some(fingerprint),
+            Some(_) => {}
+        }
+    }
+    true
+}
+
+fn partition_batch(
+    uuid: Uuid,
+    partitions: &UInt32Array,
+    dist_q_c: &Float32Array,
+) -> DataFusionResult<RecordBatch> {
+    let mut part_list_builder = ListBuilder::new(UInt32Builder::new()).with_field(Field::new(
+        "item",
+        DataType::UInt32,
+        false,
+    ));
+    part_list_builder.append_value(partitions.iter());
+    let partition_col = part_list_builder.finish();
+
+    let mut dist_q_c_list_builder = ListBuilder::new(Float32Builder::new()).with_field(Field::new(
+        "item",
+        DataType::Float32,
+        false,
+    ));
+    dist_q_c_list_builder.append_value(dist_q_c.iter());
+    let dist_q_c_col = dist_q_c_list_builder.finish();
+
+    let uuid_col = StringArray::from(vec![uuid.to_string()]);
+    Ok(RecordBatch::try_new(
+        KNN_PARTITION_SCHEMA.clone(),
+        vec![
+            Arc::new(partition_col),
+            Arc::new(dist_q_c_col),
+            Arc::new(uuid_col),
+        ],
+    )?)
 }
 
 /// [ExecutionPlan] compute vector distance from a query vector.
@@ -1141,18 +1205,17 @@ pub fn new_knn_exec(
 ///
 /// It searches the partition IDs using the input query.
 ///
-/// It searches all index deltas in parallel.  For each delta it returns a
-/// single batch with the partition IDs and the delta index `uuid`:
+/// If all deltas have the same supported coarse-quantizer fingerprint then it
+/// ranks partitions once and reuses the result. Otherwise, it searches all
+/// index deltas in parallel. For each delta it returns a single batch with the
+/// partition IDs and the delta index `uuid`:
 ///
 /// The number of partitions returned is at most `maximum_nprobes`.  If
 /// `maximum_nprobes` is not set, it will return all partitions.  The partitions
 /// are returned in sorted order from closest to farthest.
 ///
-/// Typically, all partition ids will be identical for each delta index (since delta
-/// indices have identical partitions) but the downstream nodes do not rely on this.
-///
-/// TODO: We may want to search the partitions once instead of once per delta index
-/// since the centroids are the same.
+/// The downstream nodes do not rely on partition IDs being identical across
+/// deltas, so missing or incompatible fingerprints preserve the original path.
 ///
 /// ```text
 /// {
@@ -1281,63 +1344,92 @@ impl ExecutionPlan for ANNIvfPartitionExec {
         let target_partitions = context.session_config().target_partitions();
         let query = self.query.clone();
         let ds = self.dataset.clone();
+        let index_uuids = self.index_uuids.clone();
         let metrics = Arc::new(AnnPartitionMetrics::new(&self.metrics, partition));
-        metrics.deltas_searched.add(self.index_uuids.len());
+        metrics.deltas_searched.add(index_uuids.len());
         let metrics_clone = metrics.clone();
 
-        let stream = stream::iter(self.index_uuids.clone())
-            .map(move |uuid| {
-                let query = query.clone();
-                let ds = ds.clone();
-                let metrics = metrics.clone();
-                async move {
-                    let index = ds
-                        .open_vector_index(&query.column, &uuid, &metrics.index_metrics)
-                        .await?;
-                    // Normalize cosine queries once before partition ranking.
-                    let query = normalize_query_for_index(index.as_ref(), query.clone())?;
-
-                    metrics.partitions_ranked.add(index.total_partitions());
-
-                    let (partitions, dist_q_c) = {
-                        let _timer = metrics.find_partitions_elapsed.timer();
-                        find_partitions_on_cpu(index, query).await?
-                    };
-
-                    let mut part_list_builder = ListBuilder::new(UInt32Builder::new())
-                        .with_field(Field::new("item", DataType::UInt32, false));
-                    part_list_builder.append_value(partitions.iter());
-                    let partition_col = part_list_builder.finish();
-
-                    let mut dist_q_c_list_builder = ListBuilder::new(Float32Builder::new())
-                        .with_field(Field::new("item", DataType::Float32, false));
-                    dist_q_c_list_builder.append_value(dist_q_c.iter());
-                    let dist_q_c_col = dist_q_c_list_builder.finish();
-
-                    let uuid_col = StringArray::from(vec![uuid.to_string()]);
-                    let batch = RecordBatch::try_new(
-                        KNN_PARTITION_SCHEMA.clone(),
-                        vec![
-                            Arc::new(partition_col),
-                            Arc::new(dist_q_c_col),
-                            Arc::new(uuid_col),
-                        ],
-                    )?;
-                    metrics.baseline_metrics.record_output(batch.num_rows());
-                    Ok::<_, DataFusionError>(batch)
+        let stream = stream::once(async move {
+            let can_reuse = match ds.load_indices().await {
+                Ok(indices) => has_shared_coarse_quantizer(&indices, &index_uuids),
+                Err(error) => {
+                    tracing::debug!(
+                        "Could not load vector segment metadata for coarse-quantizer reuse: {error}"
+                    );
+                    false
                 }
-            })
-            .buffered(self.index_uuids.len().min(target_partitions).max(1))
-            .finally(move || {
-                // Partition ranking reads centroids from memory, so this is
-                // typically zero; flushed for symmetry with ANNSubIndex.
-                metrics_clone.index_metrics.flush_io();
-                metrics_clone.baseline_metrics.done();
-                metrics_clone
-                    .baseline_metrics
-                    .elapsed_compute()
-                    .add_duration(timer.elapsed());
-            });
+            };
+
+            if can_reuse {
+                let representative_uuid = index_uuids[0];
+                let index = ds
+                    .open_vector_index(&query.column, &representative_uuid, &metrics.index_metrics)
+                    .await?;
+                let query = normalize_query_for_index(index.as_ref(), query)?;
+
+                metrics.shared_coarse_quantizer_fast_path.add(1);
+                metrics
+                    .coarse_quantizer_reused_segments
+                    .add(index_uuids.len() - 1);
+                metrics.partitions_ranked.add(index.total_partitions());
+                metrics.find_partitions_calls.add(1);
+
+                let (partitions, dist_q_c) = {
+                    let _timer = metrics.find_partitions_elapsed.timer();
+                    find_partitions_on_cpu(index, query).await?
+                };
+
+                let batches = index_uuids
+                    .into_iter()
+                    .map(|uuid| {
+                        let batch = partition_batch(uuid, &partitions, &dist_q_c)?;
+                        metrics.baseline_metrics.record_output(batch.num_rows());
+                        Ok(batch)
+                    })
+                    .collect::<DataFusionResult<Vec<_>>>()?;
+                return Ok::<_, DataFusionError>(stream::iter(batches.into_iter().map(Ok)).boxed());
+            }
+
+            let concurrency = index_uuids.len().min(target_partitions).max(1);
+            Ok(stream::iter(index_uuids)
+                .map(move |uuid| {
+                    let query = query.clone();
+                    let ds = ds.clone();
+                    let metrics = metrics.clone();
+                    async move {
+                        let index = ds
+                            .open_vector_index(&query.column, &uuid, &metrics.index_metrics)
+                            .await?;
+                        // Normalize cosine queries once before partition ranking.
+                        let query = normalize_query_for_index(index.as_ref(), query)?;
+
+                        metrics.partitions_ranked.add(index.total_partitions());
+                        metrics.find_partitions_calls.add(1);
+
+                        let (partitions, dist_q_c) = {
+                            let _timer = metrics.find_partitions_elapsed.timer();
+                            find_partitions_on_cpu(index, query).await?
+                        };
+
+                        let batch = partition_batch(uuid, &partitions, &dist_q_c)?;
+                        metrics.baseline_metrics.record_output(batch.num_rows());
+                        Ok::<_, DataFusionError>(batch)
+                    }
+                })
+                .buffered(concurrency)
+                .boxed())
+        })
+        .try_flatten()
+        .finally(move || {
+            // Partition ranking reads centroids from memory, so this is
+            // typically zero; flushed for symmetry with ANNSubIndex.
+            metrics_clone.index_metrics.flush_io();
+            metrics_clone.baseline_metrics.done();
+            metrics_clone
+                .baseline_metrics
+                .elapsed_compute()
+                .add_duration(timer.elapsed());
+        });
         let schema = self.schema();
         Ok(
             Box::pin(RecordBatchStreamAdapter::new(schema, stream.boxed()))
@@ -2561,7 +2653,10 @@ mod tests {
     use lance_core::deepsize::DeepSizeOf;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datafusion::exec::{ExecutionStatsCallback, ExecutionSummaryCounts};
-    use lance_datafusion::utils::FIND_PARTITIONS_ELAPSED_METRIC;
+    use lance_datafusion::utils::{
+        COARSE_QUANTIZER_REUSED_SEGMENTS_METRIC, FIND_PARTITIONS_CALLS_METRIC,
+        FIND_PARTITIONS_ELAPSED_METRIC, SHARED_COARSE_QUANTIZER_FAST_PATH_METRIC,
+    };
     use lance_datagen::{BatchCount, RowCount, array};
     use lance_index::optimize::OptimizeOptions;
     use lance_index::vector::ivf::IvfBuildParams;
@@ -2598,6 +2693,83 @@ mod tests {
             dist_q_c: 0.0,
             approx_mode: Default::default(),
         }
+    }
+
+    #[test]
+    fn test_shared_coarse_quantizer_check_fails_closed() {
+        use lance_index::pb::VectorIndexDetails;
+        use lance_index::pb::vector_index_details::CoarseQuantizerFingerprint;
+
+        fn metadata(uuid: Uuid, fingerprint: Option<CoarseQuantizerFingerprint>) -> IndexMetadata {
+            let details = VectorIndexDetails {
+                coarse_quantizer_fingerprint: fingerprint,
+                ..Default::default()
+            };
+            IndexMetadata {
+                uuid,
+                name: "vector_idx".to_string(),
+                fields: vec![0],
+                covering_fields: vec![],
+                dataset_version: 1,
+                fragment_bitmap: None,
+                index_details: Some(Arc::new(prost_types::Any::from_msg(&details).unwrap())),
+                index_version: 1,
+                created_at: None,
+                base_id: None,
+                files: None,
+            }
+        }
+
+        let first_uuid = Uuid::new_v4();
+        let second_uuid = Uuid::new_v4();
+        let fingerprint = CoarseQuantizerFingerprint {
+            version: 1,
+            digest: vec![7; 32],
+        };
+        let uuids = vec![first_uuid, second_uuid];
+        let shared = vec![
+            metadata(first_uuid, Some(fingerprint.clone())),
+            metadata(second_uuid, Some(fingerprint.clone())),
+        ];
+        assert!(has_shared_coarse_quantizer(&shared, &uuids));
+
+        let missing = vec![
+            metadata(first_uuid, Some(fingerprint.clone())),
+            metadata(second_uuid, None),
+        ];
+        assert!(!has_shared_coarse_quantizer(&missing, &uuids));
+
+        let mut other = fingerprint.clone();
+        other.digest[0] = 8;
+        let different = vec![
+            metadata(first_uuid, Some(fingerprint.clone())),
+            metadata(second_uuid, Some(other)),
+        ];
+        assert!(!has_shared_coarse_quantizer(&different, &uuids));
+
+        let invalid_version = vec![
+            metadata(first_uuid, Some(fingerprint.clone())),
+            metadata(
+                second_uuid,
+                Some(CoarseQuantizerFingerprint {
+                    version: 2,
+                    digest: vec![7; 32],
+                }),
+            ),
+        ];
+        assert!(!has_shared_coarse_quantizer(&invalid_version, &uuids));
+
+        let invalid_digest = vec![
+            metadata(first_uuid, Some(fingerprint)),
+            metadata(
+                second_uuid,
+                Some(CoarseQuantizerFingerprint {
+                    version: 1,
+                    digest: vec![7; 31],
+                }),
+            ),
+        ];
+        assert!(!has_shared_coarse_quantizer(&invalid_digest, &uuids));
     }
 
     #[test]
@@ -4130,6 +4302,18 @@ mod tests {
 
     impl NprobesTestFixture {
         pub async fn new(num_centroids: usize, num_deltas: usize) -> Self {
+            Self::new_with_retrained_centroids(num_centroids, num_deltas, false).await
+        }
+
+        async fn new_without_fingerprint(num_centroids: usize, num_deltas: usize) -> Self {
+            Self::new_with_retrained_centroids(num_centroids, num_deltas, true).await
+        }
+
+        async fn new_with_retrained_centroids(
+            num_centroids: usize,
+            num_deltas: usize,
+            retrain: bool,
+        ) -> Self {
             let tempdir = TempStrDir::default();
             let tmppath = tempdir.as_str();
 
@@ -4176,11 +4360,12 @@ mod tests {
                 .await
                 .unwrap();
 
-                let ivf_params = IvfBuildParams::try_with_centroids(
+                let mut ivf_params = IvfBuildParams::try_with_centroids(
                     num_centroids,
                     Arc::new(centroids.as_fixed_size_list().clone()),
                 )
                 .unwrap();
+                ivf_params.retrain = retrain;
 
                 let codebook = array::rand::<Float32Type>()
                     .generate_default(RowCount::from(256 * 2))
@@ -4244,6 +4429,10 @@ mod tests {
                 .unwrap_or_default()
                 > 0
         );
+    }
+
+    fn metric_count(stats: &ExecutionSummaryCounts, metric: &str) -> usize {
+        stats.all_counts.get(metric).copied().unwrap_or_default()
     }
 
     #[rstest]
@@ -4478,10 +4667,53 @@ mod tests {
             );
             assert_eq!(
                 stats.all_counts.get(PARTITIONS_RANKED_METRIC).unwrap(),
-                &(100 * num_deltas)
+                &100
+            );
+            assert_eq!(metric_count(&stats, FIND_PARTITIONS_CALLS_METRIC), 1);
+            assert_eq!(
+                metric_count(&stats, SHARED_COARSE_QUANTIZER_FAST_PATH_METRIC),
+                usize::from(num_deltas > 1)
+            );
+            assert_eq!(
+                metric_count(&stats, COARSE_QUANTIZER_REUSED_SEGMENTS_METRIC),
+                num_deltas.saturating_sub(1)
             );
             assert_find_partitions_elapsed_recorded(&stats);
         }
+    }
+
+    #[tokio::test]
+    async fn test_missing_fingerprint_uses_per_segment_partition_search() {
+        let fixture = NprobesTestFixture::new_without_fingerprint(4, 2).await;
+        let q = fixture.get_centroid(0);
+        let stats_holder = StatsHolder::default();
+
+        fixture
+            .dataset
+            .scan()
+            .nearest("vector", q.as_ref(), 10)
+            .unwrap()
+            .minimum_nprobes(2)
+            .maximum_nprobes(2)
+            .scan_stats_callback(stats_holder.get_setter())
+            .project(&Vec::<String>::new())
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        let stats = stats_holder.consume();
+        assert_eq!(metric_count(&stats, FIND_PARTITIONS_CALLS_METRIC), 2);
+        assert_eq!(metric_count(&stats, PARTITIONS_RANKED_METRIC), 8);
+        assert_eq!(
+            metric_count(&stats, SHARED_COARSE_QUANTIZER_FAST_PATH_METRIC),
+            0
+        );
+        assert_eq!(
+            metric_count(&stats, COARSE_QUANTIZER_REUSED_SEGMENTS_METRIC),
+            0
+        );
+        assert_find_partitions_elapsed_recorded(&stats);
     }
 
     #[rstest]
