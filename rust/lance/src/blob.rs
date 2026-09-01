@@ -1398,6 +1398,43 @@ mod tests {
     }
 
     #[test]
+    fn test_prepared_to_logical_blob_schema_preserves_non_blob_fields() {
+        let mut metadata = HashMap::new();
+        metadata.insert(ARROW_EXT_NAME_KEY.to_string(), BLOB_V2_EXT_NAME.to_string());
+        let prepared_field = prepared_blob_field_with_metadata("blob", true, metadata);
+        let dict_field = Field::new(
+            "dict",
+            DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
+            true,
+        );
+        let mut schema =
+            LanceSchema::try_from(&ArrowSchema::new(vec![dict_field, prepared_field])).unwrap();
+        schema.fields[0].id = 42;
+        schema.fields[1].id = 7;
+
+        let dictionary_values = Arc::new(StringArray::from(vec!["a", "b"])) as ArrayRef;
+        schema.fields[0].set_dictionary_values(&dictionary_values);
+
+        let normalized = prepared_to_logical_blob_schema(&schema).unwrap();
+
+        assert_eq!(normalized.fields[0].id, 42);
+        assert_eq!(
+            normalized.fields[0]
+                .dictionary
+                .as_ref()
+                .and_then(|dict| dict.values.as_ref())
+                .map(|values| values.len()),
+            Some(2)
+        );
+        assert_eq!(normalized.fields[1].id, 7);
+        assert_eq!(normalized.fields[1].children.len(), 2);
+        assert_eq!(normalized.fields[1].children[0].name, "data");
+        assert_eq!(normalized.fields[1].children[1].name, "uri");
+        assert!(normalized.fields[1].children[0].id >= 0);
+        assert!(normalized.fields[1].children[1].id >= 0);
+    }
+
+    #[test]
     fn test_prepared_blob_schema_normalizes_by_semantic_child_name() {
         let mut metadata = HashMap::new();
         metadata.insert(ARROW_EXT_NAME_KEY.to_string(), BLOB_V2_EXT_NAME.to_string());

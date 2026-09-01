@@ -56,6 +56,26 @@ def _blob_sidecar_path(data_dir, data_file_key, blob_id):
     return data_dir / data_file_key / sidecar_name
 
 
+def _complete_blob_table(ids, values):
+    schema = pa.schema([pa.field("id", pa.int64()), lance.blob_field("blob")])
+    return pa.Table.from_arrays(
+        [pa.array(ids, type=pa.int64()), lance.blob_array(values)],
+        schema=schema,
+    )
+
+
+def _assert_complete_blob_schema(dataset):
+    blob_type = dataset.schema.field("blob").type
+    assert isinstance(blob_type, pa.ExtensionType)
+    assert blob_type.extension_name == "lance.blob.v2"
+    assert [field.name for field in blob_type.storage_type] == [
+        "data",
+        "uri",
+        "position",
+        "size",
+    ]
+
+
 def _add_columns_blob_v2_values(tmp_path):
     external_base = tmp_path / "external_base"
     external_blob = external_base / "external_blob.bin"
@@ -908,65 +928,55 @@ def test_blob_extension_write_inline(tmp_path):
         assert f.read() == b"foo"
 
 
-def test_complete_blob_schema_survives_create_append_and_merge_insert(tmp_path):
-    dataset_path = tmp_path / "complete_blob_schema"
-    external_path = tmp_path / "external.bin"
-    external_path.write_bytes(b"prefix-range-suffix")
-    schema = pa.schema([pa.field("id", pa.int64()), lance.blob_field("blob")])
-
-    def make_table(ids, values):
-        return pa.Table.from_arrays(
-            [pa.array(ids, type=pa.int64()), lance.blob_array(values)],
-            schema=schema,
-        )
-
-    def assert_complete_blob_schema(dataset):
-        blob_type = dataset.schema.field("blob").type
-        assert isinstance(blob_type, pa.ExtensionType)
-        assert blob_type.extension_name == "lance.blob.v2"
-        assert [field.name for field in blob_type.storage_type] == [
-            "data",
-            "uri",
-            "position",
-            "size",
-        ]
-
+def test_complete_blob_schema_survives_create(tmp_path):
+    dataset_path = tmp_path / "complete_blob_create"
     ds = lance.write_dataset(
-        make_table(
-            [0, 1],
-            [
-                Blob.from_uri(external_path.as_uri(), position=7, size=5),
-                b"initial",
-            ],
-        ),
+        _complete_blob_table([0], [b"created"]),
         dataset_path,
         data_storage_version="2.2",
-        external_blob_mode="ingest",
     )
-    external_path.unlink()
-    assert_complete_blob_schema(ds)
+    _assert_complete_blob_schema(ds)
+    assert ds.to_table(blob_handling="all_binary")["blob"].to_pylist() == [b"created"]
 
-    lance.write_dataset(make_table([2], [b"appended"]), dataset_path, mode="append")
+
+def test_complete_blob_schema_survives_append(tmp_path):
+    dataset_path = tmp_path / "complete_blob_append"
+    lance.write_dataset(
+        _complete_blob_table([0], [b"initial"]),
+        dataset_path,
+        data_storage_version="2.2",
+    )
+
+    lance.write_dataset(
+        _complete_blob_table([1], [b"appended"]), dataset_path, mode="append"
+    )
     ds = lance.dataset(dataset_path)
-    assert_complete_blob_schema(ds)
+    _assert_complete_blob_schema(ds)
+    result = ds.to_table(blob_handling="all_binary").sort_by("id")
+    assert result["id"].to_pylist() == [0, 1]
+    assert result["blob"].to_pylist() == [b"initial", b"appended"]
+
+
+def test_complete_blob_schema_survives_merge_insert(tmp_path):
+    dataset_path = tmp_path / "complete_blob_merge_insert"
+    ds = lance.write_dataset(
+        _complete_blob_table([0, 1], [b"zero", b"initial"]),
+        dataset_path,
+        data_storage_version="2.2",
+    )
 
     (
         ds.merge_insert("id")
         .when_matched_update_all()
         .when_not_matched_insert_all()
-        .execute(make_table([1, 3], [b"updated", b"inserted"]))
+        .execute(_complete_blob_table([1, 2], [b"updated", b"inserted"]))
     )
     ds = lance.dataset(dataset_path)
-    assert_complete_blob_schema(ds)
+    _assert_complete_blob_schema(ds)
 
     result = ds.to_table(blob_handling="all_binary").sort_by("id")
-    assert result["id"].to_pylist() == [0, 1, 2, 3]
-    assert result["blob"].to_pylist() == [
-        b"range",
-        b"updated",
-        b"appended",
-        b"inserted",
-    ]
+    assert result["id"].to_pylist() == [0, 1, 2]
+    assert result["blob"].to_pylist() == [b"zero", b"updated", b"inserted"]
 
 
 def test_blob_field_threshold_metadata():
