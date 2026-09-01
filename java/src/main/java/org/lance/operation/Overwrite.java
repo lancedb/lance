@@ -13,6 +13,7 @@
  */
 package org.lance.operation;
 
+import org.lance.BasePath;
 import org.lance.FragmentMetadata;
 
 import com.google.common.base.MoreObjects;
@@ -31,12 +32,17 @@ import java.util.Optional;
 public class Overwrite extends SchemaOperation {
   private final List<FragmentMetadata> fragments;
   private final Optional<Map<String, String>> configUpsertValues;
+  private final Optional<List<BasePath>> initialBases;
 
   protected Overwrite(
-      List<FragmentMetadata> fragments, Schema schema, Map<String, String> configUpsertValues) {
+      List<FragmentMetadata> fragments,
+      Schema schema,
+      Map<String, String> configUpsertValues,
+      List<BasePath> initialBases) {
     super(schema);
     this.fragments = fragments;
     this.configUpsertValues = Optional.ofNullable(configUpsertValues);
+    this.initialBases = Optional.ofNullable(initialBases);
   }
 
   public List<FragmentMetadata> fragments() {
@@ -45,6 +51,11 @@ public class Overwrite extends SchemaOperation {
 
   public Optional<Map<String, String>> configUpsertValues() {
     return configUpsertValues;
+  }
+
+  /** Base paths used when creating a dataset; absent for a regular overwrite. */
+  public Optional<List<BasePath>> initialBases() {
+    return initialBases;
   }
 
   public static Builder builder() {
@@ -62,6 +73,7 @@ public class Overwrite extends SchemaOperation {
         .add("fragments", fragments)
         .add("schema", schema())
         .add("configUpsertValues", configUpsertValues)
+        .add("initialBases", initialBases)
         .toString();
   }
 
@@ -71,13 +83,16 @@ public class Overwrite extends SchemaOperation {
     if (o == null || getClass() != o.getClass()) return false;
     if (!super.equals(o)) return false;
     Overwrite that = (Overwrite) o;
-    return Objects.equals(fragments, that.fragments);
+    return Objects.equals(fragments, that.fragments)
+        && Objects.equals(configUpsertValues, that.configUpsertValues)
+        && Objects.equals(initialBases, that.initialBases);
   }
 
   public static class Builder {
     private List<FragmentMetadata> fragments;
     private Schema schema;
     private Map<String, String> configUpsertValues;
+    private List<BasePath> initialBases;
 
     private Builder() {}
 
@@ -96,8 +111,13 @@ public class Overwrite extends SchemaOperation {
       return this;
     }
 
+    public Builder initialBases(List<BasePath> initialBases) {
+      this.initialBases = initialBases;
+      return this;
+    }
+
     public Overwrite build() {
-      return new Overwrite(fragments, schema, configUpsertValues);
+      return new Overwrite(fragments, schema, configUpsertValues, initialBases);
     }
   }
 }

@@ -117,6 +117,10 @@ impl IntoJava for &IndexMetadata {
         } else {
             JObject::null()
         };
+        let files = match &self.files {
+            Some(files) => export_vec(env, files)?,
+            None => JObject::null(),
+        };
 
         // Determine index type from index_details type_url
         let index_type = determine_index_type(env, &self.index_details)?;
@@ -124,7 +128,7 @@ impl IntoJava for &IndexMetadata {
         // Create Index object
         Ok(env.new_object(
             "org/lance/index/Index",
-            "(Ljava/util/UUID;Ljava/util/List;Ljava/util/List;Ljava/lang/String;JLjava/util/List;[BILjava/time/Instant;Ljava/lang/Integer;Ljava/lang/Long;Lorg/lance/index/IndexType;)V",
+            "(Ljava/util/UUID;Ljava/util/List;Ljava/util/List;Ljava/lang/String;JLjava/util/List;[BILjava/time/Instant;Ljava/lang/Integer;Ljava/lang/Long;Ljava/util/List;Lorg/lance/index/IndexType;)V",
             &[
                 JValue::Object(&uuid),
                 JValue::Object(&fields),
@@ -137,6 +141,7 @@ impl IntoJava for &IndexMetadata {
                 JValue::Object(&created_at),
                 JValue::Object(&base_id),
                 JValue::Object(&size_bytes),
+                JValue::Object(&files),
                 JValue::Object(&index_type),
             ],
         )?)
