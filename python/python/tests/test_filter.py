@@ -371,8 +371,8 @@ def test_filter_on_column_beside_root_extension_type(tmp_path):
 
 
 @pytest.mark.skip(
-    reason="enable this in recurring test https://github.com/lance-format/lance/pull/4190"
-    " as it requires release mode"
+    reason="requires a release build; see "
+    "https://github.com/lance-format/lance/pull/4190"
 )
 def test_filter_depth_limit():
     column_name = "a_very_long_column_name"

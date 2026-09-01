@@ -43,7 +43,7 @@ use crate::dataset::scanner::{
 };
 use crate::datatypes::Schema;
 
-use super::utils::IoMetrics;
+use super::utils::{IoMetrics, buffered_fragment_opens};
 
 async fn open_file(
     file_fragment: FileFragment,
@@ -168,18 +168,10 @@ impl LanceStream {
         metrics: &ExecutionPlanMetricsSet,
         partition: usize,
     ) -> Result<Self> {
-        let is_v2_scan = fragments
-            .iter()
-            .filter_map(|frag| frag.files.first().map(|f| !f.is_legacy_file()))
-            .next()
-            .unwrap_or(false);
-        if is_v2_scan {
-            Self::try_new_v2(
-                dataset, fragments, offsets, projection, config, metrics, partition,
-            )
-        } else {
-            Self::try_new_v1(dataset, fragments, projection, config, metrics, partition)
-        }
+        let version = dataset.manifest().data_storage_format.lance_file_format();
+        crate::dataset::versions::create_scan_stream(
+            version, dataset, fragments, offsets, projection, config, metrics, partition,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -307,6 +299,10 @@ impl LanceStream {
         let scan_scheduler_clone = scan_scheduler.clone();
 
         let materialize_dataset = dataset;
+        let materialization_context = crate::dataset::blob::BlobMaterializationContext::new(
+            Some(config.io_buffer_size),
+            config.materialization_readahead_bytes,
+        );
         let config_for_stream = config.clone();
         let batches = stream::iter(file_fragments.into_iter().enumerate())
             .map(move |(priority, file_fragment)| {
@@ -384,19 +380,25 @@ impl LanceStream {
             .boxed();
         let inner_stream = if materialize_blob_v2_binary {
             inner_stream
-                .and_then(move |batch| {
+                .map_ok(move |batch| {
                     let dataset = materialize_dataset.clone();
                     let output_projection = output_projection.clone();
+                    let materialization_context = materialization_context.clone();
+                    let admission = materialization_context.admission();
                     async move {
-                        crate::dataset::blob::materialize_blob_v2_binary_batch(
+                        crate::dataset::blob::materialize_blob_v2_binary_batch_with_admission(
                             &dataset,
                             output_projection.as_ref(),
                             batch,
+                            &materialization_context,
+                            admission,
                         )
                         .await
                         .map_err(DataFusionError::from)
                     }
                 })
+                .try_buffered(config.batch_readahead)
+                .map_ok(|batch| batch.into_batch())
                 .boxed()
         } else {
             inner_stream
@@ -416,6 +418,7 @@ impl LanceStream {
     pub fn try_new_v1(
         dataset: Arc<Dataset>,
         fragments: Arc<Vec<Fragment>>,
+        _offsets: Option<Range<u64>>,
         projection: Arc<Schema>,
         config: LanceScanConfig,
         metrics: &ExecutionPlanMetricsSet,
@@ -442,9 +445,11 @@ impl LanceStream {
             .collect::<Vec<_>>();
 
         let batches = if config.ordered_output {
-            let readers = stream::iter(file_fragments)
-                .map(move |file_fragment| {
-                    Ok(open_file(
+            let readers = buffered_fragment_opens(
+                stream::iter(file_fragments),
+                fragment_readahead,
+                move |file_fragment| {
+                    open_file(
                         file_fragment,
                         project_schema.clone(),
                         FragReadConfig::default()
@@ -456,9 +461,9 @@ impl LanceStream {
                             .with_row_created_at_version(config.with_row_created_at_version),
                         config.with_make_deletions_null,
                         None,
-                    ))
-                })
-                .try_buffered(fragment_readahead);
+                    )
+                },
+            );
             let tasks = readers.and_then(move |reader| async move {
                 reader
                     .read_all(config.batch_size as u32)
@@ -474,9 +479,11 @@ impl LanceStream {
                 .stream_in_current_span()
                 .boxed()
         } else {
-            let readers = stream::iter(file_fragments)
-                .map(move |file_fragment| {
-                    Ok(open_file(
+            let readers = buffered_fragment_opens(
+                stream::iter(file_fragments),
+                fragment_readahead,
+                move |file_fragment| {
+                    open_file(
                         file_fragment,
                         project_schema.clone(),
                         FragReadConfig::default()
@@ -488,9 +495,9 @@ impl LanceStream {
                             .with_row_created_at_version(config.with_row_created_at_version),
                         config.with_make_deletions_null,
                         None,
-                    ))
-                })
-                .try_buffered(fragment_readahead);
+                    )
+                },
+            );
             let tasks = readers.and_then(move |reader| async move {
                 reader
                     .read_all(config.batch_size as u32)
@@ -563,6 +570,7 @@ pub struct LanceScanConfig {
     pub batch_readahead: usize,
     pub fragment_readahead: Option<usize>,
     pub io_buffer_size: u64,
+    pub materialization_readahead_bytes: Option<u64>,
     pub with_row_id: bool,
     pub with_row_address: bool,
     pub with_row_last_updated_at_version: bool,
@@ -584,6 +592,7 @@ impl Default for LanceScanConfig {
             batch_readahead: get_num_compute_intensive_cpus(),
             fragment_readahead: None,
             io_buffer_size: *DEFAULT_IO_BUFFER_SIZE,
+            materialization_readahead_bytes: None,
             with_row_id: false,
             with_row_address: false,
             with_row_last_updated_at_version: false,

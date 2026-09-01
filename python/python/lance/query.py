@@ -270,7 +270,9 @@ class BooleanQuery(FullTextQuery):
         Parameters
         ----------
         queries : list[tuple(Occur, FullTextQuery)]
-            The list of queries with their occurrence requirements.
+            The list of queries with their occurrence requirements. Every MUST
+            clause must match and contributes its score; matching SHOULD scores
+            are also added, while MUST_NOT clauses only exclude documents.
         """
         self._inner = PyFullTextQuery.boolean_query(
             [(occur.value, query.inner) for occur, query in queries]

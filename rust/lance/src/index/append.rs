@@ -8,7 +8,7 @@ use lance_core::{Error, Result};
 use lance_file::reader::FileReaderOptions;
 use lance_index::{
     INDEX_FILE_NAME, IndexType,
-    frag_reuse::FragReuseIndex,
+    frag_reuse::CompactFragReuseIndex,
     metrics::NoOpMetricsCollector,
     optimize::OptimizeOptions,
     progress::{IndexBuildProgress, NoopIndexBuildProgress},
@@ -162,7 +162,7 @@ pub fn split_segment_coverage<'a>(
 }
 
 pub fn fragment_reuse_affects_segments<'a>(
-    frag_reuse_index: &FragReuseIndex,
+    frag_reuse_index: &CompactFragReuseIndex,
     segments: impl IntoIterator<Item = &'a IndexMetadata>,
 ) -> bool {
     segments.into_iter().any(|segment| {
@@ -174,7 +174,7 @@ pub fn fragment_reuse_affects_segments<'a>(
 }
 
 pub fn fragment_reuse_affects_segment(
-    frag_reuse_index: &FragReuseIndex,
+    frag_reuse_index: &CompactFragReuseIndex,
     coverage: &RoaringBitmap,
     dataset_version: u64,
 ) -> bool {
@@ -1368,21 +1368,24 @@ mod tests {
     use arrow::datatypes::{Float32Type, UInt32Type};
     use arrow_array::cast::AsArray;
     use arrow_array::{
-        Array, ArrayRef, FixedSizeListArray, Int32Array, RecordBatch, RecordBatchIterator,
-        StringArray, UInt32Array,
+        Array, ArrayRef, FixedSizeListArray, Float32Array, Int32Array, ListArray, RecordBatch,
+        RecordBatchIterator, StringArray, StructArray, UInt32Array, UInt64Array,
     };
-    use arrow_buffer::{BooleanBufferBuilder, NullBuffer};
+    use arrow_buffer::{BooleanBufferBuilder, NullBuffer, OffsetBuffer};
     use arrow_schema::{DataType, Field, Schema};
     use futures::TryStreamExt;
     use lance_arrow::FixedSizeListArrayExt;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datafusion::utils::reader_to_stream;
     use lance_datagen::{Dimension, RowCount, array};
+    use lance_file::version::LanceFileVersion;
     use lance_index::vector::hnsw::builder::HnswBuildParams;
     use lance_index::vector::sq::builder::SQBuildParams;
     use lance_index::{
         IndexType,
-        scalar::{BuiltinIndexType, ScalarIndexParams, SearchResult, TextQuery},
+        scalar::{
+            BuiltinIndexType, InvertedIndexParams, ScalarIndexParams, SearchResult, TextQuery,
+        },
         vector::{ivf::IvfBuildParams, pq::PQBuildParams},
     };
     use lance_linalg::distance::MetricType;
@@ -1406,6 +1409,7 @@ mod tests {
             uuid: Uuid::new_v4(),
             name: "text_ngram".to_string(),
             fields: vec![0],
+            covering_fields: vec![],
             dataset_version: 5,
             fragment_bitmap: Some(RoaringBitmap::from_iter([1u32])),
             index_details: None,
@@ -1414,10 +1418,10 @@ mod tests {
             base_id: None,
             files: None,
         };
-        let frag_reuse_index = FragReuseIndex {
-            uuid: Uuid::new_v4(),
-            row_id_maps: vec![],
-            details: FragReuseIndexDetails {
+        let frag_reuse_index = CompactFragReuseIndex::from_row_id_maps(
+            Uuid::new_v4(),
+            vec![],
+            FragReuseIndexDetails {
                 versions: vec![FragReuseVersion {
                     dataset_version: 5,
                     groups: vec![FragReuseGroup {
@@ -1435,7 +1439,7 @@ mod tests {
                     }],
                 }],
             },
-        };
+        );
 
         assert!(fragment_reuse_affects_segments(
             &frag_reuse_index,
@@ -2376,29 +2380,37 @@ mod tests {
     #[tokio::test]
     async fn test_query_delta_indices(
         #[values(
-            VectorIndexParams::ivf_pq(2, 8, 4, MetricType::L2, 2),
+            VectorIndexParams::ivf_pq(2, 4, 2, MetricType::L2, 2),
             VectorIndexParams::ivf_rq(2, 1, MetricType::L2),
             VectorIndexParams::ivf_hnsw(
                 MetricType::L2,
                 IvfBuildParams::new(2),
                 HnswBuildParams {
-                    max_level: 3,
-                    m: 12,
-                    ef_construction: 80,
+                    max_level: 2,
+                    m: 4,
+                    ef_construction: 16,
                     prefetch_distance: Some(1),
                 }
             ),
             VectorIndexParams::with_ivf_hnsw_pq_params(
                 MetricType::L2,
-                IvfBuildParams::new(2),
+                IvfBuildParams {
+                    num_partitions: Some(2),
+                    max_iters: 2,
+                    sample_rate: 2,
+                    ..Default::default()
+                },
                 HnswBuildParams {
-                    max_level: 3,
-                    m: 12,
-                    ef_construction: 80,
+                    max_level: 2,
+                    m: 4,
+                    ef_construction: 16,
                     prefetch_distance: Some(1),
                 },
                 PQBuildParams {
-                    num_sub_vectors: 4,
+                    num_sub_vectors: 2,
+                    num_bits: 4,
+                    max_iters: 2,
+                    sample_rate: 2,
                     ..Default::default()
                 }
             ),
@@ -2406,9 +2418,9 @@ mod tests {
                 MetricType::L2,
                 IvfBuildParams::new(2),
                 HnswBuildParams {
-                    max_level: 3,
-                    m: 12,
-                    ef_construction: 80,
+                    max_level: 2,
+                    m: 4,
+                    ef_construction: 16,
                     prefetch_distance: Some(1),
                 },
                 SQBuildParams::default()
@@ -2416,9 +2428,9 @@ mod tests {
         )]
         index_params: VectorIndexParams,
     ) {
-        const DIM: usize = 64;
-        const INITIAL_ROWS: usize = 1000;
-        const APPENDED_ROWS: usize = 64;
+        const DIM: usize = 8;
+        const INITIAL_ROWS: usize = 64;
+        const APPENDED_ROWS: usize = 16;
 
         let test_dir = TempStrDir::default();
         let test_uri = test_dir.as_str();
@@ -2730,6 +2742,139 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(results[0].num_rows(), 10);
+    }
+
+    #[tokio::test]
+    async fn test_vector_merge_filters_stable_row_id_replacements() {
+        const DIMENSION: usize = 4;
+
+        let test_dir = TempStrDir::default();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::Float32, true)),
+                    DIMENSION as i32,
+                ),
+                false,
+            ),
+        ]));
+        let initial_values = (0..40)
+            .flat_map(|row| [if row < 20 { 1.0 } else { 0.0 }; DIMENSION])
+            .collect::<Vec<_>>();
+        let initial = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..40)),
+                Arc::new(
+                    FixedSizeListArray::try_new_from_values(
+                        arrow_array::Float32Array::from(initial_values),
+                        DIMENSION as i32,
+                    )
+                    .unwrap(),
+                ),
+            ],
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(initial)], schema.clone()),
+            test_dir.as_str(),
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("vector_idx".to_string()),
+                &VectorIndexParams::ivf_flat(1, MetricType::L2),
+                true,
+            )
+            .await
+            .unwrap();
+
+        let replacements = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(20..40)),
+                Arc::new(
+                    FixedSizeListArray::try_new_from_values(
+                        arrow_array::Float32Array::from(vec![10.0; 20 * DIMENSION]),
+                        DIMENSION as i32,
+                    )
+                    .unwrap(),
+                ),
+            ],
+        )
+        .unwrap();
+        let merge_job = MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .try_build()
+            .unwrap();
+        let (dataset, stats) = merge_job
+            .execute(reader_to_stream(Box::new(RecordBatchIterator::new(
+                [Ok(replacements)],
+                schema,
+            ))))
+            .await
+            .unwrap();
+        assert_eq!(stats.num_updated_rows, 20);
+
+        let mut dataset = dataset.as_ref().clone();
+        dataset
+            .optimize_indices(&OptimizeOptions::append())
+            .await
+            .unwrap();
+        assert_eq!(
+            dataset
+                .load_indices_by_name("vector_idx")
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        dataset
+            .optimize_indices(&OptimizeOptions::merge(2))
+            .await
+            .unwrap();
+
+        let logical_index = dataset
+            .open_logical_vector_index("vector", "vector_idx")
+            .await
+            .unwrap();
+        assert_eq!(logical_index.num_segments(), 1);
+        assert_eq!(
+            logical_index
+                .num_rows_per_segment()
+                .into_iter()
+                .map(|(_, rows)| rows)
+                .sum::<u64>(),
+            40,
+            "the merged index must contain one current copy of every stable row id"
+        );
+
+        let query = arrow_array::Float32Array::from(vec![0.0; DIMENSION]);
+        let result = dataset
+            .scan()
+            .project(&["id"])
+            .unwrap()
+            .nearest("vector", &query, 5)
+            .unwrap()
+            .nprobes(1)
+            .try_into_batch()
+            .await
+            .unwrap();
+        let ids = result["id"].as_primitive::<arrow::datatypes::Int32Type>();
+        assert!(
+            ids.values().iter().all(|id| *id < 20),
+            "stale pre-update vectors must not survive the optimize merge: {ids:?}"
+        );
     }
 
     #[tokio::test]
@@ -3391,6 +3536,144 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_optimize_append_with_backpressured_multichunk_read() {
+        const WIDE_DIMENSION: usize = 140_000;
+        const NARROW_DIMENSION: usize = 4_096;
+        const SHORT_ROWS: usize = 68;
+        const LONG_ROWS: usize = 128;
+
+        fn make_batch(schema: Arc<Schema>, rows: usize, base: usize) -> RecordBatch {
+            let docs_field = schema.field(1);
+            let DataType::List(item_field) = docs_field.data_type() else {
+                unreachable!("docs must be a list");
+            };
+            let DataType::Struct(doc_fields) = item_field.data_type() else {
+                unreachable!("docs items must be structs");
+            };
+            let wide_values = Float32Array::from_iter_values(
+                (0..rows * WIDE_DIMENSION).map(|index| ((index + base) % 1009) as f32),
+            );
+            let narrow_values = Float32Array::from_iter_values(
+                (0..rows * NARROW_DIMENSION).map(|index| ((index + base) % 251) as f32),
+            );
+            let docs = StructArray::new(
+                doc_fields.clone(),
+                vec![
+                    Arc::new(
+                        FixedSizeListArray::try_new_from_values(wide_values, WIDE_DIMENSION as i32)
+                            .unwrap(),
+                    ),
+                    Arc::new(
+                        FixedSizeListArray::try_new_from_values(
+                            narrow_values,
+                            NARROW_DIMENSION as i32,
+                        )
+                        .unwrap(),
+                    ),
+                    Arc::new(StringArray::from_iter_values(
+                        (0..rows).map(|index| format!("document-{}", index + base)),
+                    )),
+                ],
+                None,
+            );
+            let docs = ListArray::new(
+                item_field.clone(),
+                OffsetBuffer::from_lengths(std::iter::repeat_n(1, rows)),
+                Arc::new(docs),
+                None,
+            );
+            let ids = UInt64Array::from_iter_values(base as u64..(base + rows) as u64);
+            RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(docs)]).unwrap()
+        }
+
+        let vector_item = Arc::new(Field::new("item", DataType::Float32, true));
+        let doc_fields = vec![
+            Field::new(
+                "wide",
+                DataType::FixedSizeList(vector_item.clone(), WIDE_DIMENSION as i32),
+                true,
+            ),
+            Field::new(
+                "narrow",
+                DataType::FixedSizeList(vector_item, NARROW_DIMENSION as i32),
+                true,
+            ),
+            Field::new("text", DataType::Utf8, true),
+        ]
+        .into();
+        let docs_item = Arc::new(Field::new("item", DataType::Struct(doc_fields), true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::UInt64, false),
+            Field::new("docs", DataType::List(docs_item), true),
+        ]));
+
+        let initial_batch = make_batch(schema.clone(), 1, 1_000);
+        let initial_reader = RecordBatchIterator::new(vec![Ok(initial_batch)], schema.clone());
+        let mut dataset = Dataset::write(
+            initial_reader,
+            "memory://",
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_1),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset
+            .create_index(
+                &["docs.text"],
+                IndexType::Inverted,
+                Some("docs_text".to_string()),
+                &InvertedIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+
+        let appended_batches = vec![
+            Ok(make_batch(schema.clone(), SHORT_ROWS, 0)),
+            Ok(make_batch(schema.clone(), LONG_ROWS, SHORT_ROWS)),
+        ];
+        let appended_reader = RecordBatchIterator::new(appended_batches, schema);
+        dataset
+            .append(
+                appended_reader,
+                Some(WriteParams {
+                    data_storage_version: Some(LanceFileVersion::V2_1),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        // The deleted first batch makes the live delta start exactly at the
+        // second write-batch boundary, matching a merge-insert style update.
+        dataset.delete("id < 68").await.unwrap();
+
+        let optimize_options = OptimizeOptions::append();
+        // Nested FTS reads the entire `docs` root. Under this budget the wide
+        // sibling is split into same-priority chunks, then the narrow sibling's
+        // higher-priority I/O consumes the remaining budget while the wide read
+        // is awaited. Admitted chunks must continue despite that backpressure.
+        let optimize = crate::index::scalar::TEST_TRAINING_IO_BUFFER_SIZE.scope(
+            70 * 1024 * 1024,
+            dataset.optimize_indices(&optimize_options),
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(20), optimize)
+            .await
+            .expect("incremental nested FTS optimization timed out")
+            .unwrap();
+
+        let segments = dataset
+            .load_indices()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|index| index.name == "docs_text")
+            .count();
+        assert_eq!(segments, 2, "optimization should add one FTS delta segment");
+    }
+
+    #[tokio::test]
     async fn test_optimize_btree_keeps_rows_with_stable_row_ids_after_compaction() {
         async fn query_id_count(dataset: &Dataset, id: &str) -> usize {
             dataset
@@ -3466,6 +3749,376 @@ mod tests {
 
         let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
         assert_eq!(query_id_count(&dataset, "song-42").await, 1);
+    }
+
+    /// Updating an indexed vector column in place (`update_columns` +
+    /// `Operation::Update`) keeps the fragment id and the row address, so after the
+    /// fragment is pruned from the old segment's bitmap that segment still physically
+    /// holds the pre-update vector. Merging the segment must drop those rows: the merge
+    /// concatenates its physical rows with the freshly scanned ones and commits the
+    /// union of both coverages, so a surviving stale row is authorized by the same
+    /// bitmap as its fresh copy and no read-time filter can separate them.
+    #[rstest]
+    // IVF_FLAT keeps the vector verbatim, so the query distance tells which of the two
+    // copies survived. IVF_PQ re-uses the codebook trained before the update, which
+    // cannot represent the new value, so it only pins the row count and covers the
+    // transposed-code path in `take_partition_batches`.
+    #[case::ivf_flat(VectorIndexParams::ivf_flat(1, MetricType::L2), true)]
+    #[case::ivf_pq(VectorIndexParams::ivf_pq(1, 8, 16, MetricType::L2, 2), false)]
+    #[tokio::test]
+    async fn test_optimize_vector_index_drops_stale_rows_on_merge(
+        #[case] index_params: VectorIndexParams,
+        #[case] distance_is_exact: bool,
+        // The two row-id schemes take different filter branches: an address carries its
+        // fragment, a stable row id needs the fragments' persisted row-id sequences.
+        #[values(false, true)] enable_stable_row_ids: bool,
+    ) {
+        use crate::dataset::transaction::{Operation, UpdateMode, UpdatedFragmentOffsets};
+        use arrow::datatypes::UInt64Type;
+        use arrow_array::{Float32Array, RecordBatchReader, UInt64Array};
+        use lance_core::ROW_ID;
+        use lance_index::vector::DIST_COL;
+        use std::collections::HashMap;
+
+        // Must match the sub-vector count in the IVF_PQ case above.
+        const DIM: usize = 16;
+        const BULK_ROWS: usize = 1000;
+        const UPDATED_ID: u32 = 10_000;
+        const STALE_VALUE: f32 = 2.0;
+        const FRESH_VALUE: f32 = 10.8;
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        let vector_type = DataType::FixedSizeList(
+            Arc::new(Field::new("item", DataType::Float32, true)),
+            DIM as i32,
+        );
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::UInt32, false),
+            Field::new("vector", vector_type.clone(), true),
+        ]));
+        let constant_vector = |value: f32| {
+            FixedSizeListArray::try_new_from_values(
+                Float32Array::from_iter_values(std::iter::repeat_n(value, DIM)),
+                DIM as i32,
+            )
+            .unwrap()
+        };
+
+        // Fragment 0: bulk vectors in [0, 1). None of them is near the query, so a
+        // surviving stale copy of the updated row ranks well inside top-k.
+        let bulk = generate_random_array_with_seed::<Float32Type>(BULK_ROWS * DIM, [42; 32]);
+        let bulk_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from_iter_values(0..BULK_ROWS as u32)),
+                Arc::new(FixedSizeListArray::try_new_from_values(bulk, DIM as i32).unwrap()),
+            ],
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(bulk_batch)], schema.clone()),
+            test_uri,
+            Some(WriteParams {
+                enable_stable_row_ids,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Fragment 1: the single row that gets updated in place.
+        let stale_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from_iter_values([UPDATED_ID])),
+                Arc::new(constant_vector(STALE_VALUE)),
+            ],
+        )
+        .unwrap();
+        dataset
+            .append(
+                RecordBatchIterator::new(vec![Ok(stale_batch)], schema.clone()),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 2);
+
+        // One segment covering both fragments.
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &index_params, true)
+            .await
+            .unwrap();
+
+        let mut fragment = dataset.get_fragment(1).unwrap();
+        let mut fragment_scan = fragment.scan();
+        fragment_scan.with_row_id();
+        let updated_row_id = fragment_scan.try_into_batch().await.unwrap()[ROW_ID]
+            .as_primitive::<UInt64Type>()
+            .value(0);
+
+        let update_schema = Arc::new(Schema::new(vec![
+            Field::new(ROW_ID, DataType::UInt64, false),
+            Field::new("vector", vector_type, true),
+        ]));
+        let update_batch = RecordBatch::try_new(
+            update_schema.clone(),
+            vec![
+                Arc::new(UInt64Array::from_iter_values([updated_row_id])),
+                Arc::new(constant_vector(FRESH_VALUE)),
+            ],
+        )
+        .unwrap();
+        let right_stream: Box<dyn RecordBatchReader + Send> = Box::new(RecordBatchIterator::new(
+            vec![Ok(update_batch)],
+            update_schema,
+        ));
+        let updated = fragment
+            .update_columns_with_offsets(right_stream, ROW_ID, ROW_ID)
+            .await
+            .unwrap();
+        let updated_fragment_id = updated.fragment.id;
+        let dataset = Dataset::commit(
+            test_uri,
+            Operation::Update {
+                removed_fragment_ids: vec![],
+                updated_fragments: vec![updated.fragment],
+                new_fragments: vec![],
+                fields_modified: updated.fields_modified,
+                compacted_sstables: Vec::new(),
+                fields_for_preserving_frag_bitmap: vec![],
+                update_mode: Some(UpdateMode::RewriteColumns),
+                inserted_rows_filter: None,
+                updated_fragment_offsets: Some(UpdatedFragmentOffsets(HashMap::from([(
+                    updated_fragment_id,
+                    updated.matched_offsets,
+                )]))),
+            },
+            Some(dataset.version().version),
+            None,
+            None,
+            Default::default(),
+            true,
+        )
+        .await
+        .unwrap();
+
+        let mut dataset = dataset;
+        dataset
+            .optimize_indices(&OptimizeOptions::merge(1))
+            .await
+            .unwrap();
+
+        let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
+        let segments = dataset.load_indices_by_name("vector_idx").await.unwrap();
+        assert_eq!(segments.len(), 1, "merge must leave a single segment");
+
+        let mut scanner = dataset.scan();
+        scanner
+            .nearest("vector", &constant_vector(FRESH_VALUE).value(0), 10)
+            .unwrap()
+            .with_row_id()
+            .project(&["id"])
+            .unwrap();
+        let results = scanner.try_into_batch().await.unwrap();
+        let hits = results["id"]
+            .as_primitive::<UInt32Type>()
+            .values()
+            .iter()
+            .zip(results[DIST_COL].as_primitive::<Float32Type>().values())
+            .filter(|(id, _)| **id == UPDATED_ID)
+            .map(|(_, distance)| *distance)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            hits.len(),
+            1,
+            "updated row returned {} times after merge; row ids = {:?}",
+            hits.len(),
+            results[ROW_ID].as_primitive::<UInt64Type>().values()
+        );
+        if distance_is_exact {
+            // The pre-update vector would sit at (FRESH - STALE)^2 * DIM from the query,
+            // so anything but ~0 means the stale copy is the one that survived.
+            assert!(
+                hits[0] < 1.0,
+                "surviving copy is the pre-update one: distance {} to the updated vector",
+                hits[0]
+            );
+        }
+    }
+
+    /// The ordinary update path (`UpdateBuilder`, `UpdateMode::RewriteRows`) commits
+    /// `fields_modified: vec![]`, so the old fragment keeps its place in the segment's
+    /// bitmap while its physical row is only deletion-marked. Under stable row ids the
+    /// rewritten copy reuses the same row id, so a merge that keeps every covered row
+    /// emits that id twice and the read-time filter admits both: the id is live again
+    /// at its new address. Coverage alone is therefore not a sufficient merge filter.
+    #[rstest]
+    // The two optimize modes read existing rows through different code, and both must
+    // filter: an explicit merge through `take_partition_batches`, and the default
+    // options over under-sized partitions through `partition_row_ids`, which feeds the
+    // join that rebuilds them.
+    #[case::merge(1, OptimizeOptions::merge(1))]
+    #[case::join(4, OptimizeOptions::new())]
+    #[tokio::test]
+    async fn test_optimize_vector_index_drops_rewritten_rows_on_merge(
+        #[case] num_partitions: usize,
+        #[case] optimize_options: OptimizeOptions,
+        // Only the stable-row-id scheme can duplicate: an address-domain rewrite lands
+        // at a new address, so the stale posting is masked at query time.
+        #[values(false, true)] enable_stable_row_ids: bool,
+    ) {
+        use crate::dataset::UpdateBuilder;
+        use arrow::datatypes::UInt64Type;
+        use arrow_array::Float32Array;
+        use lance_core::ROW_ID;
+        use lance_index::vector::DIST_COL;
+
+        const DIM: usize = 4;
+        const BULK_ROWS: usize = 1000;
+        const UPDATED_ID: u32 = 10_000;
+        const STALE_VALUE: f32 = 2.0;
+        const FRESH_VALUE: f32 = 10.8;
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::UInt32, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::Float32, true)),
+                    DIM as i32,
+                ),
+                true,
+            ),
+        ]));
+        let constant_vector = |value: f32| {
+            FixedSizeListArray::try_new_from_values(
+                Float32Array::from_iter_values(std::iter::repeat_n(value, DIM)),
+                DIM as i32,
+            )
+            .unwrap()
+        };
+
+        // The updated row shares its fragment with the bulk rows, so the update leaves
+        // that fragment covered by the segment with one row deletion-marked instead of
+        // retiring it. The bulk vectors sit in [0, 1), far from the query, so a
+        // surviving stale copy of the updated row ranks well inside top-k.
+        let bulk = generate_random_array_with_seed::<Float32Type>(BULK_ROWS * DIM, [42; 32]);
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from_iter_values(
+                    (0..BULK_ROWS as u32).chain(std::iter::once(UPDATED_ID)),
+                )),
+                Arc::new(
+                    FixedSizeListArray::try_new_from_values(
+                        Float32Array::from_iter_values(
+                            bulk.values()
+                                .iter()
+                                .copied()
+                                .chain(std::iter::repeat_n(STALE_VALUE, DIM)),
+                        ),
+                        DIM as i32,
+                    )
+                    .unwrap(),
+                ),
+            ],
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+            test_uri,
+            Some(WriteParams {
+                enable_stable_row_ids,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                None,
+                &VectorIndexParams::ivf_flat(num_partitions, MetricType::L2),
+                true,
+            )
+            .await
+            .unwrap();
+
+        let fresh_literal = format!(
+            "array[{}]",
+            std::iter::repeat_n(FRESH_VALUE.to_string(), DIM)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let mut dataset = UpdateBuilder::new(Arc::new(dataset))
+            .update_where(&format!("id = {UPDATED_ID}"))
+            .unwrap()
+            .set("vector", &fresh_literal)
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap()
+            .new_dataset
+            .as_ref()
+            .clone();
+        dataset.optimize_indices(&optimize_options).await.unwrap();
+
+        let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
+        let segments = dataset.load_indices_by_name("vector_idx").await.unwrap();
+        assert_eq!(segments.len(), 1, "merge must leave a single segment");
+        let partitions_after = dataset
+            .open_vector_index("vector", &segments[0].uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap()
+            .ivf_model()
+            .num_partitions();
+        // A join is what routes existing rows through `partition_row_ids`; without it
+        // this case would silently degrade into a second copy of the merge case.
+        assert!(
+            num_partitions == 1 || partitions_after < num_partitions,
+            "expected a join, but the index still has {partitions_after} partitions"
+        );
+
+        let mut scanner = dataset.scan();
+        scanner
+            .nearest("vector", &constant_vector(FRESH_VALUE).value(0), 10)
+            .unwrap()
+            .with_row_id()
+            .project(&["id"])
+            .unwrap();
+        let results = scanner.try_into_batch().await.unwrap();
+        let hits = results["id"]
+            .as_primitive::<UInt32Type>()
+            .values()
+            .iter()
+            .zip(results[DIST_COL].as_primitive::<Float32Type>().values())
+            .filter(|(id, _)| **id == UPDATED_ID)
+            .map(|(_, distance)| *distance)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            hits.len(),
+            1,
+            "rewritten row returned {} times after optimize; row ids = {:?}",
+            hits.len(),
+            results[ROW_ID].as_primitive::<UInt64Type>().values()
+        );
+        // The pre-update vector would sit at (FRESH - STALE)^2 * DIM from the query, so
+        // anything but ~0 means the stale copy is the one that survived.
+        assert!(
+            hits[0] < 1.0,
+            "surviving copy is the pre-update one: distance {} to the updated vector",
+            hits[0]
+        );
     }
 
     /// Under stable row ids, updating an indexed column and then calling

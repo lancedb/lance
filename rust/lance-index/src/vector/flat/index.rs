@@ -66,6 +66,11 @@ static ANN_SEARCH_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     .into()
 });
 
+/// Marker schema for the flat index, which stores no data of its own.
+static FLAT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Schema::new(vec![Field::new("__flat_marker", DataType::UInt64, false)]).into()
+});
+
 #[derive(Default)]
 pub struct FlatQueryParams {
     lower_bound: Option<f32>,
@@ -98,7 +103,7 @@ impl IvfSubIndex for FlatIndex {
     }
 
     fn schema() -> arrow_schema::SchemaRef {
-        Schema::new(vec![Field::new("__flat_marker", DataType::UInt64, false)]).into()
+        FLAT_SCHEMA.clone()
     }
 
     fn search(
@@ -517,6 +522,15 @@ mod tests {
 
     use crate::metrics::NoOpMetricsCollector;
     use crate::prefilter::NoFilter;
+
+    #[test]
+    fn test_schema_is_initialized_once() {
+        // The subindex schema is requested per call, so it is shared rather
+        // than rebuilt. Pointer equality is what distinguishes a shared schema
+        // from an equal-but-freshly-allocated one.
+        assert!(Arc::ptr_eq(&FlatIndex::schema(), &FlatIndex::schema()));
+        assert_eq!(FlatIndex::schema().field(0).name(), "__flat_marker");
+    }
 
     struct MaskPreFilter {
         mask: Arc<RowAddrMask>,

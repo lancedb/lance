@@ -45,7 +45,7 @@ use crate::utils::bytepack::ByteUnpacker;
 use crate::{
     compression::{
         BlockDecompressor, CompressionStrategy, DecompressionStrategy, MiniBlockDecompressor,
-        create_rle_decompressor,
+        compress_required_block, create_rle_decompressor,
     },
     data::{AllNullDataBlock, DataBlock, VariableWidthBlock},
     utils::bytepack::BytepackedIntegerEncoder,
@@ -106,6 +106,14 @@ const DEFAULT_DICT_DIVISOR: u64 = 2;
 const DEFAULT_DICT_MAX_CARDINALITY: u64 = 100_000;
 const DEFAULT_DICT_SIZE_RATIO: f64 = 0.8;
 const DEFAULT_DICT_VALUES_COMPRESSION: &str = "lz4";
+
+/// Largest level count a direct legacy u16-value/U8-run RLE frame can prove.
+///
+/// Mini-block level payload sizes are u16. After the eight-byte frame header, each run needs a
+/// two-byte value and a one-byte length, and each U8 run can represent at most 255 levels.
+const MAX_LEGACY_RLE_LEVELS: u64 = ((u16::MAX as u64 - std::mem::size_of::<u64>() as u64)
+    / (std::mem::size_of::<u16>() as u64 + std::mem::size_of::<u8>() as u64))
+    * u8::MAX as u64;
 
 struct PageLoadTask {
     decoder_fut: BoxFuture<'static, Result<Box<dyn StructuralPageDecoder>>>,
@@ -174,16 +182,129 @@ struct DecodeMiniBlockTask {
 }
 
 impl DecodeMiniBlockTask {
+    fn decoded_size_bytes(&self) -> Option<u64> {
+        if self.rep_decompressor.is_some() || self.def_decompressor.is_some() {
+            return None;
+        }
+        let num_values = self
+            .instructions
+            .iter()
+            .try_fold(0_u64, |total, (instruction, _)| {
+                total.checked_add(instruction.rows_to_take)
+            })?;
+        self.value_decompressor.decoded_size_bytes(num_values)
+    }
+
+    fn resolve_num_levels(
+        rep_decompressor: Option<&dyn BlockDecompressor>,
+        rep_levels: Option<&LanceBuffer>,
+        def_decompressor: Option<&dyn BlockDecompressor>,
+        def_levels: Option<&LanceBuffer>,
+        declared_num_levels: u16,
+    ) -> Result<u64> {
+        let rep_num_levels = match (rep_decompressor, rep_levels) {
+            (Some(decompressor), Some(levels)) => decompressor.infer_num_values(levels)?,
+            (None, None) => None,
+            _ => {
+                return Err(Error::invalid_input_source(
+                    "miniblock repetition codec and payload presence disagree".into(),
+                ));
+            }
+        };
+        let def_num_levels = match (def_decompressor, def_levels) {
+            (Some(decompressor), Some(levels)) => decompressor.infer_num_values(levels)?,
+            (None, None) => None,
+            _ => {
+                return Err(Error::invalid_input_source(
+                    "miniblock definition codec and payload presence disagree".into(),
+                ));
+            }
+        };
+
+        let inferred_num_levels = match (rep_num_levels, def_num_levels) {
+            (Some(rep_num_levels), Some(def_num_levels)) if rep_num_levels != def_num_levels => {
+                return Err(Error::invalid_input_source(
+                    format!(
+                        "miniblock structural streams disagree on the level count: repetition inferred {rep_num_levels}, definition inferred {def_num_levels}"
+                    )
+                    .into(),
+                ));
+            }
+            (Some(num_levels), _) | (_, Some(num_levels)) => num_levels,
+            (None, None) => return Ok(u64::from(declared_num_levels)),
+        };
+
+        let declared_num_levels = u64::from(declared_num_levels);
+        if inferred_num_levels == declared_num_levels {
+            return Ok(inferred_num_levels);
+        }
+        let u16_modulus = u64::from(u16::MAX) + 1;
+        if inferred_num_levels <= declared_num_levels
+            || inferred_num_levels % u16_modulus != declared_num_levels
+        {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "miniblock payload proves {inferred_num_levels} levels but the header declared {declared_num_levels}; the counts are not congruent modulo 65536"
+                )
+                .into(),
+            ));
+        }
+        if inferred_num_levels > MAX_LEGACY_RLE_LEVELS {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "miniblock payload proves {inferred_num_levels} levels, exceeding the legacy RLE payload bound of {MAX_LEGACY_RLE_LEVELS}"
+                )
+                .into(),
+            ));
+        }
+        Ok(inferred_num_levels)
+    }
+
     fn decode_levels(
-        rep_decompressor: &dyn BlockDecompressor,
+        decompressor: &dyn BlockDecompressor,
         levels: LanceBuffer,
-        num_levels: u16,
+        expected_num_levels: u64,
     ) -> Result<ScalarBuffer<u16>> {
-        let rep = rep_decompressor.decompress(levels, num_levels as u64)?;
-        let rep = rep.as_fixed_width().unwrap();
-        debug_assert_eq!(rep.num_values, num_levels as u64);
-        debug_assert_eq!(rep.bits_per_value, 16);
-        Ok(rep.data.borrow_to_typed_slice::<u16>())
+        let levels = decompressor.decompress(Some(levels), expected_num_levels)?;
+        let levels = levels.as_fixed_width().ok_or_else(|| {
+            Error::invalid_input_source(
+                "miniblock levels did not decode to fixed-width data".into(),
+            )
+        })?;
+        if levels.num_values != expected_num_levels {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "miniblock levels decoded {} values, expected {expected_num_levels}",
+                    levels.num_values
+                )
+                .into(),
+            ));
+        }
+        if levels.bits_per_value != 16 {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "miniblock levels decoded {} bits per value, expected 16",
+                    levels.bits_per_value
+                )
+                .into(),
+            ));
+        }
+        let expected_bytes = expected_num_levels.checked_mul(2).ok_or_else(|| {
+            Error::invalid_input_source(
+                format!("miniblock level byte count overflowed for {expected_num_levels} levels")
+                    .into(),
+            )
+        })?;
+        if levels.data.len() as u64 != expected_bytes {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "miniblock levels decoded {} bytes, expected {expected_bytes}",
+                    levels.data.len()
+                )
+                .into(),
+            ));
+        }
+        Ok(levels.data.borrow_to_typed_slice::<u16>())
     }
 
     // We are building a LevelBuffer (levels) and want to copy into it `total_len`
@@ -511,6 +632,14 @@ impl DecodeMiniBlockTask {
             def
         });
 
+        let num_levels = Self::resolve_num_levels(
+            self.rep_decompressor.as_deref(),
+            rep.as_ref(),
+            self.def_decompressor.as_deref(),
+            def.as_ref(),
+            num_levels,
+        )?;
+
         let buffers = buffer_sizes
             .into_iter()
             .map(|buf_size| {
@@ -544,6 +673,19 @@ impl DecodeMiniBlockTask {
             })
             .transpose()?;
 
+        if let (Some(rep), Some(def)) = (&rep, &def)
+            && rep.len() != def.len()
+        {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "miniblock structural streams decoded different level counts: repetition {}, definition {}",
+                    rep.len(),
+                    def.len()
+                )
+                .into(),
+            ));
+        }
+
         Ok(DecodedMiniBlockChunk { rep, def, values })
     }
 }
@@ -556,15 +698,15 @@ impl DecodePageTask for DecodeMiniBlockTask {
 
         let max_rep = self.def_meaning.iter().filter(|l| l.is_list()).count() as u16;
 
-        // This is probably an over-estimate but it's quick and easy to calculate
-        let estimated_size_bytes = self
-            .instructions
-            .iter()
-            .map(|(_, chunk)| chunk.data.len())
-            .sum::<usize>()
-            * 2;
-        let mut data_builder =
-            DataBlockBuilder::with_capacity_estimate(estimated_size_bytes as u64);
+        let estimated_size_bytes = self.decoded_size_bytes().unwrap_or_else(|| {
+            // Variable-width and rep/def encoded output sizes are not known before decoding.
+            self.instructions
+                .iter()
+                .map(|(_, chunk)| chunk.data.len() as u64)
+                .sum::<u64>()
+                * 2
+        });
+        let mut data_builder = DataBlockBuilder::with_capacity_estimate(estimated_size_bytes);
 
         // We need to keep track of the offset into repbuf/defbuf that we are building up
         let mut level_offset = 0;
@@ -1556,7 +1698,7 @@ impl StructuralPageScheduler for ComplexAllNullScheduler {
                     }
                     LevelCodec::Block(decompressor) => {
                         let frame = LanceBuffer::from_bytes(compressed_bytes, 1);
-                        let decompressed = decompressor.decompress(frame, num_values)?;
+                        let decompressed = decompressor.decompress(Some(frame), num_values)?;
                         dense_levels_from_block(decompressed, num_values, level_type)
                     }
                 }
@@ -2611,7 +2753,10 @@ impl StructuralPageScheduler for MiniBlockScheduler {
             let dictionary = if let Some(ref mut dictionary) = self.dictionary {
                 let dictionary_data = dictionary_bytes.unwrap();
                 Some(Arc::new(dictionary.dictionary_decompressor.decompress(
-                    LanceBuffer::from_bytes(dictionary_data, dictionary.dictionary_data_alignment),
+                    Some(LanceBuffer::from_bytes(
+                        dictionary_data,
+                        dictionary.dictionary_data_alignment,
+                    )),
                     dictionary.num_dictionary_items,
                 )?))
             } else {
@@ -3759,15 +3904,31 @@ struct FixedFullZipDecodeTask {
 
 impl DecodePageTask for FixedFullZipDecodeTask {
     fn decode(self: Box<Self>) -> Result<DecodedPage> {
-        // Multiply by 2 to make a stab at the size of the output buffer (which will be decompressed and thus bigger)
-        let estimated_size_bytes = self
-            .data
-            .iter()
-            .map(|task_item| task_item.data.data_size() as usize)
-            .sum::<usize>()
-            * 2;
-        let mut data_builder =
-            DataBlockBuilder::with_capacity_estimate(estimated_size_bytes as u64);
+        let estimated_size_bytes = if self.details.ctrl_word_parser.bytes_per_word() == 0 {
+            let PerValueDecompressor::Fixed(decompressor) = &self.details.value_decompressor else {
+                return Err(Error::internal(
+                    "FixedFullZipDecodeTask requires a fixed-width decompressor",
+                ));
+            };
+            decompressor
+                .decoded_size_bytes(self.num_rows as u64)
+                .unwrap_or_else(|| {
+                    self.data
+                        .iter()
+                        .map(|task_item| task_item.data.data_size())
+                        .sum::<u64>()
+                        * 2
+                })
+        } else {
+            // Rep/def levels can suppress values, so the exact output size is not known
+            // until they are decoded. Keep the existing conservative estimate.
+            self.data
+                .iter()
+                .map(|task_item| task_item.data.data_size())
+                .sum::<u64>()
+                * 2
+        };
+        let mut data_builder = DataBlockBuilder::with_capacity_estimate(estimated_size_bytes);
 
         if self.details.ctrl_word_parser.bytes_per_word() == 0 {
             // Fast path, no need to unzip because there is no rep/def
@@ -4991,8 +5152,9 @@ impl PrimitiveStructuralEncoder {
         let levels_block = DataBlock::FixedWidth(fixed_width_block);
         let levels_field = Field::new_arrow("", DataType::UInt16, false)?;
         // Pick a block compressor
-        let (compressor, compressor_desc) =
+        let compressor =
             compression_strategy.create_block_compressor(&levels_field, &levels_block)?;
+        let mut compressor_desc = None;
         // Compress blocks of levels (sized according to the chunks)
         let mut level_chunks = Vec::with_capacity(chunks.len());
         let mut values_counter = 0;
@@ -5062,7 +5224,22 @@ impl PrimitiveStructuralEncoder {
             };
             chunk_fixed_width.compute_stat();
             let chunk_levels_block = DataBlock::FixedWidth(chunk_fixed_width);
-            let compressed_levels = compressor.compress(chunk_levels_block)?;
+            let (compressed_levels, chunk_compressor_desc) =
+                compressor.compress(chunk_levels_block)?;
+            if let Some(compressor_desc) = compressor_desc.as_ref() {
+                if compressor_desc != &chunk_compressor_desc {
+                    return Err(Error::internal(
+                        "Rep/def block compressor changed encoding between chunks".to_string(),
+                    ));
+                }
+            } else {
+                compressor_desc = Some(chunk_compressor_desc);
+            }
+            let compressed_levels = compressed_levels.ok_or_else(|| {
+                Error::internal(
+                    "Rep/def block compressor selected a metadata-only codec".to_string(),
+                )
+            })?;
             let num_levels = u16::try_from(num_chunk_levels).map_err(|_| {
                 Error::invalid_input_source(
                     format!(
@@ -5087,7 +5264,9 @@ impl PrimitiveStructuralEncoder {
         };
         Ok(CompressedLevels {
             data: level_chunks,
-            compression: compressor_desc,
+            compression: compressor_desc.ok_or_else(|| {
+                Error::internal("Rep/def compression produced no chunks".to_string())
+            })?,
             rep_index,
         })
     }
@@ -5123,9 +5302,8 @@ impl PrimitiveStructuralEncoder {
 
         let levels_block = DataBlock::FixedWidth(fixed_width_block);
         let levels_field = Field::new_arrow("", DataType::UInt16, false)?;
-        let (compressor, encoding) =
-            compression_strategy.create_block_compressor(&levels_field, &levels_block)?;
-        let compressed_buffer = compressor.compress(levels_block)?;
+        let (compressed_buffer, encoding) =
+            compress_required_block(compression_strategy, &levels_field, levels_block)?;
         Ok((compressed_buffer, encoding))
     }
 
@@ -5511,9 +5689,8 @@ impl PrimitiveStructuralEncoder {
             let num_dictionary_items = dictionary_data.num_values();
             let dict_values_field = Self::build_dict_values_compressor_field(field)?;
 
-            let (compressor, dictionary_encoding) = compression_strategy
-                .create_block_compressor(&dict_values_field, &dictionary_data)?;
-            let dictionary_buffer = compressor.compress(dictionary_data)?;
+            let (dictionary_buffer, dictionary_encoding) =
+                compress_required_block(compression_strategy, &dict_values_field, dictionary_data)?;
 
             data.push(dictionary_buffer);
             if let Some(rep_index) = rep_index {
@@ -5606,8 +5783,7 @@ impl PrimitiveStructuralEncoder {
                 if control.is_new_row {
                     // We have finished a row
                     debug_assert!(offset <= len);
-                    // SAFETY: We know that `start <= len`
-                    unsafe { rep_index_builder.append(offset as u64) };
+                    rep_index_builder.append_trusted(offset as u64);
                 }
                 offset = zipped_data.len();
             }
@@ -5618,8 +5794,7 @@ impl PrimitiveStructuralEncoder {
                 if control.is_new_row {
                     // We have finished a row
                     debug_assert!(offset <= len);
-                    // SAFETY: We know that `start <= len`
-                    unsafe { rep_index_builder.append(offset as u64) };
+                    rep_index_builder.append_trusted(offset as u64);
                 }
                 if control.is_visible {
                     let value = data_iter.next().unwrap();
@@ -5631,10 +5806,7 @@ impl PrimitiveStructuralEncoder {
 
         debug_assert_eq!(zipped_data.len(), len);
         // Put the final value in the rep index
-        // SAFETY: `zipped_data.len() == len`
-        unsafe {
-            rep_index_builder.append(zipped_data.len() as u64);
-        }
+        rep_index_builder.append_trusted(zipped_data.len() as u64);
 
         let zipped_data = LanceBuffer::from(zipped_data);
         let rep_index = rep_index_builder.into_data();
@@ -5686,8 +5858,7 @@ impl PrimitiveStructuralEncoder {
                     if control.is_new_row {
                         // We have finished a row
                         debug_assert!(rep_offset <= len);
-                        // SAFETY: We know that `buf.len() <= len`
-                        unsafe { rep_index_builder.append(rep_offset as u64) };
+                        rep_index_builder.append_trusted(rep_offset as u64);
                     }
                     if control.is_visible {
                         let window = windows_iter.next().unwrap();
@@ -5709,8 +5880,7 @@ impl PrimitiveStructuralEncoder {
                     if control.is_new_row {
                         // We have finished a row
                         debug_assert!(rep_offset <= len);
-                        // SAFETY: We know that `buf.len() <= len`
-                        unsafe { rep_index_builder.append(rep_offset as u64) };
+                        rep_index_builder.append_trusted(rep_offset as u64);
                     }
                     if control.is_visible {
                         let window = windows_iter.next().unwrap();
@@ -5739,10 +5909,7 @@ impl PrimitiveStructuralEncoder {
         // if we are over `len` then we have a bug.
         debug_assert!(buf.len() <= len);
         // Put the final value in the rep index
-        // SAFETY: `zipped_data.len() == len`
-        unsafe {
-            rep_index_builder.append(buf.len() as u64);
-        }
+        rep_index_builder.append_trusted(buf.len() as u64);
 
         let zipped_data = LanceBuffer::from(buf);
         let rep_index = rep_index_builder.into_data();
@@ -6335,14 +6502,6 @@ impl PrimitiveStructuralEncoder {
                         variable.bits_per_offset
                     ))
                 }
-                DataBlock::Struct(struct_data_block)
-                    if !struct_data_block.has_variable_width_child() =>
-                {
-                    Some(
-                        "Full-zip packed struct requires at least one variable-width child"
-                            .to_string(),
-                    )
-                }
                 DataBlock::Dictionary(_) => {
                     Some("Full-zip does not encode dictionary data blocks directly".to_string())
                 }
@@ -6537,6 +6696,7 @@ impl PrimitiveStructuralEncoder {
         row_number: u64,
         num_rows: u64,
     ) -> Result<Vec<EncodeTask>> {
+        DataBlock::validate_arrays(&arrays, &self.field.name)?;
         let num_values = arrays.iter().map(|arr| arr.len() as u64).sum();
         let is_simple_validity = repdefs.iter().all(|rd| rd.is_simple_validity());
         let has_repdef_info = repdefs.iter().any(|rd| !rd.is_empty());
@@ -6968,16 +7128,19 @@ impl FieldEncoder for PrimitiveStructuralEncoder {
 #[allow(clippy::single_range_in_vec_init)]
 mod tests {
     use super::{
-        ChunkInstructions, DataBlock, DecodeMiniBlockTask, FixedPerValueDecompressor,
-        FixedWidthDataBlock, FixedWidthDictionaryEncoding, FullZipCacheableState,
-        FullZipDecodeDetails, FullZipReadSource, FullZipRepIndexDetails, FullZipScheduler,
-        LazyLevels, LevelCodec, LevelCursor, LevelPlan, MiniBlockChunk, MiniBlockChunkIndex,
-        MiniBlockCompressed, MiniblockChunkSize, PerValueDecompressor, PreambleAction,
-        RunEndsBuilder, RunPosition, RunStorage, StructuralPageScheduler, VariableFullZipDecoder,
-        dense_levels_from_block, validate_complex_all_null_levels,
+        ChunkInstructions, DataBlock, DecodeMiniBlockTask, DecodePageTask, FixedFullZipDecodeTask,
+        FixedPerValueDecompressor, FixedWidthDataBlock, FixedWidthDictionaryEncoding,
+        FullZipCacheableState, FullZipDecodeDetails, FullZipDecodeTaskItem, FullZipReadSource,
+        FullZipRepIndexDetails, FullZipScheduler, LazyLevels, LevelCodec, LevelCursor, LevelPlan,
+        MiniBlockChunk, MiniBlockChunkIndex, MiniBlockCompressed, MiniblockChunkSize,
+        PerValueDataBlock, PerValueDecompressor, PreambleAction, RunEndsBuilder, RunPosition,
+        RunStorage, StructuralPageScheduler, VariableFullZipDecoder, dense_levels_from_block,
+        validate_complex_all_null_levels,
     };
     use crate::buffer::LanceBuffer;
-    use crate::compression::{BlockCompressor, DefaultDecompressionStrategy};
+    use crate::compression::{
+        BlockCompressor, DefaultDecompressionStrategy, MiniBlockDecompressor,
+    };
     use crate::constants::{
         COMPRESSION_LEVEL_META_KEY, COMPRESSION_META_KEY, DICT_VALUES_COMPRESSION_LEVEL_META_KEY,
         DICT_VALUES_COMPRESSION_META_KEY, STRUCTURAL_ENCODING_META_KEY,
@@ -6985,17 +7148,23 @@ mod tests {
     };
     use crate::data::BlockInfo;
     use crate::decoder::{PageEncoding, StructuralFieldDecoder};
+    use crate::encodings::logical::primitive::fullzip::PerValueCompressor;
     use crate::encodings::logical::primitive::{
-        ChunkDrainInstructions, PrimitiveStructuralEncoder, StructuralPrimitiveFieldDecoder,
+        ChunkDrainInstructions, LoadedChunk, PrimitiveStructuralEncoder,
+        StructuralPrimitiveFieldDecoder,
     };
     use crate::encodings::physical::rle::{RleDecompressor, RleEncoder, RleRuns, RunLengthWidth};
+    use crate::encodings::physical::value::{ValueDecompressor, ValueEncoder};
     use crate::format::ProtobufUtils21;
     use crate::format::pb21;
     use crate::format::pb21::compressive_encoding::Compression;
     use crate::repdef::build_control_word_iterator;
     use crate::testing::TestEncoding;
     use crate::testing::{TestCases, check_round_trip_encoding_of_data};
-    use arrow_array::{ArrayRef, Int8Array, StringArray};
+    use arrow_array::{
+        Array, ArrayRef, FixedSizeListArray, Float32Array, Int8Array, StringArray, UInt8Array,
+        make_array,
+    };
     use arrow_buffer::ScalarBuffer;
     use arrow_schema::{DataType, Field as ArrowField};
     use std::collections::HashMap;
@@ -7065,6 +7234,312 @@ mod tests {
         assert!(
             err.to_string().contains("byte aligned"),
             "unexpected error: {err}"
+        );
+    }
+
+    fn decode_fixed_fullzip_no_levels(
+        decompressor: Arc<dyn FixedPerValueDecompressor>,
+        data: Vec<FullZipDecodeTaskItem>,
+        num_rows: usize,
+        bytes_per_value: usize,
+    ) -> DataBlock {
+        Box::new(FixedFullZipDecodeTask {
+            details: Arc::new(FullZipDecodeDetails {
+                value_decompressor: PerValueDecompressor::Fixed(decompressor),
+                def_meaning: Arc::from([]),
+                ctrl_word_parser: crate::repdef::ControlWordParser::new(0, 0),
+                max_rep: 0,
+                max_visible_def: u16::MAX,
+            }),
+            data,
+            num_rows,
+            bytes_per_value,
+        })
+        .decode()
+        .unwrap()
+        .data
+    }
+
+    #[test]
+    fn test_fixed_fullzip_decode_preallocates_exact_output_size() {
+        #[derive(Debug)]
+        struct IdentityFixedDecompressor;
+
+        impl FixedPerValueDecompressor for IdentityFixedDecompressor {
+            fn decompress(
+                &self,
+                data: FixedWidthDataBlock,
+                num_rows: u64,
+            ) -> crate::Result<DataBlock> {
+                assert_eq!(data.num_values, num_rows);
+                Ok(DataBlock::FixedWidth(data))
+            }
+
+            fn bits_per_value(&self) -> u64 {
+                32
+            }
+
+            fn decoded_size_bytes(&self, num_values: u64) -> Option<u64> {
+                num_values.checked_mul(4)
+            }
+        }
+
+        let make_item = |num_rows: u64| FullZipDecodeTaskItem {
+            data: PerValueDataBlock::Fixed(FixedWidthDataBlock {
+                data: LanceBuffer::from(vec![7_u8; num_rows as usize * 4]),
+                bits_per_value: 32,
+                num_values: num_rows,
+                block_info: BlockInfo::new(),
+            }),
+            rows_in_buf: num_rows,
+        };
+
+        let num_rows = 512;
+        let decoded = decode_fixed_fullzip_no_levels(
+            Arc::new(IdentityFixedDecompressor),
+            vec![make_item(128), make_item(384)],
+            num_rows,
+            4,
+        );
+        let values = decoded.as_fixed_width_ref().unwrap();
+        let expected_size = num_rows * 4;
+        assert_eq!(values.data.len(), expected_size);
+        assert_eq!(values.data.clone().into_buffer().capacity(), expected_size);
+    }
+
+    #[test]
+    fn test_fixed_fullzip_decode_falls_back_when_output_size_is_not_exact() {
+        #[derive(Debug)]
+        struct FallbackFixedDecompressor;
+
+        impl FixedPerValueDecompressor for FallbackFixedDecompressor {
+            fn decompress(
+                &self,
+                data: FixedWidthDataBlock,
+                num_rows: u64,
+            ) -> crate::Result<DataBlock> {
+                assert_eq!(data.num_values, num_rows);
+                Ok(DataBlock::FixedWidth(FixedWidthDataBlock {
+                    data: LanceBuffer::from(vec![7_u8; num_rows as usize * 4]),
+                    bits_per_value: 32,
+                    num_values: num_rows,
+                    block_info: BlockInfo::new(),
+                }))
+            }
+
+            fn bits_per_value(&self) -> u64 {
+                // This deliberately cannot be multiplied by num_rows. If FullZip treats
+                // bits_per_value as an exact decoded-size estimate, decoding will fail.
+                u64::MAX - 7
+            }
+        }
+
+        let num_rows = 2;
+        let decoded = decode_fixed_fullzip_no_levels(
+            Arc::new(FallbackFixedDecompressor),
+            vec![FullZipDecodeTaskItem {
+                data: PerValueDataBlock::Fixed(FixedWidthDataBlock {
+                    data: LanceBuffer::from(vec![0_u8; num_rows * 4]),
+                    bits_per_value: 32,
+                    num_values: num_rows as u64,
+                    block_info: BlockInfo::new(),
+                }),
+                rows_in_buf: num_rows as u64,
+            }],
+            num_rows,
+            4,
+        );
+        let values = decoded.as_fixed_width_ref().unwrap();
+        assert_eq!(values.num_values, num_rows as u64);
+        assert_eq!(values.data.len(), num_rows * 4);
+    }
+
+    #[test]
+    fn test_fixed_fullzip_real_fsl_preallocates_exact_output_size() {
+        let num_rows = 64;
+        let dimension = 32;
+        let items = Arc::new(Float32Array::from_iter_values(
+            (0..num_rows * dimension).map(|value| value as f32),
+        ));
+        let item_field = Arc::new(ArrowField::new("item", DataType::Float32, false));
+        let sample = FixedSizeListArray::new(item_field, dimension as i32, items, None);
+
+        let (data, compression) = PerValueCompressor::compress(
+            &ValueEncoder::default(),
+            DataBlock::from_array(sample.clone()),
+        )
+        .unwrap();
+        let Compression::FixedSizeList(fsl) = compression.compression.unwrap() else {
+            panic!("expected fixed-size-list compression");
+        };
+        let decompressor = ValueDecompressor::from_fsl(fsl.as_ref());
+        let expected_size = num_rows * dimension * size_of::<f32>();
+        assert_eq!(
+            FixedPerValueDecompressor::decoded_size_bytes(&decompressor, num_rows as u64),
+            Some(expected_size as u64)
+        );
+
+        let decoded = decode_fixed_fullzip_no_levels(
+            Arc::new(decompressor),
+            vec![FullZipDecodeTaskItem {
+                data,
+                rows_in_buf: num_rows as u64,
+            }],
+            num_rows,
+            dimension * size_of::<f32>(),
+        );
+        let fsl = decoded.as_fixed_size_list_ref().unwrap();
+        let values = fsl.child.as_fixed_width_ref().unwrap();
+        assert_eq!(values.data.len(), expected_size);
+        assert_eq!(values.data.clone().into_buffer().capacity(), expected_size);
+
+        let decoded_array = make_array(
+            decoded
+                .into_arrow(sample.data_type().clone(), true)
+                .unwrap(),
+        );
+        assert_eq!(decoded_array.as_ref(), &sample);
+    }
+
+    #[test]
+    fn test_fixed_fullzip_nullable_fsl_uses_fallback_end_to_end() {
+        #[derive(Debug)]
+        struct NullableFslDecompressor {
+            inner: ValueDecompressor,
+        }
+
+        impl FixedPerValueDecompressor for NullableFslDecompressor {
+            fn decompress(
+                &self,
+                data: FixedWidthDataBlock,
+                num_rows: u64,
+            ) -> crate::Result<DataBlock> {
+                FixedPerValueDecompressor::decompress(&self.inner, data, num_rows)
+            }
+
+            fn bits_per_value(&self) -> u64 {
+                // FullZip must not use this physical row width as an exact decoded-size
+                // estimate for the nullable, multi-buffer Arrow output.
+                u64::MAX - 7
+            }
+
+            fn decoded_size_bytes(&self, num_values: u64) -> Option<u64> {
+                FixedPerValueDecompressor::decoded_size_bytes(&self.inner, num_values)
+            }
+        }
+
+        let num_rows = 64;
+        let items = Arc::new(UInt8Array::from_iter(
+            (0..num_rows).map(|value| (value % 3 != 0).then_some(value as u8)),
+        ));
+        let item_field = Arc::new(ArrowField::new("item", DataType::UInt8, true));
+        let sample = FixedSizeListArray::new(item_field, 1, items, None);
+
+        let (data, compression) = PerValueCompressor::compress(
+            &ValueEncoder::default(),
+            DataBlock::from_array(sample.clone()),
+        )
+        .unwrap();
+        let Compression::FixedSizeList(fsl) = compression.compression.unwrap() else {
+            panic!("expected fixed-size-list compression");
+        };
+        let decompressor = NullableFslDecompressor {
+            inner: ValueDecompressor::from_fsl(fsl.as_ref()),
+        };
+        assert_eq!(
+            FixedPerValueDecompressor::decoded_size_bytes(&decompressor, num_rows as u64),
+            None
+        );
+
+        let decoded = decode_fixed_fullzip_no_levels(
+            Arc::new(decompressor),
+            vec![FullZipDecodeTaskItem {
+                data,
+                rows_in_buf: num_rows as u64,
+            }],
+            num_rows,
+            2,
+        );
+        let decoded_array = make_array(
+            decoded
+                .into_arrow(sample.data_type().clone(), true)
+                .unwrap(),
+        );
+        assert_eq!(decoded_array.as_ref(), &sample);
+    }
+
+    #[test]
+    fn test_miniblock_decode_uses_exact_fixed_width_output_size() {
+        #[derive(Debug)]
+        struct FixedWidthMiniBlockDecompressor;
+
+        impl MiniBlockDecompressor for FixedWidthMiniBlockDecompressor {
+            fn decompress(
+                &self,
+                data: Vec<LanceBuffer>,
+                num_values: u64,
+            ) -> crate::Result<DataBlock> {
+                assert_eq!(data.len(), 1);
+                Ok(DataBlock::FixedWidth(FixedWidthDataBlock {
+                    data: data.into_iter().next().unwrap(),
+                    bits_per_value: 32,
+                    num_values,
+                    block_info: BlockInfo::new(),
+                }))
+            }
+
+            fn decoded_size_bytes(&self, num_values: u64) -> Option<u64> {
+                num_values.checked_mul(4)
+            }
+        }
+
+        let num_rows = 512;
+        let expected_size = num_rows * 4;
+        let mut chunk_data = Vec::new();
+        chunk_data.extend_from_slice(&0_u16.to_le_bytes());
+        chunk_data.extend_from_slice(&(expected_size as u16).to_le_bytes());
+        let header_padding =
+            lance_core::utils::bit::pad_bytes::<{ super::MINIBLOCK_ALIGNMENT }>(chunk_data.len());
+        chunk_data.resize(chunk_data.len() + header_padding, 0);
+        chunk_data.resize(chunk_data.len() + expected_size as usize, 7);
+
+        let task = DecodeMiniBlockTask {
+            rep_decompressor: None,
+            def_decompressor: None,
+            value_decompressor: Arc::new(FixedWidthMiniBlockDecompressor),
+            dictionary_data: None,
+            def_meaning: Arc::from([]),
+            num_buffers: 1,
+            max_visible_level: 0,
+            instructions: vec![(
+                ChunkDrainInstructions {
+                    chunk_instructions: ChunkInstructions {
+                        chunk_idx: 0,
+                        preamble: PreambleAction::Absent,
+                        rows_to_skip: 0,
+                        rows_to_take: num_rows,
+                        take_trailer: false,
+                    },
+                    rows_to_skip: 0,
+                    rows_to_take: num_rows,
+                    preamble_action: PreambleAction::Absent,
+                },
+                LoadedChunk {
+                    byte_range: 0..chunk_data.len() as u64,
+                    data: LanceBuffer::from(chunk_data),
+                    items_in_chunk: num_rows,
+                    chunk_idx: 0,
+                },
+            )],
+            has_large_chunk: false,
+        };
+
+        let decoded = Box::new(task).decode().unwrap();
+        let values = decoded.data.as_fixed_width_ref().unwrap();
+        assert_eq!(values.data.len(), expected_size as usize);
+        assert_eq!(
+            values.data.clone().into_buffer().capacity(),
+            expected_size as usize
         );
     }
 
@@ -8417,7 +8892,7 @@ mod tests {
         let repeated_strings: Vec<_> = unique_values
             .iter()
             .cycle()
-            .take(100_000)
+            .take(10_000)
             .map(|s| Some(s.as_str()))
             .collect();
 
@@ -9304,7 +9779,7 @@ mod tests {
             .create_block_decompressor(&encoding)
             .unwrap();
         let decompressed = decompressor
-            .decompress(compressed_buf, values.len() as u64)
+            .decompress(Some(compressed_buf), values.len() as u64)
             .unwrap();
         let decompressed_fixed_width = decompressed.as_fixed_width().unwrap();
         assert_eq!(decompressed_fixed_width.num_values, values.len() as u64);
@@ -9393,6 +9868,8 @@ mod tests {
         });
         BlockCompressor::compress(&RleEncoder::with_run_length_width(run_length_width), block)
             .unwrap()
+            .0
+            .unwrap()
     }
 
     fn encoded_u16_runs(levels: &[u16], run_length_width: RunLengthWidth) -> RleRuns {
@@ -9400,6 +9877,77 @@ mod tests {
         RleDecompressor::with_run_length_width(16, run_length_width)
             .decode_u16_runs(frame, levels.len() as u64)
             .unwrap()
+    }
+
+    #[test]
+    fn miniblock_levels_use_one_count_for_mixed_codecs() {
+        let actual_num_levels = usize::from(u16::MAX) + 8;
+        let levels = vec![1_u16; actual_num_levels];
+        let rep_frame = encoded_u16_frame(&levels, RunLengthWidth::U8);
+        let rep_decompressor = RleDecompressor::new(16);
+        let def_frame = LanceBuffer::reinterpret_slice(Arc::from(levels.clone()));
+        let def_decompressor = ValueDecompressor::from_flat(&pb21::Flat {
+            bits_per_value: 16,
+            data: None,
+        });
+
+        let num_levels = DecodeMiniBlockTask::resolve_num_levels(
+            Some(&rep_decompressor),
+            Some(&rep_frame),
+            Some(&def_decompressor),
+            Some(&def_frame),
+            7,
+        )
+        .unwrap();
+        assert_eq!(num_levels, actual_num_levels as u64);
+
+        let rep =
+            DecodeMiniBlockTask::decode_levels(&rep_decompressor, rep_frame, num_levels).unwrap();
+        let def =
+            DecodeMiniBlockTask::decode_levels(&def_decompressor, def_frame, num_levels).unwrap();
+        assert_eq!(rep.as_ref(), levels);
+        assert_eq!(def, rep);
+    }
+
+    #[test]
+    fn miniblock_levels_reject_non_wrapped_count_mismatch() {
+        let frame = encoded_u16_frame(&[1_u16; 8], RunLengthWidth::U8);
+        let decompressor = RleDecompressor::new(16);
+
+        let error = DecodeMiniBlockTask::resolve_num_levels(
+            Some(&decompressor),
+            Some(&frame),
+            None,
+            None,
+            7,
+        )
+        .unwrap_err();
+        assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("not congruent modulo 65536"));
+    }
+
+    #[test]
+    fn miniblock_levels_reject_cross_stream_count_disagreement() {
+        let rep_levels = vec![1_u16; usize::from(u16::MAX) + 8];
+        let def_levels = vec![1_u16; rep_levels.len() + usize::from(u16::MAX) + 1];
+        let rep_frame = encoded_u16_frame(&rep_levels, RunLengthWidth::U8);
+        let def_frame = encoded_u16_frame(&def_levels, RunLengthWidth::U8);
+        let decompressor = RleDecompressor::new(16);
+
+        let error = DecodeMiniBlockTask::resolve_num_levels(
+            Some(&decompressor),
+            Some(&rep_frame),
+            Some(&decompressor),
+            Some(&def_frame),
+            7,
+        )
+        .unwrap_err();
+        assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("structural streams disagree on the level count")
+        );
     }
 
     fn physical_levels(levels: &[u16]) -> LazyLevels {

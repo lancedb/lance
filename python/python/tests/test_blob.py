@@ -182,6 +182,29 @@ def test_scan_blob_as_binary(tmp_path):
     assert tbl.column("blobs").to_pylist() == values
 
 
+def test_sql_blob_as_binary(tmp_path):
+    values = [b"foo", b"bar", b"baz"]
+    table = pa.table(
+        [pa.array(values, pa.large_binary())],
+        schema=pa.schema(
+            [
+                pa.field(
+                    "blobs", pa.large_binary(), metadata={"lance-encoding:blob": "true"}
+                )
+            ]
+        ),
+    )
+    ds = lance.write_dataset(table, tmp_path / "test_ds")
+
+    batches = (
+        ds.sql("SELECT blobs FROM dataset")
+        .blob_handling("all_binary")
+        .build()
+        .to_batch_records()
+    )
+    assert pa.Table.from_batches(batches).column("blobs").to_pylist() == values
+
+
 def test_v2_0_blob_descriptor_projection_and_reads(tmp_path):
     values = [b"abc", b"defgh", b"ijklmnop"]
     blob_field = pa.field(
@@ -731,6 +754,61 @@ def test_blob_file_seek(tmp_path, dataset_with_blobs):
     with blobs[1] as f:
         assert f.seek(1) == 1
         assert f.read(1) == b"a"
+
+
+@pytest.mark.parametrize(
+    "ranges",
+    [
+        pytest.param([], id="empty_list"),
+        pytest.param([(0, 0), (4, 0)], id="empty_ranges"),
+        pytest.param([(2, 1), (0, 1), (1, 1)], id="non_monotonic"),
+        pytest.param([(1, 2), (0, 4), (1, 2), (0, 0), (2, 2)], id="dup_overlap"),
+    ],
+)
+def test_blob_file_read_ranges_matches_read_range(dataset_with_blobs, ranges):
+    row_ids = _blob_row_ids(dataset_with_blobs)
+    blobs = dataset_with_blobs.take_blobs("blobs", ids=row_ids)
+    with blobs[4] as f:
+        expected = [f.read_range(offset, length) for offset, length in ranges]
+        assert f.read_ranges(ranges) == expected
+
+
+def test_blob_file_read_ranges_preserves_input_order(dataset_with_blobs):
+    row_ids = _blob_row_ids(dataset_with_blobs)
+    blobs = dataset_with_blobs.take_blobs("blobs", ids=row_ids)
+    with blobs[1] as f:
+        assert f.read_ranges([(2, 1), (0, 1), (1, 2)]) == [b"r", b"b", b"ar"]
+
+
+def test_blob_file_read_ranges_does_not_change_cursor(dataset_with_blobs):
+    row_ids = _blob_row_ids(dataset_with_blobs)
+    blobs = dataset_with_blobs.take_blobs("blobs", ids=row_ids)
+    with blobs[1] as f:
+        assert f.tell() == 0
+        assert f.read_ranges([(0, 3)]) == [b"bar"]
+        assert f.tell() == 0
+        f.seek(2)
+        assert f.read_ranges([(2, 1), (0, 3)]) == [b"r", b"bar"]
+        assert f.tell() == 2
+        assert f.read(1) == b"r"
+
+
+@pytest.mark.parametrize(
+    ("ranges", "message"),
+    [
+        pytest.param([(2**64 - 1, 2)], "offset \\+ length overflowed", id="overflow"),
+        pytest.param([(0, 1), (1, 100)], "exceeds blob size", id="out_of_bounds"),
+    ],
+)
+def test_blob_file_read_ranges_rejects_invalid_ranges(
+    dataset_with_blobs, ranges, message
+):
+    row_ids = _blob_row_ids(dataset_with_blobs)
+    blobs = dataset_with_blobs.take_blobs("blobs", ids=row_ids)
+    with blobs[0] as f:
+        with pytest.raises(ValueError, match=message):
+            f.read_ranges(ranges)
+        assert f.tell() == 0
 
 
 def test_null_blobs(tmp_path):
@@ -1355,7 +1433,9 @@ def test_packed_blob_writer_scalar_buffer_inputs(tmp_path, payload):
     assert _blob_sidecar_path(tmp_path, file_id, blob_id).read_bytes() == b"payload"
 
 
-@pytest.mark.parametrize("array_type", [pa.binary(), pa.large_binary()])
+@pytest.mark.parametrize(
+    "array_type", [pa.binary(), pa.large_binary(), pa.binary_view()]
+)
 @pytest.mark.parametrize("as_chunked", [False, True], ids=["array", "chunked_array"])
 @pytest.mark.parametrize(
     "values,slice_offset,slice_length,expected_values,expected_data",
@@ -2252,6 +2332,45 @@ def test_write_nested_blob_v2_and_take_by_field_path(tmp_path):
     assert dataset.take_blobs("info.blob", indices=[2]) == [None]
 
 
+def test_write_list_struct_nested_blob_v2(tmp_path):
+    payload_fields = [
+        lance.blob_field("blob"),
+        pa.field("format", pa.string()),
+    ]
+    payload_values = pa.StructArray.from_arrays(
+        [
+            lance.blob_array([b"first", b"second", None]),
+            pa.array(["bin", "bin", "bin"]),
+        ],
+        fields=payload_fields,
+    )
+    media_fields = [
+        pa.field("type", pa.string()),
+        pa.field("payload", payload_values.type),
+    ]
+    media_values = pa.StructArray.from_arrays(
+        [pa.array(["image", "image", "image"]), payload_values],
+        fields=media_fields,
+    )
+    media = pa.ListArray.from_arrays(pa.array([0, 2, 3]), media_values)
+    table = pa.table({"media": media})
+
+    dataset = lance.write_dataset(
+        table,
+        tmp_path / "list_struct_nested_blob_v2",
+        data_storage_version="2.2",
+    )
+
+    media = (
+        dataset.scanner(columns=["media"], blob_handling="all_binary")
+        .to_table()
+        .column("media")
+        .combine_chunks()
+    )
+    blobs = media.values.field("payload").field("blob")
+    assert blobs.to_pylist() == [b"first", b"second", None]
+
+
 def test_to_pandas_returns_blob_files_for_projected_nested_fields(
     dataset_with_nested_blobs,
 ):
@@ -2286,3 +2405,75 @@ def test_to_pandas_returns_blob_files_when_nested_field_is_aliased(
     assert images[0].readall() == b"foo"
     assert images[1] is None
     assert images[2].readall() == b"baz"
+
+
+@pytest.mark.parametrize("as_chunked", [False, True], ids=["array", "chunked_array"])
+def test_packed_blob_writer_bulk_binary_view(tmp_path, as_chunked):
+    file_id = str(uuid.uuid4())
+    blob_id = 7
+    values = [b"hello", None, b"", b"world"]
+    payloads = pa.array(values, type=pa.binary_view())
+    if as_chunked:
+        payloads = pa.chunked_array([payloads.slice(0, 2), payloads.slice(2)])
+
+    files = LanceFileSession(tmp_path)
+    packed = files.open_packed_blob_writer(f"{file_id}.lance", blob_id)
+    packed.write_blobs(payloads)
+    descriptors = packed.finish_array("image_bytes")
+
+    expected_descriptors = []
+    position = 0
+    for value in values:
+        if value is None:
+            expected_descriptors.append(None)
+        else:
+            expected_descriptors.append(
+                {
+                    "kind": 1,
+                    "data": None,
+                    "uri": None,
+                    "blob_id": blob_id,
+                    "blob_size": len(value),
+                    "position": position,
+                }
+            )
+            position += len(value)
+
+    assert descriptors.to_pylist() == expected_descriptors
+    assert _blob_sidecar_path(tmp_path, file_id, blob_id).read_bytes() == b"helloworld"
+
+
+@pytest.mark.parametrize("as_chunked", [False, True], ids=["array", "chunked_array"])
+def test_packed_blob_writer_bulk_fixed_size_binary(tmp_path, as_chunked):
+    file_id = str(uuid.uuid4())
+    blob_id = 7
+    values = [b"word", None, b"test"]
+    payloads = pa.array(values, type=pa.binary(4))
+    if as_chunked:
+        payloads = pa.chunked_array([payloads.slice(0, 2), payloads.slice(2)])
+
+    files = LanceFileSession(tmp_path)
+    packed = files.open_packed_blob_writer(f"{file_id}.lance", blob_id)
+    packed.write_blobs(payloads)
+    descriptors = packed.finish_array("image_bytes")
+
+    expected_descriptors = []
+    position = 0
+    for value in values:
+        if value is None:
+            expected_descriptors.append(None)
+        else:
+            expected_descriptors.append(
+                {
+                    "kind": 1,
+                    "data": None,
+                    "uri": None,
+                    "blob_id": blob_id,
+                    "blob_size": len(value),
+                    "position": position,
+                }
+            )
+            position += len(value)
+
+    assert descriptors.to_pylist() == expected_descriptors
+    assert _blob_sidecar_path(tmp_path, file_id, blob_id).read_bytes() == b"wordtest"

@@ -18,6 +18,7 @@ import org.lance.index.IndexParams;
 import org.lance.index.IndexType;
 import org.lance.index.scalar.ScalarIndexParams;
 import org.lance.ipc.AsyncScanner;
+import org.lance.ipc.MaterializationStyle;
 import org.lance.ipc.ScanOptions;
 
 import org.apache.arrow.memory.BufferAllocator;
@@ -166,6 +167,35 @@ public class AsyncScannerTest {
 
           assertEquals(20, rowCount, "Should read only filtered rows");
           reader.close();
+        }
+      }
+    }
+  }
+
+  @Test
+  void testAsyncScanWithPerformanceOptions(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("async_scanner_performance_options").toString();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+
+      try (Dataset dataset = testDataset.write(1, 40)) {
+        ScanOptions options =
+            new ScanOptions.Builder()
+                .filter("id < 20")
+                .batchSize(10)
+                .batchSizeBytes(1024)
+                .ioBufferSize(1024 * 1024)
+                .batchReadahead(2)
+                .fragmentReadahead(2)
+                .scanInOrder(false)
+                .lateMaterialization(MaterializationStyle.allEarly())
+                .build();
+
+        try (AsyncScanner scanner = AsyncScanner.create(dataset, options, allocator);
+            ArrowReader reader = scanner.scanBatchesAsync().get(10, TimeUnit.SECONDS)) {
+          assertEquals(20, countRows(reader));
         }
       }
     }

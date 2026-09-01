@@ -44,10 +44,12 @@ from .lance import (
     CleanupStats,
     DatasetBasePath,
     FFILanceTableProvider,
+    FtsToken,
     ScanStatistics,
     bytes_read_counter,
     iops_counter,
     simd_info,
+    tokenize,
 )
 from .mem_wal import (
     CompactedSsTable,
@@ -98,6 +100,7 @@ __all__ = [
     "DataStatistics",
     "FieldStatistics",
     "FragmentMetadata",
+    "FtsToken",
     "Index",
     "IndexFile",
     "LanceDataset",
@@ -117,6 +120,7 @@ __all__ = [
     "schema_to_json",
     "set_logger",
     "simd_info",
+    "tokenize",
     "write_dataset",
     "FFILanceTableProvider",
     "IndexProgress",

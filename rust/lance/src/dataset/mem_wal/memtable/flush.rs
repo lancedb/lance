@@ -33,6 +33,7 @@ use crate::dataset::mem_wal::manifest::ShardManifestStore;
 use crate::dataset::mem_wal::scanner::SsTableWarmer;
 use crate::dataset::mem_wal::scanner::exec::{compute_pk_hash, validate_pk_types};
 use crate::dataset::mem_wal::util::{derived_store_params, generate_random_hash, sstable_path};
+use crate::index::vector::details::vector_index_details_default;
 use crate::session::Session;
 
 #[derive(Debug, Clone)]
@@ -190,16 +191,14 @@ impl MemTableFlusher {
     /// (data fragments and index files) are written at this same version so the
     /// whole shard stays on one format (e.g. a 2.2 base => 2.2 SSTables).
     ///
-    /// Falls back to [`LanceFileVersion::default`] when no base dataset exists at
+    /// Falls back to the default selector's exact version when no base dataset exists at
     /// `base_uri` (e.g. flusher unit tests that run without a committed base).
     /// In production MemWAL is always initialized on a real dataset, so the base
     /// version is inherited; other open errors are propagated.
-    async fn base_storage_version(&self) -> Result<lance_file::version::LanceFileVersion> {
+    async fn base_storage_version(&self) -> Result<lance_file::version::ConcreteFileVersion> {
         match self.open_base().await {
-            Ok(dataset) => dataset.manifest().data_storage_format.lance_file_version(),
-            Err(Error::DatasetNotFound { .. }) => {
-                Ok(lance_file::version::LanceFileVersion::default())
-            }
+            Ok(dataset) => Ok(dataset.manifest().data_storage_format.lance_file_format()),
+            Err(Error::DatasetNotFound { .. }) => Ok(lance_file::version::stable_file_version()),
             Err(e) => Err(e),
         }
     }
@@ -358,7 +357,7 @@ impl MemTableFlusher {
         // that the dense HNSW graph List columns overflow at scale).
         let write_params = WriteParams {
             max_rows_per_file: usize::MAX,
-            data_storage_version: Some(self.base_storage_version().await?),
+            data_storage_version: Some(self.base_storage_version().await?.to_selector()),
             // Write the generation through the base's store params + session so it
             // uses the same store the base was opened with. Adapted for the
             // generation URI: a path-bound store binding would send this write at
@@ -779,6 +778,7 @@ impl MemTableFlusher {
                 uuid: index_uuid,
                 name: fts_cfg.name.clone(),
                 fields: vec![field_idx],
+                covering_fields: vec![],
                 dataset_version: dataset.version().version,
                 fragment_bitmap: Some(fragment_ids),
                 index_details: Some(Arc::new(index_details)),
@@ -901,6 +901,7 @@ impl MemTableFlusher {
         use arrow_schema::Schema as ArrowSchema;
         use lance_arrow::FixedSizeListArrayExt;
         use lance_core::ROW_ID;
+        use lance_file::versions as file_versions;
         use lance_file::writer::FileWriterOptions;
         use lance_index::pb;
         use lance_index::vector::DISTANCE_TYPE_KEY;
@@ -920,7 +921,8 @@ impl MemTableFlusher {
 
         // Write the index files at the base dataset's storage version (matches
         // the flushed data fragments; 2.2 avoids the v2.1 miniblock chunk cap).
-        let storage_version = self.base_storage_version().await?;
+        let storage_version =
+            crate::dataset::versions::index_file_version(self.base_storage_version().await?);
 
         let index_uuid = uuid::Uuid::new_v4();
         let index_dir = gen_path
@@ -992,8 +994,8 @@ impl MemTableFlusher {
         storage_ivf.add_partition(storage_batch.num_rows() as u32);
 
         let storage_path = index_dir.clone().join(INDEX_AUXILIARY_FILE_NAME);
-        let mut storage_writer = lance_file::versions::create_writer(
-            lance_file::version::ConcreteFileVersion::from(storage_version),
+        let mut storage_writer = file_versions::create_writer(
+            storage_version,
             self.object_store.create(&storage_path).await?,
             (&storage_schema).try_into()?,
             FileWriterOptions::default(),
@@ -1065,8 +1067,8 @@ impl MemTableFlusher {
             ArrowSchema::new(fields)
         };
         let index_path = index_dir.clone().join(INDEX_FILE_NAME);
-        let mut index_writer = lance_file::versions::create_writer(
-            lance_file::version::ConcreteFileVersion::from(storage_version),
+        let mut index_writer = file_versions::create_writer(
+            storage_version,
             self.object_store.create(&index_path).await?,
             (&index_schema).try_into()?,
             FileWriterOptions::default(),
@@ -1100,14 +1102,14 @@ impl MemTableFlusher {
         );
         index_writer.finish().await?;
 
-        let index_details = Some(Arc::new(prost_types::Any {
-            type_url: "type.googleapis.com/lance.index.VectorIndexDetails".to_string(),
-            value: vec![],
-        }));
+        // Packed the same way index creation does; hand-building the `Any` here
+        // produced a `type.googleapis.com/` url no other writer in lance emits.
+        let index_details = Some(Arc::new(vector_index_details_default()));
         let index_meta = IndexMetadata {
             uuid: index_uuid,
             name: config.name.clone(),
             fields: vec![0], // updated by caller
+            covering_fields: vec![],
             dataset_version: 0,
             fragment_bitmap: None,
             index_details,
@@ -1139,7 +1141,7 @@ impl MemTableFlusher {
                 });
 
                 ShardManifest {
-                    version: current.version + 1,
+                    version: current.next_version(),
                     replay_after_wal_entry_position: covered_wal_entry_position,
                     wal_entry_position_last_seen: current
                         .wal_entry_position_last_seen
@@ -1331,7 +1333,7 @@ mod tests {
         assert_eq!(result.covered_wal_entry_position, 1);
 
         // Verify manifest was updated
-        let updated_manifest = manifest_store.read_latest().await.unwrap().unwrap();
+        let updated_manifest = manifest_store.latest().await.unwrap().unwrap();
         assert_eq!(updated_manifest.version, 2);
         assert_eq!(updated_manifest.replay_after_wal_entry_position, 1);
         assert_eq!(updated_manifest.current_generation, 2);
@@ -1403,7 +1405,7 @@ mod tests {
             1,
             "pre-commit warm fires exactly once"
         );
-        let updated = manifest_store.read_latest().await.unwrap().unwrap();
+        let updated = manifest_store.latest().await.unwrap().unwrap();
         assert_eq!(
             updated.sstables.len(),
             1,

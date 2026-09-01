@@ -259,6 +259,10 @@ use crate::format::pb21;
 use crate::repdef::{CompositeRepDefUnraveler, RepDefUnraveler};
 use crate::{BufferScheduler, EncodingsIo};
 
+/// Candidate batch sizes evaluated during byte-budget planning.
+/// Powers of 4, covering 1–16Ki rows in 8 probes.
+pub const CANDIDATE_BATCH_SIZES: [u32; 8] = [1, 4, 16, 64, 256, 1024, 4096, 16384];
+
 pub trait SchedulingJob: std::fmt::Debug {
     fn schedule_next(
         &mut self,
@@ -737,36 +741,41 @@ impl CoreFieldDecoderStrategy {
         let items_scheduler =
             self.create_array_field_scheduler(&list_field.children[0], column_infos, buffers)?;
 
-        let (inner_infos, null_offset_adjustments): (Vec<_>, Vec<_>) = offsets_column
+        let mut inner_infos = Vec::with_capacity(offsets_column.page_infos.len());
+        let mut null_offset_adjustments = Vec::with_capacity(offsets_column.page_infos.len());
+        for (page_index, offsets_page) in offsets_column
             .page_infos
             .iter()
-            .filter(|offsets_page| offsets_page.num_rows > 0)
-            .map(|offsets_page| {
-                if let Some(pb::array_encoding::ArrayEncoding::List(list_encoding)) =
-                    &offsets_page.encoding.as_legacy().array_encoding
-                {
-                    let inner = PageInfo {
-                        buffer_offsets_and_sizes: offsets_page.buffer_offsets_and_sizes.clone(),
-                        encoding: PageEncoding::Legacy(
-                            list_encoding.offsets.as_ref().unwrap().as_ref().clone(),
-                        ),
-                        num_rows: offsets_page.num_rows,
-                        priority: 0,
-                    };
-                    (
-                        inner,
-                        OffsetPageInfo {
-                            offsets_in_page: offsets_page.num_rows,
-                            null_offset_adjustment: list_encoding.null_offset_adjustment,
-                            num_items_referenced_by_page: list_encoding.num_items,
-                        },
-                    )
-                } else {
-                    // TODO: Should probably return Err here
-                    panic!("Expected a list column");
-                }
-            })
-            .unzip();
+            .enumerate()
+            .filter(|(_, offsets_page)| offsets_page.num_rows > 0)
+        {
+            let PageEncoding::Legacy(pb::ArrayEncoding {
+                array_encoding: Some(pb::array_encoding::ArrayEncoding::List(list_encoding)),
+            }) = &offsets_page.encoding
+            else {
+                return Err(Error::invalid_input(format!(
+                    "expected list encoding for field '{}' in column {}, page {} but got {:?}",
+                    list_field.name, offsets_column.index, page_index, offsets_page.encoding
+                )));
+            };
+            let offsets_encoding = list_encoding.offsets.as_ref().ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "list encoding for field '{}' in column {}, page {} is missing its offsets encoding",
+                    list_field.name, offsets_column.index, page_index
+                ))
+            })?;
+            inner_infos.push(PageInfo {
+                buffer_offsets_and_sizes: offsets_page.buffer_offsets_and_sizes.clone(),
+                encoding: PageEncoding::Legacy(offsets_encoding.as_ref().clone()),
+                num_rows: offsets_page.num_rows,
+                priority: 0,
+            });
+            null_offset_adjustments.push(OffsetPageInfo {
+                offsets_in_page: offsets_page.num_rows,
+                null_offset_adjustment: list_encoding.null_offset_adjustment,
+                num_items_referenced_by_page: list_encoding.num_items,
+            });
+        }
         let inner = Arc::new(PrimitiveFieldScheduler::new(
             offsets_column.index,
             DataType::UInt64,
@@ -1809,7 +1818,12 @@ impl<T: RootDecoderType> RecordBatchReader for BatchDecodeIterator<T> {
 /// This estimate ignores validity bitmaps at the moment.  We can't infer
 /// their presence simply from the data_type and their impact is probably
 /// fairly negligible.
-fn estimate_bytes_per_row(data_type: &DataType) -> f64 {
+/// Returns a schema-based estimate of the decoded bytes per row for `data_type`.
+///
+/// Fixed-width types are exact. Variable-width types (strings, lists, etc.) use
+/// heuristic constants. This estimate is used both in batch-size planning and as
+/// a fallback for V1 files that lack structural decoders.
+pub fn estimate_bytes_per_row(data_type: &DataType) -> f64 {
     if let Some(w) = data_type.byte_width_opt() {
         return w as f64;
     }
@@ -2878,6 +2892,13 @@ pub trait DecodePageTask: Send + std::fmt::Debug {
 pub trait StructuralPageDecoder: std::fmt::Debug + Send {
     fn drain(&mut self, num_rows: u64) -> Result<Box<dyn DecodePageTask>>;
     fn num_rows(&self) -> u64;
+    /// Returns the exact decoded byte count for the next `num_rows` rows
+    /// from this decoder's current position, without consuming any rows.
+    fn decoded_bytes(&self, _num_rows: u64) -> Result<u64> {
+        Err(Error::not_supported(
+            "decoded_bytes is not implemented for this page decoder".to_string(),
+        ))
+    }
 }
 
 #[derive(Debug)]
@@ -2926,6 +2947,20 @@ pub trait StructuralFieldDecoder: std::fmt::Debug + Send {
     fn drain(&mut self, num_rows: u64) -> Result<Box<dyn StructuralDecodeArrayTask>>;
     /// The data type of the decoded data
     fn data_type(&self) -> &DataType;
+    /// Returns the exact decoded byte count for each of [`CANDIDATE_BATCH_SIZES`]
+    /// row counts, clamped to `rows_remaining`.
+    ///
+    /// Implementations should do their best to estimate the exact size required for
+    /// the uncompressed data.  In cases where this is not possible they should return
+    /// a worst-case estimate.
+    ///
+    /// The default implementation simply returns a "not supported" error though this
+    /// will hopefully be removed once implementation is complete.
+    fn plan_decoded_bytes(&self, _rows_remaining: u64) -> Result<[u64; 8]> {
+        Err(Error::not_supported(
+            "decoded_bytes is not implemented for this field decoder".to_string(),
+        ))
+    }
 }
 
 #[derive(Debug, Default)]
@@ -3112,6 +3147,51 @@ mod tests {
                 .contains("dimension must be a positive integer"),
             "unexpected error: {}",
             err
+        );
+    }
+
+    #[test]
+    fn test_list_page_with_non_list_encoding_returns_error() {
+        let item = Arc::new(ArrowField::new("item", DataType::Int32, true));
+        let list = DataType::List(item);
+        let field = Field::try_from(&ArrowField::new("values", list, true)).unwrap();
+        let values_encoding = pb::ColumnEncoding {
+            column_encoding: Some(pb::column_encoding::ColumnEncoding::Values(())),
+        };
+        let offsets_column = Arc::new(ColumnInfo::new(
+            0,
+            Arc::new([PageInfo {
+                num_rows: 1,
+                priority: 0,
+                encoding: PageEncoding::Legacy(pb::ArrayEncoding {
+                    array_encoding: Some(pb::array_encoding::ArrayEncoding::Flat(
+                        pb::Flat::default(),
+                    )),
+                }),
+                buffer_offsets_and_sizes: Arc::new([]),
+            }]),
+            vec![],
+            values_encoding.clone(),
+        ));
+        let items_column = Arc::new(ColumnInfo::new(1, Arc::new([]), vec![], values_encoding));
+        let column_indices = [0, 1];
+        let mut columns = ColumnInfoIter::new(vec![offsets_column, items_column], &column_indices);
+
+        let err = CoreFieldDecoderStrategy::default()
+            .create_array_field_scheduler(
+                &field,
+                &mut columns,
+                FileBuffers {
+                    positions_and_sizes: &[],
+                },
+            )
+            .unwrap_err();
+
+        assert!(matches!(err, Error::InvalidInput { .. }));
+        assert!(
+            err.to_string()
+                .contains("expected list encoding for field 'values' in column 0, page 0 but got"),
+            "unexpected error: {err}"
         );
     }
 

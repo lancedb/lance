@@ -45,6 +45,7 @@ pub struct CommitBuilder<'a> {
     store_params: Option<ObjectStoreParams>,
     object_store: Option<Arc<ObjectStore>>,
     source_store: Option<Arc<ObjectStore>>,
+    source_commit_handler: Option<Arc<dyn CommitHandler>>,
     session: Option<Arc<Session>>,
     detached: bool,
     commit_config: CommitConfig,
@@ -52,6 +53,8 @@ pub struct CommitBuilder<'a> {
     affected_rows: Option<RowAddrTreeMap>,
     transaction_properties: Option<Arc<HashMap<String, String>>>,
     timeout: Option<Duration>,
+    /// When `Some`, this commit is the second step of `migrate_to_stable_row_ids`.
+    migration_next_row_id: Option<u64>,
 }
 
 /// Default timeout applied to [`CommitBuilder::execute`] when none is set.
@@ -68,6 +71,7 @@ impl<'a> CommitBuilder<'a> {
             store_params: None,
             object_store: None,
             source_store: None,
+            source_commit_handler: None,
             session: None,
             detached: false,
             commit_config: Default::default(),
@@ -75,6 +79,7 @@ impl<'a> CommitBuilder<'a> {
             affected_rows: None,
             transaction_properties: None,
             timeout: Some(DEFAULT_COMMIT_TIMEOUT),
+            migration_next_row_id: None,
         }
     }
 
@@ -98,7 +103,8 @@ impl<'a> CommitBuilder<'a> {
     /// All data files must use the same storage format as the existing dataset.
     /// If a different format is passed, an error will be returned.
     pub fn with_storage_format(mut self, storage_format: LanceFileVersion) -> Self {
-        self.storage_format = Some(storage_format.into());
+        self.storage_format = Some(storage_format.resolve());
+
         self
     }
 
@@ -122,6 +128,17 @@ impl<'a> CommitBuilder<'a> {
     /// store when not set, preserving same-store behavior.
     pub fn with_source_store(mut self, source_store: Arc<ObjectStore>) -> Self {
         self.source_store = Some(source_store);
+        self
+    }
+
+    /// Pass the dataset being cloned from.
+    ///
+    /// Only used by `Operation::Clone`: the source manifest is resolved through
+    /// the dataset's commit handler and read through its object store. This is
+    /// required when the source and destination use different manifest stores.
+    pub fn with_source_dataset(mut self, source: &Dataset) -> Self {
+        self.source_store = Some(source.object_store.clone());
+        self.source_commit_handler = Some(source.commit_handler.clone());
         self
     }
 
@@ -251,6 +268,17 @@ impl<'a> CommitBuilder<'a> {
         self
     }
 
+    /// Configure this commit as the second step of a stable row ID migration.
+    ///
+    /// Sets `use_stable_row_ids = true` and supplies the `next_row_id` that was
+    /// computed during the first migration commit. This bypasses the normal
+    /// "cannot enable stable row IDs on an existing dataset" check so that the
+    /// flag can be activated without creating the dataset from scratch.
+    pub(crate) fn with_stable_row_id_migration_activation(mut self, next_row_id: u64) -> Self {
+        self.migration_next_row_id = Some(next_row_id);
+        self
+    }
+
     pub async fn execute(self, transaction: Transaction) -> Result<Dataset> {
         let timeout = self.timeout;
         if let Some(t) = timeout
@@ -283,8 +311,9 @@ impl<'a> CommitBuilder<'a> {
             .or_else(|| self.dest.dataset().map(|ds| ds.session.clone()))
             .unwrap_or_default();
 
-        // Store used to read the source manifest for a clone (see with_source_store).
+        // Store and handler used to read the source manifest for a clone.
         let source_store = self.source_store.clone();
+        let source_commit_handler = self.source_commit_handler.clone();
 
         let (object_store, base_path, commit_handler) = match &self.dest {
             WriteDestination::Dataset(dataset) => (
@@ -385,7 +414,11 @@ impl<'a> CommitBuilder<'a> {
             ManifestNamingScheme::V1
         };
 
-        let use_stable_row_ids = if let Some(ds) = dest.dataset() {
+        let use_stable_row_ids = if self.migration_next_row_id.is_some() {
+            // Migration activation always enables stable row IDs regardless of
+            // the current dataset state.
+            true
+        } else if let Some(ds) = dest.dataset() {
             ds.manifest.uses_stable_row_ids()
         } else {
             self.use_stable_row_ids.unwrap_or(false)
@@ -409,6 +442,7 @@ impl<'a> CommitBuilder<'a> {
         let manifest_config = ManifestWriteConfig {
             use_stable_row_ids,
             storage_format: self.storage_format.map(DataStorageFormat::new),
+            migration_next_row_id: self.migration_next_row_id,
             ..Default::default()
         };
 
@@ -452,6 +486,7 @@ impl<'a> CommitBuilder<'a> {
             commit_new_dataset(
                 object_store.as_ref(),
                 source_store.as_deref(),
+                source_commit_handler.as_deref(),
                 commit_handler.as_ref(),
                 &base_path,
                 &transaction,
@@ -476,13 +511,21 @@ impl<'a> CommitBuilder<'a> {
         let fragment_bitmap = Arc::new(manifest.fragments.iter().map(|f| f.id as u32).collect());
 
         match &self.dest {
-            WriteDestination::Dataset(dataset) => Ok(Dataset {
-                manifest: Arc::new(manifest),
-                manifest_location,
-                session,
-                fragment_bitmap,
-                ..dataset.as_ref().clone()
-            }),
+            WriteDestination::Dataset(dataset) => {
+                let base_object_stores = if manifest.base_paths == dataset.manifest.base_paths {
+                    dataset.base_object_stores.clone()
+                } else {
+                    Default::default()
+                };
+                Ok(Dataset {
+                    manifest: Arc::new(manifest),
+                    manifest_location,
+                    session,
+                    fragment_bitmap,
+                    base_object_stores,
+                    ..dataset.as_ref().clone()
+                })
+            }
             WriteDestination::Uri(uri) => {
                 let refs = Refs::new(
                     object_store.clone(),
@@ -509,6 +552,7 @@ impl<'a> CommitBuilder<'a> {
                     file_reader_options: None,
                     store_params: self.store_params.clone().map(Box::new),
                     base_store_params: None,
+                    base_object_stores: Default::default(),
                 })
             }
         }
@@ -576,7 +620,9 @@ mod tests {
     use lance_table::format::{
         DataFile, Fragment, IndexMetadata, Manifest, Transaction as TableTransaction,
     };
-    use lance_table::io::commit::{CommitError, ManifestLocation, ManifestWriter};
+    use lance_table::io::commit::{
+        CommitError, ConditionalPutCommitHandler, ManifestLocation, ManifestWriter,
+    };
     use std::time::Duration;
 
     use object_store::throttle::ThrottleConfig;
@@ -589,7 +635,8 @@ mod tests {
 
     fn sample_fragment() -> Fragment {
         let (major_version, minor_version) =
-            ConcreteFileVersion::from(LanceFileVersion::Stable).to_data_file_numbers();
+            LanceFileVersion::Stable.resolve().to_data_file_numbers();
+
         Fragment {
             id: 0,
             files: vec![DataFile {
@@ -644,6 +691,90 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
             Err(CommitError::CommitConflict)
         }
+    }
+
+    #[derive(Debug)]
+    struct DestinationOnlyCommitHandler;
+
+    #[async_trait::async_trait]
+    impl CommitHandler for DestinationOnlyCommitHandler {
+        async fn resolve_version_location(
+            &self,
+            _base_path: &object_store::path::Path,
+            _version: u64,
+            _object_store: &dyn object_store::ObjectStore,
+        ) -> Result<ManifestLocation> {
+            Err(Error::invalid_input(
+                "destination commit handler cannot resolve source versions",
+            ))
+        }
+
+        async fn commit(
+            &self,
+            manifest: &mut Manifest,
+            indices: Option<Vec<IndexMetadata>>,
+            base_path: &object_store::path::Path,
+            object_store: &ObjectStore,
+            manifest_writer: ManifestWriter,
+            naming_scheme: ManifestNamingScheme,
+            transaction: Option<TableTransaction>,
+        ) -> std::result::Result<ManifestLocation, CommitError> {
+            ConditionalPutCommitHandler
+                .commit(
+                    manifest,
+                    indices,
+                    base_path,
+                    object_store,
+                    manifest_writer,
+                    naming_scheme,
+                    transaction,
+                )
+                .await
+        }
+    }
+
+    #[tokio::test]
+    async fn test_clone_uses_source_dataset_commit_handler() {
+        let session = Arc::new(Session::default());
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                "i",
+                DataType::Int32,
+                false,
+            )])),
+            vec![Arc::new(Int32Array::from_iter_values(0..10_i32))],
+        )
+        .unwrap();
+        let source = InsertBuilder::new("memory://clone-source-handler/source")
+            .with_params(&WriteParams {
+                session: Some(session.clone()),
+                ..Default::default()
+            })
+            .execute(vec![batch])
+            .await
+            .unwrap();
+        let version = source.version().version;
+        let transaction = Transaction::new(
+            version,
+            Operation::Clone {
+                is_shallow: true,
+                ref_name: None,
+                ref_version: version,
+                ref_path: source.uri().to_string(),
+                branch_name: None,
+            },
+            None,
+        );
+
+        let cloned = CommitBuilder::new("memory://clone-source-handler/target")
+            .with_session(session)
+            .with_commit_handler(Arc::new(DestinationOnlyCommitHandler))
+            .with_source_dataset(&source)
+            .execute(transaction)
+            .await
+            .unwrap();
+
+        assert_eq!(cloned.count_rows(None).await.unwrap(), 10);
     }
 
     #[tokio::test]
@@ -895,7 +1026,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_commit_timeout_triggers() {
         let throttled = Arc::new(ThrottledStoreWrapper {
             config: ThrottleConfig {
@@ -934,7 +1065,7 @@ mod tests {
         assert!(matches!(&err, Error::Timeout { .. }), "got {err:?}");
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_commit_timeout_applies_to_execute_batch() {
         let throttled = Arc::new(ThrottledStoreWrapper {
             config: ThrottleConfig {
@@ -978,7 +1109,7 @@ mod tests {
     /// `with_timeout(None)` must let a commit run unbounded. Uses a throttled
     /// store so the commit takes real wall-clock time — long enough that the
     /// 50ms timeout in `test_commit_timeout_triggers` would have fired.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_commit_timeout_none_disables() {
         let throttled = Arc::new(ThrottledStoreWrapper {
             config: ThrottleConfig {
@@ -1120,7 +1251,7 @@ mod tests {
 
     /// On non-lexically-ordered stores (e.g. S3 Express) a commit should use the
     /// version hint (a few HEAD probes, O(k)) instead of a full O(n) listing.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_commit_uses_version_hint_on_non_lexical_store() {
         // Make `list` artificially slow per entry so a full listing would be
         // obvious; HEAD/GET/PUT stay fast.

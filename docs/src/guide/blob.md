@@ -115,6 +115,9 @@ Note:
   metadata for the same column are rejected.
 - `blob_pack_file_size_threshold` is a write option for rolling packed `.blob`
   sidecar files. It does not control inline-vs-packed placement.
+- Blob v2 fields can be nested inside structs and variable-length lists. Blob-aware
+  scans preserve the surrounding nested layout; use `blob_handling="all_binary"`
+  to materialize nested blob payloads as bytes.
 
 ### Example: packed external blobs (single container file)
 

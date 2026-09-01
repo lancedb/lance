@@ -62,29 +62,37 @@ public class AsyncScanner implements AutoCloseable {
     Preconditions.checkNotNull(dataset);
     Preconditions.checkNotNull(options);
     Preconditions.checkNotNull(allocator);
-    AsyncScanner scanner =
-        createAsyncScanner(
-            dataset,
-            options.getFragmentIds(),
-            options.getColumns(),
-            options.getSubstraitFilter(),
-            options.getFilter(),
-            options.getBatchSize(),
-            options.getLimit(),
-            options.getOffset(),
-            options.getNearest(),
-            options.getFullTextQuery(),
-            options.isPrefilter(),
-            options.isWithRowId(),
-            options.isWithRowAddress(),
-            options.getBatchReadahead(),
-            options.getColumnOrderings(),
-            options.isUseScalarIndex(),
-            options.isFastSearch(),
-            options.getSubstraitAggregate(),
-            options.isIncludeDeletedRows(),
-            options.isStrictBatchSize(),
-            options.isDisableScoringAutoprojection());
+    AsyncScanner scanner;
+    try (LockManager.ReadLock readLock = dataset.acquireReadLock()) {
+      scanner =
+          createAsyncScanner(
+              dataset,
+              options.getFragmentIds(),
+              options.getColumns(),
+              options.getSubstraitFilter(),
+              options.getFilter(),
+              options.getBatchSize(),
+              options.getBatchSizeBytes(),
+              options.getIoBufferSize(),
+              options.getLimit(),
+              options.getOffset(),
+              options.getNearest(),
+              options.getFullTextQuery(),
+              options.isPrefilter(),
+              options.isWithRowId(),
+              options.isWithRowAddress(),
+              options.getBatchReadahead(),
+              options.getFragmentReadahead(),
+              options.isScanInOrder(),
+              options.getLateMaterialization(),
+              options.getColumnOrderings(),
+              options.isUseScalarIndex(),
+              options.isFastSearch(),
+              options.getSubstraitAggregate(),
+              options.isIncludeDeletedRows(),
+              options.isStrictBatchSize(),
+              options.isDisableScoringAutoprojection());
+    }
     scanner.allocator = allocator;
     return scanner;
   }
@@ -96,6 +104,8 @@ public class AsyncScanner implements AutoCloseable {
       Optional<ByteBuffer> substraitFilter,
       Optional<String> filter,
       Optional<Long> batchSize,
+      Optional<Long> batchSizeBytes,
+      Optional<Long> ioBufferSize,
       Optional<Long> limit,
       Optional<Long> offset,
       Optional<Query> query,
@@ -104,6 +114,9 @@ public class AsyncScanner implements AutoCloseable {
       boolean withRowId,
       boolean withRowAddress,
       int batchReadahead,
+      Optional<Integer> fragmentReadahead,
+      boolean scanInOrder,
+      Optional<MaterializationStyle> lateMaterialization,
       Optional<List<ColumnOrdering>> columnOrderings,
       boolean useScalarIndex,
       boolean fastSearch,

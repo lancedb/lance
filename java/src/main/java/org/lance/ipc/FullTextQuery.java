@@ -45,8 +45,11 @@ public abstract class FullTextQuery {
   }
 
   public enum Occur {
+    /** The clause may match and contributes its score when it does. */
     SHOULD,
+    /** The clause must match and contributes its score. */
     MUST,
+    /** The clause must not match and never contributes to the score. */
     MUST_NOT
   }
 
