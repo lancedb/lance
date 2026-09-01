@@ -1,20 +1,28 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{ops::Range, sync::Arc};
+use std::{collections::HashMap, fs, ops::Range, sync::Arc};
 
 use arrow::array::AsArray;
-use arrow_array::{RecordBatch, RecordBatchIterator, types::Int32Type};
+use arrow_array::{
+    ArrayRef, LargeBinaryArray, RecordBatch, RecordBatchIterator, StringArray, StructArray,
+    UInt64Array, types::Int32Type,
+};
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use bytes::Bytes;
 use futures::stream;
-use lance_core::datatypes::BlobHandling;
+use lance_arrow::{ARROW_EXT_NAME_KEY, BLOB_V2_EXT_NAME};
+use lance_core::{
+    datatypes::{BLOB_V2_LOGICAL_FIELDS, BlobHandling},
+    utils::tempfile::TempDir,
+};
 use lance_file::concat::EncodedFileInput;
 use lance_file::version::LanceFileVersion;
 use lance_io::{
     scheduler::{ScanScheduler, SchedulerConfig},
     utils::CachedFileSize,
 };
+use lance_table::format::BasePath;
 
 use crate::blob::{BlobArrayBuilder, BlobDescriptorArrayBuilder, blob_field};
 use crate::dataset::fragment::FileFragment;
@@ -34,6 +42,34 @@ async fn dataset_of(batch: RecordBatch, version: LanceFileVersion) -> Dataset {
         }),
     )
     .await
+    .unwrap()
+}
+
+fn complete_logical_blob_batch(uri: &str, position: u64, size: u64) -> RecordBatch {
+    let field = Field::new(
+        "blob",
+        DataType::Struct(BLOB_V2_LOGICAL_FIELDS.clone()),
+        true,
+    )
+    .with_metadata(HashMap::from([(
+        ARROW_EXT_NAME_KEY.to_string(),
+        BLOB_V2_EXT_NAME.to_string(),
+    )]));
+    let array = StructArray::try_new(
+        BLOB_V2_LOGICAL_FIELDS.clone(),
+        vec![
+            Arc::new(LargeBinaryArray::from(vec![None::<&[u8]>])) as ArrayRef,
+            Arc::new(StringArray::from(vec![Some(uri)])) as ArrayRef,
+            Arc::new(UInt64Array::from(vec![Some(position)])) as ArrayRef,
+            Arc::new(UInt64Array::from(vec![Some(size)])) as ArrayRef,
+        ],
+        None,
+    )
+    .unwrap();
+    RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![field])),
+        vec![Arc::new(array)],
+    )
     .unwrap()
 }
 
@@ -232,6 +268,74 @@ async fn data_file_part_rejects_non_empty_file_relative_inline_blob() {
         .await
         .unwrap_err();
     assert!(error.to_string().contains("non-empty Inline"), "{error}");
+}
+
+#[tokio::test]
+async fn complete_logical_blob_schema_and_external_range_survive_assembly() {
+    let test_dir = TempDir::default();
+    let dataset_path = test_dir.std_path().join("dataset");
+    let external_base = test_dir.std_path().join("external");
+    let external_objects = external_base.join("objects");
+    fs::create_dir_all(&external_objects).unwrap();
+    let external_path = external_objects.join("blob.bin");
+    fs::write(&external_path, b"prefix-selected-suffix").unwrap();
+    let external_uri = format!("file://{}", external_path.display());
+    let external_base_uri = format!("file://{}", external_base.display());
+    let original = complete_logical_blob_batch(&external_uri, 7, 8);
+    let schema = original.schema();
+    let dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(original)], schema),
+        dataset_path.to_str().unwrap(),
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            initial_bases: Some(vec![BasePath {
+                id: 1,
+                name: Some("external".to_string()),
+                path: external_base_uri,
+                is_dataset_root: false,
+            }]),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let target = DataFileTarget::new(
+        "complete-logical-final.lance".to_string(),
+        None,
+        Arc::new(dataset.schema().clone()),
+        dataset.manifest.data_storage_format.lance_file_format(),
+    )
+    .unwrap();
+    assert_eq!(
+        target.schema().fields[0]
+            .children
+            .iter()
+            .map(|child| child.name.as_str())
+            .collect::<Vec<_>>(),
+        ["data", "uri", "position", "size"]
+    );
+
+    let part = write_part(
+        &dataset,
+        &target,
+        "complete-logical-part.lance",
+        Some(1..10),
+        complete_logical_blob_batch(&external_uri, 7, 8),
+    )
+    .await;
+    assert_eq!(part.num_rows(), 1);
+    let replacement = only_fragment(&dataset)
+        .write_columns_from_parts(&target, &[part])
+        .await
+        .unwrap();
+    let dataset = commit(&dataset, replacement).await.unwrap();
+    assert_eq!(dataset.schema().fields[0].children.len(), 4);
+
+    let mut scanner = dataset.scan();
+    scanner.blob_handling(BlobHandling::AllBinary);
+    let batch = scanner.try_into_batch().await.unwrap();
+    let values = batch["blob"].as_binary::<i64>();
+    assert_eq!(values.value(0), b"selected");
 }
 
 #[tokio::test]
