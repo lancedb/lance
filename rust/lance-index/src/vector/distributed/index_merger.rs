@@ -56,6 +56,8 @@ const PARTITION_WINDOW_SIZE_ENV: &str = "LANCE_IVF_PQ_MERGE_PARTITION_WINDOW_SIZ
 const DEFAULT_PARTITION_PREFETCH_WINDOW_COUNT: usize = 2;
 const PARTITION_PREFETCH_WINDOW_COUNT_ENV: &str =
     "LANCE_IVF_PQ_MERGE_PARTITION_PREFETCH_WINDOW_COUNT";
+const DEFAULT_NON_TRANSFORMED_PARTITION_WINDOW_BYTES: usize = 128 * 1024 * 1024;
+const NON_TRANSFORMED_PARTITION_WINDOW_BYTES_ENV: &str = "LANCE_IVF_MERGE_PARTITION_WINDOW_BYTES";
 static PARTITION_WINDOW_SIZE: LazyLock<usize> = LazyLock::new(|| {
     std::env::var(PARTITION_WINDOW_SIZE_ENV)
         .ok()
@@ -68,6 +70,67 @@ static PARTITION_PREFETCH_WINDOW_COUNT: LazyLock<usize> = LazyLock::new(|| {
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(DEFAULT_PARTITION_PREFETCH_WINDOW_COUNT)
 });
+static NON_TRANSFORMED_PARTITION_WINDOW_BYTES: LazyLock<usize> = LazyLock::new(|| {
+    std::env::var(NON_TRANSFORMED_PARTITION_WINDOW_BYTES_ENV)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_NON_TRANSFORMED_PARTITION_WINDOW_BYTES)
+});
+
+fn fixed_width_bytes(data_type: &DataType) -> Option<usize> {
+    match data_type {
+        DataType::Boolean | DataType::Int8 | DataType::UInt8 => Some(1),
+        DataType::Int16 | DataType::UInt16 | DataType::Float16 => Some(2),
+        DataType::Int32
+        | DataType::UInt32
+        | DataType::Float32
+        | DataType::Date32
+        | DataType::Time32(_) => Some(4),
+        DataType::Int64
+        | DataType::UInt64
+        | DataType::Float64
+        | DataType::Date64
+        | DataType::Time64(_)
+        | DataType::Timestamp(_, _)
+        | DataType::Duration(_) => Some(8),
+        DataType::FixedSizeBinary(width) => Some(*width as usize),
+        DataType::FixedSizeList(field, len) => {
+            fixed_width_bytes(field.data_type()).map(|width| width * *len as usize)
+        }
+        _ => None,
+    }
+}
+
+fn estimate_schema_row_width_bytes(schema: &ArrowSchema) -> usize {
+    schema
+        .fields()
+        .iter()
+        .map(|field| fixed_width_bytes(field.data_type()).unwrap_or(64))
+        .sum::<usize>()
+        .max(1)
+}
+
+fn estimate_non_transformed_partition_window_size(
+    accumulated_lengths: &[u32],
+    row_width_bytes: usize,
+    configured_window_size: usize,
+    target_window_bytes: usize,
+) -> usize {
+    let max_window_size = configured_window_size
+        .max(1)
+        .min(accumulated_lengths.len().max(1));
+    let Some(max_partition_rows) = accumulated_lengths.iter().copied().max() else {
+        return max_window_size;
+    };
+    if max_partition_rows == 0 {
+        return max_window_size;
+    }
+
+    let target_rows = (target_window_bytes as u128 / row_width_bytes.max(1) as u128).max(1);
+    let partitions = target_rows / max_partition_rows as u128;
+    partitions.clamp(1, max_window_size as u128) as usize
+}
 
 /// Strict bitwise equality check for FixedSizeListArray values.
 /// Returns true only if length, value_length and all underlying primitive values are equal.
@@ -423,6 +486,13 @@ pub async fn write_partition_rows(
     while let Some(rb) = stream.next().await {
         let rb = rb?;
         w.write_batch(&rb).await?;
+    }
+    Ok(())
+}
+
+async fn write_partition_batches(w: &mut FileWriter, batches: Vec<RecordBatch>) -> Result<()> {
+    for batch in batches {
+        w.write_batch(&batch).await?;
     }
     Ok(())
 }
@@ -814,6 +884,7 @@ pub async fn merge_partial_vector_auxiliary_files(
     // Track per-shard readers, IVF lengths, and precomputed partition offsets.
     // This avoids reopening each shard file for every partition during merge.
     let mut shard_infos: Vec<ShardInfo> = Vec::new();
+    let mut non_transformed_row_width_bytes: Option<usize> = None;
 
     progress
         .stage_start(
@@ -952,6 +1023,21 @@ pub async fn merge_partial_vector_auxiliary_files(
         // Handle logic based on detected index type
         let idx_type = detected_index_type
             .ok_or_else(|| Error::index("Unable to detect index type".to_string()))?;
+        if matches!(
+            idx_type,
+            SupportedIvfIndexType::IvfFlat
+                | SupportedIvfIndexType::IvfSq
+                | SupportedIvfIndexType::IvfHnswFlat
+                | SupportedIvfIndexType::IvfHnswSq
+        ) {
+            let schema_arrow: ArrowSchema = reader.schema().as_ref().into();
+            let row_width = estimate_schema_row_width_bytes(&schema_arrow);
+            non_transformed_row_width_bytes = Some(
+                non_transformed_row_width_bytes
+                    .map(|existing| existing.max(row_width))
+                    .unwrap_or(row_width),
+            );
+        }
 
         // Preserve the historical fallback while keeping the writer boundary exact.
         let fv = format_version.unwrap_or(ConcreteFileVersion::V2_0);
@@ -1567,23 +1653,45 @@ pub async fn merge_partial_vector_auxiliary_files(
             }
         }
         _ => {
-            for (pid, total_part_len) in accumulated_lengths.iter().copied().enumerate().take(nlist)
-            {
-                for shard in shard_infos.iter() {
-                    let part_len = shard.lengths[pid] as usize;
-                    if part_len == 0 {
-                        continue;
-                    }
-                    let offset = shard.partition_offsets[pid];
-                    if let Some(w) = v2w_opt.as_mut() {
-                        write_partition_rows(shard.reader.as_ref(), w, offset..offset + part_len)
-                            .await?;
-                    }
-                }
-                if total_part_len == 0 {
+            // Non-transformed storage (FLAT, SQ, and HNSW variants) can be
+            // copied directly, but still needs the windowed reader to avoid
+            // one read stream per (partition, shard).
+            let row_width_bytes = non_transformed_row_width_bytes.unwrap_or(1);
+            let partition_window_size = estimate_non_transformed_partition_window_size(
+                &accumulated_lengths,
+                row_width_bytes,
+                *PARTITION_WINDOW_SIZE,
+                *NON_TRANSFORMED_PARTITION_WINDOW_BYTES,
+            );
+            log::info!(
+                "Using non-transformed IVF merge partition window size {} (estimated row width: {} bytes, target window bytes: {})",
+                partition_window_size,
+                row_width_bytes,
+                *NON_TRANSFORMED_PARTITION_WINDOW_BYTES
+            );
+            let prefetch_window_count = *PARTITION_PREFETCH_WINDOW_COUNT;
+            let mut shard_merge_reader = ShardMergeReader::new(
+                shard_infos,
+                nlist,
+                partition_window_size,
+                prefetch_window_count,
+            );
+
+            while let Some((pid, batches)) = shard_merge_reader.next_partition().await? {
+                if accumulated_lengths[pid] == 0 {
                     continue;
                 }
-                merged_rows = merged_rows.saturating_add(total_part_len as u64);
+                if batches.is_empty() {
+                    return Err(Error::index(format!(
+                        "No merged batches found for non-empty partition {}",
+                        pid
+                    )));
+                }
+
+                if let Some(w) = v2w_opt.as_mut() {
+                    write_partition_batches(w, batches).await?;
+                }
+                merged_rows = merged_rows.saturating_add(accumulated_lengths[pid] as u64);
                 progress
                     .stage_progress("merge_partitions", merged_rows)
                     .await?;
@@ -1810,6 +1918,154 @@ mod tests {
         v2w.write_batch(&batch).await?;
         v2w.finish().await?;
         Ok(total_rows)
+    }
+
+    async fn flat_shard_info(store: &ObjectStore, aux_path: &Path) -> Result<ShardInfo> {
+        let sched = ScanScheduler::new(
+            Arc::new(store.clone()),
+            SchedulerConfig::max_bandwidth(store),
+        );
+        let fh = sched
+            .open_file(aux_path, &CachedFileSize::unknown())
+            .await?;
+        let reader = V2Reader::try_open(
+            fh,
+            None,
+            Arc::default(),
+            &lance_core::cache::LanceCache::no_cache(),
+            V2ReaderOptions::default(),
+        )
+        .await?;
+
+        let ivf_idx: u32 = reader
+            .metadata()
+            .file_schema
+            .metadata
+            .get(IVF_METADATA_KEY)
+            .unwrap()
+            .parse()
+            .unwrap();
+        let bytes = reader.read_global_buffer(ivf_idx).await?;
+        let pb_ivf: pb::Ivf = prost::Message::decode(bytes)?;
+
+        let mut partition_offsets = Vec::with_capacity(pb_ivf.lengths.len());
+        let mut running_offset = 0usize;
+        for length in &pb_ivf.lengths {
+            partition_offsets.push(running_offset);
+            running_offset += *length as usize;
+        }
+
+        Ok(ShardInfo {
+            reader: Arc::new(reader),
+            lengths: pb_ivf.lengths,
+            partition_offsets,
+            total_rows: running_offset,
+        })
+    }
+
+    fn row_ids_from_batches(batches: &[RecordBatch]) -> Vec<u64> {
+        batches
+            .iter()
+            .flat_map(|batch| {
+                let row_ids = batch
+                    .column_by_name(ROW_ID_FIELD.name())
+                    .unwrap()
+                    .as_primitive::<arrow_array::types::UInt64Type>();
+                row_ids.values().iter().copied().collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_estimate_non_transformed_window_size_accounts_for_row_width() {
+        let lengths = vec![4_000_u32; 1_024];
+        let target_window_bytes = 128 * 1024 * 1024;
+        let configured_window_size = 512;
+
+        let hash_like_row_width = 16;
+        let f32_768_row_width = 8 + 768 * 4;
+        let f32_1024_row_width = 8 + 1024 * 4;
+
+        let hash_window = estimate_non_transformed_partition_window_size(
+            &lengths,
+            hash_like_row_width,
+            configured_window_size,
+            target_window_bytes,
+        );
+        let f32_768_window = estimate_non_transformed_partition_window_size(
+            &lengths,
+            f32_768_row_width,
+            configured_window_size,
+            target_window_bytes,
+        );
+        let f32_1024_window = estimate_non_transformed_partition_window_size(
+            &lengths,
+            f32_1024_row_width,
+            configured_window_size,
+            target_window_bytes,
+        );
+
+        assert_eq!(hash_window, configured_window_size);
+        assert_eq!(f32_768_window, 10);
+        assert_eq!(f32_1024_window, 8);
+    }
+
+    #[test]
+    fn test_estimate_schema_row_width_bytes_for_fixed_size_vector() {
+        let schema = ArrowSchema::new(vec![
+            (*ROW_ID_FIELD).clone(),
+            Field::new(
+                crate::vector::flat::storage::FLAT_COLUMN,
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 768),
+                true,
+            ),
+        ]);
+
+        assert_eq!(estimate_schema_row_width_bytes(&schema), 8 + 768 * 4);
+    }
+
+    #[tokio::test]
+    async fn test_shard_merge_reader_reads_flat_partitions_in_windows() {
+        let object_store = ObjectStore::memory();
+        let index_dir = Path::from("index/windowed_flat");
+
+        let partial0 = index_dir.clone().join("partial_0");
+        let partial1 = index_dir.clone().join("partial_1");
+        let aux0 = partial0.clone().join(INDEX_AUXILIARY_FILE_NAME);
+        let aux1 = partial1.clone().join(INDEX_AUXILIARY_FILE_NAME);
+
+        let lengths0 = vec![2_u32, 0_u32, 1_u32, 2_u32, 0_u32];
+        let lengths1 = vec![1_u32, 1_u32, 0_u32, 1_u32, 2_u32];
+        let dim = 2_i32;
+
+        write_flat_partial_aux(&object_store, &aux0, dim, &lengths0, 0, DistanceType::L2)
+            .await
+            .unwrap();
+        write_flat_partial_aux(&object_store, &aux1, dim, &lengths1, 100, DistanceType::L2)
+            .await
+            .unwrap();
+
+        let shard_infos = vec![
+            flat_shard_info(&object_store, &aux0).await.unwrap(),
+            flat_shard_info(&object_store, &aux1).await.unwrap(),
+        ];
+        let mut reader = ShardMergeReader::new(shard_infos, lengths0.len(), 2, 1);
+
+        let mut observed = Vec::new();
+        while let Some((partition_id, batches)) = reader.next_partition().await.unwrap() {
+            observed.push((partition_id, row_ids_from_batches(&batches)));
+        }
+
+        assert_eq!(
+            observed,
+            vec![
+                (0, vec![0, 1, 100]),
+                (1, vec![101]),
+                (2, vec![2]),
+                (3, vec![3, 4, 102]),
+                (4, vec![103, 104]),
+            ]
+        );
     }
 
     #[tokio::test]
