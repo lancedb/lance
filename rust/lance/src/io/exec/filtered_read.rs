@@ -5773,10 +5773,10 @@ mod tests {
         use lance_datafusion::exec::OneShotExec;
         use rstest::rstest;
 
-        use crate::blob::BlobArrayBuilder;
+        use crate::blob::{BlobArrayBuilder, blob_field};
         use crate::dataset::{Dataset, WriteParams};
         use crate::utils::test::NoContextTestFixture;
-        use lance_core::datatypes::{BlobHandling, blob_field};
+        use lance_core::datatypes::BlobHandling;
 
         struct TakeFixture {
             dataset: Arc<Dataset>,
