@@ -43,6 +43,36 @@ public final class UpdateBases implements Operation {
     return MoreObjects.toStringHelper(this).add("newBases", newBases).toString();
   }
 
+  @Override
+  public boolean equals(Object o) {
+    if (this == o) return true;
+    if (o == null || getClass() != o.getClass()) return false;
+    UpdateBases that = (UpdateBases) o;
+    if (newBases.size() != that.newBases.size()) return false;
+    for (int i = 0; i < newBases.size(); i++) {
+      if (!basePathEquals(newBases.get(i), that.newBases.get(i))) return false;
+    }
+    return true;
+  }
+
+  @Override
+  public int hashCode() {
+    int result = 1;
+    for (BasePath base : newBases) {
+      result =
+          31 * result
+              + Objects.hash(base.getId(), base.getName(), base.getPath(), base.isDatasetRoot());
+    }
+    return result;
+  }
+
+  private static boolean basePathEquals(BasePath left, BasePath right) {
+    return left.getId() == right.getId()
+        && left.isDatasetRoot() == right.isDatasetRoot()
+        && Objects.equals(left.getName(), right.getName())
+        && Objects.equals(left.getPath(), right.getPath());
+  }
+
   public static Builder builder() {
     return new Builder();
   }

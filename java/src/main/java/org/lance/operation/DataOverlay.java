@@ -45,6 +45,19 @@ public final class DataOverlay implements Operation {
     return MoreObjects.toStringHelper(this).add("groups", groups).toString();
   }
 
+  @Override
+  public boolean equals(Object o) {
+    if (this == o) return true;
+    if (o == null || getClass() != o.getClass()) return false;
+    DataOverlay that = (DataOverlay) o;
+    return Objects.equals(groups, that.groups);
+  }
+
+  @Override
+  public int hashCode() {
+    return Objects.hash(groups);
+  }
+
   public static Builder builder() {
     return new Builder();
   }
@@ -79,6 +92,19 @@ public final class DataOverlay implements Operation {
     public List<DataOverlayFile> getOverlays() {
       return overlays;
     }
+
+    @Override
+    public boolean equals(Object o) {
+      if (this == o) return true;
+      if (o == null || getClass() != o.getClass()) return false;
+      DataOverlayGroup that = (DataOverlayGroup) o;
+      return fragmentId == that.fragmentId && Objects.equals(overlays, that.overlays);
+    }
+
+    @Override
+    public int hashCode() {
+      return Objects.hash(fragmentId, overlays);
+    }
   }
 
   /** A data file together with the physical-row coverage it supplies. */
@@ -109,6 +135,29 @@ public final class DataOverlay implements Operation {
 
     public long getCommittedVersion() {
       return committedVersion;
+    }
+
+    @Override
+    public boolean equals(Object o) {
+      if (this == o) return true;
+      if (o == null || getClass() != o.getClass()) return false;
+      DataOverlayFile that = (DataOverlayFile) o;
+      return committedVersion == that.committedVersion
+          && Objects.equals(dataFile, that.dataFile)
+          && Objects.equals(coverage, that.coverage);
+    }
+
+    @Override
+    public int hashCode() {
+      int dataFileHash =
+          Objects.hash(
+              dataFile.getPath(),
+              dataFile.getFileMajorVersion(),
+              dataFile.getFileMinorVersion(),
+              dataFile.getFileSizeBytes());
+      dataFileHash = 31 * dataFileHash + Arrays.hashCode(dataFile.getFields());
+      dataFileHash = 31 * dataFileHash + Arrays.hashCode(dataFile.getColumnIndices());
+      return Objects.hash(dataFileHash, coverage, committedVersion);
     }
   }
 

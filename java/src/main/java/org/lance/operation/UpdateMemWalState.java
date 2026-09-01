@@ -43,6 +43,32 @@ public final class UpdateMemWalState implements Operation {
     return MoreObjects.toStringHelper(this).add("compactedSstables", compactedSstables).toString();
   }
 
+  @Override
+  public boolean equals(Object o) {
+    if (this == o) return true;
+    if (o == null || getClass() != o.getClass()) return false;
+    UpdateMemWalState that = (UpdateMemWalState) o;
+    if (compactedSstables.size() != that.compactedSstables.size()) return false;
+    for (int i = 0; i < compactedSstables.size(); i++) {
+      CompactedSsTable left = compactedSstables.get(i);
+      CompactedSsTable right = that.compactedSstables.get(i);
+      if (left.getGeneration() != right.getGeneration()
+          || !Objects.equals(left.getShardId(), right.getShardId())) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  @Override
+  public int hashCode() {
+    int result = 1;
+    for (CompactedSsTable sstable : compactedSstables) {
+      result = 31 * result + Objects.hash(sstable.getShardId(), sstable.getGeneration());
+    }
+    return result;
+  }
+
   public static Builder builder() {
     return new Builder();
   }

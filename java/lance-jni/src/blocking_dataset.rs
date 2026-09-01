@@ -70,7 +70,10 @@ pub const NATIVE_DATASET: &str = "nativeDatasetHandle";
 
 impl FromJObjectWithEnv<BasePath> for JObject<'_> {
     fn extract_object(&self, env: &mut JNIEnv<'_>) -> Result<BasePath> {
-        let id = env.get_u32_from_method(self, "getId")?;
+        let java_id = env.call_method(self, "getId", "()I", &[])?.i()?;
+        let id = u32::try_from(java_id).map_err(|_| {
+            Error::input_error(format!("BasePath.id must be non-negative, got {java_id}"))
+        })?;
         let name = env.get_optional_string_from_method(self, "getName")?;
         let path = env.get_string_from_method(self, "getPath")?;
         let is_dataset_root = env.get_boolean_from_method(self, "isDatasetRoot")?;

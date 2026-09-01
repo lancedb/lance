@@ -66,8 +66,9 @@ public class Index {
     this.indexVersion = indexVersion;
     this.createdAt = createdAt;
     this.baseId = baseId;
-    this.sizeBytes = sizeBytes;
-    this.files = files;
+    boolean hasFiles = files != null && !files.isEmpty();
+    this.sizeBytes = !hasFiles && Long.valueOf(0).equals(sizeBytes) ? null : sizeBytes;
+    this.files = hasFiles ? files : null;
     this.indexType = indexType;
   }
 

@@ -56,7 +56,10 @@ public class RewrittenIndex {
     this.newIndexDetailsTypeUrl = newIndexDetailsTypeUrl;
     this.newIndexDetailsValue = newIndexDetailsValue;
     this.newIndexVersion = newIndexVersion;
-    this.newIndexFiles = Optional.ofNullable(newIndexFiles);
+    this.newIndexFiles =
+        newIndexFiles == null || newIndexFiles.isEmpty()
+            ? Optional.empty()
+            : Optional.of(newIndexFiles);
   }
 
   public UUID getOldId() {

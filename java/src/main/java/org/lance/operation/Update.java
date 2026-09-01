@@ -59,9 +59,10 @@ public class Update implements Operation {
     this.newFragments = newFragments;
     this.fieldsModified = fieldsModified;
     this.fieldsForPreservingFragBitmap = fieldsForPreservingFragBitmap;
-    this.updateMode = updateMode;
+    Objects.requireNonNull(updateMode);
+    this.updateMode = updateMode.isPresent() ? updateMode : Optional.of(UpdateMode.RewriteRows);
     this.updatedFragmentOffsets = updatedFragmentOffsets;
-    this.compactedSstables = compactedSstables;
+    this.compactedSstables = Objects.requireNonNull(compactedSstables);
     this.insertedRowsFilter = Optional.ofNullable(insertedRowsFilter);
   }
 
@@ -89,6 +90,10 @@ public class Update implements Operation {
     return fieldsForPreservingFragBitmap;
   }
 
+  /**
+   * The update strategy. Builder input that is empty is normalized to {@link
+   * UpdateMode#RewriteRows}.
+   */
   public Optional<UpdateMode> updateMode() {
     return updateMode;
   }
@@ -143,7 +148,7 @@ public class Update implements Operation {
         && Arrays.equals(fieldsModified, that.fieldsModified)
         && Arrays.equals(fieldsForPreservingFragBitmap, that.fieldsForPreservingFragBitmap)
         && Objects.equals(updateMode, that.updateMode)
-        && Objects.equals(compactedSstables, that.compactedSstables)
+        && compactedSstablesEqual(compactedSstables, that.compactedSstables)
         && Objects.equals(insertedRowsFilter, that.insertedRowsFilter)
         && offsetMapsEqual(updatedFragmentOffsets, that.updatedFragmentOffsets);
   }
@@ -158,16 +163,28 @@ public class Update implements Operation {
     return true;
   }
 
+  private static boolean compactedSstablesEqual(
+      List<CompactedSsTable> left, List<CompactedSsTable> right) {
+    if (left.size() != right.size()) return false;
+    for (int i = 0; i < left.size(); i++) {
+      CompactedSsTable a = left.get(i);
+      CompactedSsTable b = right.get(i);
+      if (a.getGeneration() != b.getGeneration()
+          || !Objects.equals(a.getShardId(), b.getShardId())) {
+        return false;
+      }
+    }
+    return true;
+  }
+
   @Override
   public int hashCode() {
     int h =
         Objects.hash(
-            removedFragmentIds,
-            updatedFragments,
-            newFragments,
-            updateMode,
-            compactedSstables,
-            insertedRowsFilter);
+            removedFragmentIds, updatedFragments, newFragments, updateMode, insertedRowsFilter);
+    for (CompactedSsTable sstable : compactedSstables) {
+      h = 31 * h + Objects.hash(sstable.getShardId(), sstable.getGeneration());
+    }
     h = 31 * h + Arrays.hashCode(fieldsModified);
     h = 31 * h + Arrays.hashCode(fieldsForPreservingFragBitmap);
     // Sum entry hashes (XOR key ^ array-content hash) so result is insertion-order-independent.

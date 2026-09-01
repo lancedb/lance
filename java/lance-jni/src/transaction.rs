@@ -47,6 +47,42 @@ fn u64_to_jlong(field: &str, value: u64) -> Result<i64> {
     })
 }
 
+fn u32_to_jint(field: &str, value: u32) -> Result<i32> {
+    i32::try_from(value).map_err(|_| {
+        Error::runtime_error(format!(
+            "Cannot convert Rust transaction field {field}={value} to Java int"
+        ))
+    })
+}
+
+fn checked_field_ids(field: &str, values: &[i64]) -> Result<Vec<u32>> {
+    values
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            u32::try_from(*value).map_err(|_| {
+                Error::input_error(format!(
+                    "Java transaction field {field}[{index}] must be between 0 and {}, got {value}",
+                    u32::MAX
+                ))
+            })
+        })
+        .collect()
+}
+
+fn import_field_ids(
+    env: &mut JNIEnv<'_>,
+    object: &JObject<'_>,
+    method: &str,
+    field: &str,
+) -> Result<Vec<u32>> {
+    let array = env.call_method(object, method, "()[J", &[])?.l()?;
+    let array = JLongArray::from(array);
+    let mut values = vec![0_i64; env.get_array_length(&array)? as usize];
+    env.get_long_array_region(&array, 0, &mut values)?;
+    checked_field_ids(field, &values)
+}
+
 fn nonnegative_jlong_to_u64(field: &str, value: i64) -> Result<u64> {
     u64::try_from(value).map_err(|_| {
         Error::input_error(format!(
@@ -74,7 +110,7 @@ impl IntoJava for &BasePath {
             "org/lance/BasePath",
             "(ILjava/util/Optional;Ljava/lang/String;Z)V",
             &[
-                JValue::Int(self.id as i32),
+                JValue::Int(u32_to_jint("basePath.id", self.id)?),
                 JValue::Object(&java_name),
                 JValue::Object(&path),
                 JValue::Bool(self.is_dataset_root as u8),
@@ -564,7 +600,7 @@ impl IntoJava for &DataOverlayGroup {
             "org/lance/operation/DataOverlay$DataOverlayGroup",
             "(JLjava/util/List;)V",
             &[
-                JValue::Long(self.fragment_id as i64),
+                JValue::Long(u64_to_jlong("dataOverlay.fragmentId", self.fragment_id)?),
                 JValue::Object(&overlays),
             ],
         )?)
@@ -574,7 +610,10 @@ impl IntoJava for &DataOverlayGroup {
 impl FromJObjectWithEnv<DataOverlayGroup> for JObject<'_> {
     fn extract_object(&self, env: &mut JNIEnv<'_>) -> Result<DataOverlayGroup> {
         Ok(DataOverlayGroup {
-            fragment_id: env.call_method(self, "getFragmentId", "()J", &[])?.j()? as u64,
+            fragment_id: nonnegative_jlong_to_u64(
+                "dataOverlay.fragmentId",
+                env.call_method(self, "getFragmentId", "()J", &[])?.j()?,
+            )?,
             overlays: import_vec_from_method(env, self, "getOverlays", |env, overlay| {
                 overlay.extract_object(env)
             })?,
@@ -1817,16 +1856,18 @@ fn convert_to_rust_operation(
                     fragment.extract_object(env)
                 })?;
 
-            let fields_modified = env
-                .call_method(java_operation, "fieldsModified", "()[J", &[])?
-                .l()?;
-            let fields_modified = JLongArray::from(fields_modified).extract_object(env)?;
-
-            let fields_for_preserving_frag_bitmap = env
-                .call_method(java_operation, "fieldsForPreservingFragBitmap", "()[J", &[])?
-                .l()?;
-            let fields_for_preserving_frag_bitmap =
-                JLongArray::from(fields_for_preserving_frag_bitmap).extract_object(env)?;
+            let fields_modified = import_field_ids(
+                env,
+                java_operation,
+                "fieldsModified",
+                "update.fieldsModified",
+            )?;
+            let fields_for_preserving_frag_bitmap = import_field_ids(
+                env,
+                java_operation,
+                "fieldsForPreservingFragBitmap",
+                "update.fieldsForPreservingFragBitmap",
+            )?;
 
             let update_mode: Option<UpdateMode> =
                 env.get_optional_from_method(java_operation, "updateMode", |env, update_mode| {
@@ -2609,5 +2650,29 @@ mod tests {
         assert!(parse_storage_format("v3.0").is_err());
         assert!(parse_storage_format("").is_err());
         assert!(parse_storage_format("foo").is_err());
+    }
+
+    #[test]
+    fn test_checked_transaction_integer_conversions() {
+        assert_eq!(
+            u32_to_jint("basePath.id", i32::MAX as u32).unwrap(),
+            i32::MAX
+        );
+        assert!(u32_to_jint("basePath.id", i32::MAX as u32 + 1).is_err());
+        assert_eq!(
+            checked_field_ids("update.fieldsModified", &[0, u32::MAX as i64]).unwrap(),
+            vec![0, u32::MAX]
+        );
+        for invalid in [-1, u32::MAX as i64 + 1] {
+            let error = checked_field_ids("update.fieldsModified", &[invalid]).unwrap_err();
+            let message = error.to_string();
+            assert!(message.contains("update.fieldsModified[0]"));
+            assert!(message.contains(&invalid.to_string()));
+        }
+        assert_eq!(
+            u64_to_jlong("dataOverlay.fragmentId", i64::MAX as u64).unwrap(),
+            i64::MAX
+        );
+        assert!(u64_to_jlong("dataOverlay.fragmentId", i64::MAX as u64 + 1).is_err());
     }
 }

@@ -71,6 +71,23 @@ public final class Clone implements Operation {
         .toString();
   }
 
+  @Override
+  public boolean equals(Object o) {
+    if (this == o) return true;
+    if (o == null || getClass() != o.getClass()) return false;
+    Clone clone = (Clone) o;
+    return shallow == clone.shallow
+        && refVersion == clone.refVersion
+        && Objects.equals(refName, clone.refName)
+        && Objects.equals(refPath, clone.refPath)
+        && Objects.equals(branchName, clone.branchName);
+  }
+
+  @Override
+  public int hashCode() {
+    return Objects.hash(shallow, refName, refVersion, refPath, branchName);
+  }
+
   public static Builder builder() {
     return new Builder();
   }

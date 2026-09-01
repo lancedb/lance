@@ -16,8 +16,6 @@ package org.lance.memwal;
 import com.google.common.base.MoreObjects;
 import com.google.common.base.Preconditions;
 
-import java.util.Objects;
-
 /**
  * Points to an SSTable compacted into the base table.
  *
@@ -46,19 +44,6 @@ public class CompactedSsTable {
   /** The compacted SSTable's generation number. */
   public long getGeneration() {
     return generation;
-  }
-
-  @Override
-  public boolean equals(Object o) {
-    if (this == o) return true;
-    if (o == null || getClass() != o.getClass()) return false;
-    CompactedSsTable that = (CompactedSsTable) o;
-    return generation == that.generation && Objects.equals(shardId, that.shardId);
-  }
-
-  @Override
-  public int hashCode() {
-    return Objects.hash(shardId, generation);
   }
 
   @Override

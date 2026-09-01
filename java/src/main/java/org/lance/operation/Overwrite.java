@@ -94,7 +94,26 @@ public class Overwrite extends SchemaOperation {
     Overwrite that = (Overwrite) o;
     return Objects.equals(fragments, that.fragments)
         && Objects.equals(configUpsertValues, that.configUpsertValues)
-        && Objects.equals(initialBases, that.initialBases);
+        && initialBasesEqual(initialBases, that.initialBases);
+  }
+
+  private static boolean initialBasesEqual(
+      Optional<List<BasePath>> left, Optional<List<BasePath>> right) {
+    if (left.isEmpty() || right.isEmpty()) return left.isEmpty() && right.isEmpty();
+    List<BasePath> leftBases = left.orElseThrow();
+    List<BasePath> rightBases = right.orElseThrow();
+    if (leftBases.size() != rightBases.size()) return false;
+    for (int i = 0; i < leftBases.size(); i++) {
+      BasePath a = leftBases.get(i);
+      BasePath b = rightBases.get(i);
+      if (a.getId() != b.getId()
+          || a.isDatasetRoot() != b.isDatasetRoot()
+          || !Objects.equals(a.getName(), b.getName())
+          || !Objects.equals(a.getPath(), b.getPath())) {
+        return false;
+      }
+    }
+    return true;
   }
 
   public static class Builder {
