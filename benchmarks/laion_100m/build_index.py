@@ -7,6 +7,7 @@ import argparse
 import base64
 import dataclasses
 import json
+import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -43,6 +44,7 @@ MODEL_METADATA_FILE = "model.json"
 CHECKPOINT_FILE = "segments.json"
 METRICS_FILE = "build_metrics.json"
 METRICS_SCHEMA_VERSION = 1
+DEFAULT_MAX_IOP_SIZE_BYTES = 16 * 1024 * 1024
 
 
 def group_fragments_by_rows(
@@ -196,6 +198,13 @@ def _utc_now() -> str:
 def _metrics_identity(
     args: argparse.Namespace, dataset: lance.LanceDataset
 ) -> dict[str, Any]:
+    max_iop_size_bytes = int(
+        os.environ.get("LANCE_MAX_IOP_SIZE", DEFAULT_MAX_IOP_SIZE_BYTES)
+    )
+    if max_iop_size_bytes <= 0:
+        raise ValueError(
+            f"LANCE_MAX_IOP_SIZE must be a positive integer, got {max_iop_size_bytes}"
+        )
     return {
         "dataset_uri": args.dataset_uri,
         "branch": args.branch,
@@ -208,6 +217,7 @@ def _metrics_identity(
         "target_partition_size": args.target_partition_size,
         "segment_target_rows": args.segment_rows,
         "num_bits": args.num_bits,
+        "max_iop_size_bytes": max_iop_size_bytes,
     }
 
 
