@@ -1030,7 +1030,8 @@ impl Dataset {
                         namespace_client.clone(),
                         table_id.clone(),
                         &uri,
-                    )?;
+                    )?
+                    .with_reservation_token(response.transaction_id.clone());
                     let commit_handler: Arc<dyn CommitHandler> =
                         Arc::new(ExternalManifestCommitHandler {
                             external_manifest_store: Arc::new(external_store),

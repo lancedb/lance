@@ -877,6 +877,7 @@ impl DirectoryNamespaceBuilder {
 /// - `s3://` locations use AWS STS AssumeRole
 /// - `gs://` locations use GCP OAuth2 tokens
 /// - `az://` locations use Azure SAS tokens
+#[derive(Clone)]
 pub struct DirectoryNamespace {
     root: String,
     storage_options: Option<HashMap<String, String>>,
@@ -1404,6 +1405,13 @@ impl DirectoryNamespace {
     }
 
     async fn table_has_actual_manifests(&self, table_name: &str) -> Result<bool> {
+        if let Some(table_info) = self
+            .table_info_from_manifest(&Some(vec![table_name.to_string()]))
+            .await?
+            && table_info.published_version_one()?.is_some()
+        {
+            return Ok(true);
+        }
         manifest::ManifestNamespace::path_has_actual_manifests(
             &self.object_store,
             &self.table_path(table_name),
@@ -1683,7 +1691,7 @@ impl DirectoryNamespace {
                 manifest_path: final_path.to_string(),
                 manifest_size: Some(final_meta.size as i64),
                 e_tag: final_meta.e_tag.clone(),
-                timestamp_millis: None,
+                timestamp_millis: Some(final_meta.last_modified.timestamp_millis()),
                 metadata: None,
             })),
             ..Default::default()
@@ -1811,15 +1819,22 @@ impl DirectoryNamespace {
         table_uri: &str,
         is_branch: bool,
         branch_parent_version: Option<u64>,
+        published_version_one: Option<&TableVersion>,
     ) -> Result<()> {
         let latest = self.list_versions_under(table_path, true, Some(1)).await?;
-        let expected = match latest.first() {
-            Some(v) => (v.version as u64).checked_add(1).ok_or_else(|| {
+        let latest_version = latest
+            .first()
+            .map(|version| version.version)
+            .into_iter()
+            .chain(published_version_one.map(|version| version.version))
+            .max();
+        let expected = match latest_version {
+            Some(latest_version) => (latest_version as u64).checked_add(1).ok_or_else(|| {
                 lance_core::Error::from(NamespaceError::ConcurrentModification {
                     message: format!(
                         "Version overflow computing next version for table at '{}': \
                              latest version {} cannot advance",
-                        table_uri, v.version
+                        table_uri, latest_version
                     ),
                 })
             })?,
@@ -1837,9 +1852,8 @@ impl DirectoryNamespace {
             }
         };
         if version != expected {
-            let latest_display = latest
-                .first()
-                .map(|v| v.version.to_string())
+            let latest_display = latest_version
+                .map(|version| version.to_string())
                 .unwrap_or_else(|| "none".to_string());
             return Err(lance_core::Error::from(
                 NamespaceError::ConcurrentModification {
@@ -1909,6 +1923,97 @@ impl DirectoryNamespace {
         let table_path = self.object_store_path_from_uri(table_uri)?;
         self.list_versions_under(&table_path, descending, limit)
             .await
+    }
+
+    async fn table_info_from_manifest(
+        &self,
+        table_id: &Option<Vec<String>>,
+    ) -> Result<Option<manifest::TableInfo>> {
+        if !self.manifest_enabled {
+            return Ok(None);
+        }
+        self.ensure_read_manifest().await?;
+        let Some(manifest_ns) = self.manifest_ns_for_read() else {
+            return Ok(None);
+        };
+        let table_id = table_id.as_ref().ok_or_else(|| {
+            lance_core::Error::from(NamespaceError::InvalidInput {
+                message: "Table ID is required".to_string(),
+            })
+        })?;
+        manifest_ns
+            .query_manifest_for_table(&manifest::ManifestNamespace::str_object_id(table_id))
+            .await
+    }
+
+    async fn describe_managed_table(
+        &self,
+        request: &DescribeTableRequest,
+        table_info: manifest::TableInfo,
+    ) -> Result<DescribeTableResponse> {
+        let table_id = request.id.as_ref().expect("validated by caller").clone();
+        let table_name = table_id.last().cloned().unwrap_or_default();
+        let namespace = table_id[..table_id.len() - 1].to_vec();
+        let table_uri =
+            manifest::ManifestNamespace::construct_full_uri(&self.root, &table_info.location)?;
+        let mut builder = DatasetBuilder::from_namespace(Arc::new(self.clone()), table_id).await?;
+        if let Some(version) = request.version {
+            builder = builder.with_version(version as u64);
+        }
+        let dataset = builder.load().await.map_err(|e| {
+            lance_core::Error::from(NamespaceError::Internal {
+                message: format!(
+                    "Table exists in manifest but failed to load managed dataset '{}': {}",
+                    table_name, e
+                ),
+            })
+        })?;
+        let version_info = dataset.version();
+        let arrow_schema: arrow_schema::Schema = dataset.schema().into();
+        let schema = arrow_schema_to_json(&arrow_schema)?;
+        let storage_options = self
+            .get_storage_options_for_table(
+                &table_uri,
+                request.vend_credentials.unwrap_or(true),
+                request.identity.as_deref(),
+            )
+            .await?;
+
+        Ok(DescribeTableResponse {
+            table: Some(table_name),
+            namespace: Some(namespace),
+            version: Some(version_info.version as i64),
+            location: Some(table_uri.clone()),
+            table_uri: Some(table_uri),
+            schema: Some(Box::new(schema)),
+            storage_options,
+            properties: table_info.metadata,
+            metadata: Some(version_info.metadata.into_iter().collect()),
+            is_only_declared: Some(false),
+            managed_versioning: Some(true),
+            ..Default::default()
+        })
+    }
+
+    fn merge_published_version_one(
+        mut versions: Vec<TableVersion>,
+        published_version_one: Option<TableVersion>,
+        descending: bool,
+        limit: Option<i32>,
+    ) -> Vec<TableVersion> {
+        if let Some(published) = published_version_one {
+            versions.retain(|version| version.version != 1);
+            versions.push(published);
+            if descending {
+                versions.sort_by_key(|version| std::cmp::Reverse(version.version));
+            } else {
+                versions.sort_by_key(|version| version.version);
+            }
+        }
+        if let Some(limit) = limit.filter(|limit| *limit >= 0) {
+            versions.truncate(limit as usize);
+        }
+        versions
     }
 
     /// List committed manifest versions under `table_path/_versions/`.
@@ -2019,6 +2124,12 @@ impl DirectoryNamespace {
         &self,
         request: DescribeTableRequest,
     ) -> Result<DescribeTableResponse> {
+        if request.load_detailed_metadata == Some(true)
+            && let Some(table_info) = self.table_info_from_manifest(&request.id).await?
+            && table_info.published_version_one()?.is_some()
+        {
+            return self.describe_managed_table(&request, table_info).await;
+        }
         let is_root_level = request.id.as_ref().is_some_and(|id| id.len() == 1);
         let is_child_table = request.id.as_ref().is_some_and(|id| id.len() > 1);
         let skip_manifest_for_root = self.dir_listing_enabled
@@ -3039,6 +3150,14 @@ impl DirectoryNamespace {
     ) -> Result<i64> {
         let mut deleted_count = 0i64;
         for te in table_entries {
+            let published_version_one = if branch.is_none() {
+                match self.table_info_from_manifest(&te.table_id).await? {
+                    Some(table_info) => table_info.published_version_one()?,
+                    None => None,
+                }
+            } else {
+                None
+            };
             let table_uri = self.resolve_table_location(&te.table_id).await?;
             let table_uri = match branch {
                 Some(b) => self.resolve_branch_location(&table_uri, b).await?,
@@ -3061,18 +3180,46 @@ impl DirectoryNamespace {
                         ),
                     })
                 })?;
-            let location_by_version: HashMap<u64, Path> = manifest_metas
+            let mut location_by_version: HashMap<u64, Path> = manifest_metas
                 .into_iter()
                 .filter_map(|meta| {
                     let version = Self::manifest_version_from_filename(meta.location.filename()?)?;
                     Some((version, meta.location))
                 })
                 .collect();
+            if let Some(published) = &published_version_one {
+                location_by_version.insert(
+                    1,
+                    Path::parse(&published.manifest_path).map_err(|e| {
+                        lance_core::Error::from(NamespaceError::Internal {
+                            message: format!(
+                                "Invalid published version 1 path '{}' for table at '{}': {}",
+                                published.manifest_path, table_uri, e
+                            ),
+                        })
+                    })?,
+                );
+            }
 
             for (&v, version_path) in &location_by_version {
                 let vi = v as i64;
                 if !te.ranges.iter().any(|&(s, e)| vi >= s && (e < 0 || vi < e)) {
                     continue;
+                }
+                if v == 1
+                    && published_version_one
+                        .as_ref()
+                        .is_some_and(|published| published.manifest_path == version_path.as_ref())
+                {
+                    let table_id = te.table_id.as_ref().expect("resolved above");
+                    if let Some(manifest_ns) = self.manifest_ns_for_write().await? {
+                        manifest_ns
+                            .unpublish_version_one(
+                                &manifest::ManifestNamespace::str_object_id(table_id),
+                                version_path.as_ref(),
+                            )
+                            .await?;
+                    }
                 }
                 match self.object_store.inner.delete(version_path).await {
                     Ok(_) => {
@@ -3944,6 +4091,20 @@ impl LanceNamespace for DirectoryNamespace {
         let table_versions = self
             .list_table_versions_from_storage(&table_uri, want_descending, request.limit)
             .await?;
+        let published_version_one = if branch.is_none() {
+            match self.table_info_from_manifest(&request.id).await? {
+                Some(table_info) => table_info.published_version_one()?,
+                None => None,
+            }
+        } else {
+            None
+        };
+        let table_versions = Self::merge_published_version_one(
+            table_versions,
+            published_version_one,
+            want_descending,
+            request.limit,
+        );
 
         Ok(ListTableVersionsResponse {
             versions: table_versions,
@@ -3958,15 +4119,41 @@ impl LanceNamespace for DirectoryNamespace {
     ) -> Result<CreateTableVersionResponse> {
         self.record_op("create_table_version");
         let branch = Self::normalized_branch(request.branch.as_deref())?;
+        let is_branch = branch.is_some();
+        let version = request.version as u64;
+        let presented_reservation_token = request
+            .context
+            .as_ref()
+            .and_then(|context| context.get(lance_namespace::RESERVATION_TOKEN_KEY))
+            .cloned();
+        let is_reserved_bootstrap =
+            version == 1 && !is_branch && presented_reservation_token.is_some();
+        let table_info = if is_branch {
+            None
+        } else {
+            self.table_info_from_manifest(&request.id).await?
+        };
         let mut describe_req = DescribeTableRequest::new();
         describe_req.id = request.id.clone();
         describe_req.load_detailed_metadata = Some(false);
         let described = self.describe_table_impl(describe_req).await?;
-        let table_uri = described.location.clone().ok_or_else(|| {
-            lance_core::Error::from(NamespaceError::TableNotFound {
-                message: format!("Table location not found for: {:?}", request.id),
-            })
-        })?;
+        let table_uri = if is_reserved_bootstrap {
+            let table_info = table_info.as_ref().ok_or_else(|| {
+                lance_core::Error::from(NamespaceError::ConcurrentModification {
+                    message: format!(
+                        "Reservation was removed while publishing version 1 for table {:?}",
+                        request.id
+                    ),
+                })
+            })?;
+            manifest::ManifestNamespace::construct_full_uri(&self.root, &table_info.location)?
+        } else {
+            described.location.clone().ok_or_else(|| {
+                lance_core::Error::from(NamespaceError::TableNotFound {
+                    message: format!("Table location not found for: {:?}", request.id),
+                })
+            })?
+        };
         let (table_uri, table_path, branch_parent_version) = match branch {
             Some(b) => self.resolve_branch_for_commit(&table_uri, b).await?,
             None => {
@@ -3976,7 +4163,6 @@ impl LanceNamespace for DirectoryNamespace {
         };
 
         let staging_manifest_path = &request.manifest_path;
-        let version = request.version as u64;
 
         // Determine naming scheme from request, default to V2
         let naming_scheme = match request.naming_scheme.as_deref() {
@@ -3984,8 +4170,16 @@ impl LanceNamespace for DirectoryNamespace {
             _ => ManifestNamingScheme::V2,
         };
 
-        // Compute final path using the naming scheme
-        let final_path = naming_scheme.manifest_path(&table_path, version);
+        let final_path = if let Some(token) = presented_reservation_token.as_deref()
+            && is_reserved_bootstrap
+        {
+            naming_scheme.manifest_path(
+                &table_path.clone().join("_reservation_versions").join(token),
+                version,
+            )
+        } else {
+            naming_scheme.manifest_path(&table_path, version)
+        };
 
         let staging_path = Path::parse(staging_manifest_path).map_err(|e| {
             lance_core::Error::from(NamespaceError::InvalidInput {
@@ -3996,21 +4190,112 @@ impl LanceNamespace for DirectoryNamespace {
             })
         })?;
 
-        // Idempotent retry: version path already published with the same content.
-        match self.object_store.inner.head(&final_path).await {
-            Ok(existing_meta) => {
-                return self
-                    .resolve_existing_table_version(ExistingTableVersionResolve {
-                        staging_path: &staging_path,
-                        final_path: &final_path,
-                        version,
-                        table_uri: &table_uri,
-                        final_meta: &existing_meta,
-                        request_manifest_size: request.manifest_size,
-                    })
-                    .await;
+        if is_reserved_bootstrap {
+            let table_info = table_info.as_ref().expect("checked above");
+            let expected = table_info
+                .metadata
+                .as_ref()
+                .and_then(|properties| properties.get(lance_namespace::RESERVATION_TOKEN_KEY));
+            if expected != presented_reservation_token.as_ref() {
+                return Err(NamespaceError::ConcurrentModification {
+                    message: format!(
+                        "Reservation token mismatch publishing version 1 for table at '{}': the declaration was superseded",
+                        table_uri
+                    ),
+                }
+                .into());
             }
-            Err(ObjectStoreError::NotFound { .. }) => {}
+
+            if let Some(published) = table_info.published_version_one()? {
+                if published.manifest_path != final_path.as_ref() {
+                    return Err(NamespaceError::ConcurrentModification {
+                        message: format!(
+                            "Version 1 is already published for table at '{}' with a different manifest path",
+                            table_uri
+                        ),
+                    }
+                    .into());
+                }
+                let final_meta = self
+                    .object_store
+                    .inner
+                    .head(&final_path)
+                    .await
+                    .map_err(|e| {
+                        lance_core::Error::from(NamespaceError::Internal {
+                            message: format!(
+                                "Failed to stat published version 1 for table at '{}': {}",
+                                table_uri, e
+                            ),
+                        })
+                    })?;
+                if !self
+                    .staging_matches_final_manifest(
+                        &staging_path,
+                        &final_path,
+                        &final_meta,
+                        request.manifest_size,
+                    )
+                    .await?
+                {
+                    return Err(NamespaceError::ConcurrentModification {
+                        message: format!(
+                            "Version 1 already exists for table at '{}' with different content",
+                            table_uri
+                        ),
+                    }
+                    .into());
+                }
+                if let Err(e) = self.object_store.inner.delete(&staging_path).await {
+                    log::warn!(
+                        "Failed to delete staging manifest at '{}': {:?}",
+                        staging_path,
+                        e
+                    );
+                }
+                return Ok(CreateTableVersionResponse {
+                    transaction_id: None,
+                    version: Some(Box::new(published)),
+                    ..Default::default()
+                });
+            }
+        }
+
+        // Idempotent retry: version path already materialized with the same content.
+        let final_already_materialized = match self.object_store.inner.head(&final_path).await {
+            Ok(existing_meta) => {
+                if !is_reserved_bootstrap {
+                    return self
+                        .resolve_existing_table_version(ExistingTableVersionResolve {
+                            staging_path: &staging_path,
+                            final_path: &final_path,
+                            version,
+                            table_uri: &table_uri,
+                            final_meta: &existing_meta,
+                            request_manifest_size: request.manifest_size,
+                        })
+                        .await;
+                }
+                if !self
+                    .staging_matches_final_manifest(
+                        &staging_path,
+                        &final_path,
+                        &existing_meta,
+                        request.manifest_size,
+                    )
+                    .await?
+                {
+                    return Err(NamespaceError::ConcurrentModification {
+                        message: format!(
+                            "Version 1 already exists for table at '{}' with different content",
+                            table_uri
+                        ),
+                    }
+                    .into());
+                }
+                true
+            }
+            Err(ObjectStoreError::NotFound { .. }) => false,
             Err(e) => {
                 return Err(lance_core::Error::from(NamespaceError::Internal {
                     message: format!(
@@ -4019,51 +4304,35 @@ impl LanceNamespace for DirectoryNamespace {
                     ),
                 }));
             }
-        }
+        };
 
         // Strict CAS: only allow appending latest+1 (or the empty-chain bootstrap
         // version: v1 on main, BranchContents.parent_version on a registered branch).
-        let is_branch = branch.is_some();
+        let published_version_one = match table_info.as_ref() {
+            Some(table_info) => table_info.published_version_one()?,
+            None => None,
+        };
         self.enforce_create_table_version_cas(
             &table_path,
             version,
             &table_uri,
             is_branch,
             branch_parent_version,
+            published_version_one.as_ref(),
         )
         .await?;
 
-        // A publisher that presents an incarnation token must hold the current
-        // one, so a stale clone cannot publish into an entry that was dropped
-        // and re-declared since it read the reservation. Token-less publishers
-        // (create flows, older clients) predate the fence and pass.
-        if version == 1 && !is_branch {
-            let expected = described
-                .properties
-                .as_ref()
-                .and_then(|properties| properties.get(lance_namespace::RESERVATION_TOKEN_KEY));
-            let presented = request
-                .context
-                .as_ref()
-                .and_then(|context| context.get(lance_namespace::RESERVATION_TOKEN_KEY));
-            if let (Some(presented), expected) = (presented, expected)
-                && Some(presented) != expected
-            {
-                return Err(lance_core::Error::from(
-                    NamespaceError::ConcurrentModification {
-                        message: format!(
-                            "Reservation token mismatch publishing version 1 for table at '{}': the declaration was superseded",
-                            table_uri
-                        ),
-                    },
-                ));
-            }
-        }
-
         // Materialize with Create / copy_if_not_exists only — never overwrite.
-        let copy_result = self
-            .materialize_version_manifest_create(&staging_path, &final_path, staging_manifest_path)
-            .await;
+        let copy_result = if final_already_materialized {
+            Ok(())
+        } else {
+            self.materialize_version_manifest_create(
+                &staging_path,
+                &final_path,
+                staging_manifest_path,
+            )
+            .await
+        };
 
         match copy_result {
             Ok(()) => {}
@@ -4078,16 +4347,35 @@ impl LanceNamespace for DirectoryNamespace {
                         ),
                     })
                 })?;
-                return self
-                    .resolve_existing_table_version(ExistingTableVersionResolve {
-                        staging_path: &staging_path,
-                        final_path: &final_path,
-                        version,
-                        table_uri: &table_uri,
-                        final_meta: &existing_meta,
-                        request_manifest_size: request.manifest_size,
-                    })
-                    .await;
+                if !is_reserved_bootstrap {
+                    return self
+                        .resolve_existing_table_version(ExistingTableVersionResolve {
+                            staging_path: &staging_path,
+                            final_path: &final_path,
+                            version,
+                            table_uri: &table_uri,
+                            final_meta: &existing_meta,
+                            request_manifest_size: request.manifest_size,
+                        })
+                        .await;
+                }
+                if !self
+                    .staging_matches_final_manifest(
+                        &staging_path,
+                        &final_path,
+                        &existing_meta,
+                        request.manifest_size,
+                    )
+                    .await?
+                {
+                    return Err(NamespaceError::ConcurrentModification {
+                        message: format!(
+                            "Version 1 already exists for table at '{}' with different content",
+                            table_uri
+                        ),
+                    }
+                    .into());
+                }
             }
             Err(ObjectStoreError::NotFound { .. }) => {
                 return Err(lance_core::Error::from(NamespaceError::InvalidInput {
@@ -4121,6 +4409,43 @@ impl LanceNamespace for DirectoryNamespace {
                 })
             })?;
 
+        let response = Self::create_table_version_response(version, &final_path, &final_meta);
+        if is_reserved_bootstrap {
+            let table_id = request.id.as_ref().expect("validated by describe_table");
+            let object_id = manifest::ManifestNamespace::str_object_id(table_id);
+            let manifest_ns = self
+                .manifest_ns_for_write()
+                .await?
+                .ok_or_else(|| {
+                    lance_core::Error::from(NamespaceError::ConcurrentModification {
+                        message: format!(
+                            "Reservation catalog is unavailable while publishing version 1 for table at '{}'",
+                            table_uri
+                        ),
+                    })
+                })?;
+            let published_version = response.version.as_ref().expect("response has version");
+            if let Err(error) = manifest_ns
+                .publish_reserved_version_one(
+                    &object_id,
+                    presented_reservation_token
+                        .as_deref()
+                        .expect("checked above"),
+                    published_version,
+                )
+                .await
+            {
+                if let Err(cleanup_error) = self.object_store.inner.delete(&final_path).await {
+                    log::warn!(
+                        "Failed to clean up unpublished reservation manifest at '{}': {:?}",
+                        final_path,
+                        cleanup_error
+                    );
+                }
+                return Err(error);
+            }
+        }
+
         // Delete the staging manifest after successful copy
         if let Err(e) = self.object_store.inner.delete(&staging_path).await {
             log::warn!(
@@ -4130,11 +4455,7 @@ impl LanceNamespace for DirectoryNamespace {
             );
         }
 
-        Ok(Self::create_table_version_response(
-            version,
-            &final_path,
-            &final_meta,
-        ))
+        Ok(response)
     }
 
     async fn describe_table_version(
@@ -4151,6 +4472,16 @@ impl LanceNamespace for DirectoryNamespace {
         let versions = self
             .list_table_versions_from_storage(&table_uri, true, None)
             .await?;
+        let published_version_one = if branch.is_none() {
+            match self.table_info_from_manifest(&request.id).await? {
+                Some(table_info) => table_info.published_version_one()?,
+                None => None,
+            }
+        } else {
+            None
+        };
+        let versions =
+            Self::merge_published_version_one(versions, published_version_one, true, None);
         let table_version = if let Some(requested_version) = request.version {
             versions
                 .into_iter()
@@ -5777,9 +6108,27 @@ impl LanceNamespace for DirectoryNamespace {
         };
 
         let table_uri = self.resolve_table_location(&request.id).await?;
-        let mut dataset = self
-            .load_dataset(&table_uri, None, "create_table_branch")
-            .await?;
+        let mut dataset = if self.table_version_tracking_enabled {
+            let table_id = request.id.as_ref().ok_or_else(|| {
+                lance_core::Error::from(NamespaceError::InvalidInput {
+                    message: "Table ID is required".to_string(),
+                })
+            })?;
+            DatasetBuilder::from_namespace(Arc::new(self.clone()), table_id.clone())
+                .await?
+                .load()
+                .await
+                .map_err(|e| {
+                    let message = format!(
+                        "Failed to open table at '{}' for create_table_branch: {}",
+                        table_uri, e
+                    );
+                    Self::map_open_error(e, NamespaceError::TableNotFound { message })
+                })?
+        } else {
+            self.load_dataset(&table_uri, None, "create_table_branch")
+                .await?
+        };
 
         // Best-effort pre-check: a duplicate returns a clean TableBranchAlreadyExists conflict
         // instead of the opaque Internal error create_branch raises on a pre-existing branch. A
@@ -12880,6 +13229,184 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_declared_table_current_reservation_token_publishes_version_one() {
+        let temp_dir = TempStdDir::default();
+        let namespace = DirectoryNamespaceBuilder::new(temp_dir.to_str().unwrap())
+            .build()
+            .await
+            .unwrap();
+        let table_id = vec!["reserved_table".to_string()];
+
+        let mut declare = DeclareTableRequest::new();
+        declare.id = Some(table_id.clone());
+        let declared = namespace.declare_table(declare).await.unwrap();
+        let token = declared.transaction_id.expect("reservation token");
+
+        let staging = namespace.base_path.clone().join("staging-current");
+        namespace
+            .object_store
+            .inner
+            .put(&staging, Bytes::from_static(b"current").into())
+            .await
+            .unwrap();
+        let mut create = CreateTableVersionRequest::new(1, staging.to_string());
+        create.id = Some(table_id.clone());
+        create.naming_scheme = Some("V2".to_string());
+        create.context = Some(HashMap::from([(
+            lance_namespace::RESERVATION_TOKEN_KEY.to_string(),
+            token.clone(),
+        )]));
+
+        let created = namespace.create_table_version(create).await.unwrap();
+        let version = created.version.expect("published version");
+        assert_eq!(version.version, 1);
+        assert!(version.manifest_path.contains(&token));
+
+        let listed = namespace
+            .list_table_versions(ListTableVersionsRequest {
+                id: Some(table_id),
+                descending: Some(true),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(listed.versions, vec![*version]);
+
+        let deleted = namespace
+            .batch_delete_table_versions(BatchDeleteTableVersionsRequest {
+                id: Some(vec!["reserved_table".to_string()]),
+                ranges: vec![lance_namespace::models::VersionRange::new(1, 2)],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(deleted.deleted_count, Some(1));
+        let listed = namespace
+            .list_table_versions(ListTableVersionsRequest {
+                id: Some(vec!["reserved_table".to_string()]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(listed.versions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_stale_reservation_cannot_publish_after_concurrent_drop_and_redeclare() {
+        let temp_dir = TempStdDir::default();
+        let root = temp_dir.to_str().unwrap();
+        let namespace_a = Arc::new(DirectoryNamespaceBuilder::new(root).build().await.unwrap());
+        let namespace_b = Arc::new(DirectoryNamespaceBuilder::new(root).build().await.unwrap());
+        let table_id = vec!["reserved_table".to_string()];
+
+        let mut declare_a = DeclareTableRequest::new();
+        declare_a.id = Some(table_id.clone());
+        let token_a = namespace_a
+            .declare_table(declare_a)
+            .await
+            .unwrap()
+            .transaction_id
+            .expect("first reservation token");
+
+        let manifest_ns_a = namespace_a.manifest_ns_for_write().await.unwrap().unwrap();
+        let mutation_guard = manifest_ns_a.lock_manifest_mutations_for_test().await;
+
+        let staging_a = namespace_a.base_path.clone().join("staging-a");
+        namespace_a
+            .object_store
+            .inner
+            .put(&staging_a, Bytes::from_static(b"generation-a").into())
+            .await
+            .unwrap();
+        let mut create_a = CreateTableVersionRequest::new(1, staging_a.to_string());
+        create_a.id = Some(table_id.clone());
+        create_a.naming_scheme = Some("V2".to_string());
+        create_a.context = Some(HashMap::from([(
+            lance_namespace::RESERVATION_TOKEN_KEY.to_string(),
+            token_a.clone(),
+        )]));
+        let publisher_a = {
+            let namespace_a = namespace_a.clone();
+            tokio::spawn(async move { namespace_a.create_table_version(create_a).await })
+        };
+
+        let generation_a_path = ManifestNamingScheme::V2.manifest_path(
+            &namespace_a
+                .table_path("reserved_table")
+                .join("_reservation_versions")
+                .join(token_a.as_str()),
+            1,
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if namespace_a
+                    .object_store
+                    .inner
+                    .head(&generation_a_path)
+                    .await
+                    .is_ok()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("publisher A should materialize before catalog publication");
+
+        let mut drop_request = DropTableRequest::new();
+        drop_request.id = Some(table_id.clone());
+        namespace_b.drop_table(drop_request).await.unwrap();
+        let mut declare_b = DeclareTableRequest::new();
+        declare_b.id = Some(table_id.clone());
+        let token_b = namespace_b
+            .declare_table(declare_b)
+            .await
+            .unwrap()
+            .transaction_id
+            .expect("second reservation token");
+        assert_ne!(token_a, token_b);
+
+        drop(mutation_guard);
+        let error = publisher_a
+            .await
+            .unwrap()
+            .expect_err("publisher A must lose the reservation CAS");
+        assert_eq!(
+            mutation_error_code(error),
+            ErrorCode::ConcurrentModification
+        );
+
+        let listed = namespace_b
+            .list_table_versions(ListTableVersionsRequest {
+                id: Some(table_id.clone()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(listed.versions.is_empty());
+
+        let staging_b = namespace_b.base_path.clone().join("staging-b");
+        namespace_b
+            .object_store
+            .inner
+            .put(&staging_b, Bytes::from_static(b"generation-b").into())
+            .await
+            .unwrap();
+        let mut create_b = CreateTableVersionRequest::new(1, staging_b.to_string());
+        create_b.id = Some(table_id.clone());
+        create_b.naming_scheme = Some("V2".to_string());
+        create_b.context = Some(HashMap::from([(
+            lance_namespace::RESERVATION_TOKEN_KEY.to_string(),
+            token_b.clone(),
+        )]));
+        let published_b = namespace_b.create_table_version(create_b).await.unwrap();
+        let published_b = published_b.version.expect("published B version");
+        assert!(published_b.manifest_path.contains(&token_b));
+        assert!(!published_b.manifest_path.contains(&token_a));
+    }
+
     /// End-to-end integration test module for table version tracking.
     mod e2e_table_version_tracking {
         use super::*;
@@ -13137,6 +13664,17 @@ mod tests {
             .await
             .unwrap();
             assert_eq!(dataset.version().version, 1);
+
+            let described = ns
+                .describe_table(DescribeTableRequest {
+                    id: Some(table_id.clone()),
+                    load_detailed_metadata: Some(true),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert_eq!(described.version, Some(1));
+            assert!(described.schema.is_some());
 
             // Verify create_table_version was called once during initial write_into_namespace
             assert_eq!(

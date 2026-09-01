@@ -52,7 +52,7 @@ use lance_namespace::models::{
     DescribeTableResponse, DropNamespaceRequest, DropNamespaceResponse, DropTableRequest,
     DropTableResponse, ListNamespacesRequest, ListNamespacesResponse, ListTablesRequest,
     ListTablesResponse, NamespaceExistsRequest, RegisterTableRequest, RegisterTableResponse,
-    TableExistsRequest,
+    TableExistsRequest, TableVersion,
 };
 use lance_namespace::schema::arrow_schema_to_json;
 use lance_table::feature_flags::{apply_feature_flags, ensure_can_write_manifest};
@@ -74,6 +74,7 @@ use tokio::sync::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use uuid::Uuid;
 
 const MANIFEST_TABLE_NAME: &str = "__manifest";
+const PUBLISHED_VERSION_ONE_KEY: &str = "__lance_namespace_published_version_one";
 const LANCE_DATA_DIR: &str = "data";
 const LANCE_INDICES_DIR: &str = "_indices";
 const DELIMITER: &str = "$";
@@ -173,6 +174,36 @@ pub struct TableInfo {
     pub name: String,
     pub location: String,
     pub metadata: Option<HashMap<String, String>>,
+}
+
+impl TableInfo {
+    pub(crate) fn published_version_one(&self) -> Result<Option<TableVersion>> {
+        let Some(serialized) = self
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get(PUBLISHED_VERSION_ONE_KEY))
+        else {
+            return Ok(None);
+        };
+        let version = serde_json::from_str::<TableVersion>(serialized).map_err(|e| {
+            lance_core::Error::from(NamespaceError::Internal {
+                message: format!(
+                    "Failed to deserialize published version 1 for table '{}': {}",
+                    self.name, e
+                ),
+            })
+        })?;
+        if version.version != 1 {
+            return Err(NamespaceError::Internal {
+                message: format!(
+                    "Published bootstrap version for table '{}' is {}, expected 1",
+                    self.name, version.version
+                ),
+            }
+            .into());
+        }
+        Ok(Some(version))
+    }
 }
 
 /// An entry to be inserted into the manifest table.
@@ -586,6 +617,222 @@ impl ManifestStreamMutation for DeleteObjectMutation {
     }
 }
 
+struct PublishVersionOneMutation {
+    object_id: String,
+    reservation_token: String,
+    version: TableVersion,
+    matched: bool,
+    changed: bool,
+}
+
+impl ManifestStreamMutation for PublishVersionOneMutation {
+    type Output = bool;
+
+    fn process_existing_row(
+        &mut self,
+        row: ManifestRowValue,
+        output: &mut ManifestBatchBuilder,
+        index_data: &mut ManifestIndexAccumulator,
+    ) -> Result<()> {
+        if row.object_id != self.object_id {
+            return output.append(
+                index_data,
+                ManifestOutputRow {
+                    object_id: &row.object_id,
+                    object_type: row.object_type,
+                    location: row.location.as_deref(),
+                    metadata: row.metadata.as_deref(),
+                    base_objects: row.base_objects.as_deref(),
+                },
+            );
+        }
+
+        self.matched = true;
+        let mut metadata = match row.metadata.as_deref() {
+            Some(metadata) => {
+                serde_json::from_str::<HashMap<String, String>>(metadata).map_err(|e| {
+                    lance_core::Error::from(NamespaceError::Internal {
+                        message: format!(
+                            "Failed to deserialize metadata for table '{}': {}",
+                            row.object_id, e
+                        ),
+                    })
+                })?
+            }
+            None => HashMap::new(),
+        };
+        if metadata.get(lance_namespace::RESERVATION_TOKEN_KEY) != Some(&self.reservation_token) {
+            return Err(NamespaceError::ConcurrentModification {
+                message: format!(
+                    "Reservation token mismatch publishing version 1 for table '{}': the declaration was superseded",
+                    row.object_id
+                ),
+            }
+            .into());
+        }
+
+        let serialized_version = serde_json::to_string(&self.version).map_err(|e| {
+            lance_core::Error::from(NamespaceError::Internal {
+                message: format!(
+                    "Failed to serialize published version 1 for table '{}': {}",
+                    row.object_id, e
+                ),
+            })
+        })?;
+        match metadata.get(PUBLISHED_VERSION_ONE_KEY) {
+            Some(existing) if existing == &serialized_version => {}
+            Some(_) => {
+                return Err(NamespaceError::ConcurrentModification {
+                    message: format!(
+                        "Version 1 is already published for table '{}' with different metadata",
+                        row.object_id
+                    ),
+                }
+                .into());
+            }
+            None => {
+                metadata.insert(PUBLISHED_VERSION_ONE_KEY.to_string(), serialized_version);
+                self.changed = true;
+            }
+        }
+
+        let serialized_metadata = serde_json::to_string(&metadata).map_err(|e| {
+            lance_core::Error::from(NamespaceError::Internal {
+                message: format!(
+                    "Failed to serialize metadata for table '{}': {}",
+                    row.object_id, e
+                ),
+            })
+        })?;
+        output.append(
+            index_data,
+            ManifestOutputRow {
+                object_id: &row.object_id,
+                object_type: row.object_type,
+                location: row.location.as_deref(),
+                metadata: Some(&serialized_metadata),
+                base_objects: row.base_objects.as_deref(),
+            },
+        )
+    }
+
+    fn append_rows(
+        &mut self,
+        _output: &mut ManifestBatchBuilder,
+        _index_data: &mut ManifestIndexAccumulator,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn finish(&self) -> CopyOnWriteMutation<Self::Output> {
+        if self.changed {
+            CopyOnWriteMutation::updated(self.matched)
+        } else {
+            CopyOnWriteMutation::unchanged(self.matched)
+        }
+    }
+}
+
+struct UnpublishVersionOneMutation {
+    object_id: String,
+    manifest_path: String,
+    changed: bool,
+}
+
+impl ManifestStreamMutation for UnpublishVersionOneMutation {
+    type Output = ();
+
+    fn process_existing_row(
+        &mut self,
+        row: ManifestRowValue,
+        output: &mut ManifestBatchBuilder,
+        index_data: &mut ManifestIndexAccumulator,
+    ) -> Result<()> {
+        if row.object_id != self.object_id {
+            return output.append(
+                index_data,
+                ManifestOutputRow {
+                    object_id: &row.object_id,
+                    object_type: row.object_type,
+                    location: row.location.as_deref(),
+                    metadata: row.metadata.as_deref(),
+                    base_objects: row.base_objects.as_deref(),
+                },
+            );
+        }
+
+        let mut metadata = match row.metadata.as_deref() {
+            Some(metadata) => {
+                serde_json::from_str::<HashMap<String, String>>(metadata).map_err(|e| {
+                    lance_core::Error::from(NamespaceError::Internal {
+                        message: format!(
+                            "Failed to deserialize metadata for table '{}': {}",
+                            row.object_id, e
+                        ),
+                    })
+                })?
+            }
+            None => HashMap::new(),
+        };
+        let should_remove = metadata
+            .get(PUBLISHED_VERSION_ONE_KEY)
+            .map(|serialized| {
+                serde_json::from_str::<TableVersion>(serialized).map_err(|e| {
+                    lance_core::Error::from(NamespaceError::Internal {
+                        message: format!(
+                            "Failed to deserialize published version 1 for table '{}': {}",
+                            row.object_id, e
+                        ),
+                    })
+                })
+            })
+            .transpose()?
+            .is_some_and(|version| version.manifest_path == self.manifest_path);
+        if should_remove {
+            metadata.remove(PUBLISHED_VERSION_ONE_KEY);
+            self.changed = true;
+        }
+        let serialized_metadata = if metadata.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(&metadata).map_err(|e| {
+                lance_core::Error::from(NamespaceError::Internal {
+                    message: format!(
+                        "Failed to serialize metadata for table '{}': {}",
+                        row.object_id, e
+                    ),
+                })
+            })?)
+        };
+        output.append(
+            index_data,
+            ManifestOutputRow {
+                object_id: &row.object_id,
+                object_type: row.object_type,
+                location: row.location.as_deref(),
+                metadata: serialized_metadata.as_deref(),
+                base_objects: row.base_objects.as_deref(),
+            },
+        )
+    }
+
+    fn append_rows(
+        &mut self,
+        _output: &mut ManifestBatchBuilder,
+        _index_data: &mut ManifestIndexAccumulator,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn finish(&self) -> CopyOnWriteMutation<Self::Output> {
+        if self.changed {
+            CopyOnWriteMutation::updated(())
+        } else {
+            CopyOnWriteMutation::unchanged(())
+        }
+    }
+}
+
 /// Information about a namespace stored in the manifest
 #[derive(Debug, Clone)]
 pub struct NamespaceInfo {
@@ -847,6 +1094,11 @@ fn convert_lance_commit_error(e: &LanceError, operation: &str, object_id: Option
 }
 
 impl ManifestNamespace {
+    #[cfg(test)]
+    pub(crate) async fn lock_manifest_mutations_for_test(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.manifest_mutation_lock.lock().await
+    }
+
     /// Create a new ManifestNamespace from an existing DirectoryNamespace
     #[allow(clippy::too_many_arguments)]
     pub async fn from_directory(
@@ -2145,7 +2397,10 @@ impl ManifestNamespace {
     }
 
     /// Query the manifest for a table with the given object ID
-    async fn query_manifest_for_table(&self, object_id: &str) -> Result<Option<TableInfo>> {
+    pub(crate) async fn query_manifest_for_table(
+        &self,
+        object_id: &str,
+    ) -> Result<Option<TableInfo>> {
         let escaped_id = object_id.replace('\'', "''");
         let filter = format!("object_id = '{}' AND object_type = 'table'", escaped_id);
         let mut scanner = self.manifest_scanner().await?;
@@ -2235,6 +2490,19 @@ impl ManifestNamespace {
         }
     }
 
+    fn validate_user_table_properties(properties: Option<&HashMap<String, String>>) -> Result<()> {
+        if properties.is_some_and(|properties| properties.contains_key(PUBLISHED_VERSION_ONE_KEY)) {
+            return Err(NamespaceError::InvalidInput {
+                message: format!(
+                    "Table property '{}' is reserved for namespace-managed version publication",
+                    PUBLISHED_VERSION_ONE_KEY
+                ),
+            }
+            .into());
+        }
+        Ok(())
+    }
+
     pub(crate) async fn path_has_actual_manifests(
         object_store: &ObjectStore,
         table_path: &Path,
@@ -2261,6 +2529,13 @@ impl ManifestNamespace {
     async fn location_has_actual_manifests(&self, location: &str) -> Result<bool> {
         Self::path_has_actual_manifests(&self.object_store, &self.base_path.clone().join(location))
             .await
+    }
+
+    async fn table_has_actual_manifests(&self, table: &TableInfo) -> Result<bool> {
+        if table.published_version_one()?.is_some() {
+            return Ok(true);
+        }
+        self.location_has_actual_manifests(&table.location).await
     }
 
     pub(crate) fn is_not_found_load_error(err: &LanceError) -> bool {
@@ -2376,6 +2651,55 @@ impl ManifestNamespace {
         self.rewrite_manifest("Failed to delete from manifest", || DeleteObjectMutation {
             object_id: object_id.clone(),
             deleted: false,
+        })
+        .await
+    }
+
+    pub(crate) async fn publish_reserved_version_one(
+        &self,
+        object_id: &str,
+        reservation_token: &str,
+        version: &TableVersion,
+    ) -> Result<()> {
+        let object_id = object_id.to_string();
+        let reservation_token = reservation_token.to_string();
+        let version = version.clone();
+        let matched = self
+            .rewrite_manifest("Failed to publish reserved table version", || {
+                PublishVersionOneMutation {
+                    object_id: object_id.clone(),
+                    reservation_token: reservation_token.clone(),
+                    version: version.clone(),
+                    matched: false,
+                    changed: false,
+                }
+            })
+            .await?;
+        if !matched {
+            return Err(NamespaceError::ConcurrentModification {
+                message: format!(
+                    "Reservation was removed while publishing version 1 for table '{}'",
+                    object_id
+                ),
+            }
+            .into());
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn unpublish_version_one(
+        &self,
+        object_id: &str,
+        manifest_path: &str,
+    ) -> Result<()> {
+        let object_id = object_id.to_string();
+        let manifest_path = manifest_path.to_string();
+        self.rewrite_manifest("Failed to unpublish table version 1", || {
+            UnpublishVersionOneMutation {
+                object_id: object_id.clone(),
+                manifest_path: manifest_path.clone(),
+                changed: false,
+            }
         })
         .await
     }
@@ -2748,11 +3072,13 @@ impl LanceNamespace for ManifestNamespace {
                 message: format!("Failed to filter: {:?}", e),
             })
         })?;
-        scanner.project(&["object_id", "location"]).map_err(|e| {
-            lance_core::Error::from(NamespaceError::Internal {
-                message: format!("Failed to project: {:?}", e),
-            })
-        })?;
+        scanner
+            .project(&["object_id", "location", "metadata"])
+            .map_err(|e| {
+                lance_core::Error::from(NamespaceError::Internal {
+                    message: format!("Failed to project: {:?}", e),
+                })
+            })?;
 
         let batches = Self::execute_scanner(scanner).await?;
 
@@ -2764,31 +3090,51 @@ impl LanceNamespace for ManifestNamespace {
 
             let object_id_array = Self::get_string_column(&batch, "object_id")?;
             let location_array = Self::get_string_column(&batch, "location")?;
+            let metadata_array = Self::get_string_column(&batch, "metadata")?;
             for i in 0..batch.num_rows() {
                 let object_id = object_id_array.value(i);
                 let location = location_array.value(i);
-                let (_namespace, name) = Self::parse_object_id(object_id);
-                table_entries.push((name, location.to_string()));
+                let (namespace, name) = Self::parse_object_id(object_id);
+                let metadata = if metadata_array.is_null(i) {
+                    None
+                } else {
+                    Some(
+                        serde_json::from_str::<HashMap<String, String>>(metadata_array.value(i))
+                            .map_err(|e| {
+                                lance_core::Error::from(NamespaceError::Internal {
+                                    message: format!(
+                                        "Failed to deserialize metadata for table '{}': {}",
+                                        object_id, e
+                                    ),
+                                })
+                            })?,
+                    )
+                };
+                table_entries.push(TableInfo {
+                    namespace,
+                    name,
+                    location: location.to_string(),
+                    metadata,
+                });
             }
         }
 
         let mut tables: Vec<String> = if request.include_declared.unwrap_or(true) {
-            table_entries.into_iter().map(|(name, _)| name).collect()
+            table_entries.into_iter().map(|table| table.name).collect()
         } else {
-            let mut stream = futures::stream::iter(table_entries.into_iter().map(
-                |(name, location)| async move {
+            let mut stream =
+                futures::stream::iter(table_entries.into_iter().map(|table| async move {
                     // `include_declared=false` is an explicit opt-in. We still pay one
                     // `_versions/` probe per table so declared-state is derived from actual
                     // manifests. This is linear in the total number of listed tables, and we do
                     // the probes with bounded concurrency before pagination.
-                    if self.location_has_actual_manifests(&location).await? {
-                        Ok::<Option<String>, Error>(Some(name))
+                    if self.table_has_actual_manifests(&table).await? {
+                        Ok::<Option<String>, Error>(Some(table.name))
                     } else {
                         Ok::<Option<String>, Error>(None)
                     }
-                },
-            ))
-            .buffered(DECLARED_FILTER_CONCURRENCY);
+                }))
+                .buffered(DECLARED_FILTER_CONCURRENCY);
 
             let mut filtered = Vec::new();
             while let Some(result) = stream.next().await {
@@ -2848,7 +3194,7 @@ impl LanceNamespace for ManifestNamespace {
                     None
                 };
                 let is_only_declared = if should_check_declared {
-                    Some(!self.location_has_actual_manifests(&info.location).await?)
+                    Some(!self.table_has_actual_manifests(&info).await?)
                 } else {
                     None
                 };
@@ -2959,6 +3305,7 @@ impl LanceNamespace for ManifestNamespace {
         request: CreateTableRequest,
         data: Bytes,
     ) -> Result<CreateTableResponse> {
+        Self::validate_user_table_properties(request.properties.as_ref())?;
         let table_id = request.id.as_ref().ok_or_else(|| {
             lance_core::Error::from(NamespaceError::InvalidInput {
                 message: "Table ID is required".to_string(),
@@ -2981,10 +3328,7 @@ impl LanceNamespace for ManifestNamespace {
 
         let existing_table = self.query_manifest_for_table(&object_id).await?;
         let existing_has_manifests = if let Some(existing_table) = &existing_table {
-            Some(
-                self.location_has_actual_manifests(&existing_table.location)
-                    .await?,
-            )
+            Some(self.table_has_actual_manifests(existing_table).await?)
         } else {
             None
         };
@@ -3450,6 +3794,7 @@ impl LanceNamespace for ManifestNamespace {
     }
 
     async fn declare_table(&self, request: DeclareTableRequest) -> Result<DeclareTableResponse> {
+        Self::validate_user_table_properties(request.properties.as_ref())?;
         let table_id = request.id.as_ref().ok_or_else(|| {
             lance_core::Error::from(NamespaceError::InvalidInput {
                 message: "Table ID is required".to_string(),

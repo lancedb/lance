@@ -880,7 +880,9 @@ async fn create_table_version(
         manifest_size: body.manifest_size,
         e_tag: body.e_tag,
         metadata: body.metadata,
+        naming_scheme: body.naming_scheme,
         branch: body.branch,
+        context: body.context,
         ..Default::default()
     };
 
@@ -1969,6 +1971,59 @@ mod tests {
             assert!(
                 result.is_ok(),
                 "Declared table should exist in child namespace"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn test_create_table_version_preserves_reservation_context() {
+            let fixture = RestServerFixture::new_managed().await;
+            let table_id = vec!["reserved_table".to_string()];
+
+            let declared_a = fixture
+                .namespace
+                .declare_table(DeclareTableRequest {
+                    id: Some(table_id.clone()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            let token_a = declared_a.transaction_id.expect("first reservation token");
+
+            fixture
+                .namespace
+                .drop_table(DropTableRequest {
+                    id: Some(table_id.clone()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            let declared_b = fixture
+                .namespace
+                .declare_table(DeclareTableRequest {
+                    id: Some(table_id.clone()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert_ne!(declared_b.transaction_id.as_deref(), Some(token_a.as_str()));
+
+            let error = fixture
+                .namespace
+                .create_table_version(CreateTableVersionRequest {
+                    id: Some(table_id),
+                    version: 1,
+                    manifest_path: "missing-staging-manifest".to_string(),
+                    context: Some(std::collections::HashMap::from([(
+                        lance_namespace::RESERVATION_TOKEN_KEY.to_string(),
+                        token_a,
+                    )])),
+                    ..Default::default()
+                })
+                .await
+                .expect_err("stale REST publisher must be rejected by token, before staging read");
+            assert!(
+                error.to_string().contains("superseded"),
+                "expected reservation mismatch from REST backend, got: {error}"
             );
         }
 
