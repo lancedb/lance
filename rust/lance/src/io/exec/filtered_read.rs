@@ -614,9 +614,7 @@ impl FilteredReadStream {
             public_blob_v2_binary_projection_schema(&options.projection)
         } else {
             Arc::new(ArrowSchema::from(
-                &crate::dataset::blob::blob_v2_descriptor_schema(
-                    &options.projection.to_bare_schema(),
-                ),
+                &crate::dataset::blob::blob_v2_descriptor_schema(&options.projection.to_schema()),
             ))
         };
         // Get scan_range_after_filter from the plan
@@ -1433,8 +1431,15 @@ impl FilteredReadStream {
         materialization_context: Arc<BlobMaterializationContext>,
         materialize_blob_v2_binary: bool,
     ) -> Result<BoxStream<'static, Result<MaterializedReadBatchFut>>> {
-        let output_schema =
-            public_blob_v2_binary_projection_schema(fragment_read_task.projection.as_ref());
+        let output_schema = if materialize_blob_v2_binary {
+            public_blob_v2_binary_projection_schema(fragment_read_task.projection.as_ref())
+        } else {
+            Arc::new(ArrowSchema::from(
+                &crate::dataset::blob::blob_v2_descriptor_schema(
+                    &fragment_read_task.projection.to_schema(),
+                ),
+            ))
+        };
 
         if let Some(filter) = &fragment_read_task.filter {
             let filter_cols = Planner::column_names_in_expr(filter);
