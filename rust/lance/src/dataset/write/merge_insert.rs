@@ -14628,24 +14628,45 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
 
     #[tokio::test]
     async fn test_merge_insert_with_blob_v2_source_provides_blob() {
-        use crate::{BlobArrayBuilder, blob_field};
         use arrow_schema::Schema as ArrowSchema;
+        use lance_arrow::{ARROW_EXT_NAME_KEY, BLOB_V2_EXT_NAME};
+        use lance_core::datatypes::BLOB_V2_LOGICAL_FIELDS;
 
         let test_dir = TempStrDir::default();
+        let blob_field = Field::new(
+            "blobs",
+            DataType::Struct(BLOB_V2_LOGICAL_FIELDS.clone()),
+            true,
+        )
+        .with_metadata(HashMap::from([(
+            ARROW_EXT_NAME_KEY.to_string(),
+            BLOB_V2_EXT_NAME.to_string(),
+        )]));
         let schema = Arc::new(ArrowSchema::new(vec![
-            blob_field("blobs", true),
+            blob_field,
             Field::new("id", DataType::Int64, true),
             Field::new("other", DataType::Int64, true),
         ]));
         let make_batch = |blob_values: &[&[u8]], ids, others| {
-            let mut blobs = BlobArrayBuilder::new(blob_values.len());
-            for value in blob_values {
-                blobs.push_bytes(value).unwrap();
-            }
+            let blobs: arrow_array::ArrayRef = Arc::new(
+                StructArray::try_new(
+                    BLOB_V2_LOGICAL_FIELDS.clone(),
+                    vec![
+                        Arc::new(arrow_array::LargeBinaryArray::from_iter(
+                            blob_values.iter().map(|value| Some(*value)),
+                        )),
+                        Arc::new(StringArray::from(vec![None::<&str>; blob_values.len()])),
+                        Arc::new(UInt64Array::from(vec![None::<u64>; blob_values.len()])),
+                        Arc::new(UInt64Array::from(vec![None::<u64>; blob_values.len()])),
+                    ],
+                    None,
+                )
+                .unwrap(),
+            );
             RecordBatch::try_new(
                 schema.clone(),
                 vec![
-                    blobs.finish().unwrap(),
+                    blobs,
                     Arc::new(Int64Array::from(ids)),
                     Arc::new(Int64Array::from(others)),
                 ],
@@ -14683,6 +14704,13 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
             .try_build()
             .unwrap();
         let (new_dataset, _) = job.execute_reader(source).await.unwrap();
+        let dataset_schema = ArrowSchema::from(new_dataset.schema());
+        let DataType::Struct(blob_children) =
+            dataset_schema.field_with_name("blobs").unwrap().data_type()
+        else {
+            panic!("expected complete logical blob struct after merge insert");
+        };
+        assert_eq!(blob_children.as_ref(), BLOB_V2_LOGICAL_FIELDS.as_ref());
         let blobs = new_dataset
             .take_blobs_by_indices(&[0, 1, 2], "blobs")
             .await

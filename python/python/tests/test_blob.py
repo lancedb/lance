@@ -908,6 +908,67 @@ def test_blob_extension_write_inline(tmp_path):
         assert f.read() == b"foo"
 
 
+def test_complete_blob_schema_survives_create_append_and_merge_insert(tmp_path):
+    dataset_path = tmp_path / "complete_blob_schema"
+    external_path = tmp_path / "external.bin"
+    external_path.write_bytes(b"prefix-range-suffix")
+    schema = pa.schema([pa.field("id", pa.int64()), lance.blob_field("blob")])
+
+    def make_table(ids, values):
+        return pa.Table.from_arrays(
+            [pa.array(ids, type=pa.int64()), lance.blob_array(values)],
+            schema=schema,
+        )
+
+    def assert_complete_blob_schema(dataset):
+        blob_type = dataset.schema.field("blob").type
+        assert isinstance(blob_type, pa.ExtensionType)
+        assert blob_type.extension_name == "lance.blob.v2"
+        assert [field.name for field in blob_type.storage_type] == [
+            "data",
+            "uri",
+            "position",
+            "size",
+        ]
+
+    ds = lance.write_dataset(
+        make_table(
+            [0, 1],
+            [
+                Blob.from_uri(external_path.as_uri(), position=7, size=5),
+                b"initial",
+            ],
+        ),
+        dataset_path,
+        data_storage_version="2.2",
+        external_blob_mode="ingest",
+    )
+    external_path.unlink()
+    assert_complete_blob_schema(ds)
+
+    lance.write_dataset(make_table([2], [b"appended"]), dataset_path, mode="append")
+    ds = lance.dataset(dataset_path)
+    assert_complete_blob_schema(ds)
+
+    (
+        ds.merge_insert("id")
+        .when_matched_update_all()
+        .when_not_matched_insert_all()
+        .execute(make_table([1, 3], [b"updated", b"inserted"]))
+    )
+    ds = lance.dataset(dataset_path)
+    assert_complete_blob_schema(ds)
+
+    result = ds.to_table(blob_handling="all_binary").sort_by("id")
+    assert result["id"].to_pylist() == [0, 1, 2, 3]
+    assert result["blob"].to_pylist() == [
+        b"range",
+        b"updated",
+        b"appended",
+        b"inserted",
+    ]
+
+
 def test_blob_field_threshold_metadata():
     field = lance.blob_field(
         "blob",

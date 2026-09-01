@@ -90,7 +90,10 @@ class BlobType(pa.ExtensionType):
     A PyArrow extension type for Lance blob columns.
 
     This is the "logical" type users write. Lance will store it in a compact
-    descriptor format, and reads will return descriptors by default.
+    descriptor format, and reads will return descriptors by default. Its storage
+    type is ``Struct<data: LargeBinary?, uri: Utf8?, position: UInt64?,
+    size: UInt64?>``. ``position`` and ``size`` select a range within an external
+    ``uri`` and must either both be set or both be null.
     """
 
     def __init__(self) -> None:
@@ -238,6 +241,11 @@ def blob_field(
 ) -> pa.Field:
     """
     Construct an Arrow field for a Lance blob column.
+
+    The returned field uses the complete logical blob shape
+    ``Struct<data: LargeBinary?, uri: Utf8?, position: UInt64?, size: UInt64?>``.
+    Lance preserves this logical schema across create, append, and merge-insert
+    writes while storing compact descriptors internally.
 
     Parameters
     ----------

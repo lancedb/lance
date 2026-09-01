@@ -4286,7 +4286,7 @@ mod tests {
         BLOB_V2_EXT_NAME, DataTypeExt,
     };
     use lance_core::{
-        datatypes::{BlobHandling, BlobKind, OnMissing},
+        datatypes::{BLOB_V2_LOGICAL_FIELDS, BlobHandling, BlobKind, OnMissing},
         utils::blob::blob_path,
     };
     use lance_io::object_store::{
@@ -4372,8 +4372,48 @@ mod tests {
         );
     }
 
-    fn nested_blob_v2_batch(blob_array: ArrayRef) -> (Arc<Schema>, RecordBatch) {
-        let blob_field = blob_field("blob", true);
+    fn complete_blob_v2_field(name: &str, nullable: bool) -> Field {
+        Field::new(
+            name,
+            DataType::Struct(BLOB_V2_LOGICAL_FIELDS.clone()),
+            nullable,
+        )
+        .with_metadata(HashMap::from([(
+            ARROW_EXT_NAME_KEY.to_string(),
+            BLOB_V2_EXT_NAME.to_string(),
+        )]))
+    }
+
+    fn complete_blob_v2_array(
+        data: Vec<Option<Vec<u8>>>,
+        uris: Vec<Option<String>>,
+        positions: Vec<Option<u64>>,
+        sizes: Vec<Option<u64>>,
+        validity: Option<NullBuffer>,
+    ) -> ArrayRef {
+        Arc::new(
+            StructArray::try_new(
+                BLOB_V2_LOGICAL_FIELDS.clone(),
+                vec![
+                    Arc::new(LargeBinaryArray::from_iter(
+                        data.iter().map(|value| value.as_deref()),
+                    )) as ArrayRef,
+                    Arc::new(StringArray::from_iter(
+                        uris.iter().map(|value| value.as_deref()),
+                    )) as ArrayRef,
+                    Arc::new(UInt64Array::from(positions)) as ArrayRef,
+                    Arc::new(UInt64Array::from(sizes)) as ArrayRef,
+                ],
+                validity,
+            )
+            .unwrap(),
+        )
+    }
+
+    fn nested_blob_v2_batch_with_field(
+        blob_field: Field,
+        blob_array: ArrayRef,
+    ) -> (Arc<Schema>, RecordBatch) {
         let info_fields = vec![Field::new("name", DataType::Utf8, false), blob_field];
         let info_array: ArrayRef = Arc::new(
             StructArray::try_new(
@@ -4396,6 +4436,10 @@ mod tests {
         )]));
         let batch = RecordBatch::try_new(schema.clone(), vec![info_array]).unwrap();
         (schema, batch)
+    }
+
+    fn nested_blob_v2_batch(blob_array: ArrayRef) -> (Arc<Schema>, RecordBatch) {
+        nested_blob_v2_batch_with_field(blob_field("blob", true), blob_array)
     }
 
     #[cfg(feature = "azure")]
@@ -6037,17 +6081,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_write_and_take_nested_blob_v2() {
+    async fn test_write_and_take_nested_complete_blob_v2() {
         let test_dir = TempStrDir::default();
         let packed_payload = vec![0x4A; super::INLINE_MAX + 1024];
 
-        let mut blob_builder = BlobArrayBuilder::new(3);
-        blob_builder.push_bytes(b"hello").unwrap();
-        blob_builder.push_bytes(&packed_payload).unwrap();
-        blob_builder.push_null().unwrap();
-        let blob_array: ArrayRef = blob_builder.finish().unwrap();
+        let blob_array = complete_blob_v2_array(
+            vec![Some(b"hello".to_vec()), Some(packed_payload.clone()), None],
+            vec![None, None, None],
+            vec![None, None, None],
+            vec![None, None, None],
+            Some(NullBuffer::from(vec![true, true, false])),
+        );
 
-        let (schema, batch) = nested_blob_v2_batch(blob_array);
+        let (schema, batch) =
+            nested_blob_v2_batch_with_field(complete_blob_v2_field("blob", true), blob_array);
         let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
 
         let dataset = Arc::new(
@@ -7718,67 +7765,72 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_blob_v2_external_ingest_inline_slice() {
+    async fn test_complete_blob_v2_create_append_and_external_slice() {
         let dataset_dir = TempDir::default();
         let external_dir = TempDir::default();
         let external_path = external_dir.std_path().join("external.bin");
         std::fs::write(&external_path, b"prefix-inline-suffix").unwrap();
         let external_uri = format!("file://{}", external_path.display());
 
-        let metadata = [(ARROW_EXT_NAME_KEY.to_string(), BLOB_V2_EXT_NAME.to_string())]
-            .into_iter()
-            .collect();
-        let blob_field = Field::new(
-            "blob",
-            DataType::Struct(
-                vec![
-                    Field::new("data", DataType::LargeBinary, true),
-                    Field::new("uri", DataType::Utf8, true),
-                    Field::new("position", DataType::UInt64, true),
-                    Field::new("size", DataType::UInt64, true),
-                ]
-                .into(),
-            ),
-            true,
-        )
-        .with_metadata(metadata);
-        let blob_array: ArrayRef = Arc::new(
-            StructArray::try_new(
-                vec![
-                    Field::new("data", DataType::LargeBinary, true),
-                    Field::new("uri", DataType::Utf8, true),
-                    Field::new("position", DataType::UInt64, true),
-                    Field::new("size", DataType::UInt64, true),
-                ]
-                .into(),
-                vec![
-                    Arc::new(arrow_array::LargeBinaryArray::from(vec![None::<&[u8]>])) as ArrayRef,
-                    Arc::new(StringArray::from(vec![Some(external_uri.as_str())])) as ArrayRef,
-                    Arc::new(UInt64Array::from(vec![Some(7)])) as ArrayRef,
-                    Arc::new(UInt64Array::from(vec![Some(6)])) as ArrayRef,
-                ],
-                None,
-            )
-            .unwrap(),
+        let blob_field = complete_blob_v2_field("blob", true);
+        let blob_array = complete_blob_v2_array(
+            vec![None],
+            vec![Some(external_uri)],
+            vec![Some(7)],
+            vec![Some(6)],
+            None,
         );
         let schema = Arc::new(Schema::new(vec![blob_field]));
         let batch = RecordBatch::try_new(schema.clone(), vec![blob_array]).unwrap();
         let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
 
-        let dataset = Arc::new(
-            Dataset::write(
-                reader,
-                &dataset_dir.path_str(),
-                Some(WriteParams {
-                    data_storage_version: Some(LanceFileVersion::V2_2),
-                    external_blob_mode: ExternalBlobMode::Ingest,
-                    ..Default::default()
-                }),
+        let mut dataset = Dataset::write(
+            reader,
+            &dataset_dir.path_str(),
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                external_blob_mode: ExternalBlobMode::Ingest,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let dataset_schema = Schema::from(dataset.schema());
+        let DataType::Struct(fields) = dataset_schema.field_with_name("blob").unwrap().data_type()
+        else {
+            panic!("expected complete logical blob struct");
+        };
+        assert_eq!(fields.as_ref(), BLOB_V2_LOGICAL_FIELDS.as_ref());
+
+        let append_schema = Arc::new(Schema::new(vec![complete_blob_v2_field("blob", true)]));
+        let append_batch = RecordBatch::try_new(
+            append_schema.clone(),
+            vec![complete_blob_v2_array(
+                vec![Some(b"appended".to_vec())],
+                vec![None],
+                vec![None],
+                vec![None],
+                None,
+            )],
+        )
+        .unwrap();
+        dataset
+            .append(
+                RecordBatchIterator::new(vec![Ok(append_batch)], append_schema),
+                None,
             )
             .await
-            .unwrap(),
-        );
+            .unwrap();
 
+        let dataset_schema = Schema::from(dataset.schema());
+        let DataType::Struct(fields) = dataset_schema.field_with_name("blob").unwrap().data_type()
+        else {
+            panic!("expected complete logical blob struct after append");
+        };
+        assert_eq!(fields.as_ref(), BLOB_V2_LOGICAL_FIELDS.as_ref());
+
+        let dataset = Arc::new(dataset);
         let desc = dataset
             .scan()
             .project(&["blob"])
@@ -7797,11 +7849,20 @@ mod tests {
             BlobKind::Inline as u8
         );
 
-        let blobs = dataset.take_blobs_by_indices(&[0], "blob").await.unwrap();
-        assert_eq!(blobs.len(), 1);
-        let blob = blobs[0].as_ref().unwrap();
-        assert_eq!(blob.kind(), BlobKind::Inline);
-        assert_eq!(blob.read().await.unwrap().as_ref(), b"inline");
+        let blobs = dataset
+            .take_blobs_by_indices(&[0, 1], "blob")
+            .await
+            .unwrap();
+        assert_eq!(blobs.len(), 2);
+        assert_eq!(blobs[0].as_ref().unwrap().kind(), BlobKind::Inline);
+        assert_eq!(
+            blobs[0].as_ref().unwrap().read().await.unwrap().as_ref(),
+            b"inline"
+        );
+        assert_eq!(
+            blobs[1].as_ref().unwrap().read().await.unwrap().as_ref(),
+            b"appended"
+        );
     }
 
     #[tokio::test]
