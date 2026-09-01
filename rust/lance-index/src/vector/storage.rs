@@ -28,7 +28,8 @@ use std::{
 
 use crossbeam_queue::ArrayQueue;
 
-use crate::frag_reuse::FragReuseIndex;
+use crate::frag_reuse::{FragReuseIndex, FragReuseIndexHandle};
+use crate::scalar::RowIdRemapper;
 use crate::{
     pb,
     vector::{
@@ -448,7 +449,7 @@ pub struct StorageBuilder<Q: Quantization> {
     distance_type: DistanceType,
     quantizer: Q,
 
-    frag_reuse_index: Option<Arc<FragReuseIndex>>,
+    frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
 }
 
 impl<Q: Quantization> StorageBuilder<Q> {
@@ -457,6 +458,18 @@ impl<Q: Quantization> StorageBuilder<Q> {
         distance_type: DistanceType,
         quantizer: Q,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
+    ) -> Result<Self> {
+        let frag_reuse_index = frag_reuse_index
+            .map(|index| Arc::new(FragReuseIndexHandle(index)) as Arc<dyn RowIdRemapper>);
+        Self::new_with_remapper(vector_column, distance_type, quantizer, frag_reuse_index)
+    }
+
+    #[doc(hidden)]
+    pub fn new_with_remapper(
+        vector_column: String,
+        distance_type: DistanceType,
+        quantizer: Q,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
     ) -> Result<Self> {
         Ok(Self {
             vector_column,
@@ -486,7 +499,7 @@ impl<Q: Quantization> StorageBuilder<Q> {
         debug_assert!(batch.column_by_name(ROW_ID).is_some());
         debug_assert!(batch.column_by_name(self.quantizer.column()).is_some());
 
-        Q::Storage::try_from_batch(
+        Q::Storage::try_from_batch_with_remapper(
             batch,
             &self.quantizer.metadata(None),
             self.distance_type,
@@ -504,7 +517,7 @@ pub struct IvfQuantizationStorage<Q: Quantization> {
     metadata: Q::Metadata,
 
     ivf: IvfModel,
-    frag_reuse_index: Option<Arc<FragReuseIndex>>,
+    frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
 }
 
 impl<Q: Quantization> DeepSizeOf for IvfQuantizationStorage<Q> {
@@ -520,6 +533,16 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
     pub async fn try_new(
         reader: FileReader,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
+    ) -> Result<Self> {
+        let frag_reuse_index = frag_reuse_index
+            .map(|index| Arc::new(FragReuseIndexHandle(index)) as Arc<dyn RowIdRemapper>);
+        Self::try_new_with_remapper(reader, frag_reuse_index).await
+    }
+
+    #[doc(hidden)]
+    pub async fn try_new_with_remapper(
+        reader: FileReader,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
     ) -> Result<Self> {
         let schema = reader.schema();
 
@@ -577,6 +600,19 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         metadata: Q::Metadata,
         distance_type: DistanceType,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
+    ) -> Self {
+        let frag_reuse_index = frag_reuse_index
+            .map(|index| Arc::new(FragReuseIndexHandle(index)) as Arc<dyn RowIdRemapper>);
+        Self::from_cached_with_remapper(reader, ivf, metadata, distance_type, frag_reuse_index)
+    }
+
+    #[doc(hidden)]
+    pub fn from_cached_with_remapper(
+        reader: FileReader,
+        ivf: IvfModel,
+        metadata: Q::Metadata,
+        distance_type: DistanceType,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
     ) -> Self {
         Self {
             reader,
@@ -660,7 +696,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             let schema = Arc::new(self.reader.schema().as_ref().into());
             concat_batches(&schema, batches.iter())?
         };
-        Q::Storage::try_from_batch(
+        Q::Storage::try_from_batch_with_remapper(
             batch,
             self.metadata(),
             self.distance_type,

@@ -2885,7 +2885,19 @@ pub async fn commit_compaction(
                                         f.id
                                     ))
                                 })?;
-                                Ok((f.id as u32, physical_rows as u32))
+                                let fragment_id = u32::try_from(f.id).map_err(|_| {
+                                    Error::invalid_input(format!(
+                                        "compacted fragment id {} is outside the row-address range",
+                                        f.id
+                                    ))
+                                })?;
+                                let physical_rows = u32::try_from(physical_rows).map_err(|_| {
+                                    Error::invalid_input(format!(
+                                        "compacted fragment {} has physical_rows={} outside the row-address range",
+                                        f.id, physical_rows
+                                    ))
+                                })?;
+                                Ok((fragment_id, physical_rows))
                             })
                             .collect::<Result<Vec<_>>>()?;
 
@@ -2894,8 +2906,15 @@ pub async fn commit_compaction(
                             old_frag_ids: task
                                 .original_fragments
                                 .iter()
-                                .map(|f| f.id as u32)
-                                .collect(),
+                                .map(|f| {
+                                    u32::try_from(f.id).map_err(|_| {
+                                        Error::invalid_input(format!(
+                                            "compacted source fragment id {} is outside the row-address range",
+                                            f.id
+                                        ))
+                                    })
+                                })
+                                .collect::<Result<Vec<_>>>()?,
                             new_frags,
                         });
                     }
@@ -3057,8 +3076,8 @@ mod tests {
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::Dimension;
     use lance_file::version::LanceFileVersion;
+    use lance_index::frag_reuse::CompactFragReuseIndexHandle;
     use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
-    use lance_index::frag_reuse::FragReuseIndexHandle;
     use lance_index::scalar::{
         BuiltinIndexType, FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams,
     };
@@ -4717,7 +4736,7 @@ mod tests {
             open_frag_reuse_index(frag_reuse_index_meta.uuid, frag_reuse_details.as_ref())
                 .await
                 .unwrap();
-        let stats = FragReuseIndexHandle(Arc::new(frag_reuse_index.clone()))
+        let stats = CompactFragReuseIndexHandle(Arc::new(frag_reuse_index.clone()))
             .statistics()
             .unwrap();
         assert_eq!(
