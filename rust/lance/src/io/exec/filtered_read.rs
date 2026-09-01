@@ -6061,9 +6061,7 @@ mod tests {
             let mut blobs = BlobArrayBuilder::new(2);
             blobs.push_bytes(&first_payload).unwrap();
             blobs.push_bytes(&second_payload).unwrap();
-            let schema = Arc::new(ArrowSchema::new(vec![ArrowField::from(&blob_field(
-                "blob", false,
-            ))]));
+            let schema = Arc::new(ArrowSchema::new(vec![blob_field("blob", false)]));
             let batch =
                 RecordBatch::try_new(schema.clone(), vec![blobs.finish().unwrap()]).unwrap();
             let dataset = Arc::new(
