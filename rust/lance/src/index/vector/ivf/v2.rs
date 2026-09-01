@@ -41,9 +41,10 @@ use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::LanceEncodingsIo;
 use lance_file::reader::{CachedFileMetadata, FileReader, FileReaderOptions, ReaderProjection};
 use lance_index::cache_pb::IvfStateHeader;
-use lance_index::frag_reuse::FragReuseIndex;
+use lance_index::frag_reuse::{CompactFragReuseIndex, CompactFragReuseIndexHandle};
 use lance_index::metrics::{LocalMetricsCollector, MetricsCollector, NoOpMetricsCollector};
 use lance_index::prefilter::NoFilter;
+use lance_index::scalar::RowIdRemapper;
 use lance_index::vector::VectorIndexCacheEntry;
 use lance_index::vector::bq::builder::RabitQuantizer;
 use lance_index::vector::bq::ex_dot::{blocked_ex_code_bytes, padded_query_len};
@@ -271,7 +272,7 @@ pub(crate) trait IvfStateEntry: DeepSizeOf + Send + Sync + 'static {
         object_store: Arc<ObjectStore>,
         file_metadata_cache: &'a LanceCache,
         index_cache: LanceCache,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<CompactFragReuseIndex>>,
     ) -> BoxFuture<'a, Result<Arc<dyn VectorIndex>>>;
 }
 
@@ -447,7 +448,7 @@ impl<Q: Quantization + 'static> IvfStateEntry for IvfIndexState<Q> {
         object_store: Arc<ObjectStore>,
         file_metadata_cache: &'a LanceCache,
         index_cache: LanceCache,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<CompactFragReuseIndex>>,
     ) -> BoxFuture<'a, Result<Arc<dyn VectorIndex>>> {
         Box::pin(async move {
             match self.sub_index_type {
@@ -1076,7 +1077,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         object_store: Arc<ObjectStore>,
         index_dir: Path,
         uuid: Uuid,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<CompactFragReuseIndex>>,
         file_metadata_cache: &LanceCache,
         index_cache: LanceCache,
         file_sizes: HashMap<String, u64>,
@@ -1149,8 +1150,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             FileReaderOptions::default(),
         )
         .await?;
+        let frag_reuse_index = frag_reuse_index
+            .clone()
+            .map(|index| Arc::new(CompactFragReuseIndexHandle(index)) as Arc<dyn RowIdRemapper>);
         let storage =
-            IvfQuantizationStorage::try_new(storage_reader, frag_reuse_index.clone()).await?;
+            IvfQuantizationStorage::try_new_with_remapper(storage_reader, frag_reuse_index).await?;
 
         // Cache file metadata so reconstructions from IvfIndexState can skip
         // footer reads.
@@ -2022,7 +2026,7 @@ async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
     object_store: Arc<ObjectStore>,
     file_metadata_cache: &LanceCache,
     index_cache: LanceCache,
-    frag_reuse_index: Option<Arc<FragReuseIndex>>,
+    frag_reuse_index: Option<Arc<CompactFragReuseIndex>>,
 ) -> Result<Arc<dyn VectorIndex>> {
     let io_parallelism = object_store.io_parallelism();
 
@@ -2055,7 +2059,9 @@ async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
     )
     .await?;
 
-    let storage = IvfQuantizationStorage::from_cached(
+    let frag_reuse_index = frag_reuse_index
+        .map(|index| Arc::new(CompactFragReuseIndexHandle(index)) as Arc<dyn RowIdRemapper>);
+    let storage = IvfQuantizationStorage::from_cached_with_remapper(
         aux_reader,
         state.aux_ivf.clone(),
         state.metadata.clone(),

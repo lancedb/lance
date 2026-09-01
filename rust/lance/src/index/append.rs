@@ -8,7 +8,7 @@ use lance_core::{Error, Result};
 use lance_file::reader::FileReaderOptions;
 use lance_index::{
     INDEX_FILE_NAME, IndexType,
-    frag_reuse::FragReuseIndex,
+    frag_reuse::CompactFragReuseIndex,
     metrics::NoOpMetricsCollector,
     optimize::OptimizeOptions,
     progress::{IndexBuildProgress, NoopIndexBuildProgress},
@@ -162,7 +162,7 @@ pub fn split_segment_coverage<'a>(
 }
 
 pub fn fragment_reuse_affects_segments<'a>(
-    frag_reuse_index: &FragReuseIndex,
+    frag_reuse_index: &CompactFragReuseIndex,
     segments: impl IntoIterator<Item = &'a IndexMetadata>,
 ) -> bool {
     segments.into_iter().any(|segment| {
@@ -174,7 +174,7 @@ pub fn fragment_reuse_affects_segments<'a>(
 }
 
 pub fn fragment_reuse_affects_segment(
-    frag_reuse_index: &FragReuseIndex,
+    frag_reuse_index: &CompactFragReuseIndex,
     coverage: &RoaringBitmap,
     dataset_version: u64,
 ) -> bool {
@@ -1418,10 +1418,10 @@ mod tests {
             base_id: None,
             files: None,
         };
-        let frag_reuse_index = FragReuseIndex {
-            uuid: Uuid::new_v4(),
-            row_id_maps: vec![],
-            details: FragReuseIndexDetails {
+        let frag_reuse_index = CompactFragReuseIndex::from_row_id_maps(
+            Uuid::new_v4(),
+            vec![],
+            FragReuseIndexDetails {
                 versions: vec![FragReuseVersion {
                     dataset_version: 5,
                     groups: vec![FragReuseGroup {
@@ -1439,7 +1439,7 @@ mod tests {
                     }],
                 }],
             },
-        };
+        );
 
         assert!(fragment_reuse_affects_segments(
             &frag_reuse_index,
