@@ -1152,10 +1152,10 @@ mod tests {
     /// Runs `kernel` over `n` targets, with 8 guard slots past the output it is
     /// handed, then checks every value and every guard.
     ///
-    /// 8 is the widest chunk store in the file, so one extra chunk iteration
-    /// lands inside this allocation rather than on unrelated memory. The
-    /// remainder loops cannot trip the guards at all: all three index through
-    /// bounds-checked `results[..]` and would panic instead.
+    /// 8 is the widest unchecked chunk store in the file, so an unchecked chunk
+    /// store that overruns by one chunk lands inside this allocation instead of
+    /// past it. The remainder loops cannot trip the guards at all: all three
+    /// index through bounds-checked `results[..]` and would panic instead.
     fn check_kernel_tail(n: usize, kernel: impl FnOnce(u64, &[u64], &mut [u32])) {
         const GUARD: u32 = u32::MAX;
         const GUARD_SLOTS: usize = 8;
@@ -1184,11 +1184,12 @@ mod tests {
     /// `hamming_batch_avx2`, 8 for `hamming_batch_avx512` and for the unrolled
     /// scalar fallback.
     ///
-    /// Those loops do run today, but only through the pairwise tests, whose row
-    /// sweep passes every width from `n - 1` down to 1 and so covers every
-    /// residue incidentally. A tail bug surfaces there as a mismatch somewhere
-    /// among hundreds of thousands of pairs. This asserts every slot at each
-    /// width instead.
+    /// The pairwise tests reach a remainder loop only when they are large enough
+    /// to take a parallel path. There the row ranges together pass every width
+    /// from one below the row count down to 1, so whichever kernel the host
+    /// dispatches has every residue covered incidentally, and a dropped or
+    /// out-of-bounds tail write surfaces somewhere in thousands of pairs, as a
+    /// mismatch or a panic. This asserts every slot at each width instead.
     #[rstest]
     #[case::one(1)]
     #[case::two(2)]
@@ -1795,10 +1796,10 @@ mod tests {
     // =========================================================================
 
     // `hamming_batch_simd` returns early on the AVX-512 branch when
-    // `avx512vpopcntdq` and `avx512f` are both present, so on a VPOPCNTDQ host
+    // `avx512vpopcntdq` and `avx512f` are both present, so on a host with both
     // nothing reaches `hamming_batch_avx2` through `hamming_batch_u64`. This
     // calls it directly. The AVX-512 kernel needs no such test: it only runs
-    // where the dispatched test already drives it, over a wider set of widths.
+    // where the dispatched test already drives it.
 
     /// `hamming_batch_avx2` consumes 4 targets per chunk, so `n % 4` covers its
     /// remainder loop.
@@ -1808,8 +1809,9 @@ mod tests {
     #[case::two(2)]
     #[case::three(3)]
     #[case::four(4)]
+    // Five, six and seven repeat remainders 1 through 3 with a chunk ahead of
+    // them, which one, two and three alone do not reach.
     #[case::five(5)]
-    // Remainder 2 with a chunk ahead of it, which `two` alone does not reach.
     #[case::six(6)]
     #[case::seven(7)]
     fn test_avx2_covers_tail(#[case] n: usize) {
