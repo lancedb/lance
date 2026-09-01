@@ -5185,6 +5185,67 @@ mod tests {
         assert_eq!(actual_payload, expected_payload);
     }
 
+    /// merge_insert matches keys by bit pattern, in the indexed probe and in the
+    /// hash join behind it alike, so a source key of `+0.0` updates only the
+    /// `+0.0` row. Filters answer zero comparisons per IEEE 754 now, and this
+    /// pins that the two are still allowed to disagree: making key matching agree
+    /// needs the unindexed join fixed too, and DataFusion 54 hashes join keys by
+    /// raw bits. Both settings of `use_index` are exercised; which one the planner
+    /// picks for a one-row source is not asserted.
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn test_merge_insert_on_float_zero_key(#[values(true, false)] use_index: bool) {
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
+
+        let target = record_batch!(
+            (
+                "key",
+                Float64,
+                [Some(-1.0), Some(-0.0), Some(0.0), Some(1.0)]
+            ),
+            ("value", Int32, [10, 20, 30, 40])
+        )
+        .unwrap();
+        let schema = target.schema();
+        let reader = RecordBatchIterator::new(vec![Ok(target)], schema.clone());
+        let mut ds = Dataset::write(reader, test_uri, None).await.unwrap();
+        ds.create_index(
+            &["key"],
+            IndexType::Scalar,
+            None,
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+
+        let source = record_batch!(("key", Float64, [Some(0.0)]), ("value", Int32, [99])).unwrap();
+        let source = Box::new(RecordBatchIterator::new(vec![Ok(source)], schema.clone()));
+
+        let (ds, _) = MergeInsertBuilder::try_new(Arc::new(ds), vec!["key".to_string()])
+            .unwrap()
+            .when_not_matched(WhenNotMatched::DoNothing)
+            .when_matched(WhenMatched::UpdateAll)
+            .use_index(use_index)
+            .try_build()
+            .unwrap()
+            .execute_reader(source)
+            .await
+            .unwrap();
+
+        // Only the +0.0 row is updated. Checking both sides pins which row was
+        // replaced, not just how many; `value = 20` is the -0.0 row.
+        assert_eq!(ds.count_rows(None).await.unwrap(), 4);
+        for (filter, expected) in [("value = 99", 1), ("value = 30", 0), ("value = 20", 1)] {
+            assert_eq!(
+                ds.count_rows(Some(filter.to_string())).await.unwrap(),
+                expected,
+                "{filter}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_indexed_merge_insert() {
         let test_dir = TempStrDir::default();
