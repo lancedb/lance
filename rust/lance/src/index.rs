@@ -25,7 +25,9 @@ use lance_file::reader::FileReaderOptions;
 use lance_file::versions::v1::reader::FileReader as V1FileReader;
 use lance_index::INDEX_METADATA_SCHEMA_KEY;
 pub use lance_index::IndexParams;
-use lance_index::frag_reuse::{FRAG_REUSE_INDEX_NAME, FragReuseIndex, FragReuseIndexHandle};
+use lance_index::frag_reuse::{
+    CompactFragReuseIndex, CompactFragReuseIndexHandle, FRAG_REUSE_INDEX_NAME,
+};
 use lance_index::mem_wal::{MEM_WAL_INDEX_NAME, MemWalIndex, MemWalIndexHandle};
 use lance_index::optimize::OptimizeOptions;
 use lance_index::pb::index::Implementation;
@@ -1037,7 +1039,7 @@ impl<'a> FragReuseIndexCacheKey<'a> {
 }
 
 impl CacheKey for FragReuseIndexCacheKey<'_> {
-    type ValueType = FragReuseIndex;
+    type ValueType = CompactFragReuseIndex;
 
     fn key(&self) -> std::borrow::Cow<'_, str> {
         if let Some(fri_uuid) = self.fri_uuid {
@@ -2552,7 +2554,7 @@ async fn index_statistics_frag_reuse(ds: &Dataset) -> Result<String> {
         .open_frag_reuse_index(&NoOpMetricsCollector)
         .await?
         .expect("FragmentReuse index does not exist");
-    serialize_index_statistics(&FragReuseIndexHandle(index).statistics()?)
+    serialize_index_statistics(&CompactFragReuseIndexHandle(index).statistics()?)
 }
 
 async fn index_statistics_mem_wal(ds: &Dataset) -> Result<String> {
@@ -2890,7 +2892,7 @@ pub trait DatasetIndexInternalExt: DatasetIndexExt {
     async fn open_frag_reuse_index(
         &self,
         metrics: &dyn MetricsCollector,
-    ) -> Result<Option<Arc<FragReuseIndex>>>;
+    ) -> Result<Option<Arc<CompactFragReuseIndex>>>;
 
     /// Opens the MemWAL index
     async fn open_mem_wal_index(
@@ -2947,7 +2949,7 @@ impl DatasetIndexInternalExt for Dataset {
 
         let frag_reuse_cache_key = FragReuseIndexCacheKey::new(uuid, frag_reuse_uuid.as_ref());
         if let Some(index) = self.index_cache.get_with_key(&frag_reuse_cache_key).await {
-            return Ok(Arc::new(FragReuseIndexHandle(index)).as_index());
+            return Ok(Arc::new(CompactFragReuseIndexHandle(index)).as_index());
         }
 
         // Sometimes we want to open an index and we don't care if it is a scalar or vector index.
@@ -3351,7 +3353,7 @@ impl DatasetIndexInternalExt for Dataset {
     async fn open_frag_reuse_index(
         &self,
         metrics: &dyn MetricsCollector,
-    ) -> Result<Option<Arc<FragReuseIndex>>> {
+    ) -> Result<Option<Arc<CompactFragReuseIndex>>> {
         if let Some(frag_reuse_index_meta) = self.load_index_by_name(FRAG_REUSE_INDEX_NAME).await? {
             let frag_reuse_uuid = frag_reuse_index_meta.uuid;
             let frag_reuse_key = FragReuseIndexKey {
@@ -5901,7 +5903,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_remap_empty() {
+    async fn test_remap_empty_chain() {
         let data = gen_batch()
             .col("int", array::step::<Int32Type>())
             .col(
@@ -5918,10 +5920,18 @@ mod tests {
             .unwrap();
 
         let index_uuid = dataset.load_indices().await.unwrap()[0].uuid;
-        let remap_to_empty = (0..dataset.count_all_rows().await.unwrap())
+        let row_count = dataset.count_all_rows().await.unwrap();
+        let first_half = (0..row_count / 2)
             .map(|i| (i as u64, None))
             .collect::<HashMap<_, _>>();
-        let new_uuid = remap_index(&dataset, &index_uuid, &RowAddrRemap::direct(remap_to_empty))
+        let second_half = (row_count / 2..row_count)
+            .map(|i| (i as u64, None))
+            .collect::<HashMap<_, _>>();
+        let remap_to_empty = RowAddrRemap::chained([
+            RowAddrRemap::direct(first_half),
+            RowAddrRemap::direct(second_half),
+        ]);
+        let new_uuid = remap_index(&dataset, &index_uuid, &remap_to_empty)
             .await
             .unwrap();
         assert_eq!(new_uuid, RemapResult::Keep(index_uuid));
