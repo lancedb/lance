@@ -1025,6 +1025,20 @@ impl BlobPreprocessor {
                 .as_ref()
                 .map(|col| !col.is_null(i))
                 .unwrap_or(false);
+
+            if has_position != has_size {
+                return Err(Error::invalid_input(format!(
+                    "Blob v2 field '{}' row {i} must set both `position` and `size`, or neither",
+                    field.name()
+                )));
+            }
+            if has_position && !has_uri {
+                return Err(Error::invalid_input(format!(
+                    "Blob v2 field '{}' row {i} sets `position` and `size` but `uri` is null",
+                    field.name()
+                )));
+            }
+
             let data_len = if has_data { data_col.value(i).len() } else { 0 };
 
             if has_data && data_len > dedicated_threshold {
@@ -8049,6 +8063,91 @@ mod tests {
             blobs[1].as_ref().unwrap().read().await.unwrap().as_ref(),
             b"appended"
         );
+    }
+
+    #[rstest]
+    #[case::reference_missing_size(
+        ExternalBlobMode::Reference,
+        Some("file:///source.bin"),
+        Some(3),
+        None,
+        "both `position` and `size`"
+    )]
+    #[case::reference_missing_position(
+        ExternalBlobMode::Reference,
+        Some("file:///source.bin"),
+        None,
+        Some(2),
+        "both `position` and `size`"
+    )]
+    #[case::reference_range_without_uri(
+        ExternalBlobMode::Reference,
+        None,
+        Some(3),
+        Some(2),
+        "`uri` is null"
+    )]
+    #[case::ingest_missing_size(
+        ExternalBlobMode::Ingest,
+        Some("file:///source.bin"),
+        Some(3),
+        None,
+        "both `position` and `size`"
+    )]
+    #[case::ingest_missing_position(
+        ExternalBlobMode::Ingest,
+        Some("file:///source.bin"),
+        None,
+        Some(2),
+        "both `position` and `size`"
+    )]
+    #[case::ingest_range_without_uri(
+        ExternalBlobMode::Ingest,
+        None,
+        Some(3),
+        Some(2),
+        "`uri` is null"
+    )]
+    #[tokio::test]
+    async fn test_complete_blob_v2_rejects_invalid_ranges(
+        #[case] external_blob_mode: ExternalBlobMode,
+        #[case] uri: Option<&str>,
+        #[case] position: Option<u64>,
+        #[case] size: Option<u64>,
+        #[case] expected_message: &str,
+    ) {
+        let dataset_dir = TempDir::default();
+        let schema = Arc::new(Schema::new(vec![complete_blob_v2_field("blob", true)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![complete_blob_v2_array(
+                vec![None],
+                vec![uri.map(str::to_string)],
+                vec![position],
+                vec![size],
+                None,
+            )],
+        )
+        .unwrap();
+
+        let error = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &dataset_dir.path_str(),
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                allow_external_blob_outside_bases: matches!(
+                    external_blob_mode,
+                    ExternalBlobMode::Reference
+                ),
+                external_blob_mode,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains(expected_message));
     }
 
     #[tokio::test]

@@ -18,6 +18,7 @@ import pandas as pd
 import pyarrow as pa
 import pytest
 from lance import Blob, BlobColumn, BlobFile, DatasetBasePath
+from lance.blob import BlobType
 from lance.file import LanceFileSession
 from lance.fragment import write_fragments
 
@@ -977,6 +978,37 @@ def test_complete_blob_schema_survives_merge_insert(tmp_path):
     result = ds.to_table(blob_handling="all_binary").sort_by("id")
     assert result["id"].to_pylist() == [0, 1, 2]
     assert result["blob"].to_pylist() == [b"zero", b"updated", b"inserted"]
+
+
+@pytest.mark.parametrize(
+    ("use_uri", "position", "size"),
+    [
+        pytest.param(True, 3, None, id="missing-size"),
+        pytest.param(False, 3, 2, id="range-without-uri"),
+    ],
+)
+def test_complete_blob_rows_reject_invalid_ranges(tmp_path, use_uri, position, size):
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"0123456789")
+    storage = pa.StructArray.from_arrays(
+        [
+            pa.array([None], type=pa.large_binary()),
+            pa.array([source.as_uri() if use_uri else None], type=pa.utf8()),
+            pa.array([position], type=pa.uint64()),
+            pa.array([size], type=pa.uint64()),
+        ],
+        names=["data", "uri", "position", "size"],
+    )
+    blobs = pa.ExtensionArray.from_storage(BlobType(), storage)
+    table = pa.Table.from_arrays([blobs], schema=pa.schema([lance.blob_field("blob")]))
+
+    with pytest.raises(OSError, match="position|size|uri"):
+        lance.write_dataset(
+            table,
+            tmp_path / "dataset",
+            data_storage_version="2.2",
+            allow_external_blob_outside_bases=True,
+        )
 
 
 def test_blob_field_threshold_metadata():
