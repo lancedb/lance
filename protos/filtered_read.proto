@@ -62,10 +62,11 @@ message FilteredReadOptionsProto {
   optional uint64 io_buffer_size_bytes = 11;
   // Arrow IPC schema for decoding Substrait filters (may be wider than projection).
   optional bytes filter_schema_ipc = 12;
-  // If present, a nonzero upper bound on estimated bytes reserved by Blob v2
-  // materialization that is awaiting ordered emission in one scanner execution.
-  // One oversized output batch may exceed the bound when no other batch is reserved.
-  // If absent, Blob v2 materialization has no independent memory bound.
+  // If present, a nonzero upper bound on bytes reserved by Blob v2
+  // materialization awaiting ordered emission in one scanner execution.
+  // Admission follows output order; one oversized output batch may exceed the
+  // bound when no other batch is reserved. If absent, Blob v2 materialization
+  // has no independent memory bound.
   optional uint64 materialization_readahead_bytes = 13;
 }
 
