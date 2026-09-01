@@ -384,12 +384,14 @@ impl LanceStream {
                     let dataset = materialize_dataset.clone();
                     let output_projection = output_projection.clone();
                     let materialization_context = materialization_context.clone();
+                    let admission = materialization_context.admission();
                     async move {
-                        crate::dataset::blob::materialize_blob_v2_binary_batch_with_context(
+                        crate::dataset::blob::materialize_blob_v2_binary_batch_with_admission(
                             &dataset,
                             output_projection.as_ref(),
                             batch,
                             &materialization_context,
+                            admission,
                         )
                         .await
                         .map_err(DataFusionError::from)
