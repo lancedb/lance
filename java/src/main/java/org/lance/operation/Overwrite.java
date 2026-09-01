@@ -46,8 +46,14 @@ public class Overwrite extends SchemaOperation {
       List<BasePath> initialBases) {
     super(schema);
     this.fragments = fragments;
-    this.configUpsertValues = Optional.ofNullable(configUpsertValues);
-    this.initialBases = Optional.ofNullable(initialBases);
+    this.configUpsertValues =
+        configUpsertValues == null || configUpsertValues.isEmpty()
+            ? Optional.empty()
+            : Optional.of(configUpsertValues);
+    this.initialBases =
+        initialBases == null || initialBases.isEmpty()
+            ? Optional.empty()
+            : Optional.of(initialBases);
   }
 
   public List<FragmentMetadata> fragments() {

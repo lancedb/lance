@@ -35,6 +35,7 @@ use lance_table::io::commit::external_manifest::ExternalManifestCommitHandler;
 use prost::Message;
 use prost_types::Any;
 use roaring::RoaringBitmap;
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -89,6 +90,36 @@ fn nonnegative_jlong_to_u64(field: &str, value: i64) -> Result<u64> {
             "Java transaction field {field} must be non-negative, got {value}"
         ))
     })
+}
+
+fn import_unsigned_longs(
+    env: &mut JNIEnv<'_>,
+    object: &JObject<'_>,
+    method: &str,
+    field: &str,
+) -> Result<Vec<u64>> {
+    let index = Cell::new(0_usize);
+    import_vec_from_method(env, object, method, |env, value| {
+        let position = index.get();
+        index.set(position + 1);
+        nonnegative_jlong_to_u64(
+            &format!("{field}[{position}]"),
+            env.call_method(value, "longValue", "()J", &[])?.j()?,
+        )
+    })
+}
+
+fn export_unsigned_longs<'a>(
+    env: &mut JNIEnv<'a>,
+    values: &[u64],
+    field: &str,
+) -> Result<JObject<'a>> {
+    let values = values
+        .iter()
+        .enumerate()
+        .map(|(index, value)| u64_to_jlong(&format!("{field}[{index}]"), *value).map(JLance))
+        .collect::<Result<Vec<_>>>()?;
+    export_vec(env, &values)
 }
 
 impl IntoJava for &BasePath {
@@ -255,7 +286,10 @@ impl IntoJava for &DataReplacementGroup {
         Ok(env.new_object(
             "org/lance/operation/DataReplacement$DataReplacementGroup",
             "(JLorg/lance/fragment/DataFile;)V",
-            &[JValue::Long(fragment_id as i64), JValue::Object(&new_file)],
+            &[
+                JValue::Long(u64_to_jlong("dataReplacement.fragmentId", fragment_id)?),
+                JValue::Object(&new_file),
+            ],
         )?)
     }
 }
@@ -637,15 +671,25 @@ impl FromJObjectWithEnv<IndexMetadata> for JObject<'_> {
             })?;
 
         let name = env.get_string_from_method(self, "name")?;
-        let dataset_version = env.get_field(self, "datasetVersion", "J")?.j()? as u64;
+        let dataset_version = nonnegative_jlong_to_u64(
+            "index.datasetVersion",
+            env.get_field(self, "datasetVersion", "J")?.j()?,
+        )?;
 
         let fragment_bitmap: Option<RoaringBitmap> =
             env.get_optional_from_method(self, "fragments", |env, fragments_obj| {
                 let frag_ids = env.get_integers(&fragments_obj)?;
                 let bitmap = frag_ids
                     .iter()
-                    .map(|val| *val as u32)
-                    .collect::<RoaringBitmap>();
+                    .enumerate()
+                    .map(|(index, value)| {
+                        u32::try_from(*value).map_err(|_| {
+                            Error::input_error(format!(
+                                "index.fragments[{index}] must be non-negative, got {value}"
+                            ))
+                        })
+                    })
+                    .collect::<Result<RoaringBitmap>>()?;
                 Ok(bitmap)
             })?;
 
@@ -679,16 +723,28 @@ impl FromJObjectWithEnv<IndexMetadata> for JObject<'_> {
             env.get_optional_from_method(self, "getFiles", |env, files| {
                 crate::traits::import_vec_to_rust(env, &files, |env, file| file.extract_object(env))
             })?;
+        let files_size = files
+            .as_ref()
+            .map(|files| {
+                files.iter().try_fold(0_u64, |total, file| {
+                    total.checked_add(file.size_bytes).ok_or_else(|| {
+                        Error::input_error("index file sizes overflow u64".to_string())
+                    })
+                })
+            })
+            .transpose()?;
+        if let Some(files_size) = files_size {
+            i64::try_from(files_size).map_err(|_| {
+                Error::input_error(format!(
+                    "index file sizes total {files_size}, which cannot be represented by Java long"
+                ))
+            })?;
+        }
         if let Some(size_bytes) = env.get_optional_u64_from_method(self, "getSizeBytes")? {
-            let files = files.as_ref().ok_or_else(|| {
+            let files_size = files_size.ok_or_else(|| {
                 Error::input_error(format!(
                     "index sizeBytes={size_bytes} cannot be represented without files"
                 ))
-            })?;
-            let files_size = files.iter().try_fold(0_u64, |total, file| {
-                total
-                    .checked_add(file.size_bytes)
-                    .ok_or_else(|| Error::input_error("index file sizes overflow u64".to_string()))
             })?;
             if size_bytes != files_size {
                 return Err(Error::input_error(format!(
@@ -715,7 +771,10 @@ impl FromJObjectWithEnv<IndexMetadata> for JObject<'_> {
 
 impl FromJObjectWithEnv<DataReplacementGroup> for JObject<'_> {
     fn extract_object(&self, env: &mut JNIEnv<'_>) -> Result<DataReplacementGroup> {
-        let fragment_id = env.call_method(self, "fragmentId", "()J", &[])?.j()? as u64;
+        let fragment_id = nonnegative_jlong_to_u64(
+            "dataReplacement.fragmentId",
+            env.call_method(self, "fragmentId", "()J", &[])?.j()?,
+        )?;
         let new_file = env
             .call_method(self, "replacedFile", "()Lorg/lance/fragment/DataFile;", &[])?
             .l()?
@@ -819,7 +878,10 @@ pub(crate) fn convert_to_java_transaction<'local>(
         "org/lance/Transaction",
         "(JLjava/lang/String;Lorg/lance/operation/Operation;Ljava/lang/String;Ljava/util/Map;)V",
         &[
-            JValue::Long(transaction.read_version as i64),
+            JValue::Long(u64_to_jlong(
+                "transaction.readVersion",
+                transaction.read_version,
+            )?),
             JValue::Object(&uuid),
             JValue::Object(&operation),
             JValue::Object(&tag),
@@ -863,11 +925,8 @@ fn convert_to_java_operation_inner<'local>(
         } => {
             let updated_fragments_obj = export_vec(env, &updated_fragments)?;
 
-            let deleted_ids: Vec<JLance<i64>> = deleted_fragment_ids
-                .iter()
-                .map(|x| JLance(*x as i64))
-                .collect();
-            let removed_fragment_ids_obj = export_vec(env, &deleted_ids)?;
+            let removed_fragment_ids_obj =
+                export_unsigned_longs(env, &deleted_fragment_ids, "delete.deletedFragmentIds")?;
 
             let predicate_obj = env.new_string(&predicate)?;
 
@@ -936,11 +995,8 @@ fn convert_to_java_operation_inner<'local>(
             inserted_rows_filter,
             updated_fragment_offsets,
         } => {
-            let removed_ids: Vec<JLance<i64>> = removed_fragment_ids
-                .iter()
-                .map(|x| JLance(*x as i64))
-                .collect();
-            let removed_fragment_ids_obj = export_vec(env, &removed_ids)?;
+            let removed_fragment_ids_obj =
+                export_unsigned_longs(env, &removed_fragment_ids, "update.removedFragmentIds")?;
             let updated_fragments_obj = export_vec(env, &updated_fragments)?;
             let new_fragments_obj = export_vec(env, &new_fragments)?;
             let fields_modified = JLance(fields_modified.clone()).into_java(env)?;
@@ -986,7 +1042,10 @@ fn convert_to_java_operation_inner<'local>(
                             let java_key = env.new_object(
                                 "java/lang/Long",
                                 "(J)V",
-                                &[JValue::Long(*frag_id as i64)],
+                                &[JValue::Long(u64_to_jlong(
+                                    "update.updatedFragmentOffsets.fragmentId",
+                                    *frag_id,
+                                )?)],
                             )?;
                             let java_arr = env.new_byte_array(buf_i8.len() as i32)?;
                             env.set_byte_array_region(&java_arr, 0, buf_i8)?;
@@ -1132,12 +1191,15 @@ fn convert_to_java_operation_inner<'local>(
         Operation::Restore { version } => Ok(env.new_object(
             "org/lance/operation/Restore",
             "(J)V",
-            &[JValue::Long(version as i64)],
+            &[JValue::Long(u64_to_jlong("restore.version", version)?)],
         )?),
         Operation::ReserveFragments { num_fragments } => Ok(env.new_object(
             "org/lance/operation/ReserveFragments",
             "(I)V",
-            &[JValue::Int(num_fragments as i32)],
+            &[JValue::Int(u32_to_jint(
+                "reserveFragments.numFragments",
+                num_fragments,
+            )?)],
         )?),
         Operation::UpdateMemWalState { compacted_sstables } => {
             let compacted_sstables = export_compacted_sstables(env, &compacted_sstables)?;
@@ -1441,7 +1503,11 @@ fn convert_to_rust_transaction(
     allocator: Option<&JObject>,
     dataset: Option<&mut BlockingDataset>,
 ) -> Result<Transaction> {
-    let read_ver = env.get_u64_from_method(&java_transaction, "readVersion")?;
+    let read_ver = nonnegative_jlong_to_u64(
+        "transaction.readVersion",
+        env.call_method(&java_transaction, "readVersion", "()J", &[])?
+            .j()?,
+    )?;
     let uuid = env.get_string_from_method(&java_transaction, "uuid")?;
     let op = env
         .call_method(
@@ -1753,13 +1819,11 @@ fn convert_to_rust_operation(
                 |env, fragment| fragment.extract_object(env),
             )?;
 
-            let deleted_fragment_ids: Vec<u64> = import_vec_from_method(
+            let deleted_fragment_ids = import_unsigned_longs(
                 env,
                 java_operation,
                 "deletedFragmentIds",
-                |env, fragment_id| {
-                    Ok(env.call_method(fragment_id, "longValue", "()J", &[])?.j()? as u64)
-                },
+                "delete.deletedFragmentIds",
             )?;
 
             let predicate = env.get_string_from_method(java_operation, "predicate")?;
@@ -1835,13 +1899,11 @@ fn convert_to_rust_operation(
             }
         }
         "Update" => {
-            let removed_fragment_ids = import_vec_from_method(
+            let removed_fragment_ids = import_unsigned_longs(
                 env,
                 java_operation,
                 "removedFragmentIds",
-                |env, fragment_id| {
-                    Ok(env.call_method(fragment_id, "longValue", "()J", &[])?.j()? as u64)
-                },
+                "update.removedFragmentIds",
             )?;
 
             let updated_fragments: Vec<Fragment> = import_vec_from_method(
@@ -1909,8 +1971,10 @@ fn convert_to_rust_operation(
                                 let Some((key, value)) = iter.next(env)? else {
                                     return Ok(None);
                                 };
-                                let frag_id =
-                                    env.call_method(&key, "longValue", "()J", &[])?.j()? as u64;
+                                let frag_id = nonnegative_jlong_to_u64(
+                                    "update.updatedFragmentOffsets.fragmentId",
+                                    env.call_method(&key, "longValue", "()J", &[])?.j()?,
+                                )?;
                                 let buf: Vec<u8> =
                                     env.convert_byte_array(JByteArray::from(value))?;
                                 let bitmap = RoaringBitmap::deserialize_from(buf.as_slice())
@@ -1986,15 +2050,22 @@ fn convert_to_rust_operation(
             }
         }
         "Restore" => {
-            let version: u64 = env
-                .call_method(java_operation, "version", "()J", &[])?
-                .j()? as u64;
+            let version = nonnegative_jlong_to_u64(
+                "restore.version",
+                env.call_method(java_operation, "version", "()J", &[])?
+                    .j()?,
+            )?;
             return Ok(Operation::Restore { version });
         }
         "ReserveFragments" => {
-            let num_fragments = env
+            let java_num_fragments = env
                 .call_method(java_operation, "numFragments", "()I", &[])?
-                .i()? as u32;
+                .i()?;
+            let num_fragments = u32::try_from(java_num_fragments).map_err(|_| {
+                Error::input_error(format!(
+                    "reserveFragments.numFragments must be non-negative, got {java_num_fragments}"
+                ))
+            })?;
             return Ok(Operation::ReserveFragments { num_fragments });
         }
         "CreateIndex" => {

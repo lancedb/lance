@@ -60,7 +60,7 @@ public class Update implements Operation {
     this.fieldsModified = fieldsModified;
     this.fieldsForPreservingFragBitmap = fieldsForPreservingFragBitmap;
     Objects.requireNonNull(updateMode);
-    this.updateMode = updateMode.isPresent() ? updateMode : Optional.of(UpdateMode.RewriteRows);
+    this.updateMode = updateMode;
     this.updatedFragmentOffsets = updatedFragmentOffsets;
     this.compactedSstables = Objects.requireNonNull(compactedSstables);
     this.insertedRowsFilter = Optional.ofNullable(insertedRowsFilter);
@@ -90,10 +90,7 @@ public class Update implements Operation {
     return fieldsForPreservingFragBitmap;
   }
 
-  /**
-   * The update strategy. Builder input that is empty is normalized to {@link
-   * UpdateMode#RewriteRows}.
-   */
+  /** The update strategy, or empty when the caller did not specify one. */
   public Optional<UpdateMode> updateMode() {
     return updateMode;
   }

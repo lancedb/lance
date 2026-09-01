@@ -25,8 +25,13 @@ import org.lance.operation.Append;
 import org.lance.operation.Clone;
 import org.lance.operation.CreateIndex;
 import org.lance.operation.DataOverlay;
+import org.lance.operation.DataReplacement;
+import org.lance.operation.Delete;
 import org.lance.operation.KeyExistenceFilter;
+import org.lance.operation.Operation;
 import org.lance.operation.Overwrite;
+import org.lance.operation.ReserveFragments;
+import org.lance.operation.Restore;
 import org.lance.operation.Rewrite;
 import org.lance.operation.RewrittenIndex;
 import org.lance.operation.Update;
@@ -127,6 +132,11 @@ public class TransactionTest {
         try (Dataset committedDataset = new CommitBuilder(datasetPath, allocator).execute(txn)) {
           assertEquals(1, committedDataset.version());
           assertEquals(20, committedDataset.countRows());
+          try (Transaction read = committedDataset.readTransaction().orElseThrow()) {
+            Overwrite operation = assertInstanceOf(Overwrite.class, read.operation());
+            assertTrue(operation.getInitialBases().isEmpty());
+            assertTrue(operation.configUpsertValues().isEmpty());
+          }
         }
       }
     }
@@ -466,7 +476,7 @@ public class TransactionTest {
           KeyExistenceFilter readFilter = updateOperation.getInsertedRowsFilter().orElseThrow();
           assertArrayEquals(new int[] {0}, readFilter.getFieldIds());
           assertArrayEquals(new long[] {42}, readFilter.getExactKeyHashes());
-          assertEquals(Update.UpdateMode.RewriteRows, updateOperation.updateMode().orElseThrow());
+          assertTrue(updateOperation.updateMode().isEmpty());
           CompactedSsTable readCompacted = updateOperation.getCompactedSstables().get(0);
           assertEquals(compacted.getShardId(), readCompacted.getShardId());
           assertEquals(compacted.getGeneration(), readCompacted.getGeneration());
@@ -531,10 +541,18 @@ public class TransactionTest {
     assertTrue(
         Arrays.stream(Introspector.getBeanInfo(Update.class).getPropertyDescriptors())
             .anyMatch(property -> property.getName().equals("insertedRowsFilter")));
-    assertEquals(
-        Update.UpdateMode.RewriteRows, Update.builder().build().updateMode().orElseThrow());
+    assertTrue(Update.builder().build().updateMode().isEmpty());
     assertThrows(
         NullPointerException.class, () -> Update.builder().compactedSstables(null).build());
+    Overwrite emptyOverwrite =
+        Overwrite.builder()
+            .fragments(Collections.emptyList())
+            .schema(new Schema(Collections.emptyList()))
+            .configUpsertValues(Collections.emptyMap())
+            .initialBases(Collections.emptyList())
+            .build();
+    assertTrue(emptyOverwrite.configUpsertValues().isEmpty());
+    assertTrue(emptyOverwrite.getInitialBases().isEmpty());
   }
 
   @Test
@@ -590,6 +608,35 @@ public class TransactionTest {
                 IllegalArgumentException.class, () -> new CommitBuilder(dataset).execute(mismatch));
         assertTrue(error.getMessage().contains("does not match"));
       }
+
+      try (Dataset dataset = Dataset.open(datasetPath, allocator)) {
+        for (List<IndexFile> files :
+            Arrays.asList(
+                Arrays.asList(
+                    new IndexFile("large-a.idx", Long.MAX_VALUE), new IndexFile("large-b.idx", 1)),
+                Arrays.asList(
+                    new IndexFile("overflow-a.idx", Long.MAX_VALUE),
+                    new IndexFile("overflow-b.idx", Long.MAX_VALUE),
+                    new IndexFile("overflow-c.idx", Long.MAX_VALUE)))) {
+          try (Transaction transaction =
+              new Transaction.Builder()
+                  .readVersion(dataset.version())
+                  .operation(
+                      CreateIndex.builder()
+                          .withNewIndices(
+                              Collections.singletonList(indexMetadata("too-large", null, files)))
+                          .build())
+                  .build()) {
+            IllegalArgumentException error =
+                assertThrows(
+                    IllegalArgumentException.class,
+                    () -> new CommitBuilder(dataset).execute(transaction));
+            assertTrue(
+                error.getMessage().contains("cannot be represented")
+                    || error.getMessage().contains("overflow"));
+          }
+        }
+      }
     }
   }
 
@@ -614,6 +661,15 @@ public class TransactionTest {
       TestUtils.SimpleTestDataset testDataset =
           new TestUtils.SimpleTestDataset(allocator, datasetPath);
       try (Dataset dataset = testDataset.createEmptyDataset()) {
+        try (Transaction transaction =
+            new Transaction.Builder().readVersion(-1).operation(Update.builder().build()).build()) {
+          IllegalArgumentException error =
+              assertThrows(
+                  IllegalArgumentException.class,
+                  () -> new CommitBuilder(dataset).execute(transaction));
+          assertTrue(error.getMessage().contains("transaction.readVersion"));
+        }
+
         for (long invalid : new long[] {-1, 1L << 32}) {
           for (boolean preserving : new boolean[] {false, true}) {
             Update.Builder update = Update.builder();
@@ -673,7 +729,80 @@ public class TransactionTest {
                   () -> new CommitBuilder(dataset).execute(transaction));
           assertTrue(error.getMessage().contains("dataOverlay.fragmentId"));
         }
+
+        assertInvalidOperation(
+            dataset,
+            Delete.builder().deletedFragmentIds(Collections.singletonList(-1L)).build(),
+            "delete.deletedFragmentIds[0]");
+        assertInvalidOperation(
+            dataset,
+            Update.builder().removedFragmentIds(Collections.singletonList(-1L)).build(),
+            "update.removedFragmentIds[0]");
+        assertInvalidOperation(
+            dataset,
+            Update.builder()
+                .updatedFragmentOffsets(Collections.singletonMap(-1L, OFFSETS_1_3_5))
+                .build(),
+            "updatedFragmentOffsets.fragmentId");
+        assertInvalidOperation(dataset, Restore.builder().version(-1).build(), "restore.version");
+        assertInvalidOperation(
+            dataset,
+            ReserveFragments.builder().numFragments(-1).build(),
+            "reserveFragments.numFragments");
+        assertInvalidOperation(
+            dataset,
+            DataReplacement.builder()
+                .replacements(
+                    Collections.singletonList(
+                        new DataReplacement.DataReplacementGroup(-1, dataFile)))
+                .build(),
+            "dataReplacement.fragmentId");
+        assertInvalidOperation(
+            dataset,
+            CreateIndex.builder()
+                .withNewIndices(
+                    Collections.singletonList(
+                        Index.builder()
+                            .uuid(UUID.randomUUID())
+                            .fields(Collections.singletonList(0))
+                            .coveringFields(Collections.emptyList())
+                            .name("negative-version")
+                            .datasetVersion(-1)
+                            .indexVersion(0)
+                            .indexType(IndexType.BTREE)
+                            .build()))
+                .build(),
+            "index.datasetVersion");
+        assertInvalidOperation(
+            dataset,
+            CreateIndex.builder()
+                .withNewIndices(
+                    Collections.singletonList(
+                        Index.builder()
+                            .uuid(UUID.randomUUID())
+                            .fields(Collections.singletonList(0))
+                            .coveringFields(Collections.emptyList())
+                            .name("negative-fragment")
+                            .datasetVersion(1)
+                            .fragments(Collections.singletonList(-1))
+                            .indexVersion(0)
+                            .indexType(IndexType.BTREE)
+                            .build()))
+                .build(),
+            "index.fragments[0]");
       }
+    }
+  }
+
+  private static void assertInvalidOperation(
+      Dataset dataset, Operation operation, String expectedMessage) {
+    try (Transaction transaction =
+        new Transaction.Builder().readVersion(dataset.version()).operation(operation).build()) {
+      IllegalArgumentException error =
+          assertThrows(
+              IllegalArgumentException.class,
+              () -> new CommitBuilder(dataset).execute(transaction));
+      assertTrue(error.getMessage().contains(expectedMessage), error.getMessage());
     }
   }
 
