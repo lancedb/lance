@@ -1167,8 +1167,16 @@ impl MemTableScanner {
             .as_ref()
             .map(|_| self.indexes.has_pk_index() && !self.indexes.pk_has_overrides())
             .unwrap_or(true);
+        // A distance lower bound excludes the *nearest* rows, and
+        // `VectorIndexExec` can only drop them after the graph search has
+        // already cut to k — leaving fewer than k in-range rows, or none.
+        // Brute force filters the complete candidate set before its cut, so it
+        // is the only correct arm here. An upper bound is safe on HNSW: it
+        // trims the far tail, which the top-k would have dropped anyway.
+        let hnsw_safe_with_bounds = query.distance_lower_bound.is_none();
         let exec: Arc<dyn ExecutionPlan> = if filter_predicate.is_none()
             && hnsw_safe_with_pk
+            && hnsw_safe_with_bounds
             && self.has_vector_index(&query.column)
         {
             Arc::new(VectorIndexExec::new(
