@@ -605,6 +605,10 @@ impl FilteredReadStream {
         );
 
         let output_schema = public_blob_v2_binary_projection_schema(&options.projection);
+        let materialization_context = crate::dataset::blob::BlobMaterializationContext::new(
+            options.io_buffer_size_bytes,
+            options.materialization_readahead_bytes,
+        );
 
         // Get scan_range_after_filter from the plan
         let scan_range_after_filter = plan.scan_range_after_filter.clone();
@@ -632,9 +636,16 @@ impl FilteredReadStream {
                     let metrics = global_metrics_clone.clone();
                     let limit = scan_range_after_filter.as_ref().map(|r| r.end);
                     let dataset = dataset.clone();
+                    let materialization_context = materialization_context.clone();
                     SpawnedTask::spawn(
-                        Self::read_fragment(dataset, scoped_fragment, metrics, limit)
-                            .in_current_span(),
+                        Self::read_fragment(
+                            dataset,
+                            scoped_fragment,
+                            metrics,
+                            limit,
+                            materialization_context,
+                        )
+                        .in_current_span(),
                     )
                     .map(|thread_result| thread_result.unwrap())
                 }
@@ -1409,6 +1420,7 @@ impl FilteredReadStream {
         mut fragment_read_task: ScopedFragmentRead,
         global_metrics: Arc<FilteredReadGlobalMetrics>,
         fragment_soft_limit: Option<u64>,
+        materialization_context: Arc<crate::dataset::blob::BlobMaterializationContext>,
     ) -> Result<BoxStream<'static, Result<ReadBatchFut>>> {
         let output_schema =
             public_blob_v2_binary_projection_schema(fragment_read_task.projection.as_ref());
@@ -1502,14 +1514,17 @@ impl FilteredReadStream {
                 if materialize_blob_v2_binary {
                     let dataset = dataset.clone();
                     let output_read_schema = output_read_schema.clone();
+                    let materialization_context = materialization_context.clone();
                     batch_fut
                         .and_then(move |batch| async move {
-                            crate::dataset::blob::materialize_blob_v2_binary_batch(
+                            crate::dataset::blob::materialize_blob_v2_binary_batch_with_context(
                                 &dataset,
                                 output_read_schema.as_ref(),
                                 batch,
+                                &materialization_context,
                             )
                             .await
+                            .map(|batch| batch.into_batch())
                         })
                         .boxed()
                 } else {
@@ -1656,6 +1671,8 @@ pub struct FilteredReadOptions {
     pub threading_mode: FilteredReadThreadingMode,
     /// The size of the I/O buffer to use for the scan
     pub io_buffer_size_bytes: Option<u64>,
+    /// Total memory budget for asynchronously materialized blob v2 batches
+    pub materialization_readahead_bytes: Option<u64>,
     /// If true, skip fragments that are not covered by the scalar index result.
     pub only_indexed_fragments: bool,
     /// Row addresses whose index entries may be stale because an overlay committed after the
@@ -1693,6 +1710,7 @@ impl FilteredReadOptions {
             full_filter: None,
             physical_filters: Vec::new(),
             io_buffer_size_bytes: None,
+            materialization_readahead_bytes: None,
             only_indexed_fragments: false,
             overlay_block: None,
             threading_mode: FilteredReadThreadingMode::OnePartitionMultipleThreads(
@@ -1893,6 +1911,12 @@ impl FilteredReadOptions {
         self
     }
 
+    /// Specify the memory budget for asynchronous blob v2 materialization.
+    pub fn with_materialization_readahead_bytes(mut self, size: u64) -> Self {
+        self.materialization_readahead_bytes = Some(size);
+        self
+    }
+
     /// Only read fragments covered by a scalar index result.
     pub fn with_only_indexed_fragments(mut self) -> Self {
         self.only_indexed_fragments = true;
@@ -2036,6 +2060,11 @@ impl FilteredReadExec {
         options: FilteredReadOptions,
         input: Option<Arc<dyn ExecutionPlan>>,
     ) -> Result<Self> {
+        if options.materialization_readahead_bytes == Some(0) {
+            return Err(Error::invalid_input_source(
+                "materialization_readahead_bytes must be greater than 0, got 0".into(),
+            ));
+        }
         match input {
             Some(input) if Self::is_index_query_schema(input.schema().as_ref()) => {
                 Self::try_new_scan(dataset, options, Some(input))
