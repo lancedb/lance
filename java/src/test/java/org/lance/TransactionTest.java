@@ -630,6 +630,12 @@ public class TransactionTest {
             Arrays.asList(new IndexFile("a.idx", 10), new IndexFile("b.idx", 20)));
     assertEquals(30L, consistent.getSizeBytes().orElseThrow());
     assertEquals(2, consistent.getFiles().orElseThrow().size());
+    Index derived =
+        indexMetadata(
+            "derived",
+            null,
+            Arrays.asList(new IndexFile("derived-a.idx", 10), new IndexFile("derived-b.idx", 20)));
+    assertEquals(30L, derived.getSizeBytes().orElseThrow());
 
     String datasetPath = tempDir.resolve("index_files").toString();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
@@ -681,23 +687,10 @@ public class TransactionTest {
                     new IndexFile("overflow-a.idx", Long.MAX_VALUE),
                     new IndexFile("overflow-b.idx", Long.MAX_VALUE),
                     new IndexFile("overflow-c.idx", Long.MAX_VALUE)))) {
-          try (Transaction transaction =
-              new Transaction.Builder()
-                  .readVersion(dataset.version())
-                  .operation(
-                      CreateIndex.builder()
-                          .withNewIndices(
-                              Collections.singletonList(indexMetadata("too-large", null, files)))
-                          .build())
-                  .build()) {
-            IllegalArgumentException error =
-                assertThrows(
-                    IllegalArgumentException.class,
-                    () -> new CommitBuilder(dataset).execute(transaction));
-            assertTrue(
-                error.getMessage().contains("cannot be represented")
-                    || error.getMessage().contains("overflow"));
-          }
+          IllegalArgumentException error =
+              assertThrows(
+                  IllegalArgumentException.class, () -> indexMetadata("too-large", null, files));
+          assertTrue(error.getMessage().contains("cannot be represented"));
         }
       }
     }

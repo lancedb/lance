@@ -67,7 +67,20 @@ public class Index {
     this.createdAt = createdAt;
     this.baseId = baseId;
     boolean hasFiles = files != null && !files.isEmpty();
-    this.sizeBytes = !hasFiles && Long.valueOf(0).equals(sizeBytes) ? null : sizeBytes;
+    if (hasFiles && sizeBytes == null) {
+      long derivedSizeBytes = 0;
+      try {
+        for (IndexFile file : files) {
+          derivedSizeBytes = Math.addExact(derivedSizeBytes, file.getSizeBytes());
+        }
+      } catch (ArithmeticException e) {
+        throw new IllegalArgumentException(
+            "index file sizes cannot be represented by Java long", e);
+      }
+      this.sizeBytes = derivedSizeBytes;
+    } else {
+      this.sizeBytes = !hasFiles && Long.valueOf(0).equals(sizeBytes) ? null : sizeBytes;
+    }
     this.files = hasFiles ? files : null;
     this.indexType = indexType;
   }
