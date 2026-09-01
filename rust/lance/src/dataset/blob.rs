@@ -2428,7 +2428,7 @@ impl Drop for BlobMaterializationReservation {
 
 /// Shared state for asynchronously materializing blob v2 descriptor batches.
 #[derive(Debug)]
-pub(crate) struct BlobMaterializationContext {
+pub struct BlobMaterializationContext {
     execution: Arc<ReadBlobsExecution>,
     budget: Option<Arc<BlobMaterializationBudget>>,
 }
@@ -2459,7 +2459,7 @@ impl BlobMaterializationContext {
 }
 
 /// A materialized batch that retains its byte-budget reservation until yielded.
-pub(crate) struct MaterializedBlobBatch {
+pub struct MaterializedBlobBatch {
     batch: RecordBatch,
     _reservation: Option<BlobMaterializationReservation>,
 }
@@ -2960,6 +2960,7 @@ fn execute_blob_read_plans_stream(
         .boxed()
 }
 
+#[cfg(test)]
 async fn execute_blob_entries(
     entries: Vec<BlobEntry>,
     io_parallelism: usize,
@@ -3454,7 +3455,7 @@ pub async fn materialize_blob_v2_binary_batch(
     )
 }
 
-pub(crate) async fn materialize_blob_v2_binary_batch_with_context(
+pub async fn materialize_blob_v2_binary_batch_with_context(
     dataset: &Arc<Dataset>,
     output_schema: &Schema,
     batch: RecordBatch,
