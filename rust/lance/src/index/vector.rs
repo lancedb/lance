@@ -8,6 +8,7 @@ use lance_core::utils::row_addr_remap::RowAddrRemap;
 use std::sync::Arc;
 use std::{any::Any, collections::HashMap};
 
+mod bounded_partition_stream;
 pub mod builder;
 pub(crate) mod details;
 pub mod hamming;
