@@ -4,6 +4,7 @@
 mod validate;
 
 use super::Dataset;
+use crate::io::deletion::read_dataset_deletion_file;
 use crate::session::caches::{RowIdIndexKey, RowIdSequenceKey};
 use crate::{Error, Result};
 use futures::{Stream, StreamExt, TryFutureExt, TryStreamExt};
@@ -18,45 +19,56 @@ use std::sync::Arc;
 pub(super) use validate::validate_stable_row_ids;
 
 /// Load a row id sequence from the given dataset and fragment.
+///
+/// Served from this version's cached [`RowIdIndex`] when there is one, since
+/// the index owns every committed sequence already; otherwise from the
+/// metadata cache, decoding on a miss.
 pub async fn load_row_id_sequence(
     dataset: &Dataset,
     fragment: &Fragment,
 ) -> Result<Arc<RowIdSequence>> {
+    let Some(row_id_meta) = &fragment.row_id_meta else {
+        return Err(Error::internal("Missing row id meta"));
+    };
+    let index_key = RowIdIndexKey {
+        version: dataset.manifest.version,
+    };
+    // The index holds the committed sequence of a fragment id; an uncommitted
+    // rewrite of the same fragment must not read as it.
+    if let Some(index) = dataset.metadata_cache.get_with_key(&index_key).await
+        && dataset
+            .find_fragment(fragment.id)
+            .is_some_and(|committed| committed.row_id_meta.as_ref() == Some(row_id_meta))
+        && let Some(sequence) = index.sequence(fragment.id as u32)
+    {
+        return Ok(sequence.clone());
+    }
+    let key = RowIdSequenceKey {
+        fragment_id: fragment.id,
+        row_id_meta,
+    };
+    dataset
+        .metadata_cache
+        .get_or_insert_with_key(key, || read_row_id_sequence(dataset, fragment))
+        .await
+}
+
+/// Decode the row id sequence of `fragment`, bypassing every cache.
+async fn read_row_id_sequence(dataset: &Dataset, fragment: &Fragment) -> Result<RowIdSequence> {
     match &fragment.row_id_meta {
         None => Err(Error::internal("Missing row id meta")),
-        Some(row_id_meta @ RowIdMeta::Inline(data)) => {
-            let data = data.clone();
-            let key = RowIdSequenceKey {
-                fragment_id: fragment.id,
-                row_id_meta,
-            };
-            dataset
-                .metadata_cache
-                .get_or_insert_with_key(key, || async move { read_row_ids(&data) })
-                .await
-        }
-        Some(row_id_meta @ RowIdMeta::External(file_slice)) => {
-            let file_slice = file_slice.clone();
-            let dataset_clone = dataset.clone();
-            let key = RowIdSequenceKey {
-                fragment_id: fragment.id,
-                row_id_meta,
-            };
-            dataset
-                .metadata_cache
-                .get_or_insert_with_key(key, || async move {
-                    let path = dataset_clone.base.clone().join(file_slice.path.as_str());
-                    let range = file_slice.offset as usize
-                        ..(file_slice.offset as usize + file_slice.size as usize);
-                    let data = dataset_clone
-                        .object_store
-                        .open(&path)
-                        .await?
-                        .get_range(range)
-                        .await?;
-                    read_row_ids(&data)
-                })
-                .await
+        Some(RowIdMeta::Inline(data)) => read_row_ids(data),
+        Some(RowIdMeta::External(file_slice)) => {
+            let path = dataset.base.clone().join(file_slice.path.as_str());
+            let range =
+                file_slice.offset as usize..(file_slice.offset as usize + file_slice.size as usize);
+            let data = dataset
+                .object_store
+                .open(&path)
+                .await?
+                .get_range(range)
+                .await?;
+            read_row_ids(&data)
         }
     }
 }
@@ -76,9 +88,7 @@ pub fn load_row_id_sequences<'a>(
         .buffer_unordered(dataset.object_store.io_parallelism())
 }
 
-pub async fn get_row_id_index(
-    dataset: &Dataset,
-) -> Result<Option<Arc<lance_table::rowids::RowIdIndex>>> {
+pub async fn get_row_id_index(dataset: &Dataset) -> Result<Option<Arc<RowIdIndex>>> {
     if dataset.manifest.uses_stable_row_ids() {
         let key = RowIdIndexKey {
             version: dataset.manifest.version,
@@ -233,50 +243,40 @@ async fn row_addrs_to_row_ids_impl(
     Ok(ids)
 }
 
-async fn load_row_id_index(dataset: &Dataset) -> Result<lance_table::rowids::RowIdIndex> {
-    let sequences = load_row_id_sequences(dataset, &dataset.manifest.fragments)
-        .try_collect::<Vec<_>>()
-        .await?;
-
-    let fragments = dataset.get_fragments();
-    let fragment_map: std::collections::HashMap<u32, &crate::dataset::fragment::FileFragment> =
-        fragments.iter().map(|f| (f.id() as u32, f)).collect();
-
-    let fragment_indices: Vec<_> =
-        futures::stream::iter(sequences.into_iter().map(|(fragment_id, sequence)| {
-            let fragment = fragment_map
-                .get(&fragment_id)
-                .expect("Fragment should exist");
-            let has_deletion_file = fragment.metadata().deletion_file.is_some();
-            let fragment_clone = (*fragment).clone();
-            async move {
-                let deletion_vector = if has_deletion_file {
-                    fragment_clone
-                        .get_deletion_vector()
-                        .await?
-                        .ok_or_else(|| {
-                            Error::internal(format!(
-                                "fragment_id={fragment_id} has deletion-file metadata but no deletion vector"
-                            ))
-                        })?
-                } else {
-                    Arc::new(DeletionVector::default())
-                };
-
-                Ok::<FragmentRowIdIndex, Error>(FragmentRowIdIndex {
-                    fragment_id,
-                    row_id_sequence: sequence,
-                    deletion_vector,
-                })
-            }
-        }))
+/// Build the index from freshly decoded sequences. The index then owns their
+/// memory alone, so its cache charge is exact and it stays cached whenever it
+/// fits; reading them through the sequence cache instead would charge each
+/// sequence twice and leave a large table's index too heavy to keep.
+async fn load_row_id_index(dataset: &Dataset) -> Result<RowIdIndex> {
+    // A `for` loop rather than `map`: a closure returning a future that borrows
+    // its argument trips the higher-ranked lifetime check on the outer future.
+    let mut loads = Vec::with_capacity(dataset.manifest.fragments.len());
+    for fragment in dataset.manifest.fragments.iter() {
+        loads.push(read_fragment_row_id_index(dataset, fragment));
+    }
+    let fragment_indices: Vec<FragmentRowIdIndex> = futures::stream::iter(loads)
         .buffer_unordered(dataset.object_store.io_parallelism())
         .try_collect()
         .await?;
+    RowIdIndex::new(&fragment_indices)
+}
 
-    let index = RowIdIndex::new(&fragment_indices)?;
-
-    Ok(index)
+async fn read_fragment_row_id_index(
+    dataset: &Dataset,
+    fragment: &Fragment,
+) -> Result<FragmentRowIdIndex> {
+    let row_id_sequence = Arc::new(read_row_id_sequence(dataset, fragment).await?);
+    let deletion_vector = match &fragment.deletion_file {
+        None => Arc::new(DeletionVector::default()),
+        Some(deletion_file) => {
+            read_dataset_deletion_file(dataset, fragment.id, deletion_file).await?
+        }
+    };
+    Ok(FragmentRowIdIndex {
+        fragment_id: fragment.id as u32,
+        row_id_sequence,
+        deletion_vector,
+    })
 }
 
 #[cfg(test)]
@@ -303,6 +303,7 @@ mod test {
     use lance_datagen::Dimension;
     use lance_index::{IndexType, scalar::ScalarIndexParams};
     use lance_io::object_store::ObjectStoreParams;
+    use lance_table::rowids::write_row_ids;
     use std::collections::HashMap;
     use std::collections::HashSet;
 
@@ -395,6 +396,55 @@ mod test {
         assert_eq!(found_addresses, expected_addresses);
 
         assert_eq!(dataset.manifest().next_row_id, num_rows);
+    }
+
+    #[tokio::test]
+    async fn test_row_id_index_owns_the_sequences_it_caches() {
+        let batch = sequence_batch(0..30);
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+        let write_params = WriteParams {
+            enable_stable_row_ids: true,
+            max_rows_per_file: 10,
+            ..Default::default()
+        };
+        let dataset = Dataset::write(reader, "memory://", Some(write_params))
+            .await
+            .unwrap();
+        let session = dataset.session();
+
+        // Building the index adds one cache entry: the index, which holds its
+        // sequences itself rather than reading them through their own entries.
+        let entries_before = session.metadata_cache_stats().await.num_entries;
+        let index = get_row_id_index(&dataset).await.unwrap().unwrap();
+        assert_eq!(
+            session.metadata_cache_stats().await.num_entries,
+            entries_before + 1
+        );
+        let again = get_row_id_index(&dataset).await.unwrap().unwrap();
+        assert!(Arc::ptr_eq(&index, &again));
+
+        // A sequence lookup is answered from the cached index, not a second copy.
+        let fragment = &dataset.manifest.fragments[1];
+        let sequence = load_row_id_sequence(&dataset, fragment).await.unwrap();
+        assert!(Arc::ptr_eq(
+            &sequence,
+            index.sequence(fragment.id as u32).unwrap()
+        ));
+        assert_eq!(
+            session.metadata_cache_stats().await.num_entries,
+            entries_before + 1
+        );
+
+        // An uncommitted rewrite of the same fragment id carries other row ids
+        // and must not be answered from the index.
+        let rewritten_ids = RowIdSequence::from(100..110);
+        let mut rewritten = fragment.clone();
+        rewritten.row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&rewritten_ids).into()));
+        let sequence = load_row_id_sequence(&dataset, &rewritten).await.unwrap();
+        assert_eq!(
+            sequence.iter().collect::<Vec<_>>(),
+            (100..110).collect::<Vec<_>>()
+        );
     }
 
     #[tokio::test]
