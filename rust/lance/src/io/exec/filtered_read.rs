@@ -6111,6 +6111,10 @@ mod tests {
             .await
             .expect("row-stream blob materialization must make progress");
             let output = concat_batches(&plan.schema(), &batches).unwrap();
+            assert!(
+                plan.materialization_context.peak_reserved_bytes()
+                    >= (101 * first_payload.len()) as u64
+            );
             let blobs = output
                 .column_by_name("blob")
                 .unwrap()

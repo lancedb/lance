@@ -2344,6 +2344,8 @@ struct BlobMaterializationBudgetState {
     next_ticket: u64,
     serving_ticket: u64,
     cancelled_tickets: HashSet<u64>,
+    #[cfg(test)]
+    peak_reserved: u64,
 }
 
 impl BlobMaterializationBudgetState {
@@ -2395,6 +2397,10 @@ impl BlobMaterializationAdmission {
                 let oversized_and_idle = state.reserved == 0 && bytes > budget.limit;
                 if self.ticket == state.serving_ticket && (fits || oversized_and_idle) {
                     state.reserved = state.reserved.saturating_add(bytes);
+                    #[cfg(test)]
+                    {
+                        state.peak_reserved = state.peak_reserved.max(state.reserved);
+                    }
                     state.serving_ticket = state.serving_ticket.wrapping_add(1);
                     state.skip_cancelled();
                     self.acquired = true;
@@ -2478,6 +2484,14 @@ impl BlobMaterializationContext {
                 acquired: false,
             },
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn peak_reserved_bytes(&self) -> u64 {
+        self.budget
+            .as_ref()
+            .map(|budget| budget.state.lock().unwrap().peak_reserved)
+            .unwrap_or(0)
     }
 }
 
