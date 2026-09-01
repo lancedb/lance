@@ -49,7 +49,6 @@ use lance_file::versions::v1::reader::{FileReader as V1FileReader, read_batch as
 use lance_file::{LanceEncodingsIo, determine_file_version, versions as file_versions};
 use lance_io::ReadBatchParams;
 use lance_io::scheduler::{FileScheduler, ScanScheduler, SchedulerConfig};
-use lance_io::stream::RecordBatchStream;
 use lance_io::utils::CachedFileSize;
 use lance_table::format::overlay::TOMBSTONE_FIELD_ID;
 use lance_table::format::{DataFile, DeletionFile, Fragment};
@@ -70,7 +69,6 @@ use super::scanner::Scanner;
 
 use super::updater::Updater;
 use super::{NewColumnTransform, WriteParams, schema_evolution, versions};
-use crate::blob::prepared_to_logical_blob_schema;
 use crate::dataset::Dataset;
 use crate::dataset::fragment::session::FragmentSession;
 use crate::dataset::overlay::{
@@ -746,70 +744,6 @@ fn relax_nullability(field: &ArrowField) -> ArrowField {
         other => other.clone(),
     };
     ArrowField::new(field.name(), data_type, true).with_metadata(field.metadata().clone())
-}
-
-/// Build the projection shape from the requested schema while preserving a
-/// blob leaf's accepted logical/prepared representation from the staged batch.
-fn staged_projection_field(staged: &ArrowField, requested: &ArrowField) -> ArrowField {
-    if crate::blob::blob_v2_layout(staged).is_some() {
-        return relax_nullability(staged);
-    }
-
-    let data_type = match (staged.data_type(), requested.data_type()) {
-        (DataType::Struct(staged_children), DataType::Struct(requested_children)) => {
-            DataType::Struct(
-                requested_children
-                    .iter()
-                    .map(|requested_child| {
-                        let staged_child = staged_children
-                            .iter()
-                            .find(|field| field.name() == requested_child.name())
-                            .expect("compatible struct contains every requested child");
-                        Arc::new(staged_projection_field(staged_child, requested_child))
-                    })
-                    .collect(),
-            )
-        }
-        (DataType::List(staged_item), DataType::List(requested_item)) => DataType::List(Arc::new(
-            staged_projection_field(staged_item, requested_item),
-        )),
-        (DataType::LargeList(staged_item), DataType::LargeList(requested_item)) => {
-            DataType::LargeList(Arc::new(staged_projection_field(
-                staged_item,
-                requested_item,
-            )))
-        }
-        (
-            DataType::FixedSizeList(staged_item, _),
-            DataType::FixedSizeList(requested_item, width),
-        ) => DataType::FixedSizeList(
-            Arc::new(staged_projection_field(staged_item, requested_item)),
-            *width,
-        ),
-        (DataType::Map(staged_entries, _), DataType::Map(requested_entries, sorted)) => {
-            match (staged_entries.data_type(), requested_entries.data_type()) {
-                (DataType::Struct(staged_kv), DataType::Struct(requested_kv))
-                    if staged_kv.len() == 2 && requested_kv.len() == 2 =>
-                {
-                    let key = Arc::new(
-                        staged_projection_field(&staged_kv[0], &requested_kv[0])
-                            .with_nullable(false),
-                    );
-                    let value = Arc::new(staged_projection_field(&staged_kv[1], &requested_kv[1]));
-                    let entries = ArrowField::new(
-                        requested_entries.name(),
-                        DataType::Struct(vec![key, value].into()),
-                        false,
-                    )
-                    .with_metadata(requested_entries.metadata().clone());
-                    DataType::Map(Arc::new(entries), *sorted)
-                }
-                _ => requested.data_type().clone(),
-            }
-        }
-        _ => requested.data_type().clone(),
-    };
-    ArrowField::new(requested.name(), data_type, true).with_metadata(requested.metadata().clone())
 }
 
 impl FileFragment {
@@ -2383,35 +2317,11 @@ impl FileFragment {
     /// Callers should take care to set the read version correctly. If this is
     /// not done then multiple replacements to the same field will not be
     /// detected as a conflict.
-    ///
-    /// ```
-    /// # use arrow_array::RecordBatch;
-    /// # use futures::stream;
-    /// # use lance::{dataset::fragment::FileFragment, Result};
-    /// # use lance_core::datatypes::Schema;
-    /// # async fn stage(
-    /// #     fragment: &FileFragment,
-    /// #     batch: RecordBatch,
-    /// #     schema: &Schema,
-    /// # ) -> Result<()> {
-    /// let replacement = fragment
-    ///     .write_columns(stream::iter([Ok(batch)]), schema)
-    ///     .await?;
-    /// # let _ = replacement;
-    /// # Ok(())
-    /// # }
-    /// ```
     pub async fn write_columns(
         &self,
         data: impl Stream<Item = Result<RecordBatch>> + Send,
         schema: &Schema,
     ) -> Result<super::transaction::DataReplacementGroup> {
-        if schema.fields.is_empty() {
-            return Err(Error::invalid_input(format!(
-                "write_columns requires at least one target field for fragment {}",
-                self.id()
-            )));
-        }
         let expected_rows = self.physical_rows().await? as u64;
 
         // Readers take everything but the field id from the manifest, so a
@@ -2478,8 +2388,17 @@ impl FileFragment {
         }
         let writer_schema = Schema {
             fields: writer_fields,
-            metadata: dataset_schema.metadata.clone(),
+            metadata: schema.metadata.clone(),
         };
+        let batch_schema = ArrowSchema::from(&writer_schema);
+        let projection_schema = ArrowSchema::new(
+            batch_schema
+                .fields()
+                .iter()
+                .map(|field| relax_nullability(field))
+                .collect::<Vec<_>>(),
+        );
+
         let file_version = self
             .dataset
             .manifest
@@ -2535,9 +2454,8 @@ impl FileFragment {
                     return Err(self.schema_mismatch(format!("column '{duplicate}' appears twice")));
                 }
                 LanceSchema::try_from(batch.schema_ref().as_ref())
-                    .and_then(|staged| prepared_to_logical_blob_schema(&staged))
-                    .and_then(|normalized_staged| {
-                        normalized_staged.check_compatible(
+                    .and_then(|staged| {
+                        staged.check_compatible(
                             &writer_schema,
                             &SchemaCompareOptions {
                                 compare_nullability: NullabilityComparison::Ignore,
@@ -2547,20 +2465,6 @@ impl FileFragment {
                         )
                     })
                     .map_err(|mismatch| self.schema_mismatch(mismatch))?;
-                let batch_schema = batch.schema();
-                let requested_schema = ArrowSchema::from(&writer_schema);
-                let projection_schema = ArrowSchema::new(
-                    requested_schema
-                        .fields()
-                        .iter()
-                        .map(|field| {
-                            let (_, staged_field) = batch_schema
-                                .column_with_name(field.name())
-                                .expect("compatible schema contains every requested field");
-                            staged_projection_field(staged_field, field)
-                        })
-                        .collect::<Vec<_>>(),
-                );
                 let batch = batch
                     .project_by_schema(&projection_schema)
                     .map_err(|err| self.schema_mismatch(err))?;
