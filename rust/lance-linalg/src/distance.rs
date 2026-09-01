@@ -51,6 +51,9 @@ fn assert_batch_layout(vector_len: usize, batch_len: usize, dimension: usize) {
     );
 }
 
+/// Largest number of maximal u8 product terms whose sum fits in a u32.
+const U8_U32_ACCUMULATOR_MAX_LEN: usize = u32::MAX as usize / (u8::MAX as usize * u8::MAX as usize);
+
 /// Number of distances computed per call into a runtime-selected batch kernel.
 ///
 /// Keeping a small output buffer amortizes the `#[target_feature]` call while
