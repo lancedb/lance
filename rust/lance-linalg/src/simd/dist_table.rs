@@ -14,7 +14,8 @@ pub const PERM0: [usize; 16] = [0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7
 pub const PERM0_INVERSE: [usize; 16] = [0, 2, 4, 6, 8, 10, 12, 14, 1, 3, 5, 7, 9, 11, 13, 15];
 pub const BATCH_SIZE: usize = 32;
 
-/// Which kernel a `dist_table` entry point runs on this host.
+/// Which kernel a `dist_table` entry point prefers on this host. An entry point
+/// with no arm for the chosen backend falls through to scalar.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DistTableBackend {
     Avx512,
@@ -23,8 +24,9 @@ enum DistTableBackend {
     Scalar,
 }
 
-/// Picks the kernel from the tier and the CPU features, reading neither, so the
-/// consequences of the tier ladder are testable without a host of each kind.
+/// Picks the kernel from a tier and two feature bits passed in, reading neither
+/// `SIMD_SUPPORT` nor the CPU, so the consequences of the tier ladder are
+/// testable without a host of each kind.
 ///
 /// `avx512_kernel` says whether the calling entry point has an AVX-512 kernel to
 /// offer: `sum_4bit_dist_table_uninit` has one behind
@@ -47,10 +49,6 @@ fn dist_table_backend(
             DistTableBackend::Avx2
         }
         SimdSupport::Neon => DistTableBackend::Neon,
-        // Everything else, including `Avx` and `AvxFma`: the AVX2 inner uses
-        // integer ops (`_mm256_shuffle_epi8`, `_mm256_and_si256`,
-        // `_mm256_srli_epi16`, `_mm256_add_epi16`) that neither of those tiers
-        // provides.
         _ => DistTableBackend::Scalar,
     }
 }
@@ -169,7 +167,7 @@ pub unsafe fn sum_4bit_dist_table_uninit(
                 )
             }
         },
-        // `Scalar`, plus any backend this build compiled no arm for.
+        // `Scalar`.
         _ => {
             dists[..n].fill(MaybeUninit::new(0));
             // Every slot was initialized immediately above.
@@ -298,8 +296,9 @@ pub unsafe fn sum_4bit_hacc_dist_table_uninit(
     debug_assert!(hacc_dist_table.len() >= code_len * 64);
 
     // `false` for the AVX-512 kernel: this entry point has none, so an AVX-512
-    // host takes AVX2 here. It has no NEON kernel either, so an aarch64 host gets
-    // `Neon` from the selector and falls through to scalar below.
+    // host with AVX2 takes AVX2 here. It has no NEON kernel either, and an
+    // aarch64 tier is `Neon` or `None`, so the selector returns `Neon` or
+    // `Scalar` and both land on the scalar `_` arm.
     let (has_avx512bw, has_avx2) = x86_dist_table_features();
     match dist_table_backend(*SIMD_SUPPORT, false, has_avx512bw, has_avx2) {
         #[cfg(target_arch = "x86_64")]
@@ -710,18 +709,18 @@ unsafe extern "C" {
 mod tests {
     use super::*;
 
-    /// The tier ladder is exclusive, so most of these combinations cannot be
-    /// produced by any one host and the selector is the only place they can be
-    /// checked. `avx512_kernel` false covers both callers that reach it: the hacc
-    /// entry point, which has no AVX-512 kernel at all, and
-    /// `sum_4bit_dist_table_uninit` in a build where
-    /// `kernel_support = "avx512_dist_table"` is unset.
+    /// `avx512_kernel` false covers both callers that reach it: the hacc entry
+    /// point, which has no AVX-512 kernel at all, and
+    /// `sum_4bit_dist_table_uninit` wherever its
+    /// `cfg!(all(kernel_support = "avx512_dist_table", target_arch = "x86_64"))`
+    /// is false, which is every non-x86_64 build as well as an x86_64 one that
+    /// compiled no AVX-512 C.
     #[rstest::rstest]
-    // An AVX-512 host with the C kernel built takes it.
+    // An AVX-512 host with the C kernel built and `avx512bw` present takes it.
     #[case::avx512_ready(SimdSupport::Avx512, true, true, true, DistTableBackend::Avx512)]
     #[case::avx512fp16_ready(SimdSupport::Avx512FP16, true, true, true, DistTableBackend::Avx512)]
-    // The two ways an AVX-512 host misses that arm. Both must reach AVX2, which
-    // it has, rather than scalar.
+    // The two ways an AVX-512 host with AVX2 misses the AVX-512 arm. Both must
+    // reach AVX2 rather than scalar.
     #[case::avx512_no_bw(SimdSupport::Avx512, true, false, true, DistTableBackend::Avx2)]
     #[case::avx512_kernel_absent(SimdSupport::Avx512, false, true, true, DistTableBackend::Avx2)]
     #[case::avx512fp16_no_bw(SimdSupport::Avx512FP16, true, false, true, DistTableBackend::Avx2)]
@@ -734,8 +733,9 @@ mod tests {
     )]
     #[case::avx2_tier(SimdSupport::Avx2, true, false, true, DistTableBackend::Avx2)]
     // The tier alone must not authorize the AVX2 kernel: it is
-    // `#[target_feature(enable = "avx2")]` and called from an `unsafe` block that
-    // has only the detected feature to stand on.
+    // `#[target_feature(enable = "avx2")]`. No host produces this pair, since
+    // `cpu.rs` selects `Avx2` only when the same `avx2` detection returned true,
+    // so this row pins the selector's contract rather than a real configuration.
     #[case::avx2_tier_without_the_feature(
         SimdSupport::Avx2,
         false,
@@ -743,14 +743,17 @@ mod tests {
         false,
         DistTableBackend::Scalar
     )]
-    // Without AVX2 there is nothing to fall back to.
+    // Without AVX2 there is nothing to fall back to; this row pins the selector.
     #[case::avx512_no_avx2(SimdSupport::Avx512, false, false, false, DistTableBackend::Scalar)]
-    // `Avx` and `AvxFma` lack the integer ops the AVX2 inner uses.
     #[case::avx_fma(SimdSupport::AvxFma, false, false, false, DistTableBackend::Scalar)]
     #[case::avx(SimdSupport::Avx, false, false, false, DistTableBackend::Scalar)]
-    // AVX2 present but the tier says otherwise, which is what an AVX2 host
-    // without FMA reports. The tier gate has to hold on its own here.
+    // An `Avx` tier that reports AVX2. `cpu.rs` notes that every shipping AVX2
+    // part has FMA, so no shipping part produces this pair, though a masked or
+    // feature-forced build can: the tier alone leaves it on scalar, even though
+    // the kernel needs no FMA.
     #[case::avx_tier_with_avx2(SimdSupport::Avx, false, false, true, DistTableBackend::Scalar)]
+    // `Sse` is a variant the x86 ladder never produces, so this row pins the
+    // selector rather than a real host.
     #[case::sse(SimdSupport::Sse, false, false, false, DistTableBackend::Scalar)]
     #[case::none(SimdSupport::None, false, false, false, DistTableBackend::Scalar)]
     #[case::neon(SimdSupport::Neon, false, false, false, DistTableBackend::Neon)]
