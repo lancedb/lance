@@ -16,7 +16,7 @@ use arrow_array::{
 };
 use arrow_buffer::{NullBuffer, OffsetBuffer};
 use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
-use futures::{TryStreamExt, stream};
+use futures::{StreamExt, TryStreamExt, stream};
 use lance_core::datatypes::Schema as LanceSchema;
 use lance_core::utils::tempfile::TempStrDir;
 use lance_core::{Error, ROW_ID, ROW_LAST_UPDATED_AT_VERSION};
