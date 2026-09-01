@@ -2377,7 +2377,7 @@ impl BlobMaterializationBudget {
     }
 }
 
-pub(crate) struct BlobMaterializationAdmission {
+pub struct BlobMaterializationAdmission {
     budget: Option<Arc<BlobMaterializationBudget>>,
     ticket: u64,
     acquired: bool,
@@ -3539,7 +3539,7 @@ pub fn materialize_blob_v2_binary_batch_with_context<'a>(
     )
 }
 
-pub(crate) fn materialize_blob_v2_binary_batch_with_admission<'a>(
+pub fn materialize_blob_v2_binary_batch_with_admission<'a>(
     dataset: &'a Arc<Dataset>,
     output_schema: &'a Schema,
     batch: RecordBatch,
@@ -7594,7 +7594,7 @@ mod tests {
 
         let output_schema = dataset
             .empty_projection()
-            .union_columns(&["blob"], OnMissing::Error)
+            .union_columns(["blob"], OnMissing::Error)
             .unwrap()
             .with_blob_handling(BlobHandling::AllBinary)
             .to_schema();

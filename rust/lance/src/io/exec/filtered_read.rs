@@ -577,6 +577,7 @@ impl FilteredReadStream {
     /// scheduler is created here; the row-stream path injects its per-query
     /// shared one and a per-batch priority offset.
     #[instrument(name = "init_filtered_read_stream", skip_all)]
+    #[allow(clippy::too_many_arguments)]
     fn try_new(
         dataset: Arc<Dataset>,
         options: FilteredReadOptions,
@@ -2197,7 +2198,7 @@ impl FilteredReadExec {
                 .properties()
                 .as_ref()
                 .clone()
-                .with_eq_properties(EquivalenceProperties::new(output_schema.clone())),
+                .with_eq_properties(EquivalenceProperties::new(output_schema)),
         );
 
         let bare_lance_schema = fields_to_read.to_bare_schema();
@@ -2206,7 +2207,7 @@ impl FilteredReadExec {
         let read_lance_schema = if materialize_blob_v2_binary {
             crate::dataset::blob::blob_v2_descriptor_schema(&bare_lance_schema)
         } else {
-            bare_lance_schema.clone()
+            bare_lance_schema
         };
         let bare_schema = arrow_schema::Schema::from(&read_lance_schema);
         let mut new_fields = bare_schema.fields().iter().cloned().collect::<Vec<_>>();
@@ -6091,7 +6092,7 @@ mod tests {
                 .unwrap();
             let projection = dataset
                 .empty_projection()
-                .union_columns(&["blob"], OnMissing::Error)
+                .union_columns(["blob"], OnMissing::Error)
                 .unwrap()
                 .with_blob_handling(BlobHandling::AllBinary);
             let plan = FilteredReadExec::try_new(
