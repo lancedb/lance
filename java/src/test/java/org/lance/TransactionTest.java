@@ -171,6 +171,33 @@ public class TransactionTest {
   }
 
   @Test
+  public void testEmptyTransactionMetadataCanonicalization(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("empty_transaction_metadata").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      FragmentMetadata fragment = testDataset.createNewFragment(1);
+      try (Dataset dataset = testDataset.createEmptyDataset();
+          Transaction transaction =
+              new Transaction.Builder()
+                  .readVersion(dataset.version())
+                  .tag("")
+                  .transactionProperties(Collections.emptyMap())
+                  .operation(
+                      Append.builder().fragments(Collections.singletonList(fragment)).build())
+                  .build()) {
+        assertTrue(transaction.tag().isEmpty());
+        assertTrue(transaction.transactionProperties().isEmpty());
+        try (Dataset committed = new CommitBuilder(dataset).execute(transaction);
+            Transaction read = committed.readTransaction().orElseThrow()) {
+          assertTrue(read.tag().isEmpty());
+          assertTrue(read.transactionProperties().isEmpty());
+        }
+      }
+    }
+  }
+
+  @Test
   public void testTransactionPropertiesRoundTrip(@TempDir Path tempDir) {
     String datasetPath = tempDir.resolve("testTransactionPropertiesRoundTrip").toString();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
@@ -345,8 +372,8 @@ public class TransactionTest {
       try (Dataset dataset = testDataset.write(1, 10)) {
         FragmentMetadata fragment = dataset.getFragments().get(0).metadata();
         DataOverlay.DataOverlayFile overlay =
-            new DataOverlay.DataOverlayFile(
-                fragment.getFiles().get(0), DataOverlay.OverlayCoverage.shared(OFFSETS_1_3_5), 0);
+            DataOverlay.DataOverlayFile.forCommit(
+                fragment.getFiles().get(0), DataOverlay.OverlayCoverage.shared(OFFSETS_1_3_5));
         DataOverlay.DataOverlayGroup group =
             new DataOverlay.DataOverlayGroup(fragment.getId(), Collections.singletonList(overlay));
         try (Transaction transaction =
@@ -468,6 +495,7 @@ public class TransactionTest {
                         Update.builder()
                             .compactedSstables(Collections.singletonList(compacted))
                             .insertedRowsFilter(filter)
+                            .updateMode(Optional.of(Update.UpdateMode.RewriteRows))
                             .build())
                     .build();
             Dataset committed = new CommitBuilder(dataset).execute(update);
@@ -476,7 +504,7 @@ public class TransactionTest {
           KeyExistenceFilter readFilter = updateOperation.getInsertedRowsFilter().orElseThrow();
           assertArrayEquals(new int[] {0}, readFilter.getFieldIds());
           assertArrayEquals(new long[] {42}, readFilter.getExactKeyHashes());
-          assertTrue(updateOperation.updateMode().isEmpty());
+          assertEquals(Update.UpdateMode.RewriteRows, updateOperation.updateMode().orElseThrow());
           CompactedSsTable readCompacted = updateOperation.getCompactedSstables().get(0);
           assertEquals(compacted.getShardId(), readCompacted.getShardId());
           assertEquals(compacted.getGeneration(), readCompacted.getGeneration());
@@ -518,7 +546,11 @@ public class TransactionTest {
           Transaction update =
               new Transaction.Builder()
                   .readVersion(dataset.version())
-                  .operation(Update.builder().insertedRowsFilter(filter).build())
+                  .operation(
+                      Update.builder()
+                          .insertedRowsFilter(filter)
+                          .updateMode(Optional.of(Update.UpdateMode.RewriteRows))
+                          .build())
                   .build();
           Dataset committed = new CommitBuilder(dataset).execute(update);
           Transaction read = committed.readTransaction().orElseThrow()) {
@@ -552,7 +584,38 @@ public class TransactionTest {
             .initialBases(Collections.emptyList())
             .build();
     assertTrue(emptyOverwrite.configUpsertValues().isEmpty());
-    assertTrue(emptyOverwrite.getInitialBases().isEmpty());
+    assertTrue(emptyOverwrite.getInitialBases().isPresent());
+    assertTrue(emptyOverwrite.getInitialBases().orElseThrow().isEmpty());
+  }
+
+  @Test
+  public void testUnrepresentableEmptyUpdateModeAndExplicitEmptyInitialBasesAreRejected(
+      @TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("unrepresentable_optionals").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      try (Dataset dataset = testDataset.createEmptyDataset()) {
+        assertInvalidOperation(
+            dataset, Update.builder().build(), "update.updateMode must be specified");
+
+        Overwrite overwrite =
+            Overwrite.builder()
+                .fragments(Collections.emptyList())
+                .schema(testDataset.getSchema())
+                .initialBases(Collections.emptyList())
+                .build();
+        assertTrue(overwrite.getInitialBases().isPresent());
+        try (Transaction transaction =
+            new Transaction.Builder().readVersion(dataset.version()).operation(overwrite).build()) {
+          IllegalArgumentException error =
+              assertThrows(
+                  IllegalArgumentException.class,
+                  () -> new CommitBuilder(dataset).execute(transaction));
+          assertTrue(error.getMessage().contains("register new bases"));
+        }
+      }
+    }
   }
 
   @Test
@@ -742,6 +805,7 @@ public class TransactionTest {
             dataset,
             Update.builder()
                 .updatedFragmentOffsets(Collections.singletonMap(-1L, OFFSETS_1_3_5))
+                .updateMode(Optional.of(Update.UpdateMode.RewriteColumns))
                 .build(),
             "updatedFragmentOffsets.fragmentId");
         assertInvalidOperation(dataset, Restore.builder().version(-1).build(), "restore.version");

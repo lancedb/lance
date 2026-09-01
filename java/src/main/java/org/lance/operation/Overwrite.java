@@ -50,10 +50,7 @@ public class Overwrite extends SchemaOperation {
         configUpsertValues == null || configUpsertValues.isEmpty()
             ? Optional.empty()
             : Optional.of(configUpsertValues);
-    this.initialBases =
-        initialBases == null || initialBases.isEmpty()
-            ? Optional.empty()
-            : Optional.of(initialBases);
+    this.initialBases = Optional.ofNullable(initialBases);
   }
 
   public List<FragmentMetadata> fragments() {
@@ -64,7 +61,10 @@ public class Overwrite extends SchemaOperation {
     return configUpsertValues;
   }
 
-  /** Base paths used when creating a dataset; absent for a regular overwrite. */
+  /**
+   * Base paths used when creating a dataset; absent for a regular overwrite. An explicit empty list
+   * is retained because Rust distinguishes it from an absent value.
+   */
   public Optional<List<BasePath>> initialBases() {
     return initialBases;
   }

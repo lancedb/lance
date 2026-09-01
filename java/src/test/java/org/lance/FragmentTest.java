@@ -341,7 +341,10 @@ public class FragmentTest {
         assertNotNull(updateFragment.getDeletionFile());
 
         Update update =
-            Update.builder().updatedFragments(Collections.singletonList(updateFragment)).build();
+            Update.builder()
+                .updatedFragments(Collections.singletonList(updateFragment))
+                .updateMode(Optional.of(Update.UpdateMode.RewriteRows))
+                .build();
         Dataset dataset3;
         try (Transaction txn =
             new Transaction.Builder().readVersion(dataset2.version()).operation(update).build()) {
@@ -361,7 +364,10 @@ public class FragmentTest {
         assertNotNull(updateFragment.getDeletionFile());
 
         update =
-            Update.builder().updatedFragments(Collections.singletonList(updateFragment)).build();
+            Update.builder()
+                .updatedFragments(Collections.singletonList(updateFragment))
+                .updateMode(Optional.of(Update.UpdateMode.RewriteRows))
+                .build();
         Dataset dataset4;
         try (Transaction txn =
             new Transaction.Builder().readVersion(dataset3.version()).operation(update).build()) {
@@ -381,6 +387,7 @@ public class FragmentTest {
         update =
             Update.builder()
                 .removedFragmentIds(Collections.singletonList(Long.valueOf(fragment.getId())))
+                .updateMode(Optional.of(Update.UpdateMode.RewriteRows))
                 .build();
         Dataset dataset5;
         try (Transaction txn =

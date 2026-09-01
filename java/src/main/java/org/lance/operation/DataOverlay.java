@@ -107,7 +107,14 @@ public final class DataOverlay implements Operation {
     }
   }
 
-  /** A data file together with the physical-row coverage it supplies. */
+  /**
+   * A data file together with the physical-row coverage it supplies.
+   *
+   * <p>When this object is used to commit an overlay, Lance ignores the supplied committed version
+   * and stamps the overlay stored in the manifest with the new dataset version (including after a
+   * retry). The value remains part of the transaction model so transactions read from native code
+   * can represent it exactly.
+   */
   public static final class DataOverlayFile {
     private final DataFile dataFile;
     private final OverlayCoverage coverage;
@@ -123,6 +130,11 @@ public final class DataOverlay implements Operation {
                 dataFile.getPath(), coverage.getBitmaps().size(), dataFile.getFields().length));
       }
       this.committedVersion = committedVersion;
+    }
+
+    /** Creates an overlay for commit; Lance stamps its manifest version during the commit. */
+    public static DataOverlayFile forCommit(DataFile dataFile, OverlayCoverage coverage) {
+      return new DataOverlayFile(dataFile, coverage, 0);
     }
 
     public DataFile getDataFile() {

@@ -90,7 +90,13 @@ public class Update implements Operation {
     return fieldsForPreservingFragBitmap;
   }
 
-  /** The update strategy, or empty when the caller did not specify one. */
+  /**
+   * The update strategy.
+   *
+   * <p>The Rust transaction model permits an absent mode, but the current transaction protobuf
+   * cannot persist that state distinctly from {@link UpdateMode#RewriteRows}. JNI therefore rejects
+   * commits with an empty mode instead of silently changing their semantics.
+   */
   public Optional<UpdateMode> updateMode() {
     return updateMode;
   }
@@ -236,6 +242,10 @@ public class Update implements Operation {
       return this;
     }
 
+    /**
+     * Set the update strategy. A mode must be present when the operation is committed because the
+     * transaction format cannot persist an absent mode losslessly.
+     */
     public Builder updateMode(Optional<UpdateMode> updateMode) {
       this.updateMode = updateMode;
       return this;

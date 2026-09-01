@@ -1935,6 +1935,13 @@ fn convert_to_rust_operation(
                 env.get_optional_from_method(java_operation, "updateMode", |env, update_mode| {
                     update_mode.extract_object(env)
                 })?;
+            if update_mode.is_none() {
+                return Err(Error::input_error(
+                    "update.updateMode must be specified because the transaction format cannot \
+                     persist an absent update mode distinctly from RewriteRows"
+                        .to_string(),
+                ));
+            }
             let compacted_sstables = import_vec_from_method(
                 env,
                 java_operation,
