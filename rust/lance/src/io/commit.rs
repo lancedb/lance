@@ -44,6 +44,7 @@ use lance_table::io::commit::{
 };
 use lance_table::io::manifest::read_manifest;
 use rand::{Rng, rng};
+use roaring::RoaringBitmap;
 
 use super::ObjectStore;
 use crate::Dataset;
@@ -348,6 +349,7 @@ pub(crate) const MAX_INLINE_TRANSACTION_BYTES: usize = 64 * 1024;
 async fn do_commit_new_dataset(
     object_store: &ObjectStore,
     source_store: Option<&ObjectStore>,
+    source_commit_handler: Option<&dyn CommitHandler>,
     commit_handler: &dyn CommitHandler,
     base_path: &Path,
     transaction: &Transaction,
@@ -372,9 +374,10 @@ async fn do_commit_new_dataset(
         // from the destination store when cloning across object stores/accounts. Falls
         // back to the destination store for same-store clones.
         let source_store = source_store.unwrap_or(object_store);
+        let source_commit_handler = source_commit_handler.unwrap_or(commit_handler);
         let source_base_path =
             ObjectStore::extract_path_from_uri(store_registry, ref_path.as_str())?;
-        let source_manifest_location = commit_handler
+        let source_manifest_location = source_commit_handler
             .resolve_version_location(&source_base_path, *ref_version, &source_store.inner)
             .await?;
         let source_manifest = Dataset::load_manifest(
@@ -623,6 +626,7 @@ async fn record_new_dataset_commit(
 pub(crate) async fn commit_new_dataset(
     object_store: &ObjectStore,
     source_store: Option<&ObjectStore>,
+    source_commit_handler: Option<&dyn CommitHandler>,
     commit_handler: &dyn CommitHandler,
     base_path: &Path,
     transaction: &Transaction,
@@ -634,6 +638,7 @@ pub(crate) async fn commit_new_dataset(
     do_commit_new_dataset(
         object_store,
         source_store,
+        source_commit_handler,
         commit_handler,
         base_path,
         transaction,
@@ -1034,17 +1039,28 @@ pub(crate) struct BadFragmentBitmapError {
 pub(crate) fn detect_overlapping_fragments(
     indices: &[IndexMetadata],
 ) -> std::result::Result<(), BadFragmentBitmapError> {
-    let index_names: HashSet<&str> = indices.iter().map(|i| i.name.as_str()).collect();
+    let mut bitmaps_by_name: HashMap<&str, Vec<&RoaringBitmap>> = HashMap::new();
+    for index in indices {
+        if let Some(fragment_bitmap) = index.fragment_bitmap.as_ref() {
+            bitmaps_by_name
+                .entry(index.name.as_str())
+                .or_default()
+                .push(fragment_bitmap);
+        }
+    }
     let mut bad_indices = Vec::new(); // (index_name, overlapping_fragments)
-    for name in index_names {
+    for (name, fragment_bitmaps) in bitmaps_by_name {
+        // A single segment (the common case) cannot overlap with itself, so
+        // skip it before hashing every fragment id it covers.
+        if fragment_bitmaps.len() < 2 {
+            continue;
+        }
         let mut seen_fragment_ids = HashSet::new();
         let mut overlap = Vec::new();
-        for index in indices.iter().filter(|i| i.name == name) {
-            if let Some(fragment_bitmap) = index.fragment_bitmap.as_ref() {
-                for fragment in fragment_bitmap {
-                    if !seen_fragment_ids.insert(fragment) {
-                        overlap.push(fragment);
-                    }
+        for fragment_bitmap in fragment_bitmaps {
+            for fragment in fragment_bitmap {
+                if !seen_fragment_ids.insert(fragment) {
+                    overlap.push(fragment);
                 }
             }
         }
@@ -1314,6 +1330,7 @@ async fn record_successful_commit(
         let key = IndexMetadataKey {
             version: manifest.version,
             store_identity: &dataset.object_store.store_prefix,
+            e_tag: location.e_tag.as_deref(),
         };
         dataset
             .index_cache
@@ -3063,5 +3080,42 @@ mod tests {
             recomputed[0].fragment_bitmap.is_some(),
             "migrate_indices should have recalculated the fragment bitmap for the covered index"
         );
+    }
+
+    fn index_segment(name: &str, fragment_bitmap: Option<RoaringBitmap>) -> IndexMetadata {
+        IndexMetadata {
+            uuid: uuid::Uuid::new_v4(),
+            name: name.to_string(),
+            fields: vec![0],
+            covering_fields: vec![],
+            dataset_version: 1,
+            fragment_bitmap,
+            index_details: None,
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+            files: None,
+        }
+    }
+
+    #[test]
+    fn test_detect_overlapping_fragments() {
+        let indices = vec![
+            index_segment("idx_a", Some(RoaringBitmap::from_iter(0..5))),
+            index_segment("idx_a", Some(RoaringBitmap::from_iter([3, 4, 10]))),
+            index_segment("idx_a", None),
+            index_segment("idx_b", Some(RoaringBitmap::from_iter(0..5))),
+        ];
+        let err = detect_overlapping_fragments(&indices).unwrap_err();
+        assert_eq!(err.bad_indices.len(), 1);
+        let (name, overlapping) = &err.bad_indices[0];
+        assert_eq!(name, "idx_a");
+        assert_eq!(overlapping, &vec![3, 4]);
+
+        let disjoint = vec![
+            index_segment("idx_a", Some(RoaringBitmap::from_iter(0..5))),
+            index_segment("idx_a", Some(RoaringBitmap::from_iter(5..10))),
+        ];
+        assert!(detect_overlapping_fragments(&disjoint).is_ok());
     }
 }
