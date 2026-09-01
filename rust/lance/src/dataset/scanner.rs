@@ -1775,13 +1775,18 @@ impl Scanner {
     ///
     /// Blob descriptors are decoded before their payloads are fetched. When this
     /// budget is set, payload materialization may run ahead while the aggregate
-    /// descriptor and payload memory stays within `size`. A single oversized
+    /// descriptor arrays, output offsets, and payload bytes awaiting ordered
+    /// emission stay within `size`. Admission follows output order, and each
+    /// reservation is retained until its batch is emitted. A single oversized
     /// batch is admitted when no other materialization is reserved, which
-    /// guarantees forward progress.
+    /// guarantees forward progress. External descriptors without a stored size
+    /// resolve the complete object length before admission.
     ///
     /// This budget is separate from [`Self::io_buffer_size`], which controls the
     /// storage I/O scheduler, and [`Self::batch_size_bytes`], which targets the
-    /// size of individual decoded batches.
+    /// size of individual decoded batches. If this setting is not provided,
+    /// Blob v2 materialization has no independent memory bound. A size of zero
+    /// is rejected when the scan plan is built.
     pub fn materialization_readahead_bytes(&mut self, size: u64) -> &mut Self {
         self.materialization_readahead_bytes = Some(size);
         self
