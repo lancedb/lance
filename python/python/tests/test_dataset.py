@@ -1734,6 +1734,24 @@ def test_cleanup_with_retain_versions(tmp_path: Path):
     assert ds.count_rows() == len(ds.to_table())
 
 
+def test_cleanup_specific_versions(tmp_path: Path):
+    base_dir = tmp_path / "cleanup_specific_versions"
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    lance.write_dataset(table, base_dir, mode="create")
+    time.sleep(0.05)
+    lance.write_dataset(table, base_dir, mode="overwrite")
+    time.sleep(0.05)
+    lance.write_dataset(table, base_dir, mode="overwrite")
+    time.sleep(0.05)
+    ds = lance.write_dataset(table, base_dir, mode="append")
+
+    assert [v["version"] for v in ds.versions()] == [1, 2, 3, 4]
+
+    stats = ds.cleanup_old_versions(versions=[2])
+    assert stats.old_versions == 1
+    assert [v["version"] for v in ds.versions()] == [1, 3, 4]
+
+
 def test_cleanup_with_older_than_and_retain_versions(tmp_path: Path):
     base_dir = tmp_path / "cleanup_policy"
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
