@@ -1754,6 +1754,27 @@ def test_cleanup_with_older_than_and_retain_versions(tmp_path: Path):
     assert ds.count_rows() == len(ds.to_table())
 
 
+def _wait_until_latest_version_is_older_than(dataset, older_than_seconds):
+    latest_timestamp = dataset.versions()[-1]["timestamp"]
+    threshold = latest_timestamp + timedelta(seconds=older_than_seconds)
+    deadline = time.monotonic() + older_than_seconds + 1
+
+    while True:
+        now = (
+            datetime.now(latest_timestamp.tzinfo)
+            if latest_timestamp.tzinfo is not None
+            else datetime.now()
+        )
+        remaining = (threshold - now).total_seconds()
+        if remaining < 0:
+            return
+
+        timeout_remaining = deadline - time.monotonic()
+        if timeout_remaining <= 0:
+            pytest.fail("latest dataset version did not pass the cleanup age threshold")
+        time.sleep(min(remaining + 0.05, timeout_remaining))
+
+
 def test_auto_cleanup(tmp_path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"
@@ -1768,11 +1789,11 @@ def test_auto_cleanup(tmp_path):
     lance.write_dataset(table, base_dir, mode="append")
     lance.write_dataset(table, base_dir, mode="append")
 
-    time.sleep(5)
+    dataset = lance.dataset(base_dir)
+    _wait_until_latest_version_is_older_than(dataset, 1)
 
     # trigger cleanup
     lance.write_dataset(table, base_dir, mode="append")
-    dataset = lance.dataset(base_dir)
     assert len(dataset.versions()) == 2
 
 
@@ -1787,7 +1808,7 @@ def test_config_update_auto_cleanup(tmp_path):
     lance.write_dataset(table, base_dir, mode="append")
     lance.write_dataset(table, base_dir, mode="append")
 
-    time.sleep(5)
+    _wait_until_latest_version_is_older_than(ds, 0.001)
 
     # trigger cleanup
     lance.write_dataset(table, base_dir, mode="append")
@@ -1823,12 +1844,13 @@ def test_auto_cleanup_invalid(tmp_path):
         table, base_dir, auto_cleanup_options=auto_cleanup_options, mode="append"
     )
 
-    time.sleep(3)
+    dataset = lance.dataset(base_dir)
+    assert "lance.auto_cleanup.interval" not in dataset.config()
+    assert "lance.auto_cleanup.older_than" not in dataset.config()
 
     lance.write_dataset(
         table, base_dir, auto_cleanup_options=auto_cleanup_options, mode="append"
     )
-    dataset = lance.dataset(base_dir)
     assert len(dataset.versions()) == 4
 
 
@@ -1846,7 +1868,7 @@ def test_enable_disable_auto_cleanup(tmp_path):
     lance.write_dataset(table, base_dir, mode="append")
     lance.write_dataset(table, base_dir, mode="append")
 
-    time.sleep(5)
+    _wait_until_latest_version_is_older_than(ds, 1)
 
     # trigger cleanup
     lance.write_dataset(table, base_dir, mode="append")
@@ -1854,12 +1876,14 @@ def test_enable_disable_auto_cleanup(tmp_path):
 
     # this is a transactional commit, so will increase a version
     ds.optimize.disable_auto_cleanup()
+    assert "lance.auto_cleanup.interval" not in ds.config()
+    assert "lance.auto_cleanup.older_than" not in ds.config()
 
     lance.write_dataset(table, base_dir, mode="append")
     lance.write_dataset(table, base_dir, mode="append")
     lance.write_dataset(table, base_dir, mode="append")
 
-    time.sleep(5)
+    _wait_until_latest_version_is_older_than(ds, 1)
 
     # wait to see if cleanup would be trigger
     lance.write_dataset(table, base_dir, mode="append")
@@ -1920,10 +1944,12 @@ def test_strict_overwrite(tmp_path: Path):
     )
     with pytest.raises(
         OSError, match=f"Commit conflict for version {dataset_v1.version + 1}"
-    ):
+    ) as exc_info:
         lance.LanceDataset.commit(
             base_dir, operation, read_version=dataset_v1.version, max_retries=0
         )
+    # CommitConflict means commit-step retries were exhausted; it is safe to retry.
+    assert exc_info.value.retryable is True
 
 
 def test_commit_timeout(tmp_path: Path):
@@ -5389,6 +5415,69 @@ def test_dataset_drop(tmp_path: Path):
         lance.LanceDataset.drop(tmp_path)
 
 
+def test_dataset_drop_rejects_non_dataset_directory(tmp_path: Path):
+    warehouse = tmp_path / "warehouse"
+    lance.write_dataset(pa.table({"x": [0]}), warehouse / "t.lance")
+
+    # Pointing at the parent of a dataset must not wipe out the whole warehouse.
+    with pytest.raises(ValueError, match="no readable Lance manifest"):
+        lance.LanceDataset.drop(warehouse)
+    assert (warehouse / "t.lance").exists()
+
+    lance.LanceDataset.drop(warehouse / "t.lance")
+    assert not (warehouse / "t.lance").exists()
+
+
+@pytest.mark.parametrize(
+    "entries",
+    [
+        # A storage root holding a "data" prefix is indistinguishable from the
+        # leftovers of a write that died before committing.
+        ["data/0.lance"],
+        # A file merely sitting under _versions/, or merely named like a manifest, is
+        # not evidence that a dataset was ever committed here.
+        ["_versions/README", "reports/q1.csv"],
+        ["_versions/1.manifest", "reports/q1.csv"],
+    ],
+)
+def test_dataset_drop_rejects_paths_without_readable_manifest(
+    tmp_path: Path, entries: list
+):
+    storage_root = tmp_path / "storage_root"
+    for entry in entries:
+        path = storage_root / entry
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"irreplaceable")
+
+    with pytest.raises(ValueError, match="no readable Lance manifest"):
+        lance.LanceDataset.drop(storage_root)
+    for entry in entries:
+        assert (storage_root / entry).exists()
+
+
+def test_dataset_drop_allows_create_over_uncommitted_leftovers(tmp_path: Path):
+    # Refusing to drop data files without a manifest costs nothing, because those
+    # leftovers do not stop the dataset from being created and then dropped.
+    dataset_dir = tmp_path / "t.lance"
+    (dataset_dir / "data").mkdir(parents=True)
+    (dataset_dir / "data" / "0.lance").write_bytes(b"partial")
+
+    lance.write_dataset(pa.table({"x": [0]}), dataset_dir)
+    lance.LanceDataset.drop(dataset_dir)
+    assert not dataset_dir.exists()
+
+
+def test_dataset_drop_allows_dataset_with_unmanaged_files(tmp_path: Path):
+    # Cleanup deliberately preserves unmanaged files under a dataset root, so their
+    # presence must not stop a drop either.
+    dataset_dir = tmp_path / "t.lance"
+    lance.write_dataset(pa.table({"x": [0]}), dataset_dir)
+    (dataset_dir / "notes.txt").write_text("kept next to the dataset")
+
+    lance.LanceDataset.drop(dataset_dir)
+    assert not dataset_dir.exists()
+
+
 def test_dataset_schema(tmp_path: Path):
     table = pa.table({"x": [0]})
     ds = lance.write_dataset(table, str(tmp_path))  # noqa: F841
@@ -5445,7 +5534,12 @@ def _write_overlay_file(
     )
 
 
-def test_data_overlay_dense(tmp_path: Path):
+@pytest.fixture
+def enable_unstable_data_overlay_files(monkeypatch):
+    monkeypatch.setenv("LANCE_ENABLE_UNSTABLE_DATA_OVERLAY_FILES", "1")
+
+
+def test_data_overlay_dense(tmp_path: Path, enable_unstable_data_overlay_files):
     base_dir = tmp_path / "test"
     table = pa.table(
         {
@@ -5477,7 +5571,7 @@ def test_data_overlay_dense(tmp_path: Path):
     assert result.column("id").to_pylist() == list(range(10))
 
 
-def test_data_overlay_newest_wins(tmp_path: Path):
+def test_data_overlay_newest_wins(tmp_path: Path, enable_unstable_data_overlay_files):
     base_dir = tmp_path / "test"
     table = pa.table(
         {
@@ -5531,7 +5625,9 @@ def test_data_overlay_newest_wins(tmp_path: Path):
     assert val[4] == 444  # only the older overlay covers offset 4
 
 
-def test_data_overlay_sparse_per_field(tmp_path: Path):
+def test_data_overlay_sparse_per_field(
+    tmp_path: Path, enable_unstable_data_overlay_files
+):
     base_dir = tmp_path / "test"
     table = pa.table(
         {
@@ -5571,7 +5667,9 @@ def test_data_overlay_sparse_per_field(tmp_path: Path):
     assert result.column("val").to_pylist()[2] == 20
 
 
-def test_data_overlay_round_trips_through_fragment_metadata(tmp_path: Path):
+def test_data_overlay_round_trips_through_fragment_metadata(
+    tmp_path: Path, enable_unstable_data_overlay_files
+):
     import json
 
     base_dir = tmp_path / "test"
@@ -5624,7 +5722,9 @@ def test_data_overlay_round_trips_through_fragment_metadata(tmp_path: Path):
     assert result.column("id").to_pylist() == list(range(10))
 
 
-def test_data_overlay_rejects_invalid_offsets(tmp_path: Path):
+def test_data_overlay_rejects_invalid_offsets(
+    tmp_path: Path, enable_unstable_data_overlay_files
+):
     base_dir = tmp_path / "test"
     table = pa.table({"val": pa.array([0, 1, 2], pa.int32())})
     dataset = lance.write_dataset(table, base_dir)
@@ -5666,7 +5766,9 @@ def test_data_overlay_rejects_invalid_offsets(tmp_path: Path):
         [[1, 1]],  # sparse, duplicate
     ],
 )
-def test_data_overlay_rejects_unsorted_offsets(tmp_path: Path, offsets):
+def test_data_overlay_rejects_unsorted_offsets(
+    tmp_path: Path, offsets, enable_unstable_data_overlay_files
+):
     # Offsets map positionally to value rows in data_file. A RoaringBitmap would
     # silently reorder/dedup them, so a non-ascending list must be rejected up
     # front rather than corrupting the row mapping.
@@ -5841,6 +5943,33 @@ def test_dataset_sql(tmp_path: Path):
     complex_result = complex_query.to_batch_records()
     expected_complex = pa.table({"user_id": [1, 2, 3], "val": ["A", "B", "C"]})
     assert pa.Table.from_batches(complex_result) == expected_complex
+
+
+def test_dataset_sql_batch_size_rows(tmp_path: Path):
+    table = pa.table({"id": range(50)})
+    ds = lance.write_dataset(table, tmp_path / "test_sql_batch_size_rows")
+
+    batches = list(
+        ds.sql("SELECT * FROM dataset").batch_size(7).build().to_stream_reader()
+    )
+
+    assert sum(batch.num_rows for batch in batches) == 50
+    assert all(batch.num_rows <= 7 for batch in batches)
+
+
+@pytest.mark.parametrize("batch_size", [0, 2**32])
+def test_dataset_sql_rejects_invalid_batch_size(tmp_path: Path, batch_size: int):
+    ds = lance.write_dataset(
+        pa.table({"id": range(3)}), tmp_path / "test_sql_invalid_batch_size"
+    )
+
+    with pytest.raises(ValueError, match="batch_size must be between 1 and 4294967295"):
+        (
+            ds.sql("SELECT * FROM dataset")
+            .batch_size(batch_size)
+            .build()
+            .to_batch_records()
+        )
 
 
 def test_file_reader_options(tmp_path: Path):

@@ -48,7 +48,7 @@ use lance::dataset::{
     BatchInfo, BatchUDF, CommitBuilder, MergeStats, NewColumnTransform, UDFCheckpointStore,
     WriteDestination,
 };
-use lance::dataset::{ColumnAlteration, ProjectionRequest};
+use lance::dataset::{ColumnAlteration, ProjectionRequest, validate_dataset_root_for_drop};
 use lance::dataset::{
     Dataset as LanceDataset, DeleteBuilder, ExternalBlobMode,
     MergeInsertBuilder as LanceMergeInsertBuilder, MergeInsertWriteMode, ReadParams,
@@ -2942,6 +2942,9 @@ impl Dataset {
         rt().spawn(None, async move {
             let (object_store, path) =
                 object_store_from_uri_or_path(&dest, storage_options).await?;
+            validate_dataset_root_for_drop(&object_store, &path)
+                .await
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
             let result = object_store.remove_dir_all(path).await;
 
             match result {
@@ -3208,7 +3211,7 @@ impl Dataset {
                 new_self.add_columns(transforms, None, batch_size).await?;
                 Ok(new_self)
             })?
-            .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
+            .io_or_commit_conflict_error()?;
         self.ds = Arc::new(new_self);
 
         Ok(())
@@ -3232,7 +3235,7 @@ impl Dataset {
                     .await?;
                 Ok(new_self)
             })?
-            .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
+            .io_or_commit_conflict_error()?;
         self.ds = Arc::new(new_self);
 
         Ok(())
@@ -3250,7 +3253,7 @@ impl Dataset {
                 new_self.add_columns(transform, None, None).await?;
                 Ok(new_self)
             })?
-            .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
+            .io_or_commit_conflict_error()?;
         self.ds = Arc::new(new_self);
         Ok(())
     }
@@ -4134,6 +4137,20 @@ impl SqlQueryBuilder {
         Ok(Self {
             builder: self.builder.clone().blob_handling(blob_handling),
         })
+    }
+
+    #[pyo3(signature = (batch_size))]
+    fn batch_size(&self, batch_size: usize) -> Self {
+        Self {
+            builder: self.builder.clone().batch_size(batch_size),
+        }
+    }
+
+    #[pyo3(signature = (batch_size_bytes))]
+    fn batch_size_bytes(&self, batch_size_bytes: u64) -> Self {
+        Self {
+            builder: self.builder.clone().batch_size_bytes(batch_size_bytes),
+        }
     }
 
     /// Build the SQL query.

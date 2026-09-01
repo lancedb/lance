@@ -3027,7 +3027,7 @@ class LanceDataset(pa.dataset.Dataset):
             where = str(where)
         return self._ds.update(updates, where, conflict_retries, retry_timeout)
 
-    def versions(self):
+    def versions(self) -> List[Version]:
         """
         Return all versions in this dataset.
         """
@@ -5260,6 +5260,31 @@ class LanceDataset(pa.dataset.Dataset):
         storage_options: Optional[Dict[str, str]] = None,
         ignore_not_found: Optional[bool] = None,
     ) -> None:
+        """Delete a dataset and everything under ``base_uri``.
+
+        To limit the damage a mistyped or misconfigured path can do, ``base_uri``
+        must be a dataset root, meaning it holds a manifest that can be read, or a
+        namespace declare/deregister marker. Anything else raises
+        :class:`ValueError`, including a path that holds only data files or only
+        unreadable manifests: such leftovers need an explicit storage-level delete.
+
+        Note that a path which passes this check is deleted in full, including any
+        unmanaged files kept next to the dataset.
+
+        Parameters
+        ----------
+        base_uri : str or Path
+            Root of the dataset to delete.
+        storage_options : optional, dict
+            Extra options for the storage backend.
+        ignore_not_found : optional, bool
+            If True, return successfully when ``base_uri`` does not exist.
+
+        Raises
+        ------
+        ValueError
+            If ``base_uri`` is not a Lance dataset root.
+        """
         _Dataset.drop(str(base_uri), storage_options, ignore_not_found=ignore_not_found)
 
     def get_ivf_model(self, index_name: str):
@@ -5683,6 +5708,26 @@ class SqlQueryBuilder:
           columns.
         """
         self._builder = self._builder.blob_handling(blob_handling)
+        return self
+
+    def batch_size(self, batch_size: int) -> "SqlQueryBuilder":
+        """
+        Set the maximum number of rows produced by each query batch.
+
+        If :meth:`batch_size_bytes` is also set, both limits apply and the one
+        reached first determines the scan batch size.
+        """
+        self._builder = self._builder.batch_size(batch_size)
+        return self
+
+    def batch_size_bytes(self, batch_size_bytes: int) -> "SqlQueryBuilder":
+        """
+        Set the approximate maximum bytes produced by each scan batch.
+
+        If :meth:`batch_size` is also set, both limits apply and the one
+        reached first determines the scan batch size.
+        """
+        self._builder = self._builder.batch_size_bytes(batch_size_bytes)
         return self
 
     def build(self) -> SqlQuery:
@@ -7183,7 +7228,7 @@ class LanceScanner(pa.dataset.Scanner):
         """
         return self.to_table()[:num_rows]
 
-    def count_rows(self):
+    def count_rows(self) -> int:
         """Count rows matching the scanner filter.
 
         Returns
@@ -7393,7 +7438,7 @@ class DatasetOptimizer:
         }
         return Compaction.execute(self._dataset, opts)
 
-    def optimize_indices(self, **kwargs):
+    def optimize_indices(self, **kwargs) -> None:
         """Optimizes index performance.
 
         As new data arrives it is not added to existing indexes automatically.
@@ -7701,6 +7746,7 @@ def write_dataset(
     blob_pack_file_size_threshold: Optional[int] = None,
     namespace_client: Optional[LanceNamespace] = None,
     table_id: Optional[List[str]] = None,
+    session: Optional[Session] = None,
 ) -> LanceDataset:
     """Write a given data_obj to the given uri
 
@@ -7960,6 +8006,7 @@ def write_dataset(
         "external_blob_mode": external_blob_mode,
         "allow_external_blob_outside_bases": allow_external_blob_outside_bases,
         "blob_pack_file_size_threshold": blob_pack_file_size_threshold,
+        "session": session,
     }
 
     # Add namespace_client and table_id for storage options provider and managed
