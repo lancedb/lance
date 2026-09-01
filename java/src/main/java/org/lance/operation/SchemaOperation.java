@@ -31,10 +31,9 @@ import java.util.Objects;
  *   <li>Otherwise, allocate based on the max field id of the dataset.
  * </ol>
  *
- * <p>New datasets use stable field IDs. On those datasets, metadata may identify an existing field
- * for rename or reorder, but it cannot allocate a new identity. New IDs are assigned by the dataset
- * allocator, and field mappings in fragments committed by the same operation are remapped to the
- * canonical IDs.
+ * <p>Datasets use stable field IDs only after explicit migration. On those datasets, compatible
+ * existing fields keep their identities, while new IDs are assigned by the dataset allocator and
+ * field mappings in fragments committed by the same operation are remapped to the canonical IDs.
  */
 public abstract class SchemaOperation implements Operation {
   private final Schema schema;

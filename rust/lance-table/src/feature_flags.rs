@@ -70,7 +70,7 @@ const _: () = assert!(FLAG_MIXED_DATA_FILE_VERSIONS < FLAG_UNKNOWN);
 const _: () = assert!(FLAG_STABLE_FIELD_IDS < FLAG_UNKNOWN);
 
 pub(crate) const STICKY_PAIRED_FLAGS: u64 = FLAG_MIXED_DATA_FILE_VERSIONS;
-pub(crate) const STICKY_READER_FLAGS: u64 = STICKY_PAIRED_FLAGS | FLAG_STABLE_FIELD_IDS;
+pub(crate) const STICKY_READER_FLAGS: u64 = STICKY_PAIRED_FLAGS;
 pub(crate) const STICKY_WRITER_FLAGS: u64 = STICKY_PAIRED_FLAGS | FLAG_STABLE_FIELD_IDS;
 
 /// Environment variable that opts a release build into reading and writing data
@@ -92,7 +92,11 @@ pub fn apply_feature_flags(
     let covered_index_metadata = (manifest.reader_feature_flags | manifest.writer_feature_flags)
         & FLAG_COVERED_INDEX_METADATA;
     let sticky_paired_flags = validated_sticky_paired_flags(manifest)?;
-    let stable_field_id_reader_fence = manifest.reader_feature_flags & FLAG_STABLE_FIELD_IDS;
+    let stable_field_ids = manifest.max_allocated_field_id.is_some();
+    if stable_field_ids {
+        manifest.writer_feature_flags |= FLAG_STABLE_FIELD_IDS;
+    }
+    validate_stable_field_id_flags(manifest)?;
     // Reset flags
     manifest.reader_feature_flags = 0;
     manifest.writer_feature_flags = 0;
@@ -151,8 +155,7 @@ pub fn apply_feature_flags(
         manifest.writer_feature_flags |= FLAG_DISABLE_TRANSACTION_FILE;
     }
 
-    if manifest.max_allocated_field_id.is_some() {
-        manifest.reader_feature_flags |= stable_field_id_reader_fence;
+    if stable_field_ids {
         manifest.writer_feature_flags |= FLAG_STABLE_FIELD_IDS;
     }
 
@@ -171,14 +174,11 @@ pub fn apply_feature_flags(
 /// also validates that the source is not half-set before a derived manifest is
 /// committed.
 ///
-/// Stable field IDs permit writer-only fencing after an explicit migration,
-/// while automatic activation also carries a reader fence to exclude released
-/// writers that did not enforce unknown writer flags on every commit path.
+/// Stable field IDs are activated explicitly and only require writer support.
 pub fn inherit_sticky_feature_flags(destination: &mut Manifest, source: &Manifest) -> Result<()> {
     let sticky_flags = validated_sticky_paired_flags(source)?;
     validate_stable_field_id_flags(source)?;
-    destination.reader_feature_flags |=
-        sticky_flags | (source.reader_feature_flags & FLAG_STABLE_FIELD_IDS);
+    destination.reader_feature_flags |= sticky_flags;
     destination.writer_feature_flags |=
         sticky_flags | (source.writer_feature_flags & FLAG_STABLE_FIELD_IDS);
     Ok(())
@@ -287,10 +287,8 @@ pub fn validate_paired_feature_flags(manifest: &Manifest) -> Result<()> {
 /// Refuse a manifest whose stable-field-ID marker and required flags disagree.
 ///
 /// The high-water mark is the activation marker and always requires the writer
-/// bit. Automatic activation also sets the reader bit as a compatibility fence
-/// against released writers that did not enforce unknown writer flags on every
-/// commit path. Explicit migration may remain writer-only once older writers
-/// have been retired.
+/// bit. Stable field IDs do not change read semantics, so the reader bit is not
+/// a valid activation mode.
 pub fn validate_stable_field_id_flags(manifest: &Manifest) -> Result<()> {
     let activated = manifest.max_allocated_field_id.is_some();
     let reader = manifest.reader_feature_flags & FLAG_STABLE_FIELD_IDS != 0;
@@ -301,10 +299,10 @@ pub fn validate_stable_field_id_flags(manifest: &Manifest) -> Result<()> {
             "Manifest stable-field-ID high-water mark and writer feature flag disagree",
         ));
     }
-    if reader && !writer {
+    if reader {
         return Err(Error::corrupt_file_named(
             "manifest",
-            "Manifest has the stable-field-ID reader fence without the activation marker and writer feature flag",
+            "Manifest has a stable-field-ID reader feature flag, but stable field IDs only require writer support",
         ));
     }
     Ok(())
@@ -518,24 +516,16 @@ mod tests {
     }
 
     #[test]
-    fn inheriting_preserves_stable_field_id_fence_mode() {
-        for reader_fenced in [false, true] {
-            let mut source = empty_manifest();
-            source.activate_stable_field_ids();
-            source.writer_feature_flags |= FLAG_STABLE_FIELD_IDS;
-            if reader_fenced {
-                source.reader_feature_flags |= FLAG_STABLE_FIELD_IDS;
-            }
-            let mut destination = empty_manifest();
+    fn inheriting_preserves_stable_field_id_writer_gate() {
+        let mut source = empty_manifest();
+        source.activate_stable_field_ids();
+        source.writer_feature_flags |= FLAG_STABLE_FIELD_IDS;
+        let mut destination = empty_manifest();
 
-            inherit_sticky_feature_flags(&mut destination, &source).unwrap();
+        inherit_sticky_feature_flags(&mut destination, &source).unwrap();
 
-            assert_eq!(
-                destination.reader_feature_flags & FLAG_STABLE_FIELD_IDS != 0,
-                reader_fenced
-            );
-            assert_ne!(destination.writer_feature_flags & FLAG_STABLE_FIELD_IDS, 0);
-        }
+        assert_eq!(destination.reader_feature_flags & FLAG_STABLE_FIELD_IDS, 0);
+        assert_ne!(destination.writer_feature_flags & FLAG_STABLE_FIELD_IDS, 0);
     }
 
     #[test]
@@ -607,17 +597,18 @@ mod tests {
     }
 
     #[test]
-    fn apply_feature_flags_preserves_automatic_stable_field_id_reader_fence() {
+    fn apply_feature_flags_rejects_stable_field_id_reader_flag() {
         let mut manifest = empty_manifest();
         manifest.activate_stable_field_ids();
         manifest.reader_feature_flags |= FLAG_STABLE_FIELD_IDS;
         manifest.writer_feature_flags |= FLAG_STABLE_FIELD_IDS;
 
-        apply_feature_flags(&mut manifest, false, false).unwrap();
-        apply_feature_flags(&mut manifest, false, false).unwrap();
+        let err = apply_feature_flags(&mut manifest, false, false).unwrap_err();
 
-        assert_ne!(manifest.reader_feature_flags & FLAG_STABLE_FIELD_IDS, 0);
-        assert_ne!(manifest.writer_feature_flags & FLAG_STABLE_FIELD_IDS, 0);
+        assert!(
+            err.to_string().contains("only require writer support"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -637,7 +628,7 @@ mod tests {
 
         let mut paired = writer_only.clone();
         paired.reader_feature_flags |= FLAG_STABLE_FIELD_IDS;
-        validate_stable_field_id_flags(&paired).unwrap();
+        assert!(validate_stable_field_id_flags(&paired).is_err());
 
         let mut reader_without_activation = empty_manifest();
         reader_without_activation.reader_feature_flags |= FLAG_STABLE_FIELD_IDS;

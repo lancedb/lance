@@ -7,7 +7,6 @@
 //! a fragment list that disagrees with the schema, a merge that silently dropped
 //! or rewrote data files — before any manifest is written.
 
-use crate::feature_flags::FLAG_STABLE_FIELD_IDS;
 use crate::format::{Fragment, Manifest};
 use crate::io::deletion::relative_deletion_file_path;
 use crate::transaction::{Operation, UpdateMode, UpdatedFragmentOffsets};
@@ -71,7 +70,8 @@ pub fn canonicalize_stable_field_ids(
         Operation::Overwrite {
             schema, fragments, ..
         } => {
-            let field_id_remap = canonicalize_schema(manifest, schema, true, raw_arrow_schema)?;
+            let field_id_remap =
+                canonicalize_schema(manifest, schema, !raw_arrow_schema, raw_arrow_schema)?;
             remap_fragment_field_ids(fragments, &field_id_remap, &HashSet::new())?;
         }
         Operation::Project { schema, .. } if raw_arrow_schema => {
@@ -471,13 +471,6 @@ pub fn validate_stable_field_id_transition(
         return Err(Error::invalid_input(format!(
             "Stable field-ID high-water mark decreases from {parent_max_field_id} to {successor_max_field_id}"
         )));
-    }
-    if parent.reader_feature_flags & FLAG_STABLE_FIELD_IDS != 0
-        && successor.reader_feature_flags & FLAG_STABLE_FIELD_IDS == 0
-    {
-        return Err(Error::invalid_input(
-            "Stable field-ID reader fence cannot be removed after automatic activation",
-        ));
     }
     let successor_schema_ids = successor
         .schema
@@ -1151,6 +1144,40 @@ mod tests {
     }
 
     #[test]
+    fn canonicalize_raw_arrow_overwrite_matches_reordered_fields_by_name() {
+        let schema = LanceSchema::try_from(&ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, true),
+            ArrowField::new("b", DataType::Int32, true),
+        ]))
+        .unwrap();
+        let mut manifest = manifest_with_file_fields(schema, vec![0, 1]);
+        manifest.activate_stable_field_ids();
+        let mut raw_schema = LanceSchema::try_from(&ArrowSchema::new(vec![
+            ArrowField::new("b", DataType::Int32, true),
+            ArrowField::new("a", DataType::Int32, true),
+        ]))
+        .unwrap();
+        raw_schema.metadata.insert(
+            TRANSACTION_SCHEMA_SOURCE_RAW_ARROW.to_string(),
+            String::new(),
+        );
+        let mut operation = Operation::Overwrite {
+            fragments: vec![],
+            schema: raw_schema,
+            config_upsert_values: None,
+            initial_bases: None,
+        };
+
+        canonicalize_stable_field_ids(Some(&manifest), &mut operation).unwrap();
+
+        let Operation::Overwrite { schema, .. } = operation else {
+            unreachable!();
+        };
+        assert_eq!(schema.field("b").unwrap().id, 1);
+        assert_eq!(schema.field("a").unwrap().id, 0);
+    }
+
+    #[test]
     fn canonicalize_overwrite_preserves_already_canonical_fragment_field_ids() {
         let manifest = activated_manifest();
         let mut schema = LanceSchema::try_from(&ArrowSchema::new(vec![
@@ -1493,32 +1520,6 @@ mod tests {
 
         assert!(
             err.to_string().contains("high-water mark decreases"),
-            "{err}"
-        );
-    }
-
-    #[test]
-    fn stable_field_id_transition_rejects_removing_reader_fence() {
-        let mut manifest = activated_manifest();
-        manifest.reader_feature_flags |= FLAG_STABLE_FIELD_IDS;
-        let mut successor = Manifest::new_from_previous(
-            &manifest,
-            manifest.schema.clone(),
-            manifest.fragments.clone(),
-        );
-        successor.reader_feature_flags &= !FLAG_STABLE_FIELD_IDS;
-        let operation = Operation::UpdateConfig {
-            config_updates: None,
-            table_metadata_updates: None,
-            schema_metadata_updates: None,
-            field_metadata_updates: HashMap::new(),
-        };
-
-        let err =
-            validate_stable_field_id_transition(&manifest, &successor, &operation).unwrap_err();
-
-        assert!(
-            err.to_string().contains("reader fence cannot be removed"),
             "{err}"
         );
     }

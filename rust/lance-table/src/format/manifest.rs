@@ -1673,41 +1673,33 @@ mod tests {
     }
 
     #[test]
-    fn shallow_clone_preserves_stable_field_id_allocation_state_and_fence_mode() {
+    fn shallow_clone_preserves_stable_field_id_allocation_state() {
         let arrow_schema = ArrowSchema::new(vec![ArrowField::new(
             "a",
             arrow_schema::DataType::Int64,
             false,
         )]);
         let schema = Schema::try_from(&arrow_schema).unwrap();
-        for reader_fenced in [false, true] {
-            let mut manifest = Manifest::new(
-                schema.clone(),
-                Arc::new(vec![]),
-                DataStorageFormat::default(),
-                HashMap::new(),
-            );
-            manifest.max_allocated_field_id = Some(41);
-            manifest.writer_feature_flags |= FLAG_STABLE_FIELD_IDS;
-            if reader_fenced {
-                manifest.reader_feature_flags |= FLAG_STABLE_FIELD_IDS;
-            }
+        let mut manifest = Manifest::new(
+            schema,
+            Arc::new(vec![]),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+        manifest.max_allocated_field_id = Some(41);
+        manifest.writer_feature_flags |= FLAG_STABLE_FIELD_IDS;
 
-            let cloned = manifest.shallow_clone(
-                Some("parent".to_string()),
-                "memory://parent".to_string(),
-                7,
-                None,
-                String::new(),
-            );
+        let cloned = manifest.shallow_clone(
+            Some("parent".to_string()),
+            "memory://parent".to_string(),
+            7,
+            None,
+            String::new(),
+        );
 
-            assert_eq!(cloned.max_allocated_field_id, Some(41));
-            assert_eq!(
-                cloned.reader_feature_flags & FLAG_STABLE_FIELD_IDS != 0,
-                reader_fenced
-            );
-            assert_ne!(cloned.writer_feature_flags & FLAG_STABLE_FIELD_IDS, 0);
-        }
+        assert_eq!(cloned.max_allocated_field_id, Some(41));
+        assert_eq!(cloned.reader_feature_flags & FLAG_STABLE_FIELD_IDS, 0);
+        assert_ne!(cloned.writer_feature_flags & FLAG_STABLE_FIELD_IDS, 0);
     }
 
     #[test]

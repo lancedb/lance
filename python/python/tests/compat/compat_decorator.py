@@ -202,12 +202,7 @@ class UpgradeDowngradeTest:
 
 
 class DatasetUpgradeDowngradeTest(UpgradeDowngradeTest):
-    """Compatibility contract for new datasets with stable field IDs."""
-
-    def skip_downgrade(self, version: str) -> bool:
-        # Automatically activated datasets fence released runtimes from opening
-        # them. A dedicated v11 regression verifies this refusal.
-        return True
+    """Compatibility contract for datasets."""
 
 
 @contextmanager

@@ -1303,12 +1303,6 @@ impl Transaction {
             )
         };
 
-        if current_manifest.is_none() {
-            manifest.activate_stable_field_ids();
-            manifest.reader_feature_flags |= FLAG_STABLE_FIELD_IDS;
-            manifest.writer_feature_flags |= FLAG_STABLE_FIELD_IDS;
-        }
-
         if config.activate_stable_field_ids {
             let already_active = current_manifest
                 .map(|manifest| manifest.uses_stable_field_ids())
@@ -1607,7 +1601,7 @@ mod tests {
     }
 
     #[test]
-    fn new_dataset_builds_with_stable_field_ids_by_default() {
+    fn new_dataset_preserves_legacy_field_id_allocation_by_default() {
         let arrow_schema = ArrowSchema::new(vec![ArrowField::new("id", DataType::Int32, false)]);
         let mut schema = LanceSchema::try_from(&arrow_schema).unwrap();
         schema.try_set_field_id(None).unwrap();
@@ -1626,9 +1620,9 @@ mod tests {
             .build_manifest(None, vec![], "txn", &default_build_config())
             .unwrap();
 
-        assert_eq!(manifest.max_allocated_field_id, Some(0));
-        assert_ne!(manifest.reader_feature_flags & FLAG_STABLE_FIELD_IDS, 0);
-        assert_ne!(manifest.writer_feature_flags & FLAG_STABLE_FIELD_IDS, 0);
+        assert_eq!(manifest.max_allocated_field_id, None);
+        assert_eq!(manifest.reader_feature_flags & FLAG_STABLE_FIELD_IDS, 0);
+        assert_eq!(manifest.writer_feature_flags & FLAG_STABLE_FIELD_IDS, 0);
     }
 
     #[test]
