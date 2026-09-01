@@ -15,7 +15,9 @@ use arrow_array::{
     Array, ArrayRef, GenericListArray, OffsetSizeTrait, RecordBatch, builder::LargeBinaryBuilder,
 };
 use arrow_buffer::{ArrowNativeType, OffsetBuffer, ScalarBuffer};
-use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+use arrow_schema::{
+    DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef,
+};
 use bytes::Bytes;
 use futures::future::BoxFuture;
 use futures::stream::BoxStream;
@@ -2461,10 +2463,41 @@ impl BlobMaterializationContext {
 /// A materialized batch that retains its byte-budget reservation until yielded.
 pub struct MaterializedBlobBatch {
     batch: RecordBatch,
-    _reservation: Option<BlobMaterializationReservation>,
+    _reservations: Vec<BlobMaterializationReservation>,
 }
 
 impl MaterializedBlobBatch {
+    pub(crate) fn unreserved(batch: RecordBatch) -> Self {
+        Self {
+            batch,
+            _reservations: Vec::new(),
+        }
+    }
+
+    pub(crate) fn batch(&self) -> &RecordBatch {
+        &self.batch
+    }
+
+    pub(crate) fn with_batch(self, batch: RecordBatch) -> Self {
+        Self {
+            batch,
+            _reservations: self._reservations,
+        }
+    }
+
+    pub(crate) fn concat(schema: &SchemaRef, batches: Vec<Self>) -> Result<Self> {
+        let mut record_batches = Vec::with_capacity(batches.len());
+        let mut reservations = Vec::new();
+        for batch in batches {
+            record_batches.push(batch.batch);
+            reservations.extend(batch._reservations);
+        }
+        Ok(Self {
+            batch: arrow::compute::concat_batches(schema, record_batches.iter())?,
+            _reservations: reservations,
+        })
+    }
+
     pub(crate) fn into_batch(self) -> RecordBatch {
         self.batch
     }
@@ -3516,7 +3549,7 @@ pub async fn materialize_blob_v2_binary_batch_with_context(
             )),
             columns,
         )?,
-        _reservation: reservation,
+        _reservations: reservation.into_iter().collect(),
     })
 }
 

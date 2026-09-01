@@ -59,6 +59,7 @@ use tokio::sync::{Mutex as AsyncMutex, OnceCell};
 use tracing::{Instrument, instrument};
 
 use crate::Dataset;
+use crate::dataset::blob::{BlobMaterializationContext, MaterializedBlobBatch};
 use crate::dataset::fragment::{FileFragment, FragReadConfig};
 use crate::dataset::rowids::load_row_id_sequence;
 use crate::dataset::scanner::{
@@ -68,6 +69,8 @@ use crate::dataset::scanner::{
 use crate::dataset::versions;
 
 use super::utils::IoMetrics;
+
+type MaterializedReadBatchFut = futures::future::BoxFuture<'static, Result<MaterializedBlobBatch>>;
 
 fn public_blob_v2_binary_projection_schema(projection: &Projection) -> SchemaRef {
     let schema = projection.to_schema();
@@ -435,7 +438,7 @@ struct FilteredReadStream {
     /// The stream of filtered rows, expressed as a stream of tasks (batch futures)
     ///
     /// This stream can be shared by multiple partitions
-    task_stream: Arc<AsyncMutex<BoxStream<'static, Result<ReadBatchFut>>>>,
+    task_stream: Arc<AsyncMutex<BoxStream<'static, Result<MaterializedReadBatchFut>>>>,
     /// The scan scheduler for the scan
     scan_scheduler: Arc<ScanScheduler>,
     /// The global metrics for the scan
@@ -581,6 +584,7 @@ impl FilteredReadStream {
         plan: FilteredReadInternalPlan,
         scan_scheduler: Option<Arc<ScanScheduler>>,
         priority_offset: Option<u32>,
+        materialization_context: Arc<BlobMaterializationContext>,
     ) -> Self {
         let scan_scheduler =
             scan_scheduler.unwrap_or_else(|| Self::make_scan_scheduler(&dataset, &options));
@@ -605,11 +609,6 @@ impl FilteredReadStream {
         );
 
         let output_schema = public_blob_v2_binary_projection_schema(&options.projection);
-        let materialization_context = crate::dataset::blob::BlobMaterializationContext::new(
-            options.io_buffer_size_bytes,
-            options.materialization_readahead_bytes,
-        );
-
         // Get scan_range_after_filter from the plan
         let scan_range_after_filter = plan.scan_range_after_filter.clone();
 
@@ -684,7 +683,7 @@ impl FilteredReadStream {
 
     /// Drain the entire read into batches (used by the row-stream path,
     /// which is the stream's only consumer and records metrics per batch)
-    async fn collect_all(&self, decode_parallelism: usize) -> Result<Vec<RecordBatch>> {
+    async fn collect_all(&self, decode_parallelism: usize) -> Result<Vec<MaterializedBlobBatch>> {
         let mut task_stream = self.task_stream.lock().await;
         (&mut *task_stream)
             .try_buffered(decode_parallelism)
@@ -1319,16 +1318,16 @@ impl FilteredReadStream {
                     }
                 });
                 let partition_metrics_clone = partition_metrics.clone();
-                let base_batch_stream =
-                    futures_stream
-                        .try_buffered(num_threads)
-                        .try_filter_map(move |batch| {
-                            std::future::ready(Ok(if batch.num_rows() == 0 {
-                                None
-                            } else {
-                                Some(batch)
-                            }))
-                        });
+                let base_batch_stream = futures_stream
+                    .try_buffered(num_threads)
+                    .map_ok(MaterializedBlobBatch::into_batch)
+                    .try_filter_map(move |batch| {
+                        std::future::ready(Ok(if batch.num_rows() == 0 {
+                            None
+                        } else {
+                            Some(batch)
+                        }))
+                    });
 
                 let batch_stream = if let Some(ref range) = self.scan_range_after_filter {
                     Self::apply_hard_range(base_batch_stream, range.clone()).boxed()
@@ -1384,7 +1383,7 @@ impl FilteredReadStream {
                             };
                             if let Some(task) = maybe_task {
                                 let task = task?;
-                                let batch = task.await?;
+                                let batch = task.await?.into_batch();
                                 partition_metrics
                                     .baseline_metrics
                                     .record_output(batch.num_rows());
@@ -1420,8 +1419,8 @@ impl FilteredReadStream {
         mut fragment_read_task: ScopedFragmentRead,
         global_metrics: Arc<FilteredReadGlobalMetrics>,
         fragment_soft_limit: Option<u64>,
-        materialization_context: Arc<crate::dataset::blob::BlobMaterializationContext>,
-    ) -> Result<BoxStream<'static, Result<ReadBatchFut>>> {
+        materialization_context: Arc<BlobMaterializationContext>,
+    ) -> Result<BoxStream<'static, Result<MaterializedReadBatchFut>>> {
         let output_schema =
             public_blob_v2_binary_projection_schema(fragment_read_task.projection.as_ref());
 
@@ -1524,11 +1523,10 @@ impl FilteredReadStream {
                                 &materialization_context,
                             )
                             .await
-                            .map(|batch| batch.into_batch())
                         })
                         .boxed()
                 } else {
-                    batch_fut
+                    batch_fut.map_ok(MaterializedBlobBatch::unreserved).boxed()
                 }
             })
             .zip(futures::stream::repeat((
@@ -1546,22 +1544,23 @@ impl FilteredReadStream {
     }
 
     fn wrap_with_filter(
-        batch_fut: ReadBatchFut,
+        batch_fut: MaterializedReadBatchFut,
         filter: Option<Arc<dyn PhysicalExpr>>,
         output_schema: SchemaRef,
-    ) -> Result<ReadBatchFut> {
+    ) -> Result<MaterializedReadBatchFut> {
         if let Some(filter) = filter {
             Ok(batch_fut
                 .map(move |batch| {
                     let batch = batch?;
-                    let batch = datafusion_physical_plan::filter::batch_filter(&batch, &filter)
-                        .map_err(|e| {
-                            Error::execution(format!(
-                                "Error applying filter expression to batch: {e}"
-                            ))
-                        })?;
+                    let filtered =
+                        datafusion_physical_plan::filter::batch_filter(batch.batch(), &filter)
+                            .map_err(|e| {
+                                Error::execution(format!(
+                                    "Error applying filter expression to batch: {e}"
+                                ))
+                            })?;
                     // Drop any fields loaded purely for the purpose of applying the filter
-                    Ok(batch.project_by_schema(output_schema.as_ref())?)
+                    Ok(batch.with_batch(filtered.project_by_schema(output_schema.as_ref())?))
                 })
                 .boxed())
         } else {
@@ -1569,9 +1568,12 @@ impl FilteredReadStream {
         }
     }
 
-    fn apply_soft_limit<S>(stream: S, limit: u64) -> impl Stream<Item = Result<ReadBatchFut>>
+    fn apply_soft_limit<S>(
+        stream: S,
+        limit: u64,
+    ) -> impl Stream<Item = Result<MaterializedReadBatchFut>>
     where
-        S: Stream<Item = Result<ReadBatchFut>>,
+        S: Stream<Item = Result<MaterializedReadBatchFut>>,
     {
         let rows_read = Arc::new(AtomicUsize::new(0));
 
@@ -1586,7 +1588,7 @@ impl FilteredReadStream {
                     batch_fut
                         .map(move |batch_result| {
                             batch_result.inspect(|batch| {
-                                let batch_rows = batch.num_rows();
+                                let batch_rows = batch.batch().num_rows();
                                 rows_read.fetch_add(batch_rows, Ordering::Relaxed);
                             })
                         })
@@ -1955,6 +1957,7 @@ impl FilteredReadOptions {
 pub struct FilteredReadExec {
     dataset: Arc<Dataset>,
     options: FilteredReadOptions,
+    materialization_context: Arc<BlobMaterializationContext>,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
     input: RowSelector,
@@ -2195,6 +2198,10 @@ impl FilteredReadExec {
         };
 
         Ok(Self {
+            materialization_context: BlobMaterializationContext::new(
+                options.io_buffer_size_bytes,
+                options.materialization_readahead_bytes,
+            ),
             dataset,
             options,
             properties,
@@ -2284,6 +2291,10 @@ impl FilteredReadExec {
         let metrics = ExecutionPlanMetricsSet::new();
 
         Ok(Self {
+            materialization_context: BlobMaterializationContext::new(
+                options.io_buffer_size_bytes,
+                options.materialization_readahead_bytes,
+            ),
             dataset,
             options,
             properties,
@@ -2490,6 +2501,7 @@ impl FilteredReadExec {
         let metrics = self.metrics.clone();
         let index_input = self.input.row_set_plan().cloned();
         let plan_cell = self.plan.clone();
+        let materialization_context = self.materialization_context.clone();
 
         let stream = futures::stream::once(async move {
             let mut running_stream = running_stream_lock.lock().await;
@@ -2513,6 +2525,7 @@ impl FilteredReadExec {
                     plan.clone(),
                     None,
                     None,
+                    materialization_context,
                 );
                 let first_stream = new_running_stream.get_stream(&metrics, partition);
                 *running_stream = Some(new_running_stream);
@@ -2599,6 +2612,7 @@ impl FilteredReadExec {
             Self::carried_schema(source.plan.schema().as_ref(), &self.options.projection);
         let output_schema = self.schema();
         let metrics = self.metrics.clone();
+        let materialization_context = self.materialization_context.clone();
 
         let lazy_stream = futures::stream::once(async move {
             let row_stream_read = Arc::new(RowStreamRead::new(
@@ -2608,6 +2622,7 @@ impl FilteredReadExec {
                 output_schema,
                 &metrics,
                 partition,
+                materialization_context,
             ));
             row_stream_read.apply(input_stream)
         })
@@ -2652,6 +2667,7 @@ struct RowStreamRead {
     carried_schema: SchemaRef,
     output_schema: SchemaRef,
     scan_scheduler: Arc<ScanScheduler>,
+    materialization_context: Arc<BlobMaterializationContext>,
     loaded_fragments: OnceCell<StreamFragments>,
     global_metrics: Arc<FilteredReadGlobalMetrics>,
     baseline_metrics: BaselineMetrics,
@@ -2665,6 +2681,7 @@ impl RowStreamRead {
         output_schema: SchemaRef,
         metrics: &ExecutionPlanMetricsSet,
         partition: usize,
+        materialization_context: Arc<BlobMaterializationContext>,
     ) -> Self {
         let scan_scheduler =
             FilteredReadStream::make_scan_scheduler(&dataset, &source.read_options);
@@ -2674,6 +2691,7 @@ impl RowStreamRead {
             carried_schema,
             output_schema,
             scan_scheduler,
+            materialization_context,
             loaded_fragments: OnceCell::new(),
             global_metrics: Arc::new(FilteredReadGlobalMetrics::new(metrics)),
             baseline_metrics: BaselineMetrics::new(metrics, partition),
@@ -2834,7 +2852,7 @@ impl RowStreamRead {
         &self,
         internal_plan: FilteredReadInternalPlan,
         batch_index: u32,
-    ) -> DataFusionResult<RecordBatch> {
+    ) -> DataFusionResult<MaterializedBlobBatch> {
         let fragment_count = self.load_fragments().await?.fragments.len();
         // I/O priority: earlier batches strictly first (output emits in batch
         // order), fragments keep dataset order within a batch
@@ -2846,15 +2864,16 @@ impl RowStreamRead {
             internal_plan,
             Some(self.scan_scheduler.clone()),
             Some(priority_offset),
+            self.materialization_context.clone(),
         );
         let decode_parallelism = match self.source.read_options.threading_mode {
             FilteredReadThreadingMode::OnePartitionMultipleThreads(n) => n,
             FilteredReadThreadingMode::MultiplePartitions(n) => n,
         };
         let read_batches = read.collect_all(decode_parallelism.max(1)).await?;
-        Ok(arrow::compute::concat_batches(
+        Ok(MaterializedBlobBatch::concat(
             &read.output_schema,
-            read_batches.iter(),
+            read_batches,
         )?)
     }
 
@@ -2863,29 +2882,32 @@ impl RowStreamRead {
     fn attach_columns(
         &self,
         batch: RecordBatch,
-        read_data: RecordBatch,
-    ) -> DataFusionResult<RecordBatch> {
+        read_data: MaterializedBlobBatch,
+    ) -> DataFusionResult<MaterializedBlobBatch> {
         let _compute_timer = self.baseline_metrics.elapsed_compute().timer();
         let keys = self.key_array(&batch, "input")?;
-        let read_keys = self.key_array(&read_data, "read")?;
-        attach_read_columns(
+        let read_keys = self.key_array(read_data.batch(), "read")?;
+        let output = attach_read_columns(
             &batch,
             keys,
-            &read_data,
+            read_data.batch(),
             read_keys,
             self.carried_schema.as_ref(),
             self.source.new_fields_schema.as_ref(),
             &self.output_schema,
-        )
+        )?;
+        Ok(read_data.with_batch(output))
     }
 
     async fn execute_batch(
         self: Arc<Self>,
         batch: RecordBatch,
         batch_index: u32,
-    ) -> DataFusionResult<RecordBatch> {
+    ) -> DataFusionResult<MaterializedBlobBatch> {
         if batch.num_rows() == 0 {
-            return Ok(RecordBatch::new_empty(self.output_schema.clone()));
+            return Ok(MaterializedBlobBatch::unreserved(RecordBatch::new_empty(
+                self.output_schema.clone(),
+            )));
         }
         let internal_plan = self.plan_batch(self.key_array(&batch, "input")?).await?;
         let read_data = self.read_batch(internal_plan, batch_index).await?;
@@ -2924,6 +2946,7 @@ impl RowStreamRead {
             })
             .boxed()
             .try_buffered(ROW_STREAM_CONCURRENT_BATCHES)
+            .map_ok(MaterializedBlobBatch::into_batch)
             .map(move |result| {
                 on_result
                     .global_metrics
