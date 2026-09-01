@@ -7446,10 +7446,10 @@ class DatasetOptimizer:
         an expensive unindexed search on the new data.  As the amount of new
         unindexed data grows this can have an impact on search latency.
         This function will add the new data to existing indexes, restoring the
-        performance.  This function does not retrain the index, it only assigns
-        the new data to existing partitions.  This means an update is much quicker
-        than retraining the entire index but may have less accuracy (especially
-        if the new data exhibits new patterns, concepts, or trends)
+        performance. By default, this function does not retrain the index, it only
+        assigns the new data to existing partitions. This means an update is much
+        quicker than retraining the entire index but may have less accuracy
+        (especially if the new data exhibits new patterns, concepts, or trends)
 
         Parameters
         ----------
@@ -7459,7 +7459,7 @@ class DatasetOptimizer:
         index_names: List[str], default None
             The names of the indices to optimize.
             If None, all indices will be optimized.
-        retrain: bool, default False, deprecated
+        retrain: bool, default False
             Whether to retrain the whole index.
             If true, the index will be retrained based on the current data,
             `num_indices_to_merge` will be ignored,
@@ -7467,7 +7467,7 @@ class DatasetOptimizer:
 
             This is useful when the data distribution has changed significantly,
             and we want to retrain the index to improve the search quality.
-            This would be faster than re-create the index from scratch.
+            This rebuilds the index from the source data and may be expensive.
         """
         self._dataset._ds.optimize_indices(**kwargs)
 
