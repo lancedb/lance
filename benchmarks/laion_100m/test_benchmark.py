@@ -188,6 +188,7 @@ def test_unified_index_build_flow_uses_shared_model_with_toggle(tmp_path, monkey
     assert baseline_metrics["process_cpu_seconds"] >= 0
     assert baseline_metrics["peak_rss_gib"] > 0
     assert baseline_metrics["max_iop_size_bytes"] == 16 * 1024 * 1024
+    assert baseline_metrics["download_retry_count"] == 3
 
 
 def test_recall_at_k_uses_id_sets():

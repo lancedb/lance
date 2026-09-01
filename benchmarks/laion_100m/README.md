@@ -154,6 +154,7 @@ loaded from its checkpoint.
 | `resumed_segments` | Segments loaded from the checkpoint by the latest invocation |
 | `runs` | Per-invocation status, wall/CPU/RSS, resumed count, and new segment count |
 | `max_iop_size_bytes` | Maximum object-store range request size selected by `LANCE_MAX_IOP_SIZE` (16 MiB by default) |
+| `download_retry_count` | Number of retries for a failed object-store range download selected by `LANCE_BENCHMARK_DOWNLOAD_RETRY_COUNT` (3 by default) |
 
 Compare `index_build_seconds`, not raw end-to-end time, between the two branches:
 the first invocation trains the common model while the second normally loads it.
@@ -164,6 +165,9 @@ If a storage path is unreliable for the default 16 MiB range requests, set a
 smaller integer byte value such as `LANCE_MAX_IOP_SIZE=2097152`. Use the same
 value for both A/B branches; the value is included in the metrics identity so a
 resume cannot silently change this I/O condition.
+For storage links that intermittently truncate response bodies, set
+`LANCE_BENCHMARK_DOWNLOAD_RETRY_COUNT` to a higher non-negative integer. Apply
+the same retry count to both branches; it is also part of the metrics identity.
 
 ### 3. Calibrate recall
 

@@ -30,6 +30,7 @@ DEFAULT_DIMENSION = 768
 DEFAULT_TARGET_PARTITION_SIZE = 4096
 DEFAULT_NUM_PARTITIONS = 100_000_000 // DEFAULT_TARGET_PARTITION_SIZE
 DEFAULT_SEGMENT_ROWS = DEFAULT_TARGET_PARTITION_SIZE**2
+DEFAULT_DOWNLOAD_RETRY_COUNT = 3
 
 
 class ResourceSampler:
@@ -104,6 +105,17 @@ def tos_storage_options() -> dict[str, str]:
         options["tos_region"] = region
     if token := os.environ.get("TOS_SECURITY_TOKEN"):
         options["tos_security_token"] = token
+    download_retry_count = int(
+        os.environ.get(
+            "LANCE_BENCHMARK_DOWNLOAD_RETRY_COUNT", DEFAULT_DOWNLOAD_RETRY_COUNT
+        )
+    )
+    if download_retry_count < 0:
+        raise ValueError(
+            "LANCE_BENCHMARK_DOWNLOAD_RETRY_COUNT must be non-negative, "
+            f"got {download_retry_count}"
+        )
+    options["download_retry_count"] = str(download_retry_count)
     return options
 
 

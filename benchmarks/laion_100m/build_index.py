@@ -19,6 +19,7 @@ import pyarrow.ipc as ipc
 from common import (
     DEFAULT_DATASET_URI,
     DEFAULT_DIMENSION,
+    DEFAULT_DOWNLOAD_RETRY_COUNT,
     DEFAULT_NUM_PARTITIONS,
     DEFAULT_SEGMENT_ROWS,
     DEFAULT_TARGET_PARTITION_SIZE,
@@ -205,6 +206,16 @@ def _metrics_identity(
         raise ValueError(
             f"LANCE_MAX_IOP_SIZE must be a positive integer, got {max_iop_size_bytes}"
         )
+    download_retry_count = int(
+        os.environ.get(
+            "LANCE_BENCHMARK_DOWNLOAD_RETRY_COUNT", DEFAULT_DOWNLOAD_RETRY_COUNT
+        )
+    )
+    if download_retry_count < 0:
+        raise ValueError(
+            "LANCE_BENCHMARK_DOWNLOAD_RETRY_COUNT must be non-negative, "
+            f"got {download_retry_count}"
+        )
     return {
         "dataset_uri": args.dataset_uri,
         "branch": args.branch,
@@ -218,6 +229,7 @@ def _metrics_identity(
         "segment_target_rows": args.segment_rows,
         "num_bits": args.num_bits,
         "max_iop_size_bytes": max_iop_size_bytes,
+        "download_retry_count": download_retry_count,
     }
 
 
