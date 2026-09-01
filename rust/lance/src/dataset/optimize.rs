@@ -2525,7 +2525,7 @@ async fn rewrite_files(
             let captured_ids = row_ids_rx
                 .try_recv()
                 .map_err(|err| Error::internal(format!("Failed to receive row ids: {}", err)))?;
-            let mut row_addrs = captured_ids.row_addrs(None).into_owned();
+            let mut row_addrs = captured_ids.row_addrs(None)?.into_owned();
             // Compaction reads whole fragments, so the captured addresses are
             // dense per-fragment ranges; run containers (standard roaring
             // format) shrink the persisted blob from O(rows) to O(runs) bytes.
