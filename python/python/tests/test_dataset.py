@@ -2188,6 +2188,43 @@ def test_merge_with_commit(tmp_path: Path):
     assert tbl == expected
 
 
+def test_merge_columns_with_deleted_batch_commit(tmp_path: Path):
+    base_dir = tmp_path / "test"
+    table = pa.table({"id": range(150), "value": range(150)})
+    dataset = lance.write_dataset(table, base_dir, max_rows_per_file=200)
+
+    dataset.delete("id >= 50 AND id < 100")
+    assert dataset.count_rows() == 100
+
+    merged_frags = []
+    schema = None
+    for frag in dataset.get_fragments():
+        live_ids = frag.scanner(columns=["id"]).to_table()["id"].to_pylist()
+        right_table = pa.table(
+            {
+                "merged": pa.array([row_id * 10 for row_id in live_ids], pa.int64()),
+            }
+        )
+        merged, schema = frag.merge_columns(right_table, batch_size=50)
+        merged_frags.append(merged)
+
+    dataset = lance.LanceDataset.commit(
+        dataset.uri,
+        lance.LanceOperation.Merge(merged_frags, schema),
+        read_version=dataset.version,
+    )
+    dataset.validate()
+
+    expected_ids = list(range(50)) + list(range(100, 150))
+    assert dataset.to_table() == pa.table(
+        {
+            "id": expected_ids,
+            "value": expected_ids,
+            "merged": [row_id * 10 for row_id in expected_ids],
+        }
+    )
+
+
 def test_merge_with_schema_holes(tmp_path: Path):
     # Create table with 3 cols
     table = pa.table({"a": range(10)})

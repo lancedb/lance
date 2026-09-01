@@ -1984,6 +1984,64 @@ mod test {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn test_add_columns_with_middle_fully_deleted_batch() -> Result<()> {
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "i",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..150))],
+        )?;
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 200,
+                ..Default::default()
+            }),
+        )
+        .await?;
+
+        dataset.delete("i >= 50 AND i < 100").await?;
+        assert_eq!(dataset.count_rows(None).await?, 100);
+
+        let new_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "j",
+            DataType::Int32,
+            false,
+        )]));
+        let new_batch = RecordBatch::try_new(
+            new_schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..100))],
+        )?;
+        let reader = RecordBatchIterator::new(vec![Ok(new_batch)], new_schema.clone());
+
+        dataset
+            .add_columns(NewColumnTransform::Reader(Box::new(reader)), None, Some(50))
+            .await?;
+        dataset.validate().await?;
+
+        let data = dataset.scan().try_into_batch().await?;
+        assert_eq!(data.num_rows(), 100);
+        assert_eq!(
+            data.column_by_name("i").unwrap().as_ref(),
+            &Int32Array::from_iter_values((0..50).chain(100..150))
+        );
+        assert_eq!(
+            data.column_by_name("j").unwrap().as_ref(),
+            &Int32Array::from_iter_values(0..100)
+        );
+
+        Ok(())
+    }
+
     #[rstest]
     #[tokio::test]
     async fn test_append_columns_udf(

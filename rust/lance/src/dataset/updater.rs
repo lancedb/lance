@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use arrow_array::{RecordBatch, UInt32Array};
+use arrow_array::{new_null_array, RecordBatch, UInt32Array};
 use futures::StreamExt;
 use lance_core::datatypes::{OnMissing, OnTypeMismatch};
 use lance_core::utils::deletion::DeletionVector;
@@ -52,6 +52,8 @@ pub struct Updater {
     finished: bool,
 
     deletion_restorer: DeletionRestorer,
+
+    write_batch_size: Option<u32>,
 }
 
 impl Updater {
@@ -107,6 +109,7 @@ impl Updater {
             allow_external_blob_outside_bases: false,
             finished: false,
             deletion_restorer: DeletionRestorer::new(deletion_vector, legacy_batch_size),
+            write_batch_size: Some(batch_size),
         })
     }
 
@@ -222,7 +225,25 @@ impl Updater {
 
         let writer = self.writer.as_mut().unwrap();
 
-        writer.write(&[batch]).await?;
+        if let Some(batch_size) = self.write_batch_size {
+            let batch_size = batch_size as usize;
+            if batch.num_rows() > batch_size {
+                let batches = (0..batch.num_rows())
+                    .step_by(batch_size)
+                    .map(|offset| {
+                        let len = std::cmp::min(batch_size, batch.num_rows() - offset);
+                        batch.slice(offset, len)
+                    })
+                    .collect::<Vec<_>>();
+                for batch in batches {
+                    writer.write(&[batch]).await?;
+                }
+            } else {
+                writer.write(&[batch]).await?;
+            }
+        } else {
+            writer.write(&[batch]).await?;
+        }
 
         Ok(())
     }
@@ -423,11 +444,13 @@ pub(crate) fn add_blanks(batch: RecordBatch, batch_offsets: &[u32]) -> Result<Re
     }
 
     if batch.num_rows() == 0 {
-        // TODO: implement adding blanks for an empty batch.
-        // This is difficult because we need to create a batch for arbitrary schemas.
-        return Err(Error::not_supported_source(
-            "Missing too many rows in merge, run compaction to materialize deletions first".into(),
-        ));
+        let arrays = batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| new_null_array(field.data_type(), batch_offsets.len()))
+            .collect();
+        return Ok(RecordBatch::try_new(batch.schema(), arrays)?);
     }
 
     let mut selection_vector = Vec::<u32>::with_capacity(batch.num_rows() + batch_offsets.len());
@@ -461,7 +484,13 @@ pub(crate) fn add_blanks(batch: RecordBatch, batch_offsets: &[u32]) -> Result<Re
 
 #[cfg(test)]
 mod tests {
-    use arrow::{array::AsArray, datatypes::Int32Type};
+    use std::sync::Arc;
+
+    use arrow::{
+        array::{Array, AsArray},
+        datatypes::{DataType, Field as ArrowField, Int32Type, Schema as ArrowSchema},
+    };
+    use arrow_array::RecordBatch;
     use lance_datagen::RowCount;
 
     use super::add_blanks;
@@ -537,5 +566,25 @@ mod tests {
             assert_eq!(values.value(i), (i - 1) as i32);
         }
         assert_eq!(values.value(11), 0);
+    }
+
+    #[test]
+    fn test_add_blanks_to_empty_batch() {
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "x",
+            DataType::Int32,
+            true,
+        )]));
+        let batch = RecordBatch::new_empty(schema.clone());
+
+        let with_blanks = add_blanks(batch, &[0, 1, 2]).unwrap();
+
+        assert_eq!(with_blanks.num_rows(), 3);
+        assert_eq!(with_blanks.schema(), schema);
+        let values = with_blanks.column(0).as_primitive::<Int32Type>();
+        assert_eq!(values.len(), 3);
+        assert!(values.is_null(0));
+        assert!(values.is_null(1));
+        assert!(values.is_null(2));
     }
 }
