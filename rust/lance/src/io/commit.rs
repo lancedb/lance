@@ -960,9 +960,12 @@ async fn migrate_indices(dataset: &Dataset, indices: &mut [IndexMetadata]) -> Re
         if !index_is_usable(index) {
             continue;
         }
+        // Also true when the bitmap is missing entirely, so the failure path below
+        // pairs it with `is_some` to mean "written before the 0.8.15 fix".
+        let bitmap_missing_or_legacy =
+            must_recalculate_fragment_bitmap(index, dataset.manifest.writer_version.as_ref());
         if needs_recalculating.contains(&index.name)
-            || must_recalculate_fragment_bitmap(index, dataset.manifest.writer_version.as_ref())
-                && !is_system_index(index)
+            || bitmap_missing_or_legacy && !is_system_index(index)
         {
             // A covered index still has exactly one keyed field; the trailing
             // `covering_fields` are carried, not keyed, so counting them
@@ -975,14 +978,49 @@ async fn migrate_indices(dataset: &Dataset, indices: &mut [IndexMetadata]) -> Re
             );
             let idx_field = dataset.schema().field_by_id(index.fields[0]).ok_or_else(|| Error::internal(format!("Index with uuid {} referred to field with id {} which did not exist in dataset", index.uuid, index.fields[0])))?;
             // We need to calculate the fragments covered by the index
-            let idx = dataset
-                .open_generic_index(&idx_field.name, &index.uuid, &NoOpMetricsCollector)
-                .await?;
-            let recalculated = idx.calculate_included_frags().await?;
-            if index.fragment_bitmap.as_ref() != Some(&recalculated) {
-                recovered_coverage.push(index.name.clone());
+            let recalculated = async {
+                let idx = dataset
+                    .open_generic_index(&idx_field.name, &index.uuid, &NoOpMetricsCollector)
+                    .await?;
+                idx.calculate_included_frags().await
             }
-            index.fragment_bitmap = Some(recalculated);
+            .await;
+            match recalculated {
+                Ok(fragment_bitmap) => {
+                    if index.fragment_bitmap.as_ref() != Some(&fragment_bitmap) {
+                        recovered_coverage.push(index.name.clone());
+                    }
+                    index.fragment_bitmap = Some(fragment_bitmap);
+                }
+                Err(e) => {
+                    // Recalculating means opening the index, and failing here fails
+                    // every commit the dataset takes, since migration runs on all of
+                    // them. A missing bitmap and overlapping segment bitmaps are both
+                    // re-derived from the index metadata, so they ask again on their
+                    // own; the pre-0.8.15 trigger reads the previous manifest's writer
+                    // version, which this commit replaces with the current one, and a
+                    // bitmap left in place would look migrated from here on.
+                    let repair_ends_with_this_commit =
+                        index.fragment_bitmap.is_some() && bitmap_missing_or_legacy;
+                    log::warn!(
+                        "Could not recalculate the fragment bitmap for index {} (uuid: {}): {}. {}",
+                        index.name,
+                        index.uuid,
+                        e,
+                        if repair_ends_with_this_commit {
+                            "Dropping its coverage to unknown so a build that can open the index recalculates it."
+                        } else {
+                            "Leaving the repair to a build that can open the index."
+                        }
+                    );
+                    if repair_ends_with_this_commit {
+                        index.fragment_bitmap = None;
+                        // Derivation ran before this and may have credited a
+                        // catch-up position off the bitmap being dropped here.
+                        recovered_coverage.push(index.name.clone());
+                    }
+                }
+            }
         }
         // We can't reliably recalculate the index type for label_list and bitmap indices and so we can't migrate this field.
         // However, we still log for visibility and to help potentially diagnose issues in the future if we grow to rely on the field.
@@ -1957,6 +1995,117 @@ mod tests {
         }
 
         assert!(dataset.checkout_version(4).await.is_err());
+    }
+
+    /// Every commit runs `migrate_indices`, and recalculating a missing
+    /// `fragment_bitmap` there means opening the index. An index this build
+    /// cannot open must not take the write path down with it: the dataset would
+    /// be unwritable, not merely unreadable, and every later commit would fail
+    /// the same way.
+    #[tokio::test]
+    async fn test_commit_survives_an_index_it_cannot_open() {
+        use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
+        use lance_table::io::manifest::read_manifest_indexes;
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        let reader = gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .col("payload", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+        let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+
+        // The readable companion is what makes the difference visible: with a
+        // single index, "carried through the one it cannot open" and "stopped
+        // recalculating altogether" answer every assertion below the same way.
+        let btree_params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
+        for column in ["id", "payload"] {
+            dataset
+                .create_index_builder(&[column], IndexType::BTree, &btree_params)
+                .name(format!("{column}_idx"))
+                .await
+                .unwrap();
+        }
+
+        let broken = dataset.load_index_by_name("id_idx").await.unwrap().unwrap();
+        dataset
+            .object_store
+            .remove_dir_all(dataset.indices_dir().join(broken.uuid.to_string()))
+            .await
+            .unwrap();
+
+        // Reopened so the fixture is judged on what is on disk rather than on
+        // what this process still holds from building the index.
+        let mut dataset = Dataset::open(test_uri).await.unwrap();
+        assert!(
+            dataset
+                .open_generic_index("id", &broken.uuid, &NoOpMetricsCollector)
+                .await
+                .is_err(),
+            "the fixture is supposed to leave an index this build cannot open"
+        );
+
+        // Migration recalculates a bitmap that is missing, and no current writer
+        // emits one - untrained indices get an empty bitmap, not none at all - so
+        // the state an old manifest arrives in is set here by hand.
+        let indices = read_manifest_indexes(
+            &dataset.object_store,
+            &dataset.manifest_location,
+            &dataset.manifest,
+        )
+        .await
+        .unwrap();
+        let without_bitmaps = indices
+            .iter()
+            .map(|index| IndexMetadata {
+                fragment_bitmap: None,
+                ..index.clone()
+            })
+            .collect::<Vec<_>>();
+        let transaction = Transaction::new(
+            dataset.manifest.version,
+            Operation::CreateIndex {
+                new_indices: without_bitmaps,
+                removed_indices: indices,
+            },
+            None,
+        );
+        dataset
+            .apply_commit(transaction, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+
+        // And an unrelated commit after it, since the missing bitmap is now what
+        // the manifest holds and migration retries on every commit.
+        dataset.delete("false").await.unwrap();
+
+        let migrated = read_manifest_indexes(
+            &dataset.object_store,
+            &dataset.manifest_location,
+            &dataset.manifest,
+        )
+        .await
+        .unwrap();
+        let coverage = |name: &str| {
+            migrated
+                .iter()
+                .find(|index| index.name == name)
+                .unwrap_or_else(|| panic!("no index named {name} in the manifest"))
+                .fragment_bitmap
+                .as_ref()
+                .map(|bitmap| bitmap.iter().collect::<Vec<_>>())
+        };
+        assert_eq!(
+            coverage("id_idx"),
+            None,
+            "an index that cannot be opened must report unknown coverage"
+        );
+        assert_eq!(
+            coverage("payload_idx"),
+            Some(vec![0]),
+            "an index that opens must still have its coverage recalculated"
+        );
     }
 
     #[tokio::test]
