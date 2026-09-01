@@ -30,10 +30,11 @@ use lance_core::{Error, ROW_ID_FIELD, Result};
 use lance_file::version::ConcreteFileVersion;
 use lance_file::versions as file_versions;
 use lance_file::writer::FileWriterOptions;
-use lance_index::frag_reuse::FragReuseIndex;
+use lance_index::frag_reuse::{CompactFragReuseIndex, CompactFragReuseIndexHandle};
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::progress::{IndexBuildProgress, NoopIndexBuildProgress};
+use lance_index::scalar::RowIdRemapper;
 use lance_index::vector::bq::storage::{RABIT_CODE_COLUMN, unpack_codes};
 use lance_index::vector::kmeans::KMeansParams;
 use lance_index::vector::pq::storage::transpose;
@@ -83,7 +84,6 @@ use crate::Dataset;
 use crate::dataset::ProjectionRequest;
 use crate::dataset::index::dataset_format_version;
 use crate::index::append::build_old_data_filter;
-use crate::index::vector::ivf::v2::PartitionEntry;
 use crate::index::vector::utils::infer_vector_dim;
 
 use super::v2::IVFIndex;
@@ -237,7 +237,7 @@ pub struct IvfIndexBuilder<S: IvfSubIndex, Q: Quantization> {
     // fields for merging indices / remapping
     existing_indices: Vec<ExistingIndex>,
 
-    frag_reuse_index: Option<Arc<FragReuseIndex>>,
+    frag_reuse_index: Option<Arc<CompactFragReuseIndex>>,
 
     // fragments for distributed indexing
     fragment_filter: Option<Vec<u32>>,
@@ -276,7 +276,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         ivf_params: Option<IvfBuildParams>,
         quantizer_params: Option<Q::BuildParams>,
         sub_index_params: S::BuildParams,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<CompactFragReuseIndex>>,
     ) -> Result<Self> {
         let temp_dir = TempStdDir::default();
         let temp_dir_path = Path::from_filesystem_path(&temp_dir)?;
@@ -317,7 +317,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         distance_type: DistanceType,
         shuffler: Box<dyn Shuffler>,
         sub_index_params: S::BuildParams,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<CompactFragReuseIndex>>,
         optimize_options: OptimizeOptions,
     ) -> Result<Self> {
         let mut builder = Self::new(
@@ -433,27 +433,23 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         log::info!("remap {} partitions", ivf.num_partitions());
         let existing_index = self.existing_indices[0].index.clone();
         let mapping = Arc::new(mapping.clone());
-        let build_iter =
-            (0..ivf.num_partitions()).map(move |part_id| {
-                let existing_index = existing_index.clone();
-                let mapping = mapping.clone();
-                async move {
-                    let ivf_index = existing_index
-                        .as_any()
-                        .downcast_ref::<IVFIndex<S, Q>>()
-                        .ok_or(Error::invalid_input("existing index is not IVF index"))?;
-                    let part = ivf_index
-                        .load_partition(part_id, false, &NoOpMetricsCollector)
-                        .await?;
-                    let part = part.as_any().downcast_ref::<PartitionEntry<S, Q>>().ok_or(
-                        Error::internal("failed to downcast partition entry".to_string()),
-                    )?;
+        let build_iter = (0..ivf.num_partitions()).map(move |part_id| {
+            let existing_index = existing_index.clone();
+            let mapping = mapping.clone();
+            async move {
+                let ivf_index = existing_index
+                    .as_any()
+                    .downcast_ref::<IVFIndex<S, Q>>()
+                    .ok_or(Error::invalid_input("existing index is not IVF index"))?;
+                let part = ivf_index
+                    .load_partition(part_id, false, &NoOpMetricsCollector)
+                    .await?;
 
-                    let storage = part.storage.remap(&mapping)?;
-                    let index = part.index.remap(&mapping, &storage)?;
-                    Result::Ok(Some((storage, index, 0.0)))
-                }
-            });
+                let storage = part.storage.remap(&mapping)?;
+                let index = part.index.remap(&mapping, &storage)?;
+                Result::Ok(Some((storage, index, 0.0)))
+            }
+        });
 
         let files = self
             .merge_partitions(
@@ -1107,10 +1103,13 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         sub_index_params: S::BuildParams,
         batches: Vec<RecordBatch>,
         column: String,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<CompactFragReuseIndex>>,
     ) -> Result<(Q::Storage, S)> {
-        let storage = StorageBuilder::new(column, distance_type, quantizer, frag_reuse_index)?
-            .build(batches)?;
+        let frag_reuse_index = frag_reuse_index
+            .map(|index| Arc::new(CompactFragReuseIndexHandle(index)) as Arc<dyn RowIdRemapper>);
+        let storage =
+            StorageBuilder::new_with_remapper(column, distance_type, quantizer, frag_reuse_index)?
+                .build(batches)?;
         let sub_index = S::index_vectors(&storage, sub_index_params)?;
 
         Ok((storage, sub_index))

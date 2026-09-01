@@ -1344,6 +1344,8 @@ pub struct CleanupPolicy {
     pub before_timestamp: Option<DateTime<Utc>>,
     /// If not none, cleanup all versions before the specified version.
     pub before_version: Option<u64>,
+    /// If not none, cleanup only the specified versions.
+    pub versions: Option<HashSet<u64>>,
     /// If true, delete unverified data files even if they are recent
     pub delete_unverified: bool,
     /// If true, return an Error if a tagged version is old
@@ -1367,6 +1369,9 @@ impl CleanupPolicy {
         if let Some(before_version) = self.before_version {
             should_clean &= manifest.version < before_version;
         }
+        if let Some(versions) = self.versions.as_ref() {
+            should_clean &= versions.contains(&manifest.version);
+        }
         should_clean
     }
 }
@@ -1376,6 +1381,7 @@ impl Default for CleanupPolicy {
         Self {
             before_timestamp: None,
             before_version: None,
+            versions: None,
             delete_unverified: false,
             error_if_tagged_old_versions: true,
             clean_referenced_branches: false,
@@ -1400,6 +1406,24 @@ impl CleanupPolicyBuilder {
     pub fn before_timestamp(mut self, timestamp: DateTime<Utc>) -> Self {
         self.policy.before_timestamp = Some(timestamp);
         self
+    }
+
+    /// Cleanup only the specified dataset versions.
+    ///
+    /// This is an exact-version filter. If other policy filters are also
+    /// configured, a manifest is removed only when it satisfies all of them.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `versions` is empty.
+    pub fn versions(mut self, versions: Vec<u64>) -> Result<Self> {
+        if versions.is_empty() {
+            return Err(Error::invalid_input(
+                "versions must not be empty when specified",
+            ));
+        }
+        self.policy.versions = Some(versions.into_iter().collect());
+        Ok(self)
     }
 
     /// Cleanup all versions except the last `n` versions of the dataset.
@@ -1703,6 +1727,15 @@ mod tests {
             original: Arc<dyn object_store::ObjectStore>,
         ) -> Arc<dyn object_store::ObjectStore> {
             Arc::new(ProxyObjectStore::new(original, self.policy.clone()))
+        }
+
+        // Injects behaviour into every request, so a listing must not go around it.
+        fn wrap_paginated(
+            &self,
+            _store_prefix: &str,
+            _original: Arc<dyn object_store::list::PaginatedListStore>,
+        ) -> Option<Arc<dyn object_store::list::PaginatedListStore>> {
+            None
         }
     }
 
@@ -3667,6 +3700,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cleanup_specific_versions_only() {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        fixture.overwrite_some_data().await.unwrap();
+        fixture.overwrite_some_data().await.unwrap();
+
+        let before_count = fixture.count_files().await.unwrap();
+        assert_eq!(before_count.num_manifest_files, 3);
+
+        let policy = CleanupPolicyBuilder::default()
+            .versions(vec![2])
+            .unwrap()
+            .build();
+        let removed = fixture.run_cleanup_with_policy(policy).await.unwrap();
+
+        assert_eq!(removed.old_versions, 1);
+
+        let versions = fixture
+            .open()
+            .await
+            .unwrap()
+            .version_refs()
+            .await
+            .unwrap()
+            .iter()
+            .map(|version| version.version)
+            .collect::<Vec<_>>();
+        assert_eq!(versions, vec![1, 3]);
+    }
+
+    #[tokio::test]
     async fn cleanup_before_ts_and_retain_n_recent_versions() {
         let fixture = MockDatasetFixture::try_new().unwrap();
         fixture.create_some_data().await.unwrap();
@@ -4986,7 +5050,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_cleanup_with_rate_limit() {
         // Create multiple versions with data files that will be deleted.
         let fixture = MockDatasetFixture::try_new().unwrap();
@@ -5005,7 +5069,7 @@ mod tests {
             .unwrap()
             .build();
 
-        let start = std::time::Instant::now();
+        let start = tokio::time::Instant::now();
         let db = fixture.open().await.unwrap();
         let stats = cleanup_old_versions(&db, policy).await.unwrap();
         let elapsed = start.elapsed();
