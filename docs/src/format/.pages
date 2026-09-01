@@ -1,5 +1,6 @@
 nav:
   - Overview: index.md
+  - Filtered Read Plans: filtered_read.md
   - File Format: file
   - Table Format: table
   - Index Formats: index

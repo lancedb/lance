@@ -145,6 +145,7 @@ fn fr_options_to_proto(
         threading_mode: Some(threading_mode_to_proto(&options.threading_mode)),
         io_buffer_size_bytes: options.io_buffer_size_bytes,
         filter_schema_ipc,
+        materialization_readahead_bytes: None,
     })
 }
 
