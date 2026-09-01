@@ -70,6 +70,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.stream.Collectors;
 
 /**
@@ -94,7 +95,7 @@ public class Dataset implements Closeable {
    * Serializes create/merge index builds on this Dataset handle. Always acquire the lifecycle read
    * lock first so a queued close cannot deadlock a reentrant read-lock owner.
    */
-  private final Object indexBuildLock = new Object();
+  private final ReentrantLock indexBuildLock = new ReentrantLock();
 
   private final LockManager lockManager = new LockManager(this);
 
@@ -1240,7 +1241,8 @@ public class Dataset implements Closeable {
     }
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-      synchronized (indexBuildLock) {
+      acquireIndexBuildLock();
+      try {
         if (progress == null) {
           return nativeCreateIndex(
               options.getColumns(),
@@ -1264,7 +1266,23 @@ public class Dataset implements Closeable {
             options.getIndexUUID(),
             options.getPreprocessedData().map(ArrowArrayStream::memoryAddress),
             new ContextIndexBuildProgress(this, progress));
+      } finally {
+        indexBuildLock.unlock();
       }
+    }
+  }
+
+  private void acquireIndexBuildLock() {
+    if (ContextIndexBuildProgress.isCallbackActive()) {
+      // An outer index build waits for its callback to return, so waiting here could create a
+      // cross-Dataset lock cycle between two concurrent builds.
+      if (!indexBuildLock.tryLock()) {
+        throw new IllegalStateException(
+            "Dataset is busy with an index build and cannot start another build "
+                + "from an index progress callback");
+      }
+    } else {
+      indexBuildLock.lock();
     }
   }
 
@@ -1345,7 +1363,8 @@ public class Dataset implements Closeable {
     }
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-      synchronized (indexBuildLock) {
+      acquireIndexBuildLock();
+      try {
         if (progress == null) {
           innerMergeIndexMetadata(indexUUID, indexType.getValue(), batchReadHead);
         } else {
@@ -1355,6 +1374,8 @@ public class Dataset implements Closeable {
               batchReadHead,
               new ContextIndexBuildProgress(this, progress));
         }
+      } finally {
+        indexBuildLock.unlock();
       }
     }
   }

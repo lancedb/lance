@@ -402,6 +402,48 @@ public class ScalarIndexTest {
     public void stageComplete(String stage) {}
   }
 
+  private static final class CrossDatasetLockCycleProgress implements IndexBuildProgress {
+    private final Dataset targetDataset;
+    private final IndexOptions targetOptions;
+    private final CountDownLatch callbacksReady;
+    private final CountDownLatch attemptsFinished;
+    private final AtomicBoolean attempted = new AtomicBoolean();
+    private final AtomicReference<RuntimeException> nestedFailure = new AtomicReference<>();
+
+    private CrossDatasetLockCycleProgress(
+        Dataset targetDataset,
+        IndexOptions targetOptions,
+        CountDownLatch callbacksReady,
+        CountDownLatch attemptsFinished) {
+      this.targetDataset = targetDataset;
+      this.targetOptions = targetOptions;
+      this.callbacksReady = callbacksReady;
+      this.attemptsFinished = attemptsFinished;
+    }
+
+    @Override
+    public void stageStart(String stage, Optional<Long> total, String unit) {
+      if (attempted.compareAndSet(false, true)) {
+        callbacksReady.countDown();
+        awaitLatch(callbacksReady, "Cross-Dataset callbacks did not become ready");
+        try {
+          targetDataset.createIndex(targetOptions);
+        } catch (RuntimeException failure) {
+          nestedFailure.set(failure);
+        } finally {
+          attemptsFinished.countDown();
+          awaitLatch(attemptsFinished, "Cross-Dataset build attempts did not finish");
+        }
+      }
+    }
+
+    @Override
+    public void stageProgress(String stage, long completed) {}
+
+    @Override
+    public void stageComplete(String stage) {}
+  }
+
   @Test
   public void testCreateBTreeIndex(@TempDir Path tempDir) throws Exception {
     String datasetPath = tempDir.resolve("btree_test").toString();
@@ -1123,6 +1165,98 @@ public class ScalarIndexTest {
   }
 
   @Test
+  @Timeout(value = 10, unit = TimeUnit.SECONDS)
+  public void testCreateIndexRejectsCrossDatasetCallbackLockCycle(@TempDir Path tempDir)
+      throws Exception {
+    RootAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+    Dataset datasetA = null;
+    Dataset datasetB = null;
+    Thread createA = null;
+    Thread createB = null;
+    try {
+      TestUtils.SimpleTestDataset testDatasetA =
+          new TestUtils.SimpleTestDataset(
+              allocator, tempDir.resolve("inverted_lock_cycle_a").toString());
+      TestUtils.SimpleTestDataset testDatasetB =
+          new TestUtils.SimpleTestDataset(
+              allocator, tempDir.resolve("inverted_lock_cycle_b").toString());
+      testDatasetA.createEmptyDataset().close();
+      testDatasetB.createEmptyDataset().close();
+      datasetA = testDatasetA.write(1, 20);
+      datasetB = testDatasetB.write(1, 20);
+
+      Dataset activeDatasetA = datasetA;
+      Dataset activeDatasetB = datasetB;
+      IndexOptions optionsA =
+          createInvertedSegmentOptions(activeDatasetA.getFragments().get(0).getId());
+      IndexOptions optionsB =
+          createInvertedSegmentOptions(activeDatasetB.getFragments().get(0).getId());
+      CountDownLatch callbacksReady = new CountDownLatch(2);
+      CountDownLatch attemptsFinished = new CountDownLatch(2);
+      CrossDatasetLockCycleProgress progressA =
+          new CrossDatasetLockCycleProgress(
+              activeDatasetB, optionsB, callbacksReady, attemptsFinished);
+      CrossDatasetLockCycleProgress progressB =
+          new CrossDatasetLockCycleProgress(
+              activeDatasetA, optionsA, callbacksReady, attemptsFinished);
+      AtomicReference<Index> resultA = new AtomicReference<>();
+      AtomicReference<Index> resultB = new AtomicReference<>();
+      AtomicReference<Throwable> failureA = new AtomicReference<>();
+      AtomicReference<Throwable> failureB = new AtomicReference<>();
+
+      createA =
+          new Thread(
+              () -> {
+                try {
+                  resultA.set(activeDatasetA.createIndex(optionsA, progressA));
+                } catch (Throwable failure) {
+                  failureA.set(failure);
+                }
+              },
+              "cross-dataset-create-a");
+      createB =
+          new Thread(
+              () -> {
+                try {
+                  resultB.set(activeDatasetB.createIndex(optionsB, progressB));
+                } catch (Throwable failure) {
+                  failureB.set(failure);
+                }
+              },
+              "cross-dataset-create-b");
+      createA.setDaemon(true);
+      createB.setDaemon(true);
+      createA.start();
+      createB.start();
+
+      long deadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+      joinUntil(createA, deadlineNanos);
+      joinUntil(createB, deadlineNanos);
+
+      assertFalse(createA.isAlive(), "Dataset A create deadlocked");
+      assertFalse(createB.isAlive(), "Dataset B create deadlocked");
+      assertNull(failureA.get(), "Dataset A outer create failed");
+      assertNull(failureB.get(), "Dataset B outer create failed");
+      assertNotNull(resultA.get(), "Dataset A outer create did not return an index");
+      assertNotNull(resultB.get(), "Dataset B outer create did not return an index");
+      assertBusyIndexBuildFailure(progressA.nestedFailure.get());
+      assertBusyIndexBuildFailure(progressB.nestedFailure.get());
+    } finally {
+      boolean workersStopped =
+          (createA == null || !createA.isAlive()) && (createB == null || !createB.isAlive());
+      if (workersStopped) {
+        if (datasetA != null) {
+          datasetA.close();
+        }
+        if (datasetB != null) {
+          datasetB.close();
+        }
+        allocator.close();
+      }
+    }
+  }
+
+  @Test
   public void testCreateInvertedIndexWithProgressUpdatesDatasetState(@TempDir Path tempDir)
       throws Exception {
     String datasetPath = tempDir.resolve("inverted_create_committed_progress").toString();
@@ -1384,6 +1518,22 @@ public class ScalarIndexTest {
       }
     }
     return false;
+  }
+
+  private static void assertBusyIndexBuildFailure(RuntimeException failure) {
+    assertNotNull(failure, "Expected cross-Dataset nested create to be rejected");
+    assertTrue(
+        failure.getMessage().contains("busy with an index build"),
+        "Unexpected nested create failure: " + failure.getMessage());
+  }
+
+  private static void awaitLatch(CountDownLatch latch, String message) {
+    try {
+      assertTrue(latch.await(5, TimeUnit.SECONDS), message);
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      throw new IllegalStateException(message, e);
+    }
   }
 
   private static void awaitThreadBlocked(Thread thread, String message)

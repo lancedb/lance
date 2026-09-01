@@ -53,6 +53,11 @@ final class ContextIndexBuildProgress implements IndexBuildProgress {
     return activeCallbacks != null && activeCallbacks.containsKey(dataset);
   }
 
+  static boolean isCallbackActive() {
+    IdentityHashMap<Dataset, int[]> activeCallbacks = ACTIVE_CALLBACKS.get();
+    return activeCallbacks != null && !activeCallbacks.isEmpty();
+  }
+
   private static IdentityHashMap<Dataset, int[]> activeCallbacks() {
     IdentityHashMap<Dataset, int[]> activeCallbacks = ACTIVE_CALLBACKS.get();
     if (activeCallbacks == null) {
