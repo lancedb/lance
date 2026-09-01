@@ -12,7 +12,7 @@ use super::{
     transaction::{Operation, Transaction},
     write::cleanup_data_fragments,
 };
-use crate::index::DatasetIndexExt;
+use crate::index::load_all_indices;
 use crate::{Error, Result, io::exec::Planner};
 use arrow::compute::CastOptions;
 use arrow::compute::can_cast_types;
@@ -23,6 +23,7 @@ use datafusion::execution::SendableRecordBatchStream;
 use futures::stream::{StreamExt, TryStreamExt};
 use lance_arrow::SchemaExt;
 use lance_core::datatypes::{Field, Schema};
+use lance_core::utils::parse::str_is_truthy;
 use lance_datafusion::utils::StreamingWriteSource;
 use lance_encoding::constants::{PACKED_STRUCT_LEGACY_META_KEY, PACKED_STRUCT_META_KEY};
 #[cfg(test)]
@@ -165,7 +166,7 @@ impl ArrowFieldExt for ArrowField {
         let metadata = self.metadata();
         metadata
             .get(PACKED_STRUCT_LEGACY_META_KEY)
-            .map(|v| v == "true")
+            .map(|v| str_is_truthy(v))
             .unwrap_or(metadata.contains_key(PACKED_STRUCT_META_KEY))
     }
 }
@@ -790,15 +791,19 @@ pub(super) async fn alter_columns(
     }
 
     new_schema.validate()?;
+    new_schema.verify_primary_key()?;
 
     // If any column being cast has an attached index, fail fast. Cast operations
     // rewrite the underlying column data and silently invalidate any index on the
     // affected column(s). The current behavior is to drop such indices without
     // warning, which has caused production incidents where vector search silently
     // regressed to brute-force scan. We require users to explicitly drop the
-    // index before altering the column type, so the action is never silent.
+    // index before altering the column type, so the action is never silent. That
+    // includes an index this build has no reader for: the cast reassigns the
+    // field id, so carrying it forward is impossible and staying quiet about it
+    // is the silent drop this guard exists to abolish.
     if !cast_fields.is_empty() {
-        let indices = dataset.load_indices().await?;
+        let indices = load_all_indices(dataset).await?;
         let affected: Vec<&lance_table::format::IndexMetadata> = indices
             .iter()
             .filter(|idx| {
@@ -1013,6 +1018,8 @@ fn exclude(source: &Schema, other: &Schema, version: &ConcreteFileVersion) -> Re
 #[cfg(test)]
 mod test {
     use std::{collections::HashMap, fs, num::NonZero, path::Path as StdPath, sync::Mutex};
+
+    use crate::index::DatasetIndexExt;
 
     #[test]
     fn test_merge_introduces_required_field() {
@@ -1298,16 +1305,90 @@ mod test {
         Ok(())
     }
 
+    /// Regression test: when an entire read batch has been deleted, the updater
+    /// yields a 0-row batch and the deleted rows must still be restored, because
+    /// every data file in a fragment has to keep the same physical row count.
+    ///
+    /// A single fragment holds 150 rows and 50 consecutive rows are deleted. Read
+    /// with batch_size=50 the deleted run lines up exactly with one read batch,
+    /// which therefore arrives empty. The run is placed at the start, in the
+    /// middle, and at the end because the restorer treats those positions
+    /// differently: a deleted run that trails a live batch is greedily appended to
+    /// it, while a run starting at row 0 has no preceding batch to absorb it.
+    #[rstest]
+    #[case::leading("i < 50", (50..150).collect::<Vec<i32>>())]
+    #[case::middle("i >= 50 AND i < 100", (0..50).chain(100..150).collect::<Vec<i32>>())]
+    #[case::trailing("i >= 100", (0..100).collect::<Vec<i32>>())]
     #[tokio::test]
-    async fn test_add_columns_with_fully_deleted_batch() -> Result<()> {
-        // Regression test: when an entire read batch has been deleted, the
-        // updater yields a 0-row batch. The inner loop then never runs and
-        // `batches` stays empty, so `concat_batches(&batches[0]..)` used to
-        // panic with "index out of bounds: the len is 0 but the index is 0".
-        //
-        // A single fragment holds 105 rows; deleting the trailing 5 rows means
-        // that, when read with batch_size=50, the third batch [100..105) is
-        // fully filtered out and produces an empty batch.
+    async fn test_add_columns_with_fully_deleted_batch(
+        #[case] delete_predicate: &str,
+        #[case] expected_live_ids: Vec<i32>,
+        #[values(true, false)] new_column_nullable: bool,
+    ) -> Result<()> {
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "i",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..150))],
+        )?;
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 200, // keep all rows in a single fragment
+                ..Default::default()
+            }),
+        )
+        .await?;
+
+        dataset.delete(delete_predicate).await?;
+        assert_eq!(dataset.count_rows(None).await?, 100);
+
+        let new_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "j",
+            DataType::Int32,
+            new_column_nullable,
+        )]));
+        let new_batch = RecordBatch::try_new(
+            new_schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..100))],
+        )?;
+        let reader = RecordBatchIterator::new(vec![Ok(new_batch)], new_schema.clone());
+
+        // Read with batch_size=50 so the deleted rows form a full empty batch.
+        dataset
+            .add_columns(NewColumnTransform::Reader(Box::new(reader)), None, Some(50))
+            .await?;
+        dataset.validate().await?;
+
+        let data = dataset.scan().try_into_batch().await?;
+        assert_eq!(data.num_rows(), 100);
+        assert_eq!(
+            data.column_by_name("i").unwrap().as_ref(),
+            &Int32Array::from(expected_live_ids)
+        );
+        assert_eq!(
+            data.column_by_name("j").unwrap().as_ref(),
+            &Int32Array::from_iter_values(0..100)
+        );
+
+        Ok(())
+    }
+
+    /// A legacy fragment whose trailing row group is entirely deleted cannot defer its
+    /// blanks: that batch reaches `add_blanks` with no live row to copy, so the update
+    /// is refused rather than writing a data file short of the deleted rows. Deferring
+    /// is what a v2 fragment does instead, which
+    /// `test_add_columns_with_fully_deleted_batch`'s trailing case covers.
+    #[tokio::test]
+    async fn test_add_columns_legacy_trailing_deleted_batch_errors() -> Result<()> {
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "i",
             DataType::Int32,
@@ -1325,20 +1406,22 @@ mod test {
             reader,
             test_uri,
             Some(WriteParams {
-                max_rows_per_file: 200, // keep all rows in a single fragment
+                max_rows_per_file: 200,
+                max_rows_per_group: 50,
+                data_storage_version: Some(LanceFileVersion::Legacy),
                 ..Default::default()
             }),
         )
         .await?;
 
-        // Delete the entire trailing batch [100..105).
+        // The last row group is [100, 105); deleting all of it leaves a trailing read
+        // batch with no live rows, which legacy files cannot defer past.
         dataset.delete("i >= 100").await?;
-        assert_eq!(dataset.count_rows(None).await?, 100);
 
         let new_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "j",
             DataType::Int32,
-            false,
+            true,
         )]));
         let new_batch = RecordBatch::try_new(
             new_schema.clone(),
@@ -1346,16 +1429,21 @@ mod test {
         )?;
         let reader = RecordBatchIterator::new(vec![Ok(new_batch)], new_schema.clone());
 
-        // Read with batch_size=50 so the deleted trailing rows form a full empty batch.
-        dataset
-            .add_columns(NewColumnTransform::Reader(Box::new(reader)), None, Some(50))
-            .await?;
+        let err = dataset
+            .add_columns(NewColumnTransform::Reader(Box::new(reader)), None, None)
+            .await
+            .unwrap_err();
 
-        let data = dataset.scan().try_into_batch().await?;
-        assert_eq!(data.num_rows(), 100);
-        assert_eq!(
-            data.column_by_name("j").unwrap().as_ref(),
-            &Int32Array::from_iter_values(0..100)
+        assert!(
+            matches!(err, Error::NotSupported { .. }),
+            "expected NotSupported, got {err:?}"
+        );
+        // Match add_blanks' own wording, not the shared "run compaction" tail: the
+        // stream-ended error in Updater::next carries that tail too, and this case
+        // fails before the stream ever runs out.
+        assert!(
+            err.to_string().contains("missing too many rows in merge"),
+            "expected the add_blanks rejection, got: {err}"
         );
 
         Ok(())
@@ -4100,5 +4188,53 @@ mod test {
         .with_metadata(packed_meta);
         let field4 = ArrowField::new("test", DataType::Struct(vec![conflict_field].into()), false);
         assert!(check_field_conflict(&field1, &field4, &ConcreteFileVersion::V2_2).is_err());
+    }
+
+    /// Table creation rejects a nullable primary key; altering one afterwards
+    /// reached the same state without passing that check.
+    #[tokio::test]
+    async fn test_alter_columns_cannot_make_a_primary_key_nullable() -> Result<()> {
+        let pk = ArrowField::new("id", DataType::Int32, false).with_metadata(
+            [(
+                "lance-schema:unenforced-primary-key:position".to_string(),
+                "1".to_string(),
+            )]
+            .into(),
+        );
+        let schema = Arc::new(ArrowSchema::new(vec![
+            pk,
+            ArrowField::new("value", DataType::Int32, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(Int32Array::from(vec![10, 20])),
+            ],
+        )?;
+        let test_dir = TempStrDir::default();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &test_dir,
+            None,
+        )
+        .await?;
+
+        let err = dataset
+            .alter_columns(&[ColumnAlteration::new("id".into()).set_nullable(true)])
+            .await
+            .expect_err("making a primary key nullable must be rejected");
+        assert!(
+            err.to_string().contains("must not be nullable"),
+            "unexpected error: {err}"
+        );
+
+        // Specific to the key: other columns may still be altered.
+        dataset
+            .alter_columns(&[ColumnAlteration::new("value".into()).rename("val".into())])
+            .await?;
+        assert!(!dataset.schema().unenforced_primary_key()[0].nullable);
+
+        Ok(())
     }
 }
