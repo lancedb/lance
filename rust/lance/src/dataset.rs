@@ -14,7 +14,6 @@ use lance_core::deepsize::DeepSizeOf;
 
 use crate::dataset::metadata::UpdateFieldMetadataBuilder;
 use crate::dataset::transaction::translate_schema_metadata_updates;
-use crate::index::DatasetIndexExt;
 use crate::session::caches::{DSMetadataCache, ManifestKey, TransactionKey};
 use crate::session::index_caches::DSIndexCache;
 use itertools::Itertools;
@@ -35,7 +34,6 @@ use lance_io::object_store::{
     WrappingObjectStore,
 };
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
-use lance_io::traits::{WriteExt, Writer};
 use lance_io::utils::{
     CachedFileSize, read_last_block, read_message, read_metadata_offset, read_struct,
 };
@@ -125,13 +123,12 @@ use self::refs::Refs;
 use self::scanner::{DatasetRecordBatchStream, Scanner};
 use self::statistics::DatasetStatistics;
 use self::transaction::{Operation, Transaction, TransactionBuilder, UpdateMapEntry};
-use self::write::{cleanup_data_fragments, write_fragments_internal};
+use self::write::cleanup_data_fragments;
 use crate::dataset::branch_location::BranchLocation;
 use crate::dataset::cleanup::{CleanupOperation, CleanupPolicy, CleanupPolicyBuilder};
 use crate::dataset::refs::{BranchContents, BranchIdentifier, Branches, Tags};
 use crate::dataset::sql::SqlQueryBuilder;
 use crate::datatypes::Schema;
-use crate::index::retain_supported_indices;
 use crate::io::commit::{
     DEFAULT_COMMIT_RETRY_TIMEOUT, commit_detached_transaction, commit_new_dataset,
     commit_transaction, detect_overlapping_fragments,
@@ -176,6 +173,32 @@ pub use write::{
 pub(crate) const INDICES_DIR: &str = "_indices";
 pub(crate) const DATA_DIR: &str = "data";
 pub(crate) const TRANSACTIONS_DIR: &str = "_transactions";
+const DEFAULT_MAX_STREAM_COPY_PARALLELISM: usize = 4;
+
+fn parse_deep_clone_stream_concurrency(value: &str) -> Result<usize> {
+    value
+        .parse::<NonZero<usize>>()
+        .map(NonZero::get)
+        .map_err(|_| {
+            Error::invalid_input(format!(
+                "LANCE_DEEP_CLONE_STREAM_CONCURRENCY must be a positive integer, got {value:?}"
+            ))
+        })
+}
+
+fn deep_clone_copy_parallelism(
+    configured_io_parallelism: usize,
+    uses_streaming_copy: bool,
+    stream_copy_parallelism: Option<usize>,
+) -> usize {
+    if !uses_streaming_copy {
+        configured_io_parallelism
+    } else if let Some(value) = stream_copy_parallelism {
+        value
+    } else {
+        configured_io_parallelism.min(DEFAULT_MAX_STREAM_COPY_PARALLELISM)
+    }
+}
 
 // We default to 6GB for the index cache, since indices are often large but
 // worth caching.
@@ -779,16 +802,21 @@ impl Dataset {
                 LittleEndian::read_u32(&last_block[offset_in_block..offset_in_block + 4]) as usize;
             let message_data = &last_block[offset_in_block + 4..offset_in_block + 4 + message_len];
             let section = lance_table::format::pb::IndexSection::decode(message_data)?;
-            let mut indices: Vec<IndexMetadata> = section
+            // Cached unfiltered: this is the same cache the commit path reads
+            // from, and an index this build cannot decode still has to survive
+            // into the next manifest. Version filtering happens on the way out,
+            // in `DatasetIndexExt::load_indices`.
+            let indices: Vec<IndexMetadata> = section
                 .indices
                 .into_iter()
                 .map(IndexMetadata::try_from)
                 .collect::<Result<Vec<_>>>()?;
-            retain_supported_indices(&mut indices);
+            crate::index::warn_about_unsupported_indices(&indices);
             let ds_index_cache = session.index_cache.for_dataset(uri);
             let metadata_key = crate::session::index_caches::IndexMetadataKey {
                 version: manifest_location.version,
                 store_identity: &object_store.store_prefix,
+                e_tag: manifest_location.e_tag.as_deref(),
             };
             ds_index_cache
                 .insert_with_key(&metadata_key, Arc::new(indices))
@@ -2987,7 +3015,7 @@ impl Dataset {
             let mut live_ids = Vec::with_capacity(ids.len());
             let mut addresses = Vec::with_capacity(ids.len());
             for id in ids {
-                if let Some(address) = row_id_index.get(*id) {
+                if let Some(address) = row_id_index.get(*id)? {
                     live_ids.push(*id);
                     addresses.push(u64::from(address));
                 }
@@ -3061,8 +3089,12 @@ impl Dataset {
 
         rowids::validate_stable_row_ids(self).await?;
 
-        // Validate indices
-        let indices = self.load_indices().await?;
+        // Validate indices. Over the complete list: these checks are about what
+        // the manifest says, not about what this build can use, and duplicate
+        // uuids or overlapping coverage are no less corrupt for involving an
+        // index this build has no reader for. `migrate_indices` already runs the
+        // same overlap check over the complete list on every commit.
+        let indices = crate::index::load_all_indices(self).await?;
         self.validate_indices(&indices)?;
 
         Ok(())
@@ -3250,13 +3282,15 @@ impl Dataset {
 
     /// Deep clone the target version into a new dataset at target_path.
     /// This copies all relevant dataset files (data files, deletion files, and
-    /// index files) into the target dataset without loading data into memory.
+    /// index files) into the target dataset with bounded memory use.
     ///
     /// The source files are read through this dataset's own object store while the
     /// copies are written through the target object store built from `store_params`.
     /// This makes the clone work across accounts/stores (e.g. between two abfss
-    /// accounts): when the source and target stores are the same the copy stays
-    /// server-side, otherwise the data is streamed through this process.
+    /// accounts). Object-store files are streamed through this process by default;
+    /// `LANCE_IO_SERVER_SIDE_COPY_ENABLED` opts same-store copies into
+    /// provider-native copy operations. Cross-store copies continue to stream, and
+    /// local files retain their filesystem copy path.
     ///
     /// Parameters:
     /// - `target_path`: the URI string to clone the dataset into.
@@ -3267,6 +3301,8 @@ impl Dataset {
     /// Note: external `base_paths` referenced by the source manifest are read through
     /// this dataset's object store; per-base distinct source credentials are not yet
     /// supported (see <https://github.com/lance-format/lance/issues/6093>).
+    /// Object-store streaming defaults to at most four concurrent file copies;
+    /// `LANCE_DEEP_CLONE_STREAM_CONCURRENCY` overrides that limit for this operation.
     pub async fn deep_clone(
         &mut self,
         target_path: &str,
@@ -3308,18 +3344,28 @@ impl Dataset {
             path
         };
 
-        // When the source and target live in the same store we can keep the copy
-        // server-side. Otherwise (e.g. cloning across accounts) we stream each file
-        // from the source store to the target store.
-        let same_store = src_ds.object_store.store_prefix == target_store.store_prefix;
-
-        // TODO: Leverage object store bulk copy for efficient same-store deep_clone.
-        //
-        // All cloud storage providers support batch copy APIs that would provide significant
-        // performance improvements. We use single file copy before we have upstream support.
-        //
-        // Tracked by: https://github.com/lance-format/lance/issues/5435
-        let io_parallelism = self.object_store.io_parallelism();
+        let configured_io_parallelism = src_ds.object_store.io_parallelism();
+        // Provider-native copy can fall back to streaming for large objects, so every
+        // non-direct-local transfer stays within the bounded file-copy window.
+        let uses_streaming_copy = !(src_ds.object_store.has_direct_local_paths()
+            && target_store.has_direct_local_paths());
+        let stream_copy_parallelism = match std::env::var("LANCE_DEEP_CLONE_STREAM_CONCURRENCY") {
+            Ok(value) => Some(parse_deep_clone_stream_concurrency(&value)?),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(std::env::VarError::NotUnicode(value)) => {
+                return Err(Error::invalid_input(format!(
+                    "LANCE_DEEP_CLONE_STREAM_CONCURRENCY must be valid UTF-8 and a positive \
+                     integer, got {value:?}"
+                )));
+            }
+        };
+        // Limit the number of concurrently buffered transfers by default while
+        // preserving efficient local copies and the operation-specific override.
+        let io_parallelism = deep_clone_copy_parallelism(
+            configured_io_parallelism,
+            uses_streaming_copy,
+            stream_copy_parallelism,
+        );
         let copy_futures = src_paths
             .iter()
             .map(|(relative_path, base)| {
@@ -3328,14 +3374,9 @@ impl Dataset {
                 let src_path = build_absolute_path(relative_path, base);
                 let target_path = build_absolute_path(relative_path, &target_base);
                 async move {
-                    if same_store {
-                        target_store.copy(&src_path, &target_path).await?;
-                    } else {
-                        let reader = source_store.open(&src_path).await?;
-                        let mut writer = target_store.create(&target_path).await?;
-                        writer.copy_from_reader(reader.as_ref()).await?;
-                        writer.shutdown().await?;
-                    }
+                    source_store
+                        .copy_bulk(&src_path, &target_store, &target_path)
+                        .await?;
                     Result::Ok(())
                 }
             })
@@ -4080,8 +4121,34 @@ pub(crate) async fn write_manifest_file(
     config: &ManifestWriteConfig,
     naming_scheme: ManifestNamingScheme,
     transaction: Option<lance_table::format::Transaction>,
+    may_change_schema: bool,
 ) -> std::result::Result<ManifestLocation, CommitError> {
     validate_paired_feature_flags(manifest)?;
+    // Every manifest write funnels through here, including restore and clone,
+    // which rebuild a manifest from a stored one rather than from an Arrow
+    // schema, so this is where the invariant holds for a schema that never
+    // passed through that conversion.
+    //
+    // Only for transactions that can change the schema. Released versions could
+    // install a key on a nullable column through the metadata path, and
+    // validating every write would make such a table read-only on upgrade --
+    // including through the delete that removes the offending rows, which is
+    // the first step of repairing it. A repair still has to pass: it changes
+    // the schema, and the schema it produces is valid.
+    //
+    // The caller classifies the operation, rather than this reading it off
+    // `transaction`, which is None whenever the encoded bytes were too large
+    // to inline. Deriving it here would make the verdict depend on payload
+    // size, so the same operation would be exempt while small and validated
+    // once it spilled -- and a MemWAL table spills routinely, since its
+    // transactions carry mem-table state.
+    if may_change_schema {
+        manifest
+            .schema
+            .verify_primary_key()
+            .map_err(CommitError::OtherError)?;
+    }
+
     if config.auto_set_feature_flags {
         // build_manifest may have already set FLAG_STABLE_ROW_IDS on the manifest.
         // Preserve it here so this second apply_feature_flags call does not clear it
