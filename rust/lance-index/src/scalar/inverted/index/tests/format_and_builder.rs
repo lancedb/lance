@@ -349,20 +349,20 @@ async fn test_build_search_uses_configured_posting_block_size() {
 }
 
 #[rstest::rstest]
-#[case::v1(InvertedListFormatVersion::V1, LEGACY_BLOCK_SIZE, 514, 4)]
-#[case::v2(InvertedListFormatVersion::V2, LEGACY_BLOCK_SIZE, 8, 4)]
-#[case::v3(InvertedListFormatVersion::V3, 256, 6, 4)]
+#[case::v1(InvertedListFormatVersion::V1, LEGACY_BLOCK_SIZE, 514, None)]
+#[case::v2(InvertedListFormatVersion::V2, LEGACY_BLOCK_SIZE, 8, Some(4))]
+#[case::v3(InvertedListFormatVersion::V3, 256, 6, Some(4))]
 #[tokio::test]
 async fn test_into_builder_chunks_postings_by_list_children(
     #[case] format_version: InvertedListFormatVersion,
     #[case] block_size: usize,
     #[case] max_list_children: u64,
-    #[case] expected_chunk_count: usize,
+    #[case] expected_chunk_count: Option<usize>,
 ) {
     const NUM_TOKENS: usize = 7;
     const NUM_DOCS: usize = 257;
-    // V1 and V3 both retain the generic metadata-derived child bound, which
-    // admits two token rows per read for these inputs.
+    // V1 uses the configured writer batch-row boundary and ignores the generic
+    // child bound. V2/V3 retain metadata-derived child planning.
 
     let source_dir = TempObjDir::default();
     let source_store = Arc::new(LanceIndexStore::new(
@@ -412,9 +412,11 @@ async fn test_into_builder_chunks_postings_by_list_children(
         .into_builder_with_chunk_limits(NUM_TOKENS, max_list_children)
         .await
         .unwrap();
+    let expected_chunk_count =
+        expected_chunk_count.unwrap_or_else(|| NUM_TOKENS.div_ceil(posting_batch_rows()));
     assert_eq!(
         chunk_count, expected_chunk_count,
-        "list-child limit must split merge reads"
+        "posting read planner produced an unexpected chunk count"
     );
     assert_eq!(merged.posting_lists.len(), NUM_TOKENS);
     assert!(
@@ -538,11 +540,11 @@ async fn test_position_read_ranges_respect_v1_posting_batch_rows(
         assert_eq!(
             partition
                 .inverted_list
-                .posting_read_chunk_ranges_for_test(NUM_TOKENS, 514, true, 3)
+                .posting_read_chunk_ranges_for_test(1, 1, true, 3)
                 .await
                 .unwrap(),
-            vec![(0, 2), (2, 4), (4, 6), (6, 7)],
-            "known child counts must split below the posting batch-row cap"
+            vec![(0, 3), (3, 6), (6, 7)],
+            "V1 writer-aligned ranges must ignore generic token and child limits"
         );
         assert_eq!(
             partition

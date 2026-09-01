@@ -578,11 +578,11 @@ impl PostingListReader {
     /// widest projected `List<i32>` column. V2/V3 posting lengths determine
     /// posting blocks, position-block offsets, and impact entries exactly.
     /// Compressed V1 positions use nested per-document lists whose child count
-    /// is not available in metadata, so their token ranges are capped by the
-    /// configured writer batch-row limit. Historical files do not persist their
-    /// writer batch size, so this only reconstructs known-safe write boundaries
-    /// when the reader setting and batching semantics match those used to build
-    /// the file. Otherwise this is a heuristic, not a complete offset-safety proof.
+    /// is not available in metadata. For that layout, ranges reconstruct the
+    /// configured writer batch boundaries exactly and bypass the generic size
+    /// heuristics below. Historical files do not persist their writer batch size,
+    /// so this is only a heuristic when the current setting differs from the one
+    /// used to build the file; it is not a universal historical offset-safety proof.
     /// For row-based legacy indexes, persisted posting row offsets provide the
     /// best available bound.
     fn posting_read_chunk_ranges(
@@ -592,14 +592,21 @@ impl PostingListReader {
         with_position: bool,
         posting_batch_rows: usize,
     ) -> Result<Vec<(usize, usize)>> {
-        let max_tokens = if with_position
+        if with_position
             && matches!(&self.metadata, PostingMetadata::V2 { .. })
             && matches!(self.positions_layout, PositionsLayout::LegacyPerDoc)
         {
-            max_tokens.min(posting_batch_rows.max(1))
-        } else {
-            max_tokens
-        };
+            let posting_batch_rows = posting_batch_rows.max(1);
+            return Ok((0..self.len())
+                .step_by(posting_batch_rows)
+                .map(|start| {
+                    (
+                        start,
+                        start.saturating_add(posting_batch_rows).min(self.len()),
+                    )
+                })
+                .collect());
+        }
 
         let mut ranges = Vec::new();
         let mut tok_start = 0usize;
