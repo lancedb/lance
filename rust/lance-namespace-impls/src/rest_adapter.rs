@@ -883,7 +883,6 @@ async fn create_table_version(
         naming_scheme: body.naming_scheme,
         branch: body.branch,
         context: body.context,
-        ..Default::default()
     };
 
     match backend.create_table_version(request).await {
