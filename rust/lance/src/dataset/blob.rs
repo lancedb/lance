@@ -29,6 +29,7 @@ use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry
 use lance_io::scheduler::{FileScheduler, ScanScheduler, SchedulerConfig};
 use object_store::path::Path;
 use tokio::sync::{Mutex, OnceCell, oneshot};
+use tracing::warn;
 use url::Url;
 
 use super::take::{MissingRowPolicy, TakeBuilder};
@@ -422,6 +423,12 @@ impl RollingPackedBlobWriter {
         self.current_max_pack_size = None;
         Ok(())
     }
+
+    fn abort(&mut self) {
+        self.current.take();
+        self.current_size = 0;
+        self.current_max_pack_size = None;
+    }
 }
 
 /// Preprocesses blob v2 columns on the write path so the encoder only sees lightweight descriptors:
@@ -434,6 +441,7 @@ pub struct BlobPreprocessor {
     data_dir: Path,
     data_file_key: String,
     blob_id_allocator: BlobIdAllocator,
+    part_blob_ids: Option<Range<u32>>,
     pack_writer: RollingPackedBlobWriter,
     /// Write-param override for the pack-file roll size. When set, it takes
     /// precedence over each field's `blob-pack-file-size-threshold` metadata for
@@ -548,6 +556,23 @@ impl BlobPreprocessField {
     fn requires_preprocessing(&self) -> bool {
         !matches!(self.kind, BlobPreprocessFieldKind::Passthrough)
     }
+
+    fn force_non_empty_inline_to_sidecar(&mut self) {
+        match &mut self.kind {
+            BlobPreprocessFieldKind::BlobV2 {
+                inline_threshold, ..
+            } => *inline_threshold = 0,
+            BlobPreprocessFieldKind::Struct { children } => {
+                for child in children {
+                    child.force_non_empty_inline_to_sidecar();
+                }
+            }
+            BlobPreprocessFieldKind::List { child } => {
+                child.force_non_empty_inline_to_sidecar();
+            }
+            BlobPreprocessFieldKind::Passthrough => {}
+        }
+    }
 }
 
 impl ExternalBlobSource {
@@ -625,6 +650,7 @@ impl BlobPreprocessor {
             data_dir,
             data_file_key,
             blob_id_allocator: BlobIdAllocator::new(1),
+            part_blob_ids: None,
             pack_writer,
             pack_file_size_override,
             field_processors,
@@ -634,6 +660,15 @@ impl BlobPreprocessor {
             source_store_registry,
             source_store_params,
         })
+    }
+
+    pub(super) fn with_part_blob_ids(mut self, blob_ids: Range<u32>) -> Result<Self> {
+        self.blob_id_allocator = BlobIdAllocator::from_range(blob_ids.clone())?;
+        self.part_blob_ids = Some(blob_ids);
+        for processor in &mut self.field_processors {
+            processor.force_non_empty_inline_to_sidecar();
+        }
+        Ok(self)
     }
 
     fn blob_writer_with_metadata(
@@ -685,6 +720,102 @@ impl BlobPreprocessor {
                 source,
             )
             .await
+    }
+
+    async fn prepare_blob_for_part(
+        &mut self,
+        array: ArrayRef,
+        field: &ArrowField,
+        pack_file_threshold: usize,
+        writer_metadata: &HashMap<String, String>,
+    ) -> Result<(ArrayRef, Arc<ArrowField>)> {
+        validate_prepared_blob_array(field, &array)?;
+        let values = array.as_struct();
+        let kinds = values
+            .column_by_name("kind")
+            .expect("validated prepared Blob has kind")
+            .as_primitive::<UInt8Type>();
+        let data = values
+            .column_by_name("data")
+            .expect("validated prepared Blob has data")
+            .as_binary::<i64>();
+        let uris = values
+            .column_by_name("uri")
+            .expect("validated prepared Blob has uri")
+            .as_string::<i32>();
+        let blob_ids = values
+            .column_by_name("blob_id")
+            .expect("validated prepared Blob has blob_id")
+            .as_primitive::<UInt32Type>();
+        let sizes = values
+            .column_by_name("blob_size")
+            .expect("validated prepared Blob has blob_size")
+            .as_primitive::<UInt64Type>();
+        let positions = values
+            .column_by_name("position")
+            .expect("validated prepared Blob has position")
+            .as_primitive::<UInt64Type>();
+        let mut output = self.blob_writer_with_metadata(field, writer_metadata.clone());
+
+        for row in 0..values.len() {
+            if values.is_null(row) {
+                continue;
+            }
+            match BlobKind::try_from(kinds.value(row))? {
+                BlobKind::Packed | BlobKind::Dedicated => {
+                    let blob_id = blob_ids.value(row);
+                    self.blob_id_allocator.reserve(blob_id).map_err(|error| {
+                        Error::invalid_input(format!(
+                            "Prepared Blob v2 field '{}' row {row} uses invalid managed Blob ID {blob_id}: {error}",
+                            field.name()
+                        ))
+                    })?;
+                }
+                BlobKind::Inline | BlobKind::External => {}
+            }
+        }
+
+        for row in 0..values.len() {
+            if values.is_null(row) {
+                output.push_null()?;
+                continue;
+            }
+            match BlobKind::try_from(kinds.value(row))? {
+                BlobKind::Inline => {
+                    let value = data.value(row);
+                    if value.is_empty() {
+                        output.push_inline(Bytes::new())?;
+                    } else {
+                        let descriptor = self
+                            .write_packed(pack_file_threshold, BlobWriteSource::Bytes(value))
+                            .await?;
+                        output.push(descriptor)?;
+                    }
+                }
+                BlobKind::Packed => {
+                    output.push_packed(
+                        blob_ids.value(row),
+                        BlobRange {
+                            offset: positions.value(row),
+                            size: sizes.value(row),
+                        },
+                    )?;
+                }
+                BlobKind::Dedicated => {
+                    output.push_dedicated(blob_ids.value(row), sizes.value(row))?;
+                }
+                BlobKind::External => {
+                    output.push(BlobDescriptor::External {
+                        base_id: blob_ids.value(row),
+                        uri: uris.value(row).to_string(),
+                        offset: positions.value(row),
+                        size: sizes.value(row),
+                    })?;
+                }
+            }
+        }
+        let (field, array) = output.finish()?.into_parts();
+        Ok((array, Arc::new(field)))
     }
 
     async fn resolve_external_reference(&mut self, uri: &str) -> Result<(u32, String)> {
@@ -799,6 +930,22 @@ impl BlobPreprocessor {
     ) -> BoxFuture<'a, Result<(ArrayRef, Arc<ArrowField>)>> {
         async move {
             if blob_v2_layout(field.as_ref()) == Some(BlobV2Layout::Prepared) {
+                if self.part_blob_ids.is_some()
+                    && let BlobPreprocessFieldKind::BlobV2 {
+                        pack_file_threshold,
+                        writer_metadata,
+                        ..
+                    } = &processor.kind
+                {
+                    return self
+                        .prepare_blob_for_part(
+                            array,
+                            field.as_ref(),
+                            *pack_file_threshold,
+                            writer_metadata,
+                        )
+                        .await;
+                }
                 validate_prepared_blob_array(field.as_ref(), &array)?;
                 return Ok((array, field.clone()));
             }
@@ -1132,6 +1279,23 @@ impl BlobPreprocessor {
 
     pub(crate) async fn finish(&mut self) -> Result<()> {
         self.pack_writer.finish().await
+    }
+
+    pub(super) async fn abort(&mut self) {
+        self.pack_writer.abort();
+        let ids = match self.blob_id_allocator.allocated_ids() {
+            Ok(ids) => ids,
+            Err(error) => {
+                warn!("failed to list Blob sidecars for part cleanup: {error}");
+                return;
+            }
+        };
+        for blob_id in ids {
+            let path = blob_path(&self.data_dir, &self.data_file_key, blob_id);
+            if let Err(error) = self.object_store.delete(&path).await {
+                warn!("failed to remove part Blob sidecar '{}': {error}", path);
+            }
+        }
     }
 }
 
