@@ -3213,7 +3213,7 @@ impl LanceNamespace for ManifestNamespace {
                 })
             }
             None => Err(NamespaceError::TableNotFound {
-                message: table_name.to_string(),
+                message: table_name.clone(),
             }
             .into()),
         }
@@ -3309,7 +3309,7 @@ impl LanceNamespace for ManifestNamespace {
                 ..Default::default()
             }),
             None => Err(NamespaceError::NamespaceNotFound {
-                message: object_id.to_string(),
+                message: object_id.clone(),
             }
             .into()),
         }
@@ -3342,7 +3342,7 @@ impl LanceNamespace for ManifestNamespace {
         let object_id = namespace_id.join(DELIMITER);
         if self.manifest_contains_object(&object_id).await? {
             return Err(NamespaceError::NamespaceAlreadyExists {
-                message: object_id.to_string(),
+                message: object_id.clone(),
             }
             .into());
         }
@@ -3387,7 +3387,7 @@ impl LanceNamespace for ManifestNamespace {
         // Check if namespace exists
         if !self.manifest_contains_object(&object_id).boxed().await? {
             return Err(NamespaceError::NamespaceNotFound {
-                message: object_id.to_string(),
+                message: object_id.clone(),
             }
             .into());
         }
@@ -3443,7 +3443,7 @@ impl LanceNamespace for ManifestNamespace {
             Ok(())
         } else {
             Err(NamespaceError::NamespaceNotFound {
-                message: object_id.to_string(),
+                message: object_id.clone(),
             }
             .into())
         }
@@ -3470,7 +3470,7 @@ impl LanceNamespace for ManifestNamespace {
         let existing = self.query_manifest_for_table(&object_id).await?;
         if existing.is_some() {
             return Err(NamespaceError::TableAlreadyExists {
-                message: table_name.to_string(),
+                message: table_name.clone(),
             }
             .into());
         }
@@ -3517,7 +3517,7 @@ impl LanceNamespace for ManifestNamespace {
         .map_err(|e| match e {
             super::MarkerFileError::AlreadyExists { .. } => {
                 lance_core::Error::from(NamespaceError::TableAlreadyExists {
-                    message: table_name.to_string(),
+                    message: table_name.clone(),
                 })
             }
             super::MarkerFileError::Other { message } => {
@@ -3630,7 +3630,7 @@ impl LanceNamespace for ManifestNamespace {
         // Check if table already exists
         if self.manifest_contains_object(&object_id).await? {
             return Err(NamespaceError::TableAlreadyExists {
-                message: object_id.to_string(),
+                message: object_id.clone(),
             }
             .into());
         }
@@ -3676,7 +3676,7 @@ impl LanceNamespace for ManifestNamespace {
             }
             None => {
                 return Err(NamespaceError::TableNotFound {
-                    message: object_id.to_string(),
+                    message: object_id.clone(),
                 }
                 .into());
             }

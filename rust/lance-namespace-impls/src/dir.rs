@@ -3646,7 +3646,7 @@ impl LanceNamespace for DirectoryNamespace {
         if status.exists && !status.has_reserved_file {
             // Table has data but no reserved file - it was created with data
             return Err(NamespaceError::TableAlreadyExists {
-                message: table_name.to_string(),
+                message: table_name.clone(),
             }
             .into());
         }
@@ -3665,7 +3665,7 @@ impl LanceNamespace for DirectoryNamespace {
         .map_err(|e| match e {
             MarkerFileError::AlreadyExists { .. } => {
                 lance_core::Error::from(NamespaceError::TableAlreadyExists {
-                    message: table_name.to_string(),
+                    message: table_name.clone(),
                 })
             }
             MarkerFileError::Other { message } => {
@@ -3730,7 +3730,7 @@ impl LanceNamespace for DirectoryNamespace {
 
         if !status.exists {
             return Err(NamespaceError::TableNotFound {
-                message: table_name.to_string(),
+                message: table_name.clone(),
             }
             .into());
         }
@@ -4046,17 +4046,17 @@ impl LanceNamespace for DirectoryNamespace {
                 .context
                 .as_ref()
                 .and_then(|context| context.get(lance_namespace::RESERVATION_TOKEN_KEY));
-            if let (Some(presented), expected) = (presented, expected) {
-                if Some(presented) != expected {
-                    return Err(lance_core::Error::from(
-                        NamespaceError::ConcurrentModification {
-                            message: format!(
-                                "Reservation token mismatch publishing version 1 for table at '{}': the declaration was superseded",
-                                table_uri
-                            ),
-                        },
-                    ));
-                }
+            if let (Some(presented), expected) = (presented, expected)
+                && Some(presented) != expected
+            {
+                return Err(lance_core::Error::from(
+                    NamespaceError::ConcurrentModification {
+                        message: format!(
+                            "Reservation token mismatch publishing version 1 for table at '{}': the declaration was superseded",
+                            table_uri
+                        ),
+                    },
+                ));
             }
         }
 
