@@ -36,6 +36,26 @@ use crate::{
     writer::{FileWriteSummary, FileWriterOptions},
 };
 
+/// Caller-defined identity of the namespace containing managed Blob sidecars.
+///
+/// Lance compares this value when assembling data-file parts but does not
+/// interpret or persist it. Callers persist the namespace identity alongside
+/// each part and provide the same value after recovery.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlobNamespace(Arc<str>);
+
+impl BlobNamespace {
+    /// Create an opaque Blob namespace identity.
+    pub fn new(identity: impl Into<Arc<str>>) -> Self {
+        Self(identity.into())
+    }
+
+    /// Return the caller-defined namespace identity.
+    pub fn as_str(&self) -> &str {
+        self.0.as_ref()
+    }
+}
+
 /// One complete immutable Lance file supplied to [`concat_files`].
 #[derive(Clone)]
 pub struct EncodedFileInput {
@@ -75,11 +95,12 @@ impl EncodedFileInput {
 /// A part is independently readable and is not an incomplete file-format
 /// fragment or a persisted Manifest entity. Opening one reads its real footer,
 /// verifies that its physical columns form a complete rectangular file, and
-/// checks Blob v2 descriptors against the caller-provided ID lease.
+/// checks Blob v2 descriptors against the caller-provided ID lease. Parts with
+/// Blob v2 columns are also bound to the caller-provided [`BlobNamespace`].
 ///
 /// This value has no fragment, source-row, or range identity. It is intentionally
-/// not serializable: callers persist the input location and Blob ID lease, then
-/// call [`Self::open`] after recovery. The order passed to
+/// not serializable: callers persist the input location, Blob ID lease, and Blob
+/// namespace identity, then call [`Self::open`] after recovery. The order passed to
 /// [`concat_data_file_parts`] determines final physical row order.
 ///
 /// # Example
@@ -89,7 +110,7 @@ impl EncodedFileInput {
 /// use lance_io::scheduler::FileScheduler;
 ///
 /// # async fn open_part(file: FileScheduler) -> lance_core::Result<()> {
-/// let part = DataFilePart::open(EncodedFileInput::new(file), None).await?;
+/// let part = DataFilePart::open(EncodedFileInput::new(file), None, None).await?;
 /// println!("part rows: {}", part.num_rows());
 /// # Ok(())
 /// # }
@@ -100,6 +121,7 @@ pub struct DataFilePart {
     metadata: Arc<CachedFileMetadata>,
     schema: Arc<Schema>,
     blob_ids: Option<Range<u32>>,
+    blob_namespace: Option<BlobNamespace>,
 }
 
 impl fmt::Debug for DataFilePart {
@@ -109,6 +131,7 @@ impl fmt::Debug for DataFilePart {
             .field("version", &self.metadata.version)
             .field("num_rows", &self.metadata.num_rows)
             .field("blob_ids", &self.blob_ids)
+            .field("blob_namespace", &self.blob_namespace)
             .finish()
     }
 }
@@ -117,10 +140,16 @@ impl DataFilePart {
     /// Open and validate one complete encoded file.
     ///
     /// `blob_ids` is the half-open ID range leased to this part. Managed
-    /// Packed and Dedicated descriptors must fall inside it. Non-empty Inline
-    /// Blob v2 descriptors and legacy Blob v1 columns are rejected because their
-    /// payload locations cannot be reused in a different data file.
-    pub async fn open(input: EncodedFileInput, blob_ids: Option<Range<u32>>) -> Result<Self> {
+    /// Packed and Dedicated descriptors must fall inside it. `blob_namespace`
+    /// identifies the final managed-sidecar namespace and is required whenever
+    /// the part contains Blob v2 columns. Non-empty Inline Blob v2 descriptors
+    /// and legacy Blob v1 columns are rejected because their payload locations
+    /// cannot be reused in a different data file.
+    pub async fn open(
+        input: EncodedFileInput,
+        blob_ids: Option<Range<u32>>,
+        blob_namespace: Option<BlobNamespace>,
+    ) -> Result<Self> {
         validate_blob_id_range(blob_ids.as_ref())?;
         let metadata = Arc::new(FileReader::read_all_metadata(&input.scheduler()).await?);
         let schema = Arc::new(normalize_blob_footer_schema(metadata.file_schema.as_ref()));
@@ -165,7 +194,8 @@ impl DataFilePart {
             ));
         }
 
-        if schema.fields_pre_order().any(|field| field.is_blob_v2()) {
+        let has_blob_v2 = schema.fields_pre_order().any(|field| field.is_blob_v2());
+        if has_blob_v2 {
             validate_blob_descriptors(
                 &input,
                 metadata.as_ref(),
@@ -173,6 +203,12 @@ impl DataFilePart {
                 blob_ids.as_ref(),
             )
             .await?;
+            if blob_namespace.is_none() {
+                return Err(Error::invalid_input(format!(
+                    "part at '{}' contains Blob v2 columns but no Blob namespace was provided",
+                    input.path()
+                )));
+            }
         }
 
         Ok(Self {
@@ -180,6 +216,7 @@ impl DataFilePart {
             metadata,
             schema,
             blob_ids,
+            blob_namespace,
         })
     }
 
@@ -463,12 +500,23 @@ pub struct FileConcatTarget {
     pub version: ConcreteFileVersion,
     /// Complete schema stored in every input and regenerated in the output.
     pub schema: Arc<Schema>,
+    blob_namespace: Option<BlobNamespace>,
 }
 
 impl FileConcatTarget {
     /// Create a concatenation target.
     pub fn new(version: ConcreteFileVersion, schema: Arc<Schema>) -> Self {
-        Self { version, schema }
+        Self {
+            version,
+            schema,
+            blob_namespace: None,
+        }
+    }
+
+    /// Bind Blob-bearing parts to the final managed-sidecar namespace.
+    pub fn with_blob_namespace(mut self, blob_namespace: BlobNamespace) -> Self {
+        self.blob_namespace = Some(blob_namespace);
+        self
     }
 }
 
@@ -1088,6 +1136,15 @@ where
             "concat_data_file_parts requires at least one data-file part",
         ));
     }
+    for (part_index, part) in ordered_parts.iter().enumerate() {
+        if part.blob_namespace != target.blob_namespace {
+            return Err(Error::invalid_input(format!(
+                "part {part_index} Blob namespace {:?} does not match target namespace {:?}",
+                part.blob_namespace.as_ref().map(BlobNamespace::as_str),
+                target.blob_namespace.as_ref().map(BlobNamespace::as_str)
+            )));
+        }
+    }
     let mut ranges = ordered_parts
         .iter()
         .enumerate()
@@ -1449,10 +1506,14 @@ mod tests {
         let second_path = TempObjFile::default();
         let schema = write_file(&store, &first_path, ConcreteFileVersion::V2_1, &[1]).await;
         write_file(&store, &second_path, ConcreteFileVersion::V2_1, &[2]).await;
-        let first = DataFilePart::open(input(store.clone(), &first_path, 1).await, Some(1..10))
-            .await
-            .unwrap();
-        let second = DataFilePart::open(input(store, &second_path, 1).await, Some(5..20))
+        let first = DataFilePart::open(
+            input(store.clone(), &first_path, 1).await,
+            Some(1..10),
+            None,
+        )
+        .await
+        .unwrap();
+        let second = DataFilePart::open(input(store, &second_path, 1).await, Some(5..20), None)
             .await
             .unwrap();
         let factory_calls = Arc::new(AtomicUsize::new(0));

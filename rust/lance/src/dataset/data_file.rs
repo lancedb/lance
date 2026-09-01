@@ -3,23 +3,15 @@
 
 //! Stateless writing and concatenation of complete encoded data-file parts.
 
-use std::{
-    collections::HashSet,
-    num::NonZeroU64,
-    ops::Range,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-};
+use std::{collections::HashSet, num::NonZeroU64, ops::Range, sync::Arc};
 
 use arrow_array::RecordBatch;
 use futures::{Stream, StreamExt};
 use lance_core::{Error, Result, datatypes::Schema};
 use lance_file::{
     concat::{
-        FileConcatOptions, FileConcatReason, FileConcatResult, FileConcatTarget,
-        concat_data_file_parts as concat_parts,
+        BlobNamespace, EncodedFileInput, FileConcatOptions, FileConcatReason, FileConcatResult,
+        FileConcatTarget, concat_data_file_parts as concat_parts,
     },
     version::ConcreteFileVersion,
     versions as file_versions,
@@ -31,7 +23,11 @@ use object_store::path::Path;
 
 pub use lance_file::concat::DataFilePart;
 
-use super::{Dataset, fragment::FileFragment, transaction::DataReplacementGroup};
+use super::{
+    Dataset,
+    fragment::{FileFragment, write::generate_random_filename},
+    transaction::DataReplacementGroup,
+};
 use crate::{
     blob::prepared_to_logical_blob_schema,
     dataset::{
@@ -54,15 +50,17 @@ pub struct DataFileTarget {
     base_id: Option<u32>,
     schema: Arc<Schema>,
     version: ConcreteFileVersion,
+    blob_namespace: Option<BlobNamespace>,
 }
 
 impl DataFileTarget {
-    /// Create a final data-file target.
+    /// Create a final data-file target with Lance's ordinary random file naming.
     ///
-    /// `file_name` is relative to the selected data base and must end in
-    /// `.lance`. Prepared Blob v2 schemas are normalized to their caller-visible
-    /// logical form; the persisted descriptor schema remains an internal writer
-    /// detail.
+    /// This only creates an immutable identity; it does not create, reserve, or
+    /// register an object. The caller owns persistence, retries, cleanup, and
+    /// commit state. Prepared Blob v2 schemas are normalized to their
+    /// caller-visible logical form; the persisted descriptor schema remains an
+    /// internal writer detail.
     ///
     /// # Example
     ///
@@ -74,7 +72,6 @@ impl DataFileTarget {
     ///
     /// # fn target(schema: Arc<Schema>) -> lance_core::Result<DataFileTarget> {
     /// DataFileTarget::new(
-    ///     "replacement.lance".to_owned(),
     ///     None,
     ///     schema,
     ///     ConcreteFileVersion::V2_2,
@@ -82,7 +79,6 @@ impl DataFileTarget {
     /// # }
     /// ```
     pub fn new(
-        file_name: String,
         base_id: Option<u32>,
         schema: Arc<Schema>,
         version: ConcreteFileVersion,
@@ -96,24 +92,6 @@ impl DataFileTarget {
             return Err(Error::invalid_input(
                 "DataFileTarget.base_id must not use reserved ID 0",
             ));
-        }
-        if file_name.starts_with('/') || file_name.contains('\\') {
-            return Err(Error::invalid_input(format!(
-                "DataFileTarget.file_name must be a relative object path, got {file_name:?}"
-            )));
-        }
-        let parsed = Path::parse(&file_name).map_err(|error| {
-            Error::invalid_input(format!(
-                "DataFileTarget.file_name {file_name:?} is invalid: {error}"
-            ))
-        })?;
-        if parsed.as_ref() != file_name
-            || parsed.filename().is_none()
-            || !file_name.ends_with(".lance")
-        {
-            return Err(Error::invalid_input(format!(
-                "DataFileTarget.file_name must be a normalized relative path ending in '.lance', got {file_name:?}"
-            )));
         }
         if schema.fields.is_empty() {
             return Err(Error::invalid_input(
@@ -130,6 +108,7 @@ impl DataFileTarget {
             }
         }
         let schema = Arc::new(prepared_to_logical_blob_schema(schema.as_ref())?);
+        let has_blob_v2 = schema.fields_pre_order().any(|field| field.is_blob_v2());
         if schema
             .fields_pre_order()
             .any(|field| field.is_blob() && !field.is_blob_v2())
@@ -138,11 +117,19 @@ impl DataFileTarget {
                 "DataFileTarget does not support legacy Blob v1 fields",
             ));
         }
+        let file_name = format!("{}.lance", generate_random_filename());
+        let blob_namespace = has_blob_v2.then(|| {
+            let base = base_id
+                .map(|id| format!("base:{id}"))
+                .unwrap_or_else(|| "primary".to_string());
+            BlobNamespace::new(format!("{base}/{file_name}"))
+        });
         Ok(Self {
             file_name,
             base_id,
             schema,
             version,
+            blob_namespace,
         })
     }
 
@@ -164,6 +151,16 @@ impl DataFileTarget {
     /// Exact Lance file grammar used by parts and final output.
     pub fn version(&self) -> ConcreteFileVersion {
         self.version
+    }
+
+    /// Open one caller-persisted part and bind its managed Blob descriptors to
+    /// this final data file's namespace.
+    pub async fn open_part(
+        &self,
+        input: EncodedFileInput,
+        blob_ids: Option<Range<u32>>,
+    ) -> Result<DataFilePart> {
+        DataFilePart::open(input, blob_ids, self.blob_namespace.clone()).await
     }
 
     fn object_path(&self, data_dir: &Path) -> Path {
@@ -209,19 +206,6 @@ impl Dataset {
             }
         }
 
-        let is_referenced = self.manifest.fragments.iter().any(|fragment| {
-            fragment
-                .referenced_lance_files()
-                .any(|file| file.path == target.file_name && file.base_id == target.base_id)
-        });
-        if is_referenced {
-            return Err(Error::invalid_input(format!(
-                "DataFileTarget path {:?} with base_id {:?} is already referenced by dataset version {}",
-                target.file_name,
-                target.base_id,
-                self.version_id()
-            )));
-        }
         Ok(())
     }
 
@@ -273,12 +257,7 @@ impl Dataset {
 
         let mut preprocessor = if let Some(blob_ids) = blob_ids {
             let data_dir = self.data_file_dir_for_base(target.base_id)?;
-            let target_path = target.object_path(&data_dir);
-            let target_parent = target_path.parent().unwrap_or(data_dir);
-            let target_file = target_path.filename().ok_or_else(|| {
-                Error::invalid_input("DataFileTarget.file_name has no final path component")
-            })?;
-            let data_file_key = target_file.strip_suffix(".lance").ok_or_else(|| {
+            let data_file_key = target.file_name.strip_suffix(".lance").ok_or_else(|| {
                 Error::invalid_input("DataFileTarget.file_name must end in '.lance'")
             })?;
             let object_store = self.object_store(target.base_id).await?;
@@ -291,7 +270,7 @@ impl Dataset {
             Some(
                 BlobPreprocessor::new(
                     object_store.as_ref().clone(),
-                    target_parent,
+                    data_dir,
                     data_file_key.to_string(),
                     target.schema.as_ref(),
                     external_base_resolver,
@@ -336,18 +315,19 @@ impl Dataset {
             Err(error) => {
                 writer.abort().await;
                 if let Some(preprocessor) = preprocessor.as_mut() {
-                    preprocessor.abort().await;
+                    preprocessor.abort();
                 }
                 Err(error)
             }
         }
     }
 
-    /// Concatenate validated parts into the caller-selected final data file.
+    /// Concatenate validated parts into the Lance-generated final data file.
     ///
     /// Part order is the final physical row order. The operation copies
     /// encoded page buffers and regenerates metadata and the footer; incompatible
-    /// inputs fail without a decode/re-encode fallback or dataset commit.
+    /// inputs fail without a decode/re-encode fallback or dataset commit. The
+    /// caller owns cleanup of all durable part, Blob, and final-file objects.
     ///
     /// # Example
     ///
@@ -379,20 +359,17 @@ impl Dataset {
         let data_dir = self.data_file_dir_for_base(target.base_id)?;
         let output_path = target.object_path(&data_dir);
         let object_store = self.object_store(target.base_id).await?;
-        let concat_target = FileConcatTarget::new(target.version, target.schema.clone());
-        let output_created = Arc::new(AtomicBool::new(false));
+        let mut concat_target = FileConcatTarget::new(target.version, target.schema.clone());
+        if let Some(blob_namespace) = target.blob_namespace.clone() {
+            concat_target = concat_target.with_blob_namespace(blob_namespace);
+        }
         let result = concat_parts(
             &concat_target,
             ordered_parts,
             {
                 let object_store = object_store.clone();
                 let output_path = output_path.clone();
-                let output_created = output_created.clone();
-                move || async move {
-                    let writer = object_store.create(&output_path).await?;
-                    output_created.store(true, Ordering::Release);
-                    Ok(writer)
-                }
+                move || async move { object_store.create(&output_path).await }
             },
             FileConcatOptions::default(),
         )
@@ -424,17 +401,7 @@ impl Dataset {
                     | FileConcatReason::BlobColumns => Error::not_supported(message),
                 });
             }
-            Err(error) => {
-                if output_created.load(Ordering::Acquire)
-                    && let Err(cleanup_error) = object_store.delete(&output_path).await
-                {
-                    tracing::warn!(
-                        "failed to remove incomplete concatenated data file '{}': {cleanup_error}",
-                        output_path
-                    );
-                }
-                return Err(error);
-            }
+            Err(error) => return Err(error),
         };
         let (fields, column_indices) =
             file_versions::data_file_columns(target.version, target.schema.as_ref());

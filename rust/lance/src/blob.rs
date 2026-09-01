@@ -228,8 +228,13 @@ struct BlobIdAllocatorInner {
     start_inclusive: u32,
     next: AtomicU32,
     end_exclusive: Option<u32>,
-    used: Mutex<HashSet<u32>>,
-    allocated: Mutex<HashSet<u32>>,
+    state: Mutex<BlobIdAllocatorState>,
+}
+
+#[derive(Debug, Default)]
+struct BlobIdAllocatorState {
+    used: HashSet<u32>,
+    allocated: HashSet<u32>,
 }
 
 impl BlobIdAllocator {
@@ -239,8 +244,7 @@ impl BlobIdAllocator {
                 start_inclusive: start,
                 next: AtomicU32::new(start),
                 end_exclusive: None,
-                used: Mutex::new(HashSet::new()),
-                allocated: Mutex::new(HashSet::new()),
+                state: Mutex::new(BlobIdAllocatorState::default()),
             }),
         }
     }
@@ -257,8 +261,7 @@ impl BlobIdAllocator {
                 start_inclusive: range.start,
                 next: AtomicU32::new(range.start),
                 end_exclusive: Some(range.end),
-                used: Mutex::new(HashSet::new()),
-                allocated: Mutex::new(HashSet::new()),
+                state: Mutex::new(BlobIdAllocatorState::default()),
             }),
         })
     }
@@ -282,18 +285,12 @@ impl BlobIdAllocator {
             {
                 continue;
             }
-            let mut used =
-                self.inner.used.lock().map_err(|_| {
+            let mut state =
+                self.inner.state.lock().map_err(|_| {
                     Error::internal("Blob id allocator mutex was poisoned".to_string())
                 })?;
-            if used.insert(id) {
-                self.inner
-                    .allocated
-                    .lock()
-                    .map_err(|_| {
-                        Error::internal("Blob id allocator mutex was poisoned".to_string())
-                    })?
-                    .insert(id);
+            if state.used.insert(id) {
+                state.allocated.insert(id);
                 return Ok(id);
             }
         }
@@ -313,20 +310,28 @@ impl BlobIdAllocator {
                 ),
             }));
         }
-        self.inner
-            .used
+        let mut state = self
+            .inner
+            .state
             .lock()
-            .map_err(|_| Error::internal("Blob id allocator mutex was poisoned".to_string()))?
-            .insert(id);
+            .map_err(|_| Error::internal("Blob id allocator mutex was poisoned".to_string()))?;
+        if state.allocated.contains(&id) {
+            return Err(Error::invalid_input(format!(
+                "Blob ID {id} was already allocated for a generated sidecar"
+            )));
+        }
+        state.used.insert(id);
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn allocated_ids(&self) -> Result<Vec<u32>> {
         let mut ids = self
             .inner
-            .allocated
+            .state
             .lock()
             .map_err(|_| Error::internal("Blob id allocator mutex was poisoned".to_string()))?
+            .allocated
             .iter()
             .copied()
             .collect::<Vec<_>>();
@@ -1226,6 +1231,17 @@ mod tests {
         allocator.reserve(7).unwrap();
         assert_eq!(allocator.next().unwrap(), 8);
         assert_eq!(allocator.allocated_ids().unwrap(), vec![8]);
+    }
+
+    #[test]
+    fn part_blob_id_allocator_rejects_generated_id_reservations() {
+        let allocator = BlobIdAllocator::from_range(7..9).unwrap();
+        assert_eq!(allocator.next().unwrap(), 7);
+        let error = allocator.reserve(7).unwrap_err();
+        assert!(error.to_string().contains("already allocated"), "{error}");
+
+        allocator.reserve(8).unwrap();
+        allocator.reserve(8).unwrap();
     }
 
     #[test]

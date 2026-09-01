@@ -31,7 +31,6 @@ use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry
 use lance_io::scheduler::{FileScheduler, ScanScheduler, SchedulerConfig};
 use object_store::path::Path;
 use tokio::sync::{Mutex, Notify, OnceCell, oneshot};
-use tracing::warn;
 use url::Url;
 
 use super::take::{MissingRowPolicy, TakeBuilder};
@@ -1283,21 +1282,8 @@ impl BlobPreprocessor {
         self.pack_writer.finish().await
     }
 
-    pub(super) async fn abort(&mut self) {
+    pub(super) fn abort(&mut self) {
         self.pack_writer.abort();
-        let ids = match self.blob_id_allocator.allocated_ids() {
-            Ok(ids) => ids,
-            Err(error) => {
-                warn!("failed to list Blob sidecars for part cleanup: {error}");
-                return;
-            }
-        };
-        for blob_id in ids {
-            let path = blob_path(&self.data_dir, &self.data_file_key, blob_id);
-            if let Err(error) = self.object_store.delete(&path).await {
-                warn!("failed to remove part Blob sidecar '{}': {error}", path);
-            }
-        }
     }
 }
 

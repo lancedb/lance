@@ -98,12 +98,13 @@ async fn write_part(
         .open_file(&path, &CachedFileSize::new(summary.size_bytes))
         .await
         .unwrap();
-    DataFilePart::open(
-        EncodedFileInput::new(file).with_expected_num_rows(summary.num_rows),
-        blob_ids,
-    )
-    .await
-    .unwrap()
+    target
+        .open_part(
+            EncodedFileInput::new(file).with_expected_num_rows(summary.num_rows),
+            blob_ids,
+        )
+        .await
+        .unwrap()
 }
 
 async fn commit(dataset: &Dataset, replacement: DataReplacementGroup) -> Result<Dataset> {
@@ -126,7 +127,6 @@ async fn concatenates_parts_in_caller_order_without_reusing_staging_files() {
     let original = arrow_array::record_batch!(("id", Int32, [0, 1, 2, 3])).unwrap();
     let dataset = dataset_of(original, LanceFileVersion::V2_1).await;
     let target = DataFileTarget::new(
-        "concatenated.lance".to_string(),
         None,
         Arc::new(dataset.schema().clone()),
         dataset.manifest.data_storage_format.lance_file_format(),
@@ -153,7 +153,7 @@ async fn concatenates_parts_in_caller_order_without_reusing_staging_files() {
         .write_columns_from_parts(&target, &[second, first])
         .await
         .unwrap();
-    assert_eq!(replacement.1.path, "concatenated.lance");
+    assert_eq!(replacement.1.path, target.file_name());
     let dataset = commit(&dataset, replacement).await.unwrap();
     let batch = dataset.scan().try_into_batch().await.unwrap();
     assert_eq!(
@@ -167,7 +167,6 @@ async fn fragment_adapter_rejects_incomplete_physical_coverage() {
     let original = arrow_array::record_batch!(("id", Int32, [0, 1, 2])).unwrap();
     let dataset = dataset_of(original, LanceFileVersion::V2_1).await;
     let target = DataFileTarget::new(
-        "short.lance".to_string(),
         None,
         Arc::new(dataset.schema().clone()),
         dataset.manifest.data_storage_format.lance_file_format(),
@@ -190,23 +189,26 @@ async fn fragment_adapter_rejects_incomplete_physical_coverage() {
 }
 
 #[tokio::test]
-async fn target_rejects_a_path_referenced_by_the_current_dataset_version() {
+async fn target_uses_an_ordinary_generated_data_file_name() {
     let original = arrow_array::record_batch!(("id", Int32, [0, 1])).unwrap();
     let dataset = dataset_of(original, LanceFileVersion::V2_1).await;
-    let referenced = only_fragment(&dataset).metadata.files[0].path.clone();
-    let target = DataFileTarget::new(
-        referenced,
+    let first = DataFileTarget::new(
+        None,
+        Arc::new(dataset.schema().clone()),
+        dataset.manifest.data_storage_format.lance_file_format(),
+    )
+    .unwrap();
+    let second = DataFileTarget::new(
         None,
         Arc::new(dataset.schema().clone()),
         dataset.manifest.data_storage_format.lance_file_format(),
     )
     .unwrap();
 
-    let error = dataset
-        .concat_data_file_parts(&target, &[])
-        .await
-        .unwrap_err();
-    assert!(error.to_string().contains("already referenced"), "{error}");
+    assert_ne!(first.file_name(), second.file_name());
+    assert_eq!(first.file_name().len(), 56);
+    assert!(first.file_name().ends_with(".lance"));
+    assert!(!first.file_name().contains('/'));
 }
 
 #[tokio::test]
@@ -217,7 +219,6 @@ async fn blob_part_requires_an_id_lease_before_writing() {
     let original = RecordBatch::try_new(schema.clone(), vec![blobs.finish().unwrap()]).unwrap();
     let dataset = dataset_of(original, LanceFileVersion::V2_2).await;
     let target = DataFileTarget::new(
-        "missing-lease.lance".to_owned(),
         None,
         Arc::new(dataset.schema().clone()),
         dataset.manifest.data_storage_format.lance_file_format(),
@@ -264,7 +265,7 @@ async fn data_file_part_rejects_non_empty_file_relative_inline_blob() {
         .await
         .unwrap();
 
-    let error = DataFilePart::open(EncodedFileInput::new(file), None)
+    let error = DataFilePart::open(EncodedFileInput::new(file), None, None)
         .await
         .unwrap_err();
     assert!(error.to_string().contains("non-empty Inline"), "{error}");
@@ -300,7 +301,6 @@ async fn complete_logical_blob_schema_and_external_range_survive_assembly() {
     .await
     .unwrap();
     let target = DataFileTarget::new(
-        "complete-logical-final.lance".to_string(),
         None,
         Arc::new(dataset.schema().clone()),
         dataset.manifest.data_storage_format.lance_file_format(),
@@ -380,7 +380,6 @@ async fn blob_parts_write_sidecars_in_final_namespace_and_concat_descriptors() {
     )
     .await;
     let target = DataFileTarget::new(
-        "blob-final.lance".to_string(),
         None,
         Arc::new(dataset.schema().clone()),
         dataset.manifest.data_storage_format.lance_file_format(),
@@ -405,7 +404,8 @@ async fn blob_parts_write_sidecars_in_final_namespace_and_concat_descriptors() {
         )
         .await
         .unwrap();
-    let error = DataFilePart::open(EncodedFileInput::new(file), Some(20..30))
+    let error = target
+        .open_part(EncodedFileInput::new(file), Some(20..30))
         .await
         .unwrap_err();
     assert!(
@@ -420,6 +420,25 @@ async fn blob_parts_write_sidecars_in_final_namespace_and_concat_descriptors() {
         make_batch(vec![11], vec![b"replacement-1"]),
     )
     .await;
+
+    let other_target = DataFileTarget::new(
+        None,
+        Arc::new(dataset.schema().clone()),
+        dataset.manifest.data_storage_format.lance_file_format(),
+    )
+    .unwrap();
+    let error = dataset
+        .concat_data_file_parts(&other_target, &[first.clone(), second.clone()])
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("Blob namespace"), "{error}");
+    assert!(
+        !dataset
+            .object_store
+            .exists(&dataset.data_dir().join(other_target.file_name()))
+            .await
+            .unwrap()
+    );
 
     let replacement = only_fragment(&dataset)
         .write_columns_from_parts(&target, &[first, second])
