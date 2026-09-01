@@ -73,6 +73,12 @@ static LANCE_FTS_POSTING_BATCH_ROWS: LazyLock<usize> = LazyLock::new(|| {
         .parse()
         .expect("failed to parse LANCE_FTS_POSTING_BATCH_ROWS")
 });
+
+/// Configured posting rows per writer batch, shared with merge read planning.
+pub(crate) fn posting_batch_rows() -> usize {
+    (*LANCE_FTS_POSTING_BATCH_ROWS).max(1)
+}
+
 const MAX_RETAINED_TOKEN_IDS: usize = 8 * 1024;
 
 fn default_num_workers() -> usize {
@@ -1157,7 +1163,7 @@ impl InnerBuilder {
         );
         let docs_for_batches = docs.clone();
         let schema_for_batches = schema.clone();
-        let batch_rows = *LANCE_FTS_POSTING_BATCH_ROWS;
+        let batch_rows = posting_batch_rows();
         let (tx, rx) = async_channel::bounded(*LANCE_FTS_WRITE_QUEUE_SIZE);
         // The producer builds posting-list batches on the CPU pool and hands them
         // to the writer through a bounded channel. Each batch is built inside its
