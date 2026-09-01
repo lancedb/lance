@@ -6,7 +6,11 @@
 //! File grammar belongs to `lance_file::versions`. This module contains only
 //! operation-level dataset choices whose behavior actually differs by version.
 
-use std::{collections::HashMap, ops::Range, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    ops::Range,
+    sync::Arc,
+};
 
 use arrow_schema::{DataType, Field as ArrowField};
 use datafusion::catalog::Session;
@@ -319,6 +323,16 @@ pub fn validate_column_indices(manifest: &Manifest) -> Result<()> {
 }
 
 fn validate_leaf_column_indices(manifest: &Manifest) -> Result<()> {
+    let mut fields_by_id: HashMap<i32, (&Field, bool)> = HashMap::new();
+    for field in manifest.schema.fields_pre_order() {
+        let needs_column = field.is_leaf() || field.is_packed_struct() || field.is_blob();
+        fields_by_id
+            .entry(field.id)
+            .or_insert((field, needs_column));
+    }
+
+    let mut validated_lists: HashSet<(usize, usize)> = HashSet::new();
+
     for fragment in manifest.fragments.iter() {
         for data_file in &fragment.files {
             let file_version = data_file.file_version()?;
@@ -337,13 +351,19 @@ fn validate_leaf_column_indices(manifest: &Manifest) -> Result<()> {
             if file_version == ConcreteFileVersion::V2_0 {
                 continue;
             }
+            let list_key = (
+                data_file.fields.as_ptr() as usize,
+                data_file.column_indices.as_ptr() as usize,
+            );
+            if !validated_lists.insert(list_key) {
+                continue;
+            }
             for (field_id, column_index) in
                 data_file.fields.iter().zip(data_file.column_indices.iter())
             {
-                let Some(field) = manifest.schema.field_by_id(*field_id) else {
+                let Some((field, needs_column)) = fields_by_id.get(field_id).copied() else {
                     continue;
                 };
-                let needs_column = field.is_leaf() || field.is_packed_struct() || field.is_blob();
                 if needs_column && *column_index == -1 {
                     return Err(Error::invalid_input(format!(
                         "Field '{}' (id={}) in data file '{}' (fragment {}) has column_index=-1, but leaf fields, packed structs, and blob fields must have a valid column index in file format 2.1+.",

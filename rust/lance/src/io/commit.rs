@@ -3025,6 +3025,64 @@ mod tests {
         assert!(msg.contains("must have a valid column index"), "{msg}");
     }
 
+    #[test]
+    fn test_check_column_indices_rejects_after_dedup() {
+        let mut struct_field = Field::try_from(ArrowField::new(
+            "s",
+            DataType::Struct(vec![ArrowField::new("x", DataType::Int32, false)].into()),
+            false,
+        ))
+        .unwrap();
+        struct_field.set_id(-1, &mut 0);
+
+        let schema = Schema {
+            fields: vec![struct_field],
+            metadata: Default::default(),
+        };
+
+        // struct=-1, leaf=0: valid layout; clones share the same Arcs.
+        let shared_file = DataFile::new(
+            "shared.lance",
+            vec![0, 1],
+            vec![-1, 0],
+            ConcreteFileVersion::V2_1,
+            None,
+            None,
+        );
+        // Wrongly gives the struct a real column index.
+        let bad_file = DataFile::new(
+            "bad.lance",
+            vec![0, 1],
+            vec![0, 1],
+            ConcreteFileVersion::V2_1,
+            None,
+            None,
+        );
+        let make_fragment = |id: u64, file: DataFile| Fragment {
+            id,
+            files: vec![file],
+            overlays: vec![],
+            deletion_file: None,
+            row_id_meta: None,
+            physical_rows: Some(100),
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
+        };
+        let manifest = Manifest::new(
+            schema,
+            Arc::new(vec![
+                make_fragment(0, shared_file.clone()),
+                make_fragment(1, shared_file),
+                make_fragment(2, bad_file),
+            ]),
+            DataStorageFormat::new(LanceFileVersion::V2_1.resolve()),
+            HashMap::new(),
+        );
+        let msg = check_column_indices(&manifest).unwrap_err().to_string();
+        assert!(msg.contains("Non-leaf field"), "{msg}");
+        assert!(msg.contains("bad.lance"), "{msg}");
+    }
+
     /// Reproduces the debug-only panic `migrate_indices`'s fragment-bitmap
     /// recalculation guard used to contain: a legal covered index
     /// (`fields=[a,b]`, `covering_fields=[b]`) has `fields.len() == 2`, which
