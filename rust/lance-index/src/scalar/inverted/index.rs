@@ -57,7 +57,7 @@ use tokio::{
     sync::{Mutex, OnceCell},
     task::spawn_blocking,
 };
-use tracing::{info, instrument, warn};
+use tracing::{debug, info, instrument, warn};
 
 use super::documents::{
     DocId, DocLengths, DocVisibility, PartitionDocumentStore, PartitionDocuments,
@@ -70,8 +70,8 @@ use super::{DocumentGranularity, InvertedIndexBuilder, InvertedIndexParams, wand
 use super::{
     builder::{
         BLOCK_SIZE, ScoredDoc, doc_file_path,
-        inverted_list_schema_for_version_with_block_size_and_impacts, posting_batch_rows,
-        posting_file_path, token_file_path,
+        inverted_list_schema_for_version_with_block_size_and_impacts, posting_file_path,
+        token_file_path,
     },
     iter::PlainPostingListIterator,
     query::*,
