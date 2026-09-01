@@ -26,6 +26,10 @@ pub use namespace::LanceNamespace;
 // Re-export error types
 pub use error::{ErrorCode, NamespaceError, Result as NamespaceResult};
 
+/// Context/property key carrying a table reservation's incarnation token.
+/// Minted by `declare_table`, presented by the bootstrap `create_table_version`.
+pub const RESERVATION_TOKEN_KEY: &str = "reservation_token";
+
 // Re-export reqwest client for convenience
 pub use lance_namespace_reqwest_client as reqwest_client;
 

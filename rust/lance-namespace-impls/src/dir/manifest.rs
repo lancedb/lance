@@ -2242,13 +2242,20 @@ impl ManifestNamespace {
         let versions_path = table_path
             .clone()
             .join(lance_table::io::commit::VERSIONS_DIR);
-        // `_versions/` should only contain manifest files, so probing the first entry is enough
-        // to distinguish declared-only tables (empty `_versions/`) from created tables.
-        Ok(object_store
-            .list(Some(versions_path))
-            .try_next()
-            .await?
-            .is_some())
+        // Staging blobs retained by interrupted publications are not commits:
+        // count only canonical manifest names, using the version-list filter.
+        let mut stream = object_store.list(Some(versions_path));
+        while let Some(meta) = stream.try_next().await? {
+            if meta
+                .location
+                .filename()
+                .and_then(super::DirectoryNamespace::manifest_version_from_filename)
+                .is_some()
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     async fn location_has_actual_manifests(&self, location: &str) -> Result<bool> {
@@ -3518,7 +3525,15 @@ impl LanceNamespace for ManifestNamespace {
             }
         })?;
 
-        let metadata = Self::serialize_metadata(request.properties.as_ref(), "table", &object_id)?;
+        // The reservation's incarnation token: create_table_version validates
+        // it on the bootstrap publish, and describe echoes it via properties.
+        let reservation_token = uuid::Uuid::new_v4().to_string();
+        let mut stored_properties = request.properties.clone().unwrap_or_default();
+        stored_properties.insert(
+            lance_namespace::RESERVATION_TOKEN_KEY.to_string(),
+            reservation_token.clone(),
+        );
+        let metadata = Self::serialize_metadata(Some(&stored_properties), "table", &object_id)?;
 
         // Add entry to manifest marking this as a declared table (store dir_name, not full path)
         self.insert_into_manifest_with_metadata(
@@ -3550,6 +3565,7 @@ impl LanceNamespace for ManifestNamespace {
             location: Some(table_uri),
             storage_options,
             properties: request.properties,
+            transaction_id: Some(reservation_token),
             ..Default::default()
         })
     }

@@ -1666,7 +1666,7 @@ impl DirectoryNamespace {
     /// Logical table version parsed from a manifest filename, or `None` for
     /// non-manifest / detached entries. Delegates to lance's scheme detection so
     /// version listing and deletion stay consistent with the on-disk format.
-    fn manifest_version_from_filename(filename: &str) -> Option<u64> {
+    pub(crate) fn manifest_version_from_filename(filename: &str) -> Option<u64> {
         ManifestNamingScheme::detect_scheme(filename)?.parse_version(filename)
     }
 
@@ -3958,7 +3958,15 @@ impl LanceNamespace for DirectoryNamespace {
     ) -> Result<CreateTableVersionResponse> {
         self.record_op("create_table_version");
         let branch = Self::normalized_branch(request.branch.as_deref())?;
-        let table_uri = self.resolve_table_location(&request.id).await?;
+        let mut describe_req = DescribeTableRequest::new();
+        describe_req.id = request.id.clone();
+        describe_req.load_detailed_metadata = Some(false);
+        let described = self.describe_table_impl(describe_req).await?;
+        let table_uri = described.location.clone().ok_or_else(|| {
+            lance_core::Error::from(NamespaceError::TableNotFound {
+                message: format!("Table location not found for: {:?}", request.id),
+            })
+        })?;
         let (table_uri, table_path, branch_parent_version) = match branch {
             Some(b) => self.resolve_branch_for_commit(&table_uri, b).await?,
             None => {
@@ -4024,6 +4032,33 @@ impl LanceNamespace for DirectoryNamespace {
             branch_parent_version,
         )
         .await?;
+
+        // A publisher that presents an incarnation token must hold the current
+        // one, so a stale clone cannot publish into an entry that was dropped
+        // and re-declared since it read the reservation. Token-less publishers
+        // (create flows, older clients) predate the fence and pass.
+        if version == 1 && !is_branch {
+            let expected = described
+                .properties
+                .as_ref()
+                .and_then(|properties| properties.get(lance_namespace::RESERVATION_TOKEN_KEY));
+            let presented = request
+                .context
+                .as_ref()
+                .and_then(|context| context.get(lance_namespace::RESERVATION_TOKEN_KEY));
+            if let (Some(presented), expected) = (presented, expected) {
+                if Some(presented) != expected {
+                    return Err(lance_core::Error::from(
+                        NamespaceError::ConcurrentModification {
+                            message: format!(
+                                "Reservation token mismatch publishing version 1 for table at '{}': the declaration was superseded",
+                                table_uri
+                            ),
+                        },
+                    ));
+                }
+            }
+        }
 
         // Materialize with Create / copy_if_not_exists only — never overwrite.
         let copy_result = self

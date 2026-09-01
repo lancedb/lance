@@ -40,6 +40,9 @@ pub struct LanceNamespaceExternalManifestStore {
     /// trait methods receive is resolved against this to derive which branch a
     /// request targets, so a single store serves every branch of the table.
     table_root: Path,
+    /// Reservation incarnation token from `declare_table`; the namespace
+    /// validates it where the bootstrap publish lands.
+    reservation_token: Option<String>,
 }
 
 impl LanceNamespaceExternalManifestStore {
@@ -52,7 +55,14 @@ impl LanceNamespaceExternalManifestStore {
             namespace_client,
             table_id,
             table_root,
+            reservation_token: None,
         }
+    }
+
+    /// Attach the reservation token this publisher acts under.
+    pub fn with_reservation_token(mut self, token: Option<String>) -> Self {
+        self.reservation_token = token;
+        self
     }
 
     /// Build a store for the table rooted at `table_uri`, resolving the root
@@ -154,6 +164,12 @@ impl ExternalManifestStore for LanceNamespaceExternalManifestStore {
             e_tag: e_tag.clone(),
             naming_scheme: Some(naming_scheme_str.to_string()),
             branch: self.branch_for_base(base_path.as_ref())?,
+            context: self.reservation_token.clone().map(|token| {
+                std::collections::HashMap::from([(
+                    lance_namespace::RESERVATION_TOKEN_KEY.to_string(),
+                    token,
+                )])
+            }),
             ..Default::default()
         };
 
