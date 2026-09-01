@@ -40,7 +40,17 @@ public class LockManager {
       // The outer index create already pins the Dataset with a read lock. Callback re-entry uses
       // that lease instead of blocking behind a writer queued on the same lock.
       callbackLease = dataset != null && ContextIndexBuildProgress.isActive(dataset);
-      if (!callbackLease) {
+      if (callbackLease) {
+        return;
+      }
+      if (isCallbackFromAnotherDataset()) {
+        // An untimed tryLock can join active readers even when a writer is queued, but never waits
+        // for another Dataset whose operation may itself be waiting for this callback.
+        if (!lock.readLock().tryLock()) {
+          throw new IllegalStateException(
+              "Dataset lifecycle read lock is busy in an index progress callback");
+        }
+      } else {
         lock.readLock().lock();
       }
     }
@@ -60,7 +70,14 @@ public class LockManager {
       if (dataset != null && ContextIndexBuildProgress.isActive(dataset)) {
         throw new IllegalStateException("Dataset is busy in an index progress callback");
       }
-      lock.writeLock().lock();
+      if (isCallbackFromAnotherDataset()) {
+        if (!lock.writeLock().tryLock()) {
+          throw new IllegalStateException(
+              "Dataset lifecycle write lock is busy in an index progress callback");
+        }
+      } else {
+        lock.writeLock().lock();
+      }
     }
 
     @Override
@@ -85,5 +102,11 @@ public class LockManager {
    */
   public WriteLock acquireWriteLock() {
     return new WriteLock();
+  }
+
+  private boolean isCallbackFromAnotherDataset() {
+    return dataset != null
+        && ContextIndexBuildProgress.isCallbackActive()
+        && !ContextIndexBuildProgress.isActive(dataset);
   }
 }
