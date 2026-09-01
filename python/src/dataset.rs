@@ -48,7 +48,7 @@ use lance::dataset::{
     BatchInfo, BatchUDF, CommitBuilder, MergeStats, NewColumnTransform, UDFCheckpointStore,
     WriteDestination,
 };
-use lance::dataset::{ColumnAlteration, ProjectionRequest};
+use lance::dataset::{ColumnAlteration, ProjectionRequest, validate_dataset_root_for_drop};
 use lance::dataset::{
     Dataset as LanceDataset, DeleteBuilder, ExternalBlobMode,
     MergeInsertBuilder as LanceMergeInsertBuilder, MergeInsertWriteMode, ReadParams,
@@ -812,6 +812,7 @@ impl Dataset {
         delete_unverified: Option<bool>,
         error_if_tagged_old_versions: Option<bool>,
         delete_rate_limit: Option<u64>,
+        versions: Option<Vec<u64>>,
     ) -> lance_core::Result<lance::dataset::cleanup::CleanupPolicy> {
         let mut builder = CleanupPolicyBuilder::default();
         if let Some(v) = older_than_micros {
@@ -829,6 +830,9 @@ impl Dataset {
         }
         if let Some(v) = delete_rate_limit {
             builder = builder.delete_rate_limit(v)?;
+        }
+        if let Some(v) = versions {
+            builder = builder.versions(v)?;
         }
         Ok(builder.build())
     }
@@ -2177,7 +2181,7 @@ impl Dataset {
     }
 
     /// Cleanup old versions from the dataset
-    #[pyo3(signature = (older_than_micros = None, retain_versions = None, delete_unverified = None, error_if_tagged_old_versions = None, delete_rate_limit = None))]
+    #[pyo3(signature = (older_than_micros = None, retain_versions = None, delete_unverified = None, error_if_tagged_old_versions = None, delete_rate_limit = None, versions = None))]
     fn cleanup_old_versions(
         &self,
         older_than_micros: Option<i64>,
@@ -2185,6 +2189,7 @@ impl Dataset {
         delete_unverified: Option<bool>,
         error_if_tagged_old_versions: Option<bool>,
         delete_rate_limit: Option<u64>,
+        versions: Option<Vec<u64>>,
     ) -> PyResult<CleanupStats> {
         let stats = rt()
             .block_on(None, async {
@@ -2195,6 +2200,7 @@ impl Dataset {
                         delete_unverified,
                         error_if_tagged_old_versions,
                         delete_rate_limit,
+                        versions,
                     )
                     .await?;
                 self.ds.cleanup_with_policy(policy).await
@@ -2205,7 +2211,7 @@ impl Dataset {
 
     /// Explain cleanup old versions from the dataset without deleting files
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (older_than_micros = None, retain_versions = None, delete_unverified = None, error_if_tagged_old_versions = None, delete_rate_limit = None, include_files = false, max_files = 1000))]
+    #[pyo3(signature = (older_than_micros = None, retain_versions = None, delete_unverified = None, error_if_tagged_old_versions = None, delete_rate_limit = None, versions = None, include_files = false, max_files = 1000))]
     fn explain_cleanup_old_versions(
         &self,
         older_than_micros: Option<i64>,
@@ -2213,6 +2219,7 @@ impl Dataset {
         delete_unverified: Option<bool>,
         error_if_tagged_old_versions: Option<bool>,
         delete_rate_limit: Option<u64>,
+        versions: Option<Vec<u64>>,
         include_files: bool,
         max_files: usize,
     ) -> PyResult<CleanupExplanation> {
@@ -2225,6 +2232,7 @@ impl Dataset {
                         delete_unverified,
                         error_if_tagged_old_versions,
                         delete_rate_limit,
+                        versions,
                     )
                     .await?;
                 self.ds
@@ -2474,6 +2482,9 @@ impl Dataset {
         if let Some(kwargs) = kwargs {
             if let Some(num_indices_to_merge) = kwargs.get_item("num_indices_to_merge")? {
                 options.num_indices_to_merge = num_indices_to_merge.extract()?;
+            }
+            if let Some(retrain) = kwargs.get_item("retrain")? {
+                options.retrain = retrain.extract()?;
             }
             if let Some(index_names) = kwargs.get_item("index_names")? {
                 options.index_names = Some(
@@ -2942,6 +2953,9 @@ impl Dataset {
         rt().spawn(None, async move {
             let (object_store, path) =
                 object_store_from_uri_or_path(&dest, storage_options).await?;
+            validate_dataset_root_for_drop(&object_store, &path)
+                .await
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
             let result = object_store.remove_dir_all(path).await;
 
             match result {
@@ -4134,6 +4148,20 @@ impl SqlQueryBuilder {
         Ok(Self {
             builder: self.builder.clone().blob_handling(blob_handling),
         })
+    }
+
+    #[pyo3(signature = (batch_size))]
+    fn batch_size(&self, batch_size: usize) -> Self {
+        Self {
+            builder: self.builder.clone().batch_size(batch_size),
+        }
+    }
+
+    #[pyo3(signature = (batch_size_bytes))]
+    fn batch_size_bytes(&self, batch_size_bytes: u64) -> Self {
+        Self {
+            builder: self.builder.clone().batch_size_bytes(batch_size_bytes),
+        }
     }
 
     /// Build the SQL query.

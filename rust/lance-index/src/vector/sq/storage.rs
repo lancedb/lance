@@ -25,7 +25,8 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use super::{ScalarQuantizer, scale_to_u8};
-use crate::frag_reuse::FragReuseIndex;
+use crate::frag_reuse::{FragReuseIndex, FragReuseIndexHandle};
+use crate::scalar::RowIdRemapper;
 use crate::{
     INDEX_METADATA_SCHEMA_KEY, IndexMetadata,
     vector::{
@@ -175,6 +176,18 @@ impl ScalarQuantizationStorage {
         batches: impl IntoIterator<Item = RecordBatch>,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
+        let frag_reuse_index = frag_reuse_index
+            .map(|index| Arc::new(FragReuseIndexHandle(index)) as Arc<dyn RowIdRemapper>);
+        Self::try_new_with_remapper(num_bits, distance_type, bounds, batches, frag_reuse_index)
+    }
+
+    fn try_new_with_remapper(
+        num_bits: u16,
+        distance_type: DistanceType,
+        bounds: Range<f64>,
+        batches: impl IntoIterator<Item = RecordBatch>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+    ) -> Result<Self> {
         let mut chunks = Vec::with_capacity(SQ_CHUNK_CAPACITY);
         let mut offsets = Vec::with_capacity(SQ_CHUNK_CAPACITY + 1);
         offsets.push(0);
@@ -271,6 +284,21 @@ impl QuantizerStorage for ScalarQuantizationStorage {
         Self: Sized,
     {
         Self::try_new(
+            metadata.num_bits,
+            distance_type,
+            metadata.bounds.clone(),
+            [batch],
+            frag_reuse_index,
+        )
+    }
+
+    fn try_from_batch_with_remapper(
+        batch: RecordBatch,
+        metadata: &Self::Metadata,
+        distance_type: DistanceType,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+    ) -> Result<Self> {
+        Self::try_new_with_remapper(
             metadata.num_bits,
             distance_type,
             metadata.bounds.clone(),
