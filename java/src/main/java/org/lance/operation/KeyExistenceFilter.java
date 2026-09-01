@@ -56,8 +56,18 @@ public final class KeyExistenceFilter {
 
   public static KeyExistenceFilter bloom(
       int[] fieldIds, byte[] bitmap, int numBits, long numberOfItems, double probability) {
-    if (numBits < 0 || numberOfItems < 0) {
-      throw new IllegalArgumentException("numBits and numberOfItems must be non-negative");
+    Objects.requireNonNull(bitmap, "bitmap must not be null");
+    if (numBits <= 0 || numberOfItems <= 0) {
+      throw new IllegalArgumentException("numBits and numberOfItems must be positive");
+    }
+    if (numBits != bitmap.length * Byte.SIZE) {
+      throw new IllegalArgumentException(
+          String.format(
+              "numBits (%d) must equal the bitmap length in bits (%d)",
+              numBits, bitmap.length * Byte.SIZE));
+    }
+    if (!Double.isFinite(probability) || probability <= 0.0 || probability >= 1.0) {
+      throw new IllegalArgumentException("probability must be finite and between 0 and 1");
     }
     return new KeyExistenceFilter(
         fieldIds, Type.BLOOM, null, bitmap, numBits, numberOfItems, probability);

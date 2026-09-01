@@ -35,6 +35,11 @@ public class Overwrite extends SchemaOperation {
   private final Optional<List<BasePath>> initialBases;
 
   protected Overwrite(
+      List<FragmentMetadata> fragments, Schema schema, Map<String, String> configUpsertValues) {
+    this(fragments, schema, configUpsertValues, null);
+  }
+
+  protected Overwrite(
       List<FragmentMetadata> fragments,
       Schema schema,
       Map<String, String> configUpsertValues,
@@ -55,6 +60,10 @@ public class Overwrite extends SchemaOperation {
 
   /** Base paths used when creating a dataset; absent for a regular overwrite. */
   public Optional<List<BasePath>> initialBases() {
+    return initialBases;
+  }
+
+  public Optional<List<BasePath>> getInitialBases() {
     return initialBases;
   }
 

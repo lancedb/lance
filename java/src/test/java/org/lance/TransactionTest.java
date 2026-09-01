@@ -38,9 +38,12 @@ import org.apache.arrow.vector.types.pojo.Schema;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.beans.Introspector;
 import java.nio.file.Path;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
@@ -92,6 +95,11 @@ public class TransactionTest {
         assertTrue(
             op.getRemovedIndices().isEmpty(), "removedIndices should be empty for CreateIndex");
         assertEquals("btree_id_index", (op.getNewIndices().get(0).name()));
+        Index readIndex = op.getNewIndices().get(0);
+        assertTrue(readIndex.getFiles().isPresent());
+        assertEquals(
+            readIndex.getSizeBytes().orElseThrow().longValue(),
+            readIndex.getFiles().orElseThrow().stream().mapToLong(IndexFile::getSizeBytes).sum());
       }
     }
   }
@@ -337,6 +345,65 @@ public class TransactionTest {
   }
 
   @Test
+  public void testDataOverlayPerFieldCoverageValidation(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("data_overlay_per_field").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      try (Dataset dataset = testDataset.write(1, 10)) {
+        FragmentMetadata fragment = dataset.getFragments().get(0).metadata();
+        org.lance.fragment.DataFile dataFile = fragment.getFiles().get(0);
+        int fieldCount = dataFile.getFields().length;
+        assertTrue(fieldCount > 0);
+
+        assertThrows(
+            IllegalArgumentException.class,
+            () ->
+                new DataOverlay.DataOverlayFile(
+                    dataFile, DataOverlay.OverlayCoverage.perField(Collections.emptyList()), 0));
+        assertThrows(
+            IllegalArgumentException.class,
+            () ->
+                new DataOverlay.DataOverlayFile(
+                    dataFile,
+                    DataOverlay.OverlayCoverage.perField(
+                        Collections.nCopies(fieldCount + 1, OFFSETS_1_3_5)),
+                    0));
+
+        DataOverlay.DataOverlayFile overlay =
+            new DataOverlay.DataOverlayFile(
+                dataFile,
+                DataOverlay.OverlayCoverage.perField(
+                    Collections.nCopies(fieldCount, OFFSETS_1_3_5)),
+                0);
+        DataOverlay.DataOverlayGroup group =
+            new DataOverlay.DataOverlayGroup(fragment.getId(), Collections.singletonList(overlay));
+        try (Transaction transaction =
+                new Transaction.Builder()
+                    .readVersion(dataset.version())
+                    .operation(
+                        DataOverlay.builder().groups(Collections.singletonList(group)).build())
+                    .build();
+            Dataset committed = new CommitBuilder(dataset).execute(transaction);
+            Transaction read = committed.readTransaction().orElseThrow()) {
+          DataOverlay readOperation = assertInstanceOf(DataOverlay.class, read.operation());
+          assertEquals(
+              fieldCount,
+              readOperation
+                  .getGroups()
+                  .get(0)
+                  .getOverlays()
+                  .get(0)
+                  .getCoverage()
+                  .getBitmaps()
+                  .size());
+        }
+      }
+    }
+  }
+
+  @Test
   public void testOverwriteInitialBasesAndUpdateFilterRoundTrip(@TempDir Path tempDir) {
     String datasetPath = tempDir.resolve("overwrite_initial_bases").toString();
     String basePath = tempDir.resolve("initial_base").toString();
@@ -357,24 +424,157 @@ public class TransactionTest {
           Dataset dataset = new CommitBuilder(datasetPath, allocator).execute(overwrite);
           Transaction readOverwrite = dataset.readTransaction().orElseThrow()) {
         Overwrite operation = assertInstanceOf(Overwrite.class, readOverwrite.operation());
-        assertEquals(basePath, operation.initialBases().orElseThrow().get(0).getPath());
+        BasePath expectedBasePath = new BasePath(0, Optional.of("initial"), basePath, false);
+        assertEquals(expectedBasePath, operation.getInitialBases().orElseThrow().get(0));
 
+        dataset.initializeMemWal(new InitializeMemWalParams().withUnsharded());
         KeyExistenceFilter filter = KeyExistenceFilter.exact(new int[] {0}, new long[] {42});
+        CompactedSsTable compacted = new CompactedSsTable(UUID.randomUUID().toString(), 8);
         try (Transaction update =
                 new Transaction.Builder()
                     .readVersion(dataset.version())
-                    .operation(Update.builder().insertedRowsFilter(filter).build())
+                    .operation(
+                        Update.builder()
+                            .compactedSstables(Collections.singletonList(compacted))
+                            .insertedRowsFilter(filter)
+                            .build())
                     .build();
             Dataset committed = new CommitBuilder(dataset).execute(update);
             Transaction readUpdate = committed.readTransaction().orElseThrow()) {
           Update updateOperation = assertInstanceOf(Update.class, readUpdate.operation());
-          KeyExistenceFilter readFilter = updateOperation.insertedRowsFilter().orElseThrow();
+          KeyExistenceFilter readFilter = updateOperation.getInsertedRowsFilter().orElseThrow();
           assertArrayEquals(new int[] {0}, readFilter.getFieldIds());
           assertArrayEquals(new long[] {42}, readFilter.getExactKeyHashes());
-          assertTrue(updateOperation.compactedSstables().isEmpty());
+          assertEquals(
+              Collections.singletonList(compacted), updateOperation.getCompactedSstables());
         }
       }
     }
+  }
+
+  @Test
+  public void testBloomFilterRoundTripAndValidation(@TempDir Path tempDir) {
+    byte[] bitmap = new byte[32];
+    bitmap[0] = 1;
+    KeyExistenceFilter filter =
+        KeyExistenceFilter.bloom(new int[] {0}, bitmap, bitmap.length * Byte.SIZE, 8192, 0.00057);
+
+    assertThrows(
+        IllegalArgumentException.class,
+        () -> KeyExistenceFilter.bloom(new int[] {0}, bitmap, 0, 8192, 0.00057));
+    assertThrows(
+        IllegalArgumentException.class,
+        () -> KeyExistenceFilter.bloom(new int[] {0}, bitmap, 8, 8192, 0.00057));
+    assertThrows(
+        IllegalArgumentException.class,
+        () ->
+            KeyExistenceFilter.bloom(new int[] {0}, bitmap, bitmap.length * Byte.SIZE, 0, 0.00057));
+    for (double probability : Arrays.asList(0.0, 1.0, Double.NaN, Double.POSITIVE_INFINITY)) {
+      assertThrows(
+          IllegalArgumentException.class,
+          () ->
+              KeyExistenceFilter.bloom(
+                  new int[] {0}, bitmap, bitmap.length * Byte.SIZE, 8192, probability));
+    }
+
+    String datasetPath = tempDir.resolve("bloom_filter").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      try (Dataset dataset = testDataset.createEmptyDataset();
+          Transaction update =
+              new Transaction.Builder()
+                  .readVersion(dataset.version())
+                  .operation(Update.builder().insertedRowsFilter(filter).build())
+                  .build();
+          Dataset committed = new CommitBuilder(dataset).execute(update);
+          Transaction read = committed.readTransaction().orElseThrow()) {
+        assertEquals(
+            filter,
+            assertInstanceOf(Update.class, read.operation()).getInsertedRowsFilter().orElseThrow());
+      }
+    }
+  }
+
+  @Test
+  public void testCompatibilityAccessorsAndConstructor() throws Exception {
+    Overwrite.class.getDeclaredConstructor(List.class, Schema.class, Map.class);
+    assertTrue(
+        Arrays.stream(Introspector.getBeanInfo(Overwrite.class).getPropertyDescriptors())
+            .anyMatch(property -> property.getName().equals("initialBases")));
+    assertTrue(
+        Arrays.stream(Introspector.getBeanInfo(Update.class).getPropertyDescriptors())
+            .anyMatch(property -> property.getName().equals("compactedSstables")));
+    assertTrue(
+        Arrays.stream(Introspector.getBeanInfo(Update.class).getPropertyDescriptors())
+            .anyMatch(property -> property.getName().equals("insertedRowsFilter")));
+  }
+
+  @Test
+  public void testIndexSizeMustBeRepresentable(@TempDir Path tempDir) {
+    Index consistent =
+        indexMetadata(
+            "consistent",
+            30L,
+            Arrays.asList(new IndexFile("a.idx", 10), new IndexFile("b.idx", 20)));
+    assertEquals(30L, consistent.getSizeBytes().orElseThrow());
+    assertEquals(2, consistent.getFiles().orElseThrow().size());
+
+    String datasetPath = tempDir.resolve("index_files").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      try (Dataset dataset = testDataset.createEmptyDataset();
+          Transaction missingFiles =
+              new Transaction.Builder()
+                  .readVersion(dataset.version())
+                  .operation(
+                      CreateIndex.builder()
+                          .withNewIndices(
+                              Collections.singletonList(indexMetadata("missing", 10L, null)))
+                          .build())
+                  .build()) {
+        IllegalArgumentException error =
+            assertThrows(
+                IllegalArgumentException.class,
+                () -> new CommitBuilder(dataset).execute(missingFiles));
+        assertTrue(error.getMessage().contains("without files"));
+      }
+
+      try (Dataset dataset = Dataset.open(datasetPath, allocator);
+          Transaction mismatch =
+              new Transaction.Builder()
+                  .readVersion(dataset.version())
+                  .operation(
+                      CreateIndex.builder()
+                          .withNewIndices(
+                              Collections.singletonList(
+                                  indexMetadata(
+                                      "mismatch",
+                                      11L,
+                                      Collections.singletonList(new IndexFile("c.idx", 10)))))
+                          .build())
+                  .build()) {
+        IllegalArgumentException error =
+            assertThrows(
+                IllegalArgumentException.class, () -> new CommitBuilder(dataset).execute(mismatch));
+        assertTrue(error.getMessage().contains("does not match"));
+      }
+    }
+  }
+
+  private static Index indexMetadata(String name, Long sizeBytes, List<IndexFile> files) {
+    return Index.builder()
+        .uuid(UUID.randomUUID())
+        .fields(Collections.singletonList(0))
+        .coveringFields(Collections.emptyList())
+        .name(name)
+        .datasetVersion(1)
+        .indexVersion(0)
+        .sizeBytes(sizeBytes)
+        .files(files)
+        .indexType(IndexType.BTREE)
+        .build();
   }
 
   @Test

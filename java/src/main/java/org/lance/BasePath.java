@@ -15,6 +15,7 @@ package org.lance;
 
 import com.google.common.base.MoreObjects;
 
+import java.util.Objects;
 import java.util.Optional;
 
 public final class BasePath {
@@ -44,6 +45,22 @@ public final class BasePath {
 
   public boolean isDatasetRoot() {
     return isDatasetRoot;
+  }
+
+  @Override
+  public boolean equals(Object o) {
+    if (this == o) return true;
+    if (o == null || getClass() != o.getClass()) return false;
+    BasePath basePath = (BasePath) o;
+    return id == basePath.id
+        && isDatasetRoot == basePath.isDatasetRoot
+        && Objects.equals(name, basePath.name)
+        && Objects.equals(path, basePath.path);
+  }
+
+  @Override
+  public int hashCode() {
+    return Objects.hash(id, name, path, isDatasetRoot);
   }
 
   @Override

@@ -90,6 +90,12 @@ public final class DataOverlay implements Operation {
     public DataOverlayFile(DataFile dataFile, OverlayCoverage coverage, long committedVersion) {
       this.dataFile = Objects.requireNonNull(dataFile);
       this.coverage = Objects.requireNonNull(coverage);
+      if (!coverage.isShared() && coverage.getBitmaps().size() != dataFile.getFields().length) {
+        throw new IllegalArgumentException(
+            String.format(
+                "per-field overlay coverage for %s has %d bitmaps but the data file has %d fields",
+                dataFile.getPath(), coverage.getBitmaps().size(), dataFile.getFields().length));
+      }
       this.committedVersion = committedVersion;
     }
 
@@ -106,7 +112,10 @@ public final class DataOverlay implements Operation {
     }
   }
 
-  /** Portable RoaringBitmap bytes for shared or per-field overlay coverage. */
+  /**
+   * Portable RoaringBitmap bytes for shared or per-field overlay coverage. Per-field bitmaps are
+   * ordered to match the overlay data file's fields.
+   */
   public static final class OverlayCoverage {
     private final boolean shared;
     private final List<byte[]> bitmaps;

@@ -101,7 +101,15 @@ public class Update implements Operation {
     return compactedSstables;
   }
 
+  public List<CompactedSsTable> getCompactedSstables() {
+    return compactedSstables;
+  }
+
   public Optional<KeyExistenceFilter> insertedRowsFilter() {
+    return insertedRowsFilter;
+  }
+
+  public Optional<KeyExistenceFilter> getInsertedRowsFilter() {
     return insertedRowsFilter;
   }
 

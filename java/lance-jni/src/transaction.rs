@@ -25,7 +25,7 @@ use lance::io::ObjectStoreParams;
 use lance::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
 use lance::table::format::key_existence::{FilterType, KeyExistenceFilter};
 use lance::table::format::overlay::{DataOverlayFile, OverlayCoverage};
-use lance::table::format::{BasePath, Fragment, IndexFile, IndexMetadata};
+use lance::table::format::{BasePath, DataFile, Fragment, IndexFile, IndexMetadata};
 use lance_core::datatypes::Field;
 use lance_core::datatypes::Schema as LanceSchema;
 use lance_file::version::{LanceFileVersion, V2_FORMAT_2_0, V2_FORMAT_2_1, V2_FORMAT_2_2};
@@ -381,25 +381,51 @@ fn key_existence_filter_from_java(
             let bitmap = env
                 .call_method(object, "getBloomBitmap", "()[B", &[])?
                 .l()?;
-            FilterType::Bloom {
-                bitmap: env.convert_byte_array(JByteArray::from(bitmap))?,
-                num_bits: u32::try_from(
-                    env.call_method(object, "getBloomNumBits", "()I", &[])?
-                        .i()?,
-                )
-                .map_err(|_| {
+            let bitmap = env.convert_byte_array(JByteArray::from(bitmap))?;
+            let num_bits = u32::try_from(
+                env.call_method(object, "getBloomNumBits", "()I", &[])?
+                    .i()?,
+            )
+            .map_err(|_| {
+                Error::input_error("insertedRowsFilter.numBits must be positive".to_string())
+            })?;
+            let number_of_items = nonnegative_jlong_to_u64(
+                "insertedRowsFilter.numberOfItems",
+                env.call_method(object, "getBloomNumberOfItems", "()J", &[])?
+                    .j()?,
+            )?;
+            let probability = env
+                .call_method(object, "getBloomProbability", "()D", &[])?
+                .d()?;
+            let bitmap_bits = u32::try_from(bitmap.len())
+                .ok()
+                .and_then(|len| len.checked_mul(8))
+                .ok_or_else(|| {
                     Error::input_error(
-                        "insertedRowsFilter.numBits must be non-negative".to_string(),
+                        "insertedRowsFilter.bitmap is too large to represent".to_string(),
                     )
-                })?,
-                number_of_items: nonnegative_jlong_to_u64(
-                    "insertedRowsFilter.numberOfItems",
-                    env.call_method(object, "getBloomNumberOfItems", "()J", &[])?
-                        .j()?,
-                )?,
-                probability: env
-                    .call_method(object, "getBloomProbability", "()D", &[])?
-                    .d()?,
+                })?;
+            if num_bits == 0 || num_bits != bitmap_bits {
+                return Err(Error::input_error(format!(
+                    "insertedRowsFilter.numBits={num_bits} must equal bitmap length in bits ({bitmap_bits})"
+                )));
+            }
+            if number_of_items == 0 {
+                return Err(Error::input_error(
+                    "insertedRowsFilter.numberOfItems must be positive".to_string(),
+                ));
+            }
+            if !probability.is_finite() || !(0.0..1.0).contains(&probability) || probability == 0.0
+            {
+                return Err(Error::input_error(format!(
+                    "insertedRowsFilter.probability must be finite and between 0 and 1, got {probability}"
+                )));
+            }
+            FilterType::Bloom {
+                bitmap,
+                num_bits,
+                number_of_items,
+                probability,
             }
         }
         other => {
@@ -472,7 +498,7 @@ impl IntoJava for &DataOverlayFile {
 
 impl FromJObjectWithEnv<DataOverlayFile> for JObject<'_> {
     fn extract_object(&self, env: &mut JNIEnv<'_>) -> Result<DataOverlayFile> {
-        let data_file = env
+        let data_file: DataFile = env
             .call_method(self, "getDataFile", "()Lorg/lance/fragment/DataFile;", &[])?
             .l()?
             .extract_object(env)?;
@@ -509,6 +535,14 @@ impl FromJObjectWithEnv<DataOverlayFile> for JObject<'_> {
             })?;
             OverlayCoverage::dense(bitmap)
         } else {
+            if bitmaps.len() != data_file.fields.len() {
+                return Err(Error::input_error(format!(
+                    "per-field overlay coverage for {} has {} bitmaps but the data file has {} fields",
+                    data_file.path,
+                    bitmaps.len(),
+                    data_file.fields.len()
+                )));
+            }
             OverlayCoverage::sparse(bitmaps)
         };
         Ok(DataOverlayFile {
@@ -602,9 +636,27 @@ impl FromJObjectWithEnv<IndexMetadata> for JObject<'_> {
                 })
             })?;
         let base_id = env.get_optional_u32_from_method(self, "baseId")?;
-        let files = env.get_optional_from_method(self, "getFiles", |env, files| {
-            crate::traits::import_vec_to_rust(env, &files, |env, file| file.extract_object(env))
-        })?;
+        let files: Option<Vec<IndexFile>> =
+            env.get_optional_from_method(self, "getFiles", |env, files| {
+                crate::traits::import_vec_to_rust(env, &files, |env, file| file.extract_object(env))
+            })?;
+        if let Some(size_bytes) = env.get_optional_u64_from_method(self, "getSizeBytes")? {
+            let files = files.as_ref().ok_or_else(|| {
+                Error::input_error(format!(
+                    "index sizeBytes={size_bytes} cannot be represented without files"
+                ))
+            })?;
+            let files_size = files.iter().try_fold(0_u64, |total, file| {
+                total
+                    .checked_add(file.size_bytes)
+                    .ok_or_else(|| Error::input_error("index file sizes overflow u64".to_string()))
+            })?;
+            if size_bytes != files_size {
+                return Err(Error::input_error(format!(
+                    "index sizeBytes={size_bytes} does not match the sum of file sizes ({files_size})"
+                )));
+            }
+        }
 
         Ok(IndexMetadata {
             uuid,
@@ -821,7 +873,6 @@ fn convert_to_java_operation_inner<'local>(
         Operation::CreateIndex {
             new_indices,
             removed_indices,
-            ..
         } => {
             let java_new_indices = export_vec(env, &new_indices)?;
             let java_removed_indices = export_vec(env, &removed_indices)?;
@@ -1695,7 +1746,7 @@ fn convert_to_rust_operation(
                 },
             )?;
             let initial_bases =
-                env.get_optional_from_method(java_operation, "initialBases", |env, bases| {
+                env.get_optional_from_method(java_operation, "getInitialBases", |env, bases| {
                     crate::traits::import_vec_to_rust(env, &bases, |env, base| {
                         base.extract_object(env)
                     })
@@ -1784,12 +1835,12 @@ fn convert_to_rust_operation(
             let compacted_sstables = import_vec_from_method(
                 env,
                 java_operation,
-                "compactedSstables",
+                "getCompactedSstables",
                 |env, sstable| compacted_sstable_from_java(env, &sstable),
             )?;
             let inserted_rows_filter = env.get_optional_from_method(
                 java_operation,
-                "insertedRowsFilter",
+                "getInsertedRowsFilter",
                 |env, filter| key_existence_filter_from_java(env, &filter),
             )?;
 
