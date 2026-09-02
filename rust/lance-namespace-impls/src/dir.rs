@@ -30,7 +30,10 @@ use lance_index::scalar::{
     BuiltinIndexType, FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams,
 };
 use lance_index::vector::{
-    bq::RQBuildParams, hnsw::builder::HnswBuildParams, ivf::IvfBuildParams, pq::PQBuildParams,
+    bq::{RABIT_MAX_NUM_BITS, RABIT_MIN_NUM_BITS, RQBuildParams, validate_supported_rq_num_bits},
+    hnsw::builder::HnswBuildParams,
+    ivf::IvfBuildParams,
+    pq::PQBuildParams,
     sq::builder::SQBuildParams,
 };
 use lance_index::{IndexType, is_system_index};
@@ -80,6 +83,7 @@ use lance_namespace::models::{
     UpdateTableSchemaMetadataResponse, UpdateTableTagRequest, UpdateTableTagResponse,
 };
 
+use lance_core::utils::parse::str_to_bool;
 use lance_core::{Error, Result, box_error};
 use lance_index::scalar::inverted::query::{
     BooleanQuery, BoostQuery, FtsQuery, MatchQuery, MultiMatchQuery, Occur, Operator, PhraseQuery,
@@ -498,31 +502,31 @@ impl DirectoryNamespaceBuilder {
         // Extract manifest_enabled (default: true)
         let manifest_enabled = properties
             .get("manifest_enabled")
-            .and_then(|v| v.parse::<bool>().ok())
+            .and_then(|v| str_to_bool(v))
             .unwrap_or(true);
 
         // Extract dir_listing_enabled (default: true)
         let dir_listing_enabled = properties
             .get("dir_listing_enabled")
-            .and_then(|v| v.parse::<bool>().ok())
+            .and_then(|v| str_to_bool(v))
             .unwrap_or(true);
 
         // Extract inline_optimization_enabled (default: true)
         let inline_optimization_enabled = properties
             .get("inline_optimization_enabled")
-            .and_then(|v| v.parse::<bool>().ok())
+            .and_then(|v| str_to_bool(v))
             .unwrap_or(true);
 
         // Extract table_version_tracking_enabled (default: false)
         let table_version_tracking_enabled = properties
             .get("table_version_tracking_enabled")
-            .and_then(|v| v.parse::<bool>().ok())
+            .and_then(|v| str_to_bool(v))
             .unwrap_or(false);
 
         // Extract dir_listing_to_manifest_migration_enabled (default: false)
         let dir_listing_to_manifest_migration_enabled = properties
             .get("dir_listing_to_manifest_migration_enabled")
-            .and_then(|v| v.parse::<bool>().ok())
+            .and_then(|v| str_to_bool(v))
             .unwrap_or(false);
 
         // Extract credential vendor properties (properties prefixed with "credential_vendor.")
@@ -543,7 +547,7 @@ impl DirectoryNamespaceBuilder {
         // Extract vend_input_storage_options (default: false)
         let vend_input_storage_options = properties
             .get("vend_input_storage_options")
-            .and_then(|v| v.parse::<bool>().ok())
+            .and_then(|v| str_to_bool(v))
             .unwrap_or(false);
 
         // Extract vend_input_storage_options_refresh_interval_millis (optional)
@@ -554,7 +558,7 @@ impl DirectoryNamespaceBuilder {
         // Extract ops_metrics_enabled (default: false)
         let ops_metrics_enabled = properties
             .get("ops_metrics_enabled")
-            .and_then(|v| v.parse::<bool>().ok())
+            .and_then(|v| str_to_bool(v))
             .unwrap_or(false);
 
         Ok(Self {
@@ -2453,14 +2457,30 @@ impl DirectoryNamespace {
                     SQBuildParams::default(),
                 ),
             },
-            IndexType::IvfRq => DirectoryIndexParams::Vector {
-                index_type,
-                params: VectorIndexParams::with_ivf_rq_params(
-                    Self::parse_metric_type(request.distance_type.as_deref())?,
-                    IvfBuildParams::default(),
-                    RQBuildParams::default(),
-                ),
-            },
+            IndexType::IvfRq => {
+                let rq_params = if let Some(requested_num_bits) = request.num_bits {
+                    let invalid_num_bits = || NamespaceError::InvalidInput {
+                        message: format!(
+                            "IVF_RQ num_bits must be in {}..={}, got {}",
+                            RABIT_MIN_NUM_BITS, RABIT_MAX_NUM_BITS, requested_num_bits
+                        ),
+                    };
+                    let num_bits =
+                        u8::try_from(requested_num_bits).map_err(|_| invalid_num_bits())?;
+                    validate_supported_rq_num_bits(num_bits).map_err(|_| invalid_num_bits())?;
+                    RQBuildParams::new(num_bits)
+                } else {
+                    RQBuildParams::default()
+                };
+                DirectoryIndexParams::Vector {
+                    index_type,
+                    params: VectorIndexParams::with_ivf_rq_params(
+                        Self::parse_metric_type(request.distance_type.as_deref())?,
+                        IvfBuildParams::default(),
+                        rq_params,
+                    ),
+                }
+            }
             IndexType::IvfHnswFlat => DirectoryIndexParams::Vector {
                 index_type,
                 params: VectorIndexParams::ivf_hnsw(
@@ -6104,6 +6124,55 @@ fn build_engine_match_query(
 mod tests {
     use super::*;
     use arrow_ipc::reader::{FileReader, StreamReader};
+    use lance::index::vector::StageParams;
+    use rstest::rstest;
+
+    fn build_ivf_rq_num_bits(num_bits: Option<i32>) -> Result<u8> {
+        let mut request = CreateTableIndexRequest::new("vector".to_string(), "IVF_RQ".to_string());
+        request.num_bits = num_bits;
+
+        let DirectoryIndexParams::Vector {
+            index_type: IndexType::IvfRq,
+            params,
+        } = DirectoryNamespace::build_index_params(&request)?
+        else {
+            panic!("expected IVF_RQ vector index params");
+        };
+        match params.stages.as_slice() {
+            [StageParams::Ivf(_), StageParams::RQ(rq)] => Ok(rq.num_bits),
+            stages => panic!("expected IVF and RQ stages, got {stages:?}"),
+        }
+    }
+
+    #[rstest]
+    #[case::omitted(None, 5)]
+    #[case::explicit_one(Some(1), 1)]
+    #[case::explicit_max(Some(9), 9)]
+    fn test_build_index_params_ivf_rq_num_bits(
+        #[case] requested: Option<i32>,
+        #[case] expected: u8,
+    ) {
+        assert_eq!(build_ivf_rq_num_bits(requested).unwrap(), expected);
+    }
+
+    #[rstest]
+    #[case::negative(-1)]
+    #[case::zero(0)]
+    #[case::above_max(10)]
+    #[case::conversion_overflow(i32::MAX)]
+    fn test_build_index_params_rejects_invalid_ivf_rq_num_bits(#[case] requested: i32) {
+        let error = build_ivf_rq_num_bits(Some(requested))
+            .expect_err("invalid IVF_RQ num_bits should fail");
+        let message = error.to_string();
+
+        assert_eq!(mutation_error_code(error), ErrorCode::InvalidInput);
+        assert!(
+            message.contains(&format!(
+                "IVF_RQ num_bits must be in 1..=9, got {requested}"
+            )),
+            "unexpected error message: {message}"
+        );
+    }
 
     #[test]
     fn test_build_engine_fts_query_match() {
