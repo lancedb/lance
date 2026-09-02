@@ -61,6 +61,26 @@ For example, a Lance Spark catalog named `lance` forwards settings below its
 spark-sql --conf "spark.sql.catalog.lance.storage.scheduler_error_mode=fail_fast"
 ```
 
+### Bulk copy strategy
+
+Lance streams bulk index-file movement and dataset deep-clone files through
+read and write APIs by default. This avoids requiring a provider-native copy
+operation and works across different object stores.
+
+Set `LANCE_IO_SERVER_SIDE_COPY_ENABLED` to a truthy value (`1`, `true`, `on`,
+`yes`, or `y`, case-insensitive) to opt cloud copies whose source and destination
+share the same object-store client into the provider-native server-side copy
+operation. Cross-client, cross-store, and local copies do not use this setting.
+Native copy can reduce client bandwidth and transfer cost, but it requires copy
+support from the object-store integration and is subject to the provider
+request's timeout and retry behavior.
+
+Deep clone bounds non-local file movement to four concurrent files by default.
+Set `LANCE_DEEP_CLONE_STREAM_CONCURRENCY` to a positive integer to override this
+operation-specific limit. The bound also applies when server-side copy is
+enabled because S3 and GCS copies above the provider's single-copy size limit
+fall back to streaming through Lance.
+
 ## Per-Base Configuration
 
 A dataset can register additional base paths that store part of its data, and each

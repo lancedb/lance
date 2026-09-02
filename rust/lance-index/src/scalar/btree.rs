@@ -5146,7 +5146,10 @@ mod tests {
         assert_eq!(original_data, remapped_data);
     }
 
+    // Spill-enabled index builds share the cached DataFusion memory pool within the
+    // test process, so keep them in one resource group.
     #[tokio::test]
+    #[serial_test::serial(LANCE_DF_SPILL_POOL)]
     async fn test_update_ranged_index() {
         // Setup stores for both indexes
         let old_tmpdir = TempObjDir::default();
@@ -5297,6 +5300,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(LANCE_DF_SPILL_POOL)]
     async fn test_update_with_exact_row_id_filter() {
         let old_tmpdir = TempObjDir::default();
         let old_store = Arc::new(LanceIndexStore::new(
