@@ -580,6 +580,18 @@ public class DirectoryNamespaceTest {
         }
       }
 
+      ListTableVersionsRequest listReq = new ListTableVersionsRequest();
+      listReq.setId(tableId);
+      ListTableVersionsResponse listedAfterCreate = namespaceClient.listTableVersions(listReq);
+      assertEquals(1, listedAfterCreate.getVersions().size());
+      assertTrue(
+          listedAfterCreate
+              .getVersions()
+              .get(0)
+              .getManifestPath()
+              .contains("_reservation_versions/"),
+          "managed CREATE should publish through the declaration reservation");
+
       // Verify describe_table returns managed_versioning=true
       DescribeTableRequest descReq = new DescribeTableRequest();
       descReq.setId(tableId);

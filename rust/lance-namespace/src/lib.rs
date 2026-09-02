@@ -30,6 +30,10 @@ pub use error::{ErrorCode, NamespaceError, Result as NamespaceResult};
 /// Minted by `declare_table`, presented by the bootstrap `create_table_version`.
 pub const RESERVATION_TOKEN_KEY: &str = "reservation_token";
 
+/// Context key carrying the manifest path observed while retiring a version.
+/// Implementations must only retire a record that still points at this path.
+pub const TABLE_VERSION_IDENTITY_KEY: &str = "table_version_identity";
+
 // Re-export reqwest client for convenience
 pub use lance_namespace_reqwest_client as reqwest_client;
 

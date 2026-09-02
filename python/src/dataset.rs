@@ -4923,7 +4923,11 @@ pub fn get_write_params(
                 table_id.clone(),
                 table_uri,
             )
-            .infer_error()?;
+            .infer_error()?
+            .with_reservation_token(get_dict_opt::<String>(
+                options,
+                "namespace_reservation_token",
+            )?);
             let commit_handler: Arc<dyn CommitHandler> = Arc::new(ExternalManifestCommitHandler {
                 external_manifest_store: Arc::new(external_store),
             });

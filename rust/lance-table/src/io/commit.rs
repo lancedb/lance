@@ -782,6 +782,83 @@ fn make_staging_manifest_path(base: &Path) -> Result<Path> {
 #[cfg(feature = "dynamodb")]
 const DDB_URL_QUERY_KEY: &str = "ddbTableName";
 
+/// Object-store listing of `_versions/`; the default used by commit handlers.
+pub(crate) fn default_list_manifest_locations<'a>(
+    base_path: &Path,
+    object_store: &'a ObjectStore,
+    sorted_descending: bool,
+) -> BoxStream<'a, Result<ManifestLocation>> {
+    let underlying_stream = list_manifests(base_path, &object_store.inner);
+
+    if !sorted_descending {
+        return underlying_stream.boxed();
+    }
+
+    async fn sort_stream(
+        input_stream: impl futures::Stream<Item = Result<ManifestLocation>> + Unpin,
+    ) -> Result<impl Stream<Item = Result<ManifestLocation>> + Unpin> {
+        let mut locations = input_stream.try_collect::<Vec<_>>().await?;
+        locations.sort_by_key(|m| std::cmp::Reverse(m.version));
+        Ok(futures::stream::iter(locations.into_iter().map(Ok)))
+    }
+
+    if object_store.list_is_lexically_ordered {
+        let mut peekable = underlying_stream.peekable();
+
+        futures::stream::once(async move {
+            let naming_scheme = match Pin::new(&mut peekable).peek().await {
+                Some(Ok(m)) => m.naming_scheme,
+                Some(Err(_)) | None => ManifestNamingScheme::V2,
+            };
+
+            if naming_scheme == ManifestNamingScheme::V2 {
+                Ok(Either::Left(peekable))
+            } else {
+                sort_stream(peekable).await.map(Either::Right)
+            }
+        })
+        .try_flatten()
+        .boxed()
+    } else {
+        futures::stream::once(sort_stream(underlying_stream))
+            .try_flatten()
+            .boxed()
+    }
+}
+
+pub(crate) fn default_list_manifest_locations_since<'a>(
+    base_path: &Path,
+    object_store: &'a ObjectStore,
+    since_version: u64,
+) -> BoxStream<'a, Result<ManifestLocation>> {
+    if !uses_version_hint(object_store) {
+        return default_list_manifest_locations(base_path, object_store, true)
+            .try_take_while(move |loc| future::ready(Ok(loc.version > since_version)))
+            .boxed();
+    }
+
+    let base_path = base_path.clone();
+    futures::stream::once(async move {
+        let locations =
+            match list_manifests_since_version_with_hint(object_store, &base_path, since_version)
+                .await
+            {
+                Some(locations) => locations,
+                None => {
+                    let mut locations = list_manifests(&base_path, &object_store.inner)
+                        .try_collect::<Vec<_>>()
+                        .await?;
+                    locations.retain(|loc| loc.version > since_version);
+                    locations.sort_by_key(|loc| std::cmp::Reverse(loc.version));
+                    locations
+                }
+            };
+        Ok::<_, Error>(futures::stream::iter(locations.into_iter().map(Ok)))
+    })
+    .try_flatten()
+    .boxed()
+}
+
 /// Handle commits that prevent conflicting writes.
 ///
 /// Commit implementations ensure that if there are multiple concurrent writers
@@ -874,53 +951,7 @@ pub trait CommitHandler: Debug + Send + Sync {
         object_store: &'a ObjectStore,
         sorted_descending: bool,
     ) -> BoxStream<'a, Result<ManifestLocation>> {
-        let underlying_stream = list_manifests(base_path, &object_store.inner);
-
-        if !sorted_descending {
-            return underlying_stream.boxed();
-        }
-
-        async fn sort_stream(
-            input_stream: impl futures::Stream<Item = Result<ManifestLocation>> + Unpin,
-        ) -> Result<impl Stream<Item = Result<ManifestLocation>> + Unpin> {
-            let mut locations = input_stream.try_collect::<Vec<_>>().await?;
-            locations.sort_by_key(|m| std::cmp::Reverse(m.version));
-            Ok(futures::stream::iter(locations.into_iter().map(Ok)))
-        }
-
-        // If the object store supports lexicographically ordered lists and
-        // the naming scheme is V2, we can use an optimized list operation.
-        if object_store.list_is_lexically_ordered {
-            // We don't know the naming scheme until we see the first manifest.
-            let mut peekable = underlying_stream.peekable();
-
-            futures::stream::once(async move {
-                let naming_scheme = match Pin::new(&mut peekable).peek().await {
-                    Some(Ok(m)) => m.naming_scheme,
-                    // If we get an error or no manifests are found, we default
-                    // to V2 naming scheme, since it doesn't matter.
-                    Some(Err(_)) => ManifestNamingScheme::V2,
-                    None => ManifestNamingScheme::V2,
-                };
-
-                if naming_scheme == ManifestNamingScheme::V2 {
-                    // If the first manifest is V2, we can use the optimized list operation.
-                    Ok(Either::Left(peekable))
-                } else {
-                    sort_stream(peekable).await.map(Either::Right)
-                }
-            })
-            .try_flatten()
-            .boxed()
-        } else {
-            // If the object store does not support lexicographically ordered lists,
-            // we need to sort the manifests in memory. Systems where this isn't
-            // supported (local fs, S3 express) are typically fast enough
-            // that this is not a problem.
-            futures::stream::once(sort_stream(underlying_stream))
-                .try_flatten()
-                .boxed()
-        }
+        default_list_manifest_locations(base_path, object_store, sorted_descending)
     }
 
     /// List manifest locations with version `> since_version`, in descending
@@ -943,29 +974,7 @@ pub trait CommitHandler: Debug + Send + Sync {
                 .boxed();
         }
 
-        let base_path = base_path.clone();
-        futures::stream::once(async move {
-            let locations = match list_manifests_since_version_with_hint(
-                object_store,
-                &base_path,
-                since_version,
-            )
-            .await
-            {
-                Some(locations) => locations,
-                None => {
-                    let mut locations = list_manifests(&base_path, &object_store.inner)
-                        .try_collect::<Vec<_>>()
-                        .await?;
-                    locations.retain(|loc| loc.version > since_version);
-                    locations.sort_by_key(|loc| std::cmp::Reverse(loc.version));
-                    locations
-                }
-            };
-            Ok::<_, Error>(futures::stream::iter(locations.into_iter().map(Ok)))
-        })
-        .try_flatten()
-        .boxed()
+        default_list_manifest_locations_since(base_path, object_store, since_version)
     }
 
     /// Commit a manifest.
@@ -982,6 +991,19 @@ pub trait CommitHandler: Debug + Send + Sync {
         naming_scheme: ManifestNamingScheme,
         transaction: Option<Transaction>,
     ) -> std::result::Result<ManifestLocation, CommitError>;
+
+    /// Retire an external record after its manifest has been removed.
+    ///
+    /// `manifest_path` is the record identity observed during enumeration. An
+    /// external handler must leave a record alone if it now points elsewhere.
+    async fn forget_version(
+        &self,
+        _base_path: &Path,
+        _version: u64,
+        _manifest_path: &Path,
+    ) -> Result<()> {
+        Ok(())
+    }
 
     /// Delete the recorded manifest information for a dataset at the base_path
     async fn delete(&self, _base_path: &Path) -> Result<()> {

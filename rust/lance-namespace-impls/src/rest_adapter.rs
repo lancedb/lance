@@ -924,7 +924,7 @@ async fn batch_delete_table_versions(
         identity: extract_identity(&headers),
         ranges: body.ranges,
         branch: body.branch,
-        ..Default::default()
+        context: body.context,
     };
 
     match backend.batch_delete_table_versions(request).await {
@@ -3698,6 +3698,52 @@ mod tests {
             assert_eq!(tag_open.manifest().branch.as_deref(), Some("exp"));
             assert_eq!(tag_open.version().version, overlap_version);
             assert_eq!(scan_ids(&tag_open).await, vec![1, 2, 3]);
+
+            let version_one = namespace
+                .describe_table_version(DescribeTableVersionRequest {
+                    id: Some(table_id.clone()),
+                    version: Some(1),
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+                .version;
+            let retire_version_one = |manifest_path: String| BatchDeleteTableVersionsRequest {
+                id: Some(table_id.clone()),
+                ranges: vec![VersionRange::new(1, 2)],
+                context: Some(HashMap::from([(
+                    lance_namespace::TABLE_VERSION_IDENTITY_KEY.to_string(),
+                    manifest_path,
+                )])),
+                ..Default::default()
+            };
+            let stale_retirement = namespace
+                .batch_delete_table_versions(retire_version_one("stale-path".to_string()))
+                .await
+                .unwrap();
+            assert_eq!(stale_retirement.deleted_count, Some(0));
+            namespace
+                .describe_table_version(DescribeTableVersionRequest {
+                    id: Some(table_id.clone()),
+                    version: Some(1),
+                    ..Default::default()
+                })
+                .await
+                .expect("REST retirement must preserve a mismatched incarnation");
+
+            let retired = namespace
+                .batch_delete_table_versions(retire_version_one(version_one.manifest_path))
+                .await
+                .unwrap();
+            assert_eq!(retired.deleted_count, Some(1));
+            namespace
+                .describe_table_version(DescribeTableVersionRequest {
+                    id: Some(table_id),
+                    version: Some(1),
+                    ..Default::default()
+                })
+                .await
+                .expect_err("REST retirement must remove the matching namespace record");
 
             fixture.server_handle.shutdown();
         }

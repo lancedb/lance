@@ -3004,6 +3004,36 @@ impl DirectoryNamespace {
         false
     }
 
+    /// Whether an error proves that this reservation can no longer publish.
+    /// Transport and storage failures are ambiguous and must retain the
+    /// immutable candidate in case the catalog mutation already committed.
+    fn reservation_publish_is_rejected(err: &Error) -> bool {
+        if let Error::Namespace { source, .. } = err
+            && let Some(ns_err) = source.downcast_ref::<NamespaceError>()
+        {
+            return matches!(ns_err, NamespaceError::ConcurrentModification { .. });
+        }
+        false
+    }
+
+    async fn handle_failed_reservation_publish(&self, manifest_path: &Path, error: &Error) {
+        if Self::reservation_publish_is_rejected(error) {
+            if let Err(cleanup_error) = self.object_store.inner.delete(manifest_path).await {
+                log::warn!(
+                    "Failed to clean up rejected reservation manifest at '{}': {:?}",
+                    manifest_path,
+                    cleanup_error
+                );
+            }
+        } else {
+            log::warn!(
+                "Reservation publication returned an ambiguous error; retaining manifest '{}' for retry: {}",
+                manifest_path,
+                error
+            );
+        }
+    }
+
     /// Map a dataset/version/branch open error: a transient IO error propagates
     /// typed via [`classify_storage_error`], while a genuine not-found (missing
     /// dataset, version, or ref) keeps the caller's `not_found` variant.
@@ -3166,6 +3196,7 @@ impl DirectoryNamespace {
         &self,
         table_entries: &[TableDeleteEntry],
         branch: Option<&str>,
+        expected_manifest_path: Option<&str>,
     ) -> Result<i64> {
         let mut deleted_count = 0i64;
         for te in table_entries {
@@ -3225,20 +3256,9 @@ impl DirectoryNamespace {
                 if !te.ranges.iter().any(|&(s, e)| vi >= s && (e < 0 || vi < e)) {
                     continue;
                 }
-                if v == 1
-                    && published_version_one
-                        .as_ref()
-                        .is_some_and(|published| published.manifest_path == version_path.as_ref())
+                if expected_manifest_path.is_some_and(|expected| expected != version_path.as_ref())
                 {
-                    let table_id = te.table_id.as_ref().expect("resolved above");
-                    if let Some(manifest_ns) = self.manifest_ns_for_write().await? {
-                        manifest_ns
-                            .unpublish_version_one(
-                                &manifest::ManifestNamespace::str_object_id(table_id),
-                                version_path.as_ref(),
-                            )
-                            .await?;
-                    }
+                    continue;
                 }
                 match self.object_store.inner.delete(version_path).await {
                     Ok(_) => {
@@ -3253,6 +3273,21 @@ impl DirectoryNamespace {
                             ),
                         }
                         .into());
+                    }
+                }
+                if v == 1
+                    && published_version_one
+                        .as_ref()
+                        .is_some_and(|published| published.manifest_path == version_path.as_ref())
+                {
+                    let table_id = te.table_id.as_ref().expect("resolved above");
+                    if let Some(manifest_ns) = self.manifest_ns_for_write().await? {
+                        manifest_ns
+                            .unpublish_version_one(
+                                &manifest::ManifestNamespace::str_object_id(table_id),
+                                version_path.as_ref(),
+                            )
+                            .await?;
                     }
                 }
             }
@@ -4454,13 +4489,8 @@ impl LanceNamespace for DirectoryNamespace {
                 )
                 .await
             {
-                if let Err(cleanup_error) = self.object_store.inner.delete(&final_path).await {
-                    log::warn!(
-                        "Failed to clean up unpublished reservation manifest at '{}': {:?}",
-                        final_path,
-                        cleanup_error
-                    );
-                }
+                self.handle_failed_reservation_publish(&final_path, &error)
+                    .await;
                 return Err(error);
             }
         }
@@ -4544,6 +4574,22 @@ impl LanceNamespace for DirectoryNamespace {
             .iter()
             .map(|r| (r.start_version, r.end_version))
             .collect();
+        let expected_manifest_path = request
+            .context
+            .as_ref()
+            .and_then(|context| context.get(lance_namespace::TABLE_VERSION_IDENTITY_KEY))
+            .cloned();
+        if expected_manifest_path.is_some()
+            && !matches!(ranges.as_slice(), [(start, end)] if start.checked_add(1) == Some(*end))
+        {
+            return Err(NamespaceError::InvalidInput {
+                message: format!(
+                    "{} requires exactly one table version",
+                    lance_namespace::TABLE_VERSION_IDENTITY_KEY
+                ),
+            }
+            .into());
+        }
 
         // Reject pathological bounded ranges up front: an explicit huge bounded
         // range like (0, i64::MAX) is almost certainly a mistake. A through-latest
@@ -4575,7 +4621,11 @@ impl LanceNamespace for DirectoryNamespace {
         }];
 
         let total_deleted_count = self
-            .delete_physical_version_files(&table_entries, branch)
+            .delete_physical_version_files(
+                &table_entries,
+                branch,
+                expected_manifest_path.as_deref(),
+            )
             .await?;
 
         Ok(BatchDeleteTableVersionsResponse {
@@ -13298,6 +13348,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_failed_reservation_publish_retains_ambiguous_manifest() {
+        let temp_dir = TempStdDir::default();
+        let namespace = DirectoryNamespaceBuilder::new(temp_dir.to_str().unwrap())
+            .build()
+            .await
+            .unwrap();
+
+        let ambiguous_path = namespace.base_path.clone().join("ambiguous-publish");
+        namespace
+            .object_store
+            .inner
+            .put(&ambiguous_path, Bytes::from_static(b"candidate").into())
+            .await
+            .unwrap();
+        let ambiguous_error = Error::from(NamespaceError::Internal {
+            message: "publish response was lost".to_string(),
+        });
+        namespace
+            .handle_failed_reservation_publish(&ambiguous_path, &ambiguous_error)
+            .await;
+        namespace
+            .object_store
+            .inner
+            .head(&ambiguous_path)
+            .await
+            .expect("ambiguous publication must retain its candidate");
+
+        let rejected_path = namespace.base_path.clone().join("rejected-publish");
+        namespace
+            .object_store
+            .inner
+            .put(&rejected_path, Bytes::from_static(b"candidate").into())
+            .await
+            .unwrap();
+        let rejected_error = Error::from(NamespaceError::ConcurrentModification {
+            message: "reservation was superseded".to_string(),
+        });
+        namespace
+            .handle_failed_reservation_publish(&rejected_path, &rejected_error)
+            .await;
+        assert!(matches!(
+            namespace.object_store.inner.head(&rejected_path).await,
+            Err(ObjectStoreError::NotFound { .. })
+        ));
+    }
+
+    #[tokio::test]
     async fn test_declared_table_current_reservation_token_publishes_version_one() {
         let temp_dir = TempStdDir::default();
         let namespace = DirectoryNamespaceBuilder::new(temp_dir.to_str().unwrap())
@@ -13327,7 +13424,7 @@ mod tests {
         )]));
 
         let created = namespace.create_table_version(create).await.unwrap();
-        let version = created.version.expect("published version");
+        let version = *created.version.expect("published version");
         assert_eq!(version.version, 1);
         assert!(version.manifest_path.contains(&token));
 
@@ -13339,12 +13436,30 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(listed.versions, vec![*version]);
+        assert_eq!(listed.versions, vec![version.clone()]);
+
+        let stale_retirement = namespace
+            .batch_delete_table_versions(BatchDeleteTableVersionsRequest {
+                id: Some(vec!["reserved_table".to_string()]),
+                ranges: vec![lance_namespace::models::VersionRange::new(1, 2)],
+                context: Some(HashMap::from([(
+                    lance_namespace::TABLE_VERSION_IDENTITY_KEY.to_string(),
+                    "different-incarnation".to_string(),
+                )])),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(stale_retirement.deleted_count, Some(0));
 
         let deleted = namespace
             .batch_delete_table_versions(BatchDeleteTableVersionsRequest {
                 id: Some(vec!["reserved_table".to_string()]),
                 ranges: vec![lance_namespace::models::VersionRange::new(1, 2)],
+                context: Some(HashMap::from([(
+                    lance_namespace::TABLE_VERSION_IDENTITY_KEY.to_string(),
+                    version.manifest_path,
+                )])),
                 ..Default::default()
             })
             .await
@@ -13678,6 +13793,7 @@ mod tests {
             use arrow::record_batch::RecordBatch;
             use lance::Dataset;
             use lance::dataset::builder::DatasetBuilder;
+            use lance::dataset::cleanup::{CleanupPolicyBuilder, cleanup_old_versions};
             use lance::dataset::{WriteMode, WriteParams};
             use lance_namespace::models::CreateNamespaceRequest;
 
@@ -13732,6 +13848,7 @@ mod tests {
             .await
             .unwrap();
             assert_eq!(dataset.version().version, 1);
+            assert_eq!(dataset.count_versions().await.unwrap(), 1);
 
             let described = ns
                 .describe_table(DescribeTableRequest {
@@ -13762,6 +13879,7 @@ mod tests {
             .unwrap();
             let append_batches = RecordBatchIterator::new(vec![Ok(append_batch)], arrow_schema);
             dataset.append(append_batches, None).await.unwrap();
+            assert_eq!(dataset.count_versions().await.unwrap(), 2);
 
             assert_eq!(
                 tracking_ns.create_table_version_calls(),
@@ -13799,6 +13917,24 @@ mod tests {
                 initial_describe_calls + 1,
                 "describe_table_version should have been called exactly once during checkout to version 1"
             );
+
+            let cleanup_policy = CleanupPolicyBuilder::default()
+                .versions(vec![1])
+                .unwrap()
+                .delete_unverified(true)
+                .build();
+            let stats = cleanup_old_versions(&dataset, cleanup_policy)
+                .await
+                .unwrap();
+            assert_eq!(stats.old_versions, 1);
+            assert_eq!(dataset.count_versions().await.unwrap(), 1);
+            ns.describe_table_version(DescribeTableVersionRequest {
+                id: Some(table_id),
+                version: Some(1),
+                ..Default::default()
+            })
+            .await
+            .expect_err("cleanup must retire version 1 from namespace history");
         }
 
         #[tokio::test]

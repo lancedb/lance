@@ -302,6 +302,8 @@ struct CleanupTask<'a> {
 #[derive(Clone, Debug, Default)]
 struct CleanupInspection {
     old_manifests: HashMap<Path, u64>,
+    /// External records to retire after their manifest objects are gone.
+    retired_records: HashMap<u64, Path>,
     /// Referenced files are part of our working set
     referenced_files: ReferencedFiles,
     /// Verified files may or may not be part of the working set but they are
@@ -568,6 +570,11 @@ impl<'a> CleanupTask<'a> {
                     manifest_path = %location.path,
                     "Skipping old manifest removed by concurrent cleanup"
                 );
+                inspection
+                    .lock()
+                    .unwrap()
+                    .retired_records
+                    .insert(location.version, location.path);
                 return Ok(());
             }
             Err(error) => return Err(error),
@@ -592,6 +599,9 @@ impl<'a> CleanupTask<'a> {
             inspection
                 .old_manifests
                 .insert(location.path.clone(), manifest.version);
+            inspection
+                .retired_records
+                .insert(manifest.version, location.path.clone());
             match inspection.latest_deleted_manifest_time {
                 Some(ts) if commit_ts <= ts => {}
                 _ => inspection.latest_deleted_manifest_time = Some(commit_ts),
@@ -810,6 +820,16 @@ impl<'a> CleanupTask<'a> {
                 .remove_stream(paths_to_delete)
                 .try_for_each(|_| future::ready(Ok(())))
                 .await?;
+
+            // A record may outlive its manifest and be retired by a later
+            // cleanup, but retiring first could make a live manifest
+            // unreachable after a partial failure.
+            for (version, manifest_path) in &inspection.retired_records {
+                self.dataset
+                    .commit_handler
+                    .forget_version(&self.dataset.base, *version, manifest_path)
+                    .await?;
+            }
 
             if removes_empty_dirs
                 && let Err(error) = self
@@ -1288,6 +1308,7 @@ impl<'a> CleanupTask<'a> {
             inspection
                 .old_manifests
                 .retain(|_path, version_number| *version_number != referenced_version);
+            inspection.retired_records.remove(&referenced_version);
         }
 
         Ok(())

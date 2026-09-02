@@ -552,6 +552,7 @@ fn inner_create_with_ffi_schema<'local>(
         reader,
         None,  // No namespace for schema-only creation
         false, // No managed versioning for schema-only creation
+        None,  // No reservation token without a namespace
     )
 }
 
@@ -610,6 +611,7 @@ pub extern "system" fn Java_org_lance_Dataset_createWithFfiStream<'local>(
     namespace_obj: JObject,                        // LanceNamespace (can be null)
     table_id_obj: JObject,                         // List<String> (can be null)
     namespace_client_managed_versioning: jboolean, // Whether namespace manages versioning
+    namespace_reservation_token: JString,          // String (can be null)
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
@@ -633,6 +635,7 @@ pub extern "system" fn Java_org_lance_Dataset_createWithFfiStream<'local>(
             namespace_obj,
             table_id_obj,
             namespace_client_managed_versioning != 0,
+            namespace_reservation_token,
         )
     )
 }
@@ -658,12 +661,18 @@ fn inner_create_with_ffi_stream<'local>(
     namespace_obj: JObject,                     // LanceNamespace (can be null)
     table_id_obj: JObject,                      // List<String> (can be null)
     namespace_client_managed_versioning: bool,  // Whether namespace manages versioning
+    namespace_reservation_token: JString,       // String (can be null)
 ) -> Result<JObject<'local>> {
     let stream_ptr = arrow_array_stream_addr as *mut FFI_ArrowArrayStream;
     let reader = unsafe { ArrowArrayStreamReader::from_raw(stream_ptr) }?;
 
     // Create the namespace wrapper for commit handling (if provided)
     let namespace_info = extract_namespace_info(env, &namespace_obj, &table_id_obj)?;
+    let namespace_reservation_token = if namespace_reservation_token.is_null() {
+        None
+    } else {
+        Some(namespace_reservation_token.extract(env)?)
+    };
 
     create_dataset(
         env,
@@ -684,6 +693,7 @@ fn inner_create_with_ffi_stream<'local>(
         reader,
         namespace_info,
         namespace_client_managed_versioning,
+        namespace_reservation_token,
     )
 }
 
@@ -712,6 +722,7 @@ fn create_dataset<'local>(
     reader: impl RecordBatchReader + Send + 'static,
     namespace_info: Option<(Arc<dyn LanceNamespace>, Vec<String>)>,
     namespace_client_managed_versioning: bool,
+    namespace_reservation_token: Option<String>,
 ) -> Result<JObject<'local>> {
     let path_str = path.extract(env)?;
 
@@ -740,7 +751,8 @@ fn create_dataset<'local>(
                 namespace.clone(),
                 table_id.clone(),
                 &path_str,
-            )?;
+            )?
+            .with_reservation_token(namespace_reservation_token);
             let commit_handler: Arc<dyn CommitHandler> = Arc::new(ExternalManifestCommitHandler {
                 external_manifest_store: Arc::new(external_store),
             });

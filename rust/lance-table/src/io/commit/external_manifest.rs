@@ -9,7 +9,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::StreamExt;
+use futures::stream::BoxStream;
+use futures::{StreamExt, TryStreamExt};
 use lance_core::utils::tracing::{
     AUDIT_MODE_CREATE, AUDIT_MODE_DELETE, AUDIT_TYPE_MANIFEST, TRACE_FILE_AUDIT,
 };
@@ -23,6 +24,7 @@ use tracing::info;
 
 use super::{
     MANIFEST_EXTENSION, ManifestLocation, ManifestNamingScheme, current_manifest_path,
+    default_list_manifest_locations, default_list_manifest_locations_since,
     default_resolve_version, make_staging_manifest_path, write_version_hint,
 };
 use crate::format::{IndexMetadata, Manifest, Transaction};
@@ -122,6 +124,26 @@ pub trait ExternalManifestStore: std::fmt::Debug + Send + Sync {
             })
             .transpose()
         })
+    }
+
+    /// List authoritative manifest records, or return `None` when object-store
+    /// enumeration remains authoritative for this store.
+    async fn list_versions(
+        &self,
+        _base_uri: &str,
+        _since: Option<u64>,
+    ) -> Result<Option<Vec<ManifestLocation>>> {
+        Ok(None)
+    }
+
+    /// Retire a record only if it still points at `manifest_path`.
+    async fn forget_version(
+        &self,
+        _base_uri: &str,
+        _version: u64,
+        _manifest_path: &str,
+    ) -> Result<()> {
+        Ok(())
     }
 
     /// Put the manifest to the external store.
@@ -759,6 +781,62 @@ impl CommitHandler for ExternalManifestCommitHandler {
         }
     }
 
+    fn list_manifest_locations<'a>(
+        &self,
+        base_path: &Path,
+        object_store: &'a ObjectStore,
+        sorted_descending: bool,
+    ) -> BoxStream<'a, Result<ManifestLocation>> {
+        let store = self.external_manifest_store.clone();
+        let base_path = base_path.clone();
+        futures::stream::once(async move {
+            match store.list_versions(base_path.as_ref(), None).await? {
+                Some(mut locations) => {
+                    if sorted_descending {
+                        locations.sort_by_key(|location| std::cmp::Reverse(location.version));
+                    }
+                    Ok::<_, Error>(futures::stream::iter(locations.into_iter().map(Ok)).boxed())
+                }
+                None => Ok(default_list_manifest_locations(
+                    &base_path,
+                    object_store,
+                    sorted_descending,
+                )),
+            }
+        })
+        .try_flatten()
+        .boxed()
+    }
+
+    fn list_manifest_locations_since<'a>(
+        &self,
+        base_path: &Path,
+        object_store: &'a ObjectStore,
+        since_version: u64,
+    ) -> BoxStream<'a, Result<ManifestLocation>> {
+        let store = self.external_manifest_store.clone();
+        let base_path = base_path.clone();
+        futures::stream::once(async move {
+            match store
+                .list_versions(base_path.as_ref(), Some(since_version))
+                .await?
+            {
+                Some(mut locations) => {
+                    locations.retain(|location| location.version > since_version);
+                    locations.sort_by_key(|location| std::cmp::Reverse(location.version));
+                    Ok::<_, Error>(futures::stream::iter(locations.into_iter().map(Ok)).boxed())
+                }
+                None => Ok(default_list_manifest_locations_since(
+                    &base_path,
+                    object_store,
+                    since_version,
+                )),
+            }
+        })
+        .try_flatten()
+        .boxed()
+    }
+
     async fn commit(
         &self,
         manifest: &mut Manifest,
@@ -837,6 +915,17 @@ impl CommitHandler for ExternalManifestCommitHandler {
     async fn delete(&self, base_path: &Path) -> Result<()> {
         self.external_manifest_store
             .delete(base_path.as_ref())
+            .await
+    }
+
+    async fn forget_version(
+        &self,
+        base_path: &Path,
+        version: u64,
+        manifest_path: &Path,
+    ) -> Result<()> {
+        self.external_manifest_store
+            .forget_version(base_path.as_ref(), version, manifest_path.as_ref())
             .await
     }
 }

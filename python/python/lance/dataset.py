@@ -7919,6 +7919,8 @@ def write_dataset(
             "Must specify either 'uri' or both 'namespace_client' and 'table_id'."
         )
 
+    namespace_reservation_token = None
+
     # Handle namespace-based dataset writing
     if namespace_client is not None:
         if table_id is None:
@@ -7941,6 +7943,7 @@ def write_dataset(
         if mode == "create":
             declare_request = DeclareTableRequest(id=table_id, location=None)
             response = namespace_client.declare_table(declare_request)
+            namespace_reservation_token = getattr(response, "transaction_id", None)
         elif mode in ("append", "overwrite"):
             request = DescribeTableRequest(id=table_id, version=None)
             response = namespace_client.describe_table(request)
@@ -8029,6 +8032,7 @@ def write_dataset(
         params["namespace_client_managed_versioning"] = (
             namespace_client_managed_versioning
         )
+        params["namespace_reservation_token"] = namespace_reservation_token
 
     if commit_lock:
         if not callable(commit_lock):

@@ -195,7 +195,7 @@ public class Dataset implements Closeable {
   @Deprecated
   public static Dataset create(
       BufferAllocator allocator, ArrowArrayStream stream, String path, WriteParams params) {
-    return create(allocator, stream, path, params, null, null, false);
+    return create(allocator, stream, path, params, null, null, false, null);
   }
 
   private static native Dataset createWithFfiSchema(
@@ -254,7 +254,8 @@ public class Dataset implements Closeable {
       Optional<Long> blobPackFileSizeThreshold,
       LanceNamespace namespaceClient,
       List<String> tableId,
-      boolean namespaceClientManagedVersioning);
+      boolean namespaceClientManagedVersioning,
+      String namespaceReservationToken);
 
   /**
    * Creates a dataset with optional namespace client support for managed versioning.
@@ -273,6 +274,7 @@ public class Dataset implements Closeable {
    * @param tableId optional table identifier within the namespace client (can be null)
    * @param namespaceClientManagedVersioning whether namespace manages versioning (commits go
    *     through namespace API)
+   * @param namespaceReservationToken declaration token for the initial publication, or null
    * @return Dataset
    */
   static Dataset create(
@@ -282,7 +284,8 @@ public class Dataset implements Closeable {
       WriteParams params,
       LanceNamespace namespaceClient,
       List<String> tableId,
-      boolean namespaceClientManagedVersioning) {
+      boolean namespaceClientManagedVersioning,
+      String namespaceReservationToken) {
     Preconditions.checkNotNull(allocator);
     Preconditions.checkNotNull(stream);
     Preconditions.checkNotNull(path);
@@ -306,7 +309,8 @@ public class Dataset implements Closeable {
             params.getBlobPackFileSizeThreshold(),
             namespaceClient,
             tableId,
-            namespaceClientManagedVersioning);
+            namespaceClientManagedVersioning,
+            namespaceReservationToken);
     dataset.allocator = allocator;
     return dataset;
   }

@@ -7,7 +7,8 @@ use async_trait::async_trait;
 use lance_core::Result;
 use lance_namespace::LanceNamespace;
 use lance_namespace::models::{
-    CreateTableVersionRequest, DescribeTableVersionRequest, ListTableVersionsRequest,
+    BatchDeleteTableVersionsRequest, CreateTableVersionRequest, DescribeTableVersionRequest,
+    ListTableVersionsRequest, TableVersion, VersionRange,
 };
 use lance_table::io::commit::external_manifest::ExternalManifestStore;
 use lance_table::io::commit::{ManifestLocation, ManifestNamingScheme};
@@ -86,6 +87,34 @@ impl LanceNamespaceExternalManifestStore {
     fn branch_for_base(&self, base: &str) -> Result<Option<String>> {
         BranchLocation::branch_of(self.table_root.as_ref(), base)
     }
+
+    fn manifest_location(version: TableVersion) -> Result<ManifestLocation> {
+        let path = Path::parse(&version.manifest_path).map_err(|e| {
+            lance_core::Error::invalid_input(format!(
+                "Invalid manifest path '{}': {}",
+                version.manifest_path, e
+            ))
+        })?;
+        let filename = path.filename().ok_or_else(|| {
+            lance_core::Error::invalid_input(format!(
+                "Manifest path '{}' has no filename",
+                version.manifest_path
+            ))
+        })?;
+        let naming_scheme = ManifestNamingScheme::detect_scheme(filename).ok_or_else(|| {
+            lance_core::Error::invalid_input(format!(
+                "Manifest path '{}' does not use a recognized naming scheme",
+                version.manifest_path
+            ))
+        })?;
+        Ok(ManifestLocation {
+            version: version.version as u64,
+            path,
+            size: version.manifest_size.map(|size| size as u64),
+            naming_scheme,
+            e_tag: version.e_tag,
+        })
+    }
 }
 
 #[async_trait]
@@ -139,6 +168,102 @@ impl ExternalManifestStore for LanceNamespaceExternalManifestStore {
         )))
     }
 
+    async fn get_manifest_location(
+        &self,
+        base_uri: &str,
+        version: u64,
+    ) -> Result<ManifestLocation> {
+        let request = DescribeTableVersionRequest {
+            id: Some(self.table_id.clone()),
+            version: Some(version as i64),
+            branch: self.branch_for_base(base_uri)?,
+            ..Default::default()
+        };
+        let response = self
+            .namespace_client
+            .describe_table_version(request)
+            .await?;
+        Self::manifest_location(*response.version)
+    }
+
+    async fn list_versions(
+        &self,
+        base_uri: &str,
+        since: Option<u64>,
+    ) -> Result<Option<Vec<ManifestLocation>>> {
+        let branch = self.branch_for_base(base_uri)?;
+        let mut page_token = None;
+        let mut seen_page_tokens = std::collections::HashSet::new();
+        let mut locations = Vec::new();
+
+        loop {
+            let request = ListTableVersionsRequest {
+                id: Some(self.table_id.clone()),
+                page_token,
+                limit: Some(1_000),
+                descending: Some(true),
+                branch: branch.clone(),
+                ..Default::default()
+            };
+            let response = match self.namespace_client.list_table_versions(request).await {
+                Ok(response) => response,
+                Err(error) if is_chain_not_found(&error) => return Ok(Some(Vec::new())),
+                Err(error) => return Err(error),
+            };
+
+            for version in response.versions {
+                if since.is_none_or(|since| version.version as u64 > since) {
+                    locations.push(Self::manifest_location(version)?);
+                }
+            }
+
+            page_token = response.page_token.filter(|token| !token.is_empty());
+            if let Some(token) = &page_token
+                && !seen_page_tokens.insert(token.clone())
+            {
+                return Err(lance_core::Error::internal(format!(
+                    "Namespace returned repeated table-version page token '{token}'"
+                )));
+            }
+            if page_token.is_none() {
+                break;
+            }
+        }
+
+        Ok(Some(locations))
+    }
+
+    async fn forget_version(
+        &self,
+        base_uri: &str,
+        version: u64,
+        manifest_path: &str,
+    ) -> Result<()> {
+        let version = i64::try_from(version).map_err(|_| {
+            lance_core::Error::invalid_input(format!(
+                "Table version {version} does not fit the namespace API"
+            ))
+        })?;
+        let end_version = version.checked_add(1).ok_or_else(|| {
+            lance_core::Error::invalid_input(format!(
+                "Table version {version} cannot form a deletion range"
+            ))
+        })?;
+        self.namespace_client
+            .batch_delete_table_versions(BatchDeleteTableVersionsRequest {
+                id: Some(self.table_id.clone()),
+                branch: self.branch_for_base(base_uri)?,
+                ranges: vec![VersionRange::new(version, end_version)],
+                context: Some(std::collections::HashMap::from([(
+                    lance_namespace::TABLE_VERSION_IDENTITY_KEY.to_string(),
+                    manifest_path.to_string(),
+                )])),
+                ..Default::default()
+            })
+            .await?;
+        Ok(())
+    }
+
     /// Put the manifest to the namespace store.
     async fn put(
         &self,
@@ -182,18 +307,9 @@ impl ExternalManifestStore for LanceNamespaceExternalManifestStore {
             )
         })?;
 
-        Ok(ManifestLocation {
-            version: version_info.version as u64,
-            path: Path::parse(&version_info.manifest_path).map_err(|e| {
-                lance_core::Error::invalid_input(format!(
-                    "Invalid manifest path '{}': {}",
-                    version_info.manifest_path, e
-                ))
-            })?,
-            size: version_info.manifest_size.map(|s| s as u64),
-            naming_scheme,
-            e_tag: version_info.e_tag,
-        })
+        let mut location = Self::manifest_location(*version_info)?;
+        location.naming_scheme = naming_scheme;
+        Ok(location)
     }
 
     async fn put_if_not_exists(

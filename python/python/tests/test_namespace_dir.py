@@ -1054,6 +1054,8 @@ def test_external_manifest_store_invokes_namespace_apis(use_custom):
         )
         assert ds.count_rows() == 2
         assert len(ds.versions()) == 1
+        listed = ns_client.list_table_versions(ListTableVersionsRequest(id=table_id))
+        assert "_reservation_versions/" in listed.versions[0].manifest_path
 
         # Verify describe_table returns managed_versioning=True
         describe_resp = ns_client.describe_table(DescribeTableRequest(id=table_id))

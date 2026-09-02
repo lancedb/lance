@@ -427,6 +427,7 @@ public class WriteDatasetBuilder {
     String tableUri;
     Map<String, String> namespaceStorageOptions = null;
     boolean namespaceClientManagedVersioning = false;
+    String namespaceReservationToken = null;
 
     // Mode-specific namespace client operations
     if (mode == WriteParams.WriteMode.CREATE) {
@@ -444,6 +445,7 @@ public class WriteDatasetBuilder {
 
       namespaceClientManagedVersioning =
           Boolean.TRUE.equals(declareResponse.getManagedVersioning());
+      namespaceReservationToken = declareResponse.getTransactionId();
       namespaceStorageOptions =
           ignoreNamespaceStorageOptions ? null : declareResponse.getStorageOptions();
     } else {
@@ -489,19 +491,19 @@ public class WriteDatasetBuilder {
 
     WriteParams params = paramsBuilder.build();
 
-    // Pass namespaceClient, tableId, and namespaceClientManagedVersioning to JNI
+    // Pass namespace metadata to JNI
     // Rust will automatically create a storage options provider when namespaceClient/tableId
     // are non-null for credential refresh, and will create an external manifest commit handler
     // when namespaceClientManagedVersioning is true
     if (namespaceClientManagedVersioning) {
       return createDatasetWithStreamAndNamespaceClient(
-          tableUri, params, namespaceClient, tableId, true);
+          tableUri, params, namespaceClient, tableId, true, namespaceReservationToken);
     } else {
       // Even without managed versioning, pass namespaceClient for credential refresh
       // when namespace client vends credentials (storage options was non-null)
       if (!ignoreNamespaceStorageOptions && namespaceStorageOptions != null) {
         return createDatasetWithStreamAndNamespaceClient(
-            tableUri, params, namespaceClient, tableId, false);
+            tableUri, params, namespaceClient, tableId, false, null);
       }
       return createDatasetWithStream(tableUri, params);
     }
@@ -556,7 +558,8 @@ public class WriteDatasetBuilder {
       WriteParams params,
       LanceNamespace namespaceClient,
       List<String> tableId,
-      boolean namespaceClientManagedVersioning) {
+      boolean namespaceClientManagedVersioning,
+      String namespaceReservationToken) {
     // If stream is directly provided, use it
     if (stream != null) {
       return Dataset.create(
@@ -566,7 +569,8 @@ public class WriteDatasetBuilder {
           params,
           namespaceClient,
           tableId,
-          namespaceClientManagedVersioning);
+          namespaceClientManagedVersioning,
+          namespaceReservationToken);
     }
 
     // If reader is provided, convert to stream
@@ -580,7 +584,8 @@ public class WriteDatasetBuilder {
             params,
             namespaceClient,
             tableId,
-            namespaceClientManagedVersioning);
+            namespaceClientManagedVersioning,
+            namespaceReservationToken);
       }
     }
 
