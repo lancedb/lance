@@ -150,7 +150,7 @@ impl<'a> TransactionRebase<'a> {
 
                 let initial_fragments =
                     initial_fragments_for_rebase(dataset, &transaction, &modified_fragment_ids)
-                        .await;
+                        .await?;
                 Ok(Self {
                     transaction,
                     affected_rows,
@@ -168,7 +168,7 @@ impl<'a> TransactionRebase<'a> {
 
                 let initial_fragments =
                     initial_fragments_for_rebase(dataset, &transaction, &modified_fragment_ids)
-                        .await;
+                        .await?;
                 Ok(Self {
                     transaction,
                     affected_rows,
@@ -183,7 +183,7 @@ impl<'a> TransactionRebase<'a> {
                     replacements.iter().map(|r| r.0).collect::<HashSet<_>>();
                 let initial_fragments =
                     initial_fragments_for_rebase(dataset, &transaction, &modified_fragment_ids)
-                        .await;
+                        .await?;
                 Ok(Self {
                     transaction,
                     affected_rows,
@@ -198,7 +198,7 @@ impl<'a> TransactionRebase<'a> {
                     groups.iter().map(|g| g.fragment_id).collect::<HashSet<_>>();
                 let initial_fragments =
                     initial_fragments_for_rebase(dataset, &transaction, &modified_fragment_ids)
-                        .await;
+                        .await?;
                 Ok(Self {
                     transaction,
                     affected_rows,
@@ -212,7 +212,7 @@ impl<'a> TransactionRebase<'a> {
                 let modified_fragment_ids = fragments.iter().map(|f| f.id).collect::<HashSet<_>>();
                 let initial_fragments =
                     initial_fragments_for_rebase(dataset, &transaction, &modified_fragment_ids)
-                        .await;
+                        .await?;
                 Ok(Self {
                     transaction,
                     affected_rows,
@@ -2240,23 +2240,22 @@ async fn initial_fragments_for_rebase(
     dataset: &Dataset,
     transaction: &Transaction,
     modified_fragment_ids: &HashSet<u64>,
-) -> HashMap<u64, (Fragment, bool)> {
+) -> Result<HashMap<u64, (Fragment, bool)>> {
     if modified_fragment_ids.is_empty() {
-        return HashMap::new();
+        return Ok(HashMap::new());
     }
 
     let dataset = if dataset.manifest.version != transaction.read_version {
-        Cow::Owned(
-            dataset
-                .checkout_version(transaction.read_version)
-                .await
-                .unwrap(),
-        )
+        // The read version may have been garbage-collected by a concurrent
+        // `cleanup_old_versions` between the commit attempt and the rebase.
+        // Propagate the error so the commit fails gracefully instead of
+        // panicking (which aborts the whole process when `panic = "abort"`).
+        Cow::Owned(dataset.checkout_version(transaction.read_version).await?)
     } else {
         Cow::Borrowed(dataset)
     };
 
-    dataset
+    Ok(dataset
         .fragments()
         .iter()
         .filter(|fragment| {
@@ -2264,7 +2263,7 @@ async fn initial_fragments_for_rebase(
             modified_fragment_ids.contains(&fragment.id)
         })
         .map(|fragment| (fragment.id, (fragment.clone(), false)))
-        .collect::<HashMap<_, _>>()
+        .collect())
 }
 
 /// Read a fragment's deletion vector as a bitmap of physical offsets, or an
@@ -2617,6 +2616,78 @@ mod tests {
         let io_stats = dataset.object_store.as_ref().io_stats_incremental();
         assert_io_eq!(io_stats, read_iops, 0);
         assert_io_eq!(io_stats, write_iops, 0);
+    }
+
+    #[tokio::test]
+    async fn test_rebase_errors_when_read_version_was_cleaned_up() {
+        // Regression test: `initial_fragments_for_rebase` used to `unwrap()` the
+        // result of `checkout_version(read_version)`. If a concurrent
+        // `cleanup_old_versions` removed that version between the conflicting
+        // commit and the rebase, this panicked (aborting the whole process when
+        // built with `panic = "abort"`). The rebase should fail with an error
+        // instead so the commit can be retried.
+        let tmp_dir = lance_core::utils::tempfile::TempStrDir::default();
+        let uri = tmp_dir.as_str().to_string();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..5)),
+                Arc::new(Int32Array::from_iter_values(std::iter::repeat_n(0, 5))),
+            ],
+        )
+        .unwrap();
+
+        // Write version 1, then append version 2.
+        let write_params = WriteParams {
+            max_rows_per_file: 1,
+            ..Default::default()
+        };
+        InsertBuilder::new(&uri)
+            .with_params(&write_params)
+            .execute(vec![batch.clone()])
+            .await
+            .unwrap();
+        let append_params = WriteParams {
+            mode: WriteMode::Append,
+            max_rows_per_file: 1,
+            ..Default::default()
+        };
+        let dataset = InsertBuilder::new(&uri)
+            .with_params(&append_params)
+            .execute(vec![batch])
+            .await
+            .unwrap();
+        assert_eq!(dataset.manifest.version, 2);
+
+        // A transaction that read version 1 and modified fragment 0.
+        let operation = Operation::Update {
+            updated_fragments: vec![Fragment::new(0)],
+            removed_fragment_ids: vec![],
+            new_fragments: vec![],
+            fields_modified: vec![],
+            compacted_sstables: Vec::new(),
+            fields_for_preserving_frag_bitmap: vec![],
+            update_mode: None,
+            inserted_rows_filter: None,
+            updated_fragment_offsets: None,
+        };
+        let transaction = Transaction::new_from_version(1, operation);
+
+        // Simulate a concurrent `cleanup_old_versions` removing version 1.
+        let naming_scheme = dataset.manifest_location().naming_scheme;
+        let v1_manifest = naming_scheme.manifest_path(&dataset.base, 1);
+        dataset.object_store.delete(&v1_manifest).await.unwrap();
+
+        // Rebasing now needs to check out version 1, which no longer exists.
+        // This used to panic; it should return `DatasetNotFound` instead.
+        let err = TransactionRebase::try_new(&dataset, transaction, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::DatasetNotFound { .. }));
     }
 
     async fn apply_deletion(
