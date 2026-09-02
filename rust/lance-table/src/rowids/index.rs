@@ -11,6 +11,15 @@ use lance_core::utils::deletion::DeletionVector;
 use lance_core::{Error, Result};
 use rangemap::RangeInclusiveMap;
 
+/// Fragments one lookup may have to probe before the merged map is worth its
+/// build, whatever that build costs. A compacted table interleaves its
+/// fragments, and one measured at 46.
+const MAX_PROBE_DEPTH: u64 = 64;
+
+/// Row ids the merged build may read before probing is worth its per-lookup
+/// cost instead.
+const MERGE_ROWS_BUDGET: u64 = 1 << 20;
+
 /// An index of row ids
 ///
 /// This index is used to map row ids to their corresponding addresses. These
@@ -20,11 +29,23 @@ use rangemap::RangeInclusiveMap;
 /// map to addresses that have been tombstoned. A separate tombstone index is
 /// used to track tombstoned rows.
 // (Implementation)
-// Disjoint ranges of row ids are stored as the keys of the map. The values are
-// a pair of segments. The first segment is the row ids, and the second segment
-// is the addresses.
+// Two representations answer the same lookups, chosen once by `new`. The merged
+// map keys disjoint ranges of row ids to a pair of segments, the row ids and
+// the addresses, and reads every row id to build. A probe instead reads each
+// segment's bounds and asks the covering segment for the position of the id;
+// `new` takes that when few fragments cover one id and the merged build would
+// read a lot of them.
 #[derive(Debug)]
-pub struct RowIdIndex(RangeInclusiveMap<u64, (U64Segment, U64Segment)>);
+pub struct RowIdIndex {
+    /// Fragments that hold at least one row id, sorted by their lowest row id.
+    fragments: Vec<FragmentEntry>,
+    /// Max-`end` heap over `fragments`: `end_tree[1]` is the root and leaf `i`
+    /// sits at `end_tree[len() / 2 + i]`.
+    end_tree: Vec<u64>,
+    merged: Option<MergedIndex>,
+}
+
+type MergedIndex = RangeInclusiveMap<u64, (U64Segment, U64Segment)>;
 
 pub struct FragmentRowIdIndex {
     pub fragment_id: u32,
@@ -35,7 +56,34 @@ pub struct FragmentRowIdIndex {
 impl RowIdIndex {
     /// Create a new index from a list of fragment ids and their corresponding row id sequences.
     pub fn new(fragment_indices: &[FragmentRowIdIndex]) -> Result<Self> {
-        let chunks = fragment_indices
+        let mut fragments: Vec<FragmentEntry> = fragment_indices
+            .iter()
+            .filter_map(FragmentEntry::new)
+            .collect();
+        fragments.sort_unstable_by_key(|entry| entry.start);
+
+        let mut index = Self {
+            end_tree: build_end_tree(&fragments),
+            fragments,
+            merged: None,
+        };
+        if !probing_beats_merging(&index.fragments) {
+            index.merged = Some(index.build_merged()?);
+        }
+        Ok(index)
+    }
+
+    fn build_merged(&self) -> Result<MergedIndex> {
+        let sources: Vec<FragmentRowIdIndex> = self
+            .fragments
+            .iter()
+            .map(|entry| FragmentRowIdIndex {
+                fragment_id: entry.fragment_id,
+                row_id_sequence: entry.sequence.clone(),
+                deletion_vector: entry.deletion_vector.clone(),
+            })
+            .collect();
+        let chunks = sources
             .iter()
             .flat_map(decompose_sequence)
             .collect::<Vec<_>>();
@@ -56,17 +104,22 @@ impl RowIdIndex {
             }
         }
 
-        Ok(Self(RangeInclusiveMap::from_iter(final_chunks)))
+        Ok(RangeInclusiveMap::from_iter(final_chunks))
     }
 
     /// Get the address for a given row id.
     ///
     /// Will return None if the row id does not exist in the index.
-    pub fn get(&self, row_id: u64) -> Option<RowAddress> {
-        let (row_id_segment, address_segment) = self.0.get(&row_id)?;
-        let pos = row_id_segment.position(row_id)?;
-        let address = address_segment.get(pos)?;
-        Some(RowAddress::from(address))
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the row id is live in more than one fragment,
+    /// which means the stable row ids are corrupt.
+    pub fn get(&self, row_id: u64) -> Result<Option<RowAddress>> {
+        if let Some(merged) = &self.merged {
+            return Ok(merged_get(merged, row_id));
+        }
+        self.probe(row_id)
     }
 
     /// Get addresses for many row ids in one pass over the index.
@@ -75,17 +128,30 @@ impl RowIdIndex {
     /// Sorts a working copy of the input internally so the chunk iterator
     /// is advanced at most once per chunk, amortizing the per-id tree walk
     /// from O(N · log F) to O(F + N).
-    pub fn get_many(&self, row_ids: &[u64]) -> Vec<Option<RowAddress>> {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any requested row id is live in more than one
+    /// fragment, which means the stable row ids are corrupt.
+    pub fn get_many(&self, row_ids: &[u64]) -> Result<Vec<Option<RowAddress>>> {
         let n = row_ids.len();
         let mut out = vec![None; n];
         if n == 0 {
-            return out;
+            return Ok(out);
         }
 
         let mut sorted: Vec<(u64, usize)> = row_ids.iter().copied().zip(0..n).collect();
         sorted.sort_unstable_by_key(|&(id, _)| id);
 
-        let mut chunks = self.0.iter().peekable();
+        let Some(merged) = &self.merged else {
+            // Sorted ids keep one fragment and its segments warm across the run.
+            for (id, orig_idx) in sorted {
+                out[orig_idx] = self.probe(id)?;
+            }
+            return Ok(out);
+        };
+
+        let mut chunks = merged.iter().peekable();
         for (id, orig_idx) in sorted {
             // Advance past chunks that end before this id.
             while let Some((range, _)) = chunks.peek() {
@@ -107,21 +173,262 @@ impl RowIdIndex {
                 out[orig_idx] = Some(RowAddress::from(addr));
             }
         }
-        out
+        Ok(out)
+    }
+
+    /// Address of `row_id`, from the fragment that holds it live. Descends the
+    /// max-`end` tree, so a fragment out of reach of the id costs nothing.
+    ///
+    /// Visits every candidate rather than stopping at the first hit, and
+    /// errors when a second fragment holds the id live.
+    fn probe(&self, row_id: u64) -> Result<Option<RowAddress>> {
+        let fragments = self.fragments.len();
+        if fragments == 0 {
+            return Ok(None);
+        }
+        // Only a fragment that starts at or below the id can hold it.
+        let upper = self
+            .fragments
+            .partition_point(|entry| entry.start <= row_id);
+        if upper == 0 {
+            return Ok(None);
+        }
+        let leaves = self.end_tree.len() / 2;
+        // Depth is log2(leaves), at most 64, and each level leaves one sibling.
+        let mut stack = [(0usize, 0usize, 0usize); 64];
+        stack[0] = (1, 0, leaves);
+        let mut depth = 1;
+        let mut found: Option<RowAddress> = None;
+        while depth > 0 {
+            depth -= 1;
+            let (node, lo, hi) = stack[depth];
+            if lo >= upper || self.end_tree[node] < row_id {
+                continue;
+            }
+            if hi - lo == 1 {
+                if lo < fragments
+                    && let Some(candidate) = self.fragments[lo].resolve(row_id)
+                {
+                    if found.is_some() {
+                        return Err(Error::internal(format!(
+                            "row id index corrupt: stable row id {row_id} is \
+                             live in multiple fragments",
+                        )));
+                    }
+                    found = Some(candidate);
+                }
+                continue;
+            }
+            let mid = (lo + hi) / 2;
+            // Push the left half first so the right half pops first: candidates
+            // arrive in descending slot order.
+            stack[depth] = (2 * node, lo, mid);
+            stack[depth + 1] = (2 * node + 1, mid, hi);
+            depth += 2;
+        }
+        Ok(found)
     }
 }
 
+fn merged_get(merged: &MergedIndex, row_id: u64) -> Option<RowAddress> {
+    let (row_id_segment, address_segment) = merged.get(&row_id)?;
+    let pos = row_id_segment.position(row_id)?;
+    let address = address_segment.get(pos)?;
+    Some(RowAddress::from(address))
+}
+
+/// One segment of a sequence, and the offset its first row sits at.
+#[derive(Debug)]
+struct SegmentEntry {
+    seq_idx: usize,
+    range: RangeInclusive<u64>,
+    start_offset: u32,
+    /// Row id to position for an unsorted [`U64Segment::Array`], whose own
+    /// `position` scans. `None` for the encodings that search themselves.
+    positions: Option<Vec<(u64, u32)>>,
+}
+
+impl SegmentEntry {
+    /// Position of `row_id` in this segment, or `None` if it holds no such id.
+    fn position(&self, sequence: &RowIdSequence, row_id: u64) -> Option<usize> {
+        match &self.positions {
+            None => sequence.0[self.seq_idx].position(row_id),
+            Some(positions) => positions
+                .binary_search_by_key(&row_id, |(id, _)| *id)
+                .ok()
+                .map(|found| positions[found].1 as usize),
+        }
+    }
+}
+
+/// Row id to position for a segment, sorted by row id. The first position of a
+/// repeated id wins, which is what `position` returns.
+fn build_positions(segment: &U64Segment) -> Option<Vec<(u64, u32)>> {
+    if !matches!(segment, U64Segment::Array(_)) {
+        return None;
+    }
+    let mut positions: Vec<(u64, u32)> = segment
+        .iter()
+        .enumerate()
+        .map(|(position, row_id)| (row_id, position as u32))
+        .collect();
+    positions.sort_unstable();
+    positions.dedup_by_key(|(row_id, _)| *row_id);
+    Some(positions)
+}
+
+#[derive(Debug)]
+struct FragmentEntry {
+    fragment_id: u32,
+    sequence: Arc<RowIdSequence>,
+    deletion_vector: Arc<DeletionVector>,
+    segments: Vec<SegmentEntry>,
+    start: u64,
+    end: u64,
+    /// Row ids the merged build reads one by one.
+    merge_rows: u64,
+}
+
+impl FragmentEntry {
+    fn new(source: &FragmentRowIdIndex) -> Option<Self> {
+        let mut segments: Vec<SegmentEntry> = Vec::new();
+        let mut start_offset: u32 = 0;
+        let mut merge_rows: u64 = 0;
+        let deleted = !source.deletion_vector.is_empty();
+        for (seq_idx, segment) in source.row_id_sequence.0.iter().enumerate() {
+            let len = segment.len();
+            // A `Range` without deletions decomposes in constant time.
+            if deleted || !matches!(segment, U64Segment::Range(_)) {
+                merge_rows += len as u64;
+            }
+            // `range()` reports the span of a holed encoding, so ask `len` which
+            // ids the segment actually holds before trusting those bounds.
+            if len > 0
+                && let Some(range) = segment.range()
+            {
+                segments.push(SegmentEntry {
+                    seq_idx,
+                    range,
+                    start_offset,
+                    positions: build_positions(segment),
+                });
+            }
+            start_offset += len as u32;
+        }
+        let start = segments.iter().map(|entry| *entry.range.start()).min()?;
+        let end = segments.iter().map(|entry| *entry.range.end()).max()?;
+        Some(Self {
+            fragment_id: source.fragment_id,
+            sequence: source.row_id_sequence.clone(),
+            deletion_vector: source.deletion_vector.clone(),
+            segments,
+            start,
+            end,
+            merge_rows,
+        })
+    }
+
+    /// Address of `row_id` here, or `None` when the fragment lacks it or holds
+    /// it deleted.
+    fn resolve(&self, row_id: u64) -> Option<RowAddress> {
+        for entry in &self.segments {
+            if !entry.range.contains(&row_id) {
+                continue;
+            }
+            let Some(position) = entry.position(&self.sequence, row_id) else {
+                continue;
+            };
+            let row_offset = entry.start_offset + position as u32;
+            if self.deletion_vector.contains(row_offset) {
+                continue;
+            }
+            return Some(RowAddress::new_from_parts(self.fragment_id, row_offset));
+        }
+        None
+    }
+}
+
+/// Whether to answer lookups by probing the fragments rather than by merging
+/// every row id.
+///
+/// Probing costs the fragments that cover one id, per lookup; merging costs the
+/// row ids it reads, once. So probe only when both stay on the right side of
+/// [`MAX_PROBE_DEPTH`] and [`MERGE_ROWS_BUDGET`].
+fn probing_beats_merging(fragments: &[FragmentEntry]) -> bool {
+    let merge_rows: u64 = fragments.iter().map(|entry| entry.merge_rows).sum();
+    merge_rows > MERGE_ROWS_BUDGET && max_overlap_depth(fragments) <= MAX_PROBE_DEPTH
+}
+
+/// Most fragments that cover any one row id.
+fn max_overlap_depth(fragments: &[FragmentEntry]) -> u64 {
+    let mut ends: Vec<u64> = fragments.iter().map(|entry| entry.end).collect();
+    ends.sort_unstable();
+    let mut closed = 0;
+    let mut depth: u64 = 0;
+    for (opened, entry) in fragments.iter().enumerate() {
+        while closed < ends.len() && ends[closed] < entry.start {
+            closed += 1;
+        }
+        depth = depth.max((opened + 1 - closed) as u64);
+    }
+    depth
+}
+
+/// Implicit max-`end` heap over `fragments`, padded to a power of two. Padding
+/// leaves hold 0, which prunes for every id above 0 and is filtered by slot.
+fn build_end_tree(fragments: &[FragmentEntry]) -> Vec<u64> {
+    if fragments.is_empty() {
+        return Vec::new();
+    }
+    let leaves = fragments.len().next_power_of_two();
+    let mut tree = vec![0_u64; 2 * leaves];
+    for (slot, entry) in fragments.iter().enumerate() {
+        tree[leaves + slot] = entry.end;
+    }
+    for node in (1..leaves).rev() {
+        tree[node] = tree[2 * node].max(tree[2 * node + 1]);
+    }
+    tree
+}
+
 impl DeepSizeOf for RowIdIndex {
+    /// Charges the sequences and deletion vectors the `Arc`s keep alive, which
+    /// a sequence cached under its own key is charged for as well.
     fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
-        self.0
+        let fragment_bytes: usize = self
+            .fragments
             .iter()
-            .map(|(_, (row_id_segment, address_segment))| {
-                (2 * std::mem::size_of::<u64>())
-                    + std::mem::size_of::<(U64Segment, U64Segment)>()
-                    + row_id_segment.deep_size_of_children(context)
-                    + address_segment.deep_size_of_children(context)
+            .map(|entry| {
+                entry.sequence.deep_size_of_children(context)
+                    + entry.deletion_vector.deep_size_of_children(context)
+                    + entry.segments.capacity() * std::mem::size_of::<SegmentEntry>()
+                    + entry
+                        .segments
+                        .iter()
+                        .filter_map(|segment| segment.positions.as_ref())
+                        .map(|positions| positions.capacity() * std::mem::size_of::<(u64, u32)>())
+                        .sum::<usize>()
             })
-            .sum()
+            .sum();
+        let merged_bytes: usize = self
+            .merged
+            .as_ref()
+            .map(|merged| {
+                merged
+                    .iter()
+                    .map(|(_, (row_id_segment, address_segment))| {
+                        (2 * std::mem::size_of::<u64>())
+                            + std::mem::size_of::<(U64Segment, U64Segment)>()
+                            + row_id_segment.deep_size_of_children(context)
+                            + address_segment.deep_size_of_children(context)
+                    })
+                    .sum()
+            })
+            .unwrap_or(0);
+        fragment_bytes
+            + merged_bytes
+            + self.fragments.capacity() * std::mem::size_of::<FragmentEntry>()
+            + self.end_tree.capacity() * std::mem::size_of::<u64>()
     }
 }
 
@@ -159,10 +466,13 @@ fn decompose_sequence(
 }
 
 /// Build an IndexChunk from a list of (row_id, address) pairs.
-fn build_chunk_from_pairs(pairs: Vec<(u64, u64)>) -> Option<IndexChunk> {
+fn build_chunk_from_pairs(mut pairs: Vec<(u64, u64)>) -> Option<IndexChunk> {
     if pairs.is_empty() {
         return None;
     }
+    // Sorted, so the row id segment encodes as one a lookup can search rather
+    // than an `Array` it has to scan. The address segment follows the pairing.
+    pairs.sort_unstable_by_key(|(row_id, _)| *row_id);
     let (row_ids, addresses): (Vec<u64>, Vec<u64>) = pairs.into_iter().unzip();
     let row_id_segment = U64Segment::from_iter(row_ids);
     let address_segment = U64Segment::from_iter(addresses);
@@ -366,9 +676,137 @@ fn merge_overlapping_chunks(overlapping_chunks: Vec<IndexChunk>) -> Result<Index
 }
 
 #[cfg(test)]
+impl RowIdIndex {
+    /// Index that answers from the probe path, whatever the gate decided.
+    fn probing(fragment_indices: &[FragmentRowIdIndex]) -> Result<Self> {
+        let mut fragments: Vec<FragmentEntry> = fragment_indices
+            .iter()
+            .filter_map(FragmentEntry::new)
+            .collect();
+        fragments.sort_unstable_by_key(|entry| entry.start);
+        Ok(Self {
+            end_tree: build_end_tree(&fragments),
+            fragments,
+            merged: None,
+        })
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
-    use proptest::{prelude::Strategy, prop_assert_eq};
+    use proptest::{
+        prelude::{Just, Strategy, any},
+        prop_assert, prop_assert_eq,
+    };
+
+    /// Sequence of `len` even row ids, held as a sorted array.
+    fn sparse_sequence(len: u64) -> RowIdSequence {
+        RowIdSequence(vec![U64Segment::SortedArray(
+            (0..len).map(|value| value * 2).collect::<Vec<u64>>().into(),
+        )])
+    }
+
+    fn fragment(fragment_id: u32, sequence: RowIdSequence) -> FragmentRowIdIndex {
+        FragmentRowIdIndex {
+            fragment_id,
+            row_id_sequence: Arc::new(sequence),
+            deletion_vector: Arc::new(DeletionVector::default()),
+        }
+    }
+
+    #[test]
+    fn test_new_builds_the_merged_map_unless_probing_wins() {
+        // Ranges decompose in constant time, and a small sequence is cheap to
+        // read whatever its encoding.
+        let ranges = fragment(1, RowIdSequence(vec![U64Segment::Range(0..1_000_000)]));
+        assert!(RowIdIndex::new(&[ranges]).unwrap().merged.is_some());
+        let small = fragment(1, sparse_sequence(16));
+        assert!(RowIdIndex::new(&[small]).unwrap().merged.is_some());
+
+        // Past the row budget, with one fragment covering any id.
+        let wide = fragment(1, sparse_sequence(MERGE_ROWS_BUDGET + 1));
+        let index = RowIdIndex::new(&[wide]).unwrap();
+        assert!(index.merged.is_none());
+        assert_eq!(
+            index.get(6).unwrap(),
+            Some(RowAddress::new_from_parts(1, 3))
+        );
+    }
+
+    #[test]
+    fn test_deep_overlap_merges_however_many_rows_it_reads() {
+        // Just past the row budget in total, interleaved so every fragment
+        // covers every id: the depth alone forces the merged build.
+        let fragments = MAX_PROBE_DEPTH + 1;
+        let rows_per_fragment = MERGE_ROWS_BUDGET / fragments + 1;
+        let deep: Vec<FragmentRowIdIndex> = (0..fragments as u32)
+            .map(|id| {
+                let ids: Vec<u64> = (0..rows_per_fragment)
+                    .map(|value| value * fragments + id as u64)
+                    .collect();
+                fragment(id, RowIdSequence(vec![U64Segment::SortedArray(ids.into())]))
+            })
+            .collect();
+
+        assert!(RowIdIndex::new(&deep).unwrap().merged.is_some());
+    }
+
+    #[test]
+    fn test_probe_resolves_a_row_id_the_merged_map_rejects() {
+        let sources = [
+            fragment(1, RowIdSequence::from(&[0, 2][..])),
+            fragment(2, RowIdSequence::from(&[1, 2][..])),
+        ];
+        assert!(RowIdIndex::new(&sources).is_err());
+
+        let index = RowIdIndex::probing(&sources[..1]).unwrap();
+        assert_eq!(
+            index.get(2).unwrap(),
+            Some(RowAddress::new_from_parts(1, 1))
+        );
+    }
+
+    #[test]
+    fn test_probe_errors_when_two_fragments_hold_an_id_live() {
+        let sources = [
+            fragment(1, RowIdSequence::from(&[0, 2][..])),
+            fragment(2, RowIdSequence::from(&[1, 2][..])),
+        ];
+        let index = RowIdIndex::probing(&sources).unwrap();
+        assert_eq!(
+            index.get(0).unwrap(),
+            Some(RowAddress::new_from_parts(1, 0))
+        );
+
+        let error = index.get(2).unwrap_err();
+        assert!(matches!(&error, Error::Internal { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("stable row id 2 is live in multiple fragments")
+        );
+
+        let error = index.get_many(&[0, 2]).unwrap_err();
+        assert!(matches!(&error, Error::Internal { .. }));
+    }
+
+    #[test]
+    fn test_probe_finds_every_position_of_an_unsorted_array() {
+        let row_ids: Vec<u64> = (0..2048).map(|value| (value * 7919) % 2048).collect();
+        let index = RowIdIndex::probing(&[fragment(
+            3,
+            RowIdSequence(vec![U64Segment::Array(row_ids.clone().into())]),
+        )])
+        .unwrap();
+        for (offset, row_id) in row_ids.iter().enumerate() {
+            assert_eq!(
+                index.get(*row_id).unwrap(),
+                Some(RowAddress::new_from_parts(3, offset as u32))
+            );
+        }
+        assert!(index.merged.is_none());
+    }
 
     #[test]
     fn test_new_index() {
@@ -401,14 +839,32 @@ mod tests {
         let index = RowIdIndex::new(&fragment_indices).unwrap();
 
         // Check various queries.
-        assert_eq!(index.get(0), Some(RowAddress::new_from_parts(10, 0)));
-        assert_eq!(index.get(15), None);
-        assert_eq!(index.get(16), Some(RowAddress::new_from_parts(10, 14)));
-        assert_eq!(index.get(17), Some(RowAddress::new_from_parts(20, 0)));
-        assert_eq!(index.get(25), Some(RowAddress::new_from_parts(10, 16)));
-        assert_eq!(index.get(40), Some(RowAddress::new_from_parts(20, 2)));
-        assert_eq!(index.get(60), Some(RowAddress::new_from_parts(20, 4)));
-        assert_eq!(index.get(61), None);
+        assert_eq!(
+            index.get(0).unwrap(),
+            Some(RowAddress::new_from_parts(10, 0))
+        );
+        assert_eq!(index.get(15).unwrap(), None);
+        assert_eq!(
+            index.get(16).unwrap(),
+            Some(RowAddress::new_from_parts(10, 14))
+        );
+        assert_eq!(
+            index.get(17).unwrap(),
+            Some(RowAddress::new_from_parts(20, 0))
+        );
+        assert_eq!(
+            index.get(25).unwrap(),
+            Some(RowAddress::new_from_parts(10, 16))
+        );
+        assert_eq!(
+            index.get(40).unwrap(),
+            Some(RowAddress::new_from_parts(20, 2))
+        );
+        assert_eq!(
+            index.get(60).unwrap(),
+            Some(RowAddress::new_from_parts(20, 4))
+        );
+        assert_eq!(index.get(61).unwrap(), None);
     }
 
     #[test]
@@ -440,15 +896,42 @@ mod tests {
         let index = RowIdIndex::new(&fragment_indices).unwrap();
 
         // Check various queries.
-        assert_eq!(index.get(1), Some(RowAddress::new_from_parts(10, 0)));
-        assert_eq!(index.get(2), Some(RowAddress::new_from_parts(42, 0)));
-        assert_eq!(index.get(3), Some(RowAddress::new_from_parts(23, 0)));
-        assert_eq!(index.get(4), Some(RowAddress::new_from_parts(10, 1)));
-        assert_eq!(index.get(5), Some(RowAddress::new_from_parts(42, 1)));
-        assert_eq!(index.get(6), Some(RowAddress::new_from_parts(23, 1)));
-        assert_eq!(index.get(7), Some(RowAddress::new_from_parts(10, 2)));
-        assert_eq!(index.get(8), Some(RowAddress::new_from_parts(42, 2)));
-        assert_eq!(index.get(9), Some(RowAddress::new_from_parts(23, 2)));
+        assert_eq!(
+            index.get(1).unwrap(),
+            Some(RowAddress::new_from_parts(10, 0))
+        );
+        assert_eq!(
+            index.get(2).unwrap(),
+            Some(RowAddress::new_from_parts(42, 0))
+        );
+        assert_eq!(
+            index.get(3).unwrap(),
+            Some(RowAddress::new_from_parts(23, 0))
+        );
+        assert_eq!(
+            index.get(4).unwrap(),
+            Some(RowAddress::new_from_parts(10, 1))
+        );
+        assert_eq!(
+            index.get(5).unwrap(),
+            Some(RowAddress::new_from_parts(42, 1))
+        );
+        assert_eq!(
+            index.get(6).unwrap(),
+            Some(RowAddress::new_from_parts(23, 1))
+        );
+        assert_eq!(
+            index.get(7).unwrap(),
+            Some(RowAddress::new_from_parts(10, 2))
+        );
+        assert_eq!(
+            index.get(8).unwrap(),
+            Some(RowAddress::new_from_parts(42, 2))
+        );
+        assert_eq!(
+            index.get(9).unwrap(),
+            Some(RowAddress::new_from_parts(23, 2))
+        );
     }
 
     #[test]
@@ -481,19 +964,46 @@ mod tests {
         let index = RowIdIndex::new(&fragment_indices).unwrap();
 
         // Check that all row ids can be found regardless of their order in the segments
-        assert_eq!(index.get(1), Some(RowAddress::new_from_parts(30, 1)));
-        assert_eq!(index.get(2), Some(RowAddress::new_from_parts(20, 1)));
-        assert_eq!(index.get(3), Some(RowAddress::new_from_parts(10, 1)));
-        assert_eq!(index.get(4), Some(RowAddress::new_from_parts(30, 2)));
-        assert_eq!(index.get(5), Some(RowAddress::new_from_parts(20, 2)));
-        assert_eq!(index.get(6), Some(RowAddress::new_from_parts(10, 2)));
-        assert_eq!(index.get(7), Some(RowAddress::new_from_parts(30, 0)));
-        assert_eq!(index.get(8), Some(RowAddress::new_from_parts(20, 0)));
-        assert_eq!(index.get(9), Some(RowAddress::new_from_parts(10, 0)));
+        assert_eq!(
+            index.get(1).unwrap(),
+            Some(RowAddress::new_from_parts(30, 1))
+        );
+        assert_eq!(
+            index.get(2).unwrap(),
+            Some(RowAddress::new_from_parts(20, 1))
+        );
+        assert_eq!(
+            index.get(3).unwrap(),
+            Some(RowAddress::new_from_parts(10, 1))
+        );
+        assert_eq!(
+            index.get(4).unwrap(),
+            Some(RowAddress::new_from_parts(30, 2))
+        );
+        assert_eq!(
+            index.get(5).unwrap(),
+            Some(RowAddress::new_from_parts(20, 2))
+        );
+        assert_eq!(
+            index.get(6).unwrap(),
+            Some(RowAddress::new_from_parts(10, 2))
+        );
+        assert_eq!(
+            index.get(7).unwrap(),
+            Some(RowAddress::new_from_parts(30, 0))
+        );
+        assert_eq!(
+            index.get(8).unwrap(),
+            Some(RowAddress::new_from_parts(20, 0))
+        );
+        assert_eq!(
+            index.get(9).unwrap(),
+            Some(RowAddress::new_from_parts(10, 0))
+        );
 
         // Check that non-existent row ids return None
-        assert_eq!(index.get(0), None);
-        assert_eq!(index.get(10), None);
+        assert_eq!(index.get(0).unwrap(), None);
+        assert_eq!(index.get(10).unwrap(), None);
     }
 
     #[test]
@@ -517,11 +1027,26 @@ mod tests {
         let index = RowIdIndex::new(&fragment_indices).unwrap();
 
         // Check various queries.
-        assert_eq!(index.get(0), Some(RowAddress::new_from_parts(0, 0)));
-        assert_eq!(index.get(49), Some(RowAddress::new_from_parts(0, 49)));
-        assert_eq!(index.get(50), Some(RowAddress::new_from_parts(1, 0)));
-        assert_eq!(index.get(51), Some(RowAddress::new_from_parts(0, 50)));
-        assert_eq!(index.get(99), Some(RowAddress::new_from_parts(0, 98)));
+        assert_eq!(
+            index.get(0).unwrap(),
+            Some(RowAddress::new_from_parts(0, 0))
+        );
+        assert_eq!(
+            index.get(49).unwrap(),
+            Some(RowAddress::new_from_parts(0, 49))
+        );
+        assert_eq!(
+            index.get(50).unwrap(),
+            Some(RowAddress::new_from_parts(1, 0))
+        );
+        assert_eq!(
+            index.get(51).unwrap(),
+            Some(RowAddress::new_from_parts(0, 50))
+        );
+        assert_eq!(
+            index.get(99).unwrap(),
+            Some(RowAddress::new_from_parts(0, 98))
+        );
     }
 
     #[test]
@@ -548,15 +1073,36 @@ mod tests {
 
         let index = RowIdIndex::new(&fragment_indices).unwrap();
 
-        assert_eq!(index.get(0), Some(RowAddress::new_from_parts(20, 0)));
-        assert_eq!(index.get(1), Some(RowAddress::new_from_parts(10, 0)));
-        assert_eq!(index.get(2), Some(RowAddress::new_from_parts(20, 1)));
-        assert_eq!(index.get(3), Some(RowAddress::new_from_parts(10, 1)));
-        assert_eq!(index.get(4), None);
+        assert_eq!(
+            index.get(0).unwrap(),
+            Some(RowAddress::new_from_parts(20, 0))
+        );
+        assert_eq!(
+            index.get(1).unwrap(),
+            Some(RowAddress::new_from_parts(10, 0))
+        );
+        assert_eq!(
+            index.get(2).unwrap(),
+            Some(RowAddress::new_from_parts(20, 1))
+        );
+        assert_eq!(
+            index.get(3).unwrap(),
+            Some(RowAddress::new_from_parts(10, 1))
+        );
+        assert_eq!(index.get(4).unwrap(), None);
         // Surviving ids keep their original offsets (the hole is not compacted).
-        assert_eq!(index.get(6), Some(RowAddress::new_from_parts(20, 3)));
-        assert_eq!(index.get(8), Some(RowAddress::new_from_parts(20, 4)));
-        assert_eq!(index.get(9), Some(RowAddress::new_from_parts(10, 4)));
+        assert_eq!(
+            index.get(6).unwrap(),
+            Some(RowAddress::new_from_parts(20, 3))
+        );
+        assert_eq!(
+            index.get(8).unwrap(),
+            Some(RowAddress::new_from_parts(20, 4))
+        );
+        assert_eq!(
+            index.get(9).unwrap(),
+            Some(RowAddress::new_from_parts(10, 4))
+        );
     }
 
     #[test]
@@ -571,13 +1117,25 @@ mod tests {
 
         let index = RowIdIndex::new(&fragment_indices).unwrap();
 
-        assert_eq!(index.get(0), Some(RowAddress::new_from_parts(10, 0)));
-        assert_eq!(index.get(1), Some(RowAddress::new_from_parts(10, 1)));
-        assert_eq!(index.get(4), Some(RowAddress::new_from_parts(10, 4)));
-        assert_eq!(index.get(5), Some(RowAddress::new_from_parts(10, 5)));
+        assert_eq!(
+            index.get(0).unwrap(),
+            Some(RowAddress::new_from_parts(10, 0))
+        );
+        assert_eq!(
+            index.get(1).unwrap(),
+            Some(RowAddress::new_from_parts(10, 1))
+        );
+        assert_eq!(
+            index.get(4).unwrap(),
+            Some(RowAddress::new_from_parts(10, 4))
+        );
+        assert_eq!(
+            index.get(5).unwrap(),
+            Some(RowAddress::new_from_parts(10, 5))
+        );
 
-        assert_eq!(index.get(2), None);
-        assert_eq!(index.get(3), None);
+        assert_eq!(index.get(2).unwrap(), None);
+        assert_eq!(index.get(3).unwrap(), None);
     }
 
     #[test]
@@ -597,9 +1155,15 @@ mod tests {
 
         let index = RowIdIndex::new(&fragment_indices).unwrap();
 
-        assert_eq!(index.get(5), Some(RowAddress::new_from_parts(20, 0)));
-        assert_eq!(index.get(7), Some(RowAddress::new_from_parts(20, 2)));
-        assert_eq!(index.get(4), None);
+        assert_eq!(
+            index.get(5).unwrap(),
+            Some(RowAddress::new_from_parts(20, 0))
+        );
+        assert_eq!(
+            index.get(7).unwrap(),
+            Some(RowAddress::new_from_parts(20, 2))
+        );
+        assert_eq!(index.get(4).unwrap(), None);
     }
 
     #[test]
@@ -607,8 +1171,8 @@ mod tests {
         let fragment_indices = vec![];
         let index = RowIdIndex::new(&fragment_indices).unwrap();
 
-        assert_eq!(index.get(0), None);
-        assert_eq!(index.get(100), None);
+        assert_eq!(index.get(0).unwrap(), None);
+        assert_eq!(index.get(100).unwrap(), None);
     }
 
     #[test]
@@ -633,12 +1197,30 @@ mod tests {
 
         let index = RowIdIndex::new(&fragment_indices).unwrap();
 
-        assert_eq!(index.get(0), Some(RowAddress::new_from_parts(10, 0)));
-        assert_eq!(index.get(4), Some(RowAddress::new_from_parts(10, 4)));
-        assert_eq!(index.get(5), Some(RowAddress::new_from_parts(20, 0)));
-        assert_eq!(index.get(9), Some(RowAddress::new_from_parts(20, 4)));
-        assert_eq!(index.get(10), Some(RowAddress::new_from_parts(30, 0)));
-        assert_eq!(index.get(14), Some(RowAddress::new_from_parts(30, 4)));
+        assert_eq!(
+            index.get(0).unwrap(),
+            Some(RowAddress::new_from_parts(10, 0))
+        );
+        assert_eq!(
+            index.get(4).unwrap(),
+            Some(RowAddress::new_from_parts(10, 4))
+        );
+        assert_eq!(
+            index.get(5).unwrap(),
+            Some(RowAddress::new_from_parts(20, 0))
+        );
+        assert_eq!(
+            index.get(9).unwrap(),
+            Some(RowAddress::new_from_parts(20, 4))
+        );
+        assert_eq!(
+            index.get(10).unwrap(),
+            Some(RowAddress::new_from_parts(30, 0))
+        );
+        assert_eq!(
+            index.get(14).unwrap(),
+            Some(RowAddress::new_from_parts(30, 4))
+        );
     }
 
     fn arbitrary_row_ids(
@@ -664,6 +1246,42 @@ mod tests {
                 sequences
             })
         })
+    }
+
+    fn arbitrary_row_ids_with_deletions(
+        num_fragments_range: std::ops::Range<usize>,
+        frag_size_range: std::ops::Range<usize>,
+    ) -> impl Strategy<Value = Vec<(u32, Arc<RowIdSequence>, Arc<DeletionVector>)>> {
+        arbitrary_row_ids(num_fragments_range, frag_size_range)
+            .prop_flat_map(|row_ids| {
+                let num_rows = row_ids
+                    .iter()
+                    .map(|(_, sequence)| sequence.len() as usize)
+                    .sum::<usize>();
+                (
+                    Just(row_ids),
+                    proptest::collection::vec(any::<bool>(), num_rows),
+                )
+            })
+            .prop_map(|(row_ids, deleted_rows)| {
+                let mut deleted_rows = deleted_rows.into_iter();
+                row_ids
+                    .into_iter()
+                    .map(|(fragment_id, sequence)| {
+                        let mut deletion_bitmap = roaring::RoaringBitmap::new();
+                        for offset in 0..sequence.len() as u32 {
+                            if deleted_rows.next().unwrap() {
+                                deletion_bitmap.insert(offset);
+                            }
+                        }
+                        (
+                            fragment_id,
+                            sequence,
+                            Arc::new(DeletionVector::Bitmap(deletion_bitmap)),
+                        )
+                    })
+                    .collect()
+            })
     }
 
     #[test]
@@ -694,24 +1312,27 @@ mod tests {
         let elapsed = start.elapsed();
 
         // Verify correctness at boundaries
-        assert_eq!(index.get(0), Some(RowAddress::new_from_parts(0, 0)));
         assert_eq!(
-            index.get(rows_per_fragment - 1),
+            index.get(0).unwrap(),
+            Some(RowAddress::new_from_parts(0, 0))
+        );
+        assert_eq!(
+            index.get(rows_per_fragment - 1).unwrap(),
             Some(RowAddress::new_from_parts(0, rows_per_fragment as u32 - 1))
         );
         assert_eq!(
-            index.get(rows_per_fragment),
+            index.get(rows_per_fragment).unwrap(),
             Some(RowAddress::new_from_parts(1, 0))
         );
         let last_row = num_fragments as u64 * rows_per_fragment - 1;
         assert_eq!(
-            index.get(last_row),
+            index.get(last_row).unwrap(),
             Some(RowAddress::new_from_parts(
                 num_fragments - 1,
                 rows_per_fragment as u32 - 1
             ))
         );
-        assert_eq!(index.get(last_row + 1), None);
+        assert_eq!(index.get(last_row + 1).unwrap(), None);
 
         // With the optimization, building an index for 25M rows across 100 fragments
         // should complete in well under 1 second (typically < 1ms).
@@ -757,66 +1378,143 @@ mod tests {
 
         // Deleted rows (offset 0, 3, 6, ...) should not be found.
         // Row ID 0 has offset 0 in fragment 0 -> deleted.
-        assert_eq!(index.get(0), None);
+        assert_eq!(index.get(0).unwrap(), None);
         // Row ID 3 has offset 3 in fragment 0 -> deleted.
-        assert_eq!(index.get(3), None);
+        assert_eq!(index.get(3).unwrap(), None);
 
         // Non-deleted rows should resolve correctly.
         // Row ID 1 has offset 1 in fragment 0 -> address (frag=0, row=1).
-        assert_eq!(index.get(1), Some(RowAddress::new_from_parts(0, 1)));
+        assert_eq!(
+            index.get(1).unwrap(),
+            Some(RowAddress::new_from_parts(0, 1))
+        );
         // Row ID 2 has offset 2 in fragment 0 -> address (frag=0, row=2).
-        assert_eq!(index.get(2), Some(RowAddress::new_from_parts(0, 2)));
+        assert_eq!(
+            index.get(2).unwrap(),
+            Some(RowAddress::new_from_parts(0, 2))
+        );
         // Row ID 4 has offset 4 in fragment 0 -> address (frag=0, row=4).
-        assert_eq!(index.get(4), Some(RowAddress::new_from_parts(0, 4)));
+        assert_eq!(
+            index.get(4).unwrap(),
+            Some(RowAddress::new_from_parts(0, 4))
+        );
 
         // Check second fragment: row IDs start at 1000.
         // Row ID 1000 has offset 0 in fragment 1 -> deleted.
-        assert_eq!(index.get(rows_per_fragment), None);
+        assert_eq!(index.get(rows_per_fragment).unwrap(), None);
         // Row ID 1001 has offset 1 in fragment 1 -> address (frag=1, row=1).
         assert_eq!(
-            index.get(rows_per_fragment + 1),
+            index.get(rows_per_fragment + 1).unwrap(),
             Some(RowAddress::new_from_parts(1, 1))
         );
 
         // Last fragment, last non-deleted row.
         // Row ID 9999 has offset 999 in fragment 9 -> 999 % 3 == 0 -> deleted.
         let last_row = num_fragments as u64 * rows_per_fragment - 1;
-        assert_eq!(index.get(last_row), None);
+        assert_eq!(index.get(last_row).unwrap(), None);
         // Row ID 9998 has offset 998 -> 998 % 3 == 2 -> not deleted.
         assert_eq!(
-            index.get(last_row - 1),
+            index.get(last_row - 1).unwrap(),
             Some(RowAddress::new_from_parts(num_fragments - 1, 998))
         );
 
         // Out of range.
-        assert_eq!(index.get(last_row + 1), None);
+        assert_eq!(index.get(last_row + 1).unwrap(), None);
     }
 
     proptest::proptest! {
         #[test]
-        fn test_new_index_robustness(row_ids in arbitrary_row_ids(0..5, 0..32)) {
+        fn test_new_index_robustness(
+            row_ids in arbitrary_row_ids_with_deletions(0..5, 0..32)
+        ) {
             let fragment_indices: Vec<FragmentRowIdIndex> = row_ids
                 .iter()
-                .map(|(frag_id, sequence)| FragmentRowIdIndex {
+                .map(|(frag_id, sequence, deletion_vector)| FragmentRowIdIndex {
                     fragment_id: *frag_id,
                     row_id_sequence: sequence.clone(),
-                    deletion_vector: Arc::new(DeletionVector::default()),
+                    deletion_vector: deletion_vector.clone(),
                 })
                 .collect();
 
-            let index = RowIdIndex::new(&fragment_indices).unwrap();
-            for (frag_id, sequence) in row_ids.iter() {
-                for (local_offset, row_id) in sequence.iter().enumerate() {
-                    prop_assert_eq!(
-                        index.get(row_id),
-                        Some(RowAddress::new_from_parts(*frag_id, local_offset as u32)),
-                        "Row id {} in sequence {:?} not found in index {:?}",
-                        row_id,
-                        sequence,
-                        index
-                    );
+            let merged = RowIdIndex::new(&fragment_indices).unwrap();
+            let probing = RowIdIndex::probing(&fragment_indices).unwrap();
+            for index in [&merged, &probing] {
+                for (frag_id, sequence, deletion_vector) in row_ids.iter() {
+                    for (local_offset, row_id) in sequence.iter().enumerate() {
+                        let expected = if deletion_vector.contains(local_offset as u32) {
+                            None
+                        } else {
+                            Some(RowAddress::new_from_parts(*frag_id, local_offset as u32))
+                        };
+                        prop_assert_eq!(
+                            index.get(row_id).unwrap(),
+                            expected,
+                            "Row id {} in sequence {:?} not found in index {:?}",
+                            row_id,
+                            sequence,
+                            index
+                        );
+                    }
                 }
             }
+        }
+
+        #[test]
+        fn test_new_index_moved_row_id(
+            row_id in any::<u64>(),
+            source_fragment in 0u32..1024,
+            fragment_delta in 1u32..1024,
+        ) {
+            let target_fragment = source_fragment + fragment_delta;
+            let fragment_indices = [
+                FragmentRowIdIndex {
+                    fragment_id: source_fragment,
+                    row_id_sequence: Arc::new(RowIdSequence::from(&[row_id][..])),
+                    deletion_vector: Arc::new(DeletionVector::Bitmap(
+                        roaring::RoaringBitmap::from_iter([0]),
+                    )),
+                },
+                FragmentRowIdIndex {
+                    fragment_id: target_fragment,
+                    row_id_sequence: Arc::new(RowIdSequence::from(&[row_id][..])),
+                    deletion_vector: Arc::new(DeletionVector::default()),
+                },
+            ];
+
+            let index = RowIdIndex::new(&fragment_indices).unwrap();
+            prop_assert_eq!(
+                index.get(row_id).unwrap(),
+                Some(RowAddress::new_from_parts(target_fragment, 0))
+            );
+        }
+
+        #[test]
+        fn test_new_index_rejects_duplicate_live_row_id(
+            row_id in any::<u64>(),
+            first_fragment in 0u32..1024,
+            fragment_delta in 1u32..1024,
+        ) {
+            let second_fragment = first_fragment + fragment_delta;
+            let fragment_indices = [
+                FragmentRowIdIndex {
+                    fragment_id: first_fragment,
+                    row_id_sequence: Arc::new(RowIdSequence::from(&[row_id][..])),
+                    deletion_vector: Arc::new(DeletionVector::default()),
+                },
+                FragmentRowIdIndex {
+                    fragment_id: second_fragment,
+                    row_id_sequence: Arc::new(RowIdSequence::from(&[row_id][..])),
+                    deletion_vector: Arc::new(DeletionVector::default()),
+                },
+            ];
+
+            let error = RowIdIndex::new(&fragment_indices).unwrap_err();
+            let is_internal = matches!(&error, Error::Internal { .. });
+            let expected_message =
+                format!("stable row id {row_id} is live in multiple fragments");
+            let error_message = error.to_string();
+            prop_assert!(is_internal);
+            prop_assert!(error_message.contains(&expected_message));
         }
     }
 }

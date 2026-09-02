@@ -18,12 +18,14 @@ use lance_datafusion::expr::safe_coerce_scalar;
 use lance_datafusion::planner::Planner;
 use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::inverted::query::{FtsQuery as IndexFtsQuery, Operator};
+use lance_index::scalar::inverted::{DOC_INDEX_FIELD, DocumentGranularity};
 use lance_linalg::distance::DistanceType;
 
 use super::exec::{
     BTreeIndexExec, FtsIndexExec, MemTableBruteForceVectorExec, MemTableDedupScanExec,
     MemTableScanExec, SCORE_COLUMN, VectorIndexExec,
 };
+use crate::dataset::mem_wal::index::MemTableVisibility;
 use crate::dataset::mem_wal::scanner::{exec::validate_pk_types, parse_filter_expr};
 use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
 
@@ -75,7 +77,7 @@ pub enum FtsQueryType {
     },
     /// Boolean query with MUST/SHOULD/MUST_NOT.
     Boolean {
-        /// Terms that must match.
+        /// Terms that must match and contribute to the score.
         must: Vec<String>,
         /// Terms that should match (adds to score).
         should: Vec<String>,
@@ -105,6 +107,8 @@ pub struct FtsQuery {
     pub column: String,
     /// Query type.
     pub query_type: FtsQueryType,
+    /// Logical document unit. Defaults to one document per dataset row.
+    pub document_granularity: DocumentGranularity,
     /// WAND factor for early termination (0.0 to 1.0).
     /// 1.0 = full recall (default), <1.0 = faster but may miss low-scoring results.
     pub wand_factor: f32,
@@ -141,6 +145,7 @@ impl FtsQuery {
                 operator,
                 boost: 1.0,
             },
+            document_granularity: DocumentGranularity::Row,
             wand_factor: DEFAULT_WAND_FACTOR,
             limit: None,
             include_tail: true,
@@ -155,6 +160,7 @@ impl FtsQuery {
                 query: query.into(),
                 slop,
             },
+            document_granularity: DocumentGranularity::Row,
             wand_factor: DEFAULT_WAND_FACTOR,
             limit: None,
             include_tail: true,
@@ -175,6 +181,7 @@ impl FtsQuery {
                 should,
                 must_not,
             },
+            document_granularity: DocumentGranularity::Row,
             wand_factor: DEFAULT_WAND_FACTOR,
             limit: None,
             include_tail: true,
@@ -197,6 +204,7 @@ impl FtsQuery {
                 max_expansions: DEFAULT_MAX_EXPANSIONS,
                 boost: 1.0,
             },
+            document_granularity: DocumentGranularity::Row,
             wand_factor: DEFAULT_WAND_FACTOR,
             limit: None,
             include_tail: true,
@@ -218,6 +226,7 @@ impl FtsQuery {
                 max_expansions: DEFAULT_MAX_EXPANSIONS,
                 boost: 1.0,
             },
+            document_granularity: DocumentGranularity::Row,
             wand_factor: DEFAULT_WAND_FACTOR,
             limit: None,
             include_tail: true,
@@ -241,6 +250,7 @@ impl FtsQuery {
                 max_expansions,
                 boost: 1.0,
             },
+            document_granularity: DocumentGranularity::Row,
             wand_factor: DEFAULT_WAND_FACTOR,
             limit: None,
             include_tail: true,
@@ -269,6 +279,11 @@ impl FtsQuery {
         self
     }
 
+    pub fn with_document_granularity(mut self, document_granularity: DocumentGranularity) -> Self {
+        self.document_granularity = document_granularity;
+        self
+    }
+
     fn with_boost(mut self, boost: f32) -> Self {
         match &mut self.query_type {
             FtsQueryType::Match { boost: b, .. } | FtsQueryType::Fuzzy { boost: b, .. } => {
@@ -286,7 +301,30 @@ impl FtsQuery {
 /// phrase leaf queries; the column must be bound on the query. Compound queries
 /// (boolean / boost / multi-match) cannot be modeled by the MemTable path and
 /// return a `not_supported` error rather than failing deep in planning.
-fn local_fts_query(query: FullTextSearchQuery) -> Result<FtsQuery> {
+fn resolve_memtable_document_granularity(
+    column: &str,
+    requested: Option<DocumentGranularity>,
+    indexes: Option<&IndexStore>,
+) -> Result<DocumentGranularity> {
+    let available = indexes
+        .map(|indexes| indexes.fts_document_granularities_by_column(column))
+        .unwrap_or_default();
+    match requested {
+        Some(requested) if available.is_empty() || available.contains(&requested) => Ok(requested),
+        Some(requested) => Err(Error::invalid_input(format!(
+            "FTS query for field '{column}' requested {requested:?} document granularity, but \
+             the active MemTable FTS index uses a different granularity: {available:?}"
+        ))),
+        None if available.is_empty() => Ok(DocumentGranularity::Row),
+        None if available.len() == 1 => Ok(available[0]),
+        None => Err(Error::invalid_input(format!(
+            "FTS query for field '{column}' is ambiguous because Row and ListElement active \
+             MemTable indexes coexist; specify document_granularity"
+        ))),
+    }
+}
+
+fn local_fts_query(query: FullTextSearchQuery, indexes: Option<&IndexStore>) -> Result<FtsQuery> {
     let wand_factor = query.wand_factor.unwrap_or(DEFAULT_WAND_FACTOR);
     let limit = query
         .limit
@@ -312,7 +350,9 @@ fn local_fts_query(query: FullTextSearchQuery) -> Result<FtsQuery> {
     let local = match query.query {
         IndexFtsQuery::Match(m) => {
             let column = require_column(m.column)?;
-            match m.fuzziness {
+            let document_granularity =
+                resolve_memtable_document_granularity(&column, m.document_granularity, indexes)?;
+            let local = match m.fuzziness {
                 // Some(0) is an exact match in the index model.
                 Some(0) => FtsQuery::match_query_with_operator(column, m.terms, m.operator)
                     .with_boost(m.boost),
@@ -330,9 +370,16 @@ fn local_fts_query(query: FullTextSearchQuery) -> Result<FtsQuery> {
                     m.max_expansions,
                 )
                 .with_boost(m.boost),
-            }
+            };
+            local.with_document_granularity(document_granularity)
         }
-        IndexFtsQuery::Phrase(p) => FtsQuery::phrase(require_column(p.column)?, p.terms, p.slop),
+        IndexFtsQuery::Phrase(p) => {
+            let column = require_column(p.column)?;
+            let document_granularity =
+                resolve_memtable_document_granularity(&column, p.document_granularity, indexes)?;
+            FtsQuery::phrase(column, p.terms, p.slop)
+                .with_document_granularity(document_granularity)
+        }
         other => {
             return Err(Error::not_supported(format!(
                 "MemTable full-text search supports match and phrase queries, got: {other}"
@@ -376,11 +423,11 @@ impl ScalarPredicate {
 /// Provides a builder pattern similar to Lance's Scanner interface
 /// for constructing DataFusion execution plans over in-memory data.
 ///
-/// # Index Visibility Model
+/// # Readable Prefix
 ///
-/// The scanner captures `max_visible_batch_position` from the `IndexStore` at
-/// construction time. This frozen visibility ensures queries only see data
-/// that has been indexed, providing consistent results.
+/// The scanner snapshots one readable prefix at construction, so every plan it
+/// builds cuts at the same bound. [`MemTableVisibility`] selects which prefix:
+/// published, or the writer's own indexed prefix.
 ///
 /// # Example
 ///
@@ -400,9 +447,9 @@ pub struct MemTableScanner {
     batch_store: Arc<BatchStore>,
     indexes: Arc<IndexStore>,
     schema: SchemaRef,
-    /// Frozen visibility captured at scanner construction time.
-    /// This is the `max_visible_batch_position` from the IndexStore.
-    max_visible_batch_position: usize,
+    /// Readable prefix frozen at scanner construction. Which `IndexStore`
+    /// cursor it came from is this scanner's [`MemTableVisibility`].
+    readable_count: usize,
     projection: Option<Vec<String>>,
     filter: Option<Expr>,
     limit: Option<usize>,
@@ -425,27 +472,32 @@ pub struct MemTableScanner {
 }
 
 impl MemTableScanner {
-    /// Create a new scanner.
-    ///
-    /// Captures `max_visible_batch_position` from the `IndexStore` at construction
-    /// time to ensure consistent query visibility.
+    /// Create a new scanner over the published prefix.
     ///
     /// # Arguments
     ///
     /// * `batch_store` - Lock-free batch store containing the data
-    /// * `indexes` - Index registry (carries the visibility watermark)
+    /// * `indexes` - Index registry (carries the visibility cursors)
     /// * `schema` - Schema of the data
     pub fn new(batch_store: Arc<BatchStore>, indexes: Arc<IndexStore>, schema: SchemaRef) -> Self {
-        // Snapshot the visibility cursor at construction time. The cursor is
-        // advanced by `flush_from_batch_store` after the WAL append succeeds,
-        // so this snapshot reflects WAL-durable data.
-        let max_visible_batch_position = indexes.max_visible_batch_position();
+        Self::new_at_visibility(batch_store, indexes, schema, MemTableVisibility::Published)
+    }
+
+    /// As [`Self::new`], bounded by `visibility`. Snapshotted at construction,
+    /// so every plan this scanner builds keys on one stable cursor.
+    pub fn new_at_visibility(
+        batch_store: Arc<BatchStore>,
+        indexes: Arc<IndexStore>,
+        schema: SchemaRef,
+        visibility: MemTableVisibility,
+    ) -> Self {
+        let readable_count = indexes.prefix_count(visibility);
 
         Self {
             batch_store,
             indexes,
             schema,
-            max_visible_batch_position,
+            readable_count,
             projection: None,
             filter: None,
             limit: None,
@@ -504,12 +556,12 @@ impl MemTableScanner {
         self
     }
 
-    /// The `max_visible_batch_position` snapshot this scanner latched at
-    /// construction. A downstream recency filter must key on this same snapshot
-    /// (not a fresh read of the IndexStore watermark, which a concurrent append
-    /// could have advanced) so it stays consistent with the rows the search saw.
-    pub fn max_visible_batch_position(&self) -> usize {
-        self.max_visible_batch_position
+    /// The readable-prefix snapshot this scanner latched at construction. A
+    /// downstream recency filter must key on this same snapshot (not a fresh
+    /// read of the IndexStore cursor, which a concurrent append could have
+    /// advanced) so it stays consistent with the rows the search saw.
+    pub fn readable_count(&self) -> usize {
+        self.readable_count
     }
 
     /// Include the _rowaddr column in output.
@@ -688,7 +740,7 @@ impl MemTableScanner {
     /// queries are supported; compound queries (boolean/boost/multi-match) are
     /// not yet supported by the MemTable path and return an error.
     pub fn full_text_search(&mut self, query: FullTextSearchQuery) -> Result<&mut Self> {
-        self.full_text_query = Some(local_fts_query(query)?);
+        self.full_text_query = Some(local_fts_query(query, Some(self.indexes.as_ref()))?);
         Ok(self)
     }
 
@@ -971,7 +1023,7 @@ impl MemTableScanner {
 
         let scan = MemTableScanExec::with_filter(
             self.batch_store.clone(),
-            self.max_visible_batch_position,
+            self.readable_count,
             projection_indices,
             self.output_schema(),
             self.schema.clone(),
@@ -1033,7 +1085,7 @@ impl MemTableScanner {
 
         Ok(Arc::new(MemTableDedupScanExec::new(
             self.batch_store.clone(),
-            self.max_visible_batch_position,
+            self.readable_count,
             projection_indices,
             self.output_schema(),
             pk_indices,
@@ -1046,7 +1098,7 @@ impl MemTableScanner {
 
     /// Plan a BTree index query.
     ///
-    /// Uses the effective visibility (min of max_visible and max_indexed) to ensure
+    /// Uses the effective visibility (min of max_readable and max_indexed) to ensure
     /// queries only see indexed data. Falls back to full scan if no index exists.
     async fn plan_btree_query(
         &self,
@@ -1056,14 +1108,14 @@ impl MemTableScanner {
             return self.plan_full_scan().await;
         }
 
-        let max_visible = self.max_visible_batch_position;
+        let max_readable = self.readable_count;
         let projection_indices = self.compute_projection_indices()?;
 
         let index_exec = BTreeIndexExec::new(
             self.batch_store.clone(),
             self.indexes.clone(),
             predicate.clone(),
-            max_visible,
+            max_readable,
             projection_indices,
             self.output_schema(),
             self.with_row_id,
@@ -1095,7 +1147,7 @@ impl MemTableScanner {
     }
 
     async fn plan_vector_search(&self, query: &VectorQuery) -> Result<Arc<dyn ExecutionPlan>> {
-        let max_visible = self.max_visible_batch_position;
+        let max_readable = self.readable_count;
         let projection_indices = self.compute_projection_indices()?;
         let base_schema = self.base_output_schema();
         let filter_predicate = self.filter_predicate()?;
@@ -1115,15 +1167,23 @@ impl MemTableScanner {
             .as_ref()
             .map(|_| self.indexes.has_pk_index() && !self.indexes.pk_has_overrides())
             .unwrap_or(true);
+        // A distance lower bound excludes the *nearest* rows, and
+        // `VectorIndexExec` can only drop them after the graph search has
+        // already cut to k — leaving fewer than k in-range rows, or none.
+        // Brute force filters the complete candidate set before its cut, so it
+        // is the only correct arm here. An upper bound is safe on HNSW: it
+        // trims the far tail, which the top-k would have dropped anyway.
+        let hnsw_safe_with_bounds = query.distance_lower_bound.is_none();
         let exec: Arc<dyn ExecutionPlan> = if filter_predicate.is_none()
             && hnsw_safe_with_pk
+            && hnsw_safe_with_bounds
             && self.has_vector_index(&query.column)
         {
             Arc::new(VectorIndexExec::new(
                 self.batch_store.clone(),
                 self.indexes.clone(),
                 query.clone(),
-                max_visible,
+                max_readable,
                 projection_indices,
                 base_schema,
                 self.with_row_id,
@@ -1133,7 +1193,7 @@ impl MemTableScanner {
                 MemTableBruteForceVectorExec::new(
                     self.batch_store.clone(),
                     query.clone(),
-                    max_visible,
+                    max_readable,
                     projection_indices,
                     base_schema,
                     self.with_row_id,
@@ -1147,14 +1207,14 @@ impl MemTableScanner {
 
     /// Plan a full-text search.
     ///
-    /// Uses the effective visibility (min of max_visible and max_indexed) to ensure
+    /// Uses the effective visibility (min of max_readable and max_indexed) to ensure
     /// queries only see indexed data.
     async fn plan_fts_search(&self, query: &FtsQuery) -> Result<Arc<dyn ExecutionPlan>> {
-        if !self.has_fts_index(&query.column) {
-            return self.empty_fts_plan();
+        if !self.has_fts_index(&query.column, query.document_granularity) {
+            return self.empty_fts_plan(query.document_granularity);
         }
 
-        let max_visible = self.max_visible_batch_position;
+        let max_readable = self.readable_count;
         let projection_indices = self.compute_projection_indices()?;
         let filter_predicate = self.filter_predicate()?;
         if let Some(pk_columns) = &self.pk_columns {
@@ -1165,7 +1225,7 @@ impl MemTableScanner {
             self.batch_store.clone(),
             self.indexes.clone(),
             query.clone(),
-            max_visible,
+            max_readable,
             projection_indices,
             self.base_output_schema(),
             self.with_row_id,
@@ -1175,7 +1235,10 @@ impl MemTableScanner {
         self.apply_post_index_ops(Arc::new(index_exec)).await
     }
 
-    fn empty_fts_plan(&self) -> Result<Arc<dyn ExecutionPlan>> {
+    fn empty_fts_plan(
+        &self,
+        document_granularity: DocumentGranularity,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
         use datafusion::physical_plan::empty::EmptyExec;
 
         let mut fields: Vec<Field> = self
@@ -1184,6 +1247,9 @@ impl MemTableScanner {
             .iter()
             .map(|f| f.as_ref().clone())
             .collect();
+        if document_granularity.is_list_element() {
+            fields.push(DOC_INDEX_FIELD.clone());
+        }
         fields.push(Field::new(SCORE_COLUMN, DataType::Float32, true));
         if self.with_row_id {
             fields.push(Field::new(ROW_ID, DataType::UInt64, true));
@@ -1230,15 +1296,111 @@ impl MemTableScanner {
         }
     }
 
+    /// Collect `col = lit OR col IN (lit, ..) OR ..` over one column into its
+    /// values, or return false and leave the caller to fall back to a full scan.
+    fn collect_or_equalities(
+        &self,
+        expr: &Expr,
+        column: &mut Option<String>,
+        values: &mut Vec<ScalarValue>,
+    ) -> bool {
+        let mut same_column = |name: &str| match column {
+            Some(existing) => existing == name,
+            None => {
+                *column = Some(name.to_string());
+                true
+            }
+        };
+        // The exec answers `In` by concatenating a lookup per value, so a value
+        // listed twice would emit its rows twice. Two disjuncts can easily name
+        // the same value: the signed-zero rewrite turns both sides of
+        // `x = -0.0 OR x = 0.0` into the same two-element list.
+        fn push_once(values: &mut Vec<ScalarValue>, value: ScalarValue) {
+            if !values.contains(&value) {
+                values.push(value);
+            }
+        }
+        match expr {
+            Expr::BinaryExpr(binary) if binary.op == datafusion::logical_expr::Operator::Or => {
+                self.collect_or_equalities(&binary.left, column, values)
+                    && self.collect_or_equalities(&binary.right, column, values)
+            }
+            Expr::BinaryExpr(binary) if binary.op == datafusion::logical_expr::Operator::Eq => {
+                let (Expr::Column(col), Expr::Literal(lit, _)) =
+                    (binary.left.as_ref(), binary.right.as_ref())
+                else {
+                    return false;
+                };
+                let Some(value) = self.coerce_literal_to_column(&col.name, lit) else {
+                    return false;
+                };
+                if !same_column(&col.name) {
+                    return false;
+                }
+                push_once(values, value);
+                true
+            }
+            Expr::InList(in_list) if !in_list.negated => {
+                let Expr::Column(col) = in_list.expr.as_ref() else {
+                    return false;
+                };
+                if !same_column(&col.name) {
+                    return false;
+                }
+                for item in &in_list.list {
+                    let Expr::Literal(lit, _) = item else {
+                        return false;
+                    };
+                    // A NULL among the values makes `IN` return NULL rather than
+                    // false, which a key lookup does not reproduce; fall back.
+                    if lit.is_null() {
+                        return false;
+                    }
+                    let Some(value) = self.coerce_literal_to_column(&col.name, lit) else {
+                        return false;
+                    };
+                    push_once(values, value);
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Extract a BTree-compatible predicate from the filter.
     ///
     /// This method also coerces literal values to match the column's data type
     /// (e.g., Int64 literal -> Int32 when the column is Int32).
     fn extract_btree_predicate(&self) -> Option<ScalarPredicate> {
-        let filter = self.filter.as_ref()?;
+        // `filter()` stores the parsed expression without running `optimize_expr`,
+        // so run it here to pick the plan from the same expression the full scan
+        // would evaluate. Coercion has to happen before the signed-zero rewrite
+        // inside it, otherwise `value = 0` keeps its integer literal and gets a
+        // bit-exact lookup while the scan beside it answers per IEEE 754. An
+        // expression `optimize_expr` rejects is reported by `plan_full_scan`,
+        // which runs the same pass, so there is nothing to report here.
+        let planner = Planner::new(self.schema.clone());
+        let filter = planner
+            .optimize_expr(self.filter.clone()?)
+            .inspect_err(|error| {
+                log::debug!("memtable index fast path skipped: {error}");
+            })
+            .ok()?;
 
         // Simple pattern matching for common predicates
-        match filter {
+        match &filter {
+            // `simplify` turns an `IN` list of three or fewer values back into an
+            // OR chain of equalities, and the signed-zero rewrite then turns any
+            // zero among them into a two-element list of its own, so the fast path
+            // has to accept the chain to keep covering `IN`.
+            Expr::BinaryExpr(binary) if binary.op == datafusion::logical_expr::Operator::Or => {
+                let mut column = None;
+                let mut values = Vec::new();
+                if self.collect_or_equalities(&filter, &mut column, &mut values) {
+                    debug_assert!(column.is_some(), "a true return always names the column");
+                    return column.map(|column| ScalarPredicate::In { column, values });
+                }
+            }
             Expr::BinaryExpr(binary) => {
                 if let (Expr::Column(col), Expr::Literal(lit, _)) =
                     (binary.left.as_ref(), binary.right.as_ref())
@@ -1325,8 +1487,10 @@ impl MemTableScanner {
     }
 
     /// Check if an FTS index exists for a column.
-    fn has_fts_index(&self, column: &str) -> bool {
-        self.indexes.get_fts_by_column(column).is_some()
+    fn has_fts_index(&self, column: &str, document_granularity: DocumentGranularity) -> bool {
+        self.indexes
+            .get_fts_by_column_and_granularity(column, document_granularity)
+            .is_some()
     }
 }
 
@@ -1426,7 +1590,7 @@ mod tests {
         let indexes = Arc::new(index_store);
         let scanner = MemTableScanner::new(batch_store, indexes, schema.clone());
         let result = scanner.try_into_batch().await.unwrap();
-        // max_visible_batch_position is 1, so we see batches 0 and 1 (20 rows)
+        // readable_count is 1, so we see batches 0 and 1 (20 rows)
         assert_eq!(result.num_rows(), 20);
     }
 
@@ -1443,6 +1607,105 @@ mod tests {
         let result = scanner.try_into_batch().await.unwrap();
         assert_eq!(result.num_columns(), 1);
         assert_eq!(result.schema().field(0).name(), "id");
+    }
+
+    /// The index fast path is chosen from the filter the caller set, which has not
+    /// been through `optimize_expr`. Running it there is what keeps a float zero
+    /// from getting a bit-exact lookup while the full scan beside it answers per
+    /// IEEE 754. The integer spelling matters too: the rewrite only fires once
+    /// coercion has given the literal the column's type.
+    #[rstest::rstest]
+    #[case::float_literal("value = 0.0")]
+    #[case::integer_literal("value = 0")]
+    fn test_extract_btree_predicate_covers_both_zero_encodings(#[case] equality: &str) {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Float64,
+            true,
+        )]));
+        let batch_store = Arc::new(BatchStore::with_capacity(8));
+        let mut scanner = MemTableScanner::new(
+            batch_store,
+            Arc::new(IndexStore::new()),
+            schema as SchemaRef,
+        );
+
+        scanner.filter(equality).unwrap();
+        match scanner.extract_btree_predicate() {
+            Some(ScalarPredicate::In { column, values }) => {
+                assert_eq!(column, "value");
+                assert_eq!(
+                    values,
+                    vec![
+                        ScalarValue::Float64(Some(-0.0)),
+                        ScalarValue::Float64(Some(0.0)),
+                    ]
+                );
+            }
+            other => panic!("expected an In predicate over both encodings, got {other:?}"),
+        }
+
+        // `simplify` shortens a two-value `IN` list into an OR chain, and the
+        // rewrite then replaces the zero with a list of its own. Both spellings
+        // still have to reach the index.
+        scanner.filter("value IN (0.0, 1.0)").unwrap();
+        match scanner.extract_btree_predicate() {
+            Some(ScalarPredicate::In { column, values }) => {
+                assert_eq!(column, "value");
+                assert_eq!(
+                    values,
+                    vec![
+                        ScalarValue::Float64(Some(-0.0)),
+                        ScalarValue::Float64(Some(0.0)),
+                        ScalarValue::Float64(Some(1.0)),
+                    ]
+                );
+            }
+            other => panic!("expected an In predicate covering the list, got {other:?}"),
+        }
+
+        // A short list with no zero in it is shortened just the same, so this is
+        // what keeps the pre-existing `IN` fast path from being lost.
+        scanner.filter("value IN (1.0, 2.0)").unwrap();
+        match scanner.extract_btree_predicate() {
+            Some(ScalarPredicate::In { values, .. }) => {
+                assert_eq!(
+                    values,
+                    vec![
+                        ScalarValue::Float64(Some(1.0)),
+                        ScalarValue::Float64(Some(2.0)),
+                    ]
+                );
+            }
+            other => panic!("expected an In predicate, got {other:?}"),
+        }
+
+        // Both disjuncts rewrite to the same two-element list. The exec answers
+        // `In` with one lookup per value and concatenates, so a value listed twice
+        // would return its rows twice.
+        scanner.filter("value = -0.0 OR value = 0.0").unwrap();
+        match scanner.extract_btree_predicate() {
+            Some(ScalarPredicate::In { values, .. }) => {
+                assert_eq!(
+                    values,
+                    vec![
+                        ScalarValue::Float64(Some(-0.0)),
+                        ScalarValue::Float64(Some(0.0)),
+                    ]
+                );
+            }
+            other => panic!("expected a deduplicated In predicate, got {other:?}"),
+        }
+
+        // `<` has to compare against the negative encoding, or the lookup admits a
+        // row the predicate excludes.
+        scanner.filter("value < 0.0").unwrap();
+        match scanner.extract_btree_predicate() {
+            Some(ScalarPredicate::Range { upper, .. }) => {
+                assert_eq!(upper, Some(ScalarValue::Float64(Some(-0.0))));
+            }
+            other => panic!("expected a Range predicate, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -1549,11 +1812,58 @@ mod tests {
         let q = FullTextSearchQuery::new("hello".to_string())
             .with_column("text".to_string())
             .unwrap();
-        let local = local_fts_query(q).unwrap();
+        let local = local_fts_query(q, None).unwrap();
         assert_eq!(local.column, "text");
         assert!(
             matches!(local.query_type, FtsQueryType::Match { query, operator, .. }
                 if query == "hello" && operator == Operator::Or)
+        );
+
+        let mut indexes = IndexStore::new();
+        indexes
+            .add_fts_with_params(
+                "tags_list_element_idx".to_string(),
+                1,
+                "tags".to_string(),
+                lance_index::scalar::inverted::InvertedIndexParams::default()
+                    .document_granularity(DocumentGranularity::ListElement),
+            )
+            .unwrap();
+        let inferred = FullTextSearchQuery::new("hello".to_string())
+            .with_column("tags".to_string())
+            .unwrap();
+        let inferred = local_fts_query(inferred, Some(&indexes)).unwrap();
+        assert_eq!(
+            inferred.document_granularity,
+            DocumentGranularity::ListElement
+        );
+        let conflicting = FullTextSearchQuery::new_query(IndexFtsQuery::Match(
+            MatchQuery::new("hello".to_string())
+                .with_column(Some("tags".to_string()))
+                .with_document_granularity(DocumentGranularity::Row),
+        ));
+        assert!(
+            local_fts_query(conflicting, Some(&indexes))
+                .unwrap_err()
+                .to_string()
+                .contains("different granularity")
+        );
+        indexes
+            .add_fts_with_params(
+                "tags_idx".to_string(),
+                1,
+                "tags".to_string(),
+                lance_index::scalar::inverted::InvertedIndexParams::default(),
+            )
+            .unwrap();
+        let ambiguous = FullTextSearchQuery::new("hello".to_string())
+            .with_column("tags".to_string())
+            .unwrap();
+        assert!(
+            local_fts_query(ambiguous, Some(&indexes))
+                .unwrap_err()
+                .to_string()
+                .contains("ambiguous")
         );
 
         let exact_and = FullTextSearchQuery::new_query(IndexFtsQuery::Match(
@@ -1562,7 +1872,7 @@ mod tests {
                 .with_boost(3.0)
                 .with_column(Some("text".to_string())),
         ));
-        let local = local_fts_query(exact_and).unwrap();
+        let local = local_fts_query(exact_and, None).unwrap();
         assert!(
             matches!(local.query_type, FtsQueryType::Match { query, operator, boost }
                 if query == "hello world" && operator == Operator::And && boost == 3.0)
@@ -1576,7 +1886,7 @@ mod tests {
                 .with_boost(2.5)
                 .with_column(Some("text".to_string())),
         ));
-        let local = local_fts_query(fuzzy).unwrap();
+        let local = local_fts_query(fuzzy, None).unwrap();
         assert!(
             matches!(local.query_type, FtsQueryType::Fuzzy { fuzziness, prefix_length, boost, .. }
                 if fuzziness == Some(2) && prefix_length == 2 && boost == 2.5)
@@ -1589,7 +1899,7 @@ mod tests {
                 .with_column(Some("text".to_string())),
         ));
         assert!(
-            local_fts_query(fuzzy_and).is_err(),
+            local_fts_query(fuzzy_and, None).is_err(),
             "fuzzy AND cannot be represented by the local memtable query"
         );
 
@@ -1597,7 +1907,7 @@ mod tests {
         let phrase = FullTextSearchQuery::new_query(IndexFtsQuery::Phrase(
             PhraseQuery::new("quick fox".to_string()).with_column(Some("text".to_string())),
         ));
-        let local = local_fts_query(phrase).unwrap();
+        let local = local_fts_query(phrase, None).unwrap();
         assert!(matches!(local.query_type, FtsQueryType::Phrase { .. }));
 
         // Compound (boolean) -> not supported.
@@ -1609,14 +1919,14 @@ mod tests {
                 ),
             )])));
         assert!(
-            local_fts_query(boolean).is_err(),
+            local_fts_query(boolean, None).is_err(),
             "boolean must be rejected"
         );
 
         // Missing column -> error.
         let no_col = FullTextSearchQuery::new("hi".to_string());
         assert!(
-            local_fts_query(no_col).is_err(),
+            local_fts_query(no_col, None).is_err(),
             "missing column must error"
         );
     }

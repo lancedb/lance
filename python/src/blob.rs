@@ -3,7 +3,7 @@
 
 use crate::{error::PythonErrorExt, rt};
 use arrow::{
-    array::{Array, ArrayRef, GenericBinaryArray, OffsetSizeTrait, cast::AsArray, make_array},
+    array::{Array, ArrayRef, make_array},
     pyarrow::{FromPyArrow, ToPyArrow},
 };
 use arrow_data::ArrayData;
@@ -12,13 +12,51 @@ use bytes::Bytes;
 use lance::{
     BlobDescriptor, BlobDescriptorArrayBuilder, BlobRange, DedicatedBlobWriter, PackedBlobWriter,
 };
+use lance_arrow::iter_binary_array;
 use pyo3::{
-    Bound, PyResult,
-    exceptions::PyValueError,
+    Bound, PyErr, PyResult,
+    exceptions::{PyRuntimeError, PyValueError},
     pyclass, pymethods,
     types::{PyAny, PyAnyMethods, PyDict, PyList, PyListMethods, PyModule, PyTypeMethods},
 };
-use std::{borrow::Cow, sync::Arc};
+use std::{
+    borrow::Cow,
+    sync::{Arc, Mutex},
+};
+
+fn with_writer<W, R>(
+    inner: &Mutex<Option<W>>,
+    writer_name: &str,
+    operation: impl FnOnce(&W) -> R,
+) -> PyResult<R> {
+    let guard = inner.lock().map_err(|_| poisoned_writer(writer_name))?;
+    let writer = guard.as_ref().ok_or_else(|| finished_writer(writer_name))?;
+    Ok(operation(writer))
+}
+
+fn writer_mut<'a, W>(inner: &'a mut Mutex<Option<W>>, writer_name: &str) -> PyResult<&'a mut W> {
+    inner
+        .get_mut()
+        .map_err(|_| poisoned_writer(writer_name))?
+        .as_mut()
+        .ok_or_else(|| finished_writer(writer_name))
+}
+
+fn take_writer<W>(inner: &mut Mutex<Option<W>>, writer_name: &str) -> PyResult<W> {
+    inner
+        .get_mut()
+        .map_err(|_| poisoned_writer(writer_name))?
+        .take()
+        .ok_or_else(|| finished_writer(writer_name))
+}
+
+fn finished_writer(writer_name: &str) -> PyErr {
+    PyValueError::new_err(format!("{writer_name} is already finished"))
+}
+
+fn poisoned_writer(writer_name: &str) -> PyErr {
+    PyRuntimeError::new_err(format!("{writer_name} lock is poisoned"))
+}
 
 /// Reconstruct the PyArrow equivalent of [`BlobDescriptorArrayBuilder::field`].
 ///
@@ -54,9 +92,10 @@ fn descriptor_field_to_pyarrow<'py>(
 
 /// Normalize inputs accepted by [`PyPackedBlobWriter::write_blobs`] into Arrow arrays.
 ///
-/// BinaryArray, LargeBinaryArray, and ChunkedArray values of either binary type
-/// are accepted. Chunk boundaries, nulls, and empty values remain in the arrays;
-/// each row is later passed to the core writer as an optional byte slice.
+/// BinaryArray, LargeBinaryArray, BinaryViewArray, FixedSizeBinaryArray, and
+/// ChunkedArray values of any binary type are accepted. Chunk boundaries,
+/// nulls, and empty values remain in the arrays; each row is later passed to
+/// the core writer as an optional byte slice.
 fn extract_blob_payloads(payloads: &Bound<'_, PyAny>) -> PyResult<Vec<ArrayRef>> {
     match ArrayData::from_pyarrow_bound(payloads) {
         Ok(data) => Ok(vec![validated_blob_payload(data, None)?]),
@@ -71,9 +110,9 @@ fn extract_blob_payloads(payloads: &Bound<'_, PyAny>) -> PyResult<Vec<ArrayRef>>
             }
 
             let chunked_data_type = DataType::from_pyarrow_bound(&payloads.getattr("type")?)?;
-            if !matches!(chunked_data_type, DataType::Binary | DataType::LargeBinary) {
+            if !chunked_data_type.is_binary() {
                 return Err(PyValueError::new_err(format!(
-                    "Packed blob payloads must have Arrow type Binary or LargeBinary, got {chunked_data_type}"
+                    "Packed blob payloads must have a Binary Arrow type, got {chunked_data_type}"
                 )));
             }
 
@@ -92,9 +131,9 @@ fn validated_blob_payload(data: ArrayData, chunk_index: Option<usize>) -> PyResu
     let context = chunk_index
         .map(|index| format!("Packed blob payload chunk {index}"))
         .unwrap_or_else(|| "Packed blob payload array".to_string());
-    if !matches!(data.data_type(), DataType::Binary | DataType::LargeBinary) {
+    if !data.data_type().is_binary() {
         return Err(PyValueError::new_err(format!(
-            "{context} must have Arrow type Binary or LargeBinary, got {}",
+            "{context} must have a Binary Arrow type, got {}",
             data.data_type()
         )));
     }
@@ -110,20 +149,14 @@ fn validated_blob_payload(data: ArrayData, chunk_index: Option<usize>) -> PyResu
     Ok(make_array(data))
 }
 
-/// Stream one Arrow binary array into the core writer as zero-copy row slices.
-///
-/// Null rows become `None` so the core writer records null descriptors, keeping
-/// its output row-aligned with the input.
-async fn write_binary_payloads<O: OffsetSizeTrait>(
-    writer: &mut PackedBlobWriter,
-    payloads: &GenericBinaryArray<O>,
-) -> PyResult<()> {
-    writer
-        .write_packed_blobs(
-            (0..payloads.len()).map(|row| payloads.is_valid(row).then(|| payloads.value(row))),
-        )
-        .await
-        .infer_error()
+async fn write_binary_payloads(writer: &mut PackedBlobWriter, payloads: &ArrayRef) -> PyResult<()> {
+    let iter = iter_binary_array(payloads.as_ref()).map_err(|error| {
+        PyValueError::new_err(format!(
+            "Packed blob payloads must have a Binary Arrow type, got {}: {error}",
+            payloads.data_type()
+        ))
+    })?;
+    writer.write_packed_blobs(iter).await.infer_error()
 }
 
 #[pyclass(name = "BlobDescriptor", skip_from_py_object)]
@@ -237,10 +270,10 @@ impl PyBlobDescriptorArrayBuilder {
     }
 }
 
-#[pyclass(name = "PackedBlobWriter", skip_from_py_object, unsendable)]
+#[pyclass(name = "PackedBlobWriter", skip_from_py_object)]
 pub struct PyPackedBlobWriter {
     field: Option<Field>,
-    inner: Option<PackedBlobWriter>,
+    inner: Mutex<Option<PackedBlobWriter>>,
 }
 
 impl PyPackedBlobWriter {
@@ -255,20 +288,20 @@ impl PyPackedBlobWriter {
                 .infer_error()?;
         Ok(Self {
             field: None,
-            inner: Some(inner),
+            inner: Mutex::new(Some(inner)),
         })
     }
 
-    fn inner(&self) -> PyResult<&PackedBlobWriter> {
-        self.inner
-            .as_ref()
-            .ok_or_else(|| PyValueError::new_err("PackedBlobWriter is already finished"))
+    fn with_inner<R>(&self, operation: impl FnOnce(&PackedBlobWriter) -> R) -> PyResult<R> {
+        with_writer(&self.inner, "PackedBlobWriter", operation)
     }
 
     fn inner_mut(&mut self) -> PyResult<&mut PackedBlobWriter> {
-        self.inner
-            .as_mut()
-            .ok_or_else(|| PyValueError::new_err("PackedBlobWriter is already finished"))
+        writer_mut(&mut self.inner, "PackedBlobWriter")
+    }
+
+    fn take_inner(&mut self) -> PyResult<PackedBlobWriter> {
+        take_writer(&mut self.inner, "PackedBlobWriter")
     }
 }
 
@@ -276,12 +309,12 @@ impl PyPackedBlobWriter {
 impl PyPackedBlobWriter {
     #[getter]
     pub fn blob_id(&self) -> PyResult<u32> {
-        Ok(self.inner()?.blob_id())
+        self.with_inner(PackedBlobWriter::blob_id)
     }
 
     #[getter]
     pub fn path(&self) -> PyResult<String> {
-        Ok(self.inner()?.path().to_string())
+        self.with_inner(|writer| writer.path().to_string())
     }
 
     /// The descriptor field associated with the array returned by
@@ -311,7 +344,9 @@ impl PyPackedBlobWriter {
     ///
     /// Parameters
     /// ----------
-    /// payloads : pyarrow.BinaryArray, pyarrow.LargeBinaryArray, or pyarrow.ChunkedArray
+    /// payloads : pyarrow.BinaryArray, pyarrow.LargeBinaryArray,
+    ///     pyarrow.BinaryViewArray, pyarrow.FixedSizeBinaryArray, or
+    ///     pyarrow.ChunkedArray
     ///     A binary Arrow array. Every chunk of a chunked array must be binary.
     ///     Each input row produces one descriptor row, in order, across chunks
     ///     and repeated calls. Null rows produce null descriptors; empty but
@@ -328,25 +363,10 @@ impl PyPackedBlobWriter {
     pub fn write_blobs(&mut self, payloads: &Bound<'_, PyAny>) -> PyResult<()> {
         let payloads = extract_blob_payloads(payloads)?;
         let result = {
-            let writer = self
-                .inner
-                .as_mut()
-                .ok_or_else(|| PyValueError::new_err("PackedBlobWriter is already finished"))?;
+            let writer = self.inner_mut()?;
             rt().block_on(None, async {
                 for payloads in payloads {
-                    match payloads.data_type() {
-                        DataType::Binary => {
-                            write_binary_payloads(writer, payloads.as_binary::<i32>()).await?
-                        }
-                        DataType::LargeBinary => {
-                            write_binary_payloads(writer, payloads.as_binary::<i64>()).await?
-                        }
-                        data_type => {
-                            return Err(PyValueError::new_err(format!(
-                                "Packed blob payloads must have Arrow type Binary or LargeBinary, got {data_type}"
-                            )));
-                        }
-                    }
+                    write_binary_payloads(writer, &payloads).await?;
                 }
                 Ok(())
             })
@@ -357,17 +377,14 @@ impl PyPackedBlobWriter {
                 // KeyboardInterrupt drops the async batch future. Remove the core
                 // writer as well so RAII cleanup runs and a completed prefix cannot
                 // be reused as a new batch.
-                self.inner.take();
+                self.take_inner()?;
                 Err(error)
             }
         }
     }
 
     pub fn finish(&mut self) -> PyResult<Vec<PyBlobDescriptor>> {
-        let inner = self
-            .inner
-            .take()
-            .ok_or_else(|| PyValueError::new_err("PackedBlobWriter is already finished"))?;
+        let inner = self.take_inner()?;
         let values = rt().block_on(None, inner.finish())?.infer_error()?;
         Ok(values.into_iter().map(Into::into).collect())
     }
@@ -403,10 +420,7 @@ impl PyPackedBlobWriter {
         py: pyo3::Python<'py>,
         field_name: String,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let inner = self
-            .inner
-            .take()
-            .ok_or_else(|| PyValueError::new_err("PackedBlobWriter is already finished"))?;
+        let inner = self.take_inner()?;
         let values = rt().block_on(None, inner.finish())?.infer_error()?;
         let mut builder = BlobDescriptorArrayBuilder::new(field_name);
         builder.extend(values).infer_error()?;
@@ -418,9 +432,9 @@ impl PyPackedBlobWriter {
     }
 }
 
-#[pyclass(name = "DedicatedBlobWriter", skip_from_py_object, unsendable)]
+#[pyclass(name = "DedicatedBlobWriter", skip_from_py_object)]
 pub struct PyDedicatedBlobWriter {
-    inner: Option<DedicatedBlobWriter>,
+    inner: Mutex<Option<DedicatedBlobWriter>>,
 }
 
 impl PyDedicatedBlobWriter {
@@ -433,19 +447,21 @@ impl PyDedicatedBlobWriter {
             DedicatedBlobWriter::try_new(object_store.as_ref().clone(), data_file_path, blob_id)
                 .await
                 .infer_error()?;
-        Ok(Self { inner: Some(inner) })
+        Ok(Self {
+            inner: Mutex::new(Some(inner)),
+        })
     }
 
-    fn inner(&self) -> PyResult<&DedicatedBlobWriter> {
-        self.inner
-            .as_ref()
-            .ok_or_else(|| PyValueError::new_err("DedicatedBlobWriter is already finished"))
+    fn with_inner<R>(&self, operation: impl FnOnce(&DedicatedBlobWriter) -> R) -> PyResult<R> {
+        with_writer(&self.inner, "DedicatedBlobWriter", operation)
     }
 
     fn inner_mut(&mut self) -> PyResult<&mut DedicatedBlobWriter> {
-        self.inner
-            .as_mut()
-            .ok_or_else(|| PyValueError::new_err("DedicatedBlobWriter is already finished"))
+        writer_mut(&mut self.inner, "DedicatedBlobWriter")
+    }
+
+    fn take_inner(&mut self) -> PyResult<DedicatedBlobWriter> {
+        take_writer(&mut self.inner, "DedicatedBlobWriter")
     }
 }
 
@@ -453,12 +469,12 @@ impl PyDedicatedBlobWriter {
 impl PyDedicatedBlobWriter {
     #[getter]
     pub fn blob_id(&self) -> PyResult<u32> {
-        Ok(self.inner()?.blob_id())
+        self.with_inner(DedicatedBlobWriter::blob_id)
     }
 
     #[getter]
     pub fn path(&self) -> PyResult<String> {
-        Ok(self.inner()?.path().to_string())
+        self.with_inner(|writer| writer.path().to_string())
     }
 
     pub fn write(&mut self, data: Vec<u8>) -> PyResult<()> {
@@ -467,10 +483,7 @@ impl PyDedicatedBlobWriter {
     }
 
     pub fn finish(&mut self) -> PyResult<PyBlobDescriptor> {
-        let inner = self
-            .inner
-            .take()
-            .ok_or_else(|| PyValueError::new_err("DedicatedBlobWriter is already finished"))?;
+        let inner = self.take_inner()?;
         let value = rt().block_on(None, inner.finish())?.infer_error()?;
         Ok(value.into())
     }

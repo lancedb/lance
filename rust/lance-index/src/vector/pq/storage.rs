@@ -24,8 +24,8 @@ use bytes::{Bytes, BytesMut};
 use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, ROW_ID, Result};
-use lance_file::previous::{
-    reader::FileReader as PreviousFileReader, writer::FileWriter as PreviousFileWriter,
+use lance_file::versions::v1::{
+    reader::FileReader as V1FileReader, writer::FileWriter as V1FileWriter,
 };
 use lance_io::{object_store::ObjectStore, utils::read_message};
 use lance_linalg::distance::{Cosine, DistanceType, Dot, L2};
@@ -37,7 +37,8 @@ use serde::{Deserialize, Serialize};
 
 use super::ProductQuantizer;
 use super::distance::{build_distance_table_dot, build_distance_table_l2, compute_pq_distance};
-use crate::frag_reuse::FragReuseIndex;
+use crate::frag_reuse::{FragReuseIndex, FragReuseIndexHandle};
+use crate::scalar::RowIdRemapper;
 use crate::vector::graph::{OrderedFloat, OrderedNode};
 use crate::{
     INDEX_METADATA_SCHEMA_KEY, IndexMetadata, pb,
@@ -126,7 +127,7 @@ impl QuantizerMetadata for ProductQuantizationMetadata {
         }
     }
 
-    async fn load(reader: &PreviousFileReader) -> Result<Self> {
+    async fn load(reader: &V1FileReader) -> Result<Self> {
         let metadata = reader
             .schema()
             .metadata
@@ -196,13 +197,38 @@ impl ProductQuantizationStorage {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         codebook: FixedSizeListArray,
-        mut batch: RecordBatch,
+        batch: RecordBatch,
         num_bits: u32,
         num_sub_vectors: usize,
         dimension: usize,
         distance_type: DistanceType,
         transposed: bool,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
+    ) -> Result<Self> {
+        let frag_reuse_index = frag_reuse_index
+            .map(|index| Arc::new(FragReuseIndexHandle(index)) as Arc<dyn RowIdRemapper>);
+        Self::new_with_remapper(
+            codebook,
+            batch,
+            num_bits,
+            num_sub_vectors,
+            dimension,
+            distance_type,
+            transposed,
+            frag_reuse_index,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_remapper(
+        codebook: FixedSizeListArray,
+        mut batch: RecordBatch,
+        num_bits: u32,
+        num_sub_vectors: usize,
+        dimension: usize,
+        distance_type: DistanceType,
+        transposed: bool,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
     ) -> Result<Self> {
         if batch.num_columns() != 2 {
             log::warn!(
@@ -386,7 +412,7 @@ impl ProductQuantizationStorage {
         path: &Path,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
-        let reader = PreviousFileReader::try_new_self_described(object_store, path, None).await?;
+        let reader = V1FileReader::try_new_self_described(object_store, path, None).await?;
         let schema = reader.schema();
 
         let metadata_str = schema
@@ -469,7 +495,7 @@ impl ProductQuantizationStorage {
     ///
     pub async fn write_partition(
         &self,
-        writer: &mut PreviousFileWriter<ManifestDescribing>,
+        writer: &mut V1FileWriter<ManifestDescribing>,
     ) -> Result<usize> {
         let batch_size: usize = 10240; // TODO: make it configurable
         for offset in (0..self.batch.num_rows()).step_by(batch_size) {
@@ -533,6 +559,36 @@ impl QuantizerStorage for ProductQuantizationStorage {
         };
 
         Self::new(
+            codebook,
+            batch,
+            metadata.nbits,
+            metadata.num_sub_vectors,
+            metadata.dimension,
+            distance_type,
+            metadata.transposed,
+            frag_reuse_index,
+        )
+    }
+
+    fn try_from_batch_with_remapper(
+        batch: RecordBatch,
+        metadata: &Self::Metadata,
+        distance_type: DistanceType,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+    ) -> Result<Self> {
+        let distance_type = match distance_type {
+            DistanceType::Cosine => DistanceType::L2,
+            _ => distance_type,
+        };
+        let codebook = match &metadata.codebook {
+            Some(codebook) => codebook.clone(),
+            None => {
+                debug_assert!(!metadata.codebook_tensor.is_empty());
+                let codebook_tensor = pb::Tensor::decode(metadata.codebook_tensor.as_slice())?;
+                FixedSizeListArray::try_from(&codebook_tensor)?
+            }
+        };
+        Self::new_with_remapper(
             codebook,
             batch,
             metadata.nbits,
@@ -613,9 +669,9 @@ impl QuantizerStorage for ProductQuantizationStorage {
     ///
     /// Parameters
     /// ----------
-    /// - *reader: &PreviousFileReader
+    /// - *reader: &V1FileReader
     async fn load_partition(
-        reader: &PreviousFileReader,
+        reader: &V1FileReader,
         range: std::ops::Range<usize>,
         distance_type: DistanceType,
         metadata: &Self::Metadata,

@@ -279,6 +279,31 @@ impl IndexType {
         .max()
         .unwrap_or(1)
     }
+
+    pub fn matches_details(&self, details: &prost_types::Any) -> bool {
+        let url = &details.type_url;
+        match self {
+            Self::Scalar | Self::BTree => url.ends_with("BTreeIndexDetails"),
+            Self::Bitmap => url.ends_with("BitmapIndexDetails"),
+            Self::LabelList => url.ends_with("LabelListIndexDetails"),
+            Self::Inverted => url.ends_with("InvertedIndexDetails"),
+            Self::NGram => url.ends_with("NGramIndexDetails"),
+            Self::ZoneMap => url.ends_with("ZoneMapIndexDetails"),
+            Self::BloomFilter => url.ends_with("BloomFilterIndexDetails"),
+            Self::RTree => url.ends_with("RTreeIndexDetails"),
+            Self::Fm => url.ends_with("FMIndexDetails"),
+            Self::FragmentReuse => url.ends_with("FragmentReuseIndexDetails"),
+            Self::MemWal => url.ends_with("MemWalIndexDetails"),
+            Self::Vector
+            | Self::IvfFlat
+            | Self::IvfSq
+            | Self::IvfPq
+            | Self::IvfHnswSq
+            | Self::IvfHnswPq
+            | Self::IvfHnswFlat
+            | Self::IvfRq => url.ends_with("VectorIndexDetails"),
+        }
+    }
 }
 
 pub trait IndexParams: Send + Sync {

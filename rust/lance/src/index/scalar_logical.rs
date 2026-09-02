@@ -12,7 +12,9 @@ use futures::future::try_join_all;
 use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_core::{Error, Result};
 use lance_index::metrics::MetricsCollector;
-use lance_index::scalar::{AnyQuery, CreatedIndex, ScalarIndex, SearchResult, UpdateCriteria};
+use lance_index::scalar::{
+    AnyQuery, CreatedIndex, ScalarIndex, SearchOptions, SearchResult, UpdateCriteria,
+};
 use lance_index::{Index, IndexType};
 use lance_select::NullableRowAddrSet;
 use lance_table::format::IndexMetadata;
@@ -142,10 +144,20 @@ impl ScalarIndex for LogicalScalarIndex {
         query: &dyn AnyQuery,
         metrics: &dyn MetricsCollector,
     ) -> Result<SearchResult> {
+        self.search_with_options(query, SearchOptions::default(), metrics)
+            .await
+    }
+
+    async fn search_with_options(
+        &self,
+        query: &dyn AnyQuery,
+        options: SearchOptions,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<SearchResult> {
         let results = try_join_all(
             self.segments
                 .iter()
-                .map(|segment| segment.search(query, metrics)),
+                .map(|segment| segment.search_with_options(query, options, metrics)),
         )
         .await?;
         combine_search_results(results)
@@ -366,11 +378,14 @@ mod tests {
     use datafusion::scalar::ScalarValue;
     use lance_core::utils::address::RowAddress;
     use lance_core::utils::tempfile::TempStrDir;
-    use lance_datagen::array;
+    use lance_datagen::{ArrayGeneratorExt, array};
     use lance_index::IndexType;
     use lance_index::metrics::NoOpMetricsCollector;
     use lance_index::scalar::bitmap::BITMAP_LOOKUP_NAME;
-    use lance_index::scalar::{BuiltinIndexType, SargableQuery, ScalarIndexParams};
+    use lance_index::scalar::{
+        BuiltinIndexType, SargableQuery, ScalarIndexParams, SearchOptions, SearchResult,
+    };
+    use lance_select::{RowAddrTreeMap, RowSetOps};
 
     use crate::Dataset;
     use crate::dataset::WriteParams;
@@ -432,7 +447,10 @@ mod tests {
     async fn test_open_named_scalar_index_uses_all_btree_segments() {
         let test_dir = TempStrDir::default();
         let dataset = lance_datagen::gen_batch()
-            .col("value", array::step::<Int32Type>())
+            .col(
+                "value",
+                array::fill::<Int32Type>(7).with_nulls(&[true, false, true, true]),
+            )
             .into_dataset(
                 test_dir.as_str(),
                 FragmentCount::from(4),
@@ -473,6 +491,24 @@ mod tests {
             logical.calculate_included_frags().await.unwrap(),
             dataset.fragment_bitmap.as_ref().clone()
         );
+
+        let query = SargableQuery::Equals(ScalarValue::Int32(Some(99)));
+        let tracked = logical.search(&query, &NoOpMetricsCollector).await.unwrap();
+        let SearchResult::Exact(tracked) = tracked else {
+            panic!("BTree search should be exact");
+        };
+        assert!(tracked.true_rows().is_empty());
+        assert!(!tracked.null_rows().is_empty());
+
+        let untracked = logical
+            .search_with_options(
+                &query,
+                SearchOptions::default().with_track_nulls(false),
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+        assert_eq!(untracked, SearchResult::exact(RowAddrTreeMap::default()));
 
         let combined_bitmap = scalar_index_fragment_bitmap(&dataset, "value", "value_btree")
             .await
@@ -1492,6 +1528,224 @@ mod tests {
         assert!(
             row_addrs.true_rows().row_addrs().unwrap().count() > 0,
             "rows from live fragment should still be searchable"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ngram_segment_merge_rebuilds_after_deferred_compaction() {
+        let test_dir = TempStrDir::default();
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "text",
+            arrow_schema::DataType::Utf8,
+            true,
+        )]));
+        let make_batch = |values| {
+            arrow_array::RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(arrow_array::StringArray::from(values))],
+            )
+            .unwrap()
+        };
+        let reader = arrow_array::RecordBatchIterator::new(
+            vec![Ok(make_batch(vec![Some("alpha needle"), None]))],
+            schema.clone(),
+        );
+        Dataset::write(
+            reader,
+            test_dir.as_str(),
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let appended = arrow_array::RecordBatchIterator::new(
+            vec![Ok(make_batch(vec![
+                Some("beta needle"),
+                Some("gamma stack"),
+            ]))],
+            schema.clone(),
+        );
+        let mut dataset = Dataset::write(
+            appended,
+            test_dir.as_str(),
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::NGram);
+        let mut segments = Vec::new();
+        for fragment in dataset.get_fragments() {
+            segments.push(
+                CreateIndexBuilder::new(&mut dataset, &["text"], IndexType::NGram, &params)
+                    .name("text_ngram".to_string())
+                    .fragments(vec![fragment.id() as u32])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+            );
+        }
+        let source_version = segments[0].dataset_version;
+        dataset
+            .create_index(
+                &["text"],
+                IndexType::NGram,
+                Some("compaction_guard".to_string()),
+                &params,
+                false,
+            )
+            .await
+            .unwrap();
+
+        let metrics = compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 10,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(metrics.fragments_removed > 0 && metrics.fragments_added > 0);
+        assert!(dataset.version().version > source_version);
+
+        let direct_commit_err = dataset
+            .commit_existing_index_segments("text_ngram_direct", "text", segments.clone())
+            .await
+            .unwrap_err();
+        assert!(
+            direct_commit_err
+                .to_string()
+                .contains("must be rebuilt or merged")
+        );
+
+        let rebuild_version = dataset.version().version;
+        let merged = dataset
+            .merge_existing_index_segments(segments)
+            .await
+            .unwrap();
+        assert_eq!(merged.dataset_version, rebuild_version);
+        dataset
+            .commit_existing_index_segments("text_ngram", "text", vec![merged])
+            .await
+            .unwrap();
+
+        let committed = dataset.load_indices_by_name("text_ngram").await.unwrap();
+        assert_eq!(committed.len(), 1);
+        assert_eq!(committed[0].dataset_version, rebuild_version);
+        assert_eq!(
+            committed[0].fragment_bitmap.as_ref().unwrap(),
+            dataset.fragment_bitmap.as_ref()
+        );
+
+        let logical =
+            open_named_scalar_index(&dataset, "text", "text_ngram", &NoOpMetricsCollector)
+                .await
+                .unwrap();
+        let result = logical
+            .search(
+                &lance_index::scalar::TextQuery::StringContains("needle".to_string()),
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+        let row_addrs = match result {
+            SearchResult::AtMost(row_addrs) => row_addrs,
+            other => panic!("expected AtMost result from ngram, got {other:?}"),
+        };
+        assert_eq!(row_addrs.true_rows().row_addrs().unwrap().count(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_ngram_segment_merge_rejects_retired_coverage_without_remap() {
+        let test_dir = TempStrDir::default();
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "text",
+            arrow_schema::DataType::Utf8,
+            true,
+        )]));
+        let make_batch = |values| {
+            arrow_array::RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(arrow_array::StringArray::from(values))],
+            )
+            .unwrap()
+        };
+        let reader = arrow_array::RecordBatchIterator::new(
+            vec![Ok(make_batch(vec!["alpha", "beta"]))],
+            schema.clone(),
+        );
+        Dataset::write(
+            reader,
+            test_dir.as_str(),
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let appended = arrow_array::RecordBatchIterator::new(
+            vec![Ok(make_batch(vec!["gamma", "delta"]))],
+            schema,
+        );
+        let mut dataset = Dataset::write(
+            appended,
+            test_dir.as_str(),
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::NGram);
+        let mut segments = Vec::new();
+        for fragment in dataset.get_fragments() {
+            segments.push(
+                CreateIndexBuilder::new(&mut dataset, &["text"], IndexType::NGram, &params)
+                    .name("text_ngram".to_string())
+                    .fragments(vec![fragment.id() as u32])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+            );
+        }
+
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 10,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        let direct_err = dataset
+            .commit_existing_index_segments("text_ngram", "text", segments.clone())
+            .await
+            .unwrap_err();
+        assert!(direct_err.to_string().contains("must be rebuilt or merged"));
+
+        let merge_err = dataset
+            .merge_existing_index_segments(segments)
+            .await
+            .unwrap_err();
+        assert!(
+            merge_err
+                .to_string()
+                .contains("no applicable fragment-reuse mapping is available")
         );
     }
 

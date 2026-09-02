@@ -21,6 +21,21 @@
 //! bypass `object_store`'s HTTP client, so there is no place to install the
 //! connector for them.
 //!
+//! Neither layer sees the optimized local reads and writes ([`LocalObjectReader`],
+//! [`LocalWriter`], the io_uring readers, and the local `copy` / recursive delete
+//! shortcuts), which go straight to the filesystem. Those publish the same
+//! request-level metrics themselves through
+//! [`IOTracker::begin_io`](crate::utils::tracking_store::IOTracker::begin_io).
+//! The two are installed together, so a store either publishes for all of its
+//! IO or for none of it. A store built by calling a provider's `new_store`
+//! directly, bypassing both `ObjectStore` constructors — as
+//! [`ObjectStore::local`](crate::object_store::ObjectStore::local) and
+//! [`ObjectStore::memory`](crate::object_store::ObjectStore::memory) do — is in
+//! the "none of it" case.
+//!
+//! [`LocalObjectReader`]: crate::local::LocalObjectReader
+//! [`LocalWriter`]: crate::object_writer::LocalWriter
+//!
 //! Metrics carry a `base` label identifying the store. Its cardinality is
 //! controlled by the `LANCE_OBJECT_STORE_METRICS_LABEL` environment variable
 //! ([`BASE_LABEL_ENV_VAR`]):
@@ -777,9 +792,15 @@ pub use http::MeteringHttpConnector;
 mod tests {
     use super::*;
 
+    use lance_core::utils::tempfile::TempStdDir;
     use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
     use object_store::memory::InMemory;
     use object_store::{ObjectStoreExt, PutPayload};
+    use tokio::io::AsyncWriteExt;
+    use url::Url;
+
+    use crate::object_store::ObjectStore as LanceObjectStore;
+    use crate::traits::Writer;
 
     fn payload(data: &[u8]) -> PutPayload {
         PutPayload::from_bytes(Bytes::copy_from_slice(data))
@@ -1424,6 +1445,204 @@ mod tests {
         let list_labels = [("operation", "list"), ("base", "memory")];
         assert_eq!(counter_value(&recorded, METRIC_REQUESTS, &list_labels), 1);
         assert_eq!(counter_value(&recorded, METRIC_ERRORS, &list_labels), 1);
+    }
+
+    /// The optimized local reads and writes talk to the filesystem directly, so
+    /// they never reach [`MeteredObjectStore`] and publish these metrics
+    /// themselves. They must land under the same `base` label as the store's
+    /// metered operations, which for a local store is its scheme.
+    #[test]
+    fn test_local_filesystem_io_is_metered() {
+        let tmp = TempStdDir::default();
+        let dir = tmp.join("sub");
+        let data = b"hello world";
+        let recorded = capture_metrics(|| async {
+            // Built through the registry, like any store opened from a URI.
+            let (store, path) = LanceObjectStore::from_uri(dir.join("a.bin").to_str().unwrap())
+                .await
+                .unwrap();
+            // Writes go through LocalWriter.
+            store.put(&path, data).await.unwrap();
+
+            // Reads go through LocalObjectReader.
+            let reader = store.open(&path).await.unwrap();
+            assert_eq!(reader.size().await.unwrap(), data.len());
+            assert_eq!(reader.get_range(0..5).await.unwrap().len(), 5);
+            assert_eq!(reader.get_all().await.unwrap().len(), data.len());
+            // The file is smaller than the block size, so it streams as one chunk.
+            let chunks: Vec<_> = reader.get_stream().await.unwrap().collect().await;
+            assert_eq!(chunks.len(), 1);
+
+            // Copy and recursive delete both shortcut to the filesystem too.
+            store
+                .copy(&path, &Path::from_absolute_path(dir.join("b.bin")).unwrap())
+                .await
+                .unwrap();
+            store
+                .remove_dir_all(Path::from_absolute_path(&dir).unwrap())
+                .await
+                .unwrap();
+        });
+
+        let put_labels = [("operation", "put"), ("base", "file")];
+        assert_eq!(counter_value(&recorded, METRIC_REQUESTS, &put_labels), 1);
+        assert_eq!(
+            counter_value(&recorded, METRIC_BYTES, &put_labels),
+            data.len() as u64
+        );
+        assert_eq!(histogram_count(&recorded, METRIC_DURATION, &put_labels), 1);
+        assert_eq!(gauge_value(&recorded, METRIC_IN_FLIGHT, &put_labels), 0.0);
+
+        // One request each for the range read, the full read and the single
+        // streamed chunk.
+        let get_labels = [("operation", "get"), ("base", "file")];
+        assert_eq!(counter_value(&recorded, METRIC_REQUESTS, &get_labels), 3);
+        assert_eq!(
+            counter_value(&recorded, METRIC_BYTES, &get_labels),
+            (5 + 2 * data.len()) as u64
+        );
+        assert_eq!(histogram_count(&recorded, METRIC_DURATION, &get_labels), 3);
+        assert_eq!(gauge_value(&recorded, METRIC_IN_FLIGHT, &get_labels), 0.0);
+
+        // The size lookup is the local equivalent of a HEAD, and transfers no
+        // payload bytes.
+        let head_labels = [("operation", "head"), ("base", "file")];
+        assert_eq!(counter_value(&recorded, METRIC_REQUESTS, &head_labels), 1);
+        assert_eq!(counter_value(&recorded, METRIC_BYTES, &head_labels), 0);
+
+        for operation in ["copy", "delete"] {
+            let labels = [("operation", operation), ("base", "file")];
+            assert_eq!(counter_value(&recorded, METRIC_REQUESTS, &labels), 1);
+            assert_eq!(counter_value(&recorded, METRIC_BYTES, &labels), 0);
+        }
+
+        assert_eq!(counter_value(&recorded, METRIC_ERRORS, &get_labels), 0);
+        assert_eq!(counter_value(&recorded, METRIC_ERRORS, &put_labels), 0);
+    }
+
+    #[test]
+    fn test_local_read_error_is_counted() {
+        let tmp = TempStdDir::default();
+        let recorded = capture_metrics(|| async {
+            let (store, path) = LanceObjectStore::from_uri(tmp.join("a.bin").to_str().unwrap())
+                .await
+                .unwrap();
+            store.put(&path, b"hello").await.unwrap();
+
+            let reader = store.open(&path).await.unwrap();
+            // Reading past the end of the file fails.
+            assert!(reader.get_range(0..100).await.is_err());
+        });
+
+        let labels = [("operation", "get"), ("base", "file")];
+        assert_eq!(counter_value(&recorded, METRIC_ERRORS, &labels), 1);
+        // A failed read is still counted as a request, with latency recorded.
+        assert_eq!(counter_value(&recorded, METRIC_REQUESTS, &labels), 1);
+        assert_eq!(histogram_count(&recorded, METRIC_DURATION, &labels), 1);
+        assert_eq!(counter_value(&recorded, METRIC_BYTES, &labels), 0);
+    }
+
+    /// A local write is reported as a single `put` covering the whole file, so it
+    /// stays in flight until the file is persisted under its final path.
+    #[test]
+    fn test_local_write_is_in_flight_until_persisted() {
+        let tmp = TempStdDir::default();
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let labels = [("operation", "put"), ("base", "file")];
+        metrics::with_local_recorder(&recorder, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let (store, path) = LanceObjectStore::from_uri(tmp.join("a.bin").to_str().unwrap())
+                    .await
+                    .unwrap();
+                let mut writer = store.create(&path).await.unwrap();
+                writer.write_all(b"hello").await.unwrap();
+
+                let recorded = snapshot(&snapshotter);
+                assert_eq!(gauge_value(&recorded, METRIC_IN_FLIGHT, &labels), 1.0);
+                assert_eq!(counter_value(&recorded, METRIC_REQUESTS, &labels), 0);
+
+                Writer::shutdown(writer.as_mut()).await.unwrap();
+                let recorded = snapshot(&snapshotter);
+                assert_eq!(gauge_value(&recorded, METRIC_IN_FLIGHT, &labels), 0.0);
+                assert_eq!(counter_value(&recorded, METRIC_REQUESTS, &labels), 1);
+                assert_eq!(counter_value(&recorded, METRIC_BYTES, &labels), 5);
+            });
+        });
+    }
+
+    /// A store handed in by the caller is metered like one built by the registry.
+    #[test]
+    fn test_caller_supplied_store_is_metered() {
+        let recorded = capture_metrics(|| async {
+            #[allow(deprecated)]
+            let params = crate::object_store::ObjectStoreParams {
+                object_store: Some((
+                    Arc::new(InMemory::new()) as Arc<dyn object_store::ObjectStore>,
+                    Url::parse("memory:///").unwrap(),
+                )),
+                ..Default::default()
+            };
+            let (store, _) = LanceObjectStore::from_uri_and_params(
+                Arc::new(crate::object_store::ObjectStoreRegistry::default()),
+                "memory:///",
+                &params,
+            )
+            .await
+            .unwrap();
+            store.put(&Path::from("a"), b"hello").await.unwrap();
+        });
+
+        assert_eq!(
+            counter_value(
+                &recorded,
+                METRIC_REQUESTS,
+                &[("operation", "put"), ("base", "memory")]
+            ),
+            1
+        );
+    }
+
+    /// `ObjectStore::new` is how `DatasetBuilder` wraps a caller-supplied store,
+    /// so it must meter both halves of the store: the operations that go through
+    /// `inner`, and the local ones that bypass it. Metering only one half would
+    /// report a partial picture that reads like a complete one.
+    #[test]
+    fn test_store_built_from_new_is_metered() {
+        let tmp = TempStdDir::default();
+        let recorded = capture_metrics(|| async {
+            let store = LanceObjectStore::new(
+                Arc::new(object_store::local::LocalFileSystem::new()),
+                Url::parse("file:///").unwrap(),
+                None,
+                None,
+                false,
+                false,
+                1,
+                3,
+                None,
+            );
+            let path = Path::from_absolute_path(tmp.join("a.bin")).unwrap();
+            // put and open bypass `inner` and publish for themselves.
+            store.put(&path, b"hello").await.unwrap();
+            let reader = store.open(&path).await.unwrap();
+            assert_eq!(reader.get_all().await.unwrap().len(), 5);
+            // delete goes through `inner`, so only MeteredObjectStore can count it.
+            store.delete(&path).await.unwrap();
+        });
+
+        for (operation, bytes) in [("put", 5), ("get", 5), ("delete", 0)] {
+            let labels = [("operation", operation), ("base", "file")];
+            assert_eq!(
+                counter_value(&recorded, METRIC_REQUESTS, &labels),
+                1,
+                "expected one {operation} request"
+            );
+            assert_eq!(counter_value(&recorded, METRIC_BYTES, &labels), bytes);
+        }
     }
 
     /// A store whose stream-producing operations always yield an error, used to

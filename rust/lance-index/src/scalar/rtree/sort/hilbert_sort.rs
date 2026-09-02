@@ -21,7 +21,6 @@ use geoarrow_array::{GeoArrowArray, GeoArrowArrayAccessor};
 use lance_core::Result;
 use lance_datafusion::exec::{LanceExecutionOptions, OneShotExec, execute_plan};
 use lance_geo::bbox::{BoundingBox, bounding_box};
-use std::any::Any;
 use std::sync::Arc;
 
 const HILBERT_FIELD_NAME: &str = "_hilbert";
@@ -149,10 +148,6 @@ impl HilbertUDF {
 }
 
 impl ScalarUDFImpl for HilbertUDF {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         HILBERT_UDF_NAME
     }

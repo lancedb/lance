@@ -242,6 +242,9 @@ query_result = ds.to_table(full_text_query=(q1 & q2))
 
 To combine `OR` queries via operators, use the pattern `q1 | q2`.
 
+Every query combined with `AND` becomes a scoring `MUST` clause: all clauses must match,
+and every matching clause contributes to the final `_score`.
+
 #### Exclude terms: `NOT`
 
 Queries that exclude specific keywords are explicitly written using `BooleanQuery`/`Occur`

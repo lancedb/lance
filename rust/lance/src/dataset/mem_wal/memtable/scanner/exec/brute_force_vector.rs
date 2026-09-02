@@ -11,7 +11,6 @@
 //! or new rows in the window between commit and next memtable rotation), this
 //! exec keeps KNN correct by computing exact distances row-by-row.
 
-use std::any::Any;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
@@ -40,7 +39,7 @@ use crate::dataset::mem_wal::write::BatchStore;
 /// Distance metric used when [`VectorQuery::distance_type`] is `None`. The
 /// indexed path defers to the index's own metric, but with no index there is
 /// no inherent default — L2 matches what most callers configure and what the
-/// flushed/base arms use when re-ranking unindexed candidates.
+/// SSTable/base arms use when re-ranking unindexed candidates.
 const DEFAULT_DISTANCE_TYPE: DistanceType = DistanceType::L2;
 
 /// Brute-force KNN over an active memtable without an HNSW. Produces the same
@@ -48,7 +47,7 @@ const DEFAULT_DISTANCE_TYPE: DistanceType = DistanceType::L2;
 pub struct MemTableBruteForceVectorExec {
     batch_store: Arc<BatchStore>,
     query: VectorQuery,
-    max_visible_batch_position: usize,
+    readable_count: usize,
     projection: Option<Vec<usize>>,
     output_schema: SchemaRef,
     properties: Arc<PlanProperties>,
@@ -69,10 +68,7 @@ impl Debug for MemTableBruteForceVectorExec {
         f.debug_struct("MemTableBruteForceVectorExec")
             .field("column", &self.query.column)
             .field("k", &self.query.k)
-            .field(
-                "max_visible_batch_position",
-                &self.max_visible_batch_position,
-            )
+            .field("readable_count", &self.readable_count)
             .field("with_row_id", &self.with_row_id)
             .finish()
     }
@@ -85,7 +81,7 @@ impl MemTableBruteForceVectorExec {
     pub fn new(
         batch_store: Arc<BatchStore>,
         query: VectorQuery,
-        max_visible_batch_position: usize,
+        readable_count: usize,
         projection: Option<Vec<usize>>,
         base_schema: SchemaRef,
         with_row_id: bool,
@@ -111,7 +107,7 @@ impl MemTableBruteForceVectorExec {
         Ok(Self {
             batch_store,
             query,
-            max_visible_batch_position,
+            readable_count,
             projection,
             output_schema,
             properties,
@@ -160,23 +156,23 @@ impl MemTableBruteForceVectorExec {
         Ok(Some(mask))
     }
 
-    /// Last row position visible under `max_visible_batch_position`, or `None`
-    /// if no batches are visible. Identical to `VectorIndexExec`'s helper so
-    /// both arms cut at the same MVCC boundary.
-    fn compute_max_visible_row(&self) -> Option<u64> {
-        let mut max_visible_row_exclusive: u64 = 0;
+    /// Last row position within `readable_count`, or `None` if nothing is
+    /// readable. Identical to `VectorIndexExec`'s helper so both arms cut at
+    /// the same bound.
+    fn compute_max_readable_row(&self) -> Option<u64> {
+        let mut max_readable_row_exclusive: u64 = 0;
         let mut current_row: u64 = 0;
 
         for (batch_position, stored_batch) in self.batch_store.iter().enumerate() {
             let batch_end = current_row + stored_batch.num_rows as u64;
-            if batch_position <= self.max_visible_batch_position {
-                max_visible_row_exclusive = batch_end;
+            if batch_position < self.readable_count {
+                max_readable_row_exclusive = batch_end;
             }
             current_row = batch_end;
         }
 
-        if max_visible_row_exclusive > 0 {
-            Some(max_visible_row_exclusive - 1)
+        if max_readable_row_exclusive > 0 {
+            Some(max_readable_row_exclusive - 1)
         } else {
             None
         }
@@ -208,7 +204,7 @@ impl MemTableBruteForceVectorExec {
         if self.query.k == 0 {
             return Ok(Vec::new());
         }
-        let Some(max_visible_row) = self.compute_max_visible_row() else {
+        let Some(max_readable_row) = self.compute_max_readable_row() else {
             return Ok(Vec::new());
         };
         let query_flat = self.query_as_flat()?;
@@ -225,8 +221,8 @@ impl MemTableBruteForceVectorExec {
                 newest_pk_positions(
                     &self.batch_store,
                     pk_columns,
-                    self.max_visible_batch_position,
-                    max_visible_row,
+                    self.readable_count,
+                    max_readable_row,
                 )
                 .map_err(|e| Error::invalid_input(e.to_string()))?,
             )
@@ -235,7 +231,7 @@ impl MemTableBruteForceVectorExec {
         };
 
         // Walk batches in append order. `current_row` is the global row offset
-        // of the *next* row about to be visited; rows past `max_visible_row`
+        // of the *next* row about to be visited; rows past `max_readable_row`
         // are dropped before they reach the heap.
         let mut current_row: u64 = 0;
         let mut candidates: Vec<(f32, u64)> = Vec::new();
@@ -245,7 +241,7 @@ impl MemTableBruteForceVectorExec {
             if n == 0 {
                 continue;
             }
-            if batch_position > self.max_visible_batch_position {
+            if batch_position >= self.readable_count {
                 current_row += n as u64;
                 continue;
             }
@@ -280,7 +276,7 @@ impl MemTableBruteForceVectorExec {
 
             for row in 0..n {
                 let pos = current_row + row as u64;
-                if pos > max_visible_row {
+                if pos > max_readable_row {
                     break;
                 }
                 // Skip superseded versions: only the newest version of each PK is
@@ -426,10 +422,6 @@ impl ExecutionPlan for MemTableBruteForceVectorExec {
         "MemTableBruteForceVectorExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.output_schema.clone()
     }
@@ -466,12 +458,12 @@ impl ExecutionPlan for MemTableBruteForceVectorExec {
         )))
     }
 
-    fn partition_statistics(&self, _partition: Option<usize>) -> DataFusionResult<Statistics> {
-        Ok(Statistics {
+    fn partition_statistics(&self, _partition: Option<usize>) -> DataFusionResult<Arc<Statistics>> {
+        Ok(Arc::new(Statistics {
             num_rows: Precision::Exact(self.query.k),
             total_byte_size: Precision::Absent,
             column_statistics: vec![],
-        })
+        }))
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
@@ -615,7 +607,7 @@ mod tests {
             MemTableBruteForceVectorExec::new(
                 store,
                 query,
-                /* max_visible_batch_position = */ usize::MAX,
+                /* readable_count = */ usize::MAX,
                 None,
                 schema,
                 false,
@@ -668,7 +660,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn respects_max_visible_batch_position() {
+    async fn respects_indexed_count() {
         // Two batches of two rows. Freeze at batch 0 — only ids 0,1 are
         // visible candidates; the (closer) ids 2,3 in batch 1 are excluded.
         let schema = make_schema();
@@ -678,7 +670,7 @@ mod tests {
         let query = query_for([0.0, 0.0], 4);
         let exec = Arc::new(
             MemTableBruteForceVectorExec::new(
-                store, query, /* max_visible_batch_position = */ 0, None, schema, false,
+                store, query, /* readable_count = */ 1, None, schema, false,
             )
             .expect("ctor"),
         );
