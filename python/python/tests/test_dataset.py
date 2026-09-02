@@ -5420,6 +5420,25 @@ def test_detached_commits(tmp_path: Path):
     assert detached2.to_table() == pa.table({"x": [0, 1, 3]})
 
 
+def test_detached_raw_arrow_merge_strips_transaction_metadata(tmp_path: Path):
+    dataset = lance.write_dataset(pa.table({"x": [0, 1]}), tmp_path)
+    fragment = dataset.get_fragments()[0].metadata
+    with pytest.deprecated_call():
+        operation = lance.LanceOperation.Merge([fragment], dataset.schema, True)
+
+    detached = lance.LanceDataset.commit(
+        dataset,
+        operation,
+        read_version=dataset.version,
+        detached=True,
+    )
+
+    assert detached.to_table() == dataset.to_table()
+    assert b"lance:transaction_schema_source_raw_arrow" not in (
+        detached.schema.metadata or {}
+    )
+
+
 def test_dataset_drop(tmp_path: Path):
     table = pa.table({"x": [0]})
     lance.write_dataset(table, tmp_path)

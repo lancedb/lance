@@ -11,8 +11,9 @@
 //! metadata it stamps, the validation that runs before it.
 
 use crate::feature_flags::{
-    FLAG_COVERED_INDEX_METADATA, FLAG_STABLE_ROW_IDS, apply_feature_flags,
+    FLAG_COVERED_INDEX_METADATA, FLAG_STABLE_FIELD_IDS, FLAG_STABLE_ROW_IDS, apply_feature_flags,
     ensure_can_read_manifest, ensure_can_write_manifest, inherit_sticky_feature_flags,
+    validate_stable_field_id_flags,
 };
 use crate::format::overlay::TOMBSTONE_FIELD_ID;
 use crate::format::{
@@ -32,7 +33,9 @@ use crate::system_index::mem_wal::{
 use crate::transaction::UpdateMode::{RewriteColumns, RewriteRows};
 use crate::transaction::row_version::resolve_update_version_metadata;
 use crate::transaction::update_map::apply_update_map;
-use crate::transaction::validate::merge_fragment_physically_rewritten;
+use crate::transaction::validate::{
+    merge_fragment_physically_rewritten, validate_stable_field_id_manifest,
+};
 use crate::transaction::{
     CoverageIdentity, DataReplacementGroup, LogicalIndexSegments, Operation, ReadVersionState,
     RewriteGroup, Transaction, UpdatedFragmentOffsets,
@@ -115,6 +118,16 @@ impl Transaction {
         manifest.max_fragment_id = manifest
             .max_fragment_id
             .max(current_manifest.max_fragment_id);
+        if current_manifest.uses_stable_field_ids() {
+            let Some(restored_max_field_id) = manifest.max_allocated_field_id else {
+                return Err(Error::invalid_input(format!(
+                    "Cannot restore version {version}: stable field IDs were activated after that version"
+                )));
+            };
+            manifest.max_allocated_field_id =
+                Some(restored_max_field_id.max(current_manifest.max_field_id()));
+            manifest.writer_feature_flags |= FLAG_STABLE_FIELD_IDS;
+        }
         // Row ids are a high-water mark like fragment ids: rewinding hands old ids to new rows.
         manifest.next_row_id = manifest.next_row_id.max(current_manifest.next_row_id);
         // Turning stable row ids off would revert `_rowid` to row addresses, whose
@@ -1290,6 +1303,16 @@ impl Transaction {
             )
         };
 
+        if config.activate_stable_field_ids {
+            let already_active = current_manifest
+                .map(|manifest| manifest.uses_stable_field_ids())
+                .unwrap_or(false);
+            if !already_active {
+                manifest.activate_stable_field_ids();
+                manifest.writer_feature_flags |= FLAG_STABLE_FIELD_IDS;
+            }
+        }
+
         manifest.tag.clone_from(&self.tag);
 
         if config.auto_set_feature_flags {
@@ -1335,6 +1358,7 @@ impl Transaction {
         manifest.set_timestamp(config.timestamp_nanos);
 
         manifest.update_max_fragment_id();
+        manifest.update_max_field_id();
 
         match &self.operation {
             Operation::Overwrite {
@@ -1518,6 +1542,9 @@ impl Transaction {
             manifest.next_row_id = next_row_id;
         }
 
+        validate_stable_field_id_flags(&manifest)?;
+        validate_stable_field_id_manifest(&manifest)?;
+
         Ok((manifest, final_indices))
     }
 
@@ -1571,6 +1598,57 @@ mod tests {
             DataStorageFormat::new(ConcreteFileVersion::V2_0),
             HashMap::new(),
         )
+    }
+
+    #[test]
+    fn new_dataset_preserves_legacy_field_id_allocation_by_default() {
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new("id", DataType::Int32, false)]);
+        let mut schema = LanceSchema::try_from(&arrow_schema).unwrap();
+        schema.try_set_field_id(None).unwrap();
+        let transaction = Transaction::new(
+            0,
+            Operation::Overwrite {
+                fragments: vec![],
+                schema,
+                config_upsert_values: None,
+                initial_bases: None,
+            },
+            None,
+        );
+
+        let (manifest, _) = transaction
+            .build_manifest(None, vec![], "txn", &default_build_config())
+            .unwrap();
+
+        assert_eq!(manifest.max_allocated_field_id, None);
+        assert_eq!(manifest.reader_feature_flags & FLAG_STABLE_FIELD_IDS, 0);
+        assert_eq!(manifest.writer_feature_flags & FLAG_STABLE_FIELD_IDS, 0);
+    }
+
+    #[test]
+    fn activation_sets_writer_gate_when_auto_flags_are_disabled() {
+        let manifest = sample_manifest();
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::UpdateConfig {
+                config_updates: None,
+                table_metadata_updates: None,
+                schema_metadata_updates: None,
+                field_metadata_updates: HashMap::new(),
+            },
+            None,
+        );
+        let mut config = default_build_config();
+        config.auto_set_feature_flags = false;
+        config.activate_stable_field_ids = true;
+
+        let (activated, _) = transaction
+            .build_manifest(Some(&manifest), vec![], "txn", &config)
+            .unwrap();
+
+        assert!(activated.uses_stable_field_ids());
+        assert_eq!(activated.reader_feature_flags & FLAG_STABLE_FIELD_IDS, 0);
+        assert_ne!(activated.writer_feature_flags & FLAG_STABLE_FIELD_IDS, 0);
     }
 
     #[test]

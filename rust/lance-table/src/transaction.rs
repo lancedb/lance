@@ -47,7 +47,11 @@ pub use operation::{
 pub use update_map::{
     UpdateMap, UpdateMapEntry, translate_config_updates, translate_schema_metadata_updates,
 };
-pub use validate::validate_operation;
+pub use validate::{
+    TRANSACTION_SCHEMA_SOURCE_RAW_ARROW, canonicalize_stable_field_ids,
+    validate_detached_stable_field_ids, validate_operation, validate_stable_field_id_manifest,
+    validate_stable_field_id_transition,
+};
 
 use crate::format::{IndexMetadata, Manifest};
 use roaring::RoaringBitmap;

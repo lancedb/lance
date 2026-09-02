@@ -15,6 +15,338 @@ use lance_core::{Error, Result};
 use lance_file::version::ConcreteFileVersion;
 use std::collections::{HashMap, HashSet};
 
+type DataFileIdentity = (Option<u32>, String);
+
+#[derive(Default)]
+struct FieldIdRemap {
+    canonical_ids: HashSet<i32>,
+    explicit_ids: HashMap<i32, i32>,
+    raw_source_ids: HashMap<i32, i32>,
+}
+
+/// Transient schema-metadata marker used by bindings for raw Arrow input.
+pub const TRANSACTION_SCHEMA_SOURCE_RAW_ARROW: &str = "lance:transaction_schema_source_raw_arrow";
+
+/// Canonicalize schema identities supplied by a transaction before validation.
+///
+/// Arrow field-ID metadata is descriptive input, not allocation authority. New
+/// datasets allocate from zero, while stable datasets preserve compatible
+/// existing identities and allocate every new identity above the persisted
+/// high-water mark. File mappings written against the incoming schema are
+/// updated in the same step; files retained by a merge are never rewritten.
+pub fn canonicalize_stable_field_ids(
+    manifest: Option<&Manifest>,
+    operation: &mut Operation,
+) -> Result<()> {
+    let raw_arrow_schema = match operation {
+        Operation::Overwrite { schema, .. }
+        | Operation::Project { schema, .. }
+        | Operation::Merge { schema, .. } => schema
+            .metadata
+            .remove(TRANSACTION_SCHEMA_SOURCE_RAW_ARROW)
+            .is_some(),
+        _ => false,
+    };
+    if manifest.is_some_and(|manifest| !manifest.uses_stable_field_ids()) {
+        if raw_arrow_schema {
+            match operation {
+                Operation::Overwrite { schema, .. }
+                | Operation::Project { schema, .. }
+                | Operation::Merge { schema, .. } => {
+                    // Legacy datasets retain the standalone Arrow conversion
+                    // contract. Missing IDs still need to be assigned after the
+                    // transient provenance marker has been removed.
+                    schema.try_set_field_id(None)?;
+                    schema.validate()?;
+                    schema.verify_primary_key()?;
+                }
+                _ => {}
+            }
+        }
+        return Ok(());
+    }
+
+    match operation {
+        Operation::Overwrite {
+            schema, fragments, ..
+        } => {
+            let field_id_remap =
+                canonicalize_schema(manifest, schema, !raw_arrow_schema, raw_arrow_schema)?;
+            remap_fragment_field_ids(fragments, &field_id_remap, &HashSet::new())?;
+        }
+        Operation::Project { schema, .. } if raw_arrow_schema => {
+            let Some(manifest) = manifest else {
+                return Ok(());
+            };
+            canonicalize_raw_project_schema(manifest, schema)?;
+        }
+        Operation::Merge {
+            schema, fragments, ..
+        } => {
+            let Some(manifest) = manifest else {
+                return Ok(());
+            };
+            let retained_files = manifest
+                .fragments
+                .iter()
+                .flat_map(|fragment| fragment.referenced_lance_files())
+                .map(|file| (file.base_id, file.path.clone()))
+                .collect();
+            if raw_arrow_schema {
+                let field_id_remap = canonicalize_schema(Some(manifest), schema, false, true)?;
+                remap_fragment_field_ids(fragments, &field_id_remap, &retained_files)?;
+            }
+            canonicalize_merge_replacements(manifest, schema, fragments, &retained_files)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn canonicalize_merge_replacements(
+    manifest: &Manifest,
+    schema: &mut Schema,
+    fragments: &mut [Fragment],
+    retained_files: &HashSet<DataFileIdentity>,
+) -> Result<()> {
+    let mut replaced_field_ids = HashSet::new();
+    for fragment in fragments.iter() {
+        let retained_field_ids = fragment
+            .referenced_lance_files()
+            .filter(|file| retained_files.contains(&(file.base_id, file.path.clone())))
+            .flat_map(|file| file.fields.iter().copied())
+            .collect::<HashSet<_>>();
+        replaced_field_ids.extend(
+            fragment
+                .referenced_lance_files()
+                .filter(|file| !retained_files.contains(&(file.base_id, file.path.clone())))
+                .flat_map(|file| file.fields.iter().copied())
+                .filter(|field_id| retained_field_ids.contains(field_id)),
+        );
+    }
+    if replaced_field_ids.is_empty() {
+        return Ok(());
+    }
+
+    let original = schema.clone();
+    let max_field_id = manifest.max_field_id();
+    for field in &mut schema.fields {
+        clear_replaced_and_new_field_ids(field, max_field_id, &replaced_field_ids);
+    }
+    schema.try_set_field_id(Some(max_field_id))?;
+    schema.validate()?;
+    schema.verify_primary_key()?;
+
+    let mut field_id_remap = FieldIdRemap::default();
+    for (original, canonical) in original.fields_pre_order().zip(schema.fields_pre_order()) {
+        field_id_remap.canonical_ids.insert(canonical.id);
+        if original.id >= 0 {
+            field_id_remap
+                .explicit_ids
+                .insert(original.id, canonical.id);
+        }
+    }
+    remap_fragment_field_ids(fragments, &field_id_remap, retained_files)?;
+    Ok(())
+}
+
+fn clear_replaced_and_new_field_ids(
+    field: &mut Field,
+    max_field_id: i32,
+    replaced_field_ids: &HashSet<i32>,
+) {
+    if field.id > max_field_id || replaced_field_ids.contains(&field.id) {
+        clear_field_ids(field);
+        return;
+    }
+    for child in &mut field.children {
+        clear_replaced_and_new_field_ids(child, max_field_id, replaced_field_ids);
+    }
+}
+
+fn canonicalize_raw_project_schema(manifest: &Manifest, schema: &mut Schema) -> Result<()> {
+    let mut unmatched_fields = Vec::new();
+    for field in &mut schema.fields {
+        if !canonicalize_field(field, -1, &manifest.schema, None, true) {
+            unmatched_fields.push(field.name.clone());
+        }
+    }
+    if !unmatched_fields.is_empty() {
+        return Err(Error::invalid_input(format!(
+            "Raw Arrow Project fields [{}] do not match existing field identities; Project cannot allocate new identities because it writes no data",
+            unmatched_fields.join(", ")
+        )));
+    }
+    schema.validate()?;
+    schema.verify_primary_key()?;
+    Ok(())
+}
+
+fn canonicalize_schema(
+    manifest: Option<&Manifest>,
+    schema: &mut Schema,
+    allow_id_binding: bool,
+    remap_raw_source_ids: bool,
+) -> Result<FieldIdRemap> {
+    let original = schema.clone();
+    let raw_source = if remap_raw_source_ids {
+        let mut raw_source = original.clone();
+        raw_source.try_set_field_id(None)?;
+        Some(raw_source)
+    } else {
+        None
+    };
+
+    let max_existing_id = manifest.map(Manifest::max_field_id);
+    if manifest.is_none() {
+        schema.try_reassign_field_ids(max_existing_id)?;
+    } else if let Some(manifest) = manifest {
+        for field in &mut schema.fields {
+            canonicalize_field(field, -1, &manifest.schema, None, allow_id_binding);
+        }
+        schema.try_set_field_id(max_existing_id)?;
+    }
+    schema.validate()?;
+    schema.verify_primary_key()?;
+
+    let mut field_id_remap = FieldIdRemap::default();
+    for (original, canonical) in original.fields_pre_order().zip(schema.fields_pre_order()) {
+        field_id_remap.canonical_ids.insert(canonical.id);
+        if original.id >= 0 {
+            field_id_remap
+                .explicit_ids
+                .insert(original.id, canonical.id);
+        }
+    }
+    if let Some(raw_source) = raw_source {
+        field_id_remap.raw_source_ids.extend(
+            raw_source
+                .fields_pre_order()
+                .zip(schema.fields_pre_order())
+                .map(|(source, canonical)| (source.id, canonical.id)),
+        );
+    }
+    Ok(field_id_remap)
+}
+
+fn canonicalize_field(
+    field: &mut Field,
+    parent_id: i32,
+    base_schema: &Schema,
+    base_parent: Option<&Field>,
+    allow_id_binding: bool,
+) -> bool {
+    let same_name = match base_parent {
+        Some(parent) => parent.children.iter().find(|base| base.name == field.name),
+        None => base_schema
+            .fields
+            .iter()
+            .find(|base| base.name == field.name),
+    };
+    let by_id = (allow_id_binding && field.id >= 0)
+        .then(|| base_schema.field_by_id(field.id))
+        .flatten()
+        .filter(|base| base.parent_id == parent_id);
+    let base_field = if allow_id_binding && field.id >= 0 {
+        by_id
+            .filter(|base| base.logical_type == field.logical_type)
+            .or_else(|| same_name.filter(|base| base.logical_type == field.logical_type))
+    } else {
+        same_name.filter(|base| base.logical_type == field.logical_type)
+    };
+
+    let Some(base_field) = base_field else {
+        clear_field_ids(field);
+        return false;
+    };
+
+    field.id = base_field.id;
+    field.parent_id = parent_id;
+    let mut all_children_match = true;
+    for child in &mut field.children {
+        if !canonicalize_field(
+            child,
+            field.id,
+            base_schema,
+            Some(base_field),
+            allow_id_binding,
+        ) {
+            all_children_match = false;
+        }
+    }
+    all_children_match
+}
+
+fn clear_field_ids(field: &mut Field) {
+    field.id = -1;
+    field.parent_id = -1;
+    for child in &mut field.children {
+        clear_field_ids(child);
+    }
+}
+
+fn remap_fragment_field_ids(
+    fragments: &mut [Fragment],
+    field_id_remap: &FieldIdRemap,
+    retained_files: &HashSet<DataFileIdentity>,
+) -> Result<()> {
+    for fragment in fragments {
+        let source_ids = if field_id_remap.raw_source_ids.is_empty() {
+            &field_id_remap.explicit_ids
+        } else {
+            // Raw Arrow overwrite fragments may have been written either by a
+            // standalone writer using the source schema IDs or by a
+            // dataset-aware writer using canonical IDs. Resolve that namespace
+            // once for the whole fragment so split files cannot disagree. If
+            // both interpretations are possible and produce different
+            // identities then there is no safe mapping without provenance.
+            let fragment_field_ids = fragment
+                .referenced_lance_files()
+                .filter(|file| !retained_files.contains(&(file.base_id, file.path.clone())))
+                .flat_map(|file| file.fields.iter().copied())
+                .filter(|field_id| *field_id >= 0)
+                .collect::<HashSet<_>>();
+            let canonical_source = fragment_field_ids
+                .iter()
+                .all(|field_id| field_id_remap.canonical_ids.contains(field_id));
+            let raw_source = fragment_field_ids
+                .iter()
+                .all(|field_id| field_id_remap.raw_source_ids.contains_key(field_id));
+            let raw_changes_identity = fragment_field_ids
+                .iter()
+                .any(|field_id| field_id_remap.raw_source_ids.get(field_id) != Some(field_id));
+
+            match (canonical_source, raw_source, raw_changes_identity) {
+                (true, true, true) => {
+                    return Err(Error::invalid_input(format!(
+                        "Fragment {} has ambiguous raw Arrow field IDs; its file mappings can be interpreted as either source or canonical identities",
+                        fragment.id
+                    )));
+                }
+                (true, _, _) => continue,
+                (false, true, _) => &field_id_remap.raw_source_ids,
+                (false, false, _) => {
+                    return Err(Error::invalid_input(format!(
+                        "Fragment {} field IDs do not match either the raw Arrow source schema or the canonical replacement schema",
+                        fragment.id
+                    )));
+                }
+            }
+        };
+        for file in fragment.referenced_lance_files_mut() {
+            if retained_files.contains(&(file.base_id, file.path.clone())) {
+                continue;
+            }
+            for field_id in std::sync::Arc::make_mut(&mut file.fields) {
+                if let Some(canonical_id) = source_ids.get(field_id) {
+                    *field_id = *canonical_id;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Validate the operation is valid for the given manifest.
 pub fn validate_operation(manifest: Option<&Manifest>, operation: &Operation) -> Result<()> {
     let manifest = match (manifest, operation) {
@@ -40,7 +372,7 @@ pub fn validate_operation(manifest: Option<&Manifest>, operation: &Operation) ->
         }
     };
 
-    match operation {
+    let result = match operation {
         Operation::Append { fragments } => {
             // Fragments must contain all fields in the schema
             schema_fragments_valid(Some(manifest), &manifest.schema, fragments)
@@ -94,6 +426,164 @@ pub fn validate_operation(manifest: Option<&Manifest>, operation: &Operation) ->
             }
             Ok(())
         }
+        _ => Ok(()),
+    };
+    result?;
+    validate_stable_field_id_operation(manifest, operation)
+}
+
+/// Validate stable-field-ID invariants that are independent of one operation.
+pub fn validate_stable_field_id_manifest(manifest: &Manifest) -> Result<()> {
+    let Some(max_allocated_field_id) = manifest.max_allocated_field_id else {
+        return Ok(());
+    };
+    let max_referenced_field_id = manifest.max_referenced_field_id();
+    if max_allocated_field_id < max_referenced_field_id {
+        return Err(Error::invalid_input(format!(
+            "Stable field-ID high-water mark {} is below referenced field ID {}",
+            max_allocated_field_id, max_referenced_field_id
+        )));
+    }
+    Ok(())
+}
+
+/// Validate newly referenced field IDs before advancing the high-water mark.
+///
+/// A data-only operation must not manufacture allocator state by putting an
+/// otherwise unknown ID in a data-file or overlay mapping. IDs above the parent
+/// high-water mark are legal only when the canonical successor schema contains
+/// that newly allocated identity. Overwrite has no retained physical state, so
+/// every non-negative reference must belong to its replacement schema.
+pub fn validate_stable_field_id_transition(
+    parent: &Manifest,
+    successor: &Manifest,
+    operation: &Operation,
+) -> Result<()> {
+    let Some(parent_max_field_id) = parent.max_allocated_field_id else {
+        return Ok(());
+    };
+    let Some(successor_max_field_id) = successor.max_allocated_field_id else {
+        return Err(Error::invalid_input(
+            "Stable field-ID activation marker is missing from the successor manifest",
+        ));
+    };
+    if successor_max_field_id < parent_max_field_id {
+        return Err(Error::invalid_input(format!(
+            "Stable field-ID high-water mark decreases from {parent_max_field_id} to {successor_max_field_id}"
+        )));
+    }
+    let successor_schema_ids = successor
+        .schema
+        .fields_pre_order()
+        .map(|field| field.id)
+        .collect::<HashSet<_>>();
+
+    if !matches!(operation, Operation::Restore { .. }) {
+        validate_new_field_ids(
+            parent,
+            successor
+                .schema
+                .fields_pre_order()
+                .filter(|field| parent.schema.field_by_id(field.id).is_none()),
+        )?;
+    }
+
+    for field_id in successor
+        .fragments
+        .iter()
+        .flat_map(|fragment| fragment.referenced_lance_files())
+        .flat_map(|file| file.fields.iter())
+        .copied()
+        .filter(|field_id| *field_id >= 0)
+    {
+        if matches!(operation, Operation::Overwrite { .. })
+            && !successor_schema_ids.contains(&field_id)
+        {
+            return Err(Error::invalid_input(format!(
+                "Overwrite references field ID {field_id}, which is not in its replacement schema"
+            )));
+        }
+        if field_id > parent_max_field_id && !successor_schema_ids.contains(&field_id) {
+            return Err(Error::invalid_input(format!(
+                "Data file or overlay references new field ID {field_id}, but the canonical successor schema does not contain that identity"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_new_field_ids<'a>(
+    manifest: &Manifest,
+    new_fields: impl Iterator<Item = &'a Field>,
+) -> Result<()> {
+    let max_allocated_field_id = manifest.max_field_id();
+    for field in new_fields {
+        if field.id <= max_allocated_field_id {
+            return Err(Error::invalid_input(format!(
+                "New field '{}' has ID {}, but stable field IDs must be greater than the high-water mark {}",
+                field.name, field.id, max_allocated_field_id
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_stable_field_id_operation(manifest: &Manifest, operation: &Operation) -> Result<()> {
+    if !manifest.uses_stable_field_ids() {
+        return Ok(());
+    }
+    validate_stable_field_id_manifest(manifest)?;
+
+    let (Operation::Overwrite { schema, .. }
+    | Operation::Merge { schema, .. }
+    | Operation::Project { schema, .. }) = operation
+    else {
+        return Ok(());
+    };
+    schema.validate()?;
+
+    for field in schema.fields_pre_order() {
+        let Some(prior_field) = manifest.schema.field_by_id(field.id) else {
+            continue;
+        };
+        if field.parent_id != prior_field.parent_id {
+            return Err(Error::invalid_input(format!(
+                "Field ID {} moves from parent {} to parent {}; stable field identity cannot move between parents",
+                field.id, prior_field.parent_id, field.parent_id
+            )));
+        }
+        if field.logical_type != prior_field.logical_type {
+            return Err(Error::invalid_input(format!(
+                "Field ID {} changes logical type from {} to {}; type replacement must allocate a new field ID",
+                field.id, prior_field.logical_type, field.logical_type
+            )));
+        }
+    }
+
+    validate_new_field_ids(
+        manifest,
+        schema
+            .fields_pre_order()
+            .filter(|field| manifest.schema.field_by_id(field.id).is_none()),
+    )
+}
+
+/// Reject detached schema changes once stable field identity is active.
+pub fn validate_detached_stable_field_ids(
+    manifest: &Manifest,
+    operation: &Operation,
+) -> Result<()> {
+    if !manifest.uses_stable_field_ids() {
+        return Ok(());
+    }
+    match operation {
+        Operation::Merge { schema, .. } if schema == &manifest.schema => Ok(()),
+        Operation::Merge { .. }
+        | Operation::Project { .. }
+        | Operation::Overwrite { .. }
+        | Operation::Restore { .. } => Err(Error::invalid_input(
+            "Detached commits cannot change schema after stable field IDs are activated",
+        )),
         _ => Ok(()),
     }
 }
@@ -342,7 +832,7 @@ fn merge_schema_valid(
             fragment
                 .files
                 .iter()
-                .any(|file| file.fields.contains(&field.id))
+                .any(|file| file_materializes_field(file.fields.as_ref(), field))
         });
         if !materialized {
             return Err(Error::invalid_input(format!(
@@ -355,6 +845,14 @@ fn merge_schema_valid(
     }
 
     Ok(())
+}
+
+fn file_materializes_field(file_field_ids: &[i32], field: &Field) -> bool {
+    file_field_ids.contains(&field.id)
+        || field
+            .children
+            .iter()
+            .any(|child| file_materializes_field(file_field_ids, child))
 }
 
 fn is_field_binding_fully_rewritten(
@@ -528,6 +1026,534 @@ mod tests {
             DataStorageFormat::new(ConcreteFileVersion::V2_0),
             HashMap::new(),
         )
+    }
+
+    fn activated_manifest() -> Manifest {
+        let schema = one_field_schema();
+        let mut manifest = manifest_with_file_fields(schema, vec![0]);
+        manifest.activate_stable_field_ids();
+        manifest
+    }
+
+    #[test]
+    fn stable_field_ids_allow_reserved_ids_above_high_water_mark() {
+        let mut manifest = activated_manifest();
+        manifest.max_allocated_field_id = Some(5);
+        let mut schema = manifest.schema.clone();
+        let mut new_field =
+            LanceCoreField::try_from(&ArrowField::new("b", DataType::Int32, true)).unwrap();
+        new_field.id = 6;
+        schema.fields.push(new_field);
+        let valid = Operation::Project {
+            schema: schema.clone(),
+            preserves_nullability: true,
+        };
+        validate_operation(Some(&manifest), &valid).unwrap();
+
+        schema.fields.last_mut().unwrap().id = 7;
+        let reserved = Operation::Project {
+            schema: schema.clone(),
+            preserves_nullability: true,
+        };
+        validate_operation(Some(&manifest), &reserved).unwrap();
+
+        schema.fields.last_mut().unwrap().id = 5;
+        let reused = Operation::Project {
+            schema,
+            preserves_nullability: true,
+        };
+        let err = validate_operation(Some(&manifest), &reused).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("greater than the high-water mark 5"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn stable_field_ids_require_fresh_identity_for_type_replacement() {
+        let manifest = activated_manifest();
+        let mut schema = manifest.schema.clone();
+        schema.fields[0].logical_type = LogicalType::try_from(&DataType::Float32).unwrap();
+        let operation = Operation::Project {
+            schema,
+            preserves_nullability: true,
+        };
+
+        let err = validate_operation(Some(&manifest), &operation).unwrap_err();
+
+        assert!(err.to_string().contains("type replacement"), "{err}");
+    }
+
+    #[test]
+    fn stable_field_ids_allow_overwrite_to_preserve_compatible_identity() {
+        let manifest = activated_manifest();
+        let schema = manifest.schema.clone();
+        let operation = Operation::Overwrite {
+            fragments: vec![fragment_with_file_fields(0, "new.lance", vec![0])],
+            schema,
+            config_upsert_values: None,
+            initial_bases: None,
+        };
+
+        validate_operation(Some(&manifest), &operation).unwrap();
+    }
+
+    #[test]
+    fn canonicalize_overwrite_remaps_hostile_arrow_field_ids() {
+        let manifest = activated_manifest();
+        let mut schema = one_field_schema();
+        schema.fields[0].id = i32::MAX;
+        let mut operation = Operation::Overwrite {
+            fragments: vec![fragment_with_file_fields(0, "new.lance", vec![i32::MAX])],
+            schema,
+            config_upsert_values: None,
+            initial_bases: None,
+        };
+
+        canonicalize_stable_field_ids(Some(&manifest), &mut operation).unwrap();
+
+        let Operation::Overwrite {
+            schema, fragments, ..
+        } = operation
+        else {
+            unreachable!();
+        };
+        assert_eq!(schema.fields[0].id, 0);
+        assert_eq!(fragments[0].files[0].fields.as_ref(), &[0]);
+    }
+
+    #[test]
+    fn canonicalize_overwrite_remaps_standalone_fragment_field_ids() {
+        let manifest = activated_manifest();
+        let mut schema = one_field_schema();
+        schema.fields[0].id = -1;
+        schema.metadata.insert(
+            TRANSACTION_SCHEMA_SOURCE_RAW_ARROW.to_string(),
+            String::new(),
+        );
+        let mut operation = Operation::Overwrite {
+            fragments: vec![fragment_with_file_fields(0, "new.lance", vec![0])],
+            schema,
+            config_upsert_values: None,
+            initial_bases: None,
+        };
+
+        canonicalize_stable_field_ids(Some(&manifest), &mut operation).unwrap();
+
+        let Operation::Overwrite {
+            schema, fragments, ..
+        } = operation
+        else {
+            unreachable!();
+        };
+        assert_eq!(schema.fields[0].id, 0);
+        assert_eq!(fragments[0].files[0].fields.as_ref(), &[0]);
+    }
+
+    #[test]
+    fn canonicalize_raw_arrow_overwrite_matches_reordered_fields_by_name() {
+        let schema = LanceSchema::try_from(&ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, true),
+            ArrowField::new("b", DataType::Int32, true),
+        ]))
+        .unwrap();
+        let mut manifest = manifest_with_file_fields(schema, vec![0, 1]);
+        manifest.activate_stable_field_ids();
+        let mut raw_schema = LanceSchema::try_from(&ArrowSchema::new(vec![
+            ArrowField::new("b", DataType::Int32, true),
+            ArrowField::new("a", DataType::Int32, true),
+        ]))
+        .unwrap();
+        raw_schema.metadata.insert(
+            TRANSACTION_SCHEMA_SOURCE_RAW_ARROW.to_string(),
+            String::new(),
+        );
+        let mut operation = Operation::Overwrite {
+            fragments: vec![],
+            schema: raw_schema,
+            config_upsert_values: None,
+            initial_bases: None,
+        };
+
+        canonicalize_stable_field_ids(Some(&manifest), &mut operation).unwrap();
+
+        let Operation::Overwrite { schema, .. } = operation else {
+            unreachable!();
+        };
+        assert_eq!(schema.field("b").unwrap().id, 1);
+        assert_eq!(schema.field("a").unwrap().id, 0);
+    }
+
+    #[test]
+    fn canonicalize_overwrite_preserves_already_canonical_fragment_field_ids() {
+        let manifest = activated_manifest();
+        let mut schema = LanceSchema::try_from(&ArrowSchema::new(vec![
+            ArrowField::new("b", DataType::Int32, true),
+            ArrowField::new("c", DataType::Int32, true),
+        ]))
+        .unwrap();
+        schema.fields[0].id = 1;
+        schema.fields[1].id = 2;
+        schema.metadata.insert(
+            TRANSACTION_SCHEMA_SOURCE_RAW_ARROW.to_string(),
+            String::new(),
+        );
+        let mut operation = Operation::Overwrite {
+            fragments: vec![fragment_with_file_fields(0, "new.lance", vec![1, 2])],
+            schema,
+            config_upsert_values: None,
+            initial_bases: None,
+        };
+
+        canonicalize_stable_field_ids(Some(&manifest), &mut operation).unwrap();
+
+        let Operation::Overwrite {
+            schema, fragments, ..
+        } = operation
+        else {
+            unreachable!();
+        };
+        assert_eq!(
+            schema
+                .fields_pre_order()
+                .map(|field| field.id)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(fragments[0].files[0].fields.as_ref(), &[1, 2]);
+    }
+
+    #[test]
+    fn canonicalize_overwrite_uses_one_raw_namespace_for_split_files() {
+        let manifest = activated_manifest();
+        let mut schema = LanceSchema::try_from(&ArrowSchema::new(vec![
+            ArrowField::new("b", DataType::Int32, true),
+            ArrowField::new("c", DataType::Int32, true),
+        ]))
+        .unwrap();
+        for field in &mut schema.fields {
+            field.id = -1;
+        }
+        schema.metadata.insert(
+            TRANSACTION_SCHEMA_SOURCE_RAW_ARROW.to_string(),
+            String::new(),
+        );
+        let mut fragment = fragment_with_file_fields(0, "b.lance", vec![0]);
+        fragment
+            .files
+            .push(DataFile::new_legacy_from_fields("c.lance", vec![1], None));
+        let mut operation = Operation::Overwrite {
+            fragments: vec![fragment],
+            schema,
+            config_upsert_values: None,
+            initial_bases: None,
+        };
+
+        canonicalize_stable_field_ids(Some(&manifest), &mut operation).unwrap();
+
+        let Operation::Overwrite {
+            schema, fragments, ..
+        } = operation
+        else {
+            unreachable!();
+        };
+        assert_eq!(
+            schema
+                .fields_pre_order()
+                .map(|field| field.id)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(fragments[0].files[0].fields.as_ref(), &[1]);
+        assert_eq!(fragments[0].files[1].fields.as_ref(), &[2]);
+    }
+
+    #[test]
+    fn canonicalize_overwrite_rejects_ambiguous_raw_field_ids() {
+        let manifest = activated_manifest();
+        let mut schema = LanceSchema::try_from(&ArrowSchema::new(vec![
+            ArrowField::new("b", DataType::Int32, true),
+            ArrowField::new("c", DataType::Int32, true),
+        ]))
+        .unwrap();
+        schema.fields[0].id = 2;
+        schema.fields[1].id = 1;
+        schema.metadata.insert(
+            TRANSACTION_SCHEMA_SOURCE_RAW_ARROW.to_string(),
+            String::new(),
+        );
+        let mut operation = Operation::Overwrite {
+            fragments: vec![fragment_with_file_fields(0, "new.lance", vec![2, 1])],
+            schema,
+            config_upsert_values: None,
+            initial_bases: None,
+        };
+
+        let err = canonicalize_stable_field_ids(Some(&manifest), &mut operation).unwrap_err();
+
+        assert!(err.to_string().contains("ambiguous raw Arrow field IDs"));
+    }
+
+    #[test]
+    fn canonicalize_raw_arrow_project_rejects_unmatched_field() {
+        let manifest = activated_manifest();
+        let mut schema = one_field_schema();
+        schema.fields[0].name = "renamed".to_string();
+        schema.fields[0].id = -1;
+        schema.metadata.insert(
+            TRANSACTION_SCHEMA_SOURCE_RAW_ARROW.to_string(),
+            String::new(),
+        );
+        let mut operation = Operation::Project {
+            schema,
+            preserves_nullability: true,
+        };
+
+        let err = canonicalize_stable_field_ids(Some(&manifest), &mut operation).unwrap_err();
+
+        assert!(err.to_string().contains("writes no data"), "{err}");
+    }
+
+    #[test]
+    fn canonicalize_raw_arrow_project_preserves_explicit_existing_identity() {
+        let manifest = activated_manifest();
+        let mut schema = one_field_schema();
+        schema.fields[0].name = "renamed".to_string();
+        schema.metadata.insert(
+            TRANSACTION_SCHEMA_SOURCE_RAW_ARROW.to_string(),
+            String::new(),
+        );
+        let mut operation = Operation::Project {
+            schema,
+            preserves_nullability: true,
+        };
+
+        canonicalize_stable_field_ids(Some(&manifest), &mut operation).unwrap();
+
+        let Operation::Project { schema, .. } = operation else {
+            unreachable!();
+        };
+        assert_eq!(schema.fields[0].name, "renamed");
+        assert_eq!(schema.fields[0].id, 0);
+    }
+
+    #[test]
+    fn canonicalize_raw_arrow_schema_for_legacy_dataset() {
+        let manifest = manifest_with_file_fields(one_field_schema(), vec![0]);
+        let mut schema = one_field_schema();
+        schema.fields[0].id = -1;
+        schema.metadata.insert(
+            TRANSACTION_SCHEMA_SOURCE_RAW_ARROW.to_string(),
+            String::new(),
+        );
+        let mut operation = Operation::Project {
+            schema,
+            preserves_nullability: true,
+        };
+
+        canonicalize_stable_field_ids(Some(&manifest), &mut operation).unwrap();
+
+        let Operation::Project { schema, .. } = operation else {
+            unreachable!();
+        };
+        assert_eq!(schema.fields[0].id, 0);
+        assert!(
+            !schema
+                .metadata
+                .contains_key(TRANSACTION_SCHEMA_SOURCE_RAW_ARROW)
+        );
+    }
+
+    #[test]
+    fn canonicalize_merge_preserves_identity_for_physical_rewrite() {
+        let mut manifest = activated_manifest();
+        Arc::make_mut(&mut manifest.fragments).push(fragment_with_file_fields(
+            1,
+            "retained.lance",
+            vec![0],
+        ));
+        let rewritten_fragment = fragment_with_file_fields(0, "replacement.lance", vec![0]);
+        let mut operation = Operation::Merge {
+            fragments: vec![rewritten_fragment, manifest.fragments[1].clone()],
+            schema: manifest.schema.clone(),
+            preserves_nullability: true,
+        };
+
+        canonicalize_stable_field_ids(Some(&manifest), &mut operation).unwrap();
+
+        let Operation::Merge {
+            schema, fragments, ..
+        } = operation
+        else {
+            unreachable!();
+        };
+        assert_eq!(schema.fields[0].id, 0);
+        assert_eq!(fragments[0].files[0].fields.as_ref(), &[0]);
+        assert_eq!(fragments[1].files[0].fields.as_ref(), &[0]);
+        validate_operation(
+            Some(&manifest),
+            &Operation::Merge {
+                fragments,
+                schema,
+                preserves_nullability: true,
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn canonicalize_merge_allocates_fresh_identity_for_overlaid_column() {
+        let manifest = activated_manifest();
+        let mut merged_fragment = manifest.fragments[0].clone();
+        merged_fragment.files.push(DataFile::new_legacy_from_fields(
+            "replacement.lance",
+            vec![0],
+            None,
+        ));
+        let mut operation = Operation::Merge {
+            fragments: vec![merged_fragment],
+            schema: manifest.schema.clone(),
+            preserves_nullability: true,
+        };
+
+        canonicalize_stable_field_ids(Some(&manifest), &mut operation).unwrap();
+
+        let Operation::Merge {
+            schema, fragments, ..
+        } = operation
+        else {
+            unreachable!();
+        };
+        assert_eq!(schema.fields[0].id, 1);
+        assert_eq!(fragments[0].files[0].fields.as_ref(), &[0]);
+        assert_eq!(fragments[0].files[1].fields.as_ref(), &[1]);
+    }
+
+    #[test]
+    fn canonicalize_merge_rejects_ambiguous_raw_field_ids() {
+        let manifest = activated_manifest();
+        let mut schema = LanceSchema::try_from(&ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, true),
+            ArrowField::new("b", DataType::Int32, true),
+            ArrowField::new("c", DataType::Int32, true),
+        ]))
+        .unwrap();
+        schema.fields[0].id = 0;
+        schema.fields[1].id = 2;
+        schema.fields[2].id = 1;
+        schema.metadata.insert(
+            TRANSACTION_SCHEMA_SOURCE_RAW_ARROW.to_string(),
+            String::new(),
+        );
+        let mut merged_fragment = manifest.fragments[0].clone();
+        merged_fragment.files.push(DataFile::new_legacy_from_fields(
+            "new.lance",
+            vec![1, 2],
+            None,
+        ));
+        let mut operation = Operation::Merge {
+            fragments: vec![merged_fragment],
+            schema,
+            preserves_nullability: true,
+        };
+
+        let err = canonicalize_stable_field_ids(Some(&manifest), &mut operation).unwrap_err();
+
+        assert!(err.to_string().contains("ambiguous raw Arrow field IDs"));
+    }
+
+    #[test]
+    fn stable_field_id_manifest_rejects_high_water_mark_below_overlay_reference() {
+        let mut manifest = activated_manifest();
+        Arc::make_mut(&mut manifest.fragments)[0]
+            .overlays
+            .push(DataOverlayFile {
+                data_file: DataFile::new_legacy_from_fields("overlay.lance", vec![7], None),
+                coverage: OverlayCoverage::Shared(Arc::new(RoaringBitmap::from_iter([0_u32]))),
+                committed_version: 1,
+            });
+
+        let err = validate_stable_field_id_manifest(&manifest).unwrap_err();
+
+        assert!(
+            err.to_string().contains("below referenced field ID 7"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn stable_field_id_transition_rejects_file_only_allocator_advance() {
+        let manifest = activated_manifest();
+        let mut successor = Manifest::new_from_previous(
+            &manifest,
+            manifest.schema.clone(),
+            Arc::new(vec![fragment_with_file_fields(0, "new.lance", vec![0, 1])]),
+        );
+        successor.max_allocated_field_id = manifest.max_allocated_field_id;
+        let operation = Operation::UpdateConfig {
+            config_updates: None,
+            table_metadata_updates: None,
+            schema_metadata_updates: None,
+            field_metadata_updates: HashMap::new(),
+        };
+
+        let err =
+            validate_stable_field_id_transition(&manifest, &successor, &operation).unwrap_err();
+
+        assert!(
+            err.to_string().contains("canonical successor schema"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn stable_field_id_transition_rejects_decreasing_high_water_mark() {
+        let manifest = activated_manifest();
+        let mut successor = Manifest::new_from_previous(
+            &manifest,
+            manifest.schema.clone(),
+            manifest.fragments.clone(),
+        );
+        successor.max_allocated_field_id = Some(manifest.max_field_id() - 1);
+        let operation = Operation::UpdateConfig {
+            config_updates: None,
+            table_metadata_updates: None,
+            schema_metadata_updates: None,
+            field_metadata_updates: HashMap::new(),
+        };
+
+        let err =
+            validate_stable_field_id_transition(&manifest, &successor, &operation).unwrap_err();
+
+        assert!(
+            err.to_string().contains("high-water mark decreases"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn detached_stable_field_ids_allow_data_only_merge_and_reject_schema_change() {
+        let manifest = activated_manifest();
+        let data_only = Operation::Merge {
+            fragments: manifest.fragments.as_ref().clone(),
+            schema: manifest.schema.clone(),
+            preserves_nullability: true,
+        };
+        validate_detached_stable_field_ids(&manifest, &data_only).unwrap();
+
+        let mut changed_schema = manifest.schema.clone();
+        changed_schema.fields[0].name = "renamed".to_string();
+        let schema_change = Operation::Project {
+            schema: changed_schema,
+            preserves_nullability: true,
+        };
+        let err = validate_detached_stable_field_ids(&manifest, &schema_change).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Detached commits cannot change schema"),
+            "{err}"
+        );
     }
 
     #[rstest::rstest]

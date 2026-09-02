@@ -16,15 +16,12 @@ from pathlib import Path
 import lance
 import pyarrow as pa
 
-from .compat_decorator import (
-    UpgradeDowngradeTest,
-    compat_test,
-)
+from .compat_decorator import DatasetUpgradeDowngradeTest, compat_test
 from .util import safe_data_storage_version
 
 
 @compat_test(min_version="0.30.0")
-class BTreeIndex(UpgradeDowngradeTest):
+class BTreeIndex(DatasetUpgradeDowngradeTest):
     """Test BTREE scalar index compatibility (introduced in 0.20.0).
 
     Started fully working in 0.30.0 with various fixes.
@@ -80,7 +77,7 @@ class BTreeIndex(UpgradeDowngradeTest):
 
 
 @compat_test(min_version="0.22.0")
-class BitmapLabelListIndex(UpgradeDowngradeTest):
+class BitmapLabelListIndex(DatasetUpgradeDowngradeTest):
     """Test BITMAP and LABEL_LIST scalar index compatibility (introduced in 0.20.0).
 
     Started fully working in 0.22.0 with fixes to LABEL_LIST index.
@@ -138,7 +135,7 @@ class BitmapLabelListIndex(UpgradeDowngradeTest):
 
 
 @compat_test(min_version="0.36.0")
-class NgramIndex(UpgradeDowngradeTest):
+class NgramIndex(DatasetUpgradeDowngradeTest):
     """Test NGRAM index compatibility (introduced in 0.36.0)."""
 
     def __init__(self, path: Path):
@@ -187,7 +184,7 @@ class NgramIndex(UpgradeDowngradeTest):
 
 
 @compat_test(min_version="0.36.0")
-class ZonemapBloomfilterIndex(UpgradeDowngradeTest):
+class ZonemapBloomfilterIndex(DatasetUpgradeDowngradeTest):
     """Test ZONEMAP and BLOOMFILTER index compatibility (introduced in 0.36.0)."""
 
     def __init__(self, path: Path):
@@ -264,11 +261,11 @@ class ZonemapBloomfilterIndex(UpgradeDowngradeTest):
 
     def skip_downgrade(self, version: str) -> bool:
         # In 0.X the zonemap index did not properly handle NULL in filters
-        return version.startswith("0.")
+        return super().skip_downgrade(version) or version.startswith("0.")
 
 
 @compat_test(min_version="0.36.0")
-class JsonIndex(UpgradeDowngradeTest):
+class JsonIndex(DatasetUpgradeDowngradeTest):
     """Test JSON index compatibility (introduced in 0.36.0)."""
 
     def __init__(self, path: Path):
@@ -324,7 +321,7 @@ class JsonIndex(UpgradeDowngradeTest):
 
 
 @compat_test(min_version="0.36.0")
-class FtsIndex(UpgradeDowngradeTest):
+class FtsIndex(DatasetUpgradeDowngradeTest):
     """Test FTS (full-text search) index compatibility (introduced in 0.36.0)."""
 
     def __init__(self, path: Path):
@@ -379,7 +376,7 @@ class FtsIndex(UpgradeDowngradeTest):
         ds.optimize.compact_files()
 
     def skip_downgrade(self, version: str) -> bool:
-        return version.startswith("0.")
+        return super().skip_downgrade(version) or version.startswith("0.")
 
     def current_env(self, method_name: str) -> dict[str, str]:
         if method_name == "create":

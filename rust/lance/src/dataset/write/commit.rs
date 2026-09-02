@@ -28,7 +28,6 @@ use crate::{
 
 use super::{WriteDestination, resolve_commit_handler};
 use crate::dataset::branch_location::BranchLocation;
-use crate::dataset::transaction::validate_operation;
 use lance_core::utils::tracing::{DATASET_COMMITTED_EVENT, TRACE_DATASET_EVENTS};
 use tracing::info;
 
@@ -55,6 +54,8 @@ pub struct CommitBuilder<'a> {
     timeout: Option<Duration>,
     /// When `Some`, this commit is the second step of `migrate_to_stable_row_ids`.
     migration_next_row_id: Option<u64>,
+    /// Whether this commit atomically activates stable field IDs.
+    activate_stable_field_ids: bool,
 }
 
 /// Default timeout applied to [`CommitBuilder::execute`] when none is set.
@@ -80,6 +81,7 @@ impl<'a> CommitBuilder<'a> {
             transaction_properties: None,
             timeout: Some(DEFAULT_COMMIT_TIMEOUT),
             migration_next_row_id: None,
+            activate_stable_field_ids: false,
         }
     }
 
@@ -279,6 +281,11 @@ impl<'a> CommitBuilder<'a> {
         self
     }
 
+    pub(crate) fn with_stable_field_id_migration_activation(mut self) -> Self {
+        self.activate_stable_field_ids = true;
+        self
+    }
+
     pub async fn execute(self, transaction: Transaction) -> Result<Dataset> {
         let timeout = self.timeout;
         if let Some(t) = timeout
@@ -390,14 +397,6 @@ impl<'a> CommitBuilder<'a> {
             ));
         }
 
-        // Validate the operation before proceeding with the commit
-        // This ensures that operations like Merge have proper validation for data integrity
-        if let Some(dataset) = dest.dataset() {
-            validate_operation(Some(&dataset.manifest), &transaction.operation)?;
-        } else {
-            validate_operation(None, &transaction.operation)?;
-        }
-
         let (metadata_cache, index_cache) = match &dest {
             WriteDestination::Dataset(ds) => (ds.metadata_cache.clone(), ds.index_cache.clone()),
             WriteDestination::Uri(uri) => (
@@ -443,6 +442,7 @@ impl<'a> CommitBuilder<'a> {
             use_stable_row_ids,
             storage_format: self.storage_format.map(DataStorageFormat::new),
             migration_next_row_id: self.migration_next_row_id,
+            activate_stable_field_ids: self.activate_stable_field_ids,
             ..Default::default()
         };
 
