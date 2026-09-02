@@ -537,6 +537,7 @@ pub struct TwoFileShuffler {
     output_dir: Path,
     num_partitions: usize,
     batch_size_bytes: usize,
+    max_preloaded_offsets_bytes: usize,
 
     progress: Arc<dyn crate::progress::IndexBuildProgress>,
 }
@@ -548,6 +549,7 @@ impl TwoFileShuffler {
             output_dir,
             num_partitions,
             batch_size_bytes: shuffle_batch_bytes(),
+            max_preloaded_offsets_bytes: MAX_PRELOADED_OFFSETS_BYTES,
             progress: crate::progress::noop_progress(),
         }
     }
@@ -560,6 +562,12 @@ impl TwoFileShuffler {
     #[cfg(test)]
     fn with_batch_size_bytes(mut self, batch_size_bytes: usize) -> Self {
         self.batch_size_bytes = batch_size_bytes;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_max_preloaded_offsets_bytes(mut self, max_preloaded_offsets_bytes: usize) -> Self {
+        self.max_preloaded_offsets_bytes = max_preloaded_offsets_bytes;
         self
     }
 }
@@ -660,12 +668,11 @@ impl Shuffler for TwoFileShuffler {
         let mut total_loss = 0.0f64;
         let mut accumulated: Vec<RecordBatch> = Vec::new();
         let mut acc_bytes: usize = 0;
-        // Keep the partition-boundary offsets computed at flush time. The
-        // sidecar is still written for on-demand reopen. The reader that
-        // consumes this shuffle uses these prefix sums instead of re-decoding
-        // the file, so partition sizes cannot drift from the flush that
-        // produced them.
-        let mut written_offsets: Vec<u64> = Vec::new();
+        // Keep flush-time prefix sums so the consumer does not have to re-decode
+        // the sidecar. Drop the in-memory copy once it would exceed
+        // `max_preloaded_offsets_bytes`; the sidecar remains the bounded
+        // on-demand fallback.
+        let mut written_offsets = BoundedWrittenOffsets::new(self.max_preloaded_offsets_bytes);
 
         let mut data = std::pin::pin!(data);
         while let Some(batch) = data.next().await {
@@ -734,8 +741,8 @@ impl Shuffler for TwoFileShuffler {
             num_batches,
             partition_counts,
             total_loss,
-            MAX_PRELOADED_OFFSETS_BYTES,
-            Some(written_offsets),
+            self.max_preloaded_offsets_bytes,
+            written_offsets.into_offsets(),
         )
         .await
     }
@@ -752,7 +759,7 @@ async fn flush_shuffle_batch(
     offsets_schema: Arc<Schema>,
     num_partitions: usize,
     global_row_count: u64,
-    written_offsets: &mut Vec<u64>,
+    written_offsets: &mut BoundedWrittenOffsets,
 ) -> Result<(u64, Vec<u64>)> {
     // Clone part-id columns into the CPU task (cheap: Arc ref bump, not data copy).
     let part_id_cols: Vec<UInt32Array> = accumulated
@@ -811,7 +818,7 @@ async fn flush_shuffle_batch(
             total_rows
         )));
     }
-    written_offsets.extend_from_slice(&adjusted_offsets);
+    written_offsets.retain(&adjusted_offsets)?;
     let offsets_batch = RecordBatch::try_new(
         offsets_schema,
         vec![Arc::new(UInt64Array::from(adjusted_offsets))],
@@ -929,9 +936,26 @@ impl TwoFileShuffleReader {
             );
             validator.push(&written_offsets)?;
             validator.finish()?;
-            // The sidecar is still on disk for reopen. Prefer the prefix sums
-            // computed at flush time over a decode of that ephemeral file.
-            ShuffleOffsets::Preloaded(written_offsets)
+            if should_preload_offsets(written_offsets.len(), max_preloaded_offsets_bytes)? {
+                // Prefer the prefix sums computed at flush time over a decode
+                // of the ephemeral sidecar.
+                ShuffleOffsets::Preloaded(written_offsets)
+            } else {
+                // Writer-side copy exceeded the resident-memory bound. The
+                // sidecar is still on disk; validate-and-stream it on demand.
+                drop(written_offsets);
+                load_shuffle_offsets_from_file(
+                    &scheduler,
+                    &offsets_path,
+                    expected_offsets,
+                    num_batches,
+                    num_partitions,
+                    file_reader.num_rows(),
+                    &partition_counts,
+                    false,
+                )
+                .await?
+            }
         } else {
             let should_preload_offsets =
                 should_preload_offsets(expected_offsets, max_preloaded_offsets_bytes)?;
@@ -1118,6 +1142,51 @@ fn should_preload_offsets(expected_offsets: usize, max_bytes: usize) -> Result<b
             ))
         })?;
     Ok(offsets_bytes <= max_bytes)
+}
+
+/// Writer-side prefix sums kept only while they fit in `max_bytes`.
+///
+/// Once a flush would exceed the bound the in-memory copy is dropped; the
+/// offsets sidecar remains the on-demand fallback. Checking before `extend`
+/// avoids a `Vec` realloc that could temporarily double resident capacity.
+struct BoundedWrittenOffsets {
+    offsets: Option<Vec<u64>>,
+    max_bytes: usize,
+}
+
+impl BoundedWrittenOffsets {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            offsets: Some(Vec::new()),
+            max_bytes,
+        }
+    }
+
+    fn retain(&mut self, new_offsets: &[u64]) -> Result<()> {
+        let Some(offsets) = self.offsets.as_mut() else {
+            return Ok(());
+        };
+        let new_len = offsets
+            .len()
+            .checked_add(new_offsets.len())
+            .ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "written offset count {} + {} overflows usize",
+                    offsets.len(),
+                    new_offsets.len()
+                ))
+            })?;
+        if should_preload_offsets(new_len, self.max_bytes)? {
+            offsets.extend_from_slice(new_offsets);
+        } else {
+            self.offsets = None;
+        }
+        Ok(())
+    }
+
+    fn into_offsets(self) -> Option<Vec<u64>> {
+        self.offsets
+    }
 }
 
 async fn open_shuffle_offsets_reader(
@@ -2213,7 +2282,7 @@ mod tests {
 
         let fallback_reader = TwoFileShuffleReader::try_new_with_preload_limit(
             Arc::new(ObjectStore::local()),
-            output_dir,
+            output_dir.clone(),
             3,
             2,
             vec![1, 2, 1],
@@ -2230,6 +2299,59 @@ mod tests {
         assert_eq!(window.partition_range, 1..2);
         assert_eq!(window.partitions.len(), 1);
         assert_eq!(window.partitions[0].partition_id, 1);
+
+        // Writer-side offsets that exceed the byte cap must take the same
+        // sidecar on-demand path rather than staying Preloaded.
+        let over_limit_reader = TwoFileShuffleReader::try_new_with_preload_limit(
+            Arc::new(ObjectStore::local()),
+            output_dir,
+            3,
+            2,
+            vec![1, 2, 1],
+            0.0,
+            0,
+            Some(vec![1, 2, 2, 2, 3, 4]),
+        )
+        .await
+        .unwrap();
+        let window = over_limit_reader
+            .read_partition_window(1, DEFAULT_PARTITION_WINDOW_BYTES)
+            .await
+            .unwrap();
+        assert_eq!(window.partition_range, 1..2);
+        let partition = collect_partition(over_limit_reader.as_ref(), 1)
+            .await
+            .unwrap();
+        let values: &Int32Array = partition["val"].as_primitive();
+        assert_eq!(values.values(), &[20, 30]);
+    }
+
+    #[tokio::test]
+    async fn test_shuffle_spills_offsets_when_preload_limit_is_zero() {
+        let dir = TempStrDir::default();
+        let output_dir = Path::from(dir.as_ref());
+        let reader = TwoFileShuffler::new(output_dir, 3)
+            .with_batch_size_bytes(1)
+            .with_max_preloaded_offsets_bytes(0)
+            .shuffle(batches_to_stream(vec![
+                make_batch(&[0, 1], &[10, 20], None),
+                make_batch(&[1, 2], &[30, 40], None),
+            ]))
+            .await
+            .unwrap();
+
+        assert_eq!(reader.partition_size(0).unwrap(), 1);
+        assert_eq!(reader.partition_size(1).unwrap(), 2);
+        assert_eq!(reader.partition_size(2).unwrap(), 1);
+        let p1 = collect_partition(reader.as_ref(), 1).await.unwrap();
+        let values: &Int32Array = p1["val"].as_primitive();
+        assert_eq!(values.values(), &[20, 30]);
+        // On-demand offsets cannot coalesce a window.
+        let window = reader
+            .read_partition_window(0, DEFAULT_PARTITION_WINDOW_BYTES)
+            .await
+            .unwrap();
+        assert_eq!(window.partition_range, 0..1);
     }
 
     #[test]
@@ -2408,6 +2530,27 @@ mod tests {
                 .contains("overflows byte-size calculation"),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn test_bounded_written_offsets_drops_copy_at_byte_limit() {
+        let max_bytes = 2 * std::mem::size_of::<u64>();
+        let mut written = BoundedWrittenOffsets::new(max_bytes);
+        written.retain(&[1, 2]).unwrap();
+        assert_eq!(written.offsets.as_deref(), Some(&[1, 2][..]));
+
+        written.retain(&[3]).unwrap();
+        assert!(
+            written.offsets.is_none(),
+            "exceeding the preload cap must drop the in-memory copy"
+        );
+
+        written.retain(&[4]).unwrap();
+        assert!(
+            written.offsets.is_none(),
+            "a dropped copy must stay dropped"
+        );
+        assert!(written.into_offsets().is_none());
     }
 
     #[tokio::test]
