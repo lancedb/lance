@@ -19,7 +19,7 @@ use lance_core::{
 use lance_io::ReadBatchParams;
 use tracing::instrument;
 
-use crate::rowids::RowIdSequence;
+use crate::rowids::{RowIdSequence, RowIdSequenceCursor};
 
 pub type ReadBatchFut = BoxFuture<'static, Result<RecordBatch>>;
 /// A task, emitted by a file reader, that will produce a batch (of the
@@ -506,12 +506,29 @@ pub fn wrap_with_row_id_and_delete(
     fragment_id: u32,
     config: RowIdAndDeletesConfig,
 ) -> ReadBatchFutStream {
-    let config = Arc::new(config);
-    let mut row_id_cursor = config
+    let (row_id_cursor, use_dense_row_id_expansion) = config
         .row_id_sequence
         .as_ref()
         .filter(|_| config.with_row_id)
-        .map(|sequence| sequence.cursor());
+        .map(|sequence| {
+            let (cursor, use_dense_range_expansion) = sequence.cursor_with_dense_range_expansion();
+            (Some(cursor), use_dense_range_expansion)
+        })
+        .unwrap_or((None, false));
+    if use_dense_row_id_expansion {
+        wrap_with_row_id_and_delete_impl::<true>(stream, fragment_id, config, row_id_cursor)
+    } else {
+        wrap_with_row_id_and_delete_impl::<false>(stream, fragment_id, config, row_id_cursor)
+    }
+}
+
+fn wrap_with_row_id_and_delete_impl<const USE_DENSE_ROW_ID_EXPANSION: bool>(
+    stream: ReadBatchTaskStream,
+    fragment_id: u32,
+    config: RowIdAndDeletesConfig,
+    mut row_id_cursor: Option<RowIdSequenceCursor>,
+) -> ReadBatchFutStream {
+    let config = Arc::new(config);
     let mut offset = 0;
     stream
         .map(move |batch_task| {
@@ -532,6 +549,12 @@ pub fn wrap_with_row_id_and_delete(
                         .to_ranges()
                         .unwrap();
                     let values = match selection.as_slice() {
+                        [range] if USE_DENSE_ROW_ID_EXPANSION => {
+                            UInt64Array::from(sequence.select_dense_range_with_cursor(
+                                cursor,
+                                range.start as usize..range.end as usize,
+                            ))
+                        }
                         [range] => UInt64Array::from(sequence.select_range_with_cursor(
                             cursor,
                             range.start as usize..range.end as usize,

@@ -707,20 +707,7 @@ impl SegmentCursorState {
             self.ones_before = 0;
         }
 
-        let range_start = range.start;
-        let bitmap_bytes = bitmap.bytes();
-        self.extend_sparse_bitmap_range(range_start, bitmap_bytes, selection, values);
-    }
-
-    #[inline(never)]
-    fn extend_sparse_bitmap_range(
-        &mut self,
-        range_start: u64,
-        bitmap_bytes: &[u8],
-        selection: Range<usize>,
-        values: &mut Vec<u64>,
-    ) {
-        while let Some(&byte) = bitmap_bytes.get(self.byte_idx) {
+        while let Some(&byte) = bitmap.data.get(self.byte_idx) {
             let ones = byte.count_ones() as usize;
             let ones_after_byte = self.ones_before + ones;
             if selection.start >= ones_after_byte {
@@ -737,7 +724,7 @@ impl SegmentCursorState {
                 }
                 let bit = remaining_bits.trailing_zeros() as usize;
                 if rank >= selection.start {
-                    values.push(range_start + (self.byte_idx * 8 + bit) as u64);
+                    values.push(range.start + (self.byte_idx * 8 + bit) as u64);
                 }
                 remaining_bits &= remaining_bits - 1;
                 rank += 1;
@@ -768,7 +755,7 @@ impl SegmentCursorState {
         self.extend_dense_bitmap_range(range.start, bitmap.bytes(), selection, values);
     }
 
-    #[inline(never)]
+    #[inline]
     fn extend_dense_bitmap_range(
         &mut self,
         range_start: u64,
