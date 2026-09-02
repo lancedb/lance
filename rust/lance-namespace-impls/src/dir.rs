@@ -205,6 +205,11 @@ pub(crate) struct TableStatus {
     pub(crate) has_reserved_file: bool,
 }
 
+enum ManagedHistoryState {
+    Existing,
+    Empty { reservation_token: Option<String> },
+}
+
 enum DirectoryIndexParams {
     Scalar {
         index_type: IndexType,
@@ -1681,7 +1686,7 @@ impl DirectoryNamespace {
         reader: Box<dyn arrow::record_batch::RecordBatchReader + Send>,
         mode: WriteMode,
         extra_storage_options: Option<HashMap<String, String>>,
-        reservation_token: Option<String>,
+        managed_history: Option<ManagedHistoryState>,
     ) -> Result<Dataset> {
         // Insert and merge-insert request models do not carry request-level storage options,
         // so these writes intentionally use the namespace-level storage options only.
@@ -1711,13 +1716,13 @@ impl DirectoryNamespace {
                     message: "Table ID is required for managed table writes".to_string(),
                 })
             })?;
-            if let Some(reservation_token) = reservation_token {
+            if let Some(ManagedHistoryState::Empty { reservation_token }) = managed_history {
                 let external_store = LanceNamespaceExternalManifestStore::for_table_uri(
                     Arc::new(self.clone()),
                     table_id.clone(),
                     table_uri,
                 )?
-                .with_reservation_token(Some(reservation_token));
+                .with_reservation_token(reservation_token);
                 write_params.commit_handler = Some(Arc::new(ExternalManifestCommitHandler {
                     external_manifest_store: Arc::new(external_store),
                 }));
@@ -1741,47 +1746,38 @@ impl DirectoryNamespace {
         Ok(dataset)
     }
 
-    /// Return the active declaration token only while managed history is empty.
-    async fn managed_bootstrap_reservation_token(
+    /// Classify managed history, preserving both catalog reservations and tokenless tables.
+    async fn managed_history_state(
         &self,
         table_id: &Option<Vec<String>>,
         table_uri: &str,
-    ) -> Result<Option<String>> {
+    ) -> Result<Option<ManagedHistoryState>> {
         if !self.table_version_tracking_enabled {
             return Ok(None);
         }
 
-        let table_info = self
-            .table_info_from_manifest(table_id)
-            .await?
-            .ok_or_else(|| {
-                lance_core::Error::from(NamespaceError::TableNotFound {
-                    message: Self::format_table_id_from_request(table_id),
-                })
-            })?;
-        if table_info.published_version_one()?.is_some()
+        let table_info = self.table_info_from_manifest(table_id).await?;
+        let has_published_version_one = match &table_info {
+            Some(table_info) => table_info.published_version_one()?.is_some(),
+            None => false,
+        };
+        if has_published_version_one
             || !self
                 .list_table_versions_from_storage(table_uri, true, Some(1))
                 .await?
                 .is_empty()
         {
-            return Ok(None);
+            return Ok(Some(ManagedHistoryState::Existing));
         }
 
-        table_info
-            .metadata
-            .as_ref()
-            .and_then(|metadata| metadata.get(lance_namespace::RESERVATION_TOKEN_KEY))
-            .cloned()
-            .map(Some)
-            .ok_or_else(|| {
-                lance_core::Error::from(NamespaceError::InvalidTableState {
-                    message: format!(
-                        "Managed table '{}' has empty history but no active reservation token",
-                        Self::format_table_id_from_request(table_id)
-                    ),
-                })
-            })
+        let reservation_token = table_info
+            .and_then(|table_info| table_info.metadata)
+            .and_then(|metadata| {
+                metadata
+                    .get(lance_namespace::RESERVATION_TOKEN_KEY)
+                    .cloned()
+            });
+        Ok(Some(ManagedHistoryState::Empty { reservation_token }))
     }
 
     /// Logical table version parsed from a manifest filename, or `None` for
@@ -5711,10 +5707,8 @@ impl LanceNamespace for DirectoryNamespace {
             }
         };
 
-        let reservation_token = self
-            .managed_bootstrap_reservation_token(&request.id, &table_uri)
-            .await?;
-        if reservation_token.is_some()
+        let managed_history = self.managed_history_state(&request.id, &table_uri).await?;
+        if matches!(&managed_history, Some(ManagedHistoryState::Empty { .. }))
             || (!self.table_version_tracking_enabled
                 && !self.table_uri_has_actual_manifests(&table_uri).await?)
         {
@@ -5724,12 +5718,19 @@ impl LanceNamespace for DirectoryNamespace {
                 reader,
                 WriteMode::Create,
                 None,
-                reservation_token,
+                managed_history,
             )
             .await?;
         } else {
-            self.write_reader_to_table(&request.id, &table_uri, reader, mode, None, None)
-                .await?;
+            self.write_reader_to_table(
+                &request.id,
+                &table_uri,
+                reader,
+                mode,
+                None,
+                managed_history,
+            )
+            .await?;
         }
 
         Ok(InsertIntoTableResponse {
@@ -5751,13 +5752,11 @@ impl LanceNamespace for DirectoryNamespace {
             })
         })?;
 
-        let reservation_token = self
-            .managed_bootstrap_reservation_token(&request.id, &table_uri)
-            .await?;
-        let table_has_manifests = if self.table_version_tracking_enabled {
-            reservation_token.is_none()
-        } else {
-            self.table_uri_has_actual_manifests(&table_uri).await?
+        let managed_history = self.managed_history_state(&request.id, &table_uri).await?;
+        let table_has_manifests = match &managed_history {
+            Some(ManagedHistoryState::Existing) => true,
+            Some(ManagedHistoryState::Empty { .. }) => false,
+            None => self.table_uri_has_actual_manifests(&table_uri).await?,
         };
         let (reader, num_rows) =
             Self::ipc_reader_from_request_data(&request_data, "merge_insert_into_table")?;
@@ -5770,7 +5769,7 @@ impl LanceNamespace for DirectoryNamespace {
                     reader,
                     WriteMode::Create,
                     None,
-                    reservation_token,
+                    managed_history,
                 )
                 .await?;
             let version = dataset.version().version as i64;
@@ -12220,6 +12219,103 @@ mod tests {
             versions.versions[0]
                 .manifest_path
                 .contains(&reservation_token)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_declared_managed_directory_only_writes_bootstrap_tokenless_history() {
+        use lance_namespace::models::{
+            DeclareTableRequest, InsertIntoTableRequest, ListTableVersionsRequest,
+            MergeInsertIntoTableRequest,
+        };
+
+        let temp_dir = TempStdDir::default();
+        let namespace = DirectoryNamespaceBuilder::new(temp_dir.to_str().unwrap())
+            .manifest_enabled(false)
+            .table_version_tracking_enabled(true)
+            .build()
+            .await
+            .unwrap();
+
+        let insert_table_id = vec!["insert_table".to_string()];
+        let insert_declaration = namespace
+            .declare_table(DeclareTableRequest {
+                id: Some(insert_table_id.clone()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(insert_declaration.transaction_id.is_none());
+        namespace
+            .insert_into_table(
+                InsertIntoTableRequest {
+                    id: Some(insert_table_id.clone()),
+                    ..Default::default()
+                },
+                Bytes::from(create_non_empty_test_ipc_data()),
+            )
+            .await
+            .unwrap();
+        namespace
+            .insert_into_table(
+                InsertIntoTableRequest {
+                    id: Some(insert_table_id.clone()),
+                    ..Default::default()
+                },
+                Bytes::from(create_non_empty_test_ipc_data()),
+            )
+            .await
+            .unwrap();
+
+        let insert_versions = namespace
+            .list_table_versions(ListTableVersionsRequest {
+                id: Some(insert_table_id),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(insert_versions.versions.len(), 2);
+        assert!(
+            insert_versions
+                .versions
+                .iter()
+                .all(|version| !version.manifest_path.contains("_reservation_versions"))
+        );
+
+        let merge_table_id = vec!["merge_table".to_string()];
+        let merge_declaration = namespace
+            .declare_table(DeclareTableRequest {
+                id: Some(merge_table_id.clone()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(merge_declaration.transaction_id.is_none());
+        let merge_response = namespace
+            .merge_insert_into_table(
+                MergeInsertIntoTableRequest {
+                    id: Some(merge_table_id.clone()),
+                    on: Some("id".to_string()),
+                    ..Default::default()
+                },
+                Bytes::from(create_non_empty_test_ipc_data()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(merge_response.version, Some(1));
+
+        let merge_versions = namespace
+            .list_table_versions(ListTableVersionsRequest {
+                id: Some(merge_table_id),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(merge_versions.versions.len(), 1);
+        assert!(
+            !merge_versions.versions[0]
+                .manifest_path
+                .contains("_reservation_versions")
         );
     }
 
