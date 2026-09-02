@@ -42,7 +42,6 @@ import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
-import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class ProjectTest extends OperationTestBase {
@@ -112,34 +111,6 @@ public class ProjectTest extends OperationTestBase {
           Project project = (Project) readBack.operation();
           assertTrue(project.preservesNullability());
         }
-      }
-    }
-  }
-
-  @Test
-  void testProjectRejectsUnmaterializedStableField(@TempDir Path tempDir) {
-    String datasetPath = tempDir.resolve("testProjectRejectsUnmaterializedStableField").toString();
-    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
-      TestUtils.SimpleTestDataset testDataset =
-          new TestUtils.SimpleTestDataset(allocator, datasetPath);
-      dataset = testDataset.createEmptyDataset();
-
-      Field existing = dataset.getSchema().getFields().get(0);
-      Field unmaterialized =
-          new Field("unmaterialized", existing.getFieldType(), existing.getChildren());
-      try (Transaction transaction =
-          new Transaction.Builder()
-              .readVersion(dataset.version())
-              .operation(
-                  Project.builder()
-                      .schema(new Schema(Collections.singletonList(unmaterialized)))
-                      .build())
-              .build()) {
-        IllegalArgumentException error =
-            assertThrows(
-                IllegalArgumentException.class,
-                () -> new CommitBuilder(dataset).execute(transaction));
-        assertTrue(error.getMessage().contains("writes no data"));
       }
     }
   }

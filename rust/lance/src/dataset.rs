@@ -3253,9 +3253,7 @@ impl Dataset {
     /// The activation commit records the current maximum referenced field ID as
     /// a persistent high-water mark. Later schema changes allocate above it even
     /// after fields and their files are dropped. Activation is one-way and
-    /// idempotent. Before migrating, retire every writer that does not understand
-    /// the stable field-ID writer feature flag, including writers that commit
-    /// from an already serialized manifest.
+    /// idempotent.
     ///
     /// ```
     /// # use lance::{Dataset, Result};

@@ -928,8 +928,70 @@ enum RawArrowFieldIdMode {
     ExplicitOnly,
 }
 
+#[derive(Clone, Copy)]
+enum LegacyFieldIdMode {
+    Inherit,
+    Standalone,
+}
+
 struct SchemaConversionOptions {
     raw_field_id_mode: RawArrowFieldIdMode,
+    legacy_field_id_mode: LegacyFieldIdMode,
+}
+
+type SchemaReadContext = (LanceSchema, i32, bool);
+
+fn convert_arrow_schema(
+    arrow_schema: &Schema,
+    read_context: Option<SchemaReadContext>,
+    options: SchemaConversionOptions,
+) -> Result<(LanceSchema, HashMap<i32, i32>)> {
+    let mut original_schema =
+        if matches!(options.raw_field_id_mode, RawArrowFieldIdMode::ExplicitOnly) {
+            LanceSchema {
+                fields: arrow_schema
+                    .fields
+                    .iter()
+                    .map(|field| Field::try_from(field.as_ref()))
+                    .collect::<lance_core::Result<_>>()?,
+                metadata: arrow_schema.metadata.clone(),
+            }
+        } else {
+            LanceSchema::try_from(arrow_schema).map_err(|e| {
+                Error::input_error(format!(
+                    "Failed to convert Arrow schema to Lance schema: {}",
+                    e
+                ))
+            })?
+        };
+
+    if read_context
+        .as_ref()
+        .is_none_or(|(_, _, stable_field_ids)| *stable_field_ids)
+    {
+        original_schema.metadata.insert(
+            TRANSACTION_SCHEMA_SOURCE_RAW_ARROW.to_string(),
+            String::new(),
+        );
+        return Ok((original_schema, HashMap::new()));
+    }
+
+    if matches!(options.legacy_field_id_mode, LegacyFieldIdMode::Standalone) {
+        return Ok((original_schema, HashMap::new()));
+    }
+
+    let (read_schema, max_field_id, _) = read_context.expect("legacy dataset context");
+    let schema =
+        LanceSchema::from_arrow_schema(arrow_schema, Some(read_schema), Some(max_field_id))?;
+
+    let field_id_remap = original_schema
+        .fields_pre_order()
+        .zip(schema.fields_pre_order())
+        .filter_map(|(original, canonical)| {
+            (original.id >= 0 && original.id != canonical.id).then_some((original.id, canonical.id))
+        })
+        .collect();
+    Ok((schema, field_id_remap))
 }
 
 fn convert_schema_from_operation(
@@ -950,26 +1012,7 @@ fn convert_schema_from_operation(
         .j()?;
     let c_schema_ptr = schema_ptr as *mut FFI_ArrowSchema;
     let c_schema = unsafe { FFI_ArrowSchema::from_raw(c_schema_ptr) };
-
     let arrow_schema = Schema::try_from(&c_schema)?;
-    let mut original_schema =
-        if matches!(options.raw_field_id_mode, RawArrowFieldIdMode::ExplicitOnly) {
-            LanceSchema {
-                fields: arrow_schema
-                    .fields
-                    .iter()
-                    .map(|field| Field::try_from(field.as_ref()))
-                    .collect::<lance_core::Result<_>>()?,
-                metadata: arrow_schema.metadata.clone(),
-            }
-        } else {
-            LanceSchema::try_from(&arrow_schema).map_err(|e| {
-                Error::input_error(format!(
-                    "Failed to convert Arrow schema to Lance schema: {}",
-                    e
-                ))
-            })?
-        };
 
     let read_context = match dataset {
         Some(dataset) if dataset.inner.version().version == read_version => Some((
@@ -988,29 +1031,7 @@ fn convert_schema_from_operation(
         None => None,
     };
 
-    if read_context
-        .as_ref()
-        .is_none_or(|(_, _, stable_field_ids)| *stable_field_ids)
-    {
-        original_schema.metadata.insert(
-            TRANSACTION_SCHEMA_SOURCE_RAW_ARROW.to_string(),
-            String::new(),
-        );
-        return Ok((original_schema, HashMap::new()));
-    }
-
-    let (read_schema, max_field_id, _) = read_context.expect("legacy dataset context");
-    let schema =
-        LanceSchema::from_arrow_schema(&arrow_schema, Some(read_schema), Some(max_field_id))?;
-
-    let field_id_remap = original_schema
-        .fields_pre_order()
-        .zip(schema.fields_pre_order())
-        .filter_map(|(original, canonical)| {
-            (original.id >= 0 && original.id != canonical.id).then_some((original.id, canonical.id))
-        })
-        .collect();
-    Ok((schema, field_id_remap))
+    convert_arrow_schema(&arrow_schema, read_context, options)
 }
 
 type DataFileIdentity = (Option<u32>, String);
@@ -1202,6 +1223,7 @@ fn convert_to_rust_operation(
                 read_version,
                 SchemaConversionOptions {
                     raw_field_id_mode: RawArrowFieldIdMode::ExplicitOnly,
+                    legacy_field_id_mode: LegacyFieldIdMode::Inherit,
                 },
             )?;
             Operation::Project {
@@ -1341,6 +1363,7 @@ fn convert_to_rust_operation(
                 read_version,
                 SchemaConversionOptions {
                     raw_field_id_mode: RawArrowFieldIdMode::AssignMissing,
+                    legacy_field_id_mode: LegacyFieldIdMode::Standalone,
                 },
             )?;
             remap_fragment_field_ids(&mut fragments, &field_id_remap, &HashSet::new());
@@ -1501,6 +1524,7 @@ fn convert_to_rust_operation(
                 read_version,
                 SchemaConversionOptions {
                     raw_field_id_mode: RawArrowFieldIdMode::AssignMissing,
+                    legacy_field_id_mode: LegacyFieldIdMode::Inherit,
                 },
             )?;
             let retained_files = if field_id_remap.is_empty() {
@@ -1854,6 +1878,65 @@ mod tests {
 
         assert_eq!(schema.field("a").unwrap().id, 5);
         assert_eq!(schema.field("b").unwrap().id, 9);
+    }
+
+    #[test]
+    fn stable_java_schema_conversion_marks_raw_arrow_input() {
+        let mut base = Field::new_arrow("a", ArrowDataType::Int32, false).unwrap();
+        base.id = 0;
+        let base_schema = LanceSchema {
+            fields: vec![base],
+            metadata: HashMap::new(),
+        };
+        let arrow_schema =
+            ArrowSchema::new(vec![ArrowField::new("a", ArrowDataType::Int32, false)]);
+
+        let (schema, field_id_remap) = convert_arrow_schema(
+            &arrow_schema,
+            Some((base_schema, 0, true)),
+            SchemaConversionOptions {
+                raw_field_id_mode: RawArrowFieldIdMode::ExplicitOnly,
+                legacy_field_id_mode: LegacyFieldIdMode::Inherit,
+            },
+        )
+        .unwrap();
+
+        assert!(
+            schema
+                .metadata
+                .contains_key(TRANSACTION_SCHEMA_SOURCE_RAW_ARROW)
+        );
+        assert_eq!(schema.field("a").unwrap().id, -1);
+        assert!(field_id_remap.is_empty());
+    }
+
+    #[test]
+    fn legacy_java_overwrite_allows_type_replacement() {
+        let mut base = Field::new_arrow("a", ArrowDataType::Int32, false).unwrap();
+        base.id = 0;
+        let base_schema = LanceSchema {
+            fields: vec![base],
+            metadata: HashMap::new(),
+        };
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new("a", ArrowDataType::Utf8, false)]);
+
+        let (schema, field_id_remap) = convert_arrow_schema(
+            &arrow_schema,
+            Some((base_schema, 0, false)),
+            SchemaConversionOptions {
+                raw_field_id_mode: RawArrowFieldIdMode::AssignMissing,
+                legacy_field_id_mode: LegacyFieldIdMode::Standalone,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(schema.field("a").unwrap().data_type(), ArrowDataType::Utf8);
+        assert!(
+            !schema
+                .metadata
+                .contains_key(TRANSACTION_SCHEMA_SOURCE_RAW_ARROW)
+        );
+        assert!(field_id_remap.is_empty());
     }
 
     #[test]

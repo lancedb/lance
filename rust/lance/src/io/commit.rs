@@ -1926,7 +1926,7 @@ mod tests {
     async fn raw_arrow_project_retry_matches_single_attempt_ids() {
         let tmp = TempStrDir::default();
         let uri = tmp.as_str();
-        let dataset = Dataset::write(
+        let mut dataset = Dataset::write(
             RecordBatchIterator::new(
                 vec![Ok(simple_batch(&simple_schema(), vec![1, 2, 3]))],
                 simple_schema(),
@@ -1936,6 +1936,7 @@ mod tests {
         )
         .await
         .unwrap();
+        dataset.migrate_to_stable_field_ids().await.unwrap();
 
         let mut foreign_manifest = dataset.manifest.as_ref().clone();
         foreign_manifest.max_fragment_id = Some(foreign_manifest.max_fragment_id.unwrap_or(0) + 1);
@@ -1994,7 +1995,7 @@ mod tests {
     async fn raw_arrow_merge_retry_rebinds_after_allocator_advance() {
         let tmp = TempStrDir::default();
         let uri = tmp.as_str();
-        let dataset = Dataset::write(
+        let mut dataset = Dataset::write(
             RecordBatchIterator::new(
                 vec![Ok(simple_batch(&simple_schema(), vec![1, 2, 3]))],
                 simple_schema(),
@@ -2004,6 +2005,7 @@ mod tests {
         )
         .await
         .unwrap();
+        dataset.migrate_to_stable_field_ids().await.unwrap();
 
         let mut foreign_manifest = dataset.manifest.as_ref().clone();
         foreign_manifest.max_fragment_id = Some(foreign_manifest.max_fragment_id.unwrap_or(0) + 1);

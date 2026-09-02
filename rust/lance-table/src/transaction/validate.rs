@@ -479,7 +479,7 @@ pub fn validate_stable_field_id_transition(
         .collect::<HashSet<_>>();
 
     if !matches!(operation, Operation::Restore { .. }) {
-        validate_dense_new_field_ids(
+        validate_new_field_ids(
             parent,
             successor
                 .schema
@@ -512,16 +512,16 @@ pub fn validate_stable_field_id_transition(
     Ok(())
 }
 
-fn validate_dense_new_field_ids<'a>(
+fn validate_new_field_ids<'a>(
     manifest: &Manifest,
     new_fields: impl Iterator<Item = &'a Field>,
 ) -> Result<()> {
-    let expected_ids = i64::from(manifest.max_field_id()) + 1..;
-    for (expected, field) in expected_ids.zip(new_fields) {
-        if i64::from(field.id) != expected {
+    let max_allocated_field_id = manifest.max_field_id();
+    for field in new_fields {
+        if field.id <= max_allocated_field_id {
             return Err(Error::invalid_input(format!(
-                "New field '{}' has ID {}, but stable field IDs must be densely allocated from {}",
-                field.name, field.id, expected
+                "New field '{}' has ID {}, but stable field IDs must be greater than the high-water mark {}",
+                field.name, field.id, max_allocated_field_id
             )));
         }
     }
@@ -560,7 +560,7 @@ fn validate_stable_field_id_operation(manifest: &Manifest, operation: &Operation
         }
     }
 
-    validate_dense_new_field_ids(
+    validate_new_field_ids(
         manifest,
         schema
             .fields_pre_order()
@@ -1036,7 +1036,7 @@ mod tests {
     }
 
     #[test]
-    fn stable_field_ids_require_dense_allocation_above_high_water_mark() {
+    fn stable_field_ids_allow_reserved_ids_above_high_water_mark() {
         let mut manifest = activated_manifest();
         manifest.max_allocated_field_id = Some(5);
         let mut schema = manifest.schema.clone();
@@ -1051,13 +1051,21 @@ mod tests {
         validate_operation(Some(&manifest), &valid).unwrap();
 
         schema.fields.last_mut().unwrap().id = 7;
-        let skipped = Operation::Project {
+        let reserved = Operation::Project {
+            schema: schema.clone(),
+            preserves_nullability: true,
+        };
+        validate_operation(Some(&manifest), &reserved).unwrap();
+
+        schema.fields.last_mut().unwrap().id = 5;
+        let reused = Operation::Project {
             schema,
             preserves_nullability: true,
         };
-        let err = validate_operation(Some(&manifest), &skipped).unwrap_err();
+        let err = validate_operation(Some(&manifest), &reused).unwrap_err();
         assert!(
-            err.to_string().contains("densely allocated from 6"),
+            err.to_string()
+                .contains("greater than the high-water mark 5"),
             "{err}"
         );
     }

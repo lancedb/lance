@@ -3678,6 +3678,7 @@ mod test {
             }),
         )
         .await?;
+        dataset.migrate_to_stable_field_ids().await?;
         assert!(dataset.manifest.uses_stable_field_ids());
         assert_eq!(dataset.manifest.max_field_id(), 0);
 
