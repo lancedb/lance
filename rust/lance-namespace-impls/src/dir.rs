@@ -25,6 +25,7 @@ use lance::dataset::{
     WhenNotMatchedBySource, WriteMode, WriteParams,
 };
 use lance::index::{DatasetIndexExt, IndexParams, vector::VectorIndexParams};
+use lance::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
 use lance::session::Session;
 use lance_index::scalar::{
     BuiltinIndexType, FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams,
@@ -40,6 +41,7 @@ use lance_index::{IndexType, is_system_index};
 use lance_io::object_store::throttle::is_throttle_error;
 use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
 use lance_linalg::distance::MetricType;
+use lance_table::io::commit::external_manifest::ExternalManifestCommitHandler;
 use lance_table::io::commit::{ManifestNamingScheme, VERSIONS_DIR};
 use object_store::ObjectStoreExt;
 use object_store::path::Path;
@@ -1679,6 +1681,7 @@ impl DirectoryNamespace {
         reader: Box<dyn arrow::record_batch::RecordBatchReader + Send>,
         mode: WriteMode,
         extra_storage_options: Option<HashMap<String, String>>,
+        reservation_token: Option<String>,
     ) -> Result<Dataset> {
         // Insert and merge-insert request models do not carry request-level storage options,
         // so these writes intentionally use the namespace-level storage options only.
@@ -1695,7 +1698,7 @@ impl DirectoryNamespace {
             ..Default::default()
         });
 
-        let write_params = WriteParams {
+        let mut write_params = WriteParams {
             mode,
             store_params,
             session: self.session.clone(),
@@ -1708,13 +1711,26 @@ impl DirectoryNamespace {
                     message: "Table ID is required for managed table writes".to_string(),
                 })
             })?;
-            Dataset::write_into_namespace(
-                reader,
-                Arc::new(self.clone()),
-                table_id.clone(),
-                Some(write_params),
-            )
-            .await
+            if let Some(reservation_token) = reservation_token {
+                let external_store = LanceNamespaceExternalManifestStore::for_table_uri(
+                    Arc::new(self.clone()),
+                    table_id.clone(),
+                    table_uri,
+                )?
+                .with_reservation_token(Some(reservation_token));
+                write_params.commit_handler = Some(Arc::new(ExternalManifestCommitHandler {
+                    external_manifest_store: Arc::new(external_store),
+                }));
+                Dataset::write(reader, table_uri, Some(write_params)).await
+            } else {
+                Dataset::write_into_namespace(
+                    reader,
+                    Arc::new(self.clone()),
+                    table_id.clone(),
+                    Some(write_params),
+                )
+                .await
+            }
         } else {
             Dataset::write(reader, table_uri, Some(write_params)).await
         }
@@ -1723,6 +1739,49 @@ impl DirectoryNamespace {
         })?;
 
         Ok(dataset)
+    }
+
+    /// Return the active declaration token only while managed history is empty.
+    async fn managed_bootstrap_reservation_token(
+        &self,
+        table_id: &Option<Vec<String>>,
+        table_uri: &str,
+    ) -> Result<Option<String>> {
+        if !self.table_version_tracking_enabled {
+            return Ok(None);
+        }
+
+        let table_info = self
+            .table_info_from_manifest(table_id)
+            .await?
+            .ok_or_else(|| {
+                lance_core::Error::from(NamespaceError::TableNotFound {
+                    message: Self::format_table_id_from_request(table_id),
+                })
+            })?;
+        if table_info.published_version_one()?.is_some()
+            || !self
+                .list_table_versions_from_storage(table_uri, true, Some(1))
+                .await?
+                .is_empty()
+        {
+            return Ok(None);
+        }
+
+        table_info
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get(lance_namespace::RESERVATION_TOKEN_KEY))
+            .cloned()
+            .map(Some)
+            .ok_or_else(|| {
+                lance_core::Error::from(NamespaceError::InvalidTableState {
+                    message: format!(
+                        "Managed table '{}' has empty history but no active reservation token",
+                        Self::format_table_id_from_request(table_id)
+                    ),
+                })
+            })
     }
 
     /// Logical table version parsed from a manifest filename, or `None` for
@@ -2011,6 +2070,12 @@ impl DirectoryNamespace {
         let table_uri =
             manifest::ManifestNamespace::construct_full_uri(&self.root, &table_info.location)?;
         let mut builder = DatasetBuilder::from_namespace(Arc::new(self.clone()), table_id).await?;
+        if let Some(options) = &self.storage_options {
+            builder = builder.with_storage_options(options.clone());
+        }
+        if let Some(session) = &self.session {
+            builder = builder.with_session(session.clone());
+        }
         if let Some(version) = request.version {
             builder = builder.with_version(version as u64);
         }
@@ -2475,6 +2540,9 @@ impl DirectoryNamespace {
                 );
                 Self::map_open_error(e, NamespaceError::TableNotFound { message })
             })?;
+        if let Some(options) = &self.storage_options {
+            builder = builder.with_storage_options(options.clone());
+        }
         if let Some(session) = &self.session {
             builder = builder.with_session(session.clone());
         }
@@ -3870,6 +3938,7 @@ impl LanceNamespace for DirectoryNamespace {
                 reader,
                 WriteMode::Create,
                 request.storage_options.clone(),
+                None,
             )
             .await;
         if let Err(err) = write_result {
@@ -4071,14 +4140,10 @@ impl LanceNamespace for DirectoryNamespace {
             return manifest_ns.alter_table_add_columns(request).await;
         }
 
-        let table_name = Self::table_name_from_id(&request.id)?;
         let table_uri = if self.table_version_tracking_enabled {
             self.resolve_table_location(&request.id).await?
         } else {
-            self.table_full_uri(&table_name)
-        };
-
-        if !self.table_version_tracking_enabled {
+            let table_name = Self::table_name_from_id(&request.id)?;
             let status = self.check_table_status(&table_name).await?;
             if !status.exists {
                 return Err(NamespaceError::TableNotFound {
@@ -4092,7 +4157,8 @@ impl LanceNamespace for DirectoryNamespace {
                 }
                 .into());
             }
-        }
+            self.table_full_uri(&table_name)
+        };
 
         let mut dataset = self
             .load_dataset(&request.id, &table_uri, None, "alter_table_add_columns")
@@ -4134,14 +4200,10 @@ impl LanceNamespace for DirectoryNamespace {
             return manifest_ns.alter_table_alter_columns(request).await;
         }
 
-        let table_name = Self::table_name_from_id(&request.id)?;
         let table_uri = if self.table_version_tracking_enabled {
             self.resolve_table_location(&request.id).await?
         } else {
-            self.table_full_uri(&table_name)
-        };
-
-        if !self.table_version_tracking_enabled {
+            let table_name = Self::table_name_from_id(&request.id)?;
             let status = self.check_table_status(&table_name).await?;
             if !status.exists {
                 return Err(NamespaceError::TableNotFound {
@@ -4155,7 +4217,8 @@ impl LanceNamespace for DirectoryNamespace {
                 }
                 .into());
             }
-        }
+            self.table_full_uri(&table_name)
+        };
 
         let mut dataset = self
             .load_dataset(&request.id, &table_uri, None, "alter_table_alter_columns")
@@ -4190,14 +4253,10 @@ impl LanceNamespace for DirectoryNamespace {
             return manifest_ns.alter_table_drop_columns(request).await;
         }
 
-        let table_name = Self::table_name_from_id(&request.id)?;
         let table_uri = if self.table_version_tracking_enabled {
             self.resolve_table_location(&request.id).await?
         } else {
-            self.table_full_uri(&table_name)
-        };
-
-        if !self.table_version_tracking_enabled {
+            let table_name = Self::table_name_from_id(&request.id)?;
             let status = self.check_table_status(&table_name).await?;
             if !status.exists {
                 return Err(NamespaceError::TableNotFound {
@@ -4211,7 +4270,8 @@ impl LanceNamespace for DirectoryNamespace {
                 }
                 .into());
             }
-        }
+            self.table_full_uri(&table_name)
+        };
 
         let mut dataset = self
             .load_dataset(&request.id, &table_uri, None, "alter_table_drop_columns")
@@ -5651,13 +5711,24 @@ impl LanceNamespace for DirectoryNamespace {
             }
         };
 
-        if !self.table_version_tracking_enabled
-            && !self.table_uri_has_actual_manifests(&table_uri).await?
+        let reservation_token = self
+            .managed_bootstrap_reservation_token(&request.id, &table_uri)
+            .await?;
+        if reservation_token.is_some()
+            || (!self.table_version_tracking_enabled
+                && !self.table_uri_has_actual_manifests(&table_uri).await?)
         {
-            self.write_reader_to_table(&request.id, &table_uri, reader, WriteMode::Create, None)
-                .await?;
+            self.write_reader_to_table(
+                &request.id,
+                &table_uri,
+                reader,
+                WriteMode::Create,
+                None,
+                reservation_token,
+            )
+            .await?;
         } else {
-            self.write_reader_to_table(&request.id, &table_uri, reader, mode, None)
+            self.write_reader_to_table(&request.id, &table_uri, reader, mode, None, None)
                 .await?;
         }
 
@@ -5680,14 +5751,27 @@ impl LanceNamespace for DirectoryNamespace {
             })
         })?;
 
-        let table_has_manifests = self.table_version_tracking_enabled
-            || self.table_uri_has_actual_manifests(&table_uri).await?;
+        let reservation_token = self
+            .managed_bootstrap_reservation_token(&request.id, &table_uri)
+            .await?;
+        let table_has_manifests = if self.table_version_tracking_enabled {
+            reservation_token.is_none()
+        } else {
+            self.table_uri_has_actual_manifests(&table_uri).await?
+        };
         let (reader, num_rows) =
             Self::ipc_reader_from_request_data(&request_data, "merge_insert_into_table")?;
 
         if !table_has_manifests {
             let dataset = self
-                .write_reader_to_table(&request.id, &table_uri, reader, WriteMode::Create, None)
+                .write_reader_to_table(
+                    &request.id,
+                    &table_uri,
+                    reader,
+                    WriteMode::Create,
+                    None,
+                    reservation_token,
+                )
                 .await?;
             let version = dataset.version().version as i64;
             return Ok(MergeInsertIntoTableResponse {
@@ -11659,6 +11743,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_insert_into_declared_managed_table_publishes_reservation() {
+        use lance_namespace::models::{
+            DeclareTableRequest, DescribeTableRequest, InsertIntoTableRequest,
+            ListTableVersionsRequest,
+        };
+
+        let temp_dir = TempStdDir::default();
+        let namespace = DirectoryNamespaceBuilder::new(temp_dir.to_str().unwrap())
+            .manifest_enabled(true)
+            .dir_listing_enabled(false)
+            .table_version_tracking_enabled(true)
+            .build()
+            .await
+            .unwrap();
+        let table_id = vec!["test_table".to_string()];
+
+        let mut declare_req = DeclareTableRequest::new();
+        declare_req.id = Some(table_id.clone());
+        let reservation = namespace.declare_table(declare_req).await.unwrap();
+        let reservation_token = reservation.transaction_id.expect("reservation token");
+
+        let mut insert_req = InsertIntoTableRequest::new();
+        insert_req.id = Some(table_id.clone());
+        namespace
+            .insert_into_table(insert_req, Bytes::from(create_non_empty_test_ipc_data()))
+            .await
+            .unwrap();
+
+        let described = namespace
+            .describe_table(DescribeTableRequest {
+                id: Some(table_id.clone()),
+                load_detailed_metadata: Some(true),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(described.is_only_declared, Some(false));
+        assert_eq!(described.version, Some(1));
+
+        let versions = namespace
+            .list_table_versions(ListTableVersionsRequest {
+                id: Some(table_id),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(versions.versions.len(), 1);
+        assert!(
+            versions.versions[0]
+                .manifest_path
+                .contains(&reservation_token)
+        );
+    }
+
+    #[tokio::test]
     async fn test_create_table_after_declare_table_with_manifest_creates_table() {
         use lance_namespace::models::{
             CreateTableRequest, DeclareTableRequest, DescribeTableRequest, ListTablesRequest,
@@ -12023,6 +12162,64 @@ mod tests {
         assert_eq!(
             namespace.list_tables(list_req).await.unwrap().tables,
             vec!["test_table".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_merge_insert_into_declared_managed_table_publishes_reservation() {
+        use lance_namespace::models::{
+            DeclareTableRequest, DescribeTableRequest, ListTableVersionsRequest,
+            MergeInsertIntoTableRequest,
+        };
+
+        let temp_dir = TempStdDir::default();
+        let namespace = DirectoryNamespaceBuilder::new(temp_dir.to_str().unwrap())
+            .manifest_enabled(true)
+            .dir_listing_enabled(false)
+            .table_version_tracking_enabled(true)
+            .build()
+            .await
+            .unwrap();
+        let table_id = vec!["test_table".to_string()];
+
+        let mut declare_req = DeclareTableRequest::new();
+        declare_req.id = Some(table_id.clone());
+        let reservation = namespace.declare_table(declare_req).await.unwrap();
+        let reservation_token = reservation.transaction_id.expect("reservation token");
+
+        let mut merge_req = MergeInsertIntoTableRequest::new();
+        merge_req.id = Some(table_id.clone());
+        merge_req.on = Some("id".to_string());
+        let response = namespace
+            .merge_insert_into_table(merge_req, Bytes::from(create_non_empty_test_ipc_data()))
+            .await
+            .unwrap();
+        assert_eq!(response.num_inserted_rows, Some(2));
+        assert_eq!(response.version, Some(1));
+
+        let described = namespace
+            .describe_table(DescribeTableRequest {
+                id: Some(table_id.clone()),
+                load_detailed_metadata: Some(true),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(described.is_only_declared, Some(false));
+        assert_eq!(described.version, Some(1));
+
+        let versions = namespace
+            .list_table_versions(ListTableVersionsRequest {
+                id: Some(table_id),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(versions.versions.len(), 1);
+        assert!(
+            versions.versions[0]
+                .manifest_path
+                .contains(&reservation_token)
         );
     }
 
@@ -14173,6 +14370,209 @@ mod tests {
                     .unwrap()
                     .versions
                     .len(),
+                2
+            );
+        }
+
+        #[tokio::test]
+        async fn test_managed_child_table_column_mutations_use_namespace_history() {
+            use arrow::array::{Int32Array, StringArray};
+            use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+            use arrow::record_batch::RecordBatch;
+            use lance::Dataset;
+            use lance::dataset::{WriteMode, WriteParams};
+            use lance_namespace::models::{
+                AddColumnsEntry, AlterColumnsEntry, AlterTableAddColumnsRequest,
+                AlterTableAlterColumnsRequest, AlterTableDropColumnsRequest,
+                CreateNamespaceRequest,
+            };
+
+            let temp_dir = TempStdDir::default();
+            let namespace = Arc::new(
+                DirectoryNamespaceBuilder::new(temp_dir.to_str().unwrap())
+                    .table_version_tracking_enabled(true)
+                    .manifest_enabled(true)
+                    .build()
+                    .await
+                    .unwrap(),
+            );
+            namespace
+                .create_namespace(CreateNamespaceRequest {
+                    id: Some(vec!["workspace".to_string()]),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            let table_id = vec!["workspace".to_string(), "test_table".to_string()];
+            let schema = Arc::new(ArrowSchema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("name", DataType::Utf8, true),
+            ]));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(vec![1, 2, 3])),
+                    Arc::new(StringArray::from(vec!["a", "b", "c"])),
+                ],
+            )
+            .unwrap();
+            let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
+            let client: Arc<dyn LanceNamespace> = namespace.clone();
+            Dataset::write_into_namespace(
+                batches,
+                client,
+                table_id.clone(),
+                Some(WriteParams {
+                    mode: WriteMode::Create,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+
+            let mut new_column = AddColumnsEntry::new("doubled_id".to_string());
+            new_column.expression = Some(Some("id * 2".to_string()));
+            namespace
+                .alter_table_add_columns(AlterTableAddColumnsRequest {
+                    id: Some(table_id.clone()),
+                    new_columns: vec![new_column],
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+
+            let mut alteration = AlterColumnsEntry::new("name".to_string());
+            alteration.rename = Some(Some("full_name".to_string()));
+            namespace
+                .alter_table_alter_columns(AlterTableAlterColumnsRequest {
+                    id: Some(table_id.clone()),
+                    alterations: vec![alteration],
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+
+            namespace
+                .alter_table_drop_columns(AlterTableDropColumnsRequest {
+                    id: Some(table_id.clone()),
+                    columns: vec!["doubled_id".to_string()],
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+
+            let described = namespace
+                .describe_table(DescribeTableRequest {
+                    id: Some(table_id.clone()),
+                    load_detailed_metadata: Some(true),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            let schema = described.schema.expect("managed table schema");
+            let field_names = schema
+                .fields
+                .iter()
+                .map(|field| field.name.as_str())
+                .collect::<Vec<_>>();
+            assert!(field_names.contains(&"full_name"));
+            assert!(!field_names.contains(&"name"));
+            assert!(!field_names.contains(&"doubled_id"));
+            assert_eq!(described.version, Some(4));
+            assert_eq!(
+                namespace
+                    .list_table_versions(ListTableVersionsRequest {
+                        id: Some(table_id),
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap()
+                    .versions
+                    .len(),
+                4
+            );
+        }
+
+        #[tokio::test]
+        async fn test_managed_operations_preserve_private_storage_options() {
+            use lance_io::object_store::providers::memory::MemoryStoreProvider;
+            use lance_io::object_store::{ObjectStoreProvider, uri_to_url};
+
+            #[derive(Debug)]
+            struct RequiredOptionMemoryProvider;
+
+            #[async_trait]
+            impl ObjectStoreProvider for RequiredOptionMemoryProvider {
+                async fn new_store(
+                    &self,
+                    base_path: Url,
+                    params: &ObjectStoreParams,
+                ) -> Result<ObjectStore> {
+                    if params
+                        .storage_options()
+                        .and_then(|options| options.get("required"))
+                        .map(String::as_str)
+                        != Some("yes")
+                    {
+                        return Err(Error::invalid_input("missing required storage option"));
+                    }
+                    MemoryStoreProvider.new_store(base_path, params).await
+                }
+
+                fn extract_path(&self, url: &Url) -> Result<Path> {
+                    MemoryStoreProvider.extract_path(url)
+                }
+
+                fn calculate_object_store_prefix(
+                    &self,
+                    url: &Url,
+                    storage_options: Option<&HashMap<String, String>>,
+                ) -> Result<String> {
+                    MemoryStoreProvider.calculate_object_store_prefix(url, storage_options)
+                }
+            }
+
+            let registry = Arc::new(ObjectStoreRegistry::default());
+            registry.insert("memory", Arc::new(RequiredOptionMemoryProvider));
+            let session = Arc::new(Session::new(0, 0, registry));
+            let root = uri_to_url("memory://managed-options").unwrap();
+            let namespace = DirectoryNamespaceBuilder::new(root.as_str())
+                .session(session)
+                .storage_option("required", "yes")
+                .table_version_tracking_enabled(true)
+                .manifest_enabled(true)
+                .dir_listing_enabled(false)
+                .build()
+                .await
+                .unwrap();
+            let table_id = vec!["test_table".to_string()];
+
+            namespace
+                .declare_table(DeclareTableRequest {
+                    id: Some(table_id.clone()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            namespace
+                .insert_into_table(
+                    InsertIntoTableRequest {
+                        id: Some(table_id.clone()),
+                        ..Default::default()
+                    },
+                    Bytes::from(create_non_empty_test_ipc_data()),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(
+                namespace
+                    .count_table_rows(CountTableRowsRequest {
+                        id: Some(table_id),
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap(),
                 2
             );
         }
