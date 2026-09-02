@@ -3773,20 +3773,46 @@ pub(super) fn collect_leaf_queries(query: &FtsQuery, leaves: &mut Vec<LeafQuery>
     Ok(())
 }
 
-/// Build one corpus-wide BM25 scorer containing every term required by a
+/// Prepared query leaves and their shared corpus-wide BM25 scorer.
+///
+/// Leaf order follows [`collect_leaf_queries`], so callers can preserve the
+/// identity and original token positions of every scoring leaf when moving
+/// statistics between distributed executors.
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct PreparedFtsGlobalStatistics {
+    scorer: Arc<MemBM25Scorer>,
+    query_leaves: Vec<PreparedBm25Query>,
+}
+
+impl PreparedFtsGlobalStatistics {
+    /// BM25 statistics covering every term referenced by `query_leaves`.
+    #[doc(hidden)]
+    pub fn scorer(&self) -> &Arc<MemBM25Scorer> {
+        &self.scorer
+    }
+
+    /// Canonically ordered prepared Match and Phrase leaves.
+    #[doc(hidden)]
+    pub fn query_leaves(&self) -> &[PreparedBm25Query] {
+        &self.query_leaves
+    }
+}
+
+/// Prepare every scoring leaf and one corpus-wide BM25 scorer for a
 /// one-column FTS query.
 ///
 /// Compound queries can contain multiple leaves with different fuzzy and
 /// phrase parameters. This helper applies each leaf's effective parameters,
-/// collects fuzzy expansions across every supplied segment, and returns one
-/// scorer whose term table is complete for later injection into any subset of
-/// those segments.
+/// collects fuzzy expansions across every supplied segment, and retains each
+/// leaf's final vocabulary and original query positions alongside a scorer
+/// whose term table is complete for every leaf.
 ///
 /// ```no_run
 /// # use std::sync::Arc;
 /// # use lance_core::Result;
 /// # use lance_index::scalar::inverted::{
-/// #     InvertedIndex, build_global_bm25_scorer_for_query,
+/// #     InvertedIndex, prepare_fts_global_statistics,
 /// #     query::{FtsQuery, FtsSearchParams},
 /// # };
 /// # async fn example(
@@ -3794,17 +3820,18 @@ pub(super) fn collect_leaf_queries(query: &FtsQuery, leaves: &mut Vec<LeafQuery>
 /// #     query: &FtsQuery,
 /// #     params: &FtsSearchParams,
 /// # ) -> Result<()> {
-/// let scorer = build_global_bm25_scorer_for_query(indices, query, params, None).await?;
-/// assert!(scorer.num_docs() > 0);
+/// let statistics = prepare_fts_global_statistics(indices, query, params, None).await?;
+/// assert!(statistics.scorer().num_docs() > 0);
+/// assert!(!statistics.query_leaves().is_empty());
 /// # Ok(())
 /// # }
 /// ```
-pub async fn build_global_bm25_scorer_for_query(
+pub async fn prepare_fts_global_statistics(
     indices: &[Arc<InvertedIndex>],
     query: &FtsQuery,
     params: &FtsSearchParams,
     metrics: Option<&dyn MetricsCollector>,
-) -> Result<MemBM25Scorer> {
+) -> Result<PreparedFtsGlobalStatistics> {
     let first_index = indices
         .first()
         .ok_or_else(|| Error::invalid_input("FTS index requires at least one segment"))?;
@@ -3817,6 +3844,7 @@ pub async fn build_global_bm25_scorer_for_query(
     }
 
     let mut combined: Option<MemBM25Scorer> = None;
+    let mut query_leaves = Vec::with_capacity(leaf_queries.len());
     for leaf in leaf_queries {
         let effective_params = leaf.effective_params(params);
         let tokens = tokenize_leaf(first_index, &leaf, &effective_params);
@@ -3853,9 +3881,15 @@ pub async fn build_global_bm25_scorer_for_query(
                 }
             }
         }
+        query_leaves.push(prepared);
     }
 
-    combined.ok_or_else(|| Error::internal("FTS global scorer was not initialized"))
+    let scorer =
+        combined.ok_or_else(|| Error::internal("FTS global scorer was not initialized"))?;
+    Ok(PreparedFtsGlobalStatistics {
+        scorer: Arc::new(scorer),
+        query_leaves,
+    })
 }
 
 struct PreparedLeaf {

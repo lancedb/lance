@@ -1683,8 +1683,9 @@ public class Dataset implements Closeable {
    * logical FTS index.
    *
    * <p>The returned opaque protobuf is bound to this dataset version and the exact segment set. It
-   * does not include documents in unindexed fragments. Queries spanning more than one indexed
-   * column are not supported.
+   * also preserves the prepared vocabulary and original token positions of every scoring query
+   * leaf, including fuzzy expansions. It does not include documents in unindexed fragments.
+   * Queries spanning more than one indexed column are not supported.
    *
    * <pre>{@code
    * FtsGlobalStatistics statistics =

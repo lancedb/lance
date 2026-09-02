@@ -77,8 +77,7 @@ use lance_index::scalar::inverted::query::{
 };
 use lance_index::scalar::inverted::{
     DOC_INDEX_COL, DOC_INDEX_FIELD, DocumentGranularity, INVERTED_INDEX_VERSION_V2,
-    INVERTED_INDEX_VERSION_V3, SCORE_COL, SCORE_FIELD, build_global_bm25_scorer_for_query,
-    fts_schema,
+    INVERTED_INDEX_VERSION_V3, SCORE_COL, SCORE_FIELD, fts_schema, prepare_fts_global_statistics,
 };
 use lance_index::scalar::registry::VALUE_COLUMN_NAME;
 use lance_index::vector::{ApproxMode, DEFAULT_QUERY_PARALLELISM, DIST_COL, Query};
@@ -1745,8 +1744,8 @@ impl Scanner {
         let indices =
             open_fts_segments(&self.dataset, &column, &segments, &NoOpMetricsCollector).await?;
         let params = query.params();
-        let scorer =
-            build_global_bm25_scorer_for_query(&indices, &query.query, &params, None).await?;
+        let prepared = prepare_fts_global_statistics(&indices, &query.query, &params, None).await?;
+        let scorer = prepared.scorer();
 
         let num_docs = u64::try_from(scorer.num_docs).map_err(|_| {
             Error::internal(format!(
@@ -1755,9 +1754,63 @@ impl Scanner {
             ))
         })?;
         let total_tokens = scorer.total_tokens;
-        let mut terms = scorer.token_docs.into_iter().collect::<Vec<_>>();
-        terms.sort_unstable_by(|left, right| left.0.cmp(&right.0));
-        let terms = terms
+        let mut term_statistics = scorer
+            .token_docs
+            .iter()
+            .map(|(term, document_frequency)| (term.clone(), *document_frequency))
+            .collect::<Vec<_>>();
+        term_statistics.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        let mut term_indices = HashMap::with_capacity(term_statistics.len());
+        for (term_index, (term, _)) in term_statistics.iter().enumerate() {
+            let term_index = u32::try_from(term_index).map_err(|_| {
+                Error::internal(format!(
+                    "FTS global term count {} exceeds u32::MAX",
+                    term_statistics.len()
+                ))
+            })?;
+            term_indices.insert(term.as_str(), term_index);
+        }
+        let query_leaves = prepared
+            .query_leaves()
+            .iter()
+            .enumerate()
+            .map(|(leaf_ordinal, prepared_leaf)| {
+                let leaf_ordinal = u32::try_from(leaf_ordinal).map_err(|_| {
+                    Error::internal(format!(
+                        "FTS prepared query leaf count {} exceeds u32::MAX",
+                        prepared.query_leaves().len()
+                    ))
+                })?;
+                let prepared_tokens = prepared_leaf.tokens();
+                let mut tokens = Vec::with_capacity(prepared_tokens.len());
+                for token_index in 0..prepared_tokens.len() {
+                    let term = prepared_tokens.get_token(token_index);
+                    let term_index = term_indices.get(term).copied().ok_or_else(|| {
+                        Error::internal(format!(
+                            "FTS prepared leaf {leaf_ordinal} references missing global term '{term}'"
+                        ))
+                    })?;
+                    tokens.push((prepared_tokens.position(token_index), term_index));
+                }
+                tokens.sort_unstable();
+                tokens.dedup();
+                let tokens = tokens
+                    .into_iter()
+                    .map(
+                        |(query_position, term_index)| crate::pb::FtsPreparedTokenProto {
+                            term_index: Some(term_index),
+                            query_position: Some(query_position),
+                        },
+                    )
+                    .collect();
+                Ok(crate::pb::FtsPreparedQueryLeafProto {
+                    leaf_ordinal: Some(leaf_ordinal),
+                    tokens,
+                    has_all_query_positions: Some(prepared_leaf.has_all_query_positions()),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let terms = term_statistics
             .into_iter()
             .map(|(term, document_frequency)| {
                 let document_frequency = u64::try_from(document_frequency).map_err(|_| {
@@ -1767,7 +1820,7 @@ impl Scanner {
                 })?;
                 Ok(crate::pb::FtsTermStatisticsProto {
                     term,
-                    document_frequency,
+                    document_frequency: Some(document_frequency),
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -1776,25 +1829,40 @@ impl Scanner {
             .ok_or_else(|| Error::internal("FTS index has no committed segments"))?
             .name
             .clone();
+        if let Some(segment) = segments.iter().find(|segment| segment.name != index_name) {
+            return Err(Error::internal(format!(
+                "FTS segment {} belongs to logical index '{}', expected '{}'",
+                segment.uuid, segment.name, index_name
+            )));
+        }
         let document_granularity = match document_granularity {
-            DocumentGranularity::Row => "row",
-            DocumentGranularity::ListElement => "list_element",
+            DocumentGranularity::Row => crate::pb::FtsDocumentGranularity::Row,
+            DocumentGranularity::ListElement => crate::pb::FtsDocumentGranularity::ListElement,
         };
         let mut segment_uuids = segments
-            .into_iter()
-            .map(|segment| segment.uuid.to_string())
+            .iter()
+            .map(|segment| segment.uuid.as_bytes().to_vec())
             .collect::<Vec<_>>();
         segment_uuids.sort_unstable();
+        if let Some(duplicate) = segment_uuids.windows(2).find(|uuids| uuids[0] == uuids[1]) {
+            return Err(Error::internal(format!(
+                "FTS logical index '{index_name}' contains duplicate segment UUID {}",
+                Uuid::from_slice(&duplicate[0]).map_err(|error| Error::internal(format!(
+                    "FTS segment UUID must contain 16 bytes: {error}"
+                )))?
+            )));
+        }
         Ok(crate::pb::FtsGlobalStatisticsProto {
-            format_version: crate::pb::FtsGlobalStatisticsFormatVersion::V1 as i32,
+            schema_version: crate::pb::FtsGlobalStatisticsSchemaVersion::V1 as i32,
             dataset_version: self.dataset.version_id(),
             index_name,
             column,
             segment_uuids,
-            total_tokens,
-            num_docs,
+            total_tokens: Some(total_tokens),
+            num_docs: Some(num_docs),
             terms,
-            document_granularity: document_granularity.to_string(),
+            document_granularity: document_granularity as i32,
+            query_leaves,
         }
         .encode_to_vec())
     }
@@ -16722,7 +16790,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
     }
 
     #[tokio::test]
-    async fn test_fts_global_statistics_cover_all_committed_segments() {
+    async fn test_fts_global_statistics_preserve_prepared_query() {
         let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
             .await
             .unwrap();
@@ -16740,33 +16808,118 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         let statistics = crate::pb::FtsGlobalStatisticsProto::decode(encoded.as_slice()).unwrap();
 
         assert_eq!(
-            statistics.format_version,
-            crate::pb::FtsGlobalStatisticsFormatVersion::V1 as i32
+            statistics.schema_version,
+            crate::pb::FtsGlobalStatisticsSchemaVersion::V1 as i32
         );
         assert_eq!(statistics.dataset_version, test_ds.dataset.version_id());
         assert_eq!(statistics.index_name, "s_idx");
         assert_eq!(statistics.column, "s");
-        assert_eq!(statistics.document_granularity, "row");
+        assert_eq!(
+            statistics.document_granularity,
+            crate::pb::FtsDocumentGranularity::Row as i32
+        );
         assert_eq!(statistics.segment_uuids.len(), 2);
-        assert_eq!(statistics.num_docs, 400);
-        assert!(statistics.total_tokens > 0);
+        assert!(statistics.segment_uuids.iter().all(|uuid| uuid.len() == 16));
+        assert!(
+            statistics
+                .segment_uuids
+                .windows(2)
+                .all(|uuids| uuids[0] < uuids[1])
+        );
+        assert_eq!(statistics.num_docs, Some(400));
+        assert!(statistics.total_tokens.unwrap() > 0);
         let term_document_frequencies = statistics
             .terms
             .iter()
             .map(|term| (term.term.as_str(), term.document_frequency))
             .collect::<BTreeMap<_, _>>();
-        assert_eq!(term_document_frequencies.get("s"), Some(&400));
-        assert_eq!(term_document_frequencies.get("5"), Some(&1));
+        assert_eq!(term_document_frequencies.get("s"), Some(&Some(400)));
+        assert_eq!(term_document_frequencies.get("5"), Some(&Some(1)));
         assert!(
             statistics
                 .terms
                 .windows(2)
                 .all(|terms| terms[0].term < terms[1].term)
         );
+        assert_eq!(statistics.query_leaves.len(), 1);
+        let leaf = &statistics.query_leaves[0];
+        assert_eq!(leaf.leaf_ordinal, Some(0));
+        assert_eq!(leaf.has_all_query_positions, Some(true));
+        let leaf_tokens = leaf
+            .tokens
+            .iter()
+            .map(|token| {
+                (
+                    statistics.terms[token.term_index.unwrap() as usize]
+                        .term
+                        .as_str(),
+                    token.query_position.unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(leaf_tokens, [("s", 0), ("5", 1)]);
         assert_eq!(
             scanner.fts_global_statistics().await.unwrap(),
             encoded,
             "opaque statistics serialization must be deterministic"
+        );
+
+        let query: FtsQuery = BooleanQuery::new([
+            (
+                Occur::Should,
+                MatchQuery::new("s-5".to_string())
+                    .with_column(Some("s".to_string()))
+                    .into(),
+            ),
+            (
+                Occur::Must,
+                MatchQuery::new("s-205".to_string())
+                    .with_column(Some("s".to_string()))
+                    .with_fuzziness(Some(1))
+                    .with_max_expansions(50)
+                    .into(),
+            ),
+        ])
+        .into();
+        let mut compound_scanner = test_ds.dataset.scan();
+        compound_scanner
+            .full_text_search(FullTextSearchQuery::new_query(query))
+            .unwrap();
+        let compound_statistics = crate::pb::FtsGlobalStatisticsProto::decode(
+            compound_scanner
+                .fts_global_statistics()
+                .await
+                .unwrap()
+                .as_slice(),
+        )
+        .unwrap();
+        assert_eq!(compound_statistics.query_leaves.len(), 2);
+        assert_eq!(
+            compound_statistics
+                .query_leaves
+                .iter()
+                .map(|leaf| leaf.leaf_ordinal)
+                .collect::<Vec<_>>(),
+            [Some(0), Some(1)]
+        );
+        assert_eq!(
+            compound_statistics.query_leaves[0]
+                .tokens
+                .iter()
+                .map(|token| token.query_position.unwrap())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([0, 1])
+        );
+        let fuzzy_leaf = &compound_statistics.query_leaves[1];
+        assert_eq!(fuzzy_leaf.has_all_query_positions, Some(true));
+        assert!(fuzzy_leaf.tokens.len() > 2);
+        assert_eq!(
+            fuzzy_leaf
+                .tokens
+                .iter()
+                .map(|token| token.query_position.unwrap())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([0, 1])
         );
     }
 }
