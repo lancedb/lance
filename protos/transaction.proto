@@ -144,12 +144,24 @@ message Transaction {
     repeated lance.file.Field schema = 2;
     // Schema metadata.
     map<string, bytes> schema_metadata = 3;
+    // Set when this merge makes no nullability-affecting schema change: it
+    // introduces no field that data staged against an earlier schema could
+    // not safely omit. Without the assertion (including transactions written
+    // before this field existed) the merge conservatively conflicts with
+    // concurrent value-writes, which can only cause a retry.
+    bool preserves_nullability = 4;
   }
 
   // An operation that projects a subset of columns, altering the schema.
   message Project {
     // The new schema
     repeated lance.file.Field schema = 1;
+    // Set when this projection makes no nullability-affecting schema change,
+    // as a rename or a drop does not. Without the assertion (including
+    // transactions written before this field existed) the projection
+    // conservatively conflicts with concurrent value-writes, which can only
+    // cause a retry. A nullability tightening must not set this.
+    bool preserves_nullability = 2;
   }
 
   // An operation that restores a dataset to a previous version.
@@ -243,8 +255,8 @@ message Transaction {
     repeated DataFragment new_fragments = 3;
     // The ids of the fields that have been modified.
     repeated uint32 fields_modified = 4;
-    /// List of MemWAL shard generations to mark as merged after this transaction
-    repeated MergedGeneration merged_generations = 5;
+    /// SSTables to mark as compacted after this transaction.
+    repeated CompactedSsTable compacted_sstables = 5;
     /// The fields that used to judge whether to preserve the new frag's id into
     /// the frag bitmap of the specified indices.
     repeated uint32 fields_for_preserving_frag_bitmap = 6;
@@ -254,7 +266,12 @@ message Transaction {
     // Only tracks keys from INSERT operations during merge insert, not updates.
     optional KeyExistenceFilter inserted_rows = 8;
     // Per-fragment physical row offsets that matched an update_columns hash join (RewriteColumns).
+    // Deprecated: use updated_fragment_offset_bitmaps (field 10) instead.
     map<uint64, UInt32List> updated_fragment_offsets = 9;
+    // Per-fragment matched offsets as portable RoaringBitmap bytes (replaces field 9).
+    // Writers emit field 10 only. Readers prefer field 10; fall back to field 9 for
+    // manifests written before this change.
+    map<uint64, bytes> updated_fragment_offset_bitmaps = 10;
   }
 
   // The mode of update operation
@@ -315,12 +332,34 @@ message Transaction {
     repeated DataReplacementGroup replacements = 1;
   }
 
-  // Update the merged generations in MemWAL index.
+  // Overlay files to append to a single fragment, in order (the last entry is
+  // newest). The overlays are appended to the fragment's existing `overlays`
+  // list; they do not replace it, so overlays written by concurrent commits are
+  // preserved.
+  message DataOverlayGroup {
+    uint64 fragment_id = 1;
+    // Each DataOverlayFile.committed_version is left 0 by the writer and stamped
+    // to the new dataset version at commit time (re-stamped on retry), in the
+    // same way as the created-at / last-updated-at version sequences. The fields
+    // touched are read from each overlay's `data_file.fields`.
+    repeated DataOverlayFile overlays = 2;
+  }
+
+  // Attach overlay files to fragments, supplying new values for a subset of
+  // (row offset, field) cells without rewriting the fragments' base data files.
+  // See the DataOverlayFile message in table.proto for resolution, coverage, and
+  // versioning rules, and the Data Overlay Files and Transactions specifications
+  // for the (intentionally permissive) conflict semantics.
+  message DataOverlay {
+    repeated DataOverlayGroup groups = 1;
+  }
+
+  // Update SSTable compaction progress in the MemWAL index.
   // This operation is used during merge-insert to atomically record which
-  // generations have been merged to the base table.
+  // SSTables have been compacted into the base table.
   message UpdateMemWalState {
-    // Shards and generations being marked as merged.
-    repeated MergedGeneration merged_generations = 1;
+    // SSTables being marked as compacted.
+    repeated CompactedSsTable compacted_sstables = 1;
   }
 
   // An operation that updates base paths in the dataset.
@@ -346,6 +385,7 @@ message Transaction {
     UpdateMemWalState update_mem_wal_state = 112;
     Clone clone = 113;
     UpdateBases update_bases = 114;
+    DataOverlay data_overlay = 115;
   }
 
   // Fields 200/202 (`blob_append` / `blob_overwrite`) previously represented blob dataset ops.

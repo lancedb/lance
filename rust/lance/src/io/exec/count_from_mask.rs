@@ -31,7 +31,7 @@ use datafusion::physical_plan::{
 };
 use datafusion_physical_expr::EquivalenceProperties;
 use datafusion_physical_expr::aggregate::AggregateFunctionExpr;
-use futures::{StreamExt, TryStreamExt};
+use futures::{StreamExt, TryStreamExt, stream};
 use lance_core::{Error, Result};
 use lance_select::{RowAddrMask, RowAddrSelection, RowAddrTreeMap};
 use lance_table::format::Fragment;
@@ -40,6 +40,7 @@ use tracing::instrument;
 
 use super::utils::InstrumentedRecordBatchStreamAdapter;
 use crate::Dataset;
+use crate::dataset::rowids::load_row_id_sequences;
 use crate::index::prefilter::DatasetPreFilter;
 
 /// An execution node that computes a `COUNT(*)`-style aggregate from an
@@ -234,36 +235,16 @@ impl CountFromMaskExec {
         Ok(count)
     }
 
-    #[instrument(name = "count_from_mask", skip_all, level = "debug")]
-    async fn do_execute(
-        dataset: Arc<Dataset>,
-        aggregate_funcs_len: usize,
-        prefilter_input: Option<Arc<dyn ExecutionPlan>>,
-        restrict_to_fragments: Option<RoaringBitmap>,
-        context: Arc<datafusion::execution::context::TaskContext>,
-        schema: SchemaRef,
-    ) -> Result<RecordBatch> {
-        let prefilter = match prefilter_input {
-            None => None,
-            Some(input) => Some(Self::load_prefilter(input, context.clone()).await?),
-        };
-
-        // Anchor the deletion mask against either every dataset fragment or
-        // the caller-supplied restricted subset.
-        let dataset_fragments: RoaringBitmap =
-            dataset.fragments().iter().map(|f| f.id as u32).collect();
-        let fragments_covered = match restrict_to_fragments {
-            Some(restrict) => dataset_fragments & restrict,
-            None => dataset_fragments,
-        };
-
-        // Build the fragments allow list as concrete `[0..physical_rows)`
-        // ranges rather than `Full` markers. `Full` interacts poorly with
-        // `BlockList` subtraction — `RowAddrTreeMap::Sub` materializes a
-        // `RoaringBitmap::full()` (2^32 rows) per fragment when a `Full`
-        // entry gets a partial block subtracted from it, which inflates
-        // counts and is expensive. Concrete ranges avoid that path entirely
-        // and keep `len()` exact at every combine step.
+    /// Row-address-space fragments-allow list: concrete `[0..physical_rows)`
+    /// ranges per covered fragment.
+    ///
+    /// Concrete ranges, not `Full` markers: subtracting a `BlockList` from a
+    /// `Full` entry materializes a `RoaringBitmap::full()` (2^32) per fragment,
+    /// which is slow and throws off `len()`.
+    fn address_fragments_allow(
+        dataset: &Dataset,
+        fragments_covered: &RoaringBitmap,
+    ) -> Result<RowAddrTreeMap> {
         let frag_map: HashMap<u32, &Fragment> = dataset
             .fragments()
             .iter()
@@ -287,16 +268,118 @@ impl CountFromMaskExec {
             bitmap.insert_range(0u32..(physical as u32));
             fragments_allow.insert_bitmap(frag_id, bitmap);
         }
+        Ok(fragments_allow)
+    }
 
-        // Load the deletion mask for the covered fragments.
-        let deletion_mask =
-            match DatasetPreFilter::create_deletion_mask(dataset.clone(), fragments_covered) {
-                Some(fut) => Some(fut.await?),
-                None => None,
-            };
+    /// Live (non-deleted) row count of the covered fragments, from fragment
+    /// metadata. Used for an unfiltered count: no prefilter to intersect, so no
+    /// need to build the stable-id universe.
+    async fn count_live_rows(dataset: &Dataset, fragments_covered: &RoaringBitmap) -> Result<i64> {
+        let frags = dataset
+            .get_fragments()
+            .into_iter()
+            .filter(|f| fragments_covered.contains(f.id() as u32));
+        let counts = stream::iter(frags)
+            .map(|f| async move { f.count_rows(None).await })
+            .buffer_unordered(dataset.object_store.as_ref().io_parallelism())
+            .try_collect::<Vec<_>>()
+            .await?;
+        Ok(counts.iter().sum::<usize>() as i64)
+    }
 
-        let combined = Self::combine_masks(fragments_allow, prefilter, deletion_mask);
-        let count = Self::count_from_mask(&combined, dataset.as_ref())?;
+    /// Count universe in stable-id space: live stable row ids whose current home
+    /// is in `fragments_covered`. Staying in stable-id space lets it intersect
+    /// the index prefilter directly; deletions are already folded in, so the
+    /// caller passes no separate deletion mask.
+    async fn stable_id_universe(
+        dataset: &Arc<Dataset>,
+        fragments_covered: RoaringBitmap,
+    ) -> Result<RowAddrTreeMap> {
+        // create_restricted_deletion_mask gives a live-id allow list restricted
+        // to `fragments_covered`. It returns None only with no deletions and full
+        // coverage — then the universe is every stable id, loaded below.
+        if let Some(fut) = DatasetPreFilter::create_restricted_deletion_mask(
+            dataset.clone(),
+            fragments_covered.clone(),
+        ) {
+            let mask = fut.await?;
+            return mask.allow_list().cloned().ok_or_else(|| {
+                Error::internal(
+                    "CountFromMaskExec: stable-row-id deletion mask must be an AllowList"
+                        .to_string(),
+                )
+            });
+        }
+        Self::load_stable_id_universe(dataset, &fragments_covered).await
+    }
+
+    /// Every stable row id in the covered fragments, from their row-id sequences
+    /// (metadata, not column data). Only used with no deletions and full coverage.
+    async fn load_stable_id_universe(
+        dataset: &Dataset,
+        fragments_covered: &RoaringBitmap,
+    ) -> Result<RowAddrTreeMap> {
+        let frags: Vec<Fragment> = dataset
+            .fragments()
+            .iter()
+            .filter(|f| fragments_covered.contains(f.id as u32))
+            .cloned()
+            .collect();
+        let mut sequences = load_row_id_sequences(dataset, &frags);
+        let mut universe = RowAddrTreeMap::new();
+        while let Some((_frag_id, sequence)) = sequences.try_next().await? {
+            universe |= RowAddrTreeMap::from(sequence.as_ref());
+        }
+        Ok(universe)
+    }
+
+    #[instrument(name = "count_from_mask", skip_all, level = "debug")]
+    async fn do_execute(
+        dataset: Arc<Dataset>,
+        aggregate_funcs_len: usize,
+        prefilter_input: Option<Arc<dyn ExecutionPlan>>,
+        restrict_to_fragments: Option<RoaringBitmap>,
+        context: Arc<datafusion::execution::context::TaskContext>,
+        schema: SchemaRef,
+    ) -> Result<RecordBatch> {
+        let prefilter = match prefilter_input {
+            None => None,
+            Some(input) => Some(Self::load_prefilter(input, context.clone()).await?),
+        };
+
+        // Anchor the deletion mask against either every dataset fragment or
+        // the caller-supplied restricted subset.
+        let dataset_fragments: RoaringBitmap =
+            dataset.fragments().iter().map(|f| f.id as u32).collect();
+        let fragments_covered = match restrict_to_fragments {
+            Some(restrict) => dataset_fragments & restrict,
+            None => dataset_fragments,
+        };
+
+        // Under stable row ids the prefilter and deletion masks are in stable-id
+        // space, so the universe must be too (see `stable_id_universe`); the
+        // default path builds it in row-address space.
+        let count = if dataset.manifest.uses_stable_row_ids() {
+            match prefilter {
+                // No prefilter: just the live row count, from metadata.
+                None => Self::count_live_rows(&dataset, &fragments_covered).await?,
+                Some(prefilter) => {
+                    let universe = Self::stable_id_universe(&dataset, fragments_covered).await?;
+                    let combined = Self::combine_masks(universe, Some(prefilter), None);
+                    Self::count_from_mask(&combined, dataset.as_ref())?
+                }
+            }
+        } else {
+            let fragments_allow = Self::address_fragments_allow(&dataset, &fragments_covered)?;
+            // Load the deletion mask for the covered fragments.
+            let deletion_mask =
+                match DatasetPreFilter::create_deletion_mask(dataset.clone(), fragments_covered) {
+                    Some(fut) => Some(fut.await?),
+                    None => None,
+                };
+            let combined = Self::combine_masks(fragments_allow, prefilter, deletion_mask);
+            Self::count_from_mask(&combined, dataset.as_ref())?
+        };
 
         // Every aggregate is the same non-distinct COUNT shape — emit the
         // count once per output column.
@@ -310,10 +393,6 @@ impl CountFromMaskExec {
 impl ExecutionPlan for CountFromMaskExec {
     fn name(&self) -> &str {
         "CountFromMaskExec"
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
     }
 
     fn schema(&self) -> SchemaRef {
@@ -380,11 +459,11 @@ impl ExecutionPlan for CountFromMaskExec {
     fn partition_statistics(
         &self,
         _partition: Option<usize>,
-    ) -> datafusion::error::Result<datafusion::physical_plan::Statistics> {
-        Ok(datafusion::physical_plan::Statistics {
+    ) -> datafusion::error::Result<Arc<datafusion::physical_plan::Statistics>> {
+        Ok(Arc::new(datafusion::physical_plan::Statistics {
             num_rows: datafusion::common::stats::Precision::Exact(1),
             ..datafusion::physical_plan::Statistics::new_unknown(&self.schema)
-        })
+        }))
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
@@ -411,7 +490,6 @@ mod tests {
     use datafusion::logical_expr::lit;
     use datafusion::physical_expr::execution_props::ExecutionProps;
     use datafusion::physical_plan::ExecutionPlan;
-    use datafusion::physical_planner::create_aggregate_expr_and_maybe_filter;
     use datafusion::scalar::ScalarValue;
     use futures::TryStreamExt;
     use lance_core::utils::tempfile::TempStrDir;
@@ -429,8 +507,13 @@ mod tests {
     use crate::index::DatasetIndexExt;
     use crate::io::exec::scalar_index::ScalarIndexExec;
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+    #[allow(deprecated)]
+    use datafusion::physical_planner::create_aggregate_expr_and_maybe_filter;
 
     /// Build an `AggregateFunctionExpr` matching `COUNT(*)`.
+    // TODO(datafusion-54): migrate off the deprecated
+    // create_aggregate_expr_and_maybe_filter to LoweredAggregateBuilder.
+    #[allow(deprecated)]
     fn count_star_expr(input_schema: &SchemaRef) -> Arc<AggregateFunctionExpr> {
         let expr = functions_aggregate::count::count(lit(1));
         let df_schema = DFSchema::try_from(input_schema.as_ref().clone()).unwrap();

@@ -28,6 +28,11 @@ message CompressedPostingHeader {
   PositionStorage position_storage = 4;
   // Only meaningful when position_storage == POSITION_STORAGE_SHARED.
   PositionStreamCodec position_stream_codec = 5;
+  // Number of documents in each compressed posting block. Older cache entries
+  // omit this field and decode as the legacy 128-doc block size.
+  uint32 block_size = 6;
+  // Whether an impact IPC section follows the posting/position sections.
+  bool has_impacts = 7;
 }
 
 // Header for a serialized `PlainPostingList` cache entry. Followed by an Arrow
@@ -164,6 +169,9 @@ message SqPartitionHeader {
 // three raw blobs: the IVF model protobuf, the quantizer's extra-metadata
 // buffer (may be empty), and the auxiliary IVF model protobuf.
 message IvfStateHeader {
+  reserved 8;
+  reserved "cache_key_prefix";
+
   string index_file_path = 1;
   string uuid = 2;
   string distance_type = 3;
@@ -174,7 +182,6 @@ message IvfStateHeader {
   // type is generic over the quantizer; the proto envelope still provides
   // additive evolution for the surrounding fields.
   string quantizer_metadata_json = 7;
-  string cache_key_prefix = 8;
   uint64 index_file_size = 9;
   uint64 aux_file_size = 10;
 }

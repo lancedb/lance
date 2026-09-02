@@ -111,6 +111,11 @@ public class TestUtils {
     }
 
     public List<FragmentMetadata> createNewFragment(int rowCount, int maxRowsPerFile) {
+      return createNewFragment(
+          rowCount, new WriteParams.Builder().withMaxRowsPerFile(maxRowsPerFile).build());
+    }
+
+    public List<FragmentMetadata> createNewFragment(int rowCount, WriteParams writeParams) {
       List<FragmentMetadata> fragmentMetas;
       try (VectorSchemaRoot root = VectorSchemaRoot.create(getSchema(), allocator)) {
         root.allocateNew();
@@ -124,12 +129,7 @@ public class TestUtils {
         }
         root.setRowCount(rowCount);
 
-        fragmentMetas =
-            Fragment.create(
-                datasetPath,
-                allocator,
-                root,
-                new WriteParams.Builder().withMaxRowsPerFile(maxRowsPerFile).build());
+        fragmentMetas = Fragment.create(datasetPath, allocator, root, writeParams);
       }
       return fragmentMetas;
     }
@@ -694,7 +694,8 @@ public class TestUtils {
     /**
      * Create a single fragment with given row count and return its metadata. The fragment contains
      * deterministic blob payloads: - Every 16th row starting at 0 has zero-length blob - Every 16th
-     * row starting at 1 has a ~1 MiB payload - Others have small variable blobs (128..383 bytes)
+     * row starting at 1 has a ~1 MiB payload - Every 16th row starting at 15 is null - Others have
+     * small variable blobs (128..383 bytes)
      */
     public FragmentMetadata createBlobFragment(int rowCount, int maxRowsPerFile) {
       Preconditions.checkArgument(rowCount >= 0, "rowCount must be non-negative");
@@ -716,6 +717,8 @@ public class TestUtils {
             byte[] big = new byte[1024 * 1024];
             Arrays.fill(big, (byte) 0xAB);
             blobsVec.setSafe(i, big);
+          } else if (i % 16 == 15) {
+            blobsVec.setNull(i);
           } else {
             // small variable blob
             int sz = 128 + (i % 256);

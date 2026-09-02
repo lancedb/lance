@@ -14,6 +14,15 @@ pub fn deep_copy_buffer(buffer: &Buffer) -> Buffer {
 pub fn deep_copy_nulls(nulls: Option<&NullBuffer>) -> Option<NullBuffer> {
     let nulls = nulls?;
     let bit_buffer = deep_copy_buffer(nulls.inner().inner());
+    // SAFETY: `null_count` is taken from the source `NullBuffer`, which already
+    // upheld `NullBuffer::new_unchecked`'s invariant — the unset-bit count over
+    // the logical bit slice `[bit_offset, bit_offset + bit_len)`. `NullBuffer::slice`
+    // adjusts only `BooleanBuffer::bit_offset` / `bit_len` and never byte-advances
+    // the inner `Buffer`, so `deep_copy_buffer` (which copies the source `Buffer`'s
+    // `as_slice()` view from byte 0) reproduces the exact bit pattern at the same
+    // bit offsets; the unset-bit count is therefore preserved. `BooleanBuffer::new`
+    // panics (does not UB) if `bit_offset + bit_len > 8 * buffer.len()`, and the
+    // copy has the same length, so that check still passes.
     Some(unsafe {
         NullBuffer::new_unchecked(
             BooleanBuffer::new(bit_buffer, nulls.offset(), nulls.len()),
@@ -37,6 +46,19 @@ pub fn deep_copy_array_data(data: &ArrayData) -> ArrayData {
         .iter()
         .map(deep_copy_array_data)
         .collect::<Vec<_>>();
+    // SAFETY: `build_unchecked` inherits `ArrayData::new_unchecked`'s contract —
+    // `(data_type, len, offset, nulls, buffers, child_data)` must form a valid
+    // Arrow array. This call reproduces `data` structurally: `data_type`, `len`,
+    // and `offset` are forwarded unchanged; each buffer is replaced by a byte-
+    // identical copy of its offset-applied `as_slice()` view (the output buffer
+    // is `MutableBuffer`-allocated, at least as aligned as the source); `nulls`
+    // is deep-copied with the same bit offset/length and unset-bit count (see
+    // `deep_copy_nulls`); `child_data` is recursively cloned with the same
+    // guarantee. Every value-level invariant the source upheld — UTF-8 validity,
+    // monotonic offsets, in-bounds dictionary indices, run-end monotonicity,
+    // struct child-length matching — therefore transfers to the copy. If the
+    // source `ArrayData` was itself constructed via `new_unchecked` with an
+    // invalid payload, this function faithfully reproduces that invalidity.
     unsafe {
         ArrayDataBuilder::new(data_type)
             .len(len)
