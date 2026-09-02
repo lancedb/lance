@@ -49,6 +49,7 @@ use lance_file::versions::v1::reader::{FileReader as V1FileReader, read_batch as
 use lance_file::{LanceEncodingsIo, determine_file_version, versions as file_versions};
 use lance_io::ReadBatchParams;
 use lance_io::scheduler::{FileScheduler, ScanScheduler, SchedulerConfig};
+use lance_io::stream::RecordBatchStream;
 use lance_io::utils::CachedFileSize;
 use lance_table::format::overlay::TOMBSTONE_FIELD_ID;
 use lance_table::format::{DataFile, DeletionFile, Fragment};
@@ -1686,6 +1687,108 @@ impl FileFragment {
             Ok(lance_arrow::json::convert_lance_json_to_arrow(&batch)?)
         } else {
             Ok(batch)
+        }
+    }
+
+    /// Read a fragment-local half-open physical row interval without applying deletions.
+    ///
+    /// Unlike logical range reads, offsets address the immutable rows stored in
+    /// the fragment's files. Deleted positions remain present with their stored
+    /// column values. Callers can stream the batches into
+    /// [`Dataset::write_data_file_part`](super::Dataset::write_data_file_part)
+    /// when independently computing a physical-row part.
+    ///
+    /// ```
+    /// # use lance::{dataset::fragment::FileFragment, Result};
+    /// # use lance_core::datatypes::Schema;
+    /// # async fn read(fragment: &FileFragment, schema: &Schema) -> Result<()> {
+    /// let batches = fragment.read_physical_slice(0..100, schema, 1024).await?;
+    /// # let _ = batches;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn read_physical_slice(
+        &self,
+        rows: Range<u64>,
+        projection: &Schema,
+        batch_size: u32,
+    ) -> Result<ReadBatchFutStream> {
+        if batch_size == 0 {
+            return Err(Error::invalid_input(
+                "read_physical_slice batch_size must be greater than zero",
+            ));
+        }
+        let physical_rows = self.physical_rows().await? as u64;
+        if rows.start > rows.end || rows.end > physical_rows {
+            return Err(Error::invalid_input(format!(
+                "physical slice {}..{} is outside fragment {} with {} physical rows",
+                rows.start,
+                rows.end,
+                self.id(),
+                physical_rows
+            )));
+        }
+        let offset = i64::try_from(rows.start).map_err(|_| {
+            Error::invalid_input(format!(
+                "physical slice start {} exceeds the supported scan offset range",
+                rows.start
+            ))
+        })?;
+        let limit = i64::try_from(rows.end - rows.start).map_err(|_| {
+            Error::invalid_input(format!(
+                "physical slice length {} exceeds the supported scan limit range",
+                rows.end - rows.start
+            ))
+        })?;
+
+        // Build a read-only view of this exact fragment without its deletion
+        // file. The normal scanner can then apply overlays and Blob descriptor
+        // materialization while offsets still address immutable physical rows.
+        let mut physical_metadata = self.metadata.clone();
+        physical_metadata.deletion_file = None;
+        let mut physical_dataset = self.dataset.as_ref().clone();
+        let mut physical_manifest = self.dataset.manifest.as_ref().clone();
+        physical_manifest.fragments = Arc::new(vec![physical_metadata.clone()]);
+        physical_dataset.manifest = Arc::new(physical_manifest);
+        let physical_dataset = Arc::new(physical_dataset);
+        let fragment = Self::new(physical_dataset.clone(), physical_metadata);
+        let mut scanner = fragment.scan();
+        let columns = projection
+            .fields
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect::<Vec<_>>();
+        scanner.project(&columns)?;
+        scanner.batch_size(batch_size as usize);
+        scanner.limit(Some(limit), Some(offset))?;
+
+        let has_blob_columns = projection.fields_pre_order().any(|field| field.is_blob());
+        if has_blob_columns {
+            scanner.with_row_address();
+        }
+        let stream = scanner.try_into_stream().await?;
+        if has_blob_columns {
+            let rewrite_plan = Arc::new(super::optimize::BlobV2BatchRewritePlan::try_new(
+                projection,
+                stream.schema().as_ref(),
+                false,
+            )?);
+            Ok(stream
+                .map(move |batch_result| {
+                    let physical_dataset = physical_dataset.clone();
+                    let rewrite_plan = rewrite_plan.clone();
+                    async move {
+                        rewrite_plan
+                            .transform_batch(&physical_dataset, batch_result?)
+                            .await
+                    }
+                    .boxed()
+                })
+                .boxed())
+        } else {
+            Ok(stream
+                .map(|batch_result| async move { batch_result }.boxed())
+                .boxed())
         }
     }
 
