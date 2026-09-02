@@ -643,9 +643,9 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         """
         Generate the execution plan for the merge insert operation.
 
-        This method creates the execution plan that would be used for the given
-        source schema and returns it as a formatted string for debugging and
-        analysis purposes.
+        This reports the plan a *streaming* source of the given schema would run.
+        It takes a schema rather than data, so it cannot know how ``execute`` would
+        wrap the source; see the note under the example.
 
         Parameters
         ----------
@@ -686,6 +686,13 @@ class MergeInsertBuilder(_MergeInsertBuilder):
                   ProjectionExec: expr=[..., true as __merge_source_sentinel]
                     StreamingTableExec: partition_sizes=1, ...
         <BLANKLINE>
+
+        This is always the streaming shape. `explain_plan` receives a schema rather
+        than data, so it cannot know how `execute` would wrap the source, and the
+        wrapping affects the plan. Use `analyze_plan`, which receives the real
+        source, when that matters. Note that `analyze_plan` runs the merge to
+        collect metrics and may write data files, whereas `explain_plan` writes
+        nothing.
 
         >>> # Or with explicit schema
         >>> source_schema = pa.schema([
@@ -761,11 +768,19 @@ class MergeInsertBuilder(_MergeInsertBuilder):
             MergeInsert: elapsed=..., on=[id], ..., metrics=[..., bytes_written=..., ...]
               CoalescePartitionsExec, elapsed=..., metrics=[output_rows=..., elapsed_compute=...]
                 ProjectionExec: elapsed=..., expr=[...], metrics=[...]
-                  HashJoinExec: elapsed=..., mode=CollectLeft, join_type=Right, ...
-                    LanceRead: elapsed=..., ..., metrics=[..., bytes_read=..., ...]
-                    RepartitionExec: ...
+                  RepartitionExec: ...
+                    HashJoinExec: elapsed=..., mode=CollectLeft, join_type=Left, ...
                       ProjectionExec: elapsed=..., expr=[..., true as __merge_source_sentinel], metrics=[...]
-                        StreamingTableExec: ..., metrics=[]
+                        DataSourceExec: ..., metrics=[]
+                      LanceRead: elapsed=..., ..., metrics=[..., bytes_read=..., ...]
+
+        The reported plan follows how the source was passed. `new_data` above is a
+        `pa.Table`, so it is wrapped in an in-memory table that reports exact
+        statistics, while a `pa.RecordBatchReader` reports none. DataFusion chooses
+        which side of the join to collect from those statistics and from the two
+        sides' sizes, so the same merge can plan differently depending on which one
+        you hand it. Use `explain_plan` only for the streaming shape: it takes a
+        schema rather than data, so it cannot know how the source would be wrapped.
 
         The two key parts of the plan analysis are LanceRead and MergeInsert.
         LanceRead scans join keys and columns in conditions. MergeInsert writes
@@ -786,6 +801,13 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         - requests: number of storage requests made
         """  # noqa: E501
         reader = _coerce_reader(data_obj, schema)
+
+        # Route exactly as execute() does, so the reported plan is the one that
+        # would run. A materialized source reports exact statistics where a stream
+        # reports none, which can change which side of the join is collected.
+        if _is_materialized(data_obj):
+            return super(MergeInsertBuilder, self).analyze_plan_batches(reader)
+
         return super(MergeInsertBuilder, self).analyze_plan(reader)
 
     def mark_sstables_as_compacted(

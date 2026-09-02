@@ -3723,6 +3723,42 @@ def test_merge_insert_explain_analyze_plan():
     assert "num_files_written" in analysis
 
 
+def test_merge_insert_analyze_plan_matches_execute_routing():
+    """analyze_plan must report the plan the given source would actually run.
+
+    execute() wraps a materialized source in an in-memory table, which reports
+    exact statistics; a stream reports none. DataFusion picks the collected side of
+    the join from those statistics and from the two sides' sizes, so the same merge
+    plans differently depending on which one it is handed. analyze_plan used to
+    coerce every input to a stream, so it reported the stream's plan whatever it
+    was given.
+    """
+    data = pa.table({"id": range(64), "value": [i * 10 for i in range(64)]})
+    dataset = lance.write_dataset(data, "memory://test-merge-analyze-routing")
+
+    def builder():
+        return (
+            dataset.merge_insert("id")
+            .when_matched_update_all()
+            .when_not_matched_insert_all()
+        )
+
+    # Two source rows against the target's 64 keeps the source the smaller side,
+    # which is what lets the join collect it. Raise it above 64 and the join
+    # collects the target instead and the join type stays Right.
+    source = pa.table({"id": [1, 100], "value": [999, 999]})
+
+    materialized = builder().analyze_plan(source)
+    assert "DataSourceExec" in materialized, materialized
+    assert "StreamingTableExec" not in materialized, materialized
+    assert "join_type=Left" in materialized, materialized
+
+    streaming = builder().analyze_plan(source.to_reader())
+    assert "StreamingTableExec" in streaming, streaming
+    assert "DataSourceExec" not in streaming, streaming
+    assert "join_type=Right" in streaming, streaming
+
+
 def test_merge_insert_use_index():
     """Test that use_index parameter controls whether indices are used."""
     data = pa.table({"id": range(100), "value": [i * 10 for i in range(100)]})
