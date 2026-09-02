@@ -6,7 +6,11 @@
 //! File grammar belongs to `lance_file::versions`. This module contains only
 //! operation-level dataset choices whose behavior actually differs by version.
 
-use std::{collections::HashMap, ops::Range, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    ops::Range,
+    sync::Arc,
+};
 
 use arrow_schema::{DataType, Field as ArrowField};
 use datafusion::catalog::Session;
@@ -241,6 +245,17 @@ pub async fn write_fragments_direct(
     .await
 }
 
+fn binary_copy_files_match(fragments: &[Fragment], expected: ConcreteFileVersion) -> Result<bool> {
+    for fragment in fragments {
+        for data_file in &fragment.files {
+            if data_file.file_version()? != expected {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
 pub async fn can_use_binary_copy(
     version: ConcreteFileVersion,
     dataset: &Dataset,
@@ -253,6 +268,9 @@ pub async fn can_use_binary_copy(
         | ConcreteFileVersion::V2_1
         | ConcreteFileVersion::V2_2
         | ConcreteFileVersion::V2_3 => {
+            if !binary_copy_files_match(fragments, version)? {
+                return Ok(false);
+            }
             super::optimize::can_use_binary_copy_current(dataset, options, fragments).await
         }
     }
@@ -264,13 +282,11 @@ pub async fn rewrite_files_binary_copy(
     fragments: &[Fragment],
     params: &WriteParams,
     read_batch_bytes: Option<usize>,
-) -> Result<super::optimize::binary_copy::BinaryCopyOutcome> {
+) -> Result<Vec<Fragment>> {
     match version {
-        ConcreteFileVersion::V1 => Ok(
-            super::optimize::binary_copy::BinaryCopyOutcome::Unsupported(
-                lance_file::concat::FileConcatReason::LegacyVersion,
-            ),
-        ),
+        ConcreteFileVersion::V1 => Err(Error::not_supported(
+            "binary-copy compaction is not supported for Lance file version 1".to_string(),
+        )),
         ConcreteFileVersion::V2_0
         | ConcreteFileVersion::V2_1
         | ConcreteFileVersion::V2_2
@@ -325,6 +341,8 @@ fn check_manifest_storage_contract(
     let mut first_file_version = None;
     let mut first_mismatch = None;
     let mut first_non_fallback = None;
+    let fields_by_id = field_column_requirements(manifest);
+    let mut validated_lists = HashSet::new();
 
     for fragment in manifest.fragments.iter() {
         for data_file in fragment.referenced_lance_files() {
@@ -351,7 +369,13 @@ fn check_manifest_storage_contract(
                 first_non_fallback = Some((data_file.path.clone(), fragment.id, file_version));
             }
 
-            validate_file_column_indices(manifest, fragment.id, data_file, file_version)?;
+            validate_file_column_indices(
+                &fields_by_id,
+                &mut validated_lists,
+                fragment.id,
+                data_file,
+                file_version,
+            )?;
         }
     }
 
@@ -426,10 +450,13 @@ fn check_manifest_storage_contract(
 
 #[cfg(test)]
 pub fn validate_column_indices(manifest: &Manifest) -> Result<()> {
+    let fields_by_id = field_column_requirements(manifest);
+    let mut validated_lists = HashSet::new();
     for fragment in manifest.fragments.iter() {
         for data_file in fragment.referenced_lance_files() {
             validate_file_column_indices(
-                manifest,
+                &fields_by_id,
+                &mut validated_lists,
                 fragment.id,
                 data_file,
                 data_file.file_version()?,
@@ -439,19 +466,25 @@ pub fn validate_column_indices(manifest: &Manifest) -> Result<()> {
     Ok(())
 }
 
+fn field_column_requirements(manifest: &Manifest) -> HashMap<i32, (&Field, bool)> {
+    let mut fields_by_id = HashMap::new();
+    for field in manifest.schema.fields_pre_order() {
+        let needs_column = field.is_leaf() || field.is_packed_struct() || field.is_blob();
+        fields_by_id
+            .entry(field.id)
+            .or_insert((field, needs_column));
+    }
+    fields_by_id
+}
+
 fn validate_file_column_indices(
-    manifest: &Manifest,
+    fields_by_id: &HashMap<i32, (&Field, bool)>,
+    validated_lists: &mut HashSet<(usize, usize)>,
     fragment_id: u64,
     data_file: &DataFile,
     file_version: ConcreteFileVersion,
 ) -> Result<()> {
-    if matches!(
-        file_version,
-        ConcreteFileVersion::V1 | ConcreteFileVersion::V2_0
-    ) {
-        return Ok(());
-    }
-    if data_file.column_indices.is_empty() {
+    if file_version == ConcreteFileVersion::V1 || data_file.column_indices.is_empty() {
         return Ok(());
     }
     if data_file.fields.len() != data_file.column_indices.len() {
@@ -463,11 +496,20 @@ fn validate_file_column_indices(
             data_file.column_indices.len()
         )));
     }
+    if file_version == ConcreteFileVersion::V2_0 {
+        return Ok(());
+    }
+    let list_key = (
+        data_file.fields.as_ptr() as usize,
+        data_file.column_indices.as_ptr() as usize,
+    );
+    if !validated_lists.insert(list_key) {
+        return Ok(());
+    }
     for (field_id, column_index) in data_file.fields.iter().zip(data_file.column_indices.iter()) {
-        let Some(field) = manifest.schema.field_by_id(*field_id) else {
+        let Some((field, needs_column)) = fields_by_id.get(field_id).copied() else {
             continue;
         };
-        let needs_column = field.is_leaf() || field.is_packed_struct() || field.is_blob();
         if needs_column && *column_index == -1 {
             return Err(Error::invalid_input(format!(
                 "Field '{}' (id={}) in data file '{}' (fragment {}) has column_index=-1, but leaf fields, packed structs, and blob fields must have a valid column index in file format 2.1+.",
