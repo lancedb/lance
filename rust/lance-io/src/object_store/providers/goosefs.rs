@@ -209,12 +209,20 @@ impl GooseFsStoreProvider {
             }
         };
 
+        let overflow = || {
+            Error::invalid_input(format!(
+                "invalid {option_key} `{value}`: size overflows u64"
+            ))
+        };
+
+        // Exact integer path. Digit-only coefficients that fail `u64` parsing
+        // have overflowed; do not retry them via `f64` (which cannot represent
+        // every integer above 2^53 and would saturate on `as u64`).
         if let Ok(n) = number.parse::<u64>() {
-            return n.checked_mul(multiplier).ok_or_else(|| {
-                Error::invalid_input(format!(
-                    "invalid {option_key} `{value}`: size overflows u64"
-                ))
-            });
+            return n.checked_mul(multiplier).ok_or_else(overflow);
+        }
+        if number.chars().all(|c| c.is_ascii_digit()) {
+            return Err(overflow());
         }
 
         let coeff: f64 = number.parse().map_err(|_| {
@@ -230,10 +238,11 @@ impl GooseFsStoreProvider {
 
         // Match GooseFS FormatUtils.parseSpaceSize: truncate (coeff * unit + 0.0001).
         let bytes = coeff.mul_add(multiplier as f64, 0.0001);
-        if bytes > u64::MAX as f64 {
-            return Err(Error::invalid_input(format!(
-                "invalid {option_key} `{value}`: size overflows u64"
-            )));
+        // `u64::MAX` is not representable as `f64` and rounds up to `2^64`,
+        // which *is* exact. Reject anything that is not strictly below that
+        // boundary so the `as u64` conversion cannot saturate.
+        if !(bytes >= 0.0 && bytes < u64::MAX as f64) {
+            return Err(overflow());
         }
         Ok(bytes as u64)
     }
@@ -602,6 +611,38 @@ mod tests {
         assert!(
             msg.contains(input.trim()) || input.trim().is_empty(),
             "error should include the input, got: {msg}"
+        );
+    }
+
+    #[rstest]
+    #[case::u64_max_plus_one("18446744073709551616")]
+    #[case::u64_max_plus_one_bytes("18446744073709551616b")]
+    #[case::integer_mul_overflow("16384PB")]
+    #[case::fractional_mul_overflow("16384.0PB")]
+    #[case::scientific_overflow("1e20")]
+    fn test_parse_space_size_rejects_overflow(#[case] input: &str) {
+        let err = GooseFsStoreProvider::parse_space_size("goosefs_chunk_size", input).unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "expected InvalidInput, got: {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("overflows u64"),
+            "overflowing size should be rejected, got: {msg}"
+        );
+        assert!(
+            msg.contains(input),
+            "error should include the input, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_parse_space_size_accepts_u64_max_integer() {
+        assert_eq!(
+            GooseFsStoreProvider::parse_space_size("goosefs_chunk_size", "18446744073709551615")
+                .unwrap(),
+            u64::MAX
         );
     }
 
