@@ -70,6 +70,8 @@ input_data = [
     ),
     # Pydantic model instances are auto-converted
     (None, [_InputModel(a=1.0, b=20), _InputModel(a=2.0, b=30)]),
+    (None, {"a": [1.0, 2.0], "b": [20, 30]}),
+    (None, [{"a": 1.0, "b": 20}, {"a": 2.0, "b": 30}]),
 ]
 
 

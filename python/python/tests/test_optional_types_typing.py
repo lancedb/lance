@@ -27,6 +27,44 @@ from lance.util import sanitize_ts
 
 if TYPE_CHECKING:
     import lance
+    import polars as pl
+    import pyarrow as pa
+    from lance.types import ReaderLike
+    from pyarrow.dataset import Dataset as ArrowDataset
+    from pyarrow.dataset import Scanner as ArrowScanner
+    from pydantic import BaseModel
+
+    def _accept_reader(reader: ReaderLike) -> None:
+        pass
+
+    def _check_reader_types(
+        pandas_dataframe: pd.DataFrame,
+        polars_dataframe: pl.DataFrame,
+        arrow_dataset: ArrowDataset,
+        arrow_scanner: ArrowScanner,
+        lance_dataset: lance.LanceDataset,
+        table: pa.Table,
+        batch: pa.RecordBatch,
+        reader: pa.RecordBatchReader,
+        batches: list[pa.RecordBatch],
+        models: list[BaseModel],
+    ) -> None:
+        # One case per branch of `lance.types._coerce_reader`.
+        _accept_reader(pandas_dataframe)
+        _accept_reader(polars_dataframe)
+        _accept_reader(arrow_dataset)
+        _accept_reader(arrow_scanner)
+        _accept_reader(lance_dataset)
+        _accept_reader(table)
+        _accept_reader(batch)
+        _accept_reader(reader)
+        _accept_reader(batches)
+        _accept_reader(models)
+        _accept_reader({"a": [1.0, 2.0]})
+        _accept_reader([{"a": 1.0}, {"a": 2.0}])
+        # No rejected case here: `ReaderLike` names pyarrow types, which are
+        # unresolved without `pyarrow-stubs`, and a union with an unresolved
+        # member accepts anything. The `asof` pins below have no such member.
 
     def _check_accepted_asof_types() -> None:
         # ``sanitize_ts`` is exercised at runtime below; this pins the public
