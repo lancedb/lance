@@ -578,7 +578,11 @@ type InterleaveResult = (Vec<(usize, usize)>, Vec<u64>);
 /// Also returns per-partition row counts (derived from the same sorted keys at no
 /// extra cost).
 ///
-/// Returns an error if any partition ID is out of range `[0, num_partitions)`.
+/// Returns an error if any partition ID is null or out of range `[0, num_partitions)`.
+///
+/// `PrimitiveArray::values()` stores a 0 in null slots. Treating those as
+/// partition 0 would silently move filtered/invalid rows into the first IVF
+/// partition.
 fn sort_to_interleave_indices(
     part_id_columns: &[&UInt32Array],
     num_partitions: usize,
@@ -587,8 +591,14 @@ fn sort_to_interleave_indices(
     let mut keys: Vec<(u32, u32, u32)> = Vec::with_capacity(total_rows);
     for (batch_idx, col) in part_id_columns.iter().enumerate() {
         let batch_idx = batch_idx as u32;
-        for (row_idx, &part_id) in col.values().iter().enumerate() {
-            keys.push((part_id, batch_idx, row_idx as u32));
+        for row_idx in 0..col.len() {
+            if col.is_null(row_idx) {
+                return Err(Error::invalid_input(format!(
+                    "null partition ID at batch {} row {}",
+                    batch_idx, row_idx
+                )));
+            }
+            keys.push((col.value(row_idx), batch_idx, row_idx as u32));
         }
     }
     keys.sort_unstable_by_key(|k| k.0);
@@ -650,6 +660,12 @@ impl Shuffler for TwoFileShuffler {
         let mut total_loss = 0.0f64;
         let mut accumulated: Vec<RecordBatch> = Vec::new();
         let mut acc_bytes: usize = 0;
+        // Keep the partition-boundary offsets computed at flush time. The
+        // sidecar is still written for on-demand reopen. The reader that
+        // consumes this shuffle uses these prefix sums instead of re-decoding
+        // the file, so partition sizes cannot drift from the flush that
+        // produced them.
+        let mut written_offsets: Vec<u64> = Vec::new();
 
         let mut data = std::pin::pin!(data);
         while let Some(batch) = data.next().await {
@@ -670,6 +686,7 @@ impl Shuffler for TwoFileShuffler {
                     offsets_schema.clone(),
                     num_partitions,
                     global_row_count,
+                    &mut written_offsets,
                 )
                 .await?;
                 acc_bytes = 0;
@@ -693,6 +710,7 @@ impl Shuffler for TwoFileShuffler {
                 offsets_schema,
                 num_partitions,
                 global_row_count,
+                &mut written_offsets,
             )
             .await?;
             for (p, c) in counts.iter().enumerate() {
@@ -709,13 +727,15 @@ impl Shuffler for TwoFileShuffler {
         file_writer.finish().await?;
         offsets_writer.finish().await?;
 
-        TwoFileShuffleReader::try_new(
+        TwoFileShuffleReader::try_new_with_preload_limit(
             self.object_store.clone(),
             self.output_dir.clone(),
             num_partitions,
             num_batches,
             partition_counts,
             total_loss,
+            MAX_PRELOADED_OFFSETS_BYTES,
+            Some(written_offsets),
         )
         .await
     }
@@ -732,9 +752,8 @@ async fn flush_shuffle_batch(
     offsets_schema: Arc<Schema>,
     num_partitions: usize,
     global_row_count: u64,
+    written_offsets: &mut Vec<u64>,
 ) -> Result<(u64, Vec<u64>)> {
-    let total_rows: u64 = accumulated.iter().map(|b| b.num_rows() as u64).sum();
-
     // Clone part-id columns into the CPU task (cheap: Arc ref bump, not data copy).
     let part_id_cols: Vec<UInt32Array> = accumulated
         .iter()
@@ -748,6 +767,20 @@ async fn flush_shuffle_batch(
     let (interleave_indices, batch_partition_counts) =
         spawn_cpu(move || sort_to_interleave_indices(&part_id_cols.iter().collect::<Vec<_>>(), np))
             .await?;
+
+    let total_rows = u64::try_from(interleave_indices.len()).map_err(|_| {
+        Error::invalid_input(format!(
+            "shuffle flush has {} rows, which cannot be represented as u64",
+            interleave_indices.len()
+        ))
+    })?;
+    let counted_rows: u64 = batch_partition_counts.iter().sum();
+    if counted_rows != total_rows {
+        return Err(Error::invalid_input(format!(
+            "partition counts sum to {} rows but the flush is interleaving {} rows",
+            counted_rows, total_rows
+        )));
+    }
 
     // Drop part-id column from source batches before interleaving.
     let source_batches: Vec<RecordBatch> = accumulated
@@ -770,6 +803,15 @@ async fn flush_shuffle_batch(
         running += count;
         adjusted_offsets.push(global_row_count + running);
     }
+    if adjusted_offsets.last().copied() != Some(global_row_count + total_rows) {
+        return Err(Error::invalid_input(format!(
+            "flush end offset {:?} does not equal global_row_count {} + total_rows {}",
+            adjusted_offsets.last(),
+            global_row_count,
+            total_rows
+        )));
+    }
+    written_offsets.extend_from_slice(&adjusted_offsets);
     let offsets_batch = RecordBatch::try_new(
         offsets_schema,
         vec![Arc::new(UInt64Array::from(adjusted_offsets))],
@@ -812,10 +854,12 @@ impl TwoFileShuffleReader {
             partition_counts,
             total_loss,
             MAX_PRELOADED_OFFSETS_BYTES,
+            None,
         )
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn try_new_with_preload_limit(
         object_store: Arc<ObjectStore>,
         output_dir: Path,
@@ -824,6 +868,7 @@ impl TwoFileShuffleReader {
         partition_counts: Vec<u64>,
         total_loss: f64,
         max_preloaded_offsets_bytes: usize,
+        written_offsets: Option<Vec<u64>>,
     ) -> Result<Box<dyn ShuffleReader>> {
         if num_batches == 0 {
             return Ok(Box::new(EmptyReader));
@@ -836,18 +881,6 @@ impl TwoFileShuffleReader {
         let file_reader = FileReader::try_open(
             scheduler
                 .open_file(&data_path, &CachedFileSize::unknown())
-                .await?,
-            None,
-            Arc::<DecoderPlugins>::default(),
-            &LanceCache::no_cache(),
-            FileReaderOptions::default(),
-        )
-        .await?;
-
-        let offsets_path = output_dir.clone().join("shuffle_offsets.lance");
-        let offsets_reader = FileReader::try_open(
-            scheduler
-                .open_file(&offsets_path, &CachedFileSize::unknown())
                 .await?,
             None,
             Arc::<DecoderPlugins>::default(),
@@ -876,89 +909,43 @@ impl TwoFileShuffleReader {
                 num_batches, num_partitions
             ))
         })?;
-        let expected_offsets_u64 = u64::try_from(expected_offsets).map_err(|_| {
-            Error::invalid_input(format!(
-                "expected offset count {} cannot be represented as u64",
-                expected_offsets
-            ))
-        })?;
-        if offsets_reader.num_rows() != expected_offsets_u64 {
-            return Err(Error::corrupt_file(
-                offsets_path.clone(),
-                format!(
-                    "offset count is {}, expected num_batches={} * num_partitions={} = {}",
-                    offsets_reader.num_rows(),
+        let offsets_path = output_dir.clone().join("shuffle_offsets.lance");
+        let offsets = if let Some(written_offsets) = written_offsets {
+            if written_offsets.len() != expected_offsets {
+                return Err(Error::invalid_input(format!(
+                    "writer produced {} offsets, expected num_batches={} * num_partitions={} = {}",
+                    written_offsets.len(),
                     num_batches,
                     num_partitions,
                     expected_offsets
-                ),
-            ));
-        }
-
-        let offsets_schema = offsets_reader.schema();
-        let offset_field = offsets_schema.field("offset").ok_or_else(|| {
-            Error::corrupt_file(
-                offsets_path.clone(),
-                "required non-null UInt64 column 'offset' is missing",
-            )
-        })?;
-        if offset_field.data_type() != DataType::UInt64 || offset_field.nullable {
-            return Err(Error::corrupt_file(
-                offsets_path.clone(),
-                format!(
-                    "column 'offset' must be non-null UInt64, found {:?} (nullable={})",
-                    offset_field.data_type(),
-                    offset_field.nullable
-                ),
-            ));
-        }
-
-        let should_preload_offsets =
-            should_preload_offsets(expected_offsets, max_preloaded_offsets_bytes)?;
-        let mut offsets = should_preload_offsets.then(|| Vec::with_capacity(expected_offsets));
-        let mut validator = ShuffleOffsetsValidator::new(
-            expected_offsets,
-            num_partitions,
-            file_reader.num_rows(),
-            &partition_counts,
-            &offsets_path,
-        );
-        let mut offsets_stream = offsets_reader
-            .read_stream(
-                ReadBatchParams::RangeFull,
-                1024 * 1024,
-                16,
-                FilterExpression::no_filter(),
-            )
-            .await?;
-        while let Some(batch) = offsets_stream.try_next().await? {
-            let offset_column = batch
-                .column_by_name("offset")
-                .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
-                .ok_or_else(|| {
-                    Error::corrupt_file(
-                        offsets_path.clone(),
-                        "required UInt64 column 'offset' is missing from decoded batch",
-                    )
-                })?;
-            if offset_column.null_count() != 0 {
-                return Err(Error::corrupt_file(
-                    offsets_path.clone(),
-                    format!(
-                        "column 'offset' contains {} null values",
-                        offset_column.null_count()
-                    ),
-                ));
+                )));
             }
-            validator.push(offset_column.values())?;
-            if let Some(offsets) = offsets.as_mut() {
-                offsets.extend_from_slice(offset_column.values());
-            }
-        }
-        validator.finish()?;
-        let offsets = match offsets {
-            Some(offsets) => ShuffleOffsets::Preloaded(offsets),
-            None => ShuffleOffsets::OnDemand(offsets_reader),
+            let mut validator = ShuffleOffsetsValidator::new(
+                expected_offsets,
+                num_partitions,
+                file_reader.num_rows(),
+                &partition_counts,
+                &offsets_path,
+            );
+            validator.push(&written_offsets)?;
+            validator.finish()?;
+            // The sidecar is still on disk for reopen. Prefer the prefix sums
+            // computed at flush time over a decode of that ephemeral file.
+            ShuffleOffsets::Preloaded(written_offsets)
+        } else {
+            let should_preload_offsets =
+                should_preload_offsets(expected_offsets, max_preloaded_offsets_bytes)?;
+            load_shuffle_offsets_from_file(
+                &scheduler,
+                &offsets_path,
+                expected_offsets,
+                num_batches,
+                num_partitions,
+                file_reader.num_rows(),
+                &partition_counts,
+                should_preload_offsets,
+            )
+            .await?
         };
         let decoded_schema: Schema = file_reader.schema().as_ref().into();
         let estimated_row_bytes = estimate_decoded_row_bytes(&decoded_schema)?;
@@ -1133,6 +1120,138 @@ fn should_preload_offsets(expected_offsets: usize, max_bytes: usize) -> Result<b
     Ok(offsets_bytes <= max_bytes)
 }
 
+async fn open_shuffle_offsets_reader(
+    scheduler: &Arc<ScanScheduler>,
+    offsets_path: &Path,
+    expected_offsets: usize,
+    num_batches: usize,
+    num_partitions: usize,
+) -> Result<FileReader> {
+    let offsets_reader = FileReader::try_open(
+        scheduler
+            .open_file(offsets_path, &CachedFileSize::unknown())
+            .await?,
+        None,
+        Arc::<DecoderPlugins>::default(),
+        &LanceCache::no_cache(),
+        FileReaderOptions::default(),
+    )
+    .await?;
+    let expected_offsets_u64 = u64::try_from(expected_offsets).map_err(|_| {
+        Error::invalid_input(format!(
+            "expected offset count {} cannot be represented as u64",
+            expected_offsets
+        ))
+    })?;
+    if offsets_reader.num_rows() != expected_offsets_u64 {
+        return Err(Error::corrupt_file(
+            offsets_path.clone(),
+            format!(
+                "offset count is {}, expected num_batches={} * num_partitions={} = {}",
+                offsets_reader.num_rows(),
+                num_batches,
+                num_partitions,
+                expected_offsets
+            ),
+        ));
+    }
+    let offsets_schema = offsets_reader.schema();
+    let offset_field = offsets_schema.field("offset").ok_or_else(|| {
+        Error::corrupt_file(
+            offsets_path.clone(),
+            "required non-null UInt64 column 'offset' is missing",
+        )
+    })?;
+    if offset_field.data_type() != DataType::UInt64 || offset_field.nullable {
+        return Err(Error::corrupt_file(
+            offsets_path.clone(),
+            format!(
+                "column 'offset' must be non-null UInt64, found {:?} (nullable={})",
+                offset_field.data_type(),
+                offset_field.nullable
+            ),
+        ));
+    }
+    Ok(offsets_reader)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn load_shuffle_offsets_from_file(
+    scheduler: &Arc<ScanScheduler>,
+    offsets_path: &Path,
+    expected_offsets: usize,
+    num_batches: usize,
+    num_partitions: usize,
+    data_rows: u64,
+    partition_counts: &[u64],
+    should_preload_offsets: bool,
+) -> Result<ShuffleOffsets> {
+    let offsets_reader = open_shuffle_offsets_reader(
+        scheduler,
+        offsets_path,
+        expected_offsets,
+        num_batches,
+        num_partitions,
+    )
+    .await?;
+    let mut offsets = should_preload_offsets.then(|| Vec::with_capacity(expected_offsets));
+    let mut validator = ShuffleOffsetsValidator::new(
+        expected_offsets,
+        num_partitions,
+        data_rows,
+        partition_counts,
+        offsets_path,
+    );
+    let mut offsets_stream = offsets_reader
+        .read_stream(
+            ReadBatchParams::RangeFull,
+            1024 * 1024,
+            16,
+            FilterExpression::no_filter(),
+        )
+        .await?;
+    while let Some(batch) = offsets_stream.try_next().await? {
+        let offset_column = batch
+            .column_by_name("offset")
+            .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
+            .ok_or_else(|| {
+                Error::corrupt_file(
+                    offsets_path.clone(),
+                    "required UInt64 column 'offset' is missing from decoded batch",
+                )
+            })?;
+        if offset_column.null_count() != 0 {
+            return Err(Error::corrupt_file(
+                offsets_path.clone(),
+                format!(
+                    "column 'offset' contains {} null values",
+                    offset_column.null_count()
+                ),
+            ));
+        }
+        if offset_column.values().len() != offset_column.len() {
+            return Err(Error::corrupt_file(
+                offsets_path.clone(),
+                format!(
+                    "offset values buffer length {} does not match array length {}",
+                    offset_column.values().len(),
+                    offset_column.len()
+                ),
+            ));
+        }
+        let decoded = offset_column.values().as_ref();
+        validator.push(decoded)?;
+        if let Some(offsets) = offsets.as_mut() {
+            offsets.extend_from_slice(decoded);
+        }
+    }
+    validator.finish()?;
+    Ok(match offsets {
+        Some(offsets) => ShuffleOffsets::Preloaded(offsets),
+        None => ShuffleOffsets::OnDemand(offsets_reader),
+    })
+}
+
 struct ShuffleOffsetsValidator<'a> {
     expected_offsets: usize,
     num_partitions: usize,
@@ -1233,8 +1352,12 @@ impl<'a> ShuffleOffsetsValidator<'a> {
             return Err(Error::corrupt_file(
                 self.offsets_path.clone(),
                 format!(
-                    "offset-derived count {} for partition {} does not match expected count {}",
-                    decoded, partition_id, expected
+                    "offset-derived count {} for partition {} does not match expected count {}; offset-derived counts={:?} expected counts={:?}",
+                    decoded,
+                    partition_id,
+                    expected,
+                    self.decoded_partition_counts,
+                    self.partition_counts
                 ),
             ));
         }
@@ -1998,6 +2121,7 @@ mod tests {
             vec![2, 1, 1, 3, 0],
             0.0,
             0,
+            None,
         )
         .await
         .unwrap();
@@ -2095,6 +2219,7 @@ mod tests {
             vec![1, 2, 1],
             0.0,
             0,
+            None,
         )
         .await
         .unwrap();
@@ -2342,6 +2467,69 @@ mod tests {
         };
         assert!(
             err.to_string().contains("partition ID 5 is out of range"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// CI failed `test_ann_with_deletion` with:
+    /// `offset-derived count 127 for partition 0 does not match expected count 126`
+    /// on a 512-row IVF shuffle into 4 partitions. This is that exact histogram.
+    #[tokio::test]
+    async fn test_two_file_shuffler_uneven_512_rows_four_partitions() {
+        let dir = TempStrDir::default();
+        let output_dir = Path::from(dir.as_ref());
+        let num_partitions = 4;
+
+        let mut part_ids = Vec::with_capacity(512);
+        part_ids.extend(std::iter::repeat_n(0u32, 126));
+        part_ids.extend(std::iter::repeat_n(1u32, 130));
+        part_ids.extend(std::iter::repeat_n(2u32, 128));
+        part_ids.extend(std::iter::repeat_n(3u32, 128));
+        let values: Vec<i32> = (0..512).collect();
+        let batch = make_batch(&part_ids, &values, None);
+
+        let shuffler = TwoFileShuffler::new(output_dir, num_partitions);
+        let reader = shuffler
+            .shuffle(batches_to_stream(vec![batch]))
+            .await
+            .unwrap();
+
+        assert_eq!(reader.partition_size(0).unwrap(), 126);
+        assert_eq!(reader.partition_size(1).unwrap(), 130);
+        assert_eq!(reader.partition_size(2).unwrap(), 128);
+        assert_eq!(reader.partition_size(3).unwrap(), 128);
+
+        let p0 = collect_partition(reader.as_ref(), 0).await.unwrap();
+        assert_eq!(p0.num_rows(), 126);
+        let p1 = collect_partition(reader.as_ref(), 1).await.unwrap();
+        assert_eq!(p1.num_rows(), 130);
+    }
+
+    /// Nullable `__ivf_part_id` must not be treated as partition 0 via `values()`.
+    #[tokio::test]
+    async fn test_two_file_shuffler_rejects_null_partition_ids() {
+        let dir = TempStrDir::default();
+        let output_dir = Path::from(dir.as_ref());
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new(PART_ID_COLUMN, DataType::UInt32, true),
+            Field::new("val", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(UInt32Array::from(vec![Some(0), None, Some(1)])),
+                Arc::new(Int32Array::from(vec![10, 20, 30])),
+            ],
+        )
+        .unwrap();
+
+        let shuffler = TwoFileShuffler::new(output_dir, 2);
+        let Err(err) = shuffler.shuffle(batches_to_stream(vec![batch])).await else {
+            panic!("expected an error for null partition IDs");
+        };
+        assert!(
+            err.to_string().contains("null partition ID"),
             "unexpected error: {err}"
         );
     }
