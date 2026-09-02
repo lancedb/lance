@@ -3,8 +3,11 @@
 
 //! Builders and file-level writer helpers for Lance blob v2 columns.
 //!
-//! Logical blob input uses `Struct<data: LargeBinary?, uri: Utf8?>`. File-level blob
-//! preparation produces a kind-aware writer intermediate with `blob_id` and range fields.
+//! Logical blob input uses either `Struct<data: LargeBinary?, uri: Utf8?>` or the complete
+//! `Struct<data: LargeBinary?, uri: Utf8?, position: UInt64?, size: UInt64?>` shape. In the
+//! complete shape, `position` and `size` select a non-empty range within an external `uri` and
+//! must be set together. Every non-null row must set exactly one of `data` and `uri`. File-level
+//! blob preparation produces a kind-aware writer intermediate with `blob_id` and range fields.
 
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
@@ -45,8 +48,10 @@ use crate::{Error, Result};
 
 /// Construct the Arrow field for a blob v2 column.
 ///
-/// Blob v2 expects a column shaped as `Struct<data: LargeBinary?, uri: Utf8?>` and
-/// tagged with `ARROW:extension:name = "lance.blob.v2"`.
+/// This helper constructs the minimal logical shape
+/// `Struct<data: LargeBinary?, uri: Utf8?>`, tagged with
+/// `ARROW:extension:name = "lance.blob.v2"`. Writers also accept the complete logical shape
+/// with trailing `position: UInt64?` and `size: UInt64?` fields for external URI ranges.
 pub fn blob_field(name: &str, nullable: bool) -> Field {
     blob_field_with_options(name, nullable, BlobFieldOptions::default())
 }
@@ -79,8 +84,10 @@ impl BlobFieldOptions {
 
 /// Construct the Arrow field for a blob v2 column with storage layout options.
 ///
-/// Blob v2 expects a column shaped as `Struct<data: LargeBinary?, uri: Utf8?>` and
-/// tagged with `ARROW:extension:name = "lance.blob.v2"`.
+/// This helper constructs the minimal logical shape
+/// `Struct<data: LargeBinary?, uri: Utf8?>`, tagged with
+/// `ARROW:extension:name = "lance.blob.v2"`. Writers also accept the complete logical shape
+/// with trailing `position: UInt64?` and `size: UInt64?` fields for external URI ranges.
 ///
 /// ```
 /// # use lance::{BlobFieldOptions, blob_field_with_options};
@@ -171,9 +178,17 @@ fn prepared_to_logical_blob_lance_field(field: &LanceField) -> Result<LanceField
             Some(BlobV2Layout::Prepared) => {
                 let mut normalized = field.clone();
                 let mut logical_children = logical_blob_lance_children()?;
-                for (logical_child, prepared_child) in
-                    logical_children.iter_mut().zip(field.children.iter())
-                {
+                for logical_child in &mut logical_children {
+                    let prepared_child = field
+                        .children
+                        .iter()
+                        .find(|prepared_child| prepared_child.name == logical_child.name)
+                        .ok_or_else(|| {
+                            Error::internal(format!(
+                                "Prepared blob v2 field '{}' is missing logical child '{}'",
+                                field.name, logical_child.name
+                            ))
+                        })?;
                     logical_child.id = prepared_child.id;
                     logical_child.parent_id = field.id;
                 }
@@ -1129,11 +1144,13 @@ mod tests {
     use super::*;
     use arrow_array::cast::AsArray;
     use arrow_array::{Array, StringArray};
-    use arrow_schema::Schema as ArrowSchema;
+    use arrow_schema::{Fields, Schema as ArrowSchema};
     use async_trait::async_trait;
     use futures::task::noop_waker;
+    use lance_core::datatypes::{BLOB_V2_DESC_FIELDS, BLOB_V2_LOGICAL_FIELDS};
     use lance_core::utils::tempfile::TempDir;
     use lance_io::object_writer::WriteResult;
+    use rstest::rstest;
     use tokio::io::AsyncWrite;
 
     #[derive(Clone, Copy)]
@@ -1390,6 +1407,95 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
+    enum LogicalBlobShape {
+        Minimal,
+        CompleteNullableRange,
+        CompleteRequiredRange,
+    }
+
+    fn blob_v2_field_with_children(name: &str, children: Fields, nullable: bool) -> Field {
+        let mut metadata = HashMap::new();
+        metadata.insert(ARROW_EXT_NAME_KEY.to_string(), BLOB_V2_EXT_NAME.to_string());
+        metadata.insert("blob-root-metadata".to_string(), "preserved".to_string());
+        Field::new(name, DataType::Struct(children), nullable).with_metadata(metadata)
+    }
+
+    fn logical_blob_fields(shape: LogicalBlobShape) -> Fields {
+        let source = match shape {
+            LogicalBlobShape::Minimal => &*BLOB_V2_LOGICAL_MINIMAL_FIELDS,
+            LogicalBlobShape::CompleteNullableRange | LogicalBlobShape::CompleteRequiredRange => {
+                &*BLOB_V2_LOGICAL_FIELDS
+            }
+        };
+        source
+            .iter()
+            .enumerate()
+            .map(|(index, field)| {
+                let nullable = !matches!(shape, LogicalBlobShape::CompleteRequiredRange)
+                    || index < BLOB_V2_LOGICAL_MINIMAL_FIELDS.len();
+                Arc::new(
+                    field
+                        .as_ref()
+                        .clone()
+                        .with_nullable(nullable)
+                        .with_metadata(HashMap::from([(
+                            "blob-child-metadata".to_string(),
+                            field.name().to_string(),
+                        )])),
+                )
+            })
+            .collect::<Vec<_>>()
+            .into()
+    }
+
+    fn lance_schema_with_metadata(fields: Vec<Field>) -> LanceSchema {
+        let arrow_schema = ArrowSchema::new_with_metadata(
+            fields,
+            HashMap::from([("schema-metadata".to_string(), "preserved".to_string())]),
+        );
+        let mut schema = LanceSchema::try_from(&arrow_schema).unwrap();
+        schema.set_field_id(None);
+        schema
+    }
+
+    #[rstest]
+    #[case::minimal(LogicalBlobShape::Minimal)]
+    #[case::complete_nullable_range(LogicalBlobShape::CompleteNullableRange)]
+    #[case::complete_required_range(LogicalBlobShape::CompleteRequiredRange)]
+    fn test_logical_blob_schema_normalization_is_identity(#[case] shape: LogicalBlobShape) {
+        let blob_field = blob_v2_field_with_children("blob", logical_blob_fields(shape), false);
+        let schema = lance_schema_with_metadata(vec![blob_field]);
+
+        let normalized = prepared_to_logical_blob_schema(&schema).unwrap();
+
+        assert_eq!(normalized.fields, schema.fields);
+        assert_eq!(normalized.metadata, schema.metadata);
+    }
+
+    #[test]
+    fn test_nested_logical_blob_schema_normalization_is_identity() {
+        let struct_blob = blob_v2_field_with_children(
+            "struct_blob",
+            logical_blob_fields(LogicalBlobShape::CompleteNullableRange),
+            true,
+        );
+        let list_blob = blob_v2_field_with_children(
+            "item",
+            logical_blob_fields(LogicalBlobShape::CompleteRequiredRange),
+            false,
+        );
+        let schema = lance_schema_with_metadata(vec![
+            Field::new("payload", DataType::Struct(vec![struct_blob].into()), true),
+            Field::new("items", DataType::List(Arc::new(list_blob)), false),
+        ]);
+
+        let normalized = prepared_to_logical_blob_schema(&schema).unwrap();
+
+        assert_eq!(normalized.fields, schema.fields);
+        assert_eq!(normalized.metadata, schema.metadata);
+    }
+
     #[test]
     fn test_prepared_to_logical_blob_schema_preserves_non_blob_fields() {
         let mut metadata = HashMap::new();
@@ -1425,6 +1531,72 @@ mod tests {
         assert_eq!(normalized.fields[1].children[1].name, "uri");
         assert!(normalized.fields[1].children[0].id >= 0);
         assert!(normalized.fields[1].children[1].id >= 0);
+    }
+
+    #[test]
+    fn test_prepared_blob_schema_normalizes_by_semantic_child_name() {
+        let mut metadata = HashMap::new();
+        metadata.insert(ARROW_EXT_NAME_KEY.to_string(), BLOB_V2_EXT_NAME.to_string());
+        metadata.insert("blob-root-metadata".to_string(), "preserved".to_string());
+        let prepared_field = prepared_blob_field_with_metadata("blob", false, metadata);
+        let dict_field = Field::new(
+            "dict",
+            DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
+            true,
+        );
+        let mut schema = lance_schema_with_metadata(vec![dict_field, prepared_field]);
+        schema.fields[0].id = 42;
+        schema.fields[1].id = 7;
+        for (child, id) in schema.fields[1].children.iter_mut().zip(70..76) {
+            child.id = id;
+            child.parent_id = 7;
+        }
+
+        let dictionary_values = Arc::new(StringArray::from(vec!["a", "b"])) as ArrayRef;
+        schema.fields[0].set_dictionary_values(&dictionary_values);
+
+        let normalized = prepared_to_logical_blob_schema(&schema).unwrap();
+
+        assert_eq!(normalized.metadata, schema.metadata);
+        assert_eq!(normalized.fields[0], schema.fields[0]);
+        assert_eq!(normalized.fields[1].id, 7);
+        assert!(!normalized.fields[1].nullable);
+        assert_eq!(normalized.fields[1].metadata, schema.fields[1].metadata);
+        assert_eq!(normalized.fields[1].children.len(), 2);
+        assert_eq!(normalized.fields[1].children[0].name, "data");
+        assert_eq!(normalized.fields[1].children[0].id, 71);
+        assert_eq!(normalized.fields[1].children[0].parent_id, 7);
+        assert_eq!(normalized.fields[1].children[1].name, "uri");
+        assert_eq!(normalized.fields[1].children[1].id, 72);
+        assert_eq!(normalized.fields[1].children[1].parent_id, 7);
+    }
+
+    #[rstest]
+    #[case::descriptor(BLOB_V2_DESC_FIELDS.clone(), "descriptor layout")]
+    #[case::malformed(
+        vec![
+            Field::new("data", DataType::LargeBinary, true),
+            Field::new("uri", DataType::Utf8, true),
+            Field::new("size", DataType::UInt64, true),
+        ].into(),
+        "unrecognized layout"
+    )]
+    fn test_non_logical_blob_schema_normalization_is_rejected(
+        #[case] fields: Fields,
+        #[case] actual_layout: &str,
+    ) {
+        let field = blob_v2_field_with_children("blob", fields, true);
+        let schema = lance_schema_with_metadata(vec![field]);
+
+        let error = prepared_to_logical_blob_schema(&schema).unwrap_err();
+
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains(actual_layout));
+        assert!(
+            error
+                .to_string()
+                .contains("expected logical or prepared layout")
+        );
     }
 
     #[tokio::test]

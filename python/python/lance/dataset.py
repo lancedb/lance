@@ -4306,7 +4306,7 @@ class LanceDataset(pa.dataset.Dataset):
         Optional parameters for `IVF_RQ`:
 
             - num_bits
-                The number of bits for RQ (Rabit Quantization). Default is 1.
+                The number of bits for RQ (Rabit Quantization). Default is 5.
 
         Optional parameters for `IVF_HNSW_*`:
             max_level

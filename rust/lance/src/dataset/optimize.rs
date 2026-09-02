@@ -570,7 +570,8 @@ impl CompactionOptions {
 /// - All data files share identical Lance file versions
 /// - No fragment has a deletion file
 ///   TODO: Need to support schema evolution case like add column and drop column
-/// - All data files share identical schema mappings (`fields`, `column_indices`)
+/// - All data files use an identical schema mapping (`fields`, `column_indices`) in dataset schema
+///   order
 /// - Input data files must not contain extra global buffers (beyond schema / file descriptor)
 async fn can_use_binary_copy(
     dataset: &Dataset,
@@ -622,6 +623,17 @@ pub(super) async fn can_use_binary_copy_current(
     }
     let ref_fields = &fragments[0].files[0].fields;
     let ref_cols = &fragments[0].files[0].column_indices;
+    let version = dataset.manifest.data_storage_format.lance_file_format();
+    let (schema_fields, schema_column_indices) =
+        lance_file::versions::data_file_columns(version, dataset.schema());
+    if ref_fields.as_ref() != schema_fields.as_slice()
+        || ref_cols.as_ref() != schema_column_indices.as_slice()
+    {
+        log::debug!(
+            "Binary copy disabled: data files do not use the dataset schema's physical column order"
+        );
+        return Ok(false);
+    }
     for fragment in fragments {
         if fragment.deletion_file.is_some() {
             log::debug!(
@@ -1394,15 +1406,17 @@ async fn descriptor_to_logical_blob_array(
                     let absolute_uri = format!("{}/{}", base.path.trim_end_matches('/'), uri_val);
                     uri_builder.append_value(&absolute_uri);
                 }
-                if descriptor.position_col.is_null(i) {
+                let position =
+                    (!descriptor.position_col.is_null(i)).then(|| descriptor.position_col.value(i));
+                let size = (!descriptor.size_col.is_null(i)).then(|| descriptor.size_col.value(i));
+                if position == Some(0) && size == Some(0) {
+                    // Stable descriptors use (0, 0) for the complete external object.
+                    // Logical input represents the same value by omitting the range.
                     out_position_builder.append_null();
-                } else {
-                    out_position_builder.append_value(descriptor.position_col.value(i));
-                }
-                if descriptor.size_col.is_null(i) {
                     out_size_builder.append_null();
                 } else {
-                    out_size_builder.append_value(descriptor.size_col.value(i));
+                    out_position_builder.append_option(position);
+                    out_size_builder.append_option(size);
                 }
             }
             RowClass::DataBlob => {
