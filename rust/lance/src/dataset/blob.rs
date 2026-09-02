@@ -1038,6 +1038,18 @@ impl BlobPreprocessor {
                     field.name()
                 )));
             }
+            if has_data == has_uri {
+                return Err(Error::invalid_input(format!(
+                    "Blob v2 field '{}' row {i} must set exactly one of `data` and `uri`",
+                    field.name()
+                )));
+            }
+            if has_size && size_col.as_ref().is_some_and(|col| col.value(i) == 0) {
+                return Err(Error::invalid_input(format!(
+                    "Blob v2 field '{}' row {i} external range `size` must be greater than zero",
+                    field.name()
+                )));
+            }
 
             let data_len = if has_data { data_col.value(i).len() } else { 0 };
 
@@ -8148,6 +8160,90 @@ mod tests {
 
         assert!(matches!(error, Error::InvalidInput { .. }));
         assert!(error.to_string().contains(expected_message));
+    }
+
+    #[rstest]
+    #[case::reference(ExternalBlobMode::Reference)]
+    #[case::ingest(ExternalBlobMode::Ingest)]
+    #[tokio::test]
+    async fn test_complete_blob_v2_rejects_zero_size_range(
+        #[case] external_blob_mode: ExternalBlobMode,
+    ) {
+        let dataset_dir = TempDir::default();
+        let schema = Arc::new(Schema::new(vec![complete_blob_v2_field("blob", true)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![complete_blob_v2_array(
+                vec![None],
+                vec![Some("file:///source.bin".to_string())],
+                vec![Some(3)],
+                vec![Some(0)],
+                None,
+            )],
+        )
+        .unwrap();
+
+        let error = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &dataset_dir.path_str(),
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                allow_external_blob_outside_bases: matches!(
+                    external_blob_mode,
+                    ExternalBlobMode::Reference
+                ),
+                external_blob_mode,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("greater than zero"));
+    }
+
+    #[rstest]
+    #[case::both_small(Some(5), true)]
+    #[case::both_packed(Some(crate::dataset::blob::INLINE_MAX + 1), true)]
+    #[case::neither(None, false)]
+    #[tokio::test]
+    async fn test_complete_blob_v2_rejects_invalid_representation(
+        #[case] data_size: Option<usize>,
+        #[case] has_uri: bool,
+    ) {
+        let dataset_dir = TempDir::default();
+        let schema = Arc::new(Schema::new(vec![complete_blob_v2_field("blob", true)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![complete_blob_v2_array(
+                vec![data_size.map(|size| vec![0x41; size])],
+                vec![has_uri.then(|| "file:///source.bin".to_string())],
+                vec![None],
+                vec![None],
+                None,
+            )],
+        )
+        .unwrap();
+
+        let error = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &dataset_dir.path_str(),
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                allow_external_blob_outside_bases: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("must set exactly one of `data` and `uri`")
+        );
     }
 
     #[tokio::test]

@@ -75,11 +75,14 @@ accept these logical struct shapes:
 | Minimal | `data: LargeBinary?`, `uri: Utf8?` | Inline bytes or a complete external object |
 | Complete | Minimal fields plus `position: UInt64?`, `size: UInt64?` | An optional byte range within an external object |
 
-For the complete shape, `position` and `size` must either both be set or both be
-null, and a range requires `uri`. Python's `blob_field` and `BlobType` use the
+Every non-null row must set exactly one of `data` and `uri`. For the complete
+shape, `position` and `size` must either both be set or both be null, a range
+requires `uri`, and an explicit range must have `size > 0`. Use inline `b""` for
+an empty blob; a URI without range fields still represents the complete external
+object, including an empty object. Python's `blob_field` and `BlobType` use the
 complete shape. Lance preserves an accepted logical shape, including child
-fields, nullability, and metadata, across create, append, and merge-insert writes;
-descriptor scans still return the compact stored descriptor shape.
+fields, nullability, and metadata, across create, append, and merge-insert
+writes; descriptor scans still return the compact stored descriptor shape.
 
 ```python
 import lance

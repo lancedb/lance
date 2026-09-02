@@ -65,6 +65,20 @@ def _complete_blob_table(ids, values):
     )
 
 
+def _complete_blob_storage_table(data, uri, position, size):
+    storage = pa.StructArray.from_arrays(
+        [
+            pa.array([data], type=pa.large_binary()),
+            pa.array([uri], type=pa.utf8()),
+            pa.array([position], type=pa.uint64()),
+            pa.array([size], type=pa.uint64()),
+        ],
+        names=["data", "uri", "position", "size"],
+    )
+    blobs = pa.ExtensionArray.from_storage(BlobType(), storage)
+    return pa.Table.from_arrays([blobs], schema=pa.schema([lance.blob_field("blob")]))
+
+
 def _assert_complete_blob_schema(dataset):
     blob_type = dataset.schema.field("blob").type
     assert isinstance(blob_type, pa.ExtensionType)
@@ -1009,6 +1023,84 @@ def test_complete_blob_rows_reject_invalid_ranges(tmp_path, use_uri, position, s
             data_storage_version="2.2",
             allow_external_blob_outside_bases=True,
         )
+
+
+@pytest.mark.parametrize("mode", ["reference", "ingest"])
+def test_complete_blob_rows_reject_zero_size_range(tmp_path, mode):
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"0123456789")
+    table = _complete_blob_storage_table(None, source.as_uri(), 3, 0)
+
+    with pytest.raises(OSError, match="greater than zero"):
+        lance.write_dataset(
+            table,
+            tmp_path / "dataset",
+            data_storage_version="2.2",
+            external_blob_mode=mode,
+            allow_external_blob_outside_bases=mode == "reference",
+        )
+
+
+@pytest.mark.parametrize(
+    ("data", "use_uri"),
+    [
+        pytest.param(b"small", True, id="both-small"),
+        pytest.param(b"x" * 70_000, True, id="both-packed"),
+        pytest.param(None, False, id="neither"),
+    ],
+)
+def test_complete_blob_rows_reject_invalid_representation(tmp_path, data, use_uri):
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"external")
+    table = _complete_blob_storage_table(
+        data, source.as_uri() if use_uri else None, None, None
+    )
+
+    with pytest.raises(OSError, match="data|uri"):
+        lance.write_dataset(
+            table,
+            tmp_path / "dataset",
+            data_storage_version="2.2",
+            allow_external_blob_outside_bases=True,
+        )
+
+
+@pytest.mark.parametrize("mode", ["reference", "ingest"])
+def test_empty_external_object_without_range(tmp_path, mode):
+    source = tmp_path / "empty.bin"
+    source.write_bytes(b"")
+
+    dataset = lance.write_dataset(
+        pa.table({"blob": lance.blob_array([source.as_uri()])}),
+        tmp_path / "dataset",
+        data_storage_version="2.2",
+        external_blob_mode=mode,
+        allow_external_blob_outside_bases=mode == "reference",
+    )
+
+    with dataset.take_blobs("blob", indices=[0])[0] as blob:
+        assert blob.read() == b""
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        pytest.param({}, "must set `data` or `uri`", id="neither"),
+        pytest.param(
+            {"data": b"data", "uri": "file:///source.bin"},
+            "both data and uri",
+            id="both",
+        ),
+        pytest.param(
+            {"uri": "file:///source.bin", "position": 3, "size": 0},
+            "greater than zero",
+            id="zero-size",
+        ),
+    ],
+)
+def test_blob_rejects_invalid_logical_value(kwargs, message):
+    with pytest.raises(ValueError, match=message):
+        Blob(**kwargs)
 
 
 def test_blob_field_threshold_metadata():

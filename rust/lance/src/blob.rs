@@ -5,9 +5,9 @@
 //!
 //! Logical blob input uses either `Struct<data: LargeBinary?, uri: Utf8?>` or the complete
 //! `Struct<data: LargeBinary?, uri: Utf8?, position: UInt64?, size: UInt64?>` shape. In the
-//! complete shape, `position` and `size` select a range within an external `uri` and must be
-//! set together. File-level blob preparation produces a kind-aware writer intermediate with
-//! `blob_id` and range fields.
+//! complete shape, `position` and `size` select a non-empty range within an external `uri` and
+//! must be set together. Every non-null row must set exactly one of `data` and `uri`. File-level
+//! blob preparation produces a kind-aware writer intermediate with `blob_id` and range fields.
 
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;

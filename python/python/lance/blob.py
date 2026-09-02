@@ -41,8 +41,10 @@ class Blob:
 
     A blob can be represented as:
     - inline bytes
-    - an external URI with position and size, if position and size are not set,
-      use the full uri.
+    - an external URI, optionally with a non-empty range
+
+    Every blob must use exactly one representation. Use ``None`` for a null
+    blob and :meth:`empty` for a valid empty blob.
     """
 
     data: Optional[bytes] = None
@@ -65,6 +67,10 @@ class Blob:
             raise ValueError(
                 "Blob cannot have both inline data and external slice metadata"
             )
+        if self.data is None and self.uri is None:
+            raise ValueError("Blob must set `data` or `uri`; use None for a null blob")
+        if self.size == 0:
+            raise ValueError("External blob range size must be greater than zero")
 
     @staticmethod
     def from_bytes(data: Union[bytes, bytearray, memoryview]) -> "Blob":
@@ -93,7 +99,9 @@ class BlobType(pa.ExtensionType):
     descriptor format, and reads will return descriptors by default. Its storage
     type is ``Struct<data: LargeBinary?, uri: Utf8?, position: UInt64?,
     size: UInt64?>``. ``position`` and ``size`` select a range within an external
-    ``uri`` and must either both be set or both be null.
+    ``uri`` and must either both be set or both be null. When set, ``size`` must
+    be greater than zero. Every non-null value must set exactly one of ``data``
+    and ``uri``.
     """
 
     def __init__(self) -> None:
@@ -244,8 +252,10 @@ def blob_field(
 
     The returned field uses the complete logical blob shape
     ``Struct<data: LargeBinary?, uri: Utf8?, position: UInt64?, size: UInt64?>``.
-    Lance preserves this logical schema across create, append, and merge-insert
-    writes while storing compact descriptors internally.
+    Every non-null value must set exactly one of ``data`` and ``uri``. External
+    ranges must set both ``position`` and a positive ``size``. Lance preserves
+    this logical schema across create, append, and merge-insert writes while
+    storing compact descriptors internally.
 
     Parameters
     ----------
