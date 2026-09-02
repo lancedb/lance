@@ -56,6 +56,27 @@ where
     spawn_cpu(materialize).await
 }
 
+fn compact_prewarm_batches(batches: Vec<RecordBatch>) -> Result<RecordBatch> {
+    let schema = batches
+        .first()
+        .ok_or_else(|| Error::internal("prewarm partition has no storage batches"))?
+        .schema();
+    if batches.len() == 1 {
+        let batch = batches.into_iter().next().ok_or_else(|| {
+            Error::internal("prewarm partition storage batch unexpectedly missing")
+        })?;
+        if batch.num_rows() == 0 {
+            Ok(batch)
+        } else {
+            Ok(batch.shrink_to_fit()?)
+        }
+    } else {
+        // Concatenation allocates compact output buffers already; do not
+        // deep-copy them a second time with `shrink_to_fit`.
+        Ok(concat_batches(&schema, batches.iter())?)
+    }
+}
+
 /// <section class="warning">
 ///  Internal API
 ///
@@ -674,45 +695,6 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         self.ivf.num_partitions()
     }
 
-    async fn read_partition_batches(
-        &self,
-        part_id: usize,
-        io_stats: Option<IoStats>,
-    ) -> Result<(SchemaRef, Vec<RecordBatch>)> {
-        let schema = Arc::new(self.reader.schema().as_ref().into());
-        let range = self.ivf.row_range(part_id);
-        if range.is_empty() {
-            return Ok((schema, Vec::new()));
-        }
-
-        let reader = match &io_stats {
-            Some(io_stats) => Cow::Owned(self.reader.with_io_stats(io_stats.recorder())),
-            None => Cow::Borrowed(&self.reader),
-        };
-        let batches = reader
-            .read_stream(
-                ReadBatchParams::Range(range),
-                u32::MAX,
-                1,
-                FilterExpression::no_filter(),
-            )
-            .await?
-            .try_collect::<Vec<_>>()
-            .await?;
-        Ok((schema, batches))
-    }
-
-    fn concat_partition_batches(
-        schema: &SchemaRef,
-        batches: &[RecordBatch],
-    ) -> Result<RecordBatch> {
-        if batches.is_empty() {
-            Ok(RecordBatch::new_empty(schema.clone()))
-        } else {
-            Ok(concat_batches(schema, batches.iter())?)
-        }
-    }
-
     /// Load a partition's quantization storage, optionally measuring the exact
     /// I/O it performs into `io_stats`.
     ///
@@ -756,27 +738,25 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         )
     }
 
-    /// Load and materialize a partition for the parallel prewarm path.
+    /// Materialize a compact partition for the parallel prewarm path.
     ///
-    /// Object-store reads remain in async code. Batch concatenation and
-    /// quantization-specific normalization are handed to the CPU pool only
-    /// after all reads complete.
+    /// The input may be a slice of a larger contiguous read. Deep-copying its
+    /// visible rows before constructing storage prevents a cached partition
+    /// from retaining the entire prewarm window's Arrow buffers.
     #[doc(hidden)]
-    pub async fn load_partition_for_prewarm(
+    pub async fn materialize_partition_for_prewarm(
         &self,
-        part_id: usize,
-        io_stats: Option<IoStats>,
+        batches: Vec<RecordBatch>,
     ) -> Result<Q::Storage>
     where
         Q::Metadata: 'static,
         Q::Storage: 'static,
     {
-        let (schema, batches) = self.read_partition_batches(part_id, io_stats).await?;
         let metadata = self.metadata.clone();
         let distance_type = self.distance_type;
         let frag_reuse_index = self.frag_reuse_index.clone();
         spawn_prewarm_materialization(move || {
-            let batch = Self::concat_partition_batches(&schema, &batches)?;
+            let batch = compact_prewarm_batches(batches)?;
             Q::Storage::try_from_batch_with_remapper(
                 batch,
                 &metadata,
@@ -790,8 +770,13 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
 
 #[cfg(test)]
 mod tests {
-    use super::{QueryScratchCapacity, QueryScratchPool, spawn_prewarm_materialization};
+    use super::{
+        QueryScratchCapacity, QueryScratchPool, compact_prewarm_batches,
+        spawn_prewarm_materialization,
+    };
+    use arrow_array::{Array, ArrayRef, RecordBatch, UInt64Array};
     use lance_core::deepsize::DeepSizeOf;
+    use std::sync::Arc;
 
     #[tokio::test]
     async fn test_prewarm_materialization_uses_cpu_pool() {
@@ -800,6 +785,32 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(thread_name.as_deref(), Some("lance-cpu"));
+    }
+
+    #[test]
+    fn test_prewarm_storage_batches_own_compact_buffers() {
+        let parent = RecordBatch::try_from_iter([(
+            "value",
+            Arc::new(UInt64Array::from_iter_values(0..100)) as ArrayRef,
+        )])
+        .unwrap();
+        let parent_array = parent
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        let parent_ptr = parent_array.values().as_ptr();
+        let parent_size = parent_array.get_array_memory_size();
+
+        let compact = compact_prewarm_batches(vec![parent.slice(10, 10)]).unwrap();
+        let compact_array = compact
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        assert_ne!(compact_array.values().as_ptr(), parent_ptr);
+        assert!(compact_array.get_array_memory_size() < parent_size);
+        assert_eq!(compact_array.values(), &(10..20).collect::<Vec<_>>());
     }
 
     #[test]
