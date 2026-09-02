@@ -173,13 +173,15 @@ message Manifest {
   message DataStorageFormat {
     // The format of the data files (e.g. "lance")
     string file_format = 1;
-    // The default format version for data files. Operations that do not select
-    // an exact output version use this value. The format of the version can vary
-    // by file_format and is not required to follow semver.
+    // The default format version used when writing data files. Write operations
+    // that do not select an exact version use this value. This setting does not
+    // constrain index or other file types. The version syntax is defined by
+    // file_format and is not required to follow semver.
     //
-    // When the mixed data-file-version capability is set, referenced files may
-    // use other recognized exact V2 versions. Each DataFile's version is
-    // authoritative for decoding.
+    // Unless the mixed data-file-version capability is set, every referenced
+    // data file must use this version. When the capability is set, referenced
+    // data files may use other recognized exact V2 versions, and each DataFile's
+    // version is authoritative for decoding.
     string version = 2;
   }
 
