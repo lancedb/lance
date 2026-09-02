@@ -9,6 +9,7 @@ use std::{
     any::Any,
     borrow::Cow,
     collections::{BinaryHeap, HashMap},
+    future::Future,
     sync::{
         Arc, LazyLock, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
@@ -25,9 +26,9 @@ use async_trait::async_trait;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use futures::StreamExt;
 use futures::future::BoxFuture;
 use futures::prelude::stream::{self, TryStreamExt};
-use futures::{StreamExt, TryFutureExt};
 use lance_arrow::RecordBatchExt;
 use lance_core::cache::{
     CacheCodec, CacheCodecImpl, CacheEntryReader, CacheEntryWriter, CacheKey, CacheKeySchema,
@@ -160,6 +161,33 @@ pub(crate) static STREAMING_SEARCH_BATCH_SIZE: LazyLock<usize> = LazyLock::new(|
     );
     batch_size
 });
+
+#[derive(Clone, Copy)]
+enum PartitionLoadMode {
+    Inline,
+    Prewarm,
+}
+
+fn prewarm_parallelism(io_parallelism: usize, cpu_parallelism: usize) -> usize {
+    io_parallelism.max(1).min(cpu_parallelism.max(1))
+}
+
+async fn prewarm_partitions<F, Fut>(
+    num_partitions: usize,
+    parallelism: usize,
+    mut load_partition: F,
+) -> Result<()>
+where
+    F: FnMut(usize) -> Fut,
+    Fut: Future<Output = Result<()>>,
+{
+    futures::stream::iter(0..num_partitions)
+        .map(Ok)
+        .try_for_each_concurrent(Some(parallelism.max(1)), move |partition_id| {
+            load_partition(partition_id)
+        })
+        .await
+}
 
 struct PreparedPartitionSearch<S: IvfSubIndex, Q: Quantization> {
     query: Query,
@@ -1254,6 +1282,22 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         write_cache: bool,
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<PartitionEntry<S, Q>>> {
+        self.load_partition_with_mode(
+            partition_id,
+            write_cache,
+            metrics,
+            PartitionLoadMode::Inline,
+        )
+        .await
+    }
+
+    async fn load_partition_with_mode(
+        &self,
+        partition_id: usize,
+        write_cache: bool,
+        metrics: &dyn MetricsCollector,
+        load_mode: PartitionLoadMode,
+    ) -> Result<Arc<PartitionEntry<S, Q>>> {
         if partition_id >= self.ivf.num_partitions() {
             return Err(Error::index(format!(
                 "partition id {} is out of range of {} partitions",
@@ -1270,7 +1314,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
                 .get_or_insert_with_key_hit(cache_key, || async {
                     info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_VECTOR_PART, index_type="ivf", part_id=partition_id);
                     metrics.record_part_load();
-                    self.load_partition_entry(partition_id, metrics.io_stats())
+                    self.load_partition_entry(partition_id, metrics.io_stats(), load_mode)
                         .await
                 })
                 .await;
@@ -1289,7 +1333,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_VECTOR_PART, index_type="ivf", part_id=partition_id);
             metrics.record_part_load();
             Ok(Arc::new(
-                self.load_partition_entry(partition_id, metrics.io_stats())
+                self.load_partition_entry(partition_id, metrics.io_stats(), load_mode)
                     .await?,
             ))
         }
@@ -1299,6 +1343,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         &self,
         partition_id: usize,
         io_stats: Option<IoStats>,
+        load_mode: PartitionLoadMode,
     ) -> Result<PartitionEntry<S, Q>> {
         // `concat_batches` indexes the batches by this schema's field positions
         // without comparing the two, so the schema has to describe exactly what
@@ -1354,7 +1399,16 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             self.sub_index_metadata[partition_id].clone(),
         )?;
         let idx = S::load(batch)?;
-        let storage = self.load_partition_storage(partition_id, io_stats).await?;
+        let storage = match load_mode {
+            PartitionLoadMode::Inline => {
+                self.load_partition_storage(partition_id, io_stats).await?
+            }
+            PartitionLoadMode::Prewarm => {
+                self.storage
+                    .load_partition_for_prewarm(partition_id, io_stats)
+                    .await?
+            }
+        };
         Ok(PartitionEntry::new(idx, storage))
     }
 
@@ -1411,13 +1465,23 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<S, 
     }
 
     async fn prewarm(&self) -> Result<()> {
-        futures::stream::iter(0..self.ivf.num_partitions())
-            .map(Ok)
-            .try_for_each_concurrent(Some(self.io_parallelism), |part_id| {
-                self.load_partition(part_id, true, &NoOpMetricsCollector)
-                    .map_ok(|_| ())
-            })
-            .await
+        let parallelism =
+            prewarm_parallelism(self.io_parallelism, get_num_compute_intensive_cpus());
+        prewarm_partitions(
+            self.ivf.num_partitions(),
+            parallelism,
+            |part_id| async move {
+                self.load_partition_with_mode(
+                    part_id,
+                    true,
+                    &NoOpMetricsCollector,
+                    PartitionLoadMode::Prewarm,
+                )
+                .await
+                .map(|_| ())
+            },
+        )
+        .await
     }
 
     fn index_type(&self) -> IndexType {
@@ -2099,6 +2163,7 @@ mod tests {
             atomic::{AtomicBool, AtomicUsize, Ordering},
         },
     };
+    use tokio::sync::Barrier;
 
     use all_asserts::{assert_ge, assert_lt};
     use arrow::datatypes::{Float64Type, UInt8Type, UInt64Type};
@@ -2125,6 +2190,7 @@ mod tests {
     use crate::index::DatasetIndexInternalExt;
     use crate::index::vector::ivf::v2::{
         IVFPartitionKey, IvfFlatIndex, IvfHnswSqIndex, IvfPq, IvfStateEntryBox, PartitionEntry,
+        PartitionLoadMode,
     };
     use crate::utils::test::copy_test_data_to_tmp;
     use crate::{
@@ -2191,6 +2257,44 @@ mod tests {
     const LIGHTWEIGHT_PQ_SUB_VECTORS: usize = 4;
 
     lance_testing::define_stage_event_progress!(RecordingProgress, IndexBuildProgress, Result<()>);
+
+    #[test]
+    fn test_prewarm_parallelism_is_bounded_by_io_and_cpu() {
+        assert_eq!(super::prewarm_parallelism(8, 4), 4);
+        assert_eq!(super::prewarm_parallelism(2, 4), 2);
+        assert_eq!(super::prewarm_parallelism(0, 0), 1);
+    }
+
+    #[tokio::test]
+    async fn test_prewarm_partition_admission_is_parallel_and_bounded() {
+        const PARALLELISM: usize = 3;
+        const NUM_PARTITIONS: usize = PARALLELISM * 2;
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let completed = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(Barrier::new(PARALLELISM));
+
+        super::prewarm_partitions(NUM_PARTITIONS, PARALLELISM, |_| {
+            let active = active.clone();
+            let max_active = max_active.clone();
+            let completed = completed.clone();
+            let barrier = barrier.clone();
+            async move {
+                let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                max_active.fetch_max(current, Ordering::SeqCst);
+                barrier.wait().await;
+                active.fetch_sub(1, Ordering::SeqCst);
+                completed.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(completed.load(Ordering::SeqCst), NUM_PARTITIONS);
+        assert_eq!(max_active.load(Ordering::SeqCst), PARALLELISM);
+    }
 
     struct PartitionCoverageTestFilter {
         needs_partition_rows: bool,
@@ -5387,7 +5491,10 @@ mod tests {
         // Every partition, not just the first: a projection that applied
         // unevenly would leave the partition cache holding mixed schemas.
         for partition_id in 0..hnsw.ivf.num_partitions() {
-            let entry = hnsw.load_partition_entry(partition_id, None).await.unwrap();
+            let entry = hnsw
+                .load_partition_entry(partition_id, None, PartitionLoadMode::Inline)
+                .await
+                .unwrap();
             let loaded = entry.index.to_batch().unwrap();
             let loaded_schema = loaded.schema();
             let read = loaded_schema
@@ -7099,8 +7206,19 @@ mod tests {
         }
     }
 
+    #[rstest]
+    #[case::ivf_pq(VectorIndexParams::with_ivf_pq_params(
+        DistanceType::L2,
+        IvfBuildParams::new(4),
+        PQBuildParams::new(4, 4),
+    ))]
+    #[case::ivf_rq(VectorIndexParams::with_ivf_rq_params(
+        DistanceType::L2,
+        IvfBuildParams::new(4),
+        RQBuildParams::with_rotation_type(5, RQRotationType::Fast),
+    ))]
     #[tokio::test]
-    async fn test_prewarm_ivf_pq() {
+    async fn test_prewarm_vector_index(#[case] params: VectorIndexParams) {
         use lance_io::assert_io_eq;
 
         const INDEX_NAME: &str = "my_idx";
@@ -7108,11 +7226,6 @@ mod tests {
         let test_uri = test_dir.as_str();
         let (mut dataset, vectors) = generate_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await;
 
-        let params = VectorIndexParams::with_ivf_pq_params(
-            DistanceType::L2,
-            IvfBuildParams::new(4),
-            PQBuildParams::new(4, 4),
-        );
         dataset
             .create_index(
                 &["vector"],
@@ -7140,8 +7253,14 @@ mod tests {
         // Reset IO stats after index creation.
         dataset.object_store.as_ref().io_stats_incremental();
 
-        // Prewarm should perform IO to load all index deltas into cache.
-        dataset.prewarm_index(INDEX_NAME).await.unwrap();
+        // Concurrent prewarms should single-flight each partition through the
+        // cache loader and leave a complete warm cache for both callers.
+        let (first, second) = tokio::join!(
+            dataset.prewarm_index(INDEX_NAME),
+            dataset.prewarm_index(INDEX_NAME)
+        );
+        first.unwrap();
+        second.unwrap();
         let stats = dataset.object_store.as_ref().io_stats_incremental();
         assert!(
             stats.read_iops > 0,

@@ -10,6 +10,7 @@ use arrow_schema::SchemaRef;
 use futures::prelude::stream::TryStreamExt;
 use lance_arrow::RecordBatchExt;
 use lance_core::deepsize::DeepSizeOf;
+use lance_core::utils::tokio::spawn_cpu;
 use lance_core::{Error, ROW_ID, Result};
 use lance_encoding::decoder::FilterExpression;
 use lance_file::reader::FileReader;
@@ -42,6 +43,18 @@ use super::graph::OrderedFloat;
 use super::graph::OrderedNode;
 use super::quantizer::{Quantizer, QuantizerMetadata};
 use super::{ApproxMode, DISTANCE_TYPE_KEY};
+
+async fn spawn_prewarm_materialization<R, F>(materialize: F) -> Result<R>
+where
+    R: Send + 'static,
+    F: FnOnce() -> Result<R> + Send + 'static,
+{
+    // `spawn_cpu` work is non-cancellable. If the caller-owned cache loader is
+    // dropped, this pure CPU tail may finish, but its result is dropped with
+    // this future and therefore cannot be inserted into the cache. A later
+    // cache lookup remains responsible for retrying the load.
+    spawn_cpu(materialize).await
+}
 
 /// <section class="warning">
 ///  Internal API
@@ -661,6 +674,45 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         self.ivf.num_partitions()
     }
 
+    async fn read_partition_batches(
+        &self,
+        part_id: usize,
+        io_stats: Option<IoStats>,
+    ) -> Result<(SchemaRef, Vec<RecordBatch>)> {
+        let schema = Arc::new(self.reader.schema().as_ref().into());
+        let range = self.ivf.row_range(part_id);
+        if range.is_empty() {
+            return Ok((schema, Vec::new()));
+        }
+
+        let reader = match &io_stats {
+            Some(io_stats) => Cow::Owned(self.reader.with_io_stats(io_stats.recorder())),
+            None => Cow::Borrowed(&self.reader),
+        };
+        let batches = reader
+            .read_stream(
+                ReadBatchParams::Range(range),
+                u32::MAX,
+                1,
+                FilterExpression::no_filter(),
+            )
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+        Ok((schema, batches))
+    }
+
+    fn concat_partition_batches(
+        schema: &SchemaRef,
+        batches: &[RecordBatch],
+    ) -> Result<RecordBatch> {
+        if batches.is_empty() {
+            Ok(RecordBatch::new_empty(schema.clone()))
+        } else {
+            Ok(concat_batches(schema, batches.iter())?)
+        }
+    }
+
     /// Load a partition's quantization storage, optionally measuring the exact
     /// I/O it performs into `io_stats`.
     ///
@@ -703,12 +755,52 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             self.frag_reuse_index.clone(),
         )
     }
+
+    /// Load and materialize a partition for the parallel prewarm path.
+    ///
+    /// Object-store reads remain in async code. Batch concatenation and
+    /// quantization-specific normalization are handed to the CPU pool only
+    /// after all reads complete.
+    #[doc(hidden)]
+    pub async fn load_partition_for_prewarm(
+        &self,
+        part_id: usize,
+        io_stats: Option<IoStats>,
+    ) -> Result<Q::Storage>
+    where
+        Q::Metadata: 'static,
+        Q::Storage: 'static,
+    {
+        let (schema, batches) = self.read_partition_batches(part_id, io_stats).await?;
+        let metadata = self.metadata.clone();
+        let distance_type = self.distance_type;
+        let frag_reuse_index = self.frag_reuse_index.clone();
+        spawn_prewarm_materialization(move || {
+            let batch = Self::concat_partition_batches(&schema, &batches)?;
+            Q::Storage::try_from_batch_with_remapper(
+                batch,
+                &metadata,
+                distance_type,
+                frag_reuse_index,
+            )
+        })
+        .await
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{QueryScratchCapacity, QueryScratchPool};
+    use super::{QueryScratchCapacity, QueryScratchPool, spawn_prewarm_materialization};
     use lance_core::deepsize::DeepSizeOf;
+
+    #[tokio::test]
+    async fn test_prewarm_materialization_uses_cpu_pool() {
+        let thread_name =
+            spawn_prewarm_materialization(|| Ok(std::thread::current().name().map(str::to_owned)))
+                .await
+                .unwrap();
+        assert_eq!(thread_name.as_deref(), Some("lance-cpu"));
+    }
 
     #[test]
     fn test_query_scratch_pool_reuses_buffers() {
