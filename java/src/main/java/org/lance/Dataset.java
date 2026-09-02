@@ -142,6 +142,18 @@ public class Dataset implements Closeable {
   @Deprecated
   public static Dataset create(
       BufferAllocator allocator, String path, Schema schema, WriteParams params) {
+    return create(allocator, path, schema, params, null, null, false, null);
+  }
+
+  static Dataset create(
+      BufferAllocator allocator,
+      String path,
+      Schema schema,
+      WriteParams params,
+      LanceNamespace namespaceClient,
+      List<String> tableId,
+      boolean namespaceClientManagedVersioning,
+      String namespaceReservationToken) {
     Preconditions.checkNotNull(allocator);
     Preconditions.checkNotNull(path);
     Preconditions.checkNotNull(schema);
@@ -164,7 +176,11 @@ public class Dataset implements Closeable {
               params.getInitialBases(),
               params.getTargetBases(),
               params.getAllowExternalBlobOutsideBases(),
-              params.getBlobPackFileSizeThreshold());
+              params.getBlobPackFileSizeThreshold(),
+              namespaceClient,
+              tableId,
+              namespaceClientManagedVersioning,
+              namespaceReservationToken);
       dataset.allocator = allocator;
       return dataset;
     }
@@ -213,7 +229,11 @@ public class Dataset implements Closeable {
       Optional<List<BasePath>> initialBases,
       Optional<List<String>> targetBases,
       Optional<Boolean> allowExternalBlobOutsideBases,
-      Optional<Long> blobPackFileSizeThreshold);
+      Optional<Long> blobPackFileSizeThreshold,
+      LanceNamespace namespaceClient,
+      List<String> tableId,
+      boolean namespaceClientManagedVersioning,
+      String namespaceReservationToken);
 
   /**
    * Creates a dataset from an FFI arrow stream.

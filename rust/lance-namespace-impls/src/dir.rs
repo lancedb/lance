@@ -1530,9 +1530,15 @@ impl DirectoryNamespace {
         }
     }
 
-    async fn open_validated_branch(&self, table_uri: &str, branch: &str) -> Result<Dataset> {
+    async fn open_validated_branch(
+        &self,
+        table_id: &Option<Vec<String>>,
+        table_uri: &str,
+        branch: &str,
+    ) -> Result<Dataset> {
         let dataset = self
-            .configured_builder(table_uri)
+            .configured_builder_for_table(table_id, table_uri, "open branch")
+            .await?
             .with_branch(branch, None)
             .load()
             .await
@@ -1554,12 +1560,40 @@ impl DirectoryNamespace {
         Ok(dataset)
     }
 
-    async fn resolve_branch_location(&self, table_uri: &str, branch: &str) -> Result<String> {
-        Ok(self
-            .open_validated_branch(table_uri, branch)
+    async fn resolve_branch_location(
+        &self,
+        table_id: &Option<Vec<String>>,
+        table_uri: &str,
+        branch: &str,
+    ) -> Result<String> {
+        let main = self
+            .configured_builder_for_table(table_id, table_uri, "resolve branch")
             .await?
-            .branch_location()
-            .uri)
+            .load()
+            .await
+            .map_err(|e| {
+                let message = format!("table at '{}' not found: {}", table_uri, e);
+                Self::map_open_error(e, NamespaceError::TableNotFound { message })
+            })?;
+        main.branches().get(branch).await.map_err(|e| {
+            Self::map_open_error(
+                e,
+                NamespaceError::TableNotFound {
+                    message: format!("branch '{}' not found for table at '{}'", branch, table_uri),
+                },
+            )
+        })?;
+        let branch_location = main.branch_location().find_branch(Some(branch))?;
+        if !self
+            .branch_has_committed_versions(&branch_location.path)
+            .await?
+        {
+            return Err(NamespaceError::TableNotFound {
+                message: format!("branch '{}' not found for table at '{}'", branch, table_uri),
+            }
+            .into());
+        }
+        Ok(branch_location.uri)
     }
 
     /// Resolves a branch to its `(uri, object-store path, parent_version)` for
@@ -1573,11 +1607,13 @@ impl DirectoryNamespace {
     /// committed versions as a zombie.
     async fn resolve_branch_for_commit(
         &self,
+        table_id: &Option<Vec<String>>,
         table_uri: &str,
         branch: &str,
     ) -> Result<(String, Path, Option<u64>)> {
         let main = self
-            .configured_builder(table_uri)
+            .configured_builder_for_table(table_id, table_uri, "commit branch")
+            .await?
             .load()
             .await
             .map_err(|e| {
@@ -1638,6 +1674,7 @@ impl DirectoryNamespace {
 
     async fn write_reader_to_table(
         &self,
+        table_id: &Option<Vec<String>>,
         table_uri: &str,
         reader: Box<dyn arrow::record_batch::RecordBatchReader + Send>,
         mode: WriteMode,
@@ -1665,11 +1702,25 @@ impl DirectoryNamespace {
             ..Default::default()
         };
 
-        let dataset = Dataset::write(reader, table_uri, Some(write_params))
-            .await
-            .map_err(|e| NamespaceError::Internal {
-                message: format!("Failed to write table at '{}': {}", table_uri, e),
+        let dataset = if self.table_version_tracking_enabled {
+            let table_id = table_id.as_ref().ok_or_else(|| {
+                lance_core::Error::from(NamespaceError::InvalidInput {
+                    message: "Table ID is required for managed table writes".to_string(),
+                })
             })?;
+            Dataset::write_into_namespace(
+                reader,
+                Arc::new(self.clone()),
+                table_id.clone(),
+                Some(write_params),
+            )
+            .await
+        } else {
+            Dataset::write(reader, table_uri, Some(write_params)).await
+        }
+        .map_err(|e| NamespaceError::Internal {
+            message: format!("Failed to write table at '{}': {}", table_uri, e),
+        })?;
 
         Ok(dataset)
     }
@@ -2400,8 +2451,39 @@ impl DirectoryNamespace {
         builder
     }
 
+    async fn configured_builder_for_table(
+        &self,
+        table_id: &Option<Vec<String>>,
+        table_uri: &str,
+        operation: &str,
+    ) -> Result<DatasetBuilder> {
+        if !self.table_version_tracking_enabled {
+            return Ok(self.configured_builder(table_uri));
+        }
+
+        let table_id = table_id.as_ref().ok_or_else(|| {
+            lance_core::Error::from(NamespaceError::InvalidInput {
+                message: format!("Table ID is required for {}", operation),
+            })
+        })?;
+        let mut builder = DatasetBuilder::from_namespace(Arc::new(self.clone()), table_id.clone())
+            .await
+            .map_err(|e| {
+                let message = format!(
+                    "Failed to resolve table at '{}' for {}: {}",
+                    table_uri, operation, e
+                );
+                Self::map_open_error(e, NamespaceError::TableNotFound { message })
+            })?;
+        if let Some(session) = &self.session {
+            builder = builder.with_session(session.clone());
+        }
+        Ok(builder)
+    }
+
     async fn load_dataset(
         &self,
+        table_id: &Option<Vec<String>>,
         table_uri: &str,
         version: Option<i64>,
         operation: &str,
@@ -2418,26 +2500,28 @@ impl DirectoryNamespace {
             .into());
         }
 
-        let builder = self.configured_builder(table_uri);
+        let mut builder = self
+            .configured_builder_for_table(table_id, table_uri, operation)
+            .await?;
+        if let Some(version) = version {
+            builder = builder.with_version(version as u64);
+        }
 
         let dataset = builder.load().await.map_err(|e| {
-            let message = format!(
-                "Failed to open table at '{}' for {}: {}",
-                table_uri, operation, e
-            );
-            Self::map_open_error(e, NamespaceError::TableNotFound { message })
-        })?;
-
-        if let Some(version) = version {
-            return dataset.checkout_version(version as u64).await.map_err(|e| {
+            if let Some(version) = version {
                 let message = format!(
-                    "Failed to checkout version {} for table at '{}' during {}: {}",
+                    "Failed to open version {} for table at '{}' during {}: {}",
                     version, table_uri, operation, e
                 );
                 Self::map_open_error(e, NamespaceError::TableVersionNotFound { message })
-            });
-        }
-
+            } else {
+                let message = format!(
+                    "Failed to open table at '{}' for {}: {}",
+                    table_uri, operation, e
+                );
+                Self::map_open_error(e, NamespaceError::TableNotFound { message })
+            }
+        })?;
         Ok(dataset)
     }
 
@@ -3210,7 +3294,10 @@ impl DirectoryNamespace {
             };
             let table_uri = self.resolve_table_location(&te.table_id).await?;
             let table_uri = match branch {
-                Some(b) => self.resolve_branch_location(&table_uri, b).await?,
+                Some(b) => {
+                    self.resolve_branch_location(&te.table_id, &table_uri, b)
+                        .await?
+                }
                 None => table_uri,
             };
             let table_path = self.object_store_path_from_uri(&table_uri)?;
@@ -3778,6 +3865,7 @@ impl LanceNamespace for DirectoryNamespace {
 
         let write_result = self
             .write_reader_to_table(
+                &request.id,
                 &table_uri,
                 reader,
                 WriteMode::Create,
@@ -3977,32 +4065,37 @@ impl LanceNamespace for DirectoryNamespace {
         &self,
         request: AlterTableAddColumnsRequest,
     ) -> Result<AlterTableAddColumnsResponse> {
-        if let Some(manifest_ns) = self.manifest_ns_for_write().await? {
+        if !self.table_version_tracking_enabled
+            && let Some(manifest_ns) = self.manifest_ns_for_write().await?
+        {
             return manifest_ns.alter_table_add_columns(request).await;
         }
 
-        // Non-manifest mode: open Dataset directly via table URI and perform the operation
         let table_name = Self::table_name_from_id(&request.id)?;
-        let table_uri = self.table_full_uri(&table_name);
+        let table_uri = if self.table_version_tracking_enabled {
+            self.resolve_table_location(&request.id).await?
+        } else {
+            self.table_full_uri(&table_name)
+        };
 
-        // Check table existence and deregistration status before opening the dataset
-        let status = self.check_table_status(&table_name).await?;
-        if !status.exists {
-            return Err(NamespaceError::TableNotFound {
-                message: table_name,
+        if !self.table_version_tracking_enabled {
+            let status = self.check_table_status(&table_name).await?;
+            if !status.exists {
+                return Err(NamespaceError::TableNotFound {
+                    message: table_name,
+                }
+                .into());
             }
-            .into());
-        }
-        if status.is_deregistered {
-            return Err(NamespaceError::TableNotFound {
-                message: format!("Table is deregistered: {}", table_name),
+            if status.is_deregistered {
+                return Err(NamespaceError::TableNotFound {
+                    message: format!("Table is deregistered: {}", table_name),
+                }
+                .into());
             }
-            .into());
         }
 
         let mut dataset = self
-            .configured_builder(&table_uri)
-            .load()
+            .load_dataset(&request.id, &table_uri, None, "alter_table_add_columns")
             .await
             .map_err(|e| {
                 Error::io_source(box_error(std::io::Error::other(format!(
@@ -4035,31 +4128,37 @@ impl LanceNamespace for DirectoryNamespace {
         &self,
         request: AlterTableAlterColumnsRequest,
     ) -> Result<AlterTableAlterColumnsResponse> {
-        if let Some(manifest_ns) = self.manifest_ns_for_write().await? {
+        if !self.table_version_tracking_enabled
+            && let Some(manifest_ns) = self.manifest_ns_for_write().await?
+        {
             return manifest_ns.alter_table_alter_columns(request).await;
         }
 
         let table_name = Self::table_name_from_id(&request.id)?;
-        let table_uri = self.table_full_uri(&table_name);
+        let table_uri = if self.table_version_tracking_enabled {
+            self.resolve_table_location(&request.id).await?
+        } else {
+            self.table_full_uri(&table_name)
+        };
 
-        // Check table existence and deregistration status before opening the dataset
-        let status = self.check_table_status(&table_name).await?;
-        if !status.exists {
-            return Err(NamespaceError::TableNotFound {
-                message: table_name,
+        if !self.table_version_tracking_enabled {
+            let status = self.check_table_status(&table_name).await?;
+            if !status.exists {
+                return Err(NamespaceError::TableNotFound {
+                    message: table_name,
+                }
+                .into());
             }
-            .into());
-        }
-        if status.is_deregistered {
-            return Err(NamespaceError::TableNotFound {
-                message: format!("Table is deregistered: {}", table_name),
+            if status.is_deregistered {
+                return Err(NamespaceError::TableNotFound {
+                    message: format!("Table is deregistered: {}", table_name),
+                }
+                .into());
             }
-            .into());
         }
 
         let mut dataset = self
-            .configured_builder(&table_uri)
-            .load()
+            .load_dataset(&request.id, &table_uri, None, "alter_table_alter_columns")
             .await
             .map_err(|e| {
                 Error::io_source(box_error(std::io::Error::other(format!(
@@ -4085,31 +4184,37 @@ impl LanceNamespace for DirectoryNamespace {
         &self,
         request: AlterTableDropColumnsRequest,
     ) -> Result<AlterTableDropColumnsResponse> {
-        if let Some(manifest_ns) = self.manifest_ns_for_write().await? {
+        if !self.table_version_tracking_enabled
+            && let Some(manifest_ns) = self.manifest_ns_for_write().await?
+        {
             return manifest_ns.alter_table_drop_columns(request).await;
         }
 
         let table_name = Self::table_name_from_id(&request.id)?;
-        let table_uri = self.table_full_uri(&table_name);
+        let table_uri = if self.table_version_tracking_enabled {
+            self.resolve_table_location(&request.id).await?
+        } else {
+            self.table_full_uri(&table_name)
+        };
 
-        // Check table existence and deregistration status before opening the dataset
-        let status = self.check_table_status(&table_name).await?;
-        if !status.exists {
-            return Err(NamespaceError::TableNotFound {
-                message: table_name,
+        if !self.table_version_tracking_enabled {
+            let status = self.check_table_status(&table_name).await?;
+            if !status.exists {
+                return Err(NamespaceError::TableNotFound {
+                    message: table_name,
+                }
+                .into());
             }
-            .into());
-        }
-        if status.is_deregistered {
-            return Err(NamespaceError::TableNotFound {
-                message: format!("Table is deregistered: {}", table_name),
+            if status.is_deregistered {
+                return Err(NamespaceError::TableNotFound {
+                    message: format!("Table is deregistered: {}", table_name),
+                }
+                .into());
             }
-            .into());
         }
 
         let mut dataset = self
-            .configured_builder(&table_uri)
-            .load()
+            .load_dataset(&request.id, &table_uri, None, "alter_table_drop_columns")
             .await
             .map_err(|e| {
                 Error::io_source(box_error(std::io::Error::other(format!(
@@ -4138,7 +4243,10 @@ impl LanceNamespace for DirectoryNamespace {
         let branch = Self::normalized_branch(request.branch.as_deref())?;
         let table_uri = self.resolve_table_location(&request.id).await?;
         let table_uri = match branch {
-            Some(b) => self.resolve_branch_location(&table_uri, b).await?,
+            Some(b) => {
+                self.resolve_branch_location(&request.id, &table_uri, b)
+                    .await?
+            }
             None => table_uri,
         };
         let want_descending = request.descending == Some(true);
@@ -4209,7 +4317,10 @@ impl LanceNamespace for DirectoryNamespace {
             })?
         };
         let (table_uri, table_path, branch_parent_version) = match branch {
-            Some(b) => self.resolve_branch_for_commit(&table_uri, b).await?,
+            Some(b) => {
+                self.resolve_branch_for_commit(&request.id, &table_uri, b)
+                    .await?
+            }
             None => {
                 let table_path = self.object_store_path_from_uri(&table_uri)?;
                 (table_uri, table_path, None)
@@ -4515,7 +4626,10 @@ impl LanceNamespace for DirectoryNamespace {
         let branch = Self::normalized_branch(request.branch.as_deref())?;
         let table_uri = self.resolve_table_location(&request.id).await?;
         let table_uri = match branch {
-            Some(b) => self.resolve_branch_location(&table_uri, b).await?,
+            Some(b) => {
+                self.resolve_branch_location(&request.id, &table_uri, b)
+                    .await?
+            }
             None => table_uri,
         };
         let versions = self
@@ -4642,7 +4756,7 @@ impl LanceNamespace for DirectoryNamespace {
         self.record_op("create_table_index");
         let table_uri = self.resolve_table_location(&request.id).await?;
         let mut dataset = self
-            .load_dataset(&table_uri, None, "create_table_index")
+            .load_dataset(&request.id, &table_uri, None, "create_table_index")
             .await?;
         let index_request = Self::build_index_params(&request)?;
 
@@ -4714,7 +4828,12 @@ impl LanceNamespace for DirectoryNamespace {
         self.record_op("list_table_indices");
         let table_uri = self.resolve_table_location(&request.id).await?;
         let dataset = self
-            .load_dataset(&table_uri, request.version, "list_table_indices")
+            .load_dataset(
+                &request.id,
+                &table_uri,
+                request.version,
+                "list_table_indices",
+            )
             .await?;
         let total_rows = dataset.count_rows(None).await.map_err(|e| {
             lance_core::Error::from(NamespaceError::Internal {
@@ -4810,7 +4929,12 @@ impl LanceNamespace for DirectoryNamespace {
         self.record_op("describe_table_index_stats");
         let table_uri = self.resolve_table_location(&request.id).await?;
         let dataset = self
-            .load_dataset(&table_uri, request.version, "describe_table_index_stats")
+            .load_dataset(
+                &request.id,
+                &table_uri,
+                request.version,
+                "describe_table_index_stats",
+            )
             .await?;
         let index_name = request.index_name.as_deref().ok_or_else(|| {
             lance_core::Error::from(NamespaceError::InvalidInput {
@@ -4882,7 +5006,7 @@ impl LanceNamespace for DirectoryNamespace {
         let table_id = Some(request_id);
         let table_uri = self.resolve_table_location(&table_id).await?;
         let dataset = self
-            .load_dataset(&table_uri, None, "describe_transaction")
+            .load_dataset(&table_id, &table_uri, None, "describe_transaction")
             .await?;
         let (version, transaction) = self.find_transaction(&dataset, &id).await?;
 
@@ -4922,7 +5046,7 @@ impl LanceNamespace for DirectoryNamespace {
         let table_id = Some(request_id);
         let table_uri = self.resolve_table_location(&table_id).await?;
         let dataset = self
-            .load_dataset(&table_uri, None, "alter_transaction")
+            .load_dataset(&table_id, &table_uri, None, "alter_transaction")
             .await?;
         let (version, transaction) = self.find_transaction(&dataset, &txn_id).await?;
 
@@ -5130,7 +5254,7 @@ impl LanceNamespace for DirectoryNamespace {
             })
         })?;
         let mut dataset = self
-            .load_dataset(&table_uri, None, "drop_table_index")
+            .load_dataset(&request.id, &table_uri, None, "drop_table_index")
             .await?;
         let metadatas = dataset
             .load_indices_by_name(index_name)
@@ -5207,8 +5331,14 @@ impl LanceNamespace for DirectoryNamespace {
         let branch = Self::normalized_branch(request.branch.as_deref())?;
         let table_uri = self.resolve_table_location(&request.id).await?;
         let mut dataset = match branch {
-            Some(branch) => self.open_validated_branch(&table_uri, branch).await?,
-            None => self.load_dataset(&table_uri, None, "restore_table").await?,
+            Some(branch) => {
+                self.open_validated_branch(&request.id, &table_uri, branch)
+                    .await?
+            }
+            None => {
+                self.load_dataset(&request.id, &table_uri, None, "restore_table")
+                    .await?
+            }
         };
 
         dataset = dataset
@@ -5260,7 +5390,12 @@ impl LanceNamespace for DirectoryNamespace {
     ) -> Result<UpdateTableSchemaMetadataResponse> {
         let table_uri = self.resolve_table_location(&request.id).await?;
         let mut dataset = self
-            .load_dataset(&table_uri, None, "update_table_schema_metadata")
+            .load_dataset(
+                &request.id,
+                &table_uri,
+                None,
+                "update_table_schema_metadata",
+            )
             .await?;
 
         let new_metadata = request.metadata.unwrap_or_default();
@@ -5304,7 +5439,7 @@ impl LanceNamespace for DirectoryNamespace {
     ) -> Result<GetTableStatsResponse> {
         let table_uri = self.resolve_table_location(&request.id).await?;
         let dataset = Arc::new(
-            self.load_dataset(&table_uri, None, "get_table_stats")
+            self.load_dataset(&request.id, &table_uri, None, "get_table_stats")
                 .await?,
         );
 
@@ -5385,6 +5520,7 @@ impl LanceNamespace for DirectoryNamespace {
         let table_uri = self.resolve_table_location(&request.id).await?;
         let dataset = self
             .load_dataset(
+                &request.id,
                 &table_uri,
                 request.query.version,
                 "explain_table_query_plan",
@@ -5431,7 +5567,12 @@ impl LanceNamespace for DirectoryNamespace {
     ) -> Result<String> {
         let table_uri = self.resolve_table_location(&request.id).await?;
         let dataset = self
-            .load_dataset(&table_uri, request.version, "analyze_table_query_plan")
+            .load_dataset(
+                &request.id,
+                &table_uri,
+                request.version,
+                "analyze_table_query_plan",
+            )
             .await?;
 
         let mut scanner = dataset.scan();
@@ -5471,7 +5612,7 @@ impl LanceNamespace for DirectoryNamespace {
         self.record_op("count_table_rows");
         let table_uri = self.resolve_table_location(&request.id).await?;
         let dataset = self
-            .load_dataset(&table_uri, request.version, "count_table_rows")
+            .load_dataset(&request.id, &table_uri, request.version, "count_table_rows")
             .await?;
 
         let count =
@@ -5510,11 +5651,13 @@ impl LanceNamespace for DirectoryNamespace {
             }
         };
 
-        if !self.table_uri_has_actual_manifests(&table_uri).await? {
-            self.write_reader_to_table(&table_uri, reader, WriteMode::Create, None)
+        if !self.table_version_tracking_enabled
+            && !self.table_uri_has_actual_manifests(&table_uri).await?
+        {
+            self.write_reader_to_table(&request.id, &table_uri, reader, WriteMode::Create, None)
                 .await?;
         } else {
-            self.write_reader_to_table(&table_uri, reader, mode, None)
+            self.write_reader_to_table(&request.id, &table_uri, reader, mode, None)
                 .await?;
         }
 
@@ -5537,13 +5680,14 @@ impl LanceNamespace for DirectoryNamespace {
             })
         })?;
 
-        let table_has_manifests = self.table_uri_has_actual_manifests(&table_uri).await?;
+        let table_has_manifests = self.table_version_tracking_enabled
+            || self.table_uri_has_actual_manifests(&table_uri).await?;
         let (reader, num_rows) =
             Self::ipc_reader_from_request_data(&request_data, "merge_insert_into_table")?;
 
         if !table_has_manifests {
             let dataset = self
-                .write_reader_to_table(&table_uri, reader, WriteMode::Create, None)
+                .write_reader_to_table(&request.id, &table_uri, reader, WriteMode::Create, None)
                 .await?;
             let version = dataset.version().version as i64;
             return Ok(MergeInsertIntoTableResponse {
@@ -5557,7 +5701,7 @@ impl LanceNamespace for DirectoryNamespace {
         }
 
         let dataset = Arc::new(
-            self.load_dataset(&table_uri, None, "merge_insert_into_table")
+            self.load_dataset(&request.id, &table_uri, None, "merge_insert_into_table")
                 .await?,
         );
 
@@ -5670,7 +5814,10 @@ impl LanceNamespace for DirectoryNamespace {
         }
 
         let table_uri = self.resolve_table_location(&request.id).await?;
-        let dataset = Arc::new(self.load_dataset(&table_uri, None, "update_table").await?);
+        let dataset = Arc::new(
+            self.load_dataset(&request.id, &table_uri, None, "update_table")
+                .await?,
+        );
 
         let mut builder = UpdateBuilder::new(dataset);
         for pair in &request.updates {
@@ -5727,7 +5874,7 @@ impl LanceNamespace for DirectoryNamespace {
 
         let table_uri = self.resolve_table_location(&request.id).await?;
         let mut dataset = self
-            .load_dataset(&table_uri, None, "delete_from_table")
+            .load_dataset(&request.id, &table_uri, None, "delete_from_table")
             .await?;
 
         let result = dataset
@@ -5748,7 +5895,7 @@ impl LanceNamespace for DirectoryNamespace {
         self.record_op("query_table");
         let table_uri = self.resolve_table_location(&request.id).await?;
         let dataset = self
-            .load_dataset(&table_uri, request.version, "query_table")
+            .load_dataset(&request.id, &table_uri, request.version, "query_table")
             .await?;
 
         // Build scanner
@@ -5990,7 +6137,7 @@ impl LanceNamespace for DirectoryNamespace {
         self.record_op("list_table_tags");
         let table_uri = self.resolve_table_location(&request.id).await?;
         let dataset = self
-            .load_dataset(&table_uri, None, "list_table_tags")
+            .load_dataset(&request.id, &table_uri, None, "list_table_tags")
             .await?;
 
         let raw_tags = dataset.tags().list().await.map_err(|e| {
@@ -6030,7 +6177,7 @@ impl LanceNamespace for DirectoryNamespace {
 
         let table_uri = self.resolve_table_location(&request.id).await?;
         let dataset = self
-            .load_dataset(&table_uri, None, "get_table_tag_version")
+            .load_dataset(&request.id, &table_uri, None, "get_table_tag_version")
             .await?;
 
         let contents = dataset
@@ -6069,7 +6216,7 @@ impl LanceNamespace for DirectoryNamespace {
 
         let table_uri = self.resolve_table_location(&request.id).await?;
         let dataset = self
-            .load_dataset(&table_uri, None, "create_table_tag")
+            .load_dataset(&request.id, &table_uri, None, "create_table_tag")
             .await?;
 
         dataset
@@ -6098,7 +6245,7 @@ impl LanceNamespace for DirectoryNamespace {
 
         let table_uri = self.resolve_table_location(&request.id).await?;
         let dataset = self
-            .load_dataset(&table_uri, None, "delete_table_tag")
+            .load_dataset(&request.id, &table_uri, None, "delete_table_tag")
             .await?;
 
         dataset
@@ -6136,7 +6283,7 @@ impl LanceNamespace for DirectoryNamespace {
 
         let table_uri = self.resolve_table_location(&request.id).await?;
         let dataset = self
-            .load_dataset(&table_uri, None, "update_table_tag")
+            .load_dataset(&request.id, &table_uri, None, "update_table_tag")
             .await?;
 
         dataset
@@ -6177,27 +6324,9 @@ impl LanceNamespace for DirectoryNamespace {
         };
 
         let table_uri = self.resolve_table_location(&request.id).await?;
-        let mut dataset = if self.table_version_tracking_enabled {
-            let table_id = request.id.as_ref().ok_or_else(|| {
-                lance_core::Error::from(NamespaceError::InvalidInput {
-                    message: "Table ID is required".to_string(),
-                })
-            })?;
-            DatasetBuilder::from_namespace(Arc::new(self.clone()), table_id.clone())
-                .await?
-                .load()
-                .await
-                .map_err(|e| {
-                    let message = format!(
-                        "Failed to open table at '{}' for create_table_branch: {}",
-                        table_uri, e
-                    );
-                    Self::map_open_error(e, NamespaceError::TableNotFound { message })
-                })?
-        } else {
-            self.load_dataset(&table_uri, None, "create_table_branch")
-                .await?
-        };
+        let mut dataset = self
+            .load_dataset(&request.id, &table_uri, None, "create_table_branch")
+            .await?;
 
         // Best-effort pre-check: a duplicate returns a clean TableBranchAlreadyExists conflict
         // instead of the opaque Internal error create_branch raises on a pre-existing branch. A
@@ -6246,7 +6375,7 @@ impl LanceNamespace for DirectoryNamespace {
         self.record_op("list_table_branches");
         let table_uri = self.resolve_table_location(&request.id).await?;
         let dataset = self
-            .load_dataset(&table_uri, None, "list_table_branches")
+            .load_dataset(&request.id, &table_uri, None, "list_table_branches")
             .await?;
 
         let raw_branches = dataset.list_branches().await.map_err(|e| {
@@ -6299,7 +6428,7 @@ impl LanceNamespace for DirectoryNamespace {
 
         let table_uri = self.resolve_table_location(&request.id).await?;
         let mut dataset = self
-            .load_dataset(&table_uri, None, "delete_table_branch")
+            .load_dataset(&request.id, &table_uri, None, "delete_table_branch")
             .await?;
 
         dataset
@@ -13860,6 +13989,18 @@ mod tests {
                 .unwrap();
             assert_eq!(described.version, Some(1));
             assert!(described.schema.is_some());
+            assert_eq!(
+                tracking_ns
+                    .inner
+                    .count_table_rows(CountTableRowsRequest {
+                        id: Some(table_id.clone()),
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap(),
+                3,
+                "DirectoryNamespace operations should resolve reserved version 1"
+            );
 
             // Verify create_table_version was called once during initial write_into_namespace
             assert_eq!(
@@ -13935,6 +14076,105 @@ mod tests {
             })
             .await
             .expect_err("cleanup must retire version 1 from namespace history");
+        }
+
+        #[tokio::test]
+        async fn test_managed_directory_insert_uses_namespace_history() {
+            use arrow::array::Int32Array;
+            use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+            use arrow::ipc::writer::StreamWriter;
+            use arrow::record_batch::RecordBatch;
+            use lance::Dataset;
+            use lance::dataset::{WriteMode, WriteParams};
+
+            let temp_dir = TempStdDir::default();
+            let namespace = Arc::new(
+                DirectoryNamespaceBuilder::new(temp_dir.to_str().unwrap())
+                    .table_version_tracking_enabled(true)
+                    .manifest_enabled(true)
+                    .build()
+                    .await
+                    .unwrap(),
+            );
+            let table_id = vec!["test_table".to_string()];
+            let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+                "id",
+                DataType::Int32,
+                false,
+            )]));
+            let initial_batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+            )
+            .unwrap();
+            let batches = RecordBatchIterator::new(vec![Ok(initial_batch)], schema.clone());
+            let client: Arc<dyn LanceNamespace> = namespace.clone();
+            Dataset::write_into_namespace(
+                batches,
+                client,
+                table_id.clone(),
+                Some(WriteParams {
+                    mode: WriteMode::Create,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+
+            let append_batch =
+                RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![4]))])
+                    .unwrap();
+            let mut ipc_data = Vec::new();
+            {
+                let mut writer = StreamWriter::try_new(&mut ipc_data, &schema).unwrap();
+                writer.write(&append_batch).unwrap();
+                writer.finish().unwrap();
+            }
+            namespace
+                .insert_into_table(
+                    InsertIntoTableRequest {
+                        id: Some(table_id.clone()),
+                        mode: Some("append".to_string()),
+                        ..Default::default()
+                    },
+                    Bytes::from(ipc_data),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(
+                namespace
+                    .count_table_rows(CountTableRowsRequest {
+                        id: Some(table_id.clone()),
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap(),
+                4
+            );
+            assert_eq!(
+                namespace
+                    .count_table_rows(CountTableRowsRequest {
+                        id: Some(table_id.clone()),
+                        version: Some(1),
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap(),
+                3
+            );
+            assert_eq!(
+                namespace
+                    .list_table_versions(ListTableVersionsRequest {
+                        id: Some(table_id),
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap()
+                    .versions
+                    .len(),
+                2
+            );
         }
 
         #[tokio::test]

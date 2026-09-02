@@ -502,6 +502,41 @@ public class DirectoryNamespaceTest {
   }
 
   @Test
+  void testSchemaOnlyCreatePublishesReservation(@TempDir Path managedVersioningTempDir)
+      throws Exception {
+    try (BufferAllocator allocator = new RootAllocator()) {
+      DirectoryNamespace namespaceClient =
+          createManagedVersioningNamespace(managedVersioningTempDir);
+      List<String> tableId = Arrays.asList("empty_table");
+      Schema schema =
+          new Schema(
+              Arrays.asList(
+                  new Field("id", FieldType.nullable(new ArrowType.Int(32, true)), null)));
+
+      try (Dataset dataset =
+          Dataset.write()
+              .allocator(allocator)
+              .schema(schema)
+              .namespaceClient(namespaceClient)
+              .tableId(tableId)
+              .mode(WriteParams.WriteMode.CREATE)
+              .execute()) {
+        assertEquals(0, dataset.countRows());
+        assertEquals(1, dataset.version());
+      }
+
+      ListTableVersionsResponse versions =
+          namespaceClient.listTableVersions(new ListTableVersionsRequest().id(tableId));
+      assertEquals(1, versions.getVersions().size());
+      assertTrue(
+          versions.getVersions().get(0).getManifestPath().contains("_reservation_versions/"),
+          "schema-only managed CREATE should publish through the declaration reservation");
+      assertEquals(1, getCreateTableVersionCount(namespaceClient));
+      namespaceClient.close();
+    }
+  }
+
+  @Test
   void testExternalManifestStoreInvokesNamespaceApis(@TempDir Path managedVersioningTempDir)
       throws Exception {
     try (BufferAllocator allocator = new RootAllocator()) {

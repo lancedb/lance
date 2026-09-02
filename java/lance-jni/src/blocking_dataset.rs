@@ -485,6 +485,10 @@ pub extern "system" fn Java_org_lance_Dataset_createWithFfiSchema<'local>(
     target_bases: JObject,
     allow_external_blob_outside_bases: JObject, // Optional<Boolean>
     blob_pack_file_size_threshold: JObject,     // Optional<Long>
+    namespace_obj: JObject,                     // LanceNamespace (can be null)
+    table_id_obj: JObject,                      // List<String> (can be null)
+    namespace_client_managed_versioning: jboolean, // Whether namespace manages versioning
+    namespace_reservation_token: JString,       // String (can be null)
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
@@ -505,6 +509,10 @@ pub extern "system" fn Java_org_lance_Dataset_createWithFfiSchema<'local>(
             target_bases,
             allow_external_blob_outside_bases,
             blob_pack_file_size_threshold,
+            namespace_obj,
+            table_id_obj,
+            namespace_client_managed_versioning != 0,
+            namespace_reservation_token,
         )
     )
 }
@@ -527,12 +535,22 @@ fn inner_create_with_ffi_schema<'local>(
     target_bases: JObject,
     allow_external_blob_outside_bases: JObject, // Optional<Boolean>
     blob_pack_file_size_threshold: JObject,     // Optional<Long>
+    namespace_obj: JObject,                     // LanceNamespace (can be null)
+    table_id_obj: JObject,                      // List<String> (can be null)
+    namespace_client_managed_versioning: bool,  // Whether namespace manages versioning
+    namespace_reservation_token: JString,       // String (can be null)
 ) -> Result<JObject<'local>> {
     let c_schema_ptr = arrow_schema_addr as *mut FFI_ArrowSchema;
     let c_schema = unsafe { FFI_ArrowSchema::from_raw(c_schema_ptr) };
     let schema = Schema::try_from(&c_schema)?;
 
     let reader = RecordBatchIterator::new(empty(), Arc::new(schema));
+    let namespace_info = extract_namespace_info(env, &namespace_obj, &table_id_obj)?;
+    let namespace_reservation_token = if namespace_reservation_token.is_null() {
+        None
+    } else {
+        Some(namespace_reservation_token.extract(env)?)
+    };
     create_dataset(
         env,
         path,
@@ -550,9 +568,9 @@ fn inner_create_with_ffi_schema<'local>(
         allow_external_blob_outside_bases,
         blob_pack_file_size_threshold,
         reader,
-        None,  // No namespace for schema-only creation
-        false, // No managed versioning for schema-only creation
-        None,  // No reservation token without a namespace
+        namespace_info,
+        namespace_client_managed_versioning,
+        namespace_reservation_token,
     )
 }
 

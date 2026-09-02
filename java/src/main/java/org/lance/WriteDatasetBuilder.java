@@ -590,9 +590,16 @@ public class WriteDatasetBuilder {
     }
 
     // If only schema is provided (empty table), use Dataset.create with schema
-    // Note: Schema-only creation doesn't support namespace client-based commit handling
     if (schema != null) {
-      return Dataset.create(allocator, path, schema, params);
+      return Dataset.create(
+          allocator,
+          path,
+          schema,
+          params,
+          namespaceClient,
+          tableId,
+          namespaceClientManagedVersioning,
+          namespaceReservationToken);
     }
 
     throw new IllegalStateException("No data source provided");
