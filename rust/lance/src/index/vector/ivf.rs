@@ -66,6 +66,7 @@ use lance_file::{
 };
 use lance_index::metrics::MetricsCollector;
 use lance_index::metrics::NoOpMetricsCollector;
+use lance_index::prefilter::NoFilter;
 use lance_index::vector::DISTANCE_TYPE_KEY;
 use lance_index::vector::bq::builder::RabitQuantizer;
 use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatMetadata, FlatQuantizer};
@@ -112,6 +113,7 @@ use lance_io::{
 };
 use lance_linalg::distance::{DistanceType, Dot, L2, MetricType};
 use lance_linalg::{distance::Normalize, kernels::normalize_fsl_owned};
+use lance_select::RowAddrTreeMap;
 use lance_table::format::{IndexFile, IndexMetadata as TableIndexMetadata};
 use log::{info, warn};
 use object_store::path::Path;
@@ -125,7 +127,7 @@ use std::{
     any::Any,
     collections::{HashMap, HashSet},
     ops::Range,
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 use tokio::sync::mpsc;
 use tracing::instrument;
@@ -187,12 +189,20 @@ pub struct IVFIndex {
     pub metric_type: MetricType,
 
     index_cache: WeakLanceCache,
+    partition_rows: Vec<OnceLock<Arc<RowAddrTreeMap>>>,
 }
 
 impl DeepSizeOf for IVFIndex {
     fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         // `Uuid` is a fixed 16-byte struct with no heap children, so contributes 0.
-        self.reader.deep_size_of_children(context) + self.sub_index.deep_size_of_children(context)
+        self.reader.deep_size_of_children(context)
+            + self.sub_index.deep_size_of_children(context)
+            + self
+                .partition_rows
+                .iter()
+                .filter_map(OnceLock::get)
+                .map(|rows| rows.deep_size_of_children(context))
+                .sum::<usize>()
     }
 }
 
@@ -222,7 +232,44 @@ impl IVFIndex {
             metric_type,
             partition_locks: PartitionLoadLock::new(num_partitions),
             index_cache: WeakLanceCache::from(&index_cache),
+            partition_rows: (0..num_partitions).map(|_| OnceLock::new()).collect(),
         })
+    }
+
+    fn cache_partition_rows(
+        &self,
+        partition_id: usize,
+        partition: &dyn VectorIndex,
+    ) -> Result<Arc<RowAddrTreeMap>> {
+        let rows = self.partition_rows.get(partition_id).ok_or_else(|| {
+            Error::index(format!(
+                "partition id {partition_id} is out of range of {} partitions",
+                self.ivf.num_partitions()
+            ))
+        })?;
+        Ok(rows
+            .get_or_init(|| Arc::new(partition.row_ids().collect()))
+            .clone())
+    }
+
+    fn prefilter_for_partition(
+        &self,
+        partition_id: usize,
+        partition: &dyn VectorIndex,
+        pre_filter: Arc<dyn PreFilter>,
+    ) -> Result<Arc<dyn PreFilter>> {
+        if pre_filter.is_empty() {
+            return Ok(Arc::new(NoFilter));
+        }
+        if !pre_filter.needs_partition_row_ids() {
+            return Ok(pre_filter);
+        }
+        let rows = self.cache_partition_rows(partition_id, partition)?;
+        if pre_filter.is_empty_for(rows.as_ref()) {
+            Ok(Arc::new(NoFilter))
+        } else {
+            Ok(pre_filter)
+        }
     }
 
     /// Load one partition of the IVF sub-index.
@@ -1393,6 +1440,9 @@ impl VectorIndex for IVFIndex {
         metrics: &dyn MetricsCollector,
     ) -> Result<RecordBatch> {
         let part_index = self.load_partition(partition_id, true, metrics).await?;
+        pre_filter.wait_for_ready().await?;
+        let pre_filter =
+            self.prefilter_for_partition(partition_id, part_index.as_ref(), pre_filter)?;
 
         let query = self.preprocess_query(partition_id, query)?;
         let batch = part_index.search(&query, pre_filter, metrics).await?;
@@ -2370,14 +2420,35 @@ async fn write_ivf_hnsw_file(
 
 /// Merge one caller-defined group of source segments into a single segment.
 pub(crate) async fn merge_segments(
-    object_store: &ObjectStore,
-    indices_dir: &Path,
+    dataset: &Dataset,
     segments: Vec<TableIndexMetadata>,
 ) -> Result<TableIndexMetadata> {
-    merge_segments_with_progress(
-        object_store,
-        indices_dir,
+    let mut row_filters = Vec::with_capacity(segments.len());
+    let no_deleted_fragments = RoaringBitmap::new();
+    for segment in &segments {
+        let owned_fragments = segment.fragment_bitmap.as_ref().ok_or_else(|| {
+            Error::index(format!(
+                "Segment '{}' is missing fragment coverage",
+                segment.uuid
+            ))
+        })?;
+        row_filters.push(
+            crate::index::append::build_old_data_filter(
+                dataset,
+                owned_fragments,
+                &no_deleted_fragments,
+            )
+            .await?
+            .ok_or_else(|| {
+                Error::internal("Vector segment ownership filter is missing".to_string())
+            })?,
+        );
+    }
+    merge_segments_with_row_filters(
+        dataset.object_store.as_ref(),
+        &dataset.indices_dir(),
         segments,
+        row_filters,
         lance_index::progress::noop_progress(),
     )
     .await
@@ -2385,10 +2456,37 @@ pub(crate) async fn merge_segments(
 
 /// Merge one caller-defined group of source segments into a single segment and
 /// report progress through the provided callback.
+#[cfg(test)]
 pub(crate) async fn merge_segments_with_progress(
     object_store: &ObjectStore,
     indices_dir: &Path,
     segments: Vec<TableIndexMetadata>,
+    progress: Arc<dyn lance_index::progress::IndexBuildProgress>,
+) -> Result<TableIndexMetadata> {
+    let row_filters = segments
+        .iter()
+        .map(|segment| {
+            let to_keep = segment.fragment_bitmap.clone().ok_or_else(|| {
+                Error::index(format!(
+                    "Segment '{}' is missing fragment coverage",
+                    segment.uuid
+                ))
+            })?;
+            Ok(lance_index::scalar::OldIndexDataFilter::Fragments {
+                to_keep,
+                to_remove: RoaringBitmap::new(),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    merge_segments_with_row_filters(object_store, indices_dir, segments, row_filters, progress)
+        .await
+}
+
+async fn merge_segments_with_row_filters(
+    object_store: &ObjectStore,
+    indices_dir: &Path,
+    segments: Vec<TableIndexMetadata>,
+    row_filters: Vec<lance_index::scalar::OldIndexDataFilter>,
     progress: Arc<dyn lance_index::progress::IndexBuildProgress>,
 ) -> Result<TableIndexMetadata> {
     if segments.is_empty() {
@@ -2409,6 +2507,16 @@ pub(crate) async fn merge_segments_with_progress(
         })?;
         fragment_bitmap |= source_fragment_bitmap.clone();
     }
+    let mut index_details = crate::index::vector_index_details_default();
+    for segment in &segments {
+        if let Some(details) = segment.index_details.as_deref() {
+            let details = details.clone();
+            if !details.value.is_empty() {
+                index_details = details;
+                break;
+            }
+        }
+    }
 
     let index_version = infer_source_index_version(&segments)?;
     let segment_uuid = Uuid::new_v4();
@@ -2418,15 +2526,15 @@ pub(crate) async fn merge_segments_with_progress(
         indices_dir,
         &final_dir,
         &segments,
+        &row_filters,
         None,
         progress,
     )
     .await?;
-
     merged_segment = TableIndexMetadata {
         uuid: segment_uuid,
         fragment_bitmap: Some(fragment_bitmap),
-        index_details: Some(Arc::new(crate::index::vector_index_details_default())),
+        index_details: Some(Arc::new(index_details)),
         index_version,
         created_at: Some(chrono::Utc::now()),
         base_id: None,
@@ -2446,6 +2554,7 @@ async fn merge_segments_to_dir(
     indices_dir: &Path,
     final_dir: &Path,
     segments: &[TableIndexMetadata],
+    row_filters: &[lance_index::scalar::OldIndexDataFilter],
     _requested_index_type: Option<IndexType>,
     progress: Arc<dyn lance_index::progress::IndexBuildProgress>,
 ) -> Result<Vec<IndexFile>> {
@@ -2474,15 +2583,14 @@ async fn merge_segments_to_dir(
                 .join(INDEX_FILE_NAME)
         })
         .collect::<Vec<_>>();
-
-    let auxiliary_file =
-        lance_index::vector::distributed::index_merger::merge_partial_vector_auxiliary_files(
-            object_store,
-            &aux_paths,
-            final_dir,
-            progress.clone(),
-        )
-        .await?;
+    let auxiliary_file = lance_index::vector::distributed::index_merger::merge_partial_vector_auxiliary_files_with_row_filters(
+        object_store,
+        &aux_paths,
+        final_dir,
+        row_filters,
+        progress.clone(),
+    )
+    .await?;
     let index_file = write_root_vector_index_from_auxiliary(
         object_store,
         final_dir,
