@@ -554,6 +554,12 @@ pub async fn build_pq_model_in_fragments(
     let num_codes = 2_usize.pow(params.num_bits as u32);
 
     if let Some(codebook) = &params.codebook {
+        lance_index::vector::pq::validate_supplied_codebook(
+            codebook.len(),
+            dim,
+            params.num_sub_vectors,
+            params.num_bits,
+        )?;
         let dt = if metric_type == MetricType::Cosine {
             info!("Normalize training data for PQ training: Cosine");
             MetricType::L2
