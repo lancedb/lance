@@ -200,6 +200,7 @@ impl DatasetPreFilter {
         let key = crate::session::caches::RowAddrMaskKey {
             version: dataset.manifest().version,
             restrict_hash,
+            e_tag: dataset.manifest_location.e_tag.as_deref(),
         };
         dataset
             .metadata_cache

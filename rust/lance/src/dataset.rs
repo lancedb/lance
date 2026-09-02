@@ -841,6 +841,7 @@ impl Dataset {
             let metadata_cache = session.metadata_cache.for_dataset(uri);
             let metadata_key = TransactionKey {
                 version: manifest_location.version,
+                e_tag: manifest_location.e_tag.as_deref(),
             };
             metadata_cache
                 .insert_with_key(&metadata_key, Arc::new(transaction))
@@ -1247,6 +1248,7 @@ impl Dataset {
     pub async fn read_transaction(&self) -> Result<Option<Transaction>> {
         let transaction_key = TransactionKey {
             version: self.manifest.version,
+            e_tag: self.manifest_location.e_tag.as_deref(),
         };
         if let Some(transaction) = self.metadata_cache.get_with_key(&transaction_key).await {
             return Ok(Some((*transaction).clone()));
@@ -3567,8 +3569,13 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
     let transactions = manifests
         .map_ok(move |(manifest, location)| async move {
             let manifest_copy = manifest.clone();
+            // Cloned rather than borrowed: `location` is moved into
+            // `checkout_manifest` below, but `tx_key` (borrowing the e-tag)
+            // is still alive at the `insert_with_key` call after that move.
+            let location_e_tag = location.e_tag.clone();
             let tx_key = TransactionKey {
                 version: manifest.version,
+                e_tag: location_e_tag.as_deref(),
             };
             let transaction =
                 if let Some(cached) = dataset.metadata_cache.get_with_key(&tx_key).await {

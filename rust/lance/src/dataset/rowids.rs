@@ -82,6 +82,7 @@ pub async fn get_row_id_index(
     if dataset.manifest.uses_stable_row_ids() {
         let key = RowIdIndexKey {
             version: dataset.manifest.version,
+            e_tag: dataset.manifest_location.e_tag.as_deref(),
         };
         let index = dataset
             .metadata_cache
