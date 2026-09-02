@@ -583,6 +583,9 @@ impl ExternalBlobSource {
 
     /// Materialize the slice into memory for the inline blob path.
     async fn read_all(&self) -> Result<bytes::Bytes> {
+        if self.size == 0 {
+            return Ok(bytes::Bytes::new());
+        }
         let range = self.reader_range()?;
         self.reader.get_range(range).await.map_err(Into::into)
     }
@@ -4340,9 +4343,10 @@ mod tests {
     use super::{
         BlobEntry, BlobFile, BlobMaterializationBudget, BlobMaterializationBudgetState,
         BlobRangeRequest, BlobReadRange, BlobSource, ExternalBaseCandidate, ExternalBaseResolver,
-        ReadBlobsExecution, blob_version_from_descriptions, collect_blob_files_v1,
-        data_file_key_from_path, execute_blob_entries, execute_blob_read_batches_stream,
-        execute_blob_read_plan, plan_blob_read_batches, plan_blob_read_plans,
+        ExternalBlobSource, ReadBlobsExecution, blob_version_from_descriptions,
+        collect_blob_files_v1, data_file_key_from_path, execute_blob_entries,
+        execute_blob_read_batches_stream, execute_blob_read_plan, plan_blob_read_batches,
+        plan_blob_read_plans,
     };
     use crate::{
         Dataset,
@@ -6589,6 +6593,19 @@ mod tests {
         let empty_blob = BlobFile::new_packed(store.clone(), path.clone(), 1, 0);
         assert!(empty_blob.read().await.unwrap().is_empty());
         assert!(empty_blob.read_up_to(16).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_external_blob_source_read_all_empty_range_returns_empty_bytes() {
+        let store = reject_empty_range_store();
+        let reader = store.open(&Path::from("blobs/test.bin")).await.unwrap();
+        let source = ExternalBlobSource {
+            reader,
+            start: 0,
+            size: 0,
+        };
+
+        assert!(source.read_all().await.unwrap().is_empty());
     }
 
     #[tokio::test]
