@@ -16,7 +16,7 @@ use arrow_array::{
 };
 use arrow_buffer::{NullBuffer, OffsetBuffer};
 use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
-use futures::{TryStreamExt, stream};
+use futures::{StreamExt, TryStreamExt, stream};
 use lance_core::datatypes::Schema as LanceSchema;
 use lance_core::utils::tempfile::TempStrDir;
 use lance_core::{Error, ROW_ID, ROW_LAST_UPDATED_AT_VERSION};
@@ -990,6 +990,28 @@ async fn test_discards_staged_artifacts_on_stream_error() {
         count_files(&dataset).await,
         before,
         "a stream error must not leave staged artifacts behind"
+    );
+}
+
+#[tokio::test]
+async fn test_physical_slice_read_preserves_deleted_positions() {
+    let mut dataset = id_dataset_of(4, 1024).await;
+    dataset.delete("id = 2").await.unwrap();
+    let fragment = only_fragment(&dataset);
+    let schema = dataset.schema().clone();
+    let batches = fragment
+        .read_physical_slice(0..4, &schema, 2)
+        .await
+        .unwrap()
+        .buffered(1)
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    let batch =
+        arrow::compute::concat_batches(&Arc::new(ArrowSchema::from(&schema)), &batches).unwrap();
+    assert_eq!(
+        batch["id"].as_primitive::<Int32Type>().values(),
+        &[1, 2, 3, 4]
     );
 }
 
