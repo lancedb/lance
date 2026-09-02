@@ -151,6 +151,21 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
         index_details: &prost_types::Any,
     ) -> Option<Box<dyn ScalarQueryParser>>;
 
+    /// Returns a query parser using the physical type recovered from a loaded index.
+    ///
+    /// Most index formats persist enough information in `index_details` and can use
+    /// the default implementation. Compatibility wrappers whose historical metadata
+    /// omitted the training type can override this method and decline routing unless
+    /// the loaded type proves that the query and stored keys have identical semantics.
+    fn new_query_parser_with_training_data_type(
+        &self,
+        index_name: String,
+        index_details: &prost_types::Any,
+        _training_data_type: Option<&DataType>,
+    ) -> Option<Box<dyn ScalarQueryParser>> {
+        self.new_query_parser(index_name, index_details)
+    }
+
     /// Load an index from storage
     ///
     /// The index details should match the details that were returned when the index was

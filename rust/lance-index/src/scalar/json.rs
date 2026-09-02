@@ -382,7 +382,7 @@ impl AnyQuery for JsonQuery {
 #[derive(Debug)]
 pub struct JsonQueryParser {
     path: String,
-    target_type: Option<DataType>,
+    target_type: DataType,
     conversion: JsonIndexConversion,
     target_parser: Box<dyn ScalarQueryParser>,
 }
@@ -395,16 +395,20 @@ impl JsonQueryParser {
     ) -> Self {
         Self {
             path,
-            target_type: Some(target_type),
+            target_type,
             conversion: JsonIndexConversion::TypedV1,
             target_parser,
         }
     }
 
-    fn new_legacy(path: String, target_parser: Box<dyn ScalarQueryParser>) -> Self {
+    fn new_legacy(
+        path: String,
+        target_type: DataType,
+        target_parser: Box<dyn ScalarQueryParser>,
+    ) -> Self {
         Self {
             path,
-            target_type: None,
+            target_type,
             conversion: JsonIndexConversion::LegacyV0,
             target_parser,
         }
@@ -503,17 +507,29 @@ impl ScalarQueryParser for JsonQueryParser {
         match self.conversion {
             JsonIndexConversion::LegacyV0 => {
                 // Version-0 indices stored decoded values and preserved their
-                // unnormalized parameter path. Keep released json_get_* queries
-                // working, but do not route json_extract: its serialized-text
-                // semantics are incompatible with these decoded keys.
+                // unnormalized parameter path. Native typed JSONPath extraction
+                // and direct typed getters are compatible only when their exact
+                // output type matches the physical B-tree key type. Decoded Utf8
+                // keys are compatible only with json_get_string, never serialized
+                // typed Utf8 extraction.
                 let reference_type = match udf.name() {
-                    "json_get_int" => DataType::Int64,
-                    "json_get_float" => DataType::Float64,
-                    "json_get_bool" => DataType::Boolean,
+                    JSON_EXTRACT_INT64_UDF_NAME | "json_get_int" => DataType::Int64,
+                    JSON_EXTRACT_FLOAT64_UDF_NAME | "json_get_float" => DataType::Float64,
+                    JSON_EXTRACT_BOOLEAN_UDF_NAME | "json_get_bool" => DataType::Boolean,
                     "json_get_string" => DataType::Utf8,
                     _ => return None,
                 };
-                (path == &self.path).then_some(reference_type)
+                if self.target_type != reference_type {
+                    return None;
+                }
+
+                let reference_path = if udf.name().starts_with("json_get") {
+                    direct_json_key_path(path)?
+                } else {
+                    normalize_json_path(path).ok()?
+                };
+                let indexed_path = normalize_json_path(&self.path).ok()?;
+                (reference_path == indexed_path).then_some(reference_type)
             }
             JsonIndexConversion::TypedV1 => {
                 let reference_type = match udf.name() {
@@ -526,20 +542,12 @@ impl ScalarQueryParser for JsonQueryParser {
                     // JSONPath extraction preserves serialized JSON text.
                     _ => return None,
                 };
-                if self.target_type.as_ref() != Some(&reference_type) {
+                if self.target_type != reference_type {
                     return None;
                 }
 
                 let normalized_path = if udf.name().starts_with("json_get") {
-                    let mut chars = path.chars();
-                    let first = chars.next()?;
-                    if !(first == '_' || first.is_ascii_alphabetic())
-                        || !chars
-                            .all(|character| character == '_' || character.is_ascii_alphanumeric())
-                    {
-                        return None;
-                    }
-                    format!("$.{path}")
+                    direct_json_key_path(path)?
                 } else {
                     normalize_json_path(path).ok()?
                 };
@@ -548,6 +556,17 @@ impl ScalarQueryParser for JsonQueryParser {
             }
         }
     }
+}
+
+fn direct_json_key_path(key: &str) -> Option<String> {
+    let mut chars = key.chars();
+    let first = chars.next()?;
+    if !(first == '_' || first.is_ascii_alphabetic())
+        || !chars.all(|character| character == '_' || character.is_ascii_alphanumeric())
+    {
+        return None;
+    }
+    Some(format!("$.{key}"))
 }
 
 pub struct JsonTrainingRequest {
@@ -602,6 +621,39 @@ impl std::fmt::Debug for JsonIndexPlugin {
 impl JsonIndexPlugin {
     fn registry(&self) -> Result<Arc<IndexPluginRegistry>> {
         Ok(self.registry.lock().unwrap().as_ref().expect_ok()?.clone())
+    }
+
+    fn query_parser(
+        &self,
+        index_name: String,
+        index_details: &prost_types::Any,
+        legacy_target_type: Option<&DataType>,
+    ) -> Option<Box<dyn ScalarQueryParser>> {
+        let registry = self.registry().ok()?;
+        let json_details =
+            crate::pb::JsonIndexDetails::decode(index_details.value.as_slice()).ok()?;
+        let target_details = json_details.target_details.as_ref()?;
+        let target_plugin = registry.get_plugin_by_details(target_details).ok()?;
+        let target_parser = target_plugin.new_query_parser(index_name, target_details)?;
+        let parser = match (
+            json_details.target_data_type.as_deref(),
+            json_details.conversion.as_deref(),
+        ) {
+            (None, None) => JsonQueryParser::new_legacy(
+                json_details.path.clone(),
+                legacy_target_type?.clone(),
+                target_parser,
+            ),
+            (Some(data_type), Some(conversion)) if conversion == JSON_INDEX_CONVERSION => {
+                JsonQueryParser::new(
+                    json_details.path.clone(),
+                    parse_json_target_type(data_type)?,
+                    target_parser,
+                )
+            }
+            _ => return None,
+        };
+        Some(Box::new(parser) as Box<dyn ScalarQueryParser>)
     }
 
     /// Evaluate a typed JSONPath while preserving all row-location columns.
@@ -1159,27 +1211,16 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
         index_name: String,
         index_details: &prost_types::Any,
     ) -> Option<Box<dyn ScalarQueryParser>> {
-        let registry = self.registry().ok()?;
-        let json_details =
-            crate::pb::JsonIndexDetails::decode(index_details.value.as_slice()).ok()?;
-        let target_details = json_details.target_details.as_ref()?;
-        let target_plugin = registry.get_plugin_by_details(target_details).ok()?;
-        let target_parser = target_plugin.new_query_parser(index_name, target_details)?;
-        let parser = match (
-            json_details.target_data_type.as_deref(),
-            json_details.conversion.as_deref(),
-        ) {
-            (None, None) => JsonQueryParser::new_legacy(json_details.path.clone(), target_parser),
-            (Some(data_type), Some(conversion)) if conversion == JSON_INDEX_CONVERSION => {
-                JsonQueryParser::new(
-                    json_details.path.clone(),
-                    parse_json_target_type(data_type)?,
-                    target_parser,
-                )
-            }
-            _ => return None,
-        };
-        Some(Box::new(parser) as Box<dyn ScalarQueryParser>)
+        self.query_parser(index_name, index_details, None)
+    }
+
+    fn new_query_parser_with_training_data_type(
+        &self,
+        index_name: String,
+        index_details: &prost_types::Any,
+        training_data_type: Option<&DataType>,
+    ) -> Option<Box<dyn ScalarQueryParser>> {
+        self.query_parser(index_name, index_details, training_data_type)
     }
 
     async fn load_index(
@@ -1263,7 +1304,10 @@ mod tests {
     use datafusion_expr::{col, expr::ScalarFunction, lit};
     use futures::stream;
     use lance_core::{ROW_ADDR, ROW_ID, utils::address::RowAddress};
-    use lance_datafusion::udf::json::{json_extract_udf, json_get_int_udf};
+    use lance_datafusion::udf::json::{
+        json_extract_udf, json_get_bool_udf, json_get_float_udf, json_get_int_udf,
+        json_get_string_udf,
+    };
     use lance_select::RowAddrTreeMap;
     use rstest::rstest;
     use std::ops::Bound;
@@ -1591,7 +1635,7 @@ mod tests {
     }
 
     #[test]
-    fn test_legacy_json_query_parser_preserves_getter_routing() {
+    fn test_legacy_json_query_parser_requires_matching_physical_type() {
         let registry = IndexPluginRegistry::with_default_plugins();
         let legacy_details = crate::pb::JsonIndexDetails {
             path: "val".to_string(),
@@ -1603,9 +1647,19 @@ mod tests {
         };
         let legacy_details = prost_types::Any::from_msg(&legacy_details).unwrap();
         let plugin = registry.get_plugin_by_name("json").unwrap();
+        assert!(
+            plugin
+                .new_query_parser("json_idx".to_string(), &legacy_details)
+                .is_none(),
+            "version-0 metadata alone must not claim a physical key type"
+        );
         let parser = plugin
-            .new_query_parser("json_idx".to_string(), &legacy_details)
-            .expect("version-0 JSON indices should retain a query parser");
+            .new_query_parser_with_training_data_type(
+                "json_idx".to_string(),
+                &legacy_details,
+                Some(&DataType::Int64),
+            )
+            .expect("a loaded version-0 Int64 B-tree should retain a query parser");
 
         let getter = Expr::ScalarFunction(ScalarFunction::new_udf(
             Arc::new(json_get_int_udf()),
@@ -1616,12 +1670,92 @@ mod tests {
             Some(DataType::Int64)
         );
 
+        let typed_int = Expr::ScalarFunction(ScalarFunction::new_udf(
+            Arc::new(json_extract_typed_udf(&DataType::Int64).unwrap()),
+            vec![col("json"), lit("$.val")],
+        ));
+        assert_eq!(
+            parser.is_valid_reference(&typed_int, &DataType::LargeBinary),
+            Some(DataType::Int64)
+        );
+
+        let float_getter = Expr::ScalarFunction(ScalarFunction::new_udf(
+            Arc::new(json_get_float_udf()),
+            vec![col("json"), lit("val")],
+        ));
+        assert_eq!(
+            parser.is_valid_reference(&float_getter, &DataType::LargeBinary),
+            None
+        );
+
+        for (target_type, getter) in [
+            (DataType::Float64, json_get_float_udf()),
+            (DataType::Boolean, json_get_bool_udf()),
+        ] {
+            let typed_parser = plugin
+                .new_query_parser_with_training_data_type(
+                    "json_idx".to_string(),
+                    &legacy_details,
+                    Some(&target_type),
+                )
+                .unwrap();
+            let getter = Expr::ScalarFunction(ScalarFunction::new_udf(
+                Arc::new(getter),
+                vec![col("json"), lit("val")],
+            ));
+            assert_eq!(
+                typed_parser.is_valid_reference(&getter, &DataType::LargeBinary),
+                Some(target_type.clone())
+            );
+            let typed_extract = Expr::ScalarFunction(ScalarFunction::new_udf(
+                Arc::new(json_extract_typed_udf(&target_type).unwrap()),
+                vec![col("json"), lit("$.val")],
+            ));
+            assert_eq!(
+                typed_parser.is_valid_reference(&typed_extract, &DataType::LargeBinary),
+                Some(target_type)
+            );
+        }
+
+        let json_path_getter = Expr::ScalarFunction(ScalarFunction::new_udf(
+            Arc::new(json_get_int_udf()),
+            vec![col("json"), lit("$.val")],
+        ));
+        assert_eq!(
+            parser.is_valid_reference(&json_path_getter, &DataType::LargeBinary),
+            None
+        );
+
         let json_extract = Expr::ScalarFunction(ScalarFunction::new_udf(
             Arc::new(json_extract_udf()),
             vec![col("json"), lit("val")],
         ));
         assert_eq!(
             parser.is_valid_reference(&json_extract, &DataType::LargeBinary),
+            None
+        );
+
+        let utf8_parser = plugin
+            .new_query_parser_with_training_data_type(
+                "json_idx".to_string(),
+                &legacy_details,
+                Some(&DataType::Utf8),
+            )
+            .unwrap();
+        let string_getter = Expr::ScalarFunction(ScalarFunction::new_udf(
+            Arc::new(json_get_string_udf()),
+            vec![col("json"), lit("val")],
+        ));
+        assert_eq!(
+            utf8_parser.is_valid_reference(&string_getter, &DataType::LargeBinary),
+            Some(DataType::Utf8)
+        );
+        let typed_utf8 = Expr::ScalarFunction(ScalarFunction::new_udf(
+            Arc::new(json_extract_typed_udf(&DataType::Utf8).unwrap()),
+            vec![col("json"), lit("$.val")],
+        ));
+        assert_eq!(
+            utf8_parser.is_valid_reference(&typed_utf8, &DataType::LargeBinary),
             None
         );
     }
