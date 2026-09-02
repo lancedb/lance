@@ -21,10 +21,20 @@ enum FtsDocumentGranularity {
 // Query-bound corpus statistics used to calculate comparable BM25 scores
 // across independently searched subsets of one logical FTS index.
 //
+// V1 represents exactly one BM25 corpus. Every scoring leaf must resolve to
+// index_name, column, document_granularity, and the corpus identified by
+// segment_uuids. A producer must reject a query containing a leaf from another
+// index, column, or document granularity.
+//
+// This is an opaque payload for a trusted planning flow. V1 does not carry the
+// source query or its preparation parameters, so a consumer cannot
+// independently prove query identity. The planner must attach the payload only
+// to the same query used to produce it.
+//
 // A consumer must reject an unsupported schema_version, a missing required
 // optional scalar, an invalid segment UUID, non-canonical ordering, duplicate
-// entries, or metadata that does not match the dataset snapshot and query it
-// will execute.
+// entries, or metadata that does not match the dataset snapshot and logical
+// FTS index it will execute.
 message FtsGlobalStatisticsProto {
   // V1 consumers must reject UNSPECIFIED and unknown values.
   FtsGlobalStatisticsSchemaVersion schema_version = 1;
@@ -50,8 +60,9 @@ message FtsGlobalStatisticsProto {
   repeated FtsTermStatisticsProto terms = 8;
   // Document unit shared by every segment in segment_uuids.
   FtsDocumentGranularity document_granularity = 9;
-  // Canonical prepared vocabulary for every scoring leaf in the query. Entries
-  // are ordered by leaf_ordinal.
+  // Canonical prepared vocabulary for every scoring leaf in the query. Every
+  // leaf belongs to the single corpus described above; cross-corpus queries
+  // cannot be encoded in V1. Entries are ordered by leaf_ordinal.
   repeated FtsPreparedQueryLeafProto query_leaves = 10;
 }
 
