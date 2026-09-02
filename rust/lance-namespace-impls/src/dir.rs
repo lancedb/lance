@@ -30,7 +30,10 @@ use lance_index::scalar::{
     BuiltinIndexType, FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams,
 };
 use lance_index::vector::{
-    bq::RQBuildParams, hnsw::builder::HnswBuildParams, ivf::IvfBuildParams, pq::PQBuildParams,
+    bq::{RABIT_MAX_NUM_BITS, RABIT_MIN_NUM_BITS, RQBuildParams, validate_supported_rq_num_bits},
+    hnsw::builder::HnswBuildParams,
+    ivf::IvfBuildParams,
+    pq::PQBuildParams,
     sq::builder::SQBuildParams,
 };
 use lance_index::{IndexType, is_system_index};
@@ -2454,14 +2457,30 @@ impl DirectoryNamespace {
                     SQBuildParams::default(),
                 ),
             },
-            IndexType::IvfRq => DirectoryIndexParams::Vector {
-                index_type,
-                params: VectorIndexParams::with_ivf_rq_params(
-                    Self::parse_metric_type(request.distance_type.as_deref())?,
-                    IvfBuildParams::default(),
-                    RQBuildParams::default(),
-                ),
-            },
+            IndexType::IvfRq => {
+                let rq_params = if let Some(requested_num_bits) = request.num_bits {
+                    let invalid_num_bits = || NamespaceError::InvalidInput {
+                        message: format!(
+                            "IVF_RQ num_bits must be in {}..={}, got {}",
+                            RABIT_MIN_NUM_BITS, RABIT_MAX_NUM_BITS, requested_num_bits
+                        ),
+                    };
+                    let num_bits =
+                        u8::try_from(requested_num_bits).map_err(|_| invalid_num_bits())?;
+                    validate_supported_rq_num_bits(num_bits).map_err(|_| invalid_num_bits())?;
+                    RQBuildParams::new(num_bits)
+                } else {
+                    RQBuildParams::default()
+                };
+                DirectoryIndexParams::Vector {
+                    index_type,
+                    params: VectorIndexParams::with_ivf_rq_params(
+                        Self::parse_metric_type(request.distance_type.as_deref())?,
+                        IvfBuildParams::default(),
+                        rq_params,
+                    ),
+                }
+            }
             IndexType::IvfHnswFlat => DirectoryIndexParams::Vector {
                 index_type,
                 params: VectorIndexParams::ivf_hnsw(
@@ -6105,6 +6124,55 @@ fn build_engine_match_query(
 mod tests {
     use super::*;
     use arrow_ipc::reader::{FileReader, StreamReader};
+    use lance::index::vector::StageParams;
+    use rstest::rstest;
+
+    fn build_ivf_rq_num_bits(num_bits: Option<i32>) -> Result<u8> {
+        let mut request = CreateTableIndexRequest::new("vector".to_string(), "IVF_RQ".to_string());
+        request.num_bits = num_bits;
+
+        let DirectoryIndexParams::Vector {
+            index_type: IndexType::IvfRq,
+            params,
+        } = DirectoryNamespace::build_index_params(&request)?
+        else {
+            panic!("expected IVF_RQ vector index params");
+        };
+        match params.stages.as_slice() {
+            [StageParams::Ivf(_), StageParams::RQ(rq)] => Ok(rq.num_bits),
+            stages => panic!("expected IVF and RQ stages, got {stages:?}"),
+        }
+    }
+
+    #[rstest]
+    #[case::omitted(None, 5)]
+    #[case::explicit_one(Some(1), 1)]
+    #[case::explicit_max(Some(9), 9)]
+    fn test_build_index_params_ivf_rq_num_bits(
+        #[case] requested: Option<i32>,
+        #[case] expected: u8,
+    ) {
+        assert_eq!(build_ivf_rq_num_bits(requested).unwrap(), expected);
+    }
+
+    #[rstest]
+    #[case::negative(-1)]
+    #[case::zero(0)]
+    #[case::above_max(10)]
+    #[case::conversion_overflow(i32::MAX)]
+    fn test_build_index_params_rejects_invalid_ivf_rq_num_bits(#[case] requested: i32) {
+        let error = build_ivf_rq_num_bits(Some(requested))
+            .expect_err("invalid IVF_RQ num_bits should fail");
+        let message = error.to_string();
+
+        assert_eq!(mutation_error_code(error), ErrorCode::InvalidInput);
+        assert!(
+            message.contains(&format!(
+                "IVF_RQ num_bits must be in 1..=9, got {requested}"
+            )),
+            "unexpected error message: {message}"
+        );
+    }
 
     #[test]
     fn test_build_engine_fts_query_match() {
