@@ -2099,7 +2099,7 @@ mod composite {
             dataset,
             vec![
                 Action::AddFragment(AddFragment {
-                    local: 0,
+                    id: Ref::Local(0),
                     physical_rows: 4,
                     row_id_meta: None,
                     last_updated_at_version_meta: None,
@@ -2235,7 +2235,7 @@ mod composite {
             dataset,
             vec![
                 Action::AddFragment(AddFragment {
-                    local: 0,
+                    id: Ref::Local(0),
                     physical_rows: 4,
                     row_id_meta: None,
                     last_updated_at_version_meta: None,
@@ -2243,7 +2243,7 @@ mod composite {
                     data_change: true,
                 }),
                 Action::AddFragment(AddFragment {
-                    local: 1,
+                    id: Ref::Local(1),
                     physical_rows: 6,
                     row_id_meta: None,
                     last_updated_at_version_meta: None,
@@ -2272,7 +2272,7 @@ mod composite {
 
         let append = |local| {
             vec![Action::AddFragment(AddFragment {
-                local,
+                id: Ref::Local(local),
                 physical_rows: 4,
                 row_id_meta: None,
                 last_updated_at_version_meta: None,
