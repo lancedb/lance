@@ -3927,6 +3927,7 @@ impl LanceNamespace for DirectoryNamespace {
             .into());
         }
 
+        let managed_history = self.managed_history_state(&request.id, &table_uri).await?;
         let write_result = self
             .write_reader_to_table(
                 &request.id,
@@ -3934,7 +3935,7 @@ impl LanceNamespace for DirectoryNamespace {
                 reader,
                 WriteMode::Create,
                 request.storage_options.clone(),
-                None,
+                managed_history,
             )
             .await;
         if let Err(err) = write_result {
@@ -12314,6 +12315,41 @@ mod tests {
         assert_eq!(merge_versions.versions.len(), 1);
         assert!(
             !merge_versions.versions[0]
+                .manifest_path
+                .contains("_reservation_versions")
+        );
+
+        let create_table_id = vec!["create_table".to_string()];
+        let create_declaration = namespace
+            .declare_table(DeclareTableRequest {
+                id: Some(create_table_id.clone()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(create_declaration.transaction_id.is_none());
+        let create_response = namespace
+            .create_table(
+                CreateTableRequest {
+                    id: Some(create_table_id.clone()),
+                    ..Default::default()
+                },
+                Bytes::from(create_non_empty_test_ipc_data()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create_response.version, Some(1));
+
+        let create_versions = namespace
+            .list_table_versions(ListTableVersionsRequest {
+                id: Some(create_table_id),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(create_versions.versions.len(), 1);
+        assert!(
+            !create_versions.versions[0]
                 .manifest_path
                 .contains("_reservation_versions")
         );
