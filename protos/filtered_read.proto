@@ -68,6 +68,10 @@ message FilteredReadOptionsProto {
   // bound when no other batch is reserved. If absent, Blob v2 materialization
   // has no independent memory bound.
   optional uint64 materialization_readahead_bytes = 13;
+  // If present, the scanner-level byte budget for output batches. When set,
+  // the file reader uses it as an additional batch boundary alongside the
+  // row-based batch_size. This corresponds to FileReaderOptions.batch_size_bytes.
+  optional uint64 batch_size_bytes = 14;
 }
 
 // Serializable form of FilteredReadPlan (planned/distributed mode).
