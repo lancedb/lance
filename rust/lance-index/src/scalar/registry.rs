@@ -178,6 +178,17 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>>;
 
+    /// Returns an additional namespace for the cached whole-index container.
+    ///
+    /// Most index metadata is immutable for the lifetime of its UUID, so the
+    /// default per-UUID namespace is sufficient. Compatibility wrappers whose
+    /// interpretation can be upgraded without changing the UUID must include
+    /// that interpretation here so readers of old and new metadata cannot
+    /// exchange stale wrapper instances.
+    fn cache_namespace(&self, _index_details: &prost_types::Any) -> Result<Option<String>> {
+        Ok(None)
+    }
+
     /// Look up a previously-opened index in the cache.
     ///
     /// `cache` is already per-index namespaced by the caller, so a plugin's key

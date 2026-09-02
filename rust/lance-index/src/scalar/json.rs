@@ -1339,6 +1339,22 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
         Ok(Arc::new(index))
     }
 
+    fn cache_namespace(&self, index_details: &prost_types::Any) -> Result<Option<String>> {
+        crate::pb::JsonIndexDetails::decode(index_details.value.as_slice())?;
+
+        // The wrapper's behavior is completely described by JsonIndexDetails.
+        // Use its exact protobuf encoding so a metadata-only binding upgrade
+        // cannot reuse (or race with) a wrapper loaded under the prior binding.
+        const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
+        let mut namespace = String::with_capacity(5 + index_details.value.len() * 2);
+        namespace.push_str("json/");
+        for byte in &index_details.value {
+            namespace.push(char::from(HEX_DIGITS[usize::from(byte >> 4)]));
+            namespace.push(char::from(HEX_DIGITS[usize::from(byte & 0x0f)]));
+        }
+        Ok(Some(namespace))
+    }
+
     fn details_as_json(&self, details: &prost_types::Any) -> Result<serde_json::Value> {
         let registry = self.registry().unwrap();
         let json_details = crate::pb::JsonIndexDetails::decode(details.value.as_slice())?;

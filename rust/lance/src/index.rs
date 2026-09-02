@@ -6590,6 +6590,27 @@ mod tests {
         let legacy_segments = dataset.load_indices_by_name(INDEX_NAME).await.unwrap();
         assert_eq!(legacy_segments.len(), 2);
 
+        // Keep the raw wrappers warm under the same UUID and fragment-reuse
+        // identity that the metadata-only upgrade will retain.
+        let field_path = dataset
+            .schema()
+            .field_path(legacy_segments[0].fields[0])
+            .unwrap();
+        let mut warmed_legacy = Vec::with_capacity(legacy_segments.len());
+        for segment in &legacy_segments {
+            let loaded = dataset
+                .open_scalar_index(&field_path, &segment.uuid, &NoOpMetricsCollector)
+                .await
+                .unwrap();
+            let cached = dataset
+                .open_scalar_index(&field_path, &segment.uuid, &NoOpMetricsCollector)
+                .await
+                .unwrap();
+            assert!(Arc::ptr_eq(&loaded, &cached));
+            warmed_legacy.push(loaded);
+        }
+        assert_eq!(warmed_legacy.len(), legacy_segments.len());
+
         // Planning may recover the physical type for this process, but it must
         // not turn an ordinary read into a metadata commit.
         let index_info = dataset.scalar_index_info().await.unwrap();
@@ -6626,6 +6647,46 @@ mod tests {
             assert_eq!(upgraded_segment, &expected);
         }
 
+        // Remap immediately in the same session, while the raw LegacyV0
+        // wrappers remain cached under the unchanged UUID and FRI identity.
+        // The remap must open wrappers bound to the newly committed details,
+        // rather than letting the stale wrappers erase the durable binding.
+        let frag_reuse_uuid = dataset.frag_reuse_index_uuid().await;
+        let mut remapped_segments = Vec::with_capacity(upgraded_segments.len());
+        for segment in &upgraded_segments {
+            let RemapResult::Remapped(remapped) =
+                remap_index(&dataset, &segment.uuid, &RowAddrRemap::empty())
+                    .await
+                    .unwrap()
+            else {
+                panic!("legacy JSON segment {} was not remapped", segment.uuid);
+            };
+            let mut remapped_metadata = segment.clone();
+            remapped_metadata.uuid = remapped.new_id;
+            remapped_metadata.index_details = Some(Arc::new(remapped.index_details));
+            remapped_metadata.index_version = remapped.index_version as i32;
+            remapped_metadata.files = remapped.files;
+            remapped_segments.push(remapped_metadata);
+        }
+        assert_eq!(dataset.frag_reuse_index_uuid().await, frag_reuse_uuid);
+        dataset
+            .commit_existing_index_segments(INDEX_NAME, "json", remapped_segments)
+            .await
+            .unwrap();
+        let upgraded_segments = dataset.load_indices_by_name(INDEX_NAME).await.unwrap();
+        assert_eq!(upgraded_segments.len(), 2);
+        for segment in &upgraded_segments {
+            let details = lance_index::pb::JsonIndexDetails::decode(
+                segment.index_details.as_ref().unwrap().value.as_slice(),
+            )
+            .unwrap();
+            assert_eq!(details.target_data_type.as_deref(), Some("Int64"));
+            assert_eq!(
+                details.conversion.as_deref(),
+                Some(JSON_INDEX_LEGACY_NATIVE_CONVERSION)
+            );
+        }
+
         // A fresh session has no loaded scalar indices. The persisted binding
         // lets planning register this logical index without reopening either
         // B-tree merely to recover its key type.
@@ -6637,8 +6698,9 @@ mod tests {
             .unwrap();
         for segment in &upgraded_segments {
             assert!(
-                crate::index::scalar::cached_scalar_index_container(&dataset, &segment.uuid)
+                crate::index::scalar::cached_scalar_index_container_for_metadata(&dataset, segment)
                     .await
+                    .unwrap()
                     .is_none()
             );
         }
@@ -6646,8 +6708,9 @@ mod tests {
         assert!(index_info.get_index("json").is_some());
         for segment in &upgraded_segments {
             assert!(
-                crate::index::scalar::cached_scalar_index_container(&dataset, &segment.uuid)
+                crate::index::scalar::cached_scalar_index_container_for_metadata(&dataset, segment)
                     .await
+                    .unwrap()
                     .is_none(),
                 "planning reopened segment {} to recover a persisted key type",
                 segment.uuid
