@@ -6480,7 +6480,10 @@ impl PrimitiveStructuralEncoder {
                 .get(STRUCTURAL_ENCODING_META_KEY)
                 .map(|requested| requested.to_lowercase());
             let fullzip_error = match &data_block {
-                DataBlock::FixedWidth(fixed) if !fixed.bits_per_value.is_multiple_of(8) => {
+                // 1-bit booleans are widened to bytes inside `encode_full_zip`.
+                DataBlock::FixedWidth(fixed)
+                    if fixed.bits_per_value != 1 && !fixed.bits_per_value.is_multiple_of(8) =>
+                {
                     Some(format!(
                         "Full-zip fixed-width values must be byte aligned, got {} bits per value",
                         fixed.bits_per_value
