@@ -54,6 +54,9 @@ use crate::{
 
 const JSON_INDEX_VERSION: u32 = 1;
 const JSON_INDEX_CONVERSION: &str = "jsonpath_typed_v1";
+/// Conversion identity for version-0 indices whose native key type has been
+/// recovered and persisted without rewriting their keys.
+pub const JSON_INDEX_LEGACY_NATIVE_CONVERSION: &str = "legacy_native_v0";
 
 fn index_version_for_target_type(target_type: &DataType) -> u32 {
     // Version-1 changes Utf8 keys from decoded strings to serialized JSON text.
@@ -69,6 +72,7 @@ fn index_version_for_target_type(target_type: &DataType) -> u32 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum JsonIndexConversion {
     LegacyV0,
+    LegacyNativeV0,
     TypedV1,
 }
 
@@ -103,9 +107,39 @@ impl JsonIndex {
         }
     }
 
+    fn new_upgraded_legacy(
+        target_index: Arc<dyn ScalarIndex>,
+        path: String,
+        target_type: DataType,
+    ) -> Self {
+        Self {
+            target_index,
+            path,
+            target_type: Some(target_type),
+            conversion: JsonIndexConversion::LegacyNativeV0,
+        }
+    }
+
+    fn is_legacy(&self) -> bool {
+        matches!(
+            self.conversion,
+            JsonIndexConversion::LegacyV0 | JsonIndexConversion::LegacyNativeV0
+        )
+    }
+
     fn wrap_target_created_index(&self, target_created: CreatedIndex) -> Result<CreatedIndex> {
         let (target_data_type, conversion, index_version) = match self.conversion {
             JsonIndexConversion::LegacyV0 => (None, None, 0),
+            JsonIndexConversion::LegacyNativeV0 => {
+                let target_type = self.target_type.as_ref().ok_or_else(|| {
+                    Error::internal("Upgraded version-0 JSON index is missing its target type")
+                })?;
+                (
+                    Some(json_target_type_name(target_type)?.to_string()),
+                    Some(JSON_INDEX_LEGACY_NATIVE_CONVERSION.to_string()),
+                    0,
+                )
+            }
             JsonIndexConversion::TypedV1 => {
                 let target_type = self.target_type.as_ref().ok_or_else(|| {
                     Error::internal("Version-1 JSON index is missing its target type")
@@ -208,7 +242,7 @@ impl ScalarIndex for JsonIndex {
         dest_store: &dyn IndexStore,
         old_data_filter: Option<super::OldIndexDataFilter>,
     ) -> Result<CreatedIndex> {
-        if self.conversion == JsonIndexConversion::LegacyV0 {
+        if self.is_legacy() {
             return Err(Error::not_supported(format!(
                 "Legacy version-0 JSON index at path '{}' must be fully rebuilt before adding new data",
                 self.path
@@ -236,14 +270,13 @@ impl ScalarIndex for JsonIndex {
     fn update_criteria(&self) -> UpdateCriteria {
         let target_criteria = self.target_index.update_criteria();
         UpdateCriteria {
-            requires_old_data: self.conversion == JsonIndexConversion::LegacyV0
-                || target_criteria.requires_old_data,
+            requires_old_data: self.is_legacy() || target_criteria.requires_old_data,
             data_criteria: json_scan_criteria(&target_criteria.data_criteria),
         }
     }
 
     fn requires_full_rebuild(&self) -> bool {
-        self.conversion == JsonIndexConversion::LegacyV0
+        self.is_legacy()
     }
 
     fn derive_index_params(&self) -> Result<super::ScalarIndexParams> {
@@ -505,7 +538,7 @@ impl ScalarQueryParser for JsonQueryParser {
         };
 
         match self.conversion {
-            JsonIndexConversion::LegacyV0 => {
+            JsonIndexConversion::LegacyV0 | JsonIndexConversion::LegacyNativeV0 => {
                 // Version-0 indices stored decoded values and preserved their
                 // unnormalized parameter path. Native typed JSONPath extraction
                 // and direct typed getters are compatible only when their exact
@@ -644,6 +677,15 @@ impl JsonIndexPlugin {
                 legacy_target_type?.clone(),
                 target_parser,
             ),
+            (Some(data_type), Some(conversion))
+                if conversion == JSON_INDEX_LEGACY_NATIVE_CONVERSION =>
+            {
+                JsonQueryParser::new_legacy(
+                    json_details.path.clone(),
+                    parse_json_target_type(data_type)?,
+                    target_parser,
+                )
+            }
             (Some(data_type), Some(conversion)) if conversion == JSON_INDEX_CONVERSION => {
                 JsonQueryParser::new(
                     json_details.path.clone(),
@@ -1242,6 +1284,19 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
             json_details.conversion.as_deref(),
         ) {
             (None, None) => (None, JsonIndexConversion::LegacyV0),
+            (Some(data_type), Some(conversion))
+                if conversion == JSON_INDEX_LEGACY_NATIVE_CONVERSION =>
+            {
+                (
+                    Some(parse_json_target_type(data_type).ok_or_else(|| {
+                        Error::invalid_input(format!(
+                            "JSON index path '{}' has unsupported target data type '{data_type}'",
+                            json_details.path
+                        ))
+                    })?),
+                    JsonIndexConversion::LegacyNativeV0,
+                )
+            }
             (Some(data_type), Some(conversion)) if conversion == JSON_INDEX_CONVERSION => (
                 Some(parse_json_target_type(data_type).ok_or_else(|| {
                     Error::invalid_input(format!(
@@ -1266,6 +1321,13 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
         };
         let index = match conversion {
             JsonIndexConversion::LegacyV0 => JsonIndex::new_legacy(target_index, json_details.path),
+            JsonIndexConversion::LegacyNativeV0 => JsonIndex::new_upgraded_legacy(
+                target_index,
+                json_details.path,
+                target_type.ok_or_else(|| {
+                    Error::internal("Upgraded version-0 JSON index is missing its target type")
+                })?,
+            ),
             JsonIndexConversion::TypedV1 => JsonIndex::new(
                 target_index,
                 json_details.path,

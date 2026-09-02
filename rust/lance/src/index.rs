@@ -34,6 +34,7 @@ use lance_index::pb::index::Implementation;
 pub use lance_index::progress::{IndexBuildProgress, NoopIndexBuildProgress};
 use lance_index::scalar::expression::{IndexInformationProvider, MultiQueryParser};
 use lance_index::scalar::inverted::{InvertedIndex, InvertedIndexPlugin};
+use lance_index::scalar::json::JSON_INDEX_LEGACY_NATIVE_CONVERSION;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::registry::{TrainingCriteria, TrainingOrdering};
 use lance_index::scalar::{CreatedIndex, ScalarIndex, index_files_to_table, table_files_to_index};
@@ -2435,6 +2436,8 @@ impl DatasetIndexExt for Dataset {
                 && index_group_is_scalar(self, deltas)
                 && index_group_has_no_unindexed(self, deltas)
             {
+                new_indices
+                    .extend(upgrade_legacy_json_index_metadata(self, deltas.as_slice()).await?);
                 continue;
             }
 
@@ -2537,6 +2540,156 @@ fn index_group_is_scalar(dataset: &Dataset, deltas: &[&IndexMetadata]) -> bool {
         Some(field) => !is_vector_field(field.data_type()),
         None => false,
     }
+}
+
+fn legacy_json_target_type_name(data_type: &DataType) -> Option<&'static str> {
+    match data_type {
+        DataType::Boolean => Some("Boolean"),
+        DataType::Int64 => Some("Int64"),
+        DataType::Float64 => Some("Float64"),
+        DataType::Utf8 => Some("Utf8"),
+        DataType::LargeBinary => Some("LargeBinary"),
+        _ => None,
+    }
+}
+
+fn parse_legacy_json_target_type(data_type: &str) -> Option<DataType> {
+    match data_type {
+        "Boolean" => Some(DataType::Boolean),
+        "Int64" => Some(DataType::Int64),
+        "Float64" => Some(DataType::Float64),
+        "Utf8" => Some(DataType::Utf8),
+        "LargeBinary" => Some(DataType::LargeBinary),
+        _ => None,
+    }
+}
+
+/// Persist the recovered native key type for a complete legacy JSON index.
+///
+/// This runs only during explicit index maintenance. Planning remains read-only:
+/// it can recover untyped legacy bindings for the current process, but only this
+/// path republishes every compatible segment in one manifest transaction.
+async fn upgrade_legacy_json_index_metadata(
+    dataset: &Dataset,
+    deltas: &[&IndexMetadata],
+) -> Result<Vec<IndexMetadata>> {
+    let Some(first) = deltas.first() else {
+        return Ok(Vec::new());
+    };
+    if !deltas.iter().all(|index| {
+        index
+            .index_details
+            .as_ref()
+            .is_some_and(|details| details.type_url.ends_with("JsonIndexDetails"))
+    }) {
+        return Ok(Vec::new());
+    }
+
+    let Some(field_id) = first.keyed_field() else {
+        return Ok(Vec::new());
+    };
+    if deltas
+        .iter()
+        .any(|index| index.keyed_field() != Some(field_id))
+    {
+        log::warn!(
+            "Skipping legacy metadata upgrade for JSON index '{}': its segments refer to different keyed fields",
+            first.name
+        );
+        return Ok(Vec::new());
+    }
+    let field_path = dataset.schema().field_path(field_id)?;
+
+    let mut expected_path_and_type: Option<(String, DataType)> = None;
+    let mut needs_upgrade = false;
+    for index in deltas {
+        let encoded = index
+            .index_details
+            .as_ref()
+            .ok_or_else(|| Error::internal("Legacy JSON metadata disappeared during an upgrade"))?;
+        let details = pb::JsonIndexDetails::decode(encoded.value.as_slice())?;
+        let target_type = match (
+            details.target_data_type.as_deref(),
+            details.conversion.as_deref(),
+        ) {
+            (None, None) => {
+                needs_upgrade = true;
+                let loaded = dataset
+                    .open_scalar_index(&field_path, &index.uuid, &NoOpMetricsCollector)
+                    .await?;
+                let Some(target_type) = loaded.training_data_type() else {
+                    log::warn!(
+                        "Skipping legacy metadata upgrade for JSON index '{}' segment {}: its physical key type could not be recovered",
+                        first.name,
+                        index.uuid
+                    );
+                    return Ok(Vec::new());
+                };
+                target_type
+            }
+            (Some(target_type), Some(conversion))
+                if conversion == JSON_INDEX_LEGACY_NATIVE_CONVERSION =>
+            {
+                let Some(target_type) = parse_legacy_json_target_type(target_type) else {
+                    log::warn!(
+                        "Skipping legacy metadata upgrade for JSON index '{}' segment {}: persisted target type '{}' is unsupported",
+                        first.name,
+                        index.uuid,
+                        target_type
+                    );
+                    return Ok(Vec::new());
+                };
+                target_type
+            }
+            _ => return Ok(Vec::new()),
+        };
+        if legacy_json_target_type_name(&target_type).is_none() {
+            log::warn!(
+                "Skipping legacy metadata upgrade for JSON index '{}' segment {}: recovered target type {:?} is unsupported",
+                first.name,
+                index.uuid,
+                target_type
+            );
+            return Ok(Vec::new());
+        }
+
+        let path_and_type = (details.path, target_type);
+        if expected_path_and_type
+            .as_ref()
+            .is_some_and(|expected| expected != &path_and_type)
+        {
+            log::warn!(
+                "Skipping legacy metadata upgrade for JSON index '{}': its segments disagree on path or physical key type",
+                first.name
+            );
+            return Ok(Vec::new());
+        }
+        expected_path_and_type = Some(path_and_type);
+    }
+
+    if !needs_upgrade {
+        return Ok(Vec::new());
+    }
+    let (_, target_type) = expected_path_and_type.ok_or_else(|| {
+        Error::internal("Legacy JSON metadata upgrade had no segment binding to persist")
+    })?;
+    let target_type = legacy_json_target_type_name(&target_type)
+        .ok_or_else(|| Error::internal("Legacy JSON metadata upgrade lost its target type"))?;
+
+    deltas
+        .iter()
+        .map(|index| {
+            let mut upgraded = (*index).clone();
+            let encoded = upgraded.index_details.as_ref().ok_or_else(|| {
+                Error::internal("Legacy JSON metadata disappeared during an upgrade")
+            })?;
+            let mut details = pb::JsonIndexDetails::decode(encoded.value.as_slice())?;
+            details.target_data_type = Some(target_type.to_string());
+            details.conversion = Some(JSON_INDEX_LEGACY_NATIVE_CONVERSION.to_string());
+            upgraded.index_details = Some(Arc::new(prost_types::Any::from_msg(&details)?));
+            Ok(upgraded)
+        })
+        .collect()
 }
 
 fn index_group_has_no_unindexed(dataset: &Dataset, deltas: &[&IndexMetadata]) -> bool {
@@ -3581,6 +3734,16 @@ impl DatasetIndexInternalExt for Dataset {
                                         None
                                     }
                                 }
+                            }
+                            (Some(target_type), Some(conversion))
+                                if conversion == JSON_INDEX_LEGACY_NATIVE_CONVERSION =>
+                            {
+                                parse_legacy_json_target_type(&target_type).map(|target_type| {
+                                    JsonQueryBinding::LegacyV0 {
+                                        path: json_details.path,
+                                        target_type,
+                                    }
+                                })
                             }
                             (Some(target_type), Some(conversion)) => {
                                 Some(JsonQueryBinding::TypedV1 {
@@ -6359,6 +6522,7 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![
             Field::new("json", DataType::Utf8, false).with_metadata(metadata),
         ]));
+        let test_dir = TempStrDir::default();
         let initial = RecordBatch::try_new(
             schema.clone(),
             vec![Arc::new(StringArray::from(vec![
@@ -6371,7 +6535,7 @@ mod tests {
         .unwrap();
         let mut dataset = Dataset::write(
             RecordBatchIterator::new([Ok(initial)], schema.clone()),
-            "memory://",
+            test_dir.as_str(),
             None,
         )
         .await
@@ -6421,6 +6585,74 @@ mod tests {
             .commit_existing_index_segments(INDEX_NAME, "json", vec![segment0, segment1])
             .await
             .unwrap();
+
+        let legacy_version = dataset.version().version;
+        let legacy_segments = dataset.load_indices_by_name(INDEX_NAME).await.unwrap();
+        assert_eq!(legacy_segments.len(), 2);
+
+        // Planning may recover the physical type for this process, but it must
+        // not turn an ordinary read into a metadata commit.
+        let index_info = dataset.scalar_index_info().await.unwrap();
+        assert!(index_info.get_index("json").is_some());
+        assert_eq!(dataset.version().version, legacy_version);
+        for segment in dataset.load_indices_by_name(INDEX_NAME).await.unwrap() {
+            let details = lance_index::pb::JsonIndexDetails::decode(
+                segment.index_details.as_ref().unwrap().value.as_slice(),
+            )
+            .unwrap();
+            assert_eq!(details.target_data_type, None);
+            assert_eq!(details.conversion, None);
+        }
+
+        dataset
+            .optimize_indices(&OptimizeOptions::default().index_names(vec![INDEX_NAME.to_string()]))
+            .await
+            .unwrap();
+        let upgraded_segments = dataset.load_indices_by_name(INDEX_NAME).await.unwrap();
+        assert_eq!(upgraded_segments.len(), 2);
+        for legacy_segment in &legacy_segments {
+            let upgraded_segment = upgraded_segments
+                .iter()
+                .find(|segment| segment.uuid == legacy_segment.uuid)
+                .unwrap();
+            let mut expected = legacy_segment.clone();
+            let mut details = lance_index::pb::JsonIndexDetails::decode(
+                expected.index_details.as_ref().unwrap().value.as_slice(),
+            )
+            .unwrap();
+            details.target_data_type = Some("Int64".to_string());
+            details.conversion = Some(JSON_INDEX_LEGACY_NATIVE_CONVERSION.to_string());
+            expected.index_details = Some(Arc::new(prost_types::Any::from_msg(&details).unwrap()));
+            assert_eq!(upgraded_segment, &expected);
+        }
+
+        // A fresh session has no loaded scalar indices. The persisted binding
+        // lets planning register this logical index without reopening either
+        // B-tree merely to recover its key type.
+        let session = Arc::new(Session::default());
+        let mut dataset = DatasetBuilder::from_uri(test_dir.as_str())
+            .with_session(session)
+            .load()
+            .await
+            .unwrap();
+        for segment in &upgraded_segments {
+            assert!(
+                crate::index::scalar::cached_scalar_index_container(&dataset, &segment.uuid)
+                    .await
+                    .is_none()
+            );
+        }
+        let index_info = dataset.scalar_index_info().await.unwrap();
+        assert!(index_info.get_index("json").is_some());
+        for segment in &upgraded_segments {
+            assert!(
+                crate::index::scalar::cached_scalar_index_container(&dataset, &segment.uuid)
+                    .await
+                    .is_none(),
+                "planning reopened segment {} to recover a persisted key type",
+                segment.uuid
+            );
+        }
 
         for (predicate, should_use_index) in [
             ("json_extract(json, '$.val') = 3", true),
@@ -6495,6 +6727,18 @@ mod tests {
                 .unwrap()
                 .len(),
             2
+        );
+        let inconsistent_version = dataset.version().version;
+        let inconsistent_segments = dataset.load_indices_by_name(INDEX_NAME).await.unwrap();
+        dataset
+            .optimize_indices(&OptimizeOptions::default().index_names(vec![INDEX_NAME.to_string()]))
+            .await
+            .unwrap();
+        assert_eq!(dataset.version().version, inconsistent_version);
+        assert_eq!(
+            dataset.load_indices_by_name(INDEX_NAME).await.unwrap(),
+            inconsistent_segments,
+            "an inconsistent logical index must not be partially upgraded"
         );
 
         let predicate = "json_extract(json, '$.val') = 3";
