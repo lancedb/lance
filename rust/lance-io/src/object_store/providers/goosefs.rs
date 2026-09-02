@@ -17,6 +17,20 @@ use lance_core::error::{Error, Result};
 /// Default GooseFS Master gRPC port.
 const DEFAULT_GOOSEFS_PORT: u16 = 9200;
 
+/// Canonical `storage_options` keys. Matching environment variables use the
+/// `GOOSEFS_*` spelling; dict keys must be this lowercase form. Wrong-case
+/// variants are rejected up front so they cannot silently fall back to the
+/// URL authority / OS username and surface as a misleading auth error.
+const STORAGE_OPTION_KEYS: &[&str] = &[
+    "goosefs_master_addr",
+    "goosefs_root",
+    "goosefs_write_type",
+    "goosefs_block_size",
+    "goosefs_chunk_size",
+    "goosefs_auth_type",
+    "goosefs_auth_username",
+];
+
 /// GooseFS object store provider.
 ///
 /// Uses OpenDAL's GooseFs service to access GooseFS via gRPC.
@@ -38,7 +52,9 @@ const DEFAULT_GOOSEFS_PORT: u16 = 9200;
 ///   yields key `k`.
 ///
 /// Supported configuration keys (via `storage_options` or environment variables,
-/// resolved with priority: `storage_options` > env var > URL authority > default):
+/// resolved with priority: `storage_options` > env var > URL authority > default).
+/// `storage_options` keys must be lowercase; uppercase/mixed-case spellings are
+/// rejected rather than silently ignored.
 ///
 /// | storage_options key       | env var                 | purpose                                                                                       |
 /// |---------------------------|-------------------------|-----------------------------------------------------------------------------------------------|
@@ -58,6 +74,38 @@ const DEFAULT_GOOSEFS_PORT: u16 = 9200;
 pub struct GooseFsStoreProvider;
 
 impl GooseFsStoreProvider {
+    /// Reject GooseFS `storage_options` keys that match a canonical key
+    /// case-insensitively but are not lowercase.
+    ///
+    /// `GOOSEFS_MASTER_ADDR` is valid as an environment variable, not as a
+    /// dict key. Silently ignoring it previously fell back to the URI host
+    /// and default OS username, which then failed as `authentication failed`.
+    fn validate_storage_option_keys(storage_options: &StorageOptions) -> Result<()> {
+        let mut wrong_case = Vec::new();
+        for key in storage_options.0.keys() {
+            let lower = key.to_ascii_lowercase();
+            if let Some(&canonical) = STORAGE_OPTION_KEYS
+                .iter()
+                .find(|&&canonical| canonical == lower.as_str())
+                && key != canonical
+            {
+                wrong_case.push((key.clone(), canonical));
+            }
+        }
+        if wrong_case.is_empty() {
+            return Ok(());
+        }
+        wrong_case.sort_by(|a, b| a.1.cmp(b.1));
+        let details = wrong_case
+            .iter()
+            .map(|(got, want)| format!("`{got}` (use `{want}`)"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Err(Error::invalid_input(format!(
+            "GooseFS storage_options keys must be lowercase; got {details}"
+        )))
+    }
+
     /// Resolve the GooseFS Master address from storage_options, environment, or URL.
     ///
     /// Priority:
@@ -119,6 +167,8 @@ impl ObjectStoreProvider for GooseFsStoreProvider {
     async fn new_store(&self, base_path: Url, params: &ObjectStoreParams) -> Result<ObjectStore> {
         let block_size = params.block_size.unwrap_or(DEFAULT_CLOUD_BLOCK_SIZE);
         let storage_options = StorageOptions(params.storage_options().cloned().unwrap_or_default());
+
+        Self::validate_storage_option_keys(&storage_options)?;
 
         // Resolve master address
         let master_addr = Self::resolve_master_addr(&base_path, &storage_options)?;
@@ -378,5 +428,53 @@ mod tests {
             "/tenant-a".to_string(),
         )]));
         assert_eq!(GooseFsStoreProvider::resolve_root(&opts), "/tenant-a");
+    }
+
+    #[test]
+    fn test_validate_storage_option_keys_accepts_lowercase() {
+        let opts = StorageOptions(HashMap::from([
+            (
+                "goosefs_master_addr".to_string(),
+                "10.0.0.1:9200,10.0.0.2:9200".to_string(),
+            ),
+            ("goosefs_auth_type".to_string(), "simple".to_string()),
+            ("goosefs_auth_username".to_string(), "lance".to_string()),
+            ("allow_http".to_string(), "true".to_string()),
+        ]));
+        GooseFsStoreProvider::validate_storage_option_keys(&opts).unwrap();
+    }
+
+    #[test]
+    fn test_validate_storage_option_keys_rejects_uppercase() {
+        let opts = StorageOptions(HashMap::from([(
+            "GOOSEFS_MASTER_ADDR".to_string(),
+            "10.0.0.1:9200,10.0.0.2:9200".to_string(),
+        )]));
+        let err = GooseFsStoreProvider::validate_storage_option_keys(&opts).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("must be lowercase"),
+            "expected lowercase-key error, got: {msg}"
+        );
+        assert!(
+            msg.contains("`GOOSEFS_MASTER_ADDR` (use `goosefs_master_addr`)"),
+            "expected canonical key hint, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_validate_storage_option_keys_rejects_mixed_case() {
+        let opts = StorageOptions(HashMap::from([
+            (
+                "Goosefs_Master_Addr".to_string(),
+                "10.0.0.1:9200".to_string(),
+            ),
+            ("GOOSEFS_AUTH_TYPE".to_string(), "simple".to_string()),
+        ]));
+        let err = GooseFsStoreProvider::validate_storage_option_keys(&opts).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("must be lowercase"), "got: {msg}");
+        assert!(msg.contains("goosefs_master_addr"), "got: {msg}");
+        assert!(msg.contains("goosefs_auth_type"), "got: {msg}");
     }
 }
