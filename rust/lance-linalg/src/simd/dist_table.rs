@@ -36,10 +36,6 @@ pub fn sum_4bit_dist_table(
     dists: &mut [u16],
 ) {
     assert!(n.is_multiple_of(BATCH_SIZE));
-    assert!(
-        code_len > 0,
-        "sum_4bit_dist_table requires code_len to be greater than zero, got {code_len}"
-    );
     assert!(dists.len() >= n);
     assert!(codes.len() >= n * code_len);
     assert!(dist_table.len() >= BATCH_SIZE * code_len);
@@ -131,6 +127,11 @@ pub fn sum_4bit_dist_table_scalar(
     dist_table: &[u8],
     dists: &mut [u16],
 ) {
+    if code_len == 0 {
+        dists.fill(0);
+        return;
+    }
+
     let num_full_vectors = codes.len() / (BATCH_SIZE * code_len) * BATCH_SIZE;
     dists[..num_full_vectors].fill(0);
 
@@ -716,24 +717,15 @@ mod tests {
     }
 
     #[test]
-    fn test_sum_4bit_dist_table_rejects_zero_code_len_before_dispatch() {
-        let mut dists = [u16::MAX; BATCH_SIZE];
-        let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            sum_4bit_dist_table(BATCH_SIZE, 0, &[], &[], &mut dists);
-        }))
-        .expect_err("a zero code_len must panic");
-        let message = payload
-            .downcast_ref::<String>()
-            .map(String::as_str)
-            .or_else(|| payload.downcast_ref::<&'static str>().copied())
-            .expect("panic payload should be a string");
+    fn test_sum_4bit_dist_table_zero_code_len_returns_zeros() {
+        let mut scalar_dists = [u16::MAX; BATCH_SIZE];
+        sum_4bit_dist_table_scalar(0, &[], &[], &mut scalar_dists);
 
-        assert!(
-            message
-                .contains("sum_4bit_dist_table requires code_len to be greater than zero, got 0"),
-            "unexpected panic message: {message}"
-        );
-        assert_eq!(dists, [u16::MAX; BATCH_SIZE]);
+        let mut dispatched_dists = [u16::MAX; BATCH_SIZE];
+        sum_4bit_dist_table(BATCH_SIZE, 0, &[], &[], &mut dispatched_dists);
+
+        assert_eq!(scalar_dists, [0; BATCH_SIZE]);
+        assert_eq!(dispatched_dists, scalar_dists);
     }
 
     #[test]
