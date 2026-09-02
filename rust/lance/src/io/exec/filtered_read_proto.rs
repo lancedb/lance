@@ -145,6 +145,7 @@ fn fr_options_to_proto(
         threading_mode: Some(threading_mode_to_proto(&options.threading_mode)),
         io_buffer_size_bytes: options.io_buffer_size_bytes,
         filter_schema_ipc,
+        materialization_readahead_bytes: options.materialization_readahead_bytes,
     })
 }
 
@@ -193,6 +194,9 @@ async fn fr_options_from_proto(
     }
     if let Some(io_buffer) = proto.io_buffer_size_bytes {
         options = options.with_io_buffer_size(io_buffer);
+    }
+    if let Some(materialization_readahead_bytes) = proto.materialization_readahead_bytes {
+        options = options.with_materialization_readahead_bytes(materialization_readahead_bytes);
     }
     if let Some(mode) = proto.threading_mode {
         options.threading_mode = threading_mode_from_proto(&mode)?;
@@ -600,7 +604,8 @@ mod tests {
             .unwrap()
             .with_batch_size(64)
             .with_fragment_readahead(4)
-            .with_io_buffer_size(1024 * 1024);
+            .with_io_buffer_size(1024 * 1024)
+            .with_materialization_readahead_bytes(8 * 1024 * 1024);
 
         let proto = fr_options_to_proto(&options, &filter_schema, &state).unwrap();
         let back = fr_options_from_proto(proto, &dataset, &state)
@@ -614,6 +619,10 @@ mod tests {
         assert_eq!(options.batch_size, back.batch_size);
         assert_eq!(options.fragment_readahead, back.fragment_readahead);
         assert_eq!(options.io_buffer_size_bytes, back.io_buffer_size_bytes);
+        assert_eq!(
+            options.materialization_readahead_bytes,
+            back.materialization_readahead_bytes
+        );
         assert_eq!(options.threading_mode, back.threading_mode);
         assert_eq!(options.with_deleted_rows, back.with_deleted_rows);
         assert_eq!(options.projection.field_ids, back.projection.field_ids);

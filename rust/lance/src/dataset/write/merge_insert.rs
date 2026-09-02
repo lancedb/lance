@@ -71,7 +71,7 @@ use arrow_array::{
     BooleanArray, RecordBatch, RecordBatchIterator, StructArray, UInt32Array, UInt64Array,
     cast::AsArray, types::UInt64Type,
 };
-use arrow_schema::{DataType, Field, Schema};
+use arrow_schema::{ArrowError, DataType, Field, Schema};
 use arrow_select::take::take_record_batch;
 use datafusion::common::NullEquality;
 use datafusion::common::tree_node::{Transformed, TreeNode};
@@ -149,6 +149,73 @@ use tracing::error;
 mod assign_action;
 mod exec;
 mod logical_plan;
+
+/// Build a source schema in target field order while preserving the source's
+/// logical leaf types. The latter matters for extension columns such as Arrow
+/// JSON, whose write input is Utf8 while the dataset's physical type is binary.
+pub(crate) fn canonical_source_schema(
+    source: &Schema,
+    target: &Schema,
+) -> std::result::Result<Schema, ArrowError> {
+    fn canonical_field(source: &Field, target: &Field) -> std::result::Result<Field, ArrowError> {
+        let data_type = match (source.data_type(), target.data_type()) {
+            (DataType::Struct(source_fields), DataType::Struct(target_fields)) => {
+                let fields = target_fields
+                    .iter()
+                    .map(|target_field| {
+                        let source_field = source_fields
+                            .iter()
+                            .find(|field| field.name() == target_field.name())
+                            .ok_or_else(|| {
+                                ArrowError::SchemaError(format!(
+                                    "field {} does not exist in source struct {}",
+                                    target_field.name(),
+                                    source.name()
+                                ))
+                            })?;
+                        canonical_field(source_field, target_field).map(Arc::new)
+                    })
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                DataType::Struct(fields.into())
+            }
+            (DataType::List(source_item), DataType::List(target_item)) => {
+                DataType::List(Arc::new(canonical_field(source_item, target_item)?))
+            }
+            (DataType::LargeList(source_item), DataType::LargeList(target_item)) => {
+                DataType::LargeList(Arc::new(canonical_field(source_item, target_item)?))
+            }
+            (
+                DataType::FixedSizeList(source_item, size),
+                DataType::FixedSizeList(target_item, _),
+            ) => {
+                DataType::FixedSizeList(Arc::new(canonical_field(source_item, target_item)?), *size)
+            }
+            (DataType::Map(source_entries, sorted), DataType::Map(target_entries, _)) => {
+                DataType::Map(
+                    Arc::new(canonical_field(source_entries, target_entries)?),
+                    *sorted,
+                )
+            }
+            _ => source.data_type().clone(),
+        };
+        Ok(source.clone().with_data_type(data_type))
+    }
+
+    let fields = target
+        .fields()
+        .iter()
+        .map(|target_field| {
+            let source_field = source.field_with_name(target_field.name()).map_err(|_| {
+                ArrowError::SchemaError(format!(
+                    "field {} does not exist in source schema",
+                    target_field.name()
+                ))
+            })?;
+            canonical_field(source_field, target_field).map(Arc::new)
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(Schema::new_with_metadata(fields, source.metadata().clone()))
+}
 
 struct UpdatedRowAddrReconciler<I>
 where
@@ -1085,6 +1152,9 @@ impl MergeInsertJob {
             .lance_file_format();
         let mut options = versions::schema_compare_options(version);
         options.compare_nullability = NullabilityComparison::Ignore;
+        // Merge columns are matched by name, so a complete source remains a
+        // full-schema merge even when the caller orders its fields differently.
+        options.ignore_field_order = true;
 
         // Try full schema match first.
         if lance_schema
@@ -1096,7 +1166,6 @@ impl MergeInsertJob {
 
         // If full match fails, try subschema match.
         options.allow_subschema = true;
-        options.ignore_field_order = true; // Subschema matching should typically ignore order.
 
         lance_schema
             .check_compatible(target_schema, &options)
@@ -1961,6 +2030,16 @@ impl MergeInsertJob {
             }
         }
 
+        // Data files record physical leaf fields, while an index can be attached to
+        // a logical parent such as a list. Include every affected ancestor so index
+        // coverage is pruned for the complete logical column that was rewritten.
+        let directly_updated_fields = all_fields_updated.iter().copied().collect::<Vec<_>>();
+        for field_id in directly_updated_fields {
+            if let Some(ancestry) = dataset.schema().field_ancestry_by_id(field_id as i32) {
+                all_fields_updated.extend(ancestry.into_iter().map(|field| field.id as u32));
+            }
+        }
+
         let new_fragments = Arc::try_unwrap(new_fragments)
             .unwrap()
             .into_inner()
@@ -2628,9 +2707,32 @@ impl MergeInsertJob {
                 compare_metadata: false,
                 // Allow nullable source fields for non-nullable targets.
                 compare_nullability: NullabilityComparison::Ignore,
+                // Keep this classification consistent with `can_use_create_plan`
+                // and `check_compatible_schema`: merge columns match by name.
+                ignore_field_order: true,
                 ..Default::default()
             },
         );
+        let source = if is_full_schema {
+            let target_schema = Schema::from(full_schema);
+            let canonical_schema = Arc::new(canonical_source_schema(
+                source_schema.as_ref(),
+                &target_schema,
+            )?);
+            let projection_schema = canonical_schema.clone();
+            let projected = source.map(move |batch| {
+                batch.and_then(|batch| {
+                    batch
+                        .project_by_schema(projection_schema.as_ref())
+                        .map_err(DataFusionError::from)
+                })
+            });
+            Box::pin(RecordBatchStreamAdapter::new(canonical_schema, projected))
+                as SendableRecordBatchStream
+        } else {
+            source
+        };
+        let source_schema = source.schema();
         let joined = self.create_joined_stream(source).await?;
         let merger = Merger::try_new(
             self.params.clone(),
@@ -2673,10 +2775,13 @@ impl MergeInsertJob {
             let removed_row_ids = Arc::into_inner(deleted_rows).unwrap().into_inner().unwrap();
             let removed_row_addr_vec =
                 if let Some(row_id_index) = get_row_id_index(&self.dataset).await? {
-                    removed_row_ids
-                        .iter()
-                        .filter_map(|id| row_id_index.get(*id).map(|address| address.into()))
-                        .collect::<Vec<_>>()
+                    let mut addresses = Vec::with_capacity(removed_row_ids.len());
+                    for id in &removed_row_ids {
+                        if let Some(address) = row_id_index.get(*id)? {
+                            addresses.push(address.into());
+                        }
+                    }
+                    addresses
                 } else {
                     removed_row_ids
                 };
@@ -2692,8 +2797,7 @@ impl MergeInsertJob {
                 fields_modified: vec![],
                 compacted_sstables: self.params.compacted_sstables.clone(),
                 fields_for_preserving_frag_bitmap: full_schema
-                    .fields
-                    .iter()
+                    .fields_pre_order()
                     .map(|f| f.id as u32)
                     .collect(),
                 update_mode: Some(RewriteRows),
@@ -2794,10 +2898,12 @@ impl MergeInsertJob {
 
                 let removed_row_addr_vec =
                     if let Some(row_id_index) = get_row_id_index(&self.dataset).await? {
-                        let addresses: Vec<u64> = removed_row_ids
-                            .iter()
-                            .filter_map(|id| row_id_index.get(*id).map(|address| address.into()))
-                            .collect::<Vec<_>>();
+                        let mut addresses: Vec<u64> = Vec::with_capacity(removed_row_ids.len());
+                        for id in &removed_row_ids {
+                            if let Some(address) = row_id_index.get(*id)? {
+                                addresses.push(address.into());
+                            }
+                        }
                         addresses
                     } else {
                         removed_row_ids
@@ -2845,8 +2951,7 @@ impl MergeInsertJob {
                 fields_modified: vec![],
                 compacted_sstables: self.params.compacted_sstables.clone(),
                 fields_for_preserving_frag_bitmap: full_schema
-                    .fields
-                    .iter()
+                    .fields_pre_order()
                     .map(|f| f.id as u32)
                     .collect(),
                 update_mode: Some(RewriteRows),
@@ -5080,6 +5185,67 @@ mod tests {
         assert_eq!(actual_payload, expected_payload);
     }
 
+    /// merge_insert matches keys by bit pattern, in the indexed probe and in the
+    /// hash join behind it alike, so a source key of `+0.0` updates only the
+    /// `+0.0` row. Filters answer zero comparisons per IEEE 754 now, and this
+    /// pins that the two are still allowed to disagree: making key matching agree
+    /// needs the unindexed join fixed too, and DataFusion 54 hashes join keys by
+    /// raw bits. Both settings of `use_index` are exercised; which one the planner
+    /// picks for a one-row source is not asserted.
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn test_merge_insert_on_float_zero_key(#[values(true, false)] use_index: bool) {
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
+
+        let target = record_batch!(
+            (
+                "key",
+                Float64,
+                [Some(-1.0), Some(-0.0), Some(0.0), Some(1.0)]
+            ),
+            ("value", Int32, [10, 20, 30, 40])
+        )
+        .unwrap();
+        let schema = target.schema();
+        let reader = RecordBatchIterator::new(vec![Ok(target)], schema.clone());
+        let mut ds = Dataset::write(reader, test_uri, None).await.unwrap();
+        ds.create_index(
+            &["key"],
+            IndexType::Scalar,
+            None,
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+
+        let source = record_batch!(("key", Float64, [Some(0.0)]), ("value", Int32, [99])).unwrap();
+        let source = Box::new(RecordBatchIterator::new(vec![Ok(source)], schema.clone()));
+
+        let (ds, _) = MergeInsertBuilder::try_new(Arc::new(ds), vec!["key".to_string()])
+            .unwrap()
+            .when_not_matched(WhenNotMatched::DoNothing)
+            .when_matched(WhenMatched::UpdateAll)
+            .use_index(use_index)
+            .try_build()
+            .unwrap()
+            .execute_reader(source)
+            .await
+            .unwrap();
+
+        // Only the +0.0 row is updated. Checking both sides pins which row was
+        // replaced, not just how many; `value = 20` is the -0.0 row.
+        assert_eq!(ds.count_rows(None).await.unwrap(), 4);
+        for (filter, expected) in [("value = 99", 1), ("value = 30", 0), ("value = 20", 1)] {
+            assert_eq!(
+                ds.count_rows(Some(filter.to_string())).await.unwrap(),
+                expected,
+                "{filter}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_indexed_merge_insert() {
         let test_dir = TempStrDir::default();
@@ -6254,6 +6420,116 @@ mod tests {
                 && !single_rendered.contains("IndexedLookup ["),
             "single-lookup Display must not include the column list, got: {single_rendered}",
         );
+    }
+
+    /// The probe loop orders join keys by how many distinct values the source
+    /// batch holds for them, so writing a composite key coarse-to-fine
+    /// (`["bucket", "id"]`) does not make the coarse probe run first and
+    /// materialize a candidate set the size of the table.
+    ///
+    /// Asserted on the emitted candidate count, which is the only observable
+    /// that says which probe ran: `IndexMetrics` has no per-probe counter and
+    /// is shared across lookups. Probing the selective key first leaves 4
+    /// candidates and stops, because 4 is already down to the source batch
+    /// size; following the caller's order instead would probe `bucket` first
+    /// (8 candidates, no stop), then intersect down to the 2 exact matches. So
+    /// the larger count is the cheaper plan — one probe instead of two — and
+    /// the surplus is trimmed by the full-key join downstream. A regression in
+    /// the ordering shows up here as 2.
+    ///
+    /// Sits with the other composite-key merge_insert tests, next to
+    /// `map_index_exec_multi_lookup_plan_shape`: probe ordering only matters on
+    /// the composite-key indexed path, and this is where that path is covered.
+    #[tokio::test]
+    async fn map_index_exec_probes_most_selective_key_first() {
+        use crate::io::exec::scalar_index::{IndexLookup, MapIndexExec};
+        use arrow_array::types::UInt64Type;
+        use datafusion::physical_plan::ExecutionPlan;
+        use lance_datafusion::exec::OneShotExec;
+
+        // `id` is unique; `bucket` takes two values, so a `bucket` probe alone
+        // reaches half the table while pruning almost nothing.
+        let initial = record_batch!(
+            (
+                "id",
+                Int32,
+                [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+            ),
+            (
+                "bucket",
+                Int32,
+                [0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1]
+            )
+        )
+        .unwrap();
+        let schema = initial.schema();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(initial)], schema),
+            "memory://",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let params = ScalarIndexParams::default();
+        for column in ["id", "bucket"] {
+            dataset
+                .create_index(
+                    &[column],
+                    IndexType::Scalar,
+                    Some(format!("{column}_idx")),
+                    &params,
+                    false,
+                )
+                .await
+                .unwrap();
+        }
+
+        // Columns are in lookup order, which is the deliberately bad one: the
+        // coarse key first. Only ids 0 and 2 also sit in bucket 0, so the exact
+        // composite match is 2 rows.
+        let probe =
+            record_batch!(("bucket", Int32, [0, 0, 0, 0]), ("id", Int32, [0, 1, 2, 3])).unwrap();
+        let source_rows = probe.num_rows();
+        let plan = MapIndexExec::new_multi(
+            Arc::new(dataset),
+            vec![
+                IndexLookup::new("bucket", "bucket_idx"),
+                IndexLookup::new("id", "id_idx"),
+            ],
+            Arc::new(OneShotExec::from_batch(probe)),
+        );
+
+        let mut stream = plan
+            .execute(0, Arc::new(datafusion::execution::TaskContext::default()))
+            .unwrap();
+        let mut candidates = Vec::new();
+        while let Some(batch) = stream.next().await {
+            let batch = batch.unwrap();
+            candidates.extend(
+                batch
+                    .column(0)
+                    .as_primitive::<UInt64Type>()
+                    .values()
+                    .iter()
+                    .copied(),
+            );
+        }
+
+        assert_eq!(
+            candidates.len(),
+            source_rows,
+            "the selective key must be probed first and stop the loop, leaving \
+             one candidate per source row; {} means the probes ran in `on` order",
+            candidates.len()
+        );
+        // Whatever the order, the candidate set has to cover the exact matches.
+        for row_addr in [0_u64, 2] {
+            assert!(
+                candidates.contains(&row_addr),
+                "candidate set must contain exact match at row {row_addr}: {candidates:?}"
+            );
+        }
     }
 
     mod subcols {
