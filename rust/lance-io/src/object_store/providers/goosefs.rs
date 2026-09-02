@@ -61,8 +61,8 @@ const STORAGE_OPTION_KEYS: &[&str] = &[
 /// | `goosefs_master_addr`     | `GOOSEFS_MASTER_ADDR`   | Master gRPC address, e.g. `host:9200`. Supports HA: `addr1:port,addr2:port`.                  |
 /// | `goosefs_root`            | `GOOSEFS_ROOT`          | Cluster-wide OpenDAL root shared by all datasets under the same master. Defaults to `/`.      |
 /// | `goosefs_write_type`      | `GOOSEFS_WRITE_TYPE`    | GooseFS write type (e.g. `MUST_CACHE`, `CACHE_THROUGH`, `THROUGH`, `ASYNC_THROUGH`).          |
-/// | `goosefs_block_size`      | `GOOSEFS_BLOCK_SIZE`    | GooseFS block size (bytes). Distinct from Lance's own `block_size`.                           |
-/// | `goosefs_chunk_size`      | `GOOSEFS_CHUNK_SIZE`    | GooseFS chunk size (bytes) used by the client.                                                |
+/// | `goosefs_block_size`      | `GOOSEFS_BLOCK_SIZE`    | GooseFS block size. Bytes or suffixes like `4MB` (binary: 1KB=1024). Distinct from Lance I/O `block_size`. |
+/// | `goosefs_chunk_size`      | `GOOSEFS_CHUNK_SIZE`    | GooseFS client chunk size. Bytes or suffixes like `4MB` (binary: 1KB=1024).                   |
 /// | `goosefs_auth_type`       | `GOOSEFS_AUTH_TYPE`     | Authentication mode: `nosasl` or `simple`.                                                    |
 /// | `goosefs_auth_username`   | `GOOSEFS_AUTH_USERNAME` | Username for `simple` auth mode.                                                              |
 ///
@@ -160,6 +160,94 @@ impl GooseFsStoreProvider {
         Self::resolve_option(storage_options, "goosefs_root", "GOOSEFS_ROOT")
             .unwrap_or_else(|| "/".to_string())
     }
+
+    /// Parse a GooseFS space-size string into bytes.
+    ///
+    /// OpenDAL's GooseFS config deserializes `chunk_size` / `block_size` as
+    /// `u64`, so a value like `4MB` fails with `ParseIntError`. GooseFS itself
+    /// accepts Hadoop-style suffixes via `FormatUtils.parseSpaceSize`, where
+    /// units are **binary** (`1KB = 1024`, so `4MB` is `4194304`), not SI
+    /// (`10^6`). Generic crates such as `parse-size` / `bytesize` default to
+    /// SI for `MB`, so this parser matches GooseFS instead of adding a dep.
+    ///
+    /// Accepted suffixes (case-insensitive): `b`, `k`/`kb`, `m`/`mb`,
+    /// `g`/`gb`, `t`/`tb`, `p`/`pb`. A missing suffix means bytes. Fractional
+    /// coefficients such as `1.5MB` are accepted.
+    fn parse_space_size(option_key: &str, value: &str) -> Result<u64> {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return Err(Error::invalid_input(format!(
+                "{option_key} must be a size such as `4MB` or `4194304`, got `{value}`"
+            )));
+        }
+
+        let suffix_start = trimmed
+            .char_indices()
+            .rev()
+            .find(|(_, c)| c.is_ascii_digit())
+            .map(|(i, c)| i + c.len_utf8())
+            .unwrap_or(0);
+        let (number, suffix) = trimmed.split_at(suffix_start);
+        if number.is_empty() {
+            return Err(Error::invalid_input(format!(
+                "invalid {option_key} `{value}`: missing numeric coefficient"
+            )));
+        }
+
+        let multiplier = match suffix.to_ascii_lowercase().as_str() {
+            "" | "b" => 1u64,
+            "k" | "kb" => 1024,
+            "m" | "mb" => 1024 * 1024,
+            "g" | "gb" => 1024 * 1024 * 1024,
+            "t" | "tb" => 1024u64.pow(4),
+            "p" | "pb" => 1024u64.pow(5),
+            other => {
+                return Err(Error::invalid_input(format!(
+                    "invalid {option_key} `{value}`: unrecognized size suffix `{other}` \
+                     (supported: b, k/kb, m/mb, g/gb, t/tb, p/pb; units are binary, 1KB=1024)"
+                )));
+            }
+        };
+
+        if let Ok(n) = number.parse::<u64>() {
+            return n.checked_mul(multiplier).ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "invalid {option_key} `{value}`: size overflows u64"
+                ))
+            });
+        }
+
+        let coeff: f64 = number.parse().map_err(|_| {
+            Error::invalid_input(format!(
+                "invalid {option_key} `{value}`: `{number}` is not a valid number"
+            ))
+        })?;
+        if !coeff.is_finite() || coeff < 0.0 {
+            return Err(Error::invalid_input(format!(
+                "invalid {option_key} `{value}`: size must be a non-negative finite number"
+            )));
+        }
+
+        // Match GooseFS FormatUtils.parseSpaceSize: truncate (coeff * unit + 0.0001).
+        let bytes = coeff.mul_add(multiplier as f64, 0.0001);
+        if bytes > u64::MAX as f64 {
+            return Err(Error::invalid_input(format!(
+                "invalid {option_key} `{value}`: size overflows u64"
+            )));
+        }
+        Ok(bytes as u64)
+    }
+
+    fn resolve_space_size(
+        storage_options: &StorageOptions,
+        option_key: &str,
+        env_key: &str,
+    ) -> Result<Option<u64>> {
+        let Some(raw) = Self::resolve_option(storage_options, option_key, env_key) else {
+            return Ok(None);
+        };
+        Self::parse_space_size(option_key, &raw).map(Some)
+    }
 }
 
 #[async_trait::async_trait]
@@ -190,18 +278,19 @@ impl ObjectStoreProvider for GooseFsStoreProvider {
             config_map.insert("write_type".to_string(), wt);
         }
 
-        // Optional: block_size (for GooseFS, not Lance block_size)
+        // Optional: block_size (for GooseFS, not Lance block_size).
+        // Normalize suffixes like `64MB` to a raw byte count; OpenDAL expects u64.
         if let Some(bs) =
-            Self::resolve_option(&storage_options, "goosefs_block_size", "GOOSEFS_BLOCK_SIZE")
+            Self::resolve_space_size(&storage_options, "goosefs_block_size", "GOOSEFS_BLOCK_SIZE")?
         {
-            config_map.insert("block_size".to_string(), bs);
+            config_map.insert("block_size".to_string(), bs.to_string());
         }
 
         // Optional: chunk_size
         if let Some(cs) =
-            Self::resolve_option(&storage_options, "goosefs_chunk_size", "GOOSEFS_CHUNK_SIZE")
+            Self::resolve_space_size(&storage_options, "goosefs_chunk_size", "GOOSEFS_CHUNK_SIZE")?
         {
-            config_map.insert("chunk_size".to_string(), cs);
+            config_map.insert("chunk_size".to_string(), cs.to_string());
         }
 
         // Optional: auth_type (nosasl / simple)
@@ -279,6 +368,7 @@ impl ObjectStoreProvider for GooseFsStoreProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
 
     #[test]
     fn test_goosefs_extract_path_basic() {
@@ -476,5 +566,64 @@ mod tests {
         assert!(msg.contains("must be lowercase"), "got: {msg}");
         assert!(msg.contains("goosefs_master_addr"), "got: {msg}");
         assert!(msg.contains("goosefs_auth_type"), "got: {msg}");
+    }
+
+    #[rstest]
+    #[case::bare_bytes("4096", 4096)]
+    #[case::suffix_b("4096b", 4096)]
+    #[case::suffix_k("4k", 4096)]
+    #[case::suffix_kb("4KB", 4096)]
+    #[case::suffix_m("4m", 4 * 1024 * 1024)]
+    #[case::suffix_mb("4MB", 4 * 1024 * 1024)]
+    #[case::suffix_gb("1GB", 1024 * 1024 * 1024)]
+    #[case::fractional_mb("1.5MB", 1_572_864)]
+    #[case::trimmed("  4MB  ", 4 * 1024 * 1024)]
+    fn test_parse_space_size_accepts_goosefs_suffixes(#[case] input: &str, #[case] expected: u64) {
+        assert_eq!(
+            GooseFsStoreProvider::parse_space_size("goosefs_chunk_size", input).unwrap(),
+            expected
+        );
+    }
+
+    #[rstest]
+    #[case::empty("")]
+    #[case::whitespace("   ")]
+    #[case::missing_number("MB")]
+    #[case::unknown_suffix("4MiB")]
+    #[case::si_mismatch_not_mib("4XB")]
+    #[case::negative("-4MB")]
+    fn test_parse_space_size_rejects_invalid(#[case] input: &str) {
+        let err = GooseFsStoreProvider::parse_space_size("goosefs_chunk_size", input).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("goosefs_chunk_size"),
+            "error should name the option, got: {msg}"
+        );
+        assert!(
+            msg.contains(input.trim()) || input.trim().is_empty(),
+            "error should include the input, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_parse_space_size_four_mb_is_binary_not_si() {
+        let bytes = GooseFsStoreProvider::parse_space_size("goosefs_chunk_size", "4MB").unwrap();
+        assert_eq!(bytes, 4_194_304, "GooseFS MB is 1024^2, not 10^6");
+        assert_ne!(bytes, 4_000_000);
+    }
+
+    #[test]
+    fn test_resolve_space_size_from_storage_options() {
+        let opts = StorageOptions(HashMap::from([(
+            "goosefs_chunk_size".to_string(),
+            "4MB".to_string(),
+        )]));
+        let bytes = GooseFsStoreProvider::resolve_space_size(
+            &opts,
+            "goosefs_chunk_size",
+            "GOOSEFS_CHUNK_SIZE",
+        )
+        .unwrap();
+        assert_eq!(bytes, Some(4 * 1024 * 1024));
     }
 }
