@@ -83,7 +83,7 @@ use lance_index::scalar::registry::VALUE_COLUMN_NAME;
 use lance_index::vector::{ApproxMode, DEFAULT_QUERY_PARALLELISM, DIST_COL, Query};
 use lance_io::stream::RecordBatchStream;
 use lance_linalg::distance::MetricType;
-use lance_select::{IndexExprResult, RowAddrSelection};
+use lance_select::IndexExprResult;
 // Re-exported so callers of `Scanner::with_row_addr_prefilter` can name the mask
 // type without depending on `lance-select` directly.
 pub use lance_select::{RowAddrMask, RowAddrTreeMap};
@@ -1598,81 +1598,6 @@ impl Scanner {
     pub fn with_row_addr_prefilter(&mut self, mask: RowAddrMask) -> &mut Self {
         self.external_row_mask = Some(Arc::new(mask));
         self
-    }
-
-    /// Restrict the scan to a selection of physical row addresses.
-    ///
-    /// Unlike [`with_row_addr_prefilter`](Self::with_row_addr_prefilter), whose mask is keyed in
-    /// the dataset's `_rowid` domain, this method always accepts physical row addresses. Each
-    /// address identifies a fragment and a physical row offset within that fragment. Deleted rows
-    /// may be present in the selection but are not returned by the scan.
-    ///
-    /// When stable row ids are enabled, this method translates the physical addresses to their
-    /// stable row ids before configuring the existing external prefilter. The translation may load
-    /// row-id sequences and deletion vectors, which is why this builder method is asynchronous.
-    /// Missing fragments and row offsets beyond a fragment's physical row count are rejected.
-    ///
-    /// Any mask previously configured by [`with_row_addr_prefilter`](Self::with_row_addr_prefilter)
-    /// or this method is replaced.
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// # use lance::{Dataset, Result};
-    /// # use lance_core::utils::address::RowAddress;
-    /// # async fn example(dataset: &Dataset) -> Result<()> {
-    /// use lance::dataset::scanner::RowAddrTreeMap;
-    ///
-    /// let mut physical_rows = RowAddrTreeMap::new();
-    /// let start = u64::from(RowAddress::new_from_parts(7, 128));
-    /// let end = u64::from(RowAddress::new_from_parts(7, 256));
-    /// physical_rows.insert_range(start..end);
-    ///
-    /// let mut scanner = dataset.scan();
-    /// scanner
-    ///     .with_physical_row_addr_prefilter(physical_rows)
-    ///     .await?;
-    /// let batch = scanner.try_into_batch().await?;
-    /// # let _ = batch;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub async fn with_physical_row_addr_prefilter(
-        &mut self,
-        physical_rows: RowAddrTreeMap,
-    ) -> Result<&mut Self> {
-        for (fragment_id, selection) in physical_rows.iter() {
-            let fragment = self
-                .dataset
-                .get_fragment(*fragment_id as usize)
-                .ok_or_else(|| {
-                    Error::invalid_input(format!(
-                        "physical row selection references fragment_id={fragment_id}, which is not present in dataset version={}",
-                        self.dataset.version().version
-                    ))
-                })?;
-
-            let RowAddrSelection::Partial(offsets) = selection else {
-                continue;
-            };
-            let Some(max_offset) = offsets.max() else {
-                continue;
-            };
-            let physical_row_count = fragment.physical_rows().await?;
-            if max_offset as usize >= physical_row_count {
-                return Err(Error::invalid_input(format!(
-                    "physical row selection for fragment_id={fragment_id} contains row_offset={max_offset}, but the fragment has physical_row_count={physical_row_count} in dataset version={}",
-                    self.dataset.version().version
-                )));
-            }
-        }
-
-        let selected_row_ids = if self.dataset.manifest().uses_stable_row_ids() {
-            translate_addr_treemap_to_row_ids(&self.dataset, &physical_rows).await?
-        } else {
-            physical_rows
-        };
-        Ok(self.with_row_addr_prefilter(RowAddrMask::from_allowed(selected_row_ids)))
     }
 
     /// Set the callback to be called after the scan with summary statistics
@@ -7906,88 +7831,6 @@ mod test {
             .as_primitive::<UInt64Type>()
             .values()
             .to_vec()
-    }
-
-    #[rstest]
-    #[case::without_stable_row_ids(false)]
-    #[case::with_stable_row_ids(true)]
-    #[tokio::test]
-    async fn physical_row_addr_prefilter_reads_ranges_with_deletions_and_refine(
-        #[case] stable_row_ids: bool,
-    ) {
-        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, stable_row_ids)
-            .await
-            .unwrap();
-        test_ds.dataset.delete("i = 2 OR i = 203").await.unwrap();
-        let ds = &test_ds.dataset;
-        let fragments = ds.get_fragments();
-        assert_eq!(fragments.len(), 2);
-
-        let mut physical_rows = RowAddrTreeMap::new();
-        for (fragment_id, start, end) in [
-            (fragments[0].id() as u32, 1, 4),
-            (fragments[1].id() as u32, 2, 5),
-        ] {
-            physical_rows.insert_range(
-                u64::from(RowAddress::new_from_parts(fragment_id, start))
-                    ..u64::from(RowAddress::new_from_parts(fragment_id, end)),
-            );
-        }
-
-        let mut scan = ds.scan();
-        scan.with_physical_row_addr_prefilter(physical_rows)
-            .await
-            .unwrap();
-        scan.filter("i >= 3").unwrap();
-        scan.project(&["i"]).unwrap();
-        let batch = scan.try_into_batch().await.unwrap();
-        let values = batch["i"].as_primitive::<Int32Type>().values().to_vec();
-        assert_eq!(values, vec![3, 202, 204]);
-    }
-
-    #[tokio::test]
-    async fn physical_row_addr_prefilter_rejects_invalid_addresses() {
-        let test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
-            .await
-            .unwrap();
-        let ds = &test_ds.dataset;
-
-        let missing_fragment_id = 42;
-        let mut missing_fragment = RowAddrTreeMap::new();
-        missing_fragment.insert_fragment(missing_fragment_id);
-        let mut scan = ds.scan();
-        let Err(error) = scan
-            .with_physical_row_addr_prefilter(missing_fragment)
-            .await
-        else {
-            panic!("expected a missing fragment to be rejected");
-        };
-        assert!(matches!(error, Error::InvalidInput { .. }));
-        assert!(
-            error
-                .to_string()
-                .contains("references fragment_id=42, which is not present")
-        );
-
-        let fragment = &ds.get_fragments()[0];
-        let physical_row_count = fragment.physical_rows().await.unwrap();
-        let invalid_offset = u32::try_from(physical_row_count).unwrap();
-        let mut past_fragment_end = RowAddrTreeMap::new();
-        past_fragment_end.insert(u64::from(RowAddress::new_from_parts(
-            fragment.id() as u32,
-            invalid_offset,
-        )));
-        let mut scan = ds.scan();
-        let Err(error) = scan
-            .with_physical_row_addr_prefilter(past_fragment_end)
-            .await
-        else {
-            panic!("expected an out-of-range physical row offset to be rejected");
-        };
-        assert!(matches!(error, Error::InvalidInput { .. }));
-        assert!(error.to_string().contains(&format!(
-            "contains row_offset={invalid_offset}, but the fragment has physical_row_count={physical_row_count}"
-        )));
     }
 
     #[rstest]
