@@ -91,6 +91,31 @@ def _assert_complete_blob_schema(dataset):
     ]
 
 
+def _assert_blob_storage_type_equal(actual, expected):
+    assert isinstance(actual, pa.StructType)
+    assert isinstance(expected, pa.StructType)
+    assert len(actual) == len(expected)
+    for actual_field, expected_field in zip(actual, expected):
+        assert actual_field.equals(expected_field, check_metadata=True)
+
+
+def _inline_blob_array(storage_type, value):
+    arrays = [
+        pa.array([value], type=pa.large_binary()),
+        pa.array([None], type=pa.utf8()),
+    ]
+    if len(storage_type) == 4:
+        arrays.extend(
+            [
+                pa.array([None], type=pa.uint64()),
+                pa.array([None], type=pa.uint64()),
+            ]
+        )
+    storage = pa.StructArray.from_arrays(arrays, fields=list(storage_type))
+    blob_type = BlobType.__arrow_ext_deserialize__(storage_type, b"")
+    return pa.ExtensionArray.from_storage(blob_type, storage)
+
+
 def _add_columns_blob_v2_values(tmp_path):
     external_base = tmp_path / "external_base"
     external_blob = external_base / "external_blob.bin"
@@ -1101,6 +1126,138 @@ def test_empty_external_object_without_range(tmp_path, mode):
 def test_blob_rejects_invalid_logical_value(kwargs, message):
     with pytest.raises(ValueError, match=message):
         Blob(**kwargs)
+
+
+@pytest.mark.parametrize(
+    "storage_type",
+    [
+        pytest.param(
+            pa.struct(
+                [
+                    pa.field("data", pa.large_binary()),
+                    pa.field("uri", pa.utf8()),
+                ]
+            ),
+            id="minimal",
+        ),
+        pytest.param(BlobType().storage_type, id="complete-nullable-range"),
+        pytest.param(
+            pa.struct(
+                [
+                    pa.field(
+                        "data",
+                        pa.large_binary(),
+                        metadata={b"source": b"preserved"},
+                    ),
+                    pa.field("uri", pa.utf8()),
+                    pa.field("position", pa.uint64(), nullable=False),
+                    pa.field("size", pa.uint64(), nullable=False),
+                ]
+            ),
+            id="complete-required-range-with-metadata",
+        ),
+    ],
+)
+def test_blob_type_preserves_storage_type_through_arrow_ipc(storage_type):
+    blob_type = BlobType.__arrow_ext_deserialize__(storage_type, b"")
+    schema = pa.schema([pa.field("blob", blob_type)])
+    sink = pa.BufferOutputStream()
+    with pa.ipc.new_stream(sink, schema):
+        pass
+
+    restored_type = pa.ipc.open_stream(sink.getvalue()).schema.field("blob").type
+
+    assert isinstance(restored_type, BlobType)
+    _assert_blob_storage_type_equal(restored_type.storage_type, storage_type)
+
+
+@pytest.mark.parametrize(
+    "storage_type",
+    [
+        pytest.param(pa.int32(), id="not-struct"),
+        pytest.param(
+            pa.struct(
+                [
+                    pa.field("data", pa.large_binary()),
+                    pa.field("uri", pa.utf8()),
+                    pa.field("position", pa.uint64()),
+                ]
+            ),
+            id="incomplete-range-shape",
+        ),
+        pytest.param(
+            pa.struct(
+                [
+                    pa.field("data", pa.large_binary(), nullable=False),
+                    pa.field("uri", pa.utf8()),
+                ]
+            ),
+            id="required-data",
+        ),
+        pytest.param(
+            pa.struct(
+                [
+                    pa.field("data", pa.large_binary()),
+                    pa.field("uri", pa.utf8()),
+                    pa.field("position", pa.uint64()),
+                    pa.field("size", pa.int64()),
+                ]
+            ),
+            id="wrong-range-type",
+        ),
+    ],
+)
+def test_blob_type_rejects_invalid_storage_type(storage_type):
+    with pytest.raises(TypeError, match="BlobType storage"):
+        BlobType.__arrow_ext_deserialize__(storage_type, b"")
+
+
+@pytest.mark.parametrize(
+    ("initial_storage_type", "append_storage_type"),
+    [
+        pytest.param(
+            pa.struct(
+                [
+                    pa.field("data", pa.large_binary()),
+                    pa.field("uri", pa.utf8()),
+                ]
+            ),
+            BlobType().storage_type,
+            id="complete-to-minimal",
+        ),
+        pytest.param(
+            BlobType().storage_type,
+            pa.struct(
+                [
+                    pa.field("data", pa.large_binary()),
+                    pa.field("uri", pa.utf8()),
+                ]
+            ),
+            id="minimal-to-complete",
+        ),
+    ],
+)
+def test_blob_v2_append_accepts_mixed_logical_shapes(
+    tmp_path, initial_storage_type, append_storage_type
+):
+    dataset_path = tmp_path / "mixed_blob_shapes"
+    initial = pa.Table.from_arrays(
+        [_inline_blob_array(initial_storage_type, b"initial")], names=["blob"]
+    )
+    append = pa.Table.from_arrays(
+        [_inline_blob_array(append_storage_type, b"appended")], names=["blob"]
+    )
+
+    lance.write_dataset(initial, dataset_path, data_storage_version="2.2")
+    lance.write_dataset(append, dataset_path, mode="append")
+    dataset = lance.dataset(dataset_path)
+
+    _assert_blob_storage_type_equal(
+        dataset.schema.field("blob").type.storage_type,
+        initial_storage_type,
+    )
+    blobs = dataset.take_blobs("blob", indices=[0, 1])
+    assert [blob.readall() for blob in blobs] == [b"initial", b"appended"]
 
 
 def test_blob_field_threshold_metadata():
