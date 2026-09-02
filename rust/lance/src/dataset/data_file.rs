@@ -10,7 +10,7 @@ use futures::{Stream, StreamExt};
 use lance_core::{Error, Result, datatypes::Schema};
 use lance_file::{
     concat::{
-        BlobNamespace, EncodedFileInput, FileConcatOptions, FileConcatReason, FileConcatResult,
+        BlobTargetId, EncodedFileInput, FileConcatOptions, FileConcatReason, FileConcatResult,
         FileConcatTarget, concat_data_file_parts as concat_parts,
     },
     version::ConcreteFileVersion,
@@ -39,28 +39,29 @@ use crate::{
     },
 };
 
-/// The immutable identity and logical schema of a final concatenated data file.
+/// Runtime identity and logical schema of a final concatenated data file.
 ///
-/// Callers persist this value alongside their part order and reuse it for every
-/// part write and for final concatenation. It contains no attempt, lease owner,
-/// retry, or commit state.
+/// Reuse the same live value for every part write and final concatenation. Lance
+/// defines no serialization or recovery contract for this type. The caller must
+/// keep every use associated with the same dataset and resolved base; Lance does
+/// not validate that association across [`Dataset`] instances.
 #[derive(Debug, Clone)]
 pub struct DataFileTarget {
     file_name: String,
     base_id: Option<u32>,
     schema: Arc<Schema>,
     version: ConcreteFileVersion,
-    blob_namespace: Option<BlobNamespace>,
+    blob_target_id: Option<BlobTargetId>,
 }
 
 impl DataFileTarget {
     /// Create a final data-file target with Lance's ordinary random file naming.
     ///
-    /// This only creates an immutable identity; it does not create, reserve, or
-    /// register an object. The caller owns persistence, retries, cleanup, and
-    /// commit state. Prepared Blob v2 schemas are normalized to their
-    /// caller-visible logical form; the persisted descriptor schema remains an
-    /// internal writer detail.
+    /// This only creates a runtime identity; it does not create, reserve, or
+    /// register an object. The caller owns the target lifetime, part storage,
+    /// cleanup, and commit state. Prepared Blob v2 schemas are normalized to
+    /// their caller-visible logical form; the persisted descriptor schema remains
+    /// an internal writer detail.
     ///
     /// # Example
     ///
@@ -118,18 +119,18 @@ impl DataFileTarget {
             ));
         }
         let file_name = format!("{}.lance", generate_random_filename());
-        let blob_namespace = has_blob_v2.then(|| {
+        let blob_target_id = has_blob_v2.then(|| {
             let base = base_id
                 .map(|id| format!("base:{id}"))
                 .unwrap_or_else(|| "primary".to_string());
-            BlobNamespace::new(format!("{base}/{file_name}"))
+            BlobTargetId::new(format!("{base}/{file_name}"))
         });
         Ok(Self {
             file_name,
             base_id,
             schema,
             version,
-            blob_namespace,
+            blob_target_id,
         })
     }
 
@@ -153,14 +154,17 @@ impl DataFileTarget {
         self.version
     }
 
-    /// Open one caller-persisted part and bind its managed Blob descriptors to
-    /// this final data file's namespace.
+    /// Open one caller-provided part and associate its managed Blob descriptors
+    /// with this runtime target.
+    ///
+    /// The caller must ensure that Blob payloads were written through this target
+    /// using the same dataset and resolved base that will assemble the part.
     pub async fn open_part(
         &self,
         input: EncodedFileInput,
         blob_ids: Option<Range<u32>>,
     ) -> Result<DataFilePart> {
-        DataFilePart::open(input, blob_ids, self.blob_namespace.clone()).await
+        DataFilePart::open(input, blob_ids, self.blob_target_id.clone()).await
     }
 
     fn object_path(&self, data_dir: &Path) -> Path {
@@ -212,9 +216,13 @@ impl Dataset {
     /// Encode one independently persisted part for a future data file.
     ///
     /// The caller owns `output` and its storage path. Managed Blob payloads are
-    /// written directly beneath the final target's namespace using IDs from
-    /// `blob_ids`; every non-empty logical Inline value is spilled to Packed or
-    /// Dedicated storage so final concatenation never copies Blob payload bytes.
+    /// written directly beneath the sidecar directory selected by the final
+    /// target using IDs from `blob_ids`; every non-empty logical Inline value is
+    /// spilled to Packed or Dedicated storage so final concatenation never copies
+    /// Blob payload bytes.
+    /// Every use of `target` must refer to the same dataset and resolved base;
+    /// associating a runtime target with that storage context is the caller's
+    /// responsibility.
     ///
     /// # Example
     ///
@@ -328,6 +336,8 @@ impl Dataset {
     /// encoded page buffers and regenerates metadata and the footer; incompatible
     /// inputs fail without a decode/re-encode fallback or dataset commit. The
     /// caller owns cleanup of all durable part, Blob, and final-file objects.
+    /// The caller must also assemble the target through the same dataset and
+    /// resolved base used to write managed Blob payloads.
     ///
     /// # Example
     ///
@@ -360,8 +370,8 @@ impl Dataset {
         let output_path = target.object_path(&data_dir);
         let object_store = self.object_store(target.base_id).await?;
         let mut concat_target = FileConcatTarget::new(target.version, target.schema.clone());
-        if let Some(blob_namespace) = target.blob_namespace.clone() {
-            concat_target = concat_target.with_blob_namespace(blob_namespace);
+        if let Some(blob_target_id) = target.blob_target_id.clone() {
+            concat_target = concat_target.with_blob_target_id(blob_target_id);
         }
         let result = concat_parts(
             &concat_target,

@@ -431,7 +431,7 @@ async fn blob_parts_write_sidecars_in_final_namespace_and_concat_descriptors() {
         .concat_data_file_parts(&other_target, &[first.clone(), second.clone()])
         .await
         .unwrap_err();
-    assert!(error.to_string().contains("Blob namespace"), "{error}");
+    assert!(error.to_string().contains("Blob target ID"), "{error}");
     assert!(
         !dataset
             .object_store
