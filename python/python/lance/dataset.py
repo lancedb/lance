@@ -3049,7 +3049,7 @@ class LanceDataset(pa.dataset.Dataset):
             where = str(where)
         return self._ds.update(updates, where, conflict_retries, retry_timeout)
 
-    def versions(self):
+    def versions(self) -> List[Version]:
         """
         Return all versions in this dataset.
         """
@@ -3221,6 +3221,7 @@ class LanceDataset(pa.dataset.Dataset):
         delete_unverified: bool = False,
         error_if_tagged_old_versions: bool = True,
         delete_rate_limit: Optional[int] = None,
+        versions: Optional[List[int]] = None,
     ) -> CleanupStats:
         """
         Cleans up old versions of the dataset.
@@ -3266,8 +3267,13 @@ class LanceDataset(pa.dataset.Dataset):
             deletions run at full speed. Set this to a positive integer to avoid
             hitting object store request rate limits (e.g. S3 HTTP 503 SlowDown).
             For example, ``delete_rate_limit=100`` limits to 100 operations/second.
+
+        versions: list[int], optional
+            Clean up only the specified dataset versions. The current version is
+            never removed, and tagged versions are still protected by
+            ``error_if_tagged_old_versions``.
         """
-        if older_than is None and retain_versions is None:
+        if older_than is None and retain_versions is None and versions is None:
             older_than = timedelta(days=14)
 
         return self._ds.cleanup_old_versions(
@@ -3276,6 +3282,7 @@ class LanceDataset(pa.dataset.Dataset):
             delete_unverified,
             error_if_tagged_old_versions,
             delete_rate_limit,
+            versions,
         )
 
     def explain_cleanup_old_versions(
@@ -3286,6 +3293,7 @@ class LanceDataset(pa.dataset.Dataset):
         delete_unverified: bool = False,
         error_if_tagged_old_versions: bool = True,
         delete_rate_limit: Optional[int] = None,
+        versions: Optional[List[int]] = None,
         include_files: bool = False,
         max_files: int = 1000,
     ) -> CleanupExplanation:
@@ -3313,6 +3321,9 @@ class LanceDataset(pa.dataset.Dataset):
             Accepted for parity with :meth:`cleanup_old_versions`; no deletes are
             issued by explain.
 
+        versions: list[int], optional
+            Explain cleanup only for the specified dataset versions.
+
         include_files: bool, default False
             If `True`, include candidate files in the explanation up to
             ``max_files`` entries. Aggregate stats always include all candidates.
@@ -3321,7 +3332,7 @@ class LanceDataset(pa.dataset.Dataset):
             Maximum number of candidate files to include when ``include_files``
             is `True`.
         """
-        if older_than is None and retain_versions is None:
+        if older_than is None and retain_versions is None and versions is None:
             older_than = timedelta(days=14)
         if max_files <= 0:
             raise ValueError("max_files must be positive")
@@ -3332,6 +3343,7 @@ class LanceDataset(pa.dataset.Dataset):
             delete_unverified,
             error_if_tagged_old_versions,
             delete_rate_limit,
+            versions,
             include_files,
             max_files,
         )
@@ -4316,7 +4328,7 @@ class LanceDataset(pa.dataset.Dataset):
         Optional parameters for `IVF_RQ`:
 
             - num_bits
-                The number of bits for RQ (Rabit Quantization). Default is 1.
+                The number of bits for RQ (Rabit Quantization). Default is 5.
 
         Optional parameters for `IVF_HNSW_*`:
             max_level
@@ -7250,7 +7262,7 @@ class LanceScanner(pa.dataset.Scanner):
         """
         return self.to_table()[:num_rows]
 
-    def count_rows(self):
+    def count_rows(self) -> int:
         """Count rows matching the scanner filter.
 
         Returns
@@ -7460,7 +7472,7 @@ class DatasetOptimizer:
         }
         return Compaction.execute(self._dataset, opts)
 
-    def optimize_indices(self, **kwargs):
+    def optimize_indices(self, **kwargs) -> None:
         """Optimizes index performance.
 
         As new data arrives it is not added to existing indexes automatically.
@@ -7468,10 +7480,10 @@ class DatasetOptimizer:
         an expensive unindexed search on the new data.  As the amount of new
         unindexed data grows this can have an impact on search latency.
         This function will add the new data to existing indexes, restoring the
-        performance.  This function does not retrain the index, it only assigns
-        the new data to existing partitions.  This means an update is much quicker
-        than retraining the entire index but may have less accuracy (especially
-        if the new data exhibits new patterns, concepts, or trends)
+        performance. By default, this function does not retrain the index, it only
+        assigns the new data to existing partitions. This means an update is much
+        quicker than retraining the entire index but may have less accuracy
+        (especially if the new data exhibits new patterns, concepts, or trends)
 
         Parameters
         ----------
@@ -7481,7 +7493,7 @@ class DatasetOptimizer:
         index_names: List[str], default None
             The names of the indices to optimize.
             If None, all indices will be optimized.
-        retrain: bool, default False, deprecated
+        retrain: bool, default False
             Whether to retrain the whole index.
             If true, the index will be retrained based on the current data,
             `num_indices_to_merge` will be ignored,
@@ -7489,7 +7501,7 @@ class DatasetOptimizer:
 
             This is useful when the data distribution has changed significantly,
             and we want to retrain the index to improve the search quality.
-            This would be faster than re-create the index from scratch.
+            This rebuilds the index from the source data and may be expensive.
         """
         self._dataset._ds.optimize_indices(**kwargs)
 

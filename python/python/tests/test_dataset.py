@@ -1734,6 +1734,24 @@ def test_cleanup_with_retain_versions(tmp_path: Path):
     assert ds.count_rows() == len(ds.to_table())
 
 
+def test_cleanup_specific_versions(tmp_path: Path):
+    base_dir = tmp_path / "cleanup_specific_versions"
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    lance.write_dataset(table, base_dir, mode="create")
+    time.sleep(0.05)
+    lance.write_dataset(table, base_dir, mode="overwrite")
+    time.sleep(0.05)
+    lance.write_dataset(table, base_dir, mode="overwrite")
+    time.sleep(0.05)
+    ds = lance.write_dataset(table, base_dir, mode="append")
+
+    assert [v["version"] for v in ds.versions()] == [1, 2, 3, 4]
+
+    stats = ds.cleanup_old_versions(versions=[2])
+    assert stats.old_versions == 1
+    assert [v["version"] for v in ds.versions()] == [1, 3, 4]
+
+
 def test_cleanup_with_older_than_and_retain_versions(tmp_path: Path):
     base_dir = tmp_path / "cleanup_policy"
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
@@ -2186,6 +2204,68 @@ def test_merge_with_commit(tmp_path: Path):
     tbl = dataset.to_table()
 
     assert tbl == expected
+
+
+@pytest.mark.parametrize(
+    ("delete_predicate", "expected_ids"),
+    [
+        pytest.param("id < 50", list(range(50, 150)), id="leading"),
+        pytest.param(
+            "id >= 50 AND id < 100",
+            list(range(50)) + list(range(100, 150)),
+            id="middle",
+        ),
+        pytest.param("id >= 100", list(range(100)), id="trailing"),
+    ],
+)
+def test_merge_columns_with_deleted_batch_commit(
+    tmp_path: Path, delete_predicate: str, expected_ids: list
+):
+    # A fully deleted read batch must still contribute its rows to the new data
+    # file, otherwise the fragment's data files disagree on the physical row
+    # count. The deleted run is placed at the start, middle, and end because the
+    # updater can only borrow a placeholder row from a batch that has live rows.
+    base_dir = tmp_path / "test"
+    table = pa.table({"id": range(150), "value": range(150)})
+    dataset = lance.write_dataset(table, base_dir, max_rows_per_file=200)
+
+    dataset.delete(delete_predicate)
+    assert dataset.count_rows() == 100
+
+    merged_frags = []
+    schema = None
+    for frag in dataset.get_fragments():
+        live_ids = frag.scanner(columns=["id"]).to_table()["id"].to_pylist()
+        right_table = pa.table(
+            {"merged": pa.array([row_id * 10 for row_id in live_ids], pa.int64())},
+            schema=pa.schema([pa.field("merged", pa.int64(), nullable=False)]),
+        )
+        merged, schema = frag.merge_columns(right_table, batch_size=50)
+        merged_frags.append(merged)
+
+    dataset = lance.LanceDataset.commit(
+        dataset.uri,
+        lance.LanceOperation.Merge(merged_frags, schema),
+        read_version=dataset.version,
+    )
+    dataset.validate()
+
+    assert dataset.to_table() == pa.table(
+        {
+            "id": expected_ids,
+            "value": expected_ids,
+            "merged": [row_id * 10 for row_id in expected_ids],
+        },
+        schema=pa.schema(
+            [
+                pa.field("id", pa.int64()),
+                pa.field("value", pa.int64()),
+                # The blanks written for the deleted rows are copies of a live row,
+                # so the merged column stays non-nullable end to end.
+                pa.field("merged", pa.int64(), nullable=False),
+            ]
+        ),
+    )
 
 
 def test_merge_with_schema_holes(tmp_path: Path):
@@ -5508,7 +5588,12 @@ def _write_overlay_file(
     )
 
 
-def test_data_overlay_dense(tmp_path: Path):
+@pytest.fixture
+def enable_unstable_data_overlay_files(monkeypatch):
+    monkeypatch.setenv("LANCE_ENABLE_UNSTABLE_DATA_OVERLAY_FILES", "1")
+
+
+def test_data_overlay_dense(tmp_path: Path, enable_unstable_data_overlay_files):
     base_dir = tmp_path / "test"
     table = pa.table(
         {
@@ -5540,7 +5625,7 @@ def test_data_overlay_dense(tmp_path: Path):
     assert result.column("id").to_pylist() == list(range(10))
 
 
-def test_data_overlay_newest_wins(tmp_path: Path):
+def test_data_overlay_newest_wins(tmp_path: Path, enable_unstable_data_overlay_files):
     base_dir = tmp_path / "test"
     table = pa.table(
         {
@@ -5594,7 +5679,9 @@ def test_data_overlay_newest_wins(tmp_path: Path):
     assert val[4] == 444  # only the older overlay covers offset 4
 
 
-def test_data_overlay_sparse_per_field(tmp_path: Path):
+def test_data_overlay_sparse_per_field(
+    tmp_path: Path, enable_unstable_data_overlay_files
+):
     base_dir = tmp_path / "test"
     table = pa.table(
         {
@@ -5634,7 +5721,9 @@ def test_data_overlay_sparse_per_field(tmp_path: Path):
     assert result.column("val").to_pylist()[2] == 20
 
 
-def test_data_overlay_round_trips_through_fragment_metadata(tmp_path: Path):
+def test_data_overlay_round_trips_through_fragment_metadata(
+    tmp_path: Path, enable_unstable_data_overlay_files
+):
     import json
 
     base_dir = tmp_path / "test"
@@ -5687,7 +5776,9 @@ def test_data_overlay_round_trips_through_fragment_metadata(tmp_path: Path):
     assert result.column("id").to_pylist() == list(range(10))
 
 
-def test_data_overlay_rejects_invalid_offsets(tmp_path: Path):
+def test_data_overlay_rejects_invalid_offsets(
+    tmp_path: Path, enable_unstable_data_overlay_files
+):
     base_dir = tmp_path / "test"
     table = pa.table({"val": pa.array([0, 1, 2], pa.int32())})
     dataset = lance.write_dataset(table, base_dir)
@@ -5729,7 +5820,9 @@ def test_data_overlay_rejects_invalid_offsets(tmp_path: Path):
         [[1, 1]],  # sparse, duplicate
     ],
 )
-def test_data_overlay_rejects_unsorted_offsets(tmp_path: Path, offsets):
+def test_data_overlay_rejects_unsorted_offsets(
+    tmp_path: Path, offsets, enable_unstable_data_overlay_files
+):
     # Offsets map positionally to value rows in data_file. A RoaringBitmap would
     # silently reorder/dedup them, so a non-ascending list must be rejected up
     # front rather than corrupting the row mapping.
