@@ -240,27 +240,57 @@ pub(crate) struct BlobIdAllocator {
 
 #[derive(Debug)]
 struct BlobIdAllocatorInner {
+    start_inclusive: u32,
     next: AtomicU32,
-    used: Mutex<HashSet<u32>>,
+    end_exclusive: Option<u32>,
+    state: Mutex<BlobIdAllocatorState>,
+}
+
+#[derive(Debug, Default)]
+struct BlobIdAllocatorState {
+    used: HashSet<u32>,
+    allocated: HashSet<u32>,
 }
 
 impl BlobIdAllocator {
     pub(crate) fn new(start: u32) -> Self {
         Self {
             inner: Arc::new(BlobIdAllocatorInner {
+                start_inclusive: start,
                 next: AtomicU32::new(start),
-                used: Mutex::new(HashSet::new()),
+                end_exclusive: None,
+                state: Mutex::new(BlobIdAllocatorState::default()),
             }),
         }
+    }
+
+    pub(crate) fn from_range(range: Range<u32>) -> Result<Self> {
+        if range.start == 0 || range.start >= range.end {
+            return Err(Error::invalid_input(format!(
+                "Blob ID range must be non-empty and start at 1 or greater, got {}..{}",
+                range.start, range.end
+            )));
+        }
+        Ok(Self {
+            inner: Arc::new(BlobIdAllocatorInner {
+                start_inclusive: range.start,
+                next: AtomicU32::new(range.start),
+                end_exclusive: Some(range.end),
+                state: Mutex::new(BlobIdAllocatorState::default()),
+            }),
+        })
     }
 
     pub(crate) fn next(&self) -> Result<u32> {
         loop {
             let id = self.inner.next.load(Ordering::Relaxed);
-            if id == u32::MAX {
-                return Err(Error::invalid_input(
-                    "Blob id allocator exhausted u32 id space",
-                ));
+            if id == u32::MAX || self.inner.end_exclusive.is_some_and(|end| id >= end) {
+                return Err(Error::invalid_input(match self.inner.end_exclusive {
+                    Some(end) => format!(
+                        "Blob ID range exhausted before allocating another sidecar; range ends at {end}"
+                    ),
+                    None => "Blob id allocator exhausted u32 id space".to_string(),
+                }));
             }
             if self
                 .inner
@@ -270,14 +300,58 @@ impl BlobIdAllocator {
             {
                 continue;
             }
-            let mut used =
-                self.inner.used.lock().map_err(|_| {
+            let mut state =
+                self.inner.state.lock().map_err(|_| {
                     Error::internal("Blob id allocator mutex was poisoned".to_string())
                 })?;
-            if used.insert(id) {
+            if state.used.insert(id) {
+                state.allocated.insert(id);
                 return Ok(id);
             }
         }
+    }
+
+    pub(crate) fn reserve(&self, id: u32) -> Result<()> {
+        if id < self.inner.start_inclusive || self.inner.end_exclusive.is_some_and(|end| id >= end)
+        {
+            return Err(Error::invalid_input(match self.inner.end_exclusive {
+                Some(end) => format!(
+                    "Blob ID {id} is outside allocator range {}..{end}",
+                    self.inner.start_inclusive
+                ),
+                None => format!(
+                    "Blob ID {id} is below allocator start {}",
+                    self.inner.start_inclusive
+                ),
+            }));
+        }
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| Error::internal("Blob id allocator mutex was poisoned".to_string()))?;
+        if state.allocated.contains(&id) {
+            return Err(Error::invalid_input(format!(
+                "Blob ID {id} was already allocated for a generated sidecar"
+            )));
+        }
+        state.used.insert(id);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn allocated_ids(&self) -> Result<Vec<u32>> {
+        let mut ids = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| Error::internal("Blob id allocator mutex was poisoned".to_string()))?
+            .allocated
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        Ok(ids)
     }
 }
 
@@ -1160,6 +1234,31 @@ mod tests {
         let waker = noop_waker();
         let mut context = Context::from_waker(&waker);
         assert!(future.as_mut().poll(&mut context).is_pending());
+    }
+
+    #[test]
+    fn part_blob_id_allocator_stops_at_lease_end() {
+        let allocator = BlobIdAllocator::from_range(7..8).unwrap();
+        assert_eq!(allocator.next().unwrap(), 7);
+        let error = allocator.next().unwrap_err();
+        assert!(error.to_string().contains("range ends at 8"), "{error}");
+        assert_eq!(allocator.allocated_ids().unwrap(), vec![7]);
+
+        let allocator = BlobIdAllocator::from_range(7..9).unwrap();
+        allocator.reserve(7).unwrap();
+        assert_eq!(allocator.next().unwrap(), 8);
+        assert_eq!(allocator.allocated_ids().unwrap(), vec![8]);
+    }
+
+    #[test]
+    fn part_blob_id_allocator_rejects_generated_id_reservations() {
+        let allocator = BlobIdAllocator::from_range(7..9).unwrap();
+        assert_eq!(allocator.next().unwrap(), 7);
+        let error = allocator.reserve(7).unwrap_err();
+        assert!(error.to_string().contains("already allocated"), "{error}");
+
+        allocator.reserve(8).unwrap();
+        allocator.reserve(8).unwrap();
     }
 
     #[test]
