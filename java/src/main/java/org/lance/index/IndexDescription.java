@@ -155,7 +155,8 @@ public final class IndexDescription {
   /**
    * Aggregate fragment coverage for this logical index.
    *
-   * @return coverage counts and bitmap size, or empty when fragment coverage is unknown
+   * @return coverage counts and bitmap size, or empty when fragment coverage is unknown or not
+   *     applicable, including for system indexes
    */
   public Optional<IndexFragmentCoverage> getFragmentCoverage() {
     return Optional.ofNullable(fragmentCoverage);

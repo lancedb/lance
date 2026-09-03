@@ -389,8 +389,9 @@ pub trait IndexDescription: Send + Sync {
 
     /// Returns aggregate fragment coverage for this logical index.
     ///
-    /// Returns `None` when any segment has no fragment bitmap, which is expected
-    /// for system indices and legacy index metadata with unknown coverage.
+    /// Returns `None` for system indices, whose bitmaps have index-specific
+    /// semantics, or when any segment has no fragment bitmap and coverage is
+    /// unknown.
     fn fragment_coverage(&self) -> Option<&IndexFragmentCoverage> {
         None
     }

@@ -1031,6 +1031,10 @@ mod tests {
             0,
             "a bitmap-less system index indexes zero rows"
         );
+        assert!(
+            mem_wal_desc.fragment_coverage().is_none(),
+            "system index fragment metadata does not represent data-index coverage"
+        );
         assert_eq!(
             descriptions.len(),
             2,

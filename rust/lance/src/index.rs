@@ -1495,7 +1495,9 @@ impl IndexDescriptionImpl {
         let mut missing_fragment_refs = 0u64;
         let mut indexed_fragments = RoaringBitmap::new();
         let mut fragment_bitmap_size_bytes = 0u64;
-        let mut has_fragment_coverage = true;
+        // System-index bitmaps have index-specific meanings (for example,
+        // fragment-reuse participation), not data-index coverage.
+        let reports_fragment_coverage = !is_system_index(example_metadata);
 
         for shard in &segments {
             let Some(fragment_bitmap) = shard.fragment_bitmap.as_ref() else {
@@ -1503,7 +1505,6 @@ impl IndexDescriptionImpl {
                 // missing bitmap means zero indexed rows. For a data index it
                 // means unknown coverage — reject rather than fabricate a count.
                 if is_system_index(shard) {
-                    has_fragment_coverage = false;
                     continue;
                 }
                 return Err(Error::index("Fragment bitmap is required for index description.  This index must be retrained to support this method.".to_string()));
@@ -1538,7 +1539,7 @@ impl IndexDescriptionImpl {
             "described index row coverage from fragment metadata"
         );
 
-        let fragment_coverage = if has_fragment_coverage {
+        let fragment_coverage = if reports_fragment_coverage {
             let current_fragments = fragment_rows.keys().copied().collect::<RoaringBitmap>();
             Some(IndexFragmentCoverage {
                 covered_fragment_count: indexed_fragments.intersection_len(&current_fragments),
