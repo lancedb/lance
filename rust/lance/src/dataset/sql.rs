@@ -294,9 +294,15 @@ pub struct SqlQuery {
 /// unsupported base type with `exec_err!`, and the analyzer wraps that in
 /// `Context`, so it would otherwise reach callers as an internal failure.
 ///
-/// Errors Lance itself raised reach DataFusion through `External` and already
-/// carry an accurate category — a scan that cannot read its index metadata is
-/// IO, not bad input — so those keep the category they came with.
+/// Only the execution category is re-classified. Every other category is either
+/// already accurate or describes a failure the caller did not cause: an
+/// unreachable object store is not a malformed query, and any other SQL would
+/// have hit it too.
+///
+/// Errors Lance itself raised reach DataFusion through `External` and keep the
+/// category they came with. Lance uses the execution category for its own
+/// internal failures as well — a spill file that cannot be created, a poisoned
+/// lock — and those are not bad input either.
 fn planning_error(error: DataFusionError) -> lance_core::Error {
     let raised_by_lance = matches!(error.find_root(), DataFusionError::External(_));
     let error = lance_core::Error::from(error);
@@ -304,7 +310,7 @@ fn planning_error(error: DataFusionError) -> lance_core::Error {
         return error;
     }
     match error {
-        error @ (lance_core::Error::Execution { .. } | lance_core::Error::IO { .. }) => {
+        error @ lance_core::Error::Execution { .. } => {
             lance_core::Error::invalid_input_source(Box::new(error))
         }
         error => error,
@@ -980,21 +986,44 @@ mod tests {
     }
 
     /// `LanceTableProvider::scan` runs during physical planning and reports
-    /// every Lance failure as `DataFusionError::External`, so storage that is
-    /// unreachable while planning must not be reported as a malformed query.
+    /// every Lance failure as `DataFusionError::External`. Lance raises
+    /// [`Error::Execution`] for its own internal failures, which is the one
+    /// category `planning_error` re-classifies, so these must be recognized as
+    /// Lance's own and left alone rather than blamed on the query.
     #[test]
     fn test_planning_error_keeps_lance_error_category() {
         let df_error = DataFusionError::Context(
             "while scanning".to_string(),
-            Box::new(DataFusionError::from(Error::io("object store unavailable"))),
+            Box::new(DataFusionError::from(Error::execution(
+                "failed to create spill file",
+            ))),
         );
 
         match planning_error(df_error) {
-            Error::IO { source, .. } => assert!(
-                source.to_string().contains("object store unavailable"),
-                "expected the original message, got: {source}"
+            Error::Execution { message, .. } => assert!(
+                message.contains("failed to create spill file"),
+                "expected the original message, got: {message}"
             ),
-            other => panic!("expected the original IO error, got {other:?}"),
+            other => panic!("expected the original execution error, got {other:?}"),
         }
+    }
+
+    /// A failure that is neither the caller's fault nor Lance's own — DataFusion
+    /// hitting a resource limit while planning — must not be reported as a
+    /// malformed query just because it surfaced during planning.
+    #[test]
+    fn test_planning_error_keeps_internal_datafusion_error() {
+        let df_error = DataFusionError::Context(
+            "while planning".to_string(),
+            Box::new(DataFusionError::ResourcesExhausted(
+                "failed to allocate memory".to_string(),
+            )),
+        );
+
+        let error = planning_error(df_error);
+        assert!(
+            !matches!(error, Error::InvalidInput { .. }),
+            "expected the error not to be blamed on the query, got {error:?}"
+        );
     }
 }
