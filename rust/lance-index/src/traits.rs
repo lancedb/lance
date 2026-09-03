@@ -297,6 +297,25 @@ pub enum PrewarmOptions {
     Fts(FtsPrewarmOptions),
 }
 
+/// Fragment coverage summary for a logical index.
+///
+/// A logical index can contain multiple physical segments. This summary unions
+/// their fragment bitmaps before comparing them with the dataset's current
+/// fragments, so fragment counts are not inflated by duplicate segment entries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexFragmentCoverage {
+    /// Number of current dataset fragments covered by the index.
+    pub covered_fragment_count: u64,
+    /// Number of fragments in the current dataset.
+    pub current_fragment_count: u64,
+    /// Number of current dataset fragments not covered by the index.
+    pub missing_fragment_count: u64,
+    /// Number of indexed fragments that are no longer in the current dataset.
+    pub stale_fragment_count: u64,
+    /// Serialized size of all physical segment fragment bitmaps in bytes.
+    pub fragment_bitmap_size_bytes: u64,
+}
+
 /// Additional information about an index
 ///
 /// Note that a single index might consist of multiple segments.  Each segment has its own
@@ -367,4 +386,12 @@ pub trait IndexDescription: Send + Sync {
     /// Returns `None` if file size information is not available for any segment
     /// (for backward compatibility with indices created before file tracking was added).
     fn total_size_bytes(&self) -> Option<u64>;
+
+    /// Returns aggregate fragment coverage for this logical index.
+    ///
+    /// Returns `None` when any segment has no fragment bitmap, which is expected
+    /// for system indices and legacy index metadata with unknown coverage.
+    fn fragment_coverage(&self) -> Option<&IndexFragmentCoverage> {
+        None
+    }
 }

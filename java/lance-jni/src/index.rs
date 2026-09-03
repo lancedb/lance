@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::traits::{IntoJava, export_vec};
 use jni::JNIEnv;
 use jni::objects::{JObject, JValue};
@@ -45,10 +45,35 @@ impl IntoJava for &Arc<dyn IndexDescription> {
         } else {
             JObject::null()
         };
+        let fragment_coverage = if let Some(coverage) = self.fragment_coverage() {
+            let covered_fragment_count =
+                u64_to_jlong(coverage.covered_fragment_count, "covered fragment count")?;
+            let current_fragment_count =
+                u64_to_jlong(coverage.current_fragment_count, "current fragment count")?;
+            let missing_fragment_count =
+                u64_to_jlong(coverage.missing_fragment_count, "missing fragment count")?;
+            let stale_fragment_count =
+                u64_to_jlong(coverage.stale_fragment_count, "stale fragment count")?;
+            let fragment_bitmap_size_bytes =
+                u64_to_jlong(coverage.fragment_bitmap_size_bytes, "fragment bitmap size")?;
+            env.new_object(
+                "org/lance/index/IndexFragmentCoverage",
+                "(JJJJJ)V",
+                &[
+                    JValue::Long(covered_fragment_count),
+                    JValue::Long(current_fragment_count),
+                    JValue::Long(missing_fragment_count),
+                    JValue::Long(stale_fragment_count),
+                    JValue::Long(fragment_bitmap_size_bytes),
+                ],
+            )?
+        } else {
+            JObject::null()
+        };
 
         let j_index_desc = env.new_object(
             "org/lance/index/IndexDescription",
-            "(Ljava/lang/String;Ljava/util/List;Ljava/lang/String;Ljava/lang/String;JLjava/util/List;Ljava/lang/String;Ljava/lang/Long;)V",
+            "(Ljava/lang/String;Ljava/util/List;Ljava/lang/String;Ljava/lang/String;JLjava/util/List;Ljava/lang/String;Ljava/lang/Long;Lorg/lance/index/IndexFragmentCoverage;)V",
             &[
                 JValue::Object(&name),
                 JValue::Object(&field_ids_list),
@@ -58,10 +83,19 @@ impl IntoJava for &Arc<dyn IndexDescription> {
                 JValue::Object(&metadata_list),
                 JValue::Object(&details),
                 JValue::Object(&total_size_bytes),
+                JValue::Object(&fragment_coverage),
             ],
         )?;
         Ok(j_index_desc)
     }
+}
+
+fn u64_to_jlong(value: u64, description: &str) -> Result<i64> {
+    i64::try_from(value).map_err(|_| {
+        Error::runtime_error(format!(
+            "Index {description} {value} exceeds Java long range"
+        ))
+    })
 }
 
 impl IntoJava for &IndexMetadata {

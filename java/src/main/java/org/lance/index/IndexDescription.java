@@ -33,6 +33,7 @@ public final class IndexDescription {
   private final List<Index> metadata;
   private final String detailsJson;
   private final Long totalSizeBytes;
+  private final IndexFragmentCoverage fragmentCoverage;
 
   public IndexDescription(
       String name,
@@ -42,7 +43,7 @@ public final class IndexDescription {
       long rowsIndexed,
       List<Index> metadata,
       String detailsJson) {
-    this(name, fieldIds, typeUrl, indexType, rowsIndexed, metadata, detailsJson, null);
+    this(name, fieldIds, typeUrl, indexType, rowsIndexed, metadata, detailsJson, null, null);
   }
 
   public IndexDescription(
@@ -54,6 +55,28 @@ public final class IndexDescription {
       List<Index> metadata,
       String detailsJson,
       Long totalSizeBytes) {
+    this(
+        name,
+        fieldIds,
+        typeUrl,
+        indexType,
+        rowsIndexed,
+        metadata,
+        detailsJson,
+        totalSizeBytes,
+        null);
+  }
+
+  public IndexDescription(
+      String name,
+      List<Integer> fieldIds,
+      String typeUrl,
+      String indexType,
+      long rowsIndexed,
+      List<Index> metadata,
+      String detailsJson,
+      Long totalSizeBytes,
+      IndexFragmentCoverage fragmentCoverage) {
     this.name = Objects.requireNonNull(name, "name must not be null");
     this.fieldIds = Objects.requireNonNull(fieldIds, "fieldIds must not be null");
     this.typeUrl = Objects.requireNonNull(typeUrl, "typeUrl must not be null");
@@ -62,6 +85,7 @@ public final class IndexDescription {
     this.metadata = Objects.requireNonNull(metadata, "metadata must not be null");
     this.detailsJson = detailsJson;
     this.totalSizeBytes = totalSizeBytes;
+    this.fragmentCoverage = fragmentCoverage;
   }
 
   /** The logical name of the index. */
@@ -125,5 +149,14 @@ public final class IndexDescription {
    */
   public Optional<Long> getTotalSizeBytes() {
     return Optional.ofNullable(totalSizeBytes);
+  }
+
+  /**
+   * Aggregate fragment coverage for this logical index.
+   *
+   * @return coverage counts and bitmap size, or empty when fragment coverage is unknown
+   */
+  public Optional<IndexFragmentCoverage> getFragmentCoverage() {
+    return Optional.ofNullable(fragmentCoverage);
   }
 }
