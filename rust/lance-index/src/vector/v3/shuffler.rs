@@ -1144,11 +1144,13 @@ fn should_preload_offsets(expected_offsets: usize, max_bytes: usize) -> Result<b
     Ok(offsets_bytes <= max_bytes)
 }
 
-/// Writer-side prefix sums kept only while they fit in `max_bytes`.
+/// Writer-side prefix sums kept only while their allocated `Vec` capacity
+/// fits in `max_bytes`.
 ///
 /// Once a flush would exceed the bound the in-memory copy is dropped; the
-/// offsets sidecar remains the on-demand fallback. Checking before `extend`
-/// avoids a `Vec` realloc that could temporarily double resident capacity.
+/// offsets sidecar remains the on-demand fallback. Growth uses
+/// [`Vec::try_reserve_exact`] rather than amortized doubling, and the copy
+/// is dropped if the allocator still rounds capacity above `max_bytes`.
 struct BoundedWrittenOffsets {
     offsets: Option<Vec<u64>>,
     max_bytes: usize,
@@ -1176,11 +1178,21 @@ impl BoundedWrittenOffsets {
                     new_offsets.len()
                 ))
             })?;
-        if should_preload_offsets(new_len, self.max_bytes)? {
-            offsets.extend_from_slice(new_offsets);
-        } else {
+        if !should_preload_offsets(new_len, self.max_bytes)? {
             self.offsets = None;
+            return Ok(());
         }
+        // `Vec::extend` doubles capacity, which can allocate past `max_bytes`
+        // even when `len * size_of::<u64>()` still fits. Reserve exactly and
+        // drop if the allocator still rounds above the ceiling.
+        if new_len > offsets.capacity()
+            && (offsets.try_reserve_exact(new_offsets.len()).is_err()
+                || !should_preload_offsets(offsets.capacity(), self.max_bytes)?)
+        {
+            self.offsets = None;
+            return Ok(());
+        }
+        offsets.extend_from_slice(new_offsets);
         Ok(())
     }
 
@@ -2532,12 +2544,29 @@ mod tests {
         );
     }
 
+    fn assert_allocated_bytes_within_limit(written: &BoundedWrittenOffsets, max_bytes: usize) {
+        let Some(offsets) = written.offsets.as_ref() else {
+            return;
+        };
+        let allocated = offsets
+            .capacity()
+            .checked_mul(std::mem::size_of::<u64>())
+            .expect("capacity * size_of::<u64> overflows");
+        assert!(
+            allocated <= max_bytes,
+            "allocated {allocated} bytes exceeds cap {max_bytes} (len={}, capacity={})",
+            offsets.len(),
+            offsets.capacity()
+        );
+    }
+
     #[test]
     fn test_bounded_written_offsets_drops_copy_at_byte_limit() {
         let max_bytes = 2 * std::mem::size_of::<u64>();
         let mut written = BoundedWrittenOffsets::new(max_bytes);
         written.retain(&[1, 2]).unwrap();
         assert_eq!(written.offsets.as_deref(), Some(&[1, 2][..]));
+        assert_allocated_bytes_within_limit(&written, max_bytes);
 
         written.retain(&[3]).unwrap();
         assert!(
@@ -2551,6 +2580,31 @@ mod tests {
             "a dropped copy must stay dropped"
         );
         assert!(written.into_offsets().is_none());
+    }
+
+    #[test]
+    fn test_bounded_written_offsets_allocated_capacity_stays_within_limit() {
+        // 3 u64s = 24 bytes. A first retain of 2 typically allocates capacity 2.
+        // A second retain of 1 still fits by length (24 bytes) but amortized
+        // doubling would grow capacity to 4 = 32 bytes, past the ceiling.
+        let max_bytes = 3 * std::mem::size_of::<u64>();
+        let mut written = BoundedWrittenOffsets::new(max_bytes);
+        written.retain(&[1, 2]).unwrap();
+        assert_eq!(written.offsets.as_deref(), Some(&[1, 2][..]));
+        assert_allocated_bytes_within_limit(&written, max_bytes);
+
+        written.retain(&[3]).unwrap();
+        if let Some(offsets) = written.offsets.as_ref() {
+            assert_eq!(offsets.as_slice(), &[1, 2, 3]);
+        }
+        assert_allocated_bytes_within_limit(&written, max_bytes);
+
+        // Filling the cap in a single retain must also keep allocated bytes
+        // at or below the ceiling.
+        let mut written = BoundedWrittenOffsets::new(max_bytes);
+        written.retain(&[1, 2, 3]).unwrap();
+        assert_eq!(written.offsets.as_deref(), Some(&[1, 2, 3][..]));
+        assert_allocated_bytes_within_limit(&written, max_bytes);
     }
 
     #[tokio::test]
