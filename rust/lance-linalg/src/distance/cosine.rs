@@ -1424,9 +1424,9 @@ mod tests {
     use num_traits::AsPrimitive;
     use proptest::prelude::*;
 
-    /// A key that does not match `dimension`, or a batch that is not a whole
-    /// number of vectors, has to stop at the boundary. Covers the trait default
-    /// through `f64` and the `f32` override.
+    /// A key that does not match `dimension`, a batch that is not a whole number
+    /// of vectors, or a zero `dimension`, has to stop at the boundary. Covers the
+    /// trait default through `f64` and the `f32` override.
     #[rstest::rstest]
     #[case::key_longer_than_dimension(32, 64, 16, "must match dimension")]
     #[case::key_shorter_than_dimension(8, 64, 16, "must match dimension")]
@@ -1464,10 +1464,10 @@ mod tests {
             .unwrap_or_default()
     }
 
-    /// The free functions are the surface most callers reach, so pin them too
-    /// rather than only the trait methods they forward to.
+    /// `DistanceType::func()` hands out `cosine_distance`, so pin the free
+    /// function too rather than only the trait method it forwards to.
     #[test]
-    fn cosine_free_functions_reject_bad_input() {
+    fn cosine_distance_rejects_mismatched_lengths() {
         let long = [1.0f32; 16];
         let short = [1.0f32; 15];
         assert!(
@@ -1481,8 +1481,10 @@ mod tests {
     /// A mismatch has to stop at the boundary rather than reach a kernel that
     /// takes one length and reads both vectors with it.
     ///
-    /// The f32 and f64 cases assert the two lengths as well as `equal lengths`,
-    /// because `dot` emits that same message on some paths.
+    /// The f32 cases assert the two lengths as well as `equal lengths`, because
+    /// an f32 kernel tail hands `dot` a shorter pair and `dot` emits the same
+    /// message with different numbers. The f64 cases assert them too, where the
+    /// numbers are redundant, since no f64 tail calls `dot`.
     #[test]
     fn cosine_rejects_mismatched_lengths() {
         let long_f32 = [1.0f32; 16];
@@ -1532,9 +1534,9 @@ mod tests {
         }
 
         // Half precision asserts the contract only, not where it was enforced.
-        // With `fp16kernels` off, which is the default, `cosine_fast` here is
-        // `cosine_scalar`, and that hands `dot` the same two slices, so the entry
-        // assert and `dot`'s produce the same message.
+        // With `fp16kernels` off, which is the default, `cosine_fast` here routes
+        // to `cosine_scalar`, and that hands `dot` the same two slices, so the
+        // entry assert and `dot`'s produce the same message.
         let long_f16 = [f16::from_f32(1.0); 16];
         let short_f16 = [f16::from_f32(1.0); 15];
         let long_bf16 = [bf16::from_f32(1.0); 16];
