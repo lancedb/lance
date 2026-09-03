@@ -6,9 +6,11 @@ use crate::datafusion::LanceTableProvider;
 use crate::dataset::scanner::validate_batch_size;
 use crate::dataset::utils::SchemaAdapter;
 use arrow_array::RecordBatch;
+use datafusion::common::DataFusionError;
 use datafusion::dataframe::DataFrame;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::logical_expr::{Expr as LogicalExpr, LogicalPlan};
+use datafusion::physical_plan::execute_stream;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion::sql::{
     parser::Statement as DFStatement,
@@ -147,10 +149,15 @@ impl SqlQueryBuilder {
         register_functions(&ctx);
         let state = ctx.state();
         let dialect = state.config_options().sql_parser.dialect;
-        let statement = state.sql_to_statement(&self.sql, &dialect)?;
+        let statement = state
+            .sql_to_statement(&self.sql, &dialect)
+            .map_err(planning_error)?;
         let mut projected = statement.clone();
         let columns = [(self.with_row_id, ROW_ID), (self.with_row_addr, ROW_ADDR)];
-        let plan = state.statement_to_plan(statement).await?;
+        let plan = state
+            .statement_to_plan(statement)
+            .await
+            .map_err(planning_error)?;
         let plan = if safe_to_inject_system_columns(&plan, &columns)
             && project_system_columns(&mut projected, &columns)
         {
@@ -161,7 +168,10 @@ impl SqlQueryBuilder {
         } else {
             plan
         };
-        let df = ctx.execute_logical_plan(plan).await?;
+        let df = ctx
+            .execute_logical_plan(plan)
+            .await
+            .map_err(planning_error)?;
         Ok(SqlQuery::new(df))
     }
 }
@@ -277,17 +287,46 @@ pub struct SqlQuery {
     dataframe: DataFrame,
 }
 
+/// Classify a failure raised while DataFusion was building a plan.
+///
+/// A query that fails to plan is malformed input, but DataFusion does not
+/// report these under a consistent error variant: `get_field` rejects an
+/// unsupported base type with `exec_err!`, and the analyzer wraps that in
+/// `Context`, so it would otherwise reach callers as an internal failure.
+///
+/// Errors Lance itself raised reach DataFusion through `External` and already
+/// carry an accurate category — a scan that cannot read its index metadata is
+/// IO, not bad input — so those keep the category they came with.
+fn planning_error(error: DataFusionError) -> lance_core::Error {
+    let raised_by_lance = matches!(error.find_root(), DataFusionError::External(_));
+    let error = lance_core::Error::from(error);
+    if raised_by_lance {
+        return error;
+    }
+    match error {
+        error @ (lance_core::Error::Execution { .. } | lance_core::Error::IO { .. }) => {
+            lance_core::Error::invalid_input_source(Box::new(error))
+        }
+        error => error,
+    }
+}
+
 impl SqlQuery {
     pub fn new(dataframe: DataFrame) -> Self {
         Self { dataframe }
     }
 
     pub async fn into_stream(self) -> lance_core::Result<SendableRecordBatchStream> {
-        let exec_node = self
+        // Physical planning runs the analyzer, so a malformed query can still
+        // fail here rather than in `SqlQueryBuilder::build`. Keep it separate
+        // from execution so the two phases can be classified differently.
+        let task_ctx = Arc::new(self.dataframe.task_ctx());
+        let plan = self
             .dataframe
-            .execute_stream()
+            .create_physical_plan()
             .await
-            .map_err(lance_core::Error::from)?;
+            .map_err(planning_error)?;
+        let exec_node = execute_stream(plan, task_ctx).map_err(lance_core::Error::from)?;
         let schema = exec_node.schema();
         if SchemaAdapter::requires_logical_conversion(&schema) {
             let adapter = SchemaAdapter::new(schema);
@@ -876,5 +915,50 @@ mod tests {
         pretty_assertions::assert_eq!(batch.num_rows(), 1);
         pretty_assertions::assert_eq!(batch.num_columns(), 1);
         pretty_assertions::assert_eq!(batch.column(0).as_primitive::<Int32Type>().value(0), 1);
+    }
+
+    /// A malformed query is user error and must surface as [`Error::InvalidInput`]
+    /// so that bindings and servers can map it to a client error rather than a
+    /// generic failure.
+    ///
+    /// Neither case reaches that variant on its own: DataFusion reports an
+    /// unknown function as a `Plan` error wrapped in `Diagnostic`, and rejects
+    /// a subscript on a non-struct column with `exec_err!` wrapped in
+    /// `Context`. Both would otherwise be classified as internal failures.
+    #[rstest]
+    #[case::unknown_function("SELECT id FROM dataset WHERE no_such_function(data) = 'Alice'")]
+    #[case::subscript_on_json_column("SELECT id FROM dataset WHERE data['user'] = 'Alice'")]
+    #[tokio::test]
+    async fn test_sql_malformed_query_is_invalid_input(#[case] sql: &str) {
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            ARROW_EXT_NAME_KEY.to_string(),
+            ARROW_JSON_EXT_NAME.to_string(),
+        );
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("data", DataType::Utf8, true).with_metadata(metadata),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(StringArray::from(vec![Some(r#"{"user": "Alice"}"#)])),
+            ],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let ds = Dataset::write(reader, "memory://test_sql_malformed_query", None)
+            .await
+            .unwrap();
+
+        let result = async { ds.sql(sql).build().await?.into_batch_records().await }.await;
+        let Err(error) = result else {
+            panic!("expected `{sql}` to fail");
+        };
+        assert!(
+            matches!(error, Error::InvalidInput { .. }),
+            "expected InvalidInput, got {error:?}"
+        );
     }
 }
