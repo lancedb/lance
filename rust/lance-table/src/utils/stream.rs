@@ -388,6 +388,10 @@ struct CachedOutputSchema {
 }
 
 impl PrecomputedRowIdChunk {
+    fn end_offset(&self) -> usize {
+        self.logical_offset + self.values.len()
+    }
+
     fn slice(&self, logical_offset: usize, num_rows: usize) -> Option<Arc<UInt64Array>> {
         let offset_in_chunk = logical_offset.checked_sub(self.logical_offset)?;
         if offset_in_chunk + num_rows > self.values.len() {
@@ -398,6 +402,50 @@ impl PrecomputedRowIdChunk {
         }
         Some(Arc::new(self.values.slice(offset_in_chunk, num_rows)))
     }
+}
+
+fn decode_row_id_chunk<const USE_DENSE_ROW_ID_EXPANSION: bool>(
+    sequence: &RowIdSequence,
+    cursor: &mut RowIdSequenceCursor,
+    params: &ReadBatchParams,
+    logical_offset: usize,
+    chunk_len: usize,
+) -> Result<PrecomputedRowIdChunk> {
+    let selection = params
+        .slice(logical_offset, chunk_len)
+        .unwrap()
+        .to_ranges()
+        .unwrap();
+    let values = match selection.as_slice() {
+        [range] if USE_DENSE_ROW_ID_EXPANSION => UInt64Array::from(
+            sequence
+                .select_dense_range_with_cursor(cursor, range.start as usize..range.end as usize),
+        ),
+        [range] => UInt64Array::from(
+            sequence.select_range_with_cursor(cursor, range.start as usize..range.end as usize),
+        ),
+        _ => sequence
+            .select_with_cursor(
+                cursor,
+                selection
+                    .iter()
+                    .flat_map(|range| range.start as usize..range.end as usize),
+            )
+            .collect::<UInt64Array>(),
+    };
+    if values.len() != chunk_len {
+        return Err(Error::corrupt_file_named(
+            "row ID metadata",
+            format!(
+                "decoded row ID chunk at selected offset {logical_offset} contains {} rows, but the selection requires {chunk_len} rows",
+                values.len()
+            ),
+        ));
+    }
+    Ok(PrecomputedRowIdChunk {
+        logical_offset,
+        values: Arc::new(values),
+    })
 }
 
 fn selected_row_count(params: &ReadBatchParams, total_num_rows: usize) -> usize {
@@ -661,48 +709,48 @@ fn wrap_with_row_id_and_delete_impl<const USE_DENSE_ROW_ID_EXPANSION: bool>(
                         return Ok(row_ids);
                     }
 
-                    let batches_per_chunk = ROW_ID_READ_AHEAD_ROWS.div_ceil(num_rows);
-                    let chunk_len = (num_rows * batches_per_chunk)
-                        .min(selected_rows.saturating_sub(logical_offset));
-                    let selection = config
-                        .params
-                        .slice(logical_offset, chunk_len)
-                        .unwrap()
-                        .to_ranges()
-                        .unwrap();
-                    let values = match selection.as_slice() {
-                        [range] if USE_DENSE_ROW_ID_EXPANSION => {
-                            UInt64Array::from(sequence.select_dense_range_with_cursor(
-                                cursor,
-                                range.start as usize..range.end as usize,
-                            ))
+                    let prefix = row_id_chunk.as_ref().and_then(|chunk| {
+                        let prefix_len = chunk.end_offset().checked_sub(logical_offset)?;
+                        if prefix_len == 0 {
+                            None
+                        } else {
+                            chunk.slice(logical_offset, prefix_len)
                         }
-                        [range] => UInt64Array::from(sequence.select_range_with_cursor(
-                            cursor,
-                            range.start as usize..range.end as usize,
-                        )),
-                        _ => sequence
-                            .select_with_cursor(
-                                cursor,
-                                selection
-                                    .iter()
-                                    .flat_map(|range| range.start as usize..range.end as usize),
-                            )
-                            .collect::<UInt64Array>(),
-                    };
-                    let chunk = PrecomputedRowIdChunk {
-                        logical_offset,
-                        values: Arc::new(values),
-                    };
-                    let row_ids = chunk.slice(logical_offset, num_rows).ok_or_else(|| {
+                    });
+                    let decode_offset = logical_offset
+                        + prefix
+                            .as_ref()
+                            .map(|row_ids| row_ids.len())
+                            .unwrap_or_default();
+                    let required_end = logical_offset + num_rows;
+                    let missing_rows = required_end.saturating_sub(decode_offset);
+                    let chunk_len = missing_rows
+                        .max(ROW_ID_READ_AHEAD_ROWS)
+                        .min(selected_rows.saturating_sub(decode_offset));
+                    let chunk = decode_row_id_chunk::<USE_DENSE_ROW_ID_EXPANSION>(
+                        sequence,
+                        cursor,
+                        &config.params,
+                        decode_offset,
+                        chunk_len,
+                    )?;
+                    let suffix = chunk.slice(decode_offset, missing_rows).ok_or_else(|| {
                         Error::corrupt_file_named(
                             "row ID metadata",
                             format!(
-                                "decoded row ID chunk at selected offset {logical_offset} contains {} rows, but the current batch requires {num_rows} rows",
+                                "decoded row ID chunk at selected offset {decode_offset} contains {} rows, but the current batch requires {missing_rows} more rows",
                                 chunk.values.len()
                             ),
                         )
                     })?;
+                    let row_ids = if let Some(prefix) = prefix {
+                        let mut values = Vec::with_capacity(num_rows);
+                        values.extend_from_slice(prefix.values());
+                        values.extend_from_slice(suffix.values());
+                        Arc::new(UInt64Array::from(values))
+                    } else {
+                        suffix
+                    };
                     row_id_chunk = Some(chunk);
                     Ok(row_ids)
                 })
@@ -1043,11 +1091,11 @@ mod tests {
             batch[ROW_ID].as_primitive::<UInt64Type>()
         }
         assert_eq!(
-            row_ids(&batches[63]).values().as_ptr(),
+            row_ids(&batches[62]).values().as_ptr(),
             row_ids(&batches[0])
                 .values()
                 .as_ptr()
-                .wrapping_add(63 * 1_025)
+                .wrapping_add(62 * 1_025)
         );
         assert_eq!(
             row_ids(&batches[68]).values().as_ptr(),
@@ -1133,8 +1181,95 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, lance_core::Error::CorruptFile { .. }));
         assert!(error.to_string().contains(
-            "decoded row ID chunk at selected offset 0 contains 5 rows, but the current batch requires 10 rows"
+            "decoded row ID chunk at selected offset 0 contains 5 rows, but the selection requires 10 rows"
         ));
+    }
+
+    #[tokio::test]
+    async fn test_truncated_stable_row_ids_with_unsorted_indices_returns_error() {
+        let tasks = (0..4).map(|_| ReadBatchTask {
+            num_rows: 1,
+            task: std::future::ready(Ok(
+                arrow_array::record_batch!(("x", Int32, vec![0])).unwrap()
+            ))
+            .boxed(),
+        });
+        let config = RowIdAndDeletesConfig {
+            params: ReadBatchParams::Indices(UInt32Array::from(vec![0, 5, 1, 2])),
+            with_row_id: true,
+            with_row_addr: false,
+            with_row_last_updated_at_version: false,
+            with_row_created_at_version: false,
+            deletion_vector: None,
+            row_id_sequence: Some(Arc::new(RowIdSequence::try_from_iter(0_u64..5).unwrap())),
+            last_updated_at_sequence: None,
+            created_at_sequence: None,
+            make_deletions_null: false,
+            total_num_rows: 6,
+        };
+
+        let error = super::wrap_with_row_id_and_delete(stream::iter(tasks).boxed(), 0, config)
+            .buffered(1)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap_err();
+        assert!(matches!(error, lance_core::Error::CorruptFile { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_stable_row_id_read_ahead_with_variable_task_boundaries() {
+        let total_rows = super::ROW_ID_READ_AHEAD_ROWS * 3 + 41;
+        let expected = (0_u64..)
+            .filter(|row_id| row_id % 17 != 0)
+            .take(total_rows)
+            .collect::<Vec<_>>();
+        let mut remaining = total_rows;
+        let mut use_short_task = true;
+        let tasks = std::iter::from_fn(move || {
+            if remaining == 0 {
+                return None;
+            }
+            let requested = if use_short_task { 32_768 } else { 32_769 };
+            use_short_task = !use_short_task;
+            let num_rows = remaining.min(requested);
+            remaining -= num_rows;
+            Some(ReadBatchTask {
+                num_rows: num_rows as u32,
+                task: std::future::ready(Ok(arrow_array::record_batch!((
+                    "x",
+                    Int32,
+                    vec![0; num_rows]
+                ))
+                .unwrap()))
+                .boxed(),
+            })
+        });
+        let config = RowIdAndDeletesConfig {
+            params: ReadBatchParams::RangeFull,
+            with_row_id: true,
+            with_row_addr: false,
+            with_row_last_updated_at_version: false,
+            with_row_created_at_version: false,
+            deletion_vector: None,
+            row_id_sequence: Some(Arc::new(
+                RowIdSequence::try_from_iter(expected.clone()).unwrap(),
+            )),
+            last_updated_at_sequence: None,
+            created_at_sequence: None,
+            make_deletions_null: false,
+            total_num_rows: total_rows as u32,
+        };
+
+        let actual = super::wrap_with_row_id_and_delete(stream::iter(tasks).boxed(), 0, config)
+            .buffered(3)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .iter()
+            .flat_map(|batch| batch[ROW_ID].as_primitive::<UInt64Type>().values())
+            .copied()
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
     }
 
     #[tokio::test]

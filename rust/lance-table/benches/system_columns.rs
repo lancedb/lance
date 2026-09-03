@@ -36,18 +36,35 @@ fn make_batch(batch_size: usize, has_payload: bool) -> RecordBatch {
     }
 }
 
-fn make_tasks(batch: RecordBatch, total_rows: usize, batch_size: usize) -> ReadBatchTaskStream {
-    let tasks = (0..total_rows).step_by(batch_size).map(move |offset| {
-        let num_rows = batch_size.min(total_rows - offset);
+fn make_tasks(
+    batch: RecordBatch,
+    total_rows: usize,
+    batch_size: usize,
+    variable_batches: bool,
+) -> ReadBatchTaskStream {
+    let mut offset = 0;
+    let mut use_short_batch = true;
+    let tasks = std::iter::from_fn(move || {
+        if offset == total_rows {
+            return None;
+        }
+        let requested = if variable_batches && use_short_batch {
+            batch_size.saturating_sub(1).max(1)
+        } else {
+            batch_size
+        };
+        use_short_batch = !use_short_batch;
+        let num_rows = requested.min(total_rows - offset);
+        offset += num_rows;
         let batch = if num_rows == batch.num_rows() {
             batch.clone()
         } else {
             batch.slice(0, num_rows)
         };
-        ReadBatchTask {
+        Some(ReadBatchTask {
             task: future::ready(Ok(batch)).boxed(),
             num_rows: num_rows as u32,
-        }
+        })
     });
     stream::iter(tasks).boxed()
 }
@@ -80,6 +97,9 @@ fn bench_stream_row_ids(c: &mut Criterion) {
         .map(|value| value.parse().unwrap())
         .unwrap_or(1_024_usize)
         .min(total_rows);
+    let variable_batches = std::env::var("BENCH_SYSTEM_VARIABLE_BATCHES")
+        .map(|value| value == "1")
+        .unwrap_or(false);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .build()
         .unwrap();
@@ -105,8 +125,9 @@ fn bench_stream_row_ids(c: &mut Criterion) {
                 } else {
                     "row_id"
                 };
-                let parameter =
-                    format!("holes_{hole_stride}/payload_{has_payload}/system_{system_columns}");
+                let parameter = format!(
+                    "holes_{hole_stride}/payload_{has_payload}/system_{system_columns}/variable_{variable_batches}"
+                );
                 group.bench_with_input(
                     BenchmarkId::new("shape", parameter),
                     &has_payload,
@@ -114,7 +135,12 @@ fn bench_stream_row_ids(c: &mut Criterion) {
                         b.iter_batched(
                             || {
                                 (
-                                    make_tasks(batch.clone(), total_rows, batch_size),
+                                    make_tasks(
+                                        batch.clone(),
+                                        total_rows,
+                                        batch_size,
+                                        variable_batches,
+                                    ),
                                     make_config(
                                         total_rows,
                                         sequence.clone(),
