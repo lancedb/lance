@@ -4662,6 +4662,7 @@ dependencies = [
  "rand 0.9.5",
  "rand_distr",
  "rand_xoshiro",
+ "rstest",
 ]
 
 [[package]]
@@ -4981,6 +4982,8 @@ dependencies = [
  "bytes",
  "lance-core",
  "lance-namespace-reqwest-client",
+ "serde",
+ "serde_json",
  "snafu",
 ]
 
@@ -5048,9 +5051,9 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace-reqwest-client"
-version = "0.11.1"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1d06b1fbb5d41f93bc652b61e2872af92e8a6c5f6b4ce8839a8ecfa05365d359"
+checksum = "d8d23e54b1634d5bbb434f8dd33dc3c05f6e58d876a9a27b3b4aef58ddbe11af"
 dependencies = [
  "reqwest 0.12.28",
  "serde",
