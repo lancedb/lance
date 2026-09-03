@@ -5,8 +5,9 @@
 
 use super::details::target_partition_size_from_details;
 use super::{
-    LogicalIvfView, derive_hnsw_params,
+    LogicalIvfView, derive_hnsw_params, has_unowned_fragment_rows,
     pq::{PQIndex, build_pq_model},
+    remap_for_owned_fragments,
     utils::{filter_finite_training_data, maybe_sample_training_data},
 };
 use super::{
@@ -2108,12 +2109,24 @@ impl RemapPageTask {
         reader: Arc<dyn Reader>,
         index: &IVFIndex,
         mapping: &RowAddrTranslator,
+        owned_fragments: Option<&RoaringBitmap>,
     ) -> Result<Self> {
         let mut page = index
             .sub_index
             .load(reader, self.offset, self.length as usize)
             .await?;
-        page.remap_streaming(mapping).await?;
+        let row_ids: Vec<u64> = page.row_ids().copied().collect();
+        let mapping = mapping.resolve(row_ids).await?;
+        let filtered_mapping;
+        let mapping = if let Some(owned_fragments) = owned_fragments
+            && has_unowned_fragment_rows(page.row_ids(), owned_fragments)
+        {
+            filtered_mapping = remap_for_owned_fragments(&mapping, page.row_ids(), owned_fragments);
+            &filtered_mapping
+        } else {
+            &mapping
+        };
+        page.remap(mapping).await?;
         self.page = Some(page);
         Ok(self)
     }
@@ -2169,8 +2182,13 @@ fn generate_remap_tasks(offsets: &[usize], lengths: &[u32]) -> Result<Vec<RemapP
 fn remap_boxed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
     mut builder: IvfIndexBuilder<S, Q>,
     mapping: &RowAddrTranslator,
+    owned_fragments: Option<&RoaringBitmap>,
 ) -> Pin<Box<impl Future<Output = Result<Vec<IndexFile>>> + Send + '_>> {
-    Box::pin(async move { builder.remap_streaming(mapping).await })
+    Box::pin(async move {
+        builder
+            .remap_streaming_with_ownership(mapping, owned_fragments)
+            .await
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2180,6 +2198,7 @@ pub(crate) async fn remap_index_file_v3(
     index: Arc<dyn VectorIndex>,
     mapping: &RowAddrTranslator,
     column: String,
+    owned_fragments: Option<&RoaringBitmap>,
 ) -> Result<Vec<IndexFile>> {
     let dataset = dataset.clone();
     let index_dir = dataset.indices_dir().join(new_uuid.to_string());
@@ -2192,6 +2211,7 @@ pub(crate) async fn remap_index_file_v3(
                         dataset, column, index_dir, index,
                     )?,
                     mapping,
+                    owned_fragments,
                 )
                 .await
             }
@@ -2201,6 +2221,7 @@ pub(crate) async fn remap_index_file_v3(
                         dataset, column, index_dir, index,
                     )?,
                     mapping,
+                    owned_fragments,
                 )
                 .await
             }
@@ -2215,6 +2236,7 @@ pub(crate) async fn remap_index_file_v3(
                     dataset, column, index_dir, index,
                 )?,
                 mapping,
+                owned_fragments,
             )
             .await
         }
@@ -2224,6 +2246,7 @@ pub(crate) async fn remap_index_file_v3(
                     dataset, column, index_dir, index,
                 )?,
                 mapping,
+                owned_fragments,
             )
             .await
         }
@@ -2233,6 +2256,7 @@ pub(crate) async fn remap_index_file_v3(
                     dataset, column, index_dir, index,
                 )?,
                 mapping,
+                owned_fragments,
             )
             .await
         }
@@ -2242,6 +2266,7 @@ pub(crate) async fn remap_index_file_v3(
                     dataset, column, index_dir, index,
                 )?,
                 mapping,
+                owned_fragments,
             )
             .await
         }
@@ -2251,6 +2276,7 @@ pub(crate) async fn remap_index_file_v3(
                     dataset, column, index_dir, index,
                 )?,
                 mapping,
+                owned_fragments,
             )
             .await
         }
@@ -2260,6 +2286,7 @@ pub(crate) async fn remap_index_file_v3(
                     dataset, column, index_dir, index,
                 )?,
                 mapping,
+                owned_fragments,
             )
             .await
         }
@@ -2269,6 +2296,7 @@ pub(crate) async fn remap_index_file_v3(
                     dataset, column, index_dir, index,
                 )?,
                 mapping,
+                owned_fragments,
             )
             .await
         }
@@ -2279,6 +2307,7 @@ pub(crate) async fn remap_index_file_v3(
                     dataset, column, index_dir, index,
                 )?,
                 mapping,
+                owned_fragments,
             )
             .await
         }
@@ -2288,6 +2317,7 @@ pub(crate) async fn remap_index_file_v3(
                     dataset, column, index_dir, index,
                 )?,
                 mapping,
+                owned_fragments,
             )
             .await
         }
@@ -2305,6 +2335,7 @@ pub(crate) async fn remap_index_file(
     name: String,
     column: String,
     transforms: Vec<pb::Transform>,
+    owned_fragments: Option<&RoaringBitmap>,
 ) -> Result<IndexFile> {
     let object_store = dataset.object_store.as_ref();
     let old_path = dataset
@@ -2330,7 +2361,7 @@ pub(crate) async fn remap_index_file(
     let tasks = generate_remap_tasks(&index.ivf.offsets, &index.ivf.lengths)?;
 
     let mut task_stream = stream::iter(tasks)
-        .map(|task| task.load_and_remap(reader.clone(), index, mapping))
+        .map(|task| task.load_and_remap(reader.clone(), index, mapping, owned_fragments))
         .buffered(object_store.io_parallelism());
 
     let mut ivf = IvfModel {
@@ -2630,11 +2661,27 @@ pub(crate) async fn merge_segments(
             })?,
         );
     }
-    merge_segments_with_row_filters(
+    merge_segments_inner(
         dataset.object_store.as_ref(),
         &dataset.indices_dir(),
         segments,
-        row_filters,
+        Some(row_filters),
+        lance_index::progress::noop_progress(),
+    )
+    .await
+}
+
+/// Merge staging segments whose remap already removed rows not owned by each
+/// source segment.
+pub(crate) async fn merge_remapped_segments(
+    dataset: &Dataset,
+    segments: Vec<TableIndexMetadata>,
+) -> Result<TableIndexMetadata> {
+    merge_segments_inner(
+        dataset.object_store.as_ref(),
+        &dataset.indices_dir(),
+        segments,
+        None,
         lance_index::progress::noop_progress(),
     )
     .await
@@ -2664,15 +2711,21 @@ pub(crate) async fn merge_segments_with_progress(
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    merge_segments_with_row_filters(object_store, indices_dir, segments, row_filters, progress)
-        .await
+    merge_segments_inner(
+        object_store,
+        indices_dir,
+        segments,
+        Some(row_filters),
+        progress,
+    )
+    .await
 }
 
-async fn merge_segments_with_row_filters(
+async fn merge_segments_inner(
     object_store: &ObjectStore,
     indices_dir: &Path,
     segments: Vec<TableIndexMetadata>,
-    row_filters: Vec<lance_index::scalar::OldIndexDataFilter>,
+    row_filters: Option<Vec<lance_index::scalar::OldIndexDataFilter>>,
     progress: Arc<dyn lance_index::progress::IndexBuildProgress>,
 ) -> Result<TableIndexMetadata> {
     if segments.is_empty() {
@@ -2712,7 +2765,7 @@ async fn merge_segments_with_row_filters(
         indices_dir,
         &final_dir,
         &segments,
-        &row_filters,
+        row_filters.as_deref(),
         None,
         progress,
     )
@@ -2740,7 +2793,7 @@ async fn merge_segments_to_dir(
     indices_dir: &Path,
     final_dir: &Path,
     segments: &[TableIndexMetadata],
-    row_filters: &[lance_index::scalar::OldIndexDataFilter],
+    row_filters: Option<&[lance_index::scalar::OldIndexDataFilter]>,
     _requested_index_type: Option<IndexType>,
     progress: Arc<dyn lance_index::progress::IndexBuildProgress>,
 ) -> Result<Vec<IndexFile>> {
@@ -2769,14 +2822,24 @@ async fn merge_segments_to_dir(
                 .join(INDEX_FILE_NAME)
         })
         .collect::<Vec<_>>();
-    let auxiliary_file = lance_index::vector::distributed::index_merger::merge_partial_vector_auxiliary_files_with_row_filters(
-        object_store,
-        &aux_paths,
-        final_dir,
-        row_filters,
-        progress.clone(),
-    )
-    .await?;
+    let auxiliary_file = if let Some(row_filters) = row_filters {
+        lance_index::vector::distributed::index_merger::merge_partial_vector_auxiliary_files_with_row_filters(
+            object_store,
+            &aux_paths,
+            final_dir,
+            row_filters,
+            progress.clone(),
+        )
+        .await?
+    } else {
+        lance_index::vector::distributed::index_merger::merge_partial_vector_auxiliary_files(
+            object_store,
+            &aux_paths,
+            final_dir,
+            progress.clone(),
+        )
+        .await?
+    };
     let index_file = write_root_vector_index_from_auxiliary(
         object_store,
         final_dir,
@@ -6346,6 +6409,7 @@ mod tests {
             INDEX_NAME.to_string(),
             WellKnownIvfPqData::COLUMN.to_string(),
             vec![],
+            None,
         )
         .await
         .unwrap();
