@@ -193,6 +193,7 @@ impl DatasetIndexRemapper {
                     .index_details
                     .as_ref()
                     .is_some_and(|details| details.type_url.ends_with("VectorIndexDetails"))
+                    || segment.fragment_bitmap.is_none()
             })
         {
             return Ok(None);
@@ -236,10 +237,9 @@ impl DatasetIndexRemapper {
             remapped_results.push(remapped);
         }
 
-        let merged = self
-            .dataset
-            .merge_existing_index_segments(remapped_segments)
-            .await?;
+        let merged =
+            crate::index::vector::ivf::merge_remapped_segments(&self.dataset, remapped_segments)
+                .await?;
         let merged_details = merged.index_details.as_ref().ok_or_else(|| {
             Error::internal(format!(
                 "Merged vector index {} is missing index details",

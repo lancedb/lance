@@ -4,7 +4,8 @@
 //! Vector Index for Fast Approximate Nearest Neighbor (ANN) Search
 //!
 
-use lance_core::utils::row_addr_remap::RowAddrRemap;
+use lance_core::utils::{address::RowAddress, row_addr_remap::RowAddrRemap};
+use roaring::RoaringBitmap;
 use std::sync::Arc;
 use std::{any::Any, collections::HashMap};
 
@@ -71,6 +72,39 @@ use crate::dataset::transaction::{Operation, Transaction};
 use crate::{Error, Result, dataset::Dataset, index::pb::vector_index_stage::Stage};
 
 pub const LANCE_VECTOR_INDEX: &str = "__lance_vector_index";
+
+/// Materialize the part of a row-address remap needed by one physical segment.
+///
+/// A segment may still contain rows from fragments it no longer owns. Those
+/// rows must be removed before its remapped output can be merged without the
+/// source segment's old fragment filter.
+fn remap_for_owned_fragments<'a>(
+    mapping: &RowAddrRemap,
+    row_addrs: impl IntoIterator<Item = &'a u64>,
+    owned_fragments: &RoaringBitmap,
+) -> RowAddrRemap {
+    RowAddrRemap::direct(
+        row_addrs
+            .into_iter()
+            .filter_map(|&row_addr| {
+                if owned_fragments.contains(RowAddress::from(row_addr).fragment_id()) {
+                    mapping.get(row_addr).map(|mapped| (row_addr, mapped))
+                } else {
+                    Some((row_addr, None))
+                }
+            })
+            .collect(),
+    )
+}
+
+fn has_unowned_fragment_rows<'a>(
+    row_addrs: impl IntoIterator<Item = &'a u64>,
+    owned_fragments: &RoaringBitmap,
+) -> bool {
+    row_addrs
+        .into_iter()
+        .any(|&row_addr| !owned_fragments.contains(RowAddress::from(row_addr).fragment_id()))
+}
 
 /// A materialized snapshot of one logical vector index and all of its segments.
 #[derive(Debug)]
@@ -1579,6 +1613,7 @@ pub(crate) async fn remap_vector_index(
     let old_index = dataset
         .open_vector_index(column, old_uuid, &NoOpMetricsCollector)
         .await?;
+    let owned_fragments = old_metadata.fragment_bitmap.as_ref();
 
     if let Some(ivf_index) = old_index.as_any().downcast_ref::<IVFIndex>() {
         let file = remap_index_file(
@@ -1594,6 +1629,7 @@ pub(crate) async fn remap_vector_index(
             // top stage is IVF and IVF does not support transforms between IVF and PQ.  This
             // will be fixed in the future.
             vec![],
+            owned_fragments,
         )
         .await?;
         Ok(vec![file])
@@ -1605,6 +1641,7 @@ pub(crate) async fn remap_vector_index(
             old_index,
             mapping,
             column.to_string(),
+            owned_fragments,
         )
         .await?;
         Ok(files)
@@ -2196,6 +2233,36 @@ mod tests {
     use lance_file::writer::FileWriterOptions;
     use lance_index::metrics::NoOpMetricsCollector;
     use lance_linalg::distance::MetricType;
+
+    #[test]
+    fn test_remap_for_owned_fragments_drops_stale_rows() {
+        let owned_moved = u64::from(RowAddress::new_from_parts(1, 0));
+        let owned_unchanged = u64::from(RowAddress::new_from_parts(1, 1));
+        let stale_moved = u64::from(RowAddress::new_from_parts(2, 0));
+        let stale_unchanged = u64::from(RowAddress::new_from_parts(3, 0));
+        let moved_owned_target = u64::from(RowAddress::new_from_parts(4, 0));
+        let moved_stale_target = u64::from(RowAddress::new_from_parts(4, 1));
+        let mapping = RowAddrRemap::direct(HashMap::from([
+            (owned_moved, Some(moved_owned_target)),
+            (stale_moved, Some(moved_stale_target)),
+        ]));
+
+        let filtered = remap_for_owned_fragments(
+            &mapping,
+            [
+                &owned_moved,
+                &owned_unchanged,
+                &stale_moved,
+                &stale_unchanged,
+            ],
+            &RoaringBitmap::from_iter([1]),
+        );
+
+        assert_eq!(filtered.get(owned_moved), Some(Some(moved_owned_target)));
+        assert_eq!(filtered.get(owned_unchanged), None);
+        assert_eq!(filtered.get(stale_moved), Some(None));
+        assert_eq!(filtered.get(stale_unchanged), Some(None));
+    }
 
     /// `open_index_file` skips the HEAD when the size is known and still falls
     /// back to a HEAD for older indices that did not record sizes. A HEAD is
