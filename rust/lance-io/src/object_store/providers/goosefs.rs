@@ -73,6 +73,31 @@ const STORAGE_OPTION_KEYS: &[&str] = &[
 #[derive(Default, Debug)]
 pub struct GooseFsStoreProvider;
 
+/// Parse the exponent of a scientific coefficient (`e10`, `E-3`, `e+02`).
+///
+/// Magnitudes that do not fit in `i32` saturate to `i32::MAX` / `i32::MIN`
+/// so a zero significand such as `0e9999999999` still evaluates to 0, while
+/// a non-zero significand overflows later in checked arithmetic.
+fn parse_decimal_exponent(s: &str) -> Option<i32> {
+    if s.is_empty() {
+        return None;
+    }
+    let (negative, digits) = if let Some(rest) = s.strip_prefix('+') {
+        (false, rest)
+    } else if let Some(rest) = s.strip_prefix('-') {
+        (true, rest)
+    } else {
+        (false, s)
+    };
+    if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    match digits.parse::<i32>() {
+        Ok(n) => Some(if negative { -n } else { n }),
+        Err(_) => Some(if negative { i32::MIN } else { i32::MAX }),
+    }
+}
+
 impl GooseFsStoreProvider {
     /// Reject GooseFS `storage_options` keys that match a canonical key
     /// case-insensitively but are not lowercase.
@@ -172,7 +197,9 @@ impl GooseFsStoreProvider {
     ///
     /// Accepted suffixes (case-insensitive): `b`, `k`/`kb`, `m`/`mb`,
     /// `g`/`gb`, `t`/`tb`, `p`/`pb`. A missing suffix means bytes. Fractional
-    /// coefficients such as `1.5MB` are accepted.
+    /// and scientific coefficients such as `1.5MB` or `1e3KB` are accepted
+    /// and converted with exact decimal arithmetic (truncated toward zero,
+    /// matching GooseFS `parseSpaceSize` without the `double` rounding fudge).
     fn parse_space_size(option_key: &str, value: &str) -> Result<u64> {
         let trimmed = value.trim();
         if trimmed.is_empty() {
@@ -216,8 +243,7 @@ impl GooseFsStoreProvider {
         };
 
         // Exact integer path. Digit-only coefficients that fail `u64` parsing
-        // have overflowed; do not retry them via `f64` (which cannot represent
-        // every integer above 2^53 and would saturate on `as u64`).
+        // have overflowed; do not retry them as decimals.
         if let Ok(n) = number.parse::<u64>() {
             return n.checked_mul(multiplier).ok_or_else(overflow);
         }
@@ -225,26 +251,122 @@ impl GooseFsStoreProvider {
             return Err(overflow());
         }
 
-        let coeff: f64 = number.parse().map_err(|_| {
+        Self::parse_decimal_times_unit(option_key, value, number, multiplier)
+    }
+
+    /// Parse a decimal or scientific coefficient and return `floor(coeff * multiplier)`.
+    ///
+    /// GooseFS `FormatUtils.parseSpaceSize` truncates toward zero after
+    /// `coeff * unit` in IEEE-754 `double`. That silently changes integers
+    /// above `2^53` (e.g. `9007199254740993.0` becomes `9007199254740992`).
+    /// This path keeps the same truncation semantics with checked decimal
+    /// arithmetic so every accepted configuration preserves its value.
+    fn parse_decimal_times_unit(
+        option_key: &str,
+        value: &str,
+        number: &str,
+        multiplier: u64,
+    ) -> Result<u64> {
+        let invalid_number = || {
             Error::invalid_input(format!(
                 "invalid {option_key} `{value}`: `{number}` is not a valid number"
             ))
-        })?;
-        if !coeff.is_finite() || coeff < 0.0 {
-            return Err(Error::invalid_input(format!(
-                "invalid {option_key} `{value}`: size must be a non-negative finite number"
-            )));
+        };
+        let overflow = || {
+            Error::invalid_input(format!(
+                "invalid {option_key} `{value}`: size overflows u64"
+            ))
+        };
+        let negative = || {
+            Error::invalid_input(format!(
+                "invalid {option_key} `{value}`: size must be a non-negative number"
+            ))
+        };
+
+        if number.starts_with('-') {
+            return Err(negative());
+        }
+        let s = number.strip_prefix('+').unwrap_or(number);
+        if s.is_empty() {
+            return Err(invalid_number());
         }
 
-        // Match GooseFS FormatUtils.parseSpaceSize: truncate (coeff * unit + 0.0001).
-        let bytes = coeff.mul_add(multiplier as f64, 0.0001);
-        // `u64::MAX` is not representable as `f64` and rounds up to `2^64`,
-        // which *is* exact. Reject anything that is not strictly below that
-        // boundary so the `as u64` conversion cannot saturate.
-        if !(bytes >= 0.0 && bytes < u64::MAX as f64) {
-            return Err(overflow());
+        let (mantissa, exp) = if let Some(e_idx) = s.find(['e', 'E']) {
+            let mantissa = &s[..e_idx];
+            let exp_str = &s[e_idx + 1..];
+            if mantissa.is_empty() {
+                return Err(invalid_number());
+            }
+            let exp = parse_decimal_exponent(exp_str).ok_or_else(invalid_number)?;
+            (mantissa, exp)
+        } else {
+            (s, 0i32)
+        };
+
+        let mut parts = mantissa.split('.');
+        let int_str = parts.next().unwrap_or("");
+        let frac_raw = parts.next();
+        if parts.next().is_some() {
+            return Err(invalid_number());
         }
-        Ok(bytes as u64)
+        if !int_str.chars().all(|c| c.is_ascii_digit()) {
+            return Err(invalid_number());
+        }
+        let frac_raw = match frac_raw {
+            Some(frac) if frac.chars().all(|c| c.is_ascii_digit()) => frac,
+            Some(_) => return Err(invalid_number()),
+            None => "",
+        };
+        if int_str.is_empty() && frac_raw.is_empty() {
+            return Err(invalid_number());
+        }
+        let frac_str = frac_raw.trim_end_matches('0');
+
+        let int_part: u128 = if int_str.is_empty() {
+            0
+        } else {
+            int_str.parse().map_err(|_| overflow())?
+        };
+        let frac_digits = u32::try_from(frac_str.len()).map_err(|_| overflow())?;
+        let frac_part: u128 = if frac_str.is_empty() {
+            0
+        } else {
+            frac_str.parse().map_err(|_| overflow())?
+        };
+
+        let significand = if frac_digits == 0 {
+            int_part
+        } else {
+            let pow10 = 10u128.checked_pow(frac_digits).ok_or_else(overflow)?;
+            int_part
+                .checked_mul(pow10)
+                .and_then(|v| v.checked_add(frac_part))
+                .ok_or_else(overflow)?
+        };
+        if significand == 0 {
+            return Ok(0);
+        }
+
+        // floor(significand * multiplier * 10^exp / 10^frac_digits)
+        let mut num = significand
+            .checked_mul(u128::from(multiplier))
+            .ok_or_else(overflow)?;
+        let scale = i64::from(frac_digits) - i64::from(exp);
+        if scale > 0 {
+            match u32::try_from(scale)
+                .ok()
+                .and_then(|s| 10u128.checked_pow(s))
+            {
+                Some(den) => num /= den,
+                None => num = 0,
+            }
+        } else if scale < 0 {
+            let raise = u32::try_from(scale.unsigned_abs()).map_err(|_| overflow())?;
+            let factor = 10u128.checked_pow(raise).ok_or_else(overflow)?;
+            num = num.checked_mul(factor).ok_or_else(overflow)?;
+        }
+
+        u64::try_from(num).map_err(|_| overflow())
     }
 
     fn resolve_space_size(
@@ -586,6 +708,10 @@ mod tests {
     #[case::suffix_mb("4MB", 4 * 1024 * 1024)]
     #[case::suffix_gb("1GB", 1024 * 1024 * 1024)]
     #[case::fractional_mb("1.5MB", 1_572_864)]
+    #[case::fractional_kb("2.5KB", 2560)]
+    #[case::scientific_kb("1e3KB", 1000 * 1024)]
+    #[case::leading_dot(".5KB", 512)]
+    #[case::truncate_toward_zero("1.9", 1)]
     #[case::trimmed("  4MB  ", 4 * 1024 * 1024)]
     fn test_parse_space_size_accepts_goosefs_suffixes(#[case] input: &str, #[case] expected: u64) {
         assert_eq!(
@@ -601,6 +727,7 @@ mod tests {
     #[case::unknown_suffix("4MiB")]
     #[case::si_mismatch_not_mib("4XB")]
     #[case::negative("-4MB")]
+    #[case::two_dots("1.2.3")]
     fn test_parse_space_size_rejects_invalid(#[case] input: &str) {
         let err = GooseFsStoreProvider::parse_space_size("goosefs_chunk_size", input).unwrap_err();
         let msg = err.to_string();
@@ -620,6 +747,7 @@ mod tests {
     #[case::integer_mul_overflow("16384PB")]
     #[case::fractional_mul_overflow("16384.0PB")]
     #[case::scientific_overflow("1e20")]
+    #[case::scientific_u64_max_plus_one("1.8446744073709551616e19")]
     fn test_parse_space_size_rejects_overflow(#[case] input: &str) {
         let err = GooseFsStoreProvider::parse_space_size("goosefs_chunk_size", input).unwrap_err();
         assert!(
@@ -643,6 +771,30 @@ mod tests {
             GooseFsStoreProvider::parse_space_size("goosefs_chunk_size", "18446744073709551615")
                 .unwrap(),
             u64::MAX
+        );
+        assert_eq!(
+            GooseFsStoreProvider::parse_space_size(
+                "goosefs_chunk_size",
+                "1.8446744073709551615e19"
+            )
+            .unwrap(),
+            u64::MAX
+        );
+    }
+
+    #[test]
+    fn test_parse_space_size_preserves_values_beyond_f64_precision() {
+        // 2^53+1 is not representable as f64. The previous `double` path
+        // silently converted `9007199254740993.0` to `9007199254740992`.
+        assert_eq!(
+            GooseFsStoreProvider::parse_space_size("goosefs_chunk_size", "9007199254740993.0")
+                .unwrap(),
+            9007199254740993
+        );
+        assert_eq!(
+            GooseFsStoreProvider::parse_space_size("goosefs_chunk_size", "9007199254740993.0b")
+                .unwrap(),
+            9007199254740993
         );
     }
 
