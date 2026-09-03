@@ -116,7 +116,8 @@ public final class IndexDescription {
   /**
    * Per-segment metadata objects for this index.
    *
-   * <p>Each entry corresponds to a single {@link Index} segment in the manifest.
+   * <p>Each entry corresponds to a single {@link Index} segment in the manifest. The list is empty
+   * for descriptions returned by {@code Dataset.describeIndexSummaries}.
    */
   public List<Index> getMetadata() {
     return metadata;

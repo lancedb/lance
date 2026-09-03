@@ -2292,6 +2292,22 @@ public class DatasetTest {
         assertTrue(coverage.getFragmentBitmapSizeBytes() > 0);
         assertEquals(1.0, coverage.getCoverageRatio().orElseThrow(AssertionError::new));
 
+        List<IndexDescription> summaries = dataset.describeIndexSummaries(criteria);
+        assertEquals(1, summaries.size());
+        IndexDescription summary = summaries.get(0);
+        assertEquals(desc.getName(), summary.getName());
+        assertEquals(desc.getRowsIndexed(), summary.getRowsIndexed());
+        assertEquals(desc.getTotalSizeBytes(), summary.getTotalSizeBytes());
+        assertTrue(summary.getSegments().isEmpty());
+        IndexFragmentCoverage summaryCoverage =
+            summary.getFragmentCoverage().orElseThrow(AssertionError::new);
+        assertEquals(coverage.getCoveredFragmentCount(), summaryCoverage.getCoveredFragmentCount());
+        assertEquals(coverage.getCurrentFragmentCount(), summaryCoverage.getCurrentFragmentCount());
+        assertEquals(coverage.getMissingFragmentCount(), summaryCoverage.getMissingFragmentCount());
+        assertEquals(coverage.getStaleFragmentCount(), summaryCoverage.getStaleFragmentCount());
+        assertEquals(
+            coverage.getFragmentBitmapSizeBytes(), summaryCoverage.getFragmentBitmapSizeBytes());
+
         descriptions = dataset.describeIndices();
         assertEquals(2, descriptions.size(), "Expected exactly one matching index");
         for (IndexDescription indexDesc : descriptions) {
