@@ -72,18 +72,25 @@ pub fn load_row_id_sequences<'a>(
 }
 
 pub async fn get_row_id_index(dataset: &Dataset) -> Result<Option<Arc<RowIdIndex>>> {
-    if dataset.manifest.uses_stable_row_ids() {
-        let key = RowIdIndexKey {
-            version: dataset.manifest.version,
-        };
-        let index = dataset
-            .metadata_cache
-            .get_or_insert_with_key(key, || load_row_id_index(dataset))
-            .await?;
-        Ok(Some(index))
-    } else {
-        Ok(None)
+    if !dataset.manifest.uses_stable_row_ids() {
+        return Ok(None);
     }
+    // The cache is shared by every dataset opened at this URI, and one dropped
+    // and recreated there restarts at version 1. Without a token for this
+    // manifest generation a cached index could be the old generation's, so
+    // build a private one instead of sharing.
+    let Some(e_tag) = dataset.manifest_location.e_tag.as_deref() else {
+        return Ok(Some(Arc::new(load_row_id_index(dataset).await?)));
+    };
+    let key = RowIdIndexKey {
+        version: dataset.manifest.version,
+        e_tag: Some(e_tag),
+    };
+    let index = dataset
+        .metadata_cache
+        .get_or_insert_with_key(key, || load_row_id_index(dataset))
+        .await?;
+    Ok(Some(index))
 }
 
 /// Map a set of physical row addresses to their stable row ids
@@ -230,9 +237,9 @@ async fn row_addrs_to_row_ids_impl(
 /// memory alone, so its cache charge is exact and it stays cached whenever it
 /// fits; reading them through the sequence cache instead would charge each
 /// sequence twice and leave a large table's index too heavy to keep. A scan
-/// that needs a sequence still caches its own copy under `RowIdSequenceKey`:
-/// that key carries the fragment's content identity, while `RowIdIndexKey` is
-/// scoped by version alone, so the index cannot stand in for it.
+/// that needs a sequence still caches its own copy under `RowIdSequenceKey`,
+/// keyed by the fragment's content; the index is keyed by manifest generation
+/// and cannot stand in for it.
 async fn load_row_id_index(dataset: &Dataset) -> Result<RowIdIndex> {
     // A `for` loop rather than `map`: a closure returning a future that borrows
     // its argument trips the higher-ranked lifetime check on the outer future.
@@ -418,6 +425,35 @@ mod test {
         assert_eq!(
             session.metadata_cache_stats().await.num_entries,
             entries_before + 2
+        );
+    }
+
+    #[tokio::test]
+    async fn test_row_id_index_is_not_shared_without_a_generation_token() {
+        let batch = sequence_batch(0..10);
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+        let write_params = WriteParams {
+            enable_stable_row_ids: true,
+            ..Default::default()
+        };
+        let mut dataset = Dataset::write(reader, "memory://", Some(write_params))
+            .await
+            .unwrap();
+        // Without an e-tag the version-only key could alias a dataset recreated
+        // at the same URI, so the index must be built privately, never cached.
+        dataset.manifest_location.e_tag = None;
+        let session = dataset.session();
+        let entries_before = session.metadata_cache_stats().await.num_entries;
+        let first = get_row_id_index(&dataset).await.unwrap().unwrap();
+        let second = get_row_id_index(&dataset).await.unwrap().unwrap();
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert_eq!(
+            session.metadata_cache_stats().await.num_entries,
+            entries_before
+        );
+        assert_eq!(
+            second.get(9).unwrap(),
+            Some(RowAddress::new_from_parts(0, 9))
         );
     }
 
@@ -616,6 +652,15 @@ mod test {
         assert_eq!(
             sequence.iter().collect::<Vec<_>>(),
             (0..60).collect::<Vec<_>>()
+        );
+
+        // The same goes for the index: row id 60 exists only in the dropped
+        // generation, whose index is still in the session cache.
+        let index = get_row_id_index(&dataset).await.unwrap().unwrap();
+        assert!(index.get(60).unwrap().is_none());
+        assert_eq!(
+            index.get(59).unwrap(),
+            Some(RowAddress::new_from_parts(0, 59))
         );
     }
 
