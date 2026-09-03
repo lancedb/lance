@@ -2533,6 +2533,18 @@ impl MaterializedBlobBatch {
         })
     }
 
+    /// Split the batch into chunks of at most `max_bytes` array memory.
+    ///
+    /// Reservations are not carried over to the chunks; the byte budget itself
+    /// bounds the output size.
+    pub(crate) fn split_by_bytes(self, max_bytes: usize) -> Result<Vec<Self>> {
+        let chunks = split_batch_by_bytes(self.batch, max_bytes)?
+            .into_iter()
+            .map(Self::unreserved)
+            .collect::<Vec<_>>();
+        Ok(chunks)
+    }
+
     pub(crate) fn into_batch(self) -> RecordBatch {
         self.batch
     }
@@ -3521,6 +3533,50 @@ pub async fn materialize_blob_v2_binary_batch(
             .await?
             .into_batch(),
     )
+}
+
+/// Split `batch` into row-aligned chunks whose total array memory size is at
+/// most `max_bytes`.
+///
+/// The split estimates chunk boundaries from average bytes per row and then
+/// recursively re-checks each deep-copied slice. Because `RecordBatch::slice`
+/// shares backing buffers, each slice is deep-copied so that
+/// `get_array_memory_size` reflects the true chunk size. Splitting stops when
+/// a chunk is within budget or contains a single indivisible row.
+pub fn split_batch_by_bytes(batch: RecordBatch, max_bytes: usize) -> Result<Vec<RecordBatch>> {
+    split_batch_by_bytes_recursive(batch, max_bytes)
+}
+
+fn split_batch_by_bytes_recursive(
+    batch: RecordBatch,
+    max_bytes: usize,
+) -> Result<Vec<RecordBatch>> {
+    if batch.num_rows() == 0 {
+        return Ok(Vec::new());
+    }
+    let total_bytes = batch.get_array_memory_size();
+    let num_rows = batch.num_rows();
+    if total_bytes <= max_bytes || num_rows == 1 {
+        return Ok(vec![batch]);
+    }
+    let bytes_per_row = total_bytes / num_rows;
+    let rows_per_chunk = (max_bytes / bytes_per_row.max(1)).max(1);
+    // Make sure we make progress: never take all rows in one slice.
+    let rows_per_chunk = rows_per_chunk.min(num_rows - 1).max(1);
+
+    let mut chunks = Vec::new();
+    let mut offset = 0;
+    while offset < num_rows {
+        let rows = (offset + rows_per_chunk).min(num_rows) - offset;
+        let sliced = batch.slice(offset, rows);
+        // Deep-copy so that `get_array_memory_size()` reports the slice's own
+        // size rather than the parent buffer's size, allowing recursion to
+        // catch skewed rows that still exceed the budget.
+        let copied = lance_arrow::deepcopy::deep_copy_batch_sliced(&sliced)?;
+        chunks.extend(split_batch_by_bytes_recursive(copied, max_bytes)?);
+        offset += rows;
+    }
+    Ok(chunks)
 }
 
 pub fn materialize_blob_v2_binary_batch_with_context<'a>(
@@ -8675,5 +8731,77 @@ mod tests {
             3,
             "write-param override should force one pack file per blob: {blob_ids:?}"
         );
+    }
+
+    #[test]
+    fn test_split_batch_by_bytes_skewed_rows() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "data",
+            DataType::LargeBinary,
+            false,
+        )]));
+        let small = vec![0u8; 1];
+        let large = vec![0u8; 10_000];
+        let values: Vec<Option<&[u8]>> = (0..100)
+            .map(|_| Some(small.as_slice()))
+            .chain(std::iter::once(Some(large.as_slice())))
+            .collect();
+        let array = Arc::new(LargeBinaryArray::from_iter(values)) as ArrayRef;
+        let batch = RecordBatch::try_new(schema, vec![array]).unwrap();
+
+        let max_bytes = 200;
+        let chunks = super::split_batch_by_bytes(batch.clone(), max_bytes).unwrap();
+        let total_rows: usize = chunks.iter().map(|c| c.num_rows()).sum();
+        assert_eq!(total_rows, batch.num_rows());
+
+        for chunk in &chunks {
+            if chunk.num_rows() > 1 {
+                assert!(
+                    chunk.get_array_memory_size() <= max_bytes,
+                    "chunk with {} rows has {} bytes, max is {}",
+                    chunk.num_rows(),
+                    chunk.get_array_memory_size(),
+                    max_bytes
+                );
+            }
+        }
+    }
+
+    // Regression: multiple medium rows that individually fit the budget can
+    // still be grouped into a chunk above it by the average-based split; the
+    // recursive re-check must split them apart (bot reproducer: 10 rows × 900 B
+    // plus 90 rows × 1 B, budget 1024 B).
+    #[test]
+    fn test_split_batch_by_bytes_grouped_oversized_rows() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "data",
+            DataType::LargeBinary,
+            false,
+        )]));
+        let small = vec![0u8; 1];
+        let medium = vec![0u8; 900];
+        let values: Vec<Option<&[u8]>> = (0..10)
+            .map(|_| Some(medium.as_slice()))
+            .chain((0..90).map(|_| Some(small.as_slice())))
+            .collect();
+        let array = Arc::new(LargeBinaryArray::from_iter(values)) as ArrayRef;
+        let batch = RecordBatch::try_new(schema, vec![array]).unwrap();
+
+        let max_bytes = 1024;
+        let chunks = super::split_batch_by_bytes(batch.clone(), max_bytes).unwrap();
+        let total_rows: usize = chunks.iter().map(|c| c.num_rows()).sum();
+        assert_eq!(total_rows, batch.num_rows());
+
+        for chunk in &chunks {
+            if chunk.num_rows() > 1 {
+                assert!(
+                    chunk.get_array_memory_size() <= max_bytes,
+                    "chunk with {} rows has {} bytes, max is {}",
+                    chunk.num_rows(),
+                    chunk.get_array_memory_size(),
+                    max_bytes
+                );
+            }
+        }
     }
 }
