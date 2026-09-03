@@ -844,6 +844,21 @@ enum ShuffleOffsets {
     OnDemand(FileReader),
 }
 
+/// How the shuffle reader should obtain partition offsets.
+///
+/// A writer-side capacity/allocation fallback must stay on-demand through
+/// reader construction. Recomputing preload eligibility from logical length
+/// would retry `Vec` allocation after the writer already dropped its copy.
+enum OffsetPreloadSource {
+    /// Writer-side prefix sums. Allocated capacity is already bounded.
+    Writer(Vec<u64>),
+    /// Writer dropped its copy after a capacity or reservation fallback.
+    ForcedOnDemand,
+    /// Reopening files without a writer copy. Decide from the byte cap, but
+    /// sidecar preload itself must still be fallible and capacity-checked.
+    Sidecar,
+}
+
 impl TwoFileShuffleReader {
     pub(super) async fn try_new(
         object_store: Arc<ObjectStore>,
@@ -861,7 +876,7 @@ impl TwoFileShuffleReader {
             partition_counts,
             total_loss,
             MAX_PRELOADED_OFFSETS_BYTES,
-            None,
+            OffsetPreloadSource::Sidecar,
         )
         .await
     }
@@ -875,7 +890,7 @@ impl TwoFileShuffleReader {
         partition_counts: Vec<u64>,
         total_loss: f64,
         max_preloaded_offsets_bytes: usize,
-        written_offsets: Option<Vec<u64>>,
+        offset_source: OffsetPreloadSource,
     ) -> Result<Box<dyn ShuffleReader>> {
         if num_batches == 0 {
             return Ok(Box::new(EmptyReader));
@@ -917,33 +932,56 @@ impl TwoFileShuffleReader {
             ))
         })?;
         let offsets_path = output_dir.clone().join("shuffle_offsets.lance");
-        let offsets = if let Some(written_offsets) = written_offsets {
-            if written_offsets.len() != expected_offsets {
-                return Err(Error::invalid_input(format!(
-                    "writer produced {} offsets, expected num_batches={} * num_partitions={} = {}",
-                    written_offsets.len(),
-                    num_batches,
+        let offsets = match offset_source {
+            OffsetPreloadSource::Writer(written_offsets) => {
+                if written_offsets.len() != expected_offsets {
+                    return Err(Error::invalid_input(format!(
+                        "writer produced {} offsets, expected num_batches={} * num_partitions={} = {}",
+                        written_offsets.len(),
+                        num_batches,
+                        num_partitions,
+                        expected_offsets
+                    )));
+                }
+                let mut validator = ShuffleOffsetsValidator::new(
+                    expected_offsets,
                     num_partitions,
-                    expected_offsets
-                )));
+                    file_reader.num_rows(),
+                    &partition_counts,
+                    &offsets_path,
+                );
+                validator.push(&written_offsets)?;
+                validator.finish()?;
+                if should_preload_offsets(written_offsets.len(), max_preloaded_offsets_bytes)?
+                    && should_preload_offsets(
+                        written_offsets.capacity(),
+                        max_preloaded_offsets_bytes,
+                    )?
+                {
+                    // Prefer the prefix sums computed at flush time over a decode
+                    // of the ephemeral sidecar.
+                    ShuffleOffsets::Preloaded(written_offsets)
+                } else {
+                    // Writer-side copy exceeded the resident-memory bound. The
+                    // sidecar is still on disk; validate-and-stream it on demand.
+                    drop(written_offsets);
+                    load_shuffle_offsets_from_file(
+                        &scheduler,
+                        &offsets_path,
+                        expected_offsets,
+                        num_batches,
+                        num_partitions,
+                        file_reader.num_rows(),
+                        &partition_counts,
+                        false,
+                        max_preloaded_offsets_bytes,
+                    )
+                    .await?
+                }
             }
-            let mut validator = ShuffleOffsetsValidator::new(
-                expected_offsets,
-                num_partitions,
-                file_reader.num_rows(),
-                &partition_counts,
-                &offsets_path,
-            );
-            validator.push(&written_offsets)?;
-            validator.finish()?;
-            if should_preload_offsets(written_offsets.len(), max_preloaded_offsets_bytes)? {
-                // Prefer the prefix sums computed at flush time over a decode
-                // of the ephemeral sidecar.
-                ShuffleOffsets::Preloaded(written_offsets)
-            } else {
-                // Writer-side copy exceeded the resident-memory bound. The
-                // sidecar is still on disk; validate-and-stream it on demand.
-                drop(written_offsets);
+            OffsetPreloadSource::ForcedOnDemand => {
+                // The writer already fell back; do not recompute eligibility
+                // from logical length and retry a full preload.
                 load_shuffle_offsets_from_file(
                     &scheduler,
                     &offsets_path,
@@ -953,23 +991,26 @@ impl TwoFileShuffleReader {
                     file_reader.num_rows(),
                     &partition_counts,
                     false,
+                    max_preloaded_offsets_bytes,
                 )
                 .await?
             }
-        } else {
-            let should_preload_offsets =
-                should_preload_offsets(expected_offsets, max_preloaded_offsets_bytes)?;
-            load_shuffle_offsets_from_file(
-                &scheduler,
-                &offsets_path,
-                expected_offsets,
-                num_batches,
-                num_partitions,
-                file_reader.num_rows(),
-                &partition_counts,
-                should_preload_offsets,
-            )
-            .await?
+            OffsetPreloadSource::Sidecar => {
+                let should_preload_offsets =
+                    should_preload_offsets(expected_offsets, max_preloaded_offsets_bytes)?;
+                load_shuffle_offsets_from_file(
+                    &scheduler,
+                    &offsets_path,
+                    expected_offsets,
+                    num_batches,
+                    num_partitions,
+                    file_reader.num_rows(),
+                    &partition_counts,
+                    should_preload_offsets,
+                    max_preloaded_offsets_bytes,
+                )
+                .await?
+            }
         };
         let decoded_schema: Schema = file_reader.schema().as_ref().into();
         let estimated_row_bytes = estimate_decoded_row_bytes(&decoded_schema)?;
@@ -1144,6 +1185,24 @@ fn should_preload_offsets(expected_offsets: usize, max_bytes: usize) -> Result<b
     Ok(offsets_bytes <= max_bytes)
 }
 
+/// Allocate a Vec for `len` u64 offsets if both the logical size and the
+/// allocated capacity fit in `max_bytes`.
+///
+/// Returns `None` on reservation failure or allocator rounding past the
+/// ceiling so the caller can stay on-demand instead of panicking.
+fn try_allocate_preloaded_offsets(len: usize, max_bytes: usize) -> Result<Option<Vec<u64>>> {
+    if !should_preload_offsets(len, max_bytes)? {
+        return Ok(None);
+    }
+    let mut offsets = Vec::new();
+    if offsets.try_reserve_exact(len).is_err()
+        || !should_preload_offsets(offsets.capacity(), max_bytes)?
+    {
+        return Ok(None);
+    }
+    Ok(Some(offsets))
+}
+
 /// Writer-side prefix sums kept only while their allocated `Vec` capacity
 /// fits in `max_bytes`.
 ///
@@ -1196,8 +1255,11 @@ impl BoundedWrittenOffsets {
         Ok(())
     }
 
-    fn into_offsets(self) -> Option<Vec<u64>> {
-        self.offsets
+    fn into_offsets(self) -> OffsetPreloadSource {
+        match self.offsets {
+            Some(offsets) => OffsetPreloadSource::Writer(offsets),
+            None => OffsetPreloadSource::ForcedOnDemand,
+        }
     }
 }
 
@@ -1265,7 +1327,8 @@ async fn load_shuffle_offsets_from_file(
     num_partitions: usize,
     data_rows: u64,
     partition_counts: &[u64],
-    should_preload_offsets: bool,
+    preload: bool,
+    max_preloaded_offsets_bytes: usize,
 ) -> Result<ShuffleOffsets> {
     let offsets_reader = open_shuffle_offsets_reader(
         scheduler,
@@ -1275,7 +1338,11 @@ async fn load_shuffle_offsets_from_file(
         num_partitions,
     )
     .await?;
-    let mut offsets = should_preload_offsets.then(|| Vec::with_capacity(expected_offsets));
+    let mut offsets = if preload {
+        try_allocate_preloaded_offsets(expected_offsets, max_preloaded_offsets_bytes)?
+    } else {
+        None
+    };
     let mut validator = ShuffleOffsetsValidator::new(
         expected_offsets,
         num_partitions,
@@ -1328,8 +1395,12 @@ async fn load_shuffle_offsets_from_file(
     }
     validator.finish()?;
     Ok(match offsets {
-        Some(offsets) => ShuffleOffsets::Preloaded(offsets),
-        None => ShuffleOffsets::OnDemand(offsets_reader),
+        Some(offsets)
+            if should_preload_offsets(offsets.capacity(), max_preloaded_offsets_bytes)? =>
+        {
+            ShuffleOffsets::Preloaded(offsets)
+        }
+        _ => ShuffleOffsets::OnDemand(offsets_reader),
     })
 }
 
@@ -2202,7 +2273,7 @@ mod tests {
             vec![2, 1, 1, 3, 0],
             0.0,
             0,
-            None,
+            OffsetPreloadSource::Sidecar,
         )
         .await
         .unwrap();
@@ -2300,7 +2371,7 @@ mod tests {
             vec![1, 2, 1],
             0.0,
             0,
-            None,
+            OffsetPreloadSource::Sidecar,
         )
         .await
         .unwrap();
@@ -2322,7 +2393,7 @@ mod tests {
             vec![1, 2, 1],
             0.0,
             0,
-            Some(vec![1, 2, 2, 2, 3, 4]),
+            OffsetPreloadSource::Writer(vec![1, 2, 2, 2, 3, 4]),
         )
         .await
         .unwrap();
@@ -2364,6 +2435,65 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(window.partition_range, 0..1);
+    }
+
+    #[tokio::test]
+    async fn test_forced_on_demand_does_not_repreload_when_logical_size_fits() {
+        let dir = TempStrDir::default();
+        let output_dir = Path::from(dir.as_ref());
+        let reader = TwoFileShuffler::new(output_dir.clone(), 3)
+            .with_batch_size_bytes(1)
+            .shuffle(batches_to_stream(vec![
+                make_batch(&[0, 1], &[10, 20], None),
+                make_batch(&[1, 2], &[30, 40], None),
+            ]))
+            .await
+            .unwrap();
+        drop(reader);
+
+        // Logical table is 2 batches * 3 partitions * 8 bytes = 48 bytes, well
+        // under the default 256 MiB cap. ForcedOnDemand must still stay
+        // on-demand instead of retrying a full sidecar preload.
+        let forced = TwoFileShuffleReader::try_new_with_preload_limit(
+            Arc::new(ObjectStore::local()),
+            output_dir.clone(),
+            3,
+            2,
+            vec![1, 2, 1],
+            0.0,
+            MAX_PRELOADED_OFFSETS_BYTES,
+            OffsetPreloadSource::ForcedOnDemand,
+        )
+        .await
+        .unwrap();
+        let forced_plan = forced
+            .plan_partition_window(0, DEFAULT_PARTITION_WINDOW_BYTES)
+            .unwrap();
+        assert_eq!(
+            forced_plan.partition_range,
+            0..1,
+            "ForcedOnDemand must not re-preload from the sidecar"
+        );
+
+        let sidecar = TwoFileShuffleReader::try_new_with_preload_limit(
+            Arc::new(ObjectStore::local()),
+            output_dir,
+            3,
+            2,
+            vec![1, 2, 1],
+            0.0,
+            MAX_PRELOADED_OFFSETS_BYTES,
+            OffsetPreloadSource::Sidecar,
+        )
+        .await
+        .unwrap();
+        let sidecar_plan = sidecar
+            .plan_partition_window(0, DEFAULT_PARTITION_WINDOW_BYTES)
+            .unwrap();
+        assert!(
+            sidecar_plan.partition_range.end > 1,
+            "sidecar reopen with room under the cap should preload and coalesce"
+        );
     }
 
     #[test]
@@ -2544,6 +2674,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_try_allocate_preloaded_offsets_is_fallible_and_capacity_checked() {
+        let elem = std::mem::size_of::<u64>();
+        let allocated = try_allocate_preloaded_offsets(4, 4 * elem)
+            .unwrap()
+            .expect("logical size fits");
+        assert!(allocated.capacity() * elem <= 4 * elem);
+
+        assert!(
+            try_allocate_preloaded_offsets(5, 4 * elem)
+                .unwrap()
+                .is_none(),
+            "logical size above the cap must stay on-demand"
+        );
+    }
+
     fn assert_allocated_bytes_within_limit(written: &BoundedWrittenOffsets, max_bytes: usize) {
         let Some(offsets) = written.offsets.as_ref() else {
             return;
@@ -2579,7 +2725,10 @@ mod tests {
             written.offsets.is_none(),
             "a dropped copy must stay dropped"
         );
-        assert!(written.into_offsets().is_none());
+        assert!(matches!(
+            written.into_offsets(),
+            OffsetPreloadSource::ForcedOnDemand
+        ));
     }
 
     #[test]
