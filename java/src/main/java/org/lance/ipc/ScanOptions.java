@@ -600,7 +600,9 @@ public class ScanOptions {
      *
      * <p>Each slice is interpreted against the dataset snapshot used to create the scanner. When
      * {@link #fragmentIds(List)} is also set, both restrictions are applied. Slice order is not an
-     * output ordering contract; results follow the scanner's fragment and physical-row order.
+     * output ordering contract; results follow the scanner's fragment and physical-row order. Plain
+     * scans with fragment slices require V2 storage; legacy V1 storage throws {@link
+     * UnsupportedOperationException} when the scan is executed.
      *
      * @param fragmentSlices physical fragment slices to scan
      * @return Builder instance for method chaining.

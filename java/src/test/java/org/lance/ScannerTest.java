@@ -177,10 +177,10 @@ public class ScannerTest {
                 .fragmentSlices(slices)
                 .columns(Collections.singletonList("id"))
                 .filter("id >= 2")
-                .limit(4)
+                .limit(3)
                 .build();
         try (LanceScanner scanner = dataset.newScan(options)) {
-          assertEquals(Arrays.asList(2, 3, 3, 4), readIds(scanner));
+          assertEquals(Arrays.asList(2, 3, 3), readIds(scanner));
         }
 
         ScanOptions intersected =
@@ -225,6 +225,21 @@ public class ScannerTest {
                 .build();
         try (LanceScanner scanner = dataset.newScan(options)) {
           assertEquals(Arrays.asList(1, 3, 4, 5), readIds(scanner));
+        }
+
+        // Count-style scans request no user columns and count rows from the returned batches.
+        ScanOptions countOptions =
+            new ScanOptions.Builder(options)
+                .columns(Collections.emptyList())
+                .withRowId(true)
+                .build();
+        try (LanceScanner scanner = dataset.newScan(countOptions);
+            ArrowReader reader = scanner.scanBatches()) {
+          long rowCount = 0;
+          while (reader.loadNextBatch()) {
+            rowCount += reader.getVectorSchemaRoot().getRowCount();
+          }
+          assertEquals(4, rowCount);
         }
       }
     }
