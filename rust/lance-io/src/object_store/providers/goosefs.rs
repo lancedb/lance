@@ -89,6 +89,19 @@ fn site_file_has_master_addresses(path: &Path) -> bool {
     parse_properties_has_master(&content)
 }
 
+/// Parse `goosefs-site.properties` the same way goosefs-sdk 0.1.8 does, and
+/// report whether that parse would set a master from the file.
+///
+/// Syntax (SDK `PropertiesMap::parse`):
+/// - `#` / `!` comments and blank lines are skipped
+/// - separator is the first `=` if the line contains one, otherwise the first `:`
+/// - empty keys are skipped; empty values are kept so a later line can override
+/// - duplicate keys last-win
+///
+/// Master selection (SDK `into_goosefs_config`):
+/// - a non-empty `goosefs.master.rpc.addresses` list wins
+/// - otherwise `goosefs.master.hostname` if that key was present
+/// - an empty addresses value does *not* fall through to hostname
 fn parse_properties_has_master(content: &str) -> bool {
     let mut hostname: Option<&str> = None;
     let mut addresses: Option<&str> = None;
@@ -97,12 +110,15 @@ fn parse_properties_has_master(content: &str) -> bool {
         if line.is_empty() || line.starts_with('#') || line.starts_with('!') {
             continue;
         }
-        let Some((key, value)) = line.split_once('=') else {
+        // Prefer `=` when present, else `:`. Matching `find('=').or_else(find(':'))`
+        // rather than "first of either" keeps colon-form HA (`host:port` in the
+        // value) aligned with the pinned SDK parser.
+        let Some(sep_pos) = line.find('=').or_else(|| line.find(':')) else {
             continue;
         };
-        let key = key.trim();
-        let value = value.trim();
-        if value.is_empty() {
+        let key = line[..sep_pos].trim();
+        let value = line[sep_pos + 1..].trim();
+        if key.is_empty() {
             continue;
         }
         match key {
@@ -820,6 +836,24 @@ mod tests {
         );
     }
 
+    /// Colon-form HA is valid in goosefs-sdk 0.1.8 (`=` or `:`). Missing it
+    /// here would overlay the dummy URI and wipe the SDK-loaded HA list.
+    #[test]
+    #[serial(GOOSEFS_SITE_CONF)]
+    fn test_resolve_master_addr_site_ha_colon_form_suppresses_dummy_uri() {
+        with_site_properties(
+            "goosefs.master.rpc.addresses:172.31.5.10:9200,172.31.5.2:9200,172.31.5.11:9200\n",
+            || {
+                let addr = resolve(
+                    "goosefs://192.0.2.5:9999/lance-cosn/lance_qta/xxx.lance",
+                    StorageOptions(HashMap::new()),
+                )
+                .unwrap();
+                assert_eq!(addr, None);
+            },
+        );
+    }
+
     #[test]
     #[serial(GOOSEFS_SITE_CONF)]
     fn test_resolve_master_addr_site_ha_allows_uri_without_host() {
@@ -837,6 +871,19 @@ mod tests {
     #[serial(GOOSEFS_SITE_CONF)]
     fn test_resolve_master_addr_site_hostname_suppresses_uri() {
         with_site_properties("goosefs.master.hostname=goosefs-master\n", || {
+            let addr = resolve(
+                "goosefs://192.0.2.5:9999/data",
+                StorageOptions(HashMap::new()),
+            )
+            .unwrap();
+            assert_eq!(addr, None);
+        });
+    }
+
+    #[test]
+    #[serial(GOOSEFS_SITE_CONF)]
+    fn test_resolve_master_addr_site_hostname_colon_form_suppresses_uri() {
+        with_site_properties("goosefs.master.hostname:goosefs-master\n", || {
             let addr = resolve(
                 "goosefs://192.0.2.5:9999/data",
                 StorageOptions(HashMap::new()),
@@ -918,6 +965,26 @@ mod tests {
         ));
         assert!(parse_properties_has_master(
             "  goosefs.master.hostname = master.local  \n"
+        ));
+        // SDK accepts `:` as well as `=`; colon-form HA must not be missed.
+        assert!(parse_properties_has_master(
+            "goosefs.master.rpc.addresses:10.0.0.1:9200,10.0.0.2:9200\n"
+        ));
+        assert!(parse_properties_has_master(
+            "goosefs.master.hostname:goosefs-master\n"
+        ));
+        // Last-wins, including an empty later line clearing a colon-form HA list.
+        assert!(parse_properties_has_master(
+            "goosefs.master.rpc.addresses=10.0.0.9:9200\n\
+             goosefs.master.rpc.addresses:10.0.0.1:9200,10.0.0.2:9200\n"
+        ));
+        assert!(!parse_properties_has_master(
+            "goosefs.master.rpc.addresses:10.0.0.1:9200,10.0.0.2:9200\n\
+             goosefs.master.rpc.addresses=\n"
+        ));
+        // Empty addresses does not fall through to hostname (SDK if/else-if).
+        assert!(!parse_properties_has_master(
+            "goosefs.master.rpc.addresses=\ngoosefs.master.hostname=master.local\n"
         ));
     }
 
