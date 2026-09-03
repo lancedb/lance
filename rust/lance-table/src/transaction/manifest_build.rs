@@ -31,7 +31,7 @@ use crate::system_index::mem_wal::{
 };
 use crate::transaction::UpdateMode::{RewriteColumns, RewriteRows};
 use crate::transaction::row_version::resolve_update_version_metadata;
-use crate::transaction::update_map::{apply_update_map, validate_config_updates};
+use crate::transaction::update_map::apply_update_map;
 use crate::transaction::validate::merge_fragment_physically_rewritten;
 use crate::transaction::{
     CoverageIdentity, DataReplacementGroup, LogicalIndexSegments, Operation, ReadVersionState,
@@ -1422,9 +1422,6 @@ impl Transaction {
                 config_upsert_values: Some(tm),
                 ..
             } => {
-                validate_config_updates(
-                    tm.iter().map(|(key, value)| (key.as_str(), value.as_str())),
-                )?;
                 manifest.config_mut().extend(tm.clone());
             }
             Operation::UpdateConfig {
@@ -1434,14 +1431,6 @@ impl Transaction {
                 field_metadata_updates,
             } => {
                 if let Some(config_updates) = config_updates {
-                    validate_config_updates(config_updates.update_entries.iter().filter_map(
-                        |entry| {
-                            entry
-                                .value
-                                .as_deref()
-                                .map(|value| (entry.key.as_str(), value))
-                        },
-                    ))?;
                     let mut config = manifest.config.clone();
                     apply_update_map(&mut config, config_updates);
                     manifest.config = config;

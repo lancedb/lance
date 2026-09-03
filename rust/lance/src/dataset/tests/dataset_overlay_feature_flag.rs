@@ -395,44 +395,55 @@ async fn test_disable_racing_a_concurrent_overlay_is_rejected() {
 }
 
 #[tokio::test]
-async fn test_unparsable_setting_is_rejected_at_write() {
-    let (_test_dir, mut dataset) = create_base_dataset().await;
-    let error = dataset
+async fn test_setting_accepts_the_usual_boolean_spellings() {
+    let (_test_dir, mut dataset) = create_base_dataset_with(None).await;
+    dataset
         .update_config([(LANCE_OVERLAYS_ENABLED.to_string(), "yes".to_string())])
         .await
-        .unwrap_err();
-    assert!(
-        error.to_string().contains("must be \"true\" or \"false\""),
-        "unexpected error: {error}"
+        .unwrap();
+    assert!(dataset.manifest.overlays_enabled());
+
+    dataset
+        .update_config([(LANCE_OVERLAYS_ENABLED.to_string(), "off".to_string())])
+        .await
+        .unwrap();
+    assert!(!dataset.manifest.overlays_enabled());
+}
+
+#[tokio::test]
+async fn test_unrecognized_setting_falls_back_instead_of_wedging() {
+    // A value that is not a boolean is stored verbatim and read as unset. It must
+    // not read as `false`: on a dataset that already carries overlays that would
+    // trip the "disabled but overlaid" invariant on every later commit, including
+    // the compaction that would have cleared the overlays.
+    let (_test_dir, dataset) = create_base_dataset().await;
+    let mut dataset = commit_overlay(dataset, 0, 0, 1000).await;
+    dataset
+        .update_config([(LANCE_OVERLAYS_ENABLED.to_string(), "sometimes".to_string())])
+        .await
+        .unwrap();
+    assert_eq!(
+        dataset
+            .config()
+            .get(LANCE_OVERLAYS_ENABLED)
+            .map(String::as_str),
+        Some("sometimes")
+    );
+    assert!(dataset.manifest.overlays_enabled());
+    let dataset = commit_overlay(dataset, 0, 1, 1001).await;
+    assert_eq!(
+        dataset.get_fragment(0).unwrap().metadata().overlays.len(),
+        2
     );
 
-    // An overwrite writes config too, so it is gated the same way. Otherwise the
-    // dataset would end up with a value that silently resolves to the default.
-    let schema = dataset.schema().clone();
-    let read_version = dataset.version().version;
-    let error = Dataset::commit(
-        WriteDestination::Dataset(Arc::new(dataset)),
-        Operation::Overwrite {
-            fragments: vec![],
-            schema,
-            config_upsert_values: Some(HashMap::from([(
-                LANCE_OVERLAYS_ENABLED.to_string(),
-                "yes".to_string(),
-            )])),
-            initial_bases: None,
-        },
-        Some(read_version),
-        None,
-        None,
-        Arc::new(Default::default()),
-        false,
-    )
-    .await
-    .unwrap_err();
-    assert!(
-        error.to_string().contains("must be \"true\" or \"false\""),
-        "unexpected error: {error}"
-    );
+    // With no overlays to fall back on, the same value resolves to the library
+    // default rather than to "enabled".
+    let (_test_dir, mut dataset) = create_base_dataset_with(None).await;
+    dataset
+        .update_config([(LANCE_OVERLAYS_ENABLED.to_string(), "sometimes".to_string())])
+        .await
+        .unwrap();
+    assert!(!dataset.manifest.overlays_enabled());
 }
 
 #[tokio::test]

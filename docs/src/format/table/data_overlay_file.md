@@ -31,7 +31,7 @@ An overlay changes individual cells.
 ## Enabling overlays
 
 A dataset records whether writers may create overlays in the table config key
-`lance.overlays.enabled`, whose value is the string `true` or `false`. This is
+`lance.overlays.enabled`, whose value is a string spelling a boolean. This is
 distinct from feature flag 64: the flag reports that overlays **are present**,
 while the config key states that they **are permitted**. Keeping the two apart is
 what lets a dataset be overlay-enabled while holding no overlays, so a writer can
@@ -45,6 +45,12 @@ The key is resolved as follows:
    This keeps datasets written before the key existed writable.
 3. Otherwise the implementation's default applies. The default is currently
    *disabled* and is expected to become *enabled* in a future release.
+
+An implementation should accept the boolean spellings it accepts elsewhere, and
+must treat a value it does not recognize as *unset* — falling through to steps 2
+and 3 — rather than as `false`. Reading it as `false` would wedge a dataset that
+already carries overlays, since every later commit would then violate the rule
+below with no way to compact the overlays away.
 
 Because absence resolves to a default that is expected to change, a dataset that
 must not accumulate overlays should set the key to `false` explicitly rather than

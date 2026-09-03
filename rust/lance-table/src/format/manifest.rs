@@ -4,6 +4,7 @@
 use async_trait::async_trait;
 use chrono::prelude::*;
 use lance_core::deepsize::DeepSizeOf;
+use lance_core::utils::parse::str_is_truthy;
 use lance_file::datatypes::{Fields, FieldsWithMeta};
 use lance_file::version::{ConcreteFileVersion, stable_file_version};
 use lance_file::versions::v1::{
@@ -149,11 +150,17 @@ pub fn overlays_enabled_with(config: &HashMap<String, String>, has_overlays: boo
 
 /// Parse a [`LANCE_OVERLAYS_ENABLED`] value, returning `None` if it is not a
 /// recognized boolean.
+// TODO: collapse to `lance_core::utils::parse::str_to_bool` once #8675 lands; the
+// vocabulary here is that function's.
 pub fn parse_overlays_enabled(value: &str) -> Option<bool> {
-    match value.to_ascii_lowercase().as_str() {
-        "true" => Some(true),
-        "false" => Some(false),
-        _ => None,
+    const FALSY: [&str; 5] = ["0", "false", "off", "no", "n"];
+    let value = value.trim();
+    if str_is_truthy(value) {
+        Some(true)
+    } else if FALSY.iter().any(|falsy| value.eq_ignore_ascii_case(falsy)) {
+        Some(false)
+    } else {
+        None
     }
 }
 
@@ -565,9 +572,10 @@ impl Manifest {
     /// untouched) without locking pre-overlay readers out of a dataset that has no
     /// overlays in it yet.
     ///
-    /// An unparsable value is treated as unset rather than rejected here, so a bad
-    /// value cannot wedge every subsequent commit; writes of the key are validated at
-    /// commit time instead.
+    /// An unrecognized value is treated as unset rather than as `false`. Reading it
+    /// as `false` would wedge a dataset that already carries overlays: every
+    /// subsequent commit would trip the "disabled but overlaid" invariant, with no
+    /// way to compact the overlays away.
     // TODO: when a session-level default lands, resolution becomes
     // explicit config -> session default -> DEFAULT_OVERLAYS_ENABLED.
     pub fn overlays_enabled(&self) -> bool {
@@ -1707,15 +1715,18 @@ mod tests {
     #[case::explicit_false(Some("false"), false, false)]
     #[case::explicit_true_with_overlays(Some("true"), true, true)]
     #[case::case_insensitive(Some("TRUE"), false, true)]
+    // The wider truthy/falsy vocabulary, not just "true"/"false".
+    #[case::truthy_alias(Some("1"), false, true)]
+    #[case::falsy_alias(Some("off"), true, false)]
     // Unset falls back to the library default, except that a dataset already
     // carrying overlays counts as enabled -- that is what keeps datasets written
     // before this setting existed writable.
     #[case::unset_without_overlays(None, false, DEFAULT_OVERLAYS_ENABLED)]
     #[case::unset_with_overlays(None, true, true)]
-    // An unparsable value is treated as unset rather than as `false`, so a bad
+    // An unrecognized value is treated as unset rather than as `false`, so a bad
     // value cannot strand a dataset that already has overlays in it.
-    #[case::unparsable_with_overlays(Some("yes"), true, true)]
-    #[case::unparsable_without_overlays(Some(""), false, DEFAULT_OVERLAYS_ENABLED)]
+    #[case::unrecognized_with_overlays(Some("sometimes"), true, true)]
+    #[case::unrecognized_without_overlays(Some(""), false, DEFAULT_OVERLAYS_ENABLED)]
     fn test_overlays_enabled_resolution(
         #[case] configured: Option<&str>,
         #[case] has_overlays: bool,
@@ -1731,7 +1742,10 @@ mod tests {
     fn test_parse_overlays_enabled() {
         assert_eq!(parse_overlays_enabled("true"), Some(true));
         assert_eq!(parse_overlays_enabled("False"), Some(false));
-        assert_eq!(parse_overlays_enabled("1"), None);
+        assert_eq!(parse_overlays_enabled("1"), Some(true));
+        assert_eq!(parse_overlays_enabled("no"), Some(false));
+        assert_eq!(parse_overlays_enabled("  on  "), Some(true));
+        assert_eq!(parse_overlays_enabled("sometimes"), None);
         assert_eq!(parse_overlays_enabled(""), None);
     }
 

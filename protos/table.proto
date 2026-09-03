@@ -191,10 +191,11 @@ message Manifest {
   // appropriately.
   //
   // Reserved keys that affect how a writer may change the table:
-  // * "lance.overlays.enabled": "true" or "false". Whether a writer may store new
-  //   values as data overlay files (see DataOverlayFile). When unset, a dataset
+  // * "lance.overlays.enabled": a string spelling a boolean. Whether a writer may
+  //   store new values as data overlay files (see DataOverlayFile). When unset --
+  //   or set to a value the reader does not recognize as a boolean -- a dataset
   //   that already carries overlays is treated as enabled and one that does not
-  //   falls back to the implementation default. It may only be set to "false"
+  //   falls back to the implementation default. It may only be set to false
   //   while no fragment carries an overlay.
   map<string, string> config = 16;
 
