@@ -627,6 +627,56 @@ message FragmentReuseIndexDetails {
   }
 }
 
+// Details of the stable partition system index, which records reordered
+// rewrites (e.g. reclustering). Unlike FragmentReuseIndexDetails, whose
+// mapping is derived from row order (a rewrite that preserves it), a
+// reordered rewrite distributes source rows across destinations in an order
+// the reader cannot derive, so each transition references a row map file
+// holding one destination label per physical source row.
+message StablePartitionIndexDetails {
+
+  oneof content {
+    // if < 200KB, store the content inline, otherwise store the InlineContent bytes in external file
+    InlineContent inline = 1;
+    ExternalFile external = 2;
+  }
+
+  message InlineContent {
+    repeated Transition transitions = 1;
+  }
+
+  message FragmentDigest {
+    uint64 id = 1;
+
+    uint64 physical_rows = 2;
+
+    uint64 num_deleted_rows = 3;
+  }
+
+  // One reordered rewrite: n source fragments scanned in order, m
+  // destination fragments filled in that same order (a stable partition).
+  message Transition {
+    // The dataset version whose commit installed this transition.
+    uint64 dataset_version = 1;
+
+    // Source fragments in scan order. Their physical row counts are the
+    // addressing base of the row map: prefix sums position each source
+    // fragment's rows in the concatenated label sequence.
+    repeated FragmentDigest sources = 2;
+
+    // Destination fragment ids in label order: a row map label is an index
+    // into this list.
+    repeated uint64 destinations = 3;
+
+    // The row map file lives at `{indices dir}/{row_map_id}/row_map.lance`:
+    // one nullable u16 label per physical source row in scan order, with the
+    // per-block cumulative counts in a global buffer.
+    string row_map_id = 4;
+
+    uint64 row_map_size_bytes = 5;
+  }
+}
+
 // ============================================================================
 // MemWAL Index Types
 // ============================================================================

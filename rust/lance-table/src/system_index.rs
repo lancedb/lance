@@ -13,12 +13,16 @@
 
 pub mod frag_reuse;
 pub mod mem_wal;
+pub mod stable_partition;
 
 use crate::format::IndexMetadata;
 use frag_reuse::FRAG_REUSE_INDEX_NAME;
 use mem_wal::MEM_WAL_INDEX_NAME;
+use stable_partition::STABLE_PARTITION_INDEX_NAME;
 
 /// Whether `index_meta` describes one of the system indices defined in this module.
 pub fn is_system_index(index_meta: &IndexMetadata) -> bool {
-    index_meta.name == FRAG_REUSE_INDEX_NAME || index_meta.name == MEM_WAL_INDEX_NAME
+    index_meta.name == FRAG_REUSE_INDEX_NAME
+        || index_meta.name == MEM_WAL_INDEX_NAME
+        || index_meta.name == STABLE_PARTITION_INDEX_NAME
 }

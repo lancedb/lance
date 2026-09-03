@@ -801,6 +801,7 @@ impl Transaction {
                 groups,
                 rewritten_indices,
                 frag_reuse_index,
+                stable_partition,
             } => {
                 final_fragments.extend(maybe_existing_fragments?.clone());
                 let current_version = current_manifest.map(|m| m.version).unwrap_or_default();
@@ -811,6 +812,15 @@ impl Transaction {
                     current_version,
                     next_row_id.as_ref(),
                 )?;
+
+                // Groups covered by the stable partition rewrite redistribute
+                // rows across their destinations, so index bitmaps must not
+                // follow them: the retired source ids stay in the bitmaps as
+                // provenance and the stable partition index entry records the
+                // row-level translation. Only the order-preserving groups
+                // take part in bitmap maintenance below.
+                let ordered_groups =
+                    Self::ordered_rewrite_groups(groups, stable_partition.as_ref())?;
 
                 if next_row_id.is_some() {
                     // We can re-use indices, but need to rewrite the fragment bitmaps
@@ -827,14 +837,18 @@ impl Transaction {
                                 // that no longer resolve, so drop the rewritten fragments from
                                 // its coverage instead and let the scanner fall back to a full
                                 // scan for them.
-                                Self::drop_rewritten_fragments(fragment_bitmap, groups)
+                                Self::drop_rewritten_fragments(fragment_bitmap, &ordered_groups)
                             } else {
-                                Self::recalculate_fragment_bitmap(fragment_bitmap, groups)?
+                                Self::recalculate_fragment_bitmap(fragment_bitmap, &ordered_groups)?
                             };
                         }
                     }
                 } else {
-                    Self::handle_rewrite_indices(&mut final_indices, rewritten_indices, groups)?;
+                    Self::handle_rewrite_indices(
+                        &mut final_indices,
+                        rewritten_indices,
+                        &ordered_groups,
+                    )?;
                 }
 
                 // A full compaction materializes a fragment's overlays into fresh
@@ -846,6 +860,24 @@ impl Transaction {
                 if let Some(frag_reuse_index) = frag_reuse_index {
                     final_indices.retain(|idx| idx.name != frag_reuse_index.name);
                     final_indices.push(frag_reuse_index.clone());
+                }
+                if let Some(stable_partition) = stable_partition {
+                    let existing_version = final_indices
+                        .iter()
+                        .find(|idx| idx.name == stable_partition.index.name)
+                        .map(|idx| idx.dataset_version);
+                    if existing_version != stable_partition.base_entry_version {
+                        return Err(Error::invalid_input(format!(
+                            "the {} index entry changed (version {:?}, this rewrite was built on {:?}): \
+                             a concurrent reordered rewrite landed, rebuild the transition against \
+                             the latest version and retry",
+                            stable_partition.index.name,
+                            existing_version,
+                            stable_partition.base_entry_version,
+                        )));
+                    }
+                    final_indices.retain(|idx| idx.name != stable_partition.index.name);
+                    final_indices.push(stable_partition.index.clone());
                 }
             }
             Operation::CreateIndex {

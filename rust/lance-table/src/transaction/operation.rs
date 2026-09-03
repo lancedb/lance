@@ -88,6 +88,11 @@ pub enum Operation {
         rewritten_indices: Vec<RewrittenIndex>,
         /// The fragment reuse index to be created or updated to
         frag_reuse_index: Option<IndexMetadata>,
+        /// The reordered part of this rewrite, if any. In-memory only, like
+        /// `frag_reuse_index`: never serialized into the transaction file,
+        /// because other writers' conflict decisions only need the fragment
+        /// sets in `groups`, which are exact either way.
+        stable_partition: Option<StablePartitionRewrite>,
     },
     /// Replace data in a column in the dataset with new data. This is used for
     /// null column population where we replace an entirely null column with a
@@ -270,6 +275,40 @@ impl std::fmt::Display for Operation {
             Self::UpdateMemWalState { .. } => write!(f, "UpdateMemWalState"),
             Self::UpdateBases { .. } => write!(f, "UpdateBases"),
         }
+    }
+}
+
+/// A reordered rewrite's contribution to a [`Operation::Rewrite`] commit.
+///
+/// Unlike compaction, the groups of a reordered rewrite redistribute rows
+/// across destinations, so index fragment bitmaps must not be swapped from
+/// old to new fragments: the retired source ids stay in the bitmaps as
+/// provenance and the stable partition index entry records how to translate
+/// (see `lance_table::system_index::stable_partition`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct StablePartitionRewrite {
+    /// The accumulated stable partition index entry to install, spliced into
+    /// the manifest's index list by name.
+    pub index: IndexMetadata,
+    /// Source fragment ids of this commit's reordered groups. A rewrite
+    /// group whose old fragments fall in this set skips fragment-bitmap
+    /// recalculation; a group must be entirely in or entirely out.
+    pub reordered_sources: RoaringBitmap,
+    /// `dataset_version` of the stable partition entry that `index` was
+    /// built by appending onto (`None` when this rewrite creates the entry).
+    /// The transaction field is never serialized, so a concurrent reordered
+    /// rewrite cannot be detected from the other transaction; instead the
+    /// commit fails when the manifest's entry no longer matches this base,
+    /// because splicing would silently drop the concurrent transition. The
+    /// caller rebuilds against the latest entry and retries.
+    pub base_entry_version: Option<u64>,
+}
+
+impl DeepSizeOf for StablePartitionRewrite {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
+        // Roaring does not expose its allocation capacity; its serialized
+        // size is a stable proxy.
+        self.index.deep_size_of_children(context) + self.reordered_sources.serialized_size()
     }
 }
 

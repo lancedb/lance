@@ -180,6 +180,7 @@ impl TryFrom<pb::Transaction> for Transaction {
                     groups,
                     rewritten_indices,
                     frag_reuse_index: None,
+                    stable_partition: None,
                 }
             }
             Some(pb::transaction::Operation::CreateIndex(pb::transaction::CreateIndex {
@@ -556,6 +557,7 @@ impl From<&Transaction> for pb::Transaction {
                 groups,
                 rewritten_indices,
                 frag_reuse_index: _,
+                stable_partition: _,
             } => pb::transaction::Operation::Rewrite(pb::transaction::Rewrite {
                 groups: groups
                     .iter()
