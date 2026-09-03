@@ -123,9 +123,18 @@ def storage_options_for(uri: str) -> dict[str, str] | None:
     return tos_storage_options() if uri.startswith("tos://") else None
 
 
-def open_branch(uri: str, branch: str) -> lance.LanceDataset:
+def open_branch(
+    uri: str,
+    branch: str,
+    *,
+    index_cache_size_bytes: int | None = None,
+) -> lance.LanceDataset:
     options = storage_options_for(uri)
-    base = lance.dataset(uri, storage_options=options)
+    base = lance.dataset(
+        uri,
+        storage_options=options,
+        index_cache_size_bytes=index_cache_size_bytes,
+    )
     if branch not in base.branches.list():
         raise ValueError(
             f"Lance branch {branch!r} does not exist. "

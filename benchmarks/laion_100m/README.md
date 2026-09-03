@@ -101,10 +101,55 @@ Use `--dataset-uri` on every command when testing a dataset other than the
 default URI. Use `--baseline-branch` and `--optimized-branch` to override the
 default branch names.
 
-### 2. Build both indices with one flow
+### 2. Measure model preparation separately
 
-The first invocation trains and checkpoints the global IVF and RQ artifacts.
-The second invocation loads exactly the same artifacts.
+Run the standalone model benchmark once if the experiment needs from-scratch
+training cost in addition to index materialization time. It trains the common IVF
+centroids once, mints one RaBitQ rotation, and trains one PQ codebook against the
+same IVF model:
+
+```bash
+cd python
+
+uv run python ../benchmarks/laion_100m/train_models.py \
+  --branch ivf-rq-reuse-off \
+  --output-dir /data00/laion-100m-model \
+  --num-partitions 24414 \
+  --rq-num-bits 5 \
+  --pq-num-subvectors 48 \
+  --pq-num-bits 8
+```
+
+The output directory must be empty. The command writes
+`ivf_centroids.arrow`, `rq_model.json`, `pq_codebook.arrow`, `model.json`, and
+`training_metrics.json`. The IVF and RQ files plus `model.json` are compatible
+with the existing `build_index.py --model-dir` flow, so the measured models are
+reused instead of trained again.
+
+`IVF_RQ` and `IVF_PQ` share the IVF K-means cost, but their quantizer preparation
+is different. RaBitQ generates a data-independent random fast rotation, while PQ
+trains a codebook from sampled IVF residuals. The main timing fields are:
+
+| Field | Interpretation |
+| --- | --- |
+| `ivf_training_seconds` | Data sampling and K-means training for the 24,414 common IVF centroids |
+| `rq_model_build_seconds` | RaBitQ fast-rotation generation; this is model construction, not data training |
+| `pq_training_seconds` | Residual sampling and PQ codebook K-means training |
+| `ivf_rq_model_prepare_seconds` | IVF training plus RaBitQ model construction, excluding persistence |
+| `ivf_pq_model_prepare_seconds` | IVF training plus PQ training, excluding persistence |
+| `model_persist_seconds` | Combined wall time to persist the IVF, RQ, and PQ artifacts |
+| `ivf_*_model_ready_seconds` | Corresponding model preparation plus the artifacts needed by that index |
+| `phases` | Status, wall time, CPU time, peak RSS, and error for every train/build/persist phase |
+
+Metrics are updated after every phase. A failed PQ training run therefore keeps
+the completed IVF and RQ measurements and artifacts, but reruns must use a new
+empty output directory.
+
+### 3. Build both indices with one flow
+
+If the standalone model benchmark above was run, both invocations load exactly
+the same IVF and RQ artifacts. Otherwise, the first invocation trains and
+checkpoints those artifacts and the second invocation loads them.
 
 ```bash
 cd python
@@ -169,7 +214,7 @@ For storage links that intermittently truncate response bodies, set
 `LANCE_BENCHMARK_DOWNLOAD_RETRY_COUNT` to a higher non-negative integer. Apply
 the same retry count to both branches; it is also part of the metrics identity.
 
-### 3. Calibrate recall
+### 4. Calibrate recall
 
 Stage `test.parquet` and `neighbors.parquet` locally, or convert them to small
 Lance datasets accessible through TOS. The expected fields are `id, emb` and
@@ -195,7 +240,44 @@ tested nprobes and the gain at the next tested point is at most 0.001. Selection
 must succeed independently for every requested `k`; the final selected value is
 the largest stable value across them.
 
-### 4. Compare latency and throughput
+### 5. Compare latency and throughput
+
+To capture the no-reuse baseline before the paired A/B run, use the same timed
+load grid with the `baseline` command:
+
+```bash
+cd python
+uv run python ../benchmarks/laion_100m/benchmark.py baseline \
+  --branch ivf-rq-reuse-off \
+  --queries /data00/laion/test.parquet \
+  --ground-truth /data00/laion/neighbors.parquet \
+  --output-dir /data00/laion-results/baseline \
+  --nprobes 256 512 1024 \
+  --concurrency 1 8 32 \
+  --duration-seconds 60 \
+  --repeats 3
+```
+
+This writes raw repeats to `summary.csv` and their medians to
+`baseline.csv/json`. It verifies that the branch has six index segments, omits
+the coarse-quantizer fingerprint, and performs six centroid-ranking calls. Use
+the paired `compare` command for final A/B claims because it alternates run
+order to reduce cache and time drift.
+
+To measure the optimized branch independently with the same output format, pass
+`--mode on` together with the reuse-on branch. This validates that the shared
+coarse-quantizer fingerprint is present and that centroid ranking uses the
+shared fast path:
+
+```bash
+cd python
+uv run python ../benchmarks/laion_100m/benchmark.py baseline \
+  --branch ivf-rq-reuse-on \
+  --mode on \
+  --queries /data00/laion/test.parquet \
+  --ground-truth /data00/laion/neighbors.parquet \
+  --output-dir /data00/laion-results/reuse-on
+```
 
 For a stable point of 512, benchmark the adjacent powers of two:
 
@@ -225,16 +307,70 @@ previous query completes. Every timed A/B run gets its own warm-up, and A/B orde
 alternates on each repeat to reduce ordering bias. These are warm-run numbers;
 the tool does not flush the OS page cache or remote object-store caches.
 
-The example above performs:
+By default, the benchmark loads every physical index segment and IVF partition
+into memory before any preflight or timed query. Disable this only for an
+explicit cold/on-demand-cache experiment:
 
-```text
-2 k values * 3 nprobes values * 3 concurrencies * 3 repeats * 2 modes
-= 108 timed runs
+```bash
+  --no-prewarm-index
 ```
 
-At 60 seconds per timed run, that is at least 108 minutes, plus warm-up,
-preflight, and object-store variance. Use a unique output directory for every
-experiment because `runs.jsonl` is append-only.
+The benchmark configures a 128-GiB index cache by default. Override it with
+`--index-cache-size-gib` when needed. The capacity is an upper bound and is not
+allocated eagerly. It must be at least as large as the logical index's reported
+on-disk size. `prewarm_index` blocks until all selected
+index segments finish loading. Prewarm time and process/cache resource usage are written to
+`prewarm.json` for a single branch or `prewarm_off.json` and `prewarm_on.json`
+for an A/B run. The benchmark fails before timing if the resident cache size is
+smaller than the reported index size. With `--no-prewarm-index`, queries populate
+the 128-GiB cache on demand.
+
+For LAION 100M the six-segment IVF_RQ index is approximately 47.4 GiB on disk.
+A 128-GiB cache leaves room for decoded entries and cache overhead. A paired A/B
+process keeps a separate cache for each branch, so plan for roughly twice the
+resident index memory.
+
+The default comparison grid performs:
+
+```text
+2 k values * 4 nprobes values * 3 concurrencies * 3 repeats * 2 modes
+= 144 timed runs
+```
+
+The default timed window is 10 seconds. This is intended for fast A/B screening
+of QPS, mean/P50 latency, and CPU behavior after full index prewarm. Treat P99
+from low-request configurations as directional; rerun selected operating points
+for 30 to 60 seconds before drawing tail-latency conclusions. Use a unique output
+directory for every experiment because `runs.jsonl` is append-only.
+
+### 6. Profile coarse and bucket-search work
+
+Run the diagnostic profile separately from the latency and throughput comparison:
+
+```bash
+cd python
+uv run python ../benchmarks/laion_100m/benchmark.py profile \
+  --baseline-branch ivf-rq-reuse-off \
+  --optimized-branch ivf-rq-reuse-on \
+  --queries /data00/laion/test.parquet \
+  --ground-truth /data00/laion/neighbors.parquet \
+  --output-dir /data00/laion-results/profile \
+  --profile-queries 50 \
+  --nprobes 128 256 512 1024 2048
+```
+
+The profile command enables `LANCE_ANN_STAGE_METRICS` before its first ANN query.
+Normal `calibrate` and `compare` commands leave the variable disabled, so their
+QPS and latency measurements do not create the additional bucket-search timers
+or counters. If the variable is exported manually, it applies to other ANN
+queries in that process as well.
+
+For every query, `ANNIvfPartition` supplies the existing coarse-ranking time and
+`ANNSubIndex` supplies the opt-in bucket-search time. These are cumulative task
+times across index segments, not wall-clock latency: concurrent segment work can
+overlap, so the two stage times must not be added to predict request latency.
+`profile_wall_ms` also includes `analyze_plan` formatting overhead and is only a
+diagnostic. Continue to use `compare` for user-facing QPS and latency conclusions.
 
 ## Output files
 
@@ -255,6 +391,14 @@ Comparison additionally writes:
 | `analyze_plan_on.txt/json` | Optimized physical plan and parsed counters |
 | `summary.csv` | Every individual repeat for both modes |
 | `comparison.csv/json` | Median A/B metrics and calculated improvement |
+
+Stage profiling writes:
+
+| File | Contents |
+| --- | --- |
+| `stage_profile.jsonl/csv` | Per-query coarse time, bucket time, calls, partitions, and node-local I/O |
+| `stage_summary.json/csv` | Median/P95 stage metrics and paired A/B work reductions by `(k, nprobes)` |
+| `stage_plans/*.txt` | The first analyzed plan for every `(mode, k, nprobes)` point |
 
 The main comparison fields are:
 
