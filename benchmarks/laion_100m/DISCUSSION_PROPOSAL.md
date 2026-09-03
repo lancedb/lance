@@ -1,6 +1,6 @@
 # Reuse IVF Coarse-Quantizer Routing Across Index Segments
 
-Draft PR: to be added after the branch is published.
+Draft PR: [#8966](https://github.com/lance-format/lance/pull/8966)
 
 ## Proposal
 
