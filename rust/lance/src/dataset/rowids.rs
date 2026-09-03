@@ -19,10 +19,6 @@ use std::sync::Arc;
 pub(super) use validate::validate_stable_row_ids;
 
 /// Load a row id sequence from the given dataset and fragment.
-///
-/// Served from this version's cached [`RowIdIndex`] when there is one, since
-/// the index owns every committed sequence already; otherwise from the
-/// metadata cache, decoding on a miss.
 pub async fn load_row_id_sequence(
     dataset: &Dataset,
     fragment: &Fragment,
@@ -30,19 +26,6 @@ pub async fn load_row_id_sequence(
     let Some(row_id_meta) = &fragment.row_id_meta else {
         return Err(Error::internal("Missing row id meta"));
     };
-    let index_key = RowIdIndexKey {
-        version: dataset.manifest.version,
-    };
-    // The index holds the committed sequence of a fragment id; an uncommitted
-    // rewrite of the same fragment must not read as it.
-    if let Some(index) = dataset.metadata_cache.get_with_key(&index_key).await
-        && dataset
-            .find_fragment(fragment.id)
-            .is_some_and(|committed| committed.row_id_meta.as_ref() == Some(row_id_meta))
-        && let Some(sequence) = index.sequence(fragment.id as u32)
-    {
-        return Ok(sequence.clone());
-    }
     let key = RowIdSequenceKey {
         fragment_id: fragment.id,
         row_id_meta,
@@ -246,7 +229,10 @@ async fn row_addrs_to_row_ids_impl(
 /// Build the index from freshly decoded sequences. The index then owns their
 /// memory alone, so its cache charge is exact and it stays cached whenever it
 /// fits; reading them through the sequence cache instead would charge each
-/// sequence twice and leave a large table's index too heavy to keep.
+/// sequence twice and leave a large table's index too heavy to keep. A scan
+/// that needs a sequence still caches its own copy under `RowIdSequenceKey`:
+/// that key carries the fragment's content identity, while `RowIdIndexKey` is
+/// scoped by version alone, so the index cannot stand in for it.
 async fn load_row_id_index(dataset: &Dataset) -> Result<RowIdIndex> {
     // A `for` loop rather than `map`: a closure returning a future that borrows
     // its argument trips the higher-ranked lifetime check on the outer future.
@@ -303,7 +289,6 @@ mod test {
     use lance_datagen::Dimension;
     use lance_index::{IndexType, scalar::ScalarIndexParams};
     use lance_io::object_store::ObjectStoreParams;
-    use lance_table::rowids::write_row_ids;
     use std::collections::HashMap;
     use std::collections::HashSet;
 
@@ -423,27 +408,16 @@ mod test {
         let again = get_row_id_index(&dataset).await.unwrap().unwrap();
         assert!(Arc::ptr_eq(&index, &again));
 
-        // A sequence lookup is answered from the cached index, not a second copy.
+        // A sequence lookup keeps its own content-keyed entry.
         let fragment = &dataset.manifest.fragments[1];
         let sequence = load_row_id_sequence(&dataset, fragment).await.unwrap();
-        assert!(Arc::ptr_eq(
-            &sequence,
-            index.sequence(fragment.id as u32).unwrap()
-        ));
-        assert_eq!(
-            session.metadata_cache_stats().await.num_entries,
-            entries_before + 1
-        );
-
-        // An uncommitted rewrite of the same fragment id carries other row ids
-        // and must not be answered from the index.
-        let rewritten_ids = RowIdSequence::from(100..110);
-        let mut rewritten = fragment.clone();
-        rewritten.row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&rewritten_ids).into()));
-        let sequence = load_row_id_sequence(&dataset, &rewritten).await.unwrap();
         assert_eq!(
             sequence.iter().collect::<Vec<_>>(),
-            (100..110).collect::<Vec<_>>()
+            (10..20).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            session.metadata_cache_stats().await.num_entries,
+            entries_before + 2
         );
     }
 
@@ -615,6 +589,10 @@ mod test {
             .await
             .unwrap();
         assert_eq!(sequence.len(), 100);
+        // Leave this generation's index in the session cache: `RowIdIndexKey`
+        // is scoped by version alone, so the recreated dataset below reaches
+        // the same key, and no sequence load may be answered from it.
+        get_row_id_index(&dataset).await.unwrap().unwrap();
 
         // Reloading the unchanged fragment must still hit: keying on contents has
         // to leave the sequence cacheable, not just make it distinguishable.

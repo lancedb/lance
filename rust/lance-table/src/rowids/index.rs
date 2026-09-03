@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::HashMap;
 use std::ops::RangeInclusive;
 use std::sync::Arc;
 
@@ -49,8 +48,6 @@ pub struct RowIdIndex {
     /// Max-`end` heap over `fragments`: `end_tree[1]` is the root and leaf `i`
     /// sits at `end_tree[len() / 2 + i]`.
     end_tree: Vec<u64>,
-    /// Slot in `fragments` of each fragment id.
-    slots: HashMap<u32, usize>,
     merged: Option<MergedIndex>,
 }
 
@@ -73,7 +70,6 @@ impl RowIdIndex {
 
         let mut index = Self {
             end_tree: build_end_tree(&fragments),
-            slots: fragment_slots(&fragments),
             fragments,
             merged: None,
         };
@@ -115,14 +111,6 @@ impl RowIdIndex {
         }
 
         Ok(RangeInclusiveMap::from_iter(final_chunks))
-    }
-
-    /// The row id sequence of `fragment_id`, or `None` when the fragment is not
-    /// indexed because it holds no row id.
-    pub fn sequence(&self, fragment_id: u32) -> Option<&Arc<RowIdSequence>> {
-        self.slots
-            .get(&fragment_id)
-            .map(|slot| &self.fragments[*slot].sequence)
     }
 
     /// Get the address for a given row id.
@@ -446,14 +434,6 @@ fn max_overlap_depth(fragments: &[FragmentEntry]) -> u64 {
     depth
 }
 
-fn fragment_slots(fragments: &[FragmentEntry]) -> HashMap<u32, usize> {
-    fragments
-        .iter()
-        .enumerate()
-        .map(|(slot, entry)| (entry.fragment_id, slot))
-        .collect()
-}
-
 /// Implicit max-`end` heap over `fragments`, padded to a power of two. Padding
 /// leaves hold 0, which prunes for every id above 0 and is filtered by slot.
 fn build_end_tree(fragments: &[FragmentEntry]) -> Vec<u64> {
@@ -516,7 +496,6 @@ impl DeepSizeOf for RowIdIndex {
             + merged_bytes
             + self.fragments.capacity() * std::mem::size_of::<FragmentEntry>()
             + self.end_tree.capacity() * std::mem::size_of::<u64>()
-            + self.slots.capacity() * std::mem::size_of::<(u32, usize)>()
     }
 }
 
@@ -774,7 +753,6 @@ impl RowIdIndex {
         fragments.sort_unstable_by_key(|entry| entry.start);
         Ok(Self {
             end_tree: build_end_tree(&fragments),
-            slots: fragment_slots(&fragments),
             fragments,
             merged: None,
         })
@@ -903,24 +881,6 @@ mod tests {
         }
         assert_eq!(index.get(999).unwrap(), None);
         assert_eq!(index.get(1000 + span).unwrap(), None);
-    }
-
-    #[test]
-    fn test_sequence_by_fragment_id() {
-        let held = Arc::new(RowIdSequence::from(0..10));
-        let index = RowIdIndex::new(&[
-            FragmentRowIdIndex {
-                fragment_id: 5,
-                row_id_sequence: held.clone(),
-                deletion_vector: Arc::new(DeletionVector::default()),
-            },
-            fragment(6, RowIdSequence::new()),
-        ])
-        .unwrap();
-        assert!(Arc::ptr_eq(index.sequence(5).unwrap(), &held));
-        // A fragment without row ids is not indexed, and neither is an unknown one.
-        assert!(index.sequence(6).is_none());
-        assert!(index.sequence(7).is_none());
     }
 
     #[test]
