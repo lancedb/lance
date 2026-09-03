@@ -13,6 +13,8 @@
  */
 package org.lance;
 
+import org.lance.fragment.DeletionFile;
+import org.lance.fragment.DeletionFileType;
 import org.lance.fragment.FragmentMergeResult;
 import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;
@@ -55,6 +57,16 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class FragmentTest {
   @Test
+  void testDeletionFileRelativePath() {
+    DeletionFile bitmap = new DeletionFile(7, 11, 2L, DeletionFileType.BITMAP, null);
+    DeletionFile array = new DeletionFile(7, 11, 2L, DeletionFileType.ARRAY, null);
+
+    assertEquals("_deletions/5-11-7.bin", bitmap.getRelativePath(5));
+    assertEquals("_deletions/5-11-7.arrow", array.getRelativePath(5));
+    assertThrows(IllegalArgumentException.class, () -> bitmap.getRelativePath(-1));
+  }
+
+  @Test
   void testFragmentCreateFfiArray(@TempDir Path tempDir) {
     String datasetPath = tempDir.resolve("new_fragment_array").toString();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
@@ -74,6 +86,7 @@ public class FragmentTest {
       testDataset.createEmptyDataset().close();
       int rowCount = 21;
       FragmentMetadata fragmentMeta = testDataset.createNewFragment(rowCount);
+      assertEquals(fragmentMeta.getFiles(), fragmentMeta.getReferencedLanceFiles());
 
       // Commit fragment
       FragmentOperation.Append appendOp = new FragmentOperation.Append(Arrays.asList(fragmentMeta));
