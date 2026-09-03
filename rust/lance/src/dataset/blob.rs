@@ -2498,7 +2498,10 @@ impl BlobMaterializationContext {
 /// A materialized batch that retains its byte-budget reservation until yielded.
 pub struct MaterializedBlobBatch {
     batch: RecordBatch,
-    _reservations: Vec<BlobMaterializationReservation>,
+    /// Reservations are reference-counted so that splitting a batch into
+    /// multiple chunks keeps the original memory reservation alive until the
+    /// last chunk is dropped.
+    _reservations: Vec<Arc<BlobMaterializationReservation>>,
 }
 
 impl MaterializedBlobBatch {
@@ -2506,6 +2509,17 @@ impl MaterializedBlobBatch {
         Self {
             batch,
             _reservations: Vec::new(),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_reservations(
+        batch: RecordBatch,
+        reservations: Vec<Arc<BlobMaterializationReservation>>,
+    ) -> Self {
+        Self {
+            batch,
+            _reservations: reservations,
         }
     }
 
@@ -2535,14 +2549,23 @@ impl MaterializedBlobBatch {
 
     /// Split the batch into chunks of at most `max_bytes` array memory.
     ///
-    /// Reservations are not carried over to the chunks; the byte budget itself
-    /// bounds the output size.
+    /// The original materialization reservation is shared across all chunks so
+    /// that the memory remains accounted for until every chunk has been
+    /// dropped, preserving the `materialization_readahead_bytes` bound while
+    /// the split chunks are queued.
     pub(crate) fn split_by_bytes(self, max_bytes: usize) -> Result<Vec<Self>> {
-        let chunks = split_batch_by_bytes(self.batch, max_bytes)?
+        let Self {
+            batch,
+            _reservations,
+        } = self;
+        let chunks = split_batch_by_bytes(batch, max_bytes)?;
+        Ok(chunks
             .into_iter()
-            .map(Self::unreserved)
-            .collect::<Vec<_>>();
-        Ok(chunks)
+            .map(|batch| Self {
+                batch,
+                _reservations: _reservations.clone(),
+            })
+            .collect())
     }
 
     pub(crate) fn into_batch(self) -> RecordBatch {
@@ -3659,7 +3682,7 @@ pub fn materialize_blob_v2_binary_batch_with_admission<'a>(
                 )),
                 columns,
             )?,
-            _reservations: reservation.into_iter().collect(),
+            _reservations: reservation.into_iter().map(Arc::new).collect(),
         })
     }
     .boxed()
@@ -8803,5 +8826,43 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_split_materialized_batch_retains_reservation_until_chunks_drop() {
+        let budget = Arc::new(super::BlobMaterializationBudget {
+            limit: 1024,
+            state: std::sync::Mutex::new(super::BlobMaterializationBudgetState::default()),
+            notify: Notify::new(),
+        });
+        let reservation = budget.reserve(800).await;
+        assert_eq!(budget.state.lock().unwrap().reserved, 800);
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "data",
+            DataType::LargeBinary,
+            false,
+        )]));
+        let value = [0u8; 100];
+        let values: Vec<Option<&[u8]>> = (0..10).map(|_| Some(value.as_slice())).collect();
+        let array = Arc::new(LargeBinaryArray::from_iter(values)) as ArrayRef;
+        let batch = RecordBatch::try_new(schema, vec![array]).unwrap();
+
+        let materialized =
+            super::MaterializedBlobBatch::with_reservations(batch, vec![Arc::new(reservation)]);
+        let chunks = materialized.split_by_bytes(200).unwrap();
+        assert!(!chunks.is_empty());
+        assert_eq!(
+            budget.state.lock().unwrap().reserved,
+            800,
+            "reservation should be held while chunks are alive"
+        );
+
+        drop(chunks);
+        assert_eq!(
+            budget.state.lock().unwrap().reserved,
+            0,
+            "reservation should be released after chunks drop"
+        );
     }
 }
