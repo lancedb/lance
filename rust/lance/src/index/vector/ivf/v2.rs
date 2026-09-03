@@ -164,7 +164,15 @@ pub(crate) static STREAMING_SEARCH_BATCH_SIZE: LazyLock<usize> = LazyLock::new(|
 });
 
 const IVF_PREWARM_WINDOW_SIZE_ENV: &str = "LANCE_IVF_PREWARM_WINDOW_SIZE_BYTES";
-const DEFAULT_IVF_PREWARM_WINDOW_SIZE_BYTES: u64 = 16 * 1024 * 1024;
+/// Default encoded-byte target of one prewarm read window.
+///
+/// Measured on one 1B-row IVF_RQ 1-bit segment (147 GB) read from S3 on
+/// r8i.8xlarge with 192 GiB of index cache: 16 MiB windows filled the cache at
+/// 500-526 MB/s regardless of how many windows were in flight (30, 128 or 512)
+/// or of `LANCE_IO_THREADS` (64, 256, 1024), while 64 MiB windows reached
+/// 935 MB/s with the same peak RSS (+1 GB) because the reader issues fewer,
+/// larger object-store requests (3.96 MB vs 2.47 MB average).
+const DEFAULT_IVF_PREWARM_WINDOW_SIZE_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PartitionWindow {
@@ -431,6 +439,9 @@ async fn read_partition_window_batches(
     split_window_batches(schema, &partition_lengths, batches)
 }
 
+/// Number of prewarm windows kept in flight. Raising this beyond the CPU pool
+/// size measured no throughput gain (see `DEFAULT_IVF_PREWARM_WINDOW_SIZE_BYTES`);
+/// the window size is the lever.
 fn prewarm_parallelism(io_parallelism: usize, cpu_parallelism: usize) -> usize {
     io_parallelism.max(1).min(cpu_parallelism.max(1))
 }
@@ -1832,9 +1843,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<S, 
 
     async fn prewarm(&self) -> Result<()> {
         let cpu_parallelism = get_num_compute_intensive_cpus();
+        let target_bytes = prewarm_window_size_bytes()?;
         let parallelism = prewarm_parallelism(self.io_parallelism, cpu_parallelism);
         let max_partitions = cpu_parallelism.saturating_mul(2).max(1);
-        let target_bytes = prewarm_window_size_bytes()?;
         let windows = plan_partition_windows(
             PrewarmFileLayout {
                 ivf: &self.ivf,
@@ -1849,12 +1860,31 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<S, 
             target_bytes,
             max_partitions,
         )?;
+        let planned_bytes: u64 = windows.iter().map(|w| w.estimated_encoded_bytes).sum();
+        info!(
+            uuid = %self.uuid,
+            windows = windows.len(),
+            planned_bytes,
+            window_bytes = target_bytes,
+            parallelism,
+            io_parallelism = self.io_parallelism,
+            "prewarming IVF partitions in byte windows"
+        );
+        let started = std::time::Instant::now();
         stream::iter(windows)
             .map(Ok)
             .try_for_each_concurrent(Some(parallelism), |window| async move {
                 self.prewarm_partition_window(window.partitions).await
             })
-            .await
+            .await?;
+        let elapsed = started.elapsed();
+        info!(
+            uuid = %self.uuid,
+            elapsed_ms = elapsed.as_millis() as u64,
+            planned_mb_per_s = planned_bytes as f64 / 1e6 / elapsed.as_secs_f64().max(1e-9),
+            "prewarmed IVF partitions"
+        );
+        Ok(())
     }
 
     fn index_type(&self) -> IndexType {
@@ -2554,6 +2584,7 @@ mod tests {
         storage::{RABIT_BLOCKED_EX_CODE_COLUMN, RabitQuantizationMetadata, RabitQueryEstimator},
         transform::{EX_ADD_FACTORS_COLUMN, EX_SCALE_FACTORS_COLUMN},
     };
+    use lance_index::vector::ivf::storage::IvfModel;
     use lance_index::vector::storage::VectorStore;
     use lance_index::vector::v3::subindex::IvfSubIndex;
 
@@ -2640,7 +2671,7 @@ mod tests {
     fn test_prewarm_window_size_config() {
         assert_eq!(
             super::parse_prewarm_window_size_bytes(None).unwrap(),
-            16 * 1024 * 1024
+            64 * 1024 * 1024
         );
         assert_eq!(
             super::parse_prewarm_window_size_bytes(Some("1048576")).unwrap(),
