@@ -356,6 +356,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
+    use super::planning_error;
     use crate::dataset::ReadParams;
     use crate::dataset::builder::DatasetBuilder;
     use crate::dataset::write::WriteParams;
@@ -366,6 +367,7 @@ mod tests {
     use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, StringArray};
     use arrow_schema::Schema as ArrowSchema;
     use arrow_schema::{DataType, Field};
+    use datafusion::common::DataFusionError;
     use lance_arrow::json::ARROW_JSON_EXT_NAME;
     use lance_arrow::{ARROW_EXT_NAME_KEY, SchemaExt};
     use lance_core::datatypes::BlobHandling;
@@ -921,15 +923,26 @@ mod tests {
     /// so that bindings and servers can map it to a client error rather than a
     /// generic failure.
     ///
-    /// Neither case reaches that variant on its own: DataFusion reports an
-    /// unknown function as a `Plan` error wrapped in `Diagnostic`, and rejects
-    /// a subscript on a non-struct column with `exec_err!` wrapped in
-    /// `Context`. Both would otherwise be classified as internal failures.
+    /// The cases differ in how DataFusion reports them: a syntax error is a
+    /// `SQL` error, an unknown function is a `Plan` error wrapped in
+    /// `Diagnostic`, and a subscript on a non-struct column is `exec_err!`
+    /// wrapped in `Context`. Only the first is classified as user input on its
+    /// own; the other two would otherwise read as internal failures.
     #[rstest]
-    #[case::unknown_function("SELECT id FROM dataset WHERE no_such_function(data) = 'Alice'")]
-    #[case::subscript_on_json_column("SELECT id FROM dataset WHERE data['user'] = 'Alice'")]
+    #[case::syntax_error("SELEC id FROM dataset", "found: SELEC at")]
+    #[case::unknown_function(
+        "SELECT id FROM dataset WHERE no_such_function(data) = 'Alice'",
+        "no_such_function"
+    )]
+    #[case::subscript_on_json_column(
+        "SELECT id FROM dataset WHERE data['user'] = 'Alice'",
+        "Cannot access field"
+    )]
     #[tokio::test]
-    async fn test_sql_malformed_query_is_invalid_input(#[case] sql: &str) {
+    async fn test_sql_malformed_query_is_invalid_input(
+        #[case] sql: &str,
+        #[case] expected_message: &str,
+    ) {
         let mut metadata = HashMap::new();
         metadata.insert(
             ARROW_EXT_NAME_KEY.to_string(),
@@ -960,5 +973,28 @@ mod tests {
             matches!(error, Error::InvalidInput { .. }),
             "expected InvalidInput, got {error:?}"
         );
+        assert!(
+            error.to_string().contains(expected_message),
+            "expected the message to name {expected_message:?}, got: {error}"
+        );
+    }
+
+    /// `LanceTableProvider::scan` runs during physical planning and reports
+    /// every Lance failure as `DataFusionError::External`, so storage that is
+    /// unreachable while planning must not be reported as a malformed query.
+    #[test]
+    fn test_planning_error_keeps_lance_error_category() {
+        let df_error = DataFusionError::Context(
+            "while scanning".to_string(),
+            Box::new(DataFusionError::from(Error::io("object store unavailable"))),
+        );
+
+        match planning_error(df_error) {
+            Error::IO { source, .. } => assert!(
+                source.to_string().contains("object store unavailable"),
+                "expected the original message, got: {source}"
+            ),
+            other => panic!("expected the original IO error, got {other:?}"),
+        }
     }
 }
