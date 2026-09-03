@@ -24,7 +24,9 @@ use crate::{
         pb21::{self, CompressiveEncoding, PageLayout, compressive_encoding::Compression},
     },
 };
-use arrow_array::{Array, ArrayRef, PrimitiveArray, cast::AsArray, make_array, types::UInt64Type};
+use arrow_array::{
+    Array, ArrayRef, PrimitiveArray, cast::AsArray, make_array, new_null_array, types::UInt64Type,
+};
 use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder, NullBuffer, ScalarBuffer};
 use arrow_schema::{DataType, Field as ArrowField};
 use bytes::Bytes;
@@ -6691,6 +6693,97 @@ impl PrimitiveStructuralEncoder {
         }
     }
 
+    /// Rebuilds dictionary chunks whose values array is empty.
+    ///
+    /// Such chunks are entirely null and retain their key validity until rep/def has been
+    /// recorded.  At flush time their keys are zeroed and attached to a neighboring non-empty
+    /// dictionary.  If every chunk is empty, one non-null placeholder value makes key zero valid.
+    /// Rep/def retains the logical nullness, so these replacement keys are never exposed.
+    fn rebuild_empty_dictionary_chunks(arrays: Vec<ArrayRef>) -> Result<Vec<ArrayRef>> {
+        if !arrays.iter().any(|array| {
+            array
+                .as_any_dictionary_opt()
+                .is_some_and(|dictionary| dictionary.values().is_empty())
+        }) {
+            return Ok(arrays);
+        }
+
+        let zeroed = |data_type: &DataType, len: usize| {
+            new_null_array(data_type, len)
+                .to_data()
+                .into_builder()
+                .nulls(None)
+                .build()
+                .map(make_array)
+        };
+        let rebuild =
+            |keys: Vec<ArrayRef>, data_type: &DataType, values: ArrayRef| -> Result<ArrayRef> {
+                let keys = keys.iter().map(|keys| keys.as_ref()).collect::<Vec<_>>();
+                let keys = arrow_select::concat::concat(&keys)?;
+                let data = keys
+                    .to_data()
+                    .into_builder()
+                    .data_type(data_type.clone())
+                    .child_data(vec![values.to_data()])
+                    .build()?;
+                Ok(make_array(data))
+            };
+
+        let mut rebuilt = Vec::with_capacity(arrays.len());
+        let mut pending_keys = Vec::with_capacity(arrays.len());
+        let mut empty_data_type = None;
+        for array in arrays {
+            let Some(dictionary) = array.as_any_dictionary_opt() else {
+                return Err(Error::invalid_input_source(
+                    "Cannot mix dictionary and non-dictionary chunks".into(),
+                ));
+            };
+            if dictionary.values().is_empty() {
+                pending_keys.push(zeroed(dictionary.keys().data_type(), array.len())?);
+                empty_data_type.get_or_insert_with(|| array.data_type().clone());
+            } else if pending_keys.is_empty() {
+                rebuilt.push(array);
+            } else {
+                pending_keys.push(make_array(dictionary.keys().to_data()));
+                rebuilt.push(rebuild(
+                    std::mem::take(&mut pending_keys),
+                    array.data_type(),
+                    dictionary.values().clone(),
+                )?);
+            }
+        }
+
+        if pending_keys.is_empty() {
+            return Ok(rebuilt);
+        }
+        if let Some(array) = rebuilt.pop() {
+            let Some(dictionary) = array.as_any_dictionary_opt() else {
+                return Err(Error::invalid_input_source(
+                    "Cannot mix dictionary and non-dictionary chunks".into(),
+                ));
+            };
+            let mut keys = Vec::with_capacity(pending_keys.len() + 1);
+            keys.push(make_array(dictionary.keys().to_data()));
+            keys.append(&mut pending_keys);
+            rebuilt.push(rebuild(
+                keys,
+                array.data_type(),
+                dictionary.values().clone(),
+            )?);
+        } else {
+            let data_type = empty_data_type.ok_or_else(|| {
+                Error::internal("Missing data type for an empty dictionary chunk")
+            })?;
+            let DataType::Dictionary(_, value_type) = &data_type else {
+                return Err(Error::internal(format!(
+                    "Expected dictionary data type, got {data_type}"
+                )));
+            };
+            rebuilt.push(rebuild(pending_keys, &data_type, zeroed(value_type, 1)?)?);
+        }
+        Ok(rebuilt)
+    }
+
     // Creates encode tasks, consuming all buffered data
     fn do_flush(
         &mut self,
@@ -6699,6 +6792,7 @@ impl PrimitiveStructuralEncoder {
         row_number: u64,
         num_rows: u64,
     ) -> Result<Vec<EncodeTask>> {
+        let arrays = Self::rebuild_empty_dictionary_chunks(arrays)?;
         DataBlock::validate_arrays(&arrays, &self.field.name)?;
         let num_values = arrays.iter().map(|arr| arr.len() as u64).sum();
         let is_simple_validity = repdefs.iter().all(|rd| rd.is_simple_validity());
@@ -6761,6 +6855,14 @@ impl PrimitiveStructuralEncoder {
                 repdef.add_validity_bitmap(validity.clone());
             } else {
                 repdef.add_validity_bitmap(deep_copy_nulls(Some(validity)).unwrap());
+            }
+            // Empty dictionaries have no valid key payload.  Keep the validity until rep/def is
+            // grouped with the buffered page; `do_flush` then rebuilds the keys against either a
+            // neighboring values array or an all-empty-page placeholder.
+            if let Some(dictionary) = array.as_any_dictionary_opt()
+                && dictionary.values().is_empty()
+            {
+                return Ok(array);
             }
             let data_no_nulls = array.to_data().into_builder().nulls(None).build()?;
             Ok(make_array(data_no_nulls))
@@ -7166,10 +7268,10 @@ mod tests {
     use crate::testing::TestEncoding;
     use crate::testing::{TestCases, check_round_trip_encoding_of_data};
     use arrow_array::{
-        Array, ArrayRef, FixedSizeListArray, Float32Array, Int8Array, StringArray, UInt8Array,
-        make_array,
+        Array, ArrayRef, DictionaryArray, FixedSizeListArray, Float32Array, Int8Array,
+        PrimitiveArray, StringArray, UInt8Array, make_array, new_null_array, types::Int32Type,
     };
-    use arrow_buffer::ScalarBuffer;
+    use arrow_buffer::{BooleanBuffer, NullBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Field as ArrowField};
     use std::collections::HashMap;
     use std::{collections::VecDeque, sync::Arc};
@@ -7192,6 +7294,75 @@ mod tests {
         ]);
         let block = DataBlock::from_array(string_array);
         assert!((!PrimitiveStructuralEncoder::is_narrow(&block)));
+    }
+
+    fn valued_dictionary() -> ArrayRef {
+        Arc::new(
+            DictionaryArray::<Int32Type>::try_new(
+                PrimitiveArray::<Int32Type>::from(vec![0]),
+                Arc::new(StringArray::from(vec!["a"])),
+            )
+            .unwrap(),
+        )
+    }
+
+    fn empty_dictionary() -> ArrayRef {
+        new_null_array(
+            &DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+            1,
+        )
+    }
+
+    fn null_valued_dictionary() -> ArrayRef {
+        Arc::new(
+            DictionaryArray::<Int32Type>::try_new(
+                PrimitiveArray::<Int32Type>::from(vec![0]),
+                Arc::new(StringArray::from(vec![None::<&str>])),
+            )
+            .unwrap(),
+        )
+    }
+
+    fn sliced_empty_dictionary_with_hidden_key_payload() -> ArrayRef {
+        let keys = PrimitiveArray::<Int32Type>::new(
+            ScalarBuffer::from(vec![5, 7, 9]),
+            Some(NullBuffer::new(BooleanBuffer::new_unset(3))),
+        );
+        let values = Arc::new(StringArray::from(Vec::<&str>::new())) as ArrayRef;
+        let dictionary = DictionaryArray::<Int32Type>::try_new(keys, values).unwrap();
+        Arc::new(dictionary.slice(1, 1))
+    }
+
+    #[rstest::rstest]
+    #[case::empty_after_value(vec![valued_dictionary(), empty_dictionary()])]
+    #[case::empty_before_value(vec![empty_dictionary(), valued_dictionary()])]
+    #[case::null_value_after_value(vec![valued_dictionary(), null_valued_dictionary()])]
+    #[case::hidden_sliced_after_value(vec![
+        valued_dictionary(),
+        sliced_empty_dictionary_with_hidden_key_payload(),
+    ])]
+    #[tokio::test]
+    async fn test_mixed_valued_and_all_null_dictionary_chunks(#[case] dictionaries: Vec<ArrayRef>) {
+        check_round_trip_encoding_of_data(
+            dictionaries,
+            &TestCases::default()
+                .with_structural_encodings()
+                .with_page_sizes(vec![4096]),
+            HashMap::new(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_sliced_empty_dictionary_with_hidden_key_payload() {
+        check_round_trip_encoding_of_data(
+            vec![sliced_empty_dictionary_with_hidden_key_payload()],
+            &TestCases::default()
+                .with_structural_encodings()
+                .with_page_sizes(vec![4096]),
+            HashMap::new(),
+        )
+        .await;
     }
 
     #[test]
