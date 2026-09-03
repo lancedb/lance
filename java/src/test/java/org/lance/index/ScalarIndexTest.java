@@ -43,6 +43,8 @@ import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
@@ -52,7 +54,9 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -207,6 +211,47 @@ public class ScalarIndexTest {
     public void stageComplete(String stage) {
       recorder.stageComplete(stage);
     }
+  }
+
+  private enum DeprecatedConfigMutation {
+    UPDATE,
+    DELETE
+  }
+
+  private static final class ConfigWriteReentrantIndexBuildProgress implements IndexBuildProgress {
+    private static final String CONFIG_KEY = "callback_config_key";
+
+    private final Dataset dataset;
+    private final DeprecatedConfigMutation mutation;
+    private final AtomicBoolean attempted = new AtomicBoolean();
+    private final AtomicReference<RuntimeException> writeFailure = new AtomicReference<>();
+
+    private ConfigWriteReentrantIndexBuildProgress(
+        Dataset dataset, DeprecatedConfigMutation mutation) {
+      this.dataset = dataset;
+      this.mutation = mutation;
+    }
+
+    @Override
+    public void stageStart(String stage, Optional<Long> total, String unit) {
+      if (attempted.compareAndSet(false, true)) {
+        try {
+          if (mutation == DeprecatedConfigMutation.UPDATE) {
+            dataset.updateConfig(Map.of(CONFIG_KEY, "updated"));
+          } else {
+            dataset.deleteConfigKeys(Set.of(CONFIG_KEY));
+          }
+        } catch (RuntimeException failure) {
+          writeFailure.set(failure);
+        }
+      }
+    }
+
+    @Override
+    public void stageProgress(String stage, long completed) {}
+
+    @Override
+    public void stageComplete(String stage) {}
   }
 
   private static final class NestedCreateIndexBuildProgress implements IndexBuildProgress {
@@ -1021,6 +1066,40 @@ public class ScalarIndexTest {
             failure.getMessage().contains("busy in an index progress callback"),
             "Unexpected write re-entry failure: " + failure.getMessage());
         assertTrue(progress.reentries.get() > 0, "Expected callback to attempt a write lock");
+      }
+    }
+  }
+
+  @ParameterizedTest
+  @EnumSource(DeprecatedConfigMutation.class)
+  @Timeout(value = 5, unit = TimeUnit.SECONDS)
+  public void testCreateInvertedIndexRejectsConfigWriteBeforeCommit(
+      DeprecatedConfigMutation mutation, @TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("inverted_create_config_write_reentry").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      try (Dataset dataset = testDataset.write(1, 20)) {
+        dataset.updateConfig(Map.of(ConfigWriteReentrantIndexBuildProgress.CONFIG_KEY, "original"));
+        long versionBeforeCreate = dataset.latestVersion();
+        Fragment fragment = dataset.getFragments().get(0);
+        ConfigWriteReentrantIndexBuildProgress progress =
+            new ConfigWriteReentrantIndexBuildProgress(dataset, mutation);
+
+        Index segment =
+            dataset.createIndex(createInvertedSegmentOptions(fragment.getId()), progress);
+
+        assertNotNull(segment);
+        RuntimeException failure = progress.writeFailure.get();
+        assertNotNull(failure, "Expected config write re-entry to be rejected");
+        assertTrue(
+            failure.getMessage().contains("busy in an index progress callback"),
+            "Unexpected config write re-entry failure: " + failure.getMessage());
+        assertEquals(versionBeforeCreate, dataset.version());
+        assertEquals(versionBeforeCreate, dataset.latestVersion());
+        assertEquals(
+            "original", dataset.getConfig().get(ConfigWriteReentrantIndexBuildProgress.CONFIG_KEY));
       }
     }
   }

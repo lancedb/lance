@@ -1811,6 +1811,9 @@ public class Dataset implements Closeable {
    */
   @Deprecated
   public void updateConfig(Map<String, String> tableConfig) {
+    if (ContextIndexBuildProgress.isActive(this)) {
+      throw new IllegalStateException("Dataset is busy in an index progress callback");
+    }
     UpdateMap configUpdate = UpdateMap.builder().updates(tableConfig).replace(true).build();
 
     UpdateConfig operation = UpdateConfig.builder().configUpdates(configUpdate).build();
@@ -1827,6 +1830,9 @@ public class Dataset implements Closeable {
    */
   @Deprecated
   public void deleteConfigKeys(Set<String> deleteKeys) {
+    if (ContextIndexBuildProgress.isActive(this)) {
+      throw new IllegalStateException("Dataset is busy in an index progress callback");
+    }
     Map<String, String> deleteMap = new HashMap<>();
     deleteKeys.forEach(key -> deleteMap.put(key, null));
     UpdateMap configUpdate = UpdateMap.builder().updates(deleteMap).replace(false).build();
