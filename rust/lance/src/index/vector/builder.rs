@@ -527,11 +527,13 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
 
                 let filtered_mapping;
                 let mapping = if let Some(owned_fragments) = owned_fragments
-                    && has_unowned_fragment_rows(part.storage.row_ids(), owned_fragments.as_ref())
-                {
+                    && has_unowned_fragment_rows(
+                        part.storage.row_ids().copied(),
+                        owned_fragments.as_ref(),
+                    ) {
                     filtered_mapping = remap_for_owned_fragments(
-                        mapping.as_ref(),
-                        part.storage.row_ids(),
+                        mapping.clone(),
+                        part.storage.row_ids().copied(),
                         owned_fragments.as_ref(),
                     );
                     &filtered_mapping

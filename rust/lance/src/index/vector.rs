@@ -73,37 +73,33 @@ use crate::{Error, Result, dataset::Dataset, index::pb::vector_index_stage::Stag
 
 pub const LANCE_VECTOR_INDEX: &str = "__lance_vector_index";
 
-/// Materialize the part of a row-address remap needed by one physical segment.
+/// Restrict a row-address remap to the fragments owned by one physical segment.
 ///
 /// A segment may still contain rows from fragments it no longer owns. Those
 /// rows must be removed before its remapped output can be merged without the
 /// source segment's old fragment filter.
-fn remap_for_owned_fragments<'a>(
-    mapping: &RowAddrRemap,
-    row_addrs: impl IntoIterator<Item = &'a u64>,
+fn remap_for_owned_fragments(
+    mapping: Arc<RowAddrRemap>,
+    row_addrs: impl IntoIterator<Item = u64>,
     owned_fragments: &RoaringBitmap,
 ) -> RowAddrRemap {
-    RowAddrRemap::direct(
-        row_addrs
-            .into_iter()
-            .filter_map(|&row_addr| {
-                if owned_fragments.contains(RowAddress::from(row_addr).fragment_id()) {
-                    mapping.get(row_addr).map(|mapped| (row_addr, mapped))
-                } else {
-                    Some((row_addr, None))
-                }
-            })
-            .collect(),
-    )
+    let removed_fragments = row_addrs
+        .into_iter()
+        .filter_map(|row_addr| {
+            let fragment_id = RowAddress::from(row_addr).fragment_id();
+            (!owned_fragments.contains(fragment_id)).then_some(fragment_id)
+        })
+        .collect();
+    RowAddrRemap::with_removed_fragments(mapping, removed_fragments)
 }
 
-fn has_unowned_fragment_rows<'a>(
-    row_addrs: impl IntoIterator<Item = &'a u64>,
+fn has_unowned_fragment_rows(
+    row_addrs: impl IntoIterator<Item = u64>,
     owned_fragments: &RoaringBitmap,
 ) -> bool {
     row_addrs
         .into_iter()
-        .any(|&row_addr| !owned_fragments.contains(RowAddress::from(row_addr).fragment_id()))
+        .any(|row_addr| !owned_fragments.contains(RowAddress::from(row_addr).fragment_id()))
 }
 
 /// A materialized snapshot of one logical vector index and all of its segments.
@@ -2228,40 +2224,46 @@ mod tests {
     use arrow_array::RecordBatch;
     use arrow_array::types::{Float32Type, Int32Type};
     use arrow_schema::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
+    use lance_core::utils::row_addr_remap::GroupInput;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::{BatchCount, RowCount, array};
     use lance_file::writer::FileWriterOptions;
     use lance_index::metrics::NoOpMetricsCollector;
     use lance_linalg::distance::MetricType;
+    use roaring::RoaringTreemap;
 
     #[test]
     fn test_remap_for_owned_fragments_drops_stale_rows() {
-        let owned_moved = u64::from(RowAddress::new_from_parts(1, 0));
-        let owned_unchanged = u64::from(RowAddress::new_from_parts(1, 1));
-        let stale_moved = u64::from(RowAddress::new_from_parts(2, 0));
-        let stale_unchanged = u64::from(RowAddress::new_from_parts(3, 0));
-        let moved_owned_target = u64::from(RowAddress::new_from_parts(4, 0));
-        let moved_stale_target = u64::from(RowAddress::new_from_parts(4, 1));
-        let mapping = RowAddrRemap::direct(HashMap::from([
-            (owned_moved, Some(moved_owned_target)),
-            (stale_moved, Some(moved_stale_target)),
-        ]));
+        const NUM_OWNED_ROWS: u32 = 1_048_576;
+        let owned_addr = |offset| u64::from(RowAddress::new_from_parts(1, offset));
+        let moved_addr = |offset| u64::from(RowAddress::new_from_parts(4, offset));
+        let stale_addr = u64::from(RowAddress::new_from_parts(2, 0));
+        let mapping = Arc::new(
+            RowAddrRemap::compact([GroupInput {
+                rewritten_old_row_addrs: RoaringTreemap::from_iter(
+                    (0..NUM_OWNED_ROWS).map(owned_addr),
+                ),
+                old_frag_ids: vec![1],
+                new_frags: vec![(4, NUM_OWNED_ROWS)],
+            }])
+            .unwrap(),
+        );
 
         let filtered = remap_for_owned_fragments(
-            &mapping,
-            [
-                &owned_moved,
-                &owned_unchanged,
-                &stale_moved,
-                &stale_unchanged,
-            ],
+            mapping,
+            (0..NUM_OWNED_ROWS)
+                .map(owned_addr)
+                .chain(std::iter::once(stale_addr)),
             &RoaringBitmap::from_iter([1]),
         );
 
-        assert_eq!(filtered.get(owned_moved), Some(Some(moved_owned_target)));
-        assert_eq!(filtered.get(owned_unchanged), None);
-        assert_eq!(filtered.get(stale_moved), Some(None));
-        assert_eq!(filtered.get(stale_unchanged), Some(None));
+        assert!(matches!(filtered, RowAddrRemap::Compact(_)));
+        assert_eq!(filtered.get(owned_addr(0)), Some(Some(moved_addr(0))));
+        assert_eq!(
+            filtered.get(owned_addr(NUM_OWNED_ROWS - 1)),
+            Some(Some(moved_addr(NUM_OWNED_ROWS - 1)))
+        );
+        assert_eq!(filtered.get(stale_addr), Some(None));
     }
 
     /// `open_index_file` skips the HEAD when the size is known and still falls

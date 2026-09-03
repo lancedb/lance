@@ -2043,8 +2043,8 @@ impl RemapPageTask {
         mut self,
         reader: Arc<dyn Reader>,
         index: &IVFIndex,
-        mapping: &RowAddrRemap,
-        owned_fragments: Option<&RoaringBitmap>,
+        mapping: Arc<RowAddrRemap>,
+        owned_fragments: Option<Arc<RoaringBitmap>>,
     ) -> Result<Self> {
         let mut page = index
             .sub_index
@@ -2052,12 +2052,16 @@ impl RemapPageTask {
             .await?;
         let filtered_mapping;
         let mapping = if let Some(owned_fragments) = owned_fragments
-            && has_unowned_fragment_rows(page.row_ids(), owned_fragments)
+            && has_unowned_fragment_rows(page.row_ids().copied(), owned_fragments.as_ref())
         {
-            filtered_mapping = remap_for_owned_fragments(mapping, page.row_ids(), owned_fragments);
+            filtered_mapping = remap_for_owned_fragments(
+                mapping,
+                page.row_ids().copied(),
+                owned_fragments.as_ref(),
+            );
             &filtered_mapping
         } else {
-            mapping
+            mapping.as_ref()
         };
         page.remap(mapping).await?;
         self.page = Some(page);
@@ -2231,9 +2235,18 @@ pub(crate) async fn remap_index_file(
     let mut writer = object_store.create(&new_path).await?;
 
     let tasks = generate_remap_tasks(&index.ivf.offsets, &index.ivf.lengths)?;
+    let mapping = Arc::new(mapping.clone());
+    let owned_fragments = owned_fragments.cloned().map(Arc::new);
 
     let mut task_stream = stream::iter(tasks)
-        .map(|task| task.load_and_remap(reader.clone(), index, mapping, owned_fragments))
+        .map(|task| {
+            task.load_and_remap(
+                reader.clone(),
+                index,
+                mapping.clone(),
+                owned_fragments.clone(),
+            )
+        })
         .buffered(object_store.io_parallelism());
 
     let mut ivf = IvfModel {
