@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use opendal::{Operator, services::GooseFs};
@@ -31,6 +32,95 @@ const STORAGE_OPTION_KEYS: &[&str] = &[
     "goosefs_auth_username",
 ];
 
+/// Filename searched under `GOOSEFS_CONF_DIR` / `GOOSEFS_HOME/conf` / `~/.goosefs` / `/etc/goosefs`.
+const SITE_PROPERTIES_FILENAME: &str = "goosefs-site.properties";
+
+/// Discover `goosefs-site.properties` using the same search order as goosefs-sdk.
+///
+/// 1. `$GOOSEFS_CONFIG_FILE`
+/// 2. `$GOOSEFS_CONF_DIR/goosefs-site.properties`
+/// 3. `$GOOSEFS_HOME/conf/goosefs-site.properties`
+/// 4. `~/.goosefs/goosefs-site.properties`
+/// 5. `/etc/goosefs/goosefs-site.properties`
+fn discover_site_properties_file() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("GOOSEFS_CONFIG_FILE") {
+        let pb = PathBuf::from(p);
+        if pb.is_file() {
+            return Some(pb);
+        }
+    }
+    if let Ok(dir) = std::env::var("GOOSEFS_CONF_DIR") {
+        let p = PathBuf::from(dir).join(SITE_PROPERTIES_FILENAME);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    if let Ok(home) = std::env::var("GOOSEFS_HOME") {
+        let p = PathBuf::from(home)
+            .join("conf")
+            .join(SITE_PROPERTIES_FILENAME);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
+        let p = PathBuf::from(home)
+            .join(".goosefs")
+            .join(SITE_PROPERTIES_FILENAME);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    let system = PathBuf::from("/etc/goosefs").join(SITE_PROPERTIES_FILENAME);
+    if system.is_file() {
+        return Some(system);
+    }
+    None
+}
+
+/// True when the properties file names a master via HA list or hostname.
+///
+/// A file that exists but has neither key must *not* suppress the URI
+/// fallback, otherwise `from_properties_auto()` would dial `127.0.0.1:9200`.
+fn site_file_has_master_addresses(path: &Path) -> bool {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    parse_properties_has_master(&content)
+}
+
+fn parse_properties_has_master(content: &str) -> bool {
+    let mut hostname: Option<&str> = None;
+    let mut addresses: Option<&str> = None;
+    for raw in content.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with('!') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        let value = value.trim();
+        if value.is_empty() {
+            continue;
+        }
+        match key {
+            "goosefs.master.rpc.addresses" => addresses = Some(value),
+            "goosefs.master.hostname" => hostname = Some(value),
+            _ => {}
+        }
+    }
+    if let Some(addrs) = addresses {
+        return addrs.split(',').any(|s| !s.trim().is_empty());
+    }
+    hostname.is_some()
+}
+
+fn site_properties_have_master_addresses() -> bool {
+    discover_site_properties_file().is_some_and(|path| site_file_has_master_addresses(&path))
+}
+
 /// GooseFS object store provider.
 ///
 /// Uses OpenDAL's GooseFs service to access GooseFS via gRPC.
@@ -52,7 +142,8 @@ const STORAGE_OPTION_KEYS: &[&str] = &[
 ///   yields key `k`.
 ///
 /// Supported configuration keys (via `storage_options` or environment variables,
-/// resolved with priority: `storage_options` > env var > URL authority > default).
+/// resolved with priority: `storage_options` > `GOOSEFS_MASTER_ADDR` >
+/// `goosefs.master.rpc.addresses` in `goosefs-site.properties` > URL authority).
 /// `storage_options` keys must be lowercase; uppercase/mixed-case spellings are
 /// rejected rather than silently ignored.
 ///
@@ -131,38 +222,56 @@ impl GooseFsStoreProvider {
         )))
     }
 
-    /// Resolve the GooseFS Master address from storage_options, environment, or URL.
+    /// Resolve the GooseFS Master address to pass to OpenDAL.
+    ///
+    /// Returns `Ok(Some(addr))` when Lance should set OpenDAL `master_addr`
+    /// (this *overrides* anything `from_properties_auto()` loaded from
+    /// `goosefs-site.properties`). Returns `Ok(None)` when the site file
+    /// already names masters and neither `storage_options` nor
+    /// `GOOSEFS_MASTER_ADDR` was set — OpenDAL then uses the file as-is,
+    /// so a dummy URI authority is not dialed.
     ///
     /// Priority:
     /// 1. `storage_options["goosefs_master_addr"]` (supports HA: "addr1:port,addr2:port")
     /// 2. `GOOSEFS_MASTER_ADDR` environment variable
-    /// 3. URL authority (host:port from the URL)
-    fn resolve_master_addr(url: &Url, storage_options: &StorageOptions) -> Result<String> {
+    /// 3. `goosefs.master.rpc.addresses` / `goosefs.master.hostname` in the
+    ///    discovered `goosefs-site.properties` (`Ok(None)` — do not overlay)
+    /// 4. URL authority (host:port from the URL)
+    fn resolve_master_addr(url: &Url, storage_options: &StorageOptions) -> Result<Option<String>> {
         // 1. storage_options
         if let Some(addr) = storage_options
             .0
             .get("goosefs_master_addr")
             .filter(|v| !v.is_empty())
         {
-            return Ok(addr.clone());
+            return Ok(Some(addr.clone()));
         }
 
         // 2. Environment variable
         if let Ok(addr) = std::env::var("GOOSEFS_MASTER_ADDR")
             && !addr.is_empty()
         {
-            return Ok(addr);
+            return Ok(Some(addr));
         }
 
-        // 3. URL authority
+        // 3. Site properties already name a master. Leave OpenDAL's
+        // `from_properties_auto()` overlay empty so HA from the file wins
+        // over a dummy `goosefs://192.0.2.5:9999/...` URI.
+        if site_properties_have_master_addresses() {
+            return Ok(None);
+        }
+
+        // 4. URL authority — required when nothing else supplied a master.
         let host = url.host_str().ok_or_else(|| {
             Error::invalid_input(
-                "GooseFS URL must contain a master address (host), e.g. goosefs://host:port/path",
+                "GooseFS URL must contain a master address (host), e.g. goosefs://host:port/path, \
+                 or set goosefs_master_addr / GOOSEFS_MASTER_ADDR / \
+                 goosefs.master.rpc.addresses in goosefs-site.properties",
             )
         })?;
 
         let port = url.port().unwrap_or(DEFAULT_GOOSEFS_PORT);
-        Ok(format!("{}:{}", host, port))
+        Ok(Some(format!("{}:{}", host, port)))
     }
 
     /// Resolve a storage option from storage_options or environment variable.
@@ -389,17 +498,18 @@ impl ObjectStoreProvider for GooseFsStoreProvider {
 
         Self::validate_storage_option_keys(&storage_options)?;
 
-        // Resolve master address
-        let master_addr = Self::resolve_master_addr(&base_path, &storage_options)?;
-
         // Resolve a stable cluster-wide root. The URL path is *not* used here
         // because it varies per dataset; per-request keys are supplied by
         // `extract_path` instead.
         let root = Self::resolve_root(&storage_options);
 
-        // Build OpenDAL config map
+        // Build OpenDAL config map. `master_addr` is omitted when site
+        // properties already name masters so OpenDAL `from_properties_auto()`
+        // keeps HA instead of dialing a dummy URI authority.
         let mut config_map: HashMap<String, String> = HashMap::new();
-        config_map.insert("master_addr".to_string(), master_addr);
+        if let Some(master_addr) = Self::resolve_master_addr(&base_path, &storage_options)? {
+            config_map.insert("master_addr".to_string(), master_addr);
+        }
         config_map.insert("root".to_string(), root);
 
         // Optional: write_type
@@ -500,6 +610,29 @@ impl ObjectStoreProvider for GooseFsStoreProvider {
 mod tests {
     use super::*;
     use rstest::rstest;
+    use serial_test::serial;
+
+    /// Point `GOOSEFS_CONFIG_FILE` at a temp properties file so discovery
+    /// does not pick up `~/.goosefs` / `/etc/goosefs` from the host.
+    fn with_site_properties(contents: &str, f: impl FnOnce()) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(SITE_PROPERTIES_FILENAME);
+        std::fs::write(&path, contents).unwrap();
+        unsafe {
+            std::env::set_var("GOOSEFS_CONFIG_FILE", &path);
+            std::env::remove_var("GOOSEFS_MASTER_ADDR");
+            std::env::remove_var("GOOSEFS_CONF_DIR");
+            std::env::remove_var("GOOSEFS_HOME");
+        }
+        f();
+        unsafe {
+            std::env::remove_var("GOOSEFS_CONFIG_FILE");
+        }
+    }
+
+    fn resolve(url: &str, opts: StorageOptions) -> Result<Option<String>> {
+        GooseFsStoreProvider::resolve_master_addr(&Url::parse(url).unwrap(), &opts)
+    }
 
     #[test]
     fn test_goosefs_extract_path_basic() {
@@ -610,30 +743,182 @@ mod tests {
     }
 
     #[test]
+    #[serial(GOOSEFS_SITE_CONF)]
     fn test_resolve_master_addr_from_url() {
-        let url = Url::parse("goosefs://10.0.0.1:9200/data").unwrap();
-        let storage_options = StorageOptions(HashMap::new());
-        let addr = GooseFsStoreProvider::resolve_master_addr(&url, &storage_options).unwrap();
-        assert_eq!(addr, "10.0.0.1:9200");
+        with_site_properties("", || {
+            let addr = resolve(
+                "goosefs://10.0.0.1:9200/data",
+                StorageOptions(HashMap::new()),
+            )
+            .unwrap();
+            assert_eq!(addr.as_deref(), Some("10.0.0.1:9200"));
+        });
     }
 
     #[test]
+    #[serial(GOOSEFS_SITE_CONF)]
     fn test_resolve_master_addr_default_port() {
-        let url = Url::parse("goosefs://10.0.0.1/data").unwrap();
-        let storage_options = StorageOptions(HashMap::new());
-        let addr = GooseFsStoreProvider::resolve_master_addr(&url, &storage_options).unwrap();
-        assert_eq!(addr, "10.0.0.1:9200");
+        with_site_properties("", || {
+            let addr = resolve("goosefs://10.0.0.1/data", StorageOptions(HashMap::new())).unwrap();
+            assert_eq!(addr.as_deref(), Some("10.0.0.1:9200"));
+        });
     }
 
     #[test]
+    #[serial(GOOSEFS_SITE_CONF)]
     fn test_resolve_master_addr_from_storage_options() {
-        let url = Url::parse("goosefs://10.0.0.1:9200/data").unwrap();
-        let storage_options = StorageOptions(HashMap::from([(
-            "goosefs_master_addr".to_string(),
-            "10.0.0.2:9200,10.0.0.3:9200".to_string(),
-        )]));
-        let addr = GooseFsStoreProvider::resolve_master_addr(&url, &storage_options).unwrap();
-        assert_eq!(addr, "10.0.0.2:9200,10.0.0.3:9200");
+        with_site_properties(
+            "goosefs.master.rpc.addresses=10.0.0.9:9200,10.0.0.8:9200\n",
+            || {
+                let storage_options = StorageOptions(HashMap::from([(
+                    "goosefs_master_addr".to_string(),
+                    "10.0.0.2:9200,10.0.0.3:9200".to_string(),
+                )]));
+                let addr = resolve("goosefs://10.0.0.1:9200/data", storage_options).unwrap();
+                assert_eq!(addr.as_deref(), Some("10.0.0.2:9200,10.0.0.3:9200"));
+            },
+        );
+    }
+
+    #[test]
+    #[serial(GOOSEFS_SITE_CONF)]
+    fn test_resolve_master_addr_env_beats_uri_and_site() {
+        with_site_properties(
+            "goosefs.master.rpc.addresses=10.0.0.9:9200,10.0.0.8:9200\n",
+            || {
+                unsafe {
+                    std::env::set_var("GOOSEFS_MASTER_ADDR", "10.0.0.7:9200,10.0.0.6:9200");
+                }
+                let addr = resolve(
+                    "goosefs://192.0.2.5:9999/data",
+                    StorageOptions(HashMap::new()),
+                )
+                .unwrap();
+                unsafe {
+                    std::env::remove_var("GOOSEFS_MASTER_ADDR");
+                }
+                assert_eq!(addr.as_deref(), Some("10.0.0.7:9200,10.0.0.6:9200"));
+            },
+        );
+    }
+
+    /// Ticket: dummy URI + empty storage_options + site HA must not overlay
+    /// OpenDAL `master_addr` (OpenDAL then keeps `from_properties_auto()`).
+    #[test]
+    #[serial(GOOSEFS_SITE_CONF)]
+    fn test_resolve_master_addr_site_ha_suppresses_dummy_uri() {
+        with_site_properties(
+            "goosefs.master.rpc.addresses=172.31.5.10:9200,172.31.5.2:9200,172.31.5.11:9200\n",
+            || {
+                let addr = resolve(
+                    "goosefs://192.0.2.5:9999/lance-cosn/lance_qta/xxx.lance",
+                    StorageOptions(HashMap::new()),
+                )
+                .unwrap();
+                assert_eq!(addr, None);
+            },
+        );
+    }
+
+    #[test]
+    #[serial(GOOSEFS_SITE_CONF)]
+    fn test_resolve_master_addr_site_ha_allows_uri_without_host() {
+        with_site_properties(
+            "goosefs.master.rpc.addresses=10.0.0.1:9200,10.0.0.2:9200\n",
+            || {
+                let addr =
+                    resolve("goosefs:///data/ds.lance", StorageOptions(HashMap::new())).unwrap();
+                assert_eq!(addr, None);
+            },
+        );
+    }
+
+    #[test]
+    #[serial(GOOSEFS_SITE_CONF)]
+    fn test_resolve_master_addr_site_hostname_suppresses_uri() {
+        with_site_properties("goosefs.master.hostname=goosefs-master\n", || {
+            let addr = resolve(
+                "goosefs://192.0.2.5:9999/data",
+                StorageOptions(HashMap::new()),
+            )
+            .unwrap();
+            assert_eq!(addr, None);
+        });
+    }
+
+    #[test]
+    #[serial(GOOSEFS_SITE_CONF)]
+    fn test_resolve_master_addr_empty_site_file_keeps_real_uri() {
+        with_site_properties(
+            "# no master keys\ngoosefs.user.block.size.bytes.default=4MB\n",
+            || {
+                let addr = resolve(
+                    "goosefs://10.0.0.1:9200/data",
+                    StorageOptions(HashMap::new()),
+                )
+                .unwrap();
+                assert_eq!(addr.as_deref(), Some("10.0.0.1:9200"));
+            },
+        );
+    }
+
+    #[test]
+    #[serial(GOOSEFS_SITE_CONF)]
+    fn test_resolve_master_addr_no_host_without_site_errors() {
+        with_site_properties("", || {
+            let err =
+                resolve("goosefs:///data/ds.lance", StorageOptions(HashMap::new())).unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("must contain a master address"), "got: {msg}");
+        });
+    }
+
+    #[test]
+    #[serial(GOOSEFS_SITE_CONF)]
+    fn test_discover_site_properties_via_conf_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(SITE_PROPERTIES_FILENAME);
+        std::fs::write(
+            &path,
+            "goosefs.master.rpc.addresses=10.0.0.1:9200,10.0.0.2:9200\n",
+        )
+        .unwrap();
+        unsafe {
+            std::env::remove_var("GOOSEFS_CONFIG_FILE");
+            std::env::remove_var("GOOSEFS_MASTER_ADDR");
+            std::env::remove_var("GOOSEFS_HOME");
+            std::env::set_var("GOOSEFS_CONF_DIR", dir.path());
+        }
+
+        let addr = resolve(
+            "goosefs://192.0.2.5:9999/data",
+            StorageOptions(HashMap::new()),
+        )
+        .unwrap();
+        unsafe {
+            std::env::remove_var("GOOSEFS_CONF_DIR");
+        }
+        assert_eq!(addr, None);
+    }
+
+    #[test]
+    fn test_parse_properties_has_master_ignores_comments_and_empty() {
+        assert!(!parse_properties_has_master(""));
+        assert!(!parse_properties_has_master(
+            "# goosefs.master.rpc.addresses=a:9200\n"
+        ));
+        assert!(!parse_properties_has_master(
+            "goosefs.master.rpc.addresses=\n"
+        ));
+        assert!(!parse_properties_has_master(
+            "goosefs.master.rpc.addresses=   ,  \n"
+        ));
+        assert!(parse_properties_has_master(
+            "goosefs.master.rpc.addresses=10.0.0.1:9200,10.0.0.2:9200\n"
+        ));
+        assert!(parse_properties_has_master(
+            "  goosefs.master.hostname = master.local  \n"
+        ));
     }
 
     #[test]

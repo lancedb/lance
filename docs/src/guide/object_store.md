@@ -542,7 +542,13 @@ The Master address can be resolved from (in priority order):
 
 1. The `goosefs_master_addr` storage option (supports HA: `"addr1:port,addr2:port"`).
 2. The `GOOSEFS_MASTER_ADDR` environment variable.
-3. The host and port from the URL authority.
+3. `goosefs.master.rpc.addresses` / `goosefs.master.hostname` in `goosefs-site.properties`
+   (discovered via `$GOOSEFS_CONFIG_FILE`, `$GOOSEFS_CONF_DIR`, `$GOOSEFS_HOME/conf`,
+   `~/.goosefs`, or `/etc/goosefs`). When this source is used, a dummy URL
+   authority such as `goosefs://192.0.2.5:9999/...` is **not** dialed.
+4. The host and port from the URL authority (required when none of the above
+   supplies a master — a real leader in the URI with no env and no site file
+   still works).
 
 `storage_options` keys **must be lowercase**. Uppercase or mixed-case spellings
 such as `GOOSEFS_MASTER_ADDR` are rejected with an explicit error — they are
@@ -551,7 +557,7 @@ Environment variables keep the `GOOSEFS_*` form.
 
 | storage_options key | env var | Description |
 |---------------------|---------|-------------|
-| `goosefs_master_addr` | `GOOSEFS_MASTER_ADDR` | GooseFS Master address. Supports a single address (`host:port`) or comma-separated HA addresses (`addr1:port,addr2:port`). Optional if the address is provided in the URL. |
+| `goosefs_master_addr` | `GOOSEFS_MASTER_ADDR` | GooseFS Master address. Supports a single address (`host:port`) or comma-separated HA addresses (`addr1:port,addr2:port`). Optional if the address is in the URL or in `goosefs-site.properties`. |
 | `goosefs_write_type` | `GOOSEFS_WRITE_TYPE` | Write type, e.g. `MUST_CACHE`, `CACHE_THROUGH`, `THROUGH`, `ASYNC_THROUGH`. Optional. |
 | `goosefs_block_size` | `GOOSEFS_BLOCK_SIZE` | GooseFS block size (this is the GooseFS-side block size, not Lance's I/O block size). Accepts a raw byte count or GooseFS suffixes such as `64MB` (binary units: `1KB = 1024`). Optional. |
 | `goosefs_chunk_size` | `GOOSEFS_CHUNK_SIZE` | Chunk size used when reading or writing files. Accepts a raw byte count or GooseFS suffixes such as `4MB` (binary units: `1KB = 1024`). Optional. |
