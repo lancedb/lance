@@ -77,7 +77,14 @@ public class DeletionFile implements Serializable {
       default:
         throw new IllegalStateException("Unsupported deletion file type: " + fileType);
     }
-    return "_deletions/" + fragmentId + "-" + readVersion + "-" + id + "." + suffix;
+    return "_deletions/"
+        + fragmentId
+        + "-"
+        + readVersion
+        + "-"
+        + Long.toUnsignedString(id)
+        + "."
+        + suffix;
   }
 
   @Override

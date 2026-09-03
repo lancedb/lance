@@ -60,9 +60,11 @@ public class FragmentTest {
   void testDeletionFileRelativePath() {
     DeletionFile bitmap = new DeletionFile(7, 11, 2L, DeletionFileType.BITMAP, null);
     DeletionFile array = new DeletionFile(7, 11, 2L, DeletionFileType.ARRAY, null);
+    DeletionFile highBitId = new DeletionFile(-1L, 11, 2L, DeletionFileType.BITMAP, null);
 
     assertEquals("_deletions/5-11-7.bin", bitmap.getRelativePath(5));
     assertEquals("_deletions/5-11-7.arrow", array.getRelativePath(5));
+    assertEquals("_deletions/5-11-18446744073709551615.bin", highBitId.getRelativePath(5));
     assertThrows(IllegalArgumentException.class, () -> bitmap.getRelativePath(-1));
   }
 
