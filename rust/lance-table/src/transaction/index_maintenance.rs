@@ -22,8 +22,8 @@ use lance_core::datatypes::Schema;
 use lance_core::{Error, Result};
 use roaring::RoaringBitmap;
 use std::collections::{HashMap, HashSet};
-use uuid::Uuid;
 use std::sync::Arc;
+use uuid::Uuid;
 
 impl Transaction {
     pub(super) fn register_pure_rewrite_rows_update_frags_in_indices(

@@ -101,7 +101,7 @@ use super::v2::IVFIndex;
 use super::{
     has_unowned_fragment_rows,
     ivf::load_precomputed_partitions_if_available,
-    remap_for_owned_fragments,
+    remap_for_owned_fragments, resolve_shared_remap,
     utils::{self, get_vector_type},
 };
 
@@ -203,18 +203,22 @@ fn apply_centroid_splits(
 async fn remap_hnsw_partition<S: IvfSubIndex + 'static, Q: Quantization>(
     index: &IVFIndex<S, Q>,
     partition_id: usize,
-    mapping: &RowAddrRemap,
+    mapping: Arc<RowAddrRemap>,
     owned_fragments: Option<&RoaringBitmap>,
 ) -> Result<(Q::Storage, S)> {
     let old_storage = index.load_partition_storage(partition_id, None).await?;
     let filtered_mapping;
     let mapping = if let Some(owned_fragments) = owned_fragments
-        && has_unowned_fragment_rows(old_storage.row_ids(), owned_fragments)
+        && has_unowned_fragment_rows(old_storage.row_ids().copied(), owned_fragments)
     {
-        filtered_mapping = remap_for_owned_fragments(mapping, old_storage.row_ids(), owned_fragments);
+        filtered_mapping = remap_for_owned_fragments(
+            mapping.clone(),
+            old_storage.row_ids().copied(),
+            owned_fragments,
+        );
         &filtered_mapping
     } else {
-        mapping
+        mapping.as_ref()
     };
     let storage = old_storage.remap(mapping)?;
     let graph = index.read_sub_index_batch(partition_id, None, None).await?;
@@ -661,23 +665,30 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 // One partition's addresses are the unit of translation; the
                 // partition itself is the working set it always was.
                 let row_ids: Vec<u64> = part.storage.row_ids().copied().collect();
-                let mapping = mapping.resolve(row_ids).await?;
+                let mapping = resolve_shared_remap(&mapping, row_ids).await?;
                 let (storage, index) = if S::name() == HNSW::name() {
-                    remap_hnsw_partition(ivf_index, part_id, &mapping, owned_fragments.as_deref())
-                        .await?
+                    remap_hnsw_partition(
+                        ivf_index,
+                        part_id,
+                        mapping.clone(),
+                        owned_fragments.as_deref(),
+                    )
+                    .await?
                 } else {
                     let filtered_mapping;
                     let mapping = if let Some(owned_fragments) = owned_fragments.as_deref()
-                        && has_unowned_fragment_rows(part.storage.row_ids(), owned_fragments)
-                    {
+                        && has_unowned_fragment_rows(
+                            part.storage.row_ids().copied(),
+                            owned_fragments,
+                        ) {
                         filtered_mapping = remap_for_owned_fragments(
-                            &mapping,
-                            part.storage.row_ids(),
+                            mapping.clone(),
+                            part.storage.row_ids().copied(),
                             owned_fragments,
                         );
                         &filtered_mapping
                     } else {
-                        &mapping
+                        mapping.as_ref()
                     };
                     let storage = part.storage.remap(mapping)?;
                     let index = part.index.remap(mapping, &storage)?;
