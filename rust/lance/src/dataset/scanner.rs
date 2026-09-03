@@ -5588,6 +5588,14 @@ impl Scanner {
         if q.minimum_nprobes == 0 {
             return Ok(false);
         }
+        // The per-query path threads a caller-supplied external row-address mask
+        // (`with_row_addr_prefilter`) into each query's prefilter via
+        // `with_external_mask`; the shared batch path builds one prefilter across
+        // the batch and does not carry that mask. Rather than silently returning
+        // masked-out rows, fall back to the per-query loop whenever a mask is set.
+        if self.external_row_mask.is_some() {
+            return Ok(false);
+        }
         // Decide from the index metadata (no I/O) rather than opening the index
         // to call `supports_batch_partition_search()`: this is a planning-time
         // gate and the single-query path likewise avoids opening the index here.
@@ -10096,6 +10104,75 @@ mod test {
                 batch_slice["i"].as_primitive::<Int32Type>().values(),
                 single["i"].as_primitive::<Int32Type>().values(),
                 "nprobes(0) query {query_index}: batch rows must match single-query rows"
+            );
+        }
+    }
+
+    /// A caller-supplied external row-address mask (`with_row_addr_prefilter`) is
+    /// applied per query on the single-query prefilter path (`with_external_mask`)
+    /// but is not carried by the shared batch scan. An otherwise batch-eligible
+    /// query must therefore fall back to the per-query loop when a mask is present,
+    /// and every returned row must honor the mask — otherwise the batch path would
+    /// silently return masked-out rows.
+    #[tokio::test]
+    async fn test_batch_knn_indexed_external_mask_falls_back() {
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, true)
+            .await
+            .unwrap();
+        test_ds.make_vector_index().await.unwrap();
+        let dataset = &test_ds.dataset;
+        let (queries, _query_values) = batch_knn_two_queries();
+        let k = 15;
+
+        // Same query shape as `test_batch_knn_indexed`: without a mask it is
+        // batch-eligible, so the mask is the only thing that forces the fallback.
+        let mut unmasked = dataset.scan();
+        unmasked.nearest("vec", &queries, k).unwrap();
+        unmasked.nprobes(2);
+        unmasked.project(&["i"]).unwrap();
+        let unmasked_plan = unmasked.explain_plan(false).await.unwrap();
+        assert!(
+            unmasked_plan.contains("ANNIvfBatch"),
+            "without a mask this query should use the shared-scan batch node, got:\n{unmasked_plan}"
+        );
+
+        // Build an allowlist from the dataset's row addresses (freshly created
+        // single fragment, so _rowid == row address).
+        let mut scan = dataset.scan();
+        scan.with_row_id();
+        let all_ids = batch_row_ids(&scan.try_into_batch().await.unwrap());
+        let allow: Vec<u64> = all_ids.iter().copied().step_by(2).collect();
+        let allow_set: BTreeSet<u64> = allow.iter().copied().collect();
+
+        let mut scan = dataset.scan();
+        scan.nearest("vec", &queries, k).unwrap();
+        scan.nprobes(2);
+        scan.with_row_addr_prefilter(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(
+            allow.iter().copied(),
+        )));
+        scan.with_row_id();
+
+        let plan = scan.explain_plan(false).await.unwrap();
+        assert!(
+            !plan.contains("ANNIvfBatch"),
+            "an external row mask must not use the shared-scan batch node, which \
+             does not carry the mask, got:\n{plan}"
+        );
+        assert!(
+            plan.contains("ANNSubIndex"),
+            "a masked batch query should fall back to the per-query indexed loop, got:\n{plan}"
+        );
+
+        // The fallback must honor the mask: every returned row is in the allowlist.
+        let got = batch_row_ids(&scan.try_into_batch().await.unwrap());
+        assert!(
+            !got.is_empty(),
+            "masked batch KNN should still return allowed rows"
+        );
+        for id in got {
+            assert!(
+                allow_set.contains(&id),
+                "returned _rowid {id} not in allowlist"
             );
         }
     }
