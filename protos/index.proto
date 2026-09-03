@@ -188,14 +188,8 @@ message VectorIndex {
 message VectorIndexDetails {
   // Content-derived identity of the IVF coarse quantizer used by this segment.
   // Readers may reuse coarse-quantizer search results only when every segment
-  // has the same supported fingerprint.
-  message CoarseQuantizerFingerprint {
-    // Fingerprint encoding version. Version 1 uses SHA-256.
-    uint32 version = 1;
-
-    // SHA-256 digest of the metric, dimensions, and ordered centroid bits.
-    bytes digest = 2;
-  }
+  // has the same well-formed fingerprint. The current encoding is a 32-byte
+  // SHA-256 digest of the metric, dimensions, and ordered centroid bits.
 
   VectorMetricType metric_type = 1;
 
@@ -239,7 +233,7 @@ message VectorIndexDetails {
 
   // Absent for independently trained and legacy segments. Presence means the
   // builder derived the identity from final, externally supplied centroids.
-  optional CoarseQuantizerFingerprint coarse_quantizer_fingerprint = 10;
+  optional bytes coarse_quantizer_fingerprint = 10;
 }
 
 // Hierarchical Navigable Small World (HNSW) parameters, used as an optional configuration for IVF indexes.

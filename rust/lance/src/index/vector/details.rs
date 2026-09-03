@@ -20,9 +20,7 @@ use lance_file::reader::FileReaderOptions;
 use lance_index::pb::VectorIndexDetails;
 use lance_index::pb::VectorMetricType;
 use lance_index::pb::index::Implementation;
-use lance_index::pb::vector_index_details::{
-    CoarseQuantizerFingerprint, Compression, FlatCompression, rabit_quantization,
-};
+use lance_index::pb::vector_index_details::{Compression, FlatCompression, rabit_quantization};
 use lance_index::{INDEX_FILE_NAME, INDEX_METADATA_SCHEMA_KEY, pb};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::traits::Reader;
@@ -43,7 +41,6 @@ use crate::dataset::Dataset;
 use crate::index::open_index_proto;
 use crate::{Error, Result};
 
-const COARSE_QUANTIZER_FINGERPRINT_VERSION: u32 = 1;
 const COARSE_QUANTIZER_FINGERPRINT_DIGEST_SIZE: usize = 32;
 const SHARED_COARSE_QUANTIZER_HINT: &str = "lance.ivf.shared_coarse_quantizer";
 
@@ -63,13 +60,7 @@ struct VectorDetailsJson {
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     runtime_hints: HashMap<String, String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    coarse_quantizer_fingerprint: Option<CoarseQuantizerFingerprintJson>,
-}
-
-#[derive(Serialize)]
-struct CoarseQuantizerFingerprintJson {
-    version: u32,
-    digest: String,
+    coarse_quantizer_fingerprint: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -145,7 +136,7 @@ fn update_centroid_bits(hasher: &mut Sha256, centroids: &FixedSizeListArray) -> 
 fn coarse_quantizer_fingerprint(
     params: &VectorIndexParams,
     metric_type: VectorMetricType,
-) -> Option<CoarseQuantizerFingerprint> {
+) -> Option<Vec<u8>> {
     if params
         .runtime_hints
         .get(SHARED_COARSE_QUANTIZER_HINT)
@@ -163,41 +154,32 @@ fn coarse_quantizer_fingerprint(
     let centroids = ivf.centroids.as_deref()?;
 
     let mut hasher = Sha256::new();
-    hasher.update(b"lance.coarse_quantizer");
-    hasher.update(COARSE_QUANTIZER_FINGERPRINT_VERSION.to_le_bytes());
+    hasher.update(b"lance.coarse_quantizer.v1");
     hasher.update((metric_type as i32).to_le_bytes());
     hasher.update((centroids.len() as u64).to_le_bytes());
     hasher.update((centroids.value_length() as u64).to_le_bytes());
     update_centroid_bits(&mut hasher, centroids)?;
 
-    Some(CoarseQuantizerFingerprint {
-        version: COARSE_QUANTIZER_FINGERPRINT_VERSION,
-        digest: hasher.finalize().to_vec(),
-    })
+    Some(hasher.finalize().to_vec())
 }
 
-/// Read a supported, well-formed coarse-quantizer fingerprint from manifest
-/// metadata. Returning `None` forces the query path to preserve per-segment
-/// partition ranking.
-pub(crate) fn coarse_quantizer_fingerprint_from_metadata(
-    index: &IndexMetadata,
-) -> Option<CoarseQuantizerFingerprint> {
+/// Read a well-formed coarse-quantizer fingerprint from manifest metadata.
+/// Returning `None` forces the query path to preserve per-segment partition
+/// ranking.
+pub fn coarse_quantizer_fingerprint_from_metadata(index: &IndexMetadata) -> Option<Vec<u8>> {
     let details = index
         .index_details
         .as_ref()?
         .to_msg::<VectorIndexDetails>()
         .ok()?;
-    details.coarse_quantizer_fingerprint.filter(|fingerprint| {
-        fingerprint.version == COARSE_QUANTIZER_FINGERPRINT_VERSION
-            && fingerprint.digest.len() == COARSE_QUANTIZER_FINGERPRINT_DIGEST_SIZE
-    })
+    details
+        .coarse_quantizer_fingerprint
+        .filter(|fingerprint| fingerprint.len() == COARSE_QUANTIZER_FINGERPRINT_DIGEST_SIZE)
 }
 
 /// Remove a stale coarse-quantizer identity when an operation retrains the IVF
 /// model but cannot surface the new final centroids to the manifest writer.
-pub(crate) fn clear_coarse_quantizer_fingerprint(
-    details: prost_types::Any,
-) -> Result<prost_types::Any> {
+pub fn clear_coarse_quantizer_fingerprint(details: prost_types::Any) -> Result<prost_types::Any> {
     let mut details_message = details.to_msg::<VectorIndexDetails>().map_err(|error| {
         Error::index(format!(
             "Failed to clear coarse quantizer fingerprint from VectorIndexDetails: {error}"
@@ -619,14 +601,10 @@ pub fn vector_details_as_json(details: &prost_types::Any) -> Result<String> {
         compression,
         runtime_hints: d.runtime_hints,
         coarse_quantizer_fingerprint: d.coarse_quantizer_fingerprint.map(|fingerprint| {
-            CoarseQuantizerFingerprintJson {
-                version: fingerprint.version,
-                digest: fingerprint
-                    .digest
-                    .iter()
-                    .map(|byte| format!("{byte:02x}"))
-                    .collect(),
-            }
+            fingerprint
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect()
         }),
     };
 
@@ -1068,7 +1046,7 @@ mod tests {
             )
         }
 
-        fn fingerprint(params: &VectorIndexParams) -> CoarseQuantizerFingerprint {
+        fn fingerprint(params: &VectorIndexParams) -> Vec<u8> {
             vector_index_details(params)
                 .to_msg::<VectorIndexDetails>()
                 .unwrap()
@@ -1082,11 +1060,18 @@ mod tests {
         let other_metric = params(vec![1.0, 2.0, 3.0, 4.0], DistanceType::Dot);
 
         let first_fingerprint = fingerprint(&first);
-        assert_eq!(first_fingerprint.version, 1);
-        assert_eq!(first_fingerprint.digest.len(), 32);
+        assert_eq!(first_fingerprint.len(), 32);
         assert_eq!(first_fingerprint, fingerprint(&same));
         assert_ne!(first_fingerprint, fingerprint(&reordered));
         assert_ne!(first_fingerprint, fingerprint(&other_metric));
+
+        let json: serde_json::Value =
+            serde_json::from_str(&vector_details_as_json(&vector_index_details(&first)).unwrap())
+                .unwrap();
+        assert_eq!(
+            json["coarse_quantizer_fingerprint"].as_str().unwrap().len(),
+            64
+        );
     }
 
     #[test]
