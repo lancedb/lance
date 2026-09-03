@@ -1490,7 +1490,9 @@ impl CleanupPolicyBuilder {
 /// This function will remove old manifest files, data files, indexes,
 /// delete files, and transaction files.
 ///
-/// It will only remove files that are not referenced by any valid manifest.
+/// Files that are not referenced by any valid manifest are removed if they are more
+/// than 7 days old, unless `delete_unverified` is set, which removes this age
+/// protection.
 ///
 /// The latest manifest is always considered valid and will not be removed
 /// even if it satisfied the cleanup policy.
