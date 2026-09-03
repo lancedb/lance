@@ -317,42 +317,31 @@ struct CleanupInspection {
 }
 
 impl CleanupInspection {
-    /// Cutoff for `read_dir_all(..., unmodified_since)`: it must be late
-    /// enough to list every kind of file cleanup can remove.
+    /// Cutoff for `read_dir_all(..., unmodified_since)`.
     ///
-    /// A file referenced only by manifests being removed needs
-    /// `earliest_retained`. That is valid when the working set is a time
-    /// suffix: every retained version is newer than every deleted one, so
-    /// those files predate the retained floor. A tagged old version (or any
-    /// other sparse retain) pulls the cutoff backwards, leaving files of newer
-    /// deleted versions unlisted while their manifests are removed, which
-    /// orphans them permanently ([#8705](https://github.com/lance-format/lance/issues/8705)).
-    /// In that case drop the cutoff and scan the whole subtree — the same
-    /// approach already used for `_indices/`.
+    /// This bounds files owned by a manifest being removed. Listing only files
+    /// with `last_modified <= earliest_retained` is valid when the working set
+    /// is a time suffix: every retained version is newer than every deleted
+    /// one, so those files predate the retained floor. A tagged old version (or
+    /// any other sparse retain) pulls that cutoff backwards, so files from
+    /// newer deleted versions are never listed. Their manifests are still
+    /// removed, which permanently orphans the data files
+    /// ([#8705](https://github.com/lance-format/lance/issues/8705)).
     ///
-    /// A file referenced by *no* manifest is instead removed on its age, and
-    /// its mtime is unrelated to the retained floor: abandoned
-    /// `write_fragments` output is written whenever the writer ran, possibly
-    /// long after the oldest retained version was committed. Listing it
-    /// requires a cutoff no earlier than `unverified_threshold`, so take the
-    /// later of the two ([#8942](https://github.com/lance-format/lance/issues/8942)).
-    /// With `delete_unverified` such a file is a candidate at any age, which
-    /// admits no cutoff at all.
-    fn listing_unmodified_since(
-        &self,
-        delete_unverified: bool,
-        unverified_threshold: DateTime<Utc>,
-    ) -> Option<DateTime<Utc>> {
-        if delete_unverified {
-            return None;
-        }
+    /// When a deleted manifest is newer than the earliest retained one, drop
+    /// the cutoff and scan the whole subtree — the same approach already used
+    /// for `_indices/`.
+    ///
+    /// A file owned by *no* manifest is bounded by its age instead, not by this
+    /// floor; the `data/` listing widens this accordingly at the call site
+    /// ([#8942](https://github.com/lance-format/lance/issues/8942)).
+    fn listing_unmodified_since(&self) -> Option<DateTime<Utc>> {
         match (
             self.earliest_retained_manifest_time,
             self.latest_deleted_manifest_time,
         ) {
             (Some(retained), Some(deleted)) if deleted > retained => None,
-            (Some(retained), _) => Some(retained.max(unverified_threshold)),
-            (None, _) => None,
+            (retained, _) => retained,
         }
     }
 }
@@ -732,16 +721,25 @@ impl<'a> CleanupTask<'a> {
         };
 
         // Restrict scanning to Lance-managed subtrees for safety and performance.
-        // The cutoff has to cover every candidate class: files of newer deleted
-        // versions (hidden by a sparse retain such as a tag) and unreferenced
-        // files that have aged past the unverified threshold. See
+        // Drop the retained-manifest cutoff when a sparse retain (e.g. a tag)
+        // would hide files that belong to newer deleted versions. See
         // [`CleanupInspection::listing_unmodified_since`].
-        let unmodified_since = inspection
-            .listing_unmodified_since(self.policy.delete_unverified, verification_threshold);
+        let unmodified_since = inspection.listing_unmodified_since();
+        // A data file owned by no manifest is removed on its age, and its mtime is
+        // unrelated to the retained floor: abandoned `write_fragments` output is
+        // written whenever the writer ran, possibly long after the oldest retained
+        // version was committed. List through the moving unverified threshold so it
+        // becomes a candidate once old enough, and drop the cutoff entirely under
+        // `delete_unverified`, where it is a candidate at any age.
+        let data_unmodified_since = if self.policy.delete_unverified {
+            None
+        } else {
+            unmodified_since.map(|cutoff| cutoff.max(verification_threshold))
+        };
         let streams = vec![
             build_listing_stream(self.dataset.versions_dir(), unmodified_since),
             build_listing_stream(self.dataset.transactions_dir(), unmodified_since),
-            build_listing_stream(self.dataset.data_dir(), unmodified_since),
+            build_listing_stream(self.dataset.data_dir(), data_unmodified_since),
             // Index UUIDs from manifests being removed are proof that their files are
             // safe to delete. Scan every index artifact while that proof is available;
             // a retained-manifest cutoff can otherwise skip newer artifacts and lose
@@ -2557,8 +2555,16 @@ mod tests {
         assert_eq!(after_count.num_tx_files, 2);
     }
 
+    #[rstest]
+    // Aged past the unverified threshold, collected by the default policy.
+    #[case::aged(false, 20)]
+    // Fresh, but `delete_unverified` waives the age protection entirely.
+    #[case::delete_unverified(true, 4)]
     #[tokio::test]
-    async fn cleanup_deletes_aged_orphan_newer_than_retained_manifests() {
+    async fn cleanup_deletes_aged_orphan_newer_than_retained_manifests(
+        #[case] delete_unverified: bool,
+        #[case] cleanup_day: i64,
+    ) {
         // A data file referenced by no manifest (e.g. abandoned
         // `write_fragments` output) is deleted based on its age, and its mtime
         // is unrelated to the retained floor.
@@ -2582,7 +2588,7 @@ mod tests {
             .unwrap();
         drop(dataset);
 
-        MockClock::set_system_time(TimeDelta::try_days(20).unwrap().to_std().unwrap());
+        MockClock::set_system_time(TimeDelta::try_days(cleanup_day).unwrap().to_std().unwrap());
 
         let before_count = fixture.count_files().await.unwrap();
         assert_eq!(before_count.num_data_files, 4);
@@ -2590,7 +2596,11 @@ mod tests {
 
         // Suffix-only retention: the two oldest versions go, the latest stays.
         let removed = fixture
-            .run_cleanup(utc_now() - TimeDelta::try_days(8).unwrap())
+            .run_cleanup_with_override(
+                utc_now() - TimeDelta::try_days(2).unwrap(),
+                Some(delete_unverified),
+                None,
+            )
             .await
             .unwrap();
 
