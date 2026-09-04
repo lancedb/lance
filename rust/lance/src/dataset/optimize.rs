@@ -2329,6 +2329,7 @@ async fn rewrite_files(
     // an index to remap now, or a deferred remap through the FRI.
     let capture_row_addrs = !dataset.manifest.uses_stable_row_ids()
         && (options.defer_index_remap
+            || !dataset.manifest.stable_partition_transitions.is_empty()
             || load_indices_for_remapping(dataset.as_ref())
                 .await?
                 .is_some());
@@ -2856,7 +2857,7 @@ pub async fn commit_compaction(
     } else {
         RoaringBitmap::new()
     };
-    let mut any_group_indexed = false;
+    let mut any_group_indexed = !dataset.manifest.stable_partition_transitions.is_empty();
 
     for task in completed_tasks {
         metrics += task.metrics;
@@ -2865,6 +2866,17 @@ pub async fn commit_compaction(
             new_fragments: task.new_fragments.clone(),
         };
 
+        if !dataset.manifest.stable_partition_transitions.is_empty() && !options.defer_index_remap {
+            let changed_row_addrs = task.row_addrs.clone().ok_or_else(|| {
+                Error::invalid_input("mixed FRI compaction requires captured source addresses")
+            })?;
+            frag_reuse_groups.push(FragReuseGroup {
+                changed_row_addrs,
+                old_frags: task.original_fragments.iter().map(Into::into).collect(),
+                new_frags: task.new_fragments.iter().map(Into::into).collect(),
+            });
+            new_fragment_bitmap.extend(task.new_fragments.iter().map(|f| f.id as u32));
+        }
         if index_remapper.is_some() {
             if let Some(row_addrs_bytes) = task.row_addrs {
                 let row_addrs =
@@ -2990,7 +3002,9 @@ pub async fn commit_compaction(
     };
 
     // No indexed/chain data touched -> no FRI (all-or-nothing, see above).
-    let frag_reuse_index = if options.defer_index_remap && any_group_indexed {
+    let frag_reuse_index = if (options.defer_index_remap && any_group_indexed)
+        || !dataset.manifest.stable_partition_transitions.is_empty()
+    {
         Some(build_new_frag_reuse_index(dataset, frag_reuse_groups, new_fragment_bitmap).await?)
     } else {
         if options.defer_index_remap {
@@ -3014,6 +3028,7 @@ pub async fn commit_compaction(
             groups: rewrite_groups,
             rewritten_indices,
             frag_reuse_index,
+            stable_partition: None,
         },
     )
     .transaction_properties(options.transaction_properties.clone())

@@ -820,6 +820,8 @@ def test_remap_row_addrs(tmp_path: Path):
     # No fragment-reuse index yet -> None (nothing to remap against).
     addrs = pa.array([0, 1 << 32, (5 << 32) | 7], pa.uint64())
     assert ds.remap_row_addrs(addrs) is None
+    with pytest.raises(TypeError, match="UInt64"):
+        ds.remap_row_addrs(pa.array([0], pa.int32()))
 
     before = ds.scanner(columns=["id"], with_row_address=True).to_table()
     old = dict(zip(before["id"].to_pylist(), before["_rowaddr"].to_pylist()))
@@ -842,3 +844,5 @@ def test_remap_row_addrs(tmp_path: Path):
         pa.array([old[i] for i in sample], pa.uint64())
     ).to_pylist()
     assert remapped == [new[i] for i in sample]
+    nullable = ds.remap_row_addrs(pa.array([old[0], None, old[999]], pa.uint64()))
+    assert nullable.to_pylist() == [new[0], None, new[999]]

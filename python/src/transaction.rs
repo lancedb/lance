@@ -495,6 +495,7 @@ impl FromPyObject<'_, '_> for PyLance<Operation> {
                     rewritten_indices,
                     // TODO: pass frag_reuse_index when available
                     frag_reuse_index: None,
+                    stable_partition: None,
                 };
                 Ok(Self(op))
             }
@@ -728,8 +729,14 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
             Operation::Rewrite {
                 groups,
                 rewritten_indices,
+                stable_partition,
                 ..
             } => {
+                if stable_partition.is_some() {
+                    return Err(pyo3::exceptions::PyNotImplementedError::new_err(
+                        "Python operation objects do not yet support stable-partition descriptors",
+                    ));
+                }
                 let groups_py = export_vec(py, groups.as_slice())?;
                 let rewritten_indices_py = export_vec(py, rewritten_indices.as_slice())?;
                 let cls = namespace

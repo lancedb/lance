@@ -8,6 +8,8 @@ mod fragment;
 mod index;
 pub mod key_existence;
 mod manifest;
+mod stable_partition;
+pub use stable_partition::{ROW_MAP_FILE_NAME, ROW_MAPS_DIR, StablePartitionTransition};
 pub mod overlay;
 mod row_ids;
 mod transaction;

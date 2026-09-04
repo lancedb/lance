@@ -535,7 +535,14 @@ fn convert_to_java_operation_inner<'local>(
             groups,
             rewritten_indices,
             frag_reuse_index,
+            stable_partition,
         } => {
+            if stable_partition.is_some() {
+                return Err(lance::Error::not_supported(
+                    "Java operation objects do not yet support stable-partition descriptors",
+                )
+                .into());
+            }
             let java_groups = export_vec(env, &groups)?;
             let java_indices = export_vec(env, &rewritten_indices)?;
             let java_frag_reuse_index = match frag_reuse_index {
@@ -1273,6 +1280,7 @@ fn convert_to_rust_operation(
                 groups,
                 rewritten_indices,
                 frag_reuse_index,
+                stable_partition: None,
             }
         }
         "Update" => {

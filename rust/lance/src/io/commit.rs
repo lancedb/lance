@@ -386,6 +386,11 @@ async fn do_commit_new_dataset(
         )
         .await?;
         ensure_can_write_manifest(&source_manifest)?;
+        if !source_manifest.stable_partition_transitions.is_empty() {
+            return Err(Error::not_supported(
+                "cloning datasets with stable-partition mappings is not yet supported",
+            ));
+        }
         Some((source_store, source_manifest_location, source_manifest))
     } else {
         None
@@ -1119,6 +1124,8 @@ pub(crate) async fn do_commit_detached_transaction(
     retry_timeout: Duration,
 ) -> Result<(Manifest, ManifestLocation)> {
     ensure_can_write_manifest(&dataset.manifest)?;
+    crate::index::frag_reuse_v2::validate_partition_sources(dataset, &transaction.operation)
+        .await?;
     let pb_transaction = pb::Transaction::from(transaction);
     let inline_transaction = pb_transaction.encoded_len() <= MAX_INLINE_TRANSACTION_BYTES;
     // Classified from the operation itself. Reading it back off the inline
@@ -1474,6 +1481,9 @@ pub(crate) async fn commit_transaction(
         } else {
             ensure_can_write_manifest(&dataset.manifest)?;
         }
+
+        crate::index::frag_reuse_v2::validate_partition_sources(&dataset, &transaction.operation)
+            .await?;
 
         // Recomputed every attempt: the rebase above may have rewritten the
         // transaction.

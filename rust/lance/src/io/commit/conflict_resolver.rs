@@ -3073,6 +3073,7 @@ mod tests {
                 }],
                 rewritten_indices: vec![],
                 frag_reuse_index: None,
+                stable_partition: None,
             },
             Operation::ReserveFragments { num_fragments: 3 },
             Operation::Update {
@@ -3212,6 +3213,7 @@ mod tests {
                     }],
                     rewritten_indices: Vec::new(),
                     frag_reuse_index: None,
+                    stable_partition: None,
                 },
                 [
                     Compatible,    // append
@@ -3234,6 +3236,7 @@ mod tests {
                     }],
                     rewritten_indices: Vec::new(),
                     frag_reuse_index: None,
+                    stable_partition: None,
                 },
                 [
                     Compatible,    // append
@@ -3591,6 +3594,7 @@ mod tests {
             }],
             rewritten_indices: vec![],
             frag_reuse_index: None,
+            stable_partition: None,
         };
 
         let fragment0 = Fragment::new(0);
@@ -3736,6 +3740,7 @@ mod tests {
             }],
             rewritten_indices: vec![],
             frag_reuse_index: None,
+            stable_partition: None,
         };
 
         for (other, expect_conflict) in [(overlay_on(1), true), (overlay_on(0), false)] {
@@ -4399,6 +4404,7 @@ mod tests {
                 }],
                 rewritten_indices: vec![],
                 frag_reuse_index: Some(frag_reuse_index),
+                stable_partition: None,
             },
             None,
         );
@@ -4884,6 +4890,7 @@ mod tests {
                     }],
                     rewritten_indices: vec![],
                     frag_reuse_index: None,
+                    stable_partition: None,
                 },
                 Retryable,
             ),
@@ -4899,6 +4906,7 @@ mod tests {
                     }],
                     rewritten_indices: vec![],
                     frag_reuse_index: None,
+                    stable_partition: None,
                 },
                 Compatible,
             ),

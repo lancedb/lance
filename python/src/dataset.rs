@@ -60,10 +60,7 @@ use lance::dataset::{
     transaction::{Operation, Transaction},
 };
 use lance::index::vector::utils::get_vector_type;
-use lance::index::{
-    DatasetIndexExt, DatasetIndexInternalExt, IndexSegment, IntoIndexSegment,
-    vector::VectorIndexParams,
-};
+use lance::index::{DatasetIndexExt, IndexSegment, IntoIndexSegment, vector::VectorIndexParams};
 use lance::{dataset::builder::DatasetBuilder, index::vector::IndexFileVersion};
 use lance_arrow::as_fixed_size_list_array;
 use lance_core::Error;
@@ -1170,30 +1167,25 @@ impl Dataset {
             })
     }
 
-    /// Remap row addresses across compactions still recorded in the
-    /// fragment-reuse index. Rows a compaction dropped become null. The index
-    /// retains only recent rounds (older ones are pruned as index remap catches
-    /// up), so remap promptly: an address whose round was pruned is returned
-    /// unchanged, not remapped. Returns None when there is no fragment-reuse
-    /// index.
+    /// Translate nullable UInt64 addresses through retained compactions and stable partitions.
+    /// Rows dropped by rewrites become null; later deletion vectors are not applied.
+    /// Addresses outside retained history pass through. Returns None when no history exists.
     fn remap_row_addrs(
         &self,
         py: Python,
         addrs: PyArrowType<ArrayData>,
     ) -> PyResult<Option<PyArrowType<ArrayData>>> {
-        use lance_index::metrics::NoOpMetricsCollector;
-
         let array = make_array(addrs.0);
-        let frag_reuse_index = rt()
+        let addresses = array
+            .as_primitive_opt::<arrow_array::types::UInt64Type>()
+            .ok_or_else(|| PyTypeError::new_err("row addresses must be a UInt64 Arrow array"))?;
+        let remapped = rt()
             .block_on(
                 Some(py),
-                self.ds.open_frag_reuse_index(&NoOpMetricsCollector),
+                lance::index::frag_reuse_v2::remap_row_addrs(self.ds.as_ref(), addresses),
             )?
-            .map_err(|err| {
-                PyIOError::new_err(format!("failed to open fragment reuse index: {err}"))
-            })?;
-
-        Ok(frag_reuse_index.map(|fri| PyArrowType(fri.remap_row_ids_array(array).to_data())))
+            .map_err(|err| PyIOError::new_err(format!("failed to remap row addresses: {err}")))?;
+        Ok(remapped.map(|array| PyArrowType(array.to_data())))
     }
 
     fn serialized_manifest(&self, py: Python) -> Py<PyAny> {

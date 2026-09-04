@@ -220,7 +220,25 @@ message Manifest {
 
   // The branch of the dataset. None means main branch.
   optional string branch = 20;
+
+  // Immutable stable-partition mappings. Compaction continues to use FRI V1.
+  // Both histories must be retained and translated together.
+  repeated StablePartitionTransition stable_partition_transitions = 22;
 } // Manifest
+
+// An experimental stable-partition rewrite using the row-map format.
+message StablePartitionTransition {
+  uint64 source_dataset_version = 1;
+  repeated FragmentReuseIndexDetails.FragmentDigest sources = 2;
+  repeated FragmentReuseIndexDetails.FragmentDigest destinations = 3;
+  // UUID directory under _row_maps containing row_map.lance.
+  string row_map_id = 4;
+  uint64 row_map_size_bytes = 5;
+  // Absent means this dataset's storage base.
+  optional uint32 base_id = 6;
+  // Zero in a prepared transaction; stamped when installed in a manifest.
+  uint64 committed_version = 7;
+}
 
 // external dataset base path
 message BasePath {

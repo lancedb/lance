@@ -1,339 +1,182 @@
-# Mixed FRI V1/V2: stable-partition integration draft
+# Mixed FRI V1/V2 implementation draft
 
-Status: informal design for discussion. This is not a format specification or
-an activation proposal. We will start the format-change process after the design
-is agreed. No protobuf field numbers, feature bits, or new file contracts are
-allocated by this document.
+This is experimental implementation work stacked on
+[#8972](https://github.com/lance-format/lance/pull/8972), replacing
+[#8978](https://github.com/lance-format/lance/pull/8978). The format changes here
+are provisional. Formal format review comes after the implementation and its
+semantics are agreed.
 
-This is the proposed replacement direction for [#8978](https://github.com/lance-format/lance/pull/8978),
-stacked on [#8972](https://github.com/lance-format/lance/pull/8972).
-PR #8972 already supplies the stable-partition row-map writer, reader, counts,
-and translation algorithms. Keep that foundation. This proposal addresses the
-dataset lifecycle around it; it does not repeat the codec work.
+## Stable partition
 
-## 1. What we want
+A stable partition is a value-preserving rewrite. It visits ordered source
+fragments in physical row order, skips deleted rows, and routes every live row
+to exactly one destination. Within each destination, relative source order is
+preserved. It does not declare a permanent partition key: subsequent appends
+can create ordinary fragments. Sorting within a destination is not representable
+by this encoding.
 
-People can continue compacting into the existing FRI V1 format. Stable partition
-writes V2 metadata referencing the row maps from #8972. Our new reader and writer
-handle the two paths together. No up-front rewrite of all existing indices or
-mandatory conversion of V1 history is required.
+    Sources:      A [a, b, deleted, c], B [d, e]
+    Labels:         0  1    NULL    0     1  0
+    Destinations: C [a, c, e], D [b, d]
 
-    Existing compaction -> V1 FRI details --+
-                                          +-> shared rewrite handling
-    Stable partition -> V2 transitions ---+
+The row-map implementation is reused directly from #8972:
 
-Eventually V2 should also represent order-preserving compaction. That is a later
-extension, not a prerequisite for this integration. The two physical formats
-must already behave as one logical history before mixed operations are enabled.
+- `RowMapWriter` interleaves deleted positions from source deletion vectors into
+  the stream of live-row destination labels.
+- `RowMapReader` opens the counts matrix without reading labels. A point or
+  batch lookup reads only the relevant logical blocks. Mixed translation sorts
+  requested offsets and limits each read to sixteen blocks to bound label memory.
+- A non-NULL label selects an entry in the ordered destination list. Its rank
+  among earlier equal labels is the destination offset.
 
-The initial implementation can use conservative coverage and conflict rules.
-The format should not depend on pretending an old client understands new
-maintenance semantics merely because it can parse the manifest.
+Counts check conservation; they cannot prove value identity or output order.
+The rewrite worker must write destination data and labels from the same routing
+decisions and preserve order within each destination.
 
-## 2. Stable partition, precisely
-
-Inputs are ordered source fragments from one snapshot. Within a source, visit
-rows in ascending physical offset. Each surviving row is routed to one of an
-ordered list of destination fragments. Every destination preserves the relative
-source order of its rows; values do not change.
-
-This is not a persistent partition-key declaration. Later appends may add
-ordinary fragments without routing through the same destinations. It is also
-not arbitrary sorting: sorting within a destination needs a permutation encoding.
-
-    Source A: [a, b, deleted, c]
-    Source B: [d, e]
-    Labels:   [0, 1, NULL, 0, 1, 0]
-    Dest C:   [a, c, e]
-    Dest D:   [b, d]
-
-The label is a destination-list position, not a fragment ID. For physical source
-position g, its new offset is the number of earlier occurrences of label[g].
-A NULL label means that position was deleted in the rewrite's input snapshot.
-
-Destinations have fresh, reserved fragment IDs and no deletion vectors at
-creation. Parallel writers must restore source order within each destination.
-Counts validate conservation, but cannot prove row identity or order: the writer
-must emit data and labels from the same routing decisions.
-
-## 3. Proposed V2 metadata
-
-Use immutable mapping payloads and a small catalog of transition references.
-The preferred home for that catalog is a dedicated manifest field/section.
-It describes table structure, not a searchable index. Its exact placement is
-still a review decision; a system-index envelope is an alternative only if it
-has explicit preservation and file-reachability rules.
+## Persisted state
 
     Manifest
-    +-- existing V1 FRI entry, unchanged wire format
-    +-- V2 transition catalog
-        +-- catalog format version
-        +-- transition references[]
-            +-- immutable transition ID
-            +-- actual commit version
-            +-- descriptor file reference
+    +-- index section
+    |   +-- __lance_frag_reuse (existing V1 representation)
+    +-- stable_partition_transitions[]
+        +-- source_dataset_version
+        +-- committed_version
+        +-- ordered source fragment digests
+        +-- ordered destination fragment digests
+        +-- row_map_id, row_map_size_bytes, optional base_id
 
-    _row_maps/<transition-id>/       # proposed placement, not finalized
-    +-- transition.binpb
-    +-- row_map.lance                # #8972 format
+    _row_maps/<row_map_id>/
+    +-- row_map.lance                 (#8972 labels + counts)
 
-The descriptor's proposed fields are:
+Each transition owns one immutable row-map file. `row_map_id` is an artifact
+identity, not the UUID of a searchable index or of the mutable V1 catalog.
+Updating V1 history or rebuilding a column index does not relocate or rewrite
+this file. The dedicated namespace also protects maps from older cleanup
+implementations that scan `_indices` without checking historical feature flags.
+The new cleaner explicitly marks and sweeps row-map directories from retained
+manifest references, with the usual protection for recent uncommitted files.
 
-| Field | Meaning |
-| --- | --- |
-| format_version | Descriptor version, independent of the Lance data-file version |
-| transition_id | Immutable identity; also used for idempotent publication |
-| read_version | Snapshot used to produce the outputs |
-| sources | Ordered fragment IDs and physical row counts |
-| destinations | Ordered fragment IDs and physical row counts |
-| mapping | Versioned discriminator; initially only stable partition |
-| row_map | Explicit storage base, relative path, and byte length |
+There is no external copy of the complete transition catalog and no V2
+`details.binpb`. Appends copy the small manifest descriptors, not mapping labels.
+V1 continues to use its existing inline/external details representation and
+its existing rewrite-on-update writer.
 
-The exact source snapshot, including deletion and overlay metadata, is also
-carried by the rewrite transaction for OCC validation. Do not introduce a second
-incomplete source identity based only on physical/deleted row counts.
+The experimental reader and writer feature bit is `1 << 9`. The reserved
+mixed-data-file-version bit (`1 << 8`) remains unsupported. Every manifest with
+V2 references requires bit 9 in both the reader and writer words to prevent
+older readers or writers from ignoring the mapping lifecycle. The new reader accepts ordinary V1-only
+datasets without this bit.
 
-The catalog supplies actual commit version because workers write immutable files
-before the successful commit version is known. Do not mutate a descriptor after
-publication to stamp a version. Unknown mapping variants fail closed.
+## Writing and committing
 
-Creating a new transition writes its descriptor and row map once. Publishing a
-new manifest copies the small references, not the historical mapping payloads.
-Old snapshots retain their own reference lists. This still costs O(retained
-transitions) catalog bytes per manifest; pagination/segmentation can wait for
-measurements. It avoids V1's full-history payload rewrite on the V2 path.
+`commit_stable_partition` in `lance::index::frag_reuse_v2` commits a prepared
+rewrite through the existing transaction machinery:
 
-PR #8972's row_map.lance remains one nullable UInt16 label per physical source
-row, with cumulative per-destination counts in its global buffer. Default
-logical blocks contain 65,536 rows. NULL positions preserve source deletions.
-Point lookup reads one logical block; batches coalesce block reads; sweeps stream
-blocks. Logical block boundaries need not be physical Lance page boundaries.
+1. Read source fragments from one snapshot. Produce destination data and a row
+   map using #8972's writer with Lance data-file version 2.1, which encodes
+   destination labels compactly. Reserve fresh destination fragment IDs.
+2. Open the completed row map and validate its source length, destination
+   counts, and declared file size.
+3. Commit `Operation::Rewrite` with its stable-partition descriptor. The commit
+   validates the exact source metadata, destination reservations, row counts,
+   ordering of fragment lists, and absence of conflicting index rewrites.
+4. Publish destination fragments and the descriptor in the same manifest. Stamp
+   the actual installing version at commit; retain the worker's source version
+   separately. A failed commit publishes neither.
 
-## 4. One dependency graph over both formats
+This API accepts prepared fragments; it is not a clustering scheduler or a new
+Python/Java routing API. Low-level transaction callers have the same obligation
+to finish and validate their referenced files before committing.
 
-Adapt each V1 group and V2 transition into an in-memory rewrite node with ordered
-sources, destinations, and its mapping implementation. This adapter does not
-rewrite V1's persisted protobuf or introduce labels into V1.
+Disjoint stable partitions can rebase: each appends its descriptor to the
+latest manifest. A concurrent delete, update, or rewrite touching a source
+requires rebuilding from a new snapshot. This draft deliberately does not fold
+new source deletions into an already-written row map.
 
-    A,B --V1--> C --V2--> D,E --V1--> F
+## Reading mixed history
 
-A candidate address in A must follow all three edges. Running all V1 mappings
-and then all V2 mappings is incorrect.
+`MixedFragReuseIndex` composes existing V1 compaction groups and V2 descriptors.
+An edge connects a rewrite producing a fragment to the rewrite consuming it.
+Topological order follows physical fragment lineage, not V1's recorded builder
+version, which is not guaranteed to equal its installing version. Duplicate
+producers, duplicate consumers, and cycles are rejected.
 
-Use fragment lineage to establish dependencies. If a node produces a fragment
-that another node consumes, the producer precedes the consumer. Validate that a
-source has at most one consuming rewrite in a snapshot's retained history,
-destinations are uniquely produced, and the graph has no cycles. Independent
-nodes may execute in either order. Fragment IDs are never reused.
+For each requested address:
 
-This avoids relying on V1 dataset_version as a successful commit timestamp:
-that field records the builder's snapshot. Preserve it for existing purposes;
-do not reinterpret it. V2 records actual commit version for diagnostics and
-maintenance, but graph dependencies establish address translation order.
+- A V1 node applies the existing compact bitmap-rank remapper.
+- A V2 node resolves the concatenated source offset with #8972's reader and
+  returns the destination fragment and offset, or deletion.
+- Addresses outside a node's sources pass through unchanged.
 
-For point/batch translation, dispatch by the current address's fragment ID,
-translate through that consuming node, and repeat until the fragment is live
-or the mapping reports deletion. Full-fragment removals are terminal deletions;
-current fragment existence and deletion vectors still determine visibility.
-Missing historical edges cannot silently be treated as deletion: mixed writers
-and retention must guarantee chain completeness. Where completeness cannot be
-established, disable the affected index and scan, or return a corruption error.
+The existing Python `Dataset.remap_row_addrs` method uses the same Rust mixed
+translation and preserves NULL input addresses.
 
-## 5. Coverage is separate from stored addresses
+Current snapshot deletion vectors still apply after translation. The mapping
+records deletions at rewrite time, not future tombstones.
 
-An index bitmap may already have been advanced by V1 coverage maintenance even
-though its payload still stores old row addresses. Do not relabel such a bitmap
-as the payload's original address space. Likewise, deriving current coverage
-does not mean the index bytes have been remapped.
+B-tree page reads translate physical addresses before predicate evaluation.
+Translation also applies to pages streamed for index maintenance. Cache identity
+includes the mixed history and target snapshot so cached pages cannot return
+addresses from an earlier layout. Row-map file metadata uses the dataset's
+shared metadata cache.
 
-The proposed integration maintains an explicit coverage frontier for each index
-segment: fragments it can completely answer at a known snapshot. On first V2
-use, obtain that frontier through the existing V1 coverage path at the pinned
-snapshot; this does not require remapping index bytes. A persisted coverage
-frontier/version may be added to IndexMetadata, or updated atomically as ordinary
-coverage metadata. That schema choice needs agreement before implementation.
+Stored source bitmaps remain provenance across appends and other commits.
+Query coverage is derived separately: the union of a logical index's segment
+bitmaps must cover all sources before its destinations count as covered. Every
+contributing segment is then probed. Derived probe bitmaps can overlap; they
+are never persisted as source ownership. A new segment naming a destination
+directly takes priority, and old segments discard translated entries for that
+destination before evaluating predicates.
 
-For each later rewrite in dependency order, let S be its sources and D its
-destinations. Remove S from the frontier. Add D only if the index covered all
-of S before removal. Otherwise add none of D. Intersect with current live
-fragments at the end. This conservative rule works for either encoding.
+A destination mixing indexed and unindexed rows must be scanned. Index types without asynchronous V2 translation are excluded
+from query selection when their payloads require it; their metadata remains
+in the manifest. They can be rebuilt on current fragments.
 
-Example: an index covers A but not B; a partition mixes both into C and D.
-Neither C nor D is claimed as fully indexed. Queries scan them. We can later
-add source/destination incidence metadata or finer-grained coverage, but the
-first integration need not solve that optimization. Planning rewrite groups
-with equal coverage signatures preserves more index reuse.
+## Append, delete, and compaction
 
-Retain lineage needed by the payload independently of effective coverage. A
-bitmap reaching current fragments is not evidence that an old V1 record can be
-trimmed. Only rebuilding/remapping the bytes, withdrawing the segment, or a
-sound dependency analysis can establish that.
+Append creates ordinary fragments and preserves both histories. Existing indices
+do not claim the new rows. A later stable partition can include these fragments,
+subject to the same conservative coverage rule. The prepared-commit API requires
+full index coverage unless the caller explicitly selects
+`StablePartitionCoverage::AllowUnindexed`. An unresolved destination cannot be
+repartitioned again while an index still depends on its translated entries;
+rebuild direct coverage first. This restriction also follows intervening V1
+compactions and is checked at the commit boundary.
 
-Index results must be translated and restricted to the selected segment's
-effective coverage. A partly usable index must not leak candidates into the
-scan portion and produce duplicates. Overlapping segments/generations still
-require the existing query planner's selection/merge rules.
+Delete updates current fragment tombstones without rewriting either mapping
+format. A later rewrite records deleted physical positions as NULL labels or
+uses the existing V1 survivor bitmap.
 
-For index kinds whose decoding relies on physical ordering or fragment-level
-summaries, require explicit integration or rebuild. A generic address callback
-is not proof that every index format supports reordered output. Physical
-addresses and stable logical row IDs must stay distinct; logical IDs use their
-existing lookup path.
+Compaction continues writing V1 groups. In a mixed dataset it records the V1
+mapping even when current index coverage is empty, since retained V2 mappings
+may still point at the compacted sources. Both eager and deferred B-tree index
+maintenance use the composed mapping. No V1-to-V2 migration is required.
 
-## 6. Write and commit
+V2 may eventually acquire an order-preserving representation. This PR does not
+need that encoding to coexist correctly with V1 compaction.
 
-1. Pin snapshot V, choose ordered sources, reserve destination IDs, and retain
-   the complete source metadata used by the scan.
-2. Stream live rows to destination writers and labels to #8972's RowMapWriter.
-   It interleaves deleted source positions from the source deletion vectors.
-3. Finish files. Validate per-destination totals, source row count, label bounds,
-   and source deletion positions. Write the immutable descriptor.
-4. Submit a serializable Rewrite delta containing the descriptor reference and
-   exact source/destination lists. Do not submit a replacement accumulated catalog
-   built from an earlier snapshot. Do not drop the transition on serialization.
-5. Against the latest manifest, validate unchanged source snapshots, matching
-   descriptor/group order and reserved IDs, and completed files. Merge the delta
-   into the latest catalog and assign actual commit version.
-6. Atomically publish new fragments, catalog, and coverage changes in one manifest.
+## Retention and current limits
 
-Disjoint rewrites can rebase and merge deltas. Overlapping sources conflict.
-Source deletes, updates, overlays, and other changes affecting the prepared
-outputs require retry from a new snapshot. Reusing the same read version while
-replacing the source metadata with current metadata is not a valid retry.
+Cleanup marks row-map directories from retained manifests. V1 history cleanup
+is suspended while V2 references remain, because pruning V1 independently can
+break a mixed chain. Coordinated history draining and descriptor pruning are
+follow-up work; retaining extra history is deliberate.
 
-Failed publication leaves immutable orphan files for normal age-protected
-cleanup. Retrying an already committed transaction must not append a duplicate
-transition. Existing transaction idempotency plus transition identity should
-enforce that contract.
+This draft supports physical row addresses and one storage base. Stable logical
+row IDs, shallow/deep clone of mixed datasets, and cross-base row-map reads are
+rejected explicitly. The protobuf reserves optional base ownership so it can
+be implemented without confusing local cleanup with external ownership.
 
-Ordinary compaction keeps its V1 wire format. Its orchestration must change on
-mixed datasets: it must record the next V1 edge when any old index or V2 lineage
-can depend on it, including destinations that appear unindexed in today's
-bitmap. A simple initial policy is to record every address-changing compaction
-while retained V2 transitions exist. Eager remapping cannot erase the needs of
-other segments or in-flight index builds.
+Initial query integration supports B-tree indices. Other affected index types
+use scan fallback until they gain asynchronous translation. Arbitrary output
+permutations, automatic clustering, concurrent deletion folding, and complete
+history draining remain outside this implementation.
 
-Concurrent V1 catalog replacement/trim must follow existing conflict handling
-plus the mixed-retention checks. A V2 delta being disjoint from another rewrite
-does not authorize it to overwrite a stale V1 or V2 catalog snapshot.
+## Validation
 
-## 7. Reads, appends, and deletes
-
-### Reads
-
-A full scan reads current fragments and deletion vectors without historical
-label I/O. An indexed read derives coverage, decodes candidate addresses, follows
-both mapping kinds, filters to coverage, and applies current row visibility.
-Uncovered fragments use the normal scan path.
-
-At a stable-partition hop, group candidate addresses by source label block and
-asynchronously load each required block. Offset equals the count for the label
-before the block plus its rank before the row within the block. For bulk work,
-seed per-label counters at a block boundary and sweep. Regroup after each hop:
-a sequential first hop may scatter the second hop's accesses.
-
-The current RowIdRemapper is synchronous. Introduce asynchronous batched
-preparation/translation at decode boundaries and keep arithmetic over prepared
-blocks synchronous. Do not hide object-store I/O inside the synchronous trait
-or load all labels merely to satisfy it.
-
-Cache immutable labels by storage identity, transition ID and block. Cache
-translated index units/coverage by segment generation and target manifest
-identity, incorporating both histories. The V1 FRI UUID alone is insufficient.
-
-### Appending table rows
-
-Append fresh fragments normally. No existing addresses move, so no rewrite
-transition is needed. Existing indices do not automatically cover appended
-fragments. An index built on V records that read snapshot even if it publishes
-later; publication must validate that its required history remains available.
-
-Appending a V2 transition is different: publish another immutable descriptor
-reference. Do not append bytes to an old row-map file.
-
-### Deleting rows
-
-Evaluate against a pinned snapshot, translating indexed candidates into current
-addresses first. Write deletion vectors for current fragments. Historical labels
-stay immutable: they describe relocation then, not visibility now.
-
-If A:3 mapped to C:1 and C:1 is deleted, an old index candidate A:3 translates to
-C:1 and is suppressed by C's current deletion vector. If later V1 compaction
-moves C to F, its survivor bitmap drops C:1 and the composed mapping reports
-deletion. Entirely deleted fragments may disappear without a replacement map.
-
-If delete commits first, a prepared rewrite fails source validation. If rewrite
-commits first, a stale delete against its retired sources retries/re-evaluates.
-Disjoint operations can rebase. Folding concurrent deletion vectors through a
-prepared row map can be a later optimization; it is not implicit in this format.
-
-Value-changing updates/overlays are not pure relocation. Index invalidation must
-use current derived coverage. Initially withdraw affected segments and rebuild
-them, preserving logical index definitions, rather than treating relocation as
-proof that indexed values remain valid.
-
-## 8. Retention and cleanup
-
-Keep V1 and V2 logically separate on disk but coordinate retention. In particular,
-the existing V1-only caught-up calculation must not trim an edge that feeds a
-retained V2 edge or an old payload reachable through it.
-
-Safe first policy: while V2 history is retained, preserve all retained V1/V2
-mapping records. Make V1-only trim explicitly defer on such a dataset. This
-conservatively increases metadata retention; it does not stop compaction,
-append, delete, or query operations. A later coordinated drain rebuilds/remaps
-all dependent segments and retires obsolete history atomically.
-
-For concurrent index builders, record a history-retention floor when draining.
-A stale builder whose required history predates the floor must retry/rebuild
-before publication. Validate against the latest manifest on every commit retry.
-An active builder is not automatically protected by an assumed lease.
-
-Physical cleanup roots are all retained/tagged manifests. For each, follow its
-V1 external details and V2 catalog -> descriptor -> row-map references, including
-storage bases. A live descriptor must protect its row map even when they reside
-outside an index UUID directory. Unreferenced files become eligible only after
-the ordinary in-progress protection period.
-
-Cloning/restoring must preserve the reference graph and ownership of referenced
-bases. Namespace and out-of-band cleanup must check the same capabilities.
-Unknown formats must prevent destructive cleanup, not merely dataset queries.
-
-## 9. Compatibility and rollout
-
-Allocate fresh reader and writer capability flags when the final format is
-approved. Old binaries must reject mixed datasets initially. Keeping V1's wire
-format unchanged does not make old maintenance code safe on V2 dependencies.
-Flags must survive recomputation, retry, clone, and restore, and gate destructive
-maintenance. Do not choose a numeric bit already reserved by another feature.
-
-V1-only datasets keep existing behavior. Activation of mixed handling validates
-V1 metadata and initializes coverage frontiers; it does not force eager remap
-of existing index bytes. Malformed/ambiguous legacy coverage must fall back
-conservatively rather than invent a fully indexed frontier.
-
-Later, add order-preserving writes directly to V2's mapping discriminator and
-change the compaction writer when ready. Keep the V1 reader adapter for existing
-snapshots. No V2 order-preserving codec is defined or required by this draft.
-
-## 10. Decisions to settle together
-
-- Dedicated manifest catalog versus a system-index envelope with explicit
-  structural semantics; prefer the former, but assess integration cost.
-- Exact descriptor/FileRef schema, base-path rules, and validation limits.
-- Coverage frontier persistence: dedicated metadata versus atomically maintained
-  existing coverage, without conflating it with payload address space.
-- Initial supported index kinds and where each performs asynchronous translation.
-- Whether conservative V1/V2 history retention is acceptable for first activation,
-  or coordinated draining must be implemented at the same time.
-- Which clone/namespace paths must be supported before activation.
-
-Before enabling mixed writes, require real-data tests for V1 -> V2 -> V1 and
-V2 -> V1 -> V2, partial coverage, source deletions, later deletes, append, both
-delete/rewrite commit orders, disjoint rewrite rebase, late index publication,
-cache refresh, and cleanup with retained/tagged snapshots. Validate actual row
-identities and output order, not only counts or a query falling back to scans.
-
-This draft can evolve while implementation is underway. Formal schema allocation,
-format review/voting, and release compatibility commitments follow only after
-we are comfortable with the contract.
+Tests exercise V1 → V2 → V1 with eager and deferred compaction, indexed reads,
+deletions, cleanup, reopening, repartitioning after direct rebuild, rejection of
+unresolved repartitioning, joint segment coverage, direct-destination priority,
+append-induced partial coverage, unsupported-index fallback, disjoint commits, and stale source
+rejection. Table tests cover descriptor serialization, malformed descriptors,
+and the paired reader/writer fence.

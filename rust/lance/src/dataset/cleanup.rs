@@ -77,6 +77,7 @@ struct ReferencedFiles {
     delete_paths: HashSet<Path>,
     tx_paths: HashSet<Path>,
     index_uuids: HashSet<String>,
+    row_map_uuids: HashSet<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -451,6 +452,7 @@ impl<'a> CleanupTask<'a> {
     }
 
     async fn run(self) -> Result<CleanupRunResult> {
+        lance_table::feature_flags::ensure_can_write_manifest(&self.dataset.manifest)?;
         let mut final_result = CleanupRunResult::default();
         let candidate_file_limit = self.action.candidate_file_limit();
         // First check if we need to clean referenced branches
@@ -555,6 +557,7 @@ impl<'a> CleanupTask<'a> {
         let manifest_and_indexes = async {
             let manifest =
                 read_manifest(&self.dataset.object_store, &location.path, location.size).await?;
+            lance_table::feature_flags::ensure_can_read_manifest(&manifest)?;
             let indexes =
                 read_manifest_indexes(&self.dataset.object_store, &location, &manifest).await?;
             Ok::<_, Error>((manifest, indexes))
@@ -661,6 +664,13 @@ impl<'a> CleanupTask<'a> {
             let uuid_str = index.uuid.to_string();
             referenced_files.index_uuids.insert(uuid_str);
         }
+        for transition in manifest.stable_partition_transitions.iter() {
+            if transition.base_id.is_none() {
+                referenced_files
+                    .row_map_uuids
+                    .insert(transition.row_map_id.to_string());
+            }
+        }
         Ok(())
     }
 
@@ -744,6 +754,7 @@ impl<'a> CleanupTask<'a> {
             // a retained-manifest cutoff can otherwise skip newer artifacts and lose
             // the proof when the old manifests are removed by this cleanup pass.
             build_listing_stream(self.dataset.indices_dir(), None),
+            build_listing_stream(self.dataset.row_maps_dir(), None),
             build_listing_stream(self.dataset.deletions_dir(), unmodified_since),
         ];
         let unreferenced_files = stream::iter(streams).flatten().boxed();
@@ -910,6 +921,32 @@ impl<'a> CleanupTask<'a> {
                     size_bytes,
                 ));
             }
+        }
+        if relative_path.prefix_matches(&Path::from(lance_table::format::ROW_MAPS_DIR)) {
+            let Some(uuid) = relative_path.parts().nth(1) else {
+                return Ok(None);
+            };
+            if inspection
+                .referenced_files
+                .row_map_uuids
+                .contains(uuid.as_ref())
+            {
+                return Ok(None);
+            }
+            let verified = inspection
+                .verified_files
+                .row_map_uuids
+                .contains(uuid.as_ref());
+            if verified || !maybe_in_progress {
+                // Count row maps with the other row-address mapping artifacts.
+                return Ok(cleanup_file(
+                    path,
+                    CleanupFileKind::Index,
+                    !verified,
+                    size_bytes,
+                ));
+            }
+            return Ok(None);
         }
         if relative_path.as_ref().starts_with("_indices") {
             // Indices are referenced by UUID so we need to examine the UUID

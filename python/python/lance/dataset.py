@@ -1175,12 +1175,12 @@ class LanceDataset(pa.dataset.Dataset):
         return self._ds.describe_indices()
 
     def remap_row_addrs(self, addrs: "pa.Array") -> "Optional[pa.Array]":
-        """Remap row addresses across compactions still recorded in the
-        fragment-reuse index. Rows a compaction dropped become null. The index
-        retains only recent rounds (older ones are pruned as index remap catches
-        up), so remap promptly: an address whose round was pruned is returned
-        unchanged, not remapped. Returns ``None`` when there is no fragment-reuse
-        index.
+        """Remap nullable UInt64 addresses through retained rewrites.
+
+        Rows dropped by rewrites become null; later deletion vectors are not
+        applied. Compaction history may be pruned, so remap promptly: addresses
+        outside retained history pass through unchanged. Returns ``None`` when
+        no mapping history exists.
         """
         return self._ds.remap_row_addrs(addrs)
 

@@ -153,6 +153,7 @@ impl TryFrom<pb::Transaction> for Transaction {
                 new_fragments,
                 groups,
                 rewritten_indices,
+                stable_partition,
             })) => {
                 let groups = if !groups.is_empty() {
                     groups
@@ -180,6 +181,9 @@ impl TryFrom<pb::Transaction> for Transaction {
                     groups,
                     rewritten_indices,
                     frag_reuse_index: None,
+                    stable_partition: stable_partition
+                        .map(|t| t.try_into().map(Box::new))
+                        .transpose()?,
                 }
             }
             Some(pb::transaction::Operation::CreateIndex(pb::transaction::CreateIndex {
@@ -556,7 +560,9 @@ impl From<&Transaction> for pb::Transaction {
                 groups,
                 rewritten_indices,
                 frag_reuse_index: _,
+                stable_partition,
             } => pb::transaction::Operation::Rewrite(pb::transaction::Rewrite {
+                stable_partition: stable_partition.as_deref().map(Into::into),
                 groups: groups
                     .iter()
                     .map(pb::transaction::rewrite::RewriteGroup::from)
