@@ -141,9 +141,15 @@ impl IndexMetadata {
     /// name fragments and offsets, and neither kind supports remap.
     pub fn results_are_row_addrs(&self) -> bool {
         self.index_details.as_ref().is_some_and(|details| {
+            let is_fm = details
+                .type_url
+                .rsplit_once('/')
+                .is_some_and(|(_, details_type_name)| {
+                    details_type_name.eq_ignore_ascii_case("lance.index.pb.FMIndexDetails")
+                });
             details.type_url.ends_with("ZoneMapIndexDetails")
                 || details.type_url.ends_with("BloomFilterIndexDetails")
-                || details.type_url.ends_with("FMIndexDetails")
+                || is_fm
         })
     }
 
@@ -640,6 +646,8 @@ mod tests {
     #[case::zone_map("type.googleapis.com/lance.table.ZoneMapIndexDetails", true)]
     #[case::bloom_filter("type.googleapis.com/lance.index.pb.BloomFilterIndexDetails", true)]
     #[case::fm("type.googleapis.com/lance.index.pb.FMIndexDetails", true)]
+    #[case::fm_case_insensitive("type.googleapis.com/LANCE.INDEX.PB.FMINDEXDETAILS", true)]
+    #[case::foreign_fm_terminal_name("type.googleapis.com/example.FMIndexDetails", false)]
     #[case::btree("type.googleapis.com/lance.table.BTreeIndexDetails", false)]
     fn test_results_are_row_addrs(#[case] type_url: &str, #[case] expected: bool) {
         let mut metadata = index_metadata_with(vec![0], vec![]);
