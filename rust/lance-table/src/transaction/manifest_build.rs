@@ -2685,12 +2685,15 @@ mod tests {
         let mut manifest = sample_manifest_with_fragments(0..0);
         manifest.fragments = Arc::new(vec![fragment]);
 
-        let index = Arc::new(BlobReuseIndex::new(vec![BlobReuseSource {
-            base_id: None,
-            blob_dir: "source.blob".to_string(),
-            local_ids: vec![1],
-            physical_ids: vec![2],
-        }]));
+        let index = Arc::new(
+            BlobReuseIndex::try_new(vec![BlobReuseSource {
+                base_id: None,
+                blob_dir: "source.blob".to_string(),
+                local_ids: vec![1],
+                physical_ids: vec![2],
+            }])
+            .unwrap(),
+        );
         let mut replacement = DataFile::new_legacy_from_fields("new.lance", vec![0], None);
         replacement.blob_reuse_index = Some(index.clone());
         let transaction = Transaction::new(
@@ -2712,40 +2715,46 @@ mod tests {
     #[test]
     fn blob_reuse_index_is_immutable_by_physical_data_file_identity() {
         let mut current = sample_manifest_with_fragments(0..1);
-        let left = Arc::new(BlobReuseIndex::new(vec![
-            BlobReuseSource {
-                base_id: None,
-                blob_dir: "a.blob".to_string(),
-                local_ids: vec![1],
-                physical_ids: vec![3],
-            },
-            BlobReuseSource {
-                base_id: Some(7),
-                blob_dir: "b.blob".to_string(),
-                local_ids: vec![2],
-                physical_ids: vec![4],
-            },
-        ]));
+        let left = Arc::new(
+            BlobReuseIndex::try_new(vec![
+                BlobReuseSource {
+                    base_id: None,
+                    blob_dir: "a.blob".to_string(),
+                    local_ids: vec![1],
+                    physical_ids: vec![3],
+                },
+                BlobReuseSource {
+                    base_id: Some(7),
+                    blob_dir: "b.blob".to_string(),
+                    local_ids: vec![2],
+                    physical_ids: vec![4],
+                },
+            ])
+            .unwrap(),
+        );
         let mut file = DataFile::new_legacy_from_fields("same.lance", vec![0], Some(7));
         file.blob_reuse_index = Some(left.clone());
         Arc::make_mut(&mut current.fragments)[0].files = vec![file];
 
         let mut semantically_equal = current.clone();
         Arc::make_mut(&mut semantically_equal.fragments)[0].files[0].blob_reuse_index =
-            Some(Arc::new(BlobReuseIndex::new(vec![
-                left.sources()[1].clone(),
-                BlobReuseSource {
-                    base_id: Some(7),
-                    ..left.sources()[0].clone()
-                },
-            ])));
+            Some(Arc::new(
+                BlobReuseIndex::try_new(vec![
+                    left.sources()[1].clone(),
+                    BlobReuseSource {
+                        base_id: Some(7),
+                        ..left.sources()[0].clone()
+                    },
+                ])
+                .unwrap(),
+            ));
         Transaction::validate_blob_reuse_index_immutability(&current, &semantically_equal).unwrap();
 
         let mut changed = current.clone();
         let mut changed_sources = left.sources().to_vec();
         changed_sources[0].physical_ids[0] = 9;
         Arc::make_mut(&mut changed.fragments)[0].files[0].blob_reuse_index =
-            Some(Arc::new(BlobReuseIndex::new(changed_sources)));
+            Some(Arc::new(BlobReuseIndex::try_new(changed_sources).unwrap()));
         let err =
             Transaction::validate_blob_reuse_index_immutability(&current, &changed).unwrap_err();
         assert!(err.to_string().contains("immutable"), "{err}");

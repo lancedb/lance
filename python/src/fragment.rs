@@ -914,7 +914,10 @@ impl FromPyObject<'_, '_> for PyLance<DataFile> {
                     physical_ids: source.getattr("physical_ids")?.extract()?,
                 });
             }
-            Some(Arc::new(BlobReuseIndex::new(sources)))
+            Some(Arc::new(
+                BlobReuseIndex::try_new(sources)
+                    .map_err(|error| PyValueError::new_err(error.to_string()))?,
+            ))
         };
         Ok(Self(DataFile {
             path: ob.getattr("path")?.extract()?,

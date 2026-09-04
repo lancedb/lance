@@ -174,9 +174,9 @@ def test_blob_compaction_reuses_or_materializes_dedicated_sidecars(
 
 @pytest.mark.parametrize(
     ("active_rows", "threshold", "expect_index"),
-    [(2, 0.3, False), (3, 0.3, True), (4, 0.5, False)],
+    [(2, 0.3, False), (3, 0.29, True), (4, 0.5, False)],
 )
-def test_blob_compaction_packed_repack_active_ratio_threshold(
+def test_blob_compaction_packed_repack_utilization_threshold(
     tmp_path: Path, active_rows: int, threshold: float, expect_index: bool
 ):
     dataset_uri = tmp_path / f"packed_{active_rows}_{threshold}"
@@ -192,7 +192,7 @@ def test_blob_compaction_packed_repack_active_ratio_threshold(
     dataset.optimize.compact_files(
         num_threads=1,
         materialize_deletions_threshold=0.0,
-        blob_repack_active_ratio_threshold=threshold,
+        blob_repack_utilization_threshold=threshold,
     )
 
     data_file = dataset.get_fragments()[0].metadata.files[0]

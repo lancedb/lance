@@ -180,22 +180,22 @@ pub fn extract_write_params(
 #[allow(clippy::too_many_arguments)]
 pub fn build_compaction_options(
     env: &mut JNIEnv,
-    target_rows_per_fragment: &JObject,           // Optional<Long>
-    max_rows_per_group: &JObject,                 // Optional<Long>
-    max_bytes_per_file: &JObject,                 // Optional<Long>
-    materialize_deletions: &JObject,              // Optional<Boolean>
-    materialize_deletions_threshold: &JObject,    // Optional<Float>
-    num_threads: &JObject,                        // Optional<Long>
-    batch_size: &JObject,                         // Optional<Long>
-    defer_index_remap: &JObject,                  // Optional<Boolean>
-    compaction_mode: &JObject,                    // Optional<String>
-    binary_copy_read_batch_bytes: &JObject,       // Optional<Long>
-    max_source_fragments: &JObject,               // Optional<Long>
-    max_source_rows: &JObject,                    // Optional<Long>
-    max_source_bytes: &JObject,                   // Optional<Long>
-    excluded_fragment_ids: &JObject,              // List<Long>
-    blob_reuse_index: &JObject,                   // Optional<Boolean>
-    blob_repack_active_ratio_threshold: &JObject, // Optional<Float>
+    target_rows_per_fragment: &JObject,          // Optional<Long>
+    max_rows_per_group: &JObject,                // Optional<Long>
+    max_bytes_per_file: &JObject,                // Optional<Long>
+    materialize_deletions: &JObject,             // Optional<Boolean>
+    materialize_deletions_threshold: &JObject,   // Optional<Float>
+    num_threads: &JObject,                       // Optional<Long>
+    batch_size: &JObject,                        // Optional<Long>
+    defer_index_remap: &JObject,                 // Optional<Boolean>
+    compaction_mode: &JObject,                   // Optional<String>
+    binary_copy_read_batch_bytes: &JObject,      // Optional<Long>
+    max_source_fragments: &JObject,              // Optional<Long>
+    max_source_rows: &JObject,                   // Optional<Long>
+    max_source_bytes: &JObject,                  // Optional<Long>
+    excluded_fragment_ids: &JObject,             // List<Long>
+    blob_reuse_index: &JObject,                  // Optional<Boolean>
+    blob_repack_utilization_threshold: &JObject, // Optional<Float>
     config: &std::collections::HashMap<String, String>,
 ) -> Result<CompactionOptions> {
     let mut compaction_options = CompactionOptions::from_dataset_config(config)?;
@@ -261,10 +261,10 @@ pub fn build_compaction_options(
     if let Some(blob_reuse_index) = env.get_boolean_opt(blob_reuse_index)? {
         compaction_options.blob_reuse_index = blob_reuse_index;
     }
-    if let Some(blob_repack_active_ratio_threshold) =
-        env.get_f32_opt(blob_repack_active_ratio_threshold)?
+    if let Some(blob_repack_utilization_threshold) =
+        env.get_f32_opt(blob_repack_utilization_threshold)?
     {
-        compaction_options.blob_repack_active_ratio_threshold = blob_repack_active_ratio_threshold;
+        compaction_options.blob_repack_utilization_threshold = blob_repack_utilization_threshold;
     }
 
     Ok(compaction_options)

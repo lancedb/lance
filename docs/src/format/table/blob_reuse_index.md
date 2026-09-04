@@ -69,13 +69,32 @@ payload uses its allocated identifier under the output stem and does not receive
 a BRI entry. Sources therefore have increasing local identifiers even when
 their physical identifiers are unordered.
 
-Compaction reuses terminal Dedicated sidecars by default. For each input
-fragment, it computes `active_rows / physical_rows`. Packed sidecars are reused
-when that ratio is at least the configured repack threshold and are repacked
-under the output stem when it is below the threshold. The default threshold is
-0.3, so Packed payloads are rewritten only after more than 70% of the fragment's
-rows have been deleted. The descriptor keeps its original Packed position and
+Compaction reuses terminal Dedicated sidecars by default. Packed sidecars use a
+physical-pack utilization threshold. For every terminal physical pack reachable
+from the current snapshot, the implementation computes:
+
+```text
+utilization = union_bytes(visible_packed_ranges) / physical_pack_size
+```
+
+All visible Packed descriptors that resolve to the same physical object
+participate, including descriptors reached through different DataFiles, BRI
+sources, fragments, fields, or equivalent base-path aliases. Duplicate and
+overlapping ranges count once. The calculation reads descriptors and physical
+object sizes, not payload bytes.
+
+The pack is reused when utilization is at least the configured
+`blob_repack_utilization_threshold`, and every selected reference to it is
+repacked under the output stem when utilization is below the threshold. The
+default threshold is 0.3. The descriptor keeps its original Packed position and
 size when the sidecar is reused.
+
+A low-utilization pack makes each current fragment that visibly references it a
+compaction candidate even when row-count and deletion rules would not select
+that fragment. Existing source-fragment, source-row, and source-byte budgets
+still bound the work admitted to one compaction plan. If only part of a shared
+pack's referring fragments fit, later compactions recompute utilization from
+the then-current snapshot and continue reclaiming it.
 
 Inline values remain inline, and External descriptors remain external. An
 implementation may expose a mode that disables sidecar reuse; in that mode both

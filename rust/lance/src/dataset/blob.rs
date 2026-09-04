@@ -1276,9 +1276,9 @@ impl BlobPreprocessor {
         if self.reuse_sources.is_empty() {
             Ok(None)
         } else {
-            Ok(Some(Arc::new(BlobReuseIndex::new(std::mem::take(
+            Ok(Some(Arc::new(BlobReuseIndex::try_new(std::mem::take(
                 &mut self.reuse_sources,
-            )))))
+            ))?)))
         }
     }
 }

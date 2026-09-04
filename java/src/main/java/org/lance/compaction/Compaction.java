@@ -51,7 +51,7 @@ public class Compaction {
           compactionOptions.getMaxSourceBytes(),
           compactionOptions.getExcludedFragmentIds(),
           compactionOptions.getBlobReuseIndex(),
-          compactionOptions.getBlobRepackActiveRatioThreshold());
+          compactionOptions.getBlobRepackUtilizationThreshold());
     }
   }
 
@@ -78,7 +78,7 @@ public class Compaction {
         compactionOptions.getMaxSourceBytes(),
         compactionOptions.getExcludedFragmentIds(),
         compactionOptions.getBlobReuseIndex(),
-        compactionOptions.getBlobRepackActiveRatioThreshold());
+        compactionOptions.getBlobRepackUtilizationThreshold());
   }
 
   /**
@@ -104,7 +104,7 @@ public class Compaction {
       Optional<Long> maxSourceBytes,
       List<Long> excludedFragmentIds,
       Optional<Boolean> blobReuseIndex,
-      Optional<Float> blobRepackActiveRatioThreshold) {
+      Optional<Float> blobRepackUtilizationThreshold) {
     try (LockManager.ReadLock readLock = dataset.acquireReadLock()) {
       return commitCompactionNative(
           dataset,
@@ -124,7 +124,7 @@ public class Compaction {
           maxSourceBytes,
           excludedFragmentIds,
           blobReuseIndex,
-          blobRepackActiveRatioThreshold);
+          blobRepackUtilizationThreshold);
     }
   }
 
@@ -146,7 +146,7 @@ public class Compaction {
       Optional<Long> maxSourceBytes,
       List<Long> excludedFragmentIds,
       Optional<Boolean> blobReuseIndex,
-      Optional<Float> blobRepackActiveRatioThreshold);
+      Optional<Float> blobRepackUtilizationThreshold);
 
   private static native CompactionPlan nativePlanCompaction(
       Dataset dataset,
@@ -165,5 +165,5 @@ public class Compaction {
       Optional<Long> maxSourceBytes,
       List<Long> excludedFragmentIds,
       Optional<Boolean> blobReuseIndex,
-      Optional<Float> blobRepackActiveRatioThreshold);
+      Optional<Float> blobRepackUtilizationThreshold);
 }

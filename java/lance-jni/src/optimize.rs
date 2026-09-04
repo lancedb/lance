@@ -34,23 +34,23 @@ use crate::error::Result;
 pub extern "system" fn Java_org_lance_compaction_Compaction_nativePlanCompaction<'local>(
     mut env: JNIEnv<'local>,
     _obj: JObject,
-    java_dataset: JObject,                       // Dataset
-    target_rows_per_fragment: JObject,           // Optional<Long>
-    max_rows_per_group: JObject,                 // Optional<Long>
-    max_bytes_per_file: JObject,                 // Optional<Long>
-    materialize_deletions: JObject,              // Optional<Boolean>
-    materialize_deletions_threshold: JObject,    // Optional<Float>
-    num_threads: JObject,                        // Optional<Long>
-    batch_size: JObject,                         // Optional<Long>
-    defer_index_remap: JObject,                  // Optional<Boolean>
-    compaction_mode: JObject,                    // Optional<String>
-    binary_copy_read_batch_bytes: JObject,       // Optional<Long>
-    max_source_fragments: JObject,               // Optional<Long>
-    max_source_rows: JObject,                    // Optional<Long>
-    max_source_bytes: JObject,                   // Optional<Long>
-    excluded_fragment_ids: JObject,              // List<Long>
-    blob_reuse_index: JObject,                   // Optional<Boolean>
-    blob_repack_active_ratio_threshold: JObject, // Optional<Float>
+    java_dataset: JObject,                      // Dataset
+    target_rows_per_fragment: JObject,          // Optional<Long>
+    max_rows_per_group: JObject,                // Optional<Long>
+    max_bytes_per_file: JObject,                // Optional<Long>
+    materialize_deletions: JObject,             // Optional<Boolean>
+    materialize_deletions_threshold: JObject,   // Optional<Float>
+    num_threads: JObject,                       // Optional<Long>
+    batch_size: JObject,                        // Optional<Long>
+    defer_index_remap: JObject,                 // Optional<Boolean>
+    compaction_mode: JObject,                   // Optional<String>
+    binary_copy_read_batch_bytes: JObject,      // Optional<Long>
+    max_source_fragments: JObject,              // Optional<Long>
+    max_source_rows: JObject,                   // Optional<Long>
+    max_source_bytes: JObject,                  // Optional<Long>
+    excluded_fragment_ids: JObject,             // List<Long>
+    blob_reuse_index: JObject,                  // Optional<Boolean>
+    blob_repack_utilization_threshold: JObject, // Optional<Float>
 ) -> JObject<'local> {
     ok_or_throw_with_return!(
         env,
@@ -72,7 +72,7 @@ pub extern "system" fn Java_org_lance_compaction_Compaction_nativePlanCompaction
             max_source_bytes,
             excluded_fragment_ids,
             blob_reuse_index,
-            blob_repack_active_ratio_threshold
+            blob_repack_utilization_threshold
         ),
         JObject::null()
     )
@@ -81,23 +81,23 @@ pub extern "system" fn Java_org_lance_compaction_Compaction_nativePlanCompaction
 #[allow(clippy::too_many_arguments)]
 fn inner_plan_compaction<'local>(
     env: &mut JNIEnv<'local>,
-    java_dataset: JObject,                       // Dataset
-    target_rows_per_fragment: JObject,           // Optional<Long>
-    max_rows_per_group: JObject,                 // Optional<Long>
-    max_bytes_per_file: JObject,                 // Optional<Long>
-    materialize_deletions: JObject,              // Optional<Boolean>
-    materialize_deletions_threshold: JObject,    // Optional<Float>
-    num_threads: JObject,                        // Optional<Long>
-    batch_size: JObject,                         // Optional<Long>
-    defer_index_remap: JObject,                  // Optional<Boolean>
-    compaction_mode: JObject,                    // Optional<String>
-    binary_copy_read_batch_bytes: JObject,       // Optional<Long>
-    max_source_fragments: JObject,               // Optional<Long>
-    max_source_rows: JObject,                    // Optional<Long>
-    max_source_bytes: JObject,                   // Optional<Long>
-    excluded_fragment_ids: JObject,              // List<Long>
-    blob_reuse_index: JObject,                   // Optional<Boolean>
-    blob_repack_active_ratio_threshold: JObject, // Optional<Float>
+    java_dataset: JObject,                      // Dataset
+    target_rows_per_fragment: JObject,          // Optional<Long>
+    max_rows_per_group: JObject,                // Optional<Long>
+    max_bytes_per_file: JObject,                // Optional<Long>
+    materialize_deletions: JObject,             // Optional<Boolean>
+    materialize_deletions_threshold: JObject,   // Optional<Float>
+    num_threads: JObject,                       // Optional<Long>
+    batch_size: JObject,                        // Optional<Long>
+    defer_index_remap: JObject,                 // Optional<Boolean>
+    compaction_mode: JObject,                   // Optional<String>
+    binary_copy_read_batch_bytes: JObject,      // Optional<Long>
+    max_source_fragments: JObject,              // Optional<Long>
+    max_source_rows: JObject,                   // Optional<Long>
+    max_source_bytes: JObject,                  // Optional<Long>
+    excluded_fragment_ids: JObject,             // List<Long>
+    blob_reuse_index: JObject,                  // Optional<Boolean>
+    blob_repack_utilization_threshold: JObject, // Optional<Float>
 ) -> Result<JObject<'local>> {
     let config = {
         let dataset =
@@ -121,7 +121,7 @@ fn inner_plan_compaction<'local>(
         &max_source_bytes,
         &excluded_fragment_ids,
         &blob_reuse_index,
-        &blob_repack_active_ratio_threshold,
+        &blob_repack_utilization_threshold,
         &config,
     )?;
 
@@ -137,24 +137,24 @@ fn inner_plan_compaction<'local>(
 pub extern "system" fn Java_org_lance_compaction_Compaction_commitCompactionNative<'local>(
     mut env: JNIEnv<'local>,
     _obj: JObject,
-    java_dataset: JObject,                       // Dataset
-    rewrite_results: JObject,                    // List<RewriteResult>
-    target_rows_per_fragment: JObject,           // Optional<Long>
-    max_rows_per_group: JObject,                 // Optional<Long>
-    max_bytes_per_file: JObject,                 // Optional<Long>
-    materialize_deletions: JObject,              // Optional<Boolean>
-    materialize_deletions_threshold: JObject,    // Optional<Float>
-    num_threads: JObject,                        // Optional<Long>
-    batch_size: JObject,                         // Optional<Long>
-    defer_index_remap: JObject,                  // Optional<Boolean>
-    compaction_mode: JObject,                    // Optional<String>
-    binary_copy_read_batch_bytes: JObject,       // Optional<Long>
-    max_source_fragments: JObject,               // Optional<Long>
-    max_source_rows: JObject,                    // Optional<Long>
-    max_source_bytes: JObject,                   // Optional<Long>
-    excluded_fragment_ids: JObject,              // List<Long>
-    blob_reuse_index: JObject,                   // Optional<Boolean>
-    blob_repack_active_ratio_threshold: JObject, // Optional<Float>
+    java_dataset: JObject,                      // Dataset
+    rewrite_results: JObject,                   // List<RewriteResult>
+    target_rows_per_fragment: JObject,          // Optional<Long>
+    max_rows_per_group: JObject,                // Optional<Long>
+    max_bytes_per_file: JObject,                // Optional<Long>
+    materialize_deletions: JObject,             // Optional<Boolean>
+    materialize_deletions_threshold: JObject,   // Optional<Float>
+    num_threads: JObject,                       // Optional<Long>
+    batch_size: JObject,                        // Optional<Long>
+    defer_index_remap: JObject,                 // Optional<Boolean>
+    compaction_mode: JObject,                   // Optional<String>
+    binary_copy_read_batch_bytes: JObject,      // Optional<Long>
+    max_source_fragments: JObject,              // Optional<Long>
+    max_source_rows: JObject,                   // Optional<Long>
+    max_source_bytes: JObject,                  // Optional<Long>
+    excluded_fragment_ids: JObject,             // List<Long>
+    blob_reuse_index: JObject,                  // Optional<Boolean>
+    blob_repack_utilization_threshold: JObject, // Optional<Float>
 ) -> JObject<'local> {
     ok_or_throw_with_return!(
         env,
@@ -177,7 +177,7 @@ pub extern "system" fn Java_org_lance_compaction_Compaction_commitCompactionNati
             max_source_bytes,
             excluded_fragment_ids,
             blob_reuse_index,
-            blob_repack_active_ratio_threshold,
+            blob_repack_utilization_threshold,
         ),
         JObject::null()
     )
@@ -186,24 +186,24 @@ pub extern "system" fn Java_org_lance_compaction_Compaction_commitCompactionNati
 #[allow(clippy::too_many_arguments)]
 fn inner_commit_compaction<'local>(
     env: &mut JNIEnv<'local>,
-    java_dataset: JObject,                       // Dataset
-    rewrite_results: JObject,                    // List<RewriteResult>
-    target_rows_per_fragment: JObject,           // Optional<Long>
-    max_rows_per_group: JObject,                 // Optional<Long>
-    max_bytes_per_file: JObject,                 // Optional<Long>
-    materialize_deletions: JObject,              // Optional<Boolean>
-    materialize_deletions_threshold: JObject,    // Optional<Float>
-    num_threads: JObject,                        // Optional<Long>
-    batch_size: JObject,                         // Optional<Long>
-    defer_index_remap: JObject,                  // Optional<Boolean>
-    compaction_mode: JObject,                    // Optional<String>
-    binary_copy_read_batch_bytes: JObject,       // Optional<Long>
-    max_source_fragments: JObject,               // Optional<Long>
-    max_source_rows: JObject,                    // Optional<Long>
-    max_source_bytes: JObject,                   // Optional<Long>
-    excluded_fragment_ids: JObject,              // List<Long>
-    blob_reuse_index: JObject,                   // Optional<Boolean>
-    blob_repack_active_ratio_threshold: JObject, // Optional<Float>
+    java_dataset: JObject,                      // Dataset
+    rewrite_results: JObject,                   // List<RewriteResult>
+    target_rows_per_fragment: JObject,          // Optional<Long>
+    max_rows_per_group: JObject,                // Optional<Long>
+    max_bytes_per_file: JObject,                // Optional<Long>
+    materialize_deletions: JObject,             // Optional<Boolean>
+    materialize_deletions_threshold: JObject,   // Optional<Float>
+    num_threads: JObject,                       // Optional<Long>
+    batch_size: JObject,                        // Optional<Long>
+    defer_index_remap: JObject,                 // Optional<Boolean>
+    compaction_mode: JObject,                   // Optional<String>
+    binary_copy_read_batch_bytes: JObject,      // Optional<Long>
+    max_source_fragments: JObject,              // Optional<Long>
+    max_source_rows: JObject,                   // Optional<Long>
+    max_source_bytes: JObject,                  // Optional<Long>
+    excluded_fragment_ids: JObject,             // List<Long>
+    blob_reuse_index: JObject,                  // Optional<Boolean>
+    blob_repack_utilization_threshold: JObject, // Optional<Float>
 ) -> Result<JObject<'local>> {
     let config = {
         let dataset =
@@ -227,7 +227,7 @@ fn inner_commit_compaction<'local>(
         &max_source_bytes,
         &excluded_fragment_ids,
         &blob_reuse_index,
-        &blob_repack_active_ratio_threshold,
+        &blob_repack_utilization_threshold,
         &config,
     )?;
     let completed_tasks = import_vec_to_rust(env, &rewrite_results, |env, rewrite_result| {
@@ -250,26 +250,26 @@ fn inner_commit_compaction<'local>(
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_compaction_CompactionTask_nativeExecute<'local>(
     mut env: JNIEnv<'local>,
-    _obj: JObject,                               // CompactionTask itself
-    java_dataset: JObject,                       // Dataset
-    task_data: JObject,                          // TaskData
-    read_version: jlong,                         // readVersion
-    target_rows_per_fragment: JObject,           // Optional<Long>
-    max_rows_per_group: JObject,                 // Optional<Long>
-    max_bytes_per_file: JObject,                 // Optional<Long>
-    materialize_deletions: JObject,              // Optional<Boolean>
-    materialize_deletions_threshold: JObject,    // Optional<Float>
-    num_threads: JObject,                        // Optional<Long>
-    batch_size: JObject,                         // Optional<Long>
-    defer_index_remap: JObject,                  // Optional<Boolean>
-    compaction_mode: JObject,                    // Optional<String>
-    binary_copy_read_batch_bytes: JObject,       // Optional<Long>
-    max_source_fragments: JObject,               // Optional<Long>
-    max_source_rows: JObject,                    // Optional<Long>
-    max_source_bytes: JObject,                   // Optional<Long>
-    excluded_fragment_ids: JObject,              // List<Long>
-    blob_reuse_index: JObject,                   // Optional<Boolean>
-    blob_repack_active_ratio_threshold: JObject, // Optional<Float>
+    _obj: JObject,                              // CompactionTask itself
+    java_dataset: JObject,                      // Dataset
+    task_data: JObject,                         // TaskData
+    read_version: jlong,                        // readVersion
+    target_rows_per_fragment: JObject,          // Optional<Long>
+    max_rows_per_group: JObject,                // Optional<Long>
+    max_bytes_per_file: JObject,                // Optional<Long>
+    materialize_deletions: JObject,             // Optional<Boolean>
+    materialize_deletions_threshold: JObject,   // Optional<Float>
+    num_threads: JObject,                       // Optional<Long>
+    batch_size: JObject,                        // Optional<Long>
+    defer_index_remap: JObject,                 // Optional<Boolean>
+    compaction_mode: JObject,                   // Optional<String>
+    binary_copy_read_batch_bytes: JObject,      // Optional<Long>
+    max_source_fragments: JObject,              // Optional<Long>
+    max_source_rows: JObject,                   // Optional<Long>
+    max_source_bytes: JObject,                  // Optional<Long>
+    excluded_fragment_ids: JObject,             // List<Long>
+    blob_reuse_index: JObject,                  // Optional<Boolean>
+    blob_repack_utilization_threshold: JObject, // Optional<Float>
 ) -> JObject<'local> {
     ok_or_throw_with_return!(
         env,
@@ -293,7 +293,7 @@ pub extern "system" fn Java_org_lance_compaction_CompactionTask_nativeExecute<'l
             max_source_bytes,
             excluded_fragment_ids,
             blob_reuse_index,
-            blob_repack_active_ratio_threshold
+            blob_repack_utilization_threshold
         ),
         JObject::null()
     )
@@ -302,25 +302,25 @@ pub extern "system" fn Java_org_lance_compaction_CompactionTask_nativeExecute<'l
 #[allow(clippy::too_many_arguments)]
 fn inner_execute_task<'local>(
     env: &mut JNIEnv<'local>,
-    java_dataset: JObject,                       // Dataset
-    task_data: JObject,                          // TaskData
-    read_version: jlong,                         // readVersion
-    target_rows_per_fragment: JObject,           // Optional<Long>
-    max_rows_per_group: JObject,                 // Optional<Long>
-    max_bytes_per_file: JObject,                 // Optional<Long>
-    materialize_deletions: JObject,              // Optional<Boolean>
-    materialize_deletions_threshold: JObject,    // Optional<Float>
-    num_threads: JObject,                        // Optional<Long>
-    batch_size: JObject,                         // Optional<Long>
-    defer_index_remap: JObject,                  // Optional<Boolean>
-    compaction_mode: JObject,                    // Optional<String>
-    binary_copy_read_batch_bytes: JObject,       // Optional<Long>
-    max_source_fragments: JObject,               // Optional<Long>
-    max_source_rows: JObject,                    // Optional<Long>
-    max_source_bytes: JObject,                   // Optional<Long>
-    excluded_fragment_ids: JObject,              // List<Long>
-    blob_reuse_index: JObject,                   // Optional<Boolean>
-    blob_repack_active_ratio_threshold: JObject, // Optional<Float>
+    java_dataset: JObject,                      // Dataset
+    task_data: JObject,                         // TaskData
+    read_version: jlong,                        // readVersion
+    target_rows_per_fragment: JObject,          // Optional<Long>
+    max_rows_per_group: JObject,                // Optional<Long>
+    max_bytes_per_file: JObject,                // Optional<Long>
+    materialize_deletions: JObject,             // Optional<Boolean>
+    materialize_deletions_threshold: JObject,   // Optional<Float>
+    num_threads: JObject,                       // Optional<Long>
+    batch_size: JObject,                        // Optional<Long>
+    defer_index_remap: JObject,                 // Optional<Boolean>
+    compaction_mode: JObject,                   // Optional<String>
+    binary_copy_read_batch_bytes: JObject,      // Optional<Long>
+    max_source_fragments: JObject,              // Optional<Long>
+    max_source_rows: JObject,                   // Optional<Long>
+    max_source_bytes: JObject,                  // Optional<Long>
+    excluded_fragment_ids: JObject,             // List<Long>
+    blob_reuse_index: JObject,                  // Optional<Boolean>
+    blob_repack_utilization_threshold: JObject, // Optional<Float>
 ) -> Result<JObject<'local>> {
     let task_data: TaskData = task_data.extract_object(env)?;
     let config = {
@@ -345,7 +345,7 @@ fn inner_execute_task<'local>(
         &max_source_bytes,
         &excluded_fragment_ids,
         &blob_reuse_index,
-        &blob_repack_active_ratio_threshold,
+        &blob_repack_utilization_threshold,
         &config,
     )?;
     let compaction_task = CompactionTask {
@@ -457,10 +457,10 @@ impl IntoJava for &CompactionOptions {
         let excluded_fragment_ids = to_java_list(env, &excluded_fragment_ids)?;
         let blob_reuse_index = to_java_boolean_obj(env, Some(self.blob_reuse_index))?;
         let blob_reuse_index_opt = to_java_optional(env, blob_reuse_index)?;
-        let blob_repack_active_ratio_threshold =
-            to_java_float_obj(env, Some(self.blob_repack_active_ratio_threshold))?;
-        let blob_repack_active_ratio_threshold_opt =
-            to_java_optional(env, blob_repack_active_ratio_threshold)?;
+        let blob_repack_utilization_threshold =
+            to_java_float_obj(env, Some(self.blob_repack_utilization_threshold))?;
+        let blob_repack_utilization_threshold_opt =
+            to_java_optional(env, blob_repack_utilization_threshold)?;
 
         Ok(env.new_object(
             COMPACTION_OPTIONS_CLASS,
@@ -481,7 +481,7 @@ impl IntoJava for &CompactionOptions {
                 JValueGen::Object(&max_source_bytes_opt),
                 JValueGen::Object(&excluded_fragment_ids),
                 JValueGen::Object(&blob_reuse_index_opt),
-                JValueGen::Object(&blob_repack_active_ratio_threshold_opt),
+                JValueGen::Object(&blob_repack_utilization_threshold_opt),
             ],
         )?)
     }

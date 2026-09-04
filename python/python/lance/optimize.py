@@ -95,10 +95,11 @@ class CompactionOptions(TypedDict):
     Set to False to materialize Packed and Dedicated payloads into new sidecars.
     (default: True)
     """
-    blob_repack_active_ratio_threshold: Optional[float]
+    blob_repack_utilization_threshold: Optional[float]
     """
-    Repack a fragment's Packed Blob v2 sidecars when active rows divided by
-    physical rows is below this threshold. (default: 0.3)
+    Repack a Packed Blob v2 sidecar when the union of ranges referenced by the
+    current snapshot divided by its physical size is below this threshold.
+    (default: 0.3)
     """
     max_source_fragments: Optional[int]
     """

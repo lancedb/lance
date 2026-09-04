@@ -3374,10 +3374,10 @@ fn convert_java_compaction_options_to_rust(
             &[],
         )?
         .l()?;
-    let blob_repack_active_ratio_threshold = env
+    let blob_repack_utilization_threshold = env
         .call_method(
             &java_options,
-            "getBlobRepackActiveRatioThreshold",
+            "getBlobRepackUtilizationThreshold",
             "()Ljava/util/Optional;",
             &[],
         )?
@@ -3400,7 +3400,7 @@ fn convert_java_compaction_options_to_rust(
         &max_source_bytes,
         &excluded_fragment_ids,
         &blob_reuse_index,
-        &blob_repack_active_ratio_threshold,
+        &blob_repack_utilization_threshold,
         config,
     )
 }

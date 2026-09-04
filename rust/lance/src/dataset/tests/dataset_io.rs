@@ -103,13 +103,15 @@ fn test_deep_clone_blob_dirs_avoid_data_file_stems() {
         DataFile::new_legacy_from_fields("_bri_local_source.lance", vec![0], None),
         DataFile::new_legacy_from_fields("output.lance", vec![0], None),
     ];
-    fragment.files[1].blob_reuse_index =
-        Some(Arc::new(BlobReuseIndex::new(vec![BlobReuseSource {
+    fragment.files[1].blob_reuse_index = Some(Arc::new(
+        BlobReuseIndex::try_new(vec![BlobReuseSource {
             base_id: None,
             blob_dir: "source".to_string(),
             local_ids: vec![1],
             physical_ids: vec![1],
-        }])));
+        }])
+        .unwrap(),
+    ));
     let manifest = Manifest::new(
         schema,
         Arc::new(vec![fragment]),

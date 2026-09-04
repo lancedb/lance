@@ -64,7 +64,7 @@ public class CompactionTask implements Serializable {
           compactionOptions.getMaxSourceBytes(),
           compactionOptions.getExcludedFragmentIds(),
           compactionOptions.getBlobReuseIndex(),
-          compactionOptions.getBlobRepackActiveRatioThreshold());
+          compactionOptions.getBlobRepackUtilizationThreshold());
     }
   }
 
@@ -87,7 +87,7 @@ public class CompactionTask implements Serializable {
       Optional<Long> maxSourceBytes,
       List<Long> excludedFragmentIds,
       Optional<Boolean> blobReuseIndex,
-      Optional<Float> blobRepackActiveRatioThreshold);
+      Optional<Float> blobRepackUtilizationThreshold);
 
   public CompactionOptions getCompactionOptions() {
     return compactionOptions;

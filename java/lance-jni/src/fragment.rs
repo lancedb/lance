@@ -1090,7 +1090,7 @@ impl FromJObjectWithEnv<BlobReuseIndex> for JObject<'_> {
         let sources = import_vec_from_method(env, self, "getSources", |env, value| {
             value.extract_object(env)
         })?;
-        Ok(BlobReuseIndex::new(sources))
+        Ok(BlobReuseIndex::try_new(sources)?)
     }
 }
 

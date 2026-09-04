@@ -473,7 +473,7 @@ async fn do_commit_new_dataset(
                                 Ok(source)
                             })
                             .collect::<Result<Vec<_>>>()?;
-                        df.blob_reuse_index = Some(Arc::new(BlobReuseIndex::new(sources)));
+                        df.blob_reuse_index = Some(Arc::new(BlobReuseIndex::try_new(sources)?));
                     }
                     df.base_id = None;
                 }

@@ -1210,13 +1210,15 @@ mod tests {
         )]);
         let schema = Schema::try_from(&arrow_schema).unwrap();
         let mut fragment = Fragment::with_file_legacy(0, "file.lance", &schema, Some(1));
-        fragment.files[0].blob_reuse_index =
-            Some(Arc::new(BlobReuseIndex::new(vec![BlobReuseSource {
+        fragment.files[0].blob_reuse_index = Some(Arc::new(
+            BlobReuseIndex::try_new(vec![BlobReuseSource {
                 base_id: Some(42),
                 blob_dir: "source.blob".to_string(),
                 local_ids: vec![1],
                 physical_ids: vec![1],
-            }])));
+            }])
+            .unwrap(),
+        ));
         let mut manifest = Manifest::new(
             schema,
             Arc::new(vec![fragment]),
@@ -1244,13 +1246,15 @@ mod tests {
         let schema = Schema::try_from(&arrow_schema).unwrap();
         let make_fragment = |id, physical_id| {
             let mut fragment = Fragment::with_file_legacy(id, "same.lance", &schema, Some(1));
-            fragment.files[0].blob_reuse_index =
-                Some(Arc::new(BlobReuseIndex::new(vec![BlobReuseSource {
+            fragment.files[0].blob_reuse_index = Some(Arc::new(
+                BlobReuseIndex::try_new(vec![BlobReuseSource {
                     base_id: None,
                     blob_dir: "source.blob".to_string(),
                     local_ids: vec![1],
                     physical_ids: vec![physical_id],
-                }])));
+                }])
+                .unwrap(),
+            ));
             fragment
         };
         let fragments = vec![make_fragment(0, 1), make_fragment(1, 2)];
@@ -1278,13 +1282,15 @@ mod tests {
         let schema = Schema::try_from(&arrow_schema).unwrap();
 
         let mut fragment = Fragment::with_file_legacy(0, "base.lance", &schema, Some(10));
-        fragment.files[0].blob_reuse_index =
-            Some(Arc::new(BlobReuseIndex::new(vec![BlobReuseSource {
+        fragment.files[0].blob_reuse_index = Some(Arc::new(
+            BlobReuseIndex::try_new(vec![BlobReuseSource {
                 base_id: None,
                 blob_dir: "source.blob".to_string(),
                 local_ids: vec![1],
                 physical_ids: vec![2],
-            }])));
+            }])
+            .unwrap(),
+        ));
         fragment.overlays = vec![DataOverlayFile {
             data_file: DataFile::new_legacy_from_fields("overlay.lance", vec![0], None),
             coverage: OverlayCoverage::Shared(Arc::new(RoaringBitmap::from_iter([0_u32]))),

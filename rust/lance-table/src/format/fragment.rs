@@ -67,7 +67,7 @@ pub struct BlobReuseIndex {
     /// Physical sidecar sources. This list is non-empty whenever the index is present.
     sources: Vec<BlobReuseSource>,
     /// Sorted routes from local id to `(source index, position within source)`.
-    routes: Vec<(u32, usize, usize)>,
+    routes: Vec<(u32, u32, u32)>,
 }
 
 /// Redirects a sorted set of local Blob v2 ids to one physical sidecar directory.
@@ -96,21 +96,33 @@ pub struct ResolvedBlobReference<'a> {
 
 impl BlobReuseIndex {
     /// Create an index and build its runtime lookup table.
-    pub fn new(sources: Vec<BlobReuseSource>) -> Self {
-        let mut routes = sources
-            .iter()
-            .enumerate()
-            .flat_map(|(source_index, source)| {
-                source
-                    .local_ids
-                    .iter()
-                    .copied()
-                    .enumerate()
-                    .map(move |(position, local_id)| (local_id, source_index, position))
+    ///
+    /// Returns an error when a source index or a position within a source does
+    /// not fit in the 32-bit runtime representation.
+    pub fn try_new(sources: Vec<BlobReuseSource>) -> Result<Self> {
+        let mapping_count = sources.iter().try_fold(0_usize, |total, source| {
+            total.checked_add(source.local_ids.len()).ok_or_else(|| {
+                Error::invalid_input("BlobReuseIndex mapping count exceeds usize".to_string())
             })
-            .collect::<Vec<_>>();
+        })?;
+        let mut routes = Vec::with_capacity(mapping_count);
+        for (source_index, source) in sources.iter().enumerate() {
+            let source_index = u32::try_from(source_index).map_err(|_| {
+                Error::invalid_input(format!(
+                    "BlobReuseIndex source index {source_index} exceeds u32::MAX"
+                ))
+            })?;
+            for (position, local_id) in source.local_ids.iter().copied().enumerate() {
+                let position = u32::try_from(position).map_err(|_| {
+                    Error::invalid_input(format!(
+                        "BlobReuseIndex source {source_index} position {position} exceeds u32::MAX"
+                    ))
+                })?;
+                routes.push((local_id, source_index, position));
+            }
+        }
         routes.sort_unstable_by_key(|(local_id, _, _)| *local_id);
-        Self { sources, routes }
+        Ok(Self { sources, routes })
     }
 
     /// Return the physical sidecar sources in this index.
@@ -129,11 +141,11 @@ impl BlobReuseIndex {
             .binary_search_by_key(&local_id, |(local_id, _, _)| *local_id)
             .ok()?;
         let (_, source_index, source_position) = self.routes[position];
-        let source = &self.sources[source_index];
+        let source = &self.sources[source_index as usize];
         Some(ResolvedBlobReference {
             base_id: source.base_id.or(containing_base_id),
             blob_dir: source.blob_dir.as_str(),
-            physical_id: source.physical_ids[source_position],
+            physical_id: source.physical_ids[source_position as usize],
         })
     }
 
@@ -146,7 +158,6 @@ impl BlobReuseIndex {
         }
 
         let mut source_keys = HashSet::with_capacity(self.sources.len());
-        let mut all_local_ids = HashSet::new();
         for (source_index, source) in self.sources.iter().enumerate() {
             let parsed = Path::parse(source.blob_dir.as_str()).map_err(|error| {
                 Error::corrupt_file_named(
@@ -214,12 +225,6 @@ impl BlobReuseIndex {
                         format!("source {source_index} contains reserved local id 0"),
                     ));
                 }
-                if !all_local_ids.insert(*local_id) {
-                    return Err(Error::corrupt_file_named(
-                        "blob reuse index",
-                        format!("local id {local_id} appears in more than one source"),
-                    ));
-                }
             }
             if source.physical_ids.contains(&0) {
                 return Err(Error::corrupt_file_named(
@@ -227,6 +232,16 @@ impl BlobReuseIndex {
                     format!("source {source_index} contains reserved physical id 0"),
                 ));
             }
+        }
+        if let Some(routes) = self
+            .routes
+            .windows(2)
+            .find(|routes| routes[0].0 == routes[1].0)
+        {
+            return Err(Error::corrupt_file_named(
+                "blob reuse index",
+                format!("local id {} appears in more than one source", routes[0].0),
+            ));
         }
         Ok(())
     }
@@ -238,34 +253,30 @@ impl BlobReuseIndex {
         other: &Self,
         containing_base_id: Option<u32>,
     ) -> bool {
-        fn entries(
-            index: &BlobReuseIndex,
-            containing_base_id: Option<u32>,
-        ) -> Vec<(u32, Option<u32>, &str, u32)> {
-            let mut entries = index
-                .sources
-                .iter()
-                .flat_map(|source| {
-                    source
-                        .local_ids
-                        .iter()
-                        .copied()
-                        .zip(source.physical_ids.iter().copied())
-                        .map(move |(local_id, physical_id)| {
+        self.routes.len() == other.routes.len()
+            && self.routes.iter().zip(&other.routes).all(
+                |(
+                    &(local_id, source_index, source_position),
+                    &(other_local_id, other_source_index, other_source_position),
+                )| {
+                    let source = &self.sources[source_index as usize];
+                    let other_source = &other.sources[other_source_index as usize];
+                    local_id == other_local_id
+                        && source.base_id.or(containing_base_id)
+                            == other_source.base_id.or(containing_base_id)
+                        && source.blob_dir == other_source.blob_dir
+                        && matches!(
                             (
-                                local_id,
-                                source.base_id.or(containing_base_id),
-                                source.blob_dir.as_str(),
-                                physical_id,
-                            )
-                        })
-                })
-                .collect::<Vec<_>>();
-            entries.sort_unstable();
-            entries
-        }
-
-        entries(self, containing_base_id) == entries(other, containing_base_id)
+                                source.physical_ids.get(source_position as usize),
+                                other_source
+                                    .physical_ids
+                                    .get(other_source_position as usize)
+                            ),
+                            (Some(physical_id), Some(other_physical_id))
+                                if physical_id == other_physical_id
+                        )
+                },
+            )
     }
 }
 
@@ -299,7 +310,7 @@ impl<'de> Deserialize<'de> for BlobReuseIndex {
         }
 
         let index = BlobReuseIndexOwned::deserialize(deserializer)?;
-        Ok(Self::new(index.sources))
+        Self::try_new(index.sources).map_err(serde::de::Error::custom)
     }
 }
 
@@ -362,7 +373,7 @@ fn blob_reuse_index_from_proto(proto: pb::BlobReuseIndex) -> Result<BlobReuseInd
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    Ok(BlobReuseIndex::new(sources))
+    BlobReuseIndex::try_new(sources)
 }
 
 impl From<&BlobReuseIndex> for pb::BlobReuseIndex {
@@ -574,7 +585,9 @@ impl DataFile {
     pub(crate) fn has_same_blob_reuse_index(&self, other: &Self) -> bool {
         match (&self.blob_reuse_index, &other.blob_reuse_index) {
             (None, None) => true,
-            (Some(left), Some(right)) => left.semantically_equals(right, self.base_id),
+            (Some(left), Some(right)) => {
+                Arc::ptr_eq(left, right) || left.semantically_equals(right, self.base_id)
+            }
             _ => false,
         }
     }
@@ -1412,7 +1425,7 @@ mod tests {
 
     #[test]
     fn blob_reuse_index_roundtrip_and_resolution() {
-        let index = BlobReuseIndex::new(vec![
+        let index = BlobReuseIndex::try_new(vec![
             BlobReuseSource {
                 base_id: None,
                 blob_dir: "source-a.blob".to_string(),
@@ -1425,7 +1438,8 @@ mod tests {
                 local_ids: vec![4],
                 physical_ids: vec![2],
             },
-        ]);
+        ])
+        .unwrap();
         index.validate(Some(3)).unwrap();
 
         let round_tripped = blob_reuse_index_from_proto(pb::BlobReuseIndex::from(&index)).unwrap();
@@ -1466,7 +1480,7 @@ mod tests {
 
     #[test]
     fn blob_reuse_index_routes_many_sources_by_local_id() {
-        let index = BlobReuseIndex::new(
+        let index = BlobReuseIndex::try_new(
             (1..=10_000_u32)
                 .rev()
                 .map(|local_id| BlobReuseSource {
@@ -1476,7 +1490,8 @@ mod tests {
                     physical_ids: vec![local_id + 1],
                 })
                 .collect(),
-        );
+        )
+        .unwrap();
         index.validate(None).unwrap();
 
         for local_id in [1, 5_000, 10_000] {
@@ -1484,6 +1499,7 @@ mod tests {
             assert_eq!(resolved.blob_dir, format!("source-{local_id}"));
             assert_eq!(resolved.physical_id, local_id + 1);
         }
+        assert_eq!(std::mem::size_of_val(&index.routes[0]), 12);
     }
 
     #[test]
@@ -1506,15 +1522,21 @@ mod tests {
     #[test]
     fn blob_reuse_index_rejects_invalid_structure() {
         let source = |blob_dir: &str, local_ids: Vec<u32>, physical_ids: Vec<u32>| {
-            BlobReuseIndex::new(vec![BlobReuseSource {
+            BlobReuseIndex::try_new(vec![BlobReuseSource {
                 base_id: None,
                 blob_dir: blob_dir.to_string(),
                 local_ids,
                 physical_ids,
             }])
+            .unwrap()
         };
 
-        assert!(BlobReuseIndex::new(vec![]).validate(None).is_err());
+        assert!(
+            BlobReuseIndex::try_new(vec![])
+                .unwrap()
+                .validate(None)
+                .is_err()
+        );
         assert!(
             source("nested/source.blob", vec![1], vec![1])
                 .validate(None)
@@ -1546,7 +1568,7 @@ mod tests {
                 .is_err()
         );
 
-        let duplicate_local_id = BlobReuseIndex::new(vec![
+        let duplicate_local_id = BlobReuseIndex::try_new(vec![
             BlobReuseSource {
                 base_id: None,
                 blob_dir: "a.blob".to_string(),
@@ -1559,10 +1581,11 @@ mod tests {
                 local_ids: vec![1],
                 physical_ids: vec![2],
             },
-        ]);
+        ])
+        .unwrap();
         assert!(duplicate_local_id.validate(None).is_err());
 
-        let duplicate_effective_source = BlobReuseIndex::new(vec![
+        let duplicate_effective_source = BlobReuseIndex::try_new(vec![
             BlobReuseSource {
                 base_id: None,
                 blob_dir: "source.blob".to_string(),
@@ -1575,13 +1598,14 @@ mod tests {
                 local_ids: vec![2],
                 physical_ids: vec![2],
             },
-        ]);
+        ])
+        .unwrap();
         assert!(duplicate_effective_source.validate(Some(5)).is_err());
     }
 
     #[test]
     fn blob_reuse_index_semantic_equality_ignores_source_order_and_explicit_base() {
-        let left = BlobReuseIndex::new(vec![
+        let left = BlobReuseIndex::try_new(vec![
             BlobReuseSource {
                 base_id: None,
                 blob_dir: "a.blob".to_string(),
@@ -1594,16 +1618,27 @@ mod tests {
                 local_ids: vec![2],
                 physical_ids: vec![9],
             },
-        ]);
-        let right = BlobReuseIndex::new(vec![
+        ])
+        .unwrap();
+        let right = BlobReuseIndex::try_new(vec![
             left.sources[1].clone(),
             BlobReuseSource {
                 base_id: Some(7),
                 ..left.sources[0].clone()
             },
-        ]);
+        ])
+        .unwrap();
 
         assert_ne!(left, right);
         assert!(left.semantically_equals(&right, Some(7)));
+
+        let malformed = BlobReuseIndex::try_new(vec![BlobReuseSource {
+            base_id: Some(7),
+            blob_dir: "a.blob".to_string(),
+            local_ids: vec![1],
+            physical_ids: vec![],
+        }])
+        .unwrap();
+        assert!(!left.semantically_equals(&malformed, Some(7)));
     }
 }

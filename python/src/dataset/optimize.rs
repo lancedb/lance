@@ -55,8 +55,8 @@ fn parse_compaction_options(
             "blob_reuse_index" => {
                 opts.blob_reuse_index = value.extract()?;
             }
-            "blob_repack_active_ratio_threshold" => {
-                opts.blob_repack_active_ratio_threshold = value.extract()?;
+            "blob_repack_utilization_threshold" => {
+                opts.blob_repack_utilization_threshold = value.extract()?;
             }
             "num_threads" => {
                 opts.num_threads = value.extract()?;
