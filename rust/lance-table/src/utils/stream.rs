@@ -673,6 +673,8 @@ fn wrap_with_row_id_and_delete_impl<const USE_DENSE_ROW_ID_EXPANSION: bool>(
     let config = Arc::new(config);
     let output_schema_cache = Arc::new(OnceLock::new());
     let mut row_id_chunk: Option<PrecomputedRowIdChunk> = None;
+    let mut uniform_batch_size = None;
+    let mut use_uniform_batch_fast_paths = true;
     let selected_rows = selected_row_count(&config.params, config.total_num_rows as usize);
     let mut last_updated_cursor = config
         .last_updated_at_sequence
@@ -688,23 +690,54 @@ fn wrap_with_row_id_and_delete_impl<const USE_DENSE_ROW_ID_EXPANSION: bool>(
     stream
         .map(move |batch_task| {
             let config = config.clone();
-            let output_schema_cache = output_schema_cache.clone();
             let this_offset = offset;
             let num_rows = batch_task.num_rows;
             offset += num_rows;
+            let logical_offset = this_offset as usize;
+            let num_rows_usize = num_rows as usize;
+            if num_rows_usize != 0 && use_uniform_batch_fast_paths {
+                if let Some(batch_size) = uniform_batch_size {
+                    // A shorter final batch is expected. Any other task-size change can
+                    // repeatedly straddle read-ahead boundaries and makes shared schema
+                    // lifetimes counterproductive for large buffers. Drain the current
+                    // row-ID cache, then use exact per-task work from this point forward.
+                    if num_rows_usize != batch_size
+                        && logical_offset + num_rows_usize < selected_rows
+                    {
+                        use_uniform_batch_fast_paths = false;
+                    }
+                } else {
+                    uniform_batch_size = Some(num_rows_usize);
+                }
+            }
+            let output_schema_cache = use_uniform_batch_fast_paths
+                .then(|| output_schema_cache.clone());
             // Build row ids while pulling the ordered task stream, before the
             // batch futures can run concurrently. Adjacent batches share a
             // bounded chunk and take zero-copy Arrow slices from it.
             let row_ids = config.row_id_sequence.as_ref().and_then(|sequence| {
                 row_id_cursor.as_mut().map(|cursor| {
-                    let logical_offset = this_offset as usize;
-                    let num_rows = num_rows as usize;
-                    if num_rows == 0 {
+                    if num_rows_usize == 0 {
                         return Ok(Arc::new(UInt64Array::from(Vec::<u64>::new())));
+                    }
+                    if !use_uniform_batch_fast_paths
+                        && row_id_chunk
+                            .as_ref()
+                            .is_none_or(|chunk| chunk.end_offset() <= logical_offset)
+                    {
+                        row_id_chunk = None;
+                        return decode_row_id_chunk::<USE_DENSE_ROW_ID_EXPANSION>(
+                            sequence,
+                            cursor,
+                            &config.params,
+                            logical_offset,
+                            num_rows_usize,
+                        )
+                        .map(|chunk| chunk.values);
                     }
                     if let Some(row_ids) = row_id_chunk
                         .as_ref()
-                        .and_then(|chunk| chunk.slice(logical_offset, num_rows))
+                        .and_then(|chunk| chunk.slice(logical_offset, num_rows_usize))
                     {
                         return Ok(row_ids);
                     }
@@ -722,11 +755,17 @@ fn wrap_with_row_id_and_delete_impl<const USE_DENSE_ROW_ID_EXPANSION: bool>(
                             .as_ref()
                             .map(|row_ids| row_ids.len())
                             .unwrap_or_default();
-                    let required_end = logical_offset + num_rows;
+                    let required_end = logical_offset + num_rows_usize;
                     let missing_rows = required_end.saturating_sub(decode_offset);
-                    let chunk_len = missing_rows
-                        .max(ROW_ID_READ_AHEAD_ROWS)
-                        .min(selected_rows.saturating_sub(decode_offset));
+                    let chunk_len = if use_uniform_batch_fast_paths {
+                        let batch_size = uniform_batch_size.unwrap_or(num_rows_usize);
+                        let batches_per_chunk = (ROW_ID_READ_AHEAD_ROWS / batch_size).max(1);
+                        let chunk_rows = batch_size.saturating_mul(batches_per_chunk);
+                        missing_rows.max(chunk_rows)
+                    } else {
+                        missing_rows
+                    }
+                    .min(selected_rows.saturating_sub(decode_offset));
                     let chunk = decode_row_id_chunk::<USE_DENSE_ROW_ID_EXPANSION>(
                         sequence,
                         cursor,
@@ -744,7 +783,7 @@ fn wrap_with_row_id_and_delete_impl<const USE_DENSE_ROW_ID_EXPANSION: bool>(
                         )
                     })?;
                     let row_ids = if let Some(prefix) = prefix {
-                        let mut values = Vec::with_capacity(num_rows);
+                        let mut values = Vec::with_capacity(num_rows_usize);
                         values.extend_from_slice(prefix.values());
                         values.extend_from_slice(suffix.values());
                         Arc::new(UInt64Array::from(values))
@@ -798,7 +837,7 @@ fn wrap_with_row_id_and_delete_impl<const USE_DENSE_ROW_ID_EXPANSION: bool>(
                             last_updated_versions,
                             created_versions,
                         },
-                        Some(output_schema_cache.as_ref()),
+                        output_schema_cache.as_deref(),
                     )
                 })
                 .boxed()
@@ -1260,11 +1299,16 @@ mod tests {
             total_num_rows: total_rows as u32,
         };
 
-        let actual = super::wrap_with_row_id_and_delete(stream::iter(tasks).boxed(), 0, config)
+        let batches = super::wrap_with_row_id_and_delete(stream::iter(tasks).boxed(), 0, config)
             .buffered(3)
             .try_collect::<Vec<_>>()
             .await
-            .unwrap()
+            .unwrap();
+        let second_schema = batches[1].schema();
+        let third_schema = batches[2].schema();
+        assert!(!Arc::ptr_eq(&second_schema, &third_schema));
+
+        let actual = batches
             .iter()
             .flat_map(|batch| batch[ROW_ID].as_primitive::<UInt64Type>().values())
             .copied()
