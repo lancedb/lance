@@ -22,7 +22,8 @@ import java.util.Objects;
  * <p>The payload is bound to the dataset version, logical FTS index, exact committed segment set,
  * indexed column, document granularity, prepared query leaves, and their original token positions.
  * It can be transported to another Lance executor without exposing Rust scorer internals as a Java
- * API.
+ * API. The caller must attach it only to the same query used to produce it because V1 consumers
+ * cannot independently verify the source query identity.
  */
 public final class FtsGlobalStatistics {
   private final byte[] protobuf;

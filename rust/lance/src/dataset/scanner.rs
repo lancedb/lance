@@ -1694,7 +1694,9 @@ impl Scanner {
     ///
     /// The query must resolve to exactly one indexed column. The returned bytes
     /// are an opaque transport handle intended for Lance bindings and
-    /// distributed query planning.
+    /// distributed query planning. The caller must attach them only to the same
+    /// query used to produce them; V1 consumers cannot independently verify the
+    /// source query identity.
     ///
     /// ```no_run
     /// # use lance::{Dataset, Result};
@@ -8354,6 +8356,16 @@ mod test {
             ])))
             .limit(Some(10))
         };
+
+        let mut statistics_scan = dataset.scan();
+        statistics_scan.full_text_search(cross_column()).unwrap();
+        let error = statistics_scan.fts_global_statistics().await.unwrap_err();
+        assert!(matches!(&error, Error::NotSupported { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("requires exactly one indexed column")
+        );
 
         let mut scan = dataset.scan();
         scan.full_text_search(cross_column()).unwrap();
