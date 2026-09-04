@@ -730,69 +730,35 @@ impl From<&RowIdSequence> for RowAddrTreeMap {
     fn from(row_ids: &RowIdSequence) -> Self {
         let mut tree_map = Self::new();
         for segment in &row_ids.0 {
-            tree_map |= row_ids_from_segment_slice(segment, 0, segment.len());
-        }
-        tree_map
-    }
-}
-
-impl From<&RowIdSeqSlice<'_>> for RowAddrTreeMap {
-    fn from(row_ids: &RowIdSeqSlice<'_>) -> Self {
-        let mut tree_map = Self::new();
-        let last_segment = row_ids.segments.len().saturating_sub(1);
-        for (index, segment) in row_ids.segments.iter().enumerate() {
-            let start = if index == 0 { row_ids.offset_start } else { 0 };
-            let end = if index == last_segment {
-                row_ids.offset_last
-            } else {
-                segment.len()
-            };
-            tree_map |= row_ids_from_segment_slice(segment, start, end);
-        }
-        tree_map
-    }
-}
-
-fn row_ids_from_segment_slice(segment: &U64Segment, start: usize, end: usize) -> RowAddrTreeMap {
-    let mut tree_map = RowAddrTreeMap::new();
-    if start == end {
-        return tree_map;
-    }
-
-    match segment {
-        U64Segment::Range(range) => {
-            let len = (end - start) as u64;
-            let range_start = range.start + start as u64;
-            tree_map.insert_range(range_start..range_start + len);
-        }
-        U64Segment::RangeWithBitmap { range, bitmap } if start == 0 && end == segment.len() => {
-            tree_map.insert_range(range.clone());
-            for (i, val) in range.clone().enumerate() {
-                if !bitmap.get(i) {
-                    tree_map.remove(val);
+            let mut seg = Self::new();
+            match segment {
+                U64Segment::Range(range) => {
+                    seg.insert_range(range.clone());
+                }
+                U64Segment::RangeWithBitmap { range, bitmap } => {
+                    seg.insert_range(range.clone());
+                    for (i, val) in range.clone().enumerate() {
+                        if !bitmap.get(i) {
+                            seg.remove(val);
+                        }
+                    }
+                }
+                U64Segment::RangeWithHoles { range, holes } => {
+                    seg.insert_range(range.clone());
+                    for hole in holes.iter() {
+                        seg.remove(hole);
+                    }
+                }
+                U64Segment::SortedArray(array) | U64Segment::Array(array) => {
+                    for val in array.iter() {
+                        seg.insert(val);
+                    }
                 }
             }
+            tree_map |= seg;
         }
-        U64Segment::RangeWithHoles { range, holes } if start == 0 && end == segment.len() => {
-            tree_map.insert_range(range.clone());
-            for hole in holes.iter() {
-                tree_map.remove(hole);
-            }
-        }
-        U64Segment::SortedArray(array) | U64Segment::Array(array)
-            if start == 0 && end == segment.len() =>
-        {
-            for val in array.iter() {
-                tree_map.insert(val);
-            }
-        }
-        _ => {
-            for row_id in segment.iter().skip(start).take(end - start) {
-                tree_map.insert(row_id);
-            }
-        }
+        tree_map
     }
-    tree_map
 }
 
 #[derive(Debug)]
@@ -1156,13 +1122,6 @@ mod test {
                     "Failed for offset {} and len {}",
                     offset, len
                 );
-                assert_eq!(
-                    RowAddrTreeMap::from(&slice),
-                    expected.iter().copied().collect(),
-                    "Tree map conversion failed for offset {} and len {}",
-                    offset,
-                    len
-                );
 
                 let (claimed_size, claimed_max) = slice.iter().size_hint();
                 assert_eq!(claimed_max, Some(claimed_size)); // Exact size hint
@@ -1360,20 +1319,6 @@ mod test {
         let expected = sequence.iter().collect::<RowAddrTreeMap>();
         assert_eq!(expected, (0..6).collect::<RowAddrTreeMap>());
         assert_eq!(RowAddrTreeMap::from(&sequence), expected);
-    }
-
-    #[test]
-    fn test_row_id_sequence_slice_to_treemap_preserves_large_range() {
-        let sequence = RowIdSequence::from(10..1_000_000_010);
-        let slice = sequence.slice(123, 333);
-
-        let tree_map = RowAddrTreeMap::from(&slice);
-
-        assert_eq!(tree_map.len(), Some(333));
-        assert_eq!(
-            tree_map.iter_runs().collect::<Vec<_>>(),
-            vec![(0, 133..=465)]
-        );
     }
 
     #[test]

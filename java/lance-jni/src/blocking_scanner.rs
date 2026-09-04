@@ -14,10 +14,9 @@ use arrow_schema::SchemaRef;
 use jni::objects::{JObject, JString, JValueGen};
 use jni::sys::{JNI_TRUE, jboolean, jint};
 use jni::{JNIEnv, sys::jlong};
-use lance::dataset::rowids::load_row_id_sequence;
 use lance::dataset::scanner::{
     AggregateExpr, ColumnOrdering, DatasetRecordBatchStream, ExecutionStatsCallback,
-    ExecutionSummaryCounts, MaterializationStyle, RowAddrMask, RowAddrTreeMap, Scanner,
+    ExecutionSummaryCounts, MaterializationStyle, RowAddrTreeMap, Scanner,
 };
 use lance_core::utils::address::RowAddress;
 use lance_index::scalar::FullTextSearchQuery;
@@ -348,8 +347,8 @@ fn apply_fragment_slices(
             .push((slice.row_offset, slice.row_count));
     }
 
-    let (selected_row_ids, fragments_by_id) = block_on(async {
-        let mut selected_row_ids = RowAddrTreeMap::new();
+    let (physical_rows, fragments_by_id) = block_on(async {
+        let mut physical_rows = RowAddrTreeMap::new();
         let mut fragments_by_id = BTreeMap::new();
         for (fragment_id, ranges) in slices_by_fragment {
             let Some(fragment) = dataset.get_fragment(fragment_id as usize) else {
@@ -364,22 +363,6 @@ fn apply_fragment_slices(
                         "physical row count does not fit in u64 for fragment_id={fragment_id}"
                     ))
                 })?;
-            let row_id_sequence = if dataset.manifest().uses_stable_row_ids() {
-                let sequence = load_row_id_sequence(dataset, fragment.metadata()).await?;
-                if sequence.len() != physical_row_count {
-                    return Err(Error::runtime_error(format!(
-                        "row-id sequence length={} does not match physical_row_count={} for fragment_id={} in dataset version={}",
-                        sequence.len(),
-                        physical_row_count,
-                        fragment_id,
-                        dataset.version().version
-                    )));
-                }
-                Some(sequence)
-            } else {
-                None
-            };
-
             let mut validated_ranges = Vec::with_capacity(ranges.len());
             for (row_offset, row_count) in ranges {
                 let end = row_offset.checked_add(row_count).ok_or_else(|| {
@@ -421,37 +404,22 @@ fn apply_fragment_slices(
             for range in merged_ranges {
                 let row_offset = range.start;
                 let row_count = range.end - range.start;
-                if let Some(sequence) = row_id_sequence.as_ref() {
-                    let offset = usize::try_from(row_offset).map_err(|_| {
-                        Error::input_error(format!(
-                            "rowOffset does not fit in usize: fragment_id={fragment_id}, row_offset={row_offset}"
-                        ))
-                    })?;
-                    let count = usize::try_from(row_count).map_err(|_| {
-                        Error::input_error(format!(
-                            "rowCount does not fit in usize: fragment_id={fragment_id}, row_count={row_count}"
-                        ))
-                    })?;
-                    selected_row_ids |= RowAddrTreeMap::from(&sequence.slice(offset, count));
-                } else {
-                    let row_offset = u32::try_from(row_offset).map_err(|_| {
-                        Error::input_error(format!(
-                            "rowOffset exceeds the row-address limit: fragment_id={fragment_id}, row_offset={row_offset}"
-                        ))
-                    })?;
-                    let start = u64::from(RowAddress::new_from_parts(fragment_id, row_offset));
-                    selected_row_ids.insert_range(start..start + row_count);
-                }
+                let row_offset = u32::try_from(row_offset).map_err(|_| {
+                    Error::input_error(format!(
+                        "rowOffset exceeds the row-address limit: fragment_id={fragment_id}, row_offset={row_offset}"
+                    ))
+                })?;
+                let start = u64::from(RowAddress::new_from_parts(fragment_id, row_offset));
+                physical_rows.insert_range(start..start + row_count);
             }
             fragments_by_id.insert(fragment_id, fragment.metadata().clone());
         }
-        Ok((selected_row_ids, fragments_by_id))
+        Ok((physical_rows, fragments_by_id))
     })?;
 
-    // A stable row id can move to a replacement fragment after an update. Restricting the scan to
-    // the physical fragments named by the slices prevents such a row from following its stable id
-    // outside the requested physical range. When fragmentIds are also present, preserve their
-    // ordering while applying the documented intersection with the slice fragments.
+    // Preserve fragmentIds ordering while applying the documented intersection with slices.
+    // The per-fragment physical ranges remain separate until filtered-read planning intersects
+    // them with deletion state and any scalar-index result.
     let fragments = match fragment_ids {
         Some(fragment_ids) => fragment_ids
             .iter()
@@ -460,7 +428,7 @@ fn apply_fragment_slices(
         None => fragments_by_id.into_values().collect(),
     };
     scanner.with_fragments(fragments);
-    scanner.with_row_addr_prefilter(RowAddrMask::from_allowed(selected_row_ids));
+    scanner.with_physical_row_addr_prefilter(physical_rows);
     Ok(())
 }
 

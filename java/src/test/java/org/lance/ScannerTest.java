@@ -33,6 +33,7 @@ import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.IntVector;
+import org.apache.arrow.vector.UInt8Vector;
 import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.ipc.ArrowReader;
@@ -243,6 +244,23 @@ public class ScannerTest {
           }
           assertEquals(4, rowCount);
         }
+
+        ScanOptions withDeletedOptions =
+            new ScanOptions.Builder(options).withRowId(true).includeDeletedRows(true).build();
+        try (LanceScanner scanner = dataset.newScan(withDeletedOptions);
+            ArrowReader reader = scanner.scanBatches()) {
+          assertTrue(reader.loadNextBatch());
+          VectorSchemaRoot root = reader.getVectorSchemaRoot();
+          IntVector ids = (IntVector) root.getVector("id");
+          UInt8Vector rowIds = (UInt8Vector) root.getVector("_rowid");
+          List<Integer> actualIds = new ArrayList<>();
+          for (int index = 0; index < root.getRowCount(); index++) {
+            actualIds.add(ids.get(index));
+            assertEquals(index == 1, rowIds.isNull(index));
+          }
+          assertEquals(Arrays.asList(1, 2, 3, 4, 5), actualIds);
+          assertFalse(reader.loadNextBatch());
+        }
       }
     }
   }
@@ -266,21 +284,27 @@ public class ScannerTest {
         int originalFragmentId = dataset.getFragments().get(0).getId();
         try (Dataset updated =
             dataset
-                .update(new UpdateParams(ImmutableMap.of("name", "'updated'")).withWhere("id = 2"))
+                .update(
+                    new UpdateParams(ImmutableMap.of("name", "'updated'"))
+                        .withWhere("id = 2 OR id = 3"))
                 .getDataset()) {
-          List<Integer> allFragmentIds =
-              updated.getFragments().stream().map(Fragment::getId).collect(Collectors.toList());
-          assertEquals(2, allFragmentIds.size());
+          int replacementFragmentId =
+              updated.getFragments().stream()
+                  .map(Fragment::getId)
+                  .filter(fragmentId -> fragmentId != originalFragmentId)
+                  .findFirst()
+                  .orElseThrow();
 
           ScanOptions options =
               new ScanOptions.Builder()
-                  .fragmentIds(allFragmentIds)
                   .fragmentSlices(
-                      Collections.singletonList(new FragmentSlice(originalFragmentId, 2, 1)))
+                      Arrays.asList(
+                          new FragmentSlice(originalFragmentId, 2, 1),
+                          new FragmentSlice(replacementFragmentId, 1, 1)))
                   .columns(Collections.singletonList("id"))
                   .build();
           try (LanceScanner scanner = updated.newScan(options)) {
-            assertEquals(Collections.emptyList(), readIds(scanner));
+            assertEquals(Collections.singletonList(3), readIds(scanner));
           }
         }
       }
@@ -309,6 +333,15 @@ public class ScannerTest {
                 .columns(Collections.singletonList("id"))
                 .build();
         try (LanceScanner scanner = dataset.newScan(empty)) {
+          assertEquals(Collections.emptyList(), readIds(scanner));
+        }
+
+        ScanOptions emptyList =
+            new ScanOptions.Builder()
+                .fragmentSlices(Collections.emptyList())
+                .columns(Collections.singletonList("id"))
+                .build();
+        try (LanceScanner scanner = dataset.newScan(emptyList)) {
           assertEquals(Collections.emptyList(), readIds(scanner));
         }
 
