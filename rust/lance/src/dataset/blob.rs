@@ -1291,6 +1291,32 @@ impl BlobPreprocessor {
                 .map(|col| !col.is_null(i))
                 .unwrap_or(false);
 
+            if has_uri && let Some(reuse) = decode_blob_reuse_input(uri_col.value(i))? {
+                if has_data || !has_size {
+                    return Err(Error::invalid_input(format!(
+                        "Internal blob reuse input for field '{}' must contain uri, size, and an optional Packed position",
+                        field.name()
+                    )));
+                }
+                let position = position_col
+                    .as_ref()
+                    .filter(|_| has_position)
+                    .map(|col| col.value(i));
+                let kind = if position.is_some() {
+                    BlobKind::Packed
+                } else {
+                    BlobKind::Dedicated
+                };
+                let value = self.reuse_sidecar(
+                    reuse,
+                    kind,
+                    position,
+                    size_col.as_ref().expect("size column must exist").value(i),
+                )?;
+                blob_writer.push(value)?;
+                continue;
+            }
+
             if has_position != has_size {
                 return Err(Error::invalid_input(format!(
                     "Blob v2 field '{}' row {i} must set both `position` and `size`, or neither",
@@ -1344,31 +1370,6 @@ impl BlobPreprocessor {
 
             if has_uri {
                 let uri_val = uri_col.value(i);
-                if let Some(reuse) = decode_blob_reuse_input(uri_val)? {
-                    if has_data || !has_size {
-                        return Err(Error::invalid_input(format!(
-                            "Internal blob reuse input for field '{}' must contain uri, size, and an optional Packed position",
-                            field.name()
-                        )));
-                    }
-                    let position = position_col
-                        .as_ref()
-                        .filter(|_| has_position)
-                        .map(|col| col.value(i));
-                    let kind = if position.is_some() {
-                        BlobKind::Packed
-                    } else {
-                        BlobKind::Dedicated
-                    };
-                    let value = self.reuse_sidecar(
-                        reuse,
-                        kind,
-                        position,
-                        size_col.as_ref().expect("size column must exist").value(i),
-                    )?;
-                    blob_writer.push(value)?;
-                    continue;
-                }
                 if self.external_blob_mode == ExternalBlobMode::Ingest {
                     let position = if has_position {
                         Some(

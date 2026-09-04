@@ -312,12 +312,12 @@ impl Dataset {
                     writer.write_batch(&batch).await?;
                 }
             }
-            if let Some(preprocessor) = preprocessor.as_mut() {
-                if preprocessor.finish().await?.is_some() {
-                    return Err(Error::internal(
-                        "data-file parts cannot carry Blob Reuse Index metadata",
-                    ));
-                }
+            if let Some(preprocessor) = preprocessor.as_mut()
+                && preprocessor.finish().await?.is_some()
+            {
+                return Err(Error::internal(
+                    "data-file parts cannot carry Blob Reuse Index metadata",
+                ));
             }
             writer.finish().await
         }
