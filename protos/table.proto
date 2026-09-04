@@ -768,6 +768,33 @@ message SsTable {
 
   // Directory name relative to the shard directory.
   string path = 2;
+
+  /* Payload size of the rows, as the writer's MemTable accounted for them: the
+     sum over its buffers of the window each one holds.
+
+     An estimate of the payload, not a bound on what reading the SSTable costs.
+     It excludes the per-array structure a reader materializes, so a consumer
+     budgeting memory from it must add its own headroom.
+
+     Absent on an SSTable written before this field existed, so a reader must
+     not read a missing value as zero. The same applies to the two below. */
+  optional uint64 in_memory_bytes = 3;
+
+  /* Rows held, counting the older duplicates of a primary key that the
+     generation's deletion vector masks. A scan that applies the deletion vector
+     yields fewer. */
+  optional uint64 physical_rows = 4;
+
+  /* Total payload size of the primary-key columns, summed over every row in
+     `physical_rows`. Not a per-row size: a variable-length key differs from row
+     to row, and a consumer wanting a mean divides by the row count.
+
+     Accounted the same way as `in_memory_bytes`, so the same caveat applies --
+     it is not the size of any encoded form of the key, such as a comparable
+     byte-ordered encoding a reader might build for sorting or deduplication.
+
+     Absent also on a table with no primary key. */
+  optional uint64 primary_key_bytes = 5;
 }
 
 // A pointer to the latest SSTable compacted for a shard.
