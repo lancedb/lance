@@ -3134,10 +3134,9 @@ where
         let progress = progress.clone();
         tokio::spawn(async move {
             while let Some(iter) = progress_rx.recv().await {
-                if let Err(e) = progress.stage_progress("train_ivf", iter).await {
-                    warn!("Progress callback error during train_ivf: {e}");
-                }
+                progress.stage_progress("train_ivf", iter).await?;
             }
+            Result::Ok(())
         })
     };
 
@@ -3163,9 +3162,7 @@ where
         params.sample_rate,
     );
     drop(progress_tx);
-    if let Err(e) = progress_worker.await {
-        warn!("Progress worker join error during train_ivf: {e}");
-    }
+    progress_worker.await??;
     let kmeans = kmeans?;
     let training_data = FixedSizeListArray::try_new_from_values(
         Arc::new(data.clone()) as ArrayRef,
@@ -4430,6 +4427,36 @@ fn train_weighted_hierarchical_f32_kmeans(
     f32_fsl_from_values(values, dimension)
 }
 
+async fn finish_streaming_ivf_training<T>(
+    training_result: Result<T>,
+    progress_tx: mpsc::UnboundedSender<u64>,
+    on_progress: KMeansProgressCallback,
+    progress_worker: tokio::task::JoinHandle<Result<()>>,
+    trainer_name: &str,
+) -> Result<T> {
+    drop(progress_tx);
+    drop(on_progress);
+    let progress_result = match progress_worker.await {
+        Ok(result) => result,
+        Err(err) => Err(err.into()),
+    };
+
+    match training_result {
+        Ok(value) => {
+            progress_result?;
+            Ok(value)
+        }
+        Err(training_error) => {
+            if let Err(progress_error) = progress_result {
+                warn!(
+                    "{trainer_name} failed while its progress worker also failed: {progress_error}"
+                );
+            }
+            Err(training_error)
+        }
+    }
+}
+
 async fn train_streaming_coreset_ivf_model(
     dataset: &Dataset,
     column: &str,
@@ -4469,10 +4496,9 @@ async fn train_streaming_coreset_ivf_model(
         let progress = progress.clone();
         tokio::spawn(async move {
             while let Some(iter) = progress_rx.recv().await {
-                if let Err(e) = progress.stage_progress("train_ivf", iter).await {
-                    warn!("Progress callback error during train_ivf: {e}");
-                }
+                progress.stage_progress("train_ivf", iter).await?;
             }
+            Result::Ok(())
         })
     };
 
@@ -4488,127 +4514,133 @@ async fn train_streaming_coreset_ivf_model(
         })
     };
 
-    let coreset_rate = streaming_coreset_rate(
-        total_sample_rate,
-        streaming_sample_rate,
-        params.streaming_coreset_rate,
-    );
-    let coreset_budget = num_partitions
-        .saturating_mul(coreset_rate)
-        .max(num_partitions);
-    let total_steps = total_sample_rate.div_ceil(streaming_sample_rate);
-    let decoupled_coreset_budget = params.streaming_coreset_rate.is_some();
-    let mut coreset = WeightedCoreset::new(dimension, coreset_budget.min(num_partitions * 16));
-    let mut step = 0;
-    while remaining_sample_rate > 0 {
-        let step_sample_rate = remaining_sample_rate.min(streaming_sample_rate);
-        let step_sample_size = num_partitions * step_sample_rate;
-        step += 1;
-        info!(
-            "Streaming coreset IVF training: step {}, sample_rate={}, sample_size={}",
-            step, step_sample_rate, step_sample_size
+    let training_result = async {
+        let coreset_rate = streaming_coreset_rate(
+            total_sample_rate,
+            streaming_sample_rate,
+            params.streaming_coreset_rate,
         );
+        let coreset_budget = num_partitions
+            .saturating_mul(coreset_rate)
+            .max(num_partitions);
+        let total_steps = total_sample_rate.div_ceil(streaming_sample_rate);
+        let decoupled_coreset_budget = params.streaming_coreset_rate.is_some();
+        let mut coreset = WeightedCoreset::new(dimension, coreset_budget.min(num_partitions * 16));
+        let mut step = 0;
+        while remaining_sample_rate > 0 {
+            let step_sample_rate = remaining_sample_rate.min(streaming_sample_rate);
+            let step_sample_size = num_partitions * step_sample_rate;
+            step += 1;
+            info!(
+                "Streaming coreset IVF training: step {}, sample_rate={}, sample_size={}",
+                step, step_sample_rate, step_sample_size
+            );
 
-        let (training_data, mt) = if let (Some(sample_ranges), Some(sampler)) =
-            (&fixed_sample_ranges, &fixed_sampler)
-        {
-            let ranges = sample_ranges.chunk(sample_offset, step_sample_size);
-            sample_offset += ranges.iter().map(range_len).sum::<usize>();
-            sampler.sample_ranges(&ranges, metric_type).await?
-        } else {
-            sample_ivf_training_chunk(dataset, column, step_sample_size, metric_type, fragment_ids)
+            let (training_data, mt) = if let (Some(sample_ranges), Some(sampler)) =
+                (&fixed_sample_ranges, &fixed_sampler)
+            {
+                let ranges = sample_ranges.chunk(sample_offset, step_sample_size);
+                sample_offset += ranges.iter().map(range_len).sum::<usize>();
+                sampler.sample_ranges(&ranges, metric_type).await?
+            } else {
+                sample_ivf_training_chunk(
+                    dataset,
+                    column,
+                    step_sample_size,
+                    metric_type,
+                    fragment_ids,
+                )
                 .await?
-        };
-        let training_data = if training_data.value_type() == DataType::Float32 {
-            training_data
-        } else {
-            training_data.convert_to_floating_point()?
-        };
-        if mt != DistanceType::L2 {
-            return Err(Error::invalid_input(format!(
-                "streaming coreset IVF currently supports L2/Cosine training, got {}",
-                metric_type
-            )));
-        }
-        if training_data.len() < num_partitions {
-            return Err(Error::index(format!(
-                "Not enough training vectors for streaming coreset IVF. Requires at least {} rows but sampled {} rows",
+            };
+            let training_data = if training_data.value_type() == DataType::Float32 {
+                training_data
+            } else {
+                training_data.convert_to_floating_point()?
+            };
+            if mt != DistanceType::L2 {
+                return Err(Error::invalid_input(format!(
+                    "streaming coreset IVF currently supports L2/Cosine training, got {}",
+                    metric_type
+                )));
+            }
+            if training_data.len() < num_partitions {
+                return Err(Error::index(format!(
+                    "Not enough training vectors for streaming coreset IVF. Requires at least {} rows but sampled {} rows",
+                    num_partitions,
+                    training_data.len()
+                )));
+            }
+
+            max_training_vectors = max_training_vectors.max(training_data.len());
+            total_training_vectors += training_data.len();
+            let local_k = streaming_local_coreset_k(
                 num_partitions,
-                training_data.len()
-            )));
+                training_data.len(),
+                coreset_rate,
+                total_steps,
+                decoupled_coreset_budget,
+            );
+            let mut chunk_coreset = WeightedCoreset::new(dimension, local_k);
+            append_local_coreset(
+                &mut chunk_coreset,
+                &training_data,
+                mt,
+                local_k,
+                params.max_iters,
+                on_progress.clone(),
+            )?;
+            coreset.append(chunk_coreset);
+            coreset.reduce_to_budget(dimension, coreset_budget);
+            info!(
+                "Streaming coreset IVF step {} compressed {} vectors into {} weighted centroids",
+                step,
+                total_training_vectors,
+                coreset.len()
+            );
+            remaining_sample_rate -= step_sample_rate;
         }
 
-        max_training_vectors = max_training_vectors.max(training_data.len());
-        total_training_vectors += training_data.len();
-        let local_k = streaming_local_coreset_k(
-            num_partitions,
-            training_data.len(),
-            coreset_rate,
-            total_steps,
-            decoupled_coreset_budget,
-        );
-        let mut chunk_coreset = WeightedCoreset::new(dimension, local_k);
-        append_local_coreset(
-            &mut chunk_coreset,
-            &training_data,
-            mt,
-            local_k,
-            params.max_iters,
-            on_progress.clone(),
-        )?;
-        coreset.append(chunk_coreset);
-        coreset.reduce_to_budget(dimension, coreset_budget);
-        info!(
-            "Streaming coreset IVF step {} compressed {} vectors into {} weighted centroids",
-            step,
-            total_training_vectors,
-            coreset.len()
-        );
-        remaining_sample_rate -= step_sample_rate;
-    }
-
-    let coreset_len = coreset.len();
-    let (coreset_data, coreset_weights, coreset_losses) = coreset.into_fsl_parts(dimension)?;
-    // Scope `weighted_hierarchical_params` so the `on_progress` clone it holds
-    // (which owns a clone of `progress_tx`) is dropped as soon as training
-    // returns. Otherwise it would outlive the `progress_worker.await` below,
-    // keeping a channel sender alive so `progress_rx.recv()` never returns
-    // `None` and the progress worker — and thus this function — hangs forever.
-    let mut centroids = {
-        let weighted_hierarchical_params = WeightedHierarchicalKMeansParams {
-            dimension,
-            target_k: num_partitions,
-            metric_type: DistanceType::L2,
-            max_iters: params.max_iters,
-            on_progress: on_progress.clone(),
+        let coreset_len = coreset.len();
+        let (coreset_data, coreset_weights, coreset_losses) =
+            coreset.into_fsl_parts(dimension)?;
+        // Scope `weighted_hierarchical_params` so the `on_progress` clone it holds
+        // is dropped before the progress producer is closed below.
+        let mut centroids = {
+            let weighted_hierarchical_params = WeightedHierarchicalKMeansParams {
+                dimension,
+                target_k: num_partitions,
+                metric_type: DistanceType::L2,
+                max_iters: params.max_iters,
+                on_progress: on_progress.clone(),
+            };
+            train_weighted_hierarchical_f32_kmeans(
+                &coreset_data,
+                &coreset_weights,
+                &coreset_losses,
+                &weighted_hierarchical_params,
+            )?
         };
-        train_weighted_hierarchical_f32_kmeans(
-            &coreset_data,
-            &coreset_weights,
-            &coreset_losses,
-            &weighted_hierarchical_params,
-        )?
-    };
-    let refine_iters = 3;
-    if refine_iters > 0 {
-        let refined = refine_weighted_f32_kmeans(
-            &coreset_data,
-            &coreset_weights,
-            &coreset_losses,
-            &centroids,
-            DistanceType::L2,
-            refine_iters,
-            on_progress.clone(),
-        )?;
-        centroids = f32_fsl_from_values(refined.centroids, dimension)?;
-    }
-    if params.streaming_refine_passes > 0 {
-        info!(
-            "Running {} streaming raw-vector refinement pass(es)",
-            params.streaming_refine_passes
-        );
-        centroids =
-            if let (Some(sample_ranges), Some(sampler)) = (&fixed_sample_ranges, &fixed_sampler) {
+        let refine_iters = 3;
+        if refine_iters > 0 {
+            let refined = refine_weighted_f32_kmeans(
+                &coreset_data,
+                &coreset_weights,
+                &coreset_losses,
+                &centroids,
+                DistanceType::L2,
+                refine_iters,
+                on_progress.clone(),
+            )?;
+            centroids = f32_fsl_from_values(refined.centroids, dimension)?;
+        }
+        if params.streaming_refine_passes > 0 {
+            info!(
+                "Running {} streaming raw-vector refinement pass(es)",
+                params.streaming_refine_passes
+            );
+            centroids = if let (Some(sample_ranges), Some(sampler)) =
+                (&fixed_sample_ranges, &fixed_sampler)
+            {
                 refine_streaming_f32_kmeans_with_sampler(
                     sampler,
                     metric_type,
@@ -4634,20 +4666,27 @@ async fn train_streaming_coreset_ivf_model(
                 )
                 .await?
             };
-    }
+        }
 
-    drop(progress_tx);
-    drop(on_progress);
-    if let Err(e) = progress_worker.await {
-        warn!("Progress worker join error during train_ivf: {e}");
+        Ok((IvfModel::new(centroids, None), coreset_len))
     }
+    .await;
+
+    let (ivf_model, coreset_len) = finish_streaming_ivf_training(
+        training_result,
+        progress_tx,
+        on_progress,
+        progress_worker,
+        "Streaming coreset IVF training",
+    )
+    .await?;
 
     info!(
         "Streaming coreset IVF sampled {} vectors total; max in-memory training vectors per step: {}; coreset vectors: {}",
         total_training_vectors, max_training_vectors, coreset_len
     );
 
-    Ok(IvfModel::new(centroids, None))
+    Ok(ivf_model)
 }
 
 async fn train_streaming_ivf_model(
@@ -4684,10 +4723,9 @@ async fn train_streaming_ivf_model(
         let progress = progress.clone();
         tokio::spawn(async move {
             while let Some(iter) = progress_rx.recv().await {
-                if let Err(e) = progress.stage_progress("train_ivf", iter).await {
-                    warn!("Progress callback error during train_ivf: {e}");
-                }
+                progress.stage_progress("train_ivf", iter).await?;
             }
+            Result::Ok(())
         })
     };
 
@@ -4700,67 +4738,80 @@ async fn train_streaming_ivf_model(
         })
     };
 
-    let mut step = 0;
-    while remaining_sample_rate > 0 {
-        let step_sample_rate = remaining_sample_rate.min(streaming_sample_rate);
-        let step_sample_size = num_partitions * step_sample_rate;
-        step += 1;
-        info!(
-            "Streaming IVF training: step {}, sample_rate={}, sample_size={}",
-            step, step_sample_rate, step_sample_size
-        );
-
-        let (training_data, mt) =
-            sample_ivf_training_chunk(dataset, column, step_sample_size, metric_type, fragment_ids)
-                .await?;
-        if training_data.len() < num_partitions {
-            return Err(Error::index(format!(
-                "Not enough training vectors for streaming IVF. Requires at least {} rows but sampled {} rows",
-                num_partitions,
-                training_data.len()
-            )));
-        }
-
-        max_training_vectors = max_training_vectors.max(training_data.len());
-        total_training_vectors += training_data.len();
-        if params.sample_rate >= 1024 && training_data.value_type() == DataType::Float16 {
-            warn!(
-                "Large sample_rate ({} >= 1024) for float16 vectors is possible to result in all zeros cluster centroid",
-                params.sample_rate
+    let training_result = async {
+        let mut step = 0;
+        while remaining_sample_rate > 0 {
+            let step_sample_rate = remaining_sample_rate.min(streaming_sample_rate);
+            let step_sample_size = num_partitions * step_sample_rate;
+            step += 1;
+            info!(
+                "Streaming IVF training: step {}, sample_rate={}, sample_size={}",
+                step, step_sample_rate, step_sample_size
             );
+
+            let (training_data, mt) = sample_ivf_training_chunk(
+                dataset,
+                column,
+                step_sample_size,
+                metric_type,
+                fragment_ids,
+            )
+            .await?;
+            if training_data.len() < num_partitions {
+                return Err(Error::index(format!(
+                    "Not enough training vectors for streaming IVF. Requires at least {} rows but sampled {} rows",
+                    num_partitions,
+                    training_data.len()
+                )));
+            }
+
+            max_training_vectors = max_training_vectors.max(training_data.len());
+            total_training_vectors += training_data.len();
+            if params.sample_rate >= 1024 && training_data.value_type() == DataType::Float16 {
+                warn!(
+                    "Large sample_rate ({} >= 1024) for float16 vectors is possible to result in all zeros cluster centroid",
+                    params.sample_rate
+                );
+            }
+
+            let kmeans = train_ivf_kmeans_step_arrow_array_no_loss(
+                centroids.clone(),
+                &training_data,
+                mt,
+                num_partitions,
+                step_sample_rate,
+                params.max_iters,
+                on_progress.clone(),
+            )?;
+            let trained_centroids = Arc::new(FixedSizeListArray::try_new_from_values(
+                kmeans.centroids,
+                dimension as i32,
+            )?);
+            centroids = Some(trained_centroids);
+
+            remaining_sample_rate -= step_sample_rate;
         }
 
-        let kmeans = train_ivf_kmeans_step_arrow_array_no_loss(
-            centroids.clone(),
-            &training_data,
-            mt,
-            num_partitions,
-            step_sample_rate,
-            params.max_iters,
-            on_progress.clone(),
-        )?;
-        let trained_centroids = Arc::new(FixedSizeListArray::try_new_from_values(
-            kmeans.centroids,
-            dimension as i32,
-        )?);
-        centroids = Some(trained_centroids);
-
-        remaining_sample_rate -= step_sample_rate;
+        let centroids = centroids.ok_or_else(|| Error::index("No IVF centroids trained"))?;
+        Ok(IvfModel::new((*centroids).clone(), None))
     }
+    .await;
 
-    drop(progress_tx);
-    drop(on_progress);
-    if let Err(e) = progress_worker.await {
-        warn!("Progress worker join error during train_ivf: {e}");
-    }
+    let ivf_model = finish_streaming_ivf_training(
+        training_result,
+        progress_tx,
+        on_progress,
+        progress_worker,
+        "Streaming IVF training",
+    )
+    .await?;
 
     info!(
         "Streaming IVF training sampled {} vectors total; max in-memory training vectors per step: {}",
         total_training_vectors, max_training_vectors
     );
 
-    let centroids = centroids.ok_or_else(|| Error::index("No IVF centroids trained"))?;
-    Ok(IvfModel::new((*centroids).clone(), None))
+    Ok(ivf_model)
 }
 
 /// Train IVF partitions using kmeans.
@@ -4852,6 +4903,8 @@ mod tests {
     use std::collections::HashSet;
     use std::iter::repeat_n;
     use std::ops::Range;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
 
     use arrow_array::types::UInt64Type;
     use arrow_array::{
@@ -4877,6 +4930,7 @@ mod tests {
     };
     use rand::{rng, seq::SliceRandom};
     use rstest::rstest;
+    use tokio::sync::Notify;
 
     use crate::dataset::{InsertBuilder, WriteMode, WriteParams};
     use crate::index::prefilter::DatasetPreFilter;
@@ -4886,6 +4940,36 @@ mod tests {
     use crate::utils::test::copy_test_data_to_tmp;
 
     const DIM: usize = 32;
+
+    #[derive(Debug)]
+    struct BlockingFailingProgress {
+        is_first_call: AtomicBool,
+        is_callback_active: Arc<AtomicBool>,
+        callback_started: Arc<Notify>,
+        release_callback: Arc<Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl lance_index::progress::IndexBuildProgress for BlockingFailingProgress {
+        async fn stage_start(&self, _: &str, _: Option<u64>, _: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn stage_progress(&self, _: &str, _: u64) -> Result<()> {
+            if self.is_first_call.swap(false, Ordering::SeqCst) {
+                self.is_callback_active.store(true, Ordering::SeqCst);
+                self.callback_started.notify_one();
+                self.release_callback.notified().await;
+                self.is_callback_active.store(false, Ordering::SeqCst);
+                return Err(Error::io("injected progress failure"));
+            }
+            Ok(())
+        }
+
+        async fn stage_complete(&self, _: &str) -> Result<()> {
+            Ok(())
+        }
+    }
 
     /// Building a merge filter loads a row-id sequence per covered fragment under
     /// stable row ids, and an optimize pass that only appends a delta reads no existing
@@ -6152,6 +6236,86 @@ mod tests {
             compute_test_ivf_loss(&dataset, "vector", &ivf_model)
                 .await
                 .is_finite()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_streaming_ivf_error_joins_progress_worker() {
+        let test_dir = TempStrDir::default();
+        let uri = format!("{}/ds", test_dir.as_str());
+        let reader = gen_batch()
+            .col("id", array::step::<UInt64Type>())
+            .col(
+                "vector",
+                array::rand_vec::<Float32Type>((DIM as u32).into()),
+            )
+            .into_reader_rows(RowCount::from(128), BatchCount::from(2));
+        let dataset = Arc::new(Dataset::write(reader, &uri, None).await.unwrap());
+
+        let mut params = IvfBuildParams::new(2);
+        params.sample_rate = 8;
+        params.streaming_sample_rate = Some(4);
+        params.max_iters = 2;
+
+        let is_callback_active = Arc::new(AtomicBool::new(false));
+        let callback_started = Arc::new(Notify::new());
+        let release_callback = Arc::new(Notify::new());
+        let progress = Arc::new(BlockingFailingProgress {
+            is_first_call: AtomicBool::new(true),
+            is_callback_active: is_callback_active.clone(),
+            callback_started: callback_started.clone(),
+            release_callback: release_callback.clone(),
+        });
+        let mut trainer = tokio::spawn({
+            let dataset = dataset.clone();
+            async move {
+                train_streaming_ivf_model(
+                    dataset.as_ref(),
+                    "vector",
+                    DIM - 1,
+                    MetricType::L2,
+                    &params,
+                    None,
+                    progress,
+                )
+                .await
+            }
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), callback_started.notified())
+            .await
+            .expect("streaming IVF did not report progress");
+        assert!(
+            is_callback_active.load(Ordering::SeqCst),
+            "progress callback should still be active"
+        );
+
+        let returned_while_callback_active =
+            tokio::time::timeout(Duration::from_millis(100), &mut trainer).await;
+        release_callback.notify_one();
+        assert!(
+            returned_while_callback_active.is_err(),
+            "streaming IVF returned while its progress callback was still active"
+        );
+
+        let error = tokio::time::timeout(Duration::from_secs(5), trainer)
+            .await
+            .expect("streaming IVF did not return after the callback was released")
+            .expect("streaming IVF trainer task panicked")
+            .expect_err("the mismatched dimension should fail training");
+        assert!(
+            matches!(error, Error::Arrow { .. }),
+            "expected the primary centroid conversion error, got: {error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("Incorrect length of values buffer for FixedSizeListArray"),
+            "unexpected training error: {error}"
+        );
+        assert!(
+            !is_callback_active.load(Ordering::SeqCst),
+            "progress callback remained active after streaming IVF returned"
         );
     }
 
