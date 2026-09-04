@@ -102,9 +102,7 @@ use super::{
 use crate::Dataset;
 use crate::Result;
 use crate::dataset::utils::CapturedRowIds;
-use crate::index::{
-    DatasetIndexExt, DatasetIndexInternalExt, load_all_indices, unsupported_index_version,
-};
+use crate::index::{DatasetIndexExt, DatasetIndexInternalExt, index_is_usable, load_all_indices};
 use crate::io::commit::{DEFAULT_COMMIT_RETRY_TIMEOUT, commit_transaction, migrate_fragments};
 use arrow::array::AsArray;
 use arrow::datatypes::{UInt8Type, UInt32Type, UInt64Type};
@@ -572,7 +570,8 @@ impl CompactionOptions {
 /// - All data files share identical Lance file versions
 /// - No fragment has a deletion file
 ///   TODO: Need to support schema evolution case like add column and drop column
-/// - All data files share identical schema mappings (`fields`, `column_indices`)
+/// - All data files use an identical schema mapping (`fields`, `column_indices`) in dataset schema
+///   order
 /// - Input data files must not contain extra global buffers (beyond schema / file descriptor)
 async fn can_use_binary_copy(
     dataset: &Dataset,
@@ -624,6 +623,17 @@ pub(super) async fn can_use_binary_copy_current(
     }
     let ref_fields = &fragments[0].files[0].fields;
     let ref_cols = &fragments[0].files[0].column_indices;
+    let version = dataset.manifest.data_storage_format.lance_file_format();
+    let (schema_fields, schema_column_indices) =
+        lance_file::versions::data_file_columns(version, dataset.schema());
+    if ref_fields.as_ref() != schema_fields.as_slice()
+        || ref_cols.as_ref() != schema_column_indices.as_slice()
+    {
+        log::debug!(
+            "Binary copy disabled: data files do not use the dataset schema's physical column order"
+        );
+        return Ok(false);
+    }
     for fragment in fragments {
         if fragment.deletion_file.is_some() {
             log::debug!(
@@ -1396,15 +1406,17 @@ async fn descriptor_to_logical_blob_array(
                     let absolute_uri = format!("{}/{}", base.path.trim_end_matches('/'), uri_val);
                     uri_builder.append_value(&absolute_uri);
                 }
-                if descriptor.position_col.is_null(i) {
+                let position =
+                    (!descriptor.position_col.is_null(i)).then(|| descriptor.position_col.value(i));
+                let size = (!descriptor.size_col.is_null(i)).then(|| descriptor.size_col.value(i));
+                if position == Some(0) && size == Some(0) {
+                    // Stable descriptors use (0, 0) for the complete external object.
+                    // Logical input represents the same value by omitting the range.
                     out_position_builder.append_null();
-                } else {
-                    out_position_builder.append_value(descriptor.position_col.value(i));
-                }
-                if descriptor.size_col.is_null(i) {
                     out_size_builder.append_null();
                 } else {
-                    out_size_builder.append_value(descriptor.size_col.value(i));
+                    out_position_builder.append_option(position);
+                    out_size_builder.append_option(size);
                 }
             }
             RowClass::DataBlob => {
@@ -2166,7 +2178,7 @@ async fn index_fragment_coverage(
 async fn unremappable_index_coverage(dataset: &Dataset) -> Result<Vec<(String, RoaringBitmap)>> {
     let mut coverage = Vec::new();
     for index in load_all_indices(dataset).await?.iter() {
-        if is_system_index(index) || unsupported_index_version(index).is_none() {
+        if index_is_usable(index) {
             continue;
         }
         coverage.push((
@@ -2517,7 +2529,11 @@ async fn rewrite_files(
             let captured_ids = row_ids_rx
                 .try_recv()
                 .map_err(|err| Error::internal(format!("Failed to receive row ids: {}", err)))?;
-            let row_addrs = captured_ids.row_addrs(None).into_owned();
+            let mut row_addrs = captured_ids.row_addrs(None)?.into_owned();
+            // Compaction reads whole fragments, so the captured addresses are
+            // dense per-fragment ranges; run containers (standard roaring
+            // format) shrink the persisted blob from O(rows) to O(runs) bytes.
+            row_addrs.optimize();
             let mut serialized = Vec::with_capacity(row_addrs.serialized_size());
             row_addrs.serialize_into(&mut serialized)?;
             Ok(Some(serialized))
@@ -2873,7 +2889,19 @@ pub async fn commit_compaction(
                                         f.id
                                     ))
                                 })?;
-                                Ok((f.id as u32, physical_rows as u32))
+                                let fragment_id = u32::try_from(f.id).map_err(|_| {
+                                    Error::invalid_input(format!(
+                                        "compacted fragment id {} is outside the row-address range",
+                                        f.id
+                                    ))
+                                })?;
+                                let physical_rows = u32::try_from(physical_rows).map_err(|_| {
+                                    Error::invalid_input(format!(
+                                        "compacted fragment {} has physical_rows={} outside the row-address range",
+                                        f.id, physical_rows
+                                    ))
+                                })?;
+                                Ok((fragment_id, physical_rows))
                             })
                             .collect::<Result<Vec<_>>>()?;
 
@@ -2882,8 +2910,15 @@ pub async fn commit_compaction(
                             old_frag_ids: task
                                 .original_fragments
                                 .iter()
-                                .map(|f| f.id as u32)
-                                .collect(),
+                                .map(|f| {
+                                    u32::try_from(f.id).map_err(|_| {
+                                        Error::invalid_input(format!(
+                                            "compacted source fragment id {} is outside the row-address range",
+                                            f.id
+                                        ))
+                                    })
+                                })
+                                .collect::<Result<Vec<_>>>()?,
                             new_frags,
                         });
                     }
@@ -3045,8 +3080,8 @@ mod tests {
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::Dimension;
     use lance_file::version::LanceFileVersion;
+    use lance_index::frag_reuse::CompactFragReuseIndexHandle;
     use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
-    use lance_index::frag_reuse::FragReuseIndexHandle;
     use lance_index::scalar::{
         BuiltinIndexType, FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams,
     };
@@ -4131,6 +4166,18 @@ mod tests {
             let row_addrs =
                 RoaringTreemap::deserialize_from(&mut Cursor::new(row_addrs_bytes)).unwrap();
             assert_eq!(row_addrs.len(), 9_000);
+            // The captured addresses are contiguous per-fragment ranges, so the
+            // persisted blob must be run-optimized: O(fragments) bytes, not
+            // O(rows). Without run containers this serializes at ~2 bytes per
+            // address (~18 KB here), so under one byte per address proves the
+            // run form was written.
+            assert!(
+                row_addrs_bytes.len() < row_addrs.len() as usize,
+                "serialized row addrs ({} bytes for {} addresses) should be \
+                 run-optimized before persisting",
+                row_addrs_bytes.len(),
+                row_addrs.len()
+            );
         } else {
             // Simulate a stale worker result that captured row addresses before the
             // dataset no longer needed a remapper. Invalid bytes ensure the commit
@@ -4693,7 +4740,7 @@ mod tests {
             open_frag_reuse_index(frag_reuse_index_meta.uuid, frag_reuse_details.as_ref())
                 .await
                 .unwrap();
-        let stats = FragReuseIndexHandle(Arc::new(frag_reuse_index.clone()))
+        let stats = CompactFragReuseIndexHandle(Arc::new(frag_reuse_index.clone()))
             .statistics()
             .unwrap();
         assert_eq!(
