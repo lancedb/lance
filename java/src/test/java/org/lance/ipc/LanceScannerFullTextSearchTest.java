@@ -75,6 +75,18 @@ class LanceScannerFullTextSearchTest {
   }
 
   @Test
+  void testCodeAnalyzerBuilderCreatesIndex() throws Exception {
+    ScalarIndexParams indexParams = InvertedIndexParams.builder().analyzer("code").build();
+
+    runFtsQuery(
+        "memory://fts_java_code_analyzer",
+        FullTextQuery.match("helloWorld", "doc"),
+        1L,
+        Arrays.asList("helloWorld", "other_value"),
+        indexParams);
+  }
+
+  @Test
   void testExplicitListElementGranularityReachesRustRouting() {
     RuntimeException error =
         assertThrows(
