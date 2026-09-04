@@ -592,7 +592,7 @@ fn apply_row_id_and_deletes_with_system_columns(
 
     let batch = if system_columns.is_empty() {
         batch
-    } else {
+    } else if let Some(output_schema_cache) = output_schema_cache {
         let input_schema = batch.schema();
         let make_output_schema = || {
             let mut fields = input_schema
@@ -606,21 +606,17 @@ fn apply_row_id_and_deletes_with_system_columns(
                 input_schema.metadata().clone(),
             ))
         };
-        let output_schema = output_schema_cache
-            .map(|cache| {
-                let cached = cache.get_or_init(|| CachedOutputSchema {
-                    input: input_schema.clone(),
-                    output: make_output_schema(),
-                });
-                if Arc::ptr_eq(&cached.input, &input_schema)
-                    || cached.input.as_ref() == input_schema.as_ref()
-                {
-                    cached.output.clone()
-                } else {
-                    make_output_schema()
-                }
-            })
-            .unwrap_or_else(make_output_schema);
+        let cached = output_schema_cache.get_or_init(|| CachedOutputSchema {
+            input: input_schema.clone(),
+            output: make_output_schema(),
+        });
+        let output_schema = if Arc::ptr_eq(&cached.input, &input_schema)
+            || cached.input.as_ref() == input_schema.as_ref()
+        {
+            cached.output.clone()
+        } else {
+            make_output_schema()
+        };
         let mut columns = Vec::with_capacity(batch.num_columns() + system_columns.len());
         columns.extend_from_slice(batch.columns());
         columns.extend(system_columns.into_iter().map(|(_, array)| array));
@@ -629,6 +625,12 @@ fn apply_row_id_and_deletes_with_system_columns(
             columns,
             &RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
         )?
+    } else {
+        system_columns
+            .into_iter()
+            .try_fold(batch, |batch, (field, array)| {
+                batch.try_with_column(field, array)
+            })?
     };
 
     match (deletion_mask, config.make_deletions_null) {
@@ -698,9 +700,9 @@ fn wrap_with_row_id_and_delete_impl<const USE_DENSE_ROW_ID_EXPANSION: bool>(
             if num_rows_usize != 0 && use_uniform_batch_fast_paths {
                 if let Some(batch_size) = uniform_batch_size {
                     // A shorter final batch is expected. Any other task-size change can
-                    // repeatedly straddle read-ahead boundaries and makes shared schema
-                    // lifetimes counterproductive for large buffers. Drain the current
-                    // row-ID cache, then use exact per-task work from this point forward.
+                    // repeatedly straddle read-ahead boundaries. Drain the current row-ID
+                    // cache, then use exact per-task decoding and the original incremental
+                    // system-column assembly from this point forward.
                     if num_rows_usize != batch_size
                         && logical_offset + num_rows_usize < selected_rows
                     {
