@@ -33,13 +33,14 @@
 //! (by stat), which is exact for the write-once contract. Two minor
 //! inexactnesses are not engineered around: a write aborted at the cap leaks its
 //! reservation until the store is dropped, and a file whose size cannot be
-//! stat-ed on drop is not released.
+//! stat-ed on drop is not released. The in-memory fallback has no file to stat,
+//! so it releases the bytes its writer accepted instead.
 
 use std::io;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll};
 
 use async_trait::async_trait;
@@ -130,6 +131,9 @@ impl DiskQuota {
 struct SpillWriter {
     inner: Box<dyn Writer>,
     quota: Option<DiskQuota>,
+    /// Bytes the inner writer accepted, tracked only alongside a `quota`: a
+    /// backing with no file to stat needs this to release its reservation.
+    written: Option<Arc<AtomicU64>>,
     finished: Arc<AtomicBool>,
 }
 
@@ -151,7 +155,12 @@ impl AsyncWrite for SpillWriter {
         }
         let poll = Pin::new(this.inner.as_mut()).poll_write(cx, buf);
         match &poll {
-            Poll::Ready(Ok(n)) => quota.release((buf.len() - *n) as u64),
+            Poll::Ready(Ok(n)) => {
+                quota.release((buf.len() - *n) as u64);
+                if let Some(written) = &this.written {
+                    written.fetch_add(*n as u64, Ordering::Relaxed);
+                }
+            }
             _ => quota.release(buf.len() as u64),
         }
         poll
@@ -189,7 +198,25 @@ impl Writer for SpillWriter {
     }
 }
 
+/// Where a [`LocalSpillStore`]'s bytes live, resolved on first use.
+enum SpillBacking {
+    /// A temp directory on local disk.
+    Disk {
+        store: Arc<ObjectStore>,
+        /// Backstop cleanup: removes the whole scratch directory on drop.
+        temp_dir: Arc<tempfile::TempDir>,
+    },
+    /// Fallback for a host where the temp directory cannot be created. The
+    /// bytes stay in this process and are reclaimed with the store.
+    Memory { store: Arc<ObjectStore> },
+}
+
 /// A [`SpillStore`] that writes temporary files to a local temp directory.
+///
+/// The directory is created on the first [`SpillStore::new_spill`] call rather
+/// than at construction, so a process that never spills never touches it. If it
+/// cannot be created, the store logs a warning and keeps spills in memory
+/// instead for the rest of its life.
 ///
 /// By default there is no disk cap. Use [`LocalSpillStore::with_cap`] to
 /// configure one shared across every handle this store produces.
@@ -197,9 +224,7 @@ impl Writer for SpillWriter {
 /// The temp directory is deleted when the store is dropped, cleaning up any
 /// files whose handles have already been dropped.
 pub struct LocalSpillStore {
-    store: Arc<ObjectStore>,
-    /// Backstop cleanup: removes the whole scratch directory on drop.
-    temp_dir: Arc<tempfile::TempDir>,
+    backing: OnceLock<SpillBacking>,
     file_counter: Arc<AtomicU64>,
     /// Byte budget shared across every handle, enforced while writing.
     quota: Option<DiskQuota>,
@@ -207,30 +232,58 @@ pub struct LocalSpillStore {
 
 impl LocalSpillStore {
     /// Create a store with no disk cap.
+    ///
+    /// The `Result` is kept for callers that already handle one; constructing a
+    /// store does no I/O and cannot fail.
     pub fn new() -> Result<Self> {
-        Ok(Self {
-            store: Arc::new(ObjectStore::local()),
-            temp_dir: Arc::new(tempfile::tempdir()?),
-            file_counter: Arc::new(AtomicU64::new(0)),
-            quota: None,
-        })
+        Ok(Self::default())
     }
 
     /// Create a store that returns [`lance_core::Error::DiskCapExceeded`] once
     /// total bytes written across all live handles would exceed `cap_bytes`.
     pub fn with_cap(cap_bytes: u64) -> Result<Self> {
         Ok(Self {
-            store: Arc::new(ObjectStore::local()),
-            temp_dir: Arc::new(tempfile::tempdir()?),
-            file_counter: Arc::new(AtomicU64::new(0)),
             quota: Some(DiskQuota::new(cap_bytes)),
+            ..Self::default()
         })
+    }
+
+    fn backing(&self) -> &SpillBacking {
+        self.backing
+            .get_or_init(|| Self::resolve_backing(tempfile::tempdir()))
+    }
+
+    /// Take the temp directory if there is one, and fall back to memory if not.
+    ///
+    /// Split from [`Self::backing`] so a test can drive the failing arm without
+    /// a host whose temp directory is unusable.
+    fn resolve_backing(attempt: io::Result<tempfile::TempDir>) -> SpillBacking {
+        match attempt {
+            Ok(temp_dir) => SpillBacking::Disk {
+                store: Arc::new(ObjectStore::local()),
+                temp_dir: Arc::new(temp_dir),
+            },
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "could not create a temp directory for spilling; \
+                     keeping spills in memory instead"
+                );
+                SpillBacking::Memory {
+                    store: Arc::new(ObjectStore::memory()),
+                }
+            }
+        }
     }
 }
 
 impl Default for LocalSpillStore {
     fn default() -> Self {
-        Self::new().expect("failed to create temp directory for LocalSpillStore")
+        Self {
+            backing: OnceLock::new(),
+            file_counter: Arc::new(AtomicU64::new(0)),
+            quota: None,
+        }
     }
 }
 
@@ -238,24 +291,48 @@ impl Default for LocalSpillStore {
 impl SpillStore for LocalSpillStore {
     async fn new_spill(&self) -> Result<(Box<dyn Writer>, Box<dyn Spill>)> {
         let idx = self.file_counter.fetch_add(1, Ordering::Relaxed);
-        let fs_path = self.temp_dir.path().join(format!("spill_{idx:06}.bin"));
-        let os_path = Path::from_absolute_path(&fs_path)?;
+        let name = format!("spill_{idx:06}.bin");
         let finished = Arc::new(AtomicBool::new(false));
 
-        let writer = Box::new(SpillWriter {
-            inner: self.store.create(&os_path).await?,
-            quota: self.quota.clone(),
-            finished: finished.clone(),
-        });
-        let spill = Box::new(LocalSpill {
-            store: self.store.clone(),
-            os_path,
-            fs_path,
-            quota: self.quota.clone(),
-            finished,
-            _temp_dir: self.temp_dir.clone(),
-        });
-        Ok((writer, spill))
+        match self.backing() {
+            SpillBacking::Disk { store, temp_dir } => {
+                let fs_path = temp_dir.path().join(name);
+                let os_path = Path::from_absolute_path(&fs_path)?;
+                let writer = Box::new(SpillWriter {
+                    inner: store.create(&os_path).await?,
+                    quota: self.quota.clone(),
+                    written: None,
+                    finished: finished.clone(),
+                });
+                let spill = Box::new(LocalSpill {
+                    store: store.clone(),
+                    os_path,
+                    fs_path,
+                    quota: self.quota.clone(),
+                    finished,
+                    _temp_dir: temp_dir.clone(),
+                });
+                Ok((writer, spill))
+            }
+            SpillBacking::Memory { store } => {
+                let os_path = Path::from(name);
+                let written = self.quota.as_ref().map(|_| Arc::new(AtomicU64::new(0)));
+                let writer = Box::new(SpillWriter {
+                    inner: store.create(&os_path).await?,
+                    quota: self.quota.clone(),
+                    written: written.clone(),
+                    finished: finished.clone(),
+                });
+                let spill = Box::new(MemorySpill {
+                    store: store.clone(),
+                    os_path,
+                    quota: self.quota.clone(),
+                    written,
+                    finished,
+                });
+                Ok((writer, spill))
+            }
+        }
     }
 }
 
@@ -298,6 +375,48 @@ impl Drop for LocalSpill {
         }
         // Best-effort removal; the temp dir is the backstop.
         let _ = std::fs::remove_file(&self.fs_path);
+    }
+}
+
+/// The readable half of an in-memory spill.
+///
+/// There is no file to unlink, so removal goes through the store, which is
+/// async: it runs on the current runtime when there is one, and otherwise the
+/// bytes are reclaimed when the store itself is dropped.
+struct MemorySpill {
+    store: Arc<ObjectStore>,
+    os_path: Path,
+    quota: Option<DiskQuota>,
+    /// Bytes the paired writer accepted, present only alongside a `quota`.
+    written: Option<Arc<AtomicU64>>,
+    /// Set by the paired [`SpillWriter`] once it has been shut down.
+    finished: Arc<AtomicBool>,
+}
+
+#[async_trait]
+impl Spill for MemorySpill {
+    async fn reader(&self) -> Result<Box<dyn Reader>> {
+        if !self.finished.load(Ordering::Relaxed) {
+            return Err(Error::invalid_input(
+                "spill reader requested before the writer was shut down",
+            ));
+        }
+        self.store.open(&self.os_path).await
+    }
+}
+
+impl Drop for MemorySpill {
+    fn drop(&mut self) {
+        if let (Some(quota), Some(written)) = (&self.quota, &self.written) {
+            quota.release(written.load(Ordering::Relaxed));
+        }
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let store = self.store.clone();
+            let os_path = self.os_path.clone();
+            handle.spawn(async move {
+                let _ = store.delete(&os_path).await;
+            });
+        }
     }
 }
 
@@ -392,7 +511,7 @@ mod tests {
         finish_writer(writer, b"some bytes").await.unwrap();
 
         // The first spill gets a deterministic name under the store's temp dir.
-        let path = store.temp_dir.path().join("spill_000000.bin");
+        let path = disk_temp_dir(&store).join("spill_000000.bin");
         assert!(path.exists());
         drop(spill);
         assert!(!path.exists(), "spill file should be deleted on drop");
@@ -514,6 +633,7 @@ mod tests {
                 outcome: Poll::Ready(Ok(10)),
             }),
             quota: Some(quota.clone()),
+            written: None,
             finished: Arc::new(AtomicBool::new(false)),
         };
         let n = writer.write(&[0u8; 40]).await.unwrap();
@@ -531,6 +651,7 @@ mod tests {
                 outcome: Poll::Ready(Err(io::Error::other("boom"))),
             }),
             quota: Some(quota.clone()),
+            written: None,
             finished: Arc::new(AtomicBool::new(false)),
         };
         writer.write(&[0u8; 40]).await.unwrap_err();
@@ -539,5 +660,88 @@ mod tests {
             0,
             "a failed write should release its entire reservation"
         );
+    }
+
+    /// Seed a store with the backing an unusable temp directory produces.
+    fn force_memory_backing(store: &LocalSpillStore) {
+        let backing =
+            LocalSpillStore::resolve_backing(Err(io::Error::from(io::ErrorKind::PermissionDenied)));
+        assert!(store.backing.set(backing).is_ok());
+        assert!(matches!(
+            store.backing.get(),
+            Some(SpillBacking::Memory { .. })
+        ));
+    }
+
+    /// The temp directory of a store whose backing has resolved to disk.
+    fn disk_temp_dir(store: &LocalSpillStore) -> &std::path::Path {
+        match store.backing.get() {
+            Some(SpillBacking::Disk { temp_dir, .. }) => temp_dir.path(),
+            _ => panic!("expected a disk backing"),
+        }
+    }
+
+    #[test]
+    fn test_construction_resolves_no_backing() {
+        // Constructing a session used to create the temp directory, so a host
+        // that cannot create one aborted on an unrelated path. Nothing may be
+        // resolved until the first spill.
+        assert!(LocalSpillStore::new().unwrap().backing.get().is_none());
+        assert!(LocalSpillStore::default().backing.get().is_none());
+        assert!(
+            LocalSpillStore::with_cap(1 << 20)
+                .unwrap()
+                .backing
+                .get()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_first_spill_resolves_the_disk_backing() {
+        let store = LocalSpillStore::new().unwrap();
+        let (writer, _spill) = store.new_spill().await.unwrap();
+        finish_writer(writer, b"resolved").await.unwrap();
+        assert!(matches!(
+            store.backing.get(),
+            Some(SpillBacking::Disk { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_memory_backing_round_trips() {
+        let store = LocalSpillStore::new().unwrap();
+        force_memory_backing(&store);
+
+        let (writer, spill) = store.new_spill().await.unwrap();
+        let data = b"spilled without a temp dir";
+        finish_writer(writer, data).await.unwrap();
+
+        let reader = spill.reader().await.unwrap();
+        assert_eq!(reader.get_all().await.unwrap().as_ref(), data);
+    }
+
+    #[tokio::test]
+    async fn test_memory_backing_rejects_a_reader_before_shutdown() {
+        let store = LocalSpillStore::new().unwrap();
+        force_memory_backing(&store);
+
+        let (_writer, spill) = store.new_spill().await.unwrap();
+        assert!(spill.reader().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_memory_backing_releases_the_quota_on_drop() {
+        let store = LocalSpillStore::with_cap(50).unwrap();
+        force_memory_backing(&store);
+
+        let (writer, spill) = store.new_spill().await.unwrap();
+        finish_writer(writer, &[0u8; 40]).await.unwrap();
+        drop(spill);
+
+        // Without the release this second write would exceed the 50-byte cap,
+        // which is what a stat-based release cannot do with no file to stat.
+        let (writer, _spill) = store.new_spill().await.unwrap();
+        finish_writer(writer, &[0u8; 40]).await.unwrap();
     }
 }
