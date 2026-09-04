@@ -3,6 +3,7 @@
 
 use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
+use crate::index::IndexDescriptionSummary;
 use crate::index_progress::JavaIndexBuildProgress;
 use crate::namespace::{
     BlockingDirectoryNamespace, BlockingRestNamespace, create_java_lance_namespace,
@@ -3940,7 +3941,19 @@ pub extern "system" fn Java_org_lance_Dataset_nativeDescribeIndices<'local>(
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
-        inner_describe_indices(&mut env, java_dataset, criteria_obj)
+        inner_describe_indices(&mut env, java_dataset, criteria_obj, true)
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_Dataset_nativeDescribeIndexSummaries<'local>(
+    mut env: JNIEnv<'local>,
+    java_dataset: JObject,
+    criteria_obj: JObject,
+) -> JObject<'local> {
+    ok_or_throw!(
+        env,
+        inner_describe_indices(&mut env, java_dataset, criteria_obj, false)
     )
 }
 
@@ -3948,6 +3961,7 @@ fn inner_describe_indices<'local>(
     env: &mut JNIEnv<'local>,
     java_dataset: JObject,
     java_index_criteria: JObject,
+    include_metadata: bool,
 ) -> Result<JObject<'local>> {
     let mut for_column = None;
     let mut has_name = None;
@@ -3972,7 +3986,15 @@ fn inner_describe_indices<'local>(
         block_on(dataset_guard.inner.describe_indices(index_criteria))?
     };
 
-    export_vec(env, &descriptions)
+    if include_metadata {
+        export_vec(env, &descriptions)
+    } else {
+        let summaries = descriptions
+            .iter()
+            .map(IndexDescriptionSummary)
+            .collect::<Vec<_>>();
+        export_vec(env, &summaries)
+    }
 }
 
 #[unsafe(no_mangle)]

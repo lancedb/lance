@@ -46,7 +46,8 @@ use lance_index::vector::sq::ScalarQuantizer;
 use lance_index::vector::v3::subindex::IvfSubIndex;
 use lance_index::{
     FtsPrewarmDiagnostics, FtsPrewarmOptions, FtsPrewarmResult, FtsPrewarmSegmentStatus,
-    INDEX_FILE_NAME, Index, IndexType, PrewarmOptions, pb, vector::VectorIndex,
+    INDEX_FILE_NAME, Index, IndexFragmentCoverage, IndexType, PrewarmOptions, pb,
+    vector::VectorIndex,
 };
 use lance_index::{
     IndexCriteria, is_system_index,
@@ -1398,6 +1399,7 @@ struct IndexDescriptionImpl {
     /// best-effort basis rather than rejected.
     details: Option<IndexDetails>,
     rows_indexed: u64,
+    fragment_coverage: Option<IndexFragmentCoverage>,
 }
 
 impl IndexDescriptionImpl {
@@ -1491,6 +1493,11 @@ impl IndexDescriptionImpl {
         let mut rows_indexed = 0;
         let mut indexed_fragment_refs = 0u64;
         let mut missing_fragment_refs = 0u64;
+        let mut indexed_fragments = RoaringBitmap::new();
+        let mut fragment_bitmap_size_bytes = 0u64;
+        // System-index bitmaps have index-specific meanings (for example,
+        // fragment-reuse participation), not data-index coverage.
+        let reports_fragment_coverage = !is_system_index(example_metadata);
 
         for shard in &segments {
             let Some(fragment_bitmap) = shard.fragment_bitmap.as_ref() else {
@@ -1503,6 +1510,15 @@ impl IndexDescriptionImpl {
                 return Err(Error::index("Fragment bitmap is required for index description.  This index must be retrained to support this method.".to_string()));
             };
 
+            indexed_fragments |= fragment_bitmap;
+            let serialized_size = shard.fragment_bitmap_serialized_size().ok_or_else(|| {
+                Error::index("Fragment bitmap disappeared while describing index".to_string())
+            })?;
+            let serialized_size = u64::try_from(serialized_size)
+                .map_err(|_| Error::index("Fragment bitmap size overflow".to_string()))?;
+            fragment_bitmap_size_bytes = fragment_bitmap_size_bytes
+                .checked_add(serialized_size)
+                .ok_or_else(|| Error::index("Fragment bitmap size overflow".to_string()))?;
             indexed_fragment_refs += fragment_bitmap.len();
             for fragment_id in fragment_bitmap.iter() {
                 if let Some(fragment_rows) = fragment_rows.get(&fragment_id) {
@@ -1523,6 +1539,19 @@ impl IndexDescriptionImpl {
             "described index row coverage from fragment metadata"
         );
 
+        let fragment_coverage = if reports_fragment_coverage {
+            let current_fragments = fragment_rows.keys().copied().collect::<RoaringBitmap>();
+            Some(IndexFragmentCoverage {
+                covered_fragment_count: indexed_fragments.intersection_len(&current_fragments),
+                current_fragment_count: current_fragments.len(),
+                missing_fragment_count: current_fragments.difference_len(&indexed_fragments),
+                stale_fragment_count: indexed_fragments.difference_len(&current_fragments),
+                fragment_bitmap_size_bytes,
+            })
+        } else {
+            None
+        };
+
         Ok(Self {
             name,
             field_ids: field_ids_vec,
@@ -1530,6 +1559,7 @@ impl IndexDescriptionImpl {
             segments,
             details,
             rows_indexed,
+            fragment_coverage,
         })
     }
 }
@@ -1593,6 +1623,10 @@ impl IndexDescription for IndexDescriptionImpl {
             }
         }
         Some(total)
+    }
+
+    fn fragment_coverage(&self) -> Option<&IndexFragmentCoverage> {
+        self.fragment_coverage.as_ref()
     }
 }
 
@@ -10342,6 +10376,19 @@ mod tests {
             descriptions[0].rows_indexed(),
             20,
             "stale bitmap entries for missing fragments should be skipped without failing"
+        );
+        assert_eq!(
+            descriptions[0].fragment_coverage(),
+            Some(&IndexFragmentCoverage {
+                covered_fragment_count: 2,
+                current_fragment_count: 2,
+                missing_fragment_count: 0,
+                stale_fragment_count: 1,
+                fragment_bitmap_size_bytes: u64::try_from(
+                    stale_segment.fragment_bitmap_serialized_size().unwrap(),
+                )
+                .unwrap(),
+            })
         );
     }
 
