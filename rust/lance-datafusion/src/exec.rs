@@ -1371,10 +1371,14 @@ mod tests {
     #[derive(Debug)]
     struct NeedsExtensionExec {
         properties: Arc<PlanProperties>,
+        /// Set once the node reaches execution with the extension present.
+        /// Observed by the test so that dropping context forwarding (which
+        /// makes `execute` error before this point) is detectable.
+        executed: Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl NeedsExtensionExec {
-        fn new() -> Self {
+        fn new(executed: Arc<std::sync::atomic::AtomicBool>) -> Self {
             let schema = Arc::new(ArrowSchema::empty());
             Self {
                 properties: Arc::new(PlanProperties::new(
@@ -1383,6 +1387,7 @@ mod tests {
                     EmissionType::Incremental,
                     Boundedness::Bounded,
                 )),
+                executed,
             }
         }
     }
@@ -1423,6 +1428,8 @@ mod tests {
                     "missing required session-config extension".to_string(),
                 ));
             }
+            self.executed
+                .store(true, std::sync::atomic::Ordering::SeqCst);
             let schema = self.schema();
             Ok(Box::pin(RecordBatchStreamAdapter::new(
                 schema,
@@ -1437,18 +1444,25 @@ mod tests {
     // unexecuted plan tree.
     #[tokio::test]
     async fn test_analyze_plan_uses_provided_task_context() {
-        let plan: Arc<dyn ExecutionPlan> = Arc::new(NeedsExtensionExec::new());
+        use std::sync::atomic::{AtomicBool, Ordering};
 
-        // Default context lacks the extension: the node errors during execute,
-        // but AnalyzeExec absorbs that per-partition failure and reports an
-        // empty, unexecuted plan tree (no `metrics=[...]` on the leaf) rather
-        // than propagating the error. This is the regression symptom.
+        let executed = Arc::new(AtomicBool::new(false));
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(NeedsExtensionExec::new(executed.clone()));
+
+        // Default context lacks the extension: the node errors during execute
+        // (never reaching the `executed` flag), but AnalyzeExec absorbs that
+        // per-partition failure and reports an empty, unexecuted plan tree
+        // rather than propagating the error. This is the regression symptom.
         let report = analyze_plan(plan.clone(), LanceExecutionOptions::default())
             .await
             .expect("AnalyzeExec swallows the node's execute error into an Ok report");
         assert!(
             report.contains("NeedsExtensionExec, metrics=[]"),
             "expected an empty, unexecuted NeedsExtensionExec node, got: {report}"
+        );
+        assert!(
+            !executed.load(Ordering::SeqCst),
+            "node must not execute successfully without the extension"
         );
 
         // A context carrying the extension executes the node successfully.
@@ -1474,5 +1488,11 @@ mod tests {
             .await
             .expect("analyze should succeed when the extension is present");
         assert!(report.contains("NeedsExtensionExec"));
+        // The node only reaches this flag when the supplied context is actually
+        // forwarded to `execute`; dropping the forwarding fails this assertion.
+        assert!(
+            executed.load(Ordering::SeqCst),
+            "supplied context must be forwarded so the node executes"
+        );
     }
 }
