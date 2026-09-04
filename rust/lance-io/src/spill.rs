@@ -32,12 +32,15 @@
 //! handles, returning a typed [`lance_core::Error::DiskCapExceeded`] rather than
 //! silently filling the disk. Accounting is reserve-on-write + release-on-drop,
 //! by stat on the disk backing and from a counter of accepted bytes in the
-//! in-memory fallback, which has no file to stat. The release is best effort: it
-//! returns whatever the stat or the counter can see when the handle drops, which
-//! is nothing if the stat fails, and nothing on the disk backing before the
-//! writer has been shut down, since the file is not in place until then.
+//! in-memory fallback, which has no file to stat. The disk backing releases when
+//! the handle drops, best effort: it returns what the stat can see then, which is
+//! nothing if the stat fails, and nothing before the writer has been shut down,
+//! since the file is not in place until then. The in-memory fallback instead
+//! charges its bytes until the last owner of that spill's backing drops, writer
+//! and readers included, so a retained reader keeps them on the budget.
 
 use std::io;
+use std::ops::Range;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -45,6 +48,9 @@ use std::sync::{Arc, Mutex, Once, OnceLock};
 use std::task::{Context, Poll};
 
 use async_trait::async_trait;
+use bytes::Bytes;
+use futures::future::BoxFuture;
+use lance_core::deepsize::DeepSizeOf;
 use object_store::path::Path;
 use tokio::io::AsyncWrite;
 
@@ -52,7 +58,7 @@ use lance_core::{Error, Result};
 
 use crate::object_store::ObjectStore;
 use crate::object_writer::WriteResult;
-use crate::traits::{Reader, Writer};
+use crate::traits::{ByteStream, Reader, Writer};
 
 /// A factory for scratch storage.
 ///
@@ -132,10 +138,31 @@ impl DiskQuota {
 struct SpillWriter {
     inner: Box<dyn Writer>,
     quota: Option<DiskQuota>,
-    /// Bytes the inner writer accepted, tracked only alongside a `quota`: a
-    /// backing with no file to stat needs this to release its reservation.
-    written: Option<Arc<AtomicU64>>,
+    /// Present only for a backing with no file to stat, which needs the accepted
+    /// byte count to release its reservation. Held rather than just written to,
+    /// so bytes this writer adds after its [`Spill`] is dropped are still
+    /// counted before the release.
+    reservation: Option<Arc<Reservation>>,
     finished: Arc<AtomicBool>,
+}
+
+/// A quota reservation released when its last owner drops.
+///
+/// The in-memory backing is reclaimed by the last `Arc` to it, and a reader is
+/// one of those owners, so the reservation has to be tied to the same set of
+/// owners: releasing it when the [`Spill`] alone drops would take bytes off the
+/// budget while a retained reader still holds them.
+#[derive(Debug)]
+struct Reservation {
+    quota: DiskQuota,
+    /// Bytes the paired writer's inner writer accepted.
+    written: AtomicU64,
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        self.quota.release(self.written.load(Ordering::Relaxed));
+    }
 }
 
 impl AsyncWrite for SpillWriter {
@@ -158,8 +185,8 @@ impl AsyncWrite for SpillWriter {
         match &poll {
             Poll::Ready(Ok(n)) => {
                 quota.release((buf.len() - *n) as u64);
-                if let Some(written) = &this.written {
-                    written.fetch_add(*n as u64, Ordering::Relaxed);
+                if let Some(reservation) = &this.reservation {
+                    reservation.written.fetch_add(*n as u64, Ordering::Relaxed);
                 }
             }
             _ => quota.release(buf.len() as u64),
@@ -313,7 +340,7 @@ impl SpillStore for LocalSpillStore {
                 let writer = Box::new(SpillWriter {
                     inner: store.create(&os_path).await?,
                     quota: self.quota.clone(),
-                    written: None,
+                    reservation: None,
                     finished: finished.clone(),
                 });
                 let spill = Box::new(LocalSpill {
@@ -331,18 +358,22 @@ impl SpillStore for LocalSpillStore {
                 // it: nothing to delete, and no runtime needed to do it.
                 let store = Arc::new(ObjectStore::memory());
                 let os_path = Path::from(name);
-                let written = self.quota.as_ref().map(|_| Arc::new(AtomicU64::new(0)));
+                let reservation = self.quota.as_ref().map(|quota| {
+                    Arc::new(Reservation {
+                        quota: quota.clone(),
+                        written: AtomicU64::new(0),
+                    })
+                });
                 let writer = Box::new(SpillWriter {
                     inner: store.create(&os_path).await?,
                     quota: self.quota.clone(),
-                    written: written.clone(),
+                    reservation: reservation.clone(),
                     finished: finished.clone(),
                 });
                 let spill = Box::new(MemorySpill {
                     store,
                     os_path,
-                    quota: self.quota.clone(),
-                    written,
+                    reservation,
                     finished,
                 });
                 Ok((writer, spill))
@@ -401,9 +432,10 @@ impl Drop for LocalSpill {
 struct MemorySpill {
     store: Arc<ObjectStore>,
     os_path: Path,
-    quota: Option<DiskQuota>,
-    /// Bytes the paired writer accepted, present only alongside a `quota`.
-    written: Option<Arc<AtomicU64>>,
+    /// Shared with the paired writer and with every reader handed out, so the
+    /// bytes leave the budget with the last owner of the backend rather than
+    /// with this handle.
+    reservation: Option<Arc<Reservation>>,
     /// Set by the paired [`SpillWriter`] once it has been shut down.
     finished: Arc<AtomicBool>,
 }
@@ -416,17 +448,67 @@ impl Spill for MemorySpill {
                 "spill reader requested before the writer was shut down",
             ));
         }
-        self.store.open(&self.os_path).await
+        let inner = self.store.open(&self.os_path).await?;
+        Ok(match &self.reservation {
+            Some(reservation) => Box::new(ChargedReader {
+                inner,
+                _reservation: reservation.clone(),
+            }),
+            None => inner,
+        })
     }
 }
 
-impl Drop for MemorySpill {
-    fn drop(&mut self) {
-        // Returning the reservation is all there is to do: dropping this handle
-        // drops its backend unless a reader or the writer still holds one.
-        if let (Some(quota), Some(written)) = (&self.quota, &self.written) {
-            quota.release(written.load(Ordering::Relaxed));
-        }
+/// A [`Reader`] that holds a share of its spill's quota reservation.
+///
+/// Delegates everything; it exists only so the bytes a retained reader keeps
+/// resident stay charged to the cap.
+#[derive(Debug)]
+struct ChargedReader {
+    inner: Box<dyn Reader>,
+    _reservation: Arc<Reservation>,
+}
+
+impl DeepSizeOf for ChargedReader {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
+        self.inner.deep_size_of_children(context)
+    }
+}
+
+impl Reader for ChargedReader {
+    fn path(&self) -> &Path {
+        self.inner.path()
+    }
+
+    fn block_size(&self) -> usize {
+        self.inner.block_size()
+    }
+
+    fn io_parallelism(&self) -> usize {
+        self.inner.io_parallelism()
+    }
+
+    fn size(&self) -> BoxFuture<'_, object_store::Result<usize>> {
+        self.inner.size()
+    }
+
+    fn get_range(&self, range: Range<usize>) -> BoxFuture<'static, object_store::Result<Bytes>> {
+        self.inner.get_range(range)
+    }
+
+    fn get_all(&self) -> BoxFuture<'_, object_store::Result<Bytes>> {
+        self.inner.get_all()
+    }
+
+    fn get_stream(&self) -> BoxFuture<'_, object_store::Result<ByteStream>> {
+        self.inner.get_stream()
+    }
+
+    fn get_range_stream(
+        &self,
+        range: Range<usize>,
+    ) -> BoxFuture<'_, object_store::Result<ByteStream>> {
+        self.inner.get_range_stream(range)
     }
 }
 
@@ -639,13 +721,16 @@ mod tests {
         // so the 30-byte remainder must be returned to the budget, and the
         // counter the in-memory arm releases from must record 10 rather than 40.
         let quota = DiskQuota::new(100);
-        let written = Arc::new(AtomicU64::new(0));
+        let reservation = Arc::new(Reservation {
+            quota: quota.clone(),
+            written: AtomicU64::new(0),
+        });
         let mut writer = SpillWriter {
             inner: Box::new(ControlledWriter {
                 outcome: Poll::Ready(Ok(10)),
             }),
             quota: Some(quota.clone()),
-            written: Some(written.clone()),
+            reservation: Some(reservation.clone()),
             finished: Arc::new(AtomicBool::new(false)),
         };
         let n = writer.write(&[0u8; 40]).await.unwrap();
@@ -655,22 +740,25 @@ mod tests {
             10,
             "only the accepted bytes should remain reserved"
         );
-        assert_eq!(written.load(Ordering::Relaxed), 10);
+        assert_eq!(reservation.written.load(Ordering::Relaxed), 10);
 
         // Failed write: the full reservation must be released, and nothing may be
         // counted as written.
         let quota = DiskQuota::new(100);
-        let written = Arc::new(AtomicU64::new(0));
+        let reservation = Arc::new(Reservation {
+            quota: quota.clone(),
+            written: AtomicU64::new(0),
+        });
         let mut writer = SpillWriter {
             inner: Box::new(ControlledWriter {
                 outcome: Poll::Ready(Err(io::Error::other("boom"))),
             }),
             quota: Some(quota.clone()),
-            written: Some(written.clone()),
+            reservation: Some(reservation.clone()),
             finished: Arc::new(AtomicBool::new(false)),
         };
         writer.write(&[0u8; 40]).await.unwrap_err();
-        assert_eq!(written.load(Ordering::Relaxed), 0);
+        assert_eq!(reservation.written.load(Ordering::Relaxed), 0);
         assert_eq!(
             *quota.used.lock().unwrap(),
             0,
@@ -789,6 +877,29 @@ mod tests {
         // point that task could not run before the read.
         tokio::task::yield_now().await;
         assert_eq!(reader.get_all().await.unwrap().as_ref(), data);
+    }
+
+    #[tokio::test]
+    async fn test_a_retained_reader_stays_charged_to_the_cap() {
+        let quota = DiskQuota::new(50);
+        let store = memory_only_store(Some(quota.clone()));
+
+        let (writer, spill) = store.new_spill().await.unwrap();
+        finish_writer(writer, &[1u8; 40]).await.unwrap();
+        let retained = spill.reader().await.unwrap();
+        drop(spill);
+
+        // The reader still holds the bytes, so releasing here would let the next
+        // spill over a cap the process is already using up.
+        assert_eq!(retained.get_all().await.unwrap().len(), 40);
+        assert_eq!(*quota.used.lock().unwrap(), 40);
+
+        let (writer, _spill) = store.new_spill().await.unwrap();
+        let err = finish_writer(writer, &[2u8; 40]).await.unwrap_err();
+        assert!(matches!(err, Error::DiskCapExceeded { .. }), "{err:?}");
+
+        drop(retained);
+        assert_eq!(*quota.used.lock().unwrap(), 0);
     }
 
     /// One failing attempt must not decide where later spills go. Uses a process
