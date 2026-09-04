@@ -282,10 +282,7 @@ impl MemTableFlusher {
         );
 
         Ok(FlushResult {
-            sstable: SsTable {
-                generation,
-                path: gen_folder_name,
-            },
+            sstable: SsTable::unmeasured(generation, gen_folder_name),
             rows_flushed,
             covered_wal_entry_position,
         })
@@ -586,10 +583,7 @@ impl MemTableFlusher {
         );
 
         Ok(FlushResult {
-            sstable: SsTable {
-                generation,
-                path: gen_folder_name,
-            },
+            sstable: SsTable::unmeasured(generation, gen_folder_name),
             rows_flushed: memtable.row_count(),
             covered_wal_entry_position,
         })
@@ -1135,10 +1129,7 @@ impl MemTableFlusher {
         self.manifest_store
             .commit_update(epoch, |current| {
                 let mut sstables = current.sstables.clone();
-                sstables.push(SsTable {
-                    generation,
-                    path: gen_path.clone(),
-                });
+                sstables.push(SsTable::unmeasured(generation, gen_path.clone()));
 
                 ShardManifest {
                     version: current.next_version(),
