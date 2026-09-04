@@ -49,6 +49,7 @@ use lance_file::versions::v1::reader::{FileReader as V1FileReader, read_batch as
 use lance_file::{LanceEncodingsIo, determine_file_version, versions as file_versions};
 use lance_io::ReadBatchParams;
 use lance_io::scheduler::{FileScheduler, ScanScheduler, SchedulerConfig};
+use lance_io::stream::RecordBatchStream;
 use lance_io::utils::CachedFileSize;
 use lance_table::format::overlay::TOMBSTONE_FIELD_ID;
 use lance_table::format::{DataFile, DeletionFile, Fragment};
@@ -1686,6 +1687,108 @@ impl FileFragment {
             Ok(lance_arrow::json::convert_lance_json_to_arrow(&batch)?)
         } else {
             Ok(batch)
+        }
+    }
+
+    /// Read a fragment-local half-open physical row interval without applying deletions.
+    ///
+    /// Unlike logical range reads, offsets address the immutable rows stored in
+    /// the fragment's files. Deleted positions remain present with their stored
+    /// column values. Callers can stream the batches into
+    /// [`Dataset::write_data_file_part`](super::Dataset::write_data_file_part)
+    /// when independently computing a physical-row part.
+    ///
+    /// ```
+    /// # use lance::{dataset::fragment::FileFragment, Result};
+    /// # use lance_core::datatypes::Schema;
+    /// # async fn read(fragment: &FileFragment, schema: &Schema) -> Result<()> {
+    /// let batches = fragment.read_physical_slice(0..100, schema, 1024).await?;
+    /// # let _ = batches;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn read_physical_slice(
+        &self,
+        rows: Range<u64>,
+        projection: &Schema,
+        batch_size: u32,
+    ) -> Result<ReadBatchFutStream> {
+        if batch_size == 0 {
+            return Err(Error::invalid_input(
+                "read_physical_slice batch_size must be greater than zero",
+            ));
+        }
+        let physical_rows = self.physical_rows().await? as u64;
+        if rows.start > rows.end || rows.end > physical_rows {
+            return Err(Error::invalid_input(format!(
+                "physical slice {}..{} is outside fragment {} with {} physical rows",
+                rows.start,
+                rows.end,
+                self.id(),
+                physical_rows
+            )));
+        }
+        let offset = i64::try_from(rows.start).map_err(|_| {
+            Error::invalid_input(format!(
+                "physical slice start {} exceeds the supported scan offset range",
+                rows.start
+            ))
+        })?;
+        let limit = i64::try_from(rows.end - rows.start).map_err(|_| {
+            Error::invalid_input(format!(
+                "physical slice length {} exceeds the supported scan limit range",
+                rows.end - rows.start
+            ))
+        })?;
+
+        // Build a read-only view of this exact fragment without its deletion
+        // file. The normal scanner can then apply overlays and Blob descriptor
+        // materialization while offsets still address immutable physical rows.
+        let mut physical_metadata = self.metadata.clone();
+        physical_metadata.deletion_file = None;
+        let mut physical_dataset = self.dataset.as_ref().clone();
+        let mut physical_manifest = self.dataset.manifest.as_ref().clone();
+        physical_manifest.fragments = Arc::new(vec![physical_metadata.clone()]);
+        physical_dataset.manifest = Arc::new(physical_manifest);
+        let physical_dataset = Arc::new(physical_dataset);
+        let fragment = Self::new(physical_dataset.clone(), physical_metadata);
+        let mut scanner = fragment.scan();
+        let columns = projection
+            .fields
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect::<Vec<_>>();
+        scanner.project(&columns)?;
+        scanner.batch_size(batch_size as usize);
+        scanner.limit(Some(limit), Some(offset))?;
+
+        let has_blob_columns = projection.fields_pre_order().any(|field| field.is_blob());
+        if has_blob_columns {
+            scanner.with_row_address();
+        }
+        let stream = scanner.try_into_stream().await?;
+        if has_blob_columns {
+            let rewrite_plan = Arc::new(super::optimize::BlobV2BatchRewritePlan::try_new(
+                projection,
+                stream.schema().as_ref(),
+                false,
+            )?);
+            Ok(stream
+                .map(move |batch_result| {
+                    let physical_dataset = physical_dataset.clone();
+                    let rewrite_plan = rewrite_plan.clone();
+                    async move {
+                        rewrite_plan
+                            .transform_batch(&physical_dataset, batch_result?)
+                            .await
+                    }
+                    .boxed()
+                })
+                .boxed())
+        } else {
+            Ok(stream
+                .map(|batch_result| async move { batch_result }.boxed())
+                .boxed())
         }
     }
 
@@ -6169,6 +6272,82 @@ mod tests {
             .unwrap();
             assert_eq!(batches[1], expected_batch);
         }
+    }
+
+    /// A deletion vector naming a row the fragment does not have leaves the restorer
+    /// with rows it can never account for, so `Updater::next` has to refuse at the end
+    /// of the stream rather than let a data file short of those rows be written.
+    ///
+    /// `write_deletions` rejects an over-long vector, so the file is written directly
+    /// to get a fragment into this state.
+    #[tokio::test]
+    async fn test_updater_rejects_deletion_vector_past_end_of_fragment() {
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
+        let mut dataset = create_dataset(test_uri, LanceFileVersion::Stable).await;
+
+        // Point a fragment's deletion file at a row it does not have. 200 rows are
+        // spread over several 40-row fragments, so 10_000 is past the end of any of
+        // them. Pick a fragment whose id is not zero, so the assertion below cannot
+        // pass on a message that dropped the id entirely.
+        let deletion_vector: DeletionVector = [10_000].into_iter().collect();
+        let fragment_index = 1;
+        let fragment_id = dataset.manifest.fragments[fragment_index].id;
+        assert_ne!(fragment_id, 0, "need a non-zero fragment id");
+        let deletion_file = write_deletion_file(
+            &dataset.base,
+            fragment_id,
+            dataset.version().version,
+            &deletion_vector,
+            dataset.object_store.as_ref(),
+        )
+        .await
+        .unwrap();
+        let mut fragments = dataset.manifest.fragments.as_ref().clone();
+        fragments[fragment_index].deletion_file = deletion_file;
+        let mut manifest = dataset.manifest.as_ref().clone();
+        manifest.fragments = Arc::new(fragments);
+        dataset.manifest = Arc::new(manifest);
+
+        let new_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "double_i",
+            DataType::Int32,
+            true,
+        )]));
+        let fragment = dataset.get_fragment(fragment_id as usize).unwrap();
+        let mut updater = fragment
+            .updater(Some(&["i"]), None, None, None)
+            .await
+            .unwrap();
+
+        // Every live row is handed back, so the loop only ends when next() gives up.
+        let err = loop {
+            match updater.next().await {
+                Ok(Some(batch)) => {
+                    let input_col = batch.column_by_name("i").unwrap();
+                    let result_col = mul(input_col, &Int32Array::new_scalar(2)).unwrap();
+                    let batch = RecordBatch::try_new(
+                        new_schema.clone(),
+                        vec![Arc::new(result_col) as ArrayRef],
+                    )
+                    .unwrap();
+                    updater.update(batch).await.unwrap();
+                }
+                Ok(None) => panic!("expected next() to refuse the unaccounted-for row"),
+                Err(err) => break err,
+            }
+        };
+
+        assert!(matches!(err, Error::NotSupported { .. }), "{err:?}");
+        let message = err.to_string();
+        assert!(
+            message.contains("unaccounted for"),
+            "expected the stream-ended wording, got: {message}"
+        );
+        assert!(
+            message.contains(&format!("fragment {fragment_id}")),
+            "message should name the fragment: {message}"
+        );
     }
 
     #[rstest]
