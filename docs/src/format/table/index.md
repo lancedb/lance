@@ -146,6 +146,14 @@ or independently of column indices due to variable encoding widths (for Lance fi
 
     See the [5.0.0 migration guide](../../guide/migration.md#500) for a detailed example.
 
+### Blob Reuse Index
+
+A DataFile may carry a Blob Reuse Index (BRI) that redirects selected file-local
+Blob v2 identifiers to immutable Packed or Dedicated sidecars owned by another
+data file. Unmapped identifiers continue to resolve under the containing data
+file's own stem. See the [Blob Reuse Index Specification](blob_reuse_index.md)
+for validation, resolution, compaction, cleanup, and clone requirements.
+
 ## Deletion Files
 
 Deletion files (a.k.a. deletion vectors) track deleted rows without rewriting data files.

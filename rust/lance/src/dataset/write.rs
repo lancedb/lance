@@ -1697,9 +1697,11 @@ impl GenericWriter for V2WriterAdapter {
         Ok(self.writer.tell().await?)
     }
     async fn finish(&mut self) -> Result<(u32, DataFile)> {
-        if let Some(pre) = self.preprocessor.as_mut() {
-            pre.finish().await?;
-        }
+        let blob_reuse_index = if let Some(pre) = self.preprocessor.as_mut() {
+            pre.finish().await?
+        } else {
+            None
+        };
         let field_ids = self
             .writer
             .field_id_to_column_indices()
@@ -1720,6 +1722,7 @@ impl GenericWriter for V2WriterAdapter {
         data_file.fields = field_ids.into();
         data_file.column_indices = column_indices.into();
         data_file.file_size_bytes = NonZero::new(write_summary.size_bytes).into();
+        data_file.blob_reuse_index = blob_reuse_index;
         Ok((write_summary.num_rows as u32, data_file))
     }
 
@@ -1850,6 +1853,7 @@ where
         object_store.clone(),
         data_dir,
         data_file_key,
+        base_id,
         schema,
         external_base_resolver,
         allow_external_blob_outside_bases,
@@ -2062,7 +2066,7 @@ mod tests {
     use lance_file::versions::v1::reader::FileReader as V1FileReader;
     use lance_io::object_store::StorageOptionsAccessor;
     use lance_io::traits::Reader;
-    use lance_table::format::BasePath;
+    use lance_table::format::{BasePath, BlobReuseIndex, BlobReuseSource};
     use rstest::rstest;
 
     async fn open_v2_1_test_writer(
@@ -4428,6 +4432,55 @@ mod tests {
             0,
             "Local data file should be deleted by cleanup"
         );
+    }
+
+    #[tokio::test]
+    async fn cleanup_data_fragments_does_not_follow_blob_reuse_index() {
+        use lance_core::utils::blob::blob_path;
+        use lance_core::utils::tempfile::TempStrDir;
+
+        let test_dir = TempStrDir::default();
+        let (object_store, base_dir) = ObjectStore::from_uri_and_params(
+            Default::default(),
+            test_dir.as_str(),
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+        let data_dir = base_dir.clone().join(DATA_DIR);
+        let output_file_path = data_dir.clone().join("output.lance");
+        let output_blob_path = blob_path(&data_dir, "output", 1);
+        let reused_blob_path = blob_path(&data_dir, "source", 2);
+        object_store.put(&output_file_path, b"data").await.unwrap();
+        object_store.put(&output_blob_path, b"new").await.unwrap();
+        object_store.put(&reused_blob_path, b"live").await.unwrap();
+
+        let mut output_file = DataFile::new_unstarted("output.lance", ConcreteFileVersion::V2_2);
+        output_file.blob_reuse_index = Some(Arc::new(
+            BlobReuseIndex::try_new(vec![BlobReuseSource {
+                base_id: None,
+                blob_dir: "source".to_string(),
+                local_ids: vec![1],
+                physical_ids: vec![2],
+            }])
+            .unwrap(),
+        ));
+        let fragments = vec![Fragment {
+            id: 0,
+            files: vec![output_file],
+            overlays: vec![],
+            deletion_file: None,
+            row_id_meta: None,
+            physical_rows: Some(1),
+            created_at_version_meta: None,
+            last_updated_at_version_meta: None,
+        }];
+
+        cleanup_data_fragments(&object_store, &base_dir, None, &fragments).await;
+
+        assert!(!object_store.exists(&output_file_path).await.unwrap());
+        assert!(!object_store.exists(&output_blob_path).await.unwrap());
+        assert!(object_store.exists(&reused_blob_path).await.unwrap());
     }
 
     /// Verifies the target-base branch in `cleanup_data_fragments`: files whose

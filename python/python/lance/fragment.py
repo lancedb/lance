@@ -220,6 +220,29 @@ class FragmentMetadata:
 
 
 @dataclass
+class BlobReuseSource:
+    """Sparse local-to-physical Blob v2 mappings for one sidecar directory."""
+
+    base_id: Optional[int]
+    blob_dir: str
+    local_ids: List[int]
+    physical_ids: List[int]
+
+
+@dataclass
+class BlobReuseIndex:
+    """Sparse redirects from file-local Blob v2 IDs to existing sidecars."""
+
+    sources: List[BlobReuseSource]
+
+    def __post_init__(self):
+        self.sources = [
+            BlobReuseSource(**source) if isinstance(source, dict) else source
+            for source in self.sources
+        ]
+
+
+@dataclass
 class DataFile:
     """
     A data file in a fragment.
@@ -239,6 +262,10 @@ class DataFile:
         The minor version of the data storage format.
     file_size_bytes : Optional[int]
         The size of the data file in bytes, if available.
+    base_id : Optional[int]
+        The base path containing the data file, when it is outside the dataset root.
+    blob_reuse_index : Optional[BlobReuseIndex]
+        Sparse redirects from this file's local Blob v2 IDs to reused sidecars.
     """
 
     _path: str
@@ -248,6 +275,7 @@ class DataFile:
     file_minor_version: int = 0
     file_size_bytes: Optional[int] = None
     base_id: Optional[int] = None
+    blob_reuse_index: Optional[BlobReuseIndex] = None
 
     def __init__(
         self,
@@ -258,6 +286,7 @@ class DataFile:
         file_minor_version: int = 0,
         file_size_bytes: Optional[int] = None,
         base_id: Optional[int] = None,
+        blob_reuse_index: Optional[Union[BlobReuseIndex, dict]] = None,
     ):
         # TODO: only we eliminate the path method, we can remove this
         self._path = path
@@ -267,15 +296,26 @@ class DataFile:
         self.file_minor_version = file_minor_version
         self.file_size_bytes = file_size_bytes
         self.base_id = base_id
+        self.blob_reuse_index = (
+            BlobReuseIndex(**blob_reuse_index)
+            if isinstance(blob_reuse_index, dict)
+            else blob_reuse_index
+        )
 
     def __repr__(self):
         # pretend we have a 'path' attribute
+        blob_reuse_index = (
+            f", blob_reuse_index={self.blob_reuse_index}"
+            if self.blob_reuse_index is not None
+            else ""
+        )
         return (
             f"DataFile(path='{self._path}', fields={self.fields}, "
             f"column_indices={self.column_indices}, "
             f"file_major_version={self.file_major_version}, "
             f"file_minor_version={self.file_minor_version}, "
-            f"file_size_bytes={self.file_size_bytes})"
+            f"file_size_bytes={self.file_size_bytes}"
+            f"{blob_reuse_index})"
         )
 
     @property

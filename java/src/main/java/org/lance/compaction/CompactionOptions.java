@@ -51,6 +51,8 @@ public class CompactionOptions implements Serializable {
   private Optional<Long> maxSourceRows;
   private Optional<Long> maxSourceBytes;
   private List<Long> excludedFragmentIds;
+  private Optional<Boolean> blobReuseIndex;
+  private Optional<Float> blobRepackUtilizationThreshold;
 
   private CompactionOptions(
       Optional<Long> targetRowsPerFragment,
@@ -66,7 +68,9 @@ public class CompactionOptions implements Serializable {
       Optional<Long> maxSourceFragments,
       Optional<Long> maxSourceRows,
       Optional<Long> maxSourceBytes,
-      List<Long> excludedFragmentIds) {
+      List<Long> excludedFragmentIds,
+      Optional<Boolean> blobReuseIndex,
+      Optional<Float> blobRepackUtilizationThreshold) {
     this.targetRowsPerFragment = targetRowsPerFragment;
     this.maxRowsPerGroup = maxRowsPerGroup;
     this.maxBytesPerFile = maxBytesPerFile;
@@ -81,6 +85,8 @@ public class CompactionOptions implements Serializable {
     this.maxSourceRows = maxSourceRows;
     this.maxSourceBytes = maxSourceBytes;
     this.excludedFragmentIds = List.copyOf(excludedFragmentIds);
+    this.blobReuseIndex = blobReuseIndex;
+    this.blobRepackUtilizationThreshold = blobRepackUtilizationThreshold;
   }
 
   public Optional<Boolean> getDeferIndexRemap() {
@@ -110,6 +116,19 @@ public class CompactionOptions implements Serializable {
 
   public List<Long> getExcludedFragmentIds() {
     return excludedFragmentIds;
+  }
+
+  /** Whether compaction should reuse immutable Blob v2 sidecars. Defaults to true. */
+  public Optional<Boolean> getBlobReuseIndex() {
+    return blobReuseIndex;
+  }
+
+  /**
+   * Repack a Packed Blob v2 sidecar when the union of ranges referenced by the current snapshot
+   * divided by its physical size is below this value. Defaults to 0.3.
+   */
+  public Optional<Float> getBlobRepackUtilizationThreshold() {
+    return blobRepackUtilizationThreshold;
   }
 
   public Optional<Boolean> getMaterializeDeletions() {
@@ -161,6 +180,8 @@ public class CompactionOptions implements Serializable {
         .add("maxSourceRows", maxSourceRows.orElse(null))
         .add("maxSourceBytes", maxSourceBytes.orElse(null))
         .add("excludedFragmentIds", excludedFragmentIds)
+        .add("blobReuseIndex", blobReuseIndex.orElse(null))
+        .add("blobRepackUtilizationThreshold", blobRepackUtilizationThreshold.orElse(null))
         .toString();
   }
 
@@ -179,6 +200,8 @@ public class CompactionOptions implements Serializable {
     output.writeObject(maxSourceRows.orElse(null));
     output.writeObject(maxSourceBytes.orElse(null));
     output.writeObject(excludedFragmentIds);
+    output.writeObject(blobReuseIndex.orElse(null));
+    output.writeObject(blobRepackUtilizationThreshold.orElse(null));
   }
 
   private void readObject(ObjectInputStream input) throws IOException, ClassNotFoundException {
@@ -205,6 +228,8 @@ public class CompactionOptions implements Serializable {
     this.maxSourceRows = readTrailingLong(input);
     this.maxSourceBytes = readTrailingLong(input);
     this.excludedFragmentIds = readTrailingLongList(input);
+    this.blobReuseIndex = readTrailingBoolean(input);
+    this.blobRepackUtilizationThreshold = readTrailingFloat(input);
   }
 
   /**
@@ -216,6 +241,30 @@ public class CompactionOptions implements Serializable {
       throws IOException, ClassNotFoundException {
     try {
       return Optional.ofNullable((Long) input.readObject());
+    } catch (OptionalDataException e) {
+      if (!e.eof) {
+        throw e;
+      }
+      return Optional.empty();
+    }
+  }
+
+  private static Optional<Boolean> readTrailingBoolean(ObjectInputStream input)
+      throws IOException, ClassNotFoundException {
+    try {
+      return Optional.ofNullable((Boolean) input.readObject());
+    } catch (OptionalDataException e) {
+      if (!e.eof) {
+        throw e;
+      }
+      return Optional.empty();
+    }
+  }
+
+  private static Optional<Float> readTrailingFloat(ObjectInputStream input)
+      throws IOException, ClassNotFoundException {
+    try {
+      return Optional.ofNullable((Float) input.readObject());
     } catch (OptionalDataException e) {
       if (!e.eof) {
         throw e;
@@ -254,6 +303,8 @@ public class CompactionOptions implements Serializable {
     private Optional<Long> maxSourceRows = Optional.empty();
     private Optional<Long> maxSourceBytes = Optional.empty();
     private List<Long> excludedFragmentIds = Collections.emptyList();
+    private Optional<Boolean> blobReuseIndex = Optional.empty();
+    private Optional<Float> blobRepackUtilizationThreshold = Optional.empty();
 
     private Builder() {}
 
@@ -365,6 +416,27 @@ public class CompactionOptions implements Serializable {
       return this;
     }
 
+    /** Reuse Blob v2 sidecars instead of materializing them during compaction. */
+    public Builder withBlobReuseIndex(boolean blobReuseIndex) {
+      this.blobReuseIndex = Optional.of(blobReuseIndex);
+      return this;
+    }
+
+    /**
+     * Repack a Packed Blob v2 sidecar when the union of ranges referenced by the current snapshot
+     * divided by its physical size is below this threshold.
+     *
+     * @throws IllegalArgumentException if the threshold is not between 0.0 and 1.0
+     */
+    public Builder withBlobRepackUtilizationThreshold(float threshold) {
+      if (!Float.isFinite(threshold) || threshold < 0.0f || threshold > 1.0f) {
+        throw new IllegalArgumentException(
+            "blobRepackUtilizationThreshold must be between 0.0 and 1.0, got " + threshold);
+      }
+      this.blobRepackUtilizationThreshold = Optional.of(threshold);
+      return this;
+    }
+
     /**
      * A max source budget of zero admits no work and a negative value would wrap around to an
      * effectively unlimited budget on the Rust side, so both are rejected here. Leave the option
@@ -393,7 +465,9 @@ public class CompactionOptions implements Serializable {
           maxSourceFragments,
           maxSourceRows,
           maxSourceBytes,
-          excludedFragmentIds);
+          excludedFragmentIds,
+          blobReuseIndex,
+          blobRepackUtilizationThreshold);
     }
   }
 }

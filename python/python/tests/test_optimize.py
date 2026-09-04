@@ -144,6 +144,64 @@ def test_blob_compaction(tmp_path: Path):
     assert contents == blobs
 
 
+@pytest.mark.parametrize(
+    ("blob_reuse_index", "expect_index"), [(None, True), (False, False)]
+)
+def test_blob_compaction_reuses_or_materializes_dedicated_sidecars(
+    tmp_path: Path, blob_reuse_index: bool | None, expect_index: bool
+):
+    dataset_uri = tmp_path / f"dedicated_{blob_reuse_index}"
+    blob_field = lance.blob_field("blob", dedicated_size_threshold=1024)
+    schema = pa.schema([pa.field("id", pa.int32()), blob_field])
+    payloads = [b"a" * 1536, b"b" * 1536]
+    table = pa.Table.from_arrays(
+        [pa.array([0, 1], type=pa.int32()), lance.blob_array(payloads)],
+        schema=schema,
+    )
+    dataset = lance.write_dataset(
+        table,
+        dataset_uri,
+        max_rows_per_file=1,
+        data_storage_version="2.2",
+    )
+
+    dataset.optimize.compact_files(num_threads=1, blob_reuse_index=blob_reuse_index)
+
+    data_file = dataset.get_fragments()[0].metadata.files[0]
+    assert (data_file.blob_reuse_index is not None) is expect_index
+    assert [data for _, data in dataset.read_blobs("blob", indices=[0, 1])] == payloads
+
+
+@pytest.mark.parametrize(
+    ("active_rows", "threshold", "expect_index"),
+    [(2, 0.3, False), (3, 0.29, True), (4, 0.5, False)],
+)
+def test_blob_compaction_packed_repack_utilization_threshold(
+    tmp_path: Path, active_rows: int, threshold: float, expect_index: bool
+):
+    dataset_uri = tmp_path / f"packed_{active_rows}_{threshold}"
+    payloads = [bytes([value]) * (64 * 1024 + 1) for value in range(10)]
+    schema = pa.schema([pa.field("id", pa.int32()), lance.blob_field("blob")])
+    table = pa.Table.from_arrays(
+        [pa.array(range(10), type=pa.int32()), lance.blob_array(payloads)],
+        schema=schema,
+    )
+    dataset = lance.write_dataset(table, dataset_uri, data_storage_version="2.2")
+    dataset.delete(f"id >= {active_rows}")
+
+    dataset.optimize.compact_files(
+        num_threads=1,
+        materialize_deletions_threshold=0.0,
+        blob_repack_utilization_threshold=threshold,
+    )
+
+    data_file = dataset.get_fragments()[0].metadata.files[0]
+    assert (data_file.blob_reuse_index is not None) is expect_index
+    assert [
+        data for _, data in dataset.read_blobs("blob", indices=range(active_rows))
+    ] == payloads[:active_rows]
+
+
 def test_blob_compaction_with_nested_json_sibling(tmp_path: Path):
     dataset_uri = tmp_path / "nested_blob_json"
     info_fields = [lance.blob_field("blob"), pa.field("meta", pa.json_())]

@@ -52,6 +52,12 @@ fn parse_compaction_options(
             "defer_index_remap" => {
                 opts.defer_index_remap = value.extract()?;
             }
+            "blob_reuse_index" => {
+                opts.blob_reuse_index = value.extract()?;
+            }
+            "blob_repack_utilization_threshold" => {
+                opts.blob_repack_utilization_threshold = value.extract()?;
+            }
             "num_threads" => {
                 opts.num_threads = value.extract()?;
             }

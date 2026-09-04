@@ -1772,6 +1772,7 @@ impl FileFragment {
                 projection,
                 stream.schema().as_ref(),
                 false,
+                false,
             )?);
             Ok(stream
                 .map(move |batch_result| {
@@ -6838,6 +6839,7 @@ mod tests {
             file_minor_version: 1,
             file_size_bytes: CachedFileSize::unknown(),
             base_id: None,
+            blob_reuse_index: None,
         };
 
         let full_struct = file_versions::reader_projection_from_column_names(

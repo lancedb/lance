@@ -883,6 +883,7 @@ async fn test_datafile_partial_replacement() {
         file_minor_version: minor,
         file_size_bytes: CachedFileSize::unknown(),
         base_id: None,
+        blob_reuse_index: None,
     };
 
     let dataset = Dataset::commit(
@@ -944,6 +945,7 @@ async fn test_datafile_partial_replacement() {
         file_minor_version: minor,
         file_size_bytes: CachedFileSize::unknown(),
         base_id: None,
+        blob_reuse_index: None,
     };
 
     let dataset = Dataset::commit(
@@ -1044,6 +1046,7 @@ async fn test_datafile_replacement_error() {
         file_minor_version: 0,
         file_size_bytes: CachedFileSize::unknown(),
         base_id: None,
+        blob_reuse_index: None,
     };
 
     let new_data_file = DataFile {
@@ -3266,6 +3269,7 @@ async fn test_cross_column_fast_search_blocks_column_local_stale_postings() {
         file_minor_version,
         file_size_bytes: CachedFileSize::unknown(),
         base_id: None,
+        blob_reuse_index: None,
     };
     let read_version = dataset.version().version;
     let dataset = Dataset::commit(

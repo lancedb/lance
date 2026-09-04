@@ -1018,6 +1018,7 @@ impl Transaction {
                             file.path = new_file.path.clone();
                             file.file_size_bytes = new_file.file_size_bytes.clone();
                             file.base_id = new_file.base_id;
+                            file.blob_reuse_index = new_file.blob_reuse_index.clone();
                             replaced_in_place = true;
                         }
                         columns_covered.extend(file.fields.iter());
@@ -1518,7 +1519,40 @@ impl Transaction {
             manifest.next_row_id = next_row_id;
         }
 
+        manifest.validate_blob_reuse_indices()?;
+        if let Some(current_manifest) = current_manifest {
+            Self::validate_blob_reuse_index_immutability(current_manifest, &manifest)?;
+        }
+
         Ok((manifest, final_indices))
+    }
+
+    fn validate_blob_reuse_index_immutability(
+        current_manifest: &Manifest,
+        new_manifest: &Manifest,
+    ) -> Result<()> {
+        let existing = current_manifest
+            .fragments
+            .iter()
+            .flat_map(|fragment| fragment.referenced_lance_files())
+            .map(|file| ((file.base_id, file.path.as_str()), file))
+            .collect::<HashMap<_, _>>();
+
+        for file in new_manifest
+            .fragments
+            .iter()
+            .flat_map(|fragment| fragment.referenced_lance_files())
+        {
+            if let Some(previous_file) = existing.get(&(file.base_id, file.path.as_str()))
+                && !previous_file.has_same_blob_reuse_index(file)
+            {
+                return Err(Error::invalid_input(format!(
+                    "BlobReuseIndex for data file '{}' at base {:?} is immutable; write a new data file instead",
+                    file.path, file.base_id
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Remove data files that only contain tombstoned fields (-2)
@@ -1549,7 +1583,10 @@ mod tests {
     use super::*;
     use crate::format::overlay::OverlayCoverage;
     use crate::format::pb;
-    use crate::format::{RowDatasetVersionMeta, RowDatasetVersionSequence, RowIdMeta};
+    use crate::format::{
+        BlobReuseIndex, BlobReuseSource, RowDatasetVersionMeta, RowDatasetVersionSequence,
+        RowIdMeta,
+    };
     use crate::rowids::{RowIdSequence, write_row_ids};
     use crate::transaction::test_support::{
         default_build_config, make_stable_row_id_manifest, overlay_with_field,
@@ -1735,6 +1772,7 @@ mod tests {
             file_minor_version: 0,
             file_size_bytes: CachedFileSize::new(1000),
             base_id: None,
+            blob_reuse_index: None,
         });
 
         // Add a data file with all fields tombstoned
@@ -1746,6 +1784,7 @@ mod tests {
             file_minor_version: 0,
             file_size_bytes: CachedFileSize::new(500),
             base_id: None,
+            blob_reuse_index: None,
         });
 
         // Add a data file with mixed tombstoned and valid fields
@@ -1757,6 +1796,7 @@ mod tests {
             file_minor_version: 0,
             file_size_bytes: CachedFileSize::new(750),
             base_id: None,
+            blob_reuse_index: None,
         });
 
         // Add another fully tombstoned file
@@ -1768,6 +1808,7 @@ mod tests {
             file_minor_version: 0,
             file_size_bytes: CachedFileSize::new(250),
             base_id: None,
+            blob_reuse_index: None,
         });
 
         let mut fragments = vec![fragment];
@@ -2635,6 +2676,88 @@ mod tests {
         // overlay is dropped.
         assert_eq!(frag.overlays.len(), 1);
         assert_eq!(frag.overlays[0].data_file.fields.as_ref(), &[3, -2]);
+    }
+
+    #[test]
+    fn test_data_replacement_preserves_new_blob_reuse_index() {
+        let mut fragment = Fragment::new(0);
+        fragment.files = vec![DataFile::new_legacy_from_fields("old.lance", vec![0], None)];
+        let mut manifest = sample_manifest_with_fragments(0..0);
+        manifest.fragments = Arc::new(vec![fragment]);
+
+        let index = Arc::new(
+            BlobReuseIndex::try_new(vec![BlobReuseSource {
+                base_id: None,
+                blob_dir: "source.blob".to_string(),
+                local_ids: vec![1],
+                physical_ids: vec![2],
+            }])
+            .unwrap(),
+        );
+        let mut replacement = DataFile::new_legacy_from_fields("new.lance", vec![0], None);
+        replacement.blob_reuse_index = Some(index.clone());
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::DataReplacement {
+                replacements: vec![DataReplacementGroup(0, replacement)],
+            },
+            None,
+        );
+
+        let (result, _) = transaction
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
+            .unwrap();
+
+        assert_eq!(result.fragments[0].files[0].path, "new.lance");
+        assert_eq!(result.fragments[0].files[0].blob_reuse_index, Some(index));
+    }
+
+    #[test]
+    fn blob_reuse_index_is_immutable_by_physical_data_file_identity() {
+        let mut current = sample_manifest_with_fragments(0..1);
+        let left = Arc::new(
+            BlobReuseIndex::try_new(vec![
+                BlobReuseSource {
+                    base_id: None,
+                    blob_dir: "a.blob".to_string(),
+                    local_ids: vec![1],
+                    physical_ids: vec![3],
+                },
+                BlobReuseSource {
+                    base_id: Some(7),
+                    blob_dir: "b.blob".to_string(),
+                    local_ids: vec![2],
+                    physical_ids: vec![4],
+                },
+            ])
+            .unwrap(),
+        );
+        let mut file = DataFile::new_legacy_from_fields("same.lance", vec![0], Some(7));
+        file.blob_reuse_index = Some(left.clone());
+        Arc::make_mut(&mut current.fragments)[0].files = vec![file];
+
+        let mut semantically_equal = current.clone();
+        Arc::make_mut(&mut semantically_equal.fragments)[0].files[0].blob_reuse_index =
+            Some(Arc::new(
+                BlobReuseIndex::try_new(vec![
+                    left.sources()[1].clone(),
+                    BlobReuseSource {
+                        base_id: Some(7),
+                        ..left.sources()[0].clone()
+                    },
+                ])
+                .unwrap(),
+            ));
+        Transaction::validate_blob_reuse_index_immutability(&current, &semantically_equal).unwrap();
+
+        let mut changed = current.clone();
+        let mut changed_sources = left.sources().to_vec();
+        changed_sources[0].physical_ids[0] = 9;
+        Arc::make_mut(&mut changed.fragments)[0].files[0].blob_reuse_index =
+            Some(Arc::new(BlobReuseIndex::try_new(changed_sources).unwrap()));
+        let err =
+            Transaction::validate_blob_reuse_index_immutability(&current, &changed).unwrap_err();
+        assert!(err.to_string().contains("immutable"), "{err}");
     }
 
     /// Replace `fields` in `fragment` at `read_version`, against a manifest

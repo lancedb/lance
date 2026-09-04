@@ -280,6 +280,7 @@ impl Dataset {
                     object_store.as_ref().clone(),
                     data_dir,
                     data_file_key.to_string(),
+                    target.base_id,
                     target.schema.as_ref(),
                     external_base_resolver,
                     false,
@@ -311,8 +312,12 @@ impl Dataset {
                     writer.write_batch(&batch).await?;
                 }
             }
-            if let Some(preprocessor) = preprocessor.as_mut() {
-                preprocessor.finish().await?;
+            if let Some(preprocessor) = preprocessor.as_mut()
+                && preprocessor.finish().await?.is_some()
+            {
+                return Err(Error::internal(
+                    "data-file parts cannot carry Blob Reuse Index metadata",
+                ));
             }
             writer.finish().await
         }

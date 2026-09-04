@@ -7368,6 +7368,8 @@ class DatasetOptimizer:
         materialize_deletions: Optional[bool] = None,
         materialize_deletions_threshold: Optional[float] = None,
         defer_index_remap: Optional[bool] = None,
+        blob_reuse_index: Optional[bool] = None,
+        blob_repack_utilization_threshold: Optional[float] = None,
         num_threads: Optional[int] = None,
         batch_size: Optional[int] = None,
         compaction_mode: Optional[
@@ -7406,6 +7408,8 @@ class DatasetOptimizer:
         ``lance.compaction.materialize_deletions``,
         ``lance.compaction.materialize_deletions_threshold``,
         ``lance.compaction.defer_index_remap``,
+        ``lance.compaction.blob_reuse_index``,
+        ``lance.compaction.blob_repack_utilization_threshold``,
         ``lance.compaction.batch_size``,
         ``lance.compaction.compaction_mode``,
         ``lance.compaction.binary_copy_read_batch_bytes``,
@@ -7444,6 +7448,15 @@ class DatasetOptimizer:
         defer_index_remap: bool, optional
             Whether to defer index remapping during compaction. If not specified,
             uses the manifest config value, or False.
+        blob_reuse_index: bool, optional
+            Whether to reuse Blob v2 sidecars through a Blob Reuse Index. If
+            False, Packed and Dedicated payloads are materialized into new
+            sidecars. If not specified, uses the manifest config value, or True.
+        blob_repack_utilization_threshold: float, optional
+            Repack a Packed Blob v2 sidecar when the union of ranges referenced
+            by the current snapshot divided by its physical size is below this
+            threshold. Must be between 0.0 and 1.0. If not specified, uses the
+            manifest config value, or 0.3.
         num_threads: int, optional
             The number of threads to use when performing compaction. If not
             specified, defaults to the number of cores on the machine.
@@ -7506,6 +7519,8 @@ class DatasetOptimizer:
                 materialize_deletions=materialize_deletions,
                 materialize_deletions_threshold=materialize_deletions_threshold,
                 defer_index_remap=defer_index_remap,
+                blob_reuse_index=blob_reuse_index,
+                blob_repack_utilization_threshold=blob_repack_utilization_threshold,
                 num_threads=num_threads,
                 batch_size=batch_size,
                 compaction_mode=compaction_mode,

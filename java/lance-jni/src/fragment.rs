@@ -13,7 +13,8 @@ use jni::{
 };
 use lance::datatypes::Schema;
 use lance::table::format::{
-    DataFile, DeletionFile, DeletionFileType, Fragment, RowDatasetVersionMeta, RowIdMeta,
+    BlobReuseIndex, BlobReuseSource, DataFile, DeletionFile, DeletionFileType, Fragment,
+    RowDatasetVersionMeta, RowIdMeta,
 };
 use lance_io::utils::CachedFileSize;
 use lance_table::rowids::{RowIdSequence, write_row_ids};
@@ -32,7 +33,9 @@ use crate::blocking_dataset::extract_namespace_info;
 use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
 use crate::session::session_from_handle;
-use crate::traits::{FromJObjectWithEnv, IntoJava, JLance, export_vec, import_vec};
+use crate::traits::{
+    FromJObjectWithEnv, IntoJava, JLance, export_vec, import_vec, import_vec_from_method,
+};
 use crate::utils::extract_storage_options;
 use crate::{
     block_on,
@@ -684,8 +687,11 @@ fn inner_encode_row_ids(env: &mut JNIEnv, row_ids: &JLongArray) -> Result<String
 }
 
 const DATA_FILE_CLASS: &str = "org/lance/fragment/DataFile";
-const DATA_FILE_CONSTRUCTOR_SIG: &str =
-    "(Ljava/lang/String;[I[IIILjava/lang/Long;Ljava/lang/Integer;)V";
+const DATA_FILE_CONSTRUCTOR_SIG: &str = "(Ljava/lang/String;[I[IIILjava/lang/Long;Ljava/lang/Integer;Lorg/lance/fragment/BlobReuseIndex;)V";
+const BLOB_REUSE_INDEX_CLASS: &str = "org/lance/fragment/BlobReuseIndex";
+const BLOB_REUSE_INDEX_CONSTRUCTOR_SIG: &str = "(Ljava/util/List;)V";
+const BLOB_REUSE_SOURCE_CLASS: &str = "org/lance/fragment/BlobReuseSource";
+const BLOB_REUSE_SOURCE_CONSTRUCTOR_SIG: &str = "(Ljava/lang/Integer;Ljava/lang/String;[J[J)V";
 const DELETE_FILE_CLASS: &str = "org/lance/fragment/DeletionFile";
 const DELETE_FILE_CONSTRUCTOR_SIG: &str =
     "(JJLjava/lang/Long;Lorg/lance/fragment/DeletionFileType;Ljava/lang/Integer;)V";
@@ -745,6 +751,10 @@ impl IntoJava for &DataFile {
             None => JObject::null(),
         };
         let base_id = convert_to_java_integer(env, self.base_id)?;
+        let blob_reuse_index = match self.blob_reuse_index.as_deref() {
+            Some(index) => index.into_java(env)?,
+            None => JObject::null(),
+        };
         Ok(env.new_object(
             DATA_FILE_CLASS,
             DATA_FILE_CONSTRUCTOR_SIG,
@@ -756,6 +766,49 @@ impl IntoJava for &DataFile {
                 JValueGen::Int(self.file_minor_version as i32),
                 JValueGen::Object(&file_size_bytes),
                 JValueGen::Object(&base_id),
+                JValueGen::Object(&blob_reuse_index),
+            ],
+        )?)
+    }
+}
+
+impl IntoJava for &BlobReuseIndex {
+    fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
+        let sources = export_vec(env, self.sources())?;
+        Ok(env.new_object(
+            BLOB_REUSE_INDEX_CLASS,
+            BLOB_REUSE_INDEX_CONSTRUCTOR_SIG,
+            &[JValueGen::Object(&sources)],
+        )?)
+    }
+}
+
+impl IntoJava for &BlobReuseSource {
+    fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
+        let base_id = convert_to_java_integer(env, self.base_id)?;
+        let blob_dir = env.new_string(&self.blob_dir)?.into();
+        let local_ids = JLance(
+            self.local_ids
+                .iter()
+                .map(|id| i64::from(*id))
+                .collect::<Vec<_>>(),
+        )
+        .into_java(env)?;
+        let physical_ids = JLance(
+            self.physical_ids
+                .iter()
+                .map(|id| i64::from(*id))
+                .collect::<Vec<_>>(),
+        )
+        .into_java(env)?;
+        Ok(env.new_object(
+            BLOB_REUSE_SOURCE_CLASS,
+            BLOB_REUSE_SOURCE_CONSTRUCTOR_SIG,
+            &[
+                JValueGen::Object(&base_id),
+                JValueGen::Object(&blob_dir),
+                JValueGen::Object(&local_ids),
+                JValueGen::Object(&physical_ids),
             ],
         )?)
     }
@@ -1020,6 +1073,11 @@ impl FromJObjectWithEnv<DataFile> for JObject<'_> {
         let file_size_bytes =
             file_size_bytes.map_or(Default::default(), |r| CachedFileSize::new(r as u64));
         let base_id = get_base_id(env, self)?;
+        let blob_reuse_index = env
+            .get_optional_from_method(self, "getBlobReuseIndex", |env, value| {
+                value.extract_object(env)
+            })?
+            .map(Arc::new);
         Ok(DataFile {
             path,
             fields: fields.into(),
@@ -1028,6 +1086,56 @@ impl FromJObjectWithEnv<DataFile> for JObject<'_> {
             file_minor_version,
             file_size_bytes,
             base_id,
+            blob_reuse_index,
+        })
+    }
+}
+
+impl FromJObjectWithEnv<BlobReuseIndex> for JObject<'_> {
+    fn extract_object(&self, env: &mut JNIEnv<'_>) -> Result<BlobReuseIndex> {
+        let sources = import_vec_from_method(env, self, "getSources", |env, value| {
+            value.extract_object(env)
+        })?;
+        Ok(BlobReuseIndex::try_new(sources)?)
+    }
+}
+
+impl FromJObjectWithEnv<BlobReuseSource> for JObject<'_> {
+    fn extract_object(&self, env: &mut JNIEnv<'_>) -> Result<BlobReuseSource> {
+        let base_id = env.get_optional_u32_from_method(self, "getBaseId")?;
+        let blob_dir = env
+            .call_method(self, "getBlobDir", "()Ljava/lang/String;", &[])?
+            .l()?;
+        let blob_dir = env.get_string(&JString::from(blob_dir))?.into();
+        let local_ids = env.call_method(self, "getLocalIds", "()[J", &[])?.l()?;
+        let local_ids: Vec<i64> = JLongArray::from(local_ids).extract_object(env)?;
+        let physical_ids = env.call_method(self, "getPhysicalIds", "()[J", &[])?.l()?;
+        let physical_ids: Vec<i64> = JLongArray::from(physical_ids).extract_object(env)?;
+        Ok(BlobReuseSource {
+            base_id,
+            blob_dir,
+            local_ids: local_ids
+                .into_iter()
+                .map(|id| {
+                    u32::try_from(id).map_err(|_| {
+                        Error::input_error(format!(
+                            "Blob reuse local id must be between 0 and {}, got {id}",
+                            u32::MAX
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
+            physical_ids: physical_ids
+                .into_iter()
+                .map(|id| {
+                    u32::try_from(id).map_err(|_| {
+                        Error::input_error(format!(
+                            "Blob reuse physical id must be between 0 and {}, got {id}",
+                            u32::MAX
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
         })
     }
 }

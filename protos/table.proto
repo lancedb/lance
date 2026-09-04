@@ -8,6 +8,7 @@ package lance.table;
 import "google/protobuf/any.proto";
 import "google/protobuf/timestamp.proto";
 import "file.proto";
+import "rowids.proto";
 
 /*
 
@@ -481,7 +482,30 @@ message DataFile {
   // The base path index of the data file. Used when the file is imported or referred from another dataset.
   // Lance use it as key of the base_paths field in Manifest to determine the actual base path of the data file.
   optional uint32 base_id = 7;
+
+  // Sparse redirects from file-local blob ids to reused Blob v2 sidecars.
+  // Absent means every Packed or Dedicated blob id resolves below this data
+  // file's own stem directory.
+  BlobReuseIndex blob_reuse_index = 8;
 } // DataFile
+
+// Sparse physical-sidecar redirects used by Blob v2 compaction and cloning.
+message BlobReuseIndex {
+  // Non-empty when BlobReuseIndex is present.
+  repeated BlobReuseSource sources = 1;
+}
+
+message BlobReuseSource {
+  // The base path containing the reused sidecars. Absent means the same base
+  // as the DataFile that contains this source.
+  optional uint32 base_id = 1;
+  // One sidecar directory name relative to the base's data directory.
+  string blob_dir = 2;
+  // Strictly increasing output-local blob ids redirected by this source.
+  RowIdSequence local_ids = 3;
+  // Physical blob ids aligned positionally with local_ids.
+  EncodedU64Array physical_ids = 4;
+}
 
 // An overlay file supplies new values for a subset of (row offset, field) cells
 // within a fragment, without rewriting the fragment's base data files. It is

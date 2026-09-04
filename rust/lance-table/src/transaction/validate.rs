@@ -196,6 +196,7 @@ pub(super) fn merge_fragment_physically_rewritten(prev: &Fragment, merged: &Frag
             || p.file_major_version != m.file_major_version
             || p.file_minor_version != m.file_minor_version
             || p.base_id != m.base_id
+            || !p.has_same_blob_reuse_index(m)
     })
 }
 

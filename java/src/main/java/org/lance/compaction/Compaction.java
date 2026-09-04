@@ -49,7 +49,9 @@ public class Compaction {
           compactionOptions.getMaxSourceFragments(),
           compactionOptions.getMaxSourceRows(),
           compactionOptions.getMaxSourceBytes(),
-          compactionOptions.getExcludedFragmentIds());
+          compactionOptions.getExcludedFragmentIds(),
+          compactionOptions.getBlobReuseIndex(),
+          compactionOptions.getBlobRepackUtilizationThreshold());
     }
   }
 
@@ -74,7 +76,9 @@ public class Compaction {
         compactionOptions.getMaxSourceFragments(),
         compactionOptions.getMaxSourceRows(),
         compactionOptions.getMaxSourceBytes(),
-        compactionOptions.getExcludedFragmentIds());
+        compactionOptions.getExcludedFragmentIds(),
+        compactionOptions.getBlobReuseIndex(),
+        compactionOptions.getBlobRepackUtilizationThreshold());
   }
 
   /**
@@ -98,7 +102,9 @@ public class Compaction {
       Optional<Long> maxSourceFragments,
       Optional<Long> maxSourceRows,
       Optional<Long> maxSourceBytes,
-      List<Long> excludedFragmentIds) {
+      List<Long> excludedFragmentIds,
+      Optional<Boolean> blobReuseIndex,
+      Optional<Float> blobRepackUtilizationThreshold) {
     try (LockManager.ReadLock readLock = dataset.acquireReadLock()) {
       return commitCompactionNative(
           dataset,
@@ -116,7 +122,9 @@ public class Compaction {
           maxSourceFragments,
           maxSourceRows,
           maxSourceBytes,
-          excludedFragmentIds);
+          excludedFragmentIds,
+          blobReuseIndex,
+          blobRepackUtilizationThreshold);
     }
   }
 
@@ -136,7 +144,9 @@ public class Compaction {
       Optional<Long> maxSourceFragments,
       Optional<Long> maxSourceRows,
       Optional<Long> maxSourceBytes,
-      List<Long> excludedFragmentIds);
+      List<Long> excludedFragmentIds,
+      Optional<Boolean> blobReuseIndex,
+      Optional<Float> blobRepackUtilizationThreshold);
 
   private static native CompactionPlan nativePlanCompaction(
       Dataset dataset,
@@ -153,5 +163,7 @@ public class Compaction {
       Optional<Long> maxSourceFragments,
       Optional<Long> maxSourceRows,
       Optional<Long> maxSourceBytes,
-      List<Long> excludedFragmentIds);
+      List<Long> excludedFragmentIds,
+      Optional<Boolean> blobReuseIndex,
+      Optional<Float> blobRepackUtilizationThreshold);
 }

@@ -17,8 +17,8 @@ use crate::dataset::mem_wal::DatasetMemWalExt;
 use crate::dataset::schema_evolution::ColumnAlteration;
 use crate::dataset::transaction::Operation;
 use crate::dataset::{
-    ManifestWriteConfig, deep_clone_copy_parallelism, parse_deep_clone_stream_concurrency,
-    validate_dataset_root_for_drop, write_manifest_file,
+    ManifestWriteConfig, deep_clone_blob_dirs, deep_clone_copy_parallelism,
+    parse_deep_clone_stream_concurrency, validate_dataset_root_for_drop, write_manifest_file,
 };
 use crate::session::Session;
 use crate::session::caches::ManifestKey;
@@ -49,7 +49,9 @@ use lance_file::{
 };
 use lance_io::assert_io_eq;
 use lance_table::feature_flags;
-use lance_table::format::{BasePath, Fragment, pb};
+use lance_table::format::{
+    BasePath, BlobReuseIndex, BlobReuseSource, DataFile, Fragment, Manifest, pb,
+};
 use object_store::ObjectStoreExt;
 use prost::Message;
 
@@ -86,6 +88,81 @@ fn test_parse_deep_clone_stream_concurrency_rejects_invalid_values(#[case] value
 #[test]
 fn test_parse_deep_clone_stream_concurrency_accepts_positive_value() {
     assert_eq!(parse_deep_clone_stream_concurrency("17").unwrap(), 17);
+}
+
+#[test]
+fn test_deep_clone_blob_dirs_avoid_data_file_stems() {
+    let schema = lance_core::datatypes::Schema::try_from(&ArrowSchema::new(vec![ArrowField::new(
+        "id",
+        DataType::Int32,
+        false,
+    )]))
+    .unwrap();
+    let mut fragment = Fragment::new(0);
+    fragment.files = vec![
+        DataFile::new_legacy_from_fields("_bri_local_source.lance", vec![0], None),
+        DataFile::new_legacy_from_fields("output.lance", vec![0], None),
+    ];
+    fragment.files[1].blob_reuse_index = Some(Arc::new(
+        BlobReuseIndex::try_new(vec![BlobReuseSource {
+            base_id: None,
+            blob_dir: "source".to_string(),
+            local_ids: vec![1],
+            physical_ids: vec![1],
+        }])
+        .unwrap(),
+    ));
+    let manifest = Manifest::new(
+        schema,
+        Arc::new(vec![fragment]),
+        DataStorageFormat::default(),
+        HashMap::new(),
+    );
+
+    assert_eq!(
+        deep_clone_blob_dirs(&manifest).get(&(None, "source".to_string())),
+        Some(&"_bri_local_source_1".to_string())
+    );
+}
+
+#[tokio::test]
+async fn test_collect_paths_skips_blob_directory_list_for_non_blob_file() {
+    let source_dir = TempStdDir::default();
+    let source_uri = file_object_store_uri(&source_dir);
+    let tracker = Arc::new(IOTracker::default());
+    let store_params = ObjectStoreParams {
+        object_store_wrapper: Some(tracker.clone()),
+        ..Default::default()
+    };
+    let data_reader = gen_batch()
+        .col("id", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(8), BatchCount::from(1));
+    let dataset = Dataset::write(
+        data_reader,
+        &source_uri,
+        Some(WriteParams {
+            store_params: Some(store_params),
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let data_file = &dataset.manifest.fragments[0].files[0];
+    let data_file_key = data_file.path.strip_suffix(".lance").unwrap();
+    let blob_dir = dataset.data_dir().join(data_file_key);
+
+    tracker.incremental_stats();
+    dataset.collect_paths().await.unwrap();
+    let stats = tracker.incremental_stats();
+    assert!(
+        stats
+            .requests
+            .iter()
+            .all(|request| request.method != "list" || request.path != blob_dir),
+        "non-Blob DataFile should not list its sidecar directory: {:?}",
+        stats.requests
+    );
 }
 
 #[rstest]

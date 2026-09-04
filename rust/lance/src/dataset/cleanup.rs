@@ -44,6 +44,7 @@ use futures::{StreamExt, TryStreamExt, stream};
 use humantime::parse_duration;
 use lance_core::{
     Error, Result,
+    utils::blob::blob_path,
     utils::tracing::{
         AUDIT_MODE_DELETE, AUDIT_MODE_DELETE_UNVERIFIED, AUDIT_TYPE_DATA, AUDIT_TYPE_DELETION,
         AUDIT_TYPE_INDEX, AUDIT_TYPE_MANIFEST, DATASET_CLEANING_EVENT, TRACE_DATASET_EVENTS,
@@ -74,6 +75,7 @@ use tracing::{Span, debug, info, instrument, warn};
 #[derive(Clone, Debug, Default)]
 struct ReferencedFiles {
     data_paths: HashSet<Path>,
+    blob_paths: HashSet<Path>,
     delete_paths: HashSet<Path>,
     tx_paths: HashSet<Path>,
     index_uuids: HashSet<String>,
@@ -418,6 +420,35 @@ impl<'a> CleanupOperation<'a> {
 }
 
 impl<'a> CleanupTask<'a> {
+    fn current_data_dir_for_base(
+        &self,
+        manifest: &Manifest,
+        base_id: Option<u32>,
+    ) -> Result<Option<Path>> {
+        let Some(base_id) = base_id else {
+            return Ok(Some(self.dataset.data_dir()));
+        };
+        let base_path = manifest.base_paths.get(&base_id).ok_or_else(|| {
+            Error::corrupt_file_named(
+                "manifest",
+                format!("BlobReuseIndex references missing base id {base_id}"),
+            )
+        })?;
+        let registry = self.dataset.session.store_registry();
+        let store_params = self.dataset.store_params_for_base(Some(base_path));
+        let store_prefix = registry
+            .calculate_object_store_prefix(&base_path.path, store_params.storage_options())?;
+        if store_prefix != self.dataset.object_store.store_prefix {
+            return Ok(None);
+        }
+        let mut data_dir = base_path.extract_path(registry)?;
+        if base_path.is_dataset_root {
+            data_dir = data_dir.join(crate::dataset::DATA_DIR);
+        }
+        let is_current = data_dir.prefix_match(&self.dataset.data_dir()).is_some();
+        Ok(is_current.then_some(data_dir))
+    }
+
     fn new(dataset: &'a Dataset, policy: CleanupPolicy, action: CleanupAction) -> Self {
         let track_removed_manifests = policy.clean_referenced_branches;
         let include_referenced_branches = action.candidate_file_limit().is_some();
@@ -641,6 +672,22 @@ impl<'a> CleanupTask<'a> {
                 let full_data_path = self.dataset.data_dir().clone().join(file.path.as_str());
                 let relative_data_path = remove_prefix(&full_data_path, &self.dataset.base);
                 referenced_files.data_paths.insert(relative_data_path);
+                if let Some(index) = &file.blob_reuse_index {
+                    for source in index.sources() {
+                        let effective_base_id = source.base_id.or(file.base_id);
+                        if let Some(source_data_dir) =
+                            self.current_data_dir_for_base(manifest, effective_base_id)?
+                        {
+                            for physical_id in &source.physical_ids {
+                                let full_blob_path =
+                                    blob_path(&source_data_dir, &source.blob_dir, *physical_id);
+                                referenced_files
+                                    .blob_paths
+                                    .insert(remove_prefix(&full_blob_path, &self.dataset.base));
+                            }
+                        }
+                    }
+                }
             }
             let delpath = fragment
                 .deletion_file
@@ -1015,6 +1062,14 @@ impl<'a> CleanupTask<'a> {
 
                 if inspection
                     .referenced_files
+                    .blob_paths
+                    .contains(&relative_path)
+                {
+                    return Ok(None);
+                }
+
+                if inspection
+                    .referenced_files
                     .data_paths
                     .contains(&parent_data_path)
                 {
@@ -1023,8 +1078,12 @@ impl<'a> CleanupTask<'a> {
                     Ok(cleanup_file(path, CleanupFileKind::Data, true, size_bytes))
                 } else if inspection
                     .verified_files
-                    .data_paths
-                    .contains(&parent_data_path)
+                    .blob_paths
+                    .contains(&relative_path)
+                    || inspection
+                        .verified_files
+                        .data_paths
+                        .contains(&parent_data_path)
                 {
                     Ok(cleanup_file(path, CleanupFileKind::Data, false, size_bytes))
                 } else {
@@ -1268,6 +1327,23 @@ impl<'a> CleanupTask<'a> {
                             .data_paths
                             .insert(relative_data_path);
                         is_referenced = true;
+                    }
+                }
+                if let Some(index) = &file.blob_reuse_index {
+                    for source in index.sources() {
+                        let effective_base_id = source.base_id.or(file.base_id);
+                        if let Some(source_data_dir) =
+                            self.current_data_dir_for_base(&manifest, effective_base_id)?
+                        {
+                            for physical_id in &source.physical_ids {
+                                let path =
+                                    blob_path(&source_data_dir, &source.blob_dir, *physical_id);
+                                let relative_path = remove_prefix(&path, &self.dataset.base);
+                                inspection.verified_files.blob_paths.remove(&relative_path);
+                                inspection.referenced_files.blob_paths.insert(relative_path);
+                            }
+                            is_referenced = true;
+                        }
                     }
                 }
             }

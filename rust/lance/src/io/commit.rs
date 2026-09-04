@@ -36,8 +36,9 @@ use lance_io::utils::CachedFileSize;
 use lance_select::RowAddrTreeMap;
 use lance_table::feature_flags::ensure_can_write_manifest;
 use lance_table::format::{
-    DETACHED_VERSION_MASK, DeletionFile, Fragment, IndexMetadata, Manifest, WriterVersion,
-    is_detached_version, list_index_files_with_sizes, operation_may_change_schema, pb,
+    BlobReuseIndex, DETACHED_VERSION_MASK, DeletionFile, Fragment, IndexMetadata, Manifest,
+    WriterVersion, is_detached_version, list_index_files_with_sizes, operation_may_change_schema,
+    pb,
 };
 use lance_table::io::commit::{
     CommitConfig, CommitError, CommitHandler, ManifestLocation, ManifestNamingScheme,
@@ -442,6 +443,7 @@ async fn do_commit_new_dataset(
             (new_manifest, updated_indices)
         } else {
             // Deep clone: build a manifest that references local files (no external bases)
+            let blob_dirs = crate::dataset::deep_clone_blob_dirs(&source_manifest);
             let mut new_manifest = source_manifest.clone();
             new_manifest.base_paths.clear();
             new_manifest.branch = None;
@@ -452,6 +454,28 @@ async fn do_commit_new_dataset(
             let mut new_frags = new_manifest.fragments.as_ref().clone();
             for f in &mut new_frags {
                 for df in f.referenced_lance_files_mut() {
+                    if let Some(index) = &df.blob_reuse_index {
+                        let sources = index
+                            .sources()
+                            .iter()
+                            .cloned()
+                            .map(|mut source| {
+                                let effective_base_id = source.base_id.or(df.base_id);
+                                source.blob_dir = blob_dirs
+                                    .get(&(effective_base_id, source.blob_dir.clone()))
+                                    .cloned()
+                                    .ok_or_else(|| {
+                                        Error::internal(format!(
+                                            "Missing deep clone target for BlobReuseIndex source {:?}:{}",
+                                            effective_base_id, source.blob_dir
+                                        ))
+                                    })?;
+                                source.base_id = None;
+                                Ok(source)
+                            })
+                            .collect::<Result<Vec<_>>>()?;
+                        df.blob_reuse_index = Some(Arc::new(BlobReuseIndex::try_new(sources)?));
+                    }
                     df.base_id = None;
                 }
                 if let Some(d) = f.deletion_file.as_mut() {

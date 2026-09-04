@@ -21,6 +21,7 @@ use lance_core::ROW_ADDR;
 use lance_core::datatypes::{OnMissing, OnTypeMismatch, Projectable, Projection};
 use lance_core::traits::DatasetTakeRows;
 use lance_core::utils::address::RowAddress;
+use lance_core::utils::blob::blob_path;
 use lance_core::utils::tracing::{
     DATASET_DELETING_EVENT, DATASET_DROPPING_COLUMN_EVENT, TRACE_DATASET_EVENTS,
 };
@@ -152,7 +153,7 @@ use lance_table::feature_flags::{
     apply_feature_flags, ensure_can_read_manifest, ensure_can_write_manifest,
     validate_paired_feature_flags,
 };
-use lance_table::io::deletion::{DELETIONS_DIR, relative_deletion_file_path};
+use lance_table::io::deletion::{DELETIONS_DIR, deletion_file_path, relative_deletion_file_path};
 use lance_table::rowids::{RowIdSequence, write_row_ids};
 pub use schema_evolution::{
     BatchInfo, BatchUDF, ColumnAlteration, NewColumnTransform, UDFCheckpointStore,
@@ -177,6 +178,71 @@ pub(crate) const INDICES_DIR: &str = "_indices";
 pub(crate) const DATA_DIR: &str = "data";
 pub(crate) const TRANSACTIONS_DIR: &str = "_transactions";
 const DEFAULT_MAX_STREAM_COPY_PARALLELISM: usize = 4;
+
+pub(crate) fn deep_clone_blob_dir(base_id: Option<u32>, blob_dir: &str) -> String {
+    match base_id {
+        Some(base_id) => format!("_bri_base_{base_id}_{blob_dir}"),
+        None => format!("_bri_local_{blob_dir}"),
+    }
+}
+
+pub(crate) type BlobSourceKey = (Option<u32>, String);
+
+pub(crate) fn deep_clone_blob_dirs(manifest: &Manifest) -> HashMap<BlobSourceKey, String> {
+    let mut occupied = manifest
+        .fragments
+        .iter()
+        .flat_map(|fragment| fragment.referenced_lance_files())
+        .filter_map(|data_file| {
+            data_file
+                .path
+                .rsplit('/')
+                .next()
+                .and_then(|name| name.strip_suffix(".lance"))
+                .map(str::to_string)
+        })
+        .collect::<HashSet<_>>();
+    let mut blob_dirs = HashMap::new();
+    for data_file in manifest
+        .fragments
+        .iter()
+        .flat_map(|fragment| fragment.referenced_lance_files())
+    {
+        let Some(index) = &data_file.blob_reuse_index else {
+            continue;
+        };
+        for source in index.sources() {
+            let effective_base_id = source.base_id.or(data_file.base_id);
+            let key = (effective_base_id, source.blob_dir.clone());
+            if blob_dirs.contains_key(&key) {
+                continue;
+            }
+            let candidate = deep_clone_blob_dir(effective_base_id, &source.blob_dir);
+            let mut target = candidate.clone();
+            let mut suffix = 1_u32;
+            while !occupied.insert(target.clone()) {
+                target = format!("{candidate}_{suffix}");
+                suffix += 1;
+            }
+            blob_dirs.insert(key, target);
+        }
+    }
+    blob_dirs
+}
+
+fn field_contains_blob_v2(field: &lance_core::datatypes::Field) -> bool {
+    field.is_blob_v2() || field.children.iter().any(field_contains_blob_v2)
+}
+
+fn data_file_has_blob_v2(manifest: &Manifest, data_file: &DataFile) -> bool {
+    data_file.blob_reuse_index.is_some()
+        || data_file
+            .fields
+            .iter()
+            .filter(|field_id| **field_id >= 0)
+            .filter_map(|field_id| manifest.schema.field_by_id(*field_id))
+            .any(field_contains_blob_v2)
+}
 
 fn parse_deep_clone_stream_concurrency(value: &str) -> Result<usize> {
     value
@@ -3288,13 +3354,13 @@ impl Dataset {
     /// This copies all relevant dataset files (data files, deletion files, and
     /// index files) into the target dataset with bounded memory use.
     ///
-    /// The source files are read through this dataset's own object store while the
-    /// copies are written through the target object store built from `store_params`.
-    /// This makes the clone work across accounts/stores (e.g. between two abfss
-    /// accounts). Object-store files are streamed through this process by default;
-    /// `LANCE_IO_SERVER_SIDE_COPY_ENABLED` opts same-store copies into
-    /// provider-native copy operations. Cross-store copies continue to stream, and
-    /// local files retain their filesystem copy path.
+    /// Each source file is read through the object store for the base that owns it,
+    /// while copies are written through the target object store built from
+    /// `store_params`. This makes the clone work across accounts and stores.
+    /// Object-store files are streamed through this process by default;
+    /// `LANCE_IO_SERVER_SIDE_COPY_ENABLED` opts same-store copies into provider-native
+    /// copy operations. Cross-store copies continue to stream, and local files retain
+    /// their filesystem copy path.
     ///
     /// Parameters:
     /// - `target_path`: the URI string to clone the dataset into.
@@ -3302,10 +3368,9 @@ impl Dataset {
     /// - `store_params`: the object store params for the target dataset (e.g. the
     ///   credentials of the target account).
     ///
-    /// Note: external `base_paths` referenced by the source manifest are read through
-    /// this dataset's object store; per-base distinct source credentials are not yet
-    /// supported (see <https://github.com/lance-format/lance/issues/6093>).
-    /// Object-store streaming defaults to at most four concurrent file copies;
+    /// External `base_paths` use the per-base storage parameters supplied when the
+    /// source dataset was opened. Object-store streaming defaults to at most four
+    /// concurrent file copies;
     /// `LANCE_DEEP_CLONE_STREAM_CONCURRENCY` overrides that limit for this operation.
     pub async fn deep_clone(
         &mut self,
@@ -3351,8 +3416,9 @@ impl Dataset {
         let configured_io_parallelism = src_ds.object_store.io_parallelism();
         // Provider-native copy can fall back to streaming for large objects, so every
         // non-direct-local transfer stays within the bounded file-copy window.
-        let uses_streaming_copy = !(src_ds.object_store.has_direct_local_paths()
-            && target_store.has_direct_local_paths());
+        let uses_streaming_copy = src_paths.iter().any(|(source_store, _, _)| {
+            !(source_store.has_direct_local_paths() && target_store.has_direct_local_paths())
+        });
         let stream_copy_parallelism = match std::env::var("LANCE_DEEP_CLONE_STREAM_CONCURRENCY") {
             Ok(value) => Some(parse_deep_clone_stream_concurrency(&value)?),
             Err(std::env::VarError::NotPresent) => None,
@@ -3372,11 +3438,11 @@ impl Dataset {
         );
         let copy_futures = src_paths
             .iter()
-            .map(|(relative_path, base)| {
-                let source_store = Arc::clone(&src_ds.object_store);
+            .map(|(source_store, src_path, relative_path)| {
+                let source_store = Arc::clone(source_store);
                 let target_store = Arc::clone(&target_store);
-                let src_path = build_absolute_path(relative_path, base);
                 let target_path = build_absolute_path(relative_path, &target_base);
+                let src_path = src_path.clone();
                 async move {
                     source_store
                         .copy_bulk(&src_path, &target_store, &target_path)
@@ -3439,9 +3505,31 @@ impl Dataset {
         }
     }
 
-    /// Collect all (relative_path, path) of the dataset files.
-    async fn collect_paths(&self) -> Result<Vec<(String, Path)>> {
-        let mut file_paths: Vec<(String, Path)> = Vec::new();
+    /// Collect source paths and their target-relative paths for a deep clone.
+    async fn collect_paths(&self) -> Result<Vec<(Arc<ObjectStore>, Path, String)>> {
+        let mut file_paths = Vec::new();
+        let mut target_sources: HashMap<String, (String, String)> = HashMap::new();
+        let blob_dirs = deep_clone_blob_dirs(&self.manifest);
+        let mut push_path =
+            |source_store: Arc<ObjectStore>, source_path: Path, target_relative_path: String| {
+                let source_identity = (source_store.store_prefix.clone(), source_path.to_string());
+                if let Some(previous) = target_sources.get(&target_relative_path) {
+                    if previous != &source_identity {
+                        return Err(Error::invalid_input(format!(
+                            "Deep clone target path '{}' maps to both '{}:{}' and '{}:{}'",
+                            target_relative_path,
+                            previous.0,
+                            previous.1,
+                            source_identity.0,
+                            source_identity.1
+                        )));
+                    }
+                    return Ok(());
+                }
+                target_sources.insert(target_relative_path.clone(), source_identity);
+                file_paths.push((source_store, source_path, target_relative_path));
+                Ok(())
+            };
         for fragment in self.manifest.fragments.iter() {
             if let Some(RowIdMeta::External(external_file)) = &fragment.row_id_meta {
                 return Err(Error::internal(format!(
@@ -3450,34 +3538,89 @@ impl Dataset {
                 )));
             }
             for data_file in fragment.referenced_lance_files() {
-                let base_root = if let Some(base_id) = data_file.base_id {
-                    let base_path =
-                        self.manifest.base_paths.get(&base_id).ok_or_else(|| {
-                            Error::internal(format!("base_id {} not found", base_id))
-                        })?;
-                    Path::parse(base_path.path.as_str())?
-                } else {
-                    self.base.clone()
-                };
-                file_paths.push((
-                    format!("{}/{}", DATA_DIR, data_file.path.clone()),
-                    base_root,
-                ));
+                let data_store = self.object_store_for_data_file(data_file).await?;
+                let data_dir = self.data_file_dir_for_base(data_file.base_id)?;
+                push_path(
+                    data_store.clone(),
+                    data_dir.clone().join(data_file.path.as_str()),
+                    format!("{}/{}", DATA_DIR, data_file.path),
+                )?;
+
+                let data_file_key = data_file
+                    .path
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(data_file.path.as_str())
+                    .strip_suffix(".lance")
+                    .unwrap_or(data_file.path.as_str());
+                if data_file_has_blob_v2(&self.manifest, data_file) {
+                    let source_blob_dir = data_dir.join(data_file_key);
+                    let mut sidecars = data_store.read_dir_all(&source_blob_dir, None);
+                    loop {
+                        match sidecars.next().await {
+                            Some(Ok(meta)) => {
+                                let relative = Path::from_iter(
+                                    meta.location
+                                        .prefix_match(&source_blob_dir)
+                                        .ok_or_else(|| {
+                                            Error::internal(format!(
+                                                "Blob sidecar path '{}' is outside source directory '{}'",
+                                                meta.location, source_blob_dir
+                                            ))
+                                        })?,
+                                );
+                                push_path(
+                                    data_store.clone(),
+                                    meta.location,
+                                    Path::from_iter(
+                                        Path::from(DATA_DIR)
+                                            .join(data_file_key)
+                                            .parts()
+                                            .chain(relative.parts()),
+                                    )
+                                    .to_string(),
+                                )?;
+                            }
+                            Some(Err(error)) if error.is_not_found() => break,
+                            Some(Err(error)) => return Err(error),
+                            None => break,
+                        }
+                    }
+                }
+
+                if let Some(index) = &data_file.blob_reuse_index {
+                    for source in index.sources() {
+                        let effective_base_id = source.base_id.or(data_file.base_id);
+                        let source_store = self.object_store(effective_base_id).await?;
+                        let source_data_dir = self.data_file_dir_for_base(effective_base_id)?;
+                        let target_blob_dir = blob_dirs
+                            .get(&(effective_base_id, source.blob_dir.clone()))
+                            .ok_or_else(|| {
+                                Error::internal(format!(
+                                    "Missing deep clone target for BlobReuseIndex source {:?}:{}",
+                                    effective_base_id, source.blob_dir
+                                ))
+                            })?;
+                        for physical_id in &source.physical_ids {
+                            push_path(
+                                source_store.clone(),
+                                blob_path(&source_data_dir, &source.blob_dir, *physical_id),
+                                blob_path(&Path::from(DATA_DIR), target_blob_dir, *physical_id)
+                                    .to_string(),
+                            )?;
+                        }
+                    }
+                }
             }
             if let Some(deletion_file) = &fragment.deletion_file {
-                let base_root = if let Some(base_id) = deletion_file.base_id {
-                    let base_path =
-                        self.manifest.base_paths.get(&base_id).ok_or_else(|| {
-                            Error::internal(format!("base_id {} not found", base_id))
-                        })?;
-                    Path::parse(base_path.path.as_str())?
-                } else {
-                    self.base.clone()
-                };
-                file_paths.push((
-                    relative_deletion_file_path(fragment.id, deletion_file),
-                    base_root,
-                ));
+                let deletion_store = self.object_store_for_deletion(deletion_file).await?;
+                let base_root = self.dataset_dir_for_deletion(deletion_file)?;
+                let relative_path = relative_deletion_file_path(fragment.id, deletion_file);
+                push_path(
+                    deletion_store,
+                    deletion_file_path(&base_root, fragment.id, deletion_file),
+                    relative_path,
+                )?;
             }
         }
 
@@ -3489,27 +3632,16 @@ impl Dataset {
         .await?;
 
         for index in &indices {
-            let base_root = if let Some(base_id) = index.base_id {
-                let base_path = self
-                    .manifest
-                    .base_paths
-                    .get(&base_id)
-                    .ok_or_else(|| Error::internal(format!("base_id {} not found", base_id)))?;
-                Path::parse(base_path.path.as_str())?
-            } else {
-                self.base.clone()
-            };
-            let index_root = base_root
-                .clone()
-                .join(INDICES_DIR)
-                .join(index.uuid.to_string());
-            let mut stream = self.object_store.read_dir_all(&index_root, None);
+            let index_store = self.object_store_for_index(index).await?;
+            let index_root = self.indice_files_dir(index)?.join(index.uuid.to_string());
+            let mut stream = index_store.read_dir_all(&index_root, None);
             while let Some(meta) = stream.next().await.transpose()? {
-                if let Some(filename) = meta.location.filename() {
-                    file_paths.push((
+                if let Some(filename) = meta.location.filename().map(str::to_string) {
+                    push_path(
+                        index_store.clone(),
+                        meta.location,
                         format!("{}/{}/{}", INDICES_DIR, index.uuid, filename),
-                        base_root.clone(),
-                    ));
+                    )?;
                 }
             }
         }
