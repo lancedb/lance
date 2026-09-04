@@ -153,7 +153,7 @@ use lance_table::feature_flags::{
     apply_feature_flags, ensure_can_read_manifest, ensure_can_write_manifest,
     validate_paired_feature_flags,
 };
-use lance_table::io::deletion::{DELETIONS_DIR, relative_deletion_file_path};
+use lance_table::io::deletion::{DELETIONS_DIR, deletion_file_path, relative_deletion_file_path};
 use lance_table::rowids::{RowIdSequence, write_row_ids};
 pub use schema_evolution::{
     BatchInfo, BatchUDF, ColumnAlteration, NewColumnTransform, UDFCheckpointStore,
@@ -3618,7 +3618,7 @@ impl Dataset {
                 let relative_path = relative_deletion_file_path(fragment.id, deletion_file);
                 push_path(
                     deletion_store,
-                    base_root.join(relative_path.as_str()),
+                    deletion_file_path(&base_root, fragment.id, deletion_file),
                     relative_path,
                 )?;
             }
