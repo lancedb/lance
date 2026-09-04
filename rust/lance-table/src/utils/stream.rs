@@ -19,7 +19,7 @@ use lance_core::{
 use lance_io::ReadBatchParams;
 use tracing::instrument;
 
-use crate::rowids::RowIdSequence;
+use crate::rowids::{RowIdSequence, RowIdSequenceCursor};
 
 pub type ReadBatchFut = BoxFuture<'static, Result<RecordBatch>>;
 /// A task, emitted by a file reader, that will produce a batch (of the
@@ -257,11 +257,11 @@ fn apply_deletions_as_nulls(batch: RecordBatch, mask: &BooleanArray) -> Result<R
     )?)
 }
 
-/// Extract version values for a batch selection by binary-searching over
-/// precomputed RLE run offsets. Single-run fragments (the common case)
-/// take the O(1) fast path.
-fn version_values_for_selection(
+/// Extract version values for a batch selection with a reusable RLE cursor.
+/// Single-run fragments (the common case) take the O(1) fast path.
+fn version_values_for_selection_with_cursor(
     sequence: &crate::rowids::version::RowDatasetVersionSequence,
+    cursor: &mut crate::rowids::version::RowDatasetVersionCursor,
     params: &ReadBatchParams,
     batch_offset: u32,
     num_rows: u32,
@@ -277,34 +277,35 @@ fn version_values_for_selection(
     }
 
     let mut versions = Vec::with_capacity(num_rows as usize);
-    let run_offsets: Vec<usize> = sequence
-        .runs
-        .iter()
-        .scan(0usize, |acc, run| {
-            let start = *acc;
-            *acc += run.len();
-            Some(start)
-        })
-        .collect();
-    let total_len: usize = sequence.runs.iter().map(|r| r.len()).sum();
-
     for r in &selection {
-        for pos in r.start..r.end {
-            let pos = pos as usize;
-            if pos >= total_len {
-                return Err(lance_core::Error::internal(format!(
-                    "version column position {} out of range (total_len={})",
-                    pos, total_len
-                )));
-            }
-            let run_idx = match run_offsets.binary_search(&pos) {
-                Ok(idx) => idx,
-                Err(idx) => idx - 1,
-            };
-            versions.push(sequence.runs[run_idx].version());
-        }
+        cursor.extend_range(sequence, r.start as usize..r.end as usize, &mut versions)?;
     }
     Ok(versions)
+}
+
+fn version_values_for_selection(
+    sequence: &crate::rowids::version::RowDatasetVersionSequence,
+    params: &ReadBatchParams,
+    batch_offset: u32,
+    num_rows: u32,
+) -> Result<Vec<u64>> {
+    // Preserve the common direct-call path without constructing a cursor.
+    // Keep the selection validation in the same order as the general path.
+    let _selection = params
+        .slice(batch_offset as usize, num_rows as usize)
+        .unwrap()
+        .to_ranges()
+        .unwrap();
+    if sequence.runs.len() == 1 {
+        return Ok(vec![sequence.runs[0].version(); num_rows as usize]);
+    }
+    version_values_for_selection_with_cursor(
+        sequence,
+        &mut sequence.cursor(),
+        params,
+        batch_offset,
+        num_rows,
+    )
 }
 
 /// Configuration needed to apply row ids and deletions to a batch
@@ -351,17 +352,35 @@ pub fn apply_row_id_and_deletes(
     fragment_id: u32,
     config: &RowIdAndDeletesConfig,
 ) -> Result<RecordBatch> {
-    apply_row_id_and_deletes_with_row_ids(batch, batch_offset, fragment_id, config, None)
+    apply_row_id_and_deletes_with_system_columns(
+        batch,
+        batch_offset,
+        fragment_id,
+        config,
+        PrecomputedSystemColumns::default(),
+    )
+}
+
+#[derive(Default)]
+struct PrecomputedSystemColumns {
+    row_ids: Option<Arc<UInt64Array>>,
+    last_updated_versions: Option<Result<Arc<UInt64Array>>>,
+    created_versions: Option<Result<Arc<UInt64Array>>>,
 }
 
 #[instrument(name = "apply_row_id_and_deletes", level = "debug", skip_all)]
-fn apply_row_id_and_deletes_with_row_ids(
+fn apply_row_id_and_deletes_with_system_columns(
     batch: RecordBatch,
     batch_offset: u32,
     fragment_id: u32,
     config: &RowIdAndDeletesConfig,
-    precomputed_row_ids: Option<Arc<UInt64Array>>,
+    precomputed: PrecomputedSystemColumns,
 ) -> Result<RecordBatch> {
+    let PrecomputedSystemColumns {
+        row_ids: precomputed_row_ids,
+        last_updated_versions,
+        created_versions,
+    } = precomputed;
     let mut deletion_vector = config.deletion_vector.as_ref();
     // Convert Some(NoDeletions) into None to simplify logic below
     if let Some(deletion_vector_inner) = deletion_vector
@@ -454,7 +473,9 @@ fn apply_row_id_and_deletes_with_row_ids(
         let mut batch = batch;
 
         if config.with_row_last_updated_at_version {
-            let version_arr = if let Some(sequence) = &config.last_updated_at_sequence {
+            let version_arr = if let Some(version_arr) = last_updated_versions {
+                version_arr?
+            } else if let Some(sequence) = &config.last_updated_at_sequence {
                 Arc::new(UInt64Array::from(version_values_for_selection(
                     sequence,
                     &config.params,
@@ -470,7 +491,9 @@ fn apply_row_id_and_deletes_with_row_ids(
         }
 
         if config.with_row_created_at_version {
-            let version_arr = if let Some(sequence) = &config.created_at_sequence {
+            let version_arr = if let Some(version_arr) = created_versions {
+                version_arr?
+            } else if let Some(sequence) = &config.created_at_sequence {
                 Arc::new(UInt64Array::from(version_values_for_selection(
                     sequence,
                     &config.params,
@@ -506,11 +529,38 @@ pub fn wrap_with_row_id_and_delete(
     fragment_id: u32,
     config: RowIdAndDeletesConfig,
 ) -> ReadBatchFutStream {
-    let config = Arc::new(config);
-    let mut row_id_cursor = config
+    let (row_id_cursor, use_dense_row_id_expansion) = config
         .row_id_sequence
         .as_ref()
         .filter(|_| config.with_row_id)
+        .map(|sequence| {
+            let (cursor, use_dense_range_expansion) = sequence.cursor_with_dense_range_expansion();
+            (Some(cursor), use_dense_range_expansion)
+        })
+        .unwrap_or((None, false));
+    if use_dense_row_id_expansion {
+        wrap_with_row_id_and_delete_impl::<true>(stream, fragment_id, config, row_id_cursor)
+    } else {
+        wrap_with_row_id_and_delete_impl::<false>(stream, fragment_id, config, row_id_cursor)
+    }
+}
+
+fn wrap_with_row_id_and_delete_impl<const USE_DENSE_ROW_ID_EXPANSION: bool>(
+    stream: ReadBatchTaskStream,
+    fragment_id: u32,
+    config: RowIdAndDeletesConfig,
+    mut row_id_cursor: Option<RowIdSequenceCursor>,
+) -> ReadBatchFutStream {
+    let config = Arc::new(config);
+    let mut last_updated_cursor = config
+        .last_updated_at_sequence
+        .as_ref()
+        .filter(|sequence| config.with_row_last_updated_at_version && sequence.runs.len() > 1)
+        .map(|sequence| sequence.cursor());
+    let mut created_cursor = config
+        .created_at_sequence
+        .as_ref()
+        .filter(|sequence| config.with_row_created_at_version && sequence.runs.len() > 1)
         .map(|sequence| sequence.cursor());
     let mut offset = 0;
     stream
@@ -532,6 +582,12 @@ pub fn wrap_with_row_id_and_delete(
                         .to_ranges()
                         .unwrap();
                     let values = match selection.as_slice() {
+                        [range] if USE_DENSE_ROW_ID_EXPANSION => {
+                            UInt64Array::from(sequence.select_dense_range_with_cursor(
+                                cursor,
+                                range.start as usize..range.end as usize,
+                            ))
+                        }
                         [range] => UInt64Array::from(sequence.select_range_with_cursor(
                             cursor,
                             range.start as usize..range.end as usize,
@@ -559,15 +615,49 @@ pub fn wrap_with_row_id_and_delete(
                     Ok(Arc::new(values))
                 })
             });
+            let last_updated_versions =
+                config
+                    .last_updated_at_sequence
+                    .as_ref()
+                    .and_then(|sequence| {
+                        last_updated_cursor.as_mut().map(|cursor| {
+                            version_values_for_selection_with_cursor(
+                                sequence,
+                                cursor,
+                                &config.params,
+                                this_offset,
+                                num_rows,
+                            )
+                            .map(UInt64Array::from)
+                            .map(Arc::new)
+                        })
+                    });
+            let created_versions = config.created_at_sequence.as_ref().and_then(|sequence| {
+                created_cursor.as_mut().map(|cursor| {
+                    version_values_for_selection_with_cursor(
+                        sequence,
+                        cursor,
+                        &config.params,
+                        this_offset,
+                        num_rows,
+                    )
+                    .map(UInt64Array::from)
+                    .map(Arc::new)
+                })
+            });
             batch_task
                 .task
                 .map(move |batch| {
-                    apply_row_id_and_deletes_with_row_ids(
+                    apply_row_id_and_deletes_with_system_columns(
                         batch?,
                         this_offset,
                         fragment_id,
                         config.as_ref(),
-                        row_ids.transpose()?,
+                        PrecomputedSystemColumns {
+                            row_ids: row_ids.transpose()?,
+                            last_updated_versions,
+                            created_versions,
+                        },
                     )
                 })
                 .boxed()
@@ -1138,20 +1228,37 @@ mod tests {
         use crate::rowids::segment::U64Segment;
         use crate::rowids::version::{RowDatasetVersionRun, RowDatasetVersionSequence};
 
-        // 3 runs: 0..40 v1, 40..70 v2, 70..100 v3
-        let seq = Arc::new(RowDatasetVersionSequence {
+        // Exercise the worst-case created-at shape: one run per row.
+        let created_seq = Arc::new(RowDatasetVersionSequence {
+            runs: (0..100)
+                .map(|position| RowDatasetVersionRun {
+                    span: U64Segment::Range(position..position + 1),
+                    version: 1_000 + position,
+                })
+                .collect(),
+        });
+        // Also exercise irregular boundaries for last-updated-at.
+        let last_updated_seq = Arc::new(RowDatasetVersionSequence {
             runs: vec![
                 RowDatasetVersionRun {
-                    span: U64Segment::Range(0..40),
-                    version: 1,
+                    span: U64Segment::Range(0..7),
+                    version: 11,
                 },
                 RowDatasetVersionRun {
-                    span: U64Segment::Range(40..70),
-                    version: 2,
+                    span: U64Segment::Range(7..20),
+                    version: 22,
                 },
                 RowDatasetVersionRun {
-                    span: U64Segment::Range(70..100),
-                    version: 3,
+                    span: U64Segment::Range(20..21),
+                    version: 33,
+                },
+                RowDatasetVersionRun {
+                    span: U64Segment::Range(21..50),
+                    version: 44,
+                },
+                RowDatasetVersionRun {
+                    span: U64Segment::Range(50..100),
+                    version: 55,
                 },
             ],
         });
@@ -1172,18 +1279,18 @@ mod tests {
             params: ReadBatchParams::RangeFull,
             with_row_id: true,
             with_row_addr: false,
-            with_row_last_updated_at_version: false,
+            with_row_last_updated_at_version: true,
             with_row_created_at_version: true,
             deletion_vector: Some(Arc::new(DeletionVector::Bitmap(deletions))),
             row_id_sequence: None,
-            last_updated_at_sequence: None,
-            created_at_sequence: Some(seq),
+            last_updated_at_sequence: Some(last_updated_seq),
+            created_at_sequence: Some(created_seq),
             make_deletions_null: false,
             total_num_rows: 100,
         };
         let stream = super::wrap_with_row_id_and_delete(data, 0, config);
         let batches: Vec<_> = stream
-            .buffered(1)
+            .buffered(8)
             .try_filter(|b| std::future::ready(b.num_rows() > 0))
             .try_collect()
             .await
@@ -1192,7 +1299,7 @@ mod tests {
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 60);
 
-        let all_versions: Vec<u64> = batches
+        let created_versions: Vec<u64> = batches
             .iter()
             .flat_map(|b| {
                 b.column_by_name("_row_created_at_version")
@@ -1202,9 +1309,129 @@ mod tests {
                     .to_vec()
             })
             .collect();
+        let last_updated_versions: Vec<u64> = batches
+            .iter()
+            .flat_map(|b| {
+                b.column_by_name("_row_last_updated_at_version")
+                    .unwrap()
+                    .as_primitive::<UInt64Type>()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        let surviving_positions: Vec<u64> = (20..60).chain(80..100).collect();
+        let expected_created: Vec<u64> = surviving_positions
+            .iter()
+            .map(|position| 1_000 + position)
+            .collect();
+        let expected_last_updated: Vec<u64> = surviving_positions
+            .iter()
+            .map(|position| match position {
+                0..=6 => 11,
+                7..=19 => 22,
+                20 => 33,
+                21..=49 => 44,
+                _ => 55,
+            })
+            .collect();
 
-        assert!(all_versions[..20].iter().all(|&v| v == 1));
-        assert!(all_versions[20..40].iter().all(|&v| v == 2));
-        assert!(all_versions[40..60].iter().all(|&v| v == 3));
+        assert_eq!(created_versions, expected_created);
+        assert_eq!(last_updated_versions, expected_last_updated);
+    }
+
+    #[tokio::test]
+    async fn test_version_column_with_unsorted_indices_across_batches() {
+        use crate::rowids::segment::U64Segment;
+        use crate::rowids::version::{RowDatasetVersionRun, RowDatasetVersionSequence};
+
+        let sequence = Arc::new(RowDatasetVersionSequence {
+            runs: (0..10)
+                .map(|position| RowDatasetVersionRun {
+                    span: U64Segment::Range(position..position + 1),
+                    version: 100 + position,
+                })
+                .collect(),
+        });
+        let indices = UInt32Array::from(vec![8, 2, 9, 1, 6]);
+        let batches = [2, 2, 1].into_iter().map(|num_rows| ReadBatchTask {
+            num_rows,
+            task: std::future::ready(Ok(arrow_array::record_batch!((
+                "x",
+                Int32,
+                vec![0; num_rows as usize]
+            ))
+            .unwrap()))
+            .boxed(),
+        });
+        let config = RowIdAndDeletesConfig {
+            params: ReadBatchParams::Indices(indices.clone()),
+            with_row_id: false,
+            with_row_addr: false,
+            with_row_last_updated_at_version: true,
+            with_row_created_at_version: false,
+            deletion_vector: None,
+            row_id_sequence: None,
+            last_updated_at_sequence: Some(sequence),
+            created_at_sequence: None,
+            make_deletions_null: false,
+            total_num_rows: 10,
+        };
+
+        let actual = super::wrap_with_row_id_and_delete(stream::iter(batches).boxed(), 0, config)
+            .buffered(3)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .iter()
+            .flat_map(|batch| {
+                batch["_row_last_updated_at_version"]
+                    .as_primitive::<UInt64Type>()
+                    .values()
+            })
+            .copied()
+            .collect::<Vec<_>>();
+        let expected = indices
+            .values()
+            .iter()
+            .map(|position| 100 + u64::from(*position))
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_apply_version_column_direct_call_fallback() {
+        use crate::rowids::segment::U64Segment;
+        use crate::rowids::version::{RowDatasetVersionRun, RowDatasetVersionSequence};
+
+        let sequence = Arc::new(RowDatasetVersionSequence {
+            runs: (0..5)
+                .map(|position| RowDatasetVersionRun {
+                    span: U64Segment::Range(position..position + 1),
+                    version: 10 + position,
+                })
+                .collect(),
+        });
+        let config = RowIdAndDeletesConfig {
+            params: ReadBatchParams::Indices(UInt32Array::from(vec![4, 1, 3])),
+            with_row_id: false,
+            with_row_addr: false,
+            with_row_last_updated_at_version: true,
+            with_row_created_at_version: false,
+            deletion_vector: None,
+            row_id_sequence: None,
+            last_updated_at_sequence: Some(sequence),
+            created_at_sequence: None,
+            make_deletions_null: false,
+            total_num_rows: 5,
+        };
+        let batch = arrow_array::record_batch!(("x", Int32, vec![0; 3])).unwrap();
+
+        let actual = super::apply_row_id_and_deletes(batch, 0, 0, &config).unwrap();
+        assert_eq!(
+            actual["_row_last_updated_at_version"]
+                .as_primitive::<UInt64Type>()
+                .values(),
+            &[14, 11, 13]
+        );
     }
 }

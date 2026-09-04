@@ -40,8 +40,9 @@ use num_traits::AsPrimitive;
 use prost::Message;
 use serde::{Deserialize, Serialize};
 
-use crate::frag_reuse::FragReuseIndex;
+use crate::frag_reuse::{FragReuseIndex, FragReuseIndexHandle};
 use crate::pb;
+use crate::scalar::RowIdRemapper;
 use crate::vector::ApproxMode;
 use crate::vector::bq::dist_table_quant::{
     DistTableDequant, quantize_dist_table_into, quantize_dist_table_u16_into,
@@ -2391,13 +2392,10 @@ pub fn unpack_codes(codes: &FixedSizeListArray) -> FixedSizeListArray {
 /// to `Some(new_id)` for surviving rows or `None` for rows whose covering
 /// fragment was compacted away, suitable for `RabitQuantizationStorage::remap`.
 fn build_frag_reuse_mapping(
-    fri: Option<&FragReuseIndex>,
+    fri: Option<&dyn RowIdRemapper>,
     row_ids: &UInt64Array,
 ) -> Option<HashMap<u64, Option<u64>>> {
     let fri = fri?;
-    if fri.row_id_maps.is_empty() {
-        return None;
-    }
     let mut mapping: HashMap<u64, Option<u64>> = HashMap::new();
     for row_id in row_ids.values().iter() {
         match fri.remap_row_id(*row_id) {
@@ -2423,6 +2421,16 @@ impl QuantizerStorage for RabitQuantizationStorage {
         metadata: &Self::Metadata,
         distance_type: DistanceType,
         fri: Option<Arc<FragReuseIndex>>,
+    ) -> Result<Self> {
+        let fri = fri.map(|index| Arc::new(FragReuseIndexHandle(index)) as Arc<dyn RowIdRemapper>);
+        Self::try_from_batch_with_remapper(batch, metadata, distance_type, fri)
+    }
+
+    fn try_from_batch_with_remapper(
+        batch: RecordBatch,
+        metadata: &Self::Metadata,
+        distance_type: DistanceType,
+        fri: Option<Arc<dyn RowIdRemapper>>,
     ) -> Result<Self> {
         let distance_type = match (metadata.query_estimator, distance_type) {
             (RabitQueryEstimator::RawQuery, DistanceType::Cosine) => DistanceType::L2,

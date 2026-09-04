@@ -2095,6 +2095,32 @@ mod tests {
         .await
     }
 
+    async fn scan_sorted_ids(dataset: &Dataset) -> Vec<i32> {
+        let batches = dataset
+            .scan()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let mut ids: Vec<i32> = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column_by_name("id")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
     #[test]
     fn test_auto_cleanup_disabled_by_default() {
         // Auto-cleanup must be off by default: the cleanup hook is expensive on
@@ -3174,7 +3200,7 @@ mod tests {
         use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
 
         // Create dataset with multi-base configuration
-        let test_uri = "memory://multi_base_test";
+        let test_uri = "shared-memory://multi_base_test";
         let primary_uri = format!("{}/primary", test_uri);
         let base1_uri = format!("{}/base1", test_uri);
         let base2_uri = format!("{}/base2", test_uri);
@@ -3240,6 +3266,10 @@ mod tests {
                     .any(|file| file.base_id == Some(1))
             );
         }
+
+        assert_eq!(scan_sorted_ids(&dataset).await, (0..5).collect::<Vec<_>>());
+        let reopened = Dataset::open(&primary_uri).await.unwrap();
+        assert_eq!(scan_sorted_ids(&reopened).await, (0..5).collect::<Vec<_>>());
 
         // Test validation: cannot specify both target_bases and target_base_names_or_paths
         let mut data_gen2 =
@@ -3351,7 +3381,7 @@ mod tests {
         use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
 
         // Create initial dataset
-        let test_uri = "memory://overwrite_test";
+        let test_uri = "shared-memory://overwrite_test";
         let primary_uri = format!("{}/primary", test_uri);
         let base1_uri = format!("{}/base1", test_uri);
         let base2_uri = format!("{}/base2", test_uri);
@@ -3434,6 +3464,9 @@ mod tests {
                 .all(|f| f.metadata.files.iter().all(|file| file.base_id == Some(2)))
         );
 
+        let reopened = Dataset::open(&primary_uri).await.unwrap();
+        assert_eq!(scan_sorted_ids(&reopened).await, (0..2).collect::<Vec<_>>());
+
         // Test validation: cannot specify initial_bases in OVERWRITE mode
         let mut data_gen3 =
             BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("id".to_owned())));
@@ -3469,7 +3502,7 @@ mod tests {
         use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
 
         // Create initial dataset with multi-base configuration
-        let test_uri = "memory://append_test";
+        let test_uri = "shared-memory://append_test";
         let primary_uri = format!("{}/primary", test_uri);
         let base1_uri = format!("{}/base1", test_uri);
         let base2_uri = format!("{}/base2", test_uri);
@@ -3555,6 +3588,11 @@ mod tests {
 
         assert!(has_base1_data, "Should have data in base1");
         assert!(has_base2_data, "Should have data in base2");
+
+        let mut expected: Vec<i32> = (0..3).chain(0..2).chain(0..4).collect();
+        expected.sort_unstable();
+        let reopened = Dataset::open(&primary_uri).await.unwrap();
+        assert_eq!(scan_sorted_ids(&reopened).await, expected);
 
         // Test validation: cannot specify initial_bases in APPEND mode
         let mut data_gen4 =
@@ -4632,7 +4670,7 @@ mod tests {
     async fn test_multi_base_target_primary_and_bases() {
         use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
 
-        let test_uri = "memory://primary_slot_test";
+        let test_uri = "shared-memory://primary_slot_test";
         let primary_uri = format!("{}/primary", test_uri);
         let base1_uri = format!("{}/base1", test_uri);
         let base2_uri = format!("{}/base2", test_uri);
@@ -4724,6 +4762,11 @@ mod tests {
         assert_eq!(file_bases, vec![None, Some(2)]);
 
         assert_eq!(dataset.count_rows(None).await.unwrap(), 21);
+
+        let mut expected: Vec<i32> = (0..6).chain(0..9).chain(0..6).collect();
+        expected.sort_unstable();
+        let reopened = Dataset::open(&primary_uri).await.unwrap();
+        assert_eq!(scan_sorted_ids(&reopened).await, expected);
     }
 
     /// `target_all_bases` resolves to every registered base at execution
@@ -4732,7 +4775,7 @@ mod tests {
     async fn test_multi_base_target_all_bases() {
         use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
 
-        let test_uri = "memory://all_bases_test";
+        let test_uri = "shared-memory://all_bases_test";
         let primary_uri = format!("{}/primary", test_uri);
         let base1_uri = format!("{}/base1", test_uri);
         let base2_uri = format!("{}/base2", test_uri);
@@ -4814,6 +4857,11 @@ mod tests {
             .collect();
         assert_eq!(file_bases, vec![Some(1), Some(2)]);
 
+        let mut expected: Vec<i32> = (0..3).chain(0..9).chain(0..6).collect();
+        expected.sort_unstable();
+        let reopened = Dataset::open(&primary_uri).await.unwrap();
+        assert_eq!(scan_sorted_ids(&reopened).await, expected);
+
         // Cannot be combined with explicit target bases.
         let mut data_gen4 =
             BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("id".to_owned())));
@@ -4839,7 +4887,7 @@ mod tests {
 
         // On a dataset with no registered bases: include_primary=true is a
         // no-op rotation over primary, false is rejected.
-        let plain_uri = "memory://all_bases_plain";
+        let plain_uri = "shared-memory://all_bases_plain/primary";
         let mut data_gen5 =
             BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("id".to_owned())));
         let plain = Dataset::write(data_gen5.batch(3), plain_uri, None)
@@ -4890,12 +4938,13 @@ mod tests {
 
         // CREATE mode: initial_bases join the rotation before their ids are
         // committed to a manifest.
-        let create_uri = "memory://all_bases_create";
+        let create_root = "shared-memory://all_bases_create";
+        let create_uri = format!("{}/primary", create_root);
         let mut data_gen8 =
             BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("id".to_owned())));
         let dataset = Dataset::write(
             data_gen8.batch(9),
-            create_uri,
+            &create_uri,
             Some(
                 WriteParams {
                     mode: WriteMode::Create,
@@ -4905,13 +4954,13 @@ mod tests {
                             id: 0,
                             name: Some("base1".to_string()),
                             is_dataset_root: true,
-                            path: format!("{}/base1", create_uri),
+                            path: format!("{}/base1", create_root),
                         },
                         BasePath {
                             id: 0,
                             name: Some("base2".to_string()),
                             is_dataset_root: false,
-                            path: format!("{}/base2", create_uri),
+                            path: format!("{}/base2", create_root),
                         },
                     ]),
                     ..Default::default()
@@ -4928,6 +4977,8 @@ mod tests {
             .flat_map(|f| f.metadata.files.iter().map(|file| file.base_id))
             .collect();
         assert_eq!(file_bases, vec![None, Some(1), Some(2)]);
+        let reopened = Dataset::open(&create_uri).await.unwrap();
+        assert_eq!(scan_sorted_ids(&reopened).await, (0..9).collect::<Vec<_>>());
     }
 
     #[tokio::test]
