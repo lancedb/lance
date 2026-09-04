@@ -31,7 +31,7 @@ use super::{
     tokenizer::document_tokenizer::TextTokenizer,
     wand::{
         FLAT_SEARCH_PERCENT_THRESHOLD, LegacyWandDocuments, ModernWandDocuments, PostingIterator,
-        WandCursor, WandDocuments, score_sum_upper_bound_factor,
+        WandCursor, WandDocuments, outward_f32_upper_bound, score_sum_upper_bound_factor,
     },
 };
 use crate::{metrics::MetricsCollector, prefilter::PreFilter};
@@ -2844,32 +2844,45 @@ impl ComposableScorer for RequiredConjunctionScorer<'_> {
         // Block-max MAXSCORE for a conjunction: the document score is the sum of
         // every MUST child, so the full floor cannot be pushed to one child (a
         // child scoring below the floor may still be part of a competitive sum).
-        // Instead give child i a floor of `min_score - sum(other children's
-        // score upper bounds)`: child i's block is only skipped when even the
-        // best possible contribution from every other MUST term cannot lift the
-        // sum to the floor, so no competitive document is ever pruned.
+        // Instead give child i a floor of `min_score - upper(sum of the OTHER
+        // children)`: child i's block is only skipped when even the best possible
+        // contribution from every other MUST term cannot lift the sum to the
+        // floor, so no competitive document is ever pruned.
         //
-        // Requires non-negative scores and a finite upper bound per child so the
-        // subtraction is a sound lower bound on the "rest of the sum". Otherwise
-        // fall back to leaving the floor unset (the previous safe behavior).
-        let Some(total_upper) = self
-            .scores_non_negative()
-            .then(|| sum_global_score_upper_bounds(&self.children))
-            .flatten()
-        else {
+        // Requires non-negative scores and a finite upper bound per child.
+        // Otherwise fall back to leaving the floor unset (previous safe behavior).
+        if !self.scores_non_negative() {
             return Ok(());
-        };
-        for index in 0..self.children.len() {
-            let Some(child_upper) = self.children[index].global_score_upper_bound() else {
-                continue;
+        }
+        let mut uppers = Vec::with_capacity(self.children.len());
+        for child in &self.children {
+            let Some(upper) = child.global_score_upper_bound() else {
+                return Ok(());
             };
-            // Upper bound on the sum of the *other* children.
-            let others_upper = total_upper - child_upper;
-            if !others_upper.is_finite() || others_upper < 0.0 {
+            if !upper.is_finite() || upper < 0.0 {
+                return Ok(());
+            }
+            uppers.push(upper);
+        }
+        // Widening factor for accumulating (n-1) f32 upper bounds in the sum.
+        let factor = score_sum_upper_bound_factor(uppers.len().saturating_sub(1));
+        for index in 0..self.children.len() {
+            // Provably conservative upper bound on the sum of the *other*
+            // children: accumulate in f64, widen by the relative-error factor,
+            // then round outward to f32. This only ever over-estimates, so the
+            // derived child floor only ever under-prunes — a document whose total
+            // equals the inclusive top-k floor is never skipped.
+            let others_sum: f64 = uppers
+                .iter()
+                .enumerate()
+                .filter(|&(other, _)| other != index)
+                .map(|(_, &upper)| f64::from(upper))
+                .sum();
+            let others_upper = outward_f32_upper_bound(others_sum * factor);
+            if !others_upper.is_finite() {
                 continue;
             }
-            // Round the floor down so float error can only under-prune.
-            let child_floor = next_down(min_score - others_upper);
+            let child_floor = min_score - others_upper;
             self.children[index].set_min_competitive_score(child_floor)?;
         }
         Ok(())
@@ -5721,6 +5734,30 @@ mod tests {
 
         // All four docs survive — none wrongly pruned by left's sub-floor score.
         assert_eq!(results, rows(&[(0, 21.0), (1, 21.0), (2, 21.0), (3, 21.0)]));
+    }
+
+    // Float-tie boundary: the per-child "others" bound must be a conservative
+    // sum, not a subtraction from a widened total (which can round one ULP low
+    // and skip a document whose total equals the inclusive floor). doc 0's total
+    // equals the floor and must survive.
+    #[test]
+    fn required_conjunction_keeps_four_child_floor_tie() {
+        let actual = [0x4aff_1bae, 0x747e_bd1a, 0x77c5_238e, 0x7ea5_d7e9].map(f32::from_bits);
+        let global = [0x4aff_1bae, 0x7613_0e5d, 0x77c5_238e, 0x7ea5_d7e9].map(f32::from_bits);
+        let children = (0..actual.len())
+            .map(|i| {
+                Box::new(
+                    MaterializedScorer::try_new(rows(&[(0, actual[i]), (1, global[i])]))
+                        .unwrap()
+                        .with_block_size(1),
+                ) as BoxScorer<'_>
+            })
+            .collect();
+        let mut scorer = RequiredConjunctionScorer::try_new(children).unwrap();
+        let floor = actual.into_iter().fold(0.0_f32, |sum, score| sum + score);
+
+        scorer.set_min_competitive_score(floor).unwrap();
+        assert_eq!(scorer.next().unwrap(), Some(0));
     }
 
     #[test]
