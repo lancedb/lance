@@ -88,6 +88,9 @@ pub enum Operation {
         rewritten_indices: Vec<RewrittenIndex>,
         /// The fragment reuse index to be created or updated to
         frag_reuse_index: Option<IndexMetadata>,
+        /// Prepared stable-partition mapping, appended atomically to the manifest.
+        /// None retains the existing order-preserving compaction semantics.
+        stable_partition: Option<Box<crate::format::StablePartitionTransition>>,
     },
     /// Replace data in a column in the dataset with new data. This is used for
     /// null column population where we replace an entirely null column with a

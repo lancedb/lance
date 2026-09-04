@@ -2225,6 +2225,11 @@ impl Dataset {
         self.base.clone().join(INDICES_DIR)
     }
 
+    /// Directory containing immutable stable-partition row maps.
+    pub fn row_maps_dir(&self) -> Path {
+        self.base.clone().join(lance_table::format::ROW_MAPS_DIR)
+    }
+
     pub fn transactions_dir(&self) -> Path {
         self.base.clone().join(TRANSACTIONS_DIR)
     }
@@ -3318,6 +3323,11 @@ impl Dataset {
         // Resolve source dataset and its manifest using checkout_version
         let src_ds = self.checkout_version(version).await?;
         ensure_can_write_manifest(&src_ds.manifest)?;
+        if !src_ds.manifest.stable_partition_transitions.is_empty() {
+            return Err(Error::not_supported(
+                "cloning datasets with stable-partition mappings is not yet supported",
+            ));
+        }
         let src_paths = src_ds.collect_paths().await?;
 
         // Prepare target object store and base path

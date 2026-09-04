@@ -45,6 +45,10 @@ use roaring::RoaringBitmap;
 /// [`compact_files`]: crate::dataset::optimize::compact_files
 /// [`remap_column_index`]: crate::dataset::optimize::remapping::remap_column_index
 pub async fn cleanup_frag_reuse_index(dataset: &mut Dataset) -> lance_core::Result<()> {
+    if !dataset.manifest.stable_partition_transitions.is_empty() {
+        log::debug!("retaining FRI V1 history required by stable-partition transitions");
+        return Ok(());
+    }
     // check against index metadata before auto-remap
     let indices = read_manifest_indexes(
         &dataset.object_store,

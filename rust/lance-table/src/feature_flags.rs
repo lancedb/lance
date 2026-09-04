@@ -55,9 +55,11 @@ pub const FLAG_COVERED_INDEX_METADATA: u64 = 1 << 7;
 pub const FLAG_MIXED_DATA_FILE_VERSIONS: u64 = 1 << 8;
 /// The first bit that is unknown as a feature flag
 pub const FLAG_UNKNOWN: u64 = 1 << 8;
+/// Experimental immutable stable-partition mappings composed with FRI V1.
+pub const FLAG_STABLE_PARTITION: u64 = 1 << 9;
 
-// Supported flags stay below the unknown boundary; the mixed-version bit is
-// reserved at the boundary until its storage contract lands.
+// The mixed-version bit remains reserved at the unknown boundary. Stable
+// partitions are supported explicitly above it without enabling that bit.
 const _: () = assert!(FLAG_COVERED_INDEX_METADATA < FLAG_UNKNOWN);
 // The fence needs a bit the current released build already refuses, which means
 // at or above the boundary that build shipped with (bit 7).
@@ -84,6 +86,8 @@ pub fn apply_feature_flags(
     let covered_index_metadata = (manifest.reader_feature_flags | manifest.writer_feature_flags)
         & FLAG_COVERED_INDEX_METADATA;
     let sticky_paired_flags = validated_sticky_paired_flags(manifest)?;
+
+    let stable_partition = !manifest.stable_partition_transitions.is_empty();
 
     // Reset flags
     manifest.reader_feature_flags = 0;
@@ -143,6 +147,10 @@ pub fn apply_feature_flags(
         manifest.writer_feature_flags |= FLAG_DISABLE_TRANSACTION_FILE;
     }
 
+    if stable_partition {
+        manifest.reader_feature_flags |= FLAG_STABLE_PARTITION;
+        manifest.writer_feature_flags |= FLAG_STABLE_PARTITION;
+    }
     manifest.reader_feature_flags |= covered_index_metadata;
     manifest.writer_feature_flags |= covered_index_metadata;
     manifest.reader_feature_flags |= sticky_paired_flags;
@@ -187,7 +195,7 @@ fn mark_supported(flags: &mut u64, flag: u64, feature_enabled: bool) {
 /// is enabled. Split out from [`supported_flags`] so the policy is testable
 /// without toggling the build profile or environment.
 fn supported_flags_when(overlay_enabled: bool) -> u64 {
-    let mut supported = FLAG_UNKNOWN - 1;
+    let mut supported = (FLAG_UNKNOWN - 1) | FLAG_STABLE_PARTITION;
     mark_supported(
         &mut supported,
         FLAG_UNSTABLE_DATA_OVERLAY_FILES,
@@ -211,6 +219,16 @@ pub fn can_write_dataset(writer_flags: u64) -> bool {
 /// Refuse reads from manifests whose required reader features this build does
 /// not support or whose paired capabilities are inconsistent.
 pub fn ensure_can_read_manifest(manifest: &Manifest) -> Result<()> {
+    if !manifest.stable_partition_transitions.is_empty()
+        && (manifest.reader_feature_flags & FLAG_STABLE_PARTITION == 0
+            || manifest.writer_feature_flags & FLAG_STABLE_PARTITION == 0)
+    {
+        return Err(Error::corrupt_file_named(
+            "manifest",
+            "stable-partition transitions require both reader and writer capability flags",
+        ));
+    }
+
     validate_paired_feature_flags(manifest)?;
     if !can_read_dataset(manifest.reader_feature_flags) {
         return Err(Error::not_supported_source(
@@ -228,6 +246,16 @@ pub fn ensure_can_read_manifest(manifest: &Manifest) -> Result<()> {
 /// Refuse writes to manifests whose required writer features this build does
 /// not support or whose paired capabilities are inconsistent.
 pub fn ensure_can_write_manifest(manifest: &Manifest) -> Result<()> {
+    if !manifest.stable_partition_transitions.is_empty()
+        && (manifest.reader_feature_flags & FLAG_STABLE_PARTITION == 0
+            || manifest.writer_feature_flags & FLAG_STABLE_PARTITION == 0)
+    {
+        return Err(Error::corrupt_file_named(
+            "manifest",
+            "stable-partition transitions require both reader and writer capability flags",
+        ));
+    }
+
     validate_paired_feature_flags(manifest)?;
     if !can_write_dataset(manifest.writer_feature_flags) {
         return Err(Error::not_supported_source(
@@ -523,6 +551,54 @@ mod tests {
         let err = ensure_can_write_manifest(&manifest).unwrap_err();
         assert!(matches!(err, Error::NotSupported { .. }));
         assert!(err.to_string().contains("cannot be written"), "{err}");
+    }
+
+    #[test]
+    fn stable_partition_flags_survive_manifest_derivation() {
+        use crate::format::StablePartitionTransition;
+        use crate::system_index::frag_reuse::FragDigest;
+        use std::sync::Arc;
+
+        let mut manifest = empty_manifest();
+        Arc::make_mut(&mut manifest.stable_partition_transitions).push(StablePartitionTransition {
+            source_dataset_version: 1,
+            sources: vec![FragDigest {
+                id: 0,
+                physical_rows: 1,
+                num_deleted_rows: 0,
+            }],
+            destinations: vec![FragDigest {
+                id: 1,
+                physical_rows: 1,
+                num_deleted_rows: 0,
+            }],
+            row_map_id: uuid::Uuid::new_v4(),
+            row_map_size_bytes: 100,
+            base_id: None,
+            committed_version: 2,
+        });
+        let error = ensure_can_read_manifest(&manifest).unwrap_err();
+        assert!(matches!(error, Error::CorruptFile { .. }));
+        assert!(error.to_string().contains("both reader and writer"));
+        apply_feature_flags(&mut manifest, false, false).unwrap();
+        assert_eq!(manifest.reader_feature_flags, FLAG_STABLE_PARTITION);
+        assert_eq!(manifest.writer_feature_flags, FLAG_STABLE_PARTITION);
+        ensure_can_read_manifest(&manifest).unwrap();
+        ensure_can_write_manifest(&manifest).unwrap();
+        let next = Manifest::new_from_previous(
+            &manifest,
+            manifest.schema.clone(),
+            manifest.fragments.clone(),
+        );
+        ensure_can_read_manifest(&next).unwrap();
+        ensure_can_write_manifest(&next).unwrap();
+        assert_eq!(
+            next.stable_partition_transitions,
+            manifest.stable_partition_transitions
+        );
+        // Released readers reject bit 9; reserved bit 8 stays unsupported here.
+        assert_ne!(FLAG_STABLE_PARTITION & !(FLAG_UNKNOWN - 1), 0);
+        assert!(!can_read_dataset(FLAG_MIXED_DATA_FILE_VERSIONS));
     }
 
     fn empty_manifest() -> Manifest {

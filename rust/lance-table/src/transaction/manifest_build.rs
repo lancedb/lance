@@ -52,6 +52,99 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 impl Transaction {
+    fn validate_stable_partition(
+        groups: &[crate::transaction::RewriteGroup],
+        transition: &crate::format::StablePartitionTransition,
+        current: Option<&Manifest>,
+        read_version: u64,
+    ) -> Result<()> {
+        transition.validate()?;
+        if transition.source_dataset_version != read_version || transition.committed_version != 0 {
+            return Err(Error::invalid_input(
+                "stable partition must refer to the transaction read version and be uncommitted",
+            ));
+        }
+        let current = current
+            .ok_or_else(|| Error::invalid_input("stable partition requires an existing dataset"))?;
+        if transition.base_id.is_some()
+            || !current.base_paths.is_empty()
+            || current.uses_stable_row_ids()
+        {
+            return Err(Error::not_supported(
+                "stable-partition writes currently require physical row IDs and a single storage base",
+            ));
+        }
+        if current
+            .stable_partition_transitions
+            .iter()
+            .any(|t| t.row_map_id == transition.row_map_id)
+        {
+            return Err(Error::invalid_input(format!(
+                "row map {} is already committed",
+                transition.row_map_id
+            )));
+        }
+        let sources = groups
+            .iter()
+            .flat_map(|g| &g.old_fragments)
+            .collect::<Vec<_>>();
+        let destinations = groups
+            .iter()
+            .flat_map(|g| &g.new_fragments)
+            .collect::<Vec<_>>();
+        if sources.len() != transition.sources.len()
+            || destinations.len() != transition.destinations.len()
+        {
+            return Err(Error::invalid_input(
+                "stable-partition fragment lists differ from rewrite groups",
+            ));
+        }
+        for (source, digest) in sources.iter().zip(&transition.sources) {
+            if source
+                .deletion_file
+                .as_ref()
+                .is_some_and(|file| file.num_deleted_rows.is_none())
+            {
+                return Err(Error::invalid_input(format!(
+                    "stable-partition source {} is missing its deleted row count",
+                    source.id,
+                )));
+            }
+            if source.id != digest.id
+                || source.physical_rows != Some(digest.physical_rows)
+                || source
+                    .deletion_file
+                    .as_ref()
+                    .and_then(|d| d.num_deleted_rows)
+                    .unwrap_or(0)
+                    != digest.num_deleted_rows
+                || !current.fragments.iter().any(|f| f == *source)
+            {
+                return Err(Error::invalid_input(format!(
+                    "stable-partition source {} changed or differs from its descriptor; rebuild from the current snapshot",
+                    source.id
+                )));
+            }
+        }
+        for (destination, digest) in destinations.iter().zip(&transition.destinations) {
+            if destination.id != digest.id
+                || destination.physical_rows != Some(digest.physical_rows)
+                || destination.deletion_file.is_some()
+                || !destination.overlays.is_empty()
+                || current.fragments.iter().any(|f| f.id == destination.id)
+                || current
+                    .max_fragment_id
+                    .is_none_or(|id| destination.id > u64::from(id))
+            {
+                return Err(Error::invalid_input(format!(
+                    "stable-partition destination {} differs from its descriptor or is not reserved",
+                    destination.id
+                )));
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn fragments_with_ids<'a, T>(
         new_fragments: T,
         fragment_id: &'a mut u64,
@@ -801,7 +894,21 @@ impl Transaction {
                 groups,
                 rewritten_indices,
                 frag_reuse_index,
+                stable_partition,
             } => {
+                if let Some(transition) = stable_partition {
+                    Self::validate_stable_partition(
+                        groups,
+                        transition,
+                        current_manifest,
+                        self.read_version,
+                    )?;
+                    if !rewritten_indices.is_empty() || frag_reuse_index.is_some() {
+                        return Err(Error::invalid_input(
+                            "stable partition cannot carry eager index rewrites or an FRI V1 replacement",
+                        ));
+                    }
+                }
                 final_fragments.extend(maybe_existing_fragments?.clone());
                 let current_version = current_manifest.map(|m| m.version).unwrap_or_default();
                 Self::handle_rewrite_fragments(
@@ -812,7 +919,10 @@ impl Transaction {
                     next_row_id.as_ref(),
                 )?;
 
-                if next_row_id.is_some() {
+                if stable_partition.is_some() {
+                    // Keep the original coverage; the mixed reader derives coverage
+                    // only for index types that implement asynchronous translation.
+                } else if next_row_id.is_some() {
                     // We can re-use indices, but need to rewrite the fragment bitmaps
                     debug_assert!(rewritten_indices.is_empty());
                     for index in final_indices.iter_mut() {
@@ -1290,6 +1400,17 @@ impl Transaction {
             )
         };
 
+        if let Operation::Rewrite {
+            stable_partition: Some(transition),
+            ..
+        } = &self.operation
+        {
+            let mut transition = transition.as_ref().clone();
+            transition.committed_version = new_version;
+            Arc::make_mut(&mut manifest.stable_partition_transitions).push(transition);
+            manifest.reader_feature_flags |= crate::feature_flags::FLAG_STABLE_PARTITION;
+            manifest.writer_feature_flags |= crate::feature_flags::FLAG_STABLE_PARTITION;
+        }
         manifest.tag.clone_from(&self.tag);
 
         if config.auto_set_feature_flags {

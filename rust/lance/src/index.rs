@@ -80,6 +80,7 @@ mod api;
 pub(crate) mod append;
 mod create;
 pub mod frag_reuse;
+pub mod frag_reuse_v2;
 pub mod mem_wal;
 pub mod prefilter;
 pub mod scalar;
@@ -1873,16 +1874,51 @@ impl DatasetIndexExt for Dataset {
 
     async fn load_indices(&self) -> Result<Arc<Vec<IndexMetadata>>> {
         let indices = load_all_indices(self).await?;
-        if indices.iter().all(index_is_usable) {
-            return Ok(indices);
+        if self.manifest.stable_partition_transitions.is_empty() {
+            if indices.iter().all(index_is_usable) {
+                return Ok(indices);
+            }
+            return Ok(Arc::new(
+                indices
+                    .iter()
+                    .filter(|index| index_is_usable(index))
+                    .cloned()
+                    .collect(),
+            ));
         }
-        Ok(Arc::new(
-            indices
-                .iter()
-                .filter(|idx| index_is_usable(idx))
-                .cloned()
-                .collect(),
-        ))
+        let mixed = frag_reuse_v2::MixedFragReuseIndex::open(self).await?;
+        let mut indices = indices
+            .iter()
+            .filter(|index| {
+                index_is_usable(index)
+                    && (index.name == FRAG_REUSE_INDEX_NAME
+                        || index
+                            .index_details
+                            .as_ref()
+                            .is_some_and(|details| details.type_url.ends_with("BTreeIndexDetails"))
+                        || !mixed.requires_partition_translation(index.fragment_bitmap.as_ref()))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut groups: HashMap<String, Vec<(usize, RoaringBitmap)>> = HashMap::new();
+        for (position, index) in indices.iter().enumerate() {
+            if let Some(provenance) = &index.fragment_bitmap {
+                groups
+                    .entry(index.name.clone())
+                    .or_default()
+                    .push((position, provenance.clone()));
+            }
+        }
+        for members in groups.into_values() {
+            let (positions, provenance): (Vec<_>, Vec<_>) = members.into_iter().unzip();
+            for (position, coverage) in positions
+                .into_iter()
+                .zip(mixed.segment_coverage(&provenance))
+            {
+                indices[position].fragment_bitmap = Some(coverage);
+            }
+        }
+        Ok(Arc::new(indices))
     }
 
     async fn merge_existing_index_segments(
@@ -2808,6 +2844,10 @@ pub(crate) async fn load_all_indices(dataset: &Dataset) -> Result<Arc<Vec<IndexM
         }
     }
 
+    if !dataset.manifest.stable_partition_transitions.is_empty() {
+        // Commits need stored provenance. Only query metadata derives current coverage.
+        return Ok(indices);
+    }
     if let Some(frag_reuse_index_meta) =
         indices.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
     {
@@ -3411,10 +3451,13 @@ impl DatasetIndexInternalExt for Dataset {
 
     async fn frag_reuse_index_uuid(&self) -> Option<Uuid> {
         if let Ok(indices) = self.load_indices().await {
-            indices
-                .iter()
-                .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
-                .map(|idx| idx.uuid)
+            frag_reuse_v2::mixed_cache_id(
+                self,
+                indices
+                    .iter()
+                    .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
+                    .map(|idx| idx.uuid),
+            )
         } else {
             None
         }

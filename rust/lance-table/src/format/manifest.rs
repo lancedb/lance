@@ -60,6 +60,9 @@ pub struct Manifest {
     /// The file position of the index metadata.
     pub index_section: Option<usize>,
 
+    /// Immutable row maps for stable partitions, composed with FRI V1.
+    pub stable_partition_transitions: Arc<Vec<super::StablePartitionTransition>>,
+
     /// The creation timestamp with nanosecond resolution as 128-bit integer
     pub timestamp_nanos: u128,
 
@@ -186,6 +189,7 @@ impl Manifest {
             fragments,
             version_aux_data: 0,
             index_section: None,
+            stable_partition_transitions: Arc::new(Vec::new()),
             timestamp_nanos: 0,
             tag: None,
             reader_feature_flags: 0, // These will be set on commit
@@ -216,11 +220,14 @@ impl Manifest {
             writer_version: Some(WriterVersion::default()),
             fragments,
             version_aux_data: 0,
+            stable_partition_transitions: previous.stable_partition_transitions.clone(),
             index_section: None, // Caller should update index if they want to keep them.
             timestamp_nanos: 0,  // This will be set on commit
             tag: None,
-            reader_feature_flags: previous.reader_feature_flags & STICKY_PAIRED_FLAGS,
-            writer_feature_flags: previous.writer_feature_flags & STICKY_PAIRED_FLAGS,
+            reader_feature_flags: previous.reader_feature_flags
+                & (STICKY_PAIRED_FLAGS | crate::feature_flags::FLAG_STABLE_PARTITION),
+            writer_feature_flags: previous.writer_feature_flags
+                & (STICKY_PAIRED_FLAGS | crate::feature_flags::FLAG_STABLE_PARTITION),
             max_fragment_id: previous.max_fragment_id,
             transaction_file: None,
             transaction_section: None,
@@ -273,6 +280,18 @@ impl Manifest {
             writer_version: self.writer_version.clone(),
             fragments: Arc::new(cloned_fragments),
             version_aux_data: self.version_aux_data,
+            stable_partition_transitions: Arc::new(
+                self.stable_partition_transitions
+                    .iter()
+                    .cloned()
+                    .map(|mut transition| {
+                        if transition.base_id.is_none() {
+                            transition.base_id = Some(ref_base_id);
+                        }
+                        transition
+                    })
+                    .collect(),
+            ),
             index_section: None, // These will be set on commit
             timestamp_nanos: self.timestamp_nanos,
             tag: None,
@@ -286,9 +305,13 @@ impl Manifest {
             // Sticky capabilities are also retained because the clone keeps the
             // source file identities that require them.
             reader_feature_flags: self.reader_feature_flags
-                & (FLAG_COVERED_INDEX_METADATA | STICKY_PAIRED_FLAGS),
+                & (FLAG_COVERED_INDEX_METADATA
+                    | STICKY_PAIRED_FLAGS
+                    | crate::feature_flags::FLAG_STABLE_PARTITION),
             writer_feature_flags: self.writer_feature_flags
-                & (FLAG_COVERED_INDEX_METADATA | STICKY_PAIRED_FLAGS),
+                & (FLAG_COVERED_INDEX_METADATA
+                    | STICKY_PAIRED_FLAGS
+                    | crate::feature_flags::FLAG_STABLE_PARTITION),
             max_fragment_id: self.max_fragment_id,
             transaction_file: Some(transaction_file),
             transaction_section: None,
@@ -991,6 +1014,12 @@ impl TryFrom<pb::Manifest> for Manifest {
             writer_version,
             version_aux_data: p.version_aux_data as usize,
             index_section: p.index_section.map(|i| i as usize),
+            stable_partition_transitions: Arc::new(
+                p.stable_partition_transitions
+                    .into_iter()
+                    .map(TryInto::try_into)
+                    .collect::<Result<_>>()?,
+            ),
             timestamp_nanos: timestamp_nanos.unwrap_or(0),
             tag: if p.tag.is_empty() { None } else { Some(p.tag) },
             reader_feature_flags: p.reader_feature_flags,
@@ -1053,6 +1082,11 @@ impl From<&Manifest> for pb::Manifest {
             table_metadata: m.table_metadata.clone(),
             version_aux_data: m.version_aux_data as u64,
             index_section: m.index_section.map(|i| i as u64),
+            stable_partition_transitions: m
+                .stable_partition_transitions
+                .iter()
+                .map(Into::into)
+                .collect(),
             timestamp: timestamp_nanos,
             tag: m.tag.clone().unwrap_or_default(),
             reader_feature_flags: m.reader_feature_flags,
