@@ -3610,13 +3610,15 @@ mod tests {
             0,
             true,
         ));
+        let prefilter = empty_prefilter().await;
 
         ANNIvfSubIndexExec::late_search(
             index,
             query,
             Arc::new(UInt32Array::from(vec![0, 1, 2])),
             Arc::new(Float32Array::from(vec![0.1, 0.2, 0.3])),
-            empty_prefilter().await,
+            prefilter.clone(),
+            prefilter,
             metrics,
             state,
             usize::MAX,
