@@ -670,6 +670,42 @@ macro_rules! impl_common_protobuf_utils {
 impl_common_protobuf_utils!(pb21, ProtobufUtils21);
 
 impl ProtobufUtils21 {
+    pub fn range(
+        uncompressed_bits_per_value: u64,
+        start: u64,
+        step: u64,
+    ) -> crate::format::pb21::CompressiveEncoding {
+        crate::format::pb21::CompressiveEncoding {
+            compression: Some(
+                crate::format::pb21::compressive_encoding::Compression::Range(
+                    crate::format::pb21::Range {
+                        uncompressed_bits_per_value,
+                        start,
+                        step,
+                    },
+                ),
+            ),
+        }
+    }
+
+    pub fn delta(
+        uncompressed_bits_per_value: u64,
+        base: u64,
+        deltas: crate::format::pb21::CompressiveEncoding,
+    ) -> crate::format::pb21::CompressiveEncoding {
+        crate::format::pb21::CompressiveEncoding {
+            compression: Some(
+                crate::format::pb21::compressive_encoding::Compression::Delta(Box::new(
+                    crate::format::pb21::Delta {
+                        uncompressed_bits_per_value,
+                        base,
+                        deltas: Some(Box::new(deltas)),
+                    },
+                )),
+            ),
+        }
+    }
+
     pub fn constant_layout(
         def_meaning: &[DefinitionInterpretation],
         inline_value: Option<Vec<u8>>,
