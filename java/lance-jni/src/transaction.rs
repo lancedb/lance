@@ -25,7 +25,7 @@ use lance::io::ObjectStoreParams;
 use lance::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
 use lance::table::format::key_existence::{FilterType, KeyExistenceFilter};
 use lance::table::format::overlay::{DataOverlayFile, OverlayCoverage};
-use lance::table::format::{BasePath, DataFile, Fragment, IndexFile, IndexMetadata};
+use lance::table::format::{DataFile, Fragment, IndexFile, IndexMetadata};
 use lance_core::datatypes::Field;
 use lance_core::datatypes::Schema as LanceSchema;
 use lance_file::version::{LanceFileVersion, V2_FORMAT_2_0, V2_FORMAT_2_1, V2_FORMAT_2_2};
@@ -120,34 +120,6 @@ fn export_unsigned_longs<'a>(
         .map(|(index, value)| u64_to_jlong(&format!("{field}[{index}]"), *value).map(JLance))
         .collect::<Result<Vec<_>>>()?;
     export_vec(env, &values)
-}
-
-impl IntoJava for &BasePath {
-    fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
-        let name = match &self.name {
-            Some(name) => env.new_string(name)?.into(),
-            None => JObject::null(),
-        };
-        let java_name = env
-            .call_static_method(
-                "java/util/Optional",
-                "ofNullable",
-                "(Ljava/lang/Object;)Ljava/util/Optional;",
-                &[JValue::Object(&name)],
-            )?
-            .l()?;
-        let path = env.new_string(&self.path)?;
-        Ok(env.new_object(
-            "org/lance/BasePath",
-            "(ILjava/util/Optional;Ljava/lang/String;Z)V",
-            &[
-                JValue::Int(u32_to_jint("basePath.id", self.id)?),
-                JValue::Object(&java_name),
-                JValue::Object(&path),
-                JValue::Bool(self.is_dataset_root as u8),
-            ],
-        )?)
-    }
 }
 
 impl IntoJava for &IndexFile {
