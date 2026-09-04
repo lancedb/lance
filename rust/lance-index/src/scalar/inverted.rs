@@ -24,10 +24,10 @@ use arrow_schema::{DataType, Field};
 use async_trait::async_trait;
 pub use builder::InvertedIndexBuilder;
 pub use compound::{
-    compound_search, compound_search_prepared_match,
+    PreparedFtsGlobalStatistics, compound_search, compound_search_prepared_match,
     compound_search_prepared_match_with_score_floor, compound_search_with_base_scorer,
     compound_search_with_base_scorer_and_score_floor, exclusive_scaled_score_floor,
-    materialized_compound_top_k,
+    materialized_compound_top_k, prepare_fts_global_statistics,
 };
 #[doc(hidden)]
 pub use cross_column::cross_column_compound_search;
@@ -87,7 +87,8 @@ impl PreparedBm25Query {
         &self.scorer
     }
 
-    pub(crate) fn has_all_query_positions(&self) -> bool {
+    #[doc(hidden)]
+    pub fn has_all_query_positions(&self) -> bool {
         self.has_all_query_positions
     }
 }
