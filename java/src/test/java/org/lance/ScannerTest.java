@@ -23,7 +23,9 @@ import org.lance.ipc.LanceScanner;
 import org.lance.ipc.MaterializationStyle;
 import org.lance.ipc.ScanOptions;
 import org.lance.ipc.ScanStats;
+import org.lance.update.UpdateParams;
 
+import com.google.common.collect.ImmutableMap;
 import org.apache.arrow.c.ArrowArrayStream;
 import org.apache.arrow.c.Data;
 import org.apache.arrow.dataset.scanner.Scanner;
@@ -240,6 +242,46 @@ public class ScannerTest {
             rowCount += reader.getVectorSchemaRoot().getRowCount();
           }
           assertEquals(4, rowCount);
+        }
+      }
+    }
+  }
+
+  @Test
+  void testFragmentSliceDoesNotFollowUpdatedStableRowId(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("fragment_slice_stable_row_id_update").toString();
+    WriteParams writeParams =
+        new WriteParams.Builder()
+            .withDataStorageVersion(LanceConstants.FILE_FORMAT_VERSION_STABLE)
+            .withEnableStableRowIds(true)
+            .build();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createDatasetWithWriteParams(writeParams).close();
+      List<FragmentMetadata> metadata = testDataset.createNewFragment(8, writeParams);
+      try (Dataset dataset =
+          Dataset.commit(
+              allocator, datasetPath, new FragmentOperation.Append(metadata), Optional.of(1L))) {
+        int originalFragmentId = dataset.getFragments().get(0).getId();
+        try (Dataset updated =
+            dataset
+                .update(new UpdateParams(ImmutableMap.of("name", "'updated'")).withWhere("id = 2"))
+                .getDataset()) {
+          List<Integer> allFragmentIds =
+              updated.getFragments().stream().map(Fragment::getId).collect(Collectors.toList());
+          assertEquals(2, allFragmentIds.size());
+
+          ScanOptions options =
+              new ScanOptions.Builder()
+                  .fragmentIds(allFragmentIds)
+                  .fragmentSlices(
+                      Collections.singletonList(new FragmentSlice(originalFragmentId, 2, 1)))
+                  .columns(Collections.singletonList("id"))
+                  .build();
+          try (LanceScanner scanner = updated.newScan(options)) {
+            assertEquals(Collections.emptyList(), readIds(scanner));
+          }
         }
       }
     }

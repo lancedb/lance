@@ -333,7 +333,7 @@ fn apply_fragment_slices(
     dataset: &lance::Dataset,
     scanner: &mut Scanner,
     fragment_slices_obj: &JObject<'_>,
-    restrict_fragments: bool,
+    fragment_ids: Option<&[jint]>,
 ) -> Result<()> {
     let Some(slices) = parse_fragment_slices(env, fragment_slices_obj)? else {
         return Ok(());
@@ -347,9 +347,9 @@ fn apply_fragment_slices(
             .push((slice.row_offset, slice.row_count));
     }
 
-    let (selected_row_ids, fragments) = block_on(async {
+    let (selected_row_ids, fragments_by_id) = block_on(async {
         let mut selected_row_ids = RowAddrTreeMap::new();
-        let mut fragments = Vec::with_capacity(slices_by_fragment.len());
+        let mut fragments_by_id = BTreeMap::new();
         for (fragment_id, ranges) in slices_by_fragment {
             let Some(fragment) = dataset.get_fragment(fragment_id as usize) else {
                 return Err(Error::input_error(format!(
@@ -425,14 +425,23 @@ fn apply_fragment_slices(
                     selected_row_ids.insert_range(start..start + row_count);
                 }
             }
-            fragments.push(fragment.metadata().clone());
+            fragments_by_id.insert(fragment_id, fragment.metadata().clone());
         }
-        Ok((selected_row_ids, fragments))
+        Ok((selected_row_ids, fragments_by_id))
     })?;
 
-    if restrict_fragments {
-        scanner.with_fragments(fragments);
-    }
+    // A stable row id can move to a replacement fragment after an update. Restricting the scan to
+    // the physical fragments named by the slices prevents such a row from following its stable id
+    // outside the requested physical range. When fragmentIds are also present, preserve their
+    // ordering while applying the documented intersection with the slice fragments.
+    let fragments = match fragment_ids {
+        Some(fragment_ids) => fragment_ids
+            .iter()
+            .filter_map(|fragment_id| fragments_by_id.get(&(*fragment_id as u32)).cloned())
+            .collect(),
+        None => fragments_by_id.into_values().collect(),
+    };
+    scanner.with_fragments(fragments);
     scanner.with_row_addr_prefilter(RowAddrMask::from_allowed(selected_row_ids));
     Ok(())
 }
@@ -447,11 +456,10 @@ pub(crate) fn build_scanner_with_options<'a>(
 
     // handle fragment_ids
     let fragment_ids_opt = env.get_ints_opt(&options.fragment_ids_obj)?;
-    let restrict_to_slice_fragments = fragment_ids_opt.is_none();
-    if let Some(fragment_ids) = fragment_ids_opt {
+    if let Some(fragment_ids) = fragment_ids_opt.as_ref() {
         let mut fragments = Vec::with_capacity(fragment_ids.len());
         for fragment_id in fragment_ids {
-            let Some(fragment) = dataset.get_fragment(fragment_id as usize) else {
+            let Some(fragment) = dataset.get_fragment(*fragment_id as usize) else {
                 return Err(Error::input_error(format!(
                     "Fragment {fragment_id} not found"
                 )));
@@ -466,7 +474,7 @@ pub(crate) fn build_scanner_with_options<'a>(
         dataset,
         &mut scanner,
         &options.fragment_slices_obj,
-        restrict_to_slice_fragments,
+        fragment_ids_opt.as_deref(),
     )?;
 
     let columns_opt = env.get_strings_opt(&options.columns_obj)?;
