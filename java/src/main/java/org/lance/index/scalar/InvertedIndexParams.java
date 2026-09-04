@@ -55,6 +55,7 @@ public final class InvertedIndexParams {
     private Integer maxNgramLength;
     private Boolean prefixOnly;
     private Integer blockSize = 128;
+    private Boolean disableCrossArrayUnnest;
     private Boolean skipMerge;
     private Integer formatVersion;
     private DocumentGranularity documentGranularity = DocumentGranularity.ROW;
@@ -252,6 +253,22 @@ public final class InvertedIndexParams {
     }
 
     /**
+     * Configure whether flattened JSON tokenization avoids cross-array unnesting.
+     *
+     * <p>When true, sibling arrays are indexed independently instead of producing their Cartesian
+     * product. This can reduce index build memory for JSON records with multiple arrays but can
+     * sacrifice result accuracy for queries that constrain values across those arrays. The default
+     * is false.
+     *
+     * @param disableCrossArrayUnnest whether to avoid cross-array unnesting
+     * @return this builder
+     */
+    public Builder disableCrossArrayUnnest(boolean disableCrossArrayUnnest) {
+      this.disableCrossArrayUnnest = disableCrossArrayUnnest;
+      return this;
+    }
+
+    /**
      * Configure whether to skip the partition merge stage after indexing. If true, skip the
      * partition merge stage after indexing. This can be useful for distributed indexing where merge
      * is handled separately.
@@ -352,6 +369,9 @@ public final class InvertedIndexParams {
       }
       if (blockSize != null) {
         params.put("block_size", blockSize);
+      }
+      if (disableCrossArrayUnnest != null) {
+        params.put("disable_cross_array_unnest", disableCrossArrayUnnest);
       }
       if (skipMerge != null) {
         params.put("skip_merge", skipMerge);
