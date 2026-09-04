@@ -91,8 +91,11 @@ pub fn deep_copy_array_data_sliced(data: &ArrayData) -> ArrayData {
     // Use MutableArrayData to efficiently copy just the slice
     let mut mutable = MutableArrayData::new(vec![data], false, data.len());
 
-    // Copy from offset to offset+len (the visible slice)
-    mutable.extend(0, data.offset(), data.offset() + data.len());
+    // Copy from offset to offset+len (the visible slice). The range is taken from
+    // an already valid `ArrayData`, so the copied offsets cannot overflow.
+    mutable
+        .try_extend(0, data.offset(), data.offset() + data.len())
+        .expect("slice range comes from a valid ArrayData");
 
     // Freeze into immutable ArrayData
     mutable.freeze()
