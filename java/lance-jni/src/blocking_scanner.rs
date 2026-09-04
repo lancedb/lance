@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::collections::{BTreeMap, HashMap};
+use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
 use crate::error::{Error, Result};
@@ -379,6 +380,7 @@ fn apply_fragment_slices(
                 None
             };
 
+            let mut validated_ranges = Vec::with_capacity(ranges.len());
             for (row_offset, row_count) in ranges {
                 let end = row_offset.checked_add(row_count).ok_or_else(|| {
                     Error::input_error(format!(
@@ -401,6 +403,24 @@ fn apply_fragment_slices(
                 if row_offset == end {
                     continue;
                 }
+                validated_ranges.push(row_offset..end);
+            }
+
+            validated_ranges.sort_unstable_by_key(|range| (range.start, range.end));
+            let mut merged_ranges: Vec<Range<u64>> = Vec::with_capacity(validated_ranges.len());
+            for range in validated_ranges {
+                if let Some(previous) = merged_ranges.last_mut()
+                    && range.start <= previous.end
+                {
+                    previous.end = previous.end.max(range.end);
+                } else {
+                    merged_ranges.push(range);
+                }
+            }
+
+            for range in merged_ranges {
+                let row_offset = range.start;
+                let row_count = range.end - range.start;
                 if let Some(sequence) = row_id_sequence.as_ref() {
                     let offset = usize::try_from(row_offset).map_err(|_| {
                         Error::input_error(format!(
@@ -412,9 +432,7 @@ fn apply_fragment_slices(
                             "rowCount does not fit in usize: fragment_id={fragment_id}, row_count={row_count}"
                         ))
                     })?;
-                    for row_id in sequence.slice(offset, count).iter() {
-                        selected_row_ids.insert(row_id);
-                    }
+                    selected_row_ids |= RowAddrTreeMap::from(&sequence.slice(offset, count));
                 } else {
                     let row_offset = u32::try_from(row_offset).map_err(|_| {
                         Error::input_error(format!(
