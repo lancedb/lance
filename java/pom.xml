@@ -490,6 +490,9 @@
                             <forkNode
                                 implementation="org.apache.maven.plugin.surefire.extensions.SurefireForkNodeFactory" />
                             <useSystemClassLoader>false</useSystemClassLoader>
+                            <environmentVariables>
+                                <LANCE_LANGUAGE_MODEL_HOME>${project.basedir}/src/test/resources/language_models</LANCE_LANGUAGE_MODEL_HOME>
+                            </environmentVariables>
                         </configuration>
                     </plugin>
                 </plugins>
