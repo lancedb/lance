@@ -4110,6 +4110,13 @@ class LanceDataset(pa.dataset.Dataset):
                             f"Ivf centroids must be 2D array: (clusters, dim), "
                             f"got {ivf_centroids.shape}"
                         )
+                    if ivf_centroids.shape[0] == 0:
+                        # num_partitions was derived from shape[0] above, and
+                        # zero partitions panics in the Rust residual step.
+                        raise ValueError(
+                            "Ivf centroids must have at least one cluster, "
+                            f"got {ivf_centroids.shape}"
+                        )
                     if (
                         num_partitions is not None
                         and ivf_centroids.shape[0] != num_partitions

@@ -1559,6 +1559,19 @@ def test_pre_populated_ivf_centroids(dataset, tmp_path: Path):
             num_sub_vectors=8,
         )
 
+    # A zero-row array passes the 2D check, and the Rust residual step panics on
+    # the empty centroid buffer.
+    with pytest.raises(ValueError, match="at least one cluster"):
+        dataset.create_index(
+            ["vector"],
+            index_type="IVF_PQ",
+            metric="cosine",
+            ivf_centroids=np.empty((0, 128), dtype=np.float32),
+            num_sub_vectors=8,
+            # Otherwise the duplicate-name check intercepts first.
+            replace=True,
+        )
+
 
 def test_create_ivf_pq_skip_transpose(dataset, tmp_path: Path):
     ds = lance.write_dataset(
