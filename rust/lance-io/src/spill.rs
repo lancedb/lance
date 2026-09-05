@@ -50,6 +50,7 @@ use std::task::{Context, Poll};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::future::BoxFuture;
+use futures::stream::StreamExt;
 use lance_core::deepsize::DeepSizeOf;
 use object_store::path::Path;
 use tokio::io::AsyncWrite;
@@ -452,7 +453,7 @@ impl Spill for MemorySpill {
         Ok(match &self.reservation {
             Some(reservation) => Box::new(ChargedReader {
                 inner,
-                _reservation: reservation.clone(),
+                reservation: reservation.clone(),
             }),
             None => inner,
         })
@@ -462,11 +463,22 @@ impl Spill for MemorySpill {
 /// A [`Reader`] that holds a share of its spill's quota reservation.
 ///
 /// Delegates everything; it exists only so the bytes a retained reader keeps
-/// resident stay charged to the cap.
+/// resident stay charged to the cap. `get_range` and the two stream methods hand
+/// out products that own the backing and outlive this reader, so each of them
+/// carries its own share.
 #[derive(Debug)]
 struct ChargedReader {
     inner: Box<dyn Reader>,
-    _reservation: Arc<Reservation>,
+    reservation: Arc<Reservation>,
+}
+
+/// Tie `reservation` to the life of `stream`, which is `'static` and can outlive
+/// the reader that produced it.
+fn charged_stream(stream: ByteStream, reservation: Arc<Reservation>) -> ByteStream {
+    Box::pin(stream.map(move |item| {
+        let _ = &reservation;
+        item
+    }))
 }
 
 impl DeepSizeOf for ChargedReader {
@@ -493,7 +505,13 @@ impl Reader for ChargedReader {
     }
 
     fn get_range(&self, range: Range<usize>) -> BoxFuture<'static, object_store::Result<Bytes>> {
-        self.inner.get_range(range)
+        let reservation = self.reservation.clone();
+        let inner = self.inner.get_range(range);
+        Box::pin(async move {
+            let result = inner.await;
+            drop(reservation);
+            result
+        })
     }
 
     fn get_all(&self) -> BoxFuture<'_, object_store::Result<Bytes>> {
@@ -501,14 +519,22 @@ impl Reader for ChargedReader {
     }
 
     fn get_stream(&self) -> BoxFuture<'_, object_store::Result<ByteStream>> {
-        self.inner.get_stream()
+        let reservation = self.reservation.clone();
+        Box::pin(async move {
+            let stream = self.inner.get_stream().await?;
+            Ok(charged_stream(stream, reservation))
+        })
     }
 
     fn get_range_stream(
         &self,
         range: Range<usize>,
     ) -> BoxFuture<'_, object_store::Result<ByteStream>> {
-        self.inner.get_range_stream(range)
+        let reservation = self.reservation.clone();
+        Box::pin(async move {
+            let stream = self.inner.get_range_stream(range).await?;
+            Ok(charged_stream(stream, reservation))
+        })
     }
 }
 
@@ -899,6 +925,53 @@ mod tests {
         assert!(matches!(err, Error::DiskCapExceeded { .. }), "{err:?}");
 
         drop(retained);
+        assert_eq!(*quota.used.lock().unwrap(), 0);
+    }
+
+    /// A reader's detached products own the backing too, so each of them has to
+    /// keep the charge. One test per API that hands one out.
+    #[rstest::rstest]
+    #[case::get_range(0)]
+    #[case::get_stream(1)]
+    #[case::get_range_stream(2)]
+    #[tokio::test]
+    async fn test_a_detached_reader_product_stays_charged_to_the_cap(#[case] api: u8) {
+        let quota = DiskQuota::new(50);
+        let store = memory_only_store(Some(quota.clone()));
+
+        let (writer, spill) = store.new_spill().await.unwrap();
+        finish_writer(writer, &[1u8; 40]).await.unwrap();
+        let reader = spill.reader().await.unwrap();
+
+        // Each of these owns the in-memory backing and outlives the reader.
+        let mut detached_future = None;
+        let mut detached_stream = None;
+        match api {
+            0 => detached_future = Some(reader.get_range(0..40)),
+            1 => detached_stream = Some(reader.get_stream().await.unwrap()),
+            _ => detached_stream = Some(reader.get_range_stream(0..40).await.unwrap()),
+        }
+        drop(reader);
+        drop(spill);
+
+        assert_eq!(
+            *quota.used.lock().unwrap(),
+            40,
+            "the bytes are still reachable, so they stay charged"
+        );
+        let (writer, _second) = store.new_spill().await.unwrap();
+        let err = finish_writer(writer, &[2u8; 40]).await.unwrap_err();
+        assert!(matches!(err, Error::DiskCapExceeded { .. }), "{err:?}");
+
+        // And the product still reads what it was created for.
+        match (detached_future, detached_stream) {
+            (Some(fut), None) => assert_eq!(fut.await.unwrap().as_ref(), &[1u8; 40]),
+            (None, Some(stream)) => {
+                let chunks: Vec<Bytes> = stream.map(|c| c.unwrap()).collect().await;
+                assert_eq!(chunks.concat(), vec![1u8; 40]);
+            }
+            _ => unreachable!(),
+        }
         assert_eq!(*quota.used.lock().unwrap(), 0);
     }
 
