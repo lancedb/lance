@@ -37,6 +37,7 @@ mod hnsw;
 pub mod index;
 mod manifest;
 pub mod memtable;
+pub mod observer;
 pub mod scanner;
 pub mod sharding;
 #[cfg(test)]
@@ -131,7 +132,7 @@ pub fn schema_with_tombstone(base: &ArrowSchema) -> Arc<ArrowSchema> {
 }
 
 pub use api::{DatasetMemWalExt, InitializeMemWalBuilder, validate_maintained_indexes};
-pub use index::MemIndexKind;
+pub use index::{MemIndexKind, MemTableVisibility};
 pub use manifest::ShardManifestStore;
 pub use memtable::scanner::MemTableScanner;
 pub use scanner::{LsmDataSource, LsmGeneration, LsmScanner, ShardSnapshot};

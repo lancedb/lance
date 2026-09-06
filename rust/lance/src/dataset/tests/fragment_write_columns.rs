@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Per-fragment column writes: staging a column's data as a standalone file
-//! with `FileFragment::write_column`, and committing it as a `DataReplacement`
+//! Per-fragment column writes: staging columns' data as a standalone file with
+//! `FileFragment::write_columns`, and committing it as a `DataReplacement`
 //! whose coverage may not line up with any single file -- the case a computed
 //! column reaches once compaction folds it into a shared base file.
 
@@ -16,7 +16,7 @@ use arrow_array::{
 };
 use arrow_buffer::{NullBuffer, OffsetBuffer};
 use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
-use futures::{TryStreamExt, stream};
+use futures::{StreamExt, TryStreamExt, stream};
 use lance_core::datatypes::Schema as LanceSchema;
 use lance_core::utils::tempfile::TempStrDir;
 use lance_core::{Error, ROW_ID, ROW_LAST_UPDATED_AT_VERSION};
@@ -89,7 +89,7 @@ async fn stage(
     schema: &LanceSchema,
 ) -> Result<DataReplacementGroup> {
     only_fragment(dataset)
-        .write_column(stream::iter([Ok(batch)]), schema)
+        .write_columns(stream::iter([Ok(batch)]), schema)
         .await
 }
 
@@ -140,6 +140,50 @@ async fn declare_all_null(dataset: &mut Dataset, name: &str) {
         .unwrap();
 }
 
+#[tokio::test]
+async fn test_compact_metadata_only_all_null_dictionary() {
+    let batch = batch_of(
+        vec![ArrowField::new("id", DataType::Int32, false)],
+        vec![ints(vec![1, 2])],
+    );
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        "memory://",
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_3),
+            max_rows_per_file: 1,
+            enable_stable_row_ids: false,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let dictionary_type = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
+    dataset
+        .add_columns(
+            NewColumnTransform::AllNulls(Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                "category",
+                dictionary_type.clone(),
+                true,
+            )]))),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    compact_files(&mut dataset, CompactionOptions::default(), None)
+        .await
+        .unwrap();
+
+    let batch = dataset.scan().try_into_batch().await.unwrap();
+    assert_eq!(batch.num_rows(), 2);
+    assert_eq!(batch["category"].data_type(), &dictionary_type);
+    assert_eq!(batch["category"].null_count(), 2);
+}
+
 /// Stage `values` for an existing `column` of one fragment.
 async fn stage_column(
     dataset: &Dataset,
@@ -157,7 +201,7 @@ async fn stage_column(
         .into_iter()
         .find(|fragment| fragment.id() as u64 == fragment_id)
         .expect("fragment to stage for")
-        .write_column(stream::iter([Ok(batch)]), &schema)
+        .write_columns(stream::iter([Ok(batch)]), &schema)
         .await
         .unwrap()
 }
@@ -240,7 +284,7 @@ async fn test_records_writer_layout(
     // Streamed as two batches: the DataFile must record the writer's
     // field/column layout and the dataset's file version.
     let DataReplacementGroup(replaced, data_file) = fragment
-        .write_column(
+        .write_columns(
             stream::iter([
                 Ok(arrow_array::record_batch!(("value", Int32, [1])).unwrap()),
                 Ok(arrow_array::record_batch!(("value", Int32, [2])).unwrap()),
@@ -260,7 +304,7 @@ async fn test_records_writer_layout(
     );
 }
 
-/// Input `write_column` turns down before anything can be committed. The
+/// Input `write_columns` turns down before anything can be committed. The
 /// container cases matter twice over: projection reorders by name but downcasts
 /// by shape, so an unchecked batch is dropped silently or panics.
 #[rstest]
@@ -428,7 +472,7 @@ async fn test_rejects_empty_stream() {
 
     let before = count_files(&dataset).await;
     let err = only_fragment(&dataset)
-        .write_column(stream::iter(Vec::<Result<RecordBatch>>::new()), &schema)
+        .write_columns(stream::iter(Vec::<Result<RecordBatch>>::new()), &schema)
         .await
         .unwrap_err();
     assert!(err.to_string().contains("physical rows"), "got: {err}");
@@ -976,7 +1020,7 @@ async fn test_discards_staged_artifacts_on_stream_error() {
     let before = count_files(&dataset).await;
     let schema = dataset.schema().clone();
     let err = only_fragment(&dataset)
-        .write_column(
+        .write_columns(
             stream::iter([
                 Ok(blobs(2)),
                 Err(Error::invalid_input("stream failed".to_string())),
@@ -990,6 +1034,28 @@ async fn test_discards_staged_artifacts_on_stream_error() {
         count_files(&dataset).await,
         before,
         "a stream error must not leave staged artifacts behind"
+    );
+}
+
+#[tokio::test]
+async fn test_physical_slice_read_preserves_deleted_positions() {
+    let mut dataset = id_dataset_of(4, 1024).await;
+    dataset.delete("id = 2").await.unwrap();
+    let fragment = only_fragment(&dataset);
+    let schema = dataset.schema().clone();
+    let batches = fragment
+        .read_physical_slice(0..4, &schema, 2)
+        .await
+        .unwrap()
+        .buffered(1)
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    let batch =
+        arrow::compute::concat_batches(&Arc::new(ArrowSchema::from(&schema)), &batches).unwrap();
+    assert_eq!(
+        batch["id"].as_primitive::<Int32Type>().values(),
+        &[1, 2, 3, 4]
     );
 }
 

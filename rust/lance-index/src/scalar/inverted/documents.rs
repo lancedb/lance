@@ -8,6 +8,7 @@
 //! never has to infer which value a numeric slot represents.
 
 use std::borrow::Cow;
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, OnceLock, Weak};
 
 use arc_swap::ArcSwapWeak;
@@ -33,6 +34,11 @@ use super::index::{
 
 /// Schema metadata key persisted in every modern `docs.lance` partition.
 pub(super) const TOTAL_TOKENS_KEY: &str = "total_tokens";
+
+/// Candidate-side document reads stay sparse below this share of a partition.
+/// Larger selections amortize one dense column read and populate the reusable
+/// document cache for subsequent queries.
+const SPARSE_DOCUMENT_READ_PERCENT: usize = 10;
 
 /// Dense, immutable document identity inside one FTS partition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -254,7 +260,8 @@ impl AddressDocIdLookup {
             Some(live_docs) => live_docs.iter().collect::<Vec<_>>(),
             None => (0..projection.len() as u32).collect::<Vec<_>>(),
         };
-        doc_ids.sort_unstable_by_key(|&doc_id| projection.stored_address(doc_id as usize));
+        doc_ids
+            .sort_unstable_by_key(|&doc_id| (projection.stored_address(doc_id as usize), doc_id));
         Self::Sorted(doc_ids.into_boxed_slice())
     }
 
@@ -335,6 +342,29 @@ impl AddressDocIdLookup {
         selected
     }
 
+    fn matching_sorted_addresses(
+        &self,
+        projection: &ResidentAddressProjection,
+        addresses: &[u64],
+    ) -> std::result::Result<RoaringBitmap, RowAddressProjectionOrderError> {
+        let mut selected = RoaringBitmap::new();
+        for &address in addresses {
+            let first = self.partition_point(projection, |candidate| candidate < address);
+            let after_last = self.partition_point(projection, |candidate| candidate <= address);
+            if after_last.saturating_sub(first) > 1 {
+                return Err(RowAddressProjectionOrderError::Duplicate {
+                    first_doc_id: DocId::new(self.doc_id_at(first)),
+                    duplicate_doc_id: DocId::new(self.doc_id_at(first + 1)),
+                    address: RowAddress::new_from_u64(address),
+                });
+            }
+            if first < after_last {
+                selected.insert(self.doc_id_at(first));
+            }
+        }
+        Ok(selected)
+    }
+
     fn visibility(
         &self,
         projection: &ResidentAddressProjection,
@@ -362,6 +392,13 @@ pub(super) struct VersionAddressProjection {
     /// slot but are absent from this bitmap.
     live_docs: Option<RoaringBitmap>,
     doc_ids_by_address: OnceCell<Arc<AddressDocIdLookup>>,
+    ordered_validation: AtomicU8,
+    /// Upper-bound candidate work materialized while order is still unknown.
+    /// Once this exceeds the normal one-query flat-search budget, the next
+    /// mapper pays for one reusable ordered validation instead.
+    materialized_candidate_cost: AtomicUsize,
+    #[cfg(test)]
+    ordered_validation_visited_docs: AtomicUsize,
 }
 
 /// A query-scoped projection guard. Shared addresses remain alive only while
@@ -376,6 +413,318 @@ pub(super) struct ResidentAddressProjection {
 enum ResidentAddressValues {
     Shared(Arc<UInt64Array>),
     Owned(Arc<Vec<u64>>),
+}
+
+/// A row-granularity projection whose live row addresses are strictly ordered
+/// by partition-local document id.
+///
+/// Cross-column scorers can use this view to translate their local document
+/// domain into the shared row-address domain without materializing all hits.
+/// Construction deliberately rejects duplicate or descending live addresses;
+/// callers can distinguish those cases and select a materialized fallback.
+#[derive(Debug, Clone)]
+pub(super) struct OrderedRowAddressProjection {
+    projection: ResidentAddressProjection,
+}
+
+/// Why a resident address projection cannot be streamed in local DocId order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RowAddressProjectionOrderError {
+    Duplicate {
+        first_doc_id: DocId,
+        duplicate_doc_id: DocId,
+        address: RowAddress,
+    },
+    OutOfOrder {
+        previous_doc_id: DocId,
+        previous_address: RowAddress,
+        doc_id: DocId,
+        address: RowAddress,
+    },
+}
+
+/// Non-triggering view of the immutable ordered-validation cache.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CachedRowAddressOrder {
+    Unknown = 0,
+    Ordered = 1,
+    Duplicate = 2,
+    OutOfOrder = 3,
+}
+
+impl CachedRowAddressOrder {
+    fn from_raw(value: u8) -> Self {
+        match value {
+            value if value == Self::Ordered as u8 => Self::Ordered,
+            value if value == Self::Duplicate as u8 => Self::Duplicate,
+            value if value == Self::OutOfOrder as u8 => Self::OutOfOrder,
+            value => {
+                debug_assert_eq!(
+                    value,
+                    Self::Unknown as u8,
+                    "ordered row-address validation cache contains invalid state {value}"
+                );
+                // Treat impossible/corrupt state as cold in release builds so
+                // callers safely recompute the immutable projection order.
+                Self::Unknown
+            }
+        }
+    }
+
+    fn from_validation(
+        validation: &std::result::Result<(), RowAddressProjectionOrderError>,
+    ) -> Self {
+        match validation {
+            Ok(()) => Self::Ordered,
+            Err(RowAddressProjectionOrderError::Duplicate { .. }) => Self::Duplicate,
+            Err(RowAddressProjectionOrderError::OutOfOrder { .. }) => Self::OutOfOrder,
+        }
+    }
+}
+
+impl std::fmt::Display for RowAddressProjectionOrderError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Duplicate {
+                first_doc_id,
+                duplicate_doc_id,
+                address,
+            } => write!(
+                formatter,
+                "row address {} is shared by local documents {} and {}",
+                u64::from(*address),
+                first_doc_id.get(),
+                duplicate_doc_id.get()
+            ),
+            Self::OutOfOrder {
+                previous_doc_id,
+                previous_address,
+                doc_id,
+                address,
+            } => write!(
+                formatter,
+                "row address {} for local document {} follows larger address {} for local document {}",
+                u64::from(*address),
+                doc_id.get(),
+                u64::from(*previous_address),
+                previous_doc_id.get()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RowAddressProjectionOrderError {}
+
+impl OrderedRowAddressProjection {
+    fn validate_doc_ids(
+        projection: &ResidentAddressProjection,
+        doc_ids: impl Iterator<Item = u32>,
+    ) -> std::result::Result<(), RowAddressProjectionOrderError> {
+        let mut previous = None;
+        for doc_id in doc_ids {
+            #[cfg(test)]
+            projection
+                .projection
+                .ordered_validation_visited_docs
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+            let doc_id = DocId::new(doc_id);
+            let address = projection.stored_address(doc_id.as_usize());
+            if let Some((previous_doc_id, previous_address)) = previous {
+                if address == previous_address {
+                    return Err(RowAddressProjectionOrderError::Duplicate {
+                        first_doc_id: previous_doc_id,
+                        duplicate_doc_id: doc_id,
+                        address: RowAddress::new_from_u64(address),
+                    });
+                }
+                if address < previous_address {
+                    return Err(RowAddressProjectionOrderError::OutOfOrder {
+                        previous_doc_id,
+                        previous_address: RowAddress::new_from_u64(previous_address),
+                        doc_id,
+                        address: RowAddress::new_from_u64(address),
+                    });
+                }
+            }
+            previous = Some((doc_id, address));
+        }
+        Ok(())
+    }
+
+    fn validate(
+        projection: &ResidentAddressProjection,
+    ) -> std::result::Result<(), RowAddressProjectionOrderError> {
+        match projection.projection.live_docs.as_ref() {
+            Some(live_docs) => Self::validate_doc_ids(projection, live_docs.iter()),
+            None => Self::validate_doc_ids(projection, 0..projection.len() as u32),
+        }
+    }
+
+    fn try_new(
+        projection: &ResidentAddressProjection,
+    ) -> std::result::Result<Self, RowAddressProjectionOrderError> {
+        match projection.cached_row_address_order() {
+            CachedRowAddressOrder::Ordered => {}
+            CachedRowAddressOrder::Unknown => {
+                // Validation intentionally runs before the atomic publish. A
+                // racing query may repeat this work, but never waits for a
+                // query holding a lock while occupying a CPU worker.
+                let validation = projection.compute_ordered_validation();
+                projection.publish_ordered_validation(&validation);
+                validation?;
+            }
+            cached @ (CachedRowAddressOrder::Duplicate | CachedRowAddressOrder::OutOfOrder) => {
+                // The compact cache intentionally stores only the category.
+                // Reconstruct the exact diagnostics only for callers that ask
+                // for an ordered view after learning the projection is invalid.
+                let validation = projection.compute_ordered_validation();
+                debug_assert_eq!(CachedRowAddressOrder::from_validation(&validation), cached);
+                validation?;
+            }
+        }
+
+        Ok(Self {
+            projection: projection.clone(),
+        })
+    }
+
+    fn has_sparse_live_docs(&self) -> bool {
+        self.projection
+            .projection
+            .live_docs
+            .as_ref()
+            .is_some_and(|live_docs| live_docs.len() as usize != self.len())
+    }
+
+    fn doc_id_at(&self, position: usize) -> Option<u32> {
+        if self.has_sparse_live_docs() {
+            self.projection
+                .projection
+                .live_docs
+                .as_ref()?
+                .select(u32::try_from(position).ok()?)
+        } else {
+            let doc_id = u32::try_from(position).ok()?;
+            (position < self.len()).then_some(doc_id)
+        }
+    }
+
+    fn first_after(&self, local_doc: u64) -> Option<u32> {
+        let next_doc = u32::try_from(local_doc.checked_add(1)?).ok()?;
+        if self.has_sparse_live_docs() {
+            self.projection
+                .projection
+                .live_docs
+                .as_ref()?
+                .range(next_doc..)
+                .next()
+        } else {
+            ((next_doc as usize) < self.len()).then_some(next_doc)
+        }
+    }
+
+    /// Number of slots in the partition-local DocId domain, including deleted
+    /// slots. This is the terminal boundary used by shallow-advance mapping.
+    pub(super) fn len(&self) -> usize {
+        self.projection.len()
+    }
+
+    pub(super) fn live_len(&self) -> usize {
+        self.projection.live_len()
+    }
+
+    /// Inclusive minimum and maximum row addresses among live documents.
+    ///
+    /// Strict ordering makes this an O(1) lookup apart from sparse-bitmap
+    /// selection. Deleted DocId slots never contribute to the hull.
+    #[cfg(test)]
+    pub(super) fn live_address_hull(&self) -> Option<(u64, u64)> {
+        let first_doc_id = self.doc_id_at(0)?;
+        let last_position = self.live_len().checked_sub(1)?;
+        let last_doc_id = self.doc_id_at(last_position)?;
+        Some((
+            self.projection.stored_address(first_doc_id as usize),
+            self.projection.stored_address(last_doc_id as usize),
+        ))
+    }
+
+    /// Map sorted, deduplicated row-address candidates into live local DocIds.
+    ///
+    /// Each candidate uses binary search over live documents. Independent
+    /// lookups also keep the result exact if an internal caller accidentally
+    /// supplies duplicate or out-of-order candidates.
+    pub(super) fn select_sorted_addresses(&self, addresses: &[u64]) -> RoaringBitmap {
+        addresses
+            .iter()
+            .filter_map(|&address| {
+                let local_doc = self.lower_bound(address)?;
+                (self.address(local_doc) == Some(address)).then_some(local_doc as u32)
+            })
+            .collect()
+    }
+
+    /// Translate a live partition-local document into its row address.
+    pub(super) fn address(&self, local_doc: u64) -> Option<u64> {
+        let local_doc = u32::try_from(local_doc).ok()?;
+        if local_doc as usize >= self.len() {
+            return None;
+        }
+        self.projection.address(DocId::new(local_doc))
+    }
+
+    /// Return the first live local document whose row address is at least the
+    /// requested global row address.
+    pub(super) fn lower_bound(&self, global_row_address: u64) -> Option<u64> {
+        let mut left = 0;
+        let mut right = self.live_len();
+        while left < right {
+            let middle = left + (right - left) / 2;
+            let doc_id = self.doc_id_at(middle)?;
+            if self.projection.stored_address(doc_id as usize) < global_row_address {
+                left = middle + 1;
+            } else {
+                right = middle;
+            }
+        }
+        self.doc_id_at(left).map(u64::from)
+    }
+
+    /// Return the address of the first live document after `local_doc`.
+    ///
+    /// Deleted slots are skipped, so this can turn an inclusive local shallow
+    /// endpoint into an exclusive boundary in the shared row-address domain.
+    pub(super) fn next_address(&self, local_doc: u64) -> Option<u64> {
+        let next_doc = self.first_after(local_doc)?;
+        Some(self.projection.stored_address(next_doc as usize))
+    }
+}
+
+#[cfg(test)]
+pub(super) fn resident_row_address_projection_for_test(
+    addresses: Vec<u64>,
+) -> ResidentAddressProjection {
+    let projection = Arc::new(VersionAddressProjection {
+        addresses: AddressValues::Owned(Arc::new(addresses)),
+        live_docs: None,
+        doc_ids_by_address: OnceCell::new(),
+        ordered_validation: AtomicU8::new(CachedRowAddressOrder::Unknown as u8),
+        materialized_candidate_cost: AtomicUsize::new(0),
+        ordered_validation_visited_docs: AtomicUsize::new(0),
+    });
+    projection
+        .resident(None)
+        .expect("owned test row addresses must be resident")
+}
+
+#[cfg(test)]
+pub(super) fn ordered_row_address_projection_for_test(
+    addresses: Vec<u64>,
+) -> OrderedRowAddressProjection {
+    resident_row_address_projection_for_test(addresses)
+        .try_ordered_row_addresses()
+        .expect("test row addresses must be strictly increasing and unique")
 }
 
 impl DeepSizeOf for VersionAddressProjection {
@@ -419,6 +768,10 @@ impl VersionAddressProjection {
                 addresses: AddressValues::Shared { len: raw.len() },
                 live_docs: None,
                 doc_ids_by_address: OnceCell::new(),
+                ordered_validation: AtomicU8::new(CachedRowAddressOrder::Unknown as u8),
+                materialized_candidate_cost: AtomicUsize::new(0),
+                #[cfg(test)]
+                ordered_validation_visited_docs: AtomicUsize::new(0),
             });
         };
 
@@ -441,6 +794,10 @@ impl VersionAddressProjection {
             addresses: AddressValues::Owned(Arc::new(addresses)),
             live_docs: Some(live_docs),
             doc_ids_by_address: OnceCell::new(),
+            ordered_validation: AtomicU8::new(CachedRowAddressOrder::Unknown as u8),
+            materialized_candidate_cost: AtomicUsize::new(0),
+            #[cfg(test)]
+            ordered_validation_visited_docs: AtomicUsize::new(0),
         })
     }
 
@@ -468,6 +825,123 @@ impl VersionAddressProjection {
 impl ResidentAddressProjection {
     fn len(&self) -> usize {
         self.projection.addresses.len()
+    }
+
+    pub(super) fn live_len(&self) -> usize {
+        self.projection
+            .live_docs
+            .as_ref()
+            .map_or(self.len(), |live_docs| live_docs.len() as usize)
+    }
+
+    /// Inclusive minimum and maximum row addresses among live documents.
+    ///
+    /// Unlike [`OrderedRowAddressProjection::live_address_hull`], this scans
+    /// the live projection because remapping may reorder addresses. Deleted
+    /// DocId slots never contribute to the hull.
+    #[cfg(test)]
+    pub(super) fn live_address_hull(&self) -> Option<(u64, u64)> {
+        let mut hull: Option<(u64, u64)> = None;
+        let mut include_doc = |doc_id: u32| {
+            let address = self.stored_address(doc_id as usize);
+            hull = Some(match hull {
+                Some((minimum, maximum)) => (minimum.min(address), maximum.max(address)),
+                None => (address, address),
+            });
+        };
+        match self.projection.live_docs.as_ref() {
+            Some(live_docs) => live_docs.iter().for_each(&mut include_doc),
+            None => (0..self.len() as u32).for_each(include_doc),
+        }
+        hull
+    }
+
+    /// Decide whether another unknown-order source should be materialized.
+    ///
+    /// A single sparse query avoids an O(all documents) validation. Repeated
+    /// queries share this lock-free budget through the immutable version
+    /// projection, so materialization cannot remain the permanent execution
+    /// mode once its cumulative upper-bound cost exceeds one validation
+    /// threshold.
+    pub(super) fn should_materialize_unknown_projection(
+        &self,
+        source_cost: usize,
+        flat_search_percent_threshold: u64,
+    ) -> bool {
+        let mut current = self
+            .projection
+            .materialized_candidate_cost
+            .load(AtomicOrdering::Relaxed);
+        let cumulative_cost = loop {
+            let next = current.saturating_add(source_cost);
+            match self
+                .projection
+                .materialized_candidate_cost
+                .compare_exchange_weak(
+                    current,
+                    next,
+                    AtomicOrdering::Relaxed,
+                    AtomicOrdering::Relaxed,
+                ) {
+                Ok(_) => break next,
+                Err(observed) => current = observed,
+            }
+        };
+
+        (cumulative_cost as u128).saturating_mul(100)
+            <= u128::from(flat_search_percent_threshold).saturating_mul(self.live_len() as u128)
+    }
+
+    #[cfg(test)]
+    pub(super) fn ordered_validation_visited_docs(&self) -> usize {
+        self.projection
+            .ordered_validation_visited_docs
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Inspect ordered-validation state without starting validation or waiting
+    /// for another query's validation.
+    pub(super) fn cached_row_address_order(&self) -> CachedRowAddressOrder {
+        CachedRowAddressOrder::from_raw(
+            self.projection
+                .ordered_validation
+                .load(AtomicOrdering::Acquire),
+        )
+    }
+
+    fn compute_ordered_validation(
+        &self,
+    ) -> std::result::Result<(), RowAddressProjectionOrderError> {
+        OrderedRowAddressProjection::validate(self)
+    }
+
+    fn publish_ordered_validation(
+        &self,
+        validation: &std::result::Result<(), RowAddressProjectionOrderError>,
+    ) {
+        let status = CachedRowAddressOrder::from_validation(validation);
+        // All validation work happened before this non-blocking publication.
+        // Immutable projections make racing results deterministic, so losing
+        // the compare-exchange requires no reconciliation or wait.
+        if let Err(observed) = self.projection.ordered_validation.compare_exchange(
+            CachedRowAddressOrder::Unknown as u8,
+            status as u8,
+            AtomicOrdering::Release,
+            AtomicOrdering::Relaxed,
+        ) {
+            debug_assert_eq!(
+                observed, status as u8,
+                "immutable row-address projection published conflicting validation states"
+            );
+        }
+    }
+
+    /// Validate that this row-granularity projection can be streamed in the
+    /// shared row-address domain.
+    pub(super) fn try_ordered_row_addresses(
+        &self,
+    ) -> std::result::Result<OrderedRowAddressProjection, RowAddressProjectionOrderError> {
+        OrderedRowAddressProjection::try_new(self)
     }
 
     fn stored_address(&self, index: usize) -> u64 {
@@ -509,6 +983,48 @@ impl ResidentAddressProjection {
             })
             .await
             .cloned()
+    }
+
+    /// Map sorted, deduplicated row-address candidates into live local DocIds.
+    ///
+    /// The reusable reverse lookup handles unordered remapped projections. A
+    /// candidate that resolves to multiple live DocIds is rejected as an
+    /// invalid FTS row-address projection instead of silently merging them.
+    /// The lookup is exact for any candidate order; sorting only avoids
+    /// redundant caller work.
+    pub(super) async fn select_sorted_addresses(&self, addresses: &[u64]) -> Result<RoaringBitmap> {
+        if addresses.is_empty() || self.live_len() == 0 {
+            return Ok(RoaringBitmap::new());
+        }
+
+        let ordered = match self.cached_row_address_order() {
+            CachedRowAddressOrder::Ordered => {
+                Some(self.try_ordered_row_addresses().map_err(|error| {
+                    Error::index(format!("invalid FTS row-address projection: {error}"))
+                })?)
+            }
+            CachedRowAddressOrder::OutOfOrder => None,
+            CachedRowAddressOrder::Unknown | CachedRowAddressOrder::Duplicate => {
+                let projection = self.clone();
+                match spawn_cpu(move || Result::Ok(projection.try_ordered_row_addresses())).await? {
+                    Ok(ordered) => Some(ordered),
+                    Err(error @ RowAddressProjectionOrderError::Duplicate { .. }) => {
+                        return Err(Error::index(format!(
+                            "invalid FTS row-address projection: {error}"
+                        )));
+                    }
+                    Err(RowAddressProjectionOrderError::OutOfOrder { .. }) => None,
+                }
+            }
+        };
+        if let Some(ordered) = ordered {
+            return Ok(ordered.select_sorted_addresses(addresses));
+        }
+
+        let lookup = self.doc_ids_by_address().await?;
+        lookup
+            .matching_sorted_addresses(self, addresses)
+            .map_err(|error| Error::index(format!("invalid FTS row-address projection: {error}")))
     }
 
     async fn materialize_visibility(self, mask: Arc<RowAddrMask>) -> Result<DocVisibility> {
@@ -1004,6 +1520,164 @@ impl PartitionDocuments {
             .iter()
             .map(|doc_id| row_ids.value(doc_id.as_usize()))
             .collect())
+    }
+
+    /// Load scoring document lengths for a bounded candidate set.
+    ///
+    /// The current format stores lengths in an independent dense column. Cold
+    /// selective staged queries read only candidate rows; resident or dense
+    /// queries reuse/populate the normal full-column cache. Returned values
+    /// exactly match [`DocLengths::scoring`], including the quantized V3 path.
+    pub(crate) async fn resolve_scoring_lengths(&self, doc_ids: &[DocId]) -> Result<Vec<u32>> {
+        if doc_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.validate_doc_ids(doc_ids)?;
+        if let Some(lengths) = self.cached_lengths() {
+            return Ok(doc_ids
+                .iter()
+                .map(|&doc_id| lengths.scoring(doc_id))
+                .collect());
+        }
+        if !self.prefer_sparse_document_read(doc_ids.len()) {
+            let lengths = self.lengths().await?;
+            return Ok(doc_ids
+                .iter()
+                .map(|&doc_id| lengths.scoring(doc_id))
+                .collect());
+        }
+
+        let ranges = doc_ids
+            .iter()
+            .map(|doc_id| {
+                let index = doc_id.as_usize();
+                index..index + 1
+            })
+            .collect::<Vec<_>>();
+        let batch = self
+            .reader()
+            .await?
+            .read_ranges(&ranges, Some(&[NUM_TOKEN_COL]))
+            .await?;
+        let lengths = required_u32_column(&batch, NUM_TOKEN_COL, &self.path)?;
+        if lengths.null_count() != 0 || lengths.len() != doc_ids.len() {
+            return Err(corrupt_docs(
+                &self.path,
+                format!(
+                    "sparse {NUM_TOKEN_COL} projection returned {} rows with {} nulls for {} candidates",
+                    lengths.len(),
+                    lengths.null_count(),
+                    doc_ids.len()
+                ),
+            ));
+        }
+        Ok(lengths
+            .values()
+            .iter()
+            .map(|&length| {
+                if self.quantized_scoring {
+                    dequantize_doc_length(quantize_doc_length(length))
+                } else {
+                    length
+                }
+            })
+            .collect())
+    }
+
+    /// Resolve the row address and scoring length for a bounded candidate set.
+    ///
+    /// When neither document column is resident and the selection is sparse,
+    /// both columns are projected by one `read_ranges` call. This avoids
+    /// opening and scheduling the same document file twice during staged
+    /// cross-column execution. Asymmetric cache states continue to reuse the
+    /// resident side through the existing typed resolvers.
+    pub(crate) async fn resolve_scoring_documents(
+        &self,
+        doc_ids: &[DocId],
+    ) -> Result<Vec<(u32, u64, u32)>> {
+        if doc_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.validate_doc_ids(doc_ids)?;
+
+        let addresses_need_sparse_read = self.resident_address_projection().is_none()
+            && self.remapper.is_none()
+            && self.shared_addresses.load().upgrade().is_none()
+            && self.prefer_sparse_document_read(doc_ids.len());
+        let lengths_need_sparse_read =
+            self.cached_lengths().is_none() && self.prefer_sparse_document_read(doc_ids.len());
+        if addresses_need_sparse_read && lengths_need_sparse_read {
+            let ranges = doc_ids
+                .iter()
+                .map(|doc_id| {
+                    let index = doc_id.as_usize();
+                    index..index + 1
+                })
+                .collect::<Vec<_>>();
+            let batch = self
+                .reader()
+                .await?
+                .read_ranges(&ranges, Some(&[ROW_ID, NUM_TOKEN_COL]))
+                .await?;
+            let row_ids = required_u64_column(&batch, ROW_ID, &self.path)?;
+            let lengths = required_u32_column(&batch, NUM_TOKEN_COL, &self.path)?;
+            if row_ids.null_count() != 0
+                || lengths.null_count() != 0
+                || row_ids.len() != doc_ids.len()
+                || lengths.len() != doc_ids.len()
+            {
+                return Err(corrupt_docs(
+                    &self.path,
+                    format!(
+                        "sparse document projection returned {} row addresses ({} nulls) and {} lengths ({} nulls) for {} candidates",
+                        row_ids.len(),
+                        row_ids.null_count(),
+                        lengths.len(),
+                        lengths.null_count(),
+                        doc_ids.len()
+                    ),
+                ));
+            }
+            return Ok(doc_ids
+                .iter()
+                .zip(row_ids.values())
+                .zip(lengths.values())
+                .map(|((&doc_id, &row_address), &length)| {
+                    let scoring_length = if self.quantized_scoring {
+                        dequantize_doc_length(quantize_doc_length(length))
+                    } else {
+                        length
+                    };
+                    (doc_id.get(), row_address, scoring_length)
+                })
+                .collect());
+        }
+
+        let (row_addresses, scoring_lengths) = futures::try_join!(
+            self.resolve_addresses(doc_ids),
+            self.resolve_scoring_lengths(doc_ids)
+        )?;
+        if row_addresses.len() != doc_ids.len() || scoring_lengths.len() != doc_ids.len() {
+            return Err(Error::internal(format!(
+                "resolved {} row addresses and {} lengths for {} FTS candidates",
+                row_addresses.len(),
+                scoring_lengths.len(),
+                doc_ids.len()
+            )));
+        }
+        Ok(doc_ids
+            .iter()
+            .zip(row_addresses)
+            .zip(scoring_lengths)
+            .map(|((&doc_id, row_address), scoring_length)| {
+                (doc_id.get(), row_address, scoring_length)
+            })
+            .collect())
+    }
+
+    pub(crate) fn prefer_sparse_document_read(&self, selected: usize) -> bool {
+        (selected as u128).saturating_mul(100)
+            <= (SPARSE_DOCUMENT_READ_PERCENT as u128).saturating_mul(self.num_docs as u128)
     }
 
     /// Resolve final global top-k DocIds to their logical FTS document keys.
@@ -1637,10 +2311,252 @@ mod tests {
             addresses: AddressValues::Owned(Arc::new(vec![10, 20, 30])),
             live_docs: Some(RoaringBitmap::from_iter([0, 2])),
             doc_ids_by_address: OnceCell::new(),
+            ordered_validation: AtomicU8::new(CachedRowAddressOrder::Unknown as u8),
+            materialized_candidate_cost: AtomicUsize::new(0),
+            ordered_validation_visited_docs: AtomicUsize::new(0),
         });
         let projection = projection.resident(None).unwrap();
         let selected = projection.live_doc_ids();
         assert_eq!(selected.iter().collect::<Vec<_>>(), vec![0, 2]);
+        assert_eq!(projection.live_address_hull(), Some((10, 30)));
+
+        let empty = Arc::new(VersionAddressProjection {
+            addresses: AddressValues::Owned(Arc::new(vec![10, 20, 30])),
+            live_docs: Some(RoaringBitmap::new()),
+            doc_ids_by_address: OnceCell::new(),
+            ordered_validation: AtomicU8::new(CachedRowAddressOrder::Unknown as u8),
+            materialized_candidate_cost: AtomicUsize::new(0),
+            ordered_validation_visited_docs: AtomicUsize::new(0),
+        });
+        assert_eq!(empty.resident(None).unwrap().live_address_hull(), None);
+    }
+
+    #[test]
+    fn ordered_row_address_projection_maps_identity_domain() {
+        let addresses = Arc::new(UInt64Array::from(vec![10, 20, 30]));
+        let projection = Arc::new(VersionAddressProjection {
+            addresses: AddressValues::Shared {
+                len: addresses.len(),
+            },
+            live_docs: None,
+            doc_ids_by_address: OnceCell::new(),
+            ordered_validation: AtomicU8::new(CachedRowAddressOrder::Unknown as u8),
+            materialized_candidate_cost: AtomicUsize::new(0),
+            ordered_validation_visited_docs: AtomicUsize::new(0),
+        });
+        let projection = projection.resident(Some(addresses)).unwrap();
+        let ordered = projection.try_ordered_row_addresses().unwrap();
+
+        assert_eq!(ordered.len(), 3);
+        assert_eq!(ordered.live_len(), 3);
+        assert_eq!(ordered.live_address_hull(), Some((10, 30)));
+        assert_eq!(
+            ordered
+                .select_sorted_addresses(&[5, 10, 25, 30, 50])
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![0, 2]
+        );
+        assert!(ordered.select_sorted_addresses(&[]).is_empty());
+        assert_eq!(ordered.address(0), Some(10));
+        assert_eq!(ordered.address(2), Some(30));
+        assert_eq!(ordered.address(3), None);
+        assert_eq!(ordered.lower_bound(0), Some(0));
+        assert_eq!(ordered.lower_bound(10), Some(0));
+        assert_eq!(ordered.lower_bound(11), Some(1));
+        assert_eq!(ordered.lower_bound(30), Some(2));
+        assert_eq!(ordered.lower_bound(31), None);
+        assert_eq!(ordered.next_address(0), Some(20));
+        assert_eq!(ordered.next_address(1), Some(30));
+        assert_eq!(ordered.next_address(2), None);
+        assert_eq!(ordered.next_address(u64::MAX), None);
+    }
+
+    #[test]
+    fn ordered_row_address_projection_caches_successful_validation() {
+        let projection = resident_row_address_projection_for_test(vec![10, 20, 30, 40]);
+        assert_eq!(
+            projection.cached_row_address_order(),
+            CachedRowAddressOrder::Unknown
+        );
+        assert_eq!(projection.ordered_validation_visited_docs(), 0);
+
+        let first = projection.try_ordered_row_addresses().unwrap();
+        assert_eq!(
+            projection.cached_row_address_order(),
+            CachedRowAddressOrder::Ordered
+        );
+        assert_eq!(projection.ordered_validation_visited_docs(), 4);
+        assert_eq!(first.lower_bound(25), Some(2));
+
+        let second_query = projection.projection.resident(None).unwrap();
+        let second = second_query.try_ordered_row_addresses().unwrap();
+        assert_eq!(second_query.ordered_validation_visited_docs(), 4);
+        assert_eq!(second.lower_bound(25), Some(2));
+    }
+
+    #[test]
+    fn ordered_validation_computes_before_short_cache_publication() {
+        let projection = resident_row_address_projection_for_test(vec![10, 20, 30, 40]);
+
+        let validation = projection.compute_ordered_validation();
+        assert_eq!(validation, Ok(()));
+        assert_eq!(projection.ordered_validation_visited_docs(), 4);
+        assert_eq!(
+            projection.cached_row_address_order(),
+            CachedRowAddressOrder::Unknown
+        );
+
+        projection.publish_ordered_validation(&validation);
+        assert_eq!(
+            projection.cached_row_address_order(),
+            CachedRowAddressOrder::Ordered
+        );
+        assert_eq!(projection.ordered_validation_visited_docs(), 4);
+    }
+
+    #[test]
+    fn ordered_validation_concurrent_race_publishes_one_stable_state() {
+        let projection = resident_row_address_projection_for_test(vec![10, 20, 30, 40]);
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let handles = (0..2)
+            .map(|_| {
+                let projection = projection.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    projection.try_ordered_row_addresses().map(drop)
+                })
+            })
+            .collect::<Vec<_>>();
+
+        barrier.wait();
+        for handle in handles {
+            handle.join().unwrap().unwrap();
+        }
+        assert_eq!(
+            projection.cached_row_address_order(),
+            CachedRowAddressOrder::Ordered
+        );
+        assert!(matches!(
+            projection.ordered_validation_visited_docs(),
+            4 | 8
+        ));
+    }
+
+    #[test]
+    fn ordered_row_address_projection_skips_deleted_slots() {
+        let projection = Arc::new(VersionAddressProjection {
+            addresses: AddressValues::Owned(Arc::new(vec![10, 0, 30, 0, 50])),
+            live_docs: Some(RoaringBitmap::from_iter([0, 2, 4])),
+            doc_ids_by_address: OnceCell::new(),
+            ordered_validation: AtomicU8::new(CachedRowAddressOrder::Unknown as u8),
+            materialized_candidate_cost: AtomicUsize::new(0),
+            ordered_validation_visited_docs: AtomicUsize::new(0),
+        });
+        let projection = projection.resident(None).unwrap();
+        assert_eq!(projection.ordered_validation_visited_docs(), 0);
+        let ordered = projection.try_ordered_row_addresses().unwrap();
+        assert_eq!(projection.ordered_validation_visited_docs(), 3);
+        projection.try_ordered_row_addresses().unwrap();
+        assert_eq!(projection.ordered_validation_visited_docs(), 3);
+
+        assert_eq!(ordered.len(), 5);
+        assert_eq!(ordered.live_len(), 3);
+        assert_eq!(ordered.live_address_hull(), Some((10, 50)));
+        assert_eq!(
+            ordered
+                .select_sorted_addresses(&[0, 10, 30, 40, 50, 60])
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![0, 2, 4]
+        );
+        assert_eq!(ordered.address(0), Some(10));
+        assert_eq!(ordered.address(1), None);
+        assert_eq!(ordered.address(2), Some(30));
+        assert_eq!(ordered.lower_bound(11), Some(2));
+        assert_eq!(ordered.lower_bound(30), Some(2));
+        assert_eq!(ordered.lower_bound(31), Some(4));
+        assert_eq!(ordered.lower_bound(51), None);
+        assert_eq!(ordered.next_address(0), Some(30));
+        assert_eq!(ordered.next_address(1), Some(30));
+        assert_eq!(ordered.next_address(2), Some(50));
+        assert_eq!(ordered.next_address(4), None);
+        assert_eq!(
+            ordered.address(1).or_else(|| ordered.next_address(1)),
+            Some(30)
+        );
+    }
+
+    #[test]
+    fn ordered_row_address_projection_rejects_nonmonotonic_remap() {
+        let raw = UInt64Array::from(vec![10, 20, 30, 40]);
+        let remapper = TestRemapper {
+            mapping: HashMap::from([(10, Some(100)), (20, None), (30, Some(300))]),
+        };
+        let projection = Arc::new(
+            VersionAddressProjection::try_new(&raw, 4, Some(&remapper), "docs")
+                .expect("valid projection"),
+        );
+        let projection = projection.resident(None).unwrap();
+
+        let expected = RowAddressProjectionOrderError::OutOfOrder {
+            previous_doc_id: DocId::new(2),
+            previous_address: RowAddress::new_from_u64(300),
+            doc_id: DocId::new(3),
+            address: RowAddress::new_from_u64(40),
+        };
+        assert_eq!(
+            projection.try_ordered_row_addresses().unwrap_err(),
+            expected
+        );
+        assert_eq!(
+            projection.cached_row_address_order(),
+            CachedRowAddressOrder::OutOfOrder
+        );
+        assert_eq!(projection.ordered_validation_visited_docs(), 3);
+        assert_eq!(
+            projection.try_ordered_row_addresses().unwrap_err(),
+            expected
+        );
+        assert_eq!(
+            projection.cached_row_address_order(),
+            CachedRowAddressOrder::OutOfOrder
+        );
+        assert_eq!(projection.ordered_validation_visited_docs(), 6);
+    }
+
+    #[test]
+    fn ordered_row_address_projection_rejects_duplicate_address() {
+        let projection = Arc::new(VersionAddressProjection {
+            addresses: AddressValues::Owned(Arc::new(vec![10, 20, 20, 30])),
+            live_docs: None,
+            doc_ids_by_address: OnceCell::new(),
+            ordered_validation: AtomicU8::new(CachedRowAddressOrder::Unknown as u8),
+            materialized_candidate_cost: AtomicUsize::new(0),
+            ordered_validation_visited_docs: AtomicUsize::new(0),
+        });
+        let projection = projection.resident(None).unwrap();
+
+        let expected = RowAddressProjectionOrderError::Duplicate {
+            first_doc_id: DocId::new(1),
+            duplicate_doc_id: DocId::new(2),
+            address: RowAddress::new_from_u64(20),
+        };
+        assert_eq!(
+            projection.try_ordered_row_addresses().unwrap_err(),
+            expected
+        );
+        assert_eq!(
+            projection.cached_row_address_order(),
+            CachedRowAddressOrder::Duplicate
+        );
+        assert_eq!(projection.ordered_validation_visited_docs(), 3);
+        assert_eq!(
+            projection.try_ordered_row_addresses().unwrap_err(),
+            expected
+        );
+        assert_eq!(projection.ordered_validation_visited_docs(), 6);
     }
 
     #[tokio::test]
@@ -1662,6 +2578,7 @@ mod tests {
 
         let all_live = projection.live_doc_ids();
         assert_eq!(all_live.iter().collect::<Vec<_>>(), vec![0, 2, 3]);
+        assert_eq!(projection.live_address_hull(), Some((40, 300)));
 
         let allowed = Arc::new(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter([
             100, 40,
@@ -1675,6 +2592,11 @@ mod tests {
             panic!("allow-list must compile to DocIds")
         };
         assert_eq!(selected.iter().collect::<Vec<_>>(), vec![0, 3]);
+        let candidate_selected = projection
+            .select_sorted_addresses(&[10, 40, 100])
+            .await
+            .expect("valid candidate projection");
+        assert_eq!(candidate_selected, selected);
 
         let first_lookup = projection
             .doc_ids_by_address()
@@ -1711,8 +2633,22 @@ mod tests {
             ])),
             live_docs: None,
             doc_ids_by_address: OnceCell::new(),
+            ordered_validation: AtomicU8::new(CachedRowAddressOrder::Unknown as u8),
+            materialized_candidate_cost: AtomicUsize::new(0),
+            ordered_validation_visited_docs: AtomicUsize::new(0),
         });
         let projection = projection.resident(None).unwrap();
+
+        let duplicate = projection
+            .select_sorted_addresses(&[row_address(1, 2)])
+            .await
+            .unwrap_err();
+        assert!(matches!(duplicate, Error::Index { .. }));
+        assert!(
+            duplicate
+                .to_string()
+                .contains("row address 4294967298 is shared by local documents 1 and 2")
+        );
 
         let allowed = Arc::new(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter([
             row_address(1, 2),
@@ -1741,12 +2677,35 @@ mod tests {
         assert_eq!(selected.iter().collect::<Vec<_>>(), vec![0]);
     }
 
+    #[tokio::test]
+    async fn candidate_projection_ignores_deleted_duplicate_addresses() {
+        let projection = Arc::new(VersionAddressProjection {
+            addresses: AddressValues::Owned(Arc::new(vec![30, 10, 10, 20])),
+            live_docs: Some(RoaringBitmap::from_iter([0, 1, 3])),
+            doc_ids_by_address: OnceCell::new(),
+            ordered_validation: AtomicU8::new(CachedRowAddressOrder::Unknown as u8),
+            materialized_candidate_cost: AtomicUsize::new(0),
+            ordered_validation_visited_docs: AtomicUsize::new(0),
+        });
+        let projection = projection.resident(None).unwrap();
+
+        assert_eq!(projection.live_address_hull(), Some((10, 30)));
+        let selected = projection
+            .select_sorted_addresses(&[10, 20, 25, 30])
+            .await
+            .expect("deleted duplicate does not collide");
+        assert_eq!(selected.iter().collect::<Vec<_>>(), vec![0, 1, 3]);
+    }
+
     #[test]
     fn lazy_visibility_projects_only_candidate_doc_ids() {
         let projection = Arc::new(VersionAddressProjection {
             addresses: AddressValues::Owned(Arc::new(vec![10, 20, 30])),
             live_docs: Some(RoaringBitmap::from_iter([0, 2])),
             doc_ids_by_address: OnceCell::new(),
+            ordered_validation: AtomicU8::new(CachedRowAddressOrder::Unknown as u8),
+            materialized_candidate_cost: AtomicUsize::new(0),
+            ordered_validation_visited_docs: AtomicUsize::new(0),
         });
         let resident = projection.resident(None).unwrap();
         let visibility = DocVisibility::Filtered {
@@ -2184,6 +3143,127 @@ mod tests {
         assert_eq!(counts.range_calls.load(Ordering::Relaxed), 1);
         assert_eq!(counts.address_rows.load(Ordering::Relaxed), 600);
         assert!(!documents.projection_loaded());
+    }
+
+    #[tokio::test]
+    async fn selective_scoring_lengths_read_only_candidate_rows() {
+        let (_directory, store, cache) = test_store();
+        let path = "docs.lance";
+        let num_docs = 600_u32;
+        write_documents(
+            store.as_ref(),
+            path,
+            UInt64Array::from_iter_values((0..num_docs).map(u64::from)),
+            UInt32Array::from_iter_values(1..=num_docs),
+            Some(
+                &u64::from(num_docs)
+                    .saturating_mul(u64::from(num_docs + 1))
+                    .div_ceil(2)
+                    .to_string(),
+            ),
+        )
+        .await;
+        let (counting, counts) = counted_store(store, path);
+        let documents = open_documents(counting, path, cache.as_ref(), None)
+            .await
+            .unwrap();
+        let doc_ids = [DocId::new(2), DocId::new(10), DocId::new(2)];
+
+        assert_eq!(
+            documents.resolve_scoring_lengths(&doc_ids).await.unwrap(),
+            vec![3, 11, 3]
+        );
+        assert_eq!(counts.ranges_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(counts.range_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(counts.length_rows.load(Ordering::Relaxed), doc_ids.len());
+        assert!(!documents.lengths_loaded());
+    }
+
+    #[tokio::test]
+    async fn selective_scoring_documents_share_one_candidate_read() {
+        let (_directory, store, cache) = test_store();
+        let path = "docs.lance";
+        let num_docs = 600_u32;
+        write_documents(
+            store.as_ref(),
+            path,
+            UInt64Array::from_iter_values((0..num_docs).map(|doc_id| 10_000 + u64::from(doc_id))),
+            UInt32Array::from_iter_values((0..num_docs).map(|doc_id| doc_id + 1)),
+            Some("180300"),
+        )
+        .await;
+        let (counting, counts) = counted_store(store, path);
+        let documents = open_documents(counting, path, cache.as_ref(), None)
+            .await
+            .unwrap();
+        let doc_ids = [DocId::new(2), DocId::new(10), DocId::new(2)];
+
+        assert_eq!(
+            documents.resolve_scoring_documents(&doc_ids).await.unwrap(),
+            vec![(2, 10_002, 3), (10, 10_010, 11), (2, 10_002, 3)]
+        );
+        assert_eq!(counts.ranges_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(counts.range_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(counts.address_rows.load(Ordering::Relaxed), doc_ids.len());
+        assert_eq!(counts.length_rows.load(Ordering::Relaxed), doc_ids.len());
+        assert!(!documents.lengths_loaded());
+        assert!(!documents.projection_loaded());
+    }
+
+    #[tokio::test]
+    async fn selective_scoring_documents_preserve_quantized_lengths() {
+        let (_directory, store, cache) = test_store();
+        let path = "docs.lance";
+        let num_docs = 600_u32;
+        let lengths = (0..num_docs)
+            .map(|doc_id| if doc_id == 10 { 300 } else { doc_id + 1 })
+            .collect::<Vec<_>>();
+        let total_tokens = lengths
+            .iter()
+            .map(|&length| u64::from(length))
+            .sum::<u64>()
+            .to_string();
+        write_documents(
+            store.as_ref(),
+            path,
+            UInt64Array::from_iter_values((0..num_docs).map(|doc_id| 20_000 + u64::from(doc_id))),
+            UInt32Array::from(lengths.clone()),
+            Some(&total_tokens),
+        )
+        .await;
+        let (counting, counts) = counted_store(store, path);
+        let reader = counting.open_index_file(path).await.unwrap();
+        let documents = PartitionDocuments::try_new(
+            counting,
+            path.to_owned(),
+            0,
+            WeakLanceCache::from(cache.as_ref()),
+            reader.as_ref(),
+            None,
+            true,
+        )
+        .unwrap();
+        let doc_ids = [DocId::new(10), DocId::new(500)];
+
+        assert_eq!(
+            documents.resolve_scoring_documents(&doc_ids).await.unwrap(),
+            vec![
+                (
+                    10,
+                    20_010,
+                    dequantize_doc_length(quantize_doc_length(lengths[10])),
+                ),
+                (
+                    500,
+                    20_500,
+                    dequantize_doc_length(quantize_doc_length(lengths[500])),
+                ),
+            ]
+        );
+        assert_eq!(counts.ranges_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(counts.address_rows.load(Ordering::Relaxed), doc_ids.len());
+        assert_eq!(counts.length_rows.load(Ordering::Relaxed), doc_ids.len());
+        assert!(!documents.lengths_loaded());
     }
 
     #[tokio::test]

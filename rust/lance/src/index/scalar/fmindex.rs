@@ -70,7 +70,6 @@ pub(in crate::index) async fn merge_segments(
 
         return Ok(IndexMetadata {
             uuid: new_uuid,
-            fields: vec![field_id],
             dataset_version: dataset.manifest.version,
             fragment_bitmap: Some(fragment_bitmap),
             index_details: Some(Arc::new(created_index.index_details)),
@@ -105,7 +104,6 @@ pub(in crate::index) async fn merge_segments(
 
     Ok(IndexMetadata {
         uuid: new_uuid,
-        fields: vec![field_id],
         dataset_version: dataset.manifest.version,
         fragment_bitmap: Some(fragment_bitmap),
         index_details: Some(Arc::new(created_index.index_details)),
