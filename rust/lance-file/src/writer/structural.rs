@@ -5,7 +5,9 @@ use core::panic;
 use std::{collections::HashMap, sync::Arc};
 
 use arrow_array::{ArrayRef, RecordBatch};
+use arrow_buffer::BooleanBuffer;
 use arrow_data::ArrayData;
+use arrow_schema::DataType;
 use bytes::{Buf, Bytes, BytesMut};
 use futures::{StreamExt, stream::FuturesOrdered};
 use lance_core::{
@@ -450,14 +452,64 @@ impl EncodingPipeline {
     }
 
     fn verify_field_nullability(array: &ArrayData, field: &Field) -> Result<()> {
-        if !field.nullable && array.null_count() > 0 {
+        Self::verify_field_nullability_where_reachable(array, field, None)
+    }
+
+    /// `reachable` marks the slots a valid parent can actually see, or `None`
+    /// at the top level where every slot is reachable.
+    ///
+    /// A null struct slot leaves its children undefined, so a child null there
+    /// says nothing about whether the child is nullable. Arrow draws the line
+    /// the same way -- `StructArray::try_new` rejects only nulls in a
+    /// non-nullable child that the parent's null mask does not cover -- and a
+    /// reader is free to hand back nulls under a null parent for a column this
+    /// writer produced with values there. Judging those would make a column
+    /// unwritable after a round trip.
+    fn verify_field_nullability_where_reachable(
+        array: &ArrayData,
+        field: &Field,
+        reachable: Option<&BooleanBuffer>,
+    ) -> Result<()> {
+        let offending = match (array.nulls(), reachable) {
+            (None, _) => 0,
+            (Some(nulls), None) => nulls.null_count(),
+            (Some(nulls), Some(reachable)) => (&!nulls.inner() & reachable).count_set_bits(),
+        };
+        if !field.nullable && offending > 0 {
             return Err(Error::invalid_input(format!(
                 "The field `{}` contained null values even though the field is marked non-null in the schema",
                 field.name
             )));
         }
+        if field.children.is_empty() {
+            return Ok(());
+        }
+        // Only a struct's children sit one slot per parent slot. List-like
+        // children are addressed through offsets, so the parent's validity
+        // does not map onto them and they are checked as before.
+        if !matches!(array.data_type(), DataType::Struct(_)) {
+            for (child_field, child_array) in field.children.iter().zip(array.child_data()) {
+                Self::verify_field_nullability_where_reachable(child_array, child_field, None)?;
+            }
+            return Ok(());
+        }
+        let own = array
+            .nulls()
+            .map(|nulls| nulls.inner().clone())
+            .unwrap_or_else(|| BooleanBuffer::new_set(array.len()));
+        let child_reachable = match reachable {
+            Some(reachable) => &own & reachable,
+            None => own,
+        };
         for (child_field, child_array) in field.children.iter().zip(array.child_data()) {
-            Self::verify_field_nullability(child_array, child_field)?;
+            // Line the child up with the parent's window before comparing it
+            // against a mask built from the parent's slots.
+            let child_array = child_array.slice(array.offset(), array.len());
+            Self::verify_field_nullability_where_reachable(
+                &child_array,
+                child_field,
+                Some(&child_reachable),
+            )?;
         }
         Ok(())
     }
@@ -839,4 +891,79 @@ pub fn encode_batch_body(batch: &EncodedBatch, write_schema: bool) -> Result<Enc
         num_global_buffers,
         num_columns: batch.page_table.len() as u32,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow_array::{ArrayRef, BooleanArray, StructArray};
+    use arrow_buffer::NullBuffer;
+    use arrow_schema::{Field as ArrowField, Fields, Schema as ArrowSchema};
+    use lance_core::datatypes::Schema;
+
+    use super::FileWriter;
+
+    /// `analysis: struct<changed: bool>` where the child is declared
+    /// non-nullable, built with a nullable child so the array can carry the
+    /// nulls a reader hands back.
+    fn analysis(parent_valid: Vec<bool>, changed: Vec<Option<bool>>) -> (ArrayRef, Schema) {
+        let child = Arc::new(BooleanArray::from(changed)) as ArrayRef;
+        let array = Arc::new(StructArray::new(
+            Fields::from(vec![ArrowField::new(
+                "changed",
+                arrow_schema::DataType::Boolean,
+                true,
+            )]),
+            vec![child],
+            Some(NullBuffer::from(parent_valid)),
+        )) as ArrayRef;
+        let declared = ArrowSchema::new(vec![ArrowField::new(
+            "analysis",
+            arrow_schema::DataType::Struct(Fields::from(vec![ArrowField::new(
+                "changed",
+                arrow_schema::DataType::Boolean,
+                false,
+            )])),
+            true,
+        )]);
+        (array, Schema::try_from(&declared).unwrap())
+    }
+
+    #[test]
+    fn child_nulls_under_a_null_parent_are_writable() {
+        // A null struct slot leaves its child undefined, and a reader returns
+        // null there for a column this writer stored a value in. Rejecting it
+        // would make the column unwritable after a round trip.
+        let (array, schema) = analysis(
+            vec![true, false, true, false],
+            vec![Some(true), None, Some(false), None],
+        );
+        FileWriter::verify_field_nullability(&array.to_data(), &schema.fields[0]).unwrap();
+    }
+
+    #[test]
+    fn child_nulls_under_a_valid_parent_are_still_rejected() {
+        let (array, schema) = analysis(
+            vec![true, true, true, false],
+            vec![Some(true), None, Some(false), None],
+        );
+        let error = FileWriter::verify_field_nullability(&array.to_data(), &schema.fields[0])
+            .expect_err("a null the parent does not mask violates the schema");
+        assert!(
+            error.to_string().contains("`changed`"),
+            "should name the offending child: {error}"
+        );
+    }
+
+    #[test]
+    fn a_sliced_parent_lines_up_with_its_children() {
+        let (array, schema) = analysis(
+            vec![true, false, true, true],
+            vec![Some(true), None, Some(false), Some(true)],
+        );
+        // Dropping the first row leaves the null parent at slot 0.
+        let sliced = array.slice(1, 3);
+        FileWriter::verify_field_nullability(&sliced.to_data(), &schema.fields[0]).unwrap();
+    }
 }
