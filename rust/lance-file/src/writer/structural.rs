@@ -902,7 +902,7 @@ mod tests {
     use arrow_schema::{Field as ArrowField, Fields, Schema as ArrowSchema};
     use lance_core::datatypes::Schema;
 
-    use super::FileWriter;
+    use super::EncodingPipeline;
 
     /// `analysis: struct<changed: bool>` where the child is declared
     /// non-nullable, built with a nullable child so the array can carry the
@@ -939,7 +939,7 @@ mod tests {
             vec![true, false, true, false],
             vec![Some(true), None, Some(false), None],
         );
-        FileWriter::verify_field_nullability(&array.to_data(), &schema.fields[0]).unwrap();
+        EncodingPipeline::verify_field_nullability(&array.to_data(), &schema.fields[0]).unwrap();
     }
 
     #[test]
@@ -948,7 +948,7 @@ mod tests {
             vec![true, true, true, false],
             vec![Some(true), None, Some(false), None],
         );
-        let error = FileWriter::verify_field_nullability(&array.to_data(), &schema.fields[0])
+        let error = EncodingPipeline::verify_field_nullability(&array.to_data(), &schema.fields[0])
             .expect_err("a null the parent does not mask violates the schema");
         assert!(
             error.to_string().contains("`changed`"),
@@ -964,6 +964,6 @@ mod tests {
         );
         // Dropping the first row leaves the null parent at slot 0.
         let sliced = array.slice(1, 3);
-        FileWriter::verify_field_nullability(&sliced.to_data(), &schema.fields[0]).unwrap();
+        EncodingPipeline::verify_field_nullability(&sliced.to_data(), &schema.fields[0]).unwrap();
     }
 }
