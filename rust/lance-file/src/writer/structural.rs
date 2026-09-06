@@ -4,7 +4,7 @@
 use core::panic;
 use std::{collections::HashMap, sync::Arc};
 
-use arrow_array::{ArrayRef, RecordBatch};
+use arrow_array::{Array, ArrayRef, RecordBatch, StructArray, make_array};
 use arrow_buffer::BooleanBuffer;
 use arrow_data::ArrayData;
 use arrow_schema::DataType;
@@ -451,7 +451,7 @@ impl EncodingPipeline {
         self.schema.is_some()
     }
 
-    fn verify_field_nullability(array: &ArrayData, field: &Field) -> Result<()> {
+    fn verify_field_nullability(array: &dyn Array, field: &Field) -> Result<()> {
         Self::verify_field_nullability_where_reachable(array, field, None)
     }
 
@@ -465,12 +465,18 @@ impl EncodingPipeline {
     /// reader is free to hand back nulls under a null parent for a column this
     /// writer produced with values there. Judging those would make a column
     /// unwritable after a round trip.
+    ///
+    /// Nulls are read through `logical_nulls`, which is what Arrow validates
+    /// against. A dictionary key pointing at a null value is a null the
+    /// physical validity buffer does not carry, and masking physical validity
+    /// alone would let one through into a file Arrow refuses on readback.
     fn verify_field_nullability_where_reachable(
-        array: &ArrayData,
+        array: &dyn Array,
         field: &Field,
         reachable: Option<&BooleanBuffer>,
     ) -> Result<()> {
-        let offending = match (array.nulls(), reachable) {
+        let nulls = array.logical_nulls();
+        let offending = match (nulls.as_ref(), reachable) {
             (None, _) => 0,
             (Some(nulls), None) => nulls.null_count(),
             (Some(nulls), Some(reachable)) => (&!nulls.inner() & reachable).count_set_bits(),
@@ -487,26 +493,31 @@ impl EncodingPipeline {
         // Only a struct's children sit one slot per parent slot. List-like
         // children are addressed through offsets, so the parent's validity
         // does not map onto them and they are checked as before.
-        if !matches!(array.data_type(), DataType::Struct(_)) {
-            for (child_field, child_array) in field.children.iter().zip(array.child_data()) {
-                Self::verify_field_nullability_where_reachable(child_array, child_field, None)?;
+        let Some(parent) = array.as_any().downcast_ref::<StructArray>() else {
+            for (child_field, child_array) in
+                field.children.iter().zip(array.to_data().child_data())
+            {
+                Self::verify_field_nullability_where_reachable(
+                    make_array(child_array.clone()).as_ref(),
+                    child_field,
+                    None,
+                )?;
             }
             return Ok(());
-        }
-        let own = array
-            .nulls()
+        };
+        let own = nulls
+            .as_ref()
             .map(|nulls| nulls.inner().clone())
             .unwrap_or_else(|| BooleanBuffer::new_set(array.len()));
         let child_reachable = match reachable {
             Some(reachable) => &own & reachable,
             None => own,
         };
-        for (child_field, child_array) in field.children.iter().zip(array.child_data()) {
-            // Line the child up with the parent's window before comparing it
-            // against a mask built from the parent's slots.
-            let child_array = child_array.slice(array.offset(), array.len());
+        // `StructArray::columns` are already cut to the parent's window, so
+        // they line up with a mask built from the parent's slots.
+        for (child_field, child_array) in field.children.iter().zip(parent.columns()) {
             Self::verify_field_nullability_where_reachable(
-                &child_array,
+                child_array.as_ref(),
                 child_field,
                 Some(&child_reachable),
             )?;
@@ -520,7 +531,7 @@ impl EncodingPipeline {
             .iter()
             .zip(self.schema.as_ref().unwrap().fields.iter())
         {
-            Self::verify_field_nullability(&column.to_data(), field)?;
+            Self::verify_field_nullability(column.as_ref(), field)?;
         }
         Ok(())
     }
@@ -650,7 +661,7 @@ impl EncodingPipeline {
                 "cannot write Lance files with more than 2^32 rows".into(),
             ));
         }
-        Self::verify_field_nullability(&array.to_data(), field)?;
+        Self::verify_field_nullability(array.as_ref(), field)?;
         if array.is_empty() {
             return Ok(());
         }
@@ -939,7 +950,7 @@ mod tests {
             vec![true, false, true, false],
             vec![Some(true), None, Some(false), None],
         );
-        EncodingPipeline::verify_field_nullability(&array.to_data(), &schema.fields[0]).unwrap();
+        EncodingPipeline::verify_field_nullability(array.as_ref(), &schema.fields[0]).unwrap();
     }
 
     #[test]
@@ -948,12 +959,45 @@ mod tests {
             vec![true, true, true, false],
             vec![Some(true), None, Some(false), None],
         );
-        let error = EncodingPipeline::verify_field_nullability(&array.to_data(), &schema.fields[0])
+        let error = EncodingPipeline::verify_field_nullability(array.as_ref(), &schema.fields[0])
             .expect_err("a null the parent does not mask violates the schema");
         assert!(
             error.to_string().contains("`changed`"),
             "should name the offending child: {error}"
         );
+    }
+
+    /// A dictionary key can point at a null value, which the physical
+    /// validity buffer does not record. Masking physical validity alone would
+    /// admit that null and produce a file Arrow rejects on readback.
+    #[test]
+    fn a_logical_null_in_a_dictionary_child_is_rejected() {
+        use arrow_array::{DictionaryArray, Int32Array};
+        use arrow_schema::DataType;
+
+        let values = Arc::new(Int32Array::from(vec![Some(10), None])) as ArrayRef;
+        let keys = Int32Array::from(vec![Some(0), Some(1), None]);
+        let child = Arc::new(DictionaryArray::new(keys, values)) as ArrayRef;
+        let child_type = child.data_type().clone();
+        // Row 2's key is physically null but the parent masks it; row 1 is a
+        // logical null the parent does not mask.
+        let array = Arc::new(StructArray::new(
+            Fields::from(vec![ArrowField::new("code", child_type.clone(), true)]),
+            vec![child],
+            Some(NullBuffer::from(vec![true, true, false])),
+        )) as ArrayRef;
+        let declared = ArrowSchema::new(vec![ArrowField::new(
+            "wrapper",
+            DataType::Struct(Fields::from(vec![ArrowField::new(
+                "code", child_type, false,
+            )])),
+            true,
+        )]);
+        let schema = Schema::try_from(&declared).unwrap();
+
+        let error = EncodingPipeline::verify_field_nullability(array.as_ref(), &schema.fields[0])
+            .expect_err("the visible logical null at row 1 must be rejected");
+        assert!(error.to_string().contains("`code`"), "{error}");
     }
 
     #[test]
@@ -964,6 +1008,6 @@ mod tests {
         );
         // Dropping the first row leaves the null parent at slot 0.
         let sliced = array.slice(1, 3);
-        EncodingPipeline::verify_field_nullability(&sliced.to_data(), &schema.fields[0]).unwrap();
+        EncodingPipeline::verify_field_nullability(sliced.as_ref(), &schema.fields[0]).unwrap();
     }
 }
