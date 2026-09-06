@@ -311,7 +311,8 @@ impl Writer {
 
     /// Reject a null in a non-nullable field whether or not a null ancestor
     /// masks it: the 2.0 logical encoders cannot store such a slot. The 2.1+
-    /// structural writer counts only visible nulls (`writer::nullability`).
+    /// structural writer counts only visible nulls
+    /// (`writer::structural::FileWriter::verify_field_nullability`).
     fn verify_field_nullability(arr: &ArrayData, field: &Field) -> Result<()> {
         if !field.nullable && arr.null_count() > 0 {
             return Err(Error::invalid_input(format!(
@@ -691,7 +692,7 @@ impl Writer {
     /// `column_metadata` must describe the buffers already persisted by the
     /// underlying `ObjectWriter`, and `rows_written` should reflect the total number
     /// of rows in those buffers.
-    pub(crate) fn initialize_with_external_metadata(
+    pub fn initialize_with_external_metadata(
         &mut self,
         mut schema: lance_core::datatypes::Schema,
         column_metadata: Vec<pbfile::ColumnMetadata>,
@@ -848,7 +849,7 @@ impl Writer {
     }
 
     /// Append a buffer whose metadata is supplied by the caller.
-    pub(crate) async fn write_external_buffer(&mut self, bytes: &[u8]) -> Result<(u64, u64)> {
+    pub async fn write_external_buffer(&mut self, bytes: &[u8]) -> Result<(u64, u64)> {
         let start = self.tell().await?;
         self.writer.write_all(bytes).await?;
         Ok((start, bytes.len() as u64))

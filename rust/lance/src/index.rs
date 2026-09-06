@@ -25,7 +25,9 @@ use lance_file::reader::FileReaderOptions;
 use lance_file::versions::v1::reader::FileReader as V1FileReader;
 use lance_index::INDEX_METADATA_SCHEMA_KEY;
 pub use lance_index::IndexParams;
-use lance_index::frag_reuse::{FRAG_REUSE_INDEX_NAME, FragReuseIndex, FragReuseIndexHandle};
+use lance_index::frag_reuse::{
+    CompactFragReuseIndex, CompactFragReuseIndexHandle, FRAG_REUSE_INDEX_NAME,
+};
 use lance_index::mem_wal::{MEM_WAL_INDEX_NAME, MemWalIndex, MemWalIndexHandle};
 use lance_index::optimize::OptimizeOptions;
 use lance_index::pb::index::Implementation;
@@ -1037,7 +1039,7 @@ impl<'a> FragReuseIndexCacheKey<'a> {
 }
 
 impl CacheKey for FragReuseIndexCacheKey<'_> {
-    type ValueType = FragReuseIndex;
+    type ValueType = CompactFragReuseIndex;
 
     fn key(&self) -> std::borrow::Cow<'_, str> {
         if let Some(fri_uuid) = self.fri_uuid {
@@ -1973,12 +1975,7 @@ impl DatasetIndexExt for Dataset {
         };
 
         let mut merged_segment = if all_vector {
-            crate::index::vector::ivf::merge_segments(
-                self.object_store.as_ref(),
-                &self.indices_dir(),
-                source_segments,
-            )
-            .await?
+            crate::index::vector::ivf::merge_segments(self, source_segments).await?
         } else if all_inverted {
             crate::index::scalar::inverted::merge_segments(self, source_segments).await?
         } else if all_fmindex {
@@ -2552,7 +2549,7 @@ async fn index_statistics_frag_reuse(ds: &Dataset) -> Result<String> {
         .open_frag_reuse_index(&NoOpMetricsCollector)
         .await?
         .expect("FragmentReuse index does not exist");
-    serialize_index_statistics(&FragReuseIndexHandle(index).statistics()?)
+    serialize_index_statistics(&CompactFragReuseIndexHandle(index).statistics()?)
 }
 
 async fn index_statistics_mem_wal(ds: &Dataset) -> Result<String> {
@@ -2774,6 +2771,7 @@ pub(crate) async fn load_all_indices(dataset: &Dataset) -> Result<Arc<Vec<IndexM
     let metadata_key = IndexMetadataKey {
         version: dataset.version().version,
         store_identity: &dataset.object_store.store_prefix,
+        e_tag: dataset.manifest_location.e_tag.as_deref(),
     };
     let mut indices = dataset
         .index_cache
@@ -2889,7 +2887,7 @@ pub trait DatasetIndexInternalExt: DatasetIndexExt {
     async fn open_frag_reuse_index(
         &self,
         metrics: &dyn MetricsCollector,
-    ) -> Result<Option<Arc<FragReuseIndex>>>;
+    ) -> Result<Option<Arc<CompactFragReuseIndex>>>;
 
     /// Opens the MemWAL index
     async fn open_mem_wal_index(
@@ -2946,7 +2944,7 @@ impl DatasetIndexInternalExt for Dataset {
 
         let frag_reuse_cache_key = FragReuseIndexCacheKey::new(uuid, frag_reuse_uuid.as_ref());
         if let Some(index) = self.index_cache.get_with_key(&frag_reuse_cache_key).await {
-            return Ok(Arc::new(FragReuseIndexHandle(index)).as_index());
+            return Ok(Arc::new(CompactFragReuseIndexHandle(index)).as_index());
         }
 
         // Sometimes we want to open an index and we don't care if it is a scalar or vector index.
@@ -3350,7 +3348,7 @@ impl DatasetIndexInternalExt for Dataset {
     async fn open_frag_reuse_index(
         &self,
         metrics: &dyn MetricsCollector,
-    ) -> Result<Option<Arc<FragReuseIndex>>> {
+    ) -> Result<Option<Arc<CompactFragReuseIndex>>> {
         if let Some(frag_reuse_index_meta) = self.load_index_by_name(FRAG_REUSE_INDEX_NAME).await? {
             let frag_reuse_uuid = frag_reuse_index_meta.uuid;
             let frag_reuse_key = FragReuseIndexKey {
@@ -5702,6 +5700,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_index_metadata_cache_does_not_survive_drop_recreate_same_uri() {
+        fn batch_with_schema_metadata(metadata_value: String) -> RecordBatch {
+            let field = Field::new("tag", DataType::Utf8, false);
+            let schema = Arc::new(Schema::new_with_metadata(
+                vec![field],
+                HashMap::from([("large_metadata".to_string(), metadata_value)]),
+            ));
+            let array = StringArray::from_iter_values((0..128).map(|i| ["a", "b", "c"][i % 3]));
+            RecordBatch::try_new(schema, vec![Arc::new(array)]).unwrap()
+        }
+
+        async fn write_indexed_dataset(uri: &str, session: Arc<Session>, metadata_value: String) {
+            let batch = batch_with_schema_metadata(metadata_value);
+            let schema = batch.schema();
+            let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+            let write_params = WriteParams {
+                session: Some(session),
+                ..Default::default()
+            };
+            let mut dataset = Dataset::write(reader, uri, Some(write_params))
+                .await
+                .unwrap();
+            dataset
+                .create_index(
+                    &["tag"],
+                    IndexType::Bitmap,
+                    None,
+                    &ScalarIndexParams::default(),
+                    false,
+                )
+                .await
+                .unwrap();
+        }
+
+        let qn_session = Arc::new(Session::default());
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        write_indexed_dataset(test_uri, qn_session.clone(), "old".to_string()).await;
+        let first_dataset = DatasetBuilder::from_uri(test_uri)
+            .with_session(qn_session.clone())
+            .load()
+            .await
+            .unwrap();
+        let first_indices = first_dataset.load_indices().await.unwrap();
+        let first_uuid = first_indices[0].uuid;
+        assert_eq!(first_dataset.version().version, 2);
+        drop(first_dataset);
+
+        std::fs::remove_dir_all(test_uri).unwrap();
+
+        // Use a different writer session so the QN session keeps the previous
+        // incarnation's index metadata cache entry. The large schema metadata
+        // keeps the manifest index section outside the final read block during
+        // open, so the fresh manifest load cannot opportunistically overwrite
+        // the stale index metadata entry before load_indices().
+        write_indexed_dataset(
+            test_uri,
+            Arc::new(Session::default()),
+            "x".repeat(128 * 1024),
+        )
+        .await;
+        let second_dataset = DatasetBuilder::from_uri(test_uri)
+            .with_session(qn_session)
+            .load()
+            .await
+            .unwrap();
+        assert_eq!(second_dataset.version().version, 2);
+
+        let raw_second_indices = read_manifest_indexes(
+            second_dataset.object_store.as_ref(),
+            &second_dataset.manifest_location,
+            second_dataset.manifest(),
+        )
+        .await
+        .unwrap();
+        let raw_second_uuid = raw_second_indices[0].uuid;
+        assert_ne!(
+            raw_second_uuid, first_uuid,
+            "the recreated dataset should commit a new physical index UUID"
+        );
+
+        let cached_second_indices = second_dataset.load_indices().await.unwrap();
+        assert_eq!(
+            cached_second_indices[0].uuid, raw_second_uuid,
+            "load_indices should return index metadata from the recreated dataset, not the previous same-URI incarnation"
+        );
+    }
+
+    #[tokio::test]
     async fn test_load_indices_singleflights_concurrent_cache_misses() {
         let session = Arc::new(Session::default());
         let write_params = WriteParams {
@@ -5810,7 +5898,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_remap_empty() {
+    async fn test_remap_empty_chain() {
         let data = gen_batch()
             .col("int", array::step::<Int32Type>())
             .col(
@@ -5827,10 +5915,18 @@ mod tests {
             .unwrap();
 
         let index_uuid = dataset.load_indices().await.unwrap()[0].uuid;
-        let remap_to_empty = (0..dataset.count_all_rows().await.unwrap())
+        let row_count = dataset.count_all_rows().await.unwrap();
+        let first_half = (0..row_count / 2)
             .map(|i| (i as u64, None))
             .collect::<HashMap<_, _>>();
-        let new_uuid = remap_index(&dataset, &index_uuid, &RowAddrRemap::direct(remap_to_empty))
+        let second_half = (row_count / 2..row_count)
+            .map(|i| (i as u64, None))
+            .collect::<HashMap<_, _>>();
+        let remap_to_empty = RowAddrRemap::chained([
+            RowAddrRemap::direct(first_half),
+            RowAddrRemap::direct(second_half),
+        ]);
+        let new_uuid = remap_index(&dataset, &index_uuid, &remap_to_empty)
             .await
             .unwrap();
         assert_eq!(new_uuid, RemapResult::Keep(index_uuid));
@@ -5950,6 +6046,7 @@ mod tests {
         let metadata_key = crate::session::index_caches::IndexMetadataKey {
             version: dataset.version().version,
             store_identity: &dataset.object_store.store_prefix,
+            e_tag: dataset.manifest_location.e_tag.as_deref(),
         };
         dataset
             .index_cache
@@ -6359,6 +6456,7 @@ mod tests {
         let metadata_key = crate::session::index_caches::IndexMetadataKey {
             version: dataset.version().version,
             store_identity: &dataset.object_store.store_prefix,
+            e_tag: dataset.manifest_location.e_tag.as_deref(),
         };
         dataset
             .index_cache

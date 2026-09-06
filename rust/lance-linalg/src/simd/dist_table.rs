@@ -13,10 +13,9 @@ use lance_core::utils::cpu::{SIMD_SUPPORT, SimdSupport};
 pub const PERM0: [usize; 16] = [0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7, 15];
 pub const PERM0_INVERSE: [usize; 16] = [0, 2, 4, 6, 8, 10, 12, 14, 1, 3, 5, 7, 9, 11, 13, 15];
 pub const BATCH_SIZE: usize = 32;
-/// Maximum code length whose full-range `u8` table sum fits in `u16`.
-///
-/// Each row sums two table entries per code byte, and
-/// `2 * 128 * u8::MAX == 65_280`.
+/// A row sums `2 * code_len` table entries into a `u16`, so a full-range
+/// (`0..=u8::MAX`) table fits only up to here: `2 * 128 * u8::MAX == 65280`.
+/// Callers that cannot cap their table must use [`sum_4bit_dist_table_u32`].
 pub const SAFE_U16_CODE_LEN: usize = 128;
 
 // This function is used to sum the distance table for 4-bit codes.
@@ -32,9 +31,7 @@ pub const SAFE_U16_CODE_LEN: usize = 128;
 // | bits 4..7| 16 | 24 | 17 | 25 | 18 | 26 | 19 | 27 | 20 | 28 | 21 | 29 | 22 | 30 | 23 | 31 |
 // +----------+----+----+----+----+----+----+----+----+----+----+----+----+----+----+----+----+
 // so that we can use SIMD instruction (especially _mm256_shuffle_epi8) to do the summation.
-// Callers must ensure each row's sum fits in `u16`; use
-// `sum_4bit_dist_table_u32` for full-range tables longer than
-// `SAFE_U16_CODE_LEN`.
+// The accumulator is `u16`: see [`SAFE_U16_CODE_LEN`] for what that costs the caller.
 #[inline]
 pub fn sum_4bit_dist_table(
     n: usize,
@@ -163,24 +160,9 @@ pub fn sum_4bit_dist_table_scalar(
     }
 }
 
-/// Sum a 4-bit distance table into a `u32` accumulator.
-///
-/// The existing SIMD kernels accumulate safely-sized chunks into `u16`; this
-/// function widens and combines those chunks so the complete sum cannot wrap at
-/// production vector dimensions.
-///
-/// # Examples
-///
-/// ```
-/// use lance_linalg::simd::dist_table::{BATCH_SIZE, sum_4bit_dist_table_u32};
-///
-/// let code_len = 129;
-/// let codes = vec![0; BATCH_SIZE * code_len];
-/// let dist_table = vec![u8::MAX; BATCH_SIZE * code_len];
-/// let mut dists = vec![0; BATCH_SIZE];
-/// sum_4bit_dist_table_u32(BATCH_SIZE, code_len, &codes, &dist_table, &mut dists);
-/// assert!(dists.iter().all(|dist| *dist == 65_790));
-/// ```
+/// [`sum_4bit_dist_table`] with an accumulator wide enough for any `code_len`:
+/// the codes are summed in chunks of [`SAFE_U16_CODE_LEN`] through the same
+/// `u16` kernels, and each chunk is widened into the output.
 #[inline]
 pub fn sum_4bit_dist_table_u32(
     n: usize,
@@ -228,22 +210,20 @@ pub unsafe fn sum_4bit_dist_table_u32_uninit(
         return;
     }
 
-    for batch_start in (0..n).step_by(BATCH_SIZE) {
-        let batch_codes = &codes[batch_start * code_len..(batch_start + BATCH_SIZE) * code_len];
+    for i in (0..n).step_by(BATCH_SIZE) {
+        let batch_codes = &codes[i * code_len..(i + BATCH_SIZE) * code_len];
         let mut sums = [0u32; BATCH_SIZE];
-
-        for code_start in (0..code_len).step_by(SAFE_U16_CODE_LEN) {
-            let code_end = (code_start + SAFE_U16_CODE_LEN).min(code_len);
-            // Both blocked codes and their tables occupy BATCH_SIZE bytes per
-            // code position, so the same range advances them in lockstep.
-            let byte_range = code_start * BATCH_SIZE..code_end * BATCH_SIZE;
+        for chunk_start in (0..code_len).step_by(SAFE_U16_CODE_LEN) {
+            let chunk_end = (chunk_start + SAFE_U16_CODE_LEN).min(code_len);
+            // Bytes are grouped by sub-vector, so one range slices both arrays.
+            let bytes = chunk_start * BATCH_SIZE..chunk_end * BATCH_SIZE;
             let mut chunk_dists = [MaybeUninit::<u16>::uninit(); BATCH_SIZE];
             unsafe {
                 sum_4bit_dist_table_uninit(
                     BATCH_SIZE,
-                    code_end - code_start,
-                    &batch_codes[byte_range.clone()],
-                    &dist_table[byte_range],
+                    chunk_end - chunk_start,
+                    &batch_codes[bytes.clone()],
+                    &dist_table[bytes],
                     &mut chunk_dists,
                 );
             }
@@ -255,8 +235,7 @@ pub unsafe fn sum_4bit_dist_table_u32_uninit(
                 .zip(chunk_dists.iter())
                 .for_each(|(sum, chunk_dist)| *sum += *chunk_dist as u32);
         }
-
-        dists[batch_start..batch_start + BATCH_SIZE]
+        dists[i..i + BATCH_SIZE]
             .iter_mut()
             .zip(sums.iter())
             .for_each(|(dist, sum)| {
@@ -914,30 +893,21 @@ mod tests {
         }
     }
 
-    /// Test the narrow SIMD path with tables capped so their sums fit `u16`.
-    ///
-    /// This models the ex-code FastScan caller, which limits its LUT range.
-    /// Full-range binary LUTs use [`sum_4bit_dist_table_u32`] above the safe
-    /// code length.
+    /// SIMD against scalar over the range the `u16` entry point is contracted
+    /// for; longer codes belong to [`sum_4bit_dist_table_u32`].
     #[test]
     fn test_simd_matches_scalar_varied_dimensions() {
         use rand::{Rng, SeedableRng};
         let mut rng = rand::rngs::StdRng::seed_from_u64(42);
 
-        // code_len = dim / 8 for 1-bit quantization; we test various code_lens
-        // directly since that's what the function sees.
-        // code_len=16 → DIM=128, code_len=192 → DIM=1536,
-        // code_len=512 → DIM=4096, code_len=8192 → DIM=65536
-        for code_len in [1, 2, 3, 16, 95, 96, 192, 512, 1024, 8192] {
-            let n = BATCH_SIZE; // 32 vectors per batch
-
-            // Each code byte produces 2 lookups; cap values so
-            // 2 * code_len * max_val < u16::MAX.
-            let max_val = (u16::MAX as usize / (2 * code_len)).min(255) as u8;
+        // code_len = dim / 8 for 1-bit quantization; 128 is DIM=1024.
+        for code_len in [1, 2, 3, 16, 95, 96, 128] {
+            let n = BATCH_SIZE;
 
             let codes: Vec<u8> = (0..n * code_len).map(|_| rng.random::<u8>()).collect();
+            // `quantize_dist_table_into` spans the whole u8 range, so must this.
             let dist_table: Vec<u8> = (0..BATCH_SIZE * code_len)
-                .map(|_| rng.random_range(0..=max_val))
+                .map(|_| rng.random::<u8>())
                 .collect();
 
             let mut expected = vec![0u16; n];
@@ -962,14 +932,12 @@ mod tests {
         use rand::{Rng, SeedableRng};
         let mut rng = rand::rngs::StdRng::seed_from_u64(123);
 
-        for code_len in [1, 3, 16, 191, 192, 1024] {
+        for code_len in [1, 3, 16, 95, 96, 128] {
             let n = BATCH_SIZE * 10; // 320 vectors = 10 batches
-
-            let max_val = (u16::MAX as usize / (2 * code_len)).min(255) as u8;
 
             let codes: Vec<u8> = (0..n * code_len).map(|_| rng.random::<u8>()).collect();
             let dist_table: Vec<u8> = (0..BATCH_SIZE * code_len)
-                .map(|_| rng.random_range(0..=max_val))
+                .map(|_| rng.random::<u8>())
                 .collect();
 
             let mut expected = vec![0u16; n];
@@ -988,7 +956,7 @@ mod tests {
             );
         }
     }
-
+    /// Exact reference: the `u16`-table scalar kernel already sums into `u32`.
     fn reference_u32_sums(n: usize, code_len: usize, codes: &[u8], dist_table: &[u8]) -> Vec<u32> {
         let dist_table: Vec<u16> = dist_table.iter().map(|value| *value as u16).collect();
         let mut expected = vec![0u32; n];
@@ -1002,7 +970,7 @@ mod tests {
     }
 
     #[test]
-    fn test_safe_u16_code_len_is_the_overflow_boundary() {
+    fn test_safe_u16_code_len_is_the_overflow_bound() {
         assert!(2 * SAFE_U16_CODE_LEN * u8::MAX as usize <= u16::MAX as usize);
         assert!(2 * (SAFE_U16_CODE_LEN + 1) * u8::MAX as usize > u16::MAX as usize);
     }
@@ -1010,14 +978,15 @@ mod tests {
     #[test]
     fn test_sum_4bit_dist_table_u32_matches_reference_full_range() {
         use rand::{Rng, SeedableRng};
-        let mut rng = rand::rngs::StdRng::seed_from_u64(8908);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7157);
 
-        for code_len in [1, 128, 129, 192, 300, 512] {
+        for code_len in [1, 3, 16, 128, 129, 191, 192, 300, 512, 1024] {
             let n = BATCH_SIZE * 4;
             let codes: Vec<u8> = (0..n * code_len).map(|_| rng.random::<u8>()).collect();
             let dist_table: Vec<u8> = (0..BATCH_SIZE * code_len)
                 .map(|_| rng.random::<u8>())
                 .collect();
+
             let expected = reference_u32_sums(n, code_len, &codes, &dist_table);
 
             let mut actual = vec![u32::MAX; n];
@@ -1033,7 +1002,8 @@ mod tests {
         }
     }
 
-    /// Regression for https://github.com/lance-format/lance/issues/8908.
+    /// https://github.com/lance-format/lance/issues/7157: at DIM=4096 a
+    /// full-range table sums to four times what a `u16` holds.
     #[test]
     fn test_sum_4bit_dist_table_u32_stays_exact_past_u16_range() {
         let code_len = 512;
@@ -1043,10 +1013,43 @@ mod tests {
         let expected = 2 * code_len as u32 * u8::MAX as u32;
         assert!(expected > u16::MAX as u32);
 
-        let mut actual = vec![0u32; n];
-        sum_4bit_dist_table_u32(n, code_len, &codes, &dist_table, &mut actual);
+        let mut wide = vec![0u32; n];
+        sum_4bit_dist_table_u32(n, code_len, &codes, &dist_table, &mut wide);
+        assert!(wide.iter().all(|dist| *dist == expected));
+    }
 
-        assert!(actual.iter().all(|dist| *dist == expected));
+    /// The ex-code FastScan LUT runs codes far longer than
+    /// [`SAFE_U16_CODE_LEN`] through the `u16` kernels, staying in range by
+    /// capping the table instead. Model that cap so those lengths keep coverage.
+    #[test]
+    fn test_simd_matches_scalar_capped_table_long_code_len() {
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(8192);
+
+        for code_len in [191, 192, 512, 1024, 8192] {
+            let n = BATCH_SIZE;
+            let max_val = (u16::MAX as usize / (2 * code_len)).min(u8::MAX as usize) as u8;
+            assert!(2 * code_len * max_val as usize <= u16::MAX as usize);
+
+            let codes: Vec<u8> = (0..n * code_len).map(|_| rng.random::<u8>()).collect();
+            let dist_table: Vec<u8> = (0..BATCH_SIZE * code_len)
+                .map(|_| rng.random_range(0..=max_val))
+                .collect();
+
+            let mut expected = vec![0u16; n];
+            sum_4bit_dist_table_scalar(code_len, &codes, &dist_table, &mut expected);
+
+            let mut actual = vec![0u16; n];
+            sum_4bit_dist_table(n, code_len, &codes, &dist_table, &mut actual);
+
+            assert_eq!(
+                actual,
+                expected,
+                "SIMD and scalar mismatch for capped code_len={} (DIM={})",
+                code_len,
+                code_len * 8,
+            );
+        }
     }
 
     #[test]
