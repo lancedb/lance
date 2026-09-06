@@ -6,8 +6,6 @@ use std::{collections::HashMap, sync::Arc};
 
 use arrow_array::{Array, ArrayRef, RecordBatch, StructArray, make_array};
 use arrow_buffer::BooleanBuffer;
-use arrow_data::ArrayData;
-use arrow_schema::DataType;
 use bytes::{Buf, Bytes, BytesMut};
 use futures::{StreamExt, stream::FuturesOrdered};
 use lance_core::{
@@ -910,7 +908,7 @@ mod tests {
 
     use arrow_array::{ArrayRef, BooleanArray, StructArray};
     use arrow_buffer::NullBuffer;
-    use arrow_schema::{Field as ArrowField, Fields, Schema as ArrowSchema};
+    use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
     use lance_core::datatypes::Schema;
 
     use super::EncodingPipeline;
@@ -921,19 +919,15 @@ mod tests {
     fn analysis(parent_valid: Vec<bool>, changed: Vec<Option<bool>>) -> (ArrayRef, Schema) {
         let child = Arc::new(BooleanArray::from(changed)) as ArrayRef;
         let array = Arc::new(StructArray::new(
-            Fields::from(vec![ArrowField::new(
-                "changed",
-                arrow_schema::DataType::Boolean,
-                true,
-            )]),
+            Fields::from(vec![ArrowField::new("changed", DataType::Boolean, true)]),
             vec![child],
             Some(NullBuffer::from(parent_valid)),
         )) as ArrayRef;
         let declared = ArrowSchema::new(vec![ArrowField::new(
             "analysis",
-            arrow_schema::DataType::Struct(Fields::from(vec![ArrowField::new(
+            DataType::Struct(Fields::from(vec![ArrowField::new(
                 "changed",
-                arrow_schema::DataType::Boolean,
+                DataType::Boolean,
                 false,
             )])),
             true,
@@ -973,7 +967,6 @@ mod tests {
     #[test]
     fn a_logical_null_in_a_dictionary_child_is_rejected() {
         use arrow_array::{DictionaryArray, Int32Array};
-        use arrow_schema::DataType;
 
         let values = Arc::new(Int32Array::from(vec![Some(10), None])) as ArrayRef;
         let keys = Int32Array::from(vec![Some(0), Some(1), None]);
