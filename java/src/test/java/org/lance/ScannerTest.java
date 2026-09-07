@@ -1272,8 +1272,41 @@ public class ScannerTest {
             resultsWithIndex,
             resultsWithoutIndex,
             "Results should be identical with or without scalar index");
+
+        ScanOptions excludedOptions =
+            new ScanOptions.Builder()
+                .filter("id < 50")
+                .excludedScalarIndexNames(Collections.singletonList("id_btree_index"))
+                .columns(Collections.singletonList("id"))
+                .collectStats(true)
+                .build();
+        assertEquals(
+            Collections.singletonList("id_btree_index"),
+            excludedOptions.getExcludedScalarIndexNames().get());
+        try (LanceScanner scanner = dataset.newScan(excludedOptions)) {
+          int rowCount = 0;
+          try (ArrowReader reader = scanner.scanBatches()) {
+            while (reader.loadNextBatch()) {
+              rowCount += reader.getVectorSchemaRoot().getRowCount();
+            }
+          }
+          assertEquals(50, rowCount);
+          assertEquals(0, scanner.getStats().get().getIndexComparisons());
+        }
       }
     }
+  }
+
+  @Test
+  void testExcludedScalarIndexNamesRejectsEmptyName() {
+    IllegalArgumentException error =
+        assertThrows(
+            IllegalArgumentException.class,
+            () ->
+                new ScanOptions.Builder()
+                    .excludedScalarIndexNames(Collections.singletonList(""))
+                    .build());
+    assertTrue(error.getMessage().contains("cannot contain null or empty names"));
   }
 
   @Test

@@ -1146,6 +1146,9 @@ pub struct Scanner {
     /// to handle this better in the future as well)
     use_scalar_index: bool,
 
+    /// Scalar indices that must not participate in expression-filter planning.
+    excluded_scalar_index_names: HashSet<String>,
+
     /// Whether to use statistics to optimize the scan (default: true)
     ///
     /// This is used for debugging or benchmarking purposes.
@@ -1415,6 +1418,7 @@ impl Scanner {
             index_segments: None,
             fast_search: false,
             use_scalar_index: true,
+            excluded_scalar_index_names: HashSet::new(),
             include_deleted_rows: false,
             scan_stats_callback: None,
             strict_batch_size: false,
@@ -1848,6 +1852,37 @@ impl Scanner {
     /// This option allows users to disable scalar indices for a query.
     pub fn use_scalar_index(&mut self, use_scalar_index: bool) -> &mut Self {
         self.use_scalar_index = use_scalar_index;
+        self
+    }
+
+    /// Exclude named scalar indices from expression-filter planning.
+    ///
+    /// Other scalar indices remain eligible, and the original filter is still
+    /// evaluated for rows selected by the remaining scan plan. Names that do
+    /// not identify an available scalar index have no effect. This option is
+    /// ignored when scalar indices are disabled with [`Self::use_scalar_index`].
+    ///
+    /// This does not control vector index segments or the index selected by an
+    /// explicit full-text search query.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # async fn scan_without_one_index(dataset: &Dataset) -> Result<()> {
+    /// let mut scanner = dataset.scan();
+    /// scanner
+    ///     .filter("id = 42")?
+    ///     .with_excluded_scalar_index_names(["id_zonemap"]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_excluded_scalar_index_names<I, S>(&mut self, index_names: I) -> &mut Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.excluded_scalar_index_names = index_names.into_iter().map(Into::into).collect();
         self
     }
 
@@ -2937,7 +2972,10 @@ impl Scanner {
         // Check expr filter
         let filter_plan = if let Some(filter) = self.filter.expr_filter.as_ref() {
             let expr = filter.to_datafusion(self.dataset.schema(), filter_schema.as_ref())?;
-            let index_info = self.dataset.scalar_index_info().await?;
+            let index_info = self
+                .dataset
+                .scalar_index_info_excluding(&self.excluded_scalar_index_names)
+                .await?;
             let filter_plan =
                 planner.create_filter_plan(expr.clone(), &index_info, use_scalar_index)?;
 
@@ -12471,6 +12509,78 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             "NOT LIKE should not use scalar index, but got: {}",
             plan_str
         );
+    }
+
+    #[tokio::test]
+    async fn test_excluded_scalar_index_names() {
+        use lance_index::scalar::BuiltinIndexType;
+
+        let data = gen_batch()
+            .col("a", array::step::<Int32Type>())
+            .col("b", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(100), BatchCount::from(1));
+        let mut dataset = Dataset::write(data, "memory://", None).await.unwrap();
+
+        dataset
+            .create_index(
+                &["a"],
+                IndexType::Scalar,
+                Some("a_zonemap".to_string()),
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap),
+                false,
+            )
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["b"],
+                IndexType::BTree,
+                Some("b_btree".to_string()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let mut default_scan = dataset.scan();
+        default_scan.filter("a < 50 AND b < 50").unwrap();
+        let default_plan = default_scan.explain_plan(true).await.unwrap();
+        assert!(
+            default_plan.contains("@a_zonemap(ZoneMap)"),
+            "{default_plan}"
+        );
+        assert!(default_plan.contains("@b_btree(BTree)"), "{default_plan}");
+
+        let mut exclude_a = dataset.scan();
+        exclude_a
+            .filter("a < 50 AND b < 50")
+            .unwrap()
+            .with_excluded_scalar_index_names(["a_zonemap"]);
+        let exclude_a_plan = exclude_a.explain_plan(true).await.unwrap();
+        assert!(
+            !exclude_a_plan.contains("@a_zonemap(ZoneMap)"),
+            "{exclude_a_plan}"
+        );
+        assert!(
+            exclude_a_plan.contains("@b_btree(BTree)"),
+            "{exclude_a_plan}"
+        );
+
+        let result = exclude_a.try_into_batch().await.unwrap();
+        assert_eq!(result.num_rows(), 50);
+
+        let mut exclude_both = dataset.scan();
+        exclude_both
+            .filter("a < 50 AND b < 50")
+            .unwrap()
+            .with_excluded_scalar_index_names(["a_zonemap", "b_btree"]);
+        let exclude_both_plan = exclude_both.explain_plan(true).await.unwrap();
+        assert!(
+            !exclude_both_plan.contains("ScalarIndexQuery"),
+            "{exclude_both_plan}"
+        );
+        let result = exclude_both.try_into_batch().await.unwrap();
+        assert_eq!(result.num_rows(), 50);
     }
 
     #[tokio::test]

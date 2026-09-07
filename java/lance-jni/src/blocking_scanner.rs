@@ -276,6 +276,7 @@ pub(crate) struct ScannerOptions<'a> {
     pub late_materialization_obj: JObject<'a>,
     pub column_orderings: JObject<'a>,
     pub use_scalar_index: jboolean,
+    pub excluded_scalar_index_names_obj: JObject<'a>,
     pub fast_search: jboolean,
     pub substrait_aggregate_obj: JObject<'a>,
     pub include_deleted_rows: jboolean,
@@ -365,6 +366,11 @@ pub(crate) fn build_scanner_with_options<'a>(
     }
 
     scanner.use_scalar_index(options.use_scalar_index == JNI_TRUE);
+    if let Some(excluded_scalar_index_names) =
+        env.get_strings_opt(&options.excluded_scalar_index_names_obj)?
+    {
+        scanner.with_excluded_scalar_index_names(excluded_scalar_index_names);
+    }
 
     env.get_optional(&options.query_obj, |env, java_obj| {
         // Set column and key for nearest search
@@ -533,6 +539,7 @@ pub extern "system" fn Java_org_lance_ipc_LanceScanner_createScanner<'local>(
     late_materialization_obj: JObject<'local>, // Optional<MaterializationStyle>
     column_orderings: JObject<'local>, // Optional<List<ColumnOrdering>>
     use_scalar_index: jboolean,        // boolean
+    excluded_scalar_index_names_obj: JObject<'local>, // Optional<List<String>>
     fast_search: jboolean,             // boolean
     substrait_aggregate_obj: JObject<'local>, // Optional<ByteBuffer>
     collect_stats: jboolean,           // boolean
@@ -565,6 +572,7 @@ pub extern "system" fn Java_org_lance_ipc_LanceScanner_createScanner<'local>(
             late_materialization_obj,
             column_orderings,
             use_scalar_index,
+            excluded_scalar_index_names_obj,
             fast_search,
             substrait_aggregate_obj,
             collect_stats,
@@ -599,6 +607,7 @@ fn inner_create_scanner<'local>(
     late_materialization_obj: JObject<'local>,
     column_orderings: JObject<'local>,
     use_scalar_index: jboolean,
+    excluded_scalar_index_names_obj: JObject<'local>,
     fast_search: jboolean,
     substrait_aggregate_obj: JObject<'local>,
     collect_stats: jboolean,
@@ -632,6 +641,7 @@ fn inner_create_scanner<'local>(
         late_materialization_obj,
         column_orderings,
         use_scalar_index,
+        excluded_scalar_index_names_obj,
         fast_search,
         substrait_aggregate_obj,
         include_deleted_rows,
