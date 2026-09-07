@@ -65,6 +65,21 @@ use super::manifest::ShardManifestStore;
 // Configuration
 // ============================================================================
 
+#[cfg(test)]
+#[derive(Default)]
+struct WriterTestHooks {
+    pause_next_index_apply: std::sync::atomic::AtomicBool,
+    index_apply_release: tokio::sync::Notify,
+    memtable_index_wait_started: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl std::fmt::Debug for WriterTestHooks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WriterTestHooks").finish_non_exhaustive()
+    }
+}
+
 /// Configuration for a shard writer.
 #[derive(Debug, Clone)]
 pub struct ShardWriterConfig {
@@ -255,6 +270,9 @@ pub struct ShardWriterConfig {
     /// [`Error::Backpressure`].
     /// Default: `None` (use the built-in valve).
     pub backpressure: Option<Arc<dyn BackpressureController>>,
+
+    #[cfg(test)]
+    test_hooks: Option<Arc<WriterTestHooks>>,
 }
 
 impl Default for ShardWriterConfig {
@@ -282,6 +300,8 @@ impl Default for ShardWriterConfig {
             store_params: None,
             session: None,
             backpressure: None,
+            #[cfg(test)]
+            test_hooks: None,
         }
     }
 }
@@ -2448,6 +2468,8 @@ impl ShardWriter {
             stats.clone(),
             config.observer.clone(),
             config.frozen_memtable_grace,
+            #[cfg(test)]
+            config.test_hooks.clone(),
         );
         task_executor.add_handler(
             "memtable_flusher".to_string(),
@@ -2463,6 +2485,8 @@ impl ShardWriter {
             cursors: Arc::clone(wal_flusher.cursors()),
             wal_flusher: wal_flusher.clone(),
             stats,
+            #[cfg(test)]
+            test_hooks: config.test_hooks.clone(),
         };
         task_executor.add_handler(
             "index_applier".to_string(),
@@ -3663,11 +3687,20 @@ struct IndexApplyHandler {
     cursors: Arc<WriterCursors>,
     wal_flusher: Arc<WalFlusher>,
     stats: SharedWriteStats,
+    #[cfg(test)]
+    test_hooks: Option<Arc<WriterTestHooks>>,
 }
 
 #[async_trait]
 impl MessageHandler<TriggerIndexApply> for IndexApplyHandler {
     async fn handle(&mut self, message: TriggerIndexApply) -> Result<()> {
+        #[cfg(test)]
+        if let Some(hooks) = &self.test_hooks
+            && hooks.pause_next_index_apply.swap(false, Ordering::AcqRel)
+        {
+            hooks.index_apply_release.notified().await;
+        }
+
         match apply_index_range(&self.cursors, message).await {
             Ok(applied) => {
                 // A coalesced no-op indexes nothing (`rows_indexed == 0`);
@@ -3949,6 +3982,8 @@ struct MemTableFlushHandler {
     /// How long a frozen memtable lingers in memory after its flush commits
     /// before `SweepExpired` evicts it. See `ShardWriterConfig::frozen_memtable_grace`.
     grace: Duration,
+    #[cfg(test)]
+    test_hooks: Option<Arc<WriterTestHooks>>,
 }
 
 impl MemTableFlushHandler {
@@ -3963,6 +3998,7 @@ impl MemTableFlushHandler {
         stats: SharedWriteStats,
         observer: Option<Arc<dyn WalObserver>>,
         grace: Duration,
+        #[cfg(test)] test_hooks: Option<Arc<WriterTestHooks>>,
     ) -> Self {
         Self {
             state,
@@ -3974,6 +4010,8 @@ impl MemTableFlushHandler {
             stats,
             observer,
             grace,
+            #[cfg(test)]
+            test_hooks,
         }
     }
 
@@ -4074,18 +4112,23 @@ impl MemTableFlushHandler {
             //
             // Freeze queues the apply and this flush on separate channels, so
             // without waiting the export can run while the indexes are still
-            // behind the batch store. The generation's vector index would then
-            // be short of rows its own SSTable holds, and SSTable vector search
-            // is index-only -- `fast_search`, no brute-force scan -- so those
-            // rows stop answering once the frozen memtable retires.
+            // behind the batch store. The primary-key sidecar and every
+            // secondary index are exported from that asynchronously maintained
+            // state. A short PK index can make superseded rows visible, while
+            // an empty one publishes no sidecar at all and makes the LSM scan
+            // fail when it opens the generation. A short vector index similarly
+            // loses rows because SSTable vector search is index-only --
+            // `fast_search`, with no brute-force scan.
             //
             // `batch_count` is fixed at freeze, so this waits for a target that
             // cannot move, and the watcher surfaces a poisoned writer rather
             // than blocking on a cursor that will never arrive.
-            if !self.index_configs.is_empty()
-                && let Some(indexes) = memtable.indexes_arc()
-            {
+            if let Some(indexes) = memtable.indexes_arc() {
                 let target_indexed = memtable.batch_count();
+                #[cfg(test)]
+                if let Some(hooks) = &self.test_hooks {
+                    hooks.memtable_index_wait_started.notify_one();
+                }
                 self.wal_flusher
                     .track_batch(Some(indexes), target_indexed, 0)
                     .wait()
@@ -5117,6 +5160,72 @@ mod tests {
             manifest_scan_batch_size: 2,
             ..Default::default()
         }
+    }
+
+    /// A PK-only flush must wait for the asynchronous index apply before it
+    /// publishes the SSTable. Otherwise the manifest can name a generation
+    /// whose mandatory PK sidecar has not been written yet.
+    #[tokio::test]
+    async fn test_pk_only_flush_waits_for_index_apply() {
+        let (store, base_path, base_uri, _temp) = create_local_store().await;
+        let schema = create_pk_test_schema();
+        let shard_id = Uuid::new_v4();
+        let hooks = Arc::new(WriterTestHooks {
+            pause_next_index_apply: std::sync::atomic::AtomicBool::new(true),
+            ..Default::default()
+        });
+        let config = ShardWriterConfig {
+            shard_id,
+            durable_write: true,
+            max_wal_flush_interval: Some(Duration::from_secs(60)),
+            max_memtable_batches: 1,
+            test_hooks: Some(hooks.clone()),
+            ..Default::default()
+        };
+        let writer = ShardWriter::open(
+            store,
+            base_path,
+            base_uri.clone(),
+            config,
+            schema.clone(),
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        let (_, mut watcher) = writer
+            .put_no_wait(vec![create_test_batch(&schema, 1, 2)])
+            .await
+            .unwrap();
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            hooks.memtable_index_wait_started.notified(),
+        )
+        .await
+        .expect("PK-only flush did not wait for the pending index apply");
+        let manifest = writer.manifest().await.unwrap().unwrap();
+        assert!(
+            manifest.sstables.is_empty(),
+            "the SSTable must not be published before its PK index is ready"
+        );
+
+        hooks.index_apply_release.notify_one();
+        watcher
+            .as_mut()
+            .expect("durable put returns a watcher")
+            .wait()
+            .await
+            .unwrap();
+        writer.wait_for_flush_drain().await.unwrap();
+
+        assert_eq!(
+            read_sstable_ids_via_lsm(&writer, schema.clone(), &base_uri, shard_id, None).await,
+            vec![1, 2],
+            "the published PK-only SSTable must be readable through the LSM scanner"
+        );
+
+        writer.close().await.unwrap();
     }
 
     /// Delete a key, then flush: the tombstone and the live row land in the
