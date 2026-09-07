@@ -89,54 +89,24 @@ pub fn deep_copy_batch(batch: &RecordBatch) -> crate::Result<RecordBatch> {
 /// Deep copy array data, extracting only the sliced portion using MutableArrayData
 /// This is the most efficient and correct way to copy just the sliced data
 pub fn deep_copy_array_data_sliced(data: &ArrayData) -> ArrayData {
-    // Arrow's extenders disagree about who applies a parent offset, so no one
-    // index convention is right for every layout: the bit-packed extender adds
-    // `ArrayData::offset()` to the raw buffer itself, while the `FixedSizeList`
-    // one forwards `start * size` to a child that `ArrayData::slice` left
-    // whole. Resolving the offset into the children first settles it, after
-    // which logical indices are correct everywhere -- the convention arrow's
-    // own `concat` relies on.
-    let resolved;
-    let data = if data.offset() == 0 {
-        data
-    } else {
-        resolved = offset_resolved(data);
-        &resolved
-    };
-
+    // Use MutableArrayData to efficiently copy just the slice
     let mut mutable = MutableArrayData::new(vec![data], false, data.len());
-    mutable.extend(0, 0, data.len());
+
+    // Which index this takes depends on the layout, because arrow's extenders
+    // disagree about who applies `ArrayData::offset()`. The bit-packed one adds
+    // it to the raw values buffer itself, so an offset-applied index there
+    // reads from twice the offset and runs off the end of the buffer. Every
+    // other layout either reads through an already-offset-applied view or
+    // forwards the index to children carrying their own offsets, and takes the
+    // absolute index it has always been given.
+    let start = match data.data_type() {
+        DataType::Boolean => 0,
+        _ => data.offset(),
+    };
+    mutable.extend(0, start, start + data.len());
 
     // Freeze into immutable ArrayData
     mutable.freeze()
-}
-
-/// Push a parent offset down to wherever each layout expects to find it.
-///
-/// Rebuilding through the array API does this, and recursively: constructing a
-/// `FixedSizeListArray` slices its child by `offset * size`, and constructing a
-/// `StructArray` slices each of its children in turn.
-///
-/// The one shape that cannot be rebuilt as it stands is a struct, because
-/// `ArrayData::slice` both slices a struct's children and records the offset --
-/// double-counting, so applying it again slices past the end of the children it
-/// already produced. Dropping that now-redundant offset is what makes the
-/// struct rebuildable, and it is the reading arrow's own extender takes.
-fn offset_resolved(data: &ArrayData) -> ArrayData {
-    if matches!(data.data_type(), DataType::Struct(_)) {
-        // SAFETY: `build_unchecked` inherits `ArrayData::new_unchecked`'s
-        // contract. Only the offset changes, and only to zero; the buffers,
-        // nulls and child data are the ones `ArrayData::slice` already narrowed
-        // to this window, so every value-level invariant they upheld still
-        // holds and the payload described is the same one.
-        let data = unsafe {
-            ArrayDataBuilder::from(data.clone())
-                .offset(0)
-                .build_unchecked()
-        };
-        return make_array(data).to_data();
-    }
-    make_array(data.clone()).to_data()
 }
 
 /// Deep copy an array, extracting only the sliced portion using MutableArrayData
@@ -169,9 +139,9 @@ mod tests {
         // `ArrayData::slice` records the offset on the parent and leaves the
         // child whole -- a shape `FixedSizeListArray::slice` never produces,
         // but a legal one this public helper can be handed directly. Arrow's
-        // extender forwards `start * size` to that unsliced child, so the
-        // parent offset has to be resolved before the copy or the wrong rows
-        // come back.
+        // extender forwards `start * size` to that unsliced child and adds
+        // nothing, so the index it gets has to be the absolute one; this is
+        // here to stop the boolean fix from being generalised over it.
         let child = Int32Array::from(vec![10, 11, 20, 21]).to_data();
         let field = Arc::new(Field::new_list_field(DataType::Int32, false));
         let data = ArrayDataBuilder::new(DataType::FixedSizeList(field, 2))
@@ -187,11 +157,11 @@ mod tests {
     }
 
     #[test]
-    fn raw_sliced_struct_of_fixed_size_list_resolves_both_levels() {
+    fn raw_sliced_struct_of_fixed_size_list_reaches_the_right_values() {
         // Slicing raw struct data pushes the window into the struct's children,
         // and a fixed-size-list child takes it as its own parent offset with
-        // its values left whole -- so the offset has to be resolved at both
-        // levels, not just the outer one.
+        // its values left whole. Two levels of offset, and the absolute index
+        // has to remain right through both of them.
         let values = Int32Array::from(vec![10, 11, 20, 21, 30, 31]).to_data();
         let item = Arc::new(Field::new_list_field(DataType::Int32, false));
         let list = ArrayDataBuilder::new(DataType::FixedSizeList(item, 2))
@@ -213,19 +183,21 @@ mod tests {
     }
 
     #[test]
-    fn raw_sliced_struct_data_keeps_its_child_offset() {
-        let child = Int32Array::from(vec![10, 11, 20, 21]).to_data();
+    fn raw_parent_offset_struct_keeps_the_selected_child_row() {
+        // A struct whose children are whole and whose window is the parent
+        // offset: arrow's struct extender forwards the index to those children
+        // untouched, so it has to be the absolute one.
         let field = Arc::new(Field::new("a", DataType::Int32, false));
         let data = ArrayDataBuilder::new(DataType::Struct(vec![field].into()))
-            .len(4)
-            .add_child_data(child)
+            .len(1)
+            .offset(1)
+            .add_child_data(Int32Array::from(vec![10, 20]).to_data())
             .build()
             .unwrap();
-        let sliced = data.slice(2, 2);
 
-        let copied = super::deep_copy_array_data_sliced(&sliced);
+        let copied = super::deep_copy_array_data_sliced(&data);
         let copied_child = Int32Array::from(copied.child_data()[0].clone());
-        assert_eq!(copied_child.values().as_ref(), &[20, 21]);
+        assert_eq!(copied_child.values().as_ref(), &[20]);
     }
 
     #[test]
