@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::collections::HashMap;
+#[cfg(unix)]
 use std::fs;
 use std::sync::Arc;
 
@@ -219,6 +220,28 @@ fn rejects_no_matching_platform_without_fetching() {
 }
 
 #[test]
+fn reads_pyarrow_schemas_from_ipc() {
+    let schemas = Schemas::from_ipc(
+        include_bytes!("fixtures/py312-bookworm/input.arrow"),
+        include_bytes!("fixtures/py312-bookworm/output.arrow"),
+        include_bytes!("fixtures/py312-bookworm/initialization.arrow"),
+        &ExtensionTypes::default(),
+    )
+    .unwrap();
+    assert_pyarrow_schemas(&schemas);
+}
+
+#[cfg(not(unix))]
+#[test]
+fn rejects_image_roots_on_non_posix_hosts() {
+    let root = tempfile::tempdir().unwrap();
+    let error = ImageRoot::new(root.path()).unwrap_err();
+    assert_eq!(error.code, ErrorCode::Incompatible);
+    assert!(error.message.contains("POSIX host filesystem"));
+}
+
+#[cfg(unix)]
+#[test]
 fn reads_pyarrow_schemas_through_the_artifact_entrypoint() {
     let artifact = Artifact::resolve(INDEX, &platform(), fetch_fixture).unwrap();
     let root = tempfile::tempdir().unwrap();
@@ -243,6 +266,10 @@ fn reads_pyarrow_schemas_through_the_artifact_entrypoint() {
     let image = ImageRoot::new(root.path()).unwrap();
     let schemas =
         Schemas::from_image(artifact.descriptor(), &image, &ExtensionTypes::default()).unwrap();
+    assert_pyarrow_schemas(&schemas);
+}
+
+fn assert_pyarrow_schemas(schemas: &Schemas) {
     let expected_input = Schema::new_with_metadata(
         vec![Field::new("x", DataType::Float64, true)],
         HashMap::from([("fixture".into(), "scalar-v1".into())]),
