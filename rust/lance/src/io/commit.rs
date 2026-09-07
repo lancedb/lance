@@ -1710,6 +1710,14 @@ pub(crate) async fn commit_transaction(
     }
 
     cleanup_transaction_file(object_store, &dataset.base, &current_transaction_file).await;
+    if disable_rebase {
+        return Err(crate::Error::retryable_commit_conflict_source(
+            target_version,
+            "the transaction's read version was superseded; revalidate before committing"
+                .to_string()
+                .into(),
+        ));
+    }
     Err(crate::Error::commit_conflict_source(
         target_version,
         format!(

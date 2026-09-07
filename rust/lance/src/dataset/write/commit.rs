@@ -207,7 +207,7 @@ impl<'a> CommitBuilder<'a> {
     ///
     /// Enabled by default. When disabled, the transaction can only publish
     /// version `read_version + 1`, even if a concurrent write would normally be
-    /// compatible. A conflict is returned without rebasing or retrying, after
+    /// compatible. An [`Error::RetryableCommitConflict`] is returned without rebasing or retrying, after
     /// checking whether this transaction already committed. This lets a caller
     /// validate application-specific preconditions against `read_version`
     /// without a race between validation and publication.
@@ -1166,7 +1166,7 @@ mod tests {
             let error =
                 result.expect_err("an intervening append invalidates an exact-version commit");
             assert!(
-                matches!(error, Error::TooMuchWriteContention { .. }),
+                matches!(error, Error::RetryableCommitConflict { .. }),
                 "{error:?}"
             );
             let mut unchanged = latest.as_ref().clone();
