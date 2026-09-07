@@ -38,17 +38,14 @@ use datafusion_physical_plan::metrics::{BaselineMetrics, Count, Time};
 use futures::{Stream, StreamExt, TryFutureExt, TryStreamExt, future, stream};
 use itertools::Itertools;
 use lance_core::ROW_ID;
-use lance_core::utils::futures::{FinallyStreamExt, StreamOnDropExt};
-use lance_core::utils::parse::parse_env_as_bool;
+use lance_core::utils::futures::FinallyStreamExt;
 use lance_core::{
     ROW_ID_FIELD,
     utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu},
 };
 use lance_datafusion::utils::{
-    COARSE_QUANTIZER_REUSED_SEGMENTS_METRIC, DELTAS_SEARCHED_METRIC, ExecutionPlanMetricsSetExt,
-    FIND_PARTITIONS_CALLS_METRIC, FIND_PARTITIONS_ELAPSED_METRIC, PARTITIONS_RANKED_METRIC,
-    PARTITIONS_SEARCHED_METRIC, SEARCH_PARTITIONS_CALLS_METRIC, SEARCH_PARTITIONS_ELAPSED_METRIC,
-    SHARED_COARSE_QUANTIZER_FAST_PATH_METRIC,
+    DELTAS_SEARCHED_METRIC, ExecutionPlanMetricsSetExt, FIND_PARTITIONS_ELAPSED_METRIC,
+    PARTITIONS_RANKED_METRIC, PARTITIONS_SEARCHED_METRIC,
 };
 use lance_index::metrics::MetricsCollector;
 use lance_index::prefilter::PreFilter;
@@ -66,10 +63,10 @@ use tokio::sync::Notify;
 use uuid::Uuid;
 
 use crate::dataset::Dataset;
+use crate::index::DatasetIndexInternalExt;
 use crate::index::prefilter::{DatasetPreFilter, FilterLoader};
-use crate::index::vector::details::coarse_quantizer_fingerprint_from_metadata;
+use crate::index::vector::coarse_quantizer::CoarseQuantizerFingerprint;
 use crate::index::vector::utils::{get_vector_type, validate_distance_type_for};
-use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
 use crate::{Error, Result};
 use lance_arrow::*;
 
@@ -81,11 +78,6 @@ use super::utils::{
 
 pub const QUERY_INDEX_COL: &str = "query_index";
 
-const LANCE_ANN_STAGE_METRICS_ENV: &str = "LANCE_ANN_STAGE_METRICS";
-
-static ANN_STAGE_METRICS_ENABLED: LazyLock<bool> =
-    LazyLock::new(|| parse_env_as_bool(LANCE_ANN_STAGE_METRICS_ENV, false));
-
 pub fn query_index_field() -> Field {
     Field::new(QUERY_INDEX_COL, DataType::Int32, false)
 }
@@ -95,9 +87,6 @@ pub struct AnnPartitionMetrics {
     partitions_ranked: Count,
     deltas_searched: Count,
     find_partitions_elapsed: Time,
-    find_partitions_calls: Count,
-    shared_coarse_quantizer_fast_path: Count,
-    coarse_quantizer_reused_segments: Count,
     baseline_metrics: BaselineMetrics,
 }
 
@@ -108,11 +97,6 @@ impl AnnPartitionMetrics {
             partitions_ranked: metrics.new_count(PARTITIONS_RANKED_METRIC, partition),
             deltas_searched: metrics.new_count(DELTAS_SEARCHED_METRIC, partition),
             find_partitions_elapsed: metrics.new_time(FIND_PARTITIONS_ELAPSED_METRIC, partition),
-            find_partitions_calls: metrics.new_count(FIND_PARTITIONS_CALLS_METRIC, partition),
-            shared_coarse_quantizer_fast_path: metrics
-                .new_count(SHARED_COARSE_QUANTIZER_FAST_PATH_METRIC, partition),
-            coarse_quantizer_reused_segments: metrics
-                .new_count(COARSE_QUANTIZER_REUSED_SEGMENTS_METRIC, partition),
             baseline_metrics: BaselineMetrics::new(metrics, partition),
         }
     }
@@ -121,47 +105,15 @@ impl AnnPartitionMetrics {
 pub struct AnnIndexMetrics {
     index_metrics: IndexMetrics,
     partitions_searched: Count,
-    search_partitions_elapsed: Option<Time>,
-    search_partitions_calls: Option<Count>,
     baseline_metrics: BaselineMetrics,
 }
 
 impl AnnIndexMetrics {
     pub fn new(metrics: &ExecutionPlanMetricsSet, partition: usize) -> Self {
-        Self::new_with_stage_metrics(metrics, partition, *ANN_STAGE_METRICS_ENABLED)
-    }
-
-    fn new_with_stage_metrics(
-        metrics: &ExecutionPlanMetricsSet,
-        partition: usize,
-        stage_metrics_enabled: bool,
-    ) -> Self {
         Self {
             index_metrics: IndexMetrics::new(metrics, partition),
             partitions_searched: metrics.new_count(PARTITIONS_SEARCHED_METRIC, partition),
-            search_partitions_elapsed: stage_metrics_enabled
-                .then(|| metrics.new_time(SEARCH_PARTITIONS_ELAPSED_METRIC, partition)),
-            search_partitions_calls: stage_metrics_enabled
-                .then(|| metrics.new_count(SEARCH_PARTITIONS_CALLS_METRIC, partition)),
             baseline_metrics: BaselineMetrics::new(metrics, partition),
-        }
-    }
-
-    fn start_search_partitions(&self) -> Option<Instant> {
-        self.search_partitions_elapsed
-            .as_ref()
-            .map(|_| Instant::now())
-    }
-
-    fn record_search_partitions_call(&self) {
-        if let Some(calls) = self.search_partitions_calls.as_ref() {
-            calls.add(1);
-        }
-    }
-
-    fn record_search_partitions_elapsed(&self, started: Option<Instant>) {
-        if let (Some(elapsed), Some(started)) = (self.search_partitions_elapsed.as_ref(), started) {
-            elapsed.add_duration(started.elapsed());
         }
     }
 }
@@ -188,26 +140,38 @@ fn normalize_query_for_index(index: &dyn VectorIndex, query: Query) -> DataFusio
     Ok(query)
 }
 
-fn has_shared_coarse_quantizer(indices: &[IndexMetadata], index_uuids: &[Uuid]) -> bool {
-    if index_uuids.len() < 2 {
-        return false;
-    }
+#[derive(Clone, Debug, PartialEq)]
+struct IvfRoutingGroup {
+    representative_uuid: Uuid,
+    member_uuids: Vec<Uuid>,
+}
 
-    let mut expected = None;
-    for uuid in index_uuids {
-        let Some(index) = indices.iter().find(|index| index.uuid == *uuid) else {
-            return false;
+fn routing_groups(indices: &[IndexMetadata]) -> Vec<IvfRoutingGroup> {
+    let mut group_by_fingerprint =
+        HashMap::<CoarseQuantizerFingerprint, usize>::with_capacity(indices.len());
+    let mut groups = Vec::<IvfRoutingGroup>::with_capacity(indices.len());
+
+    for index in indices {
+        let Some(fingerprint) = CoarseQuantizerFingerprint::from_metadata(index) else {
+            groups.push(IvfRoutingGroup {
+                representative_uuid: index.uuid,
+                member_uuids: vec![index.uuid],
+            });
+            continue;
         };
-        let Some(fingerprint) = coarse_quantizer_fingerprint_from_metadata(index) else {
-            return false;
-        };
-        match &expected {
-            Some(expected) if expected != &fingerprint => return false,
-            None => expected = Some(fingerprint),
-            Some(_) => {}
+
+        if let Some(group_index) = group_by_fingerprint.get(&fingerprint).copied() {
+            groups[group_index].member_uuids.push(index.uuid);
+        } else {
+            group_by_fingerprint.insert(fingerprint, groups.len());
+            groups.push(IvfRoutingGroup {
+                representative_uuid: index.uuid,
+                member_uuids: vec![index.uuid],
+            });
         }
     }
-    true
+
+    groups
 }
 
 fn partition_batch(
@@ -1217,11 +1181,7 @@ pub fn new_knn_exec(
     overlay_block: Option<RowAddrMask>,
     external_mask: Option<Arc<RowAddrMask>>,
 ) -> Result<Arc<dyn ExecutionPlan>> {
-    let ivf_node = ANNIvfPartitionExec::try_new(
-        dataset.clone(),
-        indices.iter().map(|idx| idx.uuid).collect_vec(),
-        query.clone(),
-    )?;
+    let ivf_node = ANNIvfPartitionExec::try_new(dataset.clone(), indices, query.clone())?;
 
     let mut sub_index = ANNIvfSubIndexExec::try_new(
         Arc::new(ivf_node),
@@ -1244,10 +1204,10 @@ pub fn new_knn_exec(
 ///
 /// It searches the partition IDs using the input query.
 ///
-/// If all deltas have the same supported coarse-quantizer fingerprint then it
-/// ranks partitions once and reuses the result. Otherwise, it searches all
-/// index deltas in parallel. For each delta it returns a single batch with the
-/// partition IDs and the delta index `uuid`:
+/// Segments with the same supported coarse-quantizer fingerprint are grouped.
+/// Partition ranking runs once per group and its result is reused by every
+/// member. Segments without a valid identity form independent groups. For each
+/// segment this node returns one batch with partition IDs and the index `uuid`:
 ///
 /// The number of partitions returned is at most `maximum_nprobes`.  If
 /// `maximum_nprobes` is not set, it will return all partitions.  The partitions
@@ -1272,20 +1232,25 @@ pub struct ANNIvfPartitionExec {
     /// The UUIDs of the indices to search.
     pub index_uuids: Vec<Uuid>,
 
+    routing_groups: Vec<IvfRoutingGroup>,
+
     pub properties: Arc<PlanProperties>,
 
     pub metrics: ExecutionPlanMetricsSet,
 }
 
 impl ANNIvfPartitionExec {
-    pub fn try_new(dataset: Arc<Dataset>, index_uuids: Vec<Uuid>, query: Query) -> Result<Self> {
+    pub fn try_new(dataset: Arc<Dataset>, indices: &[IndexMetadata], query: Query) -> Result<Self> {
         let dataset_schema = dataset.schema();
         get_vector_type(dataset_schema, &query.column)?;
-        if index_uuids.is_empty() {
+        if indices.is_empty() {
             return Err(Error::execution(
                 "ANNIVFPartitionExec node: no index found for query".to_string(),
             ));
         }
+
+        let index_uuids = indices.iter().map(|index| index.uuid).collect();
+        let routing_groups = routing_groups(indices);
 
         let schema = KNN_PARTITION_SCHEMA.clone();
         let properties = Arc::new(PlanProperties::new(
@@ -1299,6 +1264,7 @@ impl ANNIvfPartitionExec {
             dataset,
             query,
             index_uuids,
+            routing_groups,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         })
@@ -1383,92 +1349,58 @@ impl ExecutionPlan for ANNIvfPartitionExec {
         let target_partitions = context.session_config().target_partitions();
         let query = self.query.clone();
         let ds = self.dataset.clone();
-        let index_uuids = self.index_uuids.clone();
+        let routing_groups = self.routing_groups.clone();
         let metrics = Arc::new(AnnPartitionMetrics::new(&self.metrics, partition));
-        metrics.deltas_searched.add(index_uuids.len());
+        metrics.deltas_searched.add(self.index_uuids.len());
         let metrics_clone = metrics.clone();
 
-        let stream = stream::once(async move {
-            let can_reuse = match ds.load_indices().await {
-                Ok(indices) => has_shared_coarse_quantizer(&indices, &index_uuids),
-                Err(error) => {
-                    tracing::debug!(
-                        "Could not load vector segment metadata for coarse-quantizer reuse: {error}"
-                    );
-                    false
+        let concurrency = routing_groups.len().min(target_partitions).max(1);
+        let stream = stream::iter(routing_groups)
+            .map(move |group| {
+                let query = query.clone();
+                let ds = ds.clone();
+                let metrics = metrics.clone();
+                async move {
+                    let index = ds
+                        .open_vector_index(
+                            &query.column,
+                            &group.representative_uuid,
+                            &metrics.index_metrics,
+                        )
+                        .await?;
+                    let query = normalize_query_for_index(index.as_ref(), query)?;
+
+                    metrics.partitions_ranked.add(index.total_partitions());
+
+                    let (partitions, dist_q_c) = {
+                        let _timer = metrics.find_partitions_elapsed.timer();
+                        find_partitions_on_cpu(index, query).await?
+                    };
+
+                    group
+                        .member_uuids
+                        .into_iter()
+                        .map(|uuid| {
+                            let batch = partition_batch(uuid, &partitions, &dist_q_c)?;
+                            metrics.baseline_metrics.record_output(batch.num_rows());
+                            Ok(batch)
+                        })
+                        .collect::<DataFusionResult<Vec<_>>>()
                 }
-            };
-
-            if can_reuse {
-                let representative_uuid = index_uuids[0];
-                let index = ds
-                    .open_vector_index(&query.column, &representative_uuid, &metrics.index_metrics)
-                    .await?;
-                let query = normalize_query_for_index(index.as_ref(), query)?;
-
-                metrics.shared_coarse_quantizer_fast_path.add(1);
-                metrics
-                    .coarse_quantizer_reused_segments
-                    .add(index_uuids.len() - 1);
-                metrics.partitions_ranked.add(index.total_partitions());
-                metrics.find_partitions_calls.add(1);
-
-                let (partitions, dist_q_c) = {
-                    let _timer = metrics.find_partitions_elapsed.timer();
-                    find_partitions_on_cpu(index, query).await?
-                };
-
-                let batches = index_uuids
-                    .into_iter()
-                    .map(|uuid| {
-                        let batch = partition_batch(uuid, &partitions, &dist_q_c)?;
-                        metrics.baseline_metrics.record_output(batch.num_rows());
-                        Ok(batch)
-                    })
-                    .collect::<DataFusionResult<Vec<_>>>()?;
-                return Ok::<_, DataFusionError>(stream::iter(batches.into_iter().map(Ok)).boxed());
-            }
-
-            let concurrency = index_uuids.len().min(target_partitions).max(1);
-            Ok(stream::iter(index_uuids)
-                .map(move |uuid| {
-                    let query = query.clone();
-                    let ds = ds.clone();
-                    let metrics = metrics.clone();
-                    async move {
-                        let index = ds
-                            .open_vector_index(&query.column, &uuid, &metrics.index_metrics)
-                            .await?;
-                        // Normalize cosine queries once before partition ranking.
-                        let query = normalize_query_for_index(index.as_ref(), query)?;
-
-                        metrics.partitions_ranked.add(index.total_partitions());
-                        metrics.find_partitions_calls.add(1);
-
-                        let (partitions, dist_q_c) = {
-                            let _timer = metrics.find_partitions_elapsed.timer();
-                            find_partitions_on_cpu(index, query).await?
-                        };
-
-                        let batch = partition_batch(uuid, &partitions, &dist_q_c)?;
-                        metrics.baseline_metrics.record_output(batch.num_rows());
-                        Ok::<_, DataFusionError>(batch)
-                    }
-                })
-                .buffered(concurrency)
-                .boxed())
-        })
-        .try_flatten()
-        .finally(move || {
-            // Partition ranking reads centroids from memory, so this is
-            // typically zero; flushed for symmetry with ANNSubIndex.
-            metrics_clone.index_metrics.flush_io();
-            metrics_clone.baseline_metrics.done();
-            metrics_clone
-                .baseline_metrics
-                .elapsed_compute()
-                .add_duration(timer.elapsed());
-        });
+            })
+            .buffered(concurrency)
+            .map_ok(|batches| stream::iter(batches.into_iter().map(Ok)))
+            .try_flatten()
+            .finally(move || {
+                // Partition ranking reads centroids from memory, so this is
+                // typically zero; flushed for symmetry with ANNSubIndex.
+                metrics_clone.index_metrics.flush_io();
+                metrics_clone.baseline_metrics.done();
+                metrics_clone
+                    .baseline_metrics
+                    .elapsed_compute()
+                    .add_duration(timer.elapsed());
+            });
         let schema = self.schema();
         Ok(
             Box::pin(RecordBatchStreamAdapter::new(schema, stream.boxed()))
@@ -1861,19 +1793,6 @@ fn effective_query_parallelism_for(
 }
 
 impl ANNIvfSubIndexExec {
-    fn instrument_search_stream(
-        stream: stream::BoxStream<'static, DataFusionResult<RecordBatch>>,
-        metrics: Arc<AnnIndexMetrics>,
-        started: Option<Instant>,
-    ) -> stream::BoxStream<'static, DataFusionResult<RecordBatch>> {
-        if started.is_none() {
-            return stream;
-        }
-        stream
-            .on_drop(move || metrics.record_search_partitions_elapsed(started))
-            .boxed()
-    }
-
     async fn search_partition(
         index: Arc<dyn VectorIndex>,
         query: Query,
@@ -1882,7 +1801,6 @@ impl ANNIvfSubIndexExec {
         metrics: Arc<AnnIndexMetrics>,
         seg_mask: Option<Arc<RowAddrMask>>,
     ) -> DataFusionResult<RecordBatch> {
-        metrics.record_search_partitions_call();
         let batch = index
             .search_in_partition(part_id, &query, pre_filter, &metrics.index_metrics)
             .map_err(|e| DataFusionError::Execution(format!("Failed to calculate KNN: {}", e)))
@@ -2025,9 +1943,7 @@ impl ANNIvfSubIndexExec {
                     let prefilter: Arc<dyn PreFilter> = prefilter;
                     let index_metrics: Arc<dyn MetricsCollector> =
                         Arc::new(metrics.index_metrics.clone());
-                    let started = metrics.start_search_partitions();
-                    metrics.record_search_partitions_call();
-                    let stream = match index
+                    let stream = index
                         .search_partitions(
                             query,
                             partitions,
@@ -2045,21 +1961,10 @@ impl ANNIvfSubIndexExec {
                         .await
                         .map_err(|e| {
                             DataFusionError::Execution(format!("Failed to search partitions: {e}"))
-                        }) {
-                        Ok(stream) => stream,
-                        Err(error) => {
-                            metrics.record_search_partitions_elapsed(started);
-                            return Err(error);
-                        }
-                    };
-                    let stream = Self::instrument_search_stream(
-                        stream.boxed(),
-                        metrics.clone(),
-                        started,
-                    );
+                        })?;
                     Ok::<stream::BoxStream<'static, DataFusionResult<RecordBatch>>, DataFusionError>(
                         Self::instrument_sequential_partition_stream(
-                            stream,
+                            stream.boxed(),
                             metrics,
                             state,
                             false,
@@ -2072,14 +1977,12 @@ impl ANNIvfSubIndexExec {
                 .boxed();
             }
 
-            let started = metrics.start_search_partitions();
-            let partition_metrics = metrics.clone();
-            let search_stream = futures::stream::iter(min_nprobes..max_nprobes)
+            futures::stream::iter(min_nprobes..max_nprobes)
                 .map(move |idx| {
                     let part_id = partitions.value(idx);
                     let mut query = query.clone();
                     query.dist_q_c = q_c_dists.value(idx);
-                    let metrics = partition_metrics.clone();
+                    let metrics = metrics.clone();
                     let pre_filter = prefilter.clone();
                     let state = state.clone();
                     let index = index.clone();
@@ -2104,8 +2007,7 @@ impl ANNIvfSubIndexExec {
                     std::future::ready(found_so_far < max_results)
                 })
                 .buffered(query_parallelism)
-                .boxed();
-            Self::instrument_search_stream(search_stream, metrics, started)
+                .boxed()
         });
         stream.flatten()
     }
@@ -2132,9 +2034,7 @@ impl ANNIvfSubIndexExec {
                 let prefilter: Arc<dyn PreFilter> = prefilter;
                 let index_metrics: Arc<dyn MetricsCollector> =
                     Arc::new(metrics.index_metrics.clone());
-                let started = metrics.start_search_partitions();
-                metrics.record_search_partitions_call();
-                let stream = match index
+                let stream = index
                     .search_partitions(
                         query,
                         partitions,
@@ -2148,18 +2048,15 @@ impl ANNIvfSubIndexExec {
                     .await
                     .map_err(|e| {
                         DataFusionError::Execution(format!("Failed to search partitions: {e}"))
-                    }) {
-                    Ok(stream) => stream,
-                    Err(error) => {
-                        metrics.record_search_partitions_elapsed(started);
-                        return Err(error);
-                    }
-                };
-                let stream =
-                    Self::instrument_search_stream(stream.boxed(), metrics.clone(), started);
+                    })?;
                 Ok::<stream::BoxStream<'static, DataFusionResult<RecordBatch>>, DataFusionError>(
                     Self::instrument_sequential_partition_stream(
-                        stream, metrics, state, true, false, seg_mask,
+                        stream.boxed(),
+                        metrics,
+                        state,
+                        true,
+                        false,
+                        seg_mask,
                     ),
                 )
             })
@@ -2168,14 +2065,12 @@ impl ANNIvfSubIndexExec {
         }
 
         metrics.partitions_searched.add(minimum_nprobes);
-        let started = metrics.start_search_partitions();
-        let partition_metrics = metrics.clone();
-        let search_stream = futures::stream::iter(0..minimum_nprobes)
+        futures::stream::iter(0..minimum_nprobes)
             .map(move |idx| {
                 let part_id = partitions.value(idx);
                 let mut query = query.clone();
                 query.dist_q_c = q_c_dists.value(idx);
-                let metrics = partition_metrics.clone();
+                let metrics = metrics.clone();
                 let index = index.clone();
                 let pre_filter = prefilter.clone();
                 let state = state.clone();
@@ -2195,8 +2090,7 @@ impl ANNIvfSubIndexExec {
                 }
             })
             .buffered(query_parallelism)
-            .boxed();
-        Self::instrument_search_stream(search_stream, metrics, started)
+            .boxed()
     }
 }
 
@@ -2730,13 +2624,10 @@ mod tests {
     use lance_core::deepsize::DeepSizeOf;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datafusion::exec::{ExecutionStatsCallback, ExecutionSummaryCounts};
-    use lance_datafusion::utils::{
-        COARSE_QUANTIZER_REUSED_SEGMENTS_METRIC, FIND_PARTITIONS_CALLS_METRIC,
-        FIND_PARTITIONS_ELAPSED_METRIC, MetricsExt, SEARCH_PARTITIONS_CALLS_METRIC,
-        SEARCH_PARTITIONS_ELAPSED_METRIC, SHARED_COARSE_QUANTIZER_FAST_PATH_METRIC,
-    };
+    use lance_datafusion::utils::FIND_PARTITIONS_ELAPSED_METRIC;
     use lance_datagen::{BatchCount, RowCount, array};
     use lance_index::optimize::OptimizeOptions;
+    use lance_index::pb::VectorIndexDetails;
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_index::vector::pq::PQBuildParams;
     use lance_index::vector::{DEFAULT_QUERY_PARALLELISM, PreparedPartitionSearchHandle};
@@ -2773,10 +2664,12 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_shared_coarse_quantizer_check_fails_closed() {
-        use lance_index::pb::VectorIndexDetails;
+    fn prepared_metrics() -> Arc<AnnIndexMetrics> {
+        Arc::new(AnnIndexMetrics::new(&ExecutionPlanMetricsSet::new(), 0))
+    }
 
+    #[test]
+    fn test_coarse_quantizer_groups_are_fail_closed() {
         fn metadata(uuid: Uuid, fingerprint: Option<Vec<u8>>) -> IndexMetadata {
             let details = VectorIndexDetails {
                 coarse_quantizer_fingerprint: fingerprint,
@@ -2799,33 +2692,26 @@ mod tests {
 
         let first_uuid = Uuid::new_v4();
         let second_uuid = Uuid::new_v4();
+        let third_uuid = Uuid::new_v4();
+        let fourth_uuid = Uuid::new_v4();
         let fingerprint = vec![7; 32];
-        let uuids = vec![first_uuid, second_uuid];
-        let shared = vec![
-            metadata(first_uuid, Some(fingerprint.clone())),
-            metadata(second_uuid, Some(fingerprint.clone())),
-        ];
-        assert!(has_shared_coarse_quantizer(&shared, &uuids));
-
-        let missing = vec![
-            metadata(first_uuid, Some(fingerprint.clone())),
-            metadata(second_uuid, None),
-        ];
-        assert!(!has_shared_coarse_quantizer(&missing, &uuids));
-
         let mut other = fingerprint.clone();
         other[0] = 8;
-        let different = vec![
+        let indices = vec![
             metadata(first_uuid, Some(fingerprint.clone())),
-            metadata(second_uuid, Some(other)),
+            metadata(second_uuid, Some(fingerprint)),
+            metadata(third_uuid, Some(other)),
+            metadata(fourth_uuid, None),
+            metadata(Uuid::new_v4(), Some(vec![7; 31])),
         ];
-        assert!(!has_shared_coarse_quantizer(&different, &uuids));
+        let groups = routing_groups(&indices);
 
-        let invalid_digest = vec![
-            metadata(first_uuid, Some(fingerprint)),
-            metadata(second_uuid, Some(vec![7; 31])),
-        ];
-        assert!(!has_shared_coarse_quantizer(&invalid_digest, &uuids));
+        assert_eq!(groups.len(), 4);
+        assert_eq!(groups[0].representative_uuid, first_uuid);
+        assert_eq!(groups[0].member_uuids, vec![first_uuid, second_uuid]);
+        assert_eq!(groups[1].member_uuids, vec![third_uuid]);
+        assert_eq!(groups[2].member_uuids, vec![fourth_uuid]);
+        assert_eq!(groups[3].member_uuids, vec![indices[4].uuid]);
     }
 
     #[test]
@@ -3420,224 +3306,6 @@ mod tests {
             !ordinary_segment.needs_partition_row_ids(),
             "a user filter cannot take the no-filter fast path, so partition coverage is unused"
         );
-    }
-
-    fn prepared_metrics() -> Arc<AnnIndexMetrics> {
-        Arc::new(AnnIndexMetrics::new_with_stage_metrics(
-            &ExecutionPlanMetricsSet::new(),
-            0,
-            false,
-        ))
-    }
-
-    fn count_metric(metrics: &ExecutionPlanMetricsSet, name: &str) -> Option<usize> {
-        let metrics = metrics.clone_inner();
-        metrics
-            .iter_counts()
-            .find_map(|(metric_name, value)| (metric_name.as_ref() == name).then(|| value.value()))
-    }
-
-    fn time_metric(metrics: &ExecutionPlanMetricsSet, name: &str) -> Option<usize> {
-        let metrics = metrics.clone_inner();
-        metrics
-            .iter_times()
-            .find_map(|(metric_name, value)| (metric_name.as_ref() == name).then(|| value.value()))
-    }
-
-    #[test]
-    fn test_ann_search_stage_metrics_are_opt_in() {
-        let disabled_set = ExecutionPlanMetricsSet::new();
-        let disabled = AnnIndexMetrics::new_with_stage_metrics(&disabled_set, 0, false);
-        assert!(disabled.search_partitions_elapsed.is_none());
-        assert!(disabled.search_partitions_calls.is_none());
-        assert_eq!(
-            time_metric(&disabled_set, SEARCH_PARTITIONS_ELAPSED_METRIC),
-            None
-        );
-        assert_eq!(
-            count_metric(&disabled_set, SEARCH_PARTITIONS_CALLS_METRIC),
-            None
-        );
-
-        let enabled_set = ExecutionPlanMetricsSet::new();
-        let enabled = AnnIndexMetrics::new_with_stage_metrics(&enabled_set, 0, true);
-        assert!(enabled.search_partitions_elapsed.is_some());
-        assert!(enabled.search_partitions_calls.is_some());
-        assert_eq!(
-            time_metric(&enabled_set, SEARCH_PARTITIONS_ELAPSED_METRIC),
-            Some(0)
-        );
-        assert_eq!(
-            count_metric(&enabled_set, SEARCH_PARTITIONS_CALLS_METRIC),
-            Some(0)
-        );
-    }
-
-    #[tokio::test]
-    async fn test_ann_search_stage_timer_spans_stream_consumption() {
-        let plan_metrics = ExecutionPlanMetricsSet::new();
-        let metrics = Arc::new(AnnIndexMetrics::new_with_stage_metrics(
-            &plan_metrics,
-            0,
-            true,
-        ));
-        metrics.record_search_partitions_call();
-        let started = metrics.start_search_partitions();
-        let delayed = stream::once(async {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            Ok(RecordBatch::new_empty(KNN_INDEX_SCHEMA.clone()))
-        })
-        .boxed();
-        ANNIvfSubIndexExec::instrument_search_stream(delayed, metrics, started)
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
-
-        assert_eq!(
-            count_metric(&plan_metrics, SEARCH_PARTITIONS_CALLS_METRIC),
-            Some(1)
-        );
-        assert!(
-            time_metric(&plan_metrics, SEARCH_PARTITIONS_ELAPSED_METRIC).unwrap() >= 10_000_000
-        );
-    }
-
-    #[tokio::test]
-    async fn test_ann_search_stage_timer_records_stream_failure() {
-        let plan_metrics = ExecutionPlanMetricsSet::new();
-        let metrics = Arc::new(AnnIndexMetrics::new_with_stage_metrics(
-            &plan_metrics,
-            0,
-            true,
-        ));
-        let started = metrics.start_search_partitions();
-        let failed = stream::once(async {
-            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-            Err(DataFusionError::Execution("expected failure".to_string()))
-        })
-        .boxed();
-        let error = ANNIvfSubIndexExec::instrument_search_stream(failed, metrics, started)
-            .try_collect::<Vec<RecordBatch>>()
-            .await
-            .unwrap_err();
-
-        assert!(error.to_string().contains("expected failure"));
-        assert!(time_metric(&plan_metrics, SEARCH_PARTITIONS_ELAPSED_METRIC).unwrap() > 0);
-    }
-
-    #[tokio::test]
-    async fn test_ann_search_stage_timer_records_stream_cancellation() {
-        let plan_metrics = ExecutionPlanMetricsSet::new();
-        let metrics = Arc::new(AnnIndexMetrics::new_with_stage_metrics(
-            &plan_metrics,
-            0,
-            true,
-        ));
-        let started = metrics.start_search_partitions();
-        let pending = stream::pending::<DataFusionResult<RecordBatch>>().boxed();
-        let mut instrumented =
-            ANNIvfSubIndexExec::instrument_search_stream(pending, metrics, started);
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(1), instrumented.next())
-                .await
-                .is_err()
-        );
-        drop(instrumented);
-
-        assert!(time_metric(&plan_metrics, SEARCH_PARTITIONS_ELAPSED_METRIC).unwrap() > 0);
-    }
-
-    #[rstest]
-    #[tokio::test]
-    async fn test_ann_search_stage_metrics_cover_sequential_and_parallel_paths(
-        #[values(1, 2)] query_parallelism: i32,
-    ) {
-        let num_partitions = 3;
-        let (index, _, _, _) = prepared_index(vec![11, 12, 13]);
-        let mut query = base_query();
-        query.minimum_nprobes = num_partitions;
-        query.query_parallelism = query_parallelism;
-        let state = Arc::new(ANNIvfEarlySearchResults::new(1, query.k));
-        let plan_metrics = ExecutionPlanMetricsSet::new();
-        let metrics = Arc::new(AnnIndexMetrics::new_with_stage_metrics(
-            &plan_metrics,
-            0,
-            true,
-        ));
-
-        ANNIvfSubIndexExec::initial_search(
-            index,
-            query,
-            Arc::new(UInt32Array::from(vec![0, 1, 2])),
-            Arc::new(Float32Array::from(vec![0.1, 0.2, 0.3])),
-            empty_prefilter().await,
-            metrics,
-            state,
-            usize::MAX,
-            None,
-        )
-        .try_collect::<Vec<_>>()
-        .await
-        .unwrap();
-
-        let expected_calls = if query_parallelism == 1 {
-            1
-        } else {
-            num_partitions
-        };
-        assert_eq!(
-            count_metric(&plan_metrics, SEARCH_PARTITIONS_CALLS_METRIC),
-            Some(expected_calls)
-        );
-        assert!(time_metric(&plan_metrics, SEARCH_PARTITIONS_ELAPSED_METRIC).unwrap() > 0);
-    }
-
-    #[rstest]
-    #[tokio::test]
-    async fn test_ann_search_stage_metrics_cover_late_search(
-        #[values(1, 2)] query_parallelism: i32,
-    ) {
-        let num_partitions = 3;
-        let (index, _, _, _) = prepared_index(vec![11, 12, 13]);
-        let mut query = base_query();
-        query.minimum_nprobes = 0;
-        query.maximum_nprobes = Some(num_partitions);
-        query.query_parallelism = query_parallelism;
-        let state = Arc::new(ANNIvfEarlySearchResults::new(1, query.k));
-        let plan_metrics = ExecutionPlanMetricsSet::new();
-        let metrics = Arc::new(AnnIndexMetrics::new_with_stage_metrics(
-            &plan_metrics,
-            0,
-            true,
-        ));
-        let prefilter = empty_prefilter().await;
-
-        ANNIvfSubIndexExec::late_search(
-            index,
-            query,
-            Arc::new(UInt32Array::from(vec![0, 1, 2])),
-            Arc::new(Float32Array::from(vec![0.1, 0.2, 0.3])),
-            prefilter.clone(),
-            prefilter,
-            metrics,
-            state,
-            usize::MAX,
-            None,
-        )
-        .try_collect::<Vec<_>>()
-        .await
-        .unwrap();
-
-        let expected_calls = if query_parallelism == 1 {
-            1
-        } else {
-            num_partitions
-        };
-        assert_eq!(
-            count_metric(&plan_metrics, SEARCH_PARTITIONS_CALLS_METRIC),
-            Some(expected_calls)
-        );
-        assert!(time_metric(&plan_metrics, SEARCH_PARTITIONS_ELAPSED_METRIC).unwrap() > 0);
     }
 
     type PreparedIndexState = (
@@ -4572,18 +4240,6 @@ mod tests {
 
     impl NprobesTestFixture {
         pub async fn new(num_centroids: usize, num_deltas: usize) -> Self {
-            Self::new_with_retrained_centroids(num_centroids, num_deltas, false).await
-        }
-
-        async fn new_without_fingerprint(num_centroids: usize, num_deltas: usize) -> Self {
-            Self::new_with_retrained_centroids(num_centroids, num_deltas, true).await
-        }
-
-        async fn new_with_retrained_centroids(
-            num_centroids: usize,
-            num_deltas: usize,
-            retrain: bool,
-        ) -> Self {
             let tempdir = TempStrDir::default();
             let tmppath = tempdir.as_str();
 
@@ -4630,12 +4286,11 @@ mod tests {
                 .await
                 .unwrap();
 
-                let mut ivf_params = IvfBuildParams::try_with_centroids(
+                let ivf_params = IvfBuildParams::try_with_centroids(
                     num_centroids,
                     Arc::new(centroids.as_fixed_size_list().clone()),
                 )
                 .unwrap();
-                ivf_params.retrain = retrain;
 
                 let codebook = array::rand::<Float32Type>()
                     .generate_default(RowCount::from(256 * 2))
@@ -4699,10 +4354,6 @@ mod tests {
                 .unwrap_or_default()
                 > 0
         );
-    }
-
-    fn metric_count(stats: &ExecutionSummaryCounts, metric: &str) -> usize {
-        stats.all_counts.get(metric).copied().unwrap_or_default()
     }
 
     #[rstest]
@@ -4939,51 +4590,8 @@ mod tests {
                 stats.all_counts.get(PARTITIONS_RANKED_METRIC).unwrap(),
                 &100
             );
-            assert_eq!(metric_count(&stats, FIND_PARTITIONS_CALLS_METRIC), 1);
-            assert_eq!(
-                metric_count(&stats, SHARED_COARSE_QUANTIZER_FAST_PATH_METRIC),
-                usize::from(num_deltas > 1)
-            );
-            assert_eq!(
-                metric_count(&stats, COARSE_QUANTIZER_REUSED_SEGMENTS_METRIC),
-                num_deltas.saturating_sub(1)
-            );
             assert_find_partitions_elapsed_recorded(&stats);
         }
-    }
-
-    #[tokio::test]
-    async fn test_missing_fingerprint_uses_per_segment_partition_search() {
-        let fixture = NprobesTestFixture::new_without_fingerprint(4, 2).await;
-        let q = fixture.get_centroid(0);
-        let stats_holder = StatsHolder::default();
-
-        fixture
-            .dataset
-            .scan()
-            .nearest("vector", q.as_ref(), 10)
-            .unwrap()
-            .minimum_nprobes(2)
-            .maximum_nprobes(2)
-            .scan_stats_callback(stats_holder.get_setter())
-            .project(&Vec::<String>::new())
-            .unwrap()
-            .try_into_batch()
-            .await
-            .unwrap();
-
-        let stats = stats_holder.consume();
-        assert_eq!(metric_count(&stats, FIND_PARTITIONS_CALLS_METRIC), 2);
-        assert_eq!(metric_count(&stats, PARTITIONS_RANKED_METRIC), 8);
-        assert_eq!(
-            metric_count(&stats, SHARED_COARSE_QUANTIZER_FAST_PATH_METRIC),
-            0
-        );
-        assert_eq!(
-            metric_count(&stats, COARSE_QUANTIZER_REUSED_SEGMENTS_METRIC),
-            0
-        );
-        assert_find_partitions_elapsed_recorded(&stats);
     }
 
     #[rstest]
