@@ -2763,6 +2763,7 @@ mod tests {
             DEFAULT_COMMIT_RETRY_TIMEOUT,
             dataset.manifest_location.naming_scheme,
             None,
+            false,
         )
         .await
         .expect("the inline transaction must identify the landed commit");

@@ -2276,6 +2276,7 @@ async fn reserve_fragment_ids(
         DEFAULT_COMMIT_RETRY_TIMEOUT,
         dataset.manifest_location.naming_scheme,
         None,
+        false,
     )
     .await?;
 
