@@ -10,6 +10,7 @@ pub(crate) mod btree;
 pub(crate) mod fmindex;
 pub(crate) mod inverted;
 pub(crate) mod label_list;
+pub(crate) mod minhash_lsh;
 pub(crate) mod ngram;
 #[cfg(feature = "geo")]
 pub(crate) mod rtree;
@@ -298,6 +299,11 @@ impl IndexDetails {
     pub fn supports_fts(&self) -> bool {
         // In the future this may need to change if we want FTS indices to be pluggable
         self.0.type_url.ends_with("InvertedIndexDetails")
+    }
+
+    /// Returns true if the index supports MinHash similarity search
+    pub fn supports_minhash(&self) -> bool {
+        self.0.type_url.ends_with("MinHashLshIndexDetails")
     }
 
     /// Returns the plugin for the index
@@ -770,6 +776,9 @@ pub fn index_matches_criteria(
         if criteria.must_support_fts && !index_details.supports_fts() {
             return Ok(false);
         }
+        if criteria.must_support_minhash && !index_details.supports_minhash() {
+            return Ok(false);
+        }
 
         // We should not use FTS / NGram indices for exact equality queries
         // (i.e. merge insert with a join on the indexed column)
@@ -946,6 +955,7 @@ mod tests {
             must_support_fts: false,
             fts_document_granularity: None,
             must_support_exact_equality: false,
+            must_support_minhash: false,
             for_column: None,
             has_name: None,
         };
@@ -973,6 +983,7 @@ mod tests {
             must_support_fts: false,
             fts_document_granularity: None,
             must_support_exact_equality: false,
+            must_support_minhash: false,
             for_column: None,
             has_name: None,
         };
@@ -995,6 +1006,7 @@ mod tests {
             must_support_fts: false,
             fts_document_granularity: None,
             must_support_exact_equality: false,
+            must_support_minhash: false,
             for_column: Some("mycol"),
             has_name: None,
         };
@@ -1012,6 +1024,7 @@ mod tests {
             must_support_fts: false,
             fts_document_granularity: None,
             must_support_exact_equality: false,
+            must_support_minhash: false,
             for_column: None,
             has_name: Some("btree_index"),
         };
@@ -1035,6 +1048,7 @@ mod tests {
             must_support_fts: false,
             fts_document_granularity: None,
             must_support_exact_equality: true,
+            must_support_minhash: false,
             for_column: None,
             has_name: None,
         };
@@ -1057,6 +1071,7 @@ mod tests {
             must_support_fts: false,
             fts_document_granularity: None,
             must_support_exact_equality: false,
+            must_support_minhash: false,
             for_column: None,
             has_name: None,
         };
@@ -1090,6 +1105,7 @@ mod tests {
             must_support_fts: false,
             fts_document_granularity: None,
             must_support_exact_equality: false,
+            must_support_minhash: false,
             for_column: Some("mycol"),
             has_name: None,
         };

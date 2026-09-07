@@ -4877,6 +4877,7 @@ dependencies = [
  "test-log",
  "tokio",
  "tracing",
+ "twox-hash",
  "uuid",
 ]
 
