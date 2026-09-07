@@ -35,7 +35,7 @@ use lance_file::writer::FileWriterOptions;
 
 use crate::Dataset;
 use crate::dataset::optimize::{CompactionOptions, compact_files, remapping};
-use crate::dataset::scanner::RowAddrTreeMap;
+use crate::dataset::scanner::{RowAddrMask, RowAddrTreeMap};
 use crate::dataset::transaction::{DataOverlayGroup, Operation};
 use crate::dataset::{WriteDestination, WriteParams};
 use crate::index::vector::VectorIndexParams;
@@ -279,7 +279,9 @@ async fn test_physical_row_selection_constrains_overlay_stale_replay(
     let selected_addr = u64::from(RowAddress::new_from_parts(0, 2));
     let mut scanner = dataset.scan();
     scanner
-        .with_physical_row_addr_prefilter(RowAddrTreeMap::from_iter([selected_addr]))
+        .with_row_addr_prefilter(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter([
+            selected_addr,
+        ])))
         .filter("age = 999")
         .unwrap()
         .project(&["id"])
@@ -289,7 +291,9 @@ async fn test_physical_row_selection_constrains_overlay_stale_replay(
     let selected_addr = u64::from(RowAddress::new_from_parts(0, 1));
     let mut scanner = dataset.scan();
     scanner
-        .with_physical_row_addr_prefilter(RowAddrTreeMap::from_iter([selected_addr]))
+        .with_row_addr_prefilter(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter([
+            selected_addr,
+        ])))
         .filter("age = 999")
         .unwrap()
         .project(&["id"])

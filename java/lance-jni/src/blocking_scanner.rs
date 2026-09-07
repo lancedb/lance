@@ -16,7 +16,7 @@ use jni::sys::{JNI_TRUE, jboolean, jint};
 use jni::{JNIEnv, sys::jlong};
 use lance::dataset::scanner::{
     AggregateExpr, ColumnOrdering, DatasetRecordBatchStream, ExecutionStatsCallback,
-    ExecutionSummaryCounts, MaterializationStyle, RowAddrTreeMap, Scanner,
+    ExecutionSummaryCounts, MaterializationStyle, RowAddrMask, RowAddrTreeMap, Scanner,
 };
 use lance_core::utils::address::RowAddress;
 use lance_index::scalar::FullTextSearchQuery;
@@ -428,7 +428,7 @@ fn apply_fragment_slices(
         None => fragments_by_id.into_values().collect(),
     };
     scanner.with_fragments(fragments);
-    scanner.with_physical_row_addr_prefilter(physical_rows);
+    scanner.with_row_addr_prefilter(RowAddrMask::from_allowed(physical_rows));
     Ok(())
 }
 

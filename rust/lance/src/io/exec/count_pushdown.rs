@@ -170,7 +170,7 @@ fn try_rewrite(agg: &AggregateExec) -> DFResult<Option<Arc<dyn ExecutionPlan>>> 
     // A physical row selection is already represented in FilteredReadExec's planned ranges.
     // CountFromMaskExec only understands fragment scope, deletion masks, and scalar-index masks,
     // so replacing the read would count rows outside the selected fragment-local ranges.
-    if options.physical_row_addr_prefilter.is_some() {
+    if options.row_addr_prefilter.is_some() {
         return Ok(None);
     }
     // We rely on the deletion mask being applied; with_deleted_rows changes
