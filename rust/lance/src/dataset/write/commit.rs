@@ -48,6 +48,7 @@ pub struct CommitBuilder<'a> {
     session: Option<Arc<Session>>,
     detached: bool,
     commit_config: CommitConfig,
+    disable_rebase: bool,
     retry_timeout: Duration,
     affected_rows: Option<RowAddrTreeMap>,
     transaction_properties: Option<Arc<HashMap<String, String>>>,
@@ -73,6 +74,7 @@ impl<'a> CommitBuilder<'a> {
             session: None,
             detached: false,
             commit_config: Default::default(),
+            disable_rebase: false,
             retry_timeout: DEFAULT_COMMIT_RETRY_TIMEOUT,
             affected_rows: None,
             transaction_properties: None,
@@ -198,6 +200,29 @@ impl<'a> CommitBuilder<'a> {
     /// If a commit operation fails, it will be retried up to `max_retries` times.
     pub fn with_max_retries(mut self, max_retries: u32) -> Self {
         self.commit_config.num_retries = max_retries;
+        self
+    }
+
+    /// Whether an attached transaction may be rebased over concurrent commits.
+    ///
+    /// Enabled by default. When disabled, the transaction can only publish
+    /// version `read_version + 1`, even if a concurrent write would normally be
+    /// compatible. A conflict is returned without rebasing or retrying, after
+    /// checking whether this transaction already committed. This lets a caller
+    /// validate application-specific preconditions against `read_version`
+    /// without a race between validation and publication.
+    ///
+    /// Unlike setting [`Self::with_max_retries`] to zero, this also disables
+    /// rebasing before the first commit attempt. Detached commits and creation
+    /// of a new dataset do not rebase and are unaffected by this option.
+    ///
+    /// ```
+    /// use lance::dataset::CommitBuilder;
+    ///
+    /// let builder = CommitBuilder::new("memory://dataset").with_auto_rebase(false);
+    /// ```
+    pub fn with_auto_rebase(mut self, enabled: bool) -> Self {
+        self.disable_rebase = !enabled;
         self
     }
 
@@ -468,6 +493,7 @@ impl<'a> CommitBuilder<'a> {
                     self.retry_timeout,
                     manifest_naming_scheme,
                     self.affected_rows.as_ref(),
+                    self.disable_rebase,
                 )
                 .await?
             }
@@ -607,6 +633,7 @@ pub struct BatchCommitResult {
 mod tests {
     use arrow::array::{Int32Array, RecordBatch};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+    use lance_datagen::{RowCount, array, gen_batch};
 
     use lance_io::utils::CachedFileSize;
     use lance_io::{assert_io_eq, assert_io_gt};
@@ -1085,6 +1112,67 @@ mod tests {
             matches!(&error, Error::TooMuchWriteContention { message, .. } if message.contains("failed on retry_timeout")),
             "got {error:?}"
         );
+    }
+
+    #[tokio::test]
+    #[rstest::rstest]
+    #[case(false, 20, false)]
+    #[case(true, 0, true)]
+    #[case(true, 20, true)]
+    async fn test_commit_auto_rebase(
+        #[case] auto_rebase: bool,
+        #[case] max_retries: u32,
+        #[case] succeeds: bool,
+    ) {
+        let batch = gen_batch()
+            .col("i", array::step::<arrow_array::types::Int32Type>())
+            .into_batch_rows(RowCount::from(4))
+            .unwrap();
+        let source = Arc::new(
+            InsertBuilder::new("memory://")
+                .execute(vec![batch])
+                .await
+                .unwrap(),
+        );
+        let winner = sample_transaction(source.version().version);
+        let latest = Arc::new(
+            CommitBuilder::new(source.clone())
+                .with_auto_rebase(false)
+                .execute(winner.clone())
+                .await
+                .unwrap(),
+        );
+
+        // Losing a successful response still recovers the original version.
+        let replayed = CommitBuilder::new(source.clone())
+            .with_auto_rebase(false)
+            .execute(winner)
+            .await
+            .unwrap();
+        assert_eq!(replayed.version().version, latest.version().version);
+
+        // A latest destination handle must not bypass the transaction's read version.
+        let result = CommitBuilder::new(latest.clone())
+            .with_auto_rebase(auto_rebase)
+            .with_max_retries(max_retries)
+            .execute(sample_transaction(source.version().version))
+            .await;
+        if succeeds {
+            assert_eq!(
+                result.unwrap().version().version,
+                latest.version().version + 1
+            );
+        } else {
+            let error =
+                result.expect_err("an intervening append invalidates an exact-version commit");
+            assert!(
+                matches!(error, Error::TooMuchWriteContention { .. }),
+                "{error:?}"
+            );
+            let mut unchanged = latest.as_ref().clone();
+            unchanged.checkout_latest().await.unwrap();
+            assert_eq!(unchanged.version().version, latest.version().version);
+        }
     }
 
     #[tokio::test]

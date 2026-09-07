@@ -1396,6 +1396,7 @@ pub(crate) async fn commit_transaction(
     retry_timeout: Duration,
     manifest_naming_scheme: ManifestNamingScheme,
     affected_rows: Option<&RowAddrTreeMap>,
+    disable_rebase: bool,
 ) -> Result<(Manifest, ManifestLocation)> {
     // Note: object_store has been configured with WriteParams, but dataset.object_store.as_ref()
     // has not necessarily. So for anything involving writing, use `object_store`.
@@ -1434,7 +1435,11 @@ pub(crate) async fn commit_transaction(
 
     let mut transaction = transaction.clone();
 
-    let num_attempts = std::cmp::max(commit_config.num_retries, 1);
+    let num_attempts = if disable_rebase {
+        1
+    } else {
+        std::cmp::max(commit_config.num_retries, 1)
+    };
     let mut backoff = SlotBackoff::default();
     let start = Instant::now();
 
@@ -1453,7 +1458,7 @@ pub(crate) async fn commit_transaction(
         // faster and the slow path slower, which makes performance less predictable
         // for users. So we always check for other transactions.
         // We skip this for strict overwrites, because strict overwrites can't be rebased.
-        if !strict_overwrite {
+        if !strict_overwrite && !disable_rebase {
             (dataset, other_transactions) = load_and_sort_new_transactions(&dataset).await?;
 
             ensure_can_write_manifest(&dataset.manifest)?;
