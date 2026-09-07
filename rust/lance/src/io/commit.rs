@@ -1409,15 +1409,16 @@ pub(crate) async fn commit_transaction(
     // Strict overwrites are not subject to any sort of automatic conflict resolution.
     let strict_overwrite = matches!(transaction.operation, Operation::Overwrite { .. })
         && commit_config.num_retries == 0;
-    let mut dataset =
-        if dataset.manifest.version != read_version && (read_version != 0 || strict_overwrite) {
-            // If the dataset version is not the same as the read version, we need to
-            // checkout the read version.
-            dataset.checkout_version(read_version).await?
-        } else {
-            // If the dataset version is the same as the read version, we can use it directly.
-            dataset.clone()
-        };
+    let mut dataset = if dataset.manifest.version != read_version
+        && (read_version != 0 || strict_overwrite || disable_rebase)
+    {
+        // If the dataset version is not the same as the read version, we need to
+        // checkout the read version.
+        dataset.checkout_version(read_version).await?
+    } else {
+        // If the dataset version is the same as the read version, we can use it directly.
+        dataset.clone()
+    };
 
     // The version this transaction read, captured before the retry loop moves
     // `dataset` forward. MemWAL index catch-up is derived from it: an index
