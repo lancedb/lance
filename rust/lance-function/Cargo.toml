@@ -1,0 +1,29 @@
+[package]
+name = "lance-function"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Lance Function artifact and Arrow interface contracts"
+readme = "README.md"
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+arrow-array.workspace = true
+arrow-ipc.workspace = true
+arrow-schema.workspace = true
+hex.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+sha2 = "0.10"
+
+[dev-dependencies]
+arrow-buffer.workspace = true
+flatbuffers = "25.12.19"
+rstest.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

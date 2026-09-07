@@ -4786,6 +4786,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "lance-function"
+version = "12.0.0-beta.14"
+dependencies = [
+ "arrow-array",
+ "arrow-buffer",
+ "arrow-ipc",
+ "arrow-schema",
+ "flatbuffers",
+ "hex",
+ "rstest",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+]
+
+[[package]]
 name = "lance-geo"
 version = "12.0.0-beta.14"
 dependencies = [
