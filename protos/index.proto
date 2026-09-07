@@ -251,38 +251,44 @@ message RTreeIndexDetails {}
 
 message FMIndexDetails {}
 
-// Details for a MinHash LSH index used for near-duplicate detection
-// (approximate Jaccard similarity top-k over text).
-//
-// Every parameter that shapes a signature lives here and nowhere else. All
-// segments of one logical index must carry identical parameters so that
-// signatures written by different segments (and computed on the query side)
-// are comparable; the index files repeat them as schema metadata only to
-// detect a details/file mismatch.
+/* Details for a MinHash LSH index used for near-duplicate detection
+ * (approximate Jaccard similarity top-k over text).
+ *
+ * Every parameter that shapes a signature lives here and nowhere else. All
+ * segments of one logical index must carry identical parameters so that
+ * signatures written by different segments (and computed on the query side)
+ * are comparable; the index files repeat them as schema metadata only to
+ * detect a details/file mismatch.
+ */
 message MinHashLshIndexDetails {
-  // Number of MinHash values per signature (k). Must be a positive multiple of
-  // `num_bands`.
+  /* Number of MinHash values per signature (k). Must be a positive multiple of
+   * `num_bands`.
+   */
   uint32 num_hashes = 1;
 
-  // Number of LSH bands (b). Each band covers `num_hashes / num_bands`
-  // consecutive signature values. Must be in [1, 256].
+  /* Number of LSH bands (b). Each band covers `num_hashes / num_bands`
+   * consecutive signature values. Must be in [1, 256].
+   */
   uint32 num_bands = 2;
 
   // Number of consecutive tokens joined into one shingle before hashing.
   uint32 shingle_size = 3;
 
-  // Seed used to derive the shingle hash and the `num_hashes` permutation
-  // functions. Fixed at index creation; the query side reads it from here.
+  /* Seed used to derive the shingle hash and the `num_hashes` permutation
+   * functions. Fixed at index creation; the query side reads it from here.
+   */
   uint64 seed = 4;
 
-  // The tokenizer, recorded exactly like a full text search index records
-  // it. Only the tokenization fields matter here; fields that shape full text
-  // search postings (`with_position`, `block_size`, `posting_format_version`,
-  // `document_granularity`) are carried unchanged and ignored.
+  /* The tokenizer, recorded exactly like a full text search index records
+   * it. Only the tokenization fields matter here; fields that shape full text
+   * search postings (`with_position`, `block_size`, `posting_format_version`,
+   * `document_granularity`) are carried unchanged and ignored.
+   */
   lance.table.InvertedIndexDetails tokenizer = 5;
 
-  // Version of the signature generation behavior (tokenize, shingle, hash,
-  // permute). Bumped whenever any step changes in a way that makes old and
-  // new signatures incomparable. Independent of the index file format version.
+  /* Version of the signature generation behavior (tokenize, shingle, hash,
+   * permute). Bumped whenever any step changes in a way that makes old and
+   * new signatures incomparable. Independent of the index file format version.
+   */
   uint32 signature_version = 6;
 }
