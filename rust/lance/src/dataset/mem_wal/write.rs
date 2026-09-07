@@ -71,6 +71,7 @@ struct WriterTestHooks {
     pause_next_index_apply: std::sync::atomic::AtomicBool,
     index_apply_release: tokio::sync::Notify,
     memtable_index_wait_started: tokio::sync::Notify,
+    memtable_index_wait_finished: tokio::sync::Notify,
 }
 
 #[cfg(test)]
@@ -3368,14 +3369,23 @@ impl ShardWriter {
     ///
     /// Blocks until any flush already mid-`handle()` settles —
     /// cancellation only fires between messages — so no flush task lingers
-    /// after abort returns. Idempotent: a second call re-cancels an
-    /// already-cancelled token and joins an already-emptied task set.
+    /// after abort returns. Cursor waiters are failed before cancellation so
+    /// they cannot be stranded when another dispatcher discards work they
+    /// depend on. Idempotent: a second call re-cancels an already-cancelled
+    /// token and joins an already-emptied task set.
     #[instrument(name = "sw_abort", level = "info", skip_all, fields(shard_id = %self.config.shard_id, epoch = self.epoch))]
     pub async fn abort(&self) -> Result<()> {
         info!(
             "Aborting ShardWriter for shard {} (no flush)",
             self.config.shard_id
         );
+        // A memtable flush may be waiting for an index apply that is still
+        // queued on another dispatcher. Cancellation is biased ahead of queued
+        // messages, so wake the dependent cursor waiter before cancellation can
+        // discard the apply and leave shutdown joining the waiter forever.
+        self.wal_flusher.poison(&Error::writer_poisoned(
+            "ShardWriter aborted while background work was pending",
+        ));
         self.task_executor.shutdown_all().await?;
         Ok(())
     }
@@ -4129,10 +4139,16 @@ impl MemTableFlushHandler {
                 if let Some(hooks) = &self.test_hooks {
                     hooks.memtable_index_wait_started.notify_one();
                 }
-                self.wal_flusher
+                let wait_result = self
+                    .wal_flusher
                     .track_batch(Some(indexes), target_indexed, 0)
                     .wait()
-                    .await?;
+                    .await;
+                #[cfg(test)]
+                if let Some(hooks) = &self.test_hooks {
+                    hooks.memtable_index_wait_finished.notify_one();
+                }
+                wait_result?;
             }
 
             // Step 2: Flush the memtable to Lance storage. The covered WAL
@@ -5226,6 +5242,76 @@ mod tests {
         );
 
         writer.close().await.unwrap();
+    }
+
+    /// Abort must wake a flush that is waiting for index work before cancelling
+    /// the dispatcher that owns that work. Otherwise cancellation can discard
+    /// the apply and leave shutdown joining the flush forever.
+    #[tokio::test]
+    async fn test_abort_wakes_flush_waiting_for_index_apply() {
+        let (store, base_path, base_uri, _temp) = create_local_store().await;
+        let schema = create_pk_test_schema();
+        let hooks = Arc::new(WriterTestHooks {
+            pause_next_index_apply: std::sync::atomic::AtomicBool::new(true),
+            ..Default::default()
+        });
+        let config = ShardWriterConfig {
+            shard_id: Uuid::new_v4(),
+            durable_write: false,
+            max_wal_flush_interval: Some(Duration::from_secs(60)),
+            max_memtable_batches: 1,
+            test_hooks: Some(hooks.clone()),
+            ..Default::default()
+        };
+        let writer = Arc::new(
+            ShardWriter::open(store, base_path, base_uri, config, schema.clone(), vec![])
+                .await
+                .unwrap(),
+        );
+
+        let (_, _watcher) = writer
+            .put_no_wait(vec![create_test_batch(&schema, 1, 2)])
+            .await
+            .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            hooks.memtable_index_wait_started.notified(),
+        )
+        .await
+        .expect("PK-only flush did not wait for the held index apply");
+
+        let abort_writer = writer.clone();
+        let abort_task = tokio::spawn(async move { abort_writer.abort().await });
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            hooks.memtable_index_wait_finished.notified(),
+        )
+        .await
+        .expect("abort did not wake the flush cursor waiter");
+        assert!(
+            !abort_task.is_finished(),
+            "abort must still join an index handler that is already in flight"
+        );
+
+        hooks.index_apply_release.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), abort_task)
+            .await
+            .expect("abort hung after the in-flight index handler was released")
+            .unwrap()
+            .unwrap();
+
+        assert!(
+            writer.wal_flusher.check_poisoned().is_err(),
+            "abort must poison the cursors before cancelling background work"
+        );
+        assert!(
+            writer
+                .manifest()
+                .await
+                .unwrap()
+                .is_none_or(|manifest| manifest.sstables.is_empty()),
+            "abort must not publish the waiting memtable"
+        );
     }
 
     /// Delete a key, then flush: the tombstone and the live row land in the
