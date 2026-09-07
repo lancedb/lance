@@ -91,8 +91,12 @@ pub fn deep_copy_array_data_sliced(data: &ArrayData) -> ArrayData {
     // Use MutableArrayData to efficiently copy just the slice
     let mut mutable = MutableArrayData::new(vec![data], false, data.len());
 
-    // Copy from offset to offset+len (the visible slice)
-    mutable.extend(0, data.offset(), data.offset() + data.len());
+    // Logical indices: `MutableArrayData` applies the source's own offset, so
+    // adding it here applies it twice. Only a layout that keeps a non-zero
+    // `ArrayData::offset()` after slicing is affected -- a primitive slice
+    // advances its buffer instead -- which in practice means the bit-packed
+    // ones, where the doubled offset runs off the end of the values buffer.
+    mutable.extend(0, 0, data.len());
 
     // Freeze into immutable ArrayData
     mutable.freeze()
@@ -119,8 +123,47 @@ pub fn deep_copy_batch_sliced(batch: &RecordBatch) -> crate::Result<RecordBatch>
 mod tests {
     use std::sync::Arc;
 
-    use arrow_array::{Array, Int32Array, RecordBatch, StringArray};
+    use arrow_array::{Array, BooleanArray, Int32Array, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema};
+
+    #[test]
+    fn sliced_boolean_deep_copy_reads_from_the_slice() {
+        // A boolean slice keeps its `ArrayData::offset()` -- the buffer cannot
+        // advance by a fraction of a byte -- so a copy that adds the offset on
+        // top of what `MutableArrayData` already applies reads past the end of
+        // the values buffer and panics.
+        let array = BooleanArray::from(vec![true, false, true, false, true, false, true, false]);
+        for (offset, len) in [(0usize, 8usize), (1, 7), (3, 5), (7, 1)] {
+            let sliced = array.slice(offset, len);
+            let copied = super::deep_copy_array_sliced(&sliced);
+            let copied = copied.as_any().downcast_ref::<BooleanArray>().unwrap();
+            let expected: Vec<bool> = (0..len).map(|i| sliced.value(i)).collect();
+            let actual: Vec<bool> = (0..len).map(|i| copied.value(i)).collect();
+            assert_eq!(actual, expected, "offset={offset} len={len}");
+        }
+    }
+
+    #[test]
+    fn sliced_boolean_deep_copy_keeps_its_nulls() {
+        let array = BooleanArray::from(vec![
+            Some(true),
+            None,
+            Some(false),
+            Some(true),
+            None,
+            Some(false),
+        ]);
+        let sliced = array.slice(1, 4);
+        let copied = super::deep_copy_array_sliced(&sliced);
+        let copied = copied.as_any().downcast_ref::<BooleanArray>().unwrap();
+        let expected: Vec<Option<bool>> = (0..sliced.len())
+            .map(|i| (!sliced.is_null(i)).then(|| sliced.value(i)))
+            .collect();
+        let actual: Vec<Option<bool>> = (0..copied.len())
+            .map(|i| (!copied.is_null(i)).then(|| copied.value(i)))
+            .collect();
+        assert_eq!(actual, expected);
+    }
 
     #[test]
     fn test_deep_copy_sliced_array_with_nulls() {
