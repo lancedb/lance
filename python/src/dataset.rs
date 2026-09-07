@@ -41,7 +41,7 @@ use lance::dataset::cleanup::{CleanupFileKind, CleanupPolicyBuilder};
 use lance::dataset::refs::{Ref, TagContents};
 use lance::dataset::scanner::{
     AggregateExpr, ColumnOrdering, DatasetRecordBatchStream, ExecutionStatsCallback,
-    MaterializationStyle, QueryFilter, RowAddrTreeMap, RowIdMask,
+    MaterializationStyle, QueryFilter, RowAddrMask, RowAddrTreeMap,
 };
 use lance::dataset::statistics::{DataStatistics, DatasetStatisticsExt};
 use lance::dataset::{
@@ -1371,15 +1371,15 @@ impl Dataset {
         }
         // Serialized RowAddrTreeMap payloads rather than an object: a mask built by
         // another extension module cannot hand over a Rust value, but both sides
-        // agree on this encoding. RowIdMask::from_serialized_parts is the shared
+        // agree on this encoding. RowAddrMask::from_serialized_parts is the shared
         // entry point, so no binding has to reimplement the allow/block combination.
-        if let Some(mask) = RowIdMask::from_serialized_parts(
+        if let Some(mask) = RowAddrMask::from_serialized_parts(
             row_addr_allowlist.as_deref(),
             row_addr_blocklist.as_deref(),
         )
         .infer_error()?
         {
-            scanner.with_row_id_prefilter(mask);
+            scanner.with_row_addr_prefilter(mask);
         }
 
         scanner

@@ -709,23 +709,11 @@ impl FilteredReadStream {
             .fragments
             .clone()
             .unwrap_or_else(|| dataset.fragments().clone());
-        let fragments = match options.row_addr_prefilter.as_deref() {
-            Some(RowAddrMask::AllowList(rows)) => Arc::new(
+        let fragments = match &options.physical_row_addr_prefilter {
+            Some(rows) => Arc::new(
                 fragments
                     .iter()
                     .filter(|fragment| rows.get(&(fragment.id as u32)).is_some())
-                    .cloned()
-                    .collect(),
-            ),
-            Some(RowAddrMask::BlockList(rows)) => Arc::new(
-                fragments
-                    .iter()
-                    .filter(|fragment| {
-                        !matches!(
-                            rows.get(&(fragment.id as u32)),
-                            Some(RowAddrSelection::Full)
-                        )
-                    })
                     .cloned()
                     .collect(),
             ),
@@ -890,32 +878,17 @@ impl FilteredReadStream {
             let mut to_read: Vec<Range<u64>> =
                 Self::full_frag_range(*num_physical_rows, deletion_vector);
 
-            if let Some(mask) = &options.row_addr_prefilter {
+            if let Some(rows) = &options.physical_row_addr_prefilter {
                 let fragment_id = fragment.id() as u32;
-                match mask.as_ref() {
-                    RowAddrMask::AllowList(rows) => {
-                        let Some(selection) = rows.get(&fragment_id) else {
-                            continue;
-                        };
-                        if let RowAddrSelection::Partial(bitmap) = selection {
-                            let requested = bitmap_to_ranges(bitmap);
-                            to_read = Self::intersect_ranges(&to_read, &requested);
-                        }
-                    }
-                    RowAddrMask::BlockList(rows) => {
-                        if let Some(selection) = rows.get(&fragment_id) {
-                            match selection {
-                                RowAddrSelection::Full => continue,
-                                RowAddrSelection::Partial(bitmap) => {
-                                    let blocked = bitmap_to_ranges(bitmap);
-                                    to_read = Self::subtract_ranges(&to_read, &blocked);
-                                }
-                            }
-                        }
-                    }
-                }
-                if to_read.is_empty() {
+                let Some(selection) = rows.get(&fragment_id) else {
                     continue;
+                };
+                if let RowAddrSelection::Partial(bitmap) = selection {
+                    let requested = bitmap_to_ranges(bitmap);
+                    to_read = Self::intersect_ranges(&to_read, &requested);
+                    if to_read.is_empty() {
+                        continue;
+                    }
                 }
             }
 
@@ -1214,38 +1187,6 @@ impl FilteredReadStream {
                 i += 1;
             } else {
                 j += 1;
-            }
-        }
-
-        result
-    }
-
-    /// Subtract a set of sorted ranges from another set of sorted ranges.
-    fn subtract_ranges(ranges: &[Range<u64>], blocked: &[Range<u64>]) -> Vec<Range<u64>> {
-        let mut result = Vec::new();
-        let mut blocked_idx = 0;
-
-        for range in ranges {
-            let mut start = range.start;
-            while blocked_idx < blocked.len() && blocked[blocked_idx].end <= start {
-                blocked_idx += 1;
-            }
-
-            let mut idx = blocked_idx;
-            while idx < blocked.len() && blocked[idx].start < range.end {
-                let blocked_range = &blocked[idx];
-                if blocked_range.start > start {
-                    result.push(start..blocked_range.start.min(range.end));
-                }
-                start = start.max(blocked_range.end);
-                if start >= range.end {
-                    break;
-                }
-                idx += 1;
-            }
-
-            if start < range.end {
-                result.push(start..range.end);
             }
         }
 
@@ -1773,8 +1714,8 @@ pub struct FilteredReadOptions {
     pub fragment_readahead: Option<usize>,
     /// The fragments to read
     pub fragments: Option<Arc<Vec<Fragment>>>,
-    /// Physical `(fragment_id, row_offset)` allow/block mask applied before filters.
-    pub(crate) row_addr_prefilter: Option<Arc<RowAddrMask>>,
+    /// Physical `(fragment_id, row_offset)` allow-list applied before filters.
+    pub(crate) physical_row_addr_prefilter: Option<Arc<RowAddrTreeMap>>,
     /// The projection to use for the scan
     pub projection: Projection,
     /// If there is a scalar index input, and the index result we get from that input is exact,
@@ -1823,7 +1764,7 @@ impl FilteredReadOptions {
             file_reader_options: None,
             fragment_readahead: None,
             fragments: None,
-            row_addr_prefilter: None,
+            physical_row_addr_prefilter: None,
             projection,
             refine_filter: None,
             full_filter: None,
@@ -1909,8 +1850,8 @@ impl FilteredReadOptions {
         self
     }
 
-    pub(crate) fn with_row_addr_prefilter(mut self, mask: Arc<RowAddrMask>) -> Self {
-        self.row_addr_prefilter = Some(mask);
+    pub(crate) fn with_physical_row_addr_prefilter(mut self, rows: Arc<RowAddrTreeMap>) -> Self {
+        self.physical_row_addr_prefilter = Some(rows);
         self
     }
 
@@ -2542,23 +2483,11 @@ impl FilteredReadExec {
                     .fragments
                     .clone()
                     .unwrap_or_else(|| dataset.fragments().clone());
-                let fragments = match options.row_addr_prefilter.as_deref() {
-                    Some(RowAddrMask::AllowList(rows)) => Arc::new(
+                let fragments = match &options.physical_row_addr_prefilter {
+                    Some(rows) => Arc::new(
                         fragments
                             .iter()
                             .filter(|fragment| rows.get(&(fragment.id as u32)).is_some())
-                            .cloned()
-                            .collect(),
-                    ),
-                    Some(RowAddrMask::BlockList(rows)) => Arc::new(
-                        fragments
-                            .iter()
-                            .filter(|fragment| {
-                                !matches!(
-                                    rows.get(&(fragment.id as u32)),
-                                    Some(RowAddrSelection::Full)
-                                )
-                            })
                             .cloned()
                             .collect(),
                     ),
@@ -3594,7 +3523,7 @@ impl ExecutionPlan for FilteredReadExec {
             // would apply before selection and keep the wrong rows; leave the limit to a
             // node above the read instead.
             if self.options.scan_range_before_filter.is_some()
-                || self.options.row_addr_prefilter.is_some()
+                || self.options.physical_row_addr_prefilter.is_some()
                 || self.index_input().is_some()
             {
                 return None;
@@ -4935,22 +4864,6 @@ mod tests {
         let mut ranges = vec![0..10, 20..30, 40..50];
         FilteredReadStream::trim_ranges_by_offset(&mut ranges, 0, 0);
         assert_eq!(ranges, vec![]);
-    }
-
-    #[test]
-    fn test_subtract_ranges() {
-        assert_eq!(
-            FilteredReadStream::subtract_ranges(&[0..10, 20..30], &[2..4, 6..25]),
-            vec![0..2, 4..6, 25..30]
-        );
-        assert_eq!(
-            FilteredReadStream::subtract_ranges(&[0..10], &[0..10]),
-            Vec::<Range<u64>>::new()
-        );
-        assert_eq!(
-            FilteredReadStream::subtract_ranges(&[5..10], &[0..3, 12..14]),
-            vec![5..10]
-        );
     }
 
     #[tokio::test]
