@@ -1276,13 +1276,13 @@ public class ScannerTest {
         ScanOptions ignoredOptions =
             new ScanOptions.Builder()
                 .filter("id < 50")
-                .ignoredScalarIndexes(Collections.singletonList("id_btree_index"))
+                .ignoredScalarIndices(Collections.singletonList("id_btree_index"))
                 .columns(Collections.singletonList("id"))
                 .collectStats(true)
                 .build();
         assertEquals(
             Collections.singletonList("id_btree_index"),
-            ignoredOptions.getIgnoredScalarIndexes().get());
+            ignoredOptions.getIgnoredScalarIndices().get());
         try (LanceScanner scanner = dataset.newScan(ignoredOptions)) {
           int rowCount = 0;
           try (ArrowReader reader = scanner.scanBatches()) {
@@ -1298,13 +1298,13 @@ public class ScannerTest {
   }
 
   @Test
-  void testIgnoredScalarIndexesRejectsEmptyName() {
+  void testIgnoredScalarIndicesRejectsEmptyName() {
     IllegalArgumentException error =
         assertThrows(
             IllegalArgumentException.class,
             () ->
                 new ScanOptions.Builder()
-                    .ignoredScalarIndexes(Collections.singletonList(""))
+                    .ignoredScalarIndices(Collections.singletonList(""))
                     .build());
     assertTrue(error.getMessage().contains("cannot contain null or empty names"));
   }

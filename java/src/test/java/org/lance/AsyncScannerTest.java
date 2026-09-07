@@ -222,7 +222,7 @@ public class AsyncScannerTest {
         ScanOptions options =
             new ScanOptions.Builder()
                 .filter("id < 20")
-                .ignoredScalarIndexes(Collections.singletonList("id_btree_index"))
+                .ignoredScalarIndices(Collections.singletonList("id_btree_index"))
                 .build();
         try (AsyncScanner scanner = AsyncScanner.create(dataset, options, allocator);
             ArrowReader reader = scanner.scanBatchesAsync().get(10, TimeUnit.SECONDS)) {

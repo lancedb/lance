@@ -44,7 +44,7 @@ public class ScanOptions {
   private final Optional<MaterializationStyle> lateMaterialization;
   private final Optional<List<ColumnOrdering>> columnOrderings;
   private final boolean useScalarIndex;
-  private final Optional<List<String>> ignoredScalarIndexes;
+  private final Optional<List<String>> ignoredScalarIndices;
   private final Optional<ByteBuffer> substraitAggregate;
   private final boolean collectStats;
   private final boolean fastSearch;
@@ -190,7 +190,7 @@ public class ScanOptions {
       Optional<MaterializationStyle> lateMaterialization,
       Optional<List<ColumnOrdering>> columnOrderings,
       boolean useScalarIndex,
-      Optional<List<String>> ignoredScalarIndexes,
+      Optional<List<String>> ignoredScalarIndices,
       Optional<ByteBuffer> substraitAggregate,
       boolean collectStats,
       boolean fastSearch,
@@ -237,16 +237,16 @@ public class ScanOptions {
     this.lateMaterialization = lateMaterialization;
     this.columnOrderings = columnOrderings;
     this.useScalarIndex = useScalarIndex;
-    ignoredScalarIndexes.ifPresent(
+    ignoredScalarIndices.ifPresent(
         names -> {
           for (String name : names) {
             Preconditions.checkArgument(
                 name != null && !name.isEmpty(),
-                "ignoredScalarIndexes cannot contain null or empty names");
+                "ignoredScalarIndices cannot contain null or empty names");
           }
         });
-    this.ignoredScalarIndexes =
-        ignoredScalarIndexes.map(names -> Collections.unmodifiableList(new ArrayList<>(names)));
+    this.ignoredScalarIndices =
+        ignoredScalarIndices.map(names -> Collections.unmodifiableList(new ArrayList<>(names)));
     this.substraitAggregate = substraitAggregate;
     this.collectStats = collectStats;
     this.fastSearch = fastSearch;
@@ -435,8 +435,8 @@ public class ScanOptions {
    *
    * @return ignored scalar index names, or empty when no names are configured.
    */
-  public Optional<List<String>> getIgnoredScalarIndexes() {
-    return ignoredScalarIndexes;
+  public Optional<List<String>> getIgnoredScalarIndices() {
+    return ignoredScalarIndices;
   }
 
   /**
@@ -513,7 +513,7 @@ public class ScanOptions {
         .add("lateMaterialization", lateMaterialization.orElse(null))
         .add("columnOrdering", columnOrderings)
         .add("useScalarIndex", useScalarIndex)
-        .add("ignoredScalarIndexes", ignoredScalarIndexes.orElse(null))
+        .add("ignoredScalarIndices", ignoredScalarIndices.orElse(null))
         .add("fastSearch", fastSearch)
         .add(
             "substraitAggregate",
@@ -547,7 +547,7 @@ public class ScanOptions {
     private Optional<MaterializationStyle> lateMaterialization = Optional.empty();
     private Optional<List<ColumnOrdering>> columnOrderings = Optional.empty();
     private boolean useScalarIndex = true;
-    private Optional<List<String>> ignoredScalarIndexes = Optional.empty();
+    private Optional<List<String>> ignoredScalarIndices = Optional.empty();
     private boolean fastSearch = false;
     private Optional<ByteBuffer> substraitAggregate = Optional.empty();
     private boolean collectStats = false;
@@ -583,7 +583,7 @@ public class ScanOptions {
       this.lateMaterialization = options.getLateMaterialization();
       this.columnOrderings = options.getColumnOrderings();
       this.useScalarIndex = options.isUseScalarIndex();
-      this.ignoredScalarIndexes = options.getIgnoredScalarIndexes();
+      this.ignoredScalarIndices = options.getIgnoredScalarIndices();
       this.fastSearch = options.isFastSearch();
       this.substraitAggregate = options.getSubstraitAggregate();
       this.collectStats = options.isCollectStats();
@@ -834,15 +834,15 @@ public class ScanOptions {
      * <pre>{@code
      * ScanOptions options = new ScanOptions.Builder()
      *     .filter("id = 42")
-     *     .ignoredScalarIndexes(Collections.singletonList("id_zonemap"))
+     *     .ignoredScalarIndices(Collections.singletonList("id_zonemap"))
      *     .build();
      * }</pre>
      *
      * @param indexNames logical scalar index names to ignore.
      * @return Builder instance for method chaining.
      */
-    public Builder ignoredScalarIndexes(List<String> indexNames) {
-      this.ignoredScalarIndexes = Optional.of(indexNames);
+    public Builder ignoredScalarIndices(List<String> indexNames) {
+      this.ignoredScalarIndices = Optional.of(indexNames);
       return this;
     }
 
@@ -946,7 +946,7 @@ public class ScanOptions {
           lateMaterialization,
           columnOrderings,
           useScalarIndex,
-          ignoredScalarIndexes,
+          ignoredScalarIndices,
           substraitAggregate,
           collectStats,
           fastSearch,
