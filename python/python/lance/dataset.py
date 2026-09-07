@@ -1230,7 +1230,7 @@ class LanceDataset(pa.dataset.Dataset):
             Literal["all_binary", "blobs_descriptions", "all_descriptions"]
         ] = None,
         use_scalar_index: Optional[bool] = None,
-        excluded_scalar_index_names: Optional[Iterable[str]] = None,
+        ignored_scalar_indices: Optional[Iterable[str]] = None,
         include_deleted_rows: Optional[bool] = None,
         scan_stats_callback: Optional[Callable[[ScanStatistics], None]] = None,
         strict_batch_size: Optional[bool] = None,
@@ -1370,8 +1370,8 @@ class LanceDataset(pa.dataset.Dataset):
             Lance will automatically use scalar indices to optimize a query.  In some
             corner cases this can make query performance worse and this parameter can
             be used to disable scalar indices in these cases.
-        excluded_scalar_index_names: iterable of str, default None
-            Logical scalar index names to exclude from expression-filter planning.
+        ignored_scalar_indices: iterable of str, default None
+            Logical scalar index names to ignore during expression-filter planning.
             Other scalar indices remain eligible, and the original filter is still
             evaluated. This does not control vector index segments or explicit
             full-text search queries.
@@ -1510,7 +1510,7 @@ class LanceDataset(pa.dataset.Dataset):
         setopt(builder.with_row_address, with_row_address)
         setopt(builder.use_stats, use_stats)
         setopt(builder.use_scalar_index, use_scalar_index)
-        setopt(builder.excluded_scalar_index_names, excluded_scalar_index_names)
+        setopt(builder.ignored_scalar_indices, ignored_scalar_indices)
         setopt(builder.fast_search, fast_search)
         setopt(builder.include_deleted_rows, include_deleted_rows)
         setopt(builder.scan_stats_callback, scan_stats_callback)
@@ -1608,7 +1608,7 @@ class LanceDataset(pa.dataset.Dataset):
         late_materialization: Optional[bool | List[str]] = None,
         blob_handling: Optional[str] = None,
         use_scalar_index: Optional[bool] = None,
-        excluded_scalar_index_names: Optional[Iterable[str]] = None,
+        ignored_scalar_indices: Optional[Iterable[str]] = None,
         include_deleted_rows: Optional[bool] = None,
         order_by: Optional[List[ColumnOrdering]] = None,
         disable_scoring_autoprojection: Optional[bool] = None,
@@ -1668,9 +1668,9 @@ class LanceDataset(pa.dataset.Dataset):
         use_scalar_index: bool, default True
             Allows custom control over scalar index usage.  See
             ``ScannerBuilder.use_scalar_index`` for more information.
-        excluded_scalar_index_names: iterable of str, default None
-            Scalar index names to exclude from expression-filter planning. See
-            ``ScannerBuilder.excluded_scalar_index_names`` for more information.
+        ignored_scalar_indices: iterable of str, default None
+            Scalar index names to ignore during expression-filter planning. See
+            ``ScannerBuilder.ignored_scalar_indices`` for more information.
         with_row_id: bool, optional, default False
             Return row ID.
         with_row_address: bool, optional, default False
@@ -1734,7 +1734,7 @@ class LanceDataset(pa.dataset.Dataset):
             late_materialization=late_materialization,
             blob_handling=blob_handling,
             use_scalar_index=use_scalar_index,
-            excluded_scalar_index_names=excluded_scalar_index_names,
+            ignored_scalar_indices=ignored_scalar_indices,
             scan_in_order=scan_in_order,
             prefilter=prefilter,
             with_row_id=with_row_id,
@@ -1769,7 +1769,7 @@ class LanceDataset(pa.dataset.Dataset):
         late_materialization: Optional[bool | List[str]] = None,
         blob_mode: str = _BLOB_PANDAS_MODE_LAZY,
         use_scalar_index: Optional[bool] = None,
-        excluded_scalar_index_names: Optional[Iterable[str]] = None,
+        ignored_scalar_indices: Optional[Iterable[str]] = None,
         include_deleted_rows: Optional[bool] = None,
         order_by: Optional[List[ColumnOrdering]] = None,
         disable_scoring_autoprojection: Optional[bool] = None,
@@ -1803,7 +1803,7 @@ class LanceDataset(pa.dataset.Dataset):
             fragment_readahead=fragment_readahead,
             late_materialization=late_materialization,
             use_scalar_index=use_scalar_index,
-            excluded_scalar_index_names=excluded_scalar_index_names,
+            ignored_scalar_indices=ignored_scalar_indices,
             scan_in_order=scan_in_order,
             prefilter=prefilter,
             with_row_id=with_row_id,
@@ -2188,7 +2188,7 @@ class LanceDataset(pa.dataset.Dataset):
         late_materialization: Optional[bool | List[str]] = None,
         blob_handling: Optional[str] = None,
         use_scalar_index: Optional[bool] = None,
-        excluded_scalar_index_names: Optional[Iterable[str]] = None,
+        ignored_scalar_indices: Optional[Iterable[str]] = None,
         strict_batch_size: Optional[bool] = None,
         order_by: Optional[List[ColumnOrdering]] = None,
         disable_scoring_autoprojection: Optional[bool] = None,
@@ -2219,7 +2219,7 @@ class LanceDataset(pa.dataset.Dataset):
             late_materialization=late_materialization,
             blob_handling=blob_handling,
             use_scalar_index=use_scalar_index,
-            excluded_scalar_index_names=excluded_scalar_index_names,
+            ignored_scalar_indices=ignored_scalar_indices,
             scan_in_order=scan_in_order,
             prefilter=prefilter,
             with_row_id=with_row_id,
@@ -6661,7 +6661,7 @@ class ScannerBuilder:
         self._fast_search = False
         self._full_text_query = None
         self._use_scalar_index = None
-        self._excluded_scalar_index_names = None
+        self._ignored_scalar_indices = None
         self._include_deleted_rows = None
         self._scan_stats_callback: Optional[Callable[[ScanStatistics], None]] = None
         self._strict_batch_size = False
@@ -6939,8 +6939,8 @@ class ScannerBuilder:
         self._use_scalar_index = use_scalar_index
         return self
 
-    def excluded_scalar_index_names(self, index_names: Iterable[str]) -> ScannerBuilder:
-        """Exclude named scalar indices from expression-filter planning.
+    def ignored_scalar_indices(self, index_names: Iterable[str]) -> ScannerBuilder:
+        """Ignore named scalar indices from expression-filter planning.
 
         Other scalar indices remain eligible, and the original filter is still
         evaluated. Names that do not identify an available scalar index have no
@@ -6952,10 +6952,8 @@ class ScannerBuilder:
         """
         index_names = list(index_names)
         if any(not isinstance(name, str) or not name for name in index_names):
-            raise ValueError(
-                "excluded_scalar_index_names must contain non-empty strings"
-            )
-        self._excluded_scalar_index_names = index_names
+            raise ValueError("ignored_scalar_indices must contain non-empty strings")
+        self._ignored_scalar_indices = index_names
         return self
 
     def with_fragments(
@@ -7181,7 +7179,7 @@ class ScannerBuilder:
             self._late_materialization,
             self._blob_handling,
             self._use_scalar_index,
-            self._excluded_scalar_index_names,
+            self._ignored_scalar_indices,
             self._include_deleted_rows,
             self._scan_stats_callback,
             self._strict_batch_size,

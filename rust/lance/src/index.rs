@@ -2902,9 +2902,9 @@ pub trait DatasetIndexInternalExt: DatasetIndexExt {
     async fn scalar_index_info(&self) -> Result<ScalarIndexInfo>;
 
     /// Loads scalar index information, omitting logical indices with the given names.
-    async fn scalar_index_info_excluding(
+    async fn scalar_index_info_ignoring(
         &self,
-        excluded_index_names: &HashSet<String>,
+        ignored_index_names: &HashSet<String>,
     ) -> Result<ScalarIndexInfo>;
 
     /// Return the fragments that are not covered by any of the deltas of the index.
@@ -3428,13 +3428,13 @@ impl DatasetIndexInternalExt for Dataset {
 
     #[instrument(level = "trace", skip_all)]
     async fn scalar_index_info(&self) -> Result<ScalarIndexInfo> {
-        self.scalar_index_info_excluding(&HashSet::new()).await
+        self.scalar_index_info_ignoring(&HashSet::new()).await
     }
 
     #[instrument(level = "trace", skip_all)]
-    async fn scalar_index_info_excluding(
+    async fn scalar_index_info_ignoring(
         &self,
-        excluded_index_names: &HashSet<String>,
+        ignored_index_names: &HashSet<String>,
     ) -> Result<ScalarIndexInfo> {
         let indices = self.load_indices().await?;
         let schema = self.schema();
@@ -3446,7 +3446,7 @@ impl DatasetIndexInternalExt for Dataset {
         // so the optimizer treats coverage as unknown.
         let mut fragment_bitmaps: HashMap<(String, String), Option<RoaringBitmap>> = HashMap::new();
         for index in indices.iter().filter(|idx| {
-            if excluded_index_names.contains(&idx.name) {
+            if ignored_index_names.contains(&idx.name) {
                 return false;
             }
 

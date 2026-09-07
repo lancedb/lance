@@ -202,8 +202,8 @@ public class AsyncScannerTest {
   }
 
   @Test
-  void testAsyncScanWithExcludedScalarIndex(@TempDir Path tempDir) throws Exception {
-    String datasetPath = tempDir.resolve("async_scanner_excluded_scalar_index").toString();
+  void testAsyncScanWithIgnoredScalarIndex(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("async_scanner_ignored_scalar_index").toString();
     try (BufferAllocator allocator = new RootAllocator()) {
       TestUtils.SimpleTestDataset testDataset =
           new TestUtils.SimpleTestDataset(allocator, datasetPath);
@@ -222,7 +222,7 @@ public class AsyncScannerTest {
         ScanOptions options =
             new ScanOptions.Builder()
                 .filter("id < 20")
-                .excludedScalarIndexNames(Collections.singletonList("id_btree_index"))
+                .ignoredScalarIndexes(Collections.singletonList("id_btree_index"))
                 .build();
         try (AsyncScanner scanner = AsyncScanner.create(dataset, options, allocator);
             ArrowReader reader = scanner.scanBatchesAsync().get(10, TimeUnit.SECONDS)) {

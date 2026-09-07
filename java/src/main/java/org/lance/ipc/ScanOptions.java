@@ -44,7 +44,7 @@ public class ScanOptions {
   private final Optional<MaterializationStyle> lateMaterialization;
   private final Optional<List<ColumnOrdering>> columnOrderings;
   private final boolean useScalarIndex;
-  private final Optional<List<String>> excludedScalarIndexNames;
+  private final Optional<List<String>> ignoredScalarIndexes;
   private final Optional<ByteBuffer> substraitAggregate;
   private final boolean collectStats;
   private final boolean fastSearch;
@@ -190,7 +190,7 @@ public class ScanOptions {
       Optional<MaterializationStyle> lateMaterialization,
       Optional<List<ColumnOrdering>> columnOrderings,
       boolean useScalarIndex,
-      Optional<List<String>> excludedScalarIndexNames,
+      Optional<List<String>> ignoredScalarIndexes,
       Optional<ByteBuffer> substraitAggregate,
       boolean collectStats,
       boolean fastSearch,
@@ -237,16 +237,16 @@ public class ScanOptions {
     this.lateMaterialization = lateMaterialization;
     this.columnOrderings = columnOrderings;
     this.useScalarIndex = useScalarIndex;
-    excludedScalarIndexNames.ifPresent(
+    ignoredScalarIndexes.ifPresent(
         names -> {
           for (String name : names) {
             Preconditions.checkArgument(
                 name != null && !name.isEmpty(),
-                "excludedScalarIndexNames cannot contain null or empty names");
+                "ignoredScalarIndexes cannot contain null or empty names");
           }
         });
-    this.excludedScalarIndexNames =
-        excludedScalarIndexNames.map(names -> Collections.unmodifiableList(new ArrayList<>(names)));
+    this.ignoredScalarIndexes =
+        ignoredScalarIndexes.map(names -> Collections.unmodifiableList(new ArrayList<>(names)));
     this.substraitAggregate = substraitAggregate;
     this.collectStats = collectStats;
     this.fastSearch = fastSearch;
@@ -431,12 +431,12 @@ public class ScanOptions {
   }
 
   /**
-   * Get scalar index names excluded from expression-filter planning.
+   * Get scalar index names ignored during expression-filter planning.
    *
-   * @return excluded scalar index names, or empty when no exclusions are configured.
+   * @return ignored scalar index names, or empty when no names are configured.
    */
-  public Optional<List<String>> getExcludedScalarIndexNames() {
-    return excludedScalarIndexNames;
+  public Optional<List<String>> getIgnoredScalarIndexes() {
+    return ignoredScalarIndexes;
   }
 
   /**
@@ -513,7 +513,7 @@ public class ScanOptions {
         .add("lateMaterialization", lateMaterialization.orElse(null))
         .add("columnOrdering", columnOrderings)
         .add("useScalarIndex", useScalarIndex)
-        .add("excludedScalarIndexNames", excludedScalarIndexNames.orElse(null))
+        .add("ignoredScalarIndexes", ignoredScalarIndexes.orElse(null))
         .add("fastSearch", fastSearch)
         .add(
             "substraitAggregate",
@@ -547,7 +547,7 @@ public class ScanOptions {
     private Optional<MaterializationStyle> lateMaterialization = Optional.empty();
     private Optional<List<ColumnOrdering>> columnOrderings = Optional.empty();
     private boolean useScalarIndex = true;
-    private Optional<List<String>> excludedScalarIndexNames = Optional.empty();
+    private Optional<List<String>> ignoredScalarIndexes = Optional.empty();
     private boolean fastSearch = false;
     private Optional<ByteBuffer> substraitAggregate = Optional.empty();
     private boolean collectStats = false;
@@ -583,7 +583,7 @@ public class ScanOptions {
       this.lateMaterialization = options.getLateMaterialization();
       this.columnOrderings = options.getColumnOrderings();
       this.useScalarIndex = options.isUseScalarIndex();
-      this.excludedScalarIndexNames = options.getExcludedScalarIndexNames();
+      this.ignoredScalarIndexes = options.getIgnoredScalarIndexes();
       this.fastSearch = options.isFastSearch();
       this.substraitAggregate = options.getSubstraitAggregate();
       this.collectStats = options.isCollectStats();
@@ -824,7 +824,7 @@ public class ScanOptions {
     }
 
     /**
-     * Exclude named scalar indices from expression-filter planning.
+     * Ignore named scalar indices from expression-filter planning.
      *
      * <p>Other scalar indices remain eligible, and the original filter is still evaluated for rows
      * selected by the remaining scan plan. Names that do not identify an available scalar index
@@ -834,15 +834,15 @@ public class ScanOptions {
      * <pre>{@code
      * ScanOptions options = new ScanOptions.Builder()
      *     .filter("id = 42")
-     *     .excludedScalarIndexNames(Collections.singletonList("id_zonemap"))
+     *     .ignoredScalarIndexes(Collections.singletonList("id_zonemap"))
      *     .build();
      * }</pre>
      *
-     * @param indexNames logical scalar index names to exclude.
+     * @param indexNames logical scalar index names to ignore.
      * @return Builder instance for method chaining.
      */
-    public Builder excludedScalarIndexNames(List<String> indexNames) {
-      this.excludedScalarIndexNames = Optional.of(indexNames);
+    public Builder ignoredScalarIndexes(List<String> indexNames) {
+      this.ignoredScalarIndexes = Optional.of(indexNames);
       return this;
     }
 
@@ -946,7 +946,7 @@ public class ScanOptions {
           lateMaterialization,
           columnOrderings,
           useScalarIndex,
-          excludedScalarIndexNames,
+          ignoredScalarIndexes,
           substraitAggregate,
           collectStats,
           fastSearch,
