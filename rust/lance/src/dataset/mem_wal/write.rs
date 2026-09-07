@@ -7572,9 +7572,10 @@ mod tests {
             .unwrap();
         assert_eq!(writer.memtable_stats().await.unwrap().row_count, 10);
 
-        // Tear the background tasks down out from under the writer, so the
-        // freeze's dispatch sends hit closed channels.
-        writer.abort().await.unwrap();
+        // Tear the background tasks down without using `abort`, which poisons
+        // the writer before shutdown. This test specifically exercises the
+        // freeze dispatch failure as the first terminal error.
+        writer.task_executor.shutdown_all().await.unwrap();
 
         let err = writer
             .force_seal_active()
