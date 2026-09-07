@@ -1073,11 +1073,12 @@ pub fn ranges_to_bitmap(ranges: &[Range<u64>], sorted: bool) -> RoaringBitmap {
     bm
 }
 
-/// A set of stable row ids backed by a 64-bit Roaring bitmap.
+/// A set of opaque row ids backed by a 64-bit Roaring bitmap.
 ///
 /// This is a thin wrapper around [`RoaringTreemap`]. It represents a
-/// collection of unique row ids and provides the common row-set
-/// operations defined by [`RowSetOps`].
+/// collection of unique row ids without assigning fragment/offset semantics
+/// to their bits, and provides the common row-set operations defined by
+/// [`RowSetOps`].
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct RowIdSet {
     inner: RoaringTreemap,
@@ -1101,6 +1102,14 @@ impl RowIdSet {
     pub fn difference(mut self, other: &Self) -> Self {
         self.inner -= &other.inner;
         self
+    }
+}
+
+impl FromIterator<u64> for RowIdSet {
+    fn from_iter<T: IntoIterator<Item = u64>>(iter: T) -> Self {
+        Self {
+            inner: RoaringTreemap::from_iter(iter),
+        }
     }
 }
 
@@ -1149,10 +1158,11 @@ impl RowSetOps for RowIdSet {
     }
 }
 
-/// A mask over stable row ids based on an allow-list or block-list.
+/// A mask over opaque row ids based on an allow-list or block-list.
 ///
-/// The semantics mirror [`RowAddrMask`], but operate on stable
-/// row ids instead of physical row addresses.
+/// The semantics mirror [`RowAddrMask`], but values are not interpreted as
+/// physical `(fragment_id, row_offset)` addresses. A caller determines the
+/// row-id domain; for example, a Scanner uses the Dataset's `_rowid` domain.
 #[derive(Clone, Debug, PartialEq)]
 pub enum RowIdMask {
     /// Only the ids in the set are selected.
@@ -1183,6 +1193,38 @@ impl RowIdMask {
     /// Create a mask from a block list.
     pub fn from_block(block_list: RowIdSet) -> Self {
         Self::BlockList(block_list)
+    }
+    /// Build a row-id mask from serialized [`RowAddrTreeMap`] payloads.
+    ///
+    /// This accepts the legacy serialized representation used by language
+    /// bindings. Full-fragment entries cannot be represented in row-id space
+    /// because their row-id domain is not known without dataset metadata.
+    pub fn from_serialized_parts(
+        allow: Option<&[u8]>,
+        block: Option<&[u8]>,
+    ) -> Result<Option<Self>> {
+        fn decode(bytes: &[u8], which: &str) -> Result<RowIdSet> {
+            let rows = RowAddrTreeMap::deserialize_from(bytes).map_err(|e| {
+                Error::invalid_input(format!(
+                    "row id {which} is not a serialized RowAddrTreeMap: {e}"
+                ))
+            })?;
+            let row_ids = rows.row_addrs().ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "row id {which} contains a full-fragment entry, which cannot be represented without dataset metadata"
+                ))
+            })?;
+            Ok(row_ids.map(u64::from).collect())
+        }
+
+        let allow = allow.map(|bytes| decode(bytes, "allowlist")).transpose()?;
+        let block = block.map(|bytes| decode(bytes, "blocklist")).transpose()?;
+        Ok(match (allow, block) {
+            (Some(allow), Some(block)) => Some(Self::from_allowed(allow).also_block(block)),
+            (Some(allow), None) => Some(Self::from_allowed(allow)),
+            (None, Some(block)) => Some(Self::from_block(block)),
+            (None, None) => None,
+        })
     }
     /// True if the row id is selected by the mask, false otherwise.
     pub fn selected(&self, row_id: u64) -> bool {
@@ -2391,6 +2433,9 @@ mod tests {
         assert!(set.contains(20));
         assert!(set.contains(30));
         assert!(!set.contains(15));
+
+        let set = RowIdSet::from_iter([30, 10, 20, 20]);
+        assert_eq!(set.iter().collect::<Vec<_>>(), vec![10, 20, 30]);
     }
 
     #[test]
@@ -2535,6 +2580,31 @@ mod tests {
         let block_list = RowIdMask::from_block(row_ids(&[10, 20, 30]));
         assert_eq!(block_list.max_len(), None);
         assert_row_id_mask_selects(&block_list, &[0, 15, 25, 40], &[10, 20, 30]);
+    }
+
+    #[test]
+    fn test_row_id_mask_from_serialized_parts() {
+        fn serialize(ids: impl IntoIterator<Item = u64>) -> Vec<u8> {
+            let rows = RowAddrTreeMap::from_iter(ids);
+            let mut bytes = Vec::with_capacity(rows.serialized_size());
+            rows.serialize_into(&mut bytes).unwrap();
+            bytes
+        }
+
+        let allow = serialize([10, 20, 30]);
+        let block = serialize([20, 40]);
+        let mask = RowIdMask::from_serialized_parts(Some(&allow), Some(&block))
+            .unwrap()
+            .unwrap();
+        assert_row_id_mask_selects(&mask, &[10, 30], &[20, 40]);
+        assert_eq!(RowIdMask::from_serialized_parts(None, None).unwrap(), None);
+
+        let mut full_fragment = RowAddrTreeMap::new();
+        full_fragment.insert_fragment(7);
+        let mut bytes = Vec::with_capacity(full_fragment.serialized_size());
+        full_fragment.serialize_into(&mut bytes).unwrap();
+        let error = RowIdMask::from_serialized_parts(Some(&bytes), None).unwrap_err();
+        assert!(error.to_string().contains("full-fragment"));
     }
 
     #[test]
