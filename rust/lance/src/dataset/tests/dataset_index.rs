@@ -2805,7 +2805,7 @@ async fn test_partial_compound_hybrid_prunes_same_path_different_base_rewrite() 
         .create(&replacement_path)
         .await
         .unwrap();
-    let mut writer = lance_file::versions::v2_1::create_writer(
+    let mut writer = lance_file::versions::v2_2::create_writer(
         object_writer,
         schema.as_ref().try_into().unwrap(),
         Default::default(),
