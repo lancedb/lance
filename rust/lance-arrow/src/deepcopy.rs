@@ -6,6 +6,7 @@ use std::sync::Arc;
 use arrow_array::{Array, RecordBatch, make_array};
 use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer};
 use arrow_data::{ArrayData, ArrayDataBuilder, transform::MutableArrayData};
+use arrow_schema::DataType;
 
 pub fn deep_copy_buffer(buffer: &Buffer) -> Buffer {
     Buffer::from(buffer.as_slice())
@@ -88,18 +89,54 @@ pub fn deep_copy_batch(batch: &RecordBatch) -> crate::Result<RecordBatch> {
 /// Deep copy array data, extracting only the sliced portion using MutableArrayData
 /// This is the most efficient and correct way to copy just the sliced data
 pub fn deep_copy_array_data_sliced(data: &ArrayData) -> ArrayData {
-    // Use MutableArrayData to efficiently copy just the slice
-    let mut mutable = MutableArrayData::new(vec![data], false, data.len());
+    // Arrow's extenders disagree about who applies a parent offset, so no one
+    // index convention is right for every layout: the bit-packed extender adds
+    // `ArrayData::offset()` to the raw buffer itself, while the `FixedSizeList`
+    // one forwards `start * size` to a child that `ArrayData::slice` left
+    // whole. Resolving the offset into the children first settles it, after
+    // which logical indices are correct everywhere -- the convention arrow's
+    // own `concat` relies on.
+    let resolved;
+    let data = if data.offset() == 0 {
+        data
+    } else {
+        resolved = offset_resolved(data);
+        &resolved
+    };
 
-    // Logical indices: `MutableArrayData` applies the source's own offset, so
-    // adding it here applies it twice. Only a layout that keeps a non-zero
-    // `ArrayData::offset()` after slicing is affected -- a primitive slice
-    // advances its buffer instead -- which in practice means the bit-packed
-    // ones, where the doubled offset runs off the end of the values buffer.
+    let mut mutable = MutableArrayData::new(vec![data], false, data.len());
     mutable.extend(0, 0, data.len());
 
     // Freeze into immutable ArrayData
     mutable.freeze()
+}
+
+/// Push a parent offset down to wherever each layout expects to find it.
+///
+/// Rebuilding through the array API does this, and recursively: constructing a
+/// `FixedSizeListArray` slices its child by `offset * size`, and constructing a
+/// `StructArray` slices each of its children in turn.
+///
+/// The one shape that cannot be rebuilt as it stands is a struct, because
+/// `ArrayData::slice` both slices a struct's children and records the offset --
+/// double-counting, so applying it again slices past the end of the children it
+/// already produced. Dropping that now-redundant offset is what makes the
+/// struct rebuildable, and it is the reading arrow's own extender takes.
+fn offset_resolved(data: &ArrayData) -> ArrayData {
+    if matches!(data.data_type(), DataType::Struct(_)) {
+        // SAFETY: `build_unchecked` inherits `ArrayData::new_unchecked`'s
+        // contract. Only the offset changes, and only to zero; the buffers,
+        // nulls and child data are the ones `ArrayData::slice` already narrowed
+        // to this window, so every value-level invariant they upheld still
+        // holds and the payload described is the same one.
+        let data = unsafe {
+            ArrayDataBuilder::from(data.clone())
+                .offset(0)
+                .build_unchecked()
+        };
+        return make_array(data).to_data();
+    }
+    make_array(data.clone()).to_data()
 }
 
 /// Deep copy an array, extracting only the sliced portion using MutableArrayData
@@ -124,7 +161,72 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_array::{Array, BooleanArray, Int32Array, RecordBatch, StringArray};
+    use arrow_data::ArrayDataBuilder;
     use arrow_schema::{DataType, Field, Schema};
+
+    #[test]
+    fn raw_sliced_fixed_size_list_data_keeps_its_child_offset() {
+        // `ArrayData::slice` records the offset on the parent and leaves the
+        // child whole -- a shape `FixedSizeListArray::slice` never produces,
+        // but a legal one this public helper can be handed directly. Arrow's
+        // extender forwards `start * size` to that unsliced child, so the
+        // parent offset has to be resolved before the copy or the wrong rows
+        // come back.
+        let child = Int32Array::from(vec![10, 11, 20, 21]).to_data();
+        let field = Arc::new(Field::new_list_field(DataType::Int32, false));
+        let data = ArrayDataBuilder::new(DataType::FixedSizeList(field, 2))
+            .len(2)
+            .add_child_data(child)
+            .build()
+            .unwrap();
+        let sliced = data.slice(1, 1);
+
+        let copied = super::deep_copy_array_data_sliced(&sliced);
+        let copied_child = Int32Array::from(copied.child_data()[0].clone());
+        assert_eq!(copied_child.values().as_ref(), &[20, 21]);
+    }
+
+    #[test]
+    fn raw_sliced_struct_of_fixed_size_list_resolves_both_levels() {
+        // Slicing raw struct data pushes the window into the struct's children,
+        // and a fixed-size-list child takes it as its own parent offset with
+        // its values left whole -- so the offset has to be resolved at both
+        // levels, not just the outer one.
+        let values = Int32Array::from(vec![10, 11, 20, 21, 30, 31]).to_data();
+        let item = Arc::new(Field::new_list_field(DataType::Int32, false));
+        let list = ArrayDataBuilder::new(DataType::FixedSizeList(item, 2))
+            .len(3)
+            .add_child_data(values)
+            .build()
+            .unwrap();
+        let field = Arc::new(Field::new("l", list.data_type().clone(), false));
+        let data = ArrayDataBuilder::new(DataType::Struct(vec![field].into()))
+            .len(3)
+            .add_child_data(list)
+            .build()
+            .unwrap();
+        let sliced = data.slice(2, 1);
+
+        let copied = super::deep_copy_array_data_sliced(&sliced);
+        let copied_values = Int32Array::from(copied.child_data()[0].child_data()[0].clone());
+        assert_eq!(copied_values.values().as_ref(), &[30, 31]);
+    }
+
+    #[test]
+    fn raw_sliced_struct_data_keeps_its_child_offset() {
+        let child = Int32Array::from(vec![10, 11, 20, 21]).to_data();
+        let field = Arc::new(Field::new("a", DataType::Int32, false));
+        let data = ArrayDataBuilder::new(DataType::Struct(vec![field].into()))
+            .len(4)
+            .add_child_data(child)
+            .build()
+            .unwrap();
+        let sliced = data.slice(2, 2);
+
+        let copied = super::deep_copy_array_data_sliced(&sliced);
+        let copied_child = Int32Array::from(copied.child_data()[0].clone());
+        assert_eq!(copied_child.values().as_ref(), &[20, 21]);
+    }
 
     #[test]
     fn sliced_boolean_deep_copy_reads_from_the_slice() {
