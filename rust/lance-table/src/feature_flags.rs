@@ -279,6 +279,15 @@ pub fn has_deprecated_v2_feature_flag(writer_flags: u64) -> bool {
 /// commit path refuses to *produce* this, so seeing it on read means the
 /// manifest was written by something that did not.
 pub fn validate_paired_feature_flags(manifest: &Manifest) -> Result<()> {
+    if (manifest.reader_feature_flags ^ manifest.writer_feature_flags)
+        & FLAG_EXPERIMENTAL_DIRECT_BLOBS
+        != 0
+    {
+        return Err(Error::corrupt_file_named(
+            "manifest",
+            "Experimental direct blob reader and writer feature bits must be paired",
+        ));
+    }
     let reader = manifest.reader_feature_flags & FLAG_MIXED_DATA_FILE_VERSIONS != 0;
     let writer = manifest.writer_feature_flags & FLAG_MIXED_DATA_FILE_VERSIONS != 0;
     if reader != writer {
