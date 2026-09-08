@@ -995,13 +995,6 @@ impl<'a> CleanupTask<'a> {
                 {
                     return Ok(None);
                 }
-                if inspection
-                    .verified_files
-                    .direct_blob_paths
-                    .contains(&relative_path)
-                {
-                    return Ok(cleanup_file(path, CleanupFileKind::Data, false, size_bytes));
-                }
 
                 // Blob v2 sidecar files are keyed by the data file stem:
                 //   data/{data_file_key}/{obfuscated_blob_id:032b}.blob
@@ -1063,6 +1056,10 @@ impl<'a> CleanupTask<'a> {
                     .verified_files
                     .data_paths
                     .contains(&parent_data_path)
+                    || inspection
+                        .verified_files
+                        .direct_blob_paths
+                        .contains(&relative_path)
                 {
                     Ok(cleanup_file(path, CleanupFileKind::Data, false, size_bytes))
                 } else {
