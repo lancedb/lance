@@ -123,6 +123,11 @@ const DEFAULT_PAGE_ROWS: usize = 4096;
 /// Byte inserted between the tokens of one shingle so that different token
 /// splits of the same characters hash differently.
 const SHINGLE_SEPARATOR: u8 = 0x1F;
+/// Rows per read while collecting the interior pages of a bucket that spans
+/// pages. Those pages hold nothing but that bucket, so only their doc ids are
+/// read (1 MiB per window), merged into the candidate set and dropped; the
+/// memory of a query does not grow with the size of a bucket.
+const BUCKET_READ_ROWS: usize = 1 << 18;
 /// A candidate set covering more than this percentage of a segment is refined
 /// with a sequential scan of the signature file instead of a scattered read.
 const SPARSE_REFINE_READ_PERCENT: u64 = 10;
@@ -648,12 +653,6 @@ impl BandPage {
             .count();
         &self.doc_ids[start..start + len]
     }
-
-    /// Whether the bucket `band_key` reaches the end of this page and may
-    /// therefore continue on the next one.
-    fn continues_after(&self, band_key: u64) -> bool {
-        self.keys.last() == Some(&band_key)
-    }
 }
 
 /// The two non-null columns of a bands or spill batch.
@@ -1074,46 +1073,62 @@ impl MinHashLshIndex {
     }
 
     /// Union the postings of every band key present in the bands file.
+    /// Union of the buckets of `band_keys`.
+    ///
+    /// A bucket is a run of equal keys in the sorted bands file, and the page
+    /// table locates it without probing: it starts in the first page whose max
+    /// key reaches the key and ends in the first page whose max key exceeds it,
+    /// and the pages in between hold nothing else. The boundary pages of all
+    /// buckets are fetched through the cache in one read; interior pages are
+    /// read as doc ids only, one bounded window at a time.
     async fn collect_candidates(
         &self,
         band_keys: &[u64],
         metrics: &dyn MetricsCollector,
     ) -> Result<RoaringBitmap> {
-        let mut lookups: Vec<(u32, u64)> = band_keys
+        let num_pages = self.page_max_keys.len();
+        let mut buckets: Vec<(u32, u32, u64)> = band_keys
             .iter()
             .filter_map(|&key| {
-                let page = self.page_max_keys.partition_point(|&max_key| max_key < key);
-                // `page == len` means the key is larger than every stored key.
-                (page < self.page_max_keys.len()).then_some((page as u32, key))
+                let first = self.page_max_keys.partition_point(|&max_key| max_key < key);
+                // `first == num_pages` means the key is larger than every stored key.
+                (first < num_pages).then(|| {
+                    let end = self
+                        .page_max_keys
+                        .partition_point(|&max_key| max_key <= key);
+                    (first as u32, end as u32, key)
+                })
             })
             .collect();
         metrics.record_comparisons(band_keys.len());
         let mut candidates = RoaringBitmap::new();
-        if lookups.is_empty() {
+        if buckets.is_empty() {
             return Ok(candidates);
         }
-        lookups.sort_unstable();
-        let mut pages: Vec<u32> = lookups.iter().map(|(page, _)| *page).collect();
-        pages.dedup();
-        let mut pages = self.load_pages(&pages, metrics).await?;
-        let num_pages = self.page_max_keys.len();
-        for (first_page, key) in lookups {
-            let mut page_id = first_page;
-            loop {
-                if !pages.contains_key(&page_id) {
-                    pages.extend(self.load_pages(&[page_id], metrics).await?);
-                }
-                let Some(page) = pages.get(&page_id) else {
-                    return Err(Error::internal(format!(
-                        "band page {page_id} was requested but not loaded"
-                    )));
-                };
-                candidates.extend(page.members(key).iter().copied());
-                // A bucket larger than the rest of its page continues on the next one
-                if !page.continues_after(key) || page_id as usize + 1 >= num_pages {
-                    break;
-                }
-                page_id += 1;
+        buckets.sort_unstable();
+        let mut boundary_pages: Vec<u32> = buckets
+            .iter()
+            .flat_map(|&(first, end, _)| [first, end])
+            .filter(|&page| (page as usize) < num_pages)
+            .collect();
+        boundary_pages.sort_unstable();
+        boundary_pages.dedup();
+        let pages = self.load_pages(&boundary_pages, metrics).await?;
+        let page = |page_id: u32| {
+            pages.get(&page_id).ok_or_else(|| {
+                Error::internal(format!("band page {page_id} was requested but not loaded"))
+            })
+        };
+        for (first, end, key) in buckets {
+            candidates.extend(page(first)?.members(key).iter().copied());
+            if end == first {
+                continue;
+            }
+            self.collect_bucket_interior(first + 1..end, &mut candidates, metrics)
+                .await?;
+            // `end == num_pages` when the bucket reaches the end of the file
+            if (end as usize) < num_pages {
+                candidates.extend(page(end)?.members(key).iter().copied());
             }
         }
         if let Some(max_doc_id) = candidates.max()
@@ -1128,6 +1143,44 @@ impl MinHashLshIndex {
             ));
         }
         Ok(candidates)
+    }
+
+    /// Add the doc ids of `pages`, which lie strictly inside one bucket, to
+    /// `candidates`. The windows are not cached: they are only useful to a
+    /// query with the same key, and a large bucket would evict the pages
+    /// every other query needs.
+    async fn collect_bucket_interior(
+        &self,
+        pages: Range<u32>,
+        candidates: &mut RoaringBitmap,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<()> {
+        let mut from = pages.start as usize * self.page_rows;
+        let end = (pages.end as usize * self.page_rows).min(self.bands.num_rows());
+        while from < end {
+            let to = (from + BUCKET_READ_ROWS).min(end);
+            metrics.record_parts_loaded(1);
+            tracing::info!(
+                target: TRACE_IO_EVENTS,
+                r#type = IO_TYPE_LOAD_SCALAR_PART,
+                index_type = "minhashlsh",
+                num_parts = 1,
+            );
+            let batch = self.bands.read_range(from..to, Some(&[DOC_ID_COL])).await?;
+            let doc_ids = batch
+                .column_by_name(DOC_ID_COL)
+                .and_then(|column| column.as_primitive_opt::<UInt32Type>())
+                .filter(|doc_ids| doc_ids.null_count() == 0)
+                .ok_or_else(|| {
+                    Error::corrupt_file_named(
+                        BANDS_FILENAME,
+                        format!("{DOC_ID_COL} is not a non-null UInt32 column"),
+                    )
+                })?;
+            candidates.extend(doc_ids.values().iter().copied());
+            from = to;
+        }
+        Ok(())
     }
 
     /// Fetch pages through the cache; every page missing from the cache is
@@ -3006,12 +3059,22 @@ mod tests {
         assert_eq!(total, 300_000);
     }
 
+    #[rstest]
+    #[case::within_a_page(3, 5)]
+    #[case::one_page(4, 5)]
+    #[case::several_pages(10, 5)]
+    #[case::many_pages(200, 5)]
+    #[case::whole_file(10, 0)]
     #[tokio::test]
-    async fn test_bucket_spanning_pages_is_fully_collected() {
-        // Ten identical texts share every bucket; with four rows per page each
-        // bucket spans several pages and every member must still be found.
-        let (bases, _) = near_duplicate_corpus(6, 40);
-        let mut texts: Vec<&str> = vec![bases[0].as_str(); 10];
+    async fn test_bucket_spanning_pages_is_fully_collected(
+        #[case] num_duplicates: usize,
+        #[case] num_others: usize,
+    ) {
+        // Identical texts share every bucket; with four rows per page a bucket
+        // spans several pages and every member must still be found. Without
+        // other texts every bucket also fills its band up to the next one.
+        let (bases, _) = near_duplicate_corpus(1 + num_others, 40);
+        let mut texts: Vec<&str> = vec![bases[0].as_str(); num_duplicates];
         texts.extend(bases[1..].iter().map(String::as_str));
         let rows = rows_from(&texts);
         let (_tmpdir, store) = test_store();
@@ -3023,11 +3086,30 @@ mod tests {
             &LanceCache::no_cache(),
         )
         .await;
-        let hits = search(&index, &bases[0], 10).await;
+        let metrics = LocalMetricsCollector::default();
+        let hits = index
+            .search_text(
+                &bases[0],
+                num_duplicates,
+                &RowAddrMask::all_rows(),
+                &metrics,
+            )
+            .await
+            .unwrap();
         let mut row_ids: Vec<u64> = hits.iter().map(|hit| hit.row_id).collect();
         row_ids.sort_unstable();
-        assert_eq!(row_ids, (0..10).collect::<Vec<u64>>());
+        assert_eq!(row_ids, (0..num_duplicates as u64).collect::<Vec<u64>>());
         assert!(hits.iter().all(|hit| hit.distance == 0.0));
+        // Each bucket costs at most its two boundary pages and one interior
+        // window, whatever its size, plus the refine reads.
+        let num_bands = index.params.num_bands as usize;
+        let parts_loaded = metrics
+            .parts_loaded
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            parts_loaded <= 3 * num_bands + 4,
+            "{parts_loaded} parts loaded for {num_bands} bands"
+        );
     }
 
     #[tokio::test]
@@ -3257,8 +3339,6 @@ mod tests {
         assert_eq!(page.members(5), &[10, 11]);
         assert_eq!(page.members(6), &[12, 13]);
         assert!(page.members(7).is_empty());
-        assert!(page.continues_after(6));
-        assert!(!page.continues_after(5));
         // Four rows of twelve bytes, not the 1000-row batch
         assert!(page.deep_size_of() < 256, "{}", page.deep_size_of());
     }
