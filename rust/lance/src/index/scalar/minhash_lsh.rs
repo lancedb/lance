@@ -228,7 +228,7 @@ mod tests {
 
         // A segment built with different parameters cannot join the index
         let drifted_params = ScalarIndexParams::for_builtin(BuiltinIndexType::MinHashLsh)
-            .with_params(&serde_json::json!({"num_hashes": 32, "num_bands": 8, "seed": 7}));
+            .with_params(&serde_json::json!({"num_hashes": 32, "num_bands": 8, "shingle_size": 4}));
         let drifted = CreateIndexBuilder::new(
             &mut dataset,
             &["text"],

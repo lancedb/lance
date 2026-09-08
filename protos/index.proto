@@ -274,21 +274,17 @@ message MinHashLshIndexDetails {
   // Number of consecutive tokens joined into one shingle before hashing.
   uint32 shingle_size = 3;
 
-  /* Seed used to derive the shingle hash and the `num_hashes` permutation
-   * functions. Fixed at index creation; the query side reads it from here.
-   */
-  uint64 seed = 4;
-
   /* The tokenizer, recorded exactly like a full text search index records
    * it. Only the tokenization fields matter here; fields that shape full text
    * search postings (`with_position`, `block_size`, `posting_format_version`,
    * `document_granularity`) are carried unchanged and ignored.
    */
-  lance.table.InvertedIndexDetails tokenizer = 5;
+  lance.table.InvertedIndexDetails tokenizer = 4;
 
   /* Version of the signature generation behavior (tokenize, shingle, hash,
-   * permute). Bumped whenever any step changes in a way that makes old and
-   * new signatures incomparable. Independent of the index file format version.
+   * permute, compress, including the fixed seed the coefficients derive from).
+   * Bumped whenever any step changes in a way that makes old and new
+   * signatures incomparable. Independent of the index file format version.
    */
-  uint32 signature_version = 6;
+  uint32 signature_version = 5;
 }

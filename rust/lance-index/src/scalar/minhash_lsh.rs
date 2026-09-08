@@ -83,19 +83,24 @@ use crate::{pb, pbold};
 
 /// On-disk format version of the index files. The format is unstable; bump
 /// on any layout change instead of adding compatibility paths.
-pub const MINHASH_LSH_INDEX_VERSION: u32 = 1;
+pub const MINHASH_LSH_INDEX_VERSION: u32 = 0;
 /// Version of the signature generation behavior (tokenizer pipeline, shingle
 /// hashing, permutation family and the 16-bit truncation); bumped whenever a
 /// change would make old and new signatures incomparable.
-pub const SIGNATURE_VERSION: u32 = 3;
+pub const SIGNATURE_VERSION: u32 = 0;
 
-/// A stored MinHash value: 16 bits of the mixed 64-bit permuted minimum
-/// (b-bit MinHash). The minimum of a set is not uniformly distributed (it
-/// shrinks as the set grows), so its bits cannot be stored directly; mixing
-/// it first makes two unrelated documents agree on a stored value with
-/// probability 2^-16 whatever their length, far below the 1/num_hashes
-/// resolution of the Jaccard estimate, while the signature file is a quarter
-/// of the 64-bit minima.
+/// Seed of the shingle hash and of the generator that derives the permutation
+/// and compression coefficients. Part of the signature scheme: changing it
+/// changes every signature and therefore [`SIGNATURE_VERSION`].
+const SIGNATURE_SEED: u64 = 42;
+
+/// A stored MinHash value: the 64-bit permuted minimum compressed to 16 bits
+/// by multiply-shift hashing (b-bit MinHash). A minimum is not uniformly
+/// distributed (it shrinks as the set grows), so its bits cannot be stored
+/// directly; multiply-shift with a random odd multiplier is 2-universal, so
+/// two unrelated documents agree on a stored value with probability at most
+/// 2^-15 whatever their length, far below the 1/num_hashes resolution of the
+/// Jaccard estimate.
 pub type SignatureValue = u16;
 
 pub const SIGNATURES_FILENAME: &str = "signatures.lance";
@@ -257,8 +262,6 @@ pub struct MinHashLshIndexParams {
     /// Number of consecutive tokens joined into one shingle. Documents shorter
     /// than this produce a single shingle of all their tokens.
     pub shingle_size: u32,
-    /// Seed for the shingle hash and the permutation functions.
-    pub seed: u64,
     /// Tokenizer configuration, using the same keys as the inverted (full
     /// text search) index. Defaults to lower-casing without stemming or stop
     /// word removal: aggressive normalization inflates Jaccard similarity and
@@ -272,7 +275,6 @@ impl Default for MinHashLshIndexParams {
             num_hashes: 128,
             num_bands: 16,
             shingle_size: 3,
-            seed: 42,
             tokenizer: InvertedIndexParams::default()
                 .stem(false)
                 .remove_stop_words(false),
@@ -288,7 +290,6 @@ struct RawMinHashLshIndexParams {
     num_hashes: Option<u32>,
     num_bands: Option<u32>,
     shingle_size: Option<u32>,
-    seed: Option<u64>,
     tokenizer: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
@@ -315,9 +316,6 @@ impl MinHashLshIndexParams {
         }
         if let Some(shingle_size) = raw.shingle_size {
             resolved.shingle_size = shingle_size;
-        }
-        if let Some(seed) = raw.seed {
-            resolved.seed = seed;
         }
         if let Some(tokenizer) = raw.tokenizer {
             // Presets (`analyzer`) and full text search defaults resolve inside
@@ -400,7 +398,6 @@ impl MinHashLshIndexParams {
             num_hashes: self.num_hashes,
             num_bands: self.num_bands,
             shingle_size: self.shingle_size,
-            seed: self.seed,
             tokenizer: Some(pbold::InvertedIndexDetails::try_from(&self.tokenizer)?),
             signature_version: SIGNATURE_VERSION,
         })
@@ -426,7 +423,6 @@ impl MinHashLshIndexParams {
             num_hashes: details.num_hashes,
             num_bands: details.num_bands,
             shingle_size: details.shingle_size,
-            seed: details.seed,
             tokenizer,
         };
         params.validate()?;
@@ -444,12 +440,7 @@ impl MinHashLshIndexParams {
 /// detail.
 fn splitmix64(state: &mut u64) -> u64 {
     *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    mix64(*state)
-}
-
-/// SplitMix64's finalizer: maps any 64-bit value to a uniformly distributed
-/// one, so that bits of a skewed value (such as a minimum) can be sampled.
-fn mix64(mut z: u64) -> u64 {
+    let mut z = *state;
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     z ^ (z >> 31)
@@ -463,11 +454,12 @@ pub struct SignatureGenerator {
     tokenizer: Box<dyn LanceTokenizer>,
     shingle_size: usize,
     num_bands: usize,
-    seed: u64,
     /// Odd multipliers of the `num_hashes` permutations `h(x) = a * x + b`.
     multipliers: Vec<u64>,
     /// Increments of the permutations.
     increments: Vec<u64>,
+    /// Odd multipliers compressing each 64-bit minimum to its stored 16 bits.
+    compressors: Vec<u64>,
     /// Token bytes of the current document, separated by [`SHINGLE_SEPARATOR`],
     /// and the end offset of each token; a shingle is one contiguous slice.
     token_text: Vec<u8>,
@@ -482,7 +474,6 @@ impl std::fmt::Debug for SignatureGenerator {
             .field("num_hashes", &self.multipliers.len())
             .field("num_bands", &self.num_bands)
             .field("shingle_size", &self.shingle_size)
-            .field("seed", &self.seed)
             .finish()
     }
 }
@@ -491,20 +482,23 @@ impl SignatureGenerator {
     pub fn try_new(params: &MinHashLshIndexParams) -> Result<Self> {
         params.validate()?;
         let num_hashes = params.num_hashes as usize;
-        let mut state = params.seed;
+        let mut state = SIGNATURE_SEED;
         let mut multipliers = Vec::with_capacity(num_hashes);
         let mut increments = Vec::with_capacity(num_hashes);
         for _ in 0..num_hashes {
             multipliers.push(splitmix64(&mut state) | 1);
             increments.push(splitmix64(&mut state));
         }
+        let compressors = (0..num_hashes)
+            .map(|_| splitmix64(&mut state) | 1)
+            .collect();
         Ok(Self {
             tokenizer: params.tokenizer.build()?,
             shingle_size: params.shingle_size as usize,
             num_bands: params.num_bands as usize,
-            seed: params.seed,
             multipliers,
             increments,
+            compressors,
             token_text: Vec::new(),
             token_ends: Vec::new(),
             mins: vec![u64::MAX; num_hashes],
@@ -556,7 +550,7 @@ impl SignatureGenerator {
                 self.token_ends[start - 1] + 1
             };
             let to = self.token_ends[start + window - 1];
-            let base = XxHash64::oneshot(self.seed, &self.token_text[from..to]);
+            let base = XxHash64::oneshot(SIGNATURE_SEED, &self.token_text[from..to]);
             for ((value, multiplier), increment) in self
                 .mins
                 .iter_mut()
@@ -573,10 +567,13 @@ impl SignatureGenerator {
             }
         }
         // A minimum shrinks with the number of shingles, so its raw bits are
-        // not comparable across documents of different lengths; mix it and
-        // sample the mixed value instead.
-        for (value, min) in signature.iter_mut().zip(&self.mins) {
-            *value = (mix64(*min) >> 48) as SignatureValue;
+        // not comparable across documents of different lengths. Multiply-shift
+        // with a random odd multiplier is 2-universal for any input
+        // distribution: distinct minima collide with probability <= 2^-15.
+        for ((value, min), compressor) in
+            signature.iter_mut().zip(&self.mins).zip(&self.compressors)
+        {
+            *value = (compressor.wrapping_mul(*min) >> 48) as SignatureValue;
         }
         true
     }
@@ -594,7 +591,7 @@ impl SignatureGenerator {
             for value in band {
                 band_bytes.extend_from_slice(&value.to_le_bytes());
             }
-            let hash = XxHash64::oneshot(self.seed, &band_bytes);
+            let hash = XxHash64::oneshot(SIGNATURE_SEED, &band_bytes);
             keys.push(((band_id as u64) << 56) | (hash & 0x00FF_FFFF_FFFF_FFFF));
         }
     }
@@ -1533,7 +1530,6 @@ impl Index for MinHashLshIndex {
             "num_hashes": self.params.num_hashes,
             "num_bands": self.params.num_bands,
             "shingle_size": self.params.shingle_size,
-            "seed": self.params.seed,
             "signature_version": SIGNATURE_VERSION,
         }))
     }
@@ -3364,7 +3360,7 @@ mod tests {
             .train(text_stream(&rows, 1), store.as_ref())
             .await
             .unwrap();
-        let other = MinHashLshIndexParams::from_json(r#"{"seed": 7}"#).unwrap();
+        let other = MinHashLshIndexParams::from_json(r#"{"shingle_size": 4}"#).unwrap();
         let err = MinHashLshIndex::load(
             store.clone(),
             &other.details_any().unwrap(),
@@ -3554,7 +3550,7 @@ mod tests {
         // Segments built with different parameters cannot be merged
         let (_dir_c, store_c) = test_store();
         let other = MinHashLshIndexBuilder::try_new(
-            MinHashLshIndexParams::from_json(r#"{"seed": 9}"#).unwrap(),
+            MinHashLshIndexParams::from_json(r#"{"shingle_size": 4}"#).unwrap(),
         )
         .unwrap();
         let segment_c = build_and_load(&store_c, other, &rows_a, 3, &LanceCache::no_cache()).await;
@@ -3574,7 +3570,7 @@ mod tests {
     fn test_plugin_validates_segment_parameter_drift() {
         let plugin = MinHashLshIndexPlugin;
         let a = MinHashLshIndexParams::default().details_any().unwrap();
-        let b = MinHashLshIndexParams::from_json(r#"{"seed": 1}"#)
+        let b = MinHashLshIndexParams::from_json(r#"{"shingle_size": 4}"#)
             .unwrap()
             .details_any()
             .unwrap();
