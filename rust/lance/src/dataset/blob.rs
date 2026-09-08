@@ -133,48 +133,131 @@ pub(super) async fn preserve_direct_descriptors(
     Ok(builder.finish()?.into_parts().1)
 }
 
+fn contains_direct_blob(field: &LanceField) -> bool {
+    field
+        .metadata
+        .get("lance:blob-direct-poc")
+        .map(String::as_str)
+        == Some("1")
+        || field.children.iter().any(contains_direct_blob)
+}
+
+fn collect_direct_row(
+    dataset: &Dataset,
+    field: &LanceField,
+    array: &dyn Array,
+    row: usize,
+    row_addr: u64,
+    paths: &mut HashSet<Path>,
+) -> Result<()> {
+    if array.is_null(row) {
+        return Ok(());
+    }
+    if field
+        .metadata
+        .get("lance:blob-direct-poc")
+        .map(String::as_str)
+        == Some("1")
+    {
+        let cols = BlobV2DescriptorColumns::new(array.as_struct());
+        if !cols.is_null_blob(row) && cols.kinds.value(row) == BlobKind::Managed as u8 {
+            let base_id =
+                direct_base_id(dataset, field.id as u32, row_addr, cols.blob_ids.value(row))?;
+            let object = cols.blob_uris.value(row);
+            crate::blob::validate_managed_object(object)?;
+            paths.insert(dataset.data_file_dir_for_base(base_id)?.join(object));
+        }
+        return Ok(());
+    }
+    match array.data_type() {
+        ArrowDataType::Struct(_) => {
+            for child in field
+                .children
+                .iter()
+                .filter(|child| contains_direct_blob(child))
+            {
+                let child_array = array
+                    .as_struct()
+                    .column_by_name(&child.name)
+                    .ok_or_else(|| Error::internal("Missing nested blob field"))?;
+                collect_direct_row(dataset, child, child_array.as_ref(), row, row_addr, paths)?;
+            }
+        }
+        ArrowDataType::List(_) => {
+            let list = array.as_list::<i32>();
+            let child = field
+                .children
+                .first()
+                .ok_or_else(|| Error::internal("Missing list item field"))?;
+            for index in list.value_offsets()[row]..list.value_offsets()[row + 1] {
+                collect_direct_row(
+                    dataset,
+                    child,
+                    list.values().as_ref(),
+                    index as usize,
+                    row_addr,
+                    paths,
+                )?;
+            }
+        }
+        ArrowDataType::LargeList(_) => {
+            let list = array.as_list::<i64>();
+            let child = field
+                .children
+                .first()
+                .ok_or_else(|| Error::internal("Missing list item field"))?;
+            for index in list.value_offsets()[row]..list.value_offsets()[row + 1] {
+                collect_direct_row(
+                    dataset,
+                    child,
+                    list.values().as_ref(),
+                    index as usize,
+                    row_addr,
+                    paths,
+                )?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 pub(super) async fn direct_references(dataset: &Dataset) -> Result<HashSet<Path>> {
     let fields = dataset
         .schema()
-        .fields_pre_order()
-        .filter(|field| {
-            field
-                .metadata
-                .get("lance:blob-direct-poc")
-                .map(String::as_str)
-                == Some("1")
-        })
-        .map(|field| (field.id as u32, field.name.clone()))
+        .fields
+        .iter()
+        .filter(|field| contains_direct_blob(field))
         .collect::<Vec<_>>();
     let mut paths = HashSet::new();
-    for (field_id, name) in fields {
-        let mut scanner = dataset.scan();
-        scanner.project(&[&name])?.with_row_address();
-        let mut stream = scanner.try_into_stream().await?;
-        while let Some(batch) = stream.try_next().await? {
-            let values = batch
-                .column_by_name(&name)
-                .ok_or_else(|| Error::internal("Missing direct blob column"))?
-                .as_struct();
-            let columns = BlobV2DescriptorColumns::new(values);
-            let addrs = batch
-                .column_by_name(ROW_ADDR)
-                .ok_or_else(|| Error::internal("Missing row addresses"))?
-                .as_primitive::<UInt64Type>();
-            for row in 0..values.len() {
-                if columns.is_null_blob(row) || columns.kinds.value(row) != BlobKind::Managed as u8
-                {
-                    continue;
-                }
-                let base_id = direct_base_id(
+    if fields.is_empty() {
+        return Ok(paths);
+    }
+    let names = fields
+        .iter()
+        .map(|field| field.name.as_str())
+        .collect::<Vec<_>>();
+    let mut scanner = dataset.scan();
+    scanner.project(&names)?.with_row_address();
+    let mut stream = scanner.try_into_stream().await?;
+    while let Some(batch) = stream.try_next().await? {
+        let addrs = batch
+            .column_by_name(ROW_ADDR)
+            .ok_or_else(|| Error::internal("Missing row addresses"))?
+            .as_primitive::<UInt64Type>();
+        for field in &fields {
+            let array = batch
+                .column_by_name(&field.name)
+                .ok_or_else(|| Error::internal("Missing direct blob column"))?;
+            for row in 0..batch.num_rows() {
+                collect_direct_row(
                     dataset,
-                    field_id,
+                    field,
+                    array.as_ref(),
+                    row,
                     addrs.value(row),
-                    columns.blob_ids.value(row),
+                    &mut paths,
                 )?;
-                let object = columns.blob_uris.value(row);
-                crate::blob::validate_managed_object(object)?;
-                paths.insert(dataset.data_file_dir_for_base(base_id)?.join(object));
             }
         }
     }

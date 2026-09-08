@@ -64,7 +64,12 @@ const _: () = assert!(FLAG_COVERED_INDEX_METADATA < FLAG_UNKNOWN);
 const _: () = assert!(FLAG_COVERED_INDEX_METADATA >= 1 << 7);
 const _: () = assert!(FLAG_MIXED_DATA_FILE_VERSIONS == FLAG_UNKNOWN);
 
-pub(crate) const STICKY_PAIRED_FLAGS: u64 = FLAG_MIXED_DATA_FILE_VERSIONS;
+/// Experimental fence for datasets containing direct managed blob references.
+/// Released binaries must refuse these datasets, including maintenance operations.
+pub const FLAG_EXPERIMENTAL_DIRECT_BLOBS: u64 = 1 << 62;
+
+pub(crate) const STICKY_PAIRED_FLAGS: u64 =
+    FLAG_MIXED_DATA_FILE_VERSIONS | FLAG_EXPERIMENTAL_DIRECT_BLOBS;
 
 /// Environment variable that opts a release build into reading and writing data
 /// overlay files before the feature is generally released.
@@ -97,6 +102,22 @@ pub fn apply_feature_flags(
         // Both readers and writers need to be able to read deletion files
         manifest.reader_feature_flags |= FLAG_DELETION_FILES;
         manifest.writer_feature_flags |= FLAG_DELETION_FILES;
+    }
+
+    if manifest.schema.fields_pre_order().any(|field| {
+        field
+            .metadata
+            .get("lance:blob-direct-poc")
+            .map(String::as_str)
+            == Some("1")
+    }) {
+        if std::env::var("LANCE_ENABLE_DIRECT_BLOB_POC").as_deref() != Ok("1") {
+            return Err(Error::not_supported(
+                "Direct blob PoC requires LANCE_ENABLE_DIRECT_BLOB_POC=1",
+            ));
+        }
+        manifest.reader_feature_flags |= FLAG_EXPERIMENTAL_DIRECT_BLOBS;
+        manifest.writer_feature_flags |= FLAG_EXPERIMENTAL_DIRECT_BLOBS;
     }
 
     // If any fragment has row ids, they must all have row ids.
@@ -197,7 +218,12 @@ fn supported_flags_when(overlay_enabled: bool) -> u64 {
 }
 
 fn supported_flags() -> u64 {
-    supported_flags_when(data_overlay_files_enabled())
+    let supported = supported_flags_when(data_overlay_files_enabled());
+    if std::env::var("LANCE_ENABLE_DIRECT_BLOB_POC").as_deref() == Ok("1") {
+        supported | FLAG_EXPERIMENTAL_DIRECT_BLOBS
+    } else {
+        supported
+    }
 }
 
 pub fn can_read_dataset(reader_flags: u64) -> bool {
