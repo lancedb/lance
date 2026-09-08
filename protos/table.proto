@@ -49,10 +49,11 @@ message FragmentMetadataTree {
     string root_path = 2;
   }
   repeated FragmentMetadataMutation suffix = 3;
-  // Next sequence to assign. Greater than every buffered action.
+  /* Next action sequence for this snapshot. At least the selected root's
+   * next_action_sequence. Suffix mutations use sequences in
+   * [root.next_action_sequence, next_action_sequence).
+   */
   uint64 next_action_sequence = 4;
-  // Includes reservations. At most 2^32.
-  uint64 next_fragment_id = 5;
   // After the base and suffix. visible_rows cannot exceed total_rows.
   uint64 total_fragments = 6;
   uint64 total_rows = 7;
@@ -65,20 +66,18 @@ message FragmentMetadataRoot {
   uint64 version = 1;
   repeated FragmentMetadataChild children = 2;
   repeated FragmentMetadataMutation buffer = 3;
+  /* Next action sequence after this root. At least 1. All buffered mutations
+   * and leaf watermarks reachable from this root are below this value.
+   */
   uint64 next_action_sequence = 4;
-  uint64 next_fragment_id = 5;
-  // Byte targets chosen when this root was written. Each must fit hard_capacity_bytes.
-  uint64 max_node_bytes = 6;
-  uint64 max_leaf_bytes = 7;
-  uint64 semantic_buffer_bytes = 8;
-  // Largest encoded object this tree will write, even a leaf with one fragment.
+  // Reader-enforced maximum encoded size of this root and any reachable node or leaf.
   uint64 hard_capacity_bytes = 9;
 }
 
-/* Children are sorted by min_key. That is the start of the range this child
- * owns. The next sibling's min_key is the end. Keys below the first min_key go
- * to the first child. max_key is the largest stored id. Buffered inserts can
- * sit past it.
+/* Children are ordered by min_key. Each min_key is the inclusive lower bound
+ * of that child's range, and the next sibling's min_key is the exclusive upper
+ * bound. The first child's min_key equals the containing node's lower bound,
+ * which is 0 at the root. max_key is a summary only.
  */
 message FragmentMetadataChild {
   // Child object path, relative to the dataset.
@@ -95,22 +94,23 @@ message FragmentMetadataChild {
   uint64 total_rows = 8;
   // Encoded size of the child object. Used to split leaves.
   uint64 object_size = 9;
-  /* This leaf already contains every action through this sequence. Replay only
-   * newer ones. Zero on interiors and on bootstrap leaves.
+  /* Leaf materialization watermark. Every mutation for this leaf's range with
+   * action_sequence at or below this value has been applied with no gaps.
+   * 0 means none. Must be 0 on interiors.
    */
   uint64 materialized_through_action_sequence = 10;
   uint64 visible_rows = 11;
 }
 
-// Routing node on disk. Each buffered action maps to one child range.
+// Routing node on disk. Each buffered mutation maps to one child range.
 message FragmentMetadataNode {
   repeated FragmentMetadataChild children = 1;
   repeated FragmentMetadataMutation buffer = 2;
 }
 
-/* A stored change. Sequence numbers are unique among pending actions and below
- * next_action_sequence. Gaps are fine. The deltas are the count change from the
- * last validated state.
+/* A validated fragment metadata mutation. action_sequence is nonzero and
+ * unique within the tree. Count deltas are the exact before and after change
+ * for the target fragment.
  */
 message FragmentMetadataMutation {
   uint64 action_sequence = 1;
@@ -295,6 +295,9 @@ message Manifest {
    * have been used in previous versions.
    *
    * For a single fragment, will be zero. For no fragments, will be absent.
+   *
+   * This is the authoritative fragment-id allocation high-water mark for both
+   * flat and fragment metadata tree layouts, reservations included.
    */
   optional uint32 max_fragment_id = 11;
 
