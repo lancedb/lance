@@ -58,7 +58,7 @@ pub(super) fn direct_base_id(
     base_id: u32,
 ) -> Result<Option<u32>> {
     if base_id != 0 {
-        return Ok(Some(base_id));
+        return Ok(Some(base_id - 1));
     }
     let fragment = dataset
         .get_fragment(RowAddress::from(row_addr).fragment_id() as usize)
@@ -67,6 +67,16 @@ pub(super) fn direct_base_id(
         .data_file_for_field(field_id)
         .ok_or_else(|| Error::invalid_input("Managed blob data file is missing"))?;
     Ok(file.base_id)
+}
+
+fn direct_base_code(base_id: Option<u32>) -> Result<u32> {
+    base_id
+        .map(|id| {
+            id.checked_add(1)
+                .ok_or_else(|| Error::invalid_input("Managed blob base ID cannot be represented"))
+        })
+        .transpose()
+        .map(|id| id.unwrap_or(0))
 }
 
 fn direct_descriptor(value: BlobDescriptor, object_key: &str) -> Result<BlobDescriptor> {
@@ -109,8 +119,12 @@ pub(super) async fn preserve_direct_descriptors(
         let kind = BlobKind::try_from(columns.kinds.value(row))?;
         match kind {
             BlobKind::Managed => builder.push(BlobDescriptor::Managed {
-                base_id: direct_base_id(dataset, field_id, *row_addr, columns.blob_ids.value(row))?
-                    .unwrap_or(0),
+                base_id: direct_base_code(direct_base_id(
+                    dataset,
+                    field_id,
+                    *row_addr,
+                    columns.blob_ids.value(row),
+                )?)?,
                 object: columns.blob_uris.value(row).to_string(),
                 offset: columns.positions.value(row),
                 size: columns.sizes.value(row),
@@ -393,13 +407,12 @@ impl Dataset {
                     } else {
                         let descriptor = match kind {
                             BlobKind::Managed => BlobDescriptor::Managed {
-                                base_id: direct_base_id(
+                                base_id: direct_base_code(direct_base_id(
                                     self,
                                     field_id,
                                     addrs.value(row),
                                     cols.blob_ids.value(row),
-                                )?
-                                .unwrap_or(0),
+                                )?)?,
                                 object: cols.blob_uris.value(row).to_string(),
                                 offset: cols.positions.value(row),
                                 size: cols.sizes.value(row),

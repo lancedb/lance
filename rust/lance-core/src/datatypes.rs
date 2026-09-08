@@ -594,7 +594,8 @@ pub enum BlobKind {
     /// it defaults to 0, which points to the beginning of the blob.
     External = 3,
     /// Experimental direct managed reference. Requires `lance:blob-direct-poc=1`.
-    /// `blob_id` is the base ID, `blob_uri` is an immutable object path relative
+    /// `blob_id` is the base ID plus one (zero inherits the data file base),
+    /// `blob_uri` is an immutable object path relative
     /// to its data directory, and `position`/`size` are the exact payload range.
     Managed = 128,
 }
