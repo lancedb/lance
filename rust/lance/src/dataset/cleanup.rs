@@ -291,33 +291,32 @@ fn remove_prefix(path: &Path, prefix: &Path) -> Path {
     Path::from_iter(relative_parts.unwrap())
 }
 
-fn is_staging_manifest_path(relative_path: &Path) -> bool {
+fn staging_manifest_version(relative_path: &Path) -> Option<u64> {
     let mut parts = relative_path.parts();
     let (Some(versions_dir), Some(filename), None) = (parts.next(), parts.next(), parts.next())
     else {
-        return false;
+        return None;
     };
     if versions_dir.as_ref() != "_versions" {
-        return false;
+        return None;
     }
 
     let filename = filename.as_ref();
-    let Some(uuid_start) = filename.len().checked_sub(uuid::fmt::Hyphenated::LENGTH) else {
-        return false;
-    };
+    let uuid_start = filename.len().checked_sub(uuid::fmt::Hyphenated::LENGTH)?;
     if uuid_start == 0 || filename.as_bytes().get(uuid_start - 1) != Some(&b'-') {
-        return false;
+        return None;
     }
     let (Some(manifest_filename), Some(uuid_suffix)) =
         (filename.get(..uuid_start - 1), filename.get(uuid_start..))
     else {
-        return false;
+        return None;
     };
 
-    let Some(scheme) = ManifestNamingScheme::detect_scheme(manifest_filename) else {
-        return false;
-    };
-    scheme.parse_version(manifest_filename).is_some() && uuid::Uuid::parse_str(uuid_suffix).is_ok()
+    let scheme = ManifestNamingScheme::detect_scheme(manifest_filename)?;
+    if uuid::Uuid::parse_str(uuid_suffix).is_err() {
+        return None;
+    }
+    scheme.parse_version(manifest_filename)
 }
 
 #[derive(Clone, Debug)]
@@ -335,9 +334,6 @@ struct CleanupTask<'a> {
 #[derive(Clone, Debug, Default)]
 struct CleanupInspection {
     old_manifests: HashMap<Path, u64>,
-    /// Every manifest path returned by the active commit handler. External
-    /// stores may record a staging-shaped path as the final, live manifest.
-    recorded_manifest_paths: HashSet<Path>,
     /// Store records to retire once their manifests are gone, by version;
     /// see `CommitHandler::forget_version`.
     retired_records: HashMap<u64, String>,
@@ -626,9 +622,6 @@ impl<'a> CleanupTask<'a> {
         let is_tagged = tagged_versions.contains(&manifest.version);
         let in_working_set = is_latest || !self.policy.should_clean(&manifest) || is_tagged;
         let mut inspection = inspection.lock().unwrap();
-        inspection
-            .recorded_manifest_paths
-            .insert(location.path.clone());
 
         // Track tagged old versions in case we want to return a `CleanupError` later.
         // Only track tagged when it is old.
@@ -759,12 +752,7 @@ impl<'a> CleanupTask<'a> {
                     // delete it if we can verify it is part of an old version.
                     let maybe_in_progress = !self.policy.delete_unverified
                         && obj_meta.last_modified >= verification_threshold;
-                    let file_to_remove = self.cleanup_file_if_not_referenced(
-                        obj_meta,
-                        maybe_in_progress,
-                        inspection_ref,
-                    );
-                    future::ready(file_to_remove)
+                    self.cleanup_file_if_not_referenced(obj_meta, maybe_in_progress, inspection_ref)
                 })
                 .boxed()
         };
@@ -777,7 +765,7 @@ impl<'a> CleanupTask<'a> {
         let streams = vec![
             // Staging manifests can be newer than the latest retained manifest,
             // so a retained-manifest cutoff could hide them indefinitely. Live
-            // paths are protected by `recorded_manifest_paths` instead.
+            // paths are revalidated against the commit handler instead.
             build_listing_stream(self.dataset.versions_dir(), None),
             build_listing_stream(self.dataset.transactions_dir(), unmodified_since),
             build_listing_stream(self.dataset.data_dir(), unmodified_since),
@@ -928,7 +916,7 @@ impl<'a> CleanupTask<'a> {
         Ok(cleanup_result)
     }
 
-    fn cleanup_file_if_not_referenced(
+    async fn cleanup_file_if_not_referenced(
         &self,
         obj_meta: ObjectMeta,
         maybe_in_progress: bool,
@@ -953,10 +941,21 @@ impl<'a> CleanupTask<'a> {
                 ));
             }
         }
-        if is_staging_manifest_path(&relative_path) {
-            // An external manifest store may intentionally use this path shape
-            // for a committed version. Only an unrecorded path is an orphan.
-            if maybe_in_progress || inspection.recorded_manifest_paths.contains(&path) {
+        if let Some(version) = staging_manifest_version(&relative_path) {
+            // Bulk manifest enumeration may fall back to object listing, which
+            // omits an external store's staging-shaped authoritative path.
+            if maybe_in_progress
+                || self
+                    .dataset
+                    .commit_handler
+                    .is_manifest_path_authoritative(
+                        &self.dataset.base,
+                        version,
+                        &path,
+                        self.dataset.object_store.inner.as_ref(),
+                    )
+                    .await?
+            {
                 return Ok(None);
             }
             return Ok(cleanup_file(
@@ -2798,9 +2797,9 @@ mod tests {
                 .read_dir_all(&dataset.versions_dir(), None)
                 .try_filter_map(|meta| {
                     let relative_path = remove_prefix(&meta.location, &dataset.base);
-                    future::ready(Ok(
-                        is_staging_manifest_path(&relative_path).then_some(meta.location)
-                    ))
+                    future::ready(Ok(staging_manifest_version(&relative_path)
+                        .is_some()
+                        .then_some(meta.location)))
                 })
                 .try_collect::<Vec<_>>()
                 .await
@@ -5332,10 +5331,9 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(is_staging_manifest_path(&remove_prefix(
-            &current_manifest,
-            &dataset.base
-        )));
+        assert!(
+            staging_manifest_version(&remove_prefix(&current_manifest, &dataset.base)).is_some()
+        );
         let orphan_manifest = dataset
             .versions_dir()
             .join(format!("999.manifest-{}", Uuid::new_v4()));
