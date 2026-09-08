@@ -50,6 +50,137 @@ use lance_core::{Error, ROW_ADDR, Result, utils::address::RowAddress};
 use lance_io::traits::Reader;
 use lance_io::utils::CachedFileSize;
 
+/// Resolve the implicit origin base of an unchanged descriptor in a cloned data file.
+pub(super) fn direct_base_id(
+    dataset: &Dataset,
+    field_id: u32,
+    row_addr: u64,
+    base_id: u32,
+) -> Result<Option<u32>> {
+    if base_id != 0 {
+        return Ok(Some(base_id));
+    }
+    let fragment = dataset
+        .get_fragment(RowAddress::from(row_addr).fragment_id() as usize)
+        .ok_or_else(|| Error::invalid_input("Managed blob fragment is missing"))?;
+    let file = fragment
+        .data_file_for_field(field_id)
+        .ok_or_else(|| Error::invalid_input("Managed blob data file is missing"))?;
+    Ok(file.base_id)
+}
+
+fn direct_descriptor(value: BlobDescriptor, object_key: &str) -> Result<BlobDescriptor> {
+    let (blob_id, offset, size) = match value {
+        BlobDescriptor::Packed {
+            blob_id,
+            offset,
+            size,
+        } => (blob_id, offset, size),
+        BlobDescriptor::Dedicated { blob_id, size } => (blob_id, 0, size),
+        _ => return Err(Error::internal("Expected a managed sidecar write")),
+    };
+    Ok(BlobDescriptor::Managed {
+        base_id: 0,
+        object: blob_path(&Path::default(), object_key, blob_id).to_string(),
+        offset,
+        size,
+    })
+}
+
+pub(super) async fn preserve_direct_descriptors(
+    dataset: &Arc<Dataset>,
+    field_id: u32,
+    values: &StructArray,
+    row_addrs: &[u64],
+    field: &ArrowField,
+) -> Result<ArrayRef> {
+    let columns = BlobV2DescriptorColumns::new(values);
+    let mut builder = BlobDescriptorArrayBuilder::new_with_metadata(
+        field.name(),
+        field.is_nullable(),
+        field.metadata().clone(),
+    );
+    let mut context = BlobV2ReadContext::new(dataset, field_id);
+    for (row, row_addr) in row_addrs.iter().enumerate() {
+        if columns.is_null_blob(row) {
+            builder.push_null()?;
+            continue;
+        }
+        let kind = BlobKind::try_from(columns.kinds.value(row))?;
+        match kind {
+            BlobKind::Managed => builder.push(BlobDescriptor::Managed {
+                base_id: direct_base_id(dataset, field_id, *row_addr, columns.blob_ids.value(row))?
+                    .unwrap_or(0),
+                object: columns.blob_uris.value(row).to_string(),
+                offset: columns.positions.value(row),
+                size: columns.sizes.value(row),
+            })?,
+            BlobKind::External => builder.push(BlobDescriptor::External {
+                base_id: columns.blob_ids.value(row),
+                uri: columns.blob_uris.value(row).to_string(),
+                offset: columns.positions.value(row),
+                size: columns.sizes.value(row),
+            })?,
+            _ => {
+                let file = context
+                    .collect_file(&columns, row, *row_addr)
+                    .await?
+                    .ok_or_else(|| Error::internal("Non-null blob resolved to null"))?;
+                builder.push_inline(file.read().await?)?;
+            }
+        }
+    }
+    Ok(builder.finish()?.into_parts().1)
+}
+
+pub(super) async fn direct_references(dataset: &Dataset) -> Result<HashSet<Path>> {
+    let fields = dataset
+        .schema()
+        .fields_pre_order()
+        .filter(|field| {
+            field
+                .metadata
+                .get("lance:blob-direct-poc")
+                .map(String::as_str)
+                == Some("1")
+        })
+        .map(|field| (field.id as u32, field.name.clone()))
+        .collect::<Vec<_>>();
+    let mut paths = HashSet::new();
+    for (field_id, name) in fields {
+        let mut scanner = dataset.scan();
+        scanner.project(&[&name])?.with_row_address();
+        let mut stream = scanner.try_into_stream().await?;
+        while let Some(batch) = stream.try_next().await? {
+            let values = batch
+                .column_by_name(&name)
+                .ok_or_else(|| Error::internal("Missing direct blob column"))?
+                .as_struct();
+            let columns = BlobV2DescriptorColumns::new(values);
+            let addrs = batch
+                .column_by_name(ROW_ADDR)
+                .ok_or_else(|| Error::internal("Missing row addresses"))?
+                .as_primitive::<UInt64Type>();
+            for row in 0..values.len() {
+                if columns.is_null_blob(row) || columns.kinds.value(row) != BlobKind::Managed as u8
+                {
+                    continue;
+                }
+                let base_id = direct_base_id(
+                    dataset,
+                    field_id,
+                    addrs.value(row),
+                    columns.blob_ids.value(row),
+                )?;
+                let object = columns.blob_uris.value(row);
+                crate::blob::validate_managed_object(object)?;
+                paths.insert(dataset.data_file_dir_for_base(base_id)?.join(object));
+            }
+        }
+    }
+    Ok(paths)
+}
+
 const INLINE_MAX: usize = 64 * 1024; // 64KB inline cutoff
 const DEDICATED_THRESHOLD: usize = 4 * 1024 * 1024; // 4MB dedicated cutoff
 const PACK_FILE_MAX_SIZE: usize = 1024 * 1024 * 1024; // 1GiB per .pack sidecar
@@ -444,6 +575,8 @@ pub struct BlobPreprocessor {
     blob_id_allocator: BlobIdAllocator,
     part_blob_ids: Option<Range<u32>>,
     pack_writer: RollingPackedBlobWriter,
+    direct_pack_writer: RollingPackedBlobWriter,
+    direct_object_key: String,
     /// Write-param override for the pack-file roll size. When set, it takes
     /// precedence over each field's `blob-pack-file-size-threshold` metadata for
     /// this write job only; it is not persisted into the dataset schema.
@@ -656,6 +789,8 @@ impl BlobPreprocessor {
             blob_id_allocator: BlobIdAllocator::new(1),
             part_blob_ids: None,
             pack_writer,
+            direct_pack_writer: RollingPackedBlobWriter::new(),
+            direct_object_key: uuid::Uuid::new_v4().to_string(),
             pack_file_size_override,
             field_processors,
             external_base_resolver,
@@ -726,6 +861,27 @@ impl BlobPreprocessor {
             .await
     }
 
+    async fn write_logical_packed(
+        &mut self,
+        direct: bool,
+        threshold: usize,
+        source: BlobWriteSource<'_>,
+    ) -> Result<BlobDescriptor> {
+        if !direct {
+            return self.write_packed(threshold, source).await;
+        }
+        self.direct_pack_writer
+            .write(
+                self.object_store.clone(),
+                self.data_dir.clone(),
+                self.direct_object_key.clone(),
+                self.blob_id_allocator.clone(),
+                self.pack_file_size_override.unwrap_or(threshold),
+                source,
+            )
+            .await
+    }
+
     async fn prepare_blob_for_part(
         &mut self,
         array: ArrayRef,
@@ -775,7 +931,7 @@ impl BlobPreprocessor {
                         ))
                     })?;
                 }
-                BlobKind::Inline | BlobKind::External => {}
+                BlobKind::Inline | BlobKind::External | BlobKind::Managed => {}
             }
         }
 
@@ -807,6 +963,14 @@ impl BlobPreprocessor {
                 }
                 BlobKind::Dedicated => {
                     output.push_dedicated(blob_ids.value(row), sizes.value(row))?;
+                }
+                BlobKind::Managed => {
+                    output.push(BlobDescriptor::Managed {
+                        base_id: blob_ids.value(row),
+                        object: uris.value(row).to_string(),
+                        offset: positions.value(row),
+                        size: sizes.value(row),
+                    })?;
                 }
                 BlobKind::External => {
                     output.push(BlobDescriptor::External {
@@ -1156,6 +1320,15 @@ impl BlobPreprocessor {
             .column_by_name("size")
             .map(|col| col.as_primitive::<UInt64Type>());
 
+        let direct = writer_metadata
+            .get("lance:blob-direct-poc")
+            .map(String::as_str)
+            == Some("1");
+        let object_key = if direct {
+            self.direct_object_key.clone()
+        } else {
+            self.data_file_key.clone()
+        };
         let mut blob_writer = self.blob_writer_with_metadata(field, writer_metadata.clone());
 
         for i in 0..struct_arr.len() {
@@ -1206,23 +1379,32 @@ impl BlobPreprocessor {
                 let value = Self::write_dedicated(
                     self.object_store.clone(),
                     self.data_dir.clone(),
-                    self.data_file_key.clone(),
+                    object_key.clone(),
                     self.blob_id_allocator.clone(),
                     BlobWriteSource::Bytes(data_col.value(i)),
                 )
                 .await?;
-                blob_writer.push(value)?;
+                blob_writer.push(if direct {
+                    direct_descriptor(value, &object_key)?
+                } else {
+                    value
+                })?;
                 continue;
             }
 
             if has_data && data_len > inline_threshold {
                 let value = self
-                    .write_packed(
+                    .write_logical_packed(
+                        direct,
                         pack_file_threshold,
                         BlobWriteSource::Bytes(data_col.value(i)),
                     )
                     .await?;
-                blob_writer.push(value)?;
+                blob_writer.push(if direct {
+                    direct_descriptor(value, &object_key)?
+                } else {
+                    value
+                })?;
                 continue;
             }
 
@@ -1251,20 +1433,32 @@ impl BlobPreprocessor {
                         let value = Self::write_dedicated(
                             self.object_store.clone(),
                             self.data_dir.clone(),
-                            self.data_file_key.clone(),
+                            object_key.clone(),
                             self.blob_id_allocator.clone(),
                             BlobWriteSource::External(&source),
                         )
                         .await?;
-                        blob_writer.push(value)?;
+                        blob_writer.push(if direct {
+                            direct_descriptor(value, &object_key)?
+                        } else {
+                            value
+                        })?;
                         continue;
                     }
 
                     if data_len > inline_threshold as u64 {
                         let value = self
-                            .write_packed(pack_file_threshold, BlobWriteSource::External(&source))
+                            .write_logical_packed(
+                                direct,
+                                pack_file_threshold,
+                                BlobWriteSource::External(&source),
+                            )
                             .await?;
-                        blob_writer.push(value)?;
+                        blob_writer.push(if direct {
+                            direct_descriptor(value, &object_key)?
+                        } else {
+                            value
+                        })?;
                         continue;
                     }
 
@@ -1308,10 +1502,12 @@ impl BlobPreprocessor {
     }
 
     pub(crate) async fn finish(&mut self) -> Result<()> {
+        self.direct_pack_writer.finish().await?;
         self.pack_writer.finish().await
     }
 
     pub(super) fn abort(&mut self) {
+        self.direct_pack_writer.abort();
         self.pack_writer.abort();
     }
 }
@@ -4211,6 +4407,7 @@ impl<'a> BlobV2ReadContext<'a> {
             BlobKind::Dedicated => self.collect_dedicated(columns, idx, row_addr).await?,
             BlobKind::Packed => self.collect_packed(columns, idx, row_addr).await?,
             BlobKind::External => self.collect_external(columns, idx).await?,
+            BlobKind::Managed => self.collect_managed(columns, idx, row_addr).await?,
         };
 
         Ok(Some(file))
@@ -4287,6 +4484,32 @@ impl<'a> BlobV2ReadContext<'a> {
             position,
             size,
             BlobKind::Packed,
+            None,
+        ))
+    }
+
+    async fn collect_managed(
+        &mut self,
+        columns: &BlobV2DescriptorColumns<'_>,
+        idx: usize,
+        row_addr: u64,
+    ) -> Result<BlobFile> {
+        let object = columns.blob_uris.value(idx);
+        crate::blob::validate_managed_object(object)?;
+        let base_id = direct_base_id(
+            self.dataset,
+            self.blob_field_id,
+            row_addr,
+            columns.blob_ids.value(idx),
+        )?;
+        let store = self.dataset.object_store(base_id).await?;
+        let path = self.dataset.data_file_dir_for_base(base_id)?.join(object);
+        let source = shared_blob_source(&mut self.source_cache, store, &path);
+        Ok(BlobFile::with_source(
+            source,
+            columns.positions.value(idx),
+            columns.sizes.value(idx),
+            BlobKind::Managed,
             None,
         ))
     }

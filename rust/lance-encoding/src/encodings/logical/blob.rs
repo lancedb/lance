@@ -342,6 +342,13 @@ impl FieldEncoder for BlobV2StructuralEncoder {
                             blob_id_col.value(i),
                             "".to_string(),
                         ),
+                        BlobKind::Managed => (
+                            BlobKind::Managed as u8,
+                            packed_position_col.value(i),
+                            blob_size_col.value(i),
+                            blob_id_col.value(i),
+                            uri_col.value(i).to_string(),
+                        ),
                         BlobKind::External => {
                             let uri = uri_col.value(i).to_string();
                             let position = if packed_position_col.is_null(i) {

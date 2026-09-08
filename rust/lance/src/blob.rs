@@ -463,6 +463,32 @@ fn validate_prepared_blob_value_array(field: &Field, array: &ArrayRef) -> Result
                 }
                 validate_blob_id(blob_id_col.value(row))?;
             }
+            BlobKind::Managed => {
+                if field
+                    .metadata()
+                    .get("lance:blob-direct-poc")
+                    .map(String::as_str)
+                    != Some("1")
+                {
+                    return Err(Error::invalid_input(
+                        "Managed references require the experimental blob field marker",
+                    ));
+                }
+                if uri_col.is_null(row)
+                    || blob_id_col.is_null(row)
+                    || position_col.is_null(row)
+                    || blob_size_col.is_null(row)
+                {
+                    return Err(Error::invalid_input(
+                        "Managed references require object, base, offset and size",
+                    ));
+                }
+                validate_managed_object(uri_col.value(row))?;
+                position_col
+                    .value(row)
+                    .checked_add(blob_size_col.value(row))
+                    .ok_or_else(|| Error::invalid_input("Managed blob range overflows u64"))?;
+            }
             BlobKind::External => {
                 if uri_col.is_null(row) || uri_col.value(row).is_empty() {
                     return Err(Error::invalid_input(format!(
@@ -535,6 +561,13 @@ pub enum BlobDescriptor {
     },
     /// Payload bytes stored as the full contents of a dedicated sidecar blob.
     Dedicated { blob_id: u32, size: u64 },
+    /// Experimental immutable managed object reference, relative to a data base.
+    Managed {
+        base_id: u32,
+        object: String,
+        offset: u64,
+        size: u64,
+    },
     /// Payload bytes referenced from an external object or registered base.
     External {
         base_id: u32,
@@ -722,6 +755,20 @@ impl BlobDescriptorArrayBuilder {
                     blob_size_builder.append_value(size);
                     position_builder.append_null();
                 }
+                BlobDescriptor::Managed {
+                    base_id,
+                    object,
+                    offset,
+                    size,
+                } => {
+                    validity.append_non_null();
+                    kind_builder.append_value(BlobKind::Managed as u8);
+                    data_builder.append_null();
+                    uri_builder.append_value(object);
+                    blob_id_builder.append_value(base_id);
+                    blob_size_builder.append_value(size);
+                    position_builder.append_value(offset);
+                }
                 BlobDescriptor::External {
                     base_id,
                     uri,
@@ -760,8 +807,35 @@ impl BlobDescriptorArrayBuilder {
     }
 }
 
+pub(crate) fn validate_managed_object(object: &str) -> Result<()> {
+    let path = Path::parse(object)?;
+    if object.is_empty()
+        || path.as_ref() != object
+        || object.starts_with('/')
+        || object.contains(":")
+        || object.split('/').any(|part| part == ".." || part == ".")
+    {
+        return Err(Error::invalid_input(format!(
+            "Invalid managed object path {object:?}"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_blob_descriptor(value: &BlobDescriptor) -> Result<()> {
     match value {
+        BlobDescriptor::Managed {
+            object,
+            offset,
+            size,
+            ..
+        } => {
+            validate_managed_object(object)?;
+            offset
+                .checked_add(*size)
+                .ok_or_else(|| Error::invalid_input("Managed blob range overflows u64"))?;
+            Ok(())
+        }
         BlobDescriptor::Null => Ok(()),
         BlobDescriptor::Inline { .. } => Ok(()),
         BlobDescriptor::Packed {

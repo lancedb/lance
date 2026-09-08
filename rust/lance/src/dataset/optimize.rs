@@ -1521,9 +1521,19 @@ impl BlobV2FieldRewritePlan {
             };
             let output_field = match BlobV2Layout::classify(input_children) {
                 Some(BlobV2Layout::Logical) => Arc::new(input_field.clone()),
-                Some(BlobV2Layout::Descriptor) => {
-                    transformed_arrow_field(field, BLOB_V2_LOGICAL_TYPE.clone())
-                }
+                Some(BlobV2Layout::Descriptor) => transformed_arrow_field(
+                    field,
+                    if field
+                        .metadata
+                        .get("lance:blob-direct-poc")
+                        .map(String::as_str)
+                        == Some("1")
+                    {
+                        lance_core::datatypes::BLOB_V2_PREPARED_TYPE.clone()
+                    } else {
+                        BLOB_V2_LOGICAL_TYPE.clone()
+                    },
+                ),
                 Some(actual) => {
                     return Err(Error::invalid_input(format!(
                         "Blob v2 field '{}' has {actual} input layout; expected logical or descriptor layout during rewrite",
@@ -1636,12 +1646,15 @@ impl BlobV2FieldRewritePlan {
                 Self::Blob {
                     field_id,
                     field_name,
-                    ..
+                    output_field,
                 } => {
                     let struct_arr = array.as_struct();
                     match BlobV2Layout::classify(struct_arr.fields()) {
                         Some(BlobV2Layout::Logical) => Ok(array),
                         Some(BlobV2Layout::Descriptor) => {
+                            if output_field.metadata().get("lance:blob-direct-poc").map(String::as_str) == Some("1") {
+                                return super::blob::preserve_direct_descriptors(dataset, *field_id, struct_arr, &row_addrs, output_field).await;
+                            }
                             let descriptor =
                                 BlobV2Descriptor::try_from_struct(struct_arr, field_name)?;
                             let classification =

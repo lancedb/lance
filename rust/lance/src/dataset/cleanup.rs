@@ -74,6 +74,7 @@ use tracing::{Span, debug, info, instrument, warn};
 #[derive(Clone, Debug, Default)]
 struct ReferencedFiles {
     data_paths: HashSet<Path>,
+    direct_blob_paths: HashSet<Path>,
     delete_paths: HashSet<Path>,
     tx_paths: HashSet<Path>,
     index_uuids: HashSet<String>,
@@ -589,7 +590,29 @@ impl<'a> CleanupTask<'a> {
         let is_latest = self.read_version <= manifest.version;
         let is_tagged = tagged_versions.contains(&manifest.version);
         let in_working_set = is_latest || !self.policy.should_clean(&manifest) || is_tagged;
+        let direct_paths = if manifest.schema.fields_pre_order().any(|field| {
+            field
+                .metadata
+                .get("lance:blob-direct-poc")
+                .map(String::as_str)
+                == Some("1")
+        }) {
+            let version = self.dataset.checkout_version(manifest.version).await?;
+            super::blob::direct_references(&version).await?
+        } else {
+            HashSet::new()
+        };
         let mut inspection = inspection.lock().unwrap();
+        let references = if in_working_set {
+            &mut inspection.referenced_files
+        } else {
+            &mut inspection.verified_files
+        };
+        references.direct_blob_paths.extend(
+            direct_paths
+                .into_iter()
+                .map(|path| remove_prefix(&path, &self.dataset.base)),
+        );
 
         // Track tagged old versions in case we want to return a `CleanupError` later.
         // Only track tagged when it is old.
@@ -965,6 +988,21 @@ impl<'a> CleanupTask<'a> {
                 }
             }
             Some("blob") => {
+                if inspection
+                    .referenced_files
+                    .direct_blob_paths
+                    .contains(&relative_path)
+                {
+                    return Ok(None);
+                }
+                if inspection
+                    .verified_files
+                    .direct_blob_paths
+                    .contains(&relative_path)
+                {
+                    return Ok(cleanup_file(path, CleanupFileKind::Data, false, size_bytes));
+                }
+
                 // Blob v2 sidecar files are keyed by the data file stem:
                 //   data/{data_file_key}/{obfuscated_blob_id:032b}.blob
                 //

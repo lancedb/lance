@@ -437,7 +437,7 @@ fn validate_blob_field(
                         ));
                     }
                 }
-                BlobKind::Inline | BlobKind::External => {}
+                BlobKind::Inline | BlobKind::External | BlobKind::Managed => {}
             }
         }
         return Ok(());

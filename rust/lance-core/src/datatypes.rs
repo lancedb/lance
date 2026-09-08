@@ -593,6 +593,10 @@ pub enum BlobKind {
     /// External blobs can have a position and a size. If the position is not set,
     /// it defaults to 0, which points to the beginning of the blob.
     External = 3,
+    /// Experimental direct managed reference. Requires `lance:blob-direct-poc=1`.
+    /// `blob_id` is the base ID, `blob_uri` is an immutable object path relative
+    /// to its data directory, and `position`/`size` are the exact payload range.
+    Managed = 128,
 }
 
 impl TryFrom<u8> for BlobKind {
@@ -604,6 +608,7 @@ impl TryFrom<u8> for BlobKind {
             1 => Ok(Self::Packed),
             2 => Ok(Self::Dedicated),
             3 => Ok(Self::External),
+            128 => Ok(Self::Managed),
             other => Err(Error::invalid_input_source(
                 format!("Unknown blob kind {other:?}").into(),
             )),
