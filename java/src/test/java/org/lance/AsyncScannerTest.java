@@ -246,7 +246,7 @@ public class AsyncScannerTest {
   }
 
   @Test
-  void testFragmentSliceAsync(@TempDir Path tempDir) throws Exception {
+  void testAsyncScanRespectsFragmentSlice(@TempDir Path tempDir) throws Exception {
     String datasetPath = tempDir.resolve("async_scanner_fragment_slice").toString();
     WriteParams writeParams =
         new WriteParams.Builder()

@@ -7921,7 +7921,7 @@ mod test {
     #[case::without_stable_row_ids(false)]
     #[case::with_stable_row_ids(true)]
     #[tokio::test]
-    async fn physical_row_addr_prefilter_reads_ranges_with_deletions_and_refine(
+    async fn physical_row_selection_intersects_deletions_and_scalar_index(
         #[case] stable_row_ids: bool,
     ) {
         let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, stable_row_ids)
@@ -8045,7 +8045,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn physical_row_addr_prefilter_applies_to_take_shortcut() {
+    async fn take_shortcut_respects_physical_row_selection() {
         let test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
             .await
             .unwrap();
@@ -8064,7 +8064,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn row_addr_prefilter_keeps_released_row_id_semantics() {
+    async fn row_addr_prefilter_preserves_stable_row_id_semantics() {
         let test_ds = TestVectorDataset::new(LanceFileVersion::Stable, true)
             .await
             .unwrap();
