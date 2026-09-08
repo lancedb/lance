@@ -94,9 +94,9 @@ jobs:
           source venv/bin/activate
           pytest --doctest-modules python/lance
 
-  rust-tests:
+  python-rust-test:
     timeout-minutes: 30
-    name: Python Rust tests Linux x86_64
+    name: pylance crate Rust tests
     runs-on: "ubuntu-24.04-4x"
     defaults:
       run:
