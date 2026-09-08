@@ -179,7 +179,10 @@ fn collect_direct_row(
                 direct_base_id(dataset, field.id as u32, row_addr, cols.blob_ids.value(row))?;
             let object = cols.blob_uris.value(row);
             crate::blob::validate_managed_object(object)?;
-            paths.insert(dataset.data_file_dir_for_base(base_id)?.join(object));
+            paths.insert(join_base_and_relative_path(
+                &dataset.data_file_dir_for_base(base_id)?,
+                object,
+            )?);
         }
         return Ok(());
     }
@@ -4820,7 +4823,8 @@ impl<'a> BlobV2ReadContext<'a> {
             columns.blob_ids.value(idx),
         )?;
         let store = self.dataset.object_store(base_id).await?;
-        let path = self.dataset.data_file_dir_for_base(base_id)?.join(object);
+        let path =
+            join_base_and_relative_path(&self.dataset.data_file_dir_for_base(base_id)?, object)?;
         let source = shared_blob_source(&mut self.source_cache, store, &path);
         Ok(BlobFile::with_source(
             source,
