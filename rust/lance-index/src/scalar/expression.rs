@@ -20,7 +20,7 @@ use tokio::try_join;
 
 use super::{
     AnyQuery, BloomFilterQuery, LabelListQuery, MetricsCollector, SargableQuery, ScalarIndex,
-    SearchResult, TextQuery, TokenQuery, label_list::validate_label_list_data_type,
+    SearchOptions, SearchResult, TextQuery, TokenQuery, label_list::validate_label_list_data_type,
 };
 #[cfg(feature = "geo")]
 use super::{GeoQuery, RelationQuery};
@@ -1837,12 +1837,9 @@ impl ScalarIndexExpr {
                 search.exact_sargable_query_key()
             }
             Self::Not(inner) => match inner.as_ref() {
-                Self::Query(search)
-                    if matches!(
-                        search.exact_sargable_query(),
-                        Some(SargableQuery::Equals(value)) if !value.is_null()
-                    ) =>
-                {
+                // `NOT (predicate)` is NULL wherever the predicate is, so it
+                // cannot match a NULL row either, and `IS NOT NULL` adds nothing.
+                Self::Query(search) if search.is_null_intolerant_sargable_query() => {
                     search.exact_sargable_query_key()
                 }
                 _ => None,
@@ -1937,26 +1934,40 @@ impl ScalarIndexExpr {
     ///
     /// TODO: We could potentially try and be smarter about reusing loaded indices for
     /// any situations where the session cache has been disabled.
-    #[async_recursion]
     pub async fn evaluate_nullable(
         &self,
         index_loader: &dyn ScalarIndexLoader,
         metrics: &dyn MetricsCollector,
     ) -> Result<NullableIndexExprResult> {
+        self.evaluate_with_options(index_loader, metrics, true)
+            .await
+    }
+
+    #[async_recursion]
+    async fn evaluate_with_options(
+        &self,
+        index_loader: &dyn ScalarIndexLoader,
+        metrics: &dyn MetricsCollector,
+        track_nulls: bool,
+    ) -> Result<NullableIndexExprResult> {
         match self {
             Self::Not(inner) => {
-                let result = inner.evaluate_nullable(index_loader, metrics).await?;
+                // NOT needs the child's NULL rows to preserve SQL three-valued
+                // logic. Once enabled, keep tracking through the whole subtree.
+                let result = inner
+                    .evaluate_with_options(index_loader, metrics, true)
+                    .await?;
                 Ok(!result)
             }
             Self::And(lhs, rhs) => {
-                let lhs_result = lhs.evaluate_nullable(index_loader, metrics);
-                let rhs_result = rhs.evaluate_nullable(index_loader, metrics);
+                let lhs_result = lhs.evaluate_with_options(index_loader, metrics, track_nulls);
+                let rhs_result = rhs.evaluate_with_options(index_loader, metrics, track_nulls);
                 let (lhs_result, rhs_result) = try_join!(lhs_result, rhs_result)?;
                 Ok(lhs_result & rhs_result)
             }
             Self::Or(lhs, rhs) => {
-                let lhs_result = lhs.evaluate_nullable(index_loader, metrics);
-                let rhs_result = rhs.evaluate_nullable(index_loader, metrics);
+                let lhs_result = lhs.evaluate_with_options(index_loader, metrics, track_nulls);
+                let rhs_result = rhs.evaluate_with_options(index_loader, metrics, track_nulls);
                 let (lhs_result, rhs_result) = try_join!(lhs_result, rhs_result)?;
                 Ok(lhs_result | rhs_result)
             }
@@ -1964,7 +1975,13 @@ impl ScalarIndexExpr {
                 let index = index_loader
                     .load_index(&search.column, &search.index_name, metrics)
                     .await?;
-                let search_result = index.search(search.query.as_ref(), metrics).await?;
+                let search_result = index
+                    .search_with_options(
+                        search.query.as_ref(),
+                        SearchOptions::default().with_track_nulls(track_nulls),
+                        metrics,
+                    )
+                    .await?;
                 let result = search_result_to_nullable(search_result);
                 if index.results_are_row_addresses() {
                     // Translate address-domain results to the row-id domain
@@ -1985,7 +2002,7 @@ impl ScalarIndexExpr {
         metrics: &dyn MetricsCollector,
     ) -> Result<IndexExprResult> {
         Ok(self
-            .evaluate_nullable(index_loader, metrics)
+            .evaluate_with_options(index_loader, metrics, false)
             .await?
             .drop_nulls())
     }
@@ -5027,6 +5044,25 @@ mod tests {
                 if matches!(inner.as_ref(), ScalarIndexExpr::Query(search)
                     if matches!(search.sargable_query(), Some(SargableQuery::Equals(value))
                         if *value == ScalarValue::Int64(Some(5))))
+        ));
+    }
+
+    #[test]
+    fn test_optimize_parser_removes_is_not_null_from_not_in_list() {
+        let index_info = int64_index_info("BTree", false);
+
+        // The signed-zero rewrite turns `x != 0.0` into this shape, and it is just
+        // as null-intolerant as `x != 5`.
+        let leaves =
+            optimize_parsed_scalar_filter("x IS NOT NULL AND x NOT IN (1, 2)", &index_info);
+
+        assert_eq!(leaves.len(), 1);
+        assert!(matches!(
+            &leaves[0],
+            ScalarIndexExpr::Not(inner)
+                if matches!(inner.as_ref(), ScalarIndexExpr::Query(search)
+                    if matches!(search.sargable_query(), Some(SargableQuery::IsIn(values))
+                        if values.len() == 2))
         ));
     }
 
