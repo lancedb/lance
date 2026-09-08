@@ -32,6 +32,141 @@ message UUID {
   bytes uuid = 1;
 }
 
+// How this snapshot stores fragment records. Empty or unknown layouts are invalid.
+message FragmentMetadata {
+  oneof layout {
+    FragmentMetadataTree tree = 1;
+  }
+}
+
+/* An inline root lives in the Version Manifest. An external root is a checkpoint
+ * object, and suffix is the changes since that checkpoint. Open a named snapshot
+ * from this descriptor plus at most that one root.
+ */
+message FragmentMetadataTree {
+  oneof base {
+    FragmentMetadataRoot inline_root = 1;
+    string root_path = 2;
+  }
+  repeated FragmentMetadataMutation suffix = 3;
+  /* Next action sequence for this snapshot. At least the selected root's
+   * next_action_sequence. Suffix mutations use sequences in
+   * [root.next_action_sequence, next_action_sequence).
+   */
+  uint64 next_action_sequence = 4;
+  // After the base and suffix. visible_rows cannot exceed total_rows.
+  uint64 total_fragments = 6;
+  uint64 total_rows = 7;
+  uint64 visible_rows = 8;
+}
+
+// Checkpoint of the tree. Child counts plus this node's buffer.
+message FragmentMetadataRoot {
+  // Version that wrote this object.
+  uint64 version = 1;
+  repeated FragmentMetadataChild children = 2;
+  repeated FragmentMetadataMutation buffer = 3;
+  /* Next action sequence after this root. At least 1. All buffered mutations
+   * and leaf watermarks reachable from this root are below this value.
+   */
+  uint64 next_action_sequence = 4;
+  // Reader-enforced maximum encoded size of this root and any reachable node or leaf.
+  uint64 hard_capacity_bytes = 9;
+}
+
+/* Children are ordered by min_key. Each min_key is the inclusive lower bound
+ * of that child's range, and the next sibling's min_key is the exclusive upper
+ * bound. The first child's min_key equals the containing node's lower bound,
+ * which is 0 at the root. max_key is a summary only.
+ */
+message FragmentMetadataChild {
+  // Child object path, relative to the dataset.
+  string node_path = 1;
+  uint64 min_key = 2;
+  uint64 max_key = 3;
+  // Fragments in this subtree, including its own buffer.
+  uint64 num_keys = 4;
+  // Fragment protobuf bytes for a leaf. Encoded body for an interior.
+  uint64 byte_size = 5;
+  // 0 for a leaf. An interior is one taller than its children.
+  uint32 height = 6;
+  uint32 num_children = 7;
+  uint64 total_rows = 8;
+  // Encoded size of the child object. Used to split leaves.
+  uint64 object_size = 9;
+  /* Leaf materialization watermark. Every mutation for this leaf's range with
+   * action_sequence at or below this value has been applied with no gaps.
+   * 0 means none. Must be 0 on interiors.
+   */
+  uint64 materialized_through_action_sequence = 10;
+  uint64 visible_rows = 11;
+}
+
+// Routing node on disk. Each buffered mutation maps to one child range.
+message FragmentMetadataNode {
+  repeated FragmentMetadataChild children = 1;
+  repeated FragmentMetadataMutation buffer = 2;
+}
+
+/* A validated fragment metadata mutation. action_sequence is nonzero and
+ * unique within the tree. Count deltas are the exact before and after change
+ * for the target fragment.
+ */
+message FragmentMetadataMutation {
+  uint64 action_sequence = 1;
+  FragmentAction action = 2;
+  sint64 fragment_count_delta = 3;
+  sint64 total_rows_delta = 4;
+  sint64 visible_rows_delta = 5;
+}
+
+/* Applying these must match the native transaction, including file order and
+ * overlays. Use add_fragment when the compact actions cannot say that result.
+ */
+message FragmentAction {
+  oneof action {
+    // Replace whatever is at this fragment id.
+    DataFragment add_fragment = 1;
+    uint64 remove_fragment = 2;
+    AddDataFile add_data_file = 3;
+    RemoveDataFile remove_data_file = 4;
+    AddDeletionFile add_deletion_file = 5;
+    ClearDeletionFile clear_deletion_file = 6;
+    ReplaceDataFile replace_data_file = 7;
+  }
+}
+
+// Append onto the fragment's file list.
+message AddDataFile {
+  uint64 frag_id = 1;
+  DataFile file = 2;
+}
+
+// Drop every matching path. Keep the remaining files in order.
+message RemoveDataFile {
+  uint64 frag_id = 1;
+  string path = 2;
+}
+
+// Deletion file with a known deleted-row count.
+message AddDeletionFile {
+  uint64 frag_id = 1;
+  DeletionFile deletion_file = 2;
+}
+
+message ClearDeletionFile {
+  uint64 frag_id = 1;
+}
+
+/* Change path, file_size_bytes, and base_id on the first expected_path match.
+ * Keep that file's column mapping and file version. A missing match is invalid.
+ */
+message ReplaceDataFile {
+  uint64 frag_id = 1;
+  DataFile file = 2;
+  string expected_path = 3;
+}
+
 // Manifest is a global section shared between all the files.
 message Manifest {
   // All fields of the dataset, including the nested fields.
@@ -42,6 +177,11 @@ message Manifest {
 
   // Fragments of the dataset.
   repeated DataFragment fragments = 2;
+
+  /* Tree tables set this, leave fragments empty, and set bit 9 on both flag
+   * fields. Old readers skip unknown fields and would otherwise see an empty table.
+   */
+  FragmentMetadata fragment_metadata = 22;
 
   // Snapshot version number.
   uint64 version = 3;
@@ -133,6 +273,8 @@ message Manifest {
    * * 1 << 8: reserved for datasets that may reference recognized V2 data files
    *   with different exact versions. Implementations that do not support the
    *   per-file exact-version contract must treat this bit as unknown.
+   * * 1 << 9: fragment records live in fragment_metadata. The fragments list
+   *   must be empty. Readers that do not know this bit must refuse the dataset.
    */
   uint64 reader_feature_flags = 9;
 
@@ -153,6 +295,9 @@ message Manifest {
    * have been used in previous versions.
    *
    * For a single fragment, will be zero. For no fragments, will be absent.
+   *
+   * This is the authoritative fragment-id allocation high-water mark for both
+   * flat and fragment metadata tree layouts, reservations included.
    */
   optional uint32 max_fragment_id = 11;
 

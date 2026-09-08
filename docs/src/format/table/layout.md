@@ -35,6 +35,8 @@ A Lance dataset in its basic form stores all files within the dataset root direc
             *.json        -- Tag metadata
         branches/
             *.json        -- Branch metadata
+    _bt/
+        ...               -- Fragment metadata tree objects (see Fragment Metadata Tree)
     tree/
         {branch_name}/
             ...           -- Branch dataset
