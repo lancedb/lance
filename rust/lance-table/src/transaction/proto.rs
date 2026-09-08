@@ -381,27 +381,12 @@ impl TryFrom<pb::Transaction> for Transaction {
                     .collect::<Result<Vec<_>>>()?,
             },
             Some(pb::transaction::Operation::UpdateMemWalState(
-                pb::transaction::UpdateMemWalState {
-                    compacted_sstables,
-                    require_index_catchup,
-                },
+                pb::transaction::UpdateMemWalState { compacted_sstables },
             )) => Operation::UpdateMemWalState {
                 compacted_sstables: compacted_sstables
                     .into_iter()
                     .map(CompactedSsTable::try_from)
                     .collect::<Result<_>>()?,
-                // Absent is an ordinary progress update. Explicit `false` is
-                // refused rather than read as absent, so a caller cannot express
-                // "deactivate" -- the migration is one-way.
-                require_index_catchup: match require_index_catchup {
-                    Some(false) => {
-                        return Err(Error::invalid_input(
-                            "require_index_catchup cannot be false: MemWAL index catch-up \
-                             cannot stop being required once it is",
-                        ));
-                    }
-                    other => other.unwrap_or(false),
-                },
             },
             Some(pb::transaction::Operation::UpdateBases(pb::transaction::UpdateBases {
                 new_bases,
@@ -704,18 +689,12 @@ impl From<&Transaction> for pb::Transaction {
                         .collect(),
                 })
             }
-            Operation::UpdateMemWalState {
-                compacted_sstables,
-                require_index_catchup,
-            } => {
+            Operation::UpdateMemWalState { compacted_sstables } => {
                 pb::transaction::Operation::UpdateMemWalState(pb::transaction::UpdateMemWalState {
                     compacted_sstables: compacted_sstables
                         .iter()
                         .map(pb::CompactedSsTable::from)
                         .collect::<Vec<_>>(),
-                    // Written only when requesting activation, so an ordinary
-                    // progress update stays byte-identical to before.
-                    require_index_catchup: require_index_catchup.then_some(true),
                 })
             }
             Operation::UpdateBases { new_bases } => {

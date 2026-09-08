@@ -386,7 +386,7 @@ class LanceFragment(pa.dataset.Fragment):
         data: ReaderLike,
         fragment_id: Optional[int] = None,
         schema: Optional[pa.Schema] = None,
-        max_rows_per_group: int = 1024,
+        max_rows_per_group: Optional[int] = 1024,
         progress: Optional[FragmentWriteProgress] = None,
         mode: str = "append",
         *,
@@ -416,8 +416,9 @@ class LanceFragment(pa.dataset.Fragment):
         schema: pa.Schema, optional
             The schema of the data. If not specified, the schema will be inferred
             from the data.
-        max_rows_per_group: int, default 1024
-            The maximum number of rows per group in the data file.
+        max_rows_per_group: int, optional, default 1024
+            The maximum number of rows per group in the data file. ``None``
+            leaves the writer default in place.
         progress: FragmentWriteProgress, optional
             *Experimental API*. Progress tracking for writing the fragment. Pass
             a custom class that defines hooks to be called when each fragment is
@@ -569,6 +570,12 @@ class LanceFragment(pa.dataset.Fragment):
             Literal["all_binary", "blobs_descriptions", "all_descriptions"]
         ] = None,
         order_by: Optional[List[ColumnOrdering]] = None,
+        use_scalar_index: Optional[bool] = None,
+        io_buffer_size: Optional[int] = None,
+        late_materialization: Optional[bool | List[str]] = None,
+        include_deleted_rows: Optional[bool] = None,
+        batch_size_bytes: Optional[int] = None,
+        strict_batch_size: Optional[bool] = None,
     ) -> "LanceScanner":
         """See Dataset::scanner for details"""
         filter_str = str(filter) if filter is not None else None
@@ -590,6 +597,12 @@ class LanceFragment(pa.dataset.Fragment):
             batch_readahead=batch_readahead,
             blob_handling=blob_handling,
             order_by=order_by,
+            use_scalar_index=use_scalar_index,
+            io_buffer_size=io_buffer_size,
+            late_materialization=late_materialization,
+            include_deleted_rows=include_deleted_rows,
+            batch_size_bytes=batch_size_bytes,
+            strict_batch_size=strict_batch_size,
             **columns_arg,
         )
         from .dataset import LanceScanner
@@ -600,7 +613,7 @@ class LanceFragment(pa.dataset.Fragment):
             "_search_filter": None,
             "_substrait_filter": None,
             "_prefilter": False,
-            "_late_materialization": None,
+            "_late_materialization": late_materialization,
             "_blob_handling": blob_handling,
             "_offset": offset,
             "_columns": tuple(columns) if isinstance(columns, list) else None,
@@ -609,7 +622,8 @@ class LanceFragment(pa.dataset.Fragment):
             ),
             "_nearest": None,
             "_batch_size": batch_size,
-            "_io_buffer_size": None,
+            "_batch_size_bytes": batch_size_bytes,
+            "_io_buffer_size": io_buffer_size,
             "_batch_readahead": batch_readahead,
             "_fragment_readahead": None,
             "_scan_in_order": True,
@@ -619,10 +633,12 @@ class LanceFragment(pa.dataset.Fragment):
             "_use_stats": True,
             "_fast_search": False,
             "_full_text_query": None,
-            "_use_scalar_index": None,
-            "_include_deleted_rows": None,
+            "_use_scalar_index": use_scalar_index,
+            "_include_deleted_rows": include_deleted_rows,
             "_scan_stats_callback": None,
-            "_strict_batch_size": False,
+            "_strict_batch_size": (
+                strict_batch_size if strict_batch_size is not None else False
+            ),
             "_orderings": tuple(order_by) if order_by is not None else None,
             "_disable_scoring_autoprojection": False,
             "_substrait_aggregate": None,
@@ -673,6 +689,12 @@ class LanceFragment(pa.dataset.Fragment):
             Literal["all_binary", "blobs_descriptions", "all_descriptions"]
         ] = None,
         order_by: Optional[List[ColumnOrdering]] = None,
+        use_scalar_index: Optional[bool] = None,
+        io_buffer_size: Optional[int] = None,
+        late_materialization: Optional[bool | List[str]] = None,
+        include_deleted_rows: Optional[bool] = None,
+        batch_size_bytes: Optional[int] = None,
+        strict_batch_size: Optional[bool] = None,
     ) -> Iterator[pa.RecordBatch]:
         return self.scanner(
             columns=columns,
@@ -685,6 +707,12 @@ class LanceFragment(pa.dataset.Fragment):
             batch_readahead=batch_readahead,
             blob_handling=blob_handling,
             order_by=order_by,
+            use_scalar_index=use_scalar_index,
+            io_buffer_size=io_buffer_size,
+            late_materialization=late_materialization,
+            include_deleted_rows=include_deleted_rows,
+            batch_size_bytes=batch_size_bytes,
+            strict_batch_size=strict_batch_size,
         ).to_batches()
 
     def to_table(
@@ -699,6 +727,12 @@ class LanceFragment(pa.dataset.Fragment):
             Literal["all_binary", "blobs_descriptions", "all_descriptions"]
         ] = None,
         order_by: Optional[List[ColumnOrdering]] = None,
+        use_scalar_index: Optional[bool] = None,
+        io_buffer_size: Optional[int] = None,
+        late_materialization: Optional[bool | List[str]] = None,
+        include_deleted_rows: Optional[bool] = None,
+        batch_size_bytes: Optional[int] = None,
+        strict_batch_size: Optional[bool] = None,
     ) -> pa.Table:
         return self.scanner(
             columns=columns,
@@ -709,6 +743,12 @@ class LanceFragment(pa.dataset.Fragment):
             with_row_address=with_row_address,
             blob_handling=blob_handling,
             order_by=order_by,
+            use_scalar_index=use_scalar_index,
+            io_buffer_size=io_buffer_size,
+            late_materialization=late_materialization,
+            include_deleted_rows=include_deleted_rows,
+            batch_size_bytes=batch_size_bytes,
+            strict_batch_size=strict_batch_size,
         ).to_table()
 
     def to_pandas(
@@ -1051,12 +1091,12 @@ class LanceFragment(pa.dataset.Fragment):
 
         return self._fragment.schema()
 
-    def data_files(self):
+    def data_files(self) -> List[DataFile]:
         """Return the data files of this fragment."""
 
         return self._fragment.data_files()
 
-    def deletion_file(self):
+    def deletion_file(self) -> Optional[str]:
         """Return the deletion file, if any"""
         return self._fragment.deletion_file()
 
@@ -1082,7 +1122,7 @@ if TYPE_CHECKING:
         return_transaction: Literal[True],
         mode: str = "append",
         max_rows_per_file: int = 1024 * 1024,
-        max_rows_per_group: int = 1024,
+        max_rows_per_group: Optional[int] = 1024,
         max_bytes_per_file: int = DEFAULT_MAX_BYTES_PER_FILE,
         progress: Optional[FragmentWriteProgress] = None,
         data_storage_version: Optional[str] = None,
@@ -1109,7 +1149,7 @@ if TYPE_CHECKING:
         return_transaction: Literal[False] = False,
         mode: str = "append",
         max_rows_per_file: int = 1024 * 1024,
-        max_rows_per_group: int = 1024,
+        max_rows_per_group: Optional[int] = 1024,
         max_bytes_per_file: int = DEFAULT_MAX_BYTES_PER_FILE,
         progress: Optional[FragmentWriteProgress] = None,
         data_storage_version: Optional[str] = None,
@@ -1136,7 +1176,7 @@ def write_fragments(
     return_transaction: bool = False,
     mode: str = "append",
     max_rows_per_file: int = 1024 * 1024,
-    max_rows_per_group: int = 1024,
+    max_rows_per_group: Optional[int] = 1024,
     max_bytes_per_file: int = DEFAULT_MAX_BYTES_PER_FILE,
     progress: Optional[FragmentWriteProgress] = None,
     data_storage_version: Optional[str] = None,
@@ -1178,8 +1218,9 @@ def write_fragments(
         "overwrite" to assign new field ids to the schema.
     max_rows_per_file : int, default 1024 * 1024
         The maximum number of rows per data file.
-    max_rows_per_group : int, default 1024
-        The maximum number of rows per group in the data file.
+    max_rows_per_group : int, optional, default 1024
+        The maximum number of rows per group in the data file. ``None`` leaves
+        the writer default in place.
     max_bytes_per_file : int, default 90 * 1024 * 1024 * 1024
         The max number of bytes to write before starting a new file. This is a
         soft limit. This limit is checked after each group is written, which

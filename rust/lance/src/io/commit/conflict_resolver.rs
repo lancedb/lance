@@ -72,6 +72,27 @@ fn supplies_values(operation: &Operation) -> bool {
     )
 }
 
+/// Whether an operation changes schema-level or per-field metadata. A merge
+/// carries the complete schema from its read version, so rebasing either
+/// operation over the other can discard one side's metadata changes.
+fn updates_schema_or_field_metadata(operation: &Operation) -> bool {
+    let Operation::UpdateConfig {
+        schema_metadata_updates,
+        field_metadata_updates,
+        ..
+    } = operation
+    else {
+        return false;
+    };
+
+    schema_metadata_updates
+        .as_ref()
+        .is_some_and(|update| update.replace || !update.update_entries.is_empty())
+        || field_metadata_updates
+            .values()
+            .any(|update| update.replace || !update.update_entries.is_empty())
+}
+
 impl<'a> TransactionRebase<'a> {
     pub async fn try_new(
         dataset: &Dataset,
@@ -129,7 +150,7 @@ impl<'a> TransactionRebase<'a> {
 
                 let initial_fragments =
                     initial_fragments_for_rebase(dataset, &transaction, &modified_fragment_ids)
-                        .await;
+                        .await?;
                 Ok(Self {
                     transaction,
                     affected_rows,
@@ -147,7 +168,7 @@ impl<'a> TransactionRebase<'a> {
 
                 let initial_fragments =
                     initial_fragments_for_rebase(dataset, &transaction, &modified_fragment_ids)
-                        .await;
+                        .await?;
                 Ok(Self {
                     transaction,
                     affected_rows,
@@ -162,7 +183,7 @@ impl<'a> TransactionRebase<'a> {
                     replacements.iter().map(|r| r.0).collect::<HashSet<_>>();
                 let initial_fragments =
                     initial_fragments_for_rebase(dataset, &transaction, &modified_fragment_ids)
-                        .await;
+                        .await?;
                 Ok(Self {
                     transaction,
                     affected_rows,
@@ -177,7 +198,7 @@ impl<'a> TransactionRebase<'a> {
                     groups.iter().map(|g| g.fragment_id).collect::<HashSet<_>>();
                 let initial_fragments =
                     initial_fragments_for_rebase(dataset, &transaction, &modified_fragment_ids)
-                        .await;
+                        .await?;
                 Ok(Self {
                     transaction,
                     affected_rows,
@@ -191,7 +212,7 @@ impl<'a> TransactionRebase<'a> {
                 let modified_fragment_ids = fragments.iter().map(|f| f.id).collect::<HashSet<_>>();
                 let initial_fragments =
                     initial_fragments_for_rebase(dataset, &transaction, &modified_fragment_ids)
-                        .await;
+                        .await?;
                 Ok(Self {
                     transaction,
                     affected_rows,
@@ -276,6 +297,14 @@ impl<'a> TransactionRebase<'a> {
         let theirs = &other_transaction.operation;
         if (may_alter_nullability(ours) && supplies_values(theirs))
             || (supplies_values(ours) && may_alter_nullability(theirs))
+        {
+            return Err(self.retryable_conflict_err(other_transaction, other_version));
+        }
+        // Merge carries a complete schema from its read version. In either
+        // commit order, rebasing it with a metadata update can keep one side's
+        // schema while discarding metadata from the other side.
+        if (matches!(ours, Operation::Merge { .. }) && updates_schema_or_field_metadata(theirs))
+            || (updates_schema_or_field_metadata(ours) && matches!(theirs, Operation::Merge { .. }))
         {
             return Err(self.retryable_conflict_err(other_transaction, other_version));
         }
@@ -431,6 +460,8 @@ impl<'a> TransactionRebase<'a> {
             compacted_sstables: self_compacted_sstables,
             new_fragments: self_new_fragments,
             update_mode: self_update_mode,
+            updated_fragments: self_updated_fragments,
+            fields_modified: self_fields_modified,
             ..
         } = &self.transaction.operation
         {
@@ -487,13 +518,43 @@ impl<'a> TransactionRebase<'a> {
                 Operation::DataOverlay { groups } => {
                     // Our update recomputed rows from the pre-overlay base, so if
                     // it commits over an overlay it would silently undo the
-                    // overlay's values for any cell it recomputed. A row-moving
-                    // update (RewriteRows) relocates the rows it touches out to
-                    // new fragments; only the rows it actually moved lose their
-                    // overlay, so we conflict only when the moved rows intersect
-                    // the overlay's coverage. An in-place column rewrite
-                    // (RewriteColumns) preserves offsets and just tombstones the
-                    // overlaid fields at build time, so it never conflicts.
+                    // overlay's values for any cell it recomputed.
+                    //
+                    // An in-place column rewrite (RewriteColumns) writes a
+                    // replacement file covering *every* row of each fragment it
+                    // touches, filled from the snapshot it read. `build_manifest`
+                    // then tombstones every overlay for the fields it rewrote, so
+                    // an overlay value on a row this update never matched is
+                    // dropped and the stale copied value becomes visible. Retry
+                    // whenever the overlay touches a fragment we rewrote and a
+                    // field we rewrote; the retry re-reads the overlaid values.
+                    if matches!(self_update_mode, Some(UpdateMode::RewriteColumns)) {
+                        let rewritten: HashSet<u64> = self_updated_fragments
+                            .iter()
+                            .map(|fragment| fragment.id)
+                            .collect();
+                        for group in groups {
+                            if !rewritten.contains(&group.fragment_id) {
+                                continue;
+                            }
+                            let overlaps_rewritten_field = group.overlays.iter().any(|overlay| {
+                                overlay.data_file.fields.iter().any(|&field| {
+                                    field >= 0 && self_fields_modified.contains(&(field as u32))
+                                })
+                            });
+                            if overlaps_rewritten_field {
+                                return Err(
+                                    self.retryable_conflict_err(other_transaction, other_version)
+                                );
+                            }
+                        }
+                        return Ok(());
+                    }
+
+                    // A row-moving update (RewriteRows) relocates the rows it
+                    // touches out to new fragments; only the rows it actually
+                    // moved lose their overlay, so we conflict only when the
+                    // moved rows intersect the overlay's coverage.
                     let moves_rows = !self_new_fragments.is_empty()
                         && matches!(self_update_mode, Some(UpdateMode::RewriteRows) | None);
                     if !moves_rows {
@@ -650,7 +711,7 @@ impl<'a> TransactionRebase<'a> {
                 | Operation::UpdateBases { .. } => Ok(()),
                 Operation::CreateIndex {
                     new_indices: created_indices,
-                    ..
+                    removed_indices: committed_removed_indices,
                 } => {
                     let self_has_frag_reuse = new_indices
                         .iter()
@@ -673,10 +734,49 @@ impl<'a> TransactionRebase<'a> {
                                 .iter()
                                 .any(|created_index| created_index.name == new_index.name)
                         });
+                    // An appended segment has no removed source UUID to identify the
+                    // logical index it extends, so a concurrent same-name removal
+                    // must conflict. Replacement-style maintenance is handled by
+                    // exact source identity below, allowing disjoint segment changes
+                    // under the same logical name to merge.
+                    let has_append_drop_conflict = new_indices.iter().any(|new_index| {
+                        !removed_indices
+                            .iter()
+                            .any(|removed_index| removed_index.name == new_index.name)
+                            && committed_removed_indices
+                                .iter()
+                                .any(|removed_index| removed_index.name == new_index.name)
+                    }) || created_indices.iter().any(|created_index| {
+                        !committed_removed_indices
+                            .iter()
+                            .any(|removed_index| removed_index.name == created_index.name)
+                            && removed_indices
+                                .iter()
+                                .any(|removed_index| removed_index.name == created_index.name)
+                    });
+                    // Replacement metadata depends on the exact source segments it
+                    // was built from. If either side removed the same UUID, publishing
+                    // a replacement would undo a drop or use a stale source identity.
+                    // Concurrent pure removals remain idempotent.
+                    let has_replaced_identity_conflict =
+                        removed_indices.iter().any(|removed_index| {
+                            committed_removed_indices.iter().any(|committed_removed| {
+                                committed_removed.uuid == removed_index.uuid
+                                    && (new_indices.iter().any(|new_index| {
+                                        new_index.name == removed_index.name
+                                            || new_index.name == committed_removed.name
+                                    }) || created_indices.iter().any(|created_index| {
+                                        created_index.name == removed_index.name
+                                            || created_index.name == committed_removed.name
+                                    }))
+                            })
+                        });
 
                     if (self_has_frag_reuse && other_has_frag_reuse)
                         || (self_has_mem_wal && other_has_mem_wal)
                         || has_regular_name_conflict
+                        || has_append_drop_conflict
+                        || has_replaced_identity_conflict
                     {
                         Err(self.retryable_conflict_err(other_transaction, other_version))
                     } else {
@@ -787,15 +887,16 @@ impl<'a> TransactionRebase<'a> {
                 }
                 Operation::UpdateConfig { .. } => Ok(()),
                 Operation::DataReplacement { replacements } => {
-                    // A data replacement only conflicts if it is updating the field that
-                    // is being indexed.
-                    let newly_indexed_fields = new_indices
+                    // A data replacement only conflicts if it is updating a field the
+                    // index depends on -- whether keyed on or merely carried, since
+                    // `fields` lists both (see `IndexMetadata::covering_fields`).
+                    let newly_depended_fields = new_indices
                         .iter()
                         .flat_map(|idx| idx.fields.iter())
                         .collect::<HashSet<_>>();
                     for replacement in replacements {
                         for field in replacement.1.fields.iter() {
-                            if newly_indexed_fields.contains(&field) {
+                            if newly_depended_fields.contains(&field) {
                                 return Err(
                                     self.retryable_conflict_err(other_transaction, other_version)
                                 );
@@ -1198,20 +1299,21 @@ impl<'a> TransactionRebase<'a> {
                     Ok(())
                 }
                 Operation::CreateIndex { new_indices, .. } => {
-                    // A data replacement only conflicts if it is updating the field that
-                    // is being indexed.
+                    // A data replacement only conflicts if it is updating a field the
+                    // index depends on -- whether keyed on or merely carried, since
+                    // `fields` lists both (see `IndexMetadata::covering_fields`).
                     //
                     // TODO: We could potentially just drop the fragments being replaced from
                     // the index's fragment bitmap, which would lead to fewer conflicts.  However
                     // this would introduce fragment bitmaps with holes which may not be well tested
                     // yet.  For now, we don't allow this case.
-                    let newly_indexed_fields = new_indices
+                    let newly_depended_fields = new_indices
                         .iter()
                         .flat_map(|idx| idx.fields.iter())
                         .collect::<HashSet<_>>();
                     for replacement in replacements {
                         for field in replacement.1.fields.iter() {
-                            if newly_indexed_fields.contains(&field) {
+                            if newly_depended_fields.contains(&field) {
                                 return Err(
                                     self.retryable_conflict_err(other_transaction, other_version)
                                 );
@@ -2177,23 +2279,22 @@ async fn initial_fragments_for_rebase(
     dataset: &Dataset,
     transaction: &Transaction,
     modified_fragment_ids: &HashSet<u64>,
-) -> HashMap<u64, (Fragment, bool)> {
+) -> Result<HashMap<u64, (Fragment, bool)>> {
     if modified_fragment_ids.is_empty() {
-        return HashMap::new();
+        return Ok(HashMap::new());
     }
 
     let dataset = if dataset.manifest.version != transaction.read_version {
-        Cow::Owned(
-            dataset
-                .checkout_version(transaction.read_version)
-                .await
-                .unwrap(),
-        )
+        // The read version may have been garbage-collected by a concurrent
+        // `cleanup_old_versions` between the commit attempt and the rebase.
+        // Propagate the error so the commit fails gracefully instead of
+        // panicking (which aborts the whole process when `panic = "abort"`).
+        Cow::Owned(dataset.checkout_version(transaction.read_version).await?)
     } else {
         Cow::Borrowed(dataset)
     };
 
-    dataset
+    Ok(dataset
         .fragments()
         .iter()
         .filter(|fragment| {
@@ -2201,7 +2302,7 @@ async fn initial_fragments_for_rebase(
             modified_fragment_ids.contains(&fragment.id)
         })
         .map(|fragment| (fragment.id, (fragment.clone(), false)))
-        .collect::<HashMap<_, _>>()
+        .collect())
 }
 
 /// Read a fragment's deletion vector as a bitmap of physical offsets, or an
@@ -2258,7 +2359,7 @@ mod tests {
     use lance_table::io::deletion::{deletion_file_path, read_deletion_file};
 
     use super::*;
-    use crate::dataset::transaction::{DataReplacementGroup, RewriteGroup};
+    use crate::dataset::transaction::{DataReplacementGroup, RewriteGroup, UpdateMap};
     use crate::dataset::write::WriteMode;
     use crate::session::caches::DeletionFileKey;
     use crate::{
@@ -2340,6 +2441,149 @@ mod tests {
         }
     }
 
+    #[rstest::rstest]
+    #[case::config(false)]
+    #[case::table_metadata(true)]
+    #[tokio::test]
+    async fn test_merge_preserves_unrelated_update_config_compatibility(
+        #[case] update_table_metadata: bool,
+        #[values(true, false)] merge_commits_first: bool,
+    ) {
+        let dataset = Arc::new(test_dataset(5, 1).await);
+        let read_version = dataset.manifest.version;
+
+        let mut merged_schema = dataset.schema().clone();
+        merged_schema
+            .metadata
+            .insert("merge.schema".to_string(), "preserved".to_string());
+        let field_id = merged_schema.fields[0].id;
+        merged_schema.fields[0]
+            .metadata
+            .insert("merge.field".to_string(), "preserved".to_string());
+        let merge = Transaction::new_from_version(
+            read_version,
+            Operation::Merge {
+                fragments: dataset.manifest.fragments.as_ref().clone(),
+                schema: merged_schema,
+                preserves_nullability: true,
+            },
+        );
+
+        let replacement = UpdateMap {
+            update_entries: vec![("key", Some("value")).into()],
+            replace: true,
+        };
+        let update_config = Transaction::new_from_version(
+            read_version,
+            Operation::UpdateConfig {
+                config_updates: (!update_table_metadata).then_some(replacement.clone()),
+                table_metadata_updates: update_table_metadata.then_some(replacement),
+                schema_metadata_updates: None,
+                field_metadata_updates: HashMap::new(),
+            },
+        );
+
+        let (first, stale) = if merge_commits_first {
+            (merge, update_config)
+        } else {
+            (update_config, merge)
+        };
+        CommitBuilder::new(dataset.clone())
+            .execute(first)
+            .await
+            .unwrap();
+        let latest_dataset = CommitBuilder::new(dataset).execute(stale).await.unwrap();
+
+        assert_eq!(
+            latest_dataset
+                .schema()
+                .metadata
+                .get("merge.schema")
+                .map(String::as_str),
+            Some("preserved")
+        );
+        assert_eq!(
+            latest_dataset
+                .schema()
+                .field_by_id(field_id)
+                .unwrap()
+                .metadata
+                .get("merge.field")
+                .map(String::as_str),
+            Some("preserved")
+        );
+        let updated_map = if update_table_metadata {
+            &latest_dataset.manifest.table_metadata
+        } else {
+            &latest_dataset.manifest.config
+        };
+        assert_eq!(updated_map.get("key").map(String::as_str), Some("value"));
+    }
+
+    #[rstest::rstest]
+    #[case::schema_metadata(true)]
+    #[case::field_metadata(false)]
+    #[tokio::test]
+    async fn test_concurrent_merge_and_metadata_update_conflict(
+        #[case] replace_schema_metadata: bool,
+        #[values(true, false)] replace: bool,
+        #[values(true, false)] merge_commits_first: bool,
+    ) {
+        let dataset = Arc::new(test_dataset(5, 1).await);
+        let read_version = dataset.manifest.version;
+
+        let mut merged_schema = dataset.schema().clone();
+        merged_schema
+            .metadata
+            .insert("merge.schema".to_string(), "coordinated".to_string());
+        let field_id = merged_schema.fields[0].id;
+        merged_schema.fields[0]
+            .metadata
+            .insert("merge.field".to_string(), "coordinated".to_string());
+        let merge = Transaction::new_from_version(
+            read_version,
+            Operation::Merge {
+                fragments: dataset.manifest.fragments.as_ref().clone(),
+                schema: merged_schema,
+                preserves_nullability: true,
+            },
+        );
+
+        let metadata_update = UpdateMap {
+            update_entries: vec![("replacement", Some("coordinated")).into()],
+            replace,
+        };
+        let update_config = Transaction::new_from_version(
+            read_version,
+            Operation::UpdateConfig {
+                config_updates: None,
+                table_metadata_updates: None,
+                schema_metadata_updates: replace_schema_metadata.then_some(metadata_update.clone()),
+                field_metadata_updates: if replace_schema_metadata {
+                    HashMap::new()
+                } else {
+                    HashMap::from_iter([(field_id, metadata_update)])
+                },
+            },
+        );
+
+        let (first, stale) = if merge_commits_first {
+            (merge, update_config)
+        } else {
+            (update_config, merge)
+        };
+        CommitBuilder::new(dataset.clone())
+            .execute(first)
+            .await
+            .unwrap();
+        let error = CommitBuilder::new(dataset)
+            .execute(stale)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, Error::RetryableCommitConflict { .. }));
+    }
+
     #[tokio::test]
     async fn test_non_overlapping_rebase_delete_update() {
         let dataset = test_dataset(5, 5).await;
@@ -2411,6 +2655,78 @@ mod tests {
         let io_stats = dataset.object_store.as_ref().io_stats_incremental();
         assert_io_eq!(io_stats, read_iops, 0);
         assert_io_eq!(io_stats, write_iops, 0);
+    }
+
+    #[tokio::test]
+    async fn test_rebase_errors_when_read_version_was_cleaned_up() {
+        // Regression test: `initial_fragments_for_rebase` used to `unwrap()` the
+        // result of `checkout_version(read_version)`. If a concurrent
+        // `cleanup_old_versions` removed that version between the conflicting
+        // commit and the rebase, this panicked (aborting the whole process when
+        // built with `panic = "abort"`). The rebase should fail with an error
+        // instead so the commit can be retried.
+        let tmp_dir = lance_core::utils::tempfile::TempStrDir::default();
+        let uri = tmp_dir.as_str().to_string();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..5)),
+                Arc::new(Int32Array::from_iter_values(std::iter::repeat_n(0, 5))),
+            ],
+        )
+        .unwrap();
+
+        // Write version 1, then append version 2.
+        let write_params = WriteParams {
+            max_rows_per_file: 1,
+            ..Default::default()
+        };
+        InsertBuilder::new(&uri)
+            .with_params(&write_params)
+            .execute(vec![batch.clone()])
+            .await
+            .unwrap();
+        let append_params = WriteParams {
+            mode: WriteMode::Append,
+            max_rows_per_file: 1,
+            ..Default::default()
+        };
+        let dataset = InsertBuilder::new(&uri)
+            .with_params(&append_params)
+            .execute(vec![batch])
+            .await
+            .unwrap();
+        assert_eq!(dataset.manifest.version, 2);
+
+        // A transaction that read version 1 and modified fragment 0.
+        let operation = Operation::Update {
+            updated_fragments: vec![Fragment::new(0)],
+            removed_fragment_ids: vec![],
+            new_fragments: vec![],
+            fields_modified: vec![],
+            compacted_sstables: Vec::new(),
+            fields_for_preserving_frag_bitmap: vec![],
+            update_mode: None,
+            inserted_rows_filter: None,
+            updated_fragment_offsets: None,
+        };
+        let transaction = Transaction::new_from_version(1, operation);
+
+        // Simulate a concurrent `cleanup_old_versions` removing version 1.
+        let naming_scheme = dataset.manifest_location().naming_scheme;
+        let v1_manifest = naming_scheme.manifest_path(&dataset.base, 1);
+        dataset.object_store.delete(&v1_manifest).await.unwrap();
+
+        // Rebasing now needs to check out version 1, which no longer exists.
+        // This used to panic; it should return `DatasetNotFound` instead.
+        let err = TransactionRebase::try_new(&dataset, transaction, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::DatasetNotFound { .. }));
     }
 
     async fn apply_deletion(
@@ -2749,6 +3065,7 @@ mod tests {
             uuid: uuid::Uuid::new_v4(),
             name: "test".to_string(),
             fields: vec![0],
+            covering_fields: vec![],
             dataset_version: 1,
             fragment_bitmap: None,
             index_details: None,
@@ -2975,7 +3292,7 @@ mod tests {
                     schema: lance_core::datatypes::Schema::default(),
                     preserves_nullability: true,
                 },
-                // Merge conflicts with everything except CreateIndex and ReserveFragments.
+                // Merge also conflicts with schema and field metadata updates.
                 [
                     Retryable,     // append
                     Compatible,    // create index
@@ -2985,7 +3302,7 @@ mod tests {
                     Retryable,     // rewrite
                     Compatible,    // reserve
                     Retryable,     // update
-                    Compatible,    // update config
+                    Retryable,     // update config
                 ],
             ),
             (
@@ -3133,7 +3450,7 @@ mod tests {
                     Compatible,    // append
                     Compatible,    // create index
                     Compatible,    // delete
-                    Compatible,    // merge
+                    Retryable,     // merge
                     NotCompatible, // overwrite
                     Compatible,    // rewrite
                     Compatible,    // reserve
@@ -3160,7 +3477,7 @@ mod tests {
                     Compatible,    // append
                     Compatible,    // create index
                     Compatible,    // delete
-                    Compatible,    // merge
+                    Retryable,     // merge
                     NotCompatible, // overwrite
                     Compatible,    // rewrite
                     Compatible,    // reserve
@@ -3186,7 +3503,7 @@ mod tests {
                     Compatible,    // append
                     Compatible,    // create index
                     Compatible,    // delete
-                    Compatible,    // merge
+                    Retryable,     // merge
                     NotCompatible, // overwrite
                     Compatible,    // rewrite
                     Compatible,    // reserve
@@ -3395,7 +3712,6 @@ mod tests {
             (
                 Operation::UpdateMemWalState {
                     compacted_sstables: vec![],
-                    require_index_catchup: false,
                 },
                 NotCompatible,
             ),
@@ -3492,21 +3808,24 @@ mod tests {
         // Update and a concurrent DataOverlay has already committed. A row-moving
         // update relocates the rows it touches, so an overlay on one of those
         // fragments can no longer be applied (retryable); an overlay on any other
-        // fragment, or an in-place column rewrite, is compatible.
+        // fragment is compatible. An in-place column rewrite preserves rows but
+        // replaces the whole column from its own snapshot, so it conflicts
+        // whenever the overlay covers a fragment and field it rewrote.
         use crate::dataset::transaction::{DataOverlayGroup, UpdateMode};
         use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
         use roaring::RoaringBitmap;
 
-        let overlay_on = |fragment_id: u64| Operation::DataOverlay {
+        let overlay_on_field = |fragment_id: u64, field: i32| Operation::DataOverlay {
             groups: vec![DataOverlayGroup {
                 fragment_id,
                 overlays: vec![DataOverlayFile {
-                    data_file: DataFile::new_legacy_from_fields("overlay.lance", vec![0], None),
+                    data_file: DataFile::new_legacy_from_fields("overlay.lance", vec![field], None),
                     coverage: OverlayCoverage::dense(RoaringBitmap::from_iter([0u32])),
                     committed_version: 0,
                 }],
             }],
         };
+        let overlay_on = |fragment_id: u64| overlay_on_field(fragment_id, 0);
         // Our update always touches fragment 1.
         let update =
             |update_mode: Option<UpdateMode>, new_fragments: Vec<Fragment>| Operation::Update {
@@ -3556,10 +3875,36 @@ mod tests {
                 Some(rows_on(1, &[0])),
                 false,
             ),
-            // An in-place column rewrite preserves rows -> compatible.
+            // An in-place column rewrite replaces field 0 across all of fragment
+            // 1 from its own snapshot, and `build_manifest` tombstones the
+            // overlay for that field, so the overlay's value would be lost even
+            // though it sits on a row the update never matched -> conflict.
             (
                 update(Some(UpdateMode::RewriteColumns), vec![]),
                 overlay_on(1),
+                Some(rows_on(1, &[0])),
+                true,
+            ),
+            // ...and the coverage is irrelevant: an overlay on a row the update
+            // did not match is exactly the case that gets silently dropped.
+            (
+                update(Some(UpdateMode::RewriteColumns), vec![]),
+                overlay_on(1),
+                Some(rows_on(1, &[5])),
+                true,
+            ),
+            // An overlay on a field the rewrite did not touch survives the
+            // tombstoning, so it stays compatible.
+            (
+                update(Some(UpdateMode::RewriteColumns), vec![]),
+                overlay_on_field(1, 7),
+                Some(rows_on(1, &[0])),
+                false,
+            ),
+            // So does an overlay on a fragment the rewrite did not touch.
+            (
+                update(Some(UpdateMode::RewriteColumns), vec![]),
+                overlay_on(0),
                 Some(rows_on(1, &[0])),
                 false,
             ),
@@ -3825,6 +4170,7 @@ mod tests {
             uuid: Uuid::new_v4(),
             name: "test".to_string(),
             fields: vec![0],
+            covering_fields: vec![],
             dataset_version: 1,
             fragment_bitmap: Some(RoaringBitmap::from_iter([0, 1])),
             index_details: None,
@@ -3881,6 +4227,7 @@ mod tests {
             uuid: uuid::Uuid::new_v4(),
             name: MEM_WAL_INDEX_NAME.to_string(),
             fields: vec![],
+            covering_fields: vec![],
             dataset_version: 1,
             fragment_bitmap: None,
             index_details: None,
@@ -3957,6 +4304,7 @@ mod tests {
             uuid: uuid::Uuid::new_v4(),
             name: "test".to_string(),
             fields: vec![0],
+            covering_fields: vec![],
             dataset_version: 1,
             fragment_bitmap: None,
             index_details: None,
@@ -4023,6 +4371,7 @@ mod tests {
                         uuid: uuid::Uuid::new_v4(),
                         name: "test".to_string(),
                         fields: vec![0],
+                        covering_fields: vec![],
                         dataset_version: 1,
                         fragment_bitmap: None,
                         index_details: None,
@@ -4049,12 +4398,155 @@ mod tests {
         );
     }
 
+    #[rstest::rstest]
+    #[case::optimize_after_drop(false, true)]
+    #[case::drop_after_optimize(true, true)]
+    #[case::append_segment_after_drop(false, false)]
+    #[case::drop_after_append_segment(true, false)]
+    fn test_create_index_conflicts_with_concurrent_drop(
+        #[case] drop_is_current: bool,
+        #[case] maintenance_replaces_existing: bool,
+    ) {
+        let existing = IndexMetadata {
+            uuid: Uuid::new_v4(),
+            name: "test".to_string(),
+            fields: vec![0],
+            covering_fields: vec![],
+            dataset_version: 1,
+            fragment_bitmap: None,
+            index_details: None,
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+            files: None,
+        };
+        let drop_operation = Operation::CreateIndex {
+            new_indices: vec![],
+            removed_indices: vec![existing.clone()],
+        };
+        let maintenance_operation = Operation::CreateIndex {
+            new_indices: vec![IndexMetadata {
+                uuid: Uuid::new_v4(),
+                ..existing.clone()
+            }],
+            removed_indices: maintenance_replaces_existing
+                .then(|| existing.clone())
+                .into_iter()
+                .collect(),
+        };
+        let (current_operation, committed_operation) = if drop_is_current {
+            (drop_operation, maintenance_operation)
+        } else {
+            (maintenance_operation, drop_operation)
+        };
+
+        let mut rebase = TransactionRebase {
+            transaction: Transaction::new(0, current_operation, None),
+            initial_fragments: HashMap::new(),
+            modified_fragment_ids: HashSet::new(),
+            affected_rows: None,
+            conflicting_frag_reuse_indices: Vec::new(),
+            conflicting_mem_wal_compacted_sstables: Vec::new(),
+        };
+        let result = rebase.check_txn(&Transaction::new(0, committed_operation, None), 1);
+
+        assert!(
+            matches!(result, Err(Error::RetryableCommitConflict { .. })),
+            "Expected a retryable conflict between index maintenance and drop, got {result:?}"
+        );
+        let message = result.unwrap_err().to_string();
+        assert!(
+            message.contains("preempted by concurrent transaction")
+                && message.contains("version 1"),
+            "Unexpected conflict message: {message}"
+        );
+    }
+
+    #[test]
+    fn test_concurrent_index_drops_are_compatible() {
+        let existing = IndexMetadata {
+            uuid: Uuid::new_v4(),
+            name: "test".to_string(),
+            fields: vec![0],
+            covering_fields: vec![],
+            dataset_version: 1,
+            fragment_bitmap: None,
+            index_details: None,
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+            files: None,
+        };
+        let drop_operation = Operation::CreateIndex {
+            new_indices: vec![],
+            removed_indices: vec![existing],
+        };
+        let mut rebase = TransactionRebase {
+            transaction: Transaction::new(0, drop_operation.clone(), None),
+            initial_fragments: HashMap::new(),
+            modified_fragment_ids: HashSet::new(),
+            affected_rows: None,
+            conflicting_frag_reuse_indices: Vec::new(),
+            conflicting_mem_wal_compacted_sstables: Vec::new(),
+        };
+
+        let result = rebase.check_txn(&Transaction::new(0, drop_operation, None), 1);
+
+        assert!(
+            result.is_ok(),
+            "Concurrent drops of the same index should be idempotent, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_index_replacement_compatible_with_removing_disjoint_segment() {
+        let index = |uuid| IndexMetadata {
+            uuid,
+            name: "test".to_string(),
+            fields: vec![0],
+            covering_fields: vec![],
+            dataset_version: 1,
+            fragment_bitmap: None,
+            index_details: None,
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+            files: None,
+        };
+        let replaced = index(Uuid::new_v4());
+        let concurrently_removed = index(Uuid::new_v4());
+        let replacement_operation = Operation::CreateIndex {
+            new_indices: vec![index(Uuid::new_v4())],
+            removed_indices: vec![replaced],
+        };
+        let removal_operation = Operation::CreateIndex {
+            new_indices: vec![],
+            removed_indices: vec![concurrently_removed],
+        };
+        let mut rebase = TransactionRebase {
+            transaction: Transaction::new(0, replacement_operation, None),
+            initial_fragments: HashMap::new(),
+            modified_fragment_ids: HashSet::new(),
+            affected_rows: None,
+            conflicting_frag_reuse_indices: Vec::new(),
+            conflicting_mem_wal_compacted_sstables: Vec::new(),
+        };
+
+        let result = rebase.check_txn(&Transaction::new(0, removal_operation, None), 1);
+
+        assert!(
+            result.is_ok(),
+            "Replacing one segment should be compatible with removing another, got {result:?}"
+        );
+    }
+
     #[test]
     fn test_create_ngram_index_conflicts_with_overlapping_deferred_rewrite() {
         let ngram_index = |fragment_id| IndexMetadata {
             uuid: Uuid::new_v4(),
             name: "text_ngram".to_string(),
             fields: vec![0],
+            covering_fields: vec![],
             dataset_version: 1,
             fragment_bitmap: Some(RoaringBitmap::from_iter([fragment_id])),
             index_details: Some(Arc::new(prost_types::Any {
@@ -4070,6 +4562,7 @@ mod tests {
             uuid: Uuid::new_v4(),
             name: FRAG_REUSE_INDEX_NAME.to_string(),
             fields: vec![],
+            covering_fields: vec![],
             dataset_version: 2,
             fragment_bitmap: Some(RoaringBitmap::from_iter([2u32])),
             index_details: None,
@@ -4739,6 +5232,41 @@ mod tests {
                 },
                 Retryable,
             ),
+            (
+                // Unlike every other case here, op1 is CreateIndex and op2 is
+                // DataReplacement. This is deliberate, not an inconsistency:
+                // `check_txn` dispatches on op1's operation type, so only
+                // op1 == CreateIndex reaches `check_create_index_txn`'s
+                // `Operation::DataReplacement` arm, which is the arm this case
+                // targets. Swapping the order to match the other cases would
+                // instead exercise the mirrored `check_data_replacement_txn`'s
+                // `Operation::CreateIndex` arm, leaving the intended arm with
+                // zero coverage.
+                "CreateIndex covering a field vs DataReplacement of that field",
+                Operation::CreateIndex {
+                    new_indices: vec![IndexMetadata {
+                        uuid: Uuid::new_v4(),
+                        name: "covering_idx".to_string(),
+                        fields: vec![0, 3],
+                        covering_fields: vec![3],
+                        dataset_version: 1,
+                        fragment_bitmap: Some(RoaringBitmap::from_iter([0u32])),
+                        index_details: None,
+                        index_version: 0,
+                        created_at: None,
+                        base_id: None,
+                        files: None,
+                    }],
+                    removed_indices: vec![],
+                },
+                Operation::DataReplacement {
+                    replacements: vec![DataReplacementGroup(
+                        0,
+                        DataFile::new_legacy_from_fields("path0_3", vec![3], None),
+                    )],
+                },
+                Retryable,
+            ),
         ];
 
         for (description, op1, op2, expected) in cases {
@@ -4796,7 +5324,6 @@ mod tests {
             0,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
-                require_index_catchup: false,
             },
             None,
         );
@@ -4805,7 +5332,6 @@ mod tests {
             0,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 5)],
-                require_index_catchup: false,
             },
             None,
         );
@@ -4836,7 +5362,6 @@ mod tests {
             0,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
-                require_index_catchup: false,
             },
             None,
         );
@@ -4845,7 +5370,6 @@ mod tests {
             0,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
-                require_index_catchup: false,
             },
             None,
         );
@@ -4877,7 +5401,6 @@ mod tests {
             0,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 5)],
-                require_index_catchup: false,
             },
             None,
         );
@@ -4886,7 +5409,6 @@ mod tests {
             0,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
-                require_index_catchup: false,
             },
             None,
         );
@@ -4918,7 +5440,6 @@ mod tests {
             0,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard1, 10)],
-                require_index_catchup: false,
             },
             None,
         );
@@ -4927,7 +5448,6 @@ mod tests {
             0,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard2, 5)],
-                require_index_catchup: false,
             },
             None,
         );
@@ -4978,7 +5498,6 @@ mod tests {
             0,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 5)],
-                require_index_catchup: false,
             },
             None,
         );
@@ -5004,7 +5523,6 @@ mod tests {
             0,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 15)],
-                require_index_catchup: false,
             },
             None,
         );
@@ -5051,7 +5569,6 @@ mod tests {
             0,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
-                require_index_catchup: false,
             },
             None,
         );

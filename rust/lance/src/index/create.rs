@@ -9,7 +9,7 @@ use crate::{
     },
     index::{
         DatasetIndexExt, DatasetIndexInternalExt, IntoIndexSegment,
-        build_index_metadata_from_segments,
+        build_index_metadata_from_segments, load_all_indices,
         scalar::{build_bitmap_index_segment, build_scalar_index},
         vector::{
             LANCE_VECTOR_INDEX, StageParams, VectorIndexParams, build_distributed_vector_index,
@@ -50,18 +50,16 @@ fn default_index_name(fields: &[&str]) -> String {
 }
 
 fn resolved_inverted_params(params: &ScalarIndexParams) -> Result<InvertedIndexParams> {
-    let mut merged = serde_json::to_value(InvertedIndexParams::default())?;
-    if let Some(raw_params) = params.params.as_deref() {
-        let provided = serde_json::from_str::<serde_json::Value>(raw_params)?;
-        let merged = merged.as_object_mut().ok_or_else(|| {
-            Error::internal("default inverted index parameters are not a JSON object".to_string())
-        })?;
-        let provided = provided.as_object().ok_or_else(|| {
-            Error::invalid_input("inverted index parameters must be a JSON object".to_string())
-        })?;
-        merged.extend(provided.clone());
-    }
-    Ok(serde_json::from_value(merged)?)
+    let provided = params
+        .params
+        .as_deref()
+        .map(serde_json::from_str::<serde_json::Value>)
+        .transpose()?
+        .unwrap_or_else(|| serde_json::json!({}));
+    provided.as_object().ok_or_else(|| {
+        Error::invalid_input("inverted index parameters must be a JSON object".to_string())
+    })?;
+    Ok(serde_json::from_value(provided)?)
 }
 
 fn scalar_params_from_inverted(params: &InvertedIndexParams) -> Result<ScalarIndexParams> {
@@ -261,8 +259,10 @@ impl<'a> CreateIndexBuilder<'a> {
         )
         .await?;
 
-        // Load indices from the disk.
-        let indices = self.dataset.load_indices().await?;
+        // Load indices from the disk. Names are reserved against every index the
+        // manifest carries: one this build cannot read still owns its name, and
+        // handing that name out again commits two indices under it.
+        let indices = load_all_indices(self.dataset).await?;
         let fri = self
             .dataset
             .open_frag_reuse_index(&NoOpMetricsCollector)
@@ -288,9 +288,13 @@ impl<'a> CreateIndexBuilder<'a> {
             let mut candidate = base_name.clone();
             let mut counter = 2; // Start with no suffix, then use _2, _3, ...
             while indices.iter().any(|idx| {
+                // A covered index still names the same column by its keyed
+                // prefix; only that prefix decides whether this is "the same
+                // field", not the full `fields` vector including carried
+                // columns.
+                let different_field = idx.keyed_field() != Some(field.id);
                 idx.name == candidate
-                    && (idx.fields != [field.id]
-                        || !index_matches_type(idx, self.index_type, self.params))
+                    && (different_field || !index_matches_type(idx, self.index_type, self.params))
             }) {
                 candidate = format!("{base_name}_{counter}");
                 counter += 1;
@@ -301,10 +305,11 @@ impl<'a> CreateIndexBuilder<'a> {
             .iter()
             .filter(|idx| idx.name == index_name)
             .collect::<Vec<_>>();
-        if existing_named_indices
-            .iter()
-            .any(|idx| idx.fields != [field.id])
-        {
+        if existing_named_indices.iter().any(|idx| {
+            // Same rule as above: the keyed prefix decides identity, not the
+            // full `fields` vector.
+            idx.keyed_field() != Some(field.id)
+        }) {
             return Err(Error::index(format!(
                 "Index name '{index_name}' already exists with different fields, \
                 please specify a different name"
@@ -596,6 +601,7 @@ impl<'a> CreateIndexBuilder<'a> {
             uuid: output_index_uuid,
             name: index_name,
             fields: vec![field.id],
+            covering_fields: vec![],
             dataset_version: self.dataset.manifest.version,
             fragment_bitmap: if train {
                 match &self.fragments {
@@ -629,8 +635,7 @@ impl<'a> CreateIndexBuilder<'a> {
         let new_idx = self.execute_uncommitted().await?;
         let index_uuid = new_idx.uuid;
         let removed_indices = if self.replace {
-            self.dataset
-                .load_indices()
+            load_all_indices(self.dataset)
                 .await?
                 .iter()
                 .filter(|idx| idx.name == new_idx.name)
@@ -703,7 +708,7 @@ impl<'a> CreateIndexBuilder<'a> {
             false
         };
 
-        let indices = self.dataset.load_indices().await?;
+        let indices = load_all_indices(self.dataset).await?;
         let index_name = if let Some(name) = self.name.take() {
             name
         } else {
@@ -711,10 +716,11 @@ impl<'a> CreateIndexBuilder<'a> {
             let base_name = format!("{column_path}_idx");
             let mut candidate = base_name.clone();
             let mut counter = 2;
-            while indices
-                .iter()
-                .any(|idx| idx.name == candidate && idx.fields != [field.id])
-            {
+            while indices.iter().any(|idx| {
+                // Same name-collision rule as `execute_uncommitted_impl`'s
+                // default-name loop above in this file.
+                idx.name == candidate && idx.keyed_field() != Some(field.id)
+            }) {
                 candidate = format!("{base_name}_{counter}");
                 counter += 1;
             }
@@ -724,10 +730,11 @@ impl<'a> CreateIndexBuilder<'a> {
             .iter()
             .filter(|idx| idx.name == index_name)
             .collect::<Vec<_>>();
-        if existing_named_indices
-            .iter()
-            .any(|idx| idx.fields != [field.id])
-        {
+        if existing_named_indices.iter().any(|idx| {
+            // Same rule as above: the keyed prefix decides identity, not the
+            // full `fields` vector.
+            idx.keyed_field() != Some(field.id)
+        }) {
             return Err(Error::index(format!(
                 "Index name '{index_name}' already exists with different fields, \
                 please specify a different name"
@@ -758,6 +765,7 @@ impl<'a> CreateIndexBuilder<'a> {
                 uuid: segment_uuid,
                 name: index_name.clone(),
                 fields: vec![field.id],
+                covering_fields: vec![],
                 dataset_version: self.dataset.manifest.version,
                 fragment_bitmap: Some(roaring::RoaringBitmap::new()),
                 index_details: Some(Arc::new(created_index.index_details)),
@@ -827,6 +835,7 @@ impl<'a> CreateIndexBuilder<'a> {
                 uuid: segment_uuid,
                 name: index_name.clone(),
                 fields: vec![field.id],
+                covering_fields: vec![],
                 dataset_version: self.dataset.manifest.version,
                 fragment_bitmap: Some(fragment_ids.into_iter().collect()),
                 index_details: Some(Arc::new(created_index.index_details)),
@@ -1012,6 +1021,7 @@ mod tests {
     use super::*;
     use crate::dataset::{WriteMode, WriteParams};
     use crate::index::{DatasetIndexExt, IndexSegment};
+    use crate::utils::test::covering;
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
     use arrow::datatypes::{Float32Type, Int32Type, Int64Type};
     use arrow_array::cast::AsArray;
@@ -1033,6 +1043,7 @@ mod tests {
     use lance_index::vector::kmeans::{KMeansParams, train_kmeans};
     use lance_linalg::distance::{DistanceType, MetricType};
     use roaring::RoaringBitmap;
+    use rstest::rstest;
     use std::{collections::BTreeSet, ops::Bound, sync::Arc};
     use uuid::Uuid;
 
@@ -1052,6 +1063,24 @@ mod tests {
             Some(&serde_json::Value::from(4096))
         );
         assert_eq!(json.get("num_workers"), Some(&serde_json::Value::from(7)));
+    }
+
+    #[rstest]
+    #[case::omitted(r#"{"base_tokenizer":"ngram"}"#, false)]
+    #[case::explicit(
+        r#"{"base_tokenizer":"ngram","stem":true,"remove_stop_words":true}"#,
+        true
+    )]
+    fn test_generic_inverted_params_preserve_ngram_defaults(
+        #[case] raw_params: &str,
+        #[case] expected_word_filters: bool,
+    ) {
+        let provided: serde_json::Value = serde_json::from_str(raw_params).unwrap();
+        let params = ScalarIndexParams::new("inverted".to_string()).with_params(&provided);
+        let resolved = serde_json::to_value(resolved_inverted_params(&params).unwrap()).unwrap();
+        assert_eq!(resolved["base_tokenizer"], "ngram");
+        assert_eq!(resolved["stem"], expected_word_filters);
+        assert_eq!(resolved["remove_stop_words"], expected_word_filters);
     }
 
     #[test]
@@ -1175,6 +1204,112 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.to_string().contains("already exists"));
+    }
+
+    /// A covered index still names the same column by its keyed prefix. Both
+    /// the auto-naming loop and the explicit-name check must recognize an
+    /// existing covered index as matching its keyed field, not the full
+    /// `fields` vector including the carried column -- which would otherwise
+    /// silently rename around it (auto) or spuriously reject as "different
+    /// fields" (explicit) instead of reaching the ordinary "already exists,
+    /// use replace=True" outcome.
+    #[tokio::test]
+    async fn test_index_name_collision_recognizes_covered_index() {
+        let mut dataset = gen_batch()
+            .col("a", lance_datagen::array::step::<Int32Type>())
+            .col("b", lance_datagen::array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(100))
+            .await
+            .unwrap();
+
+        covering::commit_synthetic_covered_index(&mut dataset, "a_idx", "a", "b").await;
+
+        let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::BTree);
+
+        // Default naming (the auto-name loop): must recognize the covered
+        // "a_idx" as the same field, not silently rename around it to
+        // "a_idx_2".
+        let err = CreateIndexBuilder::new(&mut dataset, &["a"], IndexType::BTree, &params)
+            .execute()
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("already exists, please specify a different name or use replace=True"),
+            "{err}"
+        );
+
+        // Explicit naming (the existing_named_indices check): must not
+        // misfire "different fields" for the same reason.
+        let err2 = CreateIndexBuilder::new(&mut dataset, &["a"], IndexType::BTree, &params)
+            .name("a_idx".to_string())
+            .execute()
+            .await
+            .unwrap_err();
+        assert!(
+            err2.to_string()
+                .contains("already exists, please specify a different name or use replace=True"),
+            "{err2}"
+        );
+    }
+
+    /// The same guard shape, duplicated in `execute_multi_segment_fmindex`
+    /// (the multi-segment FM-Index build path) under its own default-naming
+    /// loop and its own explicit-name check. `train(false)` keeps this test
+    /// fast: the guard runs before any real FM training, so an untrained
+    /// empty segment is enough to reach it.
+    #[tokio::test]
+    async fn test_fmindex_multi_segment_name_collision_recognizes_covered_index() {
+        let tmpdir = TempStrDir::default();
+        let dataset_uri = format!("file://{}", tmpdir.as_str());
+        let batch1 = create_text_batch(0, 10);
+        let batch2 = create_text_batch(10, 20);
+        let write_params = WriteParams {
+            max_rows_per_file: 10,
+            max_rows_per_group: 5,
+            ..Default::default()
+        };
+        let batches = RecordBatchIterator::new(
+            vec![Ok(batch1), Ok(batch2)],
+            create_text_batch(0, 1).schema(),
+        );
+        let mut dataset = Dataset::write(batches, &dataset_uri, Some(write_params))
+            .await
+            .unwrap();
+
+        covering::commit_synthetic_covered_index(&mut dataset, "text_idx", "text", "id").await;
+
+        let params = ScalarIndexParams {
+            index_type: "fm".to_string(),
+            params: Some(r#"{"num_segments": 2}"#.to_string()),
+        };
+
+        // Default naming: must recognize the covered "text_idx" as the same
+        // field, not silently rename around it to "text_idx_2".
+        let err = CreateIndexBuilder::new(&mut dataset, &["text"], IndexType::Fm, &params)
+            .train(false)
+            .execute()
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("already exists, please specify a different name or use replace=True"),
+            "{err}"
+        );
+
+        // Explicit naming: must not misfire "different fields" for the same
+        // reason.
+        let err2 = CreateIndexBuilder::new(&mut dataset, &["text"], IndexType::Fm, &params)
+            .name("text_idx".to_string())
+            .train(false)
+            .execute()
+            .await
+            .unwrap_err();
+        assert!(
+            err2.to_string()
+                .contains("already exists, please specify a different name or use replace=True"),
+            "{err2}"
+        );
     }
 
     #[tokio::test]
@@ -3435,6 +3570,7 @@ mod tests {
                     Arc::new(vector_index_details(&params)),
                     IndexType::IvfHnswFlat.version(),
                     source_dataset_version,
+                    vec![],
                 )],
             )
             .await
@@ -3460,6 +3596,7 @@ mod tests {
                     Arc::new(vector_index_details(&params)),
                     IndexType::IvfHnswFlat.version(),
                     dataset.manifest.version + 1,
+                    vec![],
                 )],
             )
             .await

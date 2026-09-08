@@ -123,12 +123,12 @@ public class DatasetTest {
   @Test
   void testGetLanceFileFormatVersion(@TempDir Path tempDir) {
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
-      // Test default version (V2_1)
+      // Test default version (V2_2)
       String defaultPath = tempDir.resolve("default_version").toString();
       TestUtils.SimpleTestDataset testDataset =
           new TestUtils.SimpleTestDataset(allocator, defaultPath);
       try (Dataset dataset = testDataset.createEmptyDataset()) {
-        assertEquals(LanceConstants.FILE_FORMAT_VERSION_2_1, dataset.getLanceFileFormatVersion());
+        assertEquals(LanceConstants.FILE_FORMAT_VERSION_2_2, dataset.getLanceFileFormatVersion());
         WriterVersion writerVersion = dataset.getWriterVersion().orElseThrow(AssertionError::new);
         assertEquals("lance", writerVersion.getLibrary());
         assertFalse(writerVersion.getVersion().isEmpty());
@@ -982,6 +982,23 @@ public class DatasetTest {
   }
 
   @Test
+  void testDropRejectsNonDatasetPath(@TempDir Path tempDir) {
+    Path warehouse = tempDir.resolve("warehouse");
+    Path tablePath = warehouse.resolve("table.lance");
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, tablePath.toString());
+      dataset = testDataset.createEmptyDataset();
+
+      // Pointing at the parent of a dataset must not wipe out the whole warehouse.
+      assertThrows(
+          IllegalArgumentException.class,
+          () -> Dataset.drop(warehouse.toString(), new HashMap<>()));
+      assertTrue(Files.exists(tablePath));
+    }
+  }
+
+  @Test
   void testTake(@TempDir Path tempDir) throws IOException, ClosedChannelException {
     String testMethodName = new Object() {}.getClass().getEnclosingMethod().getName();
     String datasetPath = tempDir.resolve(testMethodName).toString();
@@ -1132,7 +1149,7 @@ public class DatasetTest {
       dataset = testDataset.createEmptyDataset();
 
       try (Dataset dataset2 = testDataset.write(1, 5)) {
-        assertEquals(108, dataset2.calculateDataSize());
+        assertEquals(112, dataset2.calculateDataSize());
       }
     }
   }
@@ -2254,6 +2271,10 @@ public class DatasetTest {
 
         assertEquals(1, desc.getSegments().size(), "Expected exactly one physical segment");
         assertEquals("index1", desc.getSegments().get(0).name());
+        assertEquals(
+            Collections.emptyList(),
+            desc.getSegments().get(0).coveringFields(),
+            "no covering columns are declared yet");
         assertTrue(
             desc.getSegments().get(0).getSizeBytes().orElse(0L) > 0,
             "segment size should be positive");
