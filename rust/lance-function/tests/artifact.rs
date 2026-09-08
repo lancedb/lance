@@ -241,13 +241,21 @@ fn rejects_image_roots_on_non_posix_hosts() {
 }
 
 #[cfg(unix)]
-#[test]
-fn reads_pyarrow_schemas_through_the_artifact_entrypoint() {
+#[rstest]
+#[case::exact_limit(None, 0)]
+#[case::input_one_byte_over(Some("input.arrow"), 1)]
+#[case::output_one_byte_over(Some("output.arrow"), 1)]
+#[case::initialization_one_byte_over(Some("initialization.arrow"), 1)]
+#[case::oversized_sparse_file(Some("input.arrow"), 64 * 1024 * 1024)]
+fn reads_pyarrow_schemas_through_the_artifact_entrypoint(
+    #[case] oversized: Option<&str>,
+    #[case] extra_bytes: u64,
+) {
     let artifact = Artifact::resolve(INDEX, &platform(), fetch_fixture).unwrap();
     let root = tempfile::tempdir().unwrap();
     let schemas_path = root.path().join("opt/function/schemas");
     fs::create_dir_all(&schemas_path).unwrap();
-    for (name, bytes) in [
+    let fixtures = [
         (
             "input.arrow",
             include_bytes!("fixtures/py312-bookworm/input.arrow").as_slice(),
@@ -260,13 +268,39 @@ fn reads_pyarrow_schemas_through_the_artifact_entrypoint() {
             "initialization.arrow",
             include_bytes!("fixtures/py312-bookworm/initialization.arrow").as_slice(),
         ),
-    ] {
+    ];
+    let max_schema_bytes = fixtures.iter().map(|(_, bytes)| bytes.len()).max().unwrap() as u64;
+    for (name, bytes) in fixtures {
         fs::write(schemas_path.join(name), bytes).unwrap();
     }
+    if let Some(name) = oversized {
+        fs::File::options()
+            .write(true)
+            .open(schemas_path.join(name))
+            .unwrap()
+            .set_len(max_schema_bytes + extra_bytes)
+            .unwrap();
+    }
     let image = ImageRoot::new(root.path()).unwrap();
-    let schemas =
-        Schemas::from_image(artifact.descriptor(), &image, &ExtensionTypes::default()).unwrap();
-    assert_pyarrow_schemas(&schemas);
+    let result = Schemas::from_image(
+        artifact.descriptor(),
+        &image,
+        &ExtensionTypes::default(),
+        max_schema_bytes,
+    );
+    if let Some(name) = oversized {
+        let error = result.unwrap_err();
+        assert_eq!(error.code, ErrorCode::Incompatible);
+        assert_eq!(
+            error.message,
+            format!(
+                "schema /opt/function/schemas/{name} has {} bytes; limit is {max_schema_bytes} bytes",
+                max_schema_bytes + extra_bytes,
+            )
+        );
+    } else {
+        assert_pyarrow_schemas(&result.unwrap());
+    }
 }
 
 fn assert_pyarrow_schemas(schemas: &Schemas) {

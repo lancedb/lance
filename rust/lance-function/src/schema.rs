@@ -3,6 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::Read;
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
@@ -381,6 +382,10 @@ impl Schemas {
         let input = read_schema(input, extensions)?;
         let output = read_schema(output, extensions)?;
         let initialization = read_schema(initialization, extensions)?;
+        Self::new(input, output, initialization)
+    }
+
+    fn new(input: SchemaRef, output: SchemaRef, initialization: SchemaRef) -> Result<Self> {
         if output.fields().len() != 1 {
             return Err(Error::incompatible(format!(
                 "scalar output schema has {} fields; expected exactly one",
@@ -395,22 +400,46 @@ impl Schemas {
     }
 
     /// Load declared schemas from a complete immutable image, resolving image symlinks.
+    ///
+    /// `max_schema_bytes` limits each serialized file, including its IPC prefix.
+    /// Files larger than this caller-selected budget are rejected before reading
+    /// their contents. Each file is parsed and its byte buffer released before
+    /// loading the next. This is not a limit on decoded Arrow schema allocations.
     pub fn from_image(
         descriptor: &Descriptor,
         root: &ImageRoot,
         extensions: &ExtensionTypes,
+        max_schema_bytes: u64,
     ) -> Result<Self> {
         let paths = descriptor.schemas();
         let load = |path| {
             let resolved = root.resolve(path, PathKind::File)?;
-            fs::read(resolved)
-                .map_err(|error| Error::incompatible(format!("schema {}: {error}", path.as_str())))
+            let io_error =
+                |error| Error::incompatible(format!("schema {}: {error}", path.as_str()));
+            let file = fs::File::open(resolved).map_err(io_error)?;
+            let size = file.metadata().map_err(io_error)?.len();
+            if size > max_schema_bytes {
+                return Err(Error::incompatible(format!(
+                    "schema {} has {size} bytes; limit is {max_schema_bytes} bytes",
+                    path.as_str()
+                )));
+            }
+            let mut bytes = Vec::new();
+            file.take(max_schema_bytes.saturating_add(1))
+                .read_to_end(&mut bytes)
+                .map_err(io_error)?;
+            if bytes.len() as u64 > max_schema_bytes {
+                return Err(Error::incompatible(format!(
+                    "schema {} exceeds limit of {max_schema_bytes} bytes while reading",
+                    path.as_str()
+                )));
+            }
+            read_schema(&bytes, extensions)
         };
-        Self::from_ipc(
-            &load(&paths.input)?,
-            &load(&paths.output)?,
-            &load(&paths.initialization)?,
-            extensions,
+        Self::new(
+            load(&paths.input)?,
+            load(&paths.output)?,
+            load(&paths.initialization)?,
         )
     }
 

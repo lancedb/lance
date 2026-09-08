@@ -23,7 +23,10 @@ let artifact = Artifact::resolve(&document, &platform, |blob| {
 // The caller verifies and unpacks every layer before exposing this immutable root.
 let root = ImageRoot::new("cache/complete-rootfs")?;
 artifact.descriptor().check_image_paths(&root)?;
-let schemas = Schemas::from_image(artifact.descriptor(), &root, &ExtensionTypes::default())?;
+let max_schema_bytes = 1024 * 1024; // This caller allows up to 1 MiB per schema file.
+let schemas = Schemas::from_image(
+    artifact.descriptor(), &root, &ExtensionTypes::default(), max_schema_bytes,
+)?;
 assert_eq!(schemas.output().fields().len(), 1);
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
@@ -40,6 +43,12 @@ checks semantic type validity before Arrow conversion. No unknown extension type
 is accepted by default. Workers register validators for supported extension
 storage types and metadata. Scalar output has one field; initialization data has
 one row, including the zero-field case. Validation performs no coercions.
+
+`Schemas::from_image` requires a caller-selected byte budget for each schema file
+and rejects oversized files before reading their contents. It reads and parses
+files one at a time. The budget limits serialized input, not decoded Arrow memory;
+it is a caller resource policy, not a Function v1 format limit. Callers supplying
+bytes through `Schemas::from_ipc` are responsible for bounding their input.
 
 `ImageRoot` resolves POSIX image paths with container-root symlink semantics.
 The caller must keep the rootfs immutable during validation and use; the resolver
