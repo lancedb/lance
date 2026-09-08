@@ -1019,8 +1019,7 @@ impl From<datafusion_common::DataFusionError> for Error {
                 match std::sync::Arc::try_unwrap(shared) {
                     Ok(inner) => Self::from(inner),
                     Err(shared) => {
-                        let rewrapped =
-                            datafusion_common::DataFusionError::Shared(shared);
+                        let rewrapped = datafusion_common::DataFusionError::Shared(shared);
                         Self::External {
                             source: box_error(rewrapped),
                         }
@@ -1603,7 +1602,10 @@ mod test {
             }
             src = e.source();
         }
-        assert!(found, "MyCustomError not found in source chain: {lance_err:?}");
+        assert!(
+            found,
+            "MyCustomError not found in source chain: {lance_err:?}"
+        );
     }
 
     #[test]
