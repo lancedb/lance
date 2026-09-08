@@ -295,7 +295,7 @@ impl Dataset {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn repack_direct_blobs(&self, column: &str, objects: &[String]) -> Result<Dataset> {
+    pub async fn repack_direct_blobs(&self, column: &str, objects: &[String]) -> Result<Self> {
         let field = self
             .schema()
             .field(column)
@@ -488,7 +488,7 @@ impl Dataset {
             inserted_rows_filter: None,
             updated_fragment_offsets: None,
         };
-        Dataset::commit(
+        Self::commit(
             super::WriteDestination::Dataset(dataset),
             operation,
             Some(self.manifest.version),
