@@ -181,6 +181,227 @@ pub(super) async fn direct_references(dataset: &Dataset) -> Result<HashSet<Path>
     Ok(paths)
 }
 
+impl Dataset {
+    /// Repack selected experimental managed objects and atomically publish their new references.
+    ///
+    /// `objects` contains descriptor object paths. Only the selected top-level blob column
+    /// is rewritten in affected fragments; unrelated data files are retained. The read
+    /// version participates in normal column-update conflict checks. Empty selection is a no-op.
+    ///
+    /// ```no_run
+    /// # use lance::{Dataset, Result};
+    /// # async fn example(dataset: &Dataset) -> Result<()> {
+    /// let updated = dataset.repack_direct_blobs("image", &["pack/object.blob".into()]).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn repack_direct_blobs(&self, column: &str, objects: &[String]) -> Result<Dataset> {
+        let field = self
+            .schema()
+            .field(column)
+            .ok_or_else(|| Error::invalid_input(format!("Unknown column {column}")))?;
+        if !self.schema().fields.iter().any(|top| top.id == field.id)
+            || field
+                .metadata
+                .get("lance:blob-direct-poc")
+                .map(String::as_str)
+                != Some("1")
+        {
+            return Err(Error::invalid_input(
+                "Repack requires a top-level experimental direct blob column",
+            ));
+        }
+        let selected = objects.iter().collect::<HashSet<_>>();
+        if selected.is_empty() {
+            return Ok(self.clone());
+        }
+        for object in &selected {
+            crate::blob::validate_managed_object(object)?;
+        }
+        let dataset = Arc::new(self.clone());
+        let field_id = field.id as u32;
+        let write_schema = self.schema().project(&[column])?;
+        let output_field = ArrowField::from(field)
+            .with_data_type(lance_core::datatypes::BLOB_V2_PREPARED_TYPE.clone());
+        let object_key = uuid::Uuid::new_v4().to_string();
+        let allocator = BlobIdAllocator::new(1);
+        let mut pack = RollingPackedBlobWriter::new();
+        let mut updated_fragments = Vec::new();
+        for fragment in self.get_fragments() {
+            let mut scan = fragment.scan();
+            scan.project(&[column])?;
+            let mut stream = scan.try_into_stream().await?;
+            let mut affected = false;
+            while let Some(batch) = stream.try_next().await? {
+                let values = batch
+                    .column_by_name(column)
+                    .ok_or_else(|| Error::internal("Missing blob column"))?
+                    .as_struct();
+                let cols = BlobV2DescriptorColumns::new(values);
+                affected |= (0..values.len()).any(|row| {
+                    !cols.is_null_blob(row)
+                        && cols.kinds.value(row) == BlobKind::Managed as u8
+                        && selected.contains(&cols.blob_uris.value(row).to_string())
+                });
+            }
+            if !affected {
+                continue;
+            }
+            let mut updater = fragment
+                .updater(
+                    Some(&[column, ROW_ADDR]),
+                    Some((write_schema.clone(), self.schema().clone())),
+                    Some(64),
+                    Some(lance_core::datatypes::BlobHandling::BlobsDescriptions),
+                )
+                .await?;
+            updater.allow_external_blob_outside_bases();
+            while let Some(batch) = updater.next().await? {
+                let batch = batch.clone();
+                let values = batch
+                    .column_by_name(column)
+                    .ok_or_else(|| Error::internal("Missing blob column"))?
+                    .as_struct();
+                let addrs = batch
+                    .column_by_name(ROW_ADDR)
+                    .ok_or_else(|| Error::internal("Missing row addresses"))?
+                    .as_primitive::<UInt64Type>();
+                let preserved = preserve_direct_descriptors(
+                    &dataset,
+                    field_id,
+                    values,
+                    addrs.values(),
+                    &output_field,
+                )
+                .await?;
+                let prepared = preserved.as_struct();
+                let cols = BlobV2DescriptorColumns::new(values);
+                let mut context = BlobV2ReadContext::new(&dataset, field_id);
+                let mut builder = BlobDescriptorArrayBuilder::new_with_metadata(
+                    column,
+                    field.nullable,
+                    field.metadata.clone(),
+                );
+                for row in 0..values.len() {
+                    if cols.is_null_blob(row) {
+                        builder.push_null()?;
+                        continue;
+                    }
+                    let kind = BlobKind::try_from(cols.kinds.value(row))?;
+                    if kind == BlobKind::Managed
+                        && selected.contains(&cols.blob_uris.value(row).to_string())
+                    {
+                        let file = context
+                            .collect_file(&cols, row, addrs.value(row))
+                            .await?
+                            .ok_or_else(|| Error::internal("Missing repack payload"))?;
+                        let bytes = file.read().await?;
+                        let written = pack
+                            .write(
+                                self.object_store.as_ref().clone(),
+                                self.data_dir(),
+                                object_key.clone(),
+                                allocator.clone(),
+                                PACK_FILE_MAX_SIZE,
+                                BlobWriteSource::Bytes(&bytes),
+                            )
+                            .await?;
+                        builder.push(direct_descriptor(written, &object_key)?)?;
+                    } else {
+                        let descriptor = match kind {
+                            BlobKind::Managed => BlobDescriptor::Managed {
+                                base_id: direct_base_id(
+                                    self,
+                                    field_id,
+                                    addrs.value(row),
+                                    cols.blob_ids.value(row),
+                                )?
+                                .unwrap_or(0),
+                                object: cols.blob_uris.value(row).to_string(),
+                                offset: cols.positions.value(row),
+                                size: cols.sizes.value(row),
+                            },
+                            BlobKind::External => BlobDescriptor::External {
+                                base_id: cols.blob_ids.value(row),
+                                uri: cols.blob_uris.value(row).to_string(),
+                                offset: cols.positions.value(row),
+                                size: cols.sizes.value(row),
+                            },
+                            _ => BlobDescriptor::Inline {
+                                data: Bytes::copy_from_slice(
+                                    prepared
+                                        .column_by_name("data")
+                                        .ok_or_else(|| Error::internal("Missing prepared bytes"))?
+                                        .as_binary::<i64>()
+                                        .value(row),
+                                ),
+                            },
+                        };
+                        builder.push(descriptor)?;
+                    }
+                }
+                let (field, array) = builder.finish()?.into_parts();
+                updater
+                    .update(RecordBatch::try_new(
+                        Arc::new(ArrowSchema::new(vec![field])),
+                        vec![array],
+                    )?)
+                    .await?;
+            }
+            let mut updated = updater.finish().await?;
+            let replacement_fields = updated
+                .files
+                .last()
+                .ok_or_else(|| Error::internal("Repack produced no data file"))?
+                .fields
+                .clone();
+            for file in updated.files.iter_mut().rev().skip(1) {
+                file.fields = file
+                    .fields
+                    .iter()
+                    .map(|id| {
+                        if replacement_fields.contains(id) {
+                            -2
+                        } else {
+                            *id
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .into();
+            }
+            updated
+                .files
+                .retain(|file| file.fields.iter().any(|id| *id != -2));
+            updated_fragments.push(updated);
+        }
+        pack.finish().await?;
+        if updated_fragments.is_empty() {
+            return Ok(self.clone());
+        }
+        let operation = lance_table::transaction::Operation::Update {
+            removed_fragment_ids: vec![],
+            updated_fragments,
+            new_fragments: vec![],
+            fields_modified: vec![field_id],
+            compacted_sstables: vec![],
+            fields_for_preserving_frag_bitmap: vec![],
+            update_mode: Some(lance_table::transaction::UpdateMode::RewriteColumns),
+            inserted_rows_filter: None,
+            updated_fragment_offsets: None,
+        };
+        Dataset::commit(
+            super::WriteDestination::Dataset(dataset),
+            operation,
+            Some(self.manifest.version),
+            None,
+            None,
+            Arc::new(Default::default()),
+            false,
+        )
+        .await
+    }
+}
+
 const INLINE_MAX: usize = 64 * 1024; // 64KB inline cutoff
 const DEDICATED_THRESHOLD: usize = 4 * 1024 * 1024; // 4MB dedicated cutoff
 const PACK_FILE_MAX_SIZE: usize = 1024 * 1024 * 1024; // 1GiB per .pack sidecar
