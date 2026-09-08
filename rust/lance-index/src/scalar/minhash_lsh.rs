@@ -1007,6 +1007,7 @@ impl MinHashLshIndex {
         SignatureSource {
             reader: self.signatures.clone(),
             num_docs: self.num_docs,
+            frag_reuse_index: self.frag_reuse_index.clone(),
             transform,
         }
     }
@@ -1712,32 +1713,36 @@ pub enum RowIdTransform<'a> {
 
 impl RowIdTransform<'_> {
     /// The row id each input row keeps, or `None` for rows to drop.
-    fn apply(&self, row_ids: &UInt64Array) -> Vec<Option<u64>> {
+    ///
+    /// Stored row ids predate any deferred compaction the segment was opened
+    /// with, so `frag_reuse_index` first brings them into the current address
+    /// space, which is the space the filter or mapping is expressed in.
+    fn apply(
+        &self,
+        row_ids: &UInt64Array,
+        frag_reuse_index: Option<&dyn RowIdRemapper>,
+    ) -> Vec<Option<u64>> {
+        let mut row_ids: Vec<Option<u64>> = row_ids
+            .values()
+            .iter()
+            .map(|&row_id| match frag_reuse_index {
+                Some(remapper) => remapper.remap_row_id(row_id),
+                None => Some(row_id),
+            })
+            .collect();
         match self {
-            Self::Keep => row_ids
-                .values()
-                .iter()
-                .map(|row_id| Some(*row_id))
-                .collect(),
+            Self::Keep => {}
             Self::Filter(filter) => {
-                let keep = filter.filter_row_ids(row_ids);
-                row_ids
-                    .values()
-                    .iter()
-                    .zip(keep.iter())
-                    .map(|(row_id, keep)| keep.unwrap_or(false).then_some(*row_id))
-                    .collect()
+                let keep = filter.filter_row_ids(&UInt64Array::from(row_ids.clone()));
+                for (row_id, keep) in row_ids.iter_mut().zip(keep.iter()) {
+                    if !keep.unwrap_or(false) {
+                        *row_id = None;
+                    }
+                }
             }
-            Self::Remap(mapping) => {
-                let mut row_ids: Vec<Option<u64>> = row_ids
-                    .values()
-                    .iter()
-                    .map(|row_id| Some(*row_id))
-                    .collect();
-                mapping.remap_in_place(&mut row_ids);
-                row_ids
-            }
+            Self::Remap(mapping) => mapping.remap_in_place(&mut row_ids),
         }
+        row_ids
     }
 }
 
@@ -1746,6 +1751,9 @@ impl RowIdTransform<'_> {
 pub struct SignatureSource<'a> {
     pub reader: Arc<dyn IndexReader>,
     pub num_docs: usize,
+    /// The deferred compactions the segment was opened with; see
+    /// [`RowIdTransform::apply`].
+    pub frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
     pub transform: RowIdTransform<'a>,
 }
 
@@ -1761,6 +1769,7 @@ impl SignatureSource<'_> {
             SIGNATURE_SCAN_ROWS,
         );
         let transform = &self.transform;
+        let frag_reuse_index = self.frag_reuse_index.as_deref();
         let stream = batches
             .map(move |batch| {
                 let generator = generator.clone();
@@ -1768,7 +1777,7 @@ impl SignatureSource<'_> {
                 // the CPU task, so it runs here; band keys are computed there.
                 let prepared = batch.and_then(|batch| {
                     let (row_ids, _) = signature_columns(&batch, num_hashes)?;
-                    let kept = transform.apply(row_ids);
+                    let kept = transform.apply(row_ids, frag_reuse_index);
                     Ok((batch, kept))
                 });
                 async move {
@@ -3426,6 +3435,126 @@ mod tests {
             }
         );
         assert_eq!(hits[1].row_id, 3);
+    }
+
+    /// Row id remapper of a segment opened after a deferred compaction.
+    #[derive(Debug)]
+    struct TestRemapper(HashMap<u64, Option<u64>>);
+
+    impl RowIdRemapper for TestRemapper {
+        fn remap_row_id(&self, row_id: u64) -> Option<u64> {
+            self.0.get(&row_id).copied().unwrap_or(Some(row_id))
+        }
+
+        fn remap_row_addrs_tree_map(&self, _row_addrs: &RowAddrTreeMap) -> RowAddrTreeMap {
+            unreachable!()
+        }
+
+        fn remap_row_ids_roaring_tree_map(
+            &self,
+            _row_ids: &roaring::RoaringTreemap,
+        ) -> roaring::RoaringTreemap {
+            unreachable!()
+        }
+
+        fn remap_row_ids_record_batch(
+            &self,
+            _batch: RecordBatch,
+            _row_id_idx: usize,
+        ) -> Result<RecordBatch> {
+            unreachable!()
+        }
+    }
+
+    async fn load_created(
+        store: &Arc<LanceIndexStore>,
+        created: &CreatedIndex,
+    ) -> Arc<MinHashLshIndex> {
+        MinHashLshIndex::load(
+            store.clone(),
+            &created.index_details,
+            None,
+            &LanceCache::no_cache(),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_rebuilds_remap_rows_of_a_deferred_compaction() {
+        // The segment stores fragment 0 addresses; a deferred compaction moved
+        // its rows to fragment 1 and deleted row 2. Filters and mappings are
+        // expressed in the compacted address space, so a rebuild applying
+        // them to the stored addresses dropped every old row.
+        let (_tmpdir, store) = test_store();
+        let (bases, duplicates) = near_duplicate_corpus(4, 40);
+        let rows = rows_from(&bases.iter().map(String::as_str).collect::<Vec<_>>());
+        build_and_load(&store, default_builder(), &rows, 4, &LanceCache::no_cache()).await;
+        let compacted = |row: u64| (1u64 << 32) | row;
+        let remapper = TestRemapper(HashMap::from([
+            (0u64, Some(compacted(0))),
+            (1u64, Some(compacted(1))),
+            (2u64, None),
+            (3u64, Some(compacted(3))),
+        ]));
+        let index = MinHashLshIndex::load(
+            store.clone(),
+            &MinHashLshIndexParams::default().details_any().unwrap(),
+            Some(Arc::new(remapper)),
+            &LanceCache::no_cache(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(search(&index, &bases[0], 1).await[0].row_id, compacted(0));
+
+        // Update: keep the compacted fragment, add a duplicate of row 3
+        let filter = OldIndexDataFilter::Fragments {
+            to_keep: RoaringBitmap::from_iter([1u32]),
+            to_remove: RoaringBitmap::from_iter([0u32]),
+        };
+        let new_rows = [(Some(duplicates[3].as_str()), 2u64 << 32)];
+        let (_dir, dest_store) = test_store();
+        let created = index
+            .update(
+                text_stream(&new_rows, 1),
+                dest_store.as_ref(),
+                Some(filter.clone()),
+            )
+            .await
+            .unwrap();
+        let updated = load_created(&dest_store, &created).await;
+        assert_eq!(updated.num_docs(), 3 + 1);
+        assert_eq!(search(&updated, &bases[0], 1).await[0].row_id, compacted(0));
+        assert!(search(&updated, &bases[2], 5).await.is_empty());
+        let hits = search(&updated, &duplicates[3], 2).await;
+        assert_eq!(hits[0].row_id, 2u64 << 32);
+        assert_eq!(hits[1].row_id, compacted(3));
+
+        // Merge with the same filter
+        let (_dir, dest_store) = test_store();
+        let created = merge_minhash_indices(&[(&index, Some(&filter))], dest_store.as_ref())
+            .await
+            .unwrap();
+        let merged = load_created(&dest_store, &created).await;
+        assert_eq!(merged.num_docs(), 3);
+        assert_eq!(search(&merged, &bases[3], 1).await[0].row_id, compacted(3));
+        assert!(search(&merged, &bases[2], 5).await.is_empty());
+
+        // An eager remap after the deferred one composes both
+        let mapping = RowAddrRemap::direct(HashMap::from([
+            (compacted(0), Some(9u64)),
+            (compacted(1), None),
+        ]));
+        let (_dir, dest_store) = test_store();
+        let created = index.remap(&mapping, dest_store.as_ref()).await.unwrap();
+        let remapped = load_created(&dest_store, &created).await;
+        assert_eq!(remapped.num_docs(), 2);
+        assert_eq!(search(&remapped, &bases[0], 1).await[0].row_id, 9);
+        assert!(search(&remapped, &bases[1], 5).await.is_empty());
+        assert_eq!(
+            search(&remapped, &bases[3], 1).await[0].row_id,
+            compacted(3)
+        );
     }
 
     #[tokio::test]

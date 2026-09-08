@@ -399,6 +399,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_deferred_compaction_survives_merge_and_optimize() {
+        // A deferred compaction leaves the stored row ids in the old fragments;
+        // merges and updates must remap them the way queries do, otherwise the
+        // rebuilt segment claims the compacted fragment without its rows.
+        let test_dir = TempStrDir::default();
+        let uri = test_dir.as_str();
+        let mut dataset = write(uri, 0..6, 2).await;
+        dataset
+            .create_index(
+                &["text"],
+                IndexType::MinHashLsh,
+                Some(INDEX_NAME.into()),
+                &params(),
+                true,
+            )
+            .await
+            .unwrap();
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 10,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        // An explicit merge of the deferred segment
+        let mut dataset = DatasetBuilder::from_uri(uri).load().await.unwrap();
+        let segments = dataset.load_indices_by_name(INDEX_NAME).await.unwrap();
+        let merged = dataset
+            .merge_existing_index_segments(segments)
+            .await
+            .unwrap();
+        dataset
+            .commit_existing_index_segments(INDEX_NAME, "text", vec![merged])
+            .await
+            .unwrap();
+        for id in 0..6 {
+            assert_eq!(search_ids(&dataset, id, 1).await, vec![id]);
+        }
+
+        // An append followed by the default optimize updates the segment
+        let mut dataset = append(uri, 6..7).await;
+        dataset
+            .optimize_indices(&OptimizeOptions::default())
+            .await
+            .unwrap();
+        let segments = dataset.load_indices_by_name(INDEX_NAME).await.unwrap();
+        assert_eq!(segments.len(), 1);
+        assert_eq!(
+            segments[0].fragment_bitmap.as_ref().unwrap(),
+            dataset.fragment_bitmap.as_ref()
+        );
+        for id in 0..7 {
+            assert_eq!(search_ids(&dataset, id, 1).await, vec![id]);
+        }
+    }
+
+    #[tokio::test]
     async fn test_compaction_remaps_index() {
         let test_dir = TempStrDir::default();
         let uri = test_dir.as_str();
