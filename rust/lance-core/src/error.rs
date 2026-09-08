@@ -409,6 +409,19 @@ pub enum Error {
         #[snafu(implicit)]
         location: Location,
     },
+    /// A write was refused to keep the writer inside its memory budget.
+    ///
+    /// Unlike every other write error this one is *expected* under load and
+    /// carries no data loss: the write was never accepted, so a caller that
+    /// retries once the flush pipeline drains loses nothing. Callers should
+    /// surface it as a retryable "busy" signal (HTTP 503), not a failure.
+    /// Match via [`Error::is_backpressure`] rather than on the message.
+    #[snafu(display("Write rejected by backpressure: {message}, {location}"))]
+    Backpressure {
+        message: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
 }
 
 impl Error {
@@ -459,7 +472,8 @@ impl Error {
             | Self::FieldNotFound { .. }
             | Self::Timeout { .. }
             | Self::DiskCapExceeded { .. }
-            | Self::Fenced { .. } => None,
+            | Self::Fenced { .. }
+            | Self::Backpressure { .. } => None,
         }
     }
 
@@ -531,6 +545,23 @@ impl Error {
             Self::Fenced { reason, .. } => Some(*reason),
             _ => None,
         }
+    }
+
+    /// A write was refused because the writer is at its memory ceiling; the
+    /// data was never accepted. See [`Error::Backpressure`].
+    #[track_caller]
+    pub fn backpressure(message: impl Into<String>) -> Self {
+        BackpressureSnafu {
+            message: message.into(),
+        }
+        .build()
+    }
+
+    /// Whether this is [`Error::Backpressure`] — i.e. a retryable "writer is
+    /// full" signal rather than a real failure. Prefer this over matching the
+    /// error message.
+    pub fn is_backpressure(&self) -> bool {
+        matches!(self, Self::Backpressure { .. })
     }
 
     #[track_caller]
@@ -952,6 +983,22 @@ impl From<datafusion_common::DataFusionError> for Error {
     #[track_caller]
     fn from(e: datafusion_common::DataFusionError) -> Self {
         match e {
+            // DataFusion wraps an error to attach end-user context and source
+            // spans (`Diagnostic`), a description of what was running
+            // (`Context`), or to report several failures at once
+            // (`Collection`). All three are display-transparent, so the
+            // category has to come from the error underneath; classifying the
+            // wrapper itself reports a malformed query as an internal failure.
+            datafusion_common::DataFusionError::Diagnostic(_, inner)
+            | datafusion_common::DataFusionError::Context(_, inner) => Self::from(*inner),
+            datafusion_common::DataFusionError::Collection(errors) => {
+                match errors.into_iter().next() {
+                    // `Collection` reports the first error's message, so take
+                    // its category too.
+                    Some(first) => Self::from(first),
+                    None => Self::execution("DataFusion returned an empty error collection"),
+                }
+            }
             datafusion_common::DataFusionError::SQL(..)
             | datafusion_common::DataFusionError::Plan(..)
             | datafusion_common::DataFusionError::Configuration(..)
@@ -1348,6 +1395,86 @@ mod test {
                 );
             }
             _ => panic!("Expected InvalidInput variant, got {:?}", lance_err),
+        }
+    }
+
+    /// DataFusion wraps errors to attach end-user context (`Diagnostic`), a
+    /// description of what was running (`Context`), or to report several at
+    /// once (`Collection`). All three are display-transparent, so a wrapped
+    /// user error looks exactly like an unwrapped one but would be classified
+    /// as an internal failure if the conversion matched on the wrapper.
+    #[cfg(feature = "datafusion")]
+    #[rstest::rstest]
+    #[case::diagnostic(|inner| datafusion_common::DataFusionError::Diagnostic(
+        Box::new(datafusion_common::Diagnostic::new_error("invalid function", None)),
+        Box::new(inner),
+    ))]
+    #[case::context(|inner| datafusion_common::DataFusionError::Context(
+        "type_coercion".to_string(),
+        Box::new(inner),
+    ))]
+    #[case::collection(|inner| datafusion_common::DataFusionError::Collection(vec![inner]))]
+    #[case::nested(|inner| datafusion_common::DataFusionError::Diagnostic(
+        Box::new(datafusion_common::Diagnostic::new_error("invalid function", None)),
+        Box::new(datafusion_common::DataFusionError::Context(
+            "type_coercion".to_string(),
+            Box::new(inner),
+        )),
+    ))]
+    fn test_datafusion_wrapped_plan_error_is_invalid_input(
+        #[case] wrap: fn(datafusion_common::DataFusionError) -> datafusion_common::DataFusionError,
+    ) {
+        let df_err = wrap(datafusion_common::DataFusionError::Plan(
+            "Invalid function 'no_such_function'".to_string(),
+        ));
+        let lance_err = Error::from(df_err);
+
+        assert!(
+            matches!(lance_err, Error::InvalidInput { .. }),
+            "expected InvalidInput, got {lance_err:?}"
+        );
+        assert!(
+            lance_err.to_string().contains("no_such_function"),
+            "expected the function name to survive, got: {lance_err}"
+        );
+    }
+
+    /// Unwrapping must classify by the inner error rather than assume the
+    /// wrapper always hides a user error.
+    #[cfg(feature = "datafusion")]
+    #[test]
+    fn test_datafusion_wrapped_internal_error_is_not_invalid_input() {
+        let df_err = datafusion_common::DataFusionError::Context(
+            "while running".to_string(),
+            Box::new(datafusion_common::DataFusionError::Internal(
+                "invariant violated".to_string(),
+            )),
+        );
+
+        assert!(
+            matches!(Error::from(df_err), Error::IO { .. }),
+            "an internal DataFusion failure must not be reported as user input"
+        );
+    }
+
+    /// A Lance error that round-trips through DataFusion keeps its own
+    /// category even when DataFusion wraps it on the way back.
+    #[cfg(feature = "datafusion")]
+    #[test]
+    fn test_wrapped_external_lance_error_keeps_its_category() {
+        let df_err = datafusion_common::DataFusionError::Context(
+            "while scanning".to_string(),
+            Box::new(datafusion_common::DataFusionError::from(Error::io(
+                "object store unavailable",
+            ))),
+        );
+
+        match Error::from(df_err) {
+            Error::IO { source, .. } => assert!(
+                source.to_string().contains("object store unavailable"),
+                "expected the original message, got: {source}"
+            ),
+            other => panic!("expected the original IO error, got {other:?}"),
         }
     }
 

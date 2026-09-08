@@ -107,7 +107,6 @@ pub async fn cleanup_frag_reuse_index(dataset: &mut Dataset) -> lance_core::Resu
         Operation::CreateIndex {
             new_indices: vec![new_index_meta],
             removed_indices: vec![frag_reuse_index_meta.clone()],
-            mem_wal_index_catchup_advances: Vec::new(),
         },
         None,
     );
@@ -226,6 +225,7 @@ mod tests {
         IndexMetadata {
             uuid: uuid::Uuid::new_v4(),
             fields: vec![0],
+            covering_fields: vec![],
             name: "test_idx".into(),
             dataset_version,
             fragment_bitmap: Some(RoaringBitmap::from_iter(covered.iter().copied())),
