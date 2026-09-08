@@ -2987,7 +2987,7 @@ mod tests {
         delete_ids(dataset, &ids[1..]).await;
         compact_after_deletions(dataset).await;
 
-        append_constant_vector_with_start_id(
+        append_template_vector_with_start_id(
             dataset,
             ROWS_TO_APPEND_FOR_JOIN,
             &template_values,
@@ -3019,13 +3019,13 @@ mod tests {
         (deleted_rows, ROWS_TO_APPEND_FOR_JOIN, post_partitions)
     }
 
-    async fn append_constant_vector_with_start_id(
+    async fn append_template_vector_with_start_id(
         dataset: &mut Dataset,
         rows: usize,
         template: &[f32],
         next_id: &mut u64,
     ) {
-        append_constant_vector_batch(dataset, rows, template, *next_id, None).await;
+        append_template_vector_batch(dataset, rows, template, *next_id, None).await;
         *next_id += rows as u64;
     }
 
@@ -3079,17 +3079,17 @@ mod tests {
         dataset.append(batches, None).await.unwrap();
     }
 
-    async fn append_constant_vector_with_params(
+    async fn append_template_vector_with_params(
         dataset: &mut Dataset,
         rows: usize,
         template: &[f32],
         write_params: Option<WriteParams>,
     ) {
         let start_id = dataset.count_all_rows().await.unwrap() as u64;
-        append_constant_vector_batch(dataset, rows, template, start_id, write_params).await;
+        append_template_vector_batch(dataset, rows, template, start_id, write_params).await;
     }
 
-    async fn append_constant_vector_batch(
+    async fn append_template_vector_batch(
         dataset: &mut Dataset,
         rows: usize,
         template: &[f32],
@@ -3106,9 +3106,14 @@ mod tests {
         let ids = Arc::new(UInt64Array::from_iter_values(
             start_id..start_id + rows as u64,
         ));
+        // The same tiny per-row drift as `append_partition_templates`: a split
+        // into `ceil(rows / target)` pieces needs that many distinct rows, and
+        // identical rows would leave some pieces empty at random.
         let mut appended_values = Vec::with_capacity(rows * DIM);
-        for _ in 0..rows {
-            appended_values.extend_from_slice(template);
+        for row in 0..rows {
+            let mut values = template.to_vec();
+            values[0] += row as f32 * 0.0001;
+            appended_values.extend_from_slice(&values);
         }
         let vectors = Arc::new(
             FixedSizeListArray::try_new_from_values(
@@ -3142,7 +3147,7 @@ mod tests {
         expected_index_count: usize,
         expect_split: bool,
     ) {
-        append_constant_vector_with_start_id(dataset, rows_to_append, template, next_id).await;
+        append_template_vector_with_start_id(dataset, rows_to_append, template, next_id).await;
         dataset
             .optimize_indices(&OptimizeOptions::new())
             .await
@@ -6382,7 +6387,7 @@ mod tests {
             ..Default::default()
         };
         append_params.mode = WriteMode::Append;
-        append_constant_vector_with_params(
+        append_template_vector_with_params(
             &mut dataset,
             SMALL_APPEND_ROWS,
             &template_values,

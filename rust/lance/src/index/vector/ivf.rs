@@ -401,9 +401,12 @@ pub(crate) enum SteadyStateRebalance {
 /// segment's file. Joins are decided on the partition sizes summed over all
 /// segments: a delta segment's partitions are small on their own but normal
 /// once merged with the base segment, so joining them per segment would
-/// collapse every delta into a handful of partitions.
+/// collapse every delta into a handful of partitions. That merge needs the
+/// segments to share one model, so segments with different centroids (whose
+/// partition ids do not even correspond) are never joined.
 pub(crate) fn select_steady_state_rebalance(
     logical_index: &LogicalIvfView<'_>,
+    compatibility: VectorSegmentCompatibility,
 ) -> Result<Option<SteadyStateRebalance>> {
     let mut best_split = None;
     let mut summed_sizes: Vec<usize> = Vec::new();
@@ -456,6 +459,9 @@ pub(crate) fn select_steady_state_rebalance(
 
     if let Some(candidate) = best_split {
         return Ok(Some(SteadyStateRebalance::Segment(candidate.segment_id)));
+    }
+    if compatibility != VectorSegmentCompatibility::SharedModel {
+        return Ok(None);
     }
     let Some(join_threshold) = join_threshold else {
         return Ok(None);

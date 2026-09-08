@@ -50,7 +50,7 @@ use lance_index::vector::v3::shuffler::{
 };
 use lance_index::vector::v3::subindex::SubIndexType;
 use lance_index::vector::{LOSS_METADATA_KEY, PART_ID_COLUMN, PQ_CODE_COLUMN, VectorIndex};
-use lance_index::vector::{PART_ID_FIELD, ivf::storage::IvfModel};
+use lance_index::vector::{PART_ID_FIELD, ivf::IvfTransformer, ivf::storage::IvfModel};
 use lance_index::{
     INDEX_AUXILIARY_FILE_NAME, INDEX_FILE_NAME, pb,
     vector::{
@@ -112,6 +112,10 @@ const REASSIGN_SAMPLE_SIZE: usize = 512;
 /// margin of its own centroid's distance, so near-ties do not prune a neighbor
 /// that unsampled rows would still leave.
 const REASSIGN_MARGIN: f32 = 0.05;
+/// Bytes of quantized rows one join pass may keep in memory until the merge
+/// writes them out. Undersized partitions that do not fit wait for the next
+/// optimize, so joining every one of them at once cannot exhaust memory.
+const JOIN_BYTES_BUDGET: usize = 512 * 1024 * 1024;
 
 /// Number of partitions the split partitions' rows now belong to.
 fn new_partition_ids_len(split_partitions: &[(usize, Vec<usize>)]) -> usize {
@@ -1049,6 +1053,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 reader.as_ref(),
                 &self.existing_indices,
                 target_partition_size,
+                self.join_bytes_per_row()?,
             )?;
             let split_result = if splits.is_empty() {
                 None
@@ -1952,52 +1957,52 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         Ok(index_type.target_partition_size())
     }
 
-    /// Decide which partitions to split and which to join away.
-    ///
-    /// A partition above `MAX_PARTITION_SIZE_FACTOR` times the target is split
-    /// straight to the target size (`ceil(rows / target)` ways, capped at
-    /// `MAX_SPLIT_WAYS`), so one pass leaves nothing above the threshold. Every
-    /// partition below `MIN_PARTITION_SIZE_PERCENT` of the target is joined away,
-    /// except that the largest of them stays when all partitions are undersized.
+    /// Bytes one reassigned row occupies while a join runs: its row id, its
+    /// partition id and its code (the raw vector for a flat index).
+    fn join_bytes_per_row(&self) -> Result<usize> {
+        let Some(quantizer) = self.quantizer.as_ref() else {
+            return Err(Error::invalid_input(
+                "quantizer not set before planning partition joins",
+            ));
+        };
+        let code_bytes = match Q::quantization_type() {
+            QuantizationType::Flat => {
+                let Some(dataset) = self.dataset.as_ref() else {
+                    return Err(Error::invalid_input(
+                        "dataset not set before planning partition joins",
+                    ));
+                };
+                let (_, element_type) = get_vector_type(dataset.schema(), &self.column)?;
+                quantizer.code_dim() * element_type.primitive_width().unwrap_or(size_of::<f32>())
+            }
+            _ => quantizer.code_dim(),
+        };
+        Ok(code_bytes + size_of::<u64>() + size_of::<u32>())
+    }
+
+    /// Decide which partitions to split and which to join away, from the
+    /// partition sizes summed over the new rows and every existing segment.
+    /// See [`plan_partition_adjustment`] for the rules.
     fn check_partition_adjustment(
         ivf: &IvfModel,
         reader: &dyn ShuffleReader,
         existing_indices: &[ExistingIndex],
         target_partition_size: usize,
+        join_bytes_per_row: usize,
     ) -> Result<(Vec<PartitionSplit>, Vec<usize>)> {
-        let split_threshold = MAX_PARTITION_SIZE_FACTOR * target_partition_size;
-        let join_threshold = MIN_PARTITION_SIZE_PERCENT * target_partition_size / 100;
-
-        let mut splits = Vec::new();
-        let mut joins = Vec::new();
+        let mut partition_sizes = Vec::with_capacity(ivf.num_partitions());
         for partition in 0..ivf.num_partitions() {
             let mut num_rows = reader.partition_size(partition)?;
             for source in existing_indices.iter() {
                 num_rows += source.index.partition_size(partition);
             }
-            if num_rows > split_threshold {
-                splits.push(PartitionSplit {
-                    partition,
-                    ways: num_rows
-                        .div_ceil(target_partition_size)
-                        .clamp(2, MAX_SPLIT_WAYS),
-                });
-            } else if ivf.num_partitions() > 1 && num_rows < join_threshold {
-                joins.push((num_rows, partition));
-            }
+            partition_sizes.push(num_rows);
         }
-        if joins.len() == ivf.num_partitions() {
-            let largest = joins
-                .iter()
-                .enumerate()
-                .max_by_key(|(_, (num_rows, _))| *num_rows)
-                .map(|(i, _)| i)
-                .expect("joins is not empty");
-            joins.remove(largest);
-        }
-        let joins = joins.into_iter().map(|(_, partition)| partition).collect();
-
-        Ok((splits, joins))
+        Ok(plan_partition_adjustment(
+            &partition_sizes,
+            target_partition_size,
+            join_bytes_per_row,
+        ))
     }
 
     /// Split oversized partitions using a streaming approach.
@@ -2386,13 +2391,34 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         };
         // Balanced like IVF training itself, so the pieces come out even.
         let params = KMeansParams::new(None, 50, 1, normalized_dist_type).with_balance_factor(1.0);
-        let kmeans = lance_index::vector::kmeans::train_kmeans::<T>(
-            normalized_vectors.values().as_primitive::<T>(),
-            params,
+        let values = normalized_vectors.values().as_primitive::<T>();
+        let kmeans = match lance_index::vector::kmeans::train_kmeans::<T>(
+            values,
+            params.clone(),
             dimension,
             ways,
             SPLIT_SAMPLE_RATE,
-        )?;
+        ) {
+            Ok(kmeans) => kmeans,
+            Err(err) => {
+                // Above 256 ways the trainer goes hierarchical, which refuses a
+                // sample with fewer distinct rows than pieces rather than return
+                // fewer centroids. Flat k-means leaves the surplus centroids
+                // empty instead, and those are dropped below, so the partition
+                // still splits as far as its distinct rows allow.
+                log::info!(
+                    "retrying the {ways}-way split of partition {} with flat k-means: {err}",
+                    split.partition
+                );
+                lance_index::vector::kmeans::train_kmeans::<T>(
+                    values,
+                    params.with_hierarchical_k(1),
+                    dimension,
+                    ways,
+                    SPLIT_SAMPLE_RATE,
+                )?
+            }
+        };
 
         // A centroid no sampled row is nearest to would only produce an empty
         // partition (near-duplicate rows collapse onto one centroid). Keep the
@@ -2420,6 +2446,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
     /// Join undersized partitions away in one pass: their centroids are removed
     /// and every one of their vectors is reassigned to the nearest remaining
     /// partition among the `REASSIGN_RANGE` nearest neighbors of its old centroid.
+    /// Partitions are loaded one at a time and their rows quantized right away,
+    /// so only one partition's raw vectors are in memory at once.
     async fn join_partitions(&self, partitions: &[usize], ivf: &IvfModel) -> Result<JoinResult> {
         let removed: HashSet<usize> = partitions.iter().copied().collect();
         let kept_partitions: Vec<usize> = (0..ivf.num_partitions())
@@ -2512,7 +2540,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             output_partition[old] = Some(output);
         }
 
-        let mut assign_ops = vec![Vec::new(); kept_partitions.len()];
+        let (transformer, vector_field) = self.assign_transformer(new_centroids)?;
+
+        let mut assigned: Vec<Vec<RecordBatch>> = vec![Vec::new(); kept_partitions.len()];
         for &part_idx in partitions {
             let Some((row_ids, vectors)) = self.load_partition_raw_vectors(part_idx).await? else {
                 continue;
@@ -2524,6 +2554,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             let (reassign_part_ids, reassign_part_centroids) =
                 self.select_reassign_candidates(ivf, part_idx, &c0, &removed)?;
 
+            let mut assign_ops = vec![Vec::new(); kept_partitions.len()];
             for (i, &row_id) in row_ids.values().iter().enumerate() {
                 let ReassignPartition::ReassignCandidate(target) = self.reassign_vectors(
                     vectors.value(i).as_primitive::<T>(),
@@ -2542,18 +2573,34 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 })?;
                 assign_ops[output].push(AssignOp::Add((row_id, vectors.value(i))));
             }
+            let batches = Self::build_assign_batch::<T>(&transformer, &vector_field, &assign_ops)?;
+            for (output, batch) in batches.into_iter().enumerate() {
+                if let Some(batch) = batch {
+                    assigned[output].push(batch);
+                }
+            }
         }
 
-        self.build_assign_batch::<T>(new_centroids, &assign_ops)
+        let empty_deleted = UInt64Array::from(Vec::<u64>::new());
+        assigned
+            .into_iter()
+            .map(|mut batches| {
+                let batch = match batches.len() {
+                    0 => return Ok(None),
+                    1 => batches.pop().unwrap(),
+                    _ => arrow::compute::concat_batches(&batches[0].schema(), &batches)?,
+                };
+                Ok(Some((batch, empty_deleted.clone())))
+            })
+            .collect()
     }
 
-    // Build the assign batch form assign ops for each partition
-    // returns the assign batch and the deleted row ids
-    fn build_assign_batch<T: ArrowPrimitiveType>(
+    /// The IVF + quantizer transform that turns reassigned rows into index rows
+    /// of `centroids`, with the vector field its input batches use.
+    fn assign_transformer(
         &self,
         centroids: &FixedSizeListArray,
-        assign_ops: &[Vec<AssignOp>],
-    ) -> Result<Vec<Option<(RecordBatch, UInt64Array)>>> {
+    ) -> Result<(IvfTransformer, Field)> {
         let Some(dataset) = self.dataset.as_ref() else {
             return Err(Error::invalid_input(
                 "dataset not set before building assign batch",
@@ -2581,22 +2628,29 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             ));
         };
 
-        let transformer = Arc::new(
-            lance_index::vector::ivf::new_ivf_transformer_with_quantizer(
-                centroids.clone(),
-                self.distance_type,
-                vector_field.name().as_str(),
-                quantizer.into(),
-                None,
-            )?,
-        );
+        let transformer = lance_index::vector::ivf::new_ivf_transformer_with_quantizer(
+            centroids.clone(),
+            self.distance_type,
+            vector_field.name().as_str(),
+            quantizer.into(),
+            None,
+        )?;
+        Ok((transformer, vector_field))
+    }
 
+    /// Quantize the rows of `assign_ops` into one batch per output partition,
+    /// `None` where a partition receives no rows.
+    fn build_assign_batch<T: ArrowPrimitiveType>(
+        transformer: &IvfTransformer,
+        vector_field: &Field,
+        assign_ops: &[Vec<AssignOp>],
+    ) -> Result<Vec<Option<RecordBatch>>> {
+        let dimension = infer_vector_dim(vector_field.data_type())?;
         let num_rows: usize = assign_ops.iter().map(|ops| ops.len()).sum();
 
         // build the input batch with schema | row_id | vector | part_id |
         let mut row_ids_builder = UInt64Builder::with_capacity(num_rows);
-        let mut vector_builder =
-            PrimitiveBuilder::<T>::with_capacity(num_rows * centroids.value_length() as usize);
+        let mut vector_builder = PrimitiveBuilder::<T>::with_capacity(num_rows * dimension);
         let mut part_ids_builder = UInt32Builder::with_capacity(num_rows);
 
         let mut counts = Vec::with_capacity(assign_ops.len());
@@ -2610,14 +2664,12 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         }
 
         let row_ids = row_ids_builder.finish();
-        let vector = FixedSizeListArray::try_new_from_values(
-            vector_builder.finish(),
-            centroids.value_length(),
-        )?;
+        let vector =
+            FixedSizeListArray::try_new_from_values(vector_builder.finish(), dimension as i32)?;
         let part_ids = part_ids_builder.finish();
         let schema = arrow_schema::Schema::new(vec![
             ROW_ID_FIELD.clone(),
-            vector_field,
+            vector_field.clone(),
             PART_ID_FIELD.clone(),
         ]);
         let batch = RecordBatch::try_new(
@@ -2626,14 +2678,13 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         )?;
         let batch = transformer.transform(&batch)?;
 
-        let empty_deleted = UInt64Array::from(Vec::<u64>::new());
         let mut results = Vec::with_capacity(assign_ops.len());
         let mut offset = 0;
         for count in counts {
             if count == 0 {
                 results.push(None);
             } else {
-                results.push(Some((batch.slice(offset, count), empty_deleted.clone())));
+                results.push(Some(batch.slice(offset, count)));
                 offset += count;
             }
         }
@@ -2759,6 +2810,61 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
 /// The nearest `REASSIGN_RANGE` partitions to `c0`, skipping `part_idx` itself and
 /// every partition in `excluded` (partitions being joined away cannot receive
 /// vectors). Non-empty whenever a partition outside `excluded` exists.
+/// Split every partition above `MAX_PARTITION_SIZE_FACTOR` times the target
+/// straight to the target size (`ceil(rows / target)` ways, capped at
+/// `MAX_SPLIT_WAYS`), so one pass leaves nothing above the threshold. Join away
+/// partitions below `MIN_PARTITION_SIZE_PERCENT` of the target, smallest first,
+/// within two limits:
+///
+/// * Enough partitions stay for all rows to average the target size. Joined
+///   rows move to the nearest kept centroid, so joining every undersized
+///   partition into the largest one would rebuild the very oversized partition
+///   the split threshold exists to prevent.
+/// * The joined rows fit in `JOIN_BYTES_BUDGET` at `join_bytes_per_row`, since
+///   they stay in memory until the merge writes them out. The rest wait for
+///   the next optimize.
+fn plan_partition_adjustment(
+    partition_sizes: &[usize],
+    target_partition_size: usize,
+    join_bytes_per_row: usize,
+) -> (Vec<PartitionSplit>, Vec<usize>) {
+    let split_threshold = MAX_PARTITION_SIZE_FACTOR * target_partition_size;
+    let join_threshold = MIN_PARTITION_SIZE_PERCENT * target_partition_size / 100;
+    let num_partitions = partition_sizes.len();
+
+    let mut splits = Vec::new();
+    let mut joins = Vec::new();
+    for (partition, &num_rows) in partition_sizes.iter().enumerate() {
+        if num_rows > split_threshold {
+            splits.push(PartitionSplit {
+                partition,
+                ways: num_rows
+                    .div_ceil(target_partition_size)
+                    .clamp(2, MAX_SPLIT_WAYS),
+            });
+        } else if num_partitions > 1 && num_rows < join_threshold {
+            joins.push((num_rows, partition));
+        }
+    }
+
+    let total_rows: usize = partition_sizes.iter().sum();
+    let min_kept = total_rows.div_ceil(target_partition_size).max(1);
+    let max_joins = num_partitions.saturating_sub(min_kept);
+    joins.sort_unstable();
+    let mut joined_bytes = 0usize;
+    let joins = joins
+        .into_iter()
+        .take(max_joins)
+        .take_while(|(num_rows, _)| {
+            let first = joined_bytes == 0;
+            joined_bytes += num_rows * join_bytes_per_row;
+            first || joined_bytes <= JOIN_BYTES_BUDGET
+        })
+        .map(|(_, partition)| partition)
+        .collect();
+    (splits, joins)
+}
+
 fn select_reassign_candidates_impl(
     distance_type: DistanceType,
     ivf: &IvfModel,
@@ -3577,6 +3683,162 @@ mod tests {
             .map(|p| optimized.partition_size(p))
             .sum();
         assert_eq!(total, 5_510);
+    }
+
+    #[test]
+    fn plan_partition_adjustment_keeps_enough_partitions_for_the_target() {
+        // Twenty partitions of 24 rows at target 100 are all under the join
+        // threshold (25 rows). Joined into one they would make 480 rows, above
+        // the split threshold of 400, so five of them stay.
+        let (splits, joins) = plan_partition_adjustment(&[24; 20], 100, 1);
+        assert!(splits.is_empty());
+        assert_eq!(joins, (0..15).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn plan_partition_adjustment_bounds_joined_bytes_per_pass() {
+        // Each 10-row partition costs 40% of the budget: two fit, the rest wait.
+        let bytes_per_row = JOIN_BYTES_BUDGET / 25;
+        let (splits, joins) = plan_partition_adjustment(&[50, 10, 10, 10, 10], 100, bytes_per_row);
+        assert!(splits.is_empty());
+        assert_eq!(joins, vec![1, 2]);
+        // A single partition over the budget is still joined, or it never would be.
+        let (_, joins) = plan_partition_adjustment(&[50, 10], 100, JOIN_BYTES_BUDGET);
+        assert_eq!(joins, vec![1]);
+    }
+
+    #[tokio::test]
+    async fn optimize_join_leaves_no_partition_above_the_split_threshold() {
+        use crate::index::DatasetIndexExt;
+        use crate::index::vector::{StageParams, VectorIndexParams};
+        use lance_index::optimize::OptimizeOptions;
+        use lance_linalg::distance::MetricType;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let uri = tmp.path().to_str().unwrap();
+        // Twenty clusters of 24 rows: at target 100 every partition is under
+        // the join threshold (25 rows), while all of them together (480 rows)
+        // are above the split threshold (400 rows).
+        let clusters: Vec<(usize, f32)> = (0..20).map(|i| (24, i as f32 * 1000.0)).collect();
+        let mut dataset = write_clusters(uri, &clusters).await;
+        let mut params = VectorIndexParams::ivf_flat(20, MetricType::L2);
+        let StageParams::Ivf(ivf_params) = &mut params.stages[0] else {
+            panic!("ivf_flat params start with the IVF stage");
+        };
+        ivf_params.target_partition_size = Some(100);
+        dataset
+            .create_index(
+                &["vec"],
+                IndexType::Vector,
+                Some("idx".into()),
+                &params,
+                false,
+            )
+            .await
+            .unwrap();
+
+        let mut dataset = append_cluster(dataset, 1, 0.0).await;
+        dataset
+            .optimize_indices(&OptimizeOptions::default())
+            .await
+            .unwrap();
+
+        let optimized = open_single_segment(&dataset).await;
+        let ivf = optimized.ivf_model();
+        let sizes: Vec<usize> = (0..ivf.num_partitions())
+            .map(|p| optimized.partition_size(p))
+            .collect();
+        assert_eq!(sizes.iter().sum::<usize>(), 481, "all rows preserved");
+        // 481 rows need at least five partitions to average the target size.
+        assert!(ivf.num_partitions() >= 5, "{sizes:?}");
+        let max_size = *sizes.iter().max().unwrap();
+        assert!(
+            max_size <= 4 * 100,
+            "a join must not create a partition above the split threshold, got {sizes:?}"
+        );
+    }
+
+    /// `distinct` vectors, each repeated `repeats` times, at `center + i`.
+    fn duplicate_batch(
+        schema: &Arc<arrow_schema::Schema>,
+        distinct: usize,
+        repeats: usize,
+        center: f32,
+    ) -> RecordBatch {
+        let mut values = Vec::with_capacity(distinct * repeats * 4);
+        for i in 0..distinct {
+            let p = center + i as f32;
+            for _ in 0..repeats {
+                values.extend_from_slice(&[p, p, p, p]);
+            }
+        }
+        let fsl = FixedSizeListArray::try_new_from_values(Float32Array::from(values), 4).unwrap();
+        RecordBatch::try_new(schema.clone(), vec![Arc::new(fsl)]).unwrap()
+    }
+
+    #[tokio::test]
+    async fn optimize_splits_duplicate_heavy_partition_as_far_as_its_distinct_rows_allow() {
+        use crate::dataset::{InsertBuilder, WriteMode, WriteParams};
+        use crate::index::DatasetIndexExt;
+        use crate::index::vector::{StageParams, VectorIndexParams};
+        use arrow_array::RecordBatchIterator;
+        use lance_index::optimize::OptimizeOptions;
+        use lance_linalg::distance::MetricType;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let uri = tmp.path().to_str().unwrap();
+        // Five distinct vectors repeated 240 times each. At target 4 the
+        // partition asks for a ceil(1210 / 4) = 303-way split, which is more
+        // than 256 pieces and therefore trained hierarchically. The other
+        // partition stays under the split threshold of 16 rows.
+        let schema = cluster_schema();
+        let batches = vec![
+            Ok(duplicate_batch(&schema, 5, 240, 0.0)),
+            Ok(duplicate_batch(&schema, 1, 10, 1000.0)),
+        ];
+        let reader = RecordBatchIterator::new(batches, schema.clone());
+        let mut dataset = crate::Dataset::write(reader, uri, None).await.unwrap();
+        let mut params = VectorIndexParams::ivf_flat(2, MetricType::L2);
+        let StageParams::Ivf(ivf_params) = &mut params.stages[0] else {
+            panic!("ivf_flat params start with the IVF stage");
+        };
+        ivf_params.target_partition_size = Some(4);
+        dataset
+            .create_index(
+                &["vec"],
+                IndexType::Vector,
+                Some("idx".into()),
+                &params,
+                false,
+            )
+            .await
+            .unwrap();
+
+        let append = duplicate_batch(&schema, 1, 10, 0.0);
+        let mut dataset = InsertBuilder::new(Arc::new(dataset))
+            .with_params(&WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            })
+            .execute(vec![append])
+            .await
+            .unwrap();
+        dataset
+            .optimize_indices(&OptimizeOptions::default())
+            .await
+            .unwrap();
+
+        let optimized = open_single_segment(&dataset).await;
+        let ivf = optimized.ivf_model();
+        let mut sizes: Vec<usize> = (0..ivf.num_partitions())
+            .map(|p| optimized.partition_size(p))
+            .collect();
+        // The five duplicate groups come apart, one partition each, even
+        // though 303 pieces were asked for.
+        sizes.sort_unstable();
+        assert_eq!(sizes, vec![10, 240, 240, 240, 240, 250]);
+        let found = nearest_first_components(&dataset, 3.0, 5).await;
+        assert!(found.iter().all(|v| *v == 3.0), "{found:?}");
     }
 
     #[tokio::test]

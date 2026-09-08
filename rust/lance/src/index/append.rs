@@ -962,7 +962,8 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
             }
             let steady_state_rebalance =
                 if unindexed.is_empty() && options.num_indices_to_merge.is_none() {
-                    let Some(rebalance) = select_steady_state_rebalance(&ivf_view)? else {
+                    let Some(rebalance) = select_steady_state_rebalance(&ivf_view, compatibility)?
+                    else {
                         return Ok(None);
                     };
                     Some(rebalance)
@@ -1561,7 +1562,10 @@ mod tests {
 
         let initial_fragments = dataset.get_fragments();
         assert_eq!(initial_fragments.len(), 2);
-        let params = VectorIndexParams::ivf_flat(1, MetricType::L2);
+        // Two partitions per segment: summed over the segments they are under
+        // the join threshold, which must not tempt a steady-state merge of
+        // segments whose centroids differ.
+        let params = VectorIndexParams::ivf_flat(2, MetricType::L2);
         let mut initial_segments = Vec::with_capacity(initial_fragments.len());
         for fragment in &initial_fragments {
             initial_segments.push(
