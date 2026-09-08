@@ -27,15 +27,15 @@ use lance_core::{Result, is_system_column};
 use lance_datafusion::exec::OneShotExec;
 use tracing::instrument;
 
-use crate::dataset::mem_wal::TOMBSTONE;
-use crate::dataset::mem_wal::index::IndexStore;
+use crate::dataset::mem_wal::index::{IndexStore, MemTableVisibility};
 use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
+use crate::dataset::mem_wal::{TOMBSTONE, relax_non_pk_nullability};
 
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
 use super::exec::{BloomFilterGuardExec, CoalesceFirstExec, compute_pk_hash_from_scalars};
 use super::projection::{
-    DISTANCE_COLUMN, build_scanner_projection, canonical_output_schema, null_columns,
+    DISTANCE_COLUMN, build_scanner_projection, canonical_output_schema, force_schema, null_columns,
     project_to_canonical, validate_projection_names, wants_row_address, wants_row_id,
 };
 use super::sstable_cache::{DatasetCache, SsTableWarmer, open_sstable};
@@ -105,6 +105,9 @@ pub struct LsmPointLookupPlanner {
     /// on the plan fallback path (the part of point-lookup latency that doesn't
     /// scale with generation count).
     task_ctx: Arc<TaskContext>,
+    /// Prefix of the in-memory memtables this planner reads. Applies to the fast
+    /// BTree probe and the plan fallback alike, so both resolve a key the same.
+    visibility: MemTableVisibility,
 }
 
 impl LsmPointLookupPlanner {
@@ -132,7 +135,15 @@ impl LsmPointLookupPlanner {
             warmer: None,
             none_target,
             task_ctx: SessionContext::new().task_ctx(),
+            visibility: MemTableVisibility::Published,
         }
+    }
+
+    /// Read the in-memory memtables at `visibility`. See
+    /// [`MemTableVisibility::Indexed`] for when a wider bound is sound.
+    pub fn with_visibility(mut self, visibility: MemTableVisibility) -> Self {
+        self.visibility = visibility;
+        self
     }
 
     /// Set the session used to open SSTables.
@@ -321,7 +332,7 @@ impl LsmPointLookupPlanner {
     ) -> Result<RecordBatch> {
         let canonical =
             canonical_output_schema(projection, &self.base_schema, &self.pk_columns, false);
-        let target = carry_schema(&canonical);
+        let target = carry_schema(&canonical, &self.pk_columns);
         let mut out: Vec<RecordBatch> = Vec::with_capacity(keys.len());
         for key in keys {
             if let Some(b) = self.lookup_keep_tombstone(key, projection).await? {
@@ -399,6 +410,7 @@ impl LsmPointLookupPlanner {
                             &self.pk_columns[0],
                             &pk_values[0],
                             target,
+                            self.visibility,
                         )? {
                             Probe::Hit(batch) => Ok(Some(FastOutcome::Hit(batch))),
                             Probe::Deleted => Ok(Some(FastOutcome::Deleted)),
@@ -507,7 +519,8 @@ impl LsmPointLookupPlanner {
         for key in keys {
             let mut resolved = false;
             for (ri, m) in refs.iter().enumerate() {
-                match probe_position(&m.batch_store, &m.index_store, pk_col, key)? {
+                match probe_position(&m.batch_store, &m.index_store, pk_col, key, self.visibility)?
+                {
                     ProbePos::Found { batch_idx, row } => {
                         // Newest version is a tombstone → the key is deleted:
                         // resolve it as a miss (emit nothing) and do not fall
@@ -686,8 +699,12 @@ impl LsmPointLookupPlanner {
             } => {
                 use crate::dataset::mem_wal::memtable::scanner::MemTableScanner;
 
-                let mut scanner =
-                    MemTableScanner::new(batch_store.clone(), index_store.clone(), schema.clone());
+                let mut scanner = MemTableScanner::new_at_visibility(
+                    batch_store.clone(),
+                    index_store.clone(),
+                    schema.clone(),
+                    self.visibility,
+                );
                 // Carry `_tombstone` through so the post-coalesce filter can drop
                 // a deleted key; it survives the sort below.
                 let cols = cols_with_tombstone(&cols, schema.column_with_name(TOMBSTONE).is_some());
@@ -728,7 +745,7 @@ impl LsmPointLookupPlanner {
         // Output carries `_tombstone` (canonical + the marker) so it survives
         // the union/coalesce to the post-coalesce filter; base / legacy sources
         // that lack the column get a synthesized `false`.
-        project_to_carry(scan, &target)
+        project_to_carry(scan, &target, &self.pk_columns)
     }
 
     /// Create an empty execution plan with the canonical output schema.
@@ -756,11 +773,18 @@ fn cols_with_tombstone(cols: &[String], present: bool) -> Vec<String> {
     out
 }
 
-/// Carry schema = canonical output + a trailing non-nullable `_tombstone`
-/// Boolean. Non-nullable so the base arm's synthesized `Literal(false)` matches
-/// the WAL arms' real column under `CoalesceFirstExec`'s exact-schema check.
-fn carry_schema(canonical: &SchemaRef) -> SchemaRef {
-    let mut fields: Vec<Arc<Field>> = canonical.fields().iter().cloned().collect();
+/// Carry schema = canonical output widened to the storage schema's
+/// nullability, plus a trailing non-nullable `_tombstone` Boolean.
+///
+/// Widened because tombstone rows — null in every non-PK column — are still in
+/// flight; [`filter_tombstones_after_coalesce`] drops them past
+/// `CoalesceFirstExec`, and only then does the plan narrow back to the logical
+/// schema. `_tombstone` stays non-nullable so the base arm's synthesized
+/// `Literal(false)` matches the WAL arms' real column under
+/// `CoalesceFirstExec`'s exact-schema check.
+fn carry_schema(canonical: &SchemaRef, pk_columns: &[String]) -> SchemaRef {
+    let widened = relax_non_pk_nullability(canonical, pk_columns);
+    let mut fields: Vec<Arc<Field>> = widened.fields().iter().cloned().collect();
     fields.push(Arc::new(Field::new(TOMBSTONE, DataType::Boolean, false)));
     Arc::new(Schema::new(fields))
 }
@@ -772,9 +796,10 @@ fn carry_schema(canonical: &SchemaRef) -> SchemaRef {
 fn project_to_carry(
     plan: Arc<dyn ExecutionPlan>,
     canonical: &SchemaRef,
+    pk_columns: &[String],
 ) -> Result<Arc<dyn ExecutionPlan>> {
     let input = plan.schema();
-    let carry = carry_schema(canonical);
+    let carry = carry_schema(canonical, pk_columns);
     let mut project_exprs: Vec<(Arc<dyn PhysicalExpr>, String)> =
         Vec::with_capacity(carry.fields().len());
     for field in carry.fields() {
@@ -798,11 +823,11 @@ fn project_to_carry(
         };
         project_exprs.push((expr, name.clone()));
     }
-    Ok(Arc::new(
-        ProjectionExec::try_new(project_exprs, plan).map_err(|e| {
-            lance_core::Error::internal(format!("Failed to build carry ProjectionExec: {}", e))
-        })?,
-    ))
+    let projected = Arc::new(ProjectionExec::try_new(project_exprs, plan).map_err(|e| {
+        lance_core::Error::internal(format!("Failed to build carry ProjectionExec: {}", e))
+    })?);
+    // `CoalesceFirstExec` panics unless every arm lands on exactly `carry`.
+    Ok(force_schema(projected, &carry))
 }
 
 /// Drop tombstone rows after `CoalesceFirstExec` has already picked the newest
@@ -887,6 +912,7 @@ fn probe_position(
     index_store: &IndexStore,
     pk_column: &str,
     pk_value: &ScalarValue,
+    visibility: MemTableVisibility,
 ) -> Result<ProbePos> {
     // Visible batches are the committed prefix [0, last_visible_idx]; each
     // `StoredBatch` carries its cumulative `row_offset`, so visibility and the
@@ -895,10 +921,10 @@ fn probe_position(
     if len == 0 {
         return Ok(ProbePos::Miss);
     }
-    // The cursor is an exclusive count, so the last visible batch sits at
-    // `count - 1`. A count of 0 means nothing is visible yet — not "batch 0".
-    let visible_count = index_store.visible_count().min(len);
-    let Some(last_visible_idx) = visible_count.checked_sub(1) else {
+    // The cursor is an exclusive count, so the last readable batch sits at
+    // `count - 1`. A count of 0 means nothing is readable yet — not "batch 0".
+    let readable_count = index_store.prefix_count(visibility).min(len);
+    let Some(last_visible_idx) = readable_count.checked_sub(1) else {
         return Ok(ProbePos::Miss);
     };
     let last = batch_store.get(last_visible_idx).ok_or_else(|| {
@@ -1000,8 +1026,9 @@ fn probe_memtable(
     pk_column: &str,
     pk_value: &ScalarValue,
     target: &SchemaRef,
+    visibility: MemTableVisibility,
 ) -> Result<Probe> {
-    match probe_position(batch_store, index_store, pk_column, pk_value)? {
+    match probe_position(batch_store, index_store, pk_column, pk_value, visibility)? {
         ProbePos::NoIndex => Ok(Probe::NoIndex),
         ProbePos::Miss => Ok(Probe::Miss),
         ProbePos::Found { batch_idx, row } => {
@@ -1027,6 +1054,7 @@ mod tests {
     use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, StringArray};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use datafusion::physical_plan::displayable;
+    use rstest::rstest;
     use std::collections::HashMap;
     use uuid::Uuid;
 
@@ -1537,6 +1565,89 @@ mod tests {
                 .is_none(),
             "absent key must miss"
         );
+    }
+
+    /// The writer's own read at [`MemTableVisibility::Indexed`] resolves a row
+    /// whose WAL append is still outstanding, while the default `Published`
+    /// bound does not. The projection selects which read path runs: the fast
+    /// BTree probe, or the `MemTableScanner` plan fallback (a system column in
+    /// the output disqualifies the probe). Both must resolve the key alike.
+    #[rstest]
+    #[case::fast_btree_probe(None)]
+    #[case::scanner_fallback(Some(vec![
+        "id".to_string(),
+        "name".to_string(),
+        "_rowid".to_string(),
+    ]))]
+    #[tokio::test]
+    async fn test_indexed_visibility_reads_the_undurable_prefix(
+        #[case] projection: Option<Vec<String>>,
+    ) {
+        use crate::dataset::mem_wal::index::MemTableVisibility;
+        use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
+        use crate::dataset::mem_wal::wal::WriterCursors;
+        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
+
+        let schema = create_pk_schema();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp_dir.path().to_str().unwrap());
+
+        let batch_store = Arc::new(BatchStore::with_capacity(16));
+        let mut index_store = IndexStore::new();
+        index_store.enable_pk_index(&[("id".to_string(), 0)]);
+        // A writer whose durability cursor never advances: the batch indexes,
+        // but its append stays outstanding, so it never publishes.
+        index_store.set_durability(Arc::new(WriterCursors::new(true)), 0);
+
+        let batch = create_test_batch(&schema, &[1], "pending");
+        let (bp, off, _) = batch_store.append(batch.clone()).unwrap();
+        index_store
+            .insert_with_batch_position(&batch, off, Some(bp))
+            .unwrap();
+        assert_eq!(index_store.indexed_count(), 1);
+        assert_eq!(index_store.visible_count(), 0, "the append is outstanding");
+        let index_store = Arc::new(index_store);
+
+        let shard_id = Uuid::new_v4();
+        let collector = LsmDataSourceCollector::without_base_table(base_uri, vec![])
+            .with_in_memory_memtables(
+                shard_id,
+                InMemoryMemTables {
+                    active: InMemoryMemTableRef {
+                        batch_store,
+                        index_store,
+                        schema: schema.clone(),
+                        generation: 1,
+                    },
+                    frozen: vec![],
+                },
+            );
+        let planner = LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema);
+        let key = [ScalarValue::Int32(Some(1))];
+
+        assert!(
+            planner
+                .lookup(&key, projection.as_deref())
+                .await
+                .unwrap()
+                .is_none(),
+            "a row whose append is outstanding must stay invisible at Published"
+        );
+
+        let planner = planner.with_visibility(MemTableVisibility::Indexed);
+        let hit = planner
+            .lookup(&key, projection.as_deref())
+            .await
+            .unwrap()
+            .expect("the writer must read its own indexed prefix");
+        assert_eq!(hit.num_rows(), 1);
+        let name = hit
+            .column_by_name("name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(name.value(0), "pending_1");
     }
 
     #[tokio::test]

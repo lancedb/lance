@@ -239,10 +239,28 @@ pub struct ManifestLocation {
     pub size: Option<u64>,
     /// Naming scheme of the manifest file.
     pub naming_scheme: ManifestNamingScheme,
-    /// Optional e-tag, used for integrity checks. Manifests should be immutable, so
-    /// if we detect a change in the e-tag, it means the manifest was tampered with.
-    /// This might happen if the dataset was deleted and then re-created.
+    /// Optional opaque object generation token observed at `path`.
+    ///
+    /// An ETag is not necessarily a content checksum and may change when an
+    /// object is rewritten with identical bytes. In particular, S3 Express
+    /// returns an object-specific opaque value. Callers must not treat it as a
+    /// content checksum, logical manifest identity, or dataset-incarnation
+    /// identity. The generic
+    /// [`ExternalManifestStore`](crate::io::commit::external_manifest::ExternalManifestStore)
+    /// workflow therefore neither persists nor validates it: COPY and external
+    /// index publication are not atomic, so an otherwise correct equivalent
+    /// materialization can make a stored token stale before it is published.
+    ///
+    /// When present, the token still distinguishes the physical object
+    /// generation observed by this caller and can prevent reuse of an older
+    /// cached Dataset at the same URI and version. Conversely, `None` must not
+    /// be interpreted as proof that two observations belong to the same dataset
+    /// incarnation.
     pub e_tag: Option<String>,
+    /// A token unique to this manifest record in the commit handler's store,
+    /// where it keeps one (`ExternalManifestStore::get_identity`). A dataset
+    /// recreated at the same version has a different one.
+    pub identity: Option<String>,
 }
 
 impl TryFrom<object_store::ObjectMeta> for ManifestLocation {
@@ -263,6 +281,7 @@ impl TryFrom<object_store::ObjectMeta> for ManifestLocation {
             size: Some(meta.size),
             naming_scheme: scheme,
             e_tag: meta.e_tag,
+            identity: None,
         })
     }
 }
@@ -280,7 +299,7 @@ async fn current_manifest_path(
     object_store: &ObjectStore,
     base: &Path,
 ) -> Result<ManifestLocation> {
-    if object_store.is_local() {
+    if object_store.has_direct_local_paths() {
         if let Ok(Some(location)) = current_manifest_local(base) {
             return Ok(location);
         }
@@ -386,6 +405,7 @@ async fn read_version_hint_and_probe(
         size: Some(meta.size),
         naming_scheme: scheme,
         e_tag: meta.e_tag,
+        identity: None,
     })
 }
 
@@ -514,6 +534,7 @@ async fn list_manifests_since_version_with_hint(
             size: Some(meta.size),
             naming_scheme: scheme,
             e_tag: meta.e_tag,
+            identity: None,
         })
         .collect();
 
@@ -535,6 +556,7 @@ async fn list_manifests_since_version_with_hint(
                             size: Some(meta.size),
                             naming_scheme: scheme,
                             e_tag: meta.e_tag,
+                            identity: None,
                         })
                 })
                 .buffer_unordered(object_store.io_parallelism())
@@ -608,6 +630,7 @@ async fn resolve_version_from_listing(
                 size: Some(meta.size),
                 naming_scheme: scheme,
                 e_tag: meta.e_tag,
+                identity: None,
             })
         }
         // If the list is not lexically ordered, we need to iterate all manifests
@@ -641,6 +664,7 @@ async fn resolve_version_from_listing(
                 size: Some(current_meta.size),
                 naming_scheme: scheme,
                 e_tag: current_meta.e_tag,
+                identity: None,
             })
         }
         (None, _) => Err(Error::not_found(
@@ -656,7 +680,7 @@ fn current_manifest_local(base: &Path) -> std::io::Result<Option<ManifestLocatio
     let path = lance_io::local::to_local_path(&base.clone().join(VERSIONS_DIR));
     let entries = std::fs::read_dir(path)?;
 
-    let mut latest_entry: Option<(u64, DirEntry)> = None;
+    let mut latest_entry: Option<(u64, DirEntry, ManifestNamingScheme)> = None;
 
     let mut scheme: Option<ManifestNamingScheme> = None;
 
@@ -689,25 +713,24 @@ fn current_manifest_local(base: &Path) -> std::io::Result<Option<ManifestLocatio
             continue;
         };
 
-        if let Some((latest_version, _)) = &latest_entry {
+        if let Some((latest_version, _, _)) = &latest_entry {
             if version > *latest_version {
-                latest_entry = Some((version, entry));
+                latest_entry = Some((version, entry, entry_scheme));
             }
         } else {
-            latest_entry = Some((version, entry));
+            latest_entry = Some((version, entry, entry_scheme));
         }
     }
 
-    if let Some((version, entry)) = latest_entry {
-        let path = Path::from_filesystem_path(entry.path())
-            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
+    if let Some((version, entry, naming_scheme)) = latest_entry {
         let metadata = entry.metadata()?;
         Ok(Some(ManifestLocation {
             version,
-            path,
+            path: naming_scheme.manifest_path(base, version),
             size: Some(metadata.len()),
-            naming_scheme: scheme.unwrap(),
+            naming_scheme,
             e_tag: Some(get_etag(&metadata)),
+            identity: None,
         }))
     } else {
         Ok(None)
@@ -742,6 +765,7 @@ fn detached_manifest_location_from_meta(
         size: Some(meta.size),
         naming_scheme: ManifestNamingScheme::V2,
         e_tag: meta.e_tag,
+        identity: None,
     })
 }
 
@@ -762,13 +786,101 @@ pub fn list_detached_manifests<'a>(
         .boxed()
 }
 
-fn make_staging_manifest_path(base: &Path) -> Result<Path> {
+pub(crate) fn make_staging_manifest_path(base: &Path) -> Result<Path> {
     let id = uuid::Uuid::new_v4().to_string();
     Path::parse(format!("{base}-{id}")).map_err(|e| Error::io_source(Box::new(e)))
 }
 
 #[cfg(feature = "dynamodb")]
 const DDB_URL_QUERY_KEY: &str = "ddbTableName";
+
+/// Object-store listing of `_versions/`; the `CommitHandler` defaults.
+pub(crate) fn default_list_manifest_locations<'a>(
+    base_path: &Path,
+    object_store: &'a ObjectStore,
+    sorted_descending: bool,
+) -> BoxStream<'a, Result<ManifestLocation>> {
+    let underlying_stream = list_manifests(base_path, &object_store.inner);
+
+    if !sorted_descending {
+        return underlying_stream.boxed();
+    }
+
+    async fn sort_stream(
+        input_stream: impl futures::Stream<Item = Result<ManifestLocation>> + Unpin,
+    ) -> Result<impl Stream<Item = Result<ManifestLocation>> + Unpin> {
+        let mut locations = input_stream.try_collect::<Vec<_>>().await?;
+        locations.sort_by_key(|m| std::cmp::Reverse(m.version));
+        Ok(futures::stream::iter(locations.into_iter().map(Ok)))
+    }
+
+    // If the object store supports lexicographically ordered lists and
+    // the naming scheme is V2, we can use an optimized list operation.
+    if object_store.list_is_lexically_ordered {
+        // We don't know the naming scheme until we see the first manifest.
+        let mut peekable = underlying_stream.peekable();
+
+        futures::stream::once(async move {
+            let naming_scheme = match Pin::new(&mut peekable).peek().await {
+                Some(Ok(m)) => m.naming_scheme,
+                // If we get an error or no manifests are found, we default
+                // to V2 naming scheme, since it doesn't matter.
+                Some(Err(_)) => ManifestNamingScheme::V2,
+                None => ManifestNamingScheme::V2,
+            };
+
+            if naming_scheme == ManifestNamingScheme::V2 {
+                // If the first manifest is V2, we can use the optimized list operation.
+                Ok(Either::Left(peekable))
+            } else {
+                sort_stream(peekable).await.map(Either::Right)
+            }
+        })
+        .try_flatten()
+        .boxed()
+    } else {
+        // If the object store does not support lexicographically ordered lists,
+        // we need to sort the manifests in memory. Systems where this isn't
+        // supported (local fs, S3 express) are typically fast enough
+        // that this is not a problem.
+        futures::stream::once(sort_stream(underlying_stream))
+            .try_flatten()
+            .boxed()
+    }
+}
+
+pub(crate) fn default_list_manifest_locations_since<'a>(
+    base_path: &Path,
+    object_store: &'a ObjectStore,
+    since_version: u64,
+) -> BoxStream<'a, Result<ManifestLocation>> {
+    if !uses_version_hint(object_store) {
+        return default_list_manifest_locations(base_path, object_store, true)
+            .try_take_while(move |loc| future::ready(Ok(loc.version > since_version)))
+            .boxed();
+    }
+
+    let base_path = base_path.clone();
+    futures::stream::once(async move {
+        let locations =
+            match list_manifests_since_version_with_hint(object_store, &base_path, since_version)
+                .await
+            {
+                Some(locations) => locations,
+                None => {
+                    let mut locations = list_manifests(&base_path, &object_store.inner)
+                        .try_collect::<Vec<_>>()
+                        .await?;
+                    locations.retain(|loc| loc.version > since_version);
+                    locations.sort_by_key(|loc| std::cmp::Reverse(loc.version));
+                    locations
+                }
+            };
+        Ok::<_, Error>(futures::stream::iter(locations.into_iter().map(Ok)))
+    })
+    .try_flatten()
+    .boxed()
+}
 
 /// Handle commits that prevent conflicting writes.
 ///
@@ -862,53 +974,7 @@ pub trait CommitHandler: Debug + Send + Sync {
         object_store: &'a ObjectStore,
         sorted_descending: bool,
     ) -> BoxStream<'a, Result<ManifestLocation>> {
-        let underlying_stream = list_manifests(base_path, &object_store.inner);
-
-        if !sorted_descending {
-            return underlying_stream.boxed();
-        }
-
-        async fn sort_stream(
-            input_stream: impl futures::Stream<Item = Result<ManifestLocation>> + Unpin,
-        ) -> Result<impl Stream<Item = Result<ManifestLocation>> + Unpin> {
-            let mut locations = input_stream.try_collect::<Vec<_>>().await?;
-            locations.sort_by_key(|m| std::cmp::Reverse(m.version));
-            Ok(futures::stream::iter(locations.into_iter().map(Ok)))
-        }
-
-        // If the object store supports lexicographically ordered lists and
-        // the naming scheme is V2, we can use an optimized list operation.
-        if object_store.list_is_lexically_ordered {
-            // We don't know the naming scheme until we see the first manifest.
-            let mut peekable = underlying_stream.peekable();
-
-            futures::stream::once(async move {
-                let naming_scheme = match Pin::new(&mut peekable).peek().await {
-                    Some(Ok(m)) => m.naming_scheme,
-                    // If we get an error or no manifests are found, we default
-                    // to V2 naming scheme, since it doesn't matter.
-                    Some(Err(_)) => ManifestNamingScheme::V2,
-                    None => ManifestNamingScheme::V2,
-                };
-
-                if naming_scheme == ManifestNamingScheme::V2 {
-                    // If the first manifest is V2, we can use the optimized list operation.
-                    Ok(Either::Left(peekable))
-                } else {
-                    sort_stream(peekable).await.map(Either::Right)
-                }
-            })
-            .try_flatten()
-            .boxed()
-        } else {
-            // If the object store does not support lexicographically ordered lists,
-            // we need to sort the manifests in memory. Systems where this isn't
-            // supported (local fs, S3 express) are typically fast enough
-            // that this is not a problem.
-            futures::stream::once(sort_stream(underlying_stream))
-                .try_flatten()
-                .boxed()
-        }
+        default_list_manifest_locations(base_path, object_store, sorted_descending)
     }
 
     /// List manifest locations with version `> since_version`, in descending
@@ -924,36 +990,7 @@ pub trait CommitHandler: Debug + Send + Sync {
         object_store: &'a ObjectStore,
         since_version: u64,
     ) -> BoxStream<'a, Result<ManifestLocation>> {
-        if !uses_version_hint(object_store) {
-            return self
-                .list_manifest_locations(base_path, object_store, true)
-                .try_take_while(move |loc| future::ready(Ok(loc.version > since_version)))
-                .boxed();
-        }
-
-        let base_path = base_path.clone();
-        futures::stream::once(async move {
-            let locations = match list_manifests_since_version_with_hint(
-                object_store,
-                &base_path,
-                since_version,
-            )
-            .await
-            {
-                Some(locations) => locations,
-                None => {
-                    let mut locations = list_manifests(&base_path, &object_store.inner)
-                        .try_collect::<Vec<_>>()
-                        .await?;
-                    locations.retain(|loc| loc.version > since_version);
-                    locations.sort_by_key(|loc| std::cmp::Reverse(loc.version));
-                    locations
-                }
-            };
-            Ok::<_, Error>(futures::stream::iter(locations.into_iter().map(Ok)))
-        })
-        .try_flatten()
-        .boxed()
+        default_list_manifest_locations_since(base_path, object_store, since_version)
     }
 
     /// Commit a manifest.
@@ -970,6 +1007,63 @@ pub trait CommitHandler: Debug + Send + Sync {
         naming_scheme: ManifestNamingScheme,
         transaction: Option<Transaction>,
     ) -> std::result::Result<ManifestLocation, CommitError>;
+
+    /// Whether [`Self::commit_after`] is available.
+    fn supports_predecessor_condition(&self) -> bool {
+        false
+    }
+
+    /// The identity of the latest manifest, for [`Self::commit_after`].
+    /// `None` where the handler cannot condition on it.
+    async fn resolve_latest_identity(
+        &self,
+        _base_path: &Path,
+        _object_store: &ObjectStore,
+    ) -> Result<Option<PredecessorIdentity>> {
+        Ok(None)
+    }
+
+    /// The identity of the manifest at `version` as the handler's store
+    /// records it now; `None` where it keeps none or has no record.
+    async fn resolve_identity(
+        &self,
+        _base_path: &Path,
+        _object_store: &ObjectStore,
+        _version: u64,
+    ) -> Result<Option<PredecessorIdentity>> {
+        Ok(None)
+    }
+
+    /// Commit only if `predecessor` is still the manifest at its version,
+    /// decided with the reservation; otherwise [`Error::PrerequisiteFailed`],
+    /// never a conflict.
+    #[allow(clippy::too_many_arguments)]
+    async fn commit_after(
+        &self,
+        _manifest: &mut Manifest,
+        _indices: Option<Vec<IndexMetadata>>,
+        _base_path: &Path,
+        _object_store: &ObjectStore,
+        _manifest_writer: ManifestWriter,
+        _naming_scheme: ManifestNamingScheme,
+        _transaction: Option<Transaction>,
+        _predecessor: &PredecessorIdentity,
+    ) -> std::result::Result<ManifestLocation, CommitError> {
+        Err(CommitError::OtherError(Error::not_supported(
+            "this commit handler cannot condition publication on the predecessor manifest",
+        )))
+    }
+
+    /// Retire the record for `version` after its manifest was removed, only
+    /// while the record still carries `identity`; a no-op otherwise.
+    async fn forget_version(
+        &self,
+        _base_path: &Path,
+        _version: u64,
+        _identity: &str,
+    ) -> Result<()> {
+        Ok(())
+    }
 
     /// Delete the recorded manifest information for a dataset at the base_path
     async fn delete(&self, _base_path: &Path) -> Result<()> {
@@ -992,6 +1086,7 @@ async fn default_resolve_version(
             path: ManifestNamingScheme::V2.manifest_path(base_path, version),
             size: None,
             e_tag: None,
+            identity: None,
         });
     }
 
@@ -1005,6 +1100,7 @@ async fn default_resolve_version(
             size: Some(meta.size),
             naming_scheme: scheme,
             e_tag: meta.e_tag,
+            identity: None,
         }),
         Err(ObjectStoreError::NotFound { .. }) => {
             // fallback to V1
@@ -1015,6 +1111,7 @@ async fn default_resolve_version(
                 size: None,
                 naming_scheme: scheme,
                 e_tag: None,
+                identity: None,
             })
         }
         Err(e) => Err(e.into()),
@@ -1265,6 +1362,7 @@ impl CommitHandler for UnsafeCommitHandler {
             naming_scheme,
             path: version_path,
             e_tag: res.e_tag,
+            identity: None,
         })
     }
 }
@@ -1415,6 +1513,7 @@ where
             naming_scheme,
             path,
             e_tag: res.e_tag,
+            identity: None,
         })
     }
 }
@@ -1502,7 +1601,8 @@ impl CommitHandler for RenameCommitHandler {
                     path,
                     size: Some(res.size as u64),
                     naming_scheme,
-                    e_tag: None, // Re-name can change e-tag.
+                    e_tag: None, // Re-name can change e-tag.,
+                    identity: None,
                 })
             }
             Err(ObjectStoreError::AlreadyExists { .. }) => {
@@ -1588,6 +1688,7 @@ impl CommitHandler for ConditionalPutCommitHandler {
             size: Some(size),
             naming_scheme,
             e_tag: res.e_tag,
+            identity: None,
         })
     }
 }
@@ -1635,6 +1736,15 @@ impl Debug for TencentCosCommitHandler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TencentCosCommitHandler").finish()
     }
+}
+
+/// A manifest as a commit handler identifies it: its version and a token
+/// unique to that physical manifest, so a dataset recreated at the same
+/// version is told apart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PredecessorIdentity {
+    pub version: u64,
+    pub identity: String,
 }
 
 #[derive(Debug, Clone)]

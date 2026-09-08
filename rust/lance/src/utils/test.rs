@@ -27,6 +27,7 @@ use crate::dataset::WriteParams;
 use crate::dataset::fragment::write::FragmentCreateBuilder;
 use crate::dataset::transaction::Operation;
 
+pub mod covering;
 mod failing_store;
 pub mod serializing_cache;
 mod throttle_store;

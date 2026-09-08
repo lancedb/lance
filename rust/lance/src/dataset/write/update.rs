@@ -14,7 +14,7 @@ use crate::dataset::transaction::{Operation, Transaction};
 use crate::dataset::utils::make_rowid_capture_stream;
 use crate::{Dataset, io::exec::Planner};
 use crate::{Error, Result};
-use arrow_array::RecordBatch;
+use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::{ArrowError, DataType, Schema as ArrowSchema};
 use datafusion::common::DFSchema;
 use datafusion::error::{DataFusionError, Result as DFResult};
@@ -25,6 +25,7 @@ use datafusion::prelude::Expr;
 use datafusion::scalar::ScalarValue;
 use futures::StreamExt;
 use lance_arrow::RecordBatchExt;
+use lance_arrow::json::{JsonArray, is_json_field};
 use lance_core::datatypes::BlobHandling;
 use lance_core::error::{InvalidInputSnafu, box_error};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
@@ -169,7 +170,16 @@ impl UpdateBuilder {
             .get_type(&df_schema)
             .map_err(box_error)
             .context(InvalidInputSnafu {})?;
-        if dest_type != src_type {
+        // A string assigned to a JSON field is logical JSON, not its LargeBinary storage.
+        // Keep it as UTF-8 here so `apply_updates` can validate and encode it as JSONB.
+        let is_json_string = schema
+            .field_with_name(column.as_ref())
+            .is_ok_and(is_json_field)
+            && matches!(
+                &src_type,
+                DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+            );
+        if dest_type != src_type && !is_json_string {
             expr = match expr {
                 // TODO: remove this branch once DataFusion supports casting List to FSL
                 // This should happen in Arrow 51.0.0
@@ -469,7 +479,7 @@ impl UpdateJob {
 
         // Apply deletions
         let row_id_index = get_row_id_index(&self.dataset).await?;
-        let row_addrs = removed_row_ids.row_addrs(row_id_index.as_deref());
+        let row_addrs = removed_row_ids.row_addrs(row_id_index.as_deref())?;
         let deletions_result = self.apply_deletions(&row_addrs).await;
         let (old_fragments, removed_fragment_ids) = match deletions_result {
             Ok(v) => v,
@@ -551,6 +561,34 @@ impl UpdateJob {
     ) -> DFResult<RecordBatch> {
         for (column, expr) in updates.iter() {
             let new_values = expr.evaluate(&batch)?.into_array(batch.num_rows())?;
+            let schema = batch.schema();
+            let new_values: ArrayRef = if schema.field_with_name(column).is_ok_and(is_json_field)
+                && matches!(
+                    new_values.data_type(),
+                    DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+                ) {
+                let new_values = if new_values.data_type() == &DataType::Utf8View {
+                    arrow_cast::cast(new_values.as_ref(), &DataType::Utf8).map_err(|error| {
+                        DataFusionError::ArrowError(
+                            Box::new(error),
+                            Some(format!(
+                                "convert Utf8View update for JSON column '{column}'"
+                            )),
+                        )
+                    })?
+                } else {
+                    new_values
+                };
+                let json_array = JsonArray::try_from(new_values).map_err(|error| {
+                    DataFusionError::ArrowError(
+                        Box::new(error),
+                        Some(format!("encode update for JSON column '{column}'")),
+                    )
+                })?;
+                Arc::new(json_array.into_inner())
+            } else {
+                new_values
+            };
             batch = batch.replace_column_by_name(column.as_str(), new_values)?;
         }
         Ok(batch)
@@ -652,7 +690,7 @@ mod tests {
     use arrow_select::concat::concat_batches;
     use futures::{TryStreamExt, future::try_join_all};
     use lance_arrow::ARROW_EXT_NAME_KEY;
-    use lance_arrow::json::{ARROW_JSON_EXT_NAME, is_arrow_json_field, is_json_field};
+    use lance_arrow::json::{ARROW_JSON_EXT_NAME, is_arrow_json_field};
     use lance_core::ROW_ID;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::{Dimension, RowCount};
@@ -868,8 +906,11 @@ mod tests {
         assert_eq!(fragments[2].metadata.physical_rows, Some(15));
     }
 
+    #[rstest]
+    #[case::utf8(r#"'{"after": true, "n": 2}'"#)]
+    #[case::utf8_view(r#"arrow_cast('{"after": true, "n": 2}', 'Utf8View')"#)]
     #[tokio::test]
-    async fn test_update_json_and_regular_columns() {
+    async fn test_update_json_and_regular_columns(#[case] json_expression: &str) {
         let mut metadata = HashMap::new();
         metadata.insert(
             ARROW_EXT_NAME_KEY.to_string(),
@@ -912,7 +953,7 @@ mod tests {
             .unwrap()
             .set("name", "'updated'")
             .unwrap()
-            .set("meta", r#"jsonb '{"after":true,"n":2}'"#)
+            .set("meta", json_expression)
             .unwrap()
             .build()
             .unwrap()
@@ -941,6 +982,16 @@ mod tests {
 
         assert_eq!(names.value(updated_row_idx), "updated");
         assert_eq!(metas.value(updated_row_idx), r#"{"after":true,"n":2}"#);
+
+        let filtered_batch = updated_dataset
+            .scan()
+            .filter("json_extract(meta, '$.n') = '2'")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(filtered_batch.num_rows(), 1);
+        assert_eq!(filtered_batch["id"].as_primitive::<Int64Type>().value(0), 2);
     }
 
     #[rstest]
@@ -1060,8 +1111,8 @@ mod tests {
         // Increase likelihood of contention by throttling the store
         let throttled = Arc::new(ThrottledStoreWrapper {
             config: ThrottleConfig {
-                wait_list_per_call: Duration::from_millis(10),
-                wait_get_per_call: Duration::from_millis(10),
+                wait_list_per_call: Duration::from_millis(1),
+                wait_get_per_call: Duration::from_millis(1),
                 ..Default::default()
             },
         });
@@ -1393,17 +1444,30 @@ mod tests {
     }
 
     #[rstest]
-    #[case::zone_map(BuiltinIndexType::ZoneMap, "i < 100", 100)]
-    #[case::bloom_filter(BuiltinIndexType::BloomFilter, "i = 0", 1)]
+    #[case::zone_map(BuiltinIndexType::ZoneMap, IndexType::ZoneMap, "i", "i < 100", 100)]
+    #[case::bloom_filter(BuiltinIndexType::BloomFilter, IndexType::BloomFilter, "i", "i = 0", 1)]
+    #[case::fm(
+        BuiltinIndexType::Fm,
+        IndexType::Fm,
+        "text",
+        "contains(text, 'needle')",
+        50
+    )]
     #[tokio::test]
     async fn test_addr_domain_index_does_not_cover_rewritten_update_fragment(
-        #[case] index_type: BuiltinIndexType,
+        #[case] builtin: BuiltinIndexType,
+        #[case] index_type: IndexType,
+        #[case] indexed_column: &str,
         #[case] query: &str,
         #[case] expected_rows: usize,
     ) {
         let mut dataset = lance_datagen::gen_batch()
             .col("i", lance_datagen::array::step::<Int32Type>())
             .col("category", lance_datagen::array::step::<Int32Type>())
+            .col(
+                "text",
+                lance_datagen::array::cycle_utf8_literals(&["needle", "haystack"]),
+            )
             .into_ram_dataset_with_params(
                 FragmentCount::from(1),
                 FragmentRowCount::from(100),
@@ -1418,10 +1482,10 @@ mod tests {
 
         dataset
             .create_index(
-                &["i"],
-                IndexType::Scalar,
-                Some("i_idx".to_string()),
-                &ScalarIndexParams::for_builtin(index_type),
+                &[indexed_column],
+                index_type,
+                Some("addr_idx".to_string()),
+                &ScalarIndexParams::for_builtin(builtin),
                 true,
             )
             .await
@@ -1449,7 +1513,10 @@ mod tests {
             .new_dataset;
 
         let indices = dataset.load_indices().await.unwrap();
-        let index = indices.iter().find(|index| index.name == "i_idx").unwrap();
+        let index = indices
+            .iter()
+            .find(|index| index.name == "addr_idx")
+            .unwrap();
         assert_eq!(
             index
                 .fragment_bitmap
