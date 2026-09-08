@@ -67,6 +67,7 @@ serde.workspace = true
 smallvec = "1.15"
 tokio.workspace = true
 tracing.workspace = true
+twox-hash.workspace = true
 tempfile.workspace = true
 crossbeam-queue.workspace = true
 bytes.workspace = true
