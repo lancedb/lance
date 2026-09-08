@@ -311,7 +311,8 @@ impl Writer {
 
     /// Reject a null in a non-nullable field whether or not a null ancestor
     /// masks it: the 2.0 logical encoders cannot store such a slot. The 2.1+
-    /// structural writer counts only visible nulls (`writer::nullability`).
+    /// structural writer counts only visible nulls
+    /// (`writer::structural::FileWriter::verify_field_nullability`).
     fn verify_field_nullability(arr: &ArrayData, field: &Field) -> Result<()> {
         if !field.nullable && arr.null_count() > 0 {
             return Err(Error::invalid_input(format!(
@@ -693,10 +694,12 @@ impl Writer {
     /// of rows in those buffers.
     pub fn initialize_with_external_metadata(
         &mut self,
-        schema: lance_core::datatypes::Schema,
+        mut schema: lance_core::datatypes::Schema,
         column_metadata: Vec<pbfile::ColumnMetadata>,
         rows_written: u64,
     ) {
+        self.schema_metadata
+            .extend(std::mem::take(&mut schema.metadata));
         self.schema = Some(schema);
         self.num_columns = column_metadata.len() as u32;
         self.column_metadata = column_metadata;

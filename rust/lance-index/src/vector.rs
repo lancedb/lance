@@ -239,6 +239,21 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
     /// the results should be in sorted order from closest to farthest.
     fn find_partitions(&self, query: &Query) -> Result<(UInt32Array, Float32Array)>;
 
+    /// Find partitions after asynchronously loading optional routing resources.
+    ///
+    /// The default dispatches the existing synchronous implementation to the
+    /// CPU pool. Current IVF readers override this to load persisted centroid
+    /// graphs before dispatching computation.
+    async fn find_partitions_async(
+        self: Arc<Self>,
+        query: Query,
+    ) -> Result<(UInt32Array, Float32Array)>
+    where
+        Self: 'static,
+    {
+        lance_core::utils::tokio::spawn_cpu(move || self.find_partitions(&query)).await
+    }
+
     /// Get the total number of partitions in the index.
     fn total_partitions(&self) -> usize;
 

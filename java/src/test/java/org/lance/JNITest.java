@@ -18,6 +18,7 @@ import org.lance.index.IndexParams;
 import org.lance.index.vector.HnswBuildParams;
 import org.lance.index.vector.IvfBuildParams;
 import org.lance.index.vector.PQBuildParams;
+import org.lance.index.vector.RQBuildParams;
 import org.lance.index.vector.SQBuildParams;
 import org.lance.index.vector.VectorIndexParams;
 import org.lance.ipc.ApproxMode;
@@ -80,6 +81,11 @@ public class JNITest {
   }
 
   @Test
+  public void testRqBuildParamsDefaultNumBits() {
+    assertEquals((byte) 5, new RQBuildParams.Builder().build().getNumBits());
+  }
+
+  @Test
   public void testIvfPqIndexParams() {
     JniTestHelper.parseIndexParams(
         IndexParams.builder()
@@ -94,6 +100,7 @@ public class JNITest {
             .setNumPartitions(20)
             .setMaxIters(100)
             .setSampleRate(512)
+            .setCentroidHnsw(new HnswBuildParams.Builder().setM(8).build())
             .build();
     PQBuildParams pq =
         new PQBuildParams.Builder()
@@ -106,7 +113,7 @@ public class JNITest {
 
     JniTestHelper.parseIndexParams(
         IndexParams.builder()
-            .setVectorIndexParams(VectorIndexParams.withIvfPqParams(DistanceType.Cosine, ivf, pq))
+            .setVectorIndexParams(VectorIndexParams.withIvfPqParams(DistanceType.L2, ivf, pq))
             .build());
   }
 
