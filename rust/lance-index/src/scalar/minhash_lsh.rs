@@ -87,12 +87,15 @@ pub const MINHASH_LSH_INDEX_VERSION: u32 = 1;
 /// Version of the signature generation behavior (tokenizer pipeline, shingle
 /// hashing, permutation family and the 16-bit truncation); bumped whenever a
 /// change would make old and new signatures incomparable.
-pub const SIGNATURE_VERSION: u32 = 2;
+pub const SIGNATURE_VERSION: u32 = 3;
 
-/// A stored MinHash value: the high 16 bits of the 32-bit permuted minimum
-/// (b-bit MinHash). Two unrelated documents agree on a truncated value with
-/// probability 2^-16, far below the 1/num_hashes resolution of the Jaccard
-/// estimate, while the signature file halves.
+/// A stored MinHash value: 16 bits of the mixed 64-bit permuted minimum
+/// (b-bit MinHash). The minimum of a set is not uniformly distributed (it
+/// shrinks as the set grows), so its bits cannot be stored directly; mixing
+/// it first makes two unrelated documents agree on a stored value with
+/// probability 2^-16 whatever their length, far below the 1/num_hashes
+/// resolution of the Jaccard estimate, while the signature file is a quarter
+/// of the 64-bit minima.
 pub type SignatureValue = u16;
 
 pub const SIGNATURES_FILENAME: &str = "signatures.lance";
@@ -441,7 +444,12 @@ impl MinHashLshIndexParams {
 /// detail.
 fn splitmix64(state: &mut u64) -> u64 {
     *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    let mut z = *state;
+    mix64(*state)
+}
+
+/// SplitMix64's finalizer: maps any 64-bit value to a uniformly distributed
+/// one, so that bits of a skewed value (such as a minimum) can be sampled.
+fn mix64(mut z: u64) -> u64 {
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     z ^ (z >> 31)
@@ -464,8 +472,8 @@ pub struct SignatureGenerator {
     /// and the end offset of each token; a shingle is one contiguous slice.
     token_text: Vec<u8>,
     token_ends: Vec<usize>,
-    /// 32-bit minima of the current document, truncated into the signature.
-    mins: Vec<u32>,
+    /// 64-bit permuted minima of the current document, mixed into the signature.
+    mins: Vec<u64>,
 }
 
 impl std::fmt::Debug for SignatureGenerator {
@@ -499,7 +507,7 @@ impl SignatureGenerator {
             increments,
             token_text: Vec::new(),
             token_ends: Vec::new(),
-            mins: vec![u32::MAX; num_hashes],
+            mins: vec![u64::MAX; num_hashes],
         })
     }
 
@@ -537,7 +545,7 @@ impl SignatureGenerator {
         if num_tokens == 0 {
             return false;
         }
-        self.mins.fill(u32::MAX);
+        self.mins.fill(u64::MAX);
         let window = self.shingle_size.min(num_tokens);
         for start in 0..=(num_tokens - window) {
             // Tokens are stored back to back with separators, so the shingle
@@ -556,16 +564,19 @@ impl SignatureGenerator {
                 .zip(&self.increments)
             {
                 // Wrapping arithmetic is the hash function itself, not an
-                // overflowing counter. The high 32 bits are kept because the
-                // low bits of `a * x + b` depend only on the low bits of `x`.
-                // Branch-free min keeps this loop vectorizable.
-                let permuted =
-                    (multiplier.wrapping_mul(base).wrapping_add(*increment) >> 32) as u32;
+                // overflowing counter. The full 64-bit value is compared: the
+                // ordering is decided by its high bits, so the weak low bits
+                // of `a * x + b` only break ties. Branch-free min keeps this
+                // loop vectorizable.
+                let permuted = multiplier.wrapping_mul(base).wrapping_add(*increment);
                 *value = (*value).min(permuted);
             }
         }
+        // A minimum shrinks with the number of shingles, so its raw bits are
+        // not comparable across documents of different lengths; mix it and
+        // sample the mixed value instead.
         for (value, min) in signature.iter_mut().zip(&self.mins) {
-            *value = (min >> 16) as SignatureValue;
+            *value = (mix64(*min) >> 48) as SignatureValue;
         }
         true
     }
@@ -2783,6 +2794,38 @@ mod tests {
                 "band id is the high byte of the key"
             );
         }
+    }
+
+    #[rstest]
+    #[case::ten_thousand(10_000)]
+    #[case::hundred_thousand(100_000)]
+    fn test_disjoint_long_texts_stay_dissimilar(#[case] num_tokens: usize) {
+        // The minimum over n shingles is a small number: a signature storing
+        // its raw high bits had them all zero with probability e^(-n / 65536),
+        // so two unrelated 100k-token texts estimated a Jaccard near 0.8 and
+        // million-token texts looked identical.
+        let params = MinHashLshIndexParams::default();
+        let mut generator = SignatureGenerator::try_new(&params).unwrap();
+        let mut rng = Lcg(5);
+        let mut text = |prefix: char| {
+            (0..num_tokens)
+                .map(|_| format!("{prefix}{}", rng.next() % 1_000_000))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let (a, b) = (text('a'), text('b'));
+        let mut signature_a = vec![0 as SignatureValue; params.num_hashes as usize];
+        let mut signature_b = signature_a.clone();
+        assert!(generator.signature(&a, &mut signature_a));
+        assert!(generator.signature(&b, &mut signature_b));
+        let estimate = estimate_jaccard(&signature_a, &signature_b);
+        assert!(estimate < 0.05, "disjoint texts estimated at {estimate}");
+        let query = QuerySignature::compute(&mut generator, &a).unwrap();
+        assert!(!query.shares_band(&generator, &signature_b, &mut Vec::new()));
+        assert!(
+            signature_a.iter().filter(|&&value| value == 0).count() < 4,
+            "signature collapsed towards zero: {signature_a:?}"
+        );
     }
 
     #[test]
