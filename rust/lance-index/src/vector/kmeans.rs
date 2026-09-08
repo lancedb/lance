@@ -1346,6 +1346,24 @@ impl KMeans {
             kmeans.centroids.as_primitive::<T>().values(),
             params.distance_type,
         )?;
+        if children.len() < 2 {
+            // The merge handed every vector to one sub-cluster (say 999 duplicates
+            // and one outlier with a quota of 300), which would be this very node
+            // again: recursing could never make progress. Stop here as a leaf;
+            // `fill_missing_leaves` tries the remaining splits with a bounded
+            // loop and reports the shortfall.
+            let indices = children.into_iter().flatten().collect();
+            return Ok(vec![Self::leaf_from_indices::<T, Algo>(
+                data_values,
+                dimension,
+                indices,
+                params.distance_type,
+            )?]);
+        }
+        debug_assert!(
+            children.iter().all(|child| child.len() < n),
+            "every sub-cluster must be smaller than its parent for the recursion to end"
+        );
 
         let leaves = children
             .into_par_iter()
@@ -2595,6 +2613,29 @@ mod tests {
             assert!(!val.is_nan(), "Centroid should not contain NaN values");
             assert!(val != f16::ZERO);
         }
+    }
+
+    #[test]
+    fn test_hierarchical_kmeans_one_outlier_among_duplicates_errors() {
+        // 999 identical rows plus one outlier with a quota of 300: the outlier's
+        // sub-cluster earns no centroid and is merged back, which used to hand the
+        // whole node to itself again and recurse until the stack overflowed. It
+        // must end in the bounded "cannot create" error instead.
+        let mut values = vec![1.0_f32; 999];
+        values.push(100.0);
+        let data = FixedSizeListArray::try_new_from_values(Float32Array::from(values), 1).unwrap();
+        let params = KMeansParams {
+            max_iters: 10,
+            seed: Some(42),
+            ..Default::default()
+        };
+        let err = KMeans::new_with_params(&data, 300, &params)
+            .expect_err("duplicates cannot be split into 300 partitions");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Cannot create") && msg.contains("300"),
+            "unexpected error message: {msg}"
+        );
     }
 
     #[test]
