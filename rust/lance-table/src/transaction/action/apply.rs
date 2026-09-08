@@ -188,6 +188,7 @@ impl<'a> ApplyState<'a> {
             Some(current_manifest),
             schema,
             fragments,
+            &indices,
             HashMap::new(),
             false,
             config,

@@ -199,6 +199,7 @@ fn create_index_actions(
             uuid: index.uuid,
             name: index.name.clone(),
             fields: committed_field_refs(&index.fields)?,
+            covering_fields: committed_field_refs(&index.covering_fields)?,
             index_details: index.index_details.clone(),
             index_version: index.index_version,
             covered_fragments: index.fragment_bitmap.as_ref().map(|bitmap| {
@@ -236,6 +237,7 @@ fn committed_field_refs(field_ids: &[i32]) -> Result<Vec<Ref>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::feature_flags::FLAG_COVERED_INDEX_METADATA;
     use crate::format::{
         BasePath, DataFile, DeletionFile, DeletionFileType, IndexMetadata, Manifest, RowIdMeta,
     };
@@ -244,6 +246,7 @@ mod tests {
     use crate::transaction::action::CompositeOperation;
     use crate::transaction::test_support::{
         default_build_config, make_stable_row_id_manifest, sample_index_metadata, sample_manifest,
+        sample_manifest_with_carried_field,
     };
     use lance_file::version::ConcreteFileVersion;
     use std::sync::Arc;
@@ -514,6 +517,43 @@ mod tests {
         assert_eq!(indices.len(), 2);
         assert!(indices.contains(&built));
         assert!(indices.contains(&existing));
+    }
+
+    /// A carried column is not a keyed one, so translation has to preserve the
+    /// split rather than presenting every field as indexed -- and the fence
+    /// that stops an older library from answering a query from a carried column
+    /// has to reach the manifest the action path assembles, not just the one
+    /// `build_manifest` writes.
+    #[test]
+    fn test_create_index_carrying_a_column_matches_the_legacy_path() {
+        let mut manifest = sample_manifest_with_carried_field();
+        manifest.fragments = Arc::new(vec![appendable_fragment("data/0.lance")]);
+        let built = IndexMetadata {
+            fields: vec![0, 1],
+            covering_fields: vec![1],
+            ..sample_index_metadata("by_a")
+        };
+
+        let (translated, indices) = assert_parity_with_indices(
+            &manifest,
+            Operation::CreateIndex {
+                new_indices: vec![built.clone()],
+                removed_indices: Vec::new(),
+            },
+            Vec::new(),
+        );
+
+        assert_eq!(indices, vec![built]);
+        assert_ne!(
+            translated.reader_feature_flags & FLAG_COVERED_INDEX_METADATA,
+            0,
+            "the action path must fence readers off a carried column"
+        );
+        assert_ne!(
+            translated.writer_feature_flags & FLAG_COVERED_INDEX_METADATA,
+            0,
+            "the action path must fence writers off a carried column"
+        );
     }
 
     #[test]

@@ -34,6 +34,10 @@ pub struct AddIndexSegment {
     pub name: String,
     /// The indexed fields.
     pub fields: Vec<Ref>,
+    /// The trailing entries of [`Self::fields`] whose values the segment
+    /// carries but is not keyed on. Empty for a segment that carries no extra
+    /// column, and never all of `fields`.
+    pub covering_fields: Vec<Ref>,
     /// Index-type-specific metadata, opaque to the transaction layer.
     pub index_details: Option<Arc<prost_types::Any>>,
     pub index_version: i32,
@@ -76,10 +80,17 @@ impl AddIndexSegment {
             .transpose()?;
         let base_id = self.base.map(|base| state.resolve_base(base)).transpose()?;
 
-        state.add_index_segment(IndexMetadata {
+        let covering_fields = self
+            .covering_fields
+            .iter()
+            .map(|field| state.resolve_field(*field))
+            .collect::<Result<Vec<_>>>()?;
+
+        let metadata = IndexMetadata {
             uuid: self.uuid,
             name: self.name.clone(),
             fields,
+            covering_fields,
             dataset_version: self.reflected_version(state.read_version())?,
             fragment_bitmap,
             index_details: self.index_details.clone(),
@@ -87,7 +98,12 @@ impl AddIndexSegment {
             created_at: self.created_at,
             base_id,
             files: (!self.files.is_empty()).then(|| self.files.clone()),
-        })
+        };
+        // Both lists arrive as references, so whether the carried columns are
+        // still the tail of the indexed ones is only known once they resolve.
+        metadata.validate_covering_fields()?;
+
+        state.add_index_segment(metadata)
     }
 
     /// The version this segment reflects, defaulting to the one the operation
@@ -145,6 +161,7 @@ impl AddIndexSegment {
             self.name.clone(),
             IndexIdentity {
                 fields: self.fields.clone(),
+                covering_fields: self.covering_fields.clone(),
                 details: self.index_details.clone(),
                 index_version: self.index_version,
             },
@@ -165,6 +182,7 @@ impl DeepSizeOf for AddIndexSegment {
         self.uuid.as_bytes().deep_size_of_children(context)
             + self.name.deep_size_of_children(context)
             + self.fields.deep_size_of_children(context)
+            + self.covering_fields.deep_size_of_children(context)
             + index_details
             + self.covered_fragments.deep_size_of_children(context)
             + self.files.deep_size_of_children(context)
@@ -177,6 +195,11 @@ impl From<&AddIndexSegment> for pb::AddIndexSegment {
             uuid: Some((&value.uuid).into()),
             name: value.name.clone(),
             fields: value.fields.iter().map(|field| (*field).into()).collect(),
+            covering_fields: value
+                .covering_fields
+                .iter()
+                .map(|field| (*field).into())
+                .collect(),
             index_details: value
                 .index_details
                 .as_ref()
@@ -229,6 +252,11 @@ impl TryFrom<pb::AddIndexSegment> for AddIndexSegment {
                 .into_iter()
                 .map(Ref::try_from)
                 .collect::<Result<Vec<_>>>()?,
+            covering_fields: message
+                .covering_fields
+                .into_iter()
+                .map(Ref::try_from)
+                .collect::<Result<Vec<_>>>()?,
             index_details: message.index_details.map(Arc::new),
             index_version: message.index_version.unwrap_or_default(),
             covered_fragments: message
@@ -274,6 +302,7 @@ mod tests {
             uuid: Uuid::new_v4(),
             name: name.into(),
             fields,
+            covering_fields: Vec::new(),
             index_details: None,
             index_version: 1,
             covered_fragments: Some(vec![Ref::Committed(0)]),
@@ -348,6 +377,29 @@ mod tests {
         assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
         assert!(
             error.to_string().contains("could not have seen"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// The two lists arrive as references, so a segment can claim to carry a
+    /// column it is not even keyed on until they resolve. Apply is the last
+    /// place to catch it: a manifest that published the claim would have the
+    /// query path serving a column the index never indexed.
+    #[test]
+    fn test_a_segment_carrying_a_field_it_does_not_index_is_rejected() {
+        let error = apply_with_indices(
+            &backed_manifest(),
+            vec![Action::AddIndexSegment(AddIndexSegment {
+                covering_fields: vec![Ref::Committed(1)],
+                ..segment("by_a", vec![Ref::Committed(0)])
+            })],
+            Vec::new(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(
+            error.to_string().contains("among its fields"),
             "unexpected error: {error}"
         );
     }
