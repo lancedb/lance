@@ -16,6 +16,9 @@
 //!   any fragment in a valid manifest file then it will be deleted.
 //! * Unreferenced index files - If an index file is not referenced by
 //!   any valid manifest file then it will be deleted.
+//! * Orphaned staging manifests - If a staging manifest is not recorded by
+//!   the commit handler then it will be deleted after the unverified-file
+//!   retention period.
 //!
 //! It is also difficult to distinguish between a data/tx/idx file which was
 //! leftover from an abandoned transaction and a data file which is part
@@ -53,7 +56,7 @@ use lance_core::{
 use lance_table::{
     format::{IndexMetadata, Manifest},
     io::{
-        commit::ManifestLocation,
+        commit::{ManifestLocation, ManifestNamingScheme},
         deletion::deletion_file_path,
         manifest::{read_manifest, read_manifest_indexes},
     },
@@ -144,10 +147,11 @@ pub enum CleanupFileKind {
     Transaction,
     Index,
     Deletion,
-    /// A leftover `_versions/.tmp` manifest from a failed transaction.  These
-    /// are deleted but excluded from per-kind `RemovalStats` counts and audit
-    /// logs to match the long-standing cleanup behavior.  Their bytes
-    /// are still included in `bytes_removed`.
+    /// A leftover manifest from a failed transaction, either under
+    /// `_versions/.tmp` or named `<manifest>-<uuid>`. These are deleted but
+    /// excluded from per-kind `RemovalStats` counts and audit logs to match the
+    /// long-standing cleanup behavior. Their bytes are still included in
+    /// `bytes_removed`.
     TemporaryManifest,
 }
 
@@ -287,6 +291,35 @@ fn remove_prefix(path: &Path, prefix: &Path) -> Path {
     Path::from_iter(relative_parts.unwrap())
 }
 
+fn is_staging_manifest_path(relative_path: &Path) -> bool {
+    let mut parts = relative_path.parts();
+    let (Some(versions_dir), Some(filename), None) = (parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    if versions_dir.as_ref() != "_versions" {
+        return false;
+    }
+
+    let filename = filename.as_ref();
+    let Some(uuid_start) = filename.len().checked_sub(uuid::fmt::Hyphenated::LENGTH) else {
+        return false;
+    };
+    if uuid_start == 0 || filename.as_bytes().get(uuid_start - 1) != Some(&b'-') {
+        return false;
+    }
+    let (Some(manifest_filename), Some(uuid_suffix)) =
+        (filename.get(..uuid_start - 1), filename.get(uuid_start..))
+    else {
+        return false;
+    };
+
+    let Some(scheme) = ManifestNamingScheme::detect_scheme(manifest_filename) else {
+        return false;
+    };
+    scheme.parse_version(manifest_filename).is_some() && uuid::Uuid::parse_str(uuid_suffix).is_ok()
+}
+
 #[derive(Clone, Debug)]
 struct CleanupTask<'a> {
     dataset: &'a Dataset,
@@ -302,6 +335,9 @@ struct CleanupTask<'a> {
 #[derive(Clone, Debug, Default)]
 struct CleanupInspection {
     old_manifests: HashMap<Path, u64>,
+    /// Every manifest path returned by the active commit handler. External
+    /// stores may record a staging-shaped path as the final, live manifest.
+    recorded_manifest_paths: HashSet<Path>,
     /// Store records to retire once their manifests are gone, by version;
     /// see `CommitHandler::forget_version`.
     retired_records: HashMap<u64, String>,
@@ -590,6 +626,9 @@ impl<'a> CleanupTask<'a> {
         let is_tagged = tagged_versions.contains(&manifest.version);
         let in_working_set = is_latest || !self.policy.should_clean(&manifest) || is_tagged;
         let mut inspection = inspection.lock().unwrap();
+        inspection
+            .recorded_manifest_paths
+            .insert(location.path.clone());
 
         // Track tagged old versions in case we want to return a `CleanupError` later.
         // Only track tagged when it is old.
@@ -736,7 +775,10 @@ impl<'a> CleanupTask<'a> {
         // [`CleanupInspection::listing_unmodified_since`].
         let unmodified_since = inspection.listing_unmodified_since();
         let streams = vec![
-            build_listing_stream(self.dataset.versions_dir(), unmodified_since),
+            // Staging manifests can be newer than the latest retained manifest,
+            // so a retained-manifest cutoff could hide them indefinitely. Live
+            // paths are protected by `recorded_manifest_paths` instead.
+            build_listing_stream(self.dataset.versions_dir(), None),
             build_listing_stream(self.dataset.transactions_dir(), unmodified_since),
             build_listing_stream(self.dataset.data_dir(), unmodified_since),
             // Index UUIDs from manifests being removed are proof that their files are
@@ -910,6 +952,19 @@ impl<'a> CleanupTask<'a> {
                     size_bytes,
                 ));
             }
+        }
+        if is_staging_manifest_path(&relative_path) {
+            // An external manifest store may intentionally use this path shape
+            // for a committed version. Only an unrecorded path is an orphan.
+            if maybe_in_progress || inspection.recorded_manifest_paths.contains(&path) {
+                return Ok(None);
+            }
+            return Ok(cleanup_file(
+                path,
+                CleanupFileKind::TemporaryManifest,
+                true,
+                size_bytes,
+            ));
         }
         if relative_path.as_ref().starts_with("_indices") {
             // Indices are referenced by UUID so we need to examine the UUID
@@ -2732,15 +2787,33 @@ mod tests {
             MockClock::set_system_time(std::time::Duration::from_secs(0));
             let mut fixture = MockDatasetFixture::try_new().unwrap();
             fixture.create_some_data().await.unwrap();
+            let failed_commit_time = TimeDelta::try_seconds(1).unwrap().to_std().unwrap();
+            MockClock::set_system_time(failed_commit_time);
             fixture.block_commits();
             assert!(fixture.append_some_data().await.is_err());
+
+            let dataset = fixture.open().await.unwrap();
+            let staging_manifests = dataset
+                .object_store
+                .read_dir_all(&dataset.versions_dir(), None)
+                .try_filter_map(|meta| {
+                    let relative_path = remove_prefix(&meta.location, &dataset.base);
+                    future::ready(Ok(
+                        is_staging_manifest_path(&relative_path).then_some(meta.location)
+                    ))
+                })
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            assert_eq!(staging_manifests.len(), 1);
+            let staging_manifest = &staging_manifests[0];
 
             let age = if old_files {
                 TimeDelta::try_days(UNVERIFIED_THRESHOLD_DAYS + 1).unwrap()
             } else {
                 TimeDelta::try_days(UNVERIFIED_THRESHOLD_DAYS - 1).unwrap()
             };
-            MockClock::set_system_time(age.to_std().unwrap());
+            MockClock::set_system_time(failed_commit_time + age.to_std().unwrap());
 
             // The above created some unreferenced data files but, since they
             // are not referenced in any manifest, and 7 days has not passed, we
@@ -2770,6 +2843,10 @@ mod tests {
             } else {
                 assert_eq!(removed.bytes_removed, 0);
             }
+            assert_eq!(
+                dataset.object_store.exists(staging_manifest).await.unwrap(),
+                !should_delete
+            );
         }
     }
 
@@ -5228,6 +5305,46 @@ mod tests {
         }
         assert_eq!(dataset.count_versions().await.unwrap(), 3);
 
+        // Model an identity-aware store whose final record points at a
+        // staging-shaped path. An unrecorded path with the same shape is an
+        // orphan.
+        let canonical_current_manifest = Path::parse(store.get("", 3).await.unwrap()).unwrap();
+        let current_manifest =
+            Path::parse(format!("{}-{}", canonical_current_manifest, Uuid::new_v4())).unwrap();
+        dataset
+            .object_store
+            .copy(&canonical_current_manifest, &current_manifest)
+            .await
+            .unwrap();
+        dataset
+            .object_store
+            .delete(&canonical_current_manifest)
+            .await
+            .unwrap();
+        let current_manifest_size = dataset.object_store.size(&current_manifest).await.unwrap();
+        store
+            .put_if_exists(
+                "",
+                3,
+                current_manifest.as_ref(),
+                current_manifest_size,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(is_staging_manifest_path(&remove_prefix(
+            &current_manifest,
+            &dataset.base
+        )));
+        let orphan_manifest = dataset
+            .versions_dir()
+            .join(format!("999.manifest-{}", Uuid::new_v4()));
+        dataset
+            .object_store
+            .put(&orphan_manifest, b"orphan")
+            .await
+            .unwrap();
+
         // Version 1's object is already gone, as after a cleanup that stopped
         // before retiring records.
         let v1 = Path::parse(store.get("", 1).await.unwrap()).unwrap();
@@ -5237,10 +5354,20 @@ mod tests {
             &dataset,
             CleanupPolicyBuilder::default()
                 .before_timestamp(chrono::Utc::now())
+                .delete_unverified(true)
                 .build(),
         )
         .await
         .unwrap();
+
+        assert!(
+            dataset
+                .object_store
+                .exists(&current_manifest)
+                .await
+                .unwrap()
+        );
+        assert!(!dataset.object_store.exists(&orphan_manifest).await.unwrap());
 
         let mut remaining: Vec<u64> = store.rows.lock().unwrap().keys().copied().collect();
         remaining.sort();
