@@ -905,6 +905,97 @@ impl HnswBuilder {
         )
     }
 
+    /// Give every node an inbound path from the entry point on level 0.
+    ///
+    /// A query only ever enumerates level 0, so a node without a level-0 path
+    /// from the entry point can never be returned by a graph traversal.
+    /// Parallel insertion cannot rule that out: a node picks its neighbors
+    /// from the graph it searched, and by the time its reciprocal edges are
+    /// written those neighbors may have filled up with closer nodes and pruned
+    /// it straight back out, leaving it with no inbound edge at all. A node
+    /// inserted while the graph was still nearly empty is the usual victim:
+    /// its only neighbors are the first few hubs, and hubs fill up first.
+    /// Nothing inserted afterwards can rediscover such a node, since discovery
+    /// only happens by traversal.
+    ///
+    /// The level-0 graph is therefore walked once from the entry point after
+    /// the parallel phase, and every stranded node is linked from the nearest
+    /// node the walk did reach. The anchor is allowed to exceed `2 * m` by that
+    /// one edge: evicting one of its neighbors instead could strand that
+    /// neighbor in turn, and a far anchor with spare room would leave the node
+    /// findable only by queries far away from it. The extra work is bounded by
+    /// one beam search per stranded node, so it never exceeds the build itself.
+    fn connect_stranded_nodes(&self, storage: &impl VectorStore) {
+        let nodes = self.nodes.as_slice();
+        let level0 = HnswLevelView::new(0, nodes);
+        let mut reachable = vec![false; nodes.len()];
+        let mut queue = VecDeque::new();
+        let mut mark_reachable = |start: u32, reachable: &mut Vec<bool>| {
+            reachable[start as usize] = true;
+            queue.push_back(start);
+            while let Some(current) = queue.pop_front() {
+                for &neighbor in level0.neighbors(current).iter() {
+                    if !reachable[neighbor as usize] {
+                        reachable[neighbor as usize] = true;
+                        queue.push_back(neighbor);
+                    }
+                }
+            }
+        };
+        mark_reachable(self.entry_point, &mut reachable);
+
+        let mut visited_generator = VisitedGenerator::new(nodes.len());
+        let mut stranded = 0;
+        for node in 0..nodes.len() as u32 {
+            if reachable[node as usize] {
+                continue;
+            }
+            stranded += 1;
+            let dist_calc = storage.dist_calculator_from_id(node);
+            let ep = OrderedNode::new(
+                self.entry_point,
+                dist_calc.distance(self.entry_point).into(),
+            );
+            let anchor = {
+                let mut visited = visited_generator.generate(nodes.len());
+                // The beam starts at the entry point, so it only visits nodes
+                // that are reachable, and the closest of them comes first. The
+                // entry point itself is always in the result and always a
+                // valid anchor.
+                beam_search(
+                    &level0,
+                    &ep,
+                    &HnswQueryParams {
+                        ef: self.params.ef_construction,
+                        lower_bound: None,
+                        upper_bound: None,
+                        dist_q_c: 0.0,
+                        use_acorn: false,
+                    },
+                    &dist_calc,
+                    None,
+                    self.params.prefetch_distance,
+                    &mut visited,
+                )
+                .into_iter()
+                .next()
+                .unwrap_or(ep)
+            };
+            {
+                let mut anchor_node = nodes[anchor.id as usize].write().unwrap();
+                anchor_node.add_neighbor(node, anchor.dist, 0);
+                anchor_node.update_from_ranked_neighbors(0);
+            }
+            // The node's own edges may lead to other stranded nodes.
+            mark_reachable(node, &mut reachable);
+        }
+        if stranded > 0 {
+            log::debug!(
+                "Linked {stranded} HNSW node(s) that parallel construction left unreachable on level 0"
+            );
+        }
+    }
+
     fn prune(
         &self,
         storage: &impl VectorStore,
@@ -1565,6 +1656,7 @@ impl IvfSubIndex for HNSW {
             );
 
         assert_eq!(builder.level_count[0].load(Ordering::Relaxed), len);
+        builder.connect_stranded_nodes(storage);
         Ok(builder.finish())
     }
 
@@ -1910,9 +2002,85 @@ mod tests {
         );
     }
 
-    /// The lowest accepted construction settings retain a useful graph, but
-    /// do not promise full reachability. This seeded floor makes that quality
-    /// trade-off explicit and guards against catastrophic fragmentation.
+    /// Every node must have a level-0 path from the entry point, which is what
+    /// [HnswBuilder::connect_stranded_nodes] guarantees after a build.
+    fn assert_all_reachable_on_level0(hnsw: &HNSW) {
+        let nodes = hnsw.nodes().unwrap();
+        let mut reachable = vec![false; nodes.len()];
+        let mut queue = std::collections::VecDeque::from([hnsw.metadata().entry_point]);
+        reachable[hnsw.metadata().entry_point as usize] = true;
+        while let Some(current) = queue.pop_front() {
+            for &neighbor in nodes[current as usize].bottom_neighbors.iter() {
+                if !reachable[neighbor as usize] {
+                    reachable[neighbor as usize] = true;
+                    queue.push_back(neighbor);
+                }
+            }
+        }
+        let stranded: Vec<usize> = (0..nodes.len()).filter(|id| !reachable[*id]).collect();
+        assert!(
+            stranded.is_empty(),
+            "nodes {stranded:?} are unreachable from the entry point on level 0"
+        );
+    }
+
+    /// A node that parallel construction left without any inbound level-0
+    /// edge is linked from its nearest reachable node, whether or not that
+    /// node is already full, and the walk it enables covers the nodes behind
+    /// it without further links.
+    #[test]
+    fn test_connect_stranded_nodes_links_from_nearest_reachable() {
+        // Points on a line at x = id, except node 4 sits at 4.5 so that node 2
+        // is strictly the nearest reachable node to node 3.
+        let mut xs: Vec<f32> = (0..12).map(|id| id as f32).collect();
+        xs[4] = 4.5;
+        let values = Float32Array::from(xs.into_iter().flat_map(|x| [x, 0.0]).collect::<Vec<_>>());
+        let fsl = FixedSizeListArray::try_new_from_values(values, 2).unwrap();
+        let store = FlatFloatStorage::new(fsl, DistanceType::L2);
+        let params = HnswBuildParams::default()
+            .num_edges(MIN_HNSW_M)
+            .max_level(1);
+        let builder = HnswBuilder::with_params(params, &store);
+        assert_eq!(builder.entry_point, 0);
+        let set_neighbors = |id: u32, neighbors: &[u32]| {
+            let mut node = builder.nodes[id as usize].write().unwrap();
+            for &neighbor in neighbors {
+                node.add_neighbor(neighbor, store.dist_between(id, neighbor).into(), 0);
+            }
+            node.update_from_ranked_neighbors(0);
+        };
+        // Node 2 is full (2 * MIN_HNSW_M edges) and is the nearest node to the
+        // stranded node 3. Node 9 has room and is the nearest to the stranded
+        // node 10, which is the only way into node 11.
+        set_neighbors(0, &[1]);
+        set_neighbors(1, &[0, 2]);
+        set_neighbors(2, &[1, 0, 4, 5, 6, 7, 8, 9]);
+        for id in 4..=9 {
+            set_neighbors(id, &[2]);
+        }
+        set_neighbors(3, &[2]);
+        set_neighbors(10, &[9, 11]);
+        set_neighbors(11, &[10]);
+
+        builder.connect_stranded_nodes(&store);
+
+        let hnsw = builder.finish();
+        assert_all_reachable_on_level0(&hnsw);
+        let nodes = hnsw.nodes().unwrap();
+        assert_eq!(
+            *nodes[2].level_neighbors[0],
+            vec![1, 0, 4, 5, 6, 7, 8, 9, 3]
+        );
+        assert_eq!(*nodes[9].level_neighbors[0], vec![2, 10]);
+        let inbound_to_11: Vec<usize> = (0..nodes.len())
+            .filter(|id| nodes[*id].level_neighbors[0].contains(&11))
+            .collect();
+        assert_eq!(inbound_to_11, vec![10]);
+    }
+
+    /// The lowest accepted construction settings keep every node reachable on
+    /// level 0, and the greedy descent still lands close enough for a full
+    /// enumeration to cover nearly all of them.
     #[test]
     fn test_minimum_params_reachability() {
         const DIM: usize = 32;
@@ -1932,6 +2100,7 @@ mod tests {
                 .ef_construction(MIN_HNSW_M),
         )
         .unwrap();
+        assert_all_reachable_on_level0(&hnsw);
         let results = hnsw
             .search_basic(
                 vectors.value(0),
