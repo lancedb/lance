@@ -629,6 +629,7 @@ impl Transaction {
                 original_indices,
                 transaction_file_path,
                 config,
+                read_version_state,
             );
         }
 
