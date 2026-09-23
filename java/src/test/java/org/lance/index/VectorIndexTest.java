@@ -42,6 +42,7 @@ import java.nio.file.Path;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
@@ -516,6 +517,8 @@ public class VectorIndexTest {
         assertTrue(
             indexType == IndexType.VECTOR || indexType == IndexType.IVF_RQ,
             "IndexType for IVF_RQ index should be VECTOR or IVF_RQ but was " + indexType);
+        Map<String, Object> stats = dataset.getIndexStatistics(TestVectorDataset.indexName);
+        assertEquals("matrix", ((Map<?, ?>) stats.get("sub_index")).get("rotation_type"));
       }
     }
   }
