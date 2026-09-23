@@ -16,7 +16,7 @@ use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
 
 pub(crate) fn extract_rq_build_params(env: &mut JNIEnv, rq_obj: JObject) -> Result<RQBuildParams> {
-    let num_bits = env.call_method(&rq_obj, "getNumBits", "()B", &[])?.b()? as u8;
+    let num_bits = env.get_u8_from_method(&rq_obj, "getNumBits")?;
     let rotation_type_obj = env
         .call_method(
             &rq_obj,
@@ -29,8 +29,7 @@ pub(crate) fn extract_rq_build_params(env: &mut JNIEnv, rq_obj: JObject) -> Resu
         RQRotationType::from_str(&env.get_string_from_method(&rotation_type_obj, "toRustString")?)
             .map_err(|e| Error::input_error(e.to_string()))?;
     let rotation = env.get_optional_from_method(&rq_obj, "getModel", |env, model| {
-        let bytes = env.call_method(&model, "toBytes", "()[B", &[])?.l()?;
-        let bytes = env.convert_byte_array(JByteArray::from(bytes))?;
+        let bytes = env.get_vec_u8_from_method(&model, "toBytes")?;
         let metadata = parse_rq_model(&bytes)?;
         if metadata.num_bits != num_bits {
             return Err(Error::input_error(format!(
