@@ -518,7 +518,9 @@ public class VectorIndexTest {
             indexType == IndexType.VECTOR || indexType == IndexType.IVF_RQ,
             "IndexType for IVF_RQ index should be VECTOR or IVF_RQ but was " + indexType);
         Map<String, Object> stats = dataset.getIndexStatistics(TestVectorDataset.indexName);
-        assertEquals("matrix", ((Map<?, ?>) stats.get("sub_index")).get("rotation_type"));
+        List<?> segments = (List<?>) stats.get("segments");
+        Map<?, ?> segment = (Map<?, ?>) segments.get(0);
+        assertEquals("matrix", ((Map<?, ?>) segment.get("sub_index")).get("rotation_type"));
       }
     }
   }
