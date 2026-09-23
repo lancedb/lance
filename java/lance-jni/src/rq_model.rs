@@ -71,11 +71,6 @@ pub(crate) fn parse_rq_model(bytes: &[u8]) -> Result<RabitQuantizationMetadata> 
             model.rotation_type
         )));
     }
-    if model.packed {
-        return Err(Error::input_error(
-            "RQ model must contain an unpacked build rotation".to_string(),
-        ));
-    }
     model
         .validate_rotation()
         .map_err(|e| Error::input_error(e.to_string()))?;

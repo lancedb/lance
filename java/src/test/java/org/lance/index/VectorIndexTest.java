@@ -20,6 +20,7 @@ import org.lance.index.vector.IvfBuildParams;
 import org.lance.index.vector.PQBuildParams;
 import org.lance.index.vector.RQBuildParams;
 import org.lance.index.vector.RQModel;
+import org.lance.index.vector.RQRotationType;
 import org.lance.index.vector.SQBuildParams;
 import org.lance.index.vector.VectorIndexParams;
 import org.lance.index.vector.VectorTrainer;
@@ -478,7 +479,11 @@ public class VectorIndexTest {
     try (TestVectorDataset testVectorDataset = new TestVectorDataset(datasetPath)) {
       try (Dataset dataset = testVectorDataset.create()) {
         IvfBuildParams ivf = new IvfBuildParams.Builder().setNumPartitions(2).build();
-        RQBuildParams rq = new RQBuildParams.Builder().setNumBits((byte) 1).build();
+        RQBuildParams rq =
+            new RQBuildParams.Builder()
+                .setNumBits((byte) 1)
+                .setRotationType(RQRotationType.MATRIX)
+                .build();
 
         VectorIndexParams vectorIndexParams =
             VectorIndexParams.withIvfRqParams(DistanceType.L2, ivf, rq);
