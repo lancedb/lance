@@ -17,17 +17,7 @@ use crate::ffi::JNIEnvExt;
 
 pub(crate) fn extract_rq_build_params(env: &mut JNIEnv, rq_obj: JObject) -> Result<RQBuildParams> {
     let num_bits = env.get_u8_from_method(&rq_obj, "getNumBits")?;
-    let rotation_type_obj = env
-        .call_method(
-            &rq_obj,
-            "getRotationType",
-            "()Lorg/lance/index/vector/RQRotationType;",
-            &[],
-        )?
-        .l()?;
-    let rotation_type =
-        RQRotationType::from_str(&env.get_string_from_method(&rotation_type_obj, "toRustString")?)
-            .map_err(|e| Error::input_error(e.to_string()))?;
+    let rotation_type = extract_rq_rotation_type(env, &rq_obj)?;
     let rotation = env.get_optional_from_method(&rq_obj, "getModel", |env, model| {
         let bytes = env.get_vec_u8_from_method(&model, "toBytes")?;
         let metadata = parse_rq_model(&bytes)?;
@@ -50,6 +40,19 @@ pub(crate) fn extract_rq_build_params(env: &mut JNIEnv, rq_obj: JObject) -> Resu
         rotation_type,
         rotation,
     })
+}
+
+fn extract_rq_rotation_type(env: &mut JNIEnv, rq_obj: &JObject) -> Result<RQRotationType> {
+    let rotation_type_obj = env
+        .call_method(
+            rq_obj,
+            "getRotationType",
+            "()Lorg/lance/index/vector/RQRotationType;",
+            &[],
+        )?
+        .l()?;
+    RQRotationType::from_str(&env.get_string_from_method(&rotation_type_obj, "toRustString")?)
+        .map_err(|e| Error::input_error(e.to_string()))
 }
 
 pub(crate) fn parse_rq_model(bytes: &[u8]) -> Result<RabitQuantizationMetadata> {
