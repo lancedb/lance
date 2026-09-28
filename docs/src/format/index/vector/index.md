@@ -45,6 +45,7 @@ Here are the commonly used combinations:
 | **IVF_HNSW_SQ** | Inverted File with HNSW and Scalar Quantization | Uses IVF for coarse clustering and HNSW for fine-grained search with scalar quantization |
 | **IVF_SQ**      | Inverted File with Scalar Quantization          | Combines IVF clustering with scalar quantization for balanced compression                |
 | **IVF_RQ**      | Inverted File with RabitQ                       | Combines IVF clustering with RabitQ for extreme compression using binary quantization    |
+| **IVF_HNSW_RQ** | Inverted File with HNSW and RabitQ              | Uses IVF for coarse clustering and HNSW for graph search with multi-bit RabitQ           |
 | **IVF_FLAT**    | Inverted File without quantization              | Uses IVF clustering with exact vector storage for precise search within clusters         |
 
 ### Versioning

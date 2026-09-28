@@ -7,10 +7,11 @@ use std::sync::{Arc, LazyLock};
 use arrow::array::AsArray;
 use arrow::datatypes::{Float16Type, Float32Type, Float64Type, UInt32Type};
 use arrow_array::{
-    Array, ArrowNativeTypeOp, FixedSizeListArray, Float32Array, RecordBatch, UInt32Array,
+    Array, ArrowNativeTypeOp, FixedSizeListArray, Float32Array, RecordBatch, UInt8Array,
+    UInt32Array,
 };
 use arrow_schema::DataType;
-use lance_arrow::RecordBatchExt;
+use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
 use lance_core::{Error, Result};
 use lance_linalg::distance::{DistanceType, norm_squared_fsl};
 use rayon::prelude::*;
@@ -21,6 +22,7 @@ use crate::vector::bq::rabit_ex_bits;
 use crate::vector::bq::storage::{
     RABIT_BLOCKED_EX_CODE_COLUMN, RABIT_CODE_COLUMN, RabitQueryEstimator,
 };
+use crate::vector::bq::sym::sym_bin_code_bytes;
 use crate::vector::quantizer::Quantization;
 use crate::vector::transform::Transformer;
 use crate::vector::{CENTROID_DIST_COLUMN, PART_ID_COLUMN};
@@ -32,6 +34,19 @@ pub const SCALE_FACTORS_COLUMN: &str = "__scale_factors";
 pub const EX_ADD_FACTORS_COLUMN: &str = "__add_factors_ex";
 pub const EX_SCALE_FACTORS_COLUMN: &str = "__scale_factors_ex";
 pub const ERROR_FACTORS_COLUMN: &str = "__error_factors";
+pub const SYM_BIN_CODES_COLUMN: &str = "__sym_bin_codes";
+pub const SYM_RHO_COLUMN: &str = "__sym_rho";
+pub const SYM_GAMMA_COLUMN: &str = "__sym_gamma";
+pub const SYM_UNORM_COLUMN: &str = "__sym_unorm";
+pub const SYM_IP_CENT_COLUMN: &str = "__sym_ip_cent";
+
+pub const SYM_COLUMNS: [&str; 5] = [
+    SYM_BIN_CODES_COLUMN,
+    SYM_RHO_COLUMN,
+    SYM_GAMMA_COLUMN,
+    SYM_UNORM_COLUMN,
+    SYM_IP_CENT_COLUMN,
+];
 
 const RABIT_ERROR_EPSILON: f32 = 1.9;
 
@@ -54,6 +69,35 @@ pub static EX_SCALE_FACTORS_FIELD: LazyLock<arrow_schema::Field> = LazyLock::new
 pub static ERROR_FACTORS_FIELD: LazyLock<arrow_schema::Field> = LazyLock::new(|| {
     arrow_schema::Field::new(ERROR_FACTORS_COLUMN, arrow_schema::DataType::Float32, true)
 });
+pub static SYM_RHO_FIELD: LazyLock<arrow_schema::Field> = LazyLock::new(|| {
+    arrow_schema::Field::new(SYM_RHO_COLUMN, arrow_schema::DataType::Float32, true)
+});
+pub static SYM_GAMMA_FIELD: LazyLock<arrow_schema::Field> = LazyLock::new(|| {
+    arrow_schema::Field::new(SYM_GAMMA_COLUMN, arrow_schema::DataType::Float32, true)
+});
+pub static SYM_UNORM_FIELD: LazyLock<arrow_schema::Field> = LazyLock::new(|| {
+    arrow_schema::Field::new(SYM_UNORM_COLUMN, arrow_schema::DataType::Float32, true)
+});
+pub static SYM_IP_CENT_FIELD: LazyLock<arrow_schema::Field> = LazyLock::new(|| {
+    arrow_schema::Field::new(SYM_IP_CENT_COLUMN, arrow_schema::DataType::Float32, true)
+});
+
+pub fn sym_bin_codes_field(code_dim: usize) -> arrow_schema::Field {
+    arrow_schema::Field::new(
+        SYM_BIN_CODES_COLUMN,
+        DataType::FixedSizeList(
+            Arc::new(arrow_schema::Field::new("item", DataType::UInt8, true)),
+            crate::vector::bq::sym::sym_bin_code_bytes(code_dim) as i32,
+        ),
+        true,
+    )
+}
+
+fn has_sym_columns(batch: &RecordBatch) -> bool {
+    SYM_COLUMNS
+        .iter()
+        .all(|name| batch.column_by_name(name).is_some())
+}
 
 pub struct RQTransformer {
     rq: RabitQuantizer,
@@ -99,14 +143,43 @@ impl RQTransformer {
         } else {
             rayon::iter::Either::Right(ex_add.par_iter_mut().zip(ex_scale.par_iter_mut()).map(Some))
         };
+        // SymRaBitQ columns are accumulated in the same quantization pass.
+        let with_sym = self.rq.metadata_ref().uses_sym_columns();
+        let sym_rows = if with_sym { num_rows } else { 0 };
+        let sym_bin_bytes = sym_bin_code_bytes(dim);
+        let mut sym_bins = vec![0u8; sym_rows * sym_bin_bytes];
+        let mut sym_rho = vec![0.0; sym_rows];
+        let mut sym_gamma = vec![0.0; sym_rows];
+        let mut sym_unorm = vec![0.0; sym_rows];
+        let mut sym_ip_cent = vec![0.0; sym_rows];
+        let centroid_norm_sq: Vec<f32> = rotated_centroids
+            .chunks_exact(dim)
+            .map(|centroid| centroid.iter().map(|value| value * value).sum())
+            .collect();
+        let sym_dests = if with_sym {
+            rayon::iter::Either::Right(
+                sym_bins
+                    .par_chunks_mut(sym_bin_bytes)
+                    .zip(sym_rho.par_iter_mut())
+                    .zip(sym_gamma.par_iter_mut())
+                    .zip(sym_unorm.par_iter_mut())
+                    .zip(sym_ip_cent.par_iter_mut())
+                    .map(Some),
+            )
+        } else {
+            rayon::iter::Either::Left((0..num_rows).into_par_iter().map(|_| None))
+        };
         let destinations = (&mut add, &mut scale, &mut error)
             .into_par_iter()
-            .zip(extra);
+            .zip(extra)
+            .zip(sym_dests);
+        let num_bits = self.rq.num_bits();
         let codes = self.rq.quantize_with_factors(
             residual_vectors,
             destinations,
-            |row, ((add, scale, error), extra)| {
-                let start = part_ids.value(row) as usize * dim;
+            |row, (((add, scale, error), extra), sym)| {
+                let part = part_ids.value(row) as usize;
+                let start = part * dim;
                 RabitRowFactors {
                     distance_type: self.distance_type,
                     norm_square: res_norm_square.value(row),
@@ -121,6 +194,19 @@ impl RQTransformer {
                     scale,
                     error,
                     extra,
+                    sym: sym.map(|((((bin_dst, rho), gamma), unorm), ip_cent)| {
+                        SymRowFactors::new(
+                            &rotated_centroids[start..start + dim],
+                            centroid_norm_sq[part],
+                            num_bits,
+                            ex_bits,
+                            bin_dst,
+                            rho,
+                            gamma,
+                            unorm,
+                            ip_cent,
+                        )
+                    }),
                 }
             },
         )?;
@@ -147,6 +233,27 @@ impl RQTransformer {
                 .try_with_column(
                     EX_SCALE_FACTORS_FIELD.clone(),
                     Arc::new(Float32Array::from(ex_scale)),
+                )?;
+        }
+        if with_sym {
+            let sym_bin_codes = FixedSizeListArray::try_new_from_values(
+                UInt8Array::from(sym_bins),
+                sym_bin_bytes as i32,
+            )?;
+            batch = batch
+                .try_with_column(sym_bin_codes_field(dim), Arc::new(sym_bin_codes))?
+                .try_with_column(SYM_RHO_FIELD.clone(), Arc::new(Float32Array::from(sym_rho)))?
+                .try_with_column(
+                    SYM_GAMMA_FIELD.clone(),
+                    Arc::new(Float32Array::from(sym_gamma)),
+                )?
+                .try_with_column(
+                    SYM_UNORM_FIELD.clone(),
+                    Arc::new(Float32Array::from(sym_unorm)),
+                )?
+                .try_with_column(
+                    SYM_IP_CENT_FIELD.clone(),
+                    Arc::new(Float32Array::from(sym_ip_cent)),
                 )?;
         }
         Ok(batch
@@ -201,6 +308,86 @@ pub(crate) struct RabitRowFactors<'c, 'o> {
     scale: &'o mut f32,
     error: &'o mut f32,
     extra: Option<(&'o mut f32, &'o mut f32)>,
+    sym: Option<SymRowFactors<'c, 'o>>,
+}
+
+/// SymRaBitQ encode factors for one row, accumulated in the same quantization
+/// pass as [`RabitRowFactors`] so rotated residuals are never materialized.
+pub(crate) struct SymRowFactors<'c, 'o> {
+    centroid: &'c [f32],
+    centroid_norm_sq: f32,
+    ex_bits: u8,
+    code_bias: f32,
+    bin_dst: &'o mut [u8],
+    rho_sq: f32,
+    unorm_sq: f32,
+    ip: f32,
+    ip_cent: f32,
+    rho: &'o mut f32,
+    gamma: &'o mut f32,
+    unorm: &'o mut f32,
+    ip_cent_dst: &'o mut f32,
+}
+
+impl<'c, 'o> SymRowFactors<'c, 'o> {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        centroid: &'c [f32],
+        centroid_norm_sq: f32,
+        num_bits: u8,
+        ex_bits: u8,
+        bin_dst: &'o mut [u8],
+        rho: &'o mut f32,
+        gamma: &'o mut f32,
+        unorm: &'o mut f32,
+        ip_cent_dst: &'o mut f32,
+    ) -> Self {
+        Self {
+            centroid,
+            centroid_norm_sq,
+            ex_bits,
+            code_bias: ((1u32 << num_bits) - 1) as f32 / 2.0,
+            bin_dst,
+            rho_sq: 0.0,
+            unorm_sq: 0.0,
+            ip: 0.0,
+            ip_cent: 0.0,
+            rho,
+            gamma,
+            unorm,
+            ip_cent_dst,
+        }
+    }
+
+    fn observe(&mut self, dim: usize, residual: f32, extra: u8) {
+        // SymRaBitQ's sign is `residual > 0`, which differs from the binary
+        // code's `is_sign_positive` at exactly +0.0 (e.g. padded dims).
+        let sign = u32::from(residual > 0.0);
+        if sign == 1 {
+            // `pack_binary_be` layout: bit-endian 64-dim words, LE bytes.
+            let bit = 63 - dim % 64;
+            self.bin_dst[dim / 64 * 8 + bit / 8] |= 1u8 << (bit % 8);
+        }
+        let centered = ((sign << self.ex_bits) + extra as u32) as f32 - self.code_bias;
+        self.rho_sq += residual * residual;
+        self.unorm_sq += centered * centered;
+        self.ip += residual * centered;
+        self.ip_cent += residual * self.centroid[dim];
+    }
+
+    fn finish(self) {
+        let rho = self.rho_sq.sqrt();
+        let unorm = self.unorm_sq.sqrt();
+        *self.rho = rho;
+        *self.ip_cent_dst = self.ip_cent + 0.5 * self.centroid_norm_sq;
+        if rho == 0.0 || unorm == 0.0 {
+            *self.gamma = 1.0;
+            *self.unorm = 1.0;
+        } else {
+            *self.gamma = self.ip / (rho * unorm);
+            *self.unorm = unorm;
+        }
+    }
 }
 
 impl RabitRowFactors<'_, '_> {
@@ -218,6 +405,9 @@ impl RabitRowFactors<'_, '_> {
         }
         if self.distance_type == DistanceType::Dot {
             self.residual_centroid_dot += residual * centroid;
+        }
+        if let Some(sym) = &mut self.sym {
+            sym.observe(dim, residual, extra);
         }
     }
 
@@ -251,6 +441,9 @@ impl RabitRowFactors<'_, '_> {
                 }
             }
             _ => unreachable!(),
+        }
+        if let Some(sym) = self.sym {
+            sym.finish();
         }
     }
 }
@@ -448,7 +641,12 @@ impl Transformer for RQTransformer {
                 && batch.column_by_name(EX_ADD_FACTORS_COLUMN).is_some()
                 && batch.column_by_name(EX_SCALE_FACTORS_COLUMN).is_some());
         if batch.column_by_name(RABIT_CODE_COLUMN).is_some() && has_split_codes {
-            return Ok(batch.clone());
+            if !self.rq.metadata_ref().uses_sym_columns() || has_sym_columns(batch) {
+                return Ok(batch.clone());
+            }
+            return Err(Error::index(
+                "RQ Transform: batch has split codes but is missing SymRaBitQ columns".to_string(),
+            ));
         }
 
         let residual_vectors = batch
@@ -600,13 +798,15 @@ mod tests {
     use crate::vector::bq::RQRotationType;
     use crate::vector::bq::builder::RabitQuantizer;
     use crate::vector::bq::ex_dot::blocked_ex_code_bytes;
-    use crate::vector::bq::storage::RABIT_BLOCKED_EX_CODE_COLUMN;
+    use crate::vector::bq::storage::{RABIT_BLOCKED_EX_CODE_COLUMN, RABIT_CODE_COLUMN};
+    use crate::vector::bq::sym::{compute_sym_factors, pack_binary_be, sym_bin_code_bytes};
     use crate::vector::transform::Transformer;
     use crate::vector::{CENTROID_DIST_COLUMN, PART_ID_COLUMN};
 
     use super::{
         ADD_FACTORS_COLUMN, ERROR_FACTORS_COLUMN, EX_ADD_FACTORS_COLUMN, EX_SCALE_FACTORS_COLUMN,
-        RQTransformer, compute_raw_query_factors, error_factor_value,
+        RQTransformer, SYM_BIN_CODES_COLUMN, SYM_COLUMNS, SYM_GAMMA_COLUMN, SYM_IP_CENT_COLUMN,
+        SYM_RHO_COLUMN, SYM_UNORM_COLUMN, compute_raw_query_factors, error_factor_value,
     };
 
     #[rstest]
@@ -749,6 +949,38 @@ mod tests {
         assert!(error.to_string().contains("out of range"));
     }
 
+    fn pack_sign_bits_le(rotated: &[f32]) -> Vec<u8> {
+        let mut codes = vec![0u8; rotated.len().div_ceil(8)];
+        for (bit_idx, value) in rotated.iter().enumerate() {
+            if value.is_sign_positive() {
+                codes[bit_idx / 8] |= 1u8 << (bit_idx % 8);
+            }
+        }
+        codes
+    }
+
+    fn make_residual_batch(
+        residuals: Vec<f32>,
+        dim: i32,
+        part_ids: Vec<u32>,
+        centroid_dists: Vec<f32>,
+    ) -> RecordBatch {
+        let residual_vectors =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(residuals), dim).unwrap();
+        RecordBatch::try_from_iter(vec![
+            ("vector", Arc::new(residual_vectors) as ArrayRef),
+            (
+                PART_ID_COLUMN,
+                Arc::new(UInt32Array::from(part_ids)) as ArrayRef,
+            ),
+            (
+                CENTROID_DIST_COLUMN,
+                Arc::new(Float32Array::from(centroid_dists)) as ArrayRef,
+            ),
+        ])
+        .unwrap()
+    }
+
     #[test]
     fn test_rq_transformer_writes_multi_bit_ex_factors() {
         let rq = RabitQuantizer::new_with_rotation::<Float32Type>(4, 8, RQRotationType::Fast);
@@ -826,6 +1058,225 @@ mod tests {
         assert!(transformed.column_by_name(CENTROID_DIST_COLUMN).is_none());
         assert!(transformed.column_by_name(ADD_FACTORS_COLUMN).is_some());
         assert!(transformed.column_by_name(ERROR_FACTORS_COLUMN).is_some());
+    }
+
+    #[test]
+    fn test_rq_transformer_omits_sym_columns_for_one_bit() {
+        let rq = RabitQuantizer::new_with_rotation::<Float32Type>(1, 8, RQRotationType::Fast);
+        let centroids =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(vec![0.25f32; 8]), 8)
+                .unwrap();
+        let transformer = RQTransformer::new(rq, DistanceType::L2, centroids, "vector").unwrap();
+        let batch = make_residual_batch(
+            vec![1.0, -2.0, 3.0, -4.0, 0.0, -0.0, 1.5, -2.5],
+            8,
+            vec![0],
+            vec![30.5],
+        );
+        let transformed = transformer.transform(&batch).unwrap();
+        for name in SYM_COLUMNS {
+            assert!(
+                transformed.column_by_name(name).is_none(),
+                "1-bit RQ must not write {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_rq_transformer_writes_sym_columns_for_multi_bit() {
+        let dim = 8;
+        let num_bits = 4u8;
+        let mut rq =
+            RabitQuantizer::new_with_rotation::<Float32Type>(num_bits, dim, RQRotationType::Fast);
+        rq.metadata.with_sym_columns = true;
+        let centroids = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(vec![0.25, -0.5, 0.75, -1.0, 0.0, 1.25, -0.25, 0.5]),
+            dim,
+        )
+        .unwrap();
+        let residuals = vec![1.0, -2.0, 3.0, -4.0, 0.0, -0.0, 1.5, -2.5];
+        let residual_fsl =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(residuals.clone()), dim)
+                .unwrap();
+        let transformer =
+            RQTransformer::new(rq.clone(), DistanceType::L2, centroids.clone(), "vector").unwrap();
+        let batch = make_residual_batch(residuals, dim, vec![0], vec![30.5]);
+        let transformed = transformer.transform(&batch).unwrap();
+
+        for name in SYM_COLUMNS {
+            assert!(
+                transformed.column_by_name(name).is_some(),
+                "multi-bit RQ must write {name}"
+            );
+        }
+
+        let split = rq.quantize_split(&residual_fsl).unwrap();
+        let rotated = split.rotated_residuals.as_ref().unwrap();
+        let rotated_centroid = rq.rotate_fsl_to_f32(&centroids).unwrap();
+        let ex = split
+            .ex_codes
+            .as_ref()
+            .unwrap()
+            .as_fixed_size_list()
+            .value(0)
+            .as_primitive::<UInt8Type>()
+            .values()
+            .to_vec();
+        let mut expected_be = vec![0u8; sym_bin_code_bytes(dim as usize)];
+        pack_binary_be(rotated, &mut expected_be);
+        let expected_factors =
+            compute_sym_factors(rotated, &rotated_centroid, &expected_be, &ex, num_bits);
+
+        let sym_bin = transformed[SYM_BIN_CODES_COLUMN].as_fixed_size_list();
+        assert_eq!(sym_bin.value_length(), expected_be.len() as i32);
+        assert_eq!(
+            sym_bin
+                .value(0)
+                .as_primitive::<UInt8Type>()
+                .values()
+                .as_ref(),
+            expected_be.as_slice()
+        );
+
+        let le_codes = transformed[RABIT_CODE_COLUMN].as_fixed_size_list();
+        assert_eq!(le_codes.value_length(), (dim as usize / 8) as i32);
+        assert_eq!(
+            le_codes
+                .value(0)
+                .as_primitive::<UInt8Type>()
+                .values()
+                .as_ref(),
+            pack_sign_bits_le(rotated).as_slice()
+        );
+
+        let rho = transformed[SYM_RHO_COLUMN]
+            .as_primitive::<Float32Type>()
+            .value(0);
+        let gamma = transformed[SYM_GAMMA_COLUMN]
+            .as_primitive::<Float32Type>()
+            .value(0);
+        let unorm = transformed[SYM_UNORM_COLUMN]
+            .as_primitive::<Float32Type>()
+            .value(0);
+        let ip_cent = transformed[SYM_IP_CENT_COLUMN]
+            .as_primitive::<Float32Type>()
+            .value(0);
+        for (name, value) in [
+            ("rho", rho),
+            ("gamma", gamma),
+            ("unorm", unorm),
+            ("ip_cent", ip_cent),
+        ] {
+            assert!(value.is_finite(), "{name} must be finite");
+        }
+        assert!((rho - expected_factors.rho).abs() <= 1e-5 * expected_factors.rho.abs().max(1.0));
+        assert!(
+            (gamma - expected_factors.gamma).abs() <= 1e-5 * expected_factors.gamma.abs().max(1.0)
+        );
+        assert!(
+            (unorm - expected_factors.unorm).abs() <= 1e-5 * expected_factors.unorm.abs().max(1.0)
+        );
+        assert!(
+            (ip_cent - expected_factors.ip_cent).abs()
+                <= 1e-5 * expected_factors.ip_cent.abs().max(1.0)
+        );
+    }
+
+    #[test]
+    fn test_rq_transformer_writes_sym_columns_for_one_bit() {
+        let dim = 8;
+        let num_bits = 1u8;
+        let mut rq =
+            RabitQuantizer::new_with_rotation::<Float32Type>(num_bits, dim, RQRotationType::Fast);
+        rq.metadata.with_sym_columns = true;
+        let centroids = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(vec![0.25, -0.5, 0.75, -1.0, 0.0, 1.25, -0.25, 0.5]),
+            dim,
+        )
+        .unwrap();
+        let residuals = vec![1.0, -2.0, 3.0, -4.0, 0.0, -0.0, 1.5, -2.5];
+        let residual_fsl =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(residuals.clone()), dim)
+                .unwrap();
+        let transformer =
+            RQTransformer::new(rq.clone(), DistanceType::L2, centroids, "vector").unwrap();
+        let batch = make_residual_batch(residuals, dim, vec![0], vec![30.5]);
+        let transformed = transformer.transform(&batch).unwrap();
+
+        for name in SYM_COLUMNS {
+            assert!(
+                transformed.column_by_name(name).is_some(),
+                "1-bit sym RQ must write {name}"
+            );
+        }
+        // 1-bit has no ex codes at all.
+        assert!(
+            transformed
+                .column_by_name(RABIT_BLOCKED_EX_CODE_COLUMN)
+                .is_none()
+        );
+
+        let split = rq.quantize_split(&residual_fsl).unwrap();
+        let rotated = split.rotated_residuals.as_ref().unwrap();
+        let mut expected_be = vec![0u8; sym_bin_code_bytes(dim as usize)];
+        pack_binary_be(rotated, &mut expected_be);
+        let sym_bin = transformed[SYM_BIN_CODES_COLUMN].as_fixed_size_list();
+        assert_eq!(
+            sym_bin
+                .value(0)
+                .as_primitive::<UInt8Type>()
+                .values()
+                .as_ref(),
+            expected_be.as_slice()
+        );
+
+        // 1-bit centered codes are all ±0.5, so ‖û‖ = sqrt(dim) / 2.
+        let unorm = transformed[SYM_UNORM_COLUMN]
+            .as_primitive::<Float32Type>()
+            .value(0);
+        let want_unorm = (dim as f32).sqrt() / 2.0;
+        assert!(
+            (unorm - want_unorm).abs() <= 1e-5 * want_unorm,
+            "1-bit unorm: {unorm} != {want_unorm}"
+        );
+    }
+
+    #[test]
+    fn test_rq_transformer_rejects_split_batch_missing_sym_columns() {
+        let dim = 8;
+        let mut rq = RabitQuantizer::new_with_rotation::<Float32Type>(4, dim, RQRotationType::Fast);
+        rq.metadata.with_sym_columns = true;
+        let centroids = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(vec![0.25, -0.5, 0.75, -1.0, 0.0, 1.25, -0.25, 0.5]),
+            dim,
+        )
+        .unwrap();
+        let transformer = RQTransformer::new(rq, DistanceType::L2, centroids, "vector").unwrap();
+        let batch = make_residual_batch(
+            vec![1.0, -2.0, 3.0, -4.0, 0.0, -0.0, 1.5, -2.5],
+            dim,
+            vec![0],
+            vec![30.5],
+        );
+        let encoded = transformer.transform(&batch).unwrap();
+        let mut missing_sym = encoded;
+        for name in SYM_COLUMNS {
+            missing_sym = missing_sym.drop_column(name).unwrap();
+        }
+        // Residual still present must not fall through into a re-encode:
+        // try_with_column would then reject the existing _rabit_codes.
+        let residual = batch.column_by_name("vector").unwrap().clone();
+        let with_vector = missing_sym
+            .try_with_column(
+                arrow_schema::Field::new("vector", residual.data_type().clone(), true),
+                residual,
+            )
+            .unwrap();
+        let err = transformer.transform(&with_vector).unwrap_err();
+        assert!(
+            err.to_string().contains("missing SymRaBitQ columns"),
+            "{err}"
+        );
     }
 
     #[test]

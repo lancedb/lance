@@ -2650,7 +2650,7 @@ impl Dataset {
             "INVERTED" | "FTS" => IndexType::Inverted,
             "FM" => IndexType::Fm,
             "IVF_FLAT" | "IVF_PQ" | "IVF_SQ" | "IVF_RQ" | "IVF_HNSW_FLAT" | "IVF_HNSW_PQ"
-            | "IVF_HNSW_SQ" => IndexType::Vector,
+            | "IVF_HNSW_SQ" | "IVF_HNSW_RQ" => IndexType::Vector,
             _ => {
                 return Err(PyValueError::new_err(format!(
                     "Index type '{index_type}' is not supported."
@@ -5422,6 +5422,13 @@ fn prepare_vector_index_params(
             ivf_params,
             hnsw_params,
             sq_params,
+        ))),
+
+        "IVF_HNSW_RQ" => Ok(Box::new(VectorIndexParams::with_ivf_hnsw_rq_params(
+            m_type,
+            ivf_params,
+            hnsw_params,
+            rq_params,
         ))),
 
         _ => Err(PyValueError::new_err(format!(
