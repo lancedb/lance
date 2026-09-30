@@ -161,15 +161,6 @@ impl ZoneMapIndex {
         }
     }
 
-    fn scalar_is_negative_infinity(value: &ScalarValue) -> bool {
-        match value {
-            ScalarValue::Float16(Some(value)) => *value == half::f16::NEG_INFINITY,
-            ScalarValue::Float32(Some(value)) => *value == f32::NEG_INFINITY,
-            ScalarValue::Float64(Some(value)) => *value == f64::NEG_INFINITY,
-            _ => false,
-        }
-    }
-
     /// Returns true if the zone has a non-null, non-NaN min value.
     fn zone_has_finite_min(zone: &ZoneMapStatistics) -> bool {
         !(zone.min.is_null() || Self::scalar_is_nan(&zone.min))
@@ -309,17 +300,10 @@ impl ZoneMapIndex {
                 Ok(target >= &zone.min && target <= &zone.max)
             }
             SargableQuery::Range(start, end) => {
-                // NaN counts do not preserve the sign bit. A range below negative
-                // infinity is how the planner retrieves sign-bit-set NaNs, so any
-                // NaN-bearing zone is a conservative candidate for that range.
-                if zone.nan_count > 0
-                    && matches!(start, Bound::Unbounded)
-                    && matches!(
-                        end,
-                        Bound::Included(value) | Bound::Excluded(value)
-                            if Self::scalar_is_negative_infinity(value)
-                    )
-                {
+                // Total order puts sign-bit-set NaNs below every other value, and
+                // NaN counts do not record the sign, so a NaN-bearing zone is a
+                // candidate for any range without a lower bound.
+                if zone.nan_count > 0 && matches!(start, Bound::Unbounded) {
                     return Ok(true);
                 }
 

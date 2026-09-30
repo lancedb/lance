@@ -6,9 +6,9 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, LazyLock};
 
-use arrow_array::ArrayRef;
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Float16Type, Float32Type, Float64Type};
+use arrow_array::{ArrayRef, ArrowNativeTypeOp, ArrowPrimitiveType};
 use arrow_schema::DataType;
 use datafusion::error::Result as DFResult;
 use datafusion::logical_expr::expr::{Between, InList, ScalarFunction};
@@ -21,6 +21,7 @@ use datafusion::scalar::ScalarValue::{self, Float16, Float32, Float64};
 use datafusion_common::DFSchema;
 use datafusion_common::metadata::FieldMetadata;
 use datafusion_common::tree_node::{Transformed, TreeNode};
+use datafusion_common::utils::take_function_args;
 use half::f16;
 use lance_core::Result;
 
@@ -60,110 +61,54 @@ impl ScalarUDFImpl for NormalizeNanSign {
     }
 
     fn return_type(&self, arg_types: &[DataType]) -> DFResult<DataType> {
-        match arg_types {
-            [data_type @ (DataType::Float16 | DataType::Float32 | DataType::Float64)] => {
-                Ok(data_type.clone())
-            }
-            _ => Err(datafusion::error::DataFusionError::Execution(format!(
-                "{NORMALIZE_NAN_SIGN_NAME} expected one floating-point argument, got {arg_types:?}"
-            ))),
-        }
+        let [data_type] = take_function_args(self.name(), arg_types)?;
+        Ok(data_type.clone())
     }
 
     fn invoke_with_args(&self, func_args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        let mut args = func_args.args.into_iter();
-        let Some(value) = args.next() else {
-            return Err(datafusion::error::DataFusionError::Execution(format!(
-                "{NORMALIZE_NAN_SIGN_NAME} expected one argument, got none"
-            )));
-        };
-        if args.next().is_some() {
-            return Err(datafusion::error::DataFusionError::Execution(format!(
-                "{NORMALIZE_NAN_SIGN_NAME} expected one argument, got more than one"
-            )));
-        }
-        match value {
-            ColumnarValue::Array(array) => normalize_nan_array(array).map(ColumnarValue::Array),
-            ColumnarValue::Scalar(value) => normalize_nan_scalar(value).map(ColumnarValue::Scalar),
-        }
+        let [value] = take_function_args(self.name(), func_args.args)?;
+        Ok(match value {
+            ColumnarValue::Array(array) => ColumnarValue::Array(normalize_nan_array(array)?),
+            ColumnarValue::Scalar(value) => {
+                ColumnarValue::Scalar(match equivalent_encodings(&value) {
+                    Some((_, positive)) if is_nan(&value) => positive,
+                    _ => value,
+                })
+            }
+        })
     }
 }
 
 fn normalize_nan_array(array: ArrayRef) -> DFResult<ArrayRef> {
     match array.data_type() {
-        DataType::Float16 => {
-            let values = array.as_primitive::<Float16Type>();
-            if !values
-                .values()
-                .iter()
-                .any(|value| value.is_nan() && value.is_sign_negative())
-            {
-                return Ok(array);
-            }
-            Ok(Arc::new(values.unary::<_, Float16Type>(|value| {
-                if value.is_nan() {
-                    f16::from_bits(value.to_bits() & 0x7fff)
-                } else {
-                    value
-                }
-            })))
-        }
-        DataType::Float32 => {
-            let values = array.as_primitive::<Float32Type>();
-            if !values
-                .values()
-                .iter()
-                .any(|value| value.is_nan() && value.is_sign_negative())
-            {
-                return Ok(array);
-            }
-            Ok(Arc::new(values.unary::<_, Float32Type>(|value| {
-                if value.is_nan() {
-                    f32::from_bits(value.to_bits() & 0x7fff_ffff)
-                } else {
-                    value
-                }
-            })))
-        }
-        DataType::Float64 => {
-            let values = array.as_primitive::<Float64Type>();
-            if !values
-                .values()
-                .iter()
-                .any(|value| value.is_nan() && value.is_sign_negative())
-            {
-                return Ok(array);
-            }
-            Ok(Arc::new(values.unary::<_, Float64Type>(|value| {
-                if value.is_nan() {
-                    f64::from_bits(value.to_bits() & 0x7fff_ffff_ffff_ffff)
-                } else {
-                    value
-                }
-            })))
-        }
+        DataType::Float16 => Ok(clear_nan_signs::<Float16Type>(array, f16::NEG_INFINITY)),
+        DataType::Float32 => Ok(clear_nan_signs::<Float32Type>(array, f32::NEG_INFINITY)),
+        DataType::Float64 => Ok(clear_nan_signs::<Float64Type>(array, f64::NEG_INFINITY)),
         data_type => Err(datafusion::error::DataFusionError::Execution(format!(
             "{NORMALIZE_NAN_SIGN_NAME} expected a floating-point array, got {data_type}"
         ))),
     }
 }
 
-fn normalize_nan_scalar(value: ScalarValue) -> DFResult<ScalarValue> {
-    match value {
-        Float16(Some(value)) if value.is_nan() => {
-            Ok(Float16(Some(f16::from_bits(value.to_bits() & 0x7fff))))
-        }
-        Float32(Some(value)) if value.is_nan() => {
-            Ok(Float32(Some(f32::from_bits(value.to_bits() & 0x7fff_ffff))))
-        }
-        Float64(Some(value)) if value.is_nan() => Ok(Float64(Some(f64::from_bits(
-            value.to_bits() & 0x7fff_ffff_ffff_ffff,
-        )))),
-        value @ (Float16(_) | Float32(_) | Float64(_)) => Ok(value),
-        value => Err(datafusion::error::DataFusionError::Execution(format!(
-            "{NORMALIZE_NAN_SIGN_NAME} expected a floating-point scalar, got {value:?}"
-        ))),
+/// Negate every NaN with its sign bit set, which clears that bit and keeps the
+/// payload. Returns `array` itself when it holds no such NaN.
+fn clear_nan_signs<T: ArrowPrimitiveType>(
+    array: ArrayRef,
+    negative_infinity: T::Native,
+) -> ArrayRef {
+    // Total order puts exactly the sign-bit-set NaNs below negative infinity.
+    let is_negative_nan = |value: T::Native| value.is_lt(negative_infinity);
+    let values = array.as_primitive::<T>();
+    if !values.values().iter().any(|value| is_negative_nan(*value)) {
+        return array;
     }
+    Arc::new(values.unary::<_, T>(|value| {
+        if is_negative_nan(value) {
+            value.neg_wrapping()
+        } else {
+            value
+        }
+    }))
 }
 
 fn normalize_nan_expr(expr: &Expr) -> Expr {
@@ -300,32 +245,31 @@ pub fn normalize_float_comparisons(
 /// NaN payload bits are preserved. Distinct payloads therefore remain distinct;
 /// only the sign bit, which does not change the logical value, is ignored.
 fn equivalent_encodings(value: &ScalarValue) -> Option<(ScalarValue, ScalarValue)> {
+    // `copysign` only touches the sign bit, so a NaN keeps its payload.
     match value {
-        Float16(Some(v)) if *v == f16::ZERO => {
-            Some((Float16(Some(f16::NEG_ZERO)), Float16(Some(f16::ZERO))))
-        }
-        Float16(Some(v)) if v.is_nan() => Some((
-            Float16(Some(f16::from_bits(v.to_bits() | 0x8000))),
-            Float16(Some(f16::from_bits(v.to_bits() & 0x7fff))),
+        Float16(Some(v)) if *v == f16::ZERO || v.is_nan() => Some((
+            Float16(Some(v.copysign(f16::NEG_ONE))),
+            Float16(Some(v.copysign(f16::ONE))),
         )),
-        Float32(Some(v)) if *v == 0.0 => Some((Float32(Some(-0.0)), Float32(Some(0.0)))),
-        Float32(Some(v)) if v.is_nan() => Some((
-            Float32(Some(f32::from_bits(v.to_bits() | 0x8000_0000))),
-            Float32(Some(f32::from_bits(v.to_bits() & 0x7fff_ffff))),
+        Float32(Some(v)) if *v == 0.0 || v.is_nan() => Some((
+            Float32(Some(v.copysign(-1.0))),
+            Float32(Some(v.copysign(1.0))),
         )),
-        Float64(Some(v)) if *v == 0.0 => Some((Float64(Some(-0.0)), Float64(Some(0.0)))),
-        Float64(Some(v)) if v.is_nan() => Some((
-            Float64(Some(f64::from_bits(v.to_bits() | 0x8000_0000_0000_0000))),
-            Float64(Some(f64::from_bits(v.to_bits() & 0x7fff_ffff_ffff_ffff))),
+        Float64(Some(v)) if *v == 0.0 || v.is_nan() => Some((
+            Float64(Some(v.copysign(-1.0))),
+            Float64(Some(v.copysign(1.0))),
         )),
         _ => None,
     }
 }
 
 fn is_nan(value: &ScalarValue) -> bool {
-    matches!(value, Float16(Some(value)) if value.is_nan())
-        || matches!(value, Float32(Some(value)) if value.is_nan())
-        || matches!(value, Float64(Some(value)) if value.is_nan())
+    match value {
+        Float16(Some(v)) => v.is_nan(),
+        Float32(Some(v)) => v.is_nan(),
+        Float64(Some(v)) => v.is_nan(),
+        _ => false,
+    }
 }
 
 fn negative_infinity(value: &ScalarValue) -> Option<ScalarValue> {
@@ -434,40 +378,38 @@ fn comparison(left: Expr, op: Operator, right: Expr) -> Expr {
 fn paired_comparison(
     other: &Expr,
     op: Operator,
-    negative: ScalarValue,
-    positive: ScalarValue,
+    negative: &ScalarValue,
+    positive: &ScalarValue,
     metadata: Option<&FieldMetadata>,
 ) -> Option<Expr> {
-    match op {
-        Operator::Eq | Operator::NotEq => Some(Expr::InList(InList {
+    let covered = |negated| {
+        Expr::InList(InList {
             expr: Box::new(other.clone()),
             list: vec![
-                Expr::Literal(negative, metadata.cloned()),
-                Expr::Literal(positive, metadata.cloned()),
+                Expr::Literal(negative.clone(), metadata.cloned()),
+                Expr::Literal(positive.clone(), metadata.cloned()),
             ],
-            negated: op == Operator::NotEq,
-        })),
-        Operator::IsNotDistinctFrom | Operator::IsDistinctFrom => {
-            // The list names `other` once and `IS [NOT] TRUE` keeps the null case
-            // decided: `NULL IN (..)` is NULL, and `NULL IS TRUE` is false.
-            let covered = Expr::InList(InList {
-                expr: Box::new(other.clone()),
-                list: vec![
-                    Expr::Literal(negative, metadata.cloned()),
-                    Expr::Literal(positive, metadata.cloned()),
-                ],
-                negated: false,
-            });
-            Some(if op == Operator::IsDistinctFrom {
-                covered.is_not_true()
-            } else {
-                covered.is_true()
-            })
-        }
+            negated,
+        })
+    };
+    match op {
+        Operator::Eq => Some(covered(false)),
+        Operator::NotEq => Some(covered(true)),
+        // The list names `other` once and `IS [NOT] TRUE` keeps the null case
+        // decided: `NULL IN (..)` is NULL, and `NULL IS TRUE` is false.
+        Operator::IsNotDistinctFrom => Some(covered(false).is_true()),
+        Operator::IsDistinctFrom => Some(covered(false).is_not_true()),
         _ => None,
     }
 }
 
+/// Rewrite `other op literal`, with `op` already mirrored when the literal was
+/// written on the left.
+///
+/// An ordered comparison against a non-NaN bound becomes raw total-order ranges.
+/// Positive NaNs already sort above the bound, and the extra `-inf` range moves
+/// negative NaNs to that same side while leaving the primary comparison
+/// available to the scalar-index planner.
 fn rewrite_literal_comparison(
     other: &Expr,
     op: Operator,
@@ -477,80 +419,40 @@ fn rewrite_literal_comparison(
     if is_raw_float_literal(metadata) {
         return None;
     }
-
-    if let Some((negative, positive)) = equivalent_encodings(value) {
-        if let Some(rewritten) =
-            paired_comparison(other, op, negative.clone(), positive.clone(), metadata)
-        {
-            return Some(rewritten);
-        }
-        if is_nan(value) {
-            return matches!(
-                op,
-                Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq
-            )
-            .then(|| {
-                comparison(
-                    normalize_nan_expr(other),
-                    op,
-                    Expr::Literal(positive, metadata.cloned()),
-                )
-            });
-        }
-
-        let bound = match op {
-            Operator::Lt | Operator::GtEq => negative,
-            Operator::LtEq | Operator::Gt => positive,
-            _ => return None,
-        };
-        return Some(rewrite_ordered_comparison(other, op, bound, metadata));
-    }
-
-    if negative_infinity(value).is_some()
-        && matches!(
-            op,
-            Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq
-        )
+    let negative_infinity = negative_infinity(value)?;
+    let encodings = equivalent_encodings(value);
+    if let Some((negative, positive)) = &encodings
+        && let Some(rewritten) = paired_comparison(other, op, negative, positive, metadata)
     {
-        return Some(rewrite_ordered_comparison(
-            other,
-            op,
-            value.clone(),
-            metadata,
-        ));
+        return Some(rewritten);
     }
-
-    None
-}
-
-/// Express a comparison against a non-NaN bound using raw total-order ranges.
-///
-/// Positive NaNs already sort above the bound. The extra range moves negative
-/// NaNs to that same side while leaving the primary comparison available to the
-/// scalar-index planner.
-fn rewrite_ordered_comparison(
-    other: &Expr,
-    op: Operator,
-    bound: ScalarValue,
-    metadata: Option<&FieldMetadata>,
-) -> Expr {
-    let Some(negative_infinity) = negative_infinity(&bound) else {
-        return comparison(other.clone(), op, raw_float_literal(bound, metadata));
+    if !matches!(
+        op,
+        Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq
+    ) {
+        return None;
+    }
+    let bound = match (encodings, op) {
+        // A range cannot reorder NaN payloads, so normalize the operand instead.
+        (Some((_, positive)), _) if is_nan(value) => {
+            return Some(comparison(
+                normalize_nan_expr(other),
+                op,
+                Expr::Literal(positive, metadata.cloned()),
+            ));
+        }
+        (Some((negative, _)), Operator::Lt | Operator::GtEq) => negative,
+        (Some((_, positive)), _) => positive,
+        (None, _) => value.clone(),
     };
     let primary = comparison(other.clone(), op, raw_float_literal(bound, metadata));
-    match op {
-        Operator::Lt | Operator::LtEq => primary.and(comparison(
-            other.clone(),
-            Operator::GtEq,
-            raw_float_literal(negative_infinity, None),
-        )),
-        Operator::Gt | Operator::GtEq => primary.or(comparison(
-            other.clone(),
-            Operator::Lt,
-            raw_float_literal(negative_infinity, None),
-        )),
-        _ => primary,
-    }
+    let negative_infinity = raw_float_literal(negative_infinity, None);
+    Some(match op {
+        Operator::Lt | Operator::LtEq => {
+            primary.and(comparison(other.clone(), Operator::GtEq, negative_infinity))
+        }
+        _ => primary.or(comparison(other.clone(), Operator::Lt, negative_infinity)),
+    })
 }
 
 fn rewrite_node(expr: &Expr, schema: &DFSchema) -> Option<Expr> {
@@ -581,7 +483,7 @@ fn rewrite_node(expr: &Expr, schema: &DFSchema) -> Option<Expr> {
         Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
             // `resolve_expr` accepts the literal on either side, and the
             // operator mirrors when it sits on the left.
-            let rewritten = match (left.as_ref(), right.as_ref()) {
+            match (left.as_ref(), right.as_ref()) {
                 (_, Expr::Literal(value, metadata)) => {
                     rewrite_literal_comparison(left, *op, value, metadata.as_ref())
                 }
@@ -599,8 +501,7 @@ fn rewrite_node(expr: &Expr, schema: &DFSchema) -> Option<Expr> {
                     ))
                 }
                 _ => None,
-            }?;
-            (rewritten != *expr).then_some(rewritten)
+            }
         }
         // `BETWEEN` normally reaches this rewrite already expanded into `>=` and
         // `<=` by the simplifier. It survives unexpanded when every operand is
@@ -716,7 +617,7 @@ fn widen_equivalent_list(list: &[Expr]) -> Option<Vec<Expr>> {
 mod tests {
     use std::sync::Arc;
 
-    use arrow_array::{Array, Float64Array};
+    use arrow_array::{Array, Float16Array, Float32Array, Float64Array};
     use arrow_schema::{Field, Schema};
     use datafusion::prelude::{col, lit};
     use rstest::rstest;
@@ -856,6 +757,26 @@ mod tests {
         assert_eq!(normalized.value(1).to_bits(), (-1.0_f64).to_bits());
         assert_eq!(normalized.value(2).to_bits(), positive.to_bits());
         assert!(normalized.is_null(3));
+    }
+
+    /// Column-to-column comparisons run every batch through the UDF, so an array
+    /// without a negative NaN must come back as the same allocation.
+    #[rstest]
+    #[case::float16(Arc::new(Float16Array::from(vec![f16::NAN, -f16::ONE])) as ArrayRef, Arc::new(Float16Array::from(vec![-f16::NAN])) as ArrayRef)]
+    #[case::float32(Arc::new(Float32Array::from(vec![f32::NAN, -1.0])) as ArrayRef, Arc::new(Float32Array::from(vec![-f32::NAN])) as ArrayRef)]
+    #[case::float64(Arc::new(Float64Array::from(vec![f64::NAN, -1.0])) as ArrayRef, Arc::new(Float64Array::from(vec![-f64::NAN])) as ArrayRef)]
+    fn nan_array_normalization_copies_only_with_a_negative_nan(
+        #[case] unchanged: ArrayRef,
+        #[case] negative_nan: ArrayRef,
+    ) {
+        assert!(Arc::ptr_eq(
+            &normalize_nan_array(unchanged.clone()).unwrap(),
+            &unchanged
+        ));
+        let normalized = normalize_nan_array(negative_nan.clone()).unwrap();
+        assert!(!Arc::ptr_eq(&normalized, &negative_nan));
+        let expected = arrow::compute::kernels::numeric::neg(&negative_nan).unwrap();
+        assert_eq!(normalized.to_data(), expected.to_data());
     }
 
     #[rstest]
@@ -1111,6 +1032,11 @@ mod tests {
     #[case::under_in_true("((-1.0 * 0.0) < (1.0 - 1.0)) IN (TRUE)", false)]
     #[case::under_is_true_eq("((-1.0 * 0.0) = (1.0 - 1.0)) IS TRUE", true)]
     #[case::under_nested_wrappers("NOT (((-1.0 * 0.0) < (1.0 - 1.0)) IS TRUE)", true)]
+    // A folded NaN with its sign bit set. The ordered comparison against a NaN
+    // literal goes through the UDF, which the simplifier then folds as a scalar.
+    #[case::negative_nan_lt_nan("-CAST('NaN' AS DOUBLE) < CAST('NaN' AS DOUBLE)", false)]
+    #[case::negative_nan_gt_eq_nan("-CAST('NaN' AS DOUBLE) >= CAST('NaN' AS DOUBLE)", true)]
+    #[case::negative_nan_gt_finite("-CAST('NaN' AS DOUBLE) > 1.0", true)]
     fn folded_constant_comparisons_use_ieee_semantics(
         #[case] filter: &str,
         #[case] expected: bool,
