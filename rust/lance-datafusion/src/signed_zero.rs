@@ -542,19 +542,25 @@ fn drop_redundant_negative_nan_ranges(terms: &mut Vec<&Expr>) -> bool {
     if guarded.is_empty() {
         return false;
     }
-    let mut bounded: Vec<&Expr> = Vec::new();
-    for term in terms.iter_mut() {
-        if let Some((primary, operand)) = lower_bound_with_negative_nans(term)
-            && guarded.contains(&operand)
-        {
-            *term = primary;
-            bounded.push(operand);
-        }
-    }
+    let bounded: Vec<&Expr> = terms
+        .iter()
+        .filter_map(|term| lower_bound_with_negative_nans(term))
+        .map(|(_, operand)| operand)
+        .filter(|operand| guarded.contains(operand))
+        .collect();
     if bounded.is_empty() {
         return false;
     }
+    // Drop the guards before unwrapping the lower bounds: `o >= -inf` unwraps to
+    // the guard's own shape, and as the only lower bound it has to stay.
     terms.retain(|term| !excluded_negative_nans(term).is_some_and(|o| bounded.contains(&o)));
+    for term in terms.iter_mut() {
+        if let Some((primary, operand)) = lower_bound_with_negative_nans(term)
+            && bounded.contains(&operand)
+        {
+            *term = primary;
+        }
+    }
     true
 }
 
@@ -988,6 +994,9 @@ mod tests {
     #[case::between(col("x").gt_eq(lit(1.0)), col("x").lt_eq(lit(5.0)), 1.0, 5.0)]
     #[case::zero_bounds(col("x").gt(lit(0.0)), col("x").lt(lit(0.0)), 0.0, -0.0)]
     #[case::upper_first(col("x").lt(lit(5.0)), col("x").gt(lit(1.0)), 5.0, 1.0)]
+    // The lower bound unwraps to the same shape as the upper bound's guard, and
+    // must survive dropping that guard.
+    #[case::negative_infinity_lower_bound(col("x").gt_eq(lit(f64::NEG_INFINITY)), col("x").lt_eq(lit(1.0)), f64::NEG_INFINITY, 1.0)]
     fn two_sided_bound_keeps_one_range(
         #[case] first: Expr,
         #[case] second: Expr,

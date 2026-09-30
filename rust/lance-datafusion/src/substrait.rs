@@ -746,6 +746,7 @@ async fn parse_measures(
 mod tests {
     use std::sync::Arc;
 
+    use arrow_array::{Float64Array, ListArray, RecordBatch, cast::AsArray, types::Float64Type};
     use arrow_schema::{DataType, Field, Schema, TimeUnit};
     use datafusion::{
         execution::SessionState,
@@ -1623,23 +1624,76 @@ mod tests {
     }
 
     /// The float sign rewrites emit an internal UDF, which a plain session state
-    /// cannot resolve unless decoding registers it.
+    /// cannot resolve unless decoding registers it. Decoding also drops the
+    /// literal metadata that marks the rewrite's own ranges, and the scanner
+    /// optimizes the decoded filter again, so that second pass must not change
+    /// the answer either.
     #[rstest]
     #[case::column_comparison("a = b")]
     #[case::nan_bound("a < CAST('NaN' AS DOUBLE)")]
     #[case::array_has("array_has(l, 0.0)")]
+    #[case::upper_bound("a < 1.0")]
+    #[case::lower_bound("a > 1.0")]
+    #[case::two_sided_bound("a BETWEEN 0.0 AND 1.0")]
+    #[case::negative_infinity_lower_bound("a BETWEEN CAST('-inf' AS DOUBLE) AND 1.0")]
     #[tokio::test]
     async fn test_substrait_roundtrip_float_sign_rewrites(#[case] filter: &str) {
-        let schema = Schema::new(vec![
+        let schema = Arc::new(Schema::new(vec![
             Field::new("a", DataType::Float64, true),
             Field::new("b", DataType::Float64, true),
             Field::new_list("l", Field::new_list_field(DataType::Float64, true), true),
-        ]);
-        let planner = crate::planner::Planner::new(Arc::new(schema.clone()));
+        ]));
+        let nan = f64::NAN;
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Float64Array::from(vec![
+                    Some(-nan),
+                    Some(nan),
+                    Some(-0.0),
+                    Some(f64::NEG_INFINITY),
+                    Some(2.0),
+                    None,
+                ])),
+                Arc::new(Float64Array::from(vec![
+                    Some(nan),
+                    Some(-nan),
+                    Some(0.0),
+                    Some(1.0),
+                    Some(1.0),
+                    Some(1.0),
+                ])),
+                Arc::new(ListArray::from_iter_primitive::<Float64Type, _, _>(vec![
+                    Some(vec![Some(-0.0)]),
+                    Some(vec![Some(0.0)]),
+                    Some(vec![]),
+                    Some(vec![None]),
+                    None,
+                    Some(vec![Some(1.0)]),
+                ])),
+            ],
+        )
+        .unwrap();
+        let planner = crate::planner::Planner::new(schema.clone());
+        let answers = |expr: &Expr| {
+            let result = planner
+                .create_physical_expr(expr)
+                .unwrap()
+                .evaluate(&batch)
+                .unwrap()
+                .into_array(batch.num_rows())
+                .unwrap();
+            result.as_boolean().iter().collect::<Vec<_>>()
+        };
         let expr = planner
             .optimize_expr(planner.parse_filter(filter).unwrap())
             .unwrap();
-        assert_substrait_roundtrip(schema, expr).await;
+        let bytes = encode_substrait(expr.clone(), schema.clone(), &session_state()).unwrap();
+        let decoded = parse_substrait(bytes.as_slice(), schema, &session_state())
+            .await
+            .unwrap();
+        let reoptimized = planner.optimize_expr(decoded).unwrap();
+        assert_eq!(answers(&reoptimized), answers(&expr), "{reoptimized}");
     }
 
     // ==================== LIKE and starts_with tests ====================

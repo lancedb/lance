@@ -326,6 +326,13 @@ async fn test_query_float_special_values(#[case] data_type: DataType) {
                 // A two-sided bound excludes both NaNs without its own
                 // negative-NaN ranges, which is what keeps it one index range.
                 assert_filter_ids(&ds, &format!("value BETWEEN -1.0 AND {zero}"), &[0, 1, 6]).await;
+                // An infinite lower bound is still the one that excludes -NaN.
+                assert_filter_ids(
+                    &ds,
+                    &format!("value BETWEEN CAST('-inf' AS DOUBLE) AND {zero}"),
+                    &[0, 1, 3, 6, 7],
+                )
+                .await;
                 assert_filter_ids(&ds, &format!("value > {zero} AND value <= 1.0"), &[5]).await;
                 assert_filter_ids(
                     &ds,
