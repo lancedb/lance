@@ -323,6 +323,16 @@ async fn test_query_float_special_values(#[case] data_type: DataType) {
                     &[2, 3, 4, 5, 6, 7, 8, 10],
                 )
                 .await;
+                // A two-sided bound excludes both NaNs without its own
+                // negative-NaN ranges, which is what keeps it one index range.
+                assert_filter_ids(&ds, &format!("value BETWEEN -1.0 AND {zero}"), &[0, 1, 6]).await;
+                assert_filter_ids(&ds, &format!("value > {zero} AND value <= 1.0"), &[5]).await;
+                assert_filter_ids(
+                    &ds,
+                    &format!("NOT (value >= -1.0 AND value <= {zero})"),
+                    &[2, 3, 4, 5, 7, 8, 10],
+                )
+                .await;
                 // An IN list gains the encoding it does not spell out.
                 assert_filter_ids(&ds, &format!("value IN ({zero}, 1.0)"), &[0, 1, 5]).await;
                 assert_filter_ids(
@@ -414,7 +424,14 @@ async fn test_float_zero_predicate_uses_scalar_index() {
     .await
     .unwrap();
 
-    for predicate in ["value = 0.0", "value < 0.0", "value > 0.0", "value != 0.0"] {
+    for predicate in [
+        "value = 0.0",
+        "value < 0.0",
+        "value > 0.0",
+        "value != 0.0",
+        "value BETWEEN -1.0 AND 0.0",
+        "value > 0.0 AND value < 1.0",
+    ] {
         let plan = ds
             .scan()
             .filter(predicate)
@@ -429,7 +446,8 @@ async fn test_float_zero_predicate_uses_scalar_index() {
         // The rewrite's output survives a second `optimize_expr`, which the scan
         // path does run, so each required range must appear exactly once. `>` has
         // two disjoint ranges: ordinary values above zero and negative NaNs below
-        // negative infinity.
+        // negative infinity. A two-sided bound needs neither NaN range, so it
+        // stays one range.
         let expected_searches = if predicate == "value > 0.0" { 2 } else { 1 };
         assert_eq!(
             plan.matches("value_idx").count(),

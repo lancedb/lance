@@ -455,13 +455,96 @@ fn rewrite_literal_comparison(
     })
 }
 
+/// The operand of `operand >= -inf` as the range rewrite emits it for an upper
+/// bound: true for every value except a negative NaN.
+fn excluded_negative_nans(expr: &Expr) -> Option<&Expr> {
+    let Expr::BinaryExpr(BinaryExpr {
+        left,
+        op: Operator::GtEq,
+        right,
+    }) = expr
+    else {
+        return None;
+    };
+    let Expr::Literal(value, metadata) = right.as_ref() else {
+        return None;
+    };
+    (is_raw_float_literal(metadata.as_ref()) && negative_infinity(value).as_ref() == Some(value))
+        .then_some(left.as_ref())
+}
+
+/// Split `operand > c OR operand < -inf`, as the range rewrite emits it for a
+/// lower bound, into the bound itself and its operand.
+fn lower_bound_with_negative_nans(expr: &Expr) -> Option<(&Expr, &Expr)> {
+    let Expr::BinaryExpr(BinaryExpr {
+        left: primary,
+        op: Operator::Or,
+        right: negative_nans,
+    }) = expr
+    else {
+        return None;
+    };
+    let (
+        Expr::BinaryExpr(BinaryExpr {
+            left: operand,
+            op: Operator::Gt | Operator::GtEq,
+            right: bound,
+        }),
+        Expr::BinaryExpr(BinaryExpr {
+            left: nan_operand,
+            op: Operator::Lt,
+            right: negative_infinity,
+        }),
+    ) = (primary.as_ref(), negative_nans.as_ref())
+    else {
+        return None;
+    };
+    let is_raw = |literal: &Expr| matches!(literal, Expr::Literal(_, metadata) if is_raw_float_literal(metadata.as_ref()));
+    (operand == nan_operand && is_raw(bound) && is_raw(negative_infinity))
+        .then_some((primary.as_ref(), operand.as_ref()))
+}
+
+/// Drop the negative-NaN ranges that cancel out when an `AND` chain bounds an
+/// operand from both sides, and report whether any did.
+///
+/// A lower bound `o > c` or `o >= c` against a non-NaN `c` already excludes every
+/// negative NaN, so next to `o >= -inf` from an upper bound its `OR o < -inf`
+/// only re-adds rows that `o >= -inf` removes again, and `o >= -inf` itself is
+/// implied. Dropping both keeps `o BETWEEN a AND b` a single index range; with
+/// the `OR` in place the index could not intersect the two bounds and searched
+/// every row above `a`.
+fn drop_redundant_negative_nan_ranges(terms: &mut Vec<&Expr>) -> bool {
+    let guarded: Vec<&Expr> = terms
+        .iter()
+        .filter_map(|term| excluded_negative_nans(term))
+        .collect();
+    if guarded.is_empty() {
+        return false;
+    }
+    let mut bounded: Vec<&Expr> = Vec::new();
+    for term in terms.iter_mut() {
+        if let Some((primary, operand)) = lower_bound_with_negative_nans(term)
+            && guarded.contains(&operand)
+        {
+            *term = primary;
+            bounded.push(operand);
+        }
+    }
+    if bounded.is_empty() {
+        return false;
+    }
+    terms.retain(|term| !excluded_negative_nans(term).is_some_and(|o| bounded.contains(&o)));
+    true
+}
+
 fn rewrite_node(expr: &Expr, schema: &DFSchema) -> Option<Expr> {
     match expr {
         // DataFusion's simplifier expands an `IN` list of three or fewer values
         // over a bare column back into an OR chain of equalities, so a second
         // `optimize_expr` splits this rewrite's own output and re-runs it on each
         // half. Both halves then produce the same list, and dropping the repeat is
-        // what makes the rewrite survive that round trip.
+        // what makes the rewrite survive that round trip. An `AND` chain also
+        // drops the negative-NaN ranges that a two-sided bound makes redundant.
         Expr::BinaryExpr(BinaryExpr { op, .. }) if matches!(op, Operator::Or | Operator::And) => {
             let mut kept: Vec<&Expr> = Vec::new();
             flatten_chain(expr, *op, &mut kept);
@@ -472,7 +555,9 @@ fn rewrite_node(expr: &Expr, schema: &DFSchema) -> Option<Expr> {
                 }
                 deduped.push(term);
             }
-            if deduped.len() == kept.len() {
+            let is_bounded =
+                *op == Operator::And && drop_redundant_negative_nan_ranges(&mut deduped);
+            if deduped.len() == kept.len() && !is_bounded {
                 return None;
             }
             deduped.into_iter().cloned().reduce(|left, right| match op {
@@ -844,6 +929,48 @@ mod tests {
     }
 
     #[rstest]
+    #[case::between(col("x").gt_eq(lit(1.0)), col("x").lt_eq(lit(5.0)), 1.0, 5.0)]
+    #[case::zero_bounds(col("x").gt(lit(0.0)), col("x").lt(lit(0.0)), 0.0, -0.0)]
+    #[case::upper_first(col("x").lt(lit(5.0)), col("x").gt(lit(1.0)), 5.0, 1.0)]
+    fn two_sided_bound_keeps_one_range(
+        #[case] first: Expr,
+        #[case] second: Expr,
+        #[case] first_bound: f64,
+        #[case] second_bound: f64,
+    ) {
+        let raw_bound = |bound: &Expr, value: f64| {
+            let Expr::BinaryExpr(BinaryExpr { left, op, .. }) = bound else {
+                unreachable!()
+            };
+            compare(*left.clone(), *op, raw(Float64(Some(value))))
+        };
+        assert_eq!(
+            rewrite(first.clone().and(col("y").eq(lit(1.0))).and(second.clone())),
+            raw_bound(&first, first_bound)
+                .and(col("y").eq(lit(1.0)))
+                .and(raw_bound(&second, second_bound))
+        );
+    }
+
+    /// Without both a lower bound and the upper bound's `>= -inf` range on the
+    /// same operand in one `AND` chain, every negative-NaN range is still needed.
+    #[rstest]
+    #[case::different_operands(col("x").gt_eq(lit(1.0)), col("y").lt_eq(lit(5.0)), Operator::And)]
+    #[case::two_lower_bounds(col("x").gt_eq(lit(1.0)), col("x").gt(lit(2.0)), Operator::And)]
+    #[case::two_upper_bounds(col("x").lt_eq(lit(1.0)), col("x").lt(lit(2.0)), Operator::And)]
+    #[case::disjunction(col("x").gt_eq(lit(1.0)), col("x").lt_eq(lit(5.0)), Operator::Or)]
+    fn one_sided_bounds_keep_negative_nan_ranges(
+        #[case] first: Expr,
+        #[case] second: Expr,
+        #[case] op: Operator,
+    ) {
+        assert_eq!(
+            rewrite(compare(first.clone(), op, second.clone())),
+            compare(rewrite(first), op, rewrite(second))
+        );
+    }
+
+    #[rstest]
     #[case::integer_zero(col("x").eq(lit(0_i64)))]
     #[case::null_equality(compare(col("x"), Operator::Eq, Expr::Literal(Float64(None), None)))]
     #[case::null_range(compare(col("x"), Operator::Lt, Expr::Literal(Float64(None), None)))]
@@ -975,6 +1102,9 @@ mod tests {
     // bare column, which is also what DataFusion requires before it shortens a
     // list. This case fails if a release ever relaxes that.
     #[case::non_column_probe("abs(value) = 0.0")]
+    #[case::between("value BETWEEN 1.0 AND 5.0")]
+    #[case::two_sided_zero_bound("value > 0.0 AND value < 1.0")]
+    #[case::not_between("NOT (value >= -1.0 AND value <= 0.0)")]
     // `IS [NOT] DISTINCT FROM` is missing because `Planner::parse_filter` rejects
     // it as unsupported SQL; that arm is reachable only from a programmatically
     // built expression, and `rewriting_twice_changes_nothing` covers it there.
