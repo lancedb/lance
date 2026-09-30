@@ -11,6 +11,7 @@ use arrow_array::types::{Float16Type, Float32Type, Float64Type};
 use arrow_array::{ArrayRef, ArrowNativeTypeOp, ArrowPrimitiveType};
 use arrow_schema::DataType;
 use datafusion::error::Result as DFResult;
+use datafusion::functions_nested::expr_fn::array_has_any;
 use datafusion::logical_expr::expr::{Between, InList, ScalarFunction};
 use datafusion::logical_expr::{
     BinaryExpr, ColumnarValue, ExprSchemable, Operator, ScalarFunctionArgs, ScalarUDF,
@@ -25,21 +26,21 @@ use datafusion_common::utils::take_function_args;
 use half::f16;
 use lance_core::Result;
 
-const NORMALIZE_NAN_SIGN_NAME: &str = "_lance_normalize_nan_sign";
+const NORMALIZE_SIGN_NAME: &str = "_lance_normalize_float_sign";
 const RAW_FLOAT_LITERAL_MARKER: &str = "lance:raw-float-comparison";
 
-/// Clears the sign bit only when a comparison operand is NaN.
+/// Clears the sign bit only when a comparison operand is zero or NaN.
 ///
 /// Comparisons against non-NaN literals are rewritten into indexable ranges
 /// instead. This UDF is reserved for column-to-column, computed, and NaN-bound
 /// comparisons where ranges cannot normalize an operand without changing its
 /// payload ordering.
 #[derive(Debug, Eq, PartialEq, Hash)]
-struct NormalizeNanSign {
+struct NormalizeFloatSign {
     signature: Signature,
 }
 
-impl NormalizeNanSign {
+impl NormalizeFloatSign {
     fn new() -> Self {
         Self {
             signature: Signature::uniform(
@@ -51,9 +52,9 @@ impl NormalizeNanSign {
     }
 }
 
-impl ScalarUDFImpl for NormalizeNanSign {
+impl ScalarUDFImpl for NormalizeFloatSign {
     fn name(&self) -> &str {
-        NORMALIZE_NAN_SIGN_NAME
+        NORMALIZE_SIGN_NAME
     }
 
     fn signature(&self) -> &Signature {
@@ -68,42 +69,57 @@ impl ScalarUDFImpl for NormalizeNanSign {
     fn invoke_with_args(&self, func_args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         let [value] = take_function_args(self.name(), func_args.args)?;
         Ok(match value {
-            ColumnarValue::Array(array) => ColumnarValue::Array(normalize_nan_array(array)?),
+            ColumnarValue::Array(array) => ColumnarValue::Array(normalize_sign_array(array)?),
             ColumnarValue::Scalar(value) => {
                 ColumnarValue::Scalar(match equivalent_encodings(&value) {
-                    Some((_, positive)) if is_nan(&value) => positive,
-                    _ => value,
+                    Some((_, positive)) => positive,
+                    None => value,
                 })
             }
         })
     }
 }
 
-fn normalize_nan_array(array: ArrayRef) -> DFResult<ArrayRef> {
+fn normalize_sign_array(array: ArrayRef) -> DFResult<ArrayRef> {
     match array.data_type() {
-        DataType::Float16 => Ok(clear_nan_signs::<Float16Type>(array, f16::NEG_INFINITY)),
-        DataType::Float32 => Ok(clear_nan_signs::<Float32Type>(array, f32::NEG_INFINITY)),
-        DataType::Float64 => Ok(clear_nan_signs::<Float64Type>(array, f64::NEG_INFINITY)),
+        DataType::Float16 => Ok(clear_sign_bits::<Float16Type>(
+            array,
+            f16::NEG_ZERO,
+            f16::NEG_INFINITY,
+        )),
+        DataType::Float32 => Ok(clear_sign_bits::<Float32Type>(
+            array,
+            -0.0,
+            f32::NEG_INFINITY,
+        )),
+        DataType::Float64 => Ok(clear_sign_bits::<Float64Type>(
+            array,
+            -0.0,
+            f64::NEG_INFINITY,
+        )),
         data_type => Err(datafusion::error::DataFusionError::Execution(format!(
-            "{NORMALIZE_NAN_SIGN_NAME} expected a floating-point array, got {data_type}"
+            "{NORMALIZE_SIGN_NAME} expected a floating-point array, got {data_type}"
         ))),
     }
 }
 
-/// Negate every NaN with its sign bit set, which clears that bit and keeps the
-/// payload. Returns `array` itself when it holds no such NaN.
-fn clear_nan_signs<T: ArrowPrimitiveType>(
+/// Negate every `-0.0` and every NaN with its sign bit set, which clears that
+/// bit and keeps a NaN's payload. Returns `array` itself when it holds neither.
+fn clear_sign_bits<T: ArrowPrimitiveType>(
     array: ArrayRef,
+    negative_zero: T::Native,
     negative_infinity: T::Native,
 ) -> ArrayRef {
-    // Total order puts exactly the sign-bit-set NaNs below negative infinity.
-    let is_negative_nan = |value: T::Native| value.is_lt(negative_infinity);
+    // Total order puts exactly the sign-bit-set NaNs below negative infinity, and
+    // compares `-0.0` equal only to itself.
+    let is_negative =
+        |value: T::Native| value.is_eq(negative_zero) || value.is_lt(negative_infinity);
     let values = array.as_primitive::<T>();
-    if !values.values().iter().any(|value| is_negative_nan(*value)) {
+    if !values.values().iter().any(|value| is_negative(*value)) {
         return array;
     }
     Arc::new(values.unary::<_, T>(|value| {
-        if is_negative_nan(value) {
+        if is_negative(value) {
             value.neg_wrapping()
         } else {
             value
@@ -111,14 +127,18 @@ fn clear_nan_signs<T: ArrowPrimitiveType>(
     }))
 }
 
-fn normalize_nan_expr(expr: &Expr) -> Expr {
-    if matches!(expr, Expr::ScalarFunction(function) if function.name() == NORMALIZE_NAN_SIGN_NAME)
-    {
+/// Registered by the Substrait decoder, which resolves functions by name.
+pub static NORMALIZE_SIGN_UDF: LazyLock<Arc<ScalarUDF>> =
+    LazyLock::new(|| Arc::new(ScalarUDF::new_from_impl(NormalizeFloatSign::new())));
+
+fn normalize_sign_expr(expr: &Expr) -> Expr {
+    if matches!(expr, Expr::ScalarFunction(function) if function.name() == NORMALIZE_SIGN_NAME) {
         return expr.clone();
     }
-    static UDF: LazyLock<Arc<ScalarUDF>> =
-        LazyLock::new(|| Arc::new(ScalarUDF::new_from_impl(NormalizeNanSign::new())));
-    Expr::ScalarFunction(ScalarFunction::new_udf(UDF.clone(), vec![expr.clone()]))
+    Expr::ScalarFunction(ScalarFunction::new_udf(
+        NORMALIZE_SIGN_UDF.clone(),
+        vec![expr.clone()],
+    ))
 }
 
 /// Rewrite floating-point comparisons so sign-only encodings have value semantics.
@@ -137,11 +157,12 @@ fn normalize_nan_expr(expr: &Expr) -> Expr {
 /// | `x > c`, `x >= c`          | for non-NaN `c`, comparison plus `x < -inf`     |
 /// | `x = 0` / `x = NaN`        | `IN` both sign encodings                        |
 /// | `x IN (0, NaN, ..)`        | missing sign encodings are added                |
+/// | `array_has(xs, 0 / NaN)`   | `array_has_any` over both sign encodings        |
 ///
 /// The extra NaN range is combined with `AND` for `<`/`<=` and `OR` for `>`/`>=`.
 /// Equality names both encodings because scalar indices key on the bit pattern.
-/// A comparison without a literal normalizes NaN operands through an internal
-/// physical expression, preserving payload bits and evaluating each operand once.
+/// A comparison without a literal normalizes zero and NaN operands through an
+/// internal UDF, preserving payload bits and evaluating each operand once.
 ///
 /// Runs as the last step of [`crate::planner::Planner::optimize_expr`], after
 /// coercion has given the literal the column's type and the simplifier has
@@ -436,7 +457,7 @@ fn rewrite_literal_comparison(
         // A range cannot reorder NaN payloads, so normalize the operand instead.
         (Some((_, positive)), _) if is_nan(value) => {
             return Some(comparison(
-                normalize_nan_expr(other),
+                normalize_sign_expr(other),
                 op,
                 Expr::Literal(positive, metadata.cloned()),
             ));
@@ -580,9 +601,9 @@ fn rewrite_node(expr: &Expr, schema: &DFSchema) -> Option<Expr> {
                     && is_float_expr(right, schema) =>
                 {
                     Some(comparison(
-                        normalize_nan_expr(left),
+                        normalize_sign_expr(left),
                         *op,
-                        normalize_nan_expr(right),
+                        normalize_sign_expr(right),
                     ))
                 }
                 _ => None,
@@ -656,6 +677,20 @@ fn rewrite_node(expr: &Expr, schema: &DFSchema) -> Option<Expr> {
                 negated: *negated,
             }))
         }
+        // One probe for both encodings, rather than two `array_has` calls joined
+        // by `OR`, so a volatile haystack is still evaluated once.
+        Expr::ScalarFunction(ScalarFunction { func, args }) if func.name() == "array_has" => {
+            let [haystack, Expr::Literal(value, metadata)] = args.as_slice() else {
+                return None;
+            };
+            let (negative, positive) = equivalent_encodings(value)?;
+            let data_type = negative.data_type();
+            let needles = ScalarValue::new_list(&[negative, positive], &data_type, true);
+            Some(array_has_any(
+                haystack.clone(),
+                Expr::Literal(ScalarValue::List(needles), metadata.clone()),
+            ))
+        }
         _ => None,
     }
 }
@@ -704,6 +739,7 @@ mod tests {
 
     use arrow_array::{Array, Float16Array, Float32Array, Float64Array};
     use arrow_schema::{Field, Schema};
+    use datafusion::functions_nested::expr_fn::array_has;
     use datafusion::prelude::{col, lit};
     use rstest::rstest;
 
@@ -715,6 +751,7 @@ mod tests {
             Field::new("y", DataType::Float64, true),
             Field::new("a", DataType::Float64, true),
             Field::new("b", DataType::Float64, true),
+            Field::new_list("l", Field::new_list_field(DataType::Float64, true), true),
         ]))
         .unwrap();
         rewrite_float_comparisons(expr, &schema).unwrap()
@@ -814,20 +851,37 @@ mod tests {
         );
     }
 
+    #[rstest]
+    #[case::zero(0.0, -0.0)]
+    #[case::nan(
+        f64::from_bits(0x7ff8_0000_0000_0042),
+        f64::from_bits(0xfff8_0000_0000_0042)
+    )]
+    fn array_has_probes_both_sign_encodings_at_once(#[case] positive: f64, #[case] negative: f64) {
+        let needles = ScalarValue::new_list(
+            &[Float64(Some(negative)), Float64(Some(positive))],
+            &DataType::Float64,
+            true,
+        );
+        let expected = array_has_any(col("l"), lit(ScalarValue::List(needles)));
+        assert_eq!(rewrite(array_has(col("l"), lit(positive))), expected);
+        assert_eq!(rewrite(array_has(col("l"), lit(negative))), expected);
+    }
+
     #[test]
-    fn column_comparison_normalizes_each_nan_operand_once() {
+    fn column_comparison_normalizes_each_operand_once() {
         let rewritten = rewrite(col("x").lt(col("y")));
         let expected = compare(
-            normalize_nan_expr(&col("x")),
+            normalize_sign_expr(&col("x")),
             Operator::Lt,
-            normalize_nan_expr(&col("y")),
+            normalize_sign_expr(&col("y")),
         );
         assert_eq!(rewritten, expected);
         assert_eq!(rewrite(rewritten.clone()), rewritten);
     }
 
     #[test]
-    fn nan_array_normalization_preserves_payload_and_non_nan_values() {
+    fn sign_array_normalization_preserves_payload_and_other_values() {
         let negative = f64::from_bits(0xfff8_0000_0000_0042);
         let positive = f64::from_bits(0x7ff8_0000_0000_0042);
         let input = Arc::new(Float64Array::from(vec![
@@ -835,30 +889,32 @@ mod tests {
             Some(-1.0),
             Some(positive),
             None,
+            Some(-0.0),
         ])) as ArrayRef;
-        let normalized = normalize_nan_array(input).unwrap();
+        let normalized = normalize_sign_array(input).unwrap();
         let normalized = normalized.as_primitive::<Float64Type>();
         assert_eq!(normalized.value(0).to_bits(), positive.to_bits());
         assert_eq!(normalized.value(1).to_bits(), (-1.0_f64).to_bits());
         assert_eq!(normalized.value(2).to_bits(), positive.to_bits());
         assert!(normalized.is_null(3));
+        assert_eq!(normalized.value(4).to_bits(), 0.0_f64.to_bits());
     }
 
     /// Column-to-column comparisons run every batch through the UDF, so an array
-    /// without a negative NaN must come back as the same allocation.
+    /// without a negative zero or NaN must come back as the same allocation.
     #[rstest]
-    #[case::float16(Arc::new(Float16Array::from(vec![f16::NAN, -f16::ONE])) as ArrayRef, Arc::new(Float16Array::from(vec![-f16::NAN])) as ArrayRef)]
-    #[case::float32(Arc::new(Float32Array::from(vec![f32::NAN, -1.0])) as ArrayRef, Arc::new(Float32Array::from(vec![-f32::NAN])) as ArrayRef)]
-    #[case::float64(Arc::new(Float64Array::from(vec![f64::NAN, -1.0])) as ArrayRef, Arc::new(Float64Array::from(vec![-f64::NAN])) as ArrayRef)]
-    fn nan_array_normalization_copies_only_with_a_negative_nan(
+    #[case::float16(Arc::new(Float16Array::from(vec![f16::NAN, -f16::ONE, f16::ZERO])) as ArrayRef, Arc::new(Float16Array::from(vec![-f16::NAN, f16::NEG_ZERO])) as ArrayRef)]
+    #[case::float32(Arc::new(Float32Array::from(vec![f32::NAN, -1.0, 0.0])) as ArrayRef, Arc::new(Float32Array::from(vec![-f32::NAN, -0.0])) as ArrayRef)]
+    #[case::float64(Arc::new(Float64Array::from(vec![f64::NAN, -1.0, 0.0])) as ArrayRef, Arc::new(Float64Array::from(vec![-f64::NAN, -0.0])) as ArrayRef)]
+    fn sign_array_normalization_copies_only_with_a_negative_value(
         #[case] unchanged: ArrayRef,
         #[case] negative_nan: ArrayRef,
     ) {
         assert!(Arc::ptr_eq(
-            &normalize_nan_array(unchanged.clone()).unwrap(),
+            &normalize_sign_array(unchanged.clone()).unwrap(),
             &unchanged
         ));
-        let normalized = normalize_nan_array(negative_nan.clone()).unwrap();
+        let normalized = normalize_sign_array(negative_nan.clone()).unwrap();
         assert!(!Arc::ptr_eq(&normalized, &negative_nan));
         let expected = arrow::compute::kernels::numeric::neg(&negative_nan).unwrap();
         assert_eq!(normalized.to_data(), expected.to_data());
@@ -1105,16 +1161,21 @@ mod tests {
     #[case::between("value BETWEEN 1.0 AND 5.0")]
     #[case::two_sided_zero_bound("value > 0.0 AND value < 1.0")]
     #[case::not_between("NOT (value >= -1.0 AND value <= 0.0)")]
+    #[case::column_comparison("value < other")]
+    #[case::array_has("array_has(values, 0.0)")]
     // `IS [NOT] DISTINCT FROM` is missing because `Planner::parse_filter` rejects
     // it as unsupported SQL; that arm is reachable only from a programmatically
     // built expression, and `rewriting_twice_changes_nothing` covers it there.
     fn optimizing_twice_changes_nothing(#[case] filter: &str) {
-        let schema =
-            std::sync::Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
-                "value",
-                arrow_schema::DataType::Float64,
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("value", DataType::Float64, true),
+            Field::new("other", DataType::Float64, true),
+            Field::new_list(
+                "values",
+                Field::new_list_field(DataType::Float64, true),
                 true,
-            )]));
+            ),
+        ]));
         let planner = crate::planner::Planner::new(schema);
         let once = planner
             .optimize_expr(planner.parse_filter(filter).unwrap())

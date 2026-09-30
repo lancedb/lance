@@ -2,9 +2,13 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use arrow_schema::{DataType, Schema as ArrowSchema};
-use datafusion::{execution::SessionState, logical_expr::Expr};
+use datafusion::{
+    execution::SessionState,
+    logical_expr::{Expr, registry::FunctionRegistry},
+};
 
 use crate::aggregate::Aggregate;
+use crate::signed_zero::NORMALIZE_SIGN_UDF;
 use datafusion_common::DFSchema;
 use datafusion_substrait::extensions::Extensions;
 use datafusion_substrait::logical_plan::consumer::{
@@ -27,6 +31,14 @@ use lance_core::{Error, Result};
 use prost::Message;
 use std::collections::HashMap;
 use std::sync::Arc;
+
+/// Copy `state` with the functions Lance's own rewrites emit, which the decoder
+/// has to resolve by name even when the caller registered none of Lance's UDFs.
+fn decode_state(state: &SessionState) -> Result<SessionState> {
+    let mut state = state.clone();
+    state.register_udf(NORMALIZE_SIGN_UDF.clone())?;
+    Ok(state)
+}
 
 /// FixedSizeList has no Substrait producer support in datafusion-substrait.
 /// Other unsupported types (Null, Float16) are encoded as UserDefined and
@@ -528,7 +540,7 @@ pub async fn parse_substrait(
 
     let mut expr_container =
         datafusion_substrait::logical_plan::consumer::from_substrait_extended_expr(
-            state,
+            &decode_state(state)?,
             &extended_expr,
         )
         .await?;
@@ -617,7 +629,8 @@ pub async fn parse_aggregate_rel_with_extensions(
     extensions: &Extensions,
 ) -> Result<Aggregate> {
     let df_schema = DFSchema::try_from(input_schema.as_ref().clone())?;
-    let consumer = DefaultSubstraitConsumer::new(extensions, state);
+    let state = decode_state(state)?;
+    let consumer = DefaultSubstraitConsumer::new(extensions, &state);
     let group_by = parse_groupings(aggregate_rel, &df_schema, &consumer).await?;
     let aggregates = parse_measures(aggregate_rel, &df_schema, &consumer).await?;
 
@@ -1607,6 +1620,26 @@ mod tests {
             "Expected SUM aggregate, got: {}",
             agg.aggregates[1].schema_name()
         );
+    }
+
+    /// The float sign rewrites emit an internal UDF, which a plain session state
+    /// cannot resolve unless decoding registers it.
+    #[rstest]
+    #[case::column_comparison("a = b")]
+    #[case::nan_bound("a < CAST('NaN' AS DOUBLE)")]
+    #[case::array_has("array_has(l, 0.0)")]
+    #[tokio::test]
+    async fn test_substrait_roundtrip_float_sign_rewrites(#[case] filter: &str) {
+        let schema = Schema::new(vec![
+            Field::new("a", DataType::Float64, true),
+            Field::new("b", DataType::Float64, true),
+            Field::new_list("l", Field::new_list_field(DataType::Float64, true), true),
+        ]);
+        let planner = crate::planner::Planner::new(Arc::new(schema.clone()));
+        let expr = planner
+            .optimize_expr(planner.parse_filter(filter).unwrap())
+            .unwrap();
+        assert_substrait_roundtrip(schema, expr).await;
     }
 
     // ==================== LIKE and starts_with tests ====================

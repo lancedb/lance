@@ -6,7 +6,7 @@ use std::sync::Arc;
 use arrow::datatypes::*;
 use arrow_array::{
     ArrayRef, BinaryArray, BinaryViewArray, Float16Array, Float32Array, Float64Array, Int32Array,
-    LargeBinaryArray, LargeStringArray, RecordBatch, RecordBatchIterator, StringArray,
+    LargeBinaryArray, LargeStringArray, ListArray, RecordBatch, RecordBatchIterator, StringArray,
     StringViewArray,
 };
 use arrow_schema::DataType;
@@ -353,41 +353,81 @@ async fn test_query_float_special_values(#[case] data_type: DataType) {
         .await
 }
 
+/// Neither zero's nor NaN's sign is part of its value, including when both
+/// sides of a comparison are columns or the value is an `array_has` needle.
 #[tokio::test]
-async fn test_nan_sign_is_ignored_in_column_comparisons() {
-    let negative_nan = -f64::NAN;
-    let positive_nan = f64::NAN;
-    let initial = arrow_array::record_batch!(
-        ("id", Int32, [0, 1, 2, 3]),
-        ("left", Float64, [negative_nan, positive_nan, 1.0, 2.0]),
-        ("right", Float64, [positive_nan, negative_nan, 2.0, 1.0])
-    )
-    .unwrap();
-    let mut dataset = Dataset::write(
-        RecordBatchIterator::new([Ok(initial.clone())], initial.schema()),
-        "memory://",
-        None,
-    )
-    .await
+async fn test_float_sign_is_ignored_in_column_comparisons_and_array_has() {
+    let nan = f64::NAN;
+    let batch = RecordBatch::try_from_iter(vec![
+        (
+            "id",
+            Arc::new(Int32Array::from_iter_values(0..10)) as ArrayRef,
+        ),
+        (
+            "a",
+            Arc::new(Float64Array::from(vec![
+                Some(-nan),
+                Some(nan),
+                Some(-0.0),
+                Some(0.0),
+                Some(1.0),
+                Some(-1.0),
+                Some(1.0),
+                None,
+                Some(0.0),
+                Some(-nan),
+            ])) as ArrayRef,
+        ),
+        (
+            "b",
+            Arc::new(Float64Array::from(vec![
+                Some(nan),
+                Some(-nan),
+                Some(0.0),
+                Some(-0.0),
+                Some(1.0),
+                Some(1.0),
+                Some(-1.0),
+                Some(0.0),
+                None,
+                Some(0.0),
+            ])) as ArrayRef,
+        ),
+        (
+            "l",
+            Arc::new(ListArray::from_iter_primitive::<Float64Type, _, _>(vec![
+                Some(vec![Some(-nan)]),
+                Some(vec![Some(nan)]),
+                Some(vec![Some(-0.0)]),
+                Some(vec![Some(0.0)]),
+                Some(vec![Some(1.0)]),
+                Some(vec![None, Some(-0.0)]),
+                Some(vec![None]),
+                Some(vec![]),
+                None,
+                Some(vec![Some(1.0)]),
+            ])) as ArrayRef,
+        ),
+    ])
     .unwrap();
 
-    let appended = arrow_array::record_batch!(
-        ("id", Int32, [4, 5, 6, 7]),
-        ("left", Float64, [negative_nan, positive_nan, 3.0, 4.0]),
-        ("right", Float64, [0.0, negative_nan, 4.0, 3.0])
-    )
-    .unwrap();
-    dataset
-        .append(
-            RecordBatchIterator::new([Ok(appended.clone())], appended.schema()),
-            None,
-        )
-        .await
-        .unwrap();
-
-    assert_filter_ids(&dataset, "left = right", &[0, 1, 5]).await;
-    assert_filter_ids(&dataset, "left < right", &[2, 6]).await;
-    assert_filter_ids(&dataset, "left > right", &[3, 4, 7]).await;
+    DatasetTestCases::from_data(batch)
+        .with_index_types("l", [Some(IndexType::LabelList)])
+        .run(|ds: Dataset, _original: RecordBatch| async move {
+            assert_filter_ids(&ds, "a = b", &[0, 1, 2, 3, 4]).await;
+            assert_filter_ids(&ds, "a != b", &[5, 6, 9]).await;
+            assert_filter_ids(&ds, "a < b", &[5]).await;
+            assert_filter_ids(&ds, "a <= b", &[0, 1, 2, 3, 4, 5]).await;
+            assert_filter_ids(&ds, "a > b", &[6, 9]).await;
+            assert_filter_ids(&ds, "a >= b", &[0, 1, 2, 3, 4, 6, 9]).await;
+            for zero in ["0.0", "-0.0"] {
+                assert_filter_ids(&ds, &format!("array_has(l, {zero})"), &[2, 3, 5]).await;
+            }
+            for nan in ["CAST('NaN' AS DOUBLE)", "-CAST('NaN' AS DOUBLE)"] {
+                assert_filter_ids(&ds, &format!("array_has(l, {nan})"), &[0, 1]).await;
+            }
+        })
+        .await;
 }
 
 /// A rewritten zero predicate still has to reach a scalar index. Without this,
