@@ -8,7 +8,7 @@ use datafusion::{
 };
 
 use crate::aggregate::Aggregate;
-use crate::signed_zero::NORMALIZE_SIGN_UDF;
+use crate::signed_zero::COMPARE_FLOATS_UDF;
 use datafusion_common::DFSchema;
 use datafusion_substrait::extensions::Extensions;
 use datafusion_substrait::logical_plan::consumer::{
@@ -36,7 +36,7 @@ use std::sync::Arc;
 /// has to resolve by name even when the caller registered none of Lance's UDFs.
 fn decode_state(state: &SessionState) -> Result<SessionState> {
     let mut state = state.clone();
-    state.register_udf(NORMALIZE_SIGN_UDF.clone())?;
+    state.register_udf(COMPARE_FLOATS_UDF.clone())?;
     Ok(state)
 }
 

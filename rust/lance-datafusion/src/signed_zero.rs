@@ -3,141 +3,217 @@
 
 //! Rewrites for signed-zero literals and NaN sign bits in comparisons.
 
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::sync::{Arc, LazyLock};
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Float16Type, Float32Type, Float64Type};
-use arrow_array::{ArrayRef, ArrowNativeTypeOp, ArrowPrimitiveType};
+use arrow_array::{ArrayRef, ArrowNativeTypeOp, ArrowPrimitiveType, BooleanArray};
+use arrow_buffer::{BooleanBuffer, NullBuffer};
 use arrow_schema::DataType;
 use datafusion::error::Result as DFResult;
 use datafusion::functions_nested::expr_fn::array_has_any;
 use datafusion::logical_expr::expr::{Between, InList, ScalarFunction};
 use datafusion::logical_expr::{
     BinaryExpr, ColumnarValue, ExprSchemable, Operator, ScalarFunctionArgs, ScalarUDF,
-    ScalarUDFImpl, Signature, Volatility,
+    ScalarUDFImpl, Signature, TypeSignature, Volatility,
 };
-use datafusion::prelude::Expr;
+use datafusion::prelude::{Expr, lit};
 use datafusion::scalar::ScalarValue::{self, Float16, Float32, Float64};
-use datafusion_common::DFSchema;
 use datafusion_common::metadata::FieldMetadata;
 use datafusion_common::tree_node::{Transformed, TreeNode};
 use datafusion_common::utils::take_function_args;
+use datafusion_common::{DFSchema, exec_err};
 use half::f16;
 use lance_core::Result;
 
-const NORMALIZE_SIGN_NAME: &str = "_lance_normalize_float_sign";
+const COMPARE_FLOATS_NAME: &str = "_lance_compare_floats";
 const RAW_FLOAT_LITERAL_MARKER: &str = "lance:raw-float-comparison";
 
-/// Clears the sign bit only when a comparison operand is zero or NaN.
+/// The comparisons the rewrite acts on. [`CompareFloats`] names them in its
+/// third argument by their `Display` form.
+const FLOAT_COMPARISONS: [Operator; 8] = [
+    Operator::Lt,
+    Operator::LtEq,
+    Operator::Gt,
+    Operator::GtEq,
+    Operator::Eq,
+    Operator::NotEq,
+    Operator::IsDistinctFrom,
+    Operator::IsNotDistinctFrom,
+];
+
+/// `_lance_compare_floats(left, right, op)` compares two floats like `op`,
+/// except that the sign of a zero or a NaN does not take part.
 ///
 /// Comparisons against non-NaN literals are rewritten into indexable ranges
 /// instead. This UDF is reserved for column-to-column, computed, and NaN-bound
-/// comparisons where ranges cannot normalize an operand without changing its
-/// payload ordering.
+/// comparisons, where no range can express the comparison. It clears the sign
+/// bits in registers while comparing, so it allocates nothing but the result.
 #[derive(Debug, Eq, PartialEq, Hash)]
-struct NormalizeFloatSign {
+struct CompareFloats {
     signature: Signature,
 }
 
-impl NormalizeFloatSign {
+impl CompareFloats {
     fn new() -> Self {
+        let exact = |t: DataType| TypeSignature::Exact(vec![t.clone(), t, DataType::Utf8]);
         Self {
-            signature: Signature::uniform(
-                1,
-                vec![DataType::Float16, DataType::Float32, DataType::Float64],
+            signature: Signature::one_of(
+                vec![
+                    exact(DataType::Float16),
+                    exact(DataType::Float32),
+                    exact(DataType::Float64),
+                ],
                 Volatility::Immutable,
             ),
         }
     }
 }
 
-impl ScalarUDFImpl for NormalizeFloatSign {
+impl ScalarUDFImpl for CompareFloats {
     fn name(&self) -> &str {
-        NORMALIZE_SIGN_NAME
+        COMPARE_FLOATS_NAME
     }
 
     fn signature(&self) -> &Signature {
         &self.signature
     }
 
-    fn return_type(&self, arg_types: &[DataType]) -> DFResult<DataType> {
-        let [data_type] = take_function_args(self.name(), arg_types)?;
-        Ok(data_type.clone())
+    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Boolean)
     }
 
     fn invoke_with_args(&self, func_args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        let [value] = take_function_args(self.name(), func_args.args)?;
-        Ok(match value {
-            ColumnarValue::Array(array) => ColumnarValue::Array(normalize_sign_array(array)?),
-            ColumnarValue::Scalar(value) => {
-                ColumnarValue::Scalar(match equivalent_encodings(&value) {
-                    Some((_, positive)) => positive,
-                    None => value,
-                })
-            }
-        })
+        let [left, right, op_name] = take_function_args(self.name(), func_args.args)?;
+        let op = match &op_name {
+            ColumnarValue::Scalar(ScalarValue::Utf8(Some(name))) => FLOAT_COMPARISONS
+                .into_iter()
+                .find(|op| op.to_string() == *name),
+            _ => None,
+        };
+        let Some(op) = op else {
+            return exec_err!("{COMPARE_FLOATS_NAME} got an unsupported operator {op_name:?}");
+        };
+        // Only the right operand is ever a literal, a NaN bound, and it stays a
+        // one-element array instead of being broadcast.
+        let right = match right {
+            ColumnarValue::Array(array) => array,
+            ColumnarValue::Scalar(value) => value.to_array()?,
+        };
+        let left = left.into_array(func_args.number_rows)?;
+        let result = compare_float_arrays(&left, &right, op, func_args.number_rows)?;
+        Ok(ColumnarValue::Array(Arc::new(result)))
     }
 }
 
-fn normalize_sign_array(array: ArrayRef) -> DFResult<ArrayRef> {
-    match array.data_type() {
-        DataType::Float16 => Ok(clear_sign_bits::<Float16Type>(
-            array,
-            f16::NEG_ZERO,
-            f16::NEG_INFINITY,
-        )),
-        DataType::Float32 => Ok(clear_sign_bits::<Float32Type>(
-            array,
-            -0.0,
-            f32::NEG_INFINITY,
-        )),
-        DataType::Float64 => Ok(clear_sign_bits::<Float64Type>(
-            array,
-            -0.0,
-            f64::NEG_INFINITY,
-        )),
-        data_type => Err(datafusion::error::DataFusionError::Execution(format!(
-            "{NORMALIZE_SIGN_NAME} expected a floating-point array, got {data_type}"
-        ))),
-    }
-}
-
-/// Negate every `-0.0` and every NaN with its sign bit set, which clears that
-/// bit and keeps a NaN's payload. Returns `array` itself when it holds neither.
-fn clear_sign_bits<T: ArrowPrimitiveType>(
-    array: ArrayRef,
-    negative_zero: T::Native,
-    negative_infinity: T::Native,
-) -> ArrayRef {
-    // Total order puts exactly the sign-bit-set NaNs below negative infinity, and
-    // compares `-0.0` equal only to itself.
-    let is_negative =
-        |value: T::Native| value.is_eq(negative_zero) || value.is_lt(negative_infinity);
-    let values = array.as_primitive::<T>();
-    if !values.values().iter().any(|value| is_negative(*value)) {
-        return array;
-    }
-    Arc::new(values.unary::<_, T>(|value| {
-        if is_negative(value) {
-            value.neg_wrapping()
-        } else {
-            value
+/// Compare `num_rows` rows, reading a one-element `right` as a scalar.
+fn compare_float_arrays(
+    left: &ArrayRef,
+    right: &ArrayRef,
+    op: Operator,
+    num_rows: usize,
+) -> DFResult<BooleanArray> {
+    match left.data_type() {
+        DataType::Float16 => Ok(compare_floats::<Float16Type>(left, right, op, num_rows)),
+        DataType::Float32 => Ok(compare_floats::<Float32Type>(left, right, op, num_rows)),
+        DataType::Float64 => Ok(compare_floats::<Float64Type>(left, right, op, num_rows)),
+        data_type => {
+            exec_err!("{COMPARE_FLOATS_NAME} expected floating-point operands, got {data_type}")
         }
-    }))
+    }
+}
+
+fn compare_floats<T: ArrowPrimitiveType>(
+    left: &ArrayRef,
+    right: &ArrayRef,
+    op: Operator,
+    num_rows: usize,
+) -> BooleanArray {
+    let canonical = clear_sign_of_zero_and_nan::<T::Native>;
+    let (left_values, right_values) = (
+        left.as_primitive::<T>().values(),
+        right.as_primitive::<T>().values(),
+    );
+    // A scalar is canonicalized once, and each shape keeps its own loop so the
+    // array-to-array one can vectorize.
+    let right_is_scalar = right.len() != num_rows;
+    let values = if right_is_scalar {
+        let right = canonical(right_values[0]);
+        collect_ordering(op, num_rows, |row| {
+            canonical(left_values[row]).compare(right)
+        })
+    } else {
+        collect_ordering(op, num_rows, |row| {
+            canonical(left_values[row]).compare(canonical(right_values[row]))
+        })
+    };
+    let left_nulls = left.nulls().cloned();
+    let right_nulls = match right.nulls() {
+        Some(nulls) if right_is_scalar => nulls.is_null(0).then(|| NullBuffer::new_null(num_rows)),
+        nulls => nulls.cloned(),
+    };
+    if !matches!(op, Operator::IsDistinctFrom | Operator::IsNotDistinctFrom) {
+        return BooleanArray::new(
+            values,
+            NullBuffer::union(left_nulls.as_ref(), right_nulls.as_ref()),
+        );
+    }
+    // Two NULLs are not distinct, and a NULL is distinct from any value.
+    let valid = |nulls: Option<NullBuffer>| {
+        nulls.map_or_else(|| BooleanBuffer::new_set(num_rows), NullBuffer::into_inner)
+    };
+    let (left_valid, right_valid) = (valid(left_nulls), valid(right_nulls));
+    let both_valid_values = &(&left_valid & &right_valid) & &values;
+    BooleanArray::from(match op {
+        Operator::IsNotDistinctFrom => &both_valid_values | &!&(&left_valid | &right_valid),
+        _ => &both_valid_values | &(&left_valid ^ &right_valid),
+    })
+}
+
+/// `value` with the sign bit cleared if it is a zero or a NaN.
+///
+/// A zero or NaN sorts below `+0.0` in total order exactly when its sign bit is
+/// set, and negating it clears that bit while keeping a NaN's payload. Written
+/// without short-circuiting so that the comparison loops stay branch-free.
+#[inline(always)]
+fn clear_sign_of_zero_and_nan<N: ArrowNativeTypeOp>(value: N) -> N {
+    let zero = N::ZERO;
+    let is_zero_or_nan = !((value < zero) | (value > zero));
+    if is_zero_or_nan & value.is_lt(zero) {
+        value.neg_wrapping()
+    } else {
+        value
+    }
+}
+
+/// Evaluate `op` on the total-order `ordering` of each row's canonical operands.
+fn collect_ordering(
+    op: Operator,
+    num_rows: usize,
+    ordering: impl Fn(usize) -> Ordering,
+) -> BooleanBuffer {
+    match op {
+        Operator::Lt => BooleanBuffer::collect_bool(num_rows, |row| ordering(row).is_lt()),
+        Operator::LtEq => BooleanBuffer::collect_bool(num_rows, |row| ordering(row).is_le()),
+        Operator::Gt => BooleanBuffer::collect_bool(num_rows, |row| ordering(row).is_gt()),
+        Operator::GtEq => BooleanBuffer::collect_bool(num_rows, |row| ordering(row).is_ge()),
+        Operator::Eq | Operator::IsNotDistinctFrom => {
+            BooleanBuffer::collect_bool(num_rows, |row| ordering(row).is_eq())
+        }
+        _ => BooleanBuffer::collect_bool(num_rows, |row| ordering(row).is_ne()),
+    }
 }
 
 /// Registered by the Substrait decoder, which resolves functions by name.
-pub static NORMALIZE_SIGN_UDF: LazyLock<Arc<ScalarUDF>> =
-    LazyLock::new(|| Arc::new(ScalarUDF::new_from_impl(NormalizeFloatSign::new())));
+pub static COMPARE_FLOATS_UDF: LazyLock<Arc<ScalarUDF>> =
+    LazyLock::new(|| Arc::new(ScalarUDF::new_from_impl(CompareFloats::new())));
 
-fn normalize_sign_expr(expr: &Expr) -> Expr {
-    if matches!(expr, Expr::ScalarFunction(function) if function.name() == NORMALIZE_SIGN_NAME) {
-        return expr.clone();
-    }
+fn compare_floats_expr(left: Expr, op: Operator, right: Expr) -> Expr {
     Expr::ScalarFunction(ScalarFunction::new_udf(
-        NORMALIZE_SIGN_UDF.clone(),
-        vec![expr.clone()],
+        COMPARE_FLOATS_UDF.clone(),
+        vec![left, right, lit(op.to_string())],
     ))
 }
 
@@ -161,8 +237,8 @@ fn normalize_sign_expr(expr: &Expr) -> Expr {
 ///
 /// The extra NaN range is combined with `AND` for `<`/`<=` and `OR` for `>`/`>=`.
 /// Equality names both encodings because scalar indices key on the bit pattern.
-/// A comparison without a literal normalizes zero and NaN operands through an
-/// internal UDF, preserving payload bits and evaluating each operand once.
+/// A comparison without a literal runs through an internal UDF that ignores the
+/// sign of zeros and NaNs, preserving payload bits and evaluating each operand once.
 ///
 /// Runs as the last step of [`crate::planner::Planner::optimize_expr`], after
 /// coercion has given the literal the column's type and the simplifier has
@@ -179,21 +255,6 @@ pub fn rewrite_float_comparisons(expr: Expr, schema: &DFSchema) -> Result<Expr> 
             })
         })?
         .data)
-}
-
-/// Whether the rewrite acts on comparisons under `op`.
-fn is_float_comparison(op: Operator) -> bool {
-    matches!(
-        op,
-        Operator::Lt
-            | Operator::LtEq
-            | Operator::Gt
-            | Operator::GtEq
-            | Operator::Eq
-            | Operator::NotEq
-            | Operator::IsDistinctFrom
-            | Operator::IsNotDistinctFrom
-    )
 }
 
 /// Fold each sign-sensitive comparison's own operands and rewrite it, bottom-up,
@@ -228,7 +289,9 @@ pub fn normalize_float_comparisons(
     Ok(expr
         .transform_up(|node| {
             let folded = match node {
-                Expr::BinaryExpr(BinaryExpr { left, op, right }) if is_float_comparison(op) => {
+                Expr::BinaryExpr(BinaryExpr { left, op, right })
+                    if FLOAT_COMPARISONS.contains(&op) =>
+                {
                     Expr::BinaryExpr(BinaryExpr {
                         left: Box::new(fold(*left)?),
                         op,
@@ -300,13 +363,6 @@ fn negative_infinity(value: &ScalarValue) -> Option<ScalarValue> {
         Float64(Some(_)) => Some(Float64(Some(f64::NEG_INFINITY))),
         _ => None,
     }
-}
-
-fn is_float_expr(expr: &Expr, schema: &DFSchema) -> bool {
-    matches!(
-        expr.get_type(schema),
-        Ok(DataType::Float16 | DataType::Float32 | DataType::Float64)
-    )
 }
 
 /// Mark a literal that intentionally relies on Arrow's raw total order.
@@ -454,10 +510,10 @@ fn rewrite_literal_comparison(
         return None;
     }
     let bound = match (encodings, op) {
-        // A range cannot reorder NaN payloads, so normalize the operand instead.
+        // A range cannot reorder NaN payloads, so compare without the sign instead.
         (Some((_, positive)), _) if is_nan(value) => {
-            return Some(comparison(
-                normalize_sign_expr(other),
+            return Some(compare_floats_expr(
+                other.clone(),
                 op,
                 Expr::Literal(positive, metadata.cloned()),
             ));
@@ -602,14 +658,17 @@ fn rewrite_node(expr: &Expr, schema: &DFSchema) -> Option<Expr> {
                 (Expr::Literal(value, metadata), _) => {
                     rewrite_literal_comparison(right, op.swap()?, value, metadata.as_ref())
                 }
-                _ if is_float_comparison(*op)
-                    && is_float_expr(left, schema)
-                    && is_float_expr(right, schema) =>
+                _ if FLOAT_COMPARISONS.contains(op)
+                    && matches!(
+                        left.get_type(schema),
+                        Ok(float @ (DataType::Float16 | DataType::Float32 | DataType::Float64))
+                            if right.get_type(schema).ok().as_ref() == Some(&float)
+                    ) =>
                 {
-                    Some(comparison(
-                        normalize_sign_expr(left),
+                    Some(compare_floats_expr(
+                        (**left).clone(),
                         *op,
-                        normalize_sign_expr(right),
+                        (**right).clone(),
                     ))
                 }
                 _ => None,
@@ -743,7 +802,7 @@ fn widen_equivalent_list(list: &[Expr]) -> Option<Vec<Expr>> {
 mod tests {
     use std::sync::Arc;
 
-    use arrow_array::{Array, Float16Array, Float32Array, Float64Array};
+    use arrow_array::{Array, Float64Array};
     use arrow_schema::{Field, Schema};
     use datafusion::functions_nested::expr_fn::array_has;
     use datafusion::prelude::{col, lit};
@@ -805,6 +864,9 @@ mod tests {
     #[case::gt_from_negative(Operator::Gt, -0.0, 0.0)]
     #[case::gt_eq_from_positive(Operator::GtEq, 0.0, -0.0)]
     #[case::gt_eq_from_negative(Operator::GtEq, -0.0, -0.0)]
+    // A finite bound still gets the range that moves negative NaNs above it.
+    #[case::gt_finite(Operator::Gt, 1.0, 1.0)]
+    #[case::lt_eq_finite(Operator::LtEq, 1.0, 1.0)]
     fn range_comparison_uses_the_encoding_for_the_operator(
         #[case] op: Operator,
         #[case] written: f64,
@@ -813,18 +875,6 @@ mod tests {
         assert_eq!(
             rewrite(compare(col("x"), op, lit(written))),
             expected_ordered("x", op, Float64(Some(evaluated)))
-        );
-    }
-
-    #[test]
-    fn finite_range_moves_both_nan_signs_above_the_bound() {
-        assert_eq!(
-            rewrite(col("x").gt(lit(1.0))),
-            expected_ordered("x", Operator::Gt, Float64(Some(1.0)))
-        );
-        assert_eq!(
-            rewrite(col("x").lt_eq(lit(1.0))),
-            expected_ordered("x", Operator::LtEq, Float64(Some(1.0)))
         );
     }
 
@@ -840,20 +890,6 @@ mod tests {
         assert_eq!(
             rewrite(computed.gt(lit(1.0))),
             primary.or(negative_nan_range)
-        );
-    }
-
-    #[test]
-    fn nan_equality_covers_both_sign_encodings() {
-        let positive = f64::from_bits(0x7ff8_0000_0000_0042);
-        let negative = f64::from_bits(0xfff8_0000_0000_0042);
-        assert_eq!(
-            rewrite(col("x").eq(lit(negative))),
-            Expr::InList(InList {
-                expr: Box::new(col("x")),
-                list: vec![lit(negative), lit(positive)],
-                negated: false,
-            })
         );
     }
 
@@ -875,66 +911,115 @@ mod tests {
     }
 
     #[test]
-    fn column_comparison_normalizes_each_operand_once() {
+    fn column_comparison_compares_each_operand_once() {
         let rewritten = rewrite(col("x").lt(col("y")));
-        let expected = compare(
-            normalize_sign_expr(&col("x")),
-            Operator::Lt,
-            normalize_sign_expr(&col("y")),
+        assert_eq!(
+            rewritten,
+            compare_floats_expr(col("x"), Operator::Lt, col("y"))
         );
-        assert_eq!(rewritten, expected);
         assert_eq!(rewrite(rewritten.clone()), rewritten);
     }
 
-    #[test]
-    fn sign_array_normalization_preserves_payload_and_other_values() {
-        let negative = f64::from_bits(0xfff8_0000_0000_0042);
-        let positive = f64::from_bits(0x7ff8_0000_0000_0042);
-        let input = Arc::new(Float64Array::from(vec![
-            Some(negative),
-            Some(-1.0),
-            Some(positive),
-            None,
+    /// Rows: both zero signs, both NaN signs, an ordinary pair, one NULL, two NULLs.
+    #[rstest]
+    #[case::float16(DataType::Float16)]
+    #[case::float32(DataType::Float32)]
+    #[case::float64(DataType::Float64)]
+    fn compare_floats_ignores_the_sign_of_zero_and_nan(#[case] data_type: DataType) {
+        let (t, f) = (Some(true), Some(false));
+        let column = |values: Vec<Option<f64>>| {
+            arrow::compute::cast(&Float64Array::from(values), &data_type).unwrap()
+        };
+        let nan = f64::NAN;
+        let left = column(vec![
             Some(-0.0),
-        ])) as ArrayRef;
-        let normalized = normalize_sign_array(input).unwrap();
-        let normalized = normalized.as_primitive::<Float64Type>();
-        assert_eq!(normalized.value(0).to_bits(), positive.to_bits());
-        assert_eq!(normalized.value(1).to_bits(), (-1.0_f64).to_bits());
-        assert_eq!(normalized.value(2).to_bits(), positive.to_bits());
-        assert!(normalized.is_null(3));
-        assert_eq!(normalized.value(4).to_bits(), 0.0_f64.to_bits());
-    }
-
-    /// Column-to-column comparisons run every batch through the UDF, so an array
-    /// without a negative zero or NaN must come back as the same allocation.
-    #[rstest]
-    #[case::float16(Arc::new(Float16Array::from(vec![f16::NAN, -f16::ONE, f16::ZERO])) as ArrayRef, Arc::new(Float16Array::from(vec![-f16::NAN, f16::NEG_ZERO])) as ArrayRef)]
-    #[case::float32(Arc::new(Float32Array::from(vec![f32::NAN, -1.0, 0.0])) as ArrayRef, Arc::new(Float32Array::from(vec![-f32::NAN, -0.0])) as ArrayRef)]
-    #[case::float64(Arc::new(Float64Array::from(vec![f64::NAN, -1.0, 0.0])) as ArrayRef, Arc::new(Float64Array::from(vec![-f64::NAN, -0.0])) as ArrayRef)]
-    fn sign_array_normalization_copies_only_with_a_negative_value(
-        #[case] unchanged: ArrayRef,
-        #[case] negative_nan: ArrayRef,
-    ) {
-        assert!(Arc::ptr_eq(
-            &normalize_sign_array(unchanged.clone()).unwrap(),
-            &unchanged
-        ));
-        let normalized = normalize_sign_array(negative_nan.clone()).unwrap();
-        assert!(!Arc::ptr_eq(&normalized, &negative_nan));
-        let expected = arrow::compute::kernels::numeric::neg(&negative_nan).unwrap();
-        assert_eq!(normalized.to_data(), expected.to_data());
-    }
-
-    #[rstest]
-    #[case::eq(Operator::Eq, false)]
-    #[case::not_eq(Operator::NotEq, true)]
-    fn equality_covers_both_encodings(#[case] op: Operator, #[case] negated: bool) {
+            Some(0.0),
+            Some(-nan),
+            Some(nan),
+            Some(1.0),
+            None,
+            None,
+        ]);
+        let right = column(vec![
+            Some(0.0),
+            Some(-0.0),
+            Some(nan),
+            Some(-nan),
+            Some(-1.0),
+            Some(1.0),
+            None,
+        ]);
+        let compare = |right: &ArrayRef, op| {
+            compare_float_arrays(&left, right, op, left.len())
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(compare(&right, Operator::Eq), [t, t, t, t, f, None, None]);
         assert_eq!(
-            rewrite(compare(col("x"), op, lit(0.0))),
+            compare(&right, Operator::NotEq),
+            [f, f, f, f, t, None, None]
+        );
+        assert_eq!(compare(&right, Operator::Lt), [f, f, f, f, f, None, None]);
+        assert_eq!(compare(&right, Operator::GtEq), [t, t, t, t, t, None, None]);
+        assert_eq!(
+            compare(&right, Operator::IsNotDistinctFrom),
+            [t, t, t, t, f, f, t]
+        );
+        assert_eq!(
+            compare(&right, Operator::IsDistinctFrom),
+            [f, f, f, f, t, t, f]
+        );
+        // A one-element operand is a scalar applied to every row.
+        let negative_nan = column(vec![Some(-nan)]);
+        assert_eq!(
+            compare(&negative_nan, Operator::Lt),
+            [t, t, f, f, t, None, None]
+        );
+        let null = column(vec![None]);
+        assert_eq!(
+            compare(&null, Operator::IsNotDistinctFrom),
+            [f, f, f, f, f, t, t]
+        );
+    }
+
+    #[test]
+    fn compare_floats_keeps_nan_payloads_apart() {
+        let payload =
+            |bits: u64| Arc::new(Float64Array::from(vec![f64::from_bits(bits)])) as ArrayRef;
+        let positive = payload(0x7ff8_0000_0000_0042);
+        let negative = payload(0xfff8_0000_0000_0042);
+        let other = payload(0x7ff8_0000_0000_0043);
+        let equal = |left, right| {
+            compare_float_arrays(left, right, Operator::Eq, 1)
+                .unwrap()
+                .value(0)
+        };
+        assert!(equal(&negative, &positive));
+        assert!(!equal(&negative, &other));
+    }
+
+    #[rstest]
+    #[case::eq(Operator::Eq, false, 0.0, -0.0)]
+    #[case::not_eq(Operator::NotEq, true, 0.0, -0.0)]
+    // A NaN keeps its payload in both encodings.
+    #[case::nan(
+        Operator::Eq,
+        false,
+        f64::from_bits(0xfff8_0000_0000_0042),
+        f64::from_bits(0xfff8_0000_0000_0042)
+    )]
+    fn equality_covers_both_encodings(
+        #[case] op: Operator,
+        #[case] negated: bool,
+        #[case] written: f64,
+        #[case] negative: f64,
+    ) {
+        assert_eq!(
+            rewrite(compare(col("x"), op, lit(written))),
             Expr::InList(InList {
                 expr: Box::new(col("x")),
-                list: vec![lit(-0.0), lit(0.0)],
+                list: vec![lit(negative), lit(negative.abs())],
                 negated,
             })
         );
