@@ -109,10 +109,10 @@ impl JsonIndex {
             path: self.path.clone(),
             target_details: Some(target_created.index_details),
             target_data_type: crate::pb::JsonTargetDataType::Unspecified as i32,
+            target_index_version: Some(target_created.index_version),
         };
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&json_details)?,
-            // TODO: We should store the target index version in the details
             index_version: JSON_INDEX_VERSION,
             files: target_created.files,
         })
@@ -197,10 +197,10 @@ impl ScalarIndex for JsonIndex {
             path: self.path.clone(),
             target_details: Some(target_created.index_details),
             target_data_type: crate::pb::JsonTargetDataType::Unspecified as i32,
+            target_index_version: Some(target_created.index_version),
         };
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&json_details)?,
-            // TODO: We should store the target index version in the details
             index_version: JSON_INDEX_VERSION,
             files: target_created.files,
         })
@@ -1055,6 +1055,7 @@ impl BasicTrainer for JsonIndexPlugin {
             path,
             target_details: Some(target_index.index_details),
             target_data_type: crate::pb::JsonTargetDataType::Unspecified as i32,
+            target_index_version: Some(target_index.index_version),
         };
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&index_details)?,
@@ -1125,18 +1126,19 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
         let json_details = crate::pb::JsonIndexDetails::decode(index_details.value.as_slice())?;
         let target_details = json_details.target_details.as_ref().expect_ok()?;
         let target_plugin = registry.get_plugin_by_details(target_details).unwrap();
-        // `_index_version` is this *wrapper's* version (`JSON_INDEX_VERSION`,
-        // currently always 0 -- see the `// TODO` in `remap`/`update` below), not
-        // the target's; `JsonIndexDetails` does not yet record the target's own
-        // version. Every target this wrapper builds comes from a fresh training
-        // pass in this same codebase, so it is always at that plugin's current
-        // format; passing the target's own max version is the accurate stand-in
-        // until the target's version is recorded here directly.
+        // `_index_version` is this *wrapper's* version (`JSON_INDEX_VERSION`), not the
+        // target's. The target's own persisted version lives in `target_index_version`;
+        // fall back to the target plugin's current version for details written before
+        // that field existed, which matches those indexes' actual format since they
+        // always came from a fresh training pass in the same codebase.
+        let target_index_version = json_details
+            .target_index_version
+            .unwrap_or_else(|| target_plugin.version());
         let target_index = target_plugin
             .load_index(
                 index_store,
                 target_details,
-                target_plugin.version(),
+                target_index_version,
                 frag_reuse_index,
                 cache,
             )
@@ -1293,6 +1295,7 @@ mod tests {
             path: "$.value".to_string(),
             target_details: Some(target_details),
             target_data_type: crate::pb::JsonTargetDataType::Unspecified as i32,
+            target_index_version: None,
         })
         .unwrap();
 
@@ -1326,6 +1329,7 @@ mod tests {
             path: "$.value".to_string(),
             target_details: Some(target_details),
             target_data_type: crate::pb::JsonTargetDataType::Unspecified as i32,
+            target_index_version: None,
         })
         .unwrap();
 
