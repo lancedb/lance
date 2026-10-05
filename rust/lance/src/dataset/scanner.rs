@@ -3823,7 +3823,7 @@ impl Scanner {
             }
         };
 
-        // The final take reuses these columns without converting them.
+        // Load columns needed for filter and ordering
         let mut pre_filter_projection = self
             .dataset
             .empty_projection()
