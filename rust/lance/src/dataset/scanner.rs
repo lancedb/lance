@@ -3882,16 +3882,8 @@ impl Scanner {
             return Ok(plan);
         }
 
-        // Sort
+        // Sort. Ordering columns were loaded with the filter projection above.
         if let Some(ordering) = &self.ordering {
-            let ordering_columns = ordering.iter().map(|col| &col.column_name);
-            let projection_with_ordering = self
-                .dataset
-                .empty_projection()
-                .with_blob_handling(self.blob_handling.clone())
-                .union_columns(ordering_columns, OnMissing::Error)?;
-            // We haven't loaded the sort column yet so take it now
-            plan = self.take(plan, projection_with_ordering)?;
             let col_exprs = ordering
                 .iter()
                 .map(|col| {
@@ -4069,7 +4061,9 @@ impl Scanner {
 
             let scan = self.scan_fragments(
                 projection.with_row_id,
-                self.projection_plan.physical_projection.with_row_addr,
+                // The scan projection can request a row address on its own, for an empty
+                // projection or a sort column that is not selected.
+                projection.with_row_addr || self.projection_plan.physical_projection.with_row_addr,
                 self.projection_plan
                     .physical_projection
                     .with_row_last_updated_at_version,
@@ -4483,7 +4477,7 @@ impl Scanner {
                 .any(|col| projected.field(&col.column_name).is_none());
             if sort_column_missing && !projection.with_row_id && !projection.with_row_addr {
                 // The later take needs a row ID or address.
-                projection.with_row_id = true;
+                projection.with_row_addr = true;
             }
         }
 
@@ -10600,6 +10594,97 @@ mod test {
         assert_eq!(actual, expected);
     }
 
+    #[rstest]
+    #[case::postfilter(false)]
+    #[case::prefilter(true)]
+    #[tokio::test]
+    async fn test_all_binary_indexed_vector_search_with_blob_filter(#[case] prefilter: bool) {
+        use lance_core::datatypes::BlobHandling;
+
+        let num_rows = 32;
+        let dim = 2i32;
+        let has_blob = |row: usize| row % 3 != 1;
+        let item_field = Arc::new(ArrowField::new("item", DataType::Float32, true));
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new(
+                "vec",
+                DataType::FixedSizeList(item_field.clone(), dim),
+                true,
+            ),
+            blob_field("blobs", true),
+        ]));
+        let vectors = FixedSizeListArray::new(
+            item_field,
+            dim,
+            Arc::new(Float32Array::from_iter_values(
+                (0..num_rows).flat_map(|row| (0..dim).map(move |_| row as f32)),
+            )),
+            None,
+        );
+        let mut blob_builder = BlobArrayBuilder::new(num_rows);
+        for row in 0..num_rows {
+            if has_blob(row) {
+                blob_builder.push_bytes(vec![row as u8; 16]).unwrap();
+            } else {
+                blob_builder.push_null().unwrap();
+            }
+        }
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(vectors), blob_builder.finish().unwrap()],
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            "memory://",
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::Stable),
+                max_rows_per_file: 16,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let index_params = VectorIndexParams::ivf_pq(2, 4, 2, MetricType::L2, 2);
+        dataset
+            .create_index(&["vec"], IndexType::Vector, None, &index_params, false)
+            .await
+            .unwrap();
+
+        let query = Float32Array::from(vec![0.0f32; dim as usize]);
+        let mut scan = dataset.scan();
+        scan.nearest("vec", &query, num_rows)
+            .unwrap()
+            .minimum_nprobes(2)
+            .prefilter(prefilter)
+            .filter("blobs IS NOT NULL")
+            .unwrap()
+            .project(&["blobs"])
+            .unwrap()
+            .blob_handling(BlobHandling::AllBinary);
+        let plan = scan.explain_plan(false).await.unwrap();
+        assert!(
+            plan.contains("ANNSubIndex"),
+            "expected an indexed search, got {plan}"
+        );
+
+        let result = scan.try_into_batch().await.unwrap();
+        let blobs = result.column_by_name("blobs").unwrap();
+        assert_eq!(blobs.data_type(), &DataType::LargeBinary);
+        let mut actual = blobs
+            .as_binary::<i64>()
+            .iter()
+            .map(|value| value.map(<[u8]>::to_vec))
+            .collect::<Vec<_>>();
+        actual.sort();
+        let mut expected = (0..num_rows)
+            .filter(|&row| has_blob(row))
+            .map(|row| Some(vec![row as u8; 16]))
+            .collect::<Vec<_>>();
+        expected.sort();
+        assert_eq!(actual, expected);
+    }
+
     #[tokio::test]
     async fn test_all_binary_order_by_blob() {
         use lance_core::datatypes::BlobHandling;
@@ -14126,10 +14211,9 @@ mod test {
             ],
         )
         .unwrap();
-        let uri = format!("memory://order-by-unprojected-{data_storage_version:?}");
         let dataset = Dataset::write(
             RecordBatchIterator::new(vec![Ok(batch)], schema),
-            &uri,
+            "memory://",
             Some(WriteParams {
                 data_storage_version: Some(data_storage_version),
                 ..Default::default()
@@ -14147,7 +14231,7 @@ mod test {
             .unwrap();
         let plan = scan.explain_plan(false).await.unwrap();
         assert!(
-            plan.contains("projection=[id]") && plan.contains("row_id=true, row_addr=false"),
+            plan.contains("projection=[id]") && plan.contains("row_id=false, row_addr=true"),
             "{plan}"
         );
         let result = scan.try_into_batch().await.unwrap();
