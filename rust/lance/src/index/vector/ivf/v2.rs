@@ -35,7 +35,7 @@ use futures::{Stream, StreamExt};
 use lance_arrow::RecordBatchExt;
 use lance_core::cache::{
     CacheCodec, CacheCodecImpl, CacheEntryReader, CacheEntryWriter, CacheKey, CacheKeySchema,
-    KeyBuilder, LanceCache, WeakLanceCache,
+    CacheLoadOrigin, KeyBuilder, LanceCache, WeakLanceCache,
 };
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
@@ -2339,6 +2339,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         if self.caches_partition_codes() {
             return self.prewarm_partition_codes_window(partitions).await;
         }
+        let index_cache = self.index_cache.with_load_origin(CacheLoadOrigin::Warm);
         let index_schema = Arc::new(match &self.read_projection {
             Some(projection) => projection.schema.as_ref().into(),
             None => self.reader.schema().as_ref().into(),
@@ -2347,7 +2348,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         let mut partition_id = partitions.start;
         while partition_id < partitions.end {
             let leader_key = IVFPartitionKey::<S, Q>::new(partition_id);
-            if self.index_cache.get_with_key(&leader_key).await.is_some() {
+            if index_cache.get_with_key(&leader_key).await.is_some() {
                 partition_id += 1;
                 continue;
             }
@@ -2358,14 +2359,13 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             let mut run_end = partition_id + 1;
             while run_end < partitions.end {
                 let key = IVFPartitionKey::<S, Q>::new(run_end);
-                if self.index_cache.get_with_key(&key).await.is_some() {
+                if index_cache.get_with_key(&key).await.is_some() {
                     break;
                 }
                 run_end += 1;
             }
             let run = partition_id..run_end;
-            let (_, was_cached) = self
-                .index_cache
+            let (_, was_cached) = index_cache
                 .get_or_insert_with_key_hit(leader_key, || async {
                     let (index_batches, storage_batches) = tokio::try_join!(
                         read_partition_window_batches(
@@ -2407,9 +2407,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
                     let mut follower_loads = FuturesUnordered::new();
                     for (offset, batches) in payloads.enumerate() {
                         let follower_id = run.start + offset + 1;
+                        let index_cache = &index_cache;
                         follower_loads.push(async move {
                             let key = IVFPartitionKey::<S, Q>::new(follower_id);
-                            self.index_cache
+                            index_cache
                                 .get_or_insert_with_key(key, || async move {
                                     let entry = self
                                         .materialize_prewarm_partition(follower_id, batches)
