@@ -9273,8 +9273,7 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("fragment reuse index"), "{msg}");
 
-        // Address-domain indices are still allowed: the FRI repairs them. BTree
-        // migrated to row addresses, so it is now allowed here too.
+        // Address-domain indices are still allowed: the FRI repairs them.
         dataset
             .create_index(
                 &["id"],
