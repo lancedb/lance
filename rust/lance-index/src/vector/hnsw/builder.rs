@@ -1729,7 +1729,14 @@ impl IvfSubIndex for HNSW {
         };
         // if the queue is full, we just don't push it back, so ignore the error here
         let _ = self.inner.visited_generator_queue.push(prefilter_generator);
-        storage.rerank(rerank_query, params.dist_q_c, k, &mut results);
+        let num_candidates = results.len();
+        if storage.rerank(rerank_query, params.dist_q_c, num_candidates, &mut results) {
+            // The walk applied the bounds to walk scores; rerank replaced them.
+            let lower = params.lower_bound.unwrap_or(f32::MIN);
+            let upper = params.upper_bound.unwrap_or(f32::MAX);
+            results.retain(|node| node.dist.0 >= lower && node.dist.0 < upper);
+        }
+        results.truncate(k);
 
         // need to unique by row ids in case of searching multivector
         let (row_ids, dists): (Vec<_>, Vec<_>) = results

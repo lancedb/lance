@@ -5700,6 +5700,131 @@ mod tests {
         );
     }
 
+    struct AllowedRowsPreFilter {
+        mask: Arc<lance_select::RowAddrMask>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::prefilter::PreFilter for AllowedRowsPreFilter {
+        async fn wait_for_ready(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn is_empty(&self) -> bool {
+            false
+        }
+
+        fn mask(&self) -> Arc<lance_select::RowAddrMask> {
+            self.mask.clone()
+        }
+
+        fn filter_row_ids<'a>(&self, row_ids: Box<dyn Iterator<Item = &'a u64> + 'a>) -> Vec<u64> {
+            self.mask.selected_indices(row_ids)
+        }
+    }
+
+    /// A row whose warmup score passes the bound but whose reranked score does
+    /// not must not be returned, on the graph walk and on the sparse-mask flat
+    /// scan. 32 rows put a one-row mask below HNSW's 10% flat-scan threshold.
+    #[rstest]
+    #[case::graph(false)]
+    #[case::sparse_mask(true)]
+    fn test_hnsw_range_bounds_apply_to_reranked_distance(#[case] mask_one_row: bool) {
+        use crate::metrics::NoOpMetricsCollector;
+        use crate::prefilter::{NoFilter, PreFilter};
+        use crate::vector::DIST_COL;
+        use crate::vector::hnsw::HNSW;
+        use crate::vector::hnsw::builder::{HnswBuildParams, HnswQueryParams};
+        use crate::vector::v3::subindex::IvfSubIndex;
+
+        let dim = 64usize;
+        let num_rows = 32usize;
+        let residuals: Vec<f32> = (0..num_rows * dim)
+            .map(|i| {
+                let (row, d) = (i / dim, i % dim);
+                (((row * 7 + d * 3) % 11) as f32 - 5.0) * 0.05 * (1 + row % 4) as f32
+            })
+            .collect();
+        let storage = encode_residuals_storage(
+            5,
+            dim,
+            &residuals,
+            0.25,
+            DistanceType::L2,
+            RabitQueryEstimator::RawQuery,
+            true,
+        );
+        let hnsw = HNSW::index_vectors(&storage, HnswBuildParams::default()).unwrap();
+        let (query, dist_q_c) = residual_query_array(storage.code_dim());
+
+        let walk = storage.dist_calculator(query.clone(), dist_q_c);
+        let warmup: Vec<f32> = (0..num_rows as u32).map(|id| walk.distance(id)).collect();
+        let mut reranked: Vec<OrderedNode> = warmup
+            .iter()
+            .enumerate()
+            .map(|(id, dist)| OrderedNode::new(id as u32, (*dist).into()))
+            .collect();
+        assert!(storage.rerank(query.clone(), dist_q_c, num_rows, &mut reranked));
+        let mut final_dist = vec![0.0f32; num_rows];
+        for node in &reranked {
+            final_dist[node.id as usize] = node.dist.0;
+        }
+        let target = (0..num_rows)
+            .max_by(|&a, &b| {
+                let gap = |id: usize| (warmup[id] - final_dist[id]).abs();
+                gap(a).total_cmp(&gap(b))
+            })
+            .unwrap();
+        let (walk_dist, exact_dist) = (warmup[target], final_dist[target]);
+        assert!((walk_dist - exact_dist).abs() > 1e-3);
+        let mid = (walk_dist + exact_dist) / 2.0;
+        // The bound keeps the warmup score and rejects the reranked score.
+        let (lower, upper) = if exact_dist < walk_dist {
+            (Some(mid), None)
+        } else {
+            (None, Some(mid))
+        };
+
+        let prefilter: Arc<dyn PreFilter> = if mask_one_row {
+            Arc::new(AllowedRowsPreFilter {
+                mask: Arc::new(lance_select::RowAddrMask::from_allowed(
+                    lance_select::RowAddrTreeMap::from_iter([target as u64]),
+                )),
+            })
+        } else {
+            Arc::new(NoFilter)
+        };
+        let batch = hnsw
+            .search(
+                query.clone(),
+                num_rows,
+                HnswQueryParams {
+                    ef: num_rows,
+                    lower_bound: lower,
+                    upper_bound: upper,
+                    dist_q_c,
+                    use_acorn: false,
+                },
+                &storage,
+                prefilter,
+                &NoOpMetricsCollector,
+            )
+            .unwrap();
+        let dists = batch[DIST_COL].as_primitive::<Float32Type>().values();
+        let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().values();
+        let context = format!(
+            "target={target} warmup={walk_dist} reranked={exact_dist} \
+             lower={lower:?} upper={upper:?} returned={row_ids:?} {dists:?}"
+        );
+        for dist in dists.iter() {
+            assert!(
+                *dist >= lower.unwrap_or(f32::MIN) && *dist < upper.unwrap_or(f32::MAX),
+                "{context}"
+            );
+        }
+        assert!(!row_ids.contains(&(target as u64)), "{context}");
+    }
+
     #[test]
     fn test_from_id_distance_matches_sym_dist() {
         for num_bits in [1u8, 5] {
