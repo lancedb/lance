@@ -27,7 +27,7 @@ pub fn sym_bin_code_bytes(code_dim: usize) -> usize {
 pub fn pack_binary_be(residual: &[f32], out: &mut [u8]) {
     debug_assert_eq!(out.len(), sym_bin_code_bytes(residual.len()));
     out.fill(0);
-    for (word_idx, chunk) in out.chunks_exact_mut(8).enumerate() {
+    for (word_idx, chunk) in out.as_chunks_mut::<8>().0.iter_mut().enumerate() {
         let start = word_idx * 64;
         let end = residual.len().min(start + 64);
         let mut word = 0u64;
@@ -36,7 +36,7 @@ pub fn pack_binary_be(residual: &[f32], out: &mut [u8]) {
                 word |= 1u64 << (63 - offset);
             }
         }
-        chunk.copy_from_slice(&word.to_le_bytes());
+        *chunk = word.to_le_bytes();
     }
 }
 
@@ -45,7 +45,7 @@ pub fn pack_binary_be_from_le(le: &[u8], dim: usize, out: &mut [u8]) {
     debug_assert_eq!(out.len(), sym_bin_code_bytes(dim));
     debug_assert!(le.len() >= dim.div_ceil(8));
     out.fill(0);
-    for (word_idx, chunk) in out.chunks_exact_mut(8).enumerate() {
+    for (word_idx, chunk) in out.as_chunks_mut::<8>().0.iter_mut().enumerate() {
         let start = word_idx * 64;
         let end = dim.min(start + 64);
         let mut word = 0u64;
@@ -54,7 +54,7 @@ pub fn pack_binary_be_from_le(le: &[u8], dim: usize, out: &mut [u8]) {
                 word |= 1u64 << (63 - (dim_idx - start));
             }
         }
-        chunk.copy_from_slice(&word.to_le_bytes());
+        *chunk = word.to_le_bytes();
     }
 }
 
@@ -80,8 +80,8 @@ pub fn mask_ip_x0_q(query: &[f32], data_be: &[u8]) -> f32 {
 #[inline]
 pub(crate) fn mask_ip_x0_q_scalar(query: &[f32], data_be: &[u8]) -> f32 {
     let mut sum = 0.0f32;
-    for (word_idx, chunk) in data_be.chunks_exact(8).enumerate() {
-        let bits = u64::from_le_bytes(chunk.try_into().expect("8-byte BE word")).reverse_bits();
+    for (word_idx, chunk) in data_be.as_chunks::<8>().0.iter().enumerate() {
+        let bits = u64::from_le_bytes(*chunk).reverse_bits();
         let base = word_idx * 64;
         let mut bits = bits;
         for offset in 0..64 {
