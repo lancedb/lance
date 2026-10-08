@@ -1166,10 +1166,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         if Q::quantization_type() == QuantizationType::Rabit
             && let Ok(Quantizer::Rabit(rq)) = storage.quantizer()
         {
-            // SymRaBitQ (IVF_HNSW_RQ) walks on the residual 1-bit warmup, so
-            // it needs the residual query even though its estimator is raw.
-            return rq.metadata_ref().uses_sym_columns()
-                || rq.metadata_ref().query_estimator == RabitQueryEstimator::ResidualQuery;
+            // Sym columns are scored as a raw query. Their stored factors
+            // already include the centroid, and HNSW ignores QueryResidual.
+            return rq.metadata_ref().query_estimator == RabitQueryEstimator::ResidualQuery;
         }
         Q::use_residual(distance_type)
     }
@@ -3093,8 +3092,9 @@ mod tests {
     use arrow::datatypes::{Float64Type, UInt8Type, UInt32Type, UInt64Type};
     use arrow::{array::AsArray, datatypes::Float32Type};
     use arrow_array::{
-        Array, ArrayRef, ArrowPrimitiveType, FixedSizeListArray, Float32Array, Int64Array,
-        ListArray, PrimitiveArray, RecordBatch, RecordBatchIterator, UInt64Array,
+        Array, ArrayRef, ArrowPrimitiveType, FixedSizeListArray, Float16Array, Float32Array,
+        Float64Array, Int64Array, ListArray, PrimitiveArray, RecordBatch, RecordBatchIterator,
+        UInt64Array,
     };
     use arrow_buffer::OffsetBuffer;
     use arrow_schema::{DataType, Field, Schema, SchemaRef};
@@ -6809,6 +6809,133 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(remapped.num_rows(), 5);
+    }
+
+    /// Nonzero centroids stored as Float16 or Float64 must be scored with the
+    /// raw query. The stored factors already include the centroid, so `q - c`
+    /// ranks the zero row ahead of the true neighbor.
+    #[rstest]
+    #[case::f16_1bit(DataType::Float16, 1)]
+    #[case::f16_5bit(DataType::Float16, 5)]
+    #[case::f64_1bit(DataType::Float64, 1)]
+    #[case::f64_5bit(DataType::Float64, 5)]
+    #[case::f32_5bit(DataType::Float32, 5)]
+    #[tokio::test]
+    async fn test_ivf_hnsw_rq_nonzero_centroid_keeps_raw_query(
+        #[case] dtype: DataType,
+        #[case] num_bits: u8,
+    ) {
+        const DIM: usize = 8;
+        // [0], [1.1], [1.9] against query and centroid [1]. Exact nearest is id 1.
+        let vectors = repeated_rows_fsl(&dtype, &[0.0, 1.1, 1.9], DIM);
+        let centroids = repeated_rows_fsl(&dtype, &[1.0], DIM);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::UInt64, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", dtype.clone(), true)),
+                    DIM as i32,
+                ),
+                false,
+            ),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt64Array::from(vec![0u64, 1, 2])),
+                Arc::new(vectors),
+            ],
+        )
+        .unwrap();
+        let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let test_dir = TempStrDir::default();
+        let mut dataset = Dataset::write(batches, test_dir.as_str(), None)
+            .await
+            .unwrap();
+
+        let params = VectorIndexParams::with_ivf_hnsw_rq_params(
+            DistanceType::L2,
+            IvfBuildParams::try_with_centroids(1, Arc::new(centroids)).unwrap(),
+            HnswBuildParams::default(),
+            RQBuildParams::with_rotation_type(num_bits, RQRotationType::Fast),
+        );
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, true)
+            .await
+            .unwrap();
+
+        let indices = dataset.load_indices().await.unwrap();
+        let index = dataset
+            .open_vector_index("vector", &indices[0].uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let ivf = index
+            .as_any()
+            .downcast_ref::<super::IVFIndex<HNSW, lance_index::vector::bq::builder::RabitQuantizer>>()
+            .expect("IVF_HNSW_RQ");
+        assert_eq!(
+            ivf.ivf_model().centroids_array().unwrap().value_type(),
+            dtype,
+            "centroid dtype changed during the build, so this case no longer hits the residual path"
+        );
+
+        let query = scalar_vector(&dtype, 1.0, DIM);
+        let hits = dataset
+            .scan()
+            .nearest("vector", query.as_ref(), 1)
+            .unwrap()
+            .nprobes(1)
+            .ef(16)
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(
+            hits["id"].as_primitive::<UInt64Type>().value(0),
+            1,
+            "dtype={dtype} num_bits={num_bits}: raw query must rank the 1.1 row first"
+        );
+    }
+
+    fn repeated_rows_fsl(dtype: &DataType, row_values: &[f32], dim: usize) -> FixedSizeListArray {
+        match dtype {
+            DataType::Float16 => {
+                let values = row_values
+                    .iter()
+                    .flat_map(|value| repeat_n(half::f16::from_f32(*value), dim))
+                    .collect::<Vec<_>>();
+                FixedSizeListArray::try_new_from_values(Float16Array::from(values), dim as i32)
+                    .unwrap()
+            }
+            DataType::Float32 => {
+                let values = row_values
+                    .iter()
+                    .flat_map(|value| repeat_n(*value, dim))
+                    .collect::<Vec<_>>();
+                FixedSizeListArray::try_new_from_values(Float32Array::from(values), dim as i32)
+                    .unwrap()
+            }
+            DataType::Float64 => {
+                let values = row_values
+                    .iter()
+                    .flat_map(|value| repeat_n(*value as f64, dim))
+                    .collect::<Vec<_>>();
+                FixedSizeListArray::try_new_from_values(Float64Array::from(values), dim as i32)
+                    .unwrap()
+            }
+            other => panic!("unsupported vector type {other}"),
+        }
+    }
+
+    fn scalar_vector(dtype: &DataType, value: f32, dim: usize) -> ArrayRef {
+        match dtype {
+            DataType::Float16 => {
+                Arc::new(Float16Array::from(vec![half::f16::from_f32(value); dim]))
+            }
+            DataType::Float32 => Arc::new(Float32Array::from(vec![value; dim])),
+            DataType::Float64 => Arc::new(Float64Array::from(vec![value as f64; dim])),
+            other => panic!("unsupported vector type {other}"),
+        }
     }
 
     /// One fresh IVF_HNSW_RQ build over the fixed-seed test dataset, returning
