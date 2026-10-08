@@ -4061,6 +4061,37 @@ impl Scanner {
         }
     }
 
+    // Read options carrying the scanner's batch size, readahead and I/O settings.
+    fn read_options(&self, projection: Projection) -> Result<FilteredReadOptions> {
+        // Bound the decode fan-out by `batch_readahead`.
+        let mut read_options = FilteredReadOptions::new(projection).with_threading_mode(
+            FilteredReadThreadingMode::OnePartitionMultipleThreads(self.batch_readahead),
+        );
+
+        if let Some(batch_size) = self.batch_size {
+            read_options = read_options.with_batch_size(validate_batch_size(batch_size)?);
+        }
+
+        if let Some(file_reader_options) = self.resolved_file_reader_options() {
+            read_options = read_options.with_file_reader_options(file_reader_options);
+        }
+
+        if let Some(fragment_readahead) = self.fragment_readahead {
+            read_options = read_options.with_fragment_readahead(fragment_readahead);
+        }
+
+        if let Some(io_buffer_size_bytes) = self.io_buffer_size {
+            read_options = read_options.with_io_buffer_size(io_buffer_size_bytes);
+        }
+
+        if let Some(materialization_readahead_bytes) = self.materialization_readahead_bytes {
+            read_options =
+                read_options.with_materialization_readahead_bytes(materialization_readahead_bytes);
+        }
+
+        Ok(read_options)
+    }
+
     // Helper function for filtered_read
     //
     // Do not call this directly, use filtered_read instead
@@ -4078,9 +4109,9 @@ impl Scanner {
         let use_external_mask = self.use_external_mask();
         let effective_filter = self.effective_filter_plan(filter_plan);
 
-        let mut read_options = FilteredReadOptions::basic_full_read(&self.dataset)
-            .with_filter_plan(effective_filter)
-            .with_projection(projection);
+        let mut read_options = self
+            .read_options(projection)?
+            .with_filter_plan(effective_filter);
 
         if let Some(rows) = &self.physical_row_addr_prefilter {
             read_options = read_options.with_physical_row_addr_prefilter(rows.clone());
@@ -4094,34 +4125,8 @@ impl Scanner {
             read_options = read_options.with_scan_range_before_filter(scan_range)?;
         }
 
-        if let Some(batch_size) = self.batch_size {
-            read_options = read_options.with_batch_size(validate_batch_size(batch_size)?);
-        }
-
-        // Bound the decode fan-out by `batch_readahead`.
-        read_options = read_options.with_threading_mode(
-            FilteredReadThreadingMode::OnePartitionMultipleThreads(self.batch_readahead),
-        );
-
-        if let Some(file_reader_options) = self.resolved_file_reader_options() {
-            read_options = read_options.with_file_reader_options(file_reader_options);
-        }
-
-        if let Some(fragment_readahead) = self.fragment_readahead {
-            read_options = read_options.with_fragment_readahead(fragment_readahead);
-        }
-
         if make_deletions_null {
             read_options = read_options.with_deleted_rows()?;
-        }
-
-        if let Some(io_buffer_size_bytes) = self.io_buffer_size {
-            read_options = read_options.with_io_buffer_size(io_buffer_size_bytes);
-        }
-
-        if let Some(materialization_readahead_bytes) = self.materialization_readahead_bytes {
-            read_options =
-                read_options.with_materialization_readahead_bytes(materialization_readahead_bytes);
         }
 
         if self.fast_search && filter_plan.has_index_query() {
@@ -4307,10 +4312,31 @@ impl Scanner {
         self.row_ids_as_take_input(RowAddrTreeMap::from_iter(row_ids.into_iter().flatten()))
     }
 
+    // The columns the source read must produce. If we have an aggregate, we only need the
+    // columns referenced by the aggregate, not all the columns from the projection plan.
+    fn source_projection(&self) -> Result<Projection> {
+        let Some(agg) = &self.aggregate else {
+            return Ok(self.projection_plan.physical_projection.clone());
+        };
+        let required_columns = agg.required_columns();
+        if required_columns.is_empty() {
+            // COUNT(*) or similar - no columns needed
+            Ok(self.dataset.empty_projection())
+        } else {
+            // Aggregate needs specific columns
+            self.dataset
+                .empty_projection()
+                .union_columns(&required_columns, OnMissing::Error)
+        }
+    }
+
     async fn take_source(&self, take_op: TakeOperation) -> Result<Arc<dyn ExecutionPlan>> {
         // We generally assume that late materialization does not make sense for take operations
-        // so we can just use the physical projection
-        let projection = self.projection_plan.physical_projection.clone();
+        // so we can just use the source projection
+        let mut projection = self.source_projection()?;
+        // Later stages take filter, aggregate and ordering columns by row address, and
+        // an empty projection still needs an output column. The address is synthesized.
+        projection.with_row_addr = true;
 
         let input = match take_op {
             TakeOperation::RowIds(ids) => {
@@ -4325,7 +4351,7 @@ impl Scanner {
             }
         }?;
 
-        let mut filtered_read_options = FilteredReadOptions::new(projection);
+        let mut filtered_read_options = self.read_options(projection)?;
         if let Some(fragment) = self.fragments.as_ref() {
             filtered_read_options =
                 filtered_read_options.with_fragments(Arc::new(fragment.clone()));
@@ -4349,23 +4375,7 @@ impl Scanner {
     ) -> Result<PlannedFilteredScan> {
         log::trace!("source is a filtered read");
 
-        // Compute the effective projection based on what's actually needed.
-        // If we have an aggregate, we only need the columns referenced by the aggregate,
-        // not all the columns from the projection plan.
-        let effective_projection = if let Some(agg) = &self.aggregate {
-            let required_columns = agg.required_columns();
-            if required_columns.is_empty() {
-                // COUNT(*) or similar - no columns needed
-                self.dataset.empty_projection()
-            } else {
-                // Aggregate needs specific columns
-                self.dataset
-                    .empty_projection()
-                    .union_columns(&required_columns, OnMissing::Error)?
-            }
-        } else {
-            self.projection_plan.physical_projection.clone()
-        };
+        let effective_projection = self.source_projection()?;
 
         // Plan against the effective filter: with an external mask the SQL filter
         // becomes a refine, so its columns must be retained even when the original
@@ -8417,33 +8427,14 @@ impl Scanner {
             let mut projection = output_projection;
             projection.with_row_id |= has_row_id;
             projection.with_row_addr |= has_row_addr;
-            let mut read_options = FilteredReadOptions::new(projection);
+            let mut read_options = self.read_options(projection)?;
             if self.include_deleted_rows {
                 // Forwarded so the row-stream read rejects it: deleted rows
                 // carry a null row id, which the take would silently drop
                 read_options = read_options.with_deleted_rows()?;
             }
-            if let Some(batch_size) = self.batch_size {
-                read_options = read_options.with_batch_size(validate_batch_size(batch_size)?);
-            }
             if let Some(fragments) = &self.fragments {
                 read_options = read_options.with_fragments(Arc::new(fragments.clone()));
-            }
-            read_options = read_options.with_threading_mode(
-                FilteredReadThreadingMode::OnePartitionMultipleThreads(self.batch_readahead),
-            );
-            if let Some(file_reader_options) = self.resolved_file_reader_options() {
-                read_options = read_options.with_file_reader_options(file_reader_options);
-            }
-            if let Some(fragment_readahead) = self.fragment_readahead {
-                read_options = read_options.with_fragment_readahead(fragment_readahead);
-            }
-            if let Some(io_buffer_size_bytes) = self.io_buffer_size {
-                read_options = read_options.with_io_buffer_size(io_buffer_size_bytes);
-            }
-            if let Some(materialization_readahead_bytes) = self.materialization_readahead_bytes {
-                read_options = read_options
-                    .with_materialization_readahead_bytes(materialization_readahead_bytes);
             }
             return Ok(Arc::new(FilteredReadExec::try_new(
                 self.dataset.clone(),
@@ -19464,6 +19455,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
     async fn test_filter_to_take() {
         let mut ds = lance_datagen::gen_batch()
             .col("idx", array::step::<Int32Type>())
+            .col("other", array::step_custom::<Int32Type>(1000, 1))
             .into_ram_dataset(FragmentCount::from(3), FragmentRowCount::from(100))
             .await
             .unwrap();
@@ -19611,6 +19603,41 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         assert_eq!(batches[0].schema().field(0).name(), "foo");
         let val = batches[0].column(0).as_primitive::<Int32Type>().values()[0];
         assert_eq!(val, 154);
+
+        // The remainder filter reads `idx`, which the projection leaves out
+        let mut scanner = ds.scan();
+        scanner
+            .project(&["other"])
+            .unwrap()
+            .filter("_rowid IN (5, 10, 15) AND idx > 10")
+            .unwrap();
+        let batch = scanner.try_into_batch().await.unwrap();
+        assert_eq!(batch.schema().fields().len(), 1, "{:?}", batch.schema());
+        assert_eq!(batch["other"].as_primitive::<Int32Type>().values(), &[1015]);
+
+        // A count reads no data columns, and the take keeps the scanner's batch size
+        let mut scanner = ds.scan();
+        scanner
+            .batch_size(1)
+            .filter("_rowid IN (5, 10, 15)")
+            .unwrap();
+        let plan = scanner.analyze_count_plan().await.unwrap();
+        assert!(plan.contains("projection=[], "), "{plan}");
+        assert_eq!(scanner.count_rows().await.unwrap(), 3);
+        let batches = scanner
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(
+            batches
+                .iter()
+                .map(|batch| batch.num_rows())
+                .collect::<Vec<_>>(),
+            vec![1, 1, 1]
+        );
     }
 
     #[tokio::test]
