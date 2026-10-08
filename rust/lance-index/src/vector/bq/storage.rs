@@ -1501,6 +1501,62 @@ impl<'a> RabitDistCalculator<'a> {
         Some(self.raw_query_binary_distance(id, binary_ip) - error_factors[id] * self.query_error)
     }
 
+    /// Half-width of the interval around the walk score of `id` that holds
+    /// its reranked score within RaBitQ's 1-bit error bound, widened by the
+    /// warmup's query quantization error. Unbounded without error factors.
+    #[inline]
+    fn walk_score_error(&self, id: usize, warmup: &ResidualWarmupQuery) -> f32 {
+        match self.error_factors {
+            Some(error_factors) => {
+                error_factors[id] * self.query_error
+                    + self.scale_factors[id].abs() * warmup.ip_error_bound
+            }
+            None => f32::INFINITY,
+        }
+    }
+
+    /// Score of `id` from its RQ codes, ignoring the sym warmup; for the walk
+    /// calculator this is the score [`VectorStore::rerank`] assigns.
+    #[inline(always)]
+    fn code_distance(&self, id: usize) -> f32 {
+        let code_len = rabit_binary_code_bytes(self.dim);
+        let num_vectors = self.codes.len() / code_len;
+        let dist =
+            compute_single_rq_distance(self.codes, id, num_vectors, code_len, &self.dist_table);
+
+        match self.query_estimator {
+            RabitQueryEstimator::ResidualQuery => {
+                // distance between quantized residual vector and residual query vector
+                let dist_vq_qr = (2.0 * dist - self.sum_q) / self.sqrt_d;
+                dist_vq_qr * self.scale_factors[id] + self.add_factors[id] + self.query_factor
+            }
+            RabitQueryEstimator::RawQuery => {
+                let ex_bits = self.num_bits - 1;
+                if ex_bits == 0 || self.approx_mode == ApproxMode::Fast {
+                    return self.raw_query_binary_distance(id, dist);
+                }
+
+                let ex_codes = self
+                    .ex_codes
+                    .expect("raw-query multi-bit RQ requires ex codes");
+                let ex_add_factors = self
+                    .ex_add_factors
+                    .expect("raw-query multi-bit RQ requires ex add factors");
+                let ex_scale_factors = self
+                    .ex_scale_factors
+                    .expect("raw-query multi-bit RQ requires ex scale factors");
+                self.raw_query_multi_bit_exact_distance(
+                    id,
+                    dist,
+                    ex_bits,
+                    ex_codes,
+                    ex_add_factors,
+                    ex_scale_factors,
+                )
+            }
+        }
+    }
+
     #[inline]
     #[allow(clippy::too_many_arguments)]
     fn raw_query_multi_bit_exact_distance(
@@ -2134,43 +2190,27 @@ impl DistCalculator for RabitDistCalculator<'_> {
                 + self.query_factor
                 + self.scale_factors[id] * (ip + warmup.k1xsumq);
         }
+        self.code_distance(id as usize)
+    }
+
+    fn refines_range(&self) -> bool {
+        self.sym_warmup.is_some() && self.num_bits > 1
+    }
+
+    fn in_range(&self, id: u32, dist: f32, lower: f32, upper: f32) -> bool {
+        let Some(warmup) = self.sym_warmup.as_ref() else {
+            return dist >= lower && dist < upper;
+        };
         let id = id as usize;
-        let code_len = rabit_binary_code_bytes(self.dim);
-        let num_vectors = self.codes.len() / code_len;
-        let dist =
-            compute_single_rq_distance(self.codes, id, num_vectors, code_len, &self.dist_table);
-
-        match self.query_estimator {
-            RabitQueryEstimator::ResidualQuery => {
-                // distance between quantized residual vector and residual query vector
-                let dist_vq_qr = (2.0 * dist - self.sum_q) / self.sqrt_d;
-                dist_vq_qr * self.scale_factors[id] + self.add_factors[id] + self.query_factor
-            }
-            RabitQueryEstimator::RawQuery => {
-                let ex_bits = self.num_bits - 1;
-                if ex_bits == 0 || self.approx_mode == ApproxMode::Fast {
-                    return self.raw_query_binary_distance(id, dist);
-                }
-
-                let ex_codes = self
-                    .ex_codes
-                    .expect("raw-query multi-bit RQ requires ex codes");
-                let ex_add_factors = self
-                    .ex_add_factors
-                    .expect("raw-query multi-bit RQ requires ex add factors");
-                let ex_scale_factors = self
-                    .ex_scale_factors
-                    .expect("raw-query multi-bit RQ requires ex scale factors");
-                self.raw_query_multi_bit_exact_distance(
-                    id,
-                    dist,
-                    ex_bits,
-                    ex_codes,
-                    ex_add_factors,
-                    ex_scale_factors,
-                )
-            }
+        let error = self.walk_score_error(id, warmup);
+        if dist + error < lower || dist - error >= upper {
+            return false;
         }
+        if dist - error >= lower && dist + error < upper {
+            return true;
+        }
+        let reranked = self.code_distance(id);
+        reranked >= lower && reranked < upper
     }
 
     #[inline(always)]
@@ -5723,13 +5763,27 @@ mod tests {
         }
     }
 
-    /// A row whose warmup score passes the bound but whose reranked score does
-    /// not must not be returned, on the graph walk and on the sparse-mask flat
-    /// scan. 32 rows put a one-row mask below HNSW's 10% flat-scan threshold.
+    #[derive(Clone, Copy)]
+    enum RangeSearchPath {
+        Graph,
+        SparseMask,
+        Acorn,
+    }
+
+    /// HNSW range bounds judge the reranked score, not the warmup score, on
+    /// the graph walk, the sparse-mask flat scan and the ACORN walk. 32 rows
+    /// put a one-row mask below HNSW's 10% flat-scan threshold.
     #[rstest]
-    #[case::graph(false)]
-    #[case::sparse_mask(true)]
-    fn test_hnsw_range_bounds_apply_to_reranked_distance(#[case] mask_one_row: bool) {
+    #[case::graph_drops_reranked_out(RangeSearchPath::Graph, false)]
+    #[case::graph_keeps_reranked_in(RangeSearchPath::Graph, true)]
+    #[case::sparse_mask_drops_reranked_out(RangeSearchPath::SparseMask, false)]
+    #[case::sparse_mask_keeps_reranked_in(RangeSearchPath::SparseMask, true)]
+    #[case::acorn_drops_reranked_out(RangeSearchPath::Acorn, false)]
+    #[case::acorn_keeps_reranked_in(RangeSearchPath::Acorn, true)]
+    fn test_hnsw_range_bounds_apply_to_reranked_distance(
+        #[case] path: RangeSearchPath,
+        #[case] reranked_in_range: bool,
+    ) {
         use crate::metrics::NoOpMetricsCollector;
         use crate::prefilter::{NoFilter, PreFilter};
         use crate::vector::DIST_COL;
@@ -5777,22 +5831,35 @@ mod tests {
             .unwrap();
         let (walk_dist, exact_dist) = (warmup[target], final_dist[target]);
         assert!((walk_dist - exact_dist).abs() > 1e-3);
-        let mid = (walk_dist + exact_dist) / 2.0;
-        // The bound keeps the warmup score and rejects the reranked score.
-        let (lower, upper) = if exact_dist < walk_dist {
-            (Some(mid), None)
+        // Close to the warmup score so the bound stays within the target's
+        // walk score error for any rotation.
+        let bound = walk_dist + (exact_dist - walk_dist) / 4.0;
+        // The bound separates the two scores, admitting only one of them.
+        let (lower, upper) = if (exact_dist < walk_dist) != reranked_in_range {
+            (Some(bound), None)
         } else {
-            (None, Some(mid))
+            (None, Some(bound))
         };
 
-        let prefilter: Arc<dyn PreFilter> = if mask_one_row {
+        let allowed_rows = |rows: Vec<u64>| -> Arc<dyn PreFilter> {
             Arc::new(AllowedRowsPreFilter {
                 mask: Arc::new(lance_select::RowAddrMask::from_allowed(
-                    lance_select::RowAddrTreeMap::from_iter([target as u64]),
+                    lance_select::RowAddrTreeMap::from_iter(rows),
                 )),
             })
-        } else {
-            Arc::new(NoFilter)
+        };
+        let prefilter = match path {
+            RangeSearchPath::Graph => Arc::new(NoFilter) as Arc<dyn PreFilter>,
+            RangeSearchPath::SparseMask => allowed_rows(vec![target as u64]),
+            RangeSearchPath::Acorn => {
+                let excluded = (target + 1) % num_rows;
+                allowed_rows(
+                    (0..num_rows)
+                        .filter(|&row| row != excluded)
+                        .map(|row| row as u64)
+                        .collect(),
+                )
+            }
         };
         let batch = hnsw
             .search(
@@ -5803,7 +5870,7 @@ mod tests {
                     lower_bound: lower,
                     upper_bound: upper,
                     dist_q_c,
-                    use_acorn: false,
+                    use_acorn: matches!(path, RangeSearchPath::Acorn),
                 },
                 &storage,
                 prefilter,
@@ -5822,7 +5889,11 @@ mod tests {
                 "{context}"
             );
         }
-        assert!(!row_ids.contains(&(target as u64)), "{context}");
+        assert_eq!(
+            row_ids.contains(&(target as u64)),
+            reranked_in_range,
+            "{context}"
+        );
     }
 
     #[test]

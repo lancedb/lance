@@ -41,6 +41,7 @@ use crate::vector::graph::{
 };
 use crate::vector::graph::{
     Visited, beam_search_acorn, beam_search_borrowed, greedy_search, greedy_search_borrowed,
+    range_filter,
 };
 use crate::vector::storage::{DistCalculator, VectorStore};
 use crate::vector::v3::subindex::IvfSubIndex;
@@ -626,10 +627,8 @@ impl HNSW {
         prefilter_bitset: Visited,
         params: &HnswQueryParams,
     ) -> Vec<OrderedNode> {
-        let lower_bound: OrderedFloat = params.lower_bound.unwrap_or(f32::MIN).into();
-        let upper_bound: OrderedFloat = params.upper_bound.unwrap_or(f32::MAX).into();
-
         let dist_calc = storage.dist_calculator(query, params.dist_q_c);
+        let in_range = range_filter(params, &dist_calc);
         let mut heap = BinaryHeap::<OrderedNode>::with_capacity(k);
 
         match self.inner.params.prefetch_distance {
@@ -653,7 +652,7 @@ impl HNSW {
                     }
 
                     let dist: OrderedFloat = dist_calc.distance(node_id).into();
-                    if dist < lower_bound || dist >= upper_bound {
+                    if !in_range(node_id, dist) {
                         continue;
                     }
                     if heap.len() < k {
@@ -667,7 +666,7 @@ impl HNSW {
             _ => {
                 for node_id in prefilter_bitset.iter_ones().map(|i| i as u32) {
                     let dist: OrderedFloat = dist_calc.distance(node_id).into();
-                    if dist < lower_bound || dist >= upper_bound {
+                    if !in_range(node_id, dist) {
                         continue;
                     }
                     if heap.len() < k {

@@ -452,6 +452,8 @@ pub(crate) struct ScalarCode {
     pub codes: Vec<u8>,
     pub delta: f32,
     pub vl: f32,
+    /// L2 norm of the reconstruction error `delta * code + vl - query`.
+    pub error_norm: f32,
 }
 
 /// Query state for Residual `distance(id)`: BE planes + Lib `k1xsumq`.
@@ -462,6 +464,8 @@ pub struct ResidualWarmupQuery {
     pub delta: f32,
     pub vl: f32,
     pub k1xsumq: f32,
+    /// Upper bound on `|warmup IP - exact 1-bit IP|` for any binary code.
+    pub ip_error_bound: f32,
 }
 
 const QUERY_EX_BITS: u8 = QUERY_WARMUP_BITS - 1;
@@ -582,6 +586,7 @@ pub(crate) fn quantize_scalar_reconstruct(query: &[f32], t_const: f64) -> Scalar
             codes: vec![0; dim],
             delta: 0.0,
             vl: 0.0,
+            error_norm: 0.0,
         };
     }
     let max_code = (1u32 << QUERY_EX_BITS) - 1;
@@ -618,6 +623,9 @@ pub(crate) fn quantize_scalar_reconstruct(query: &[f32], t_const: f64) -> Scalar
         codes,
         delta,
         vl: delta * cb,
+        // `delta` projects the query onto the code direction, leaving the
+        // orthogonal part as the error.
+        error_norm: norm * (1.0 - cos * cos).max(0.0).sqrt(),
     }
 }
 
@@ -891,11 +899,22 @@ pub fn prepare_residual_warmup_query(rotated: &[f32], t_const: f64) -> ResidualW
     let quantized = quantize_scalar_reconstruct(rotated, t_const);
     let mut planes = vec![0u64; query_plane_words(rotated.len())];
     transpose_query_for_warmup(&quantized.codes, &mut planes);
+    let dim = rotated.len();
+    let sum_q = rotated.iter().copied().sum::<f32>();
+    let code_sum = quantized.codes[..dim]
+        .iter()
+        .map(|&code| code as u32)
+        .sum::<u32>();
+    let sum_error = quantized.delta * code_sum as f32 + quantized.vl * dim as f32 - sum_q;
     ResidualWarmupQuery {
         planes,
         delta: quantized.delta,
         vl: quantized.vl,
-        k1xsumq: rotated.iter().copied().sum::<f32>() * -0.5,
+        k1xsumq: sum_q * -0.5,
+        // A binary code `b` sums the reconstruction error `err` over its set
+        // bits, `(sum(err) + <2b - 1, err>) / 2`, and padded bits are never
+        // set; Cauchy-Schwarz bounds `|<2b - 1, err>|` by `sqrt(dim) |err|`.
+        ip_error_bound: 0.5 * (sum_error.abs() + (dim as f32).sqrt() * quantized.error_norm),
     }
 }
 

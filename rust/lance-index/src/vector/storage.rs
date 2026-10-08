@@ -135,6 +135,19 @@ pub trait DistCalculator {
 
     fn prefetch(&self, _id: u32) {}
 
+    /// Whether [`Self::distance`] is an estimate that [`VectorStore::rerank`]
+    /// replaces, so `[lower, upper)` checks on it must use [`Self::in_range`].
+    fn refines_range(&self) -> bool {
+        false
+    }
+
+    /// Whether the reranked score of `id` lies in `[lower, upper)`, given its
+    /// estimate `dist` from [`Self::distance`]. Called only when
+    /// [`Self::refines_range`] is true.
+    fn in_range(&self, _id: u32, dist: f32, lower: f32, upper: f32) -> bool {
+        dist >= lower && dist < upper
+    }
+
     /// Whether [`Self::accumulate_topk_with_scratch`] can replace scoring every
     /// row with [`Self::distance_all`] and pushing each score into a top-k heap.
     ///
