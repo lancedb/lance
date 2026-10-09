@@ -147,7 +147,7 @@ public class CleanupPolicy {
 
     /**
      * Set a positive maximum number of in-flight file deletes, independently of QPS. Referenced
-     * branches use their own settings. For example: {
+     * branches inherit this window independently, not a shared total limit. For example: {
      * CleanupPolicy.builder().withDeleteConcurrency(32).build()}. Omission uses object store I/O
      * parallelism. Validated when cleanup executes.
      */

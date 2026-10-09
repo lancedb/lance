@@ -3437,7 +3437,8 @@ class LanceDataset(pa.dataset.Dataset):
         delete_concurrency: int, optional
             Maximum concurrent file deletions for this cleanup task. Must be
             positive. Defaults to object store I/O parallelism. Independent of
-            ``delete_rate_limit``. Referenced branches use their own settings.
+            ``delete_rate_limit``. Referenced branches inherit this window;
+            the limit is per branch, not shared across the whole cleanup.
             For example, ``delete_concurrency=32`` allows 32 in-flight deletes.
 
         delete_rate_limit: int, optional

@@ -1574,6 +1574,10 @@ impl<'a> CleanupTask<'a> {
         }
         let action = self.action;
         let candidate_file_limit = self.action.candidate_file_limit();
+        let delete_concurrency = self
+            .policy
+            .delete_concurrency
+            .unwrap_or_else(|| self.dataset.object_store.io_parallelism());
         let tasks: Vec<_> = branches_chains
             .values()
             .map(|branch_chain| {
@@ -1587,7 +1591,11 @@ impl<'a> CleanupTask<'a> {
                         let ignored_manifests =
                             final_result.lock().unwrap().removed_manifests.clone();
                         if let Some(policy) =
-                            build_cleanup_policy(&branch_dataset, branch_dataset.manifest.as_ref())
+                            build_cleanup_policy_with_concurrency(
+                                &branch_dataset,
+                                branch_dataset.manifest.as_ref(),
+                                Some(delete_concurrency),
+                            )
                                 .await?
                         {
                             let result = cleanup_cascade_branch_run(
@@ -1971,8 +1979,9 @@ pub struct CleanupPolicy {
     /// their own rate settings. `None` leaves the entire operation unthrottled.
     pub delete_rate_limit: Option<u64>,
     /// Maximum in-flight file deletes for this cleanup task. Must be positive.
-    /// `None` uses the object store's I/O parallelism. Referenced branches use
-    /// their own configuration; this does not limit listing or manifest reads.
+    /// `None` uses the current dataset's object store I/O parallelism. Referenced
+    /// branches inherit this window independently, not a shared total limit.
+    /// This does not limit listing or manifest reads.
     pub delete_concurrency: Option<usize>,
 }
 
@@ -2113,8 +2122,9 @@ impl CleanupPolicyBuilder {
 
     /// Set the maximum in-flight file deletes for this task, independently of QPS.
     ///
-    /// If unset, the object store's I/O parallelism is used. Referenced branches
-    /// use their own settings. Returns an invalid-input error for zero.
+    /// If unset, the current dataset's object store I/O parallelism is used.
+    /// Referenced branches inherit the window, not a shared total limit.
+    /// Returns an invalid-input error for zero.
     ///
     /// ```
     /// # use lance::dataset::cleanup::CleanupPolicyBuilder;
@@ -2219,6 +2229,14 @@ pub async fn build_cleanup_policy(
     dataset: &Dataset,
     manifest: &Manifest,
 ) -> Result<Option<CleanupPolicy>> {
+    build_cleanup_policy_with_concurrency(dataset, manifest, None).await
+}
+
+async fn build_cleanup_policy_with_concurrency(
+    dataset: &Dataset,
+    manifest: &Manifest,
+    delete_concurrency: Option<usize>,
+) -> Result<Option<CleanupPolicy>> {
     if let Some(interval) = manifest.config.get("lance.auto_cleanup.interval") {
         let interval: u64 = match interval.parse() {
             Ok(i) => i,
@@ -2303,7 +2321,9 @@ pub async fn build_cleanup_policy(
         };
     }
 
-    if let Some(value) = manifest.config.get("lance.auto_cleanup.delete_concurrency") {
+    if let Some(concurrency) = delete_concurrency {
+        builder = builder.with_delete_concurrency(concurrency)?;
+    } else if let Some(value) = manifest.config.get("lance.auto_cleanup.delete_concurrency") {
         let concurrency = value.parse::<usize>().map_err(|error| {
             Error::invalid_input(format!(
                 "Invalid lance.auto_cleanup.delete_concurrency={value:?}: {error}"
@@ -2652,7 +2672,10 @@ mod tests {
     #[case::disabled(false)]
     #[case::enabled(true)]
     #[tokio::test]
-    async fn test_cascade_delete_concurrency(#[case] enabled: bool) {
+    async fn test_cascade_delete_concurrency(
+        #[case] enabled: bool,
+        #[values("0", "invalid", "64")] branch_concurrency: &str,
+    ) {
         let fixture = MockDatasetFixture::try_new().unwrap();
         fixture.create_some_data().await.unwrap();
         let mut parent = fixture.load().await.unwrap();
@@ -2661,10 +2684,14 @@ mod tests {
             .await
             .unwrap();
         let mut manifest = branch.manifest.as_ref().clone();
-        // The cascade must validate its own policy, not inherit a parent's settings.
+        // A cascade ignores the branch's concurrency, even if it is invalid.
         manifest
             .config
-            .insert("lance.auto_cleanup.delete_concurrency".into(), "0".into());
+            .insert("lance.auto_cleanup.delete_rate_limit".into(), "7".into());
+        manifest.config.insert(
+            "lance.auto_cleanup.delete_concurrency".into(),
+            branch_concurrency.into(),
+        );
         if enabled {
             manifest
                 .config
@@ -2672,13 +2699,28 @@ mod tests {
         } else {
             manifest.config.remove("lance.auto_cleanup.interval");
         }
-        let result = cleanup_cascade_branch(&branch, &manifest).await;
+        let policy = build_cleanup_policy_with_concurrency(&branch, &manifest, Some(2))
+            .await
+            .unwrap();
         if enabled {
-            let error = result.unwrap_err();
-            assert!(matches!(error, Error::InvalidInput { .. }));
-            assert_contains!(error.to_string(), "lance.auto_cleanup.delete_concurrency");
+            let policy = policy.unwrap();
+            assert_eq!(policy.delete_concurrency, Some(2));
+            assert_eq!(policy.delete_rate_limit, Some(7));
         } else {
-            assert!(result.unwrap().is_none());
+            assert!(policy.is_none());
+        }
+        if let Some(policy) =
+            build_cleanup_policy_with_concurrency(&branch, &manifest, Some(2)).await.unwrap()
+        {
+            cleanup_cascade_branch_run(
+                &branch,
+                policy,
+                CleanupAction::Execute,
+                HashSet::new(),
+                None,
+            )
+            .await
+            .unwrap();
         }
     }
 

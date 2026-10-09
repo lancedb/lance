@@ -604,8 +604,12 @@ of `delete_rate_limit`, which controls delete operations per second:
 dataset.cleanup_old_versions(delete_concurrency=32, delete_rate_limit=100)
 ```
 
-Each referenced branch uses its own automatic cleanup settings; these limits are
-not shared across branches or separate cleanup calls.
+Referenced branches inherit the initiating cleanup's resolved deletion concurrency,
+ignoring their own `lance.auto_cleanup.delete_concurrency` settings. Each branch
+has its own deletion window, so simultaneous branches can exceed that value in
+total. Branch cleanup eligibility, retention and `delete_rate_limit` still use
+each branch's own automatic cleanup settings. Separate cleanup calls do not
+share limits.
 
 ### Automatic cleanup
 
