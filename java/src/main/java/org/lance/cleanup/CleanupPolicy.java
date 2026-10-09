@@ -32,6 +32,7 @@ public class CleanupPolicy {
   private final Optional<Boolean> errorIfTaggedOldVersions;
   private final Optional<Boolean> cleanReferencedBranches;
   private final Optional<Long> deleteRateLimit;
+  private final Optional<Long> deleteConcurrency;
 
   private CleanupPolicy(
       Optional<Long> beforeTimestampMillis,
@@ -40,7 +41,8 @@ public class CleanupPolicy {
       Optional<Boolean> deleteUnverified,
       Optional<Boolean> errorIfTaggedOldVersions,
       Optional<Boolean> cleanReferencedBranches,
-      Optional<Long> deleteRateLimit) {
+      Optional<Long> deleteRateLimit,
+      Optional<Long> deleteConcurrency) {
     this.beforeTimestampMillis = beforeTimestampMillis;
     this.beforeVersion = beforeVersion;
     this.versions = versions;
@@ -48,6 +50,7 @@ public class CleanupPolicy {
     this.errorIfTaggedOldVersions = errorIfTaggedOldVersions;
     this.cleanReferencedBranches = cleanReferencedBranches;
     this.deleteRateLimit = deleteRateLimit;
+    this.deleteConcurrency = deleteConcurrency;
   }
 
   public static Builder builder() {
@@ -78,6 +81,11 @@ public class CleanupPolicy {
     return cleanReferencedBranches;
   }
 
+  /** Maximum in-flight deletes per cleanup task; empty uses object store I/O parallelism. */
+  public Optional<Long> getDeleteConcurrency() {
+    return deleteConcurrency;
+  }
+
   public Optional<Long> getDeleteRateLimit() {
     return deleteRateLimit;
   }
@@ -91,6 +99,7 @@ public class CleanupPolicy {
     private Optional<Boolean> errorIfTaggedOldVersions = Optional.empty();
     private Optional<Boolean> cleanReferencedBranches = Optional.empty();
     private Optional<Long> deleteRateLimit = Optional.empty();
+    private Optional<Long> deleteConcurrency = Optional.empty();
 
     private Builder() {}
 
@@ -136,6 +145,17 @@ public class CleanupPolicy {
       return this;
     }
 
+    /**
+     * Set a positive maximum number of in-flight file deletes, independently of QPS. Referenced
+     * branches use their own settings. For example: {
+     * CleanupPolicy.builder().withDeleteConcurrency(32).build()}. Omission uses object store I/O
+     * parallelism. Validated when cleanup executes.
+     */
+    public Builder withDeleteConcurrency(long deleteConcurrency) {
+      this.deleteConcurrency = Optional.of(deleteConcurrency);
+      return this;
+    }
+
     public CleanupPolicy build() {
       return new CleanupPolicy(
           beforeTimestampMillis,
@@ -144,7 +164,8 @@ public class CleanupPolicy {
           deleteUnverified,
           errorIfTaggedOldVersions,
           cleanReferencedBranches,
-          deleteRateLimit);
+          deleteRateLimit,
+          deleteConcurrency);
     }
   }
 }

@@ -22,6 +22,8 @@ import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -36,6 +38,57 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class CleanupTest {
+  @ParameterizedTest
+  @ValueSource(longs = {1, 4})
+  public void testDeleteConcurrency(long concurrency, @TempDir Path tempDir) {
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, tempDir.resolve("cleanup").toString());
+      testDataset.createEmptyDataset().close();
+      testDataset.write(1, 4).close();
+      try (Dataset dataset = testDataset.write(2, 4)) {
+        CleanupPolicy policy =
+            CleanupPolicy.builder()
+                .withBeforeVersion(3L)
+                .withDeleteConcurrency(concurrency)
+                .build();
+        assertEquals(concurrency, policy.getDeleteConcurrency().get().longValue());
+        CleanupExplanation explanation = dataset.cleanup(policy).explain();
+        assertEquals(3, dataset.listVersions().size());
+        RemovalStats stats = dataset.cleanupWithPolicy(policy);
+        assertEquals(2L, stats.getOldVersions());
+        assertEquals(explanation.getStats().getBytesRemoved(), stats.getBytesRemoved());
+        assertEquals(0L, stats.getFailedDeletes());
+      }
+    }
+  }
+
+  @ParameterizedTest
+  @ValueSource(longs = {0, -1})
+  public void testInvalidDeleteConcurrency(long concurrency, @TempDir Path tempDir) {
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, tempDir.resolve("cleanup").toString());
+      try (Dataset dataset = testDataset.createEmptyDataset()) {
+        IllegalArgumentException error =
+            Assertions.assertThrows(
+                IllegalArgumentException.class,
+                () ->
+                    dataset.cleanupWithPolicy(
+                        CleanupPolicy.builder().withDeleteConcurrency(concurrency).build()));
+        assertTrue(error.getMessage().contains("delete_concurrency"));
+        assertTrue(error.getMessage().contains(Long.toString(concurrency)));
+        Assertions.assertThrows(
+            IllegalArgumentException.class,
+            () ->
+                dataset
+                    .cleanup(CleanupPolicy.builder().withDeleteConcurrency(concurrency).build())
+                    .explain());
+        assertEquals(1, dataset.listVersions().size());
+      }
+    }
+  }
+
   @Test
   public void testCleanupBeforeVersion(@TempDir Path tempDir) {
     String datasetPath = tempDir.resolve("test_dataset_for_cleanup").toString();
@@ -237,6 +290,7 @@ public class CleanupTest {
                 CleanupPolicy.builder()
                     .withBeforeTimestampMillis(beforeTimestampMillis)
                     .withDeleteRateLimit(1L)
+                    .withDeleteConcurrency(2L)
                     .build());
         long elapsed = System.nanoTime() - start;
 

@@ -834,6 +834,7 @@ pub struct Dataset {
 }
 
 impl Dataset {
+    #[allow(clippy::too_many_arguments)]
     async fn cleanup_policy(
         &self,
         older_than_micros: Option<i64>,
@@ -842,8 +843,12 @@ impl Dataset {
         error_if_tagged_old_versions: Option<bool>,
         delete_rate_limit: Option<u64>,
         versions: Option<Vec<u64>>,
+        delete_concurrency: Option<usize>,
     ) -> lance_core::Result<lance::dataset::cleanup::CleanupPolicy> {
         let mut builder = CleanupPolicyBuilder::default();
+        if let Some(v) = delete_concurrency {
+            builder = builder.with_delete_concurrency(v)?;
+        }
         if let Some(v) = older_than_micros {
             let older_than = Duration::microseconds(v);
             builder = builder.before_timestamp(Utc::now() - older_than);
@@ -2298,7 +2303,8 @@ impl Dataset {
     }
 
     /// Cleanup old versions from the dataset
-    #[pyo3(signature = (older_than_micros = None, retain_versions = None, delete_unverified = None, error_if_tagged_old_versions = None, delete_rate_limit = None, versions = None))]
+    #[pyo3(signature = (older_than_micros = None, retain_versions = None, delete_unverified = None, error_if_tagged_old_versions = None, delete_rate_limit = None, versions = None, delete_concurrency = None))]
+    #[allow(clippy::too_many_arguments)]
     fn cleanup_old_versions(
         &self,
         older_than_micros: Option<i64>,
@@ -2307,6 +2313,7 @@ impl Dataset {
         error_if_tagged_old_versions: Option<bool>,
         delete_rate_limit: Option<u64>,
         versions: Option<Vec<u64>>,
+        delete_concurrency: Option<usize>,
     ) -> PyResult<CleanupStats> {
         let stats = rt()
             .block_on(None, async {
@@ -2318,6 +2325,7 @@ impl Dataset {
                         error_if_tagged_old_versions,
                         delete_rate_limit,
                         versions,
+                        delete_concurrency,
                     )
                     .await?;
                 self.ds.cleanup_with_policy(policy).await
@@ -2328,7 +2336,7 @@ impl Dataset {
 
     /// Explain cleanup old versions from the dataset without deleting files
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (older_than_micros = None, retain_versions = None, delete_unverified = None, error_if_tagged_old_versions = None, delete_rate_limit = None, versions = None, include_files = false, max_files = 1000))]
+    #[pyo3(signature = (older_than_micros = None, retain_versions = None, delete_unverified = None, error_if_tagged_old_versions = None, delete_rate_limit = None, versions = None, include_files = false, max_files = 1000, delete_concurrency = None))]
     fn explain_cleanup_old_versions(
         &self,
         older_than_micros: Option<i64>,
@@ -2339,6 +2347,7 @@ impl Dataset {
         versions: Option<Vec<u64>>,
         include_files: bool,
         max_files: usize,
+        delete_concurrency: Option<usize>,
     ) -> PyResult<CleanupExplanation> {
         let explanation = rt()
             .block_on(None, async {
@@ -2350,6 +2359,7 @@ impl Dataset {
                         error_if_tagged_old_versions,
                         delete_rate_limit,
                         versions,
+                        delete_concurrency,
                     )
                     .await?;
                 self.ds

@@ -502,6 +502,7 @@ impl<'a> CleanupTask<'a> {
     }
 
     async fn run(self) -> Result<CleanupRunResult> {
+        self.policy.validate()?;
         let mut final_result = CleanupRunResult::default();
         let candidate_file_limit = self.action.candidate_file_limit();
         // First check if we need to clean referenced branches
@@ -1092,7 +1093,11 @@ impl<'a> CleanupTask<'a> {
                     };
                     Ok::<_, Error>((file, outcome))
                 })
-                .buffer_unordered(self.dataset.object_store.io_parallelism())
+                .buffer_unordered(
+                    self.policy
+                        .delete_concurrency
+                        .unwrap_or_else(|| self.dataset.object_store.io_parallelism()),
+                )
                 .try_for_each(|(file, outcome)| {
                     let mut result = cleanup_result.lock().unwrap();
                     match outcome {
@@ -1965,9 +1970,22 @@ pub struct CleanupPolicy {
     /// The budget is shared by this cleanup and all cascaded branches, ignoring
     /// their own rate settings. `None` leaves the entire operation unthrottled.
     pub delete_rate_limit: Option<u64>,
+    /// Maximum in-flight file deletes for this cleanup task. Must be positive.
+    /// `None` uses the object store's I/O parallelism. Referenced branches use
+    /// their own configuration; this does not limit listing or manifest reads.
+    pub delete_concurrency: Option<usize>,
 }
 
 impl CleanupPolicy {
+    fn validate(&self) -> Result<()> {
+        if self.delete_concurrency == Some(0) {
+            return Err(Error::invalid_input(
+                "delete_concurrency must be greater than 0, got 0",
+            ));
+        }
+        Ok(())
+    }
+
     pub fn should_clean(&self, manifest: &Manifest) -> bool {
         let mut should_clean = true;
         if let Some(before_timestamp) = self.before_timestamp {
@@ -1993,6 +2011,7 @@ impl Default for CleanupPolicy {
             error_if_tagged_old_versions: true,
             clean_referenced_branches: false,
             delete_rate_limit: None,
+            delete_concurrency: None,
         }
     }
 }
@@ -2089,6 +2108,24 @@ impl CleanupPolicyBuilder {
             });
         }
         self.policy.delete_rate_limit = Some(rate);
+        Ok(self)
+    }
+
+    /// Set the maximum in-flight file deletes for this task, independently of QPS.
+    ///
+    /// If unset, the object store's I/O parallelism is used. Referenced branches
+    /// use their own settings. Returns an invalid-input error for zero.
+    ///
+    /// ```
+    /// # use lance::dataset::cleanup::CleanupPolicyBuilder;
+    /// let policy = CleanupPolicyBuilder::default()
+    ///     .with_delete_concurrency(32)?
+    ///     .build();
+    /// # Ok::<(), lance::Error>(())
+    /// ```
+    pub fn with_delete_concurrency(mut self, delete_concurrency: usize) -> Result<Self> {
+        self.policy.delete_concurrency = Some(delete_concurrency);
+        self.policy.validate()?;
         Ok(self)
     }
 
@@ -2266,6 +2303,21 @@ pub async fn build_cleanup_policy(
         };
     }
 
+    if let Some(value) = manifest.config.get("lance.auto_cleanup.delete_concurrency") {
+        let concurrency = value.parse::<usize>().map_err(|error| {
+            Error::invalid_input(format!(
+                "Invalid lance.auto_cleanup.delete_concurrency={value:?}: {error}"
+            ))
+        })?;
+        builder = builder
+            .with_delete_concurrency(concurrency)
+            .map_err(|error| {
+                Error::invalid_input(format!(
+                    "Invalid lance.auto_cleanup.delete_concurrency={value:?}: {error}"
+                ))
+            })?;
+    }
+
     Ok(Some(builder.build()))
 }
 
@@ -2329,8 +2381,306 @@ mod tests {
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32, RandomVector, some_batch};
     use mock_instant::thread_local::MockClock;
     use object_store::ObjectStoreExt;
+    use object_store::memory::InMemory;
+    use object_store::{
+        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, PutMultipartOptions,
+        PutOptions, PutPayload, PutResult,
+    };
     use rstest::rstest;
     use uuid::Uuid;
+
+    #[derive(Debug)]
+    struct ObservedDeleteStore {
+        inner: Arc<dyn object_store::ObjectStore>,
+        active: Arc<AtomicUsize>,
+        peak: Arc<AtomicUsize>,
+    }
+
+    impl std::fmt::Display for ObservedDeleteStore {
+        #[cfg_attr(coverage, coverage(off))]
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "ObservedDeleteStore")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl object_store::ObjectStore for ObservedDeleteStore {
+        #[cfg_attr(coverage, coverage(off))]
+        async fn put_opts(
+            &self,
+            path: &Path,
+            payload: PutPayload,
+            options: PutOptions,
+        ) -> object_store::Result<PutResult> {
+            self.inner.put_opts(path, payload, options).await
+        }
+
+        #[cfg_attr(coverage, coverage(off))]
+        async fn put_multipart_opts(
+            &self,
+            path: &Path,
+            options: PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(path, options).await
+        }
+
+        #[cfg_attr(coverage, coverage(off))]
+        async fn get_opts(
+            &self,
+            path: &Path,
+            options: GetOptions,
+        ) -> object_store::Result<GetResult> {
+            self.inner.get_opts(path, options).await
+        }
+
+        #[cfg_attr(coverage, coverage(off))]
+        fn delete_stream(
+            &self,
+            paths: BoxStream<'static, object_store::Result<Path>>,
+        ) -> BoxStream<'static, object_store::Result<Path>> {
+            let inner = self.inner.clone();
+            let active = self.active.clone();
+            let peak = self.peak.clone();
+            paths
+                .then(move |path| {
+                    let inner = inner.clone();
+                    let active = active.clone();
+                    let peak = peak.clone();
+                    async move {
+                        let path = path?;
+                        let count = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(count, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        let outcome = inner.delete(&path).await;
+                        active.fetch_sub(1, Ordering::SeqCst);
+                        outcome.map(|()| path)
+                    }
+                })
+                .boxed()
+        }
+
+        #[cfg_attr(coverage, coverage(off))]
+        fn list(
+            &self,
+            prefix: Option<&Path>,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        #[cfg_attr(coverage, coverage(off))]
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> object_store::Result<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        #[cfg_attr(coverage, coverage(off))]
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    #[rstest]
+    #[case::default(None, None)]
+    #[case::serial(Some(1), None)]
+    #[case::override_default(Some(4), None)]
+    #[case::with_rate_limit(Some(4), Some(10))]
+    #[tokio::test(start_paused = true)]
+    async fn test_delete_concurrency(
+        #[case] concurrency: Option<usize>,
+        #[case] rate: Option<u64>,
+    ) {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        fixture.append_some_data().await.unwrap();
+        fixture.overwrite_some_data().await.unwrap();
+        let mut dataset = fixture.open().await.unwrap();
+        let expected = dataset.scan().try_into_batch().await.unwrap();
+        // Keep the deletion test entirely in memory so virtual time cannot advance
+        // while the filesystem's blocking pool is still producing candidates.
+        let memory_store = Arc::new(InMemory::new());
+        let mut objects = dataset.object_store.inner.list(Some(&dataset.base));
+        while let Some(meta) = objects.try_next().await.unwrap() {
+            let bytes = dataset
+                .object_store
+                .inner
+                .get(&meta.location)
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap();
+            memory_store
+                .put(&meta.location, bytes.into())
+                .await
+                .unwrap();
+        }
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        dataset.object_store = Arc::new(ObjectStore::new(
+            Arc::new(ObservedDeleteStore {
+                inner: memory_store,
+                active: active.clone(),
+                peak: peak.clone(),
+            }),
+            url::Url::parse(&fixture.dataset_path).unwrap(),
+            None,
+            None,
+            false,
+            true,
+            2,
+            0,
+            None,
+        ));
+        let policy = CleanupPolicy {
+            before_version: Some(dataset.version().version),
+            delete_concurrency: concurrency,
+            delete_rate_limit: rate,
+            delete_unverified: true,
+            ..Default::default()
+        };
+        let explanation = dataset.cleanup(policy.clone()).explain().await.unwrap();
+        let expected_peak = concurrency
+            .unwrap_or_else(|| dataset.object_store.io_parallelism())
+            .min(explanation.candidate_files.len());
+        assert_eq!(peak.load(Ordering::SeqCst), 0);
+        let start = tokio::time::Instant::now();
+        let stats = dataset.cleanup_with_policy(policy).await.unwrap();
+        assert_eq!(stats.old_versions, 2);
+        assert_eq!(stats.bytes_removed, explanation.stats.bytes_removed);
+        assert_eq!(stats.data_files_removed, 2);
+        assert_eq!(stats.failed_deletes, 0);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        if rate.is_some() {
+            assert!(peak.load(Ordering::SeqCst) <= concurrency.unwrap());
+            assert!(
+                start.elapsed()
+                    >= Duration::from_millis((explanation.candidate_files.len() as u64 - 1) * 100)
+            );
+        } else {
+            assert_eq!(peak.load(Ordering::SeqCst), expected_peak);
+        }
+        assert_eq!(dataset.scan().try_into_batch().await.unwrap(), expected);
+    }
+
+    #[rstest]
+    #[case::execute(false)]
+    #[case::explain(true)]
+    #[tokio::test]
+    async fn test_invalid_delete_concurrency(#[case] explain: bool) {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        let dataset = fixture.open().await.unwrap();
+        let policy = CleanupPolicy {
+            delete_concurrency: Some(0),
+            ..Default::default()
+        };
+        let requests = Arc::new(AtomicUsize::new(0));
+        let request_count = requests.clone();
+        fixture.mock_store.policy.lock().unwrap().set_before_policy(
+            "count_requests",
+            Arc::new(move |_, _| {
+                request_count.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }),
+        );
+        let operation = dataset.cleanup(policy);
+        let error = if explain {
+            operation.explain().await.unwrap_err()
+        } else {
+            operation.execute().await.unwrap_err()
+        };
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert_contains!(
+            error.to_string(),
+            "delete_concurrency must be greater than 0, got 0"
+        );
+        let error = CleanupPolicyBuilder::default()
+            .with_delete_concurrency(0)
+            .err()
+            .unwrap();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert_contains!(error.to_string(), "delete_concurrency");
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+    }
+
+    #[rstest]
+    #[case::unset(None, true)]
+    #[case::positive(Some("4"), true)]
+    #[case::zero(Some("0"), false)]
+    #[case::negative(Some("-1"), false)]
+    #[case::invalid(Some("abc"), false)]
+    #[case::overflow(Some("18446744073709551616"), false)]
+    #[tokio::test]
+    async fn test_auto_cleanup_delete_concurrency(
+        #[case] value: Option<&str>,
+        #[case] valid: bool,
+    ) {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        let dataset = fixture.open().await.unwrap();
+        let mut manifest = dataset.manifest.as_ref().clone();
+        manifest
+            .config
+            .insert("lance.auto_cleanup.interval".into(), "0".into());
+        if let Some(value) = value {
+            manifest
+                .config
+                .insert("lance.auto_cleanup.delete_concurrency".into(), value.into());
+        }
+        let result = build_cleanup_policy(&dataset, &manifest).await;
+        if valid {
+            assert_eq!(
+                result.unwrap().unwrap().delete_concurrency,
+                value.map(|_| 4)
+            );
+        } else {
+            let error = result.unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }));
+            assert_contains!(error.to_string(), "lance.auto_cleanup.delete_concurrency");
+            assert_contains!(error.to_string(), value.unwrap());
+        }
+    }
+
+    #[rstest]
+    #[case::disabled(false)]
+    #[case::enabled(true)]
+    #[tokio::test]
+    async fn test_cascade_delete_concurrency(#[case] enabled: bool) {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        let mut parent = fixture.load().await.unwrap();
+        let branch = fixture
+            .create_branch_and_load(&mut parent, "child", (None, None))
+            .await
+            .unwrap();
+        let mut manifest = branch.manifest.as_ref().clone();
+        // The cascade must validate its own policy, not inherit a parent's settings.
+        manifest
+            .config
+            .insert("lance.auto_cleanup.delete_concurrency".into(), "0".into());
+        if enabled {
+            manifest
+                .config
+                .insert("lance.auto_cleanup.interval".into(), "0".into());
+        } else {
+            manifest.config.remove("lance.auto_cleanup.interval");
+        }
+        let result = cleanup_cascade_branch(&branch, &manifest).await;
+        if enabled {
+            let error = result.unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }));
+            assert_contains!(error.to_string(), "lance.auto_cleanup.delete_concurrency");
+        } else {
+            assert!(result.unwrap().is_none());
+        }
+    }
 
     #[derive(Debug)]
     struct MockObjectStore {
@@ -4812,6 +5162,8 @@ mod tests {
             .cleanup_with_policy(
                 CleanupPolicyBuilder::default()
                     .versions(vec![1, 2])
+                    .unwrap()
+                    .with_delete_concurrency(2)
                     .unwrap()
                     .build(),
             )
