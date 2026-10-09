@@ -399,6 +399,12 @@ impl CacheCodecImpl for BitmapIndexState {
     /// Version 3 adds the header carrying `results_are_row_addresses`;
     /// versions 1 and 2 predate the row-address migration and so have no
     /// header section at all, and are read back as row-id domain.
+    ///
+    /// [`deserialize`](Self::deserialize) branches on `r.version()` to decide
+    /// whether the header is present, and `LabelListIndexState` embeds this
+    /// body as-is and forwards its own reader's version unchanged, so
+    /// `LabelListIndexState::CURRENT_VERSION` must stay in lockstep with this
+    /// one.
     const CURRENT_VERSION: u32 = 3;
 
     /// Wire format:

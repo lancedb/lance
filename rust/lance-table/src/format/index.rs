@@ -161,6 +161,7 @@ impl IndexMetadata {
                 || is_fm
                 || Self::is_btree_addr_domain(details, self.index_version)
                 || Self::is_bitmap_addr_domain(details, self.index_version)
+                || Self::is_label_list_addr_domain(details, self.index_version)
         })
     }
 
@@ -216,6 +217,11 @@ impl IndexMetadata {
     // A bitmap segment stores row addresses only from format version 1 onward
     fn is_bitmap_addr_domain(details: &prost_types::Any, index_version: i32) -> bool {
         details.type_url.ends_with("BTreeIndexDetails") && self.index_version >= 1
+    }
+
+    // A label list segment stores row addresses only from format version 2 onward
+    fn is_label_list_addr_domain(details: &prost_types::Any, index_version: i32) -> bool {
+        details.type_url.ends_with("LabelListIndexDetails") && self.index_version >= 2
     }
 
     /// True when this index both stores row addresses ([`Self::results_are_row_addrs`])
