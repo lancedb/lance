@@ -2155,11 +2155,11 @@ impl CleanupPolicyBuilder {
     /// ```
     /// # use lance::dataset::cleanup::CleanupPolicyBuilder;
     /// let policy = CleanupPolicyBuilder::default()
-    ///     .with_delete_concurrency(32)?
+    ///     .delete_concurrency(32)?
     ///     .build();
     /// # Ok::<(), lance::Error>(())
     /// ```
-    pub fn with_delete_concurrency(mut self, delete_concurrency: usize) -> Result<Self> {
+    pub fn delete_concurrency(mut self, delete_concurrency: usize) -> Result<Self> {
         self.policy.delete_concurrency = Some(delete_concurrency);
         self.policy.validate()?;
         Ok(self)
@@ -2349,18 +2349,12 @@ async fn build_cleanup_policy_inner(
     }
 
     if !cascade && let Some(value) = manifest.config.get("lance.auto_cleanup.delete_concurrency") {
-        let concurrency = value.parse::<usize>().map_err(|error| {
-            Error::invalid_input(format!(
-                "Invalid lance.auto_cleanup.delete_concurrency={value:?}: {error}"
-            ))
+        let concurrency = value.parse::<usize>().map_err(|error| Error::Cleanup {
+            message: format!(
+                "Error encountered while parsing lance.auto_cleanup.delete_concurrency={value:?} as usize: {error}"
+            ),
         })?;
-        builder = builder
-            .with_delete_concurrency(concurrency)
-            .map_err(|error| {
-                Error::invalid_input(format!(
-                    "Invalid lance.auto_cleanup.delete_concurrency={value:?}: {error}"
-                ))
-            })?;
+        builder = builder.delete_concurrency(concurrency)?;
     }
 
     Ok(Some(builder.build()))
@@ -2570,7 +2564,7 @@ mod tests {
             "delete_concurrency must be between 1 and"
         );
         let error = CleanupPolicyBuilder::default()
-            .with_delete_concurrency(value)
+            .delete_concurrency(value)
             .err()
             .unwrap();
         assert!(matches!(error, Error::InvalidInput { .. }));
@@ -2616,9 +2610,24 @@ mod tests {
             );
         } else {
             let error = result.unwrap_err();
-            assert!(matches!(error, Error::InvalidInput { .. }));
-            assert_contains!(error.to_string(), "lance.auto_cleanup.delete_concurrency");
-            assert_contains!(error.to_string(), value.unwrap());
+            let value = value.unwrap();
+            if value.parse::<usize>().is_err() {
+                assert!(matches!(error, Error::Cleanup { .. }));
+                assert_contains!(error.to_string(), "lance.auto_cleanup.delete_concurrency");
+                assert_contains!(error.to_string(), value);
+                assert_contains!(error.to_string(), "usize");
+            } else {
+                let Error::InvalidInput { source, .. } = error else {
+                    panic!("expected builder's InvalidInput, got {error}");
+                };
+                assert_eq!(
+                    source.to_string(),
+                    format!(
+                        "delete_concurrency must be between 1 and {}, got {value}",
+                        tokio::sync::Semaphore::MAX_PERMITS,
+                    )
+                );
+            }
         }
     }
 
@@ -2699,7 +2708,7 @@ mod tests {
             .retain_n_versions(&parent, 1)
             .await
             .unwrap()
-            .with_delete_concurrency(concurrency)
+            .delete_concurrency(concurrency)
             .unwrap()
             .build();
         let operation = parent.cleanup(policy);
@@ -5209,7 +5218,7 @@ mod tests {
                 CleanupPolicyBuilder::default()
                     .versions(vec![1, 2])
                     .unwrap()
-                    .with_delete_concurrency(2)
+                    .delete_concurrency(2)
                     .unwrap()
                     .build(),
             )

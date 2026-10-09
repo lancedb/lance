@@ -847,7 +847,7 @@ impl Dataset {
     ) -> lance_core::Result<lance::dataset::cleanup::CleanupPolicy> {
         let mut builder = CleanupPolicyBuilder::default();
         if let Some(v) = delete_concurrency {
-            builder = builder.with_delete_concurrency(v)?;
+            builder = builder.delete_concurrency(v)?;
         }
         if let Some(v) = older_than_micros {
             let older_than = Duration::microseconds(v);
