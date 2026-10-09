@@ -14,9 +14,9 @@ use lance_index::{
     optimize::OptimizeOptions,
     progress::{IndexBuildProgress, NoopIndexBuildProgress},
     scalar::{
-        BuiltinIndexType, CreatedIndex, OldIndexDataFilter, ScalarIndex, index_files_to_table,
+        CreatedIndex, OldIndexDataFilter, ScalarIndex, index_files_to_table,
         inverted::InvertedIndex,
-        json::json_wrapped_target_type,
+        json,
         lance_format::LanceIndexStore,
         seed::{FragmentSeed, SEED_META_KEY_PREFIX},
         table_files_to_index,
@@ -585,25 +585,33 @@ async fn merge_scalar_indices<'a>(
         return Ok(None);
     }
 
+    // Whether a segment's type moved from row ids to row addresses, so that it
+    // may predate that move: BTree, Bitmap, LabelList, and a JSON index over a
+    // BTree or Bitmap.
+    let migrated_to_row_addrs = |segment: &IndexMetadata| match index_type {
+        IndexType::BTree | IndexType::Bitmap | IndexType::LabelList => true,
+        _ => segment
+            .index_details
+            .as_deref()
+            .is_some_and(json::wraps_row_addr_migrated_target),
+    };
+
     // `select_segments_to_merge` only looks at the trailing `num_indices_to_merge`
     // segments (plus any deletion-affected one); with `num_indices_to_merge: Some(0)`
-    // (append mode) it selects none at all. A row-id-domain BTree, Bitmap, or
-    // LabelList segment left outside that selection would otherwise survive
-    // untouched beside the freshly built address-domain segment this call is
-    // about to create. `LogicalScalarIndex` takes the whole named index's
+    // (append mode) it selects none at all. A row-id-domain segment of such a
+    // type left outside that selection would otherwise survive untouched
+    // beside the freshly built address-domain segment this call is about to
+    // create. `LogicalScalarIndex` takes the whole named index's
     // result domain from its first segment alone, so that mix makes every
     // match the new segment finds look like a row id needing resolution, and
     // matching rows silently vanish when that resolution misses. Fold every
     // such segment into this rebuild, regardless of which ones the
     // trailing-window heuristic already picked, so the named index never
     // ends up straddling both domains.
-    if matches!(
-        index_type,
-        IndexType::BTree | IndexType::Bitmap | IndexType::LabelList
-    ) && dataset.manifest.uses_stable_row_ids()
-    {
+    if dataset.manifest.uses_stable_row_ids() {
         for idx in old_indices {
-            if !idx.results_are_row_addrs()
+            if migrated_to_row_addrs(idx)
+                && !idx.results_are_row_addrs()
                 && !selected_old_indices
                     .iter()
                     .any(|selected| selected.uuid == idx.uuid)
@@ -622,36 +630,6 @@ async fn merge_scalar_indices<'a>(
     let reference_index = dataset
         .open_scalar_index_for_maintenance(field_path, &reference_idx.uuid, &NoOpMetricsCollector)
         .await?;
-
-    // A JSON-wrapped BTREE/Bitmap/LabelList segment cannot yet carry the
-    // row-address-domain migration safely on a stable-row-id dataset -- see
-    // `build_scalar_index`'s matching guard, which this mirrors so maintenance
-    // is rejected too, not just creation. Checked here, before deciding
-    // between a merge or a rebuild, rather than relying on that guard to be
-    // reached only if the rebuild branch happens to be picked.
-    if dataset.manifest.uses_stable_row_ids() {
-        let reference_params = reference_index.derive_index_params()?;
-        if reference_params.index_type.eq_ignore_ascii_case("json")
-            && let Some(target) = reference_params
-                .params
-                .as_deref()
-                .and_then(json_wrapped_target_type)
-            && let Some(builtin) = [
-                BuiltinIndexType::BTree,
-                BuiltinIndexType::Bitmap,
-                BuiltinIndexType::LabelList,
-            ]
-            .into_iter()
-            .find(|builtin| target.eq_ignore_ascii_case(builtin.as_str()))
-        {
-            let name = builtin.as_str().to_uppercase();
-            return Err(Error::not_supported(format!(
-                "a JSON-wrapped {name} index is not yet supported on a dataset with stable \
-                 row ids enabled -- create a plain {name} index on this column instead, or \
-                 disable stable row ids for this dataset"
-            )));
-        }
-    }
 
     let update_criteria = reference_index.update_criteria();
 
@@ -690,20 +668,17 @@ async fn merge_scalar_indices<'a>(
             fragment_reuse_affects_segments(frag_reuse_index, selected_old_indices.iter().copied())
         });
 
-    // A BTree, Bitmap, or LabelList segment persisted before address-domain
-    // support stores row ids directly. Merging it with newly scanned
-    // address-domain data on a stable-row-id dataset would silently combine
-    // two different domains in the same postings column, so such a segment
-    // must be rebuilt from scratch (a full rescan, never touching its stale
-    // page data) rather than merged. Harmless elsewhere: without stable row
-    // ids the two domains coincide.
-    let legacy_domain_mismatch = matches!(
-        index_type,
-        IndexType::BTree | IndexType::Bitmap | IndexType::LabelList
-    ) && dataset.manifest.uses_stable_row_ids()
+    // A segment of a migrated type persisted before address-domain support
+    // stores row ids directly. Merging it with newly scanned address-domain
+    // data on a stable-row-id dataset would silently combine two different
+    // domains in the same postings column, so such a segment must be rebuilt
+    // from scratch (a full rescan, never touching its stale page data) rather
+    // than merged. Harmless elsewhere: without stable row ids the two domains
+    // coincide.
+    let legacy_domain_mismatch = dataset.manifest.uses_stable_row_ids()
         && selected_old_indices
             .iter()
-            .any(|segment| !segment.results_are_row_addrs());
+            .any(|segment| migrated_to_row_addrs(segment) && !segment.results_are_row_addrs());
 
     // Merge new data into the existing segment(s) without rebuilding from
     // scratch, when all hold:
@@ -873,11 +848,17 @@ async fn merge_scalar_indices<'a>(
                         .await?
                 }
                 _ => {
+                    // A JSON index over an address-domain target stores row
+                    // addresses, which a row-id filter would wrongly prune.
+                    let address_domain = reference_index
+                        .as_any()
+                        .downcast_ref::<json::JsonIndex>()
+                        .is_some_and(|index| index.results_are_row_addresses());
                     let old_data_filter = build_old_data_filter(
                         dataset.as_ref(),
                         &effective_old_frags,
                         &deleted_old_frags,
-                        false,
+                        address_domain,
                     )
                     .await?;
                     reference_index
@@ -4228,98 +4209,9 @@ mod tests {
         }
     }
 
-    /// A JSON-wrapped BTREE index cannot yet carry the row-address-domain
-    /// migration through its own metadata (see the guard in
-    /// `super::super::scalar::build_scalar_index`), so creating one on a
-    /// stable-row-id dataset must be rejected rather than silently produce an
-    /// address-domain segment none of the domain-safety checks elsewhere can
-    /// see through the wrapper.
-    #[tokio::test]
-    async fn test_json_wrapped_btree_create_rejected_with_stable_row_ids() {
-        let test_dir = TempStrDir::default();
-        let test_uri = test_dir.as_str();
-
-        let (schema, batch) = json_btree_schema_and_batch(0..10);
-        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
-        let mut dataset = Dataset::write(
-            reader,
-            test_uri,
-            Some(WriteParams {
-                enable_stable_row_ids: true,
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
-
-        let params = json_btree_params();
-        let err = dataset
-            .create_index_builder(&["doc"], IndexType::Scalar, &params)
-            .name("doc_idx".to_string())
-            .await
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("JSON-wrapped BTREE"),
-            "unexpected error: {err}"
-        );
-        assert!(
-            dataset
-                .load_indices_by_name("doc_idx")
-                .await
-                .unwrap()
-                .is_empty(),
-            "the rejected index must not be committed"
-        );
-    }
-
-    /// The same guard must also cover a JSON-wrapped BITMAP target: Bitmap
-    /// moved to the row-address-domain format in this same PR, so it is
-    /// exposed to the identical wrapper-metadata gap as BTREE (see
-    /// lance-format/lance#9814's review discussion). Without this, a fresh
-    /// JSON index over a Bitmap target on a stable-row-id dataset would
-    /// silently write address-domain postings that query translation reads
-    /// back as row ids, dropping matches outside fragment 0.
-    #[tokio::test]
-    async fn test_json_wrapped_bitmap_create_rejected_with_stable_row_ids() {
-        let test_dir = TempStrDir::default();
-        let test_uri = test_dir.as_str();
-
-        let (schema, batch) = json_btree_schema_and_batch(0..10);
-        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
-        let mut dataset = Dataset::write(
-            reader,
-            test_uri,
-            Some(WriteParams {
-                enable_stable_row_ids: true,
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
-
-        let params = json_wrapped_params("bitmap");
-        let err = dataset
-            .create_index_builder(&["doc"], IndexType::Scalar, &params)
-            .name("doc_idx".to_string())
-            .await
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("JSON-wrapped BITMAP"),
-            "unexpected error: {err}"
-        );
-        assert!(
-            dataset
-                .load_indices_by_name("doc_idx")
-                .await
-                .unwrap()
-                .is_empty(),
-            "the rejected index must not be committed"
-        );
-    }
-
-    /// The same combination is unaffected -- and must keep working exactly as
-    /// before this guard was added -- on a dataset that does not use stable
-    /// row ids, where a row id and a row address are the same value.
+    /// A JSON-wrapped BTree index on a dataset without stable row ids, where a
+    /// row id and a row address are the same value, must keep working exactly
+    /// as before the row-address-domain migration.
     #[tokio::test]
     async fn test_json_wrapped_btree_create_and_optimize_without_stable_row_ids() {
         let test_dir = TempStrDir::default();
