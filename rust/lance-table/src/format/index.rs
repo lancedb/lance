@@ -160,6 +160,7 @@ impl IndexMetadata {
                 || details.type_url.ends_with("BloomFilterIndexDetails")
                 || is_fm
                 || Self::is_btree_addr_domain(details, self.index_version)
+                || Self::is_bitmap_addr_domain(details, self.index_version)
         })
     }
 
@@ -210,6 +211,11 @@ impl IndexMetadata {
     // reinterpreted as addresses.
     fn is_btree_addr_domain(details: &prost_types::Any, index_version: i32) -> bool {
         details.type_url.ends_with("BTreeIndexDetails") && index_version >= 1
+    }
+
+    // A bitmap segment stores row addresses only from format version 1 onward
+    fn is_bitmap_addr_domain(details: &prost_types::Any, index_version: i32) -> bool {
+        details.type_url.ends_with("BTreeIndexDetails") && self.index_version >= 1
     }
 
     /// True when this index both stores row addresses ([`Self::results_are_row_addrs`])
