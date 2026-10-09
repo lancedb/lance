@@ -604,12 +604,16 @@ of `delete_rate_limit`, which controls delete operations per second:
 dataset.cleanup_old_versions(delete_concurrency=32, delete_rate_limit=100)
 ```
 
-Referenced branches inherit the initiating cleanup's resolved deletion concurrency,
-ignoring their own `lance.auto_cleanup.delete_concurrency` settings. Each branch
-has its own deletion window, so simultaneous branches can exceed that value in
-total. Branch cleanup eligibility and retention still use each branch's own
-automatic cleanup settings. The initiating cleanup's `delete_rate_limit` budget
-is shared across cascaded branches. Separate cleanup calls do not share limits.
+The initiating cleanup and all cascaded branches share one deletion concurrency
+budget and one `delete_rate_limit` budget. Cascaded branches ignore their own
+concurrency and QPS settings, including invalid values. Branch cleanup eligibility
+and retention still use each branch's own automatic cleanup settings. Cleaning a
+branch independently uses and validates its own settings. Separate cleanup calls
+do not share limits.
+
+`delete_concurrency` must be between 1 and Tokio's `Semaphore::MAX_PERMITS`
+(`2**61 - 1` on 64-bit platforms). Values outside this range return an error,
+including when explaining cleanup without executing it.
 
 ### Automatic cleanup
 

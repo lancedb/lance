@@ -39,7 +39,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class CleanupTest {
   @ParameterizedTest
-  @ValueSource(longs = {0, -1})
+  @ValueSource(longs = {0, -1, Long.MAX_VALUE})
   public void testInvalidDeleteConcurrency(long concurrency, @TempDir Path tempDir) {
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
       TestUtils.SimpleTestDataset testDataset =

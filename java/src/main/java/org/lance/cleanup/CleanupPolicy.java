@@ -81,7 +81,10 @@ public class CleanupPolicy {
     return cleanReferencedBranches;
   }
 
-  /** Maximum in-flight deletes per cleanup task; empty uses object store I/O parallelism. */
+  /**
+   * Maximum in-flight deletes shared with cascaded branches; empty uses object store I/O
+   * parallelism.
+   */
   public Optional<Long> getDeleteConcurrency() {
     return deleteConcurrency;
   }
@@ -139,17 +142,19 @@ public class CleanupPolicy {
       return this;
     }
 
-    /** Set the maximum number of delete operations per second. */
+    /** Set the maximum delete operations per second shared with all cascaded branches. */
     public Builder withDeleteRateLimit(long deleteRateLimit) {
       this.deleteRateLimit = Optional.of(deleteRateLimit);
       return this;
     }
 
     /**
-     * Set a positive maximum number of in-flight file deletes, independently of QPS. Referenced
-     * branches inherit this window independently, not a shared total limit. For example: {
-     * CleanupPolicy.builder().withDeleteConcurrency(32).build()}. Omission uses object store I/O
-     * parallelism. Validated when cleanup executes.
+     * Set the maximum in-flight file deletes shared with all cascaded branches, independently of
+     * QPS. Cascaded branches ignore their own concurrency and QPS settings, including invalid
+     * values. Separate cleanup calls do not share limits. For example: {@code
+     * CleanupPolicy.builder().withDeleteConcurrency(32).build()}. Omission uses the initiating
+     * dataset's object store I/O parallelism. Must be between 1 and Tokio's semaphore limit (2^61 -
+     * 1 on 64-bit platforms). Validated when cleanup executes or is explained.
      */
     public Builder withDeleteConcurrency(long deleteConcurrency) {
       this.deleteConcurrency = Optional.of(deleteConcurrency);

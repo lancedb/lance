@@ -1978,6 +1978,7 @@ def test_enable_disable_auto_cleanup(tmp_path):
     [
         ("cleanup_old_versions", 0, OSError),
         ("explain_cleanup_old_versions", 0, OSError),
+        ("cleanup_old_versions", 2**63 - 1, OSError),
         ("cleanup_old_versions", -1, OverflowError),
         ("cleanup_old_versions", 2**128, OverflowError),
     ],
@@ -1986,9 +1987,9 @@ def test_cleanup_invalid_delete_concurrency(tmp_path, method, value, error):
     dataset = lance.write_dataset(pa.table({"a": [1]}), tmp_path)
     with pytest.raises(error) as exc:
         getattr(dataset, method)(delete_concurrency=value)
-    if value == 0:
+    if error is OSError:
         assert "delete_concurrency" in str(exc.value)
-        assert "0" in str(exc.value)
+        assert str(value) in str(exc.value)
     assert len(dataset.versions()) == 1
 
 
