@@ -1449,7 +1449,7 @@ impl MemIndexPlugin for BTreeMemIndexPlugin {
     }
 
     fn training_criteria(&self) -> TrainingCriteria {
-        TrainingCriteria::new(TrainingOrdering::Values).with_row_id()
+        TrainingCriteria::new(TrainingOrdering::Values).with_row_addr()
     }
 
     fn query_parser(
