@@ -439,12 +439,19 @@ impl LsmScanPlanner {
                 batch_store,
                 index_store,
                 schema,
+                visible_batch_count,
                 ..
             } => {
                 use crate::dataset::mem_wal::memtable::scanner::MemTableScanner;
 
-                let mut scanner =
-                    MemTableScanner::new(batch_store.clone(), index_store.clone(), schema.clone());
+                // Read the same batches the block lists cover, so every row this arm
+                // returns has its older copies blocked.
+                let mut scanner = MemTableScanner::new_at_readable_count(
+                    batch_store.clone(),
+                    index_store.clone(),
+                    schema.clone(),
+                    *visible_batch_count,
+                );
                 let cols =
                     build_scanner_projection(projection, &self.base_schema, &self.pk_columns);
 
@@ -586,6 +593,7 @@ mod integration_tests {
     use crate::dataset::mem_wal::scanner::LsmScanner;
     use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
     use crate::dataset::mem_wal::scanner::data_source::ShardSnapshot;
+    use crate::dataset::mem_wal::scanner::sstable_cache::RunOnOpen;
     use crate::dataset::mem_wal::write::{BatchStore, IndexStore, MemIndexSpec};
     use crate::dataset::{Dataset, WriteParams};
     use crate::utils::test::assert_plan_node_equals;
@@ -2655,6 +2663,70 @@ mod integration_tests {
             !ids.contains(&1) && !ids.contains(&2),
             "deleted ids must not appear, got {:?}",
             ids
+        );
+    }
+
+    /// A row that becomes visible in the active memtable while a scan is being
+    /// planned must not be returned alongside the older copy it replaces: the
+    /// block lists and the memtable arm read the memtable at one count.
+    #[tokio::test]
+    async fn test_lsm_scan_write_during_planning_returns_key_once() {
+        let schema = create_pk_schema();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp_dir.path().to_str().unwrap());
+        let shard_id = Uuid::new_v4();
+
+        // Gen 1 (SSTable) holds id=1; the active gen 2 holds only id=2.
+        let gen1_uri = format!("{}/_mem_wal/{}/gen_1", base_uri, shard_id);
+        create_dataset(&gen1_uri, vec![create_test_batch(&schema, &[1], "gen1")]).await;
+        let snapshot = ShardSnapshot::new(shard_id)
+            .with_current_generation(2)
+            .with_sstable(1, "gen_1".to_string());
+        let (batch_store, index_store) = pk_indexed(&[create_test_batch(&schema, &[2], "active")]);
+        let memtables = InMemoryMemTables {
+            active: InMemoryMemTableRef {
+                batch_store: batch_store.clone(),
+                index_store: index_store.clone(),
+                schema: schema.clone(),
+                generation: 2,
+            },
+            frozen: vec![],
+        };
+
+        // The concurrent write: a new version of id=1, appended and indexed so
+        // the active memtable's visible count grows mid-plan.
+        let update = create_test_batch(&schema, &[1], "update");
+        let write = {
+            let batch_store = batch_store.clone();
+            let index_store = index_store.clone();
+            move || {
+                let (position, offset, _) = batch_store.append(update.clone()).unwrap();
+                index_store
+                    .insert_with_batch_position(&update, offset, Some(position))
+                    .unwrap();
+            }
+        };
+        let cache = Arc::new(RunOnOpen::new(1, write));
+
+        let batches: Vec<RecordBatch> = LsmScanner::without_base_table(
+            schema.clone(),
+            base_uri,
+            vec![snapshot],
+            vec!["id".to_string()],
+        )
+        .with_in_memory_memtables(shard_id, memtables)
+        .with_sstable_cache(cache.clone())
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+        assert!(cache.has_run(), "the write must land during planning");
+        assert_eq!(
+            collect_sorted_ids(&batches),
+            vec![1, 2],
+            "each key must be returned once"
         );
     }
 }

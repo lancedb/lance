@@ -256,6 +256,7 @@ impl LsmDataSourceCollector {
                 schema: m.schema.clone(),
                 shard_id,
                 generation: LsmGeneration::memtable(m.generation),
+                visible_batch_count: m.index_store.visible_count(),
             })
             .collect()
     }
