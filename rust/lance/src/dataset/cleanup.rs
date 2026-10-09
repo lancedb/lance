@@ -1590,13 +1590,12 @@ impl<'a> CleanupTask<'a> {
                             .await?;
                         let ignored_manifests =
                             final_result.lock().unwrap().removed_manifests.clone();
-                        if let Some(policy) =
-                            build_cleanup_policy_with_concurrency(
-                                &branch_dataset,
-                                branch_dataset.manifest.as_ref(),
-                                Some(delete_concurrency),
-                            )
-                                .await?
+                        if let Some(policy) = build_cleanup_policy_with_concurrency(
+                            &branch_dataset,
+                            branch_dataset.manifest.as_ref(),
+                            Some(delete_concurrency),
+                        )
+                        .await?
                         {
                             let result = cleanup_cascade_branch_run(
                                 &branch_dataset,
@@ -2402,115 +2401,15 @@ mod tests {
     use mock_instant::thread_local::MockClock;
     use object_store::ObjectStoreExt;
     use object_store::memory::InMemory;
-    use object_store::{
-        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, PutMultipartOptions,
-        PutOptions, PutPayload, PutResult,
-    };
+    use object_store::throttle::{ThrottleConfig, ThrottledStore};
     use rstest::rstest;
     use uuid::Uuid;
-
-    #[derive(Debug)]
-    struct ObservedDeleteStore {
-        inner: Arc<dyn object_store::ObjectStore>,
-        active: Arc<AtomicUsize>,
-        peak: Arc<AtomicUsize>,
-    }
-
-    impl std::fmt::Display for ObservedDeleteStore {
-        #[cfg_attr(coverage, coverage(off))]
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(f, "ObservedDeleteStore")
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl object_store::ObjectStore for ObservedDeleteStore {
-        #[cfg_attr(coverage, coverage(off))]
-        async fn put_opts(
-            &self,
-            path: &Path,
-            payload: PutPayload,
-            options: PutOptions,
-        ) -> object_store::Result<PutResult> {
-            self.inner.put_opts(path, payload, options).await
-        }
-
-        #[cfg_attr(coverage, coverage(off))]
-        async fn put_multipart_opts(
-            &self,
-            path: &Path,
-            options: PutMultipartOptions,
-        ) -> object_store::Result<Box<dyn MultipartUpload>> {
-            self.inner.put_multipart_opts(path, options).await
-        }
-
-        #[cfg_attr(coverage, coverage(off))]
-        async fn get_opts(
-            &self,
-            path: &Path,
-            options: GetOptions,
-        ) -> object_store::Result<GetResult> {
-            self.inner.get_opts(path, options).await
-        }
-
-        #[cfg_attr(coverage, coverage(off))]
-        fn delete_stream(
-            &self,
-            paths: BoxStream<'static, object_store::Result<Path>>,
-        ) -> BoxStream<'static, object_store::Result<Path>> {
-            let inner = self.inner.clone();
-            let active = self.active.clone();
-            let peak = self.peak.clone();
-            paths
-                .then(move |path| {
-                    let inner = inner.clone();
-                    let active = active.clone();
-                    let peak = peak.clone();
-                    async move {
-                        let path = path?;
-                        let count = active.fetch_add(1, Ordering::SeqCst) + 1;
-                        peak.fetch_max(count, Ordering::SeqCst);
-                        tokio::time::sleep(Duration::from_millis(100)).await;
-                        let outcome = inner.delete(&path).await;
-                        active.fetch_sub(1, Ordering::SeqCst);
-                        outcome.map(|()| path)
-                    }
-                })
-                .boxed()
-        }
-
-        #[cfg_attr(coverage, coverage(off))]
-        fn list(
-            &self,
-            prefix: Option<&Path>,
-        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
-            self.inner.list(prefix)
-        }
-
-        #[cfg_attr(coverage, coverage(off))]
-        async fn list_with_delimiter(
-            &self,
-            prefix: Option<&Path>,
-        ) -> object_store::Result<ListResult> {
-            self.inner.list_with_delimiter(prefix).await
-        }
-
-        #[cfg_attr(coverage, coverage(off))]
-        async fn copy_opts(
-            &self,
-            from: &Path,
-            to: &Path,
-            options: CopyOptions,
-        ) -> object_store::Result<()> {
-            self.inner.copy_opts(from, to, options).await
-        }
-    }
 
     #[rstest]
     #[case::default(None, None)]
     #[case::serial(Some(1), None)]
     #[case::override_default(Some(4), None)]
-    #[case::with_rate_limit(Some(4), Some(10))]
+    #[case::with_rate_limit(Some(4), Some(2))]
     #[tokio::test(start_paused = true)]
     async fn test_delete_concurrency(
         #[case] concurrency: Option<usize>,
@@ -2541,14 +2440,15 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let active = Arc::new(AtomicUsize::new(0));
-        let peak = Arc::new(AtomicUsize::new(0));
+        let delete_latency = Duration::from_secs(1);
         dataset.object_store = Arc::new(ObjectStore::new(
-            Arc::new(ObservedDeleteStore {
-                inner: memory_store,
-                active: active.clone(),
-                peak: peak.clone(),
-            }),
+            Arc::new(ThrottledStore::new(
+                memory_store,
+                ThrottleConfig {
+                    wait_delete_per_call: delete_latency,
+                    ..Default::default()
+                },
+            )),
             url::Url::parse(&fixture.dataset_path).unwrap(),
             None,
             None,
@@ -2566,25 +2466,28 @@ mod tests {
             ..Default::default()
         };
         let explanation = dataset.cleanup(policy.clone()).explain().await.unwrap();
-        let expected_peak = concurrency
-            .unwrap_or_else(|| dataset.object_store.io_parallelism())
-            .min(explanation.candidate_files.len());
-        assert_eq!(peak.load(Ordering::SeqCst), 0);
+        let window = concurrency.unwrap_or_else(|| dataset.object_store.io_parallelism());
+        let candidate_count = explanation.candidate_files.len();
+        assert!(candidate_count >= window);
+        let expected_duration = delete_latency * candidate_count.div_ceil(window) as u32;
         let start = tokio::time::Instant::now();
         let stats = dataset.cleanup_with_policy(policy).await.unwrap();
+        let elapsed = start.elapsed();
         assert_eq!(stats.old_versions, 2);
         assert_eq!(stats.bytes_removed, explanation.stats.bytes_removed);
         assert_eq!(stats.data_files_removed, 2);
         assert_eq!(stats.failed_deletes, 0);
-        assert_eq!(active.load(Ordering::SeqCst), 0);
-        if rate.is_some() {
-            assert!(peak.load(Ordering::SeqCst) <= concurrency.unwrap());
+        assert!(elapsed >= expected_duration);
+        if let Some(rate) = rate {
             assert!(
-                start.elapsed()
-                    >= Duration::from_millis((explanation.candidate_files.len() as u64 - 1) * 100)
+                elapsed
+                    >= Duration::from_secs_f64((candidate_count - 1) as f64 / rate as f64)
+                        + delete_latency
             );
         } else {
-            assert_eq!(peak.load(Ordering::SeqCst), expected_peak);
+            // Bound both sides of the expected batch duration so serial execution
+            // and an ignored override cannot pass. Allow timer rounding only.
+            assert!(elapsed < expected_duration + Duration::from_millis(50));
         }
         assert_eq!(dataset.scan().try_into_batch().await.unwrap(), expected);
     }
@@ -2702,16 +2605,10 @@ mod tests {
         let policy = build_cleanup_policy_with_concurrency(&branch, &manifest, Some(2))
             .await
             .unwrap();
-        if enabled {
-            let policy = policy.unwrap();
+        assert_eq!(policy.is_some(), enabled);
+        if let Some(policy) = policy {
             assert_eq!(policy.delete_concurrency, Some(2));
             assert_eq!(policy.delete_rate_limit, Some(7));
-        } else {
-            assert!(policy.is_none());
-        }
-        if let Some(policy) =
-            build_cleanup_policy_with_concurrency(&branch, &manifest, Some(2)).await.unwrap()
-        {
             cleanup_cascade_branch_run(
                 &branch,
                 policy,

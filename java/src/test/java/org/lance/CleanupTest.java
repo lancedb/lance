@@ -39,31 +39,6 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class CleanupTest {
   @ParameterizedTest
-  @ValueSource(longs = {1, 4})
-  public void testDeleteConcurrency(long concurrency, @TempDir Path tempDir) {
-    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
-      TestUtils.SimpleTestDataset testDataset =
-          new TestUtils.SimpleTestDataset(allocator, tempDir.resolve("cleanup").toString());
-      testDataset.createEmptyDataset().close();
-      testDataset.write(1, 4).close();
-      try (Dataset dataset = testDataset.write(2, 4)) {
-        CleanupPolicy policy =
-            CleanupPolicy.builder()
-                .withBeforeVersion(3L)
-                .withDeleteConcurrency(concurrency)
-                .build();
-        assertEquals(concurrency, policy.getDeleteConcurrency().get().longValue());
-        CleanupExplanation explanation = dataset.cleanup(policy).explain();
-        assertEquals(3, dataset.listVersions().size());
-        RemovalStats stats = dataset.cleanupWithPolicy(policy);
-        assertEquals(2L, stats.getOldVersions());
-        assertEquals(explanation.getStats().getBytesRemoved(), stats.getBytesRemoved());
-        assertEquals(0L, stats.getFailedDeletes());
-      }
-    }
-  }
-
-  @ParameterizedTest
   @ValueSource(longs = {0, -1})
   public void testInvalidDeleteConcurrency(long concurrency, @TempDir Path tempDir) {
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
@@ -151,7 +126,8 @@ public class CleanupTest {
       testDataset.write(2, 10).close();
 
       try (Dataset dataset = testDataset.write(3, 10)) {
-        CleanupPolicy policy = CleanupPolicy.builder().withBeforeVersion(3L).build();
+        CleanupPolicy policy =
+            CleanupPolicy.builder().withBeforeVersion(3L).withDeleteConcurrency(2L).build();
         CleanupOperation cleanup = dataset.cleanup(policy);
         CleanupExplanation explanation = cleanup.explain();
 
