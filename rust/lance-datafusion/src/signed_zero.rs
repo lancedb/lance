@@ -142,6 +142,8 @@ fn compare_floats<T: ArrowPrimitiveType>(
     let right_is_scalar = right.len() != num_rows;
     let values = if right_is_scalar {
         let right = canonical(right_values[0]);
+        // Without the length check hoisted out of the loop, it does not vectorize.
+        let left_values = &left_values[..num_rows];
         collect_ordering(op, num_rows, |row| {
             canonical(left_values[row]).compare(right)
         })
