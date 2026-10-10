@@ -48,8 +48,9 @@ const FLOAT_COMPARISONS: [Operator; 8] = [
 /// except that the sign of a zero or a NaN does not take part.
 ///
 /// Comparisons against non-NaN literals are rewritten into indexable ranges
-/// instead. This UDF is reserved for column-to-column, computed, and NaN-bound
-/// comparisons, where no range can express the comparison. It clears the sign
+/// instead. This UDF is reserved for column-to-column and NaN-bound comparisons,
+/// where no range can express the comparison, and for volatile operands, which a
+/// range would evaluate twice. It clears the sign
 /// bits in registers while comparing, so it allocates nothing but the result.
 #[derive(Debug, Eq, PartialEq, Hash)]
 struct CompareFloats {
@@ -237,8 +238,9 @@ fn compare_floats_expr(left: Expr, op: Operator, right: Expr) -> Expr {
 ///
 /// The extra NaN range is combined with `AND` for `<`/`<=` and `OR` for `>`/`>=`.
 /// Equality names both encodings because scalar indices key on the bit pattern.
-/// A comparison without a literal runs through an internal UDF that ignores the
-/// sign of zeros and NaNs, preserving payload bits and evaluating each operand once.
+/// A comparison without a literal, against a NaN, or over a volatile operand runs
+/// through an internal UDF that ignores the sign of zeros and NaNs, preserving
+/// payload bits and evaluating each operand once.
 ///
 /// Runs as the last step of [`crate::planner::Planner::optimize_expr`], after
 /// coercion has given the literal the column's type and the simplifier has
@@ -509,15 +511,16 @@ fn rewrite_literal_comparison(
     ) {
         return None;
     }
+    // A range cannot reorder NaN payloads, and its second comparison would
+    // evaluate a volatile operand twice, so compare without the sign instead.
+    if is_nan(value) || other.is_volatile() {
+        return Some(compare_floats_expr(
+            other.clone(),
+            op,
+            Expr::Literal(value.clone(), metadata.cloned()),
+        ));
+    }
     let bound = match (encodings, op) {
-        // A range cannot reorder NaN payloads, so compare without the sign instead.
-        (Some((_, positive)), _) if is_nan(value) => {
-            return Some(compare_floats_expr(
-                other.clone(),
-                op,
-                Expr::Literal(positive, metadata.cloned()),
-            ));
-        }
         (Some((negative, _)), Operator::Lt | Operator::GtEq) => negative,
         (Some((_, positive)), _) => positive,
         (None, _) => value.clone(),
@@ -891,6 +894,20 @@ mod tests {
             rewrite(computed.gt(lit(1.0))),
             primary.or(negative_nan_range)
         );
+    }
+
+    /// The range form names its operand twice, so a volatile one would be drawn
+    /// twice and the two comparisons could see different values.
+    #[rstest]
+    #[case::lt(Operator::Lt, 0.0)]
+    #[case::lt_eq(Operator::LtEq, 1.0)]
+    #[case::gt(Operator::Gt, -0.0)]
+    #[case::gt_eq(Operator::GtEq, 1.0)]
+    fn volatile_operand_is_compared_once(#[case] op: Operator, #[case] bound: f64) {
+        let volatile = datafusion::functions::math::expr_fn::random();
+        let rewritten = rewrite(compare(volatile.clone(), op, lit(bound)));
+        assert_eq!(rewritten, compare_floats_expr(volatile, op, lit(bound)));
+        assert_eq!(rewrite(rewritten.clone()), rewritten);
     }
 
     #[rstest]
