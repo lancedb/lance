@@ -1696,6 +1696,41 @@ mod tests {
         assert_eq!(answers(&reoptimized), answers(&expr), "{reoptimized}");
     }
 
+    /// Aggregate decoding resolves functions through its own consumer, so it has
+    /// to register the internal UDF as well.
+    #[tokio::test]
+    async fn test_substrait_aggregate_decodes_float_sign_rewrites() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Float64, true),
+            Field::new("b", DataType::Float64, true),
+        ]));
+        let planner = crate::planner::Planner::new(schema.clone());
+        let expr = planner
+            .optimize_expr(planner.parse_filter("a = b").unwrap())
+            .unwrap();
+        let bytes = encode_substrait(expr.clone(), schema.clone(), &session_state()).unwrap();
+        let envelope = ExtendedExpression::decode(bytes.as_slice()).unwrap();
+        let Some(ExprType::Expression(grouping)) = envelope.referred_expr[0].expr_type.clone()
+        else {
+            panic!("expected a scalar expression");
+        };
+        let bytes = create_aggregate_plan(
+            vec![],
+            vec![grouping],
+            vec![Grouping {
+                #[allow(deprecated)]
+                grouping_expressions: vec![],
+                expression_references: vec![0],
+            }],
+            envelope.extensions,
+        );
+        let aggregate =
+            crate::substrait::parse_substrait_aggregate(&bytes, schema, &session_state())
+                .await
+                .unwrap();
+        assert_eq!(aggregate.group_by, vec![expr]);
+    }
+
     // ==================== LIKE and starts_with tests ====================
 
     #[tokio::test]

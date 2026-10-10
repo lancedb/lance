@@ -2958,6 +2958,15 @@ mod tests {
             Bound::Excluded(f16_scalar(1.0))
         )
     )]
+    // A two-sided bound needs neither negative-NaN range, so it stays one range.
+    #[case(
+        "temp BETWEEN 1.0 AND 2.5",
+        SargableQuery::Range(Bound::Included(f16_scalar(1.0)), Bound::Included(f16_scalar(2.5)))
+    )]
+    #[case(
+        "temp > 0.0 AND temp < 2.5",
+        SargableQuery::Range(Bound::Excluded(f16_scalar(0.0)), Bound::Excluded(f16_scalar(2.5)))
+    )]
     #[case(
         // Four elements so DataFusion's `ShortenInListSimplifier` leaves the list
         // alone; at three or fewer over a bare column it becomes an `OR` chain and
