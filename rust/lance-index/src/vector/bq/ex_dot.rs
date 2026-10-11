@@ -307,6 +307,30 @@ pub fn ex_dot_kernel(ex_bits: u8) -> ExDotFn {
     KERNELS[usize::from(ex_bits) - 1]
 }
 
+/// Available native kernels for controlled profiling and parity tests.
+pub fn ex_dot_kernel_variants(ex_bits: u8) -> Vec<(&'static str, ExDotFn)> {
+    // `mut` is only exercised on x86_64 where extra kernels may be pushed.
+    #[allow(unused_mut)]
+    let mut kernels = vec![
+        ("scalar", scalar_kernel(ex_bits)),
+        ("dispatched", ex_dot_kernel(ex_bits)),
+    ];
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
+        {
+            kernels.push(("avx2", x86::avx2_kernel(ex_bits)));
+        }
+        if std::arch::is_x86_feature_detected!("avx512f") {
+            kernels.push(("avx512", x86::avx512_baseline_kernel(ex_bits)));
+            if matches!(ex_bits, 2 | 6) {
+                kernels.push(("avx512_four_chain", x86::four_chain_kernel(ex_bits)));
+            }
+        }
+    }
+    kernels
+}
+
 fn select_ex_dot_kernel(ex_bits: u8) -> ExDotFn {
     #[cfg(target_arch = "x86_64")]
     {
@@ -372,12 +396,9 @@ fn ex_dot_scalar<const EX_BITS: u8>(ex_query: &[f32], codes: &[u8]) -> f32 {
     sum
 }
 
-/// `sum_d query[d] * (16 * hi[d] + lo[d])` for one row stored as two 4-bit
-/// blocked planes (`hi` = high nibble, `lo` = low nibble of an 8-bit ex code),
-/// i.e. the 9-bit RaBitQ ex dot product over a `1 + 4 + 4` layered layout.
-///
-/// Both planes use the 4-bit blocked layout of [`ex_dot_kernel`] and must have
-/// the same length; the query must cover a whole number of 64-dim blocks.
+/// Dot product of an `f32` query and full codes stored as high/low blocked
+/// planes. The selected kernel fixes their widths and combines the codes
+/// before accumulation. The query is padded to whole 64-dimensional blocks.
 pub type ExDotLayeredFn = fn(&[f32], &[u8], &[u8]) -> f32;
 
 /// Resolve the layered `4 + 4` dot kernel once.
@@ -386,11 +407,15 @@ pub fn ex_dot_layered_kernel() -> ExDotLayeredFn {
     *KERNEL
 }
 
-/// Fused kernel for a fixed layered index width.
+/// Fused kernel for a layered index with a total width from 3 through 9 bits.
 pub fn ex_dot_prefix_kernel(num_bits: u8) -> ExDotLayeredFn {
     match num_bits {
-        5 => select_prefix_kernel::<2>(),
-        7 => select_prefix_kernel::<4>(),
+        3 => select_prefix_kernel::<1, 1>(),
+        4 => select_prefix_kernel::<2, 1>(),
+        5 => select_prefix_kernel::<2, 2>(),
+        6 => select_prefix_kernel::<4, 1>(),
+        7 => select_prefix_kernel::<4, 2>(),
+        8 => select_prefix_kernel::<4, 3>(),
         9 => ex_dot_layered_kernel(),
         _ => unreachable!("validated layered width"),
     }
@@ -399,71 +424,54 @@ pub fn ex_dot_prefix_kernel(num_bits: u8) -> ExDotLayeredFn {
 /// Available implementations for validating and measuring a fixed prefix layout.
 #[doc(hidden)]
 pub fn ex_dot_prefix_kernel_variants(num_bits: u8) -> Vec<(&'static str, ExDotLayeredFn)> {
-    if num_bits == 9 {
-        return ex_dot_layered_kernel_variants();
-    }
-    let mut variants: Vec<(&'static str, ExDotLayeredFn)> =
-        vec![("dispatched", ex_dot_prefix_kernel(num_bits))];
     match num_bits {
-        5 => variants.push(("scalar", prefix_scalar::<2>)),
-        7 => variants.push(("scalar", prefix_scalar::<4>)),
+        3 => prefix_kernel_variants::<1, 1>(),
+        4 => prefix_kernel_variants::<2, 1>(),
+        5 => prefix_kernel_variants::<2, 2>(),
+        6 => prefix_kernel_variants::<4, 1>(),
+        7 => prefix_kernel_variants::<4, 2>(),
+        8 => prefix_kernel_variants::<4, 3>(),
+        9 => ex_dot_layered_kernel_variants(),
         _ => unreachable!("validated layered width"),
     }
+}
+
+fn prefix_kernel_variants<const H: i32, const L: i32>() -> Vec<(&'static str, ExDotLayeredFn)> {
+    let mut variants: Vec<(&'static str, ExDotLayeredFn)> = vec![
+        ("dispatched", select_prefix_kernel::<H, L>()),
+        ("scalar", prefix_scalar::<H, L>),
+    ];
     #[cfg(target_arch = "x86_64")]
     {
-        if std::arch::is_x86_feature_detected!("avx512vbmi")
+        if L == 2
+            && std::arch::is_x86_feature_detected!("avx512vbmi")
             && std::arch::is_x86_feature_detected!("avx512bw")
             && std::arch::is_x86_feature_detected!("avx512f")
             && std::arch::is_x86_feature_detected!("avx2")
         {
-            variants.push((
-                "avx512-vbmi",
-                if num_bits == 5 {
-                    x86::prefix_vbmi_dispatch::<2>
-                } else {
-                    x86::prefix_vbmi_dispatch::<4>
-                },
-            ));
+            variants.push(("avx512-vbmi", x86::prefix_vbmi_dispatch::<H>));
         }
         if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
         {
-            variants.push((
-                "avx2",
-                if num_bits == 5 {
-                    x86::prefix_avx2_dispatch::<2>
-                } else {
-                    x86::prefix_avx2_dispatch::<4>
-                },
-            ));
+            variants.push(("avx2", x86::prefix_avx2_dispatch::<H, L>));
         }
         if std::arch::is_x86_feature_detected!("avx512f")
             && std::arch::is_x86_feature_detected!("avx2")
         {
-            variants.push((
-                "avx512_two_chain",
-                if num_bits == 5 {
-                    x86::prefix_avx512_two_chain::<2>
-                } else {
-                    x86::prefix_avx512_two_chain::<4>
-                },
-            ));
-            variants.push((
-                "avx512",
-                if num_bits == 5 {
-                    x86::prefix_avx512_dispatch::<2>
-                } else {
-                    x86::prefix_avx512_dispatch::<4>
-                },
-            ));
+            variants.push(("avx512_two_chain", x86::prefix_avx512_two_chain::<H, L>));
+            variants.push(("avx512", x86::prefix_avx512_dispatch::<H, L>));
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    variants.push(("neon", neon::prefix_neon_dispatch::<H, L>));
     variants
 }
 
-fn select_prefix_kernel<const H: u8>() -> ExDotLayeredFn {
+fn select_prefix_kernel<const H: i32, const L: i32>() -> ExDotLayeredFn {
     #[cfg(target_arch = "x86_64")]
     {
-        if std::arch::is_x86_feature_detected!("avx512vbmi")
+        if L == 2
+            && std::arch::is_x86_feature_detected!("avx512vbmi")
             && std::arch::is_x86_feature_detected!("avx512bw")
             && std::arch::is_x86_feature_detected!("avx512f")
             && std::arch::is_x86_feature_detected!("avx2")
@@ -473,39 +481,40 @@ fn select_prefix_kernel<const H: u8>() -> ExDotLayeredFn {
         if std::arch::is_x86_feature_detected!("avx512f")
             && std::arch::is_x86_feature_detected!("avx2")
         {
-            return x86::prefix_avx512_dispatch::<H>;
+            return x86::prefix_avx512_dispatch::<H, L>;
         }
         if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
         {
-            return x86::prefix_avx2_dispatch::<H>;
+            return x86::prefix_avx2_dispatch::<H, L>;
         }
     }
     #[cfg(target_arch = "aarch64")]
     {
-        return neon::prefix_neon_dispatch::<H>;
+        return neon::prefix_neon_dispatch::<H, L>;
     }
     #[allow(unreachable_code)]
-    prefix_scalar::<H>
+    prefix_scalar::<H, L>
 }
 
-fn prefix_scalar<const H: u8>(q: &[f32], hi: &[u8], lo: &[u8]) -> f32 {
+fn prefix_scalar<const H: i32, const L: i32>(q: &[f32], hi: &[u8], lo: &[u8]) -> f32 {
     let mut sum = 0.0;
-    for (block, query) in q.chunks_exact(64).enumerate() {
+    for (block, query) in q.as_chunks::<64>().0.iter().enumerate() {
         let mut high = [0; 64];
         let mut low = [0; 64];
-        unpack_group(2, &lo[block * 16..(block + 1) * 16], &mut low);
-        if H == 2 {
-            unpack_group(2, &hi[block * 16..(block + 1) * 16], &mut high);
-        } else {
-            for run in 0..4 {
-                let mut group = [0; 64];
-                let start = block * 32 + run * 8;
-                unpack_group(4, &hi[start..start + 8], &mut group);
-                high[run * 16..(run + 1) * 16].copy_from_slice(&group[..16]);
+        for (bits, plane, values) in [(H as u8, hi, &mut high), (L as u8, lo, &mut low)] {
+            let block_bytes = 8 * bits as usize;
+            let group_dims = group_dims(bits);
+            let mut group = [0; 64];
+            for (group_codes, values) in plane[block * block_bytes..(block + 1) * block_bytes]
+                .chunks_exact(group_bytes(bits))
+                .zip(values.chunks_exact_mut(group_dims))
+            {
+                unpack_group(bits, group_codes, &mut group);
+                values.copy_from_slice(&group[..group_dims]);
             }
         }
         for i in 0..64 {
-            sum += query[i] * ((high[i] << 2) | low[i]) as f32;
+            sum += query[i] * ((high[i] << L) | low[i]) as f32;
         }
     }
     sum
@@ -566,7 +575,7 @@ fn ex_dot_layered_scalar(ex_query: &[f32], hi: &[u8], lo: &[u8]) -> f32 {
     let mut sum = 0.0f32;
     let mut hi_codes = [0u8; 64];
     let mut lo_codes = [0u8; 64];
-    for (group, query) in ex_query.chunks_exact(16).enumerate() {
+    for (group, query) in ex_query.as_chunks::<16>().0.iter().enumerate() {
         let start = group * LAYERED_GROUP_BYTES;
         if start + LAYERED_GROUP_BYTES > hi.len() {
             break;
@@ -600,6 +609,13 @@ mod x86 {
     }
 
     pub(super) fn avx512_kernel(ex_bits: u8) -> ExDotFn {
+        match ex_bits {
+            2 | 6 => four_chain_kernel(ex_bits),
+            _ => avx512_baseline_kernel(ex_bits),
+        }
+    }
+
+    pub(super) fn avx512_baseline_kernel(ex_bits: u8) -> ExDotFn {
         match ex_bits {
             1 => dot_u1_avx512_dispatch,
             2 => dot_u2_avx512_dispatch,
@@ -882,6 +898,60 @@ mod x86 {
         };
     }
 
+    macro_rules! four_chain_kernel {
+        ($name:ident, $dispatch:ident, $unpack:ident, $bits:expr, $fallback:ident) => {
+            #[target_feature(enable = "avx512f")]
+            unsafe fn $name(query: &[f32], codes: &[u8]) -> f32 {
+                if !query.len().is_multiple_of(64) || codes.len() != query.len() * $bits / 8 {
+                    return unsafe { $fallback(query, codes) };
+                }
+                let mut acc = [_mm512_setzero_ps(); 4];
+                for group in 0..query.len() / 64 {
+                    let runs = unsafe { $unpack(codes.as_ptr().add(group * 8 * $bits)) };
+                    for (run, bytes) in runs.into_iter().enumerate() {
+                        unsafe {
+                            fma16_avx512(
+                                bytes,
+                                query.as_ptr().add(group * 64 + run * 16),
+                                &mut acc[run],
+                            );
+                        }
+                    }
+                }
+                _mm512_reduce_add_ps(_mm512_add_ps(
+                    _mm512_add_ps(acc[0], acc[1]),
+                    _mm512_add_ps(acc[2], acc[3]),
+                ))
+            }
+            fn $dispatch(query: &[f32], codes: &[u8]) -> f32 {
+                // SAFETY: the dispatcher checks AVX-512F first.
+                unsafe { $name(query, codes) }
+            }
+        };
+    }
+    four_chain_kernel!(
+        dot_u2_four_chain,
+        dot_u2_four_chain_dispatch,
+        unpack_u2,
+        2,
+        dot_u2_avx512
+    );
+    four_chain_kernel!(
+        dot_u6_four_chain,
+        dot_u6_four_chain_dispatch,
+        unpack_u6,
+        6,
+        dot_u6_avx512
+    );
+
+    pub(super) fn four_chain_kernel(bits: u8) -> super::ExDotFn {
+        match bits {
+            2 => dot_u2_four_chain_dispatch,
+            6 => dot_u6_four_chain_dispatch,
+            _ => avx512_kernel(bits),
+        }
+    }
+
     x86_dot_kernel!(dot_u1_avx2, dot_u1_avx2_dispatch, unpack_u1, 1, 1);
     x86_dot_kernel!(dot_u2_avx2, dot_u2_avx2_dispatch, unpack_u2, 2, 4);
     x86_dot_kernel!(dot_u3_avx2, dot_u3_avx2_dispatch, unpack_u3, 3, 4);
@@ -946,9 +1016,32 @@ mod x86 {
         ]
     }
 
+    /// Decode one plane block into four runs in natural dimension order.
+    #[inline]
+    #[target_feature(enable = "sse2")]
+    unsafe fn unpack_prefix_plane<const BITS: i32>(ptr: *const u8) -> [__m128i; 4] {
+        match BITS {
+            1 => std::array::from_fn(|run| unsafe { unpack_u1(ptr.add(run * 2))[0] }),
+            2 => unsafe { unpack_u2(ptr) },
+            3 => unsafe { unpack_u3(ptr) },
+            4 => std::array::from_fn(|run| unsafe { unpack_u4(ptr.add(run * 8))[0] }),
+            _ => unreachable!("validated prefix width"),
+        }
+    }
+
     #[inline]
     #[target_feature(enable = "avx2")]
-    unsafe fn unpack_prefix<const H: u8>(hi: *const u8, lo: *const u8) -> [__m128i; 4] {
+    unsafe fn unpack_prefix<const H: i32, const L: i32>(
+        hi: *const u8,
+        lo: *const u8,
+    ) -> [__m128i; 4] {
+        if L != 2 {
+            let high = unsafe { unpack_prefix_plane::<H>(hi) };
+            let low = unsafe { unpack_prefix_plane::<L>(lo) };
+            return std::array::from_fn(|run| {
+                _mm_or_si128(_mm_slli_epi16::<L>(high[run]), low[run])
+            });
+        }
         let low = unsafe { _mm_loadu_si128(lo.cast()) };
         let mask = _mm_set1_epi8(3);
         let lows = [
@@ -985,16 +1078,16 @@ mod x86 {
         std::array::from_fn(|i| _mm_or_si128(highs[i], lows[i]))
     }
     #[target_feature(enable = "avx2,fma")]
-    unsafe fn prefix_avx2<const H: u8>(q: &[f32], hi: &[u8], lo: &[u8]) -> f32 {
+    unsafe fn prefix_avx2<const H: i32, const L: i32>(q: &[f32], hi: &[u8], lo: &[u8]) -> f32 {
         debug_assert_eq!(hi.len(), q.len() * H as usize / 8);
-        debug_assert_eq!(lo.len(), q.len() / 4);
+        debug_assert_eq!(lo.len(), q.len() * L as usize / 8);
         let mut acc = [_mm256_setzero_ps(); 2];
         for block in 0..q.len() / 64 {
             // SAFETY: complete 64-dimensional padded blocks cover both planes.
             let runs = unsafe {
-                unpack_prefix::<H>(
+                unpack_prefix::<H, L>(
                     hi.as_ptr().add(block * H as usize * 8),
-                    lo.as_ptr().add(block * 16),
+                    lo.as_ptr().add(block * L as usize * 8),
                 )
             };
             for (run, codes) in runs.into_iter().enumerate() {
@@ -1003,25 +1096,29 @@ mod x86 {
         }
         unsafe { reduce_add_avx2(acc) }
     }
-    pub(super) fn prefix_avx2_dispatch<const H: u8>(q: &[f32], hi: &[u8], lo: &[u8]) -> f32 {
+    pub(super) fn prefix_avx2_dispatch<const H: i32, const L: i32>(
+        q: &[f32],
+        hi: &[u8],
+        lo: &[u8],
+    ) -> f32 {
         // SAFETY: dispatcher checks CPU features.
-        unsafe { prefix_avx2::<H>(q, hi, lo) }
+        unsafe { prefix_avx2::<H, L>(q, hi, lo) }
     }
     #[target_feature(enable = "avx512f,avx2")]
-    unsafe fn prefix_avx512<const H: u8, const CHAINS: usize>(
+    unsafe fn prefix_avx512<const H: i32, const L: i32, const CHAINS: usize>(
         q: &[f32],
         hi: &[u8],
         lo: &[u8],
     ) -> f32 {
         debug_assert_eq!(hi.len(), q.len() * H as usize / 8);
-        debug_assert_eq!(lo.len(), q.len() / 4);
+        debug_assert_eq!(lo.len(), q.len() * L as usize / 8);
         let mut acc = [_mm512_setzero_ps(); CHAINS];
         for block in 0..q.len() / 64 {
             // SAFETY: complete 64-dimensional padded blocks cover both planes.
             let runs = unsafe {
-                unpack_prefix::<H>(
+                unpack_prefix::<H, L>(
                     hi.as_ptr().add(block * H as usize * 8),
-                    lo.as_ptr().add(block * 16),
+                    lo.as_ptr().add(block * L as usize * 8),
                 )
             };
             for (run, codes) in runs.into_iter().enumerate() {
@@ -1029,7 +1126,13 @@ mod x86 {
                     fma16_avx512(
                         codes,
                         q.as_ptr().add(block * 64 + run * 16),
-                        &mut acc[run % CHAINS],
+                        &mut acc[if CHAINS == 4 {
+                            run
+                        } else if H + L == 4 {
+                            run % 2
+                        } else {
+                            (block + run) % 2
+                        }],
                     )
                 };
             }
@@ -1041,21 +1144,29 @@ mod x86 {
         };
         _mm512_reduce_add_ps(sum)
     }
-    pub(super) fn prefix_avx512_dispatch<const H: u8>(q: &[f32], hi: &[u8], lo: &[u8]) -> f32 {
+    pub(super) fn prefix_avx512_dispatch<const H: i32, const L: i32>(
+        q: &[f32],
+        hi: &[u8],
+        lo: &[u8],
+    ) -> f32 {
         // SAFETY: dispatcher checks CPU features.
         // Match the accumulation order of the equivalent native width.
-        if H == 2 {
-            unsafe { prefix_avx512::<H, 2>(q, hi, lo) }
+        if H + L == 2 || H + L == 6 {
+            unsafe { prefix_avx512::<H, L, 4>(q, hi, lo) }
         } else {
-            unsafe { prefix_avx512::<H, 4>(q, hi, lo) }
+            unsafe { prefix_avx512::<H, L, 2>(q, hi, lo) }
         }
     }
-    pub(super) fn prefix_avx512_two_chain<const H: u8>(q: &[f32], hi: &[u8], lo: &[u8]) -> f32 {
+    pub(super) fn prefix_avx512_two_chain<const H: i32, const L: i32>(
+        q: &[f32],
+        hi: &[u8],
+        lo: &[u8],
+    ) -> f32 {
         // SAFETY: the profiling selector checks the required CPU features.
-        unsafe { prefix_avx512::<H, 2>(q, hi, lo) }
+        unsafe { prefix_avx512::<H, L, 2>(q, hi, lo) }
     }
     #[target_feature(enable = "avx512f,avx512bw,avx512vbmi,avx2")]
-    unsafe fn prefix_vbmi<const H: u8>(q: &[f32], hi: &[u8], lo: &[u8]) -> f32 {
+    unsafe fn prefix_vbmi<const H: i32>(q: &[f32], hi: &[u8], lo: &[u8]) -> f32 {
         debug_assert_eq!(hi.len(), q.len() * H as usize / 8);
         debug_assert_eq!(lo.len(), q.len() / 4);
         // Each word selects one bit field from each of its eight source bytes.
@@ -1137,7 +1248,7 @@ mod x86 {
             ))
         }
     }
-    pub(super) fn prefix_vbmi_dispatch<const H: u8>(q: &[f32], hi: &[u8], lo: &[u8]) -> f32 {
+    pub(super) fn prefix_vbmi_dispatch<const H: i32>(q: &[f32], hi: &[u8], lo: &[u8]) -> f32 {
         // SAFETY: the dispatch and profiling selectors check all required features.
         unsafe { prefix_vbmi::<H>(q, hi, lo) }
     }
@@ -1514,27 +1625,29 @@ mod neon {
         vcombine_u8(dims_0_7, dims_8_15)
     }
 
+    #[inline]
     #[target_feature(enable = "neon")]
-    unsafe fn prefix_neon<const H: u8>(q: &[f32], hi: &[u8], lo: &[u8]) -> f32 {
+    unsafe fn unpack_prefix_plane<const BITS: i32>(ptr: *const u8) -> [uint8x16_t; 4] {
+        match BITS {
+            1 => std::array::from_fn(|run| unsafe { unpack_u1(ptr.add(run * 2))[0] }),
+            2 => unsafe { unpack_u2(ptr) },
+            3 => unsafe { unpack_u3(ptr) },
+            4 => std::array::from_fn(|run| unsafe { unpack_u4(ptr.add(run * 8))[0] }),
+            _ => unreachable!("validated prefix width"),
+        }
+    }
+
+    #[target_feature(enable = "neon")]
+    unsafe fn prefix_neon<const H: i32, const L: i32>(q: &[f32], hi: &[u8], lo: &[u8]) -> f32 {
+        debug_assert_eq!(hi.len(), q.len() * H as usize / 8);
+        debug_assert_eq!(lo.len(), q.len() * L as usize / 8);
         let mut acc = [vdupq_n_f32(0.0); 4];
         for block in 0..q.len() / 64 {
             // SAFETY: each plane stores whole 64-dimensional padded blocks.
-            let low = unsafe { vld1q_u8(lo.as_ptr().add(block * 16)) };
-            let high = if H == 2 {
-                unsafe { vld1q_u8(hi.as_ptr().add(block * 16)) }
-            } else {
-                vdupq_n_u8(0)
-            };
+            let high = unsafe { unpack_prefix_plane::<H>(hi.as_ptr().add(block * H as usize * 8)) };
+            let low = unsafe { unpack_prefix_plane::<L>(lo.as_ptr().add(block * L as usize * 8)) };
             for run in 0..4 {
-                let shift = vdupq_n_s8(-(2 * run as i8));
-                let l = vandq_u8(vshlq_u8(low, shift), vdupq_n_u8(3));
-                let h = if H == 2 {
-                    vandq_u8(vshlq_u8(high, shift), vdupq_n_u8(3))
-                } else {
-                    let packed = unsafe { vld1_u8(hi.as_ptr().add(block * 32 + run * 8)) };
-                    vcombine_u8(vand_u8(packed, vdup_n_u8(15)), vshr_n_u8::<4>(packed))
-                };
-                let codes = vorrq_u8(vshlq_n_u8::<2>(h), l);
+                let codes = vorrq_u8(vshlq_n_u8::<L>(high[run]), low[run]);
                 unsafe { fma16_neon(codes, q.as_ptr().add(block * 64 + run * 16), &mut acc) };
             }
         }
@@ -1543,9 +1656,13 @@ mod neon {
             vaddq_f32(acc[2], acc[3]),
         ))
     }
-    pub(super) fn prefix_neon_dispatch<const H: u8>(q: &[f32], hi: &[u8], lo: &[u8]) -> f32 {
+    pub(super) fn prefix_neon_dispatch<const H: i32, const L: i32>(
+        q: &[f32],
+        hi: &[u8],
+        lo: &[u8],
+    ) -> f32 {
         // SAFETY: NEON is part of the aarch64 baseline.
-        unsafe { prefix_neon::<H>(q, hi, lo) }
+        unsafe { prefix_neon::<H, L>(q, hi, lo) }
     }
 
     #[target_feature(enable = "neon")]
@@ -1604,27 +1721,6 @@ mod tests {
         out
     }
 
-    fn available_kernels(ex_bits: u8) -> Vec<(&'static str, ExDotFn)> {
-        // `mut` is only exercised on x86_64 where extra kernels may be pushed.
-        #[allow(unused_mut)]
-        let mut kernels = vec![
-            ("scalar", scalar_kernel(ex_bits)),
-            ("dispatched", ex_dot_kernel(ex_bits)),
-        ];
-        #[cfg(target_arch = "x86_64")]
-        {
-            if std::arch::is_x86_feature_detected!("avx2")
-                && std::arch::is_x86_feature_detected!("fma")
-            {
-                kernels.push(("avx2", x86::avx2_kernel(ex_bits)));
-            }
-            if std::arch::is_x86_feature_detected!("avx512f") {
-                kernels.push(("avx512", x86::avx512_kernel(ex_bits)));
-            }
-        }
-        kernels
-    }
-
     #[rstest]
     fn test_ex_dot_matches_reference(
         #[values(1, 2, 3, 4, 5, 6, 7, 8)] ex_bits: u8,
@@ -1650,7 +1746,7 @@ mod tests {
         pad_query_into(&query, &mut ex_query);
 
         let tolerance = 1e-3 * expected.abs().max(1.0);
-        for (name, kernel) in available_kernels(ex_bits) {
+        for (name, kernel) in ex_dot_kernel_variants(ex_bits) {
             let actual = kernel(&ex_query, &codes) as f64;
             assert!(
                 (actual - expected).abs() <= tolerance,
@@ -1661,14 +1757,14 @@ mod tests {
 
     #[rstest]
     fn test_prefix_kernels(
-        #[values(5, 7, 9)] bits: u8,
-        #[values(64, 128, 1024, 1536, 2048)] dim: usize,
+        #[values(3, 4, 5, 6, 7, 8, 9)] bits: u8,
+        #[values(7, 64, 72, 128, 1024, 1536, 2048)] dim: usize,
     ) {
         let mut rng = SmallRng::seed_from_u64(1234);
         let layout = crate::vector::bq::layered::RQLayout::try_new(bits).unwrap();
         let mask = ((1u16 << (bits - 1)) - 1) as u8;
         let values: Vec<u8> = (0..dim).map(|_| rng.random::<u8>() & mask).collect();
-        let query: Vec<f32> = (0..dim)
+        let mut query: Vec<f32> = (0..dim)
             .map(|_| rng.random_range(-16..16) as f32 / 16.)
             .collect();
         let high: Vec<u8> = values.iter().map(|v| v >> layout.low_bits).collect();
@@ -1682,6 +1778,7 @@ mod tests {
         pack_blocked_row(&values, bits - 1, &mut packed);
         pack_blocked_row(&high, layout.high_bits, &mut hi);
         pack_blocked_row(&low, layout.low_bits, &mut lo);
+        query.resize(padded_query_len(dim), 0.0);
         let expected = ex_dot_kernel(bits - 1)(&query, &packed);
         for (name, kernel) in ex_dot_prefix_kernel_variants(bits) {
             assert_eq!(
@@ -1693,7 +1790,8 @@ mod tests {
         // Dyadic inputs above mask changes to floating-point reduction order.
         // Dispatched kernels must also match their native-width accumulation
         // for ordinary queries, particularly native u4 versus fused 2+2.
-        let query: Vec<f32> = (0..dim).map(|_| rng.random_range(-1.0..1.0)).collect();
+        let mut query: Vec<f32> = (0..dim).map(|_| rng.random_range(-1.0..1.0)).collect();
+        query.resize(padded_query_len(dim), 0.0);
         assert_eq!(
             ex_dot_prefix_kernel(bits)(&query, &hi, &lo).to_bits(),
             ex_dot_kernel(bits - 1)(&query, &packed).to_bits(),
@@ -1820,7 +1918,7 @@ mod tests {
             let mut ex_query = vec![0.0; padded_query_len(dim)];
             pad_query_into(&query, &mut ex_query);
             let tolerance = 1e-3 * expected.abs().max(1.0);
-            for (name, kernel) in available_kernels(ex_bits) {
+            for (name, kernel) in ex_dot_kernel_variants(ex_bits) {
                 let actual = kernel(&ex_query, &codes) as f64;
                 assert!(
                     (actual - expected).abs() <= tolerance,
