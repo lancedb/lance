@@ -85,6 +85,95 @@ explicitly when writing Blob v2 structs or compacting the mixed column into
 Blob v2 files. Compaction rewrites the selected fragments; it is not required
 to enable new Blob v2 writes.
 
+### Managed objects and client compatibility
+
+Writers store out-of-line Blob v2 payloads in independently named
+`_blobs/<uuid>.blob` objects and publish the Managed Blob reader and writer
+capability on the table. This works with file formats 2.2 and 2.3; it does not
+require choosing 2.3. Clients that do not understand the capability must refuse
+to open a flagged snapshot. Updating an existing table with Blob data files can
+activate it, even if that batch contains only inline values. The capability
+remains set across later writes and restores.
+
+Compaction preserves Managed payload objects and can adopt existing Packed or
+Dedicated sidecars in place. For example, compaction can replace `data/A.lance`
+with `data/B.lance` while B's Managed descriptor records the base and path of
+the existing `data/A/0001.blob`. Cleanup can then delete `data/A.lance` without
+copying or deleting the blob that B still references. The blob's path may retain
+A's name, but resolving and retaining the blob no longer requires A's data file.
+Cleanup retains objects referenced by protected snapshots; a partially live
+packed object is retained as a whole. Blob reads continue to return the same
+bytes. Raw descriptor scans report `kind = 4` for a Managed object relative to
+the data file's table base, or `kind = 5` with an explicit registered base ID.
+The default table base is implicit: moving the complete dataset moves its local
+Managed objects without retaining a URI to the old location. Explicit base IDs
+must already be registered before writing references to them. A shallow clone
+keeps the source table base through its data-file metadata; compaction preserves
+that base when it moves descriptors into new files. A deep clone copies local
+objects at the same relative paths without rewriting their descriptors.
+
+Before activating Managed Blobs on an existing table, upgrade all clients that
+run table maintenance to a version that supports Managed Blobs, or stop their
+maintenance tasks. After activation, all maintenance must use a supporting
+client.
+
+The table flag prevents older clients from opening a flagged snapshot. It does
+not revoke a handle opened before activation or prevent opening an unflagged
+historical snapshot. Older clients, including v11.0.0, can run cleanup through
+these handles without checking the feature flags of the other manifests they
+inspect. Such cleanup can delete adopted sidecars that newer snapshots still
+reference, because it treats the original data file as their owner. The table
+flag therefore does not protect against these old maintenance paths.
+
+### Explicit sharing within a table
+
+Advanced writers can reuse a Managed payload through
+`BlobDescriptorArrayBuilder.append_managed(uri, offset, size, base_id=None)`.
+The builder validates the relative path and range without uploading or copying
+bytes. The new reference becomes live only when the dataset write commits.
+For example, write one payload and append two references to the same bytes:
+
+```python
+import lance
+import pyarrow as pa
+
+schema = pa.schema([lance.blob_field("blob", inline_size_threshold=0)])
+ds = lance.write_dataset(
+    pa.Table.from_arrays([lance.blob_array([b"shared"])], schema=schema),
+    "./shared_blobs.lance",
+    data_storage_version="2.2",
+)
+descriptor = ds.to_table(blob_handling="all_descriptions")["blob"][0].as_py()
+assert descriptor["kind"] == 4  # Relative to this table's primary base.
+
+builder = lance.BlobDescriptorArrayBuilder("blob")
+for _ in range(2):
+    builder.append_managed(
+        descriptor["blob_uri"], descriptor["position"], descriptor["size"]
+    )
+references = pa.Table.from_arrays(
+    [builder.finish()], schema=pa.schema([builder.field])
+)
+ds = lance.write_dataset(references, ds.uri, mode="append")
+assert [data for _, data in ds.read_blobs("blob", indices=range(3))] == [
+    b"shared", b"shared", b"shared"
+]
+```
+
+The three rows share one immutable payload object, including after compaction.
+Cleanup retains the whole object while any retained snapshot references it.
+Keep the source snapshot protected, for example with a tag, until the append
+commits if concurrent updates and cleanup can otherwise retire it. An open
+dataset handle alone does not protect a snapshot from cleanup.
+
+Use references from the same table and preserve their base identity. Kind 5
+descriptors require their registered `blob_id` as `base_id`; for kind 4, the base
+comes from the source data file. The example uses newly written data in the
+table's primary base. Do not copy an implicit reference from a shallow clone's
+source file into a destination with a different base. Cross-table sharing and
+automatic deduplication are outside this API's contract. All maintenance clients
+must support Managed Blobs as described above.
+
 ## Blob v2: Write Patterns
 
 Use `blob_field` and `blob_array` to build blob v2 columns.
@@ -452,7 +541,7 @@ Not every binary column needs to be a blob column. Plain Arrow `binary`/`large_b
 - **Your values are large (roughly 1 MB or more on average).** Operations that rewrite entire rows, such as compaction or some updates, must copy the large inline payloads forward into the new version — even when those bytes never changed. The bigger the payload, the more bytes you rewrite per logical change (write amplification). A blob column keeps large payloads in separate `.blob` files that are referenced rather than re-copied, so these operations don't rewrite the heavy bytes.
 
 !!! tip
-    As a rule of thumb, if average payload size is below a few tens of KB and you only ever read whole values, plain inline binary is fine. Above ~1 MB, or any time you want file-like access, prefer a blob column. Blob v2 also tunes this automatically: by default it keeps payloads under 16 KiB inline, packs mid-sized payloads into shared `.blob` sidecars, and gives payloads over 2 MiB their own dedicated `.blob` file.
+    As a rule of thumb, if average payload size is below a few tens of KB and you only ever read whole values, plain inline binary is fine. Above ~1 MB, or any time you want file-like access, prefer a blob column. Blob v2 also tunes this automatically: by default it keeps payloads up to 64 KiB inline, packs payloads over 64 KiB and up to 4 MiB into shared `.blob` sidecars, and gives payloads over 4 MiB their own dedicated `.blob` file. These thresholds are configurable per column.
 
 ## Troubleshooting
 
