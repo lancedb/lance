@@ -1280,7 +1280,9 @@ impl<'a> RabitDistCalculator<'a> {
                 .min(1.0)
         };
         let errors = values
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .enumerate()
             .map(|(row, b)| {
                 let add_scale = f64::from(self.add_factor_scale).abs();
