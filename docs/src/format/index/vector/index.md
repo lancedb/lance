@@ -444,10 +444,20 @@ if storage_metadata:
 
 Layered storage is opt-in (`layered: true` in `lance:rabit`) and requires a
 reader supporting the layered layout. The default, including missing `layered`,
-is the existing single-plane layout. A layered index supports exactly these
-fixed widths: 5 bits stores sign + 2 + 2, 7 bits stores sign + 4 + 2, and 9 bits
-stores sign + 4 + 4. Widths are derived from `num_bits`; no list of planes is
-persisted. Older readers reject the shorter `__blocked_ex_codes` column with a
+is the existing single-plane layout. A layered index supports every total width
+from 3 through 9 bits, with one sign bit and these fixed high/low widths:
+
+| Total bits | Sign | High | Low |
+| ---------- | ---- | ---- | --- |
+| 3          | 1    | 1    | 1   |
+| 4          | 1    | 2    | 1   |
+| 5          | 1    | 2    | 2   |
+| 6          | 1    | 4    | 1   |
+| 7          | 1    | 4    | 2   |
+| 8          | 1    | 4    | 3   |
+| 9          | 1    | 4    | 4   |
+
+Widths are derived from `num_bits`; no list of planes is persisted. Older readers reject the shorter `__blocked_ex_codes` column with a
 byte-width mismatch instead of decoding it as the full ex code.
 
 The auxiliary file retains its IVF partition row ranges and rotation metadata.
