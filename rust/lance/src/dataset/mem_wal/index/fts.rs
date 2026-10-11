@@ -2537,6 +2537,9 @@ impl FtsMemIndex {
         max_expansions: usize,
         include_tail: bool,
     ) -> Vec<(String, u32)> {
+        if max_expansions == 0 {
+            return Vec::new();
+        }
         let tail_snap = st.tail.snapshot();
         if max_distance == 0 {
             let in_tail = include_tail
@@ -6322,6 +6325,27 @@ mod tests {
                 .search_fuzzy_tokens(&st, &unmatched, Operator::And, Some(1), 0, 50, true)
                 .is_empty()
         );
+    }
+
+    /// AUTO keeps the indexed `xy` exact, and an exact term must still respect
+    /// an exhausted budget: `alpha` spends the single slot, so the conjunction
+    /// cannot be satisfied.
+    #[test]
+    fn test_search_fuzzy_and_zero_distance_term_respects_exhausted_budget() {
+        let schema = create_test_schema();
+        let index = FtsMemIndex::new(1, "description".to_string());
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![0])),
+                Arc::new(StringArray::from(vec!["alpha xy"])),
+            ],
+        )
+        .unwrap();
+        index.insert(&batch, 0).unwrap();
+        let query =
+            FtsQueryExpr::fuzzy_with_options("alpha xy", None, 0, 1).with_operator(Operator::And);
+        assert!(index.search_query(&query).is_empty());
     }
 
     #[test]
