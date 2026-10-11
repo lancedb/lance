@@ -30,6 +30,11 @@
 //! copy lives in an SSTable; cross-tier deduplication is
 //! left to the caller in local mode.
 //!
+//! Fuzzy expansion is also per source: each source spends `max_expansions`
+//! over its own vocabulary, not the union a single merged index would use.
+//! When the cap binds, a source can match rows the merged index would not,
+//! so results may shift as rows flush or compact between tiers.
+//!
 //! Everything here is contained in the `mem_wal` module — it reuses the
 //! existing per-source FTS read paths (`scanner.full_text_search` for
 //! base/SSTable Lance datasets, `MemTableScanner` for the active
