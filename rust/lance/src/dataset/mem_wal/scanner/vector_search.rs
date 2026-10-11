@@ -132,17 +132,14 @@ pub struct LsmVectorSearchPlanner {
     /// generation's `IVF_HNSW_SQ` — and is ignored by an arm whose index is not
     /// a graph. `None` leaves each arm at its own default.
     ef: Option<usize>,
-    /// Refine factor for every approximate-index arm; see
-    /// [`Self::with_refine_factor`].
+    /// See [`Self::with_refine_factor`].
     refine_factor: Option<u32>,
-    /// Multiple of the exact distance every unrefined arm reports; see
-    /// [`Self::with_distance_scale`].
+    /// See [`Self::with_distance_scale`].
     distance_scale: f32,
 }
 
-/// Multiple of the exact distance a flushed generation's index reports. It is
-/// written as `IVF_HNSW_SQ`, which ranks cosine as L2 over normalized vectors,
-/// `2 * (1 - cos)`; the other metrics it ranks on their own scale.
+/// Multiple of the exact distance a flushed generation's `IVF_HNSW_SQ` index
+/// reports: 2 for cosine (L2 over normalized vectors), otherwise 1.
 fn sstable_distance_scale(distance_type: lance_linalg::distance::DistanceType) -> f32 {
     match distance_type {
         lance_linalg::distance::DistanceType::Cosine => 2.0,
@@ -214,27 +211,23 @@ impl LsmVectorSearchPlanner {
         self
     }
 
-    /// Set the refine factor. `Some(rf)` refines the base and SSTable arms by
-    /// `rf`, so every arm reports exact distances. `None` leaves them
-    /// unrefined; see [`Self::with_distance_scale`].
+    /// Refine the base and SSTable arms by `rf` so every arm reports exact
+    /// distances; `None` leaves them unrefined.
     pub fn with_refine_factor(mut self, refine_factor: Option<u32>) -> Self {
         self.refine_factor = refine_factor;
         self
     }
 
-    /// Report unrefined distances as `scale` times the exact distance, which
-    /// lines this plan up with a base search the caller merges it with: Lance
-    /// ranks cosine on SQ and PQ indexes as L2 over normalized vectors, twice
-    /// `1 - cos`. The memtable arm scales its exact distances, and the SSTable
-    /// arms convert from their own index's multiple. The distance range is
-    /// given on the same scale. Ignored when refining. Defaults to `1.0`.
+    /// Report unrefined distances, and take the distance range, as `scale`
+    /// times the exact distance. Cosine SQ/PQ indexes report `2 * (1 - cos)`,
+    /// so `2.0` matches such a base. Ignored when refining; defaults to `1.0`.
     pub fn with_distance_scale(mut self, scale: f32) -> Self {
         self.distance_scale = scale;
         self
     }
 
-    /// The factor that brings an arm reporting `native` times the exact
-    /// distance to the plan's scale.
+    /// Factor from an arm's `native` multiple of the exact distance to the
+    /// plan's scale; `1.0` when refining.
     fn arm_scale(&self, refine_factor: Option<u32>, native: f32) -> f32 {
         match refine_factor {
             Some(_) => 1.0,
@@ -297,10 +290,9 @@ impl LsmVectorSearchPlanner {
     /// * `k` - Number of nearest neighbors to return
     /// * `nprobes` - Exact number of IVF partitions to search (for IVF-based indexes)
     /// * `projection` - Columns to include in output (None = all columns)
-    /// * `refine_base_table` - When true and no refine factor is set, every
-    ///   approximate-index arm re-ranks its candidates with exact distances
-    ///   (refine factor 1), so the base table's are exact too. Auto-enabled
-    ///   whenever a newer generation blocks the base table (see below).
+    /// * `refine_base_table` - When true and no refine factor is set, refine
+    ///   the base and SSTable arms by 1. Auto-enabled when a newer generation
+    ///   blocks the base table.
     /// * `overfetch_factor` - Controls how aggressively sources over-fetch to
     ///   backfill the rows dropped by stale-row filtering. Values below `1.0`
     ///   are rejected; stale filtering is always enabled.
@@ -399,9 +391,8 @@ impl LsmVectorSearchPlanner {
             true, // include _distance — KNN always produces it
         )?;
 
-        // The merge ranks every arm by `_distance`, so all of them must report
-        // on one scale: exact when refining, `distance_scale` when not. A
-        // blocked base over-fetches its approximate candidates, so it refines.
+        // The merge needs every arm on one scale. A blocked base over-fetches
+        // approximate candidates, so it refines.
         // `block_lists` is non-empty exactly when a newer generation exists.
         let has_base = sources
             .iter()
@@ -3446,9 +3437,8 @@ mod tests {
         );
     }
 
-    /// The SSTable arm's `IVF_HNSW_SQ` index ranks cosine as `2 * (1 - cos)` and
-    /// the memtable arm ranks it exactly, so the plan must put both on the
-    /// requested scale or the merge interleaves them wrongly.
+    /// SSTable `IVF_HNSW_SQ` reports cosine as `2 * (1 - cos)` and the memtable
+    /// reports it exactly; both must land on the requested scale.
     #[tokio::test]
     async fn test_vector_search_cosine_arms_share_one_scale() {
         use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};

@@ -48,8 +48,7 @@ struct LsmVectorQuery {
     k: usize,
     /// IVF partition probe bounds for indexed arms.
     probe_bounds: ProbeBounds,
-    /// Refine factor for the approximate-index arms; `None` leaves them on the
-    /// index's native distance scale.
+    /// Refine factor for the base and SSTable arms; `None` leaves them unrefined.
     refine_factor: Option<u32>,
     /// Distance metric; `None` defaults to L2 (matching the unindexed memtable arm).
     metric_type: Option<DistanceType>,
@@ -528,9 +527,8 @@ impl LsmScanner {
         self
     }
 
-    /// Re-rank the approximate-index arms' candidates by exact distance,
-    /// searching `refine_factor` times as many. `0` clears it. No-op unless
-    /// `nearest` was set.
+    /// Re-rank base and SSTable candidates by exact distance over `refine_factor`
+    /// times as many. `0` clears it; no-op unless `nearest` was set.
     pub fn refine(mut self, refine_factor: u32) -> Self {
         if let Some(q) = self.nearest.as_mut() {
             q.refine_factor = (refine_factor > 0).then_some(refine_factor);

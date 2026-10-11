@@ -118,8 +118,7 @@ public class LsmVectorSearchPlanner implements AutoCloseable {
    * @param columns columns to project; pass {@code null} to return all columns plus {@code
    *     _distance}
    * @param refineBaseTable when true, the base-table and SSTable arms re-rank candidates with exact
-   *     distances (refine factor 1), so every arm reports exact distances. Auto-enabled whenever
-   *     stale filtering is on (see {@code overfetchFactor}).
+   *     distances. Auto-enabled when a newer generation blocks the base table.
    * @param overfetchFactor over-fetch multiple for sources with rows superseded by newer
    *     generations. Must be at least {@code 1.0}:
    *     <ul>

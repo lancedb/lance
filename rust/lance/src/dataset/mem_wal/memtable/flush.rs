@@ -1878,9 +1878,8 @@ mod tests {
         );
     }
 
-    /// A flushed cosine index must hold normalized vectors: its search
-    /// normalizes the query and ranks by L2, which only tracks cosine when the
-    /// stored side is normalized too.
+    /// A flushed cosine index ranks L2 against a normalized query, so it must
+    /// store normalized vectors.
     #[tokio::test]
     async fn test_flusher_cosine_index_ranks_unnormalized_vectors() {
         use super::super::super::index::IndexStore;

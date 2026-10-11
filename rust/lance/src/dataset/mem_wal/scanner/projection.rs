@@ -218,8 +218,8 @@ pub fn canonical_output_schema(
     Ok(Arc::new(Schema::new(fields)))
 }
 
-/// Wrap `plan` so `_distance` is multiplied by `factor`; all other columns are
-/// forwarded unchanged. A no-op when `factor` is `1.0`.
+/// Multiply `plan`'s `_distance` by `factor`, forwarding other columns; no-op
+/// at `1.0`.
 pub fn scale_distance(plan: Arc<dyn ExecutionPlan>, factor: f32) -> Result<Arc<dyn ExecutionPlan>> {
     if factor == 1.0 {
         return Ok(plan);
