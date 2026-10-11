@@ -13,15 +13,20 @@ pub struct RQLayout {
 }
 
 impl RQLayout {
-    /// Resolve the only supported layered layouts: 1+2+2, 1+4+2 and 1+4+4.
+    /// Resolve a sign/high/low layout for a total width from 3 through 9 bits.
+    /// High uses 1, 2 or 4 bits; low holds the remaining full-code bits.
     pub fn try_new(num_bits: u8) -> Result<Self> {
         let (high_bits, low_bits) = match num_bits {
+            3 => (1, 1),
+            4 => (2, 1),
             5 => (2, 2),
+            6 => (4, 1),
             7 => (4, 2),
+            8 => (4, 3),
             9 => (4, 4),
             _ => {
                 return Err(Error::invalid_input(format!(
-                    "IVF_RQ layered requires num_bits=5, 7 or 9, got {num_bits}"
+                    "IVF_RQ layered requires num_bits in 3..=9, got {num_bits}"
                 )));
             }
         };
@@ -319,10 +324,18 @@ mod tests {
     use rstest::rstest;
 
     #[rstest]
+    #[case::rq3_l2(3, DistanceType::L2)]
+    #[case::rq4_l2(4, DistanceType::L2)]
     #[case::rq5_l2(5, DistanceType::L2)]
+    #[case::rq6_l2(6, DistanceType::L2)]
+    #[case::rq8_l2(8, DistanceType::L2)]
     #[case::rq7_l2(7, DistanceType::L2)]
     #[case::rq9_l2(9, DistanceType::L2)]
+    #[case::rq3_dot(3, DistanceType::Dot)]
+    #[case::rq4_dot(4, DistanceType::Dot)]
     #[case::rq5_dot(5, DistanceType::Dot)]
+    #[case::rq6_dot(6, DistanceType::Dot)]
+    #[case::rq8_dot(8, DistanceType::Dot)]
     #[case::rq7_dot(7, DistanceType::Dot)]
     #[case::rq9_dot(9, DistanceType::Dot)]
     fn layered_roundtrip_and_levels(
@@ -669,18 +682,17 @@ mod tests {
     }
 
     #[rstest]
-    #[case(1)]
-    #[case(2)]
-    #[case(3)]
-    #[case(4)]
-    #[case(6)]
-    #[case(8)]
+    #[case::zero(0)]
+    #[case::sign_only(1)]
+    #[case::no_low_plane(2)]
+    #[case::too_wide(10)]
+    #[case::maximum(255)]
     fn rejects_unsupported_layout(#[case] bits: u8) {
+        let error = RQLayout::try_new(bits).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
         assert!(
-            RQLayout::try_new(bits)
-                .unwrap_err()
-                .to_string()
-                .contains("requires num_bits=5, 7 or 9")
+            error.to_string().contains("requires num_bits in 3..=9"),
+            "{error}"
         );
     }
 }

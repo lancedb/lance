@@ -7582,9 +7582,13 @@ mod tests {
     }
 
     #[rstest]
-    #[case(5)]
-    #[case(7)]
-    #[case(9)]
+    #[case::rq3(3)]
+    #[case::rq4(4)]
+    #[case::rq5(5)]
+    #[case::rq6(6)]
+    #[case::rq7(7)]
+    #[case::rq8(8)]
+    #[case::rq9(9)]
     #[tokio::test]
     async fn test_layered_rq_create_search_cascade_and_remap(
         #[case] bits: u8,
@@ -8690,6 +8694,7 @@ mod tests {
             upper_bound: None,
             minimum_nprobes: num_partitions,
             maximum_nprobes: Some(num_partitions),
+            search_effort: 0.5,
             ef: None,
             refine_factor: None,
             metric_type: Some(DistanceType::L2),

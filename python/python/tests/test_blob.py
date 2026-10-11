@@ -1991,6 +1991,117 @@ def test_blob_extension_add_columns_all_nulls_blob_v2(tmp_path):
     assert [data for _, _, data in ranges] == [None] * 4
 
 
+@pytest.mark.parametrize("version", ["2.2", "2.3"])
+@pytest.mark.parametrize("nested", [False, True], ids=["top_level", "struct"])
+def test_prepared_managed_blob_sharing_lifecycle(tmp_path, version, nested):
+    dataset_uri = tmp_path / "shared.lance"
+
+    def table(ids, field, values):
+        if nested:
+            values = pa.StructArray.from_arrays([values], fields=[field])
+            field = pa.field(
+                "value", values.type, metadata={b"example:type": b"opaque"}
+            )
+        return pa.Table.from_arrays(
+            [pa.array(ids, type=pa.int64()), values],
+            schema=pa.schema([pa.field("id", pa.int64()), field]),
+        )
+
+    initial = table(
+        [0],
+        lance.blob_field("blob", inline_size_threshold=0),
+        lance.blob_array([b"shared"]),
+    )
+    ds = lance.write_dataset(initial, dataset_uri, data_storage_version=version)
+    blob_column = "value.blob" if nested else "blob"
+    row = ds.to_table(blob_handling="all_descriptions").to_pylist()[0]
+    descriptor = (row["value"] if nested else row)["blob"]
+    assert descriptor["kind"] == 4
+    payload_files = set(dataset_uri.glob("_blobs/*.blob"))
+    assert len(payload_files) == 1
+
+    builder = lance.BlobDescriptorArrayBuilder("blob")
+    builder.append_managed(
+        descriptor["blob_uri"], descriptor["position"], descriptor["size"]
+    )
+    builder.append_managed(descriptor["blob_uri"], descriptor["position"] + 1, 3)
+    builder.append_null()
+    ds = lance.write_dataset(
+        table([1, 2, 3], builder.field, builder.finish()), dataset_uri, mode="append"
+    )
+    assert len(ds.get_fragments()) == 2
+    assert [data for _, data in ds.read_blobs(blob_column, indices=range(4))] == [
+        b"shared",
+        b"shared",
+        b"har",
+        None,
+    ]
+    assert set(dataset_uri.glob("_blobs/*.blob")) == payload_files
+
+    ds.optimize.compact_files()
+    assert len(ds.get_fragments()) == 1
+    ds.delete("id = 0")
+    ds.cleanup_old_versions(retain_versions=1, delete_unverified=True)
+    assert [data for _, data in ds.read_blobs(blob_column, indices=range(3))] == [
+        b"shared",
+        b"har",
+        None,
+    ]
+    assert set(dataset_uri.glob("_blobs/*.blob")) == payload_files
+    if nested:
+        assert ds.schema.field("value").metadata == {b"example:type": b"opaque"}
+
+    protected_version = ds.version
+    ds.tags.create("shared", protected_version)
+    ds.delete("id < 3")
+    ds.cleanup_old_versions(
+        retain_versions=1, delete_unverified=True, error_if_tagged_old_versions=False
+    )
+    protected = lance.dataset(dataset_uri, version=protected_version)
+    assert protected.take_blobs(blob_column, indices=[0])[0].readall() == b"shared"
+    assert set(dataset_uri.glob("_blobs/*.blob")) == payload_files
+
+    ds.tags.delete("shared")
+    ds.cleanup_old_versions(retain_versions=1, delete_unverified=True)
+    assert not list(dataset_uri.glob("_blobs/*.blob"))
+    assert ds.take_blobs(blob_column, indices=[0]) == [None]
+
+
+@pytest.mark.parametrize("base_id", [None, 7])
+def test_blob_descriptor_array_builder_managed(base_id):
+    builder = lance.BlobDescriptorArrayBuilder("blob")
+    builder.append_managed("_blobs/existing.blob", 10, 0, base_id=base_id)
+    assert builder.finish().to_pylist() == [
+        {
+            "kind": 4 if base_id is None else 5,
+            "data": None,
+            "uri": "_blobs/existing.blob",
+            "blob_id": base_id,
+            "blob_size": 0,
+            "position": 10,
+        }
+    ]
+    with pytest.raises(ValueError, match="already finished"):
+        builder.append_managed("_blobs/existing.blob", 0, 1)
+
+
+@pytest.mark.parametrize(
+    "uri,offset,size,message",
+    [
+        ("../outside.blob", 0, 1, "canonical relative object path"),
+        ("s3://bucket/object", 0, 1, "canonical relative object path"),
+        ("_blobs/existing.blob", 2**64 - 1, 1, "overflows u64"),
+    ],
+)
+def test_blob_descriptor_array_builder_rejects_invalid_managed(
+    uri, offset, size, message
+):
+    builder = lance.BlobDescriptorArrayBuilder("blob")
+    with pytest.raises(ValueError, match=message):
+        builder.append_managed(uri, offset, size)
+    assert len(builder.finish()) == 0
+
+
 def test_blob_descriptor_array_builder_writes_prepared_packed_blob_for_data_replacement(
     tmp_path,
 ):

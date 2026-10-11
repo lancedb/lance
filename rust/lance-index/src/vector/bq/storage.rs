@@ -78,11 +78,10 @@ pub const RABIT_EX_CODE_COLUMN: &str = "__ex_codes";
 /// older versions, which fail with a missing-column error instead of
 /// misinterpreting the bytes.
 pub const RABIT_BLOCKED_EX_CODE_COLUMN: &str = "__blocked_ex_codes";
-/// Low-nibble plane of a layered `1 + 4 + 4` 9-bit index. When present,
-/// [`RABIT_BLOCKED_EX_CODE_COLUMN`] holds the high nibble of every 8-bit ex
-/// code in the 4-bit blocked layout and this column holds the low nibble, so
-/// the index can be searched at 5 bits (sign + high plane) or at the full 9
-/// bits (both planes) without storing the codes twice.
+/// Low-bit plane of a layered index. [`RABIT_BLOCKED_EX_CODE_COLUMN`] holds
+/// the high bits; their widths come from [`super::layered::RQLayout`]. High
+/// precision omits this plane, while full precision combines both planes
+/// without storing the full codes twice.
 pub const RABIT_BLOCKED_EX_CODE_LO_COLUMN: &str = "__blocked_ex_codes_lo";
 pub const SEGMENT_LENGTH: usize = 4;
 pub const SEGMENT_NUM_CODES: usize = 1 << SEGMENT_LENGTH;
@@ -509,7 +508,7 @@ pub struct RabitQuantizationStorage {
     // sequential column with the repacked one, so rewrites emit the blocked
     // format).
     ex_codes: Option<FixedSizeListArray>,
-    // low-nibble plane of a layered 9-bit index (see RABIT_BLOCKED_EX_CODE_LO_COLUMN)
+    // Low-bit plane of a layered index (see RABIT_BLOCKED_EX_CODE_LO_COLUMN).
     ex_codes_lo: Option<FixedSizeListArray>,
     packed_ex_codes: Option<FixedSizeListArray>,
     ex_add_factors: Option<Float32Array>,
@@ -914,8 +913,10 @@ impl RabitQuantizationStorage {
                 super::layered::RQPrecision::Sign => (1, None, None, None, None, None),
                 super::layered::RQPrecision::High => (
                     match self.metadata.num_bits {
-                        5 => 3,
-                        _ => 5,
+                        3 => 2,
+                        4 | 5 => 3,
+                        6..=9 => 5,
+                        _ => unreachable!("validated layered width"),
                     },
                     ex_codes,
                     None,
@@ -1180,10 +1181,10 @@ pub struct RabitDistCalculator<'a> {
     query_estimator: RabitQueryEstimator,
     // n * d / 8 binary-code bytes
     codes: &'a [u8],
-    // per-row ex codes in the blocked kernel layout (the high nibble plane
+    // per-row ex codes in the blocked kernel layout (the high-bit plane
     // for a layered index)
     ex_codes: Option<&'a [u8]>,
-    // low nibble plane of a layered 9-bit index, same row width as `ex_codes`
+    // Low-bit plane; its row width is the full width minus `ex_code_len`.
     ex_codes_lo: Option<&'a [u8]>,
     // bytes per ex-code row; legacy rows for layout-compatible widths may be
     // shorter than the blocked size, which the kernels treat as zero padding
@@ -1390,11 +1391,9 @@ impl<'a> RabitDistCalculator<'a> {
     fn ex_code_dot(&self, ex_codes: &[u8], id: usize) -> f32 {
         let row = id * self.ex_code_len..(id + 1) * self.ex_code_len;
         if let (Some(ex_codes_lo), Some(ex_dot_layered)) = (self.ex_codes_lo, self.ex_dot_layered) {
-            let lo_bits = match self.num_bits {
-                9 => 4,
-                _ => 2,
-            };
-            let lo_len = blocked_ex_code_bytes(self.dim, lo_bits);
+            // Both planes pad to the same 64-dimensional boundary, so their
+            // row widths add up to the native full-code row width.
+            let lo_len = blocked_ex_code_bytes(self.dim, self.num_bits - 1) - self.ex_code_len;
             return ex_dot_layered(
                 self.ex_query.as_ref(),
                 &ex_codes[row],
@@ -2305,10 +2304,10 @@ fn blocked_ex_codes_from_sequential(
     )?)
 }
 
-/// Load the ex-code planes of an index batch. A layered `1 + 4 + 4` batch
-/// carries [`RABIT_BLOCKED_EX_CODE_LO_COLUMN`]; then both planes are 4-bit
-/// blocked rows and the metadata must say 9 bits. Otherwise this is
-/// [`load_blocked_ex_codes`] with no low plane.
+/// Load the ex-code planes of an index batch. A layered batch carries
+/// [`RABIT_BLOCKED_EX_CODE_LO_COLUMN`]; both blocked plane widths are derived
+/// from its total bit width. Otherwise this is [`load_blocked_ex_codes`] with
+/// no low plane.
 pub(crate) fn load_ex_code_planes(
     batch: RecordBatch,
     rotated_dim: usize,

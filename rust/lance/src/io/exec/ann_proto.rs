@@ -97,6 +97,7 @@ fn approx_mode_from_proto(value: i32) -> ApproxMode {
 }
 
 pub fn query_to_proto(query: &Query) -> Result<pb::VectorQueryProto> {
+    query.validate_search_effort()?;
     let query_vector_arrow_ipc = query_vector_to_ipc_bytes(query.key.as_ref())?;
 
     let metric_type = query
@@ -111,6 +112,7 @@ pub fn query_to_proto(query: &Query) -> Result<pb::VectorQueryProto> {
         upper_bound: query.upper_bound,
         minimum_nprobes: Some(query.minimum_nprobes as u32),
         maximum_nprobes: query.maximum_nprobes.map(|n| n as u32),
+        search_effort: (query.search_effort != 0.5).then_some(query.search_effort),
         ef: query.ef.map(|n| n as u32),
         refine_factor: query.refine_factor,
         metric_type,
@@ -143,7 +145,7 @@ pub fn query_from_proto(proto: pb::VectorQueryProto) -> Result<Query> {
         })
         .transpose()?;
 
-    Ok(Query {
+    let query = Query {
         rq_cascade_factor: proto.rq_cascade_factor,
         column: proto.column,
         key,
@@ -152,6 +154,7 @@ pub fn query_from_proto(proto: pb::VectorQueryProto) -> Result<Query> {
         upper_bound: proto.upper_bound,
         minimum_nprobes: proto.minimum_nprobes.unwrap_or(1) as usize,
         maximum_nprobes: proto.maximum_nprobes.map(|n| n as usize),
+        search_effort: proto.search_effort.unwrap_or(0.5),
         ef: proto.ef.map(|n| n as usize),
         refine_factor: proto.refine_factor,
         metric_type,
@@ -164,7 +167,9 @@ pub fn query_from_proto(proto: pb::VectorQueryProto) -> Result<Query> {
         } else {
             proto.rq_precision.parse()?
         },
-    })
+    };
+    query.validate_search_effort()?;
+    Ok(query)
 }
 
 // =============================================================================
@@ -352,12 +357,15 @@ mod tests {
         assert_eq!(arr.len(), back.len());
     }
 
-    #[test]
-    fn test_query_roundtrip() {
+    #[rstest::rstest]
+    fn test_query_roundtrip(
+        #[values(0.0, 0.25, 0.5, 0.75, 1.0)] effort: f64,
+        #[values("sign", "high", "full")] precision: &str,
+    ) {
         let key: ArrayRef = Arc::new(Float32Array::from(vec![0.1, 0.2, 0.3]));
         let query = Query {
-            rq_cascade_factor: None,
-            rq_precision: Default::default(),
+            rq_cascade_factor: (precision == "full").then_some(8),
+            rq_precision: precision.parse().unwrap(),
             column: "vector".to_string(),
             key,
             k: 10,
@@ -365,6 +373,7 @@ mod tests {
             upper_bound: Some(1.5),
             minimum_nprobes: 4,
             maximum_nprobes: Some(16),
+            search_effort: effort,
             ef: Some(64),
             refine_factor: Some(2),
             metric_type: Some(DistanceType::Cosine),
@@ -375,7 +384,11 @@ mod tests {
         };
 
         let proto = query_to_proto(&query).unwrap();
-        let back = query_from_proto(proto).unwrap();
+        assert_eq!(proto.search_effort, (effort != 0.5).then_some(effort));
+        // Exercise field numbers as well as the in-memory conversion.
+        let bytes = prost::Message::encode_to_vec(&proto);
+        let decoded = <pb::VectorQueryProto as prost::Message>::decode(bytes.as_slice()).unwrap();
+        let back = query_from_proto(decoded).unwrap();
 
         assert_eq!(query.column, back.column);
         assert_eq!(query.k, back.k);
@@ -383,6 +396,9 @@ mod tests {
         assert_eq!(query.upper_bound, back.upper_bound);
         assert_eq!(query.minimum_nprobes, back.minimum_nprobes);
         assert_eq!(query.maximum_nprobes, back.maximum_nprobes);
+        assert_eq!(query.search_effort, back.search_effort);
+        assert_eq!(query.rq_precision, back.rq_precision);
+        assert_eq!(query.rq_cascade_factor, back.rq_cascade_factor);
         assert_eq!(query.ef, back.ef);
         assert_eq!(query.refine_factor, back.refine_factor);
         assert_eq!(query.metric_type, back.metric_type);
@@ -407,6 +423,7 @@ mod tests {
             upper_bound: None,
             minimum_nprobes: 1,
             maximum_nprobes: None,
+            search_effort: 0.5,
             ef: None,
             refine_factor: None,
             metric_type: None,
@@ -421,6 +438,21 @@ mod tests {
         assert!(back.metric_type.is_none());
         assert!(!back.use_index);
         assert_eq!(back.approx_mode, ApproxMode::Normal);
+        assert_eq!(back.search_effort, 0.5);
+
+        for effort in [-0.1, 1.1, f64::NAN, f64::INFINITY] {
+            let mut proto = query_to_proto(&query).unwrap();
+            proto.search_effort = Some(effort);
+            let error = query_from_proto(proto).unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }));
+            assert!(error.to_string().contains("search_effort"));
+        }
+        let mut proto = query_to_proto(&query).unwrap();
+        proto.maximum_nprobes = proto.minimum_nprobes;
+        proto.search_effort = Some(0.75);
+        let back = query_from_proto(proto).unwrap();
+        assert_eq!(back.search_effort, 0.75);
+        assert_eq!(back.maximum_nprobes, Some(back.minimum_nprobes));
 
         let mut proto = query_to_proto(&query).unwrap();
         proto.approx_mode = i32::MAX;
@@ -487,6 +519,7 @@ mod tests {
             upper_bound: None,
             minimum_nprobes: 2,
             maximum_nprobes: Some(4),
+            search_effort: 0.5,
             ef: None,
             refine_factor: Some(2),
             metric_type: Some(DistanceType::L2),
@@ -537,6 +570,7 @@ mod tests {
             upper_bound: None,
             minimum_nprobes: 2,
             maximum_nprobes: Some(4),
+            search_effort: 0.5,
             ef: None,
             refine_factor: Some(2),
             metric_type: Some(DistanceType::L2),
@@ -603,6 +637,7 @@ mod tests {
             upper_bound: None,
             minimum_nprobes: 2,
             maximum_nprobes: None,
+            search_effort: 0.5,
             ef: None,
             refine_factor: None,
             metric_type: Some(DistanceType::L2),
