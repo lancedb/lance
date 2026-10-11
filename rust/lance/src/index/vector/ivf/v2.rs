@@ -7373,6 +7373,7 @@ mod tests {
 
         fn full_query(key: ArrayRef) -> Query {
             Query {
+                search_effort: 0.5,
                 column: "vector".to_string(),
                 key,
                 k: K,
