@@ -853,6 +853,8 @@ pub fn try_variable_width_per_value(
     let data_size = data.expect_single_stat::<UInt64Type>(Stat::DataSize);
     let per_value_requested = compression.is_some_and(|compression| compression != "fsst");
     if (max_len > 32 * 1024 || per_value_requested) && data_size >= FSST_LEAST_INPUT_SIZE as u64 {
+        // FSST uses a dedicated encoder and cannot be a general buffer compressor.
+        // Keep the existing default fallback when large values request FSST.
         if let Some(compression) = compression.filter(|compression| *compression != "fsst") {
             let config = CompressionConfig::new(compression.parse()?, params.compression_level);
             return Ok(Some(Box::new(CompressedBufferEncoder::try_new(config)?)));
