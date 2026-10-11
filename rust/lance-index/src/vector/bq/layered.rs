@@ -13,15 +13,20 @@ pub struct RQLayout {
 }
 
 impl RQLayout {
-    /// Resolve the only supported layered layouts: 1+2+2, 1+4+2 and 1+4+4.
+    /// Resolve a sign/high/low layout for a total width from 3 through 9 bits.
+    /// High uses 1, 2 or 4 bits; low holds the remaining full-code bits.
     pub fn try_new(num_bits: u8) -> Result<Self> {
         let (high_bits, low_bits) = match num_bits {
+            3 => (1, 1),
+            4 => (2, 1),
             5 => (2, 2),
+            6 => (4, 1),
             7 => (4, 2),
+            8 => (4, 3),
             9 => (4, 4),
             _ => {
                 return Err(Error::invalid_input(format!(
-                    "IVF_RQ layered requires num_bits=5, 7 or 9, got {num_bits}"
+                    "IVF_RQ layered requires num_bits in 3..=9, got {num_bits}"
                 )));
             }
         };
