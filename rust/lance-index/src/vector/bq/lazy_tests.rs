@@ -670,7 +670,10 @@ fn legal_thresholds(rng: &mut SplitMix64) -> [Threshold; 5] {
 /// lower bounds bit for bit, across SIMD block boundaries, padded dims, every
 /// layered width, both LUT precisions and the exact-dequantization fallback.
 #[rstest]
-fn sign_stage_matches_full_store(#[values(64, 96, 1024)] dim: usize, #[values(5, 7, 9)] bits: u8) {
+fn sign_stage_matches_full_store(
+    #[values(64, 96, 1024)] dim: usize,
+    #[values(3, 4, 5, 6, 7, 8, 9)] bits: u8,
+) {
     const ROWS: [usize; 14] = [0, 1, 5, 15, 16, 17, 31, 32, 33, 63, 64, 65, 100, 2158];
     let mut rng = SplitMix64(dim as u64 * 131 + bits as u64);
     let fixture = Fixture::new(dim, bits, DistanceType::L2, &mut rng);
@@ -766,7 +769,7 @@ fn sign_stage_matches_full_store(#[values(64, 96, 1024)] dim: usize, #[values(5,
 /// eager heap and prune counters bit for bit.
 #[rstest]
 fn lazy_replay_equals_dense_heap(
-    #[values(5, 7, 9)] bits: u8,
+    #[values(3, 4, 5, 6, 7, 8, 9)] bits: u8,
     #[values(DistanceType::L2, DistanceType::Dot, DistanceType::Cosine)] metric: DistanceType,
 ) {
     const SEEDS: u64 = 200;

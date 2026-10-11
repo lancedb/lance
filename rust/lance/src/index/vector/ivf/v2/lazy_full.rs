@@ -126,7 +126,7 @@ struct LazySignProbe<S: IvfSubIndex, Q: Quantization> {
 
 /// A probe ready for scoring.
 enum LazyProbe<S: IvfSubIndex, Q: Quantization> {
-    Eager(PreparedPartitionSearch<S, Q>),
+    Eager(Box<PreparedPartitionSearch<S, Q>>),
     Empty,
     Ready(Box<LazyReadyProbe<S, Q>>),
 }
@@ -748,13 +748,13 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IVFIndex<S, Q> {
         context: &LazyFetchContext,
     ) -> Result<LazyProbe<S, Q>> {
         let probe = match staged {
-            LazyStaged::Eager(prepared) => return Ok(LazyProbe::Eager(prepared)),
+            LazyStaged::Eager(prepared) => return Ok(LazyProbe::Eager(Box::new(prepared))),
             LazyStaged::Empty => return Ok(LazyProbe::Empty),
             LazyStaged::GatingOff {
                 partition_id,
                 query,
             } => {
-                return Ok(LazyProbe::Eager(
+                return Ok(LazyProbe::Eager(Box::new(
                     self.prepare_partition_without_prefilter_wait(
                         partition_id,
                         &query,
@@ -763,7 +763,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IVFIndex<S, Q> {
                         context.raw_query_context.clone(),
                     )
                     .await?,
-                ));
+                )));
             }
             LazyStaged::Lazy(probe) => *probe,
         };
@@ -941,7 +941,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IVFIndex<S, Q> {
                     Self::accumulate_prepared_partition_search(
                         scorer.use_query_residual,
                         scorer.use_residual_scratch,
-                        prepared,
+                        *prepared,
                         heap,
                         scratch,
                         scorer.metrics.as_ref(),
