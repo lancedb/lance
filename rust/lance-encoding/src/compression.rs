@@ -853,8 +853,8 @@ pub fn try_variable_width_per_value(
     let data_size = data.expect_single_stat::<UInt64Type>(Stat::DataSize);
     let per_value_requested = compression.is_some_and(|compression| compression != "fsst");
     if (max_len > 32 * 1024 || per_value_requested) && data_size >= FSST_LEAST_INPUT_SIZE as u64 {
-        if compression == Some("zstd") {
-            let config = CompressionConfig::new(CompressionScheme::Zstd, params.compression_level);
+        if let Some(compression) = compression.filter(|compression| *compression != "fsst") {
+            let config = CompressionConfig::new(compression.parse()?, params.compression_level);
             return Ok(Some(Box::new(CompressedBufferEncoder::try_new(config)?)));
         }
         return Ok(Some(Box::new(CompressedBufferEncoder::default())));
@@ -1933,6 +1933,7 @@ mod tests {
     use crate::buffer::LanceBuffer;
     use crate::compression_config::CompressionParams;
     use crate::data::{BlockInfo, DataBlock, FixedWidthDataBlock};
+    use crate::encodings::logical::primitive::fullzip::PerValueDataBlock;
     use crate::encodings::logical::primitive::miniblock::MiniBlockCompressionContext;
     use crate::format::ProtobufUtils21;
     use crate::statistics::ComputeStat;
@@ -2580,6 +2581,42 @@ mod tests {
             debug.contains("ZstdBufferCompressor") && debug.contains("compression_level: 19"),
             "expected zstd level 19 to reach the per-value compressor, got: {debug}"
         );
+    }
+
+    #[rstest::rstest]
+    #[cfg(feature = "lz4")]
+    #[case(32, 4096)]
+    #[case(64, 4096)]
+    #[case(32, 40 * 1024)]
+    #[case(64, 40 * 1024)]
+    fn test_per_value_honors_explicit_lz4(#[case] bits_per_offset: u8, #[case] value_size: usize) {
+        let mut field = create_test_field("body", DataType::Binary);
+        field
+            .metadata
+            .insert(COMPRESSION_META_KEY.to_string(), "lz4".to_string());
+        let strategy = baseline_strategy(CompressionParams::default());
+        let data = create_variable_width_block(bits_per_offset, 16, value_size);
+        let compressor = strategy.create_per_value(&field, &data).unwrap();
+        let (compressed, encoding) = compressor.compress(data.clone()).unwrap();
+        let Some(Compression::General(general)) = encoding.compression.as_ref() else {
+            panic!("Expected general per-value compression");
+        };
+        assert_eq!(
+            general.compression.as_ref().unwrap().scheme(),
+            crate::format::pb21::CompressionScheme::CompressionAlgorithmLz4
+        );
+
+        let PerValueDataBlock::Variable(compressed) = compressed else {
+            panic!("Expected variable-width compressed values");
+        };
+        let decoder = DefaultDecompressionStrategy::default()
+            .create_variable_per_value_decompressor(&encoding)
+            .unwrap();
+        let decoded = decoder.decompress(compressed).unwrap();
+        let expected = data.as_variable_width().unwrap();
+        let actual = decoded.as_variable_width().unwrap();
+        assert_eq!(actual.data.as_ref(), expected.data.as_ref());
+        assert_eq!(actual.offsets.as_ref(), expected.offsets.as_ref());
     }
 
     #[test]
