@@ -1969,6 +1969,7 @@ mod tests {
         );
     }
 
+    /// Each index query shape maps to its local form; a leaf without a column is rejected.
     #[test]
     fn local_fts_query_maps_leaf_shapes_and_rejects_the_rest() {
         use lance_index::scalar::inverted::query::{

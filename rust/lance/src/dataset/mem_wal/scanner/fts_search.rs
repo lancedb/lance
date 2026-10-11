@@ -30,10 +30,9 @@
 //! copy lives in an SSTable; cross-tier deduplication is
 //! left to the caller in local mode.
 //!
-//! Fuzzy expansion is also per source: each source spends `max_expansions`
-//! over its own vocabulary, not the union a single merged index would use.
-//! When the cap binds, a source can match rows the merged index would not,
-//! so results may shift as rows flush or compact between tiers.
+//! Fuzzy expansion is also per source: each spends `max_expansions` over its
+//! own vocabulary, not the merged one, so under a binding cap a source can
+//! match rows a merged index would not, and results shift as rows change tiers.
 //!
 //! Everything here is contained in the `mem_wal` module — it reuses the
 //! existing per-source FTS read paths (`scanner.full_text_search` for
@@ -866,9 +865,8 @@ impl LsmFtsSearchPlanner {
             resolve_fts_field(&schema, column, document_granularity)?;
         }
         set_query_document_granularity(&mut query.query, document_granularity);
-        // The base and SSTable arms go through the dataset scanner, which runs
-        // AUTO fuzziness as exact. Rewrite it here so the memtable arm, which
-        // would otherwise expand it, evaluates the same query.
+        // The dataset scanner runs AUTO as exact on the base and SSTable arms;
+        // do the same for the memtable arm.
         apply_dataset_planner_auto_fuzziness_compatibility_gate(&mut query.query);
         if sources.iter().any(|source| {
             columns
@@ -2769,9 +2767,8 @@ mod tests {
         );
     }
 
-    /// A fuzzy conjunction reaches the active memtable and requires every term:
-    /// `lance memwel` at distance 1 keeps the row carrying both words and drops
-    /// the one carrying only `lance`.
+    /// `lance memwel` at distance 1 with AND keeps the row with both words and
+    /// drops the one with only `lance`.
     #[tokio::test]
     async fn fuzzy_and_query_is_served_by_the_active_memtable() {
         use lance_index::scalar::inverted::query::{
@@ -2842,9 +2839,7 @@ mod tests {
         );
     }
 
-    /// A fuzzy conjunction must match an indexed base row and an identical
-    /// active row alike: same AUTO handling, same explicit-fuzzy tokenization
-    /// (no stop-word filter) and one leaf-wide expansion budget.
+    /// Fuzzy AND treats an indexed base row and an identical active row alike.
     #[rstest::rstest]
     #[case::fuzzy_and_matches_both_tiers("alphb beta", Some(1), 50, vec![1, 2])]
     #[case::auto_fuzziness_runs_exact("alphb beta", None, 50, vec![])]

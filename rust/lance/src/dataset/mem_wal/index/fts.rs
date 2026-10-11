@@ -171,8 +171,8 @@ pub enum FtsQueryExpr {
         prefix_length: u32,
         /// Maximum number of terms to expand to.
         max_expansions: usize,
-        /// How the expanded terms combine: `Or` unions every expansion, `And`
-        /// requires a match from each query term's own expansions.
+        /// `Or` unions every expansion; `And` requires a match from each query
+        /// term's expansions.
         operator: Operator,
         /// Boost factor applied to the score (default 1.0).
         boost: f32,
@@ -311,6 +311,7 @@ impl FtsQueryExpr {
         }
     }
 
+    /// Fuzzy leaf with AUTO distance, OR semantics, and default options.
     pub fn fuzzy(query: impl Into<String>) -> Self {
         Self::Fuzzy {
             column: None,
@@ -323,6 +324,7 @@ impl FtsQueryExpr {
         }
     }
 
+    /// Fuzzy leaf with a fixed edit distance and OR semantics.
     pub fn fuzzy_with_distance(query: impl Into<String>, fuzziness: u32) -> Self {
         Self::Fuzzy {
             column: None,
@@ -335,6 +337,7 @@ impl FtsQueryExpr {
         }
     }
 
+    /// Fuzzy leaf with OR semantics; `fuzziness: None` selects AUTO distance.
     pub fn fuzzy_with_options(
         query: impl Into<String>,
         fuzziness: Option<u32>,
@@ -408,6 +411,7 @@ impl FtsQueryExpr {
         }
     }
 
+    /// Set a leaf's boost; compound shapes are returned unchanged.
     pub fn with_boost(self, boost: f32) -> Self {
         match self {
             Self::Match {
@@ -2200,9 +2204,8 @@ impl FtsMemIndex {
         }
     }
 
-    /// Expand a term to fuzzy matches within the specified edit distance.
-    /// Returns the `max_expansions` lexicographically smallest matches as
-    /// `(matched_term, distance)` pairs, in term order.
+    /// The `max_expansions` lexicographically smallest terms within
+    /// `max_distance` of `term`, as `(term, distance)` pairs in term order.
     pub fn expand_fuzzy(
         &self,
         term: &str,
@@ -2396,6 +2399,7 @@ impl FtsMemIndex {
         results
     }
 
+    /// Conjunction over the query's position groups; see [`Self::search_groups_and`].
     fn search_grouped_and(
         &self,
         st: &IndexState,
@@ -2588,12 +2592,9 @@ impl FtsMemIndex {
         results
     }
 
-    /// Fuzzy search: each query token expands to the dictionary terms within
-    /// its edit distance, then the expansions combine per `operator`. `Or` is
-    /// one BM25 OR-search over every expansion. `And` treats each token's
-    /// expansions as one group and keeps the documents matched by every group,
-    /// summing the group scores exactly like [`Self::search_grouped_and`] does
-    /// for exact terms, so a fuzzy conjunction ranks the way a plain one does.
+    /// Expand each token within its edit distance, then combine per `operator`:
+    /// `Or` is one BM25 OR over all expansions; `And` requires a term from each
+    /// token's expansions and scores like [`Self::search_groups_and`].
     #[allow(clippy::too_many_arguments)]
     fn search_fuzzy_tokens(
         &self,
@@ -2608,9 +2609,8 @@ impl FtsMemIndex {
         if tokens.is_empty() {
             return Vec::new();
         }
-        // One `max_expansions` budget for the whole leaf, spent in query-token
-        // order, as the committed index does (`expand_fuzzy_tokens`); a
-        // per-token budget would match rows the flushed copy cannot.
+        // One leaf-wide budget spent in token order, matching the committed
+        // index's `expand_fuzzy_tokens`.
         let mut remaining = max_expansions;
         let mut groups: Vec<Vec<String>> = Vec::with_capacity(tokens.len());
         for tok in tokens {
@@ -2621,9 +2621,8 @@ impl FtsMemIndex {
                 .map(|(matched, _)| matched)
                 .collect();
             remaining -= group.len();
-            // A term with no expansion, whether nothing is within distance or
-            // the budget ran out, can never be satisfied, so neither can a
-            // conjunction that requires it.
+            // A token with no expansions (none in range or budget spent) makes
+            // the conjunction unsatisfiable.
             if group.is_empty() && operator == Operator::And {
                 return Vec::new();
             }
@@ -2646,10 +2645,9 @@ impl FtsMemIndex {
         }
     }
 
-    /// Expand `term` against the term dictionaries of every partition (and the
-    /// visible tail, when `include_tail`), keeping the `max_expansions`
-    /// lexicographically smallest matches: the committed index's selection, so
-    /// a capped expansion picks the same terms before and after flush.
+    /// Expand `term` against every partition's dictionary (and the visible tail,
+    /// when `include_tail`), keeping the `max_expansions` lexicographically
+    /// smallest matches, as the committed index does.
     fn expand_fuzzy_term(
         &self,
         st: &IndexState,
@@ -2854,10 +2852,9 @@ impl FtsMemIndex {
         query_tokens_to_vec(&self.analyze_for_search(text))
     }
 
-    /// Tokenize a fuzzy query the way the committed index does
-    /// (`tokenizer_for_match_query`): an explicit positive distance splits with
-    /// a bare `SimpleTokenizer`, bypassing the index analyzer's stop words and
-    /// stemming; AUTO uses the index analyzer.
+    /// Tokenize like the committed index's `tokenizer_for_match_query`: an
+    /// explicit positive distance uses a bare `SimpleTokenizer` (no stop words
+    /// or stemming); otherwise the index analyzer.
     fn tokenize_fuzzy_query(&self, text: &str, fuzziness: Option<u32>) -> Vec<String> {
         if !matches!(fuzziness, Some(distance) if distance > 0) {
             return self.tokenize_for_search(text);
@@ -6582,9 +6579,8 @@ mod tests {
         assert!(!entries.is_empty());
     }
 
-    /// `alpho beta` at distance 1: the first token expands to `alpha` and
-    /// `alpho`, the second to `beta` and `zeta`. AND keeps the rows that carry
-    /// one term from each group and drops the rows matching a single group.
+    /// `alpho beta` at distance 1 expands to {alpha, alpho} and {beta, zeta};
+    /// AND keeps only rows with a term from each group.
     #[test]
     fn test_search_fuzzy_and_requires_every_term() {
         let schema = create_test_schema();
@@ -6620,9 +6616,8 @@ mod tests {
         );
     }
 
-    /// AUTO keeps the indexed `xy` exact, and an exact term must still respect
-    /// an exhausted budget: `alpha` spends the single slot, so the conjunction
-    /// cannot be satisfied.
+    /// AUTO leaves `xy` exact, but it still needs budget: `alpha` spends the
+    /// only slot, so the conjunction fails.
     #[test]
     fn test_search_fuzzy_and_zero_distance_term_respects_exhausted_budget() {
         let schema = create_test_schema();
@@ -6696,6 +6691,7 @@ mod tests {
         );
     }
 
+    /// `prefix_length` counts characters, not bytes.
     #[test]
     fn test_search_query_fuzzy_prefix_length_uses_char_boundaries() {
         let schema = create_test_schema();
