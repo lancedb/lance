@@ -625,7 +625,7 @@ fn version_meta_may_match(
     meta: Option<&RowDatasetVersionMeta>,
     predicate: impl Fn(u64) -> bool,
 ) -> bool {
-    // Missing or non-inline metadata cannot safely rule out a match.
+    // Missing or column-spilled metadata cannot safely rule out a match.
     let Some(RowDatasetVersionMeta::Inline(data)) = meta else {
         return true;
     };
@@ -1189,7 +1189,7 @@ mod tests {
     #[rstest]
     #[case::missing(None, false)]
     #[case::undecodable(Some(RowDatasetVersionMeta::Inline(Arc::from([0xff]))), true)]
-    #[case::external(Some(RowDatasetVersionMeta::from_external_file("versions".into(), 0, 10)), false)]
+    #[case::column(Some(RowDatasetVersionMeta::Column), false)]
     #[case::empty(Some(RowDatasetVersionMeta::from_sequence(&RowDatasetVersionSequence::new()).unwrap()), false)]
     fn test_version_meta_pruning_unknown(
         #[case] meta: Option<RowDatasetVersionMeta>,
@@ -1330,23 +1330,21 @@ mod tests {
         assert!(read_files.len() < full_scan_files.len());
 
         for column in [ROW_CREATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION] {
-            for meta in [None, Some(RowDatasetVersionMeta::Inline(Arc::from([0xff])))] {
-                let mut unknown_dataset = dataset.clone();
-                let manifest = Arc::make_mut(&mut unknown_dataset.manifest);
-                for fragment in Arc::make_mut(&mut manifest.fragments) {
-                    if column == ROW_CREATED_AT_VERSION {
-                        fragment.created_at_version_meta = meta.clone();
-                    } else {
-                        fragment.last_updated_at_version_meta = meta.clone();
-                    }
+            let mut unknown_dataset = dataset.clone();
+            let manifest = Arc::make_mut(&mut unknown_dataset.manifest);
+            for fragment in Arc::make_mut(&mut manifest.fragments) {
+                if column == ROW_CREATED_AT_VERSION {
+                    fragment.created_at_version_meta = None;
+                } else {
+                    fragment.last_updated_at_version_meta = None;
                 }
-                let expected = scan_project_filter(&unknown_dataset, columns, Some(filter)).await;
-                assert_eq!(
-                    collect_changes(&unknown_dataset).await,
-                    expected,
-                    "Pruning changed results for {change:?} with {column} metadata {meta:?}"
-                );
             }
+            let expected = scan_project_filter(&unknown_dataset, columns, Some(filter)).await;
+            assert_eq!(
+                collect_changes(&unknown_dataset).await,
+                expected,
+                "Pruning changed results for {change:?} with missing {column} metadata"
+            );
         }
 
         let metrics = compact_files(
@@ -1406,18 +1404,13 @@ mod tests {
         assert_eq!(dataset.object_store.io_stats_incremental().read_iops, 0);
     }
 
-    #[rstest]
-    #[case::missing(None)]
-    #[case::undecodable(Some(RowDatasetVersionMeta::Inline(Arc::from([0xff]))))]
     #[tokio::test]
-    async fn test_delta_pruning_preserves_default_versions(
-        #[case] meta: Option<RowDatasetVersionMeta>,
-    ) {
+    async fn test_delta_pruning_preserves_default_versions() {
         let mut dataset = create_test_dataset(4, 1, "value", true).await;
         let manifest = Arc::make_mut(&mut dataset.manifest);
         for fragment in Arc::make_mut(&mut manifest.fragments) {
-            fragment.created_at_version_meta = meta.clone();
-            fragment.last_updated_at_version_meta = meta.clone();
+            fragment.created_at_version_meta = None;
+            fragment.last_updated_at_version_meta = None;
         }
         let delta = dataset
             .delta()
