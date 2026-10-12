@@ -1,15 +1,8 @@
 # Zone Map Index
 
-Zone maps are a columnar database technique for predicate pushdown and scan pruning.
-They break data into fixed-size chunks called "zones" and maintain summary statistics
-(min, max, null count) for each zone, enabling efficient filtering by eliminating
-zones that cannot contain matching values.
-
-Zone maps are "inexact" filters - they can definitively exclude zones but may include
-false positives that require rechecking.
-
-In addition, since finding NULLs is a common query pattern, the index also maintains a
-bitmap of null rows which allows it to return exact results for IS NULL queries.
+Zone maps summarize small groups of physical rows in a column. Readers use the
+summaries to skip zones that cannot match a predicate. Candidate rows still
+require predicate rechecking.
 
 ## Index Details
 
@@ -17,87 +10,178 @@ bitmap of null rows which allows it to return exact results for IS NULL queries.
 %%% proto.message.ZoneMapIndexDetails %%%
 ```
 
-## Storage Layout
+The index stores its zone records in `zonemap.lance`. A complete optional null
+bitmap can answer `IS NULL` exactly; without it, null counts identify candidates.
 
-The zone map index stores zone statistics in a single file:
+## Statistics versions
 
-1. `zonemap.lance` - Zone statistics for query pruning
+- **Version 0:** the existing format. It has no signed NaN count and writes a
+  `+NaN` maximum marker whenever either NaN sign is present.
+- **Version 1:** ordinary-value bounds and separate signed NaN counts, defined
+  below. `IndexMetadata.index_version` is 1, and the file schema metadata
+  `statistics_version` is the decimal string `"1"`.
 
-### Zone Statistics File Schema
+A write seed records the same `statistics_version` in its Arrow IPC schema
+metadata. Absence means version 0. Readers must validate the version before
+using either an index or a seed; an unsupported version must not contribute
+pruning decisions. Adding a version that old readers ignore is not a
+compatibility fence: the manifest feature bits below provide that fence.
 
-| Column        | Type       | Nullable | Description                             |
-|---------------|------------|----------|-----------------------------------------|
-| `min`         | {DataType} | true     | Minimum of the non-null, non-NaN values; null if there are none |
-| `max`         | {DataType} | true     | Maximum of the non-null, non-NaN values; null if there are none. Written as `+NaN` when the zone holds a positive NaN (see below) |
-| `null_count`  | UInt32     | false    | Number of null values in the zone       |
-| `nan_count`   | UInt32     | false    | Number of NaN values of either sign (float types; 0 otherwise) |
-| `negative_nan_count` | UInt32 | true  | Number of the `nan_count` NaNs with the sign bit set (float types; 0 otherwise). Null when unknown |
-| `fragment_id` | UInt64     | false    | Fragment containing this zone           |
-| `zone_start`  | UInt64     | false    | Starting row offset within the fragment |
-| `zone_length` | UInt32     | false    | Number of rows in this zone             |
+A version 1 file must contain the declared metadata and the nullable UInt32
+sign-count field. Missing fields, wrong types, or invalid counts are malformed
+version 1 statistics, not a reason to reinterpret the file as version 0.
 
-### How nulls and NaNs are accounted
+## Version 1 statistics
 
-A zone's rows fall into four groups, and the statistics describe each group on
-its own:
+`value_type` is the Arrow type used to store the indexed column's bounds.
+`min` and `max` use its comparison ordering.
 
-- **Nulls** are counted in `null_count` and never enter `min` or `max`.
-- **Ordinary values** (non-null, non-NaN) are bounded by `min` and `max`, compared
-  with Arrow's total ordering (`-0.0 < 0.0`, `-inf` and `inf` are ordinary values).
-  A zone without ordinary values stores null bounds.
-- **NaNs** never enter `min` or `max` as extrema. `nan_count` counts all of them and
-  `negative_nan_count` counts those with the sign bit set, so the number of
-  positive NaNs is `nan_count - negative_nan_count`. Arrow's total ordering places
-  a negative NaN below every other value and a positive NaN above, which is why
-  the two signs are tracked separately: a negative NaN matches `x < 0`, a positive
-  NaN matches `x > 100`.
+```python
+pa.schema([
+    pa.field("min", value_type, nullable=True),
+    pa.field("max", value_type, nullable=True),
+    pa.field("null_count", pa.uint32(), nullable=False),
+    pa.field("nan_count", pa.uint32(), nullable=False),
+    pa.field("negative_nan_count", pa.uint32(), nullable=True),
+    pa.field("fragment_id", pa.uint64(), nullable=False),
+    pa.field("zone_start", pa.uint64(), nullable=False),
+    pa.field("zone_length", pa.uint64(), nullable=False),
+])
+```
 
-A reader keeps a zone when any group can match the query: nulls for `IS NULL`,
-ordinary values when `[min, max]` intersects the query range, negative NaNs when
-the range is open below or starts at a negative NaN, positive NaNs when the range
-is open above or ends at a positive NaN. A NaN literal as a bound never rules out
-NaNs of its own sign, because same-sign NaNs still order by payload and the
-counts do not record payloads.
+### Bounds and counts
 
-#### Backward compatibility
+- **`min` and `max`:** lower and upper bounds on non-null, non-NaN values.
+  Neither field may contain a NaN. Bounds may be wider than the exact extrema,
+  but must contain every ordinary value in the zone.
+- **`null_count`:** the exact number of null physical rows.
+- **`nan_count`:** the exact number of NaNs of either sign.
+- **`negative_nan_count`:** the number of those NaNs with the sign bit set.
+  Positive NaNs number `nan_count - negative_nan_count`.
+- **`fragment_id`, `zone_start`, `zone_length`:** the fragment and physical
+  row range described by the record. Counts are not counts of rows remaining
+  after deletion filtering.
 
-Two rules exist only so that readers and writers from before `negative_nan_count`
-interoperate with current ones:
+Newly collected floating-point records must write a known sign count. Non-float
+records write zero for both NaN counts. A null sign count is allowed only when
+carrying statistics whose sign split is unknown, as described below. It never
+means zero.
 
-- **`max` is written as `+NaN` when the zone holds a positive NaN.** Readers that
-  predate `negative_nan_count` learn that a zone holds NaNs only from this `+NaN`
-  max, and a positive NaN is the largest value in the zone under Arrow's total
-  ordering, so the bound is still correct. The ordinary maximum is hidden behind
-  it; a reader that needs it must scan. A zone whose NaNs are all negative keeps
-  its ordinary maximum.
-- **A null `negative_nan_count` means the sign split is unknown**, not zero.
-  Indices and write seeds from before this column wrote `+NaN` as the max for any
-  NaN and did not record signs. A reader treats such a zone with `nan_count > 0`
-  as possibly holding NaNs of both signs and prunes it only when neither sign nor
-  the ordinary values can match. Such zones are not rewritten; the index merges
-  them as they are, and they stay unknown until the zone is rebuilt.
+Floating-point comparisons follow Arrow Rust's IEEE total ordering, including
+`-0.0 < +0.0`. Infinities are ordinary values. Negative NaNs precede all ordinary
+values; positive NaNs follow them. Same-sign NaNs are also ordered by payload.
 
-### Schema Metadata
+The counts must satisfy:
 
-| Key                 | Type   | Description                               |
-|---------------------|--------|-------------------------------------------|
-| `rows_per_zone`     | String | Number of rows per zone (default: "8192") |
-| `null_bitmap`       | UInt32 | Index of null bitmap global buffer        |
+- `null_count + nan_count <= zone_length`;
+- a known `negative_nan_count <= nan_count`.
 
-### Global Buffers
+Null bounds mean no ordinary values when `zone_length = null_count + nan_count`.
+Otherwise a null bound means that side is unknown, including unsupported value
+bounds and carried legacy summaries. Unknown bounds cannot justify exclusion.
 
-| Metadata Key        | Description                                                |
-|---------------------|------------------------------------------------------------|
-| `null_bitmap`       | A serialized RowAddrTreeMap specifying which rows are null |
+### Using signed NaNs in queries
 
-## Accelerated Queries
+A reader considers three non-null groups separately: ordinary values, negative
+NaNs, and positive NaNs. A zone stays a candidate if any group may match.
 
-The zone map index provides inexact results for the following query types (nullability queries
-return exact results):
+Conceptually, extend the ordinary range downward when negative NaNs are possible
+and upward when positive NaNs are possible. This is query-time interpretation:
+the reader does not put NaNs back into stored `min` or `max`, and does not compare
+an integer count with a column value.
 
-| Query Type | Description               | Operation                                   | Result Type |
-|------------|---------------------------|---------------------------------------------|-------------|
-| **Equals** | `column = value`          | Includes zones where min ≤ value ≤ max, or whose NaN counts allow a NaN value | AtMost      |
-| **Range**  | `column BETWEEN a AND b`  | Includes zones where ranges overlap, or whose NaN counts allow a NaN inside the range | AtMost      |
-| **IsIn**   | `column IN (v1, v2, ...)` | Includes zones that could contain any value | AtMost      |
-| **IsNull** | `column IS NULL`          | Includes zones where null_count > 0         | Exact       |
+For range predicates:
+
+- Ordinary values use their bounds. A negative NaN query boundary lies below
+  them; a positive NaN boundary lies above them. Both ends must be checked.
+- Negative NaNs may match if the lower end is unbounded or is a negative NaN,
+  provided negative NaNs are possible.
+- Positive NaNs may match if the upper end is unbounded or is a positive NaN,
+  provided positive NaNs are possible.
+
+A boundary within a possible same-sign NaN group must remain conservative:
+counts do not record payloads, so one canonical NaN cannot serve as that group's
+exact bound. Equality and `IN` with NaN literals also return candidates, not exact
+NaN row addresses. Ordinary literals use ordinary bounds. Null predicates use
+the null bitmap when available, or require rechecking count-based candidates.
+
+A global-range API that returns only ordinary min/max must report an unknown
+range when NaNs are present. It must not advertise a finite pair as a bound on
+the entire column, excluding its NaN values.
+
+## Reading legacy statistics
+
+A version 1 reader must also understand version 0 indices and seeds:
+
+- Missing `negative_nan_count` means an unknown sign split. If `nan_count > 0`,
+  either sign remains possible; if the total is zero, neither is possible.
+- A legacy `+NaN` maximum marker means the ordinary maximum is unknown. It does
+  not prove that a positive NaN exists.
+- A NaN stored as either bound must not be used as an ordinary-value bound.
+
+Old files need no in-place rewrite. When copying legacy zones into a version 1
+index, preserve their counts, replace any NaN bound with null, and retain null
+for an unknown sign count. This records missing information without inventing
+an ordinary maximum or requiring a data scan. Rebuilding a zone can replace
+unknown information with newly measured bounds and counts.
+
+## Reader and writer compatibility fence
+
+Version 1 statistics require `FLAG_ZONEMAP_SIGNED_NAN_STATS = 1 << 16` in
+**both** `Manifest.reader_feature_flags` and `Manifest.writer_feature_flags`.
+
+The commit that first references a version 1 index or a data file containing a
+version 1 seed must set both bits atomically. Merely upgrading a client or
+opening a legacy table does not enable the feature. Clients that do not support
+the bit must refuse the dataset before reading or maintaining these statistics.
+
+This is a table-level compatibility fence, not an instruction for an old reader
+to fall back to scanning. New readers retain the legacy decoding path. New
+writers must preserve the contract and both bits during append, column rewrite,
+index maintenance, cleanup, clone, and restore. The bits are sticky in derived
+snapshots, including after dropping an index: retained data files may still
+contain version 1 seeds. Existing historical snapshots are unchanged.
+
+An index version or seed metadata version alone cannot protect existing readers
+that ignore it. The feature bits are required even when the data-file encoding
+itself is unchanged.
+
+This proposal reserves the bit; implementations must not advertise support or
+emit version 1 statistics until the reader, writer, commit, and maintenance
+paths implement the complete contract.
+
+## Write seeds
+
+A seed is an Arrow IPC file in a data-file global buffer. Data-file schema
+metadata `lance.seed.<column_name>` locates it as
+`<buffer_index>:<rows_per_zone>`; version 1 adds the statistics schema metadata
+defined above, not another positional component to that locator.
+
+Its records omit fragment IDs and zone starts:
+
+```python
+pa.schema([
+    pa.field("min", value_type, nullable=True),
+    pa.field("max", value_type, nullable=True),
+    pa.field("null_count", pa.uint32(), nullable=False),
+    pa.field("nan_count", pa.uint32(), nullable=False),
+    pa.field("negative_nan_count", pa.uint32(), nullable=True),
+    pa.field("zone_length", pa.uint64(), nullable=False),
+])
+```
+
+The reader obtains the fragment ID from the containing fragment and reconstructs
+zone start as the zero-based record number times `rows_per_zone` (8,192 by
+default). The last zone may be shorter. An incompatible zone size or unsupported
+seed version must not be harvested; the index builder may scan the column.
+
+Optional IPC schema metadata `seed_null_bitmap` contains a hex-encoded Roaring
+bitmap of null row offsets. Missing metadata means exact offsets are unknown,
+not that no nulls exist. This proposal does not change that bitmap encoding.
+
+## Index metadata and global buffers
+
+`rows_per_zone` is stored as a decimal string. Optional schema metadata
+`null_bitmap` stores a decimal global-buffer index pointing to a serialized
+`RowAddrTreeMap` of exact null row addresses. Missing metadata means no complete
+null bitmap is available. These fields and the bitmap encoding are unchanged.

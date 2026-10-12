@@ -103,8 +103,15 @@ pub const FLAG_MANAGED_BLOBS: u64 = 1 << 14;
 /// Writers must understand this allocation contract. It does not change how
 /// readers interpret the schema or data files.
 pub const FLAG_NON_REUSABLE_FIELD_IDS: u64 = 1 << 15;
+/// Version 1 ZoneMap statistics use ordinary bounds without NaN markers and
+/// carry a separate negative NaN count. Both readers and writers must understand
+/// the contract, including data-file write seeds. The capability is sticky.
+///
+/// Reserved by the format proposal; readers and writers reject it until the
+/// complete statistics implementation lands.
+pub const FLAG_ZONEMAP_SIGNED_NAN_STATS: u64 = 1 << 16;
 /// The first bit that is unknown as a feature flag
-pub const FLAG_UNKNOWN: u64 = 1 << 16;
+pub const FLAG_UNKNOWN: u64 = 1 << 17;
 
 const _: () = assert!(FLAG_COVERED_INDEX_METADATA < FLAG_UNKNOWN);
 // The fence needs a bit the current released build already refuses, which means
@@ -121,9 +128,12 @@ const _: () = assert!(FLAG_FRAGMENT_TREE < FLAG_UNKNOWN);
 const _: () = assert!(FLAG_INDEPENDENT_COVERING_FIELDS < FLAG_UNKNOWN);
 
 const _: () = assert!(FLAG_MANAGED_BLOBS < FLAG_UNKNOWN);
+const _: () = assert!(FLAG_ZONEMAP_SIGNED_NAN_STATS < FLAG_UNKNOWN);
 
-pub(crate) const STICKY_PAIRED_FLAGS: u64 =
-    FLAG_MIXED_DATA_FILE_VERSIONS | FLAG_FRAGMENT_REUSE_INDEX | FLAG_MANAGED_BLOBS;
+pub(crate) const STICKY_PAIRED_FLAGS: u64 = FLAG_MIXED_DATA_FILE_VERSIONS
+    | FLAG_FRAGMENT_REUSE_INDEX
+    | FLAG_MANAGED_BLOBS
+    | FLAG_ZONEMAP_SIGNED_NAN_STATS;
 pub(crate) const STICKY_READER_FLAGS: u64 = STICKY_PAIRED_FLAGS;
 pub(crate) const STICKY_WRITER_FLAGS: u64 = STICKY_PAIRED_FLAGS | FLAG_NON_REUSABLE_FIELD_IDS;
 
@@ -309,6 +319,7 @@ fn supported_flags_when(
     // Reserved, not implemented: see the flag's doc comment.
     mark_supported(&mut supported, FLAG_FRAGMENT_TREE, false);
     mark_supported(&mut supported, FLAG_INDEPENDENT_COVERING_FIELDS, false);
+    mark_supported(&mut supported, FLAG_ZONEMAP_SIGNED_NAN_STATS, false);
     supported
 }
 
@@ -387,6 +398,7 @@ pub fn validate_paired_feature_flags(manifest: &Manifest) -> Result<()> {
     for (flag, name) in [
         (FLAG_MIXED_DATA_FILE_VERSIONS, "mixed data-file-version"),
         (FLAG_MANAGED_BLOBS, "Managed Blob"),
+        (FLAG_ZONEMAP_SIGNED_NAN_STATS, "signed NaN statistics"),
     ] {
         let reader = manifest.reader_feature_flags & flag != 0;
         let writer = manifest.writer_feature_flags & flag != 0;
@@ -469,6 +481,58 @@ mod tests {
 
     use super::*;
     use crate::format::BasePath;
+
+    #[test]
+    fn test_signed_nan_statistics_flag_is_reserved_and_sticky() {
+        assert_eq!(FLAG_ZONEMAP_SIGNED_NAN_STATS, 1 << 16);
+        assert!(!can_read_dataset(FLAG_ZONEMAP_SIGNED_NAN_STATS));
+        assert!(!can_write_dataset(FLAG_ZONEMAP_SIGNED_NAN_STATS));
+
+        let mut manifest = empty_manifest();
+        manifest.reader_feature_flags = FLAG_ZONEMAP_SIGNED_NAN_STATS;
+        manifest.writer_feature_flags = FLAG_ZONEMAP_SIGNED_NAN_STATS;
+        apply_feature_flags(&mut manifest, false, false).unwrap();
+        assert_eq!(manifest.reader_feature_flags, FLAG_ZONEMAP_SIGNED_NAN_STATS);
+        assert_eq!(manifest.writer_feature_flags, FLAG_ZONEMAP_SIGNED_NAN_STATS);
+
+        let read_error = ensure_can_read_manifest(&manifest).unwrap_err();
+        assert!(matches!(read_error, Error::NotSupported { .. }));
+        assert!(read_error.to_string().contains("Please upgrade"));
+        let write_error = ensure_can_write_manifest(&manifest).unwrap_err();
+        assert!(matches!(write_error, Error::NotSupported { .. }));
+        assert!(write_error.to_string().contains("Please upgrade"));
+
+        let mut destination = empty_manifest();
+        inherit_sticky_feature_flags(&mut destination, &manifest).unwrap();
+        assert_eq!(
+            destination.reader_feature_flags,
+            FLAG_ZONEMAP_SIGNED_NAN_STATS
+        );
+        assert_eq!(
+            destination.writer_feature_flags,
+            FLAG_ZONEMAP_SIGNED_NAN_STATS
+        );
+    }
+
+    #[test]
+    fn test_signed_nan_statistics_requires_both_feature_bits() {
+        for (reader, writer) in [(true, false), (false, true)] {
+            let mut manifest = empty_manifest();
+            manifest.reader_feature_flags = if reader {
+                FLAG_ZONEMAP_SIGNED_NAN_STATS
+            } else {
+                0
+            };
+            manifest.writer_feature_flags = if writer {
+                FLAG_ZONEMAP_SIGNED_NAN_STATS
+            } else {
+                0
+            };
+            let error = validate_paired_feature_flags(&manifest).unwrap_err();
+            assert!(matches!(error, Error::CorruptFile { .. }));
+            assert!(error.to_string().contains("signed NaN statistics"));
+        }
+    }
 
     #[test]
     fn test_fragment_tree_flag_is_reserved_not_supported() {
