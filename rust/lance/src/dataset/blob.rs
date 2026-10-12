@@ -6210,6 +6210,7 @@ mod tests {
     async fn managed_clone_preserves_existing_retention_contract(
         #[values(false, true)] deep: bool,
         #[values(false, true)] registered: bool,
+        #[values(None, Some("false"), Some("true"))] opt_in: Option<&str>,
     ) {
         let source_dir = TempStrDir::default();
         let clone_dir = TempStrDir::default();
@@ -6255,6 +6256,10 @@ mod tests {
         .await
         .unwrap();
         source.delete("id IN (1, 3, 5)").await.unwrap();
+        source
+            .update_schema_metadata([(MANAGED_BLOBS_META_KEY, opt_in)])
+            .await
+            .unwrap();
         let version = source.version_id();
         let mut cloned = if deep {
             source.deep_clone(&clone_dir, version, None).await.unwrap()
@@ -6265,6 +6270,8 @@ mod tests {
                 .await
                 .unwrap()
         };
+        assert!(cloned.manifest.has_managed_blobs());
+        assert_eq!(cloned.schema().metadata, source.schema().metadata);
         if deep && !registered {
             assert_eq!(source.manifest.fragments, cloned.manifest.fragments);
             for fragment in source.get_fragments() {
@@ -6312,7 +6319,14 @@ mod tests {
             .await
             .unwrap();
         let expected = [
-            (BlobKind::Managed, payload.as_slice()),
+            (
+                if deep || opt_in == Some("true") {
+                    BlobKind::Managed
+                } else {
+                    BlobKind::Packed
+                },
+                payload.as_slice(),
+            ),
             (BlobKind::External, b"external".as_slice()),
             (BlobKind::Inline, b"inline".as_slice()),
         ];

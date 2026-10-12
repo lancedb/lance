@@ -15,6 +15,7 @@ use arrow_schema::DataType;
 use lance_core::datatypes::{BlobHandling, BlobKind, Field};
 use lance_core::{Error, ROW_ADDR, Result};
 use lance_io::object_store::ObjectStore;
+use lance_table::feature_flags::MANAGED_BLOBS_META_KEY;
 use lance_table::format::{Fragment, Manifest};
 use object_store::path::Path;
 use uuid::Uuid;
@@ -149,7 +150,10 @@ async fn rewrite_blob_columns(
             .iter()
             .map(|field| field.name.as_str())
             .collect::<Vec<_>>();
-        let write_schema = source.schema().project(&columns)?;
+        let mut write_schema = source.schema().project(&columns)?;
+        write_schema
+            .metadata
+            .insert(MANAGED_BLOBS_META_KEY.to_string(), "true".to_string());
         let mut projection = columns.clone();
         projection.push(ROW_ADDR);
         let destination_fragment = target
