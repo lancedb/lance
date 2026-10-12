@@ -3435,15 +3435,9 @@ class LanceDataset(pa.dataset.Dataset):
             cleaned up.
 
         delete_concurrency: int, optional
-            Maximum concurrent file deletions shared by this cleanup and all
-            cascaded branches. Must be between 1 and the platform's Tokio
-            semaphore limit (2**61 - 1 on 64-bit platforms). Defaults to the
-            initiating dataset's object store I/O parallelism. Independent of
-            ``delete_rate_limit``. Cascaded branches ignore their own concurrency
-            and QPS settings, including invalid values. Separate calls do not
-            share limits. Neither deletion argument updates the table config;
-            automatic cleanup uses its separately configured limits.
-            For example, ``delete_concurrency=32`` allows 32 in-flight deletes.
+            Maximum concurrent file deletions across this cleanup and its cascaded
+            branches. Defaults to the object store's I/O parallelism.
+            Must be positive (at most 2**61 - 1 on 64-bit platforms).
 
         delete_rate_limit: int, optional
             Maximum number of delete operations per second. When not set (default),
