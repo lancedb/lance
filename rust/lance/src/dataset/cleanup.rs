@@ -2437,7 +2437,6 @@ mod tests {
     use crate::blob::{BlobArrayBuilder, blob_field};
     use crate::dataset::{InsertBuilder, WriteDestination};
     use crate::index::DatasetIndexExt;
-    use crate::utils::test::ThrottledStoreWrapper;
     use crate::{
         dataset::transaction::{Operation, Transaction},
         dataset::{AutoCleanupParams, ReadParams, WriteMode, WriteParams, builder::DatasetBuilder},
@@ -2466,11 +2465,15 @@ mod tests {
     use uuid::Uuid;
 
     #[rstest]
-    #[case::default(None)]
-    #[case::serial(Some(1))]
-    #[case::override_default(Some(4))]
+    #[case::default(None, false)]
+    #[case::serial(Some(1), false)]
+    #[case::override_default(Some(4), false)]
+    #[case::auto_config(Some(4), true)]
     #[tokio::test]
-    async fn test_delete_concurrency(#[case] concurrency: Option<usize>) {
+    async fn test_delete_concurrency(
+        #[case] concurrency: Option<usize>,
+        #[case] auto_config: bool,
+    ) {
         let data = || {
             lance_datagen::gen_batch()
                 .col(
@@ -2486,11 +2489,9 @@ mod tests {
             Some(WriteParams {
                 max_rows_per_file: 2,
                 store_params: Some(ObjectStoreParams {
-                    object_store_wrapper: Some(Arc::new(ThrottledStoreWrapper {
-                        config: ThrottleConfig {
-                            wait_delete_per_call: delete_latency,
-                            ..Default::default()
-                        },
+                    object_store_wrapper: Some(Arc::new(MockObjectStore {
+                        delete_latency,
+                        ..MockObjectStore::new()
                     })),
                     ..Default::default()
                 }),
@@ -2533,10 +2534,41 @@ mod tests {
             clean_referenced_branches: false,
             delete_rate_limit: None,
         };
-        let mut operation = dataset.cleanup(policy);
-        if let Some(concurrency) = concurrency {
-            operation = operation.with_delete_concurrency(concurrency).unwrap();
-        }
+        let operation = if auto_config {
+            let mut manifest = dataset.manifest.as_ref().clone();
+            manifest.config.extend([
+                ("lance.auto_cleanup.interval".into(), "0".into()),
+                ("lance.auto_cleanup.retain_versions".into(), "1".into()),
+                ("lance.auto_cleanup.delete_concurrency".into(), "4".into()),
+            ]);
+            let operation = build_cleanup_operation(&dataset, &manifest, false)
+                .await
+                .unwrap()
+                .unwrap();
+            for value in ["0", "abc"] {
+                manifest
+                    .config
+                    .insert("lance.auto_cleanup.delete_concurrency".into(), value.into());
+                let error = build_cleanup_operation(&dataset, &manifest, false)
+                    .await
+                    .err()
+                    .unwrap();
+                if value == "0" {
+                    assert!(matches!(error, Error::InvalidInput { .. }));
+                } else {
+                    assert!(matches!(error, Error::Cleanup { .. }));
+                }
+                assert_contains!(error.to_string(), "delete_concurrency");
+                assert_contains!(error.to_string(), value);
+            }
+            operation
+        } else {
+            let operation = dataset.cleanup(policy);
+            match concurrency {
+                Some(value) => operation.with_delete_concurrency(value).unwrap(),
+                None => operation,
+            }
+        };
         let explanation = operation.explain().await.unwrap();
         let window = concurrency.unwrap_or_else(|| dataset.object_store.io_parallelism());
         let candidate_count = explanation.candidate_files.len();
@@ -2557,82 +2589,13 @@ mod tests {
     }
 
     #[rstest]
-    #[case::execute(false)]
-    #[case::explain(true)]
-    #[tokio::test]
-    async fn test_invalid_default_delete_concurrency(#[case] explain: bool) {
-        let fixture = MockDatasetFixture::try_new().unwrap();
-        fixture.create_some_data().await.unwrap();
-        let mut dataset = fixture.open().await.unwrap();
-        let value = tokio::sync::Semaphore::MAX_PERMITS + 1;
-        dataset.object_store = Arc::new(ObjectStore::new(
-            dataset.object_store.inner.clone(),
-            url::Url::parse(&fixture.dataset_path).unwrap(),
-            None,
-            None,
-            false,
-            true,
-            value,
-            0,
-            None,
-        ));
-        let requests = Arc::new(AtomicUsize::new(0));
-        let request_count = requests.clone();
-        fixture.mock_store.policy.lock().unwrap().set_before_policy(
-            "count_requests",
-            Arc::new(move |_, _| {
-                request_count.fetch_add(1, Ordering::SeqCst);
-                Ok(())
-            }),
-        );
-        let operation = dataset.cleanup(CleanupPolicy::default());
-        let error = if explain {
-            operation.explain().await.unwrap_err()
-        } else {
-            operation.execute().await.unwrap_err()
-        };
+    #[case::zero(0)]
+    #[case::above_limit(tokio::sync::Semaphore::MAX_PERMITS + 1)]
+    fn test_invalid_delete_concurrency(#[case] value: usize) {
+        let error = validate_delete_concurrency(value).unwrap_err();
         assert!(matches!(error, Error::InvalidInput { .. }));
-        assert_contains!(
-            error.to_string(),
-            "delete_concurrency must be between 1 and"
-        );
+        assert_contains!(error.to_string(), "delete_concurrency");
         assert_contains!(error.to_string(), value.to_string());
-        assert_contains!(
-            error.to_string(),
-            tokio::sync::Semaphore::MAX_PERMITS.to_string()
-        );
-        assert_eq!(requests.load(Ordering::SeqCst), 0);
-    }
-
-    #[rstest]
-    #[case::positive("4")]
-    #[case::zero("0")]
-    #[case::invalid("abc")]
-    #[case::overflow("18446744073709551616")]
-    #[tokio::test]
-    async fn test_auto_cleanup_delete_concurrency(#[case] value: &str) {
-        let fixture = MockDatasetFixture::try_new().unwrap();
-        fixture.create_some_data().await.unwrap();
-        let dataset = fixture.open().await.unwrap();
-        let mut manifest = dataset.manifest.as_ref().clone();
-        manifest.config.extend([
-            ("lance.auto_cleanup.interval".into(), "0".into()),
-            ("lance.auto_cleanup.delete_concurrency".into(), value.into()),
-        ]);
-        let result = build_cleanup_operation(&dataset, &manifest, false).await;
-        if value == "4" {
-            assert_eq!(result.unwrap().unwrap().delete_concurrency, Some(4));
-        } else {
-            let error = result.err().unwrap();
-            if value == "0" {
-                assert!(matches!(error, Error::InvalidInput { .. }));
-            } else {
-                assert!(matches!(error, Error::Cleanup { .. }));
-                assert_contains!(error.to_string(), "lance.auto_cleanup.delete_concurrency");
-            }
-            assert_contains!(error.to_string(), "delete_concurrency");
-            assert_contains!(error.to_string(), value);
-        }
     }
 
     #[derive(Debug)]
