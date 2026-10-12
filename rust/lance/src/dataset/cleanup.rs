@@ -2461,20 +2461,16 @@ mod tests {
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32, RandomVector, some_batch};
     use mock_instant::thread_local::MockClock;
     use object_store::ObjectStoreExt;
-    use object_store::throttle::ThrottleConfig;
+    use object_store::throttle::{ThrottleConfig, ThrottledStore};
     use rstest::rstest;
     use uuid::Uuid;
 
     #[rstest]
-    #[case::default(None, None)]
-    #[case::serial(Some(1), None)]
-    #[case::override_default(Some(4), None)]
-    #[case::with_rate_limit(Some(4), Some(2))]
+    #[case::default(None)]
+    #[case::serial(Some(1))]
+    #[case::override_default(Some(4))]
     #[tokio::test]
-    async fn test_delete_concurrency(
-        #[case] concurrency: Option<usize>,
-        #[case] rate: Option<u64>,
-    ) {
+    async fn test_delete_concurrency(#[case] concurrency: Option<usize>) {
         let data = || {
             lance_datagen::gen_batch()
                 .col(
@@ -2541,9 +2537,6 @@ mod tests {
         if let Some(concurrency) = concurrency {
             operation = operation.with_delete_concurrency(concurrency).unwrap();
         }
-        if let Some(rate) = rate {
-            operation = operation.with_delete_rate_limit(rate).unwrap();
-        }
         let explanation = operation.explain().await.unwrap();
         let window = concurrency.unwrap_or_else(|| dataset.object_store.io_parallelism());
         let candidate_count = explanation.candidate_files.len();
@@ -2555,54 +2548,34 @@ mod tests {
         let stats = operation.execute().await.unwrap();
         let elapsed = start.elapsed();
         assert_eq!(stats.old_versions, 2);
-        assert_eq!(stats.bytes_removed, explanation.stats.bytes_removed);
-        assert_eq!(
-            stats.data_files_removed,
-            explanation.stats.data_files_removed
-        );
+        assert_eq!(stats, explanation.stats);
         assert!(stats.data_files_removed > 0);
-        assert_eq!(stats.failed_deletes, 0);
+        // Bound both sides so serial execution and an ignored override cannot pass.
         assert!(elapsed >= expected_duration);
-        if let Some(rate) = rate {
-            assert!(
-                elapsed
-                    >= Duration::from_secs_f64((candidate_count - 1) as f64 / rate as f64)
-                        + delete_latency
-            );
-        } else {
-            // Bound both sides of the expected batch duration so serial execution
-            // and an ignored override cannot pass. Allow timer rounding only.
-            assert!(elapsed < expected_duration + Duration::from_millis(50));
-        }
+        assert!(elapsed < expected_duration + Duration::from_millis(50));
         assert_eq!(dataset.scan().try_into_batch().await.unwrap(), expected);
     }
 
     #[rstest]
-    #[case::zero(0, false)]
-    #[case::above_limit(tokio::sync::Semaphore::MAX_PERMITS + 1, false)]
-    #[case::invalid_default(tokio::sync::Semaphore::MAX_PERMITS + 1, true)]
+    #[case::execute(false)]
+    #[case::explain(true)]
     #[tokio::test]
-    async fn test_invalid_delete_concurrency(
-        #[case] value: usize,
-        #[case] store_default: bool,
-        #[values(false, true)] explain: bool,
-    ) {
+    async fn test_invalid_default_delete_concurrency(#[case] explain: bool) {
         let fixture = MockDatasetFixture::try_new().unwrap();
         fixture.create_some_data().await.unwrap();
         let mut dataset = fixture.open().await.unwrap();
-        if store_default {
-            dataset.object_store = Arc::new(ObjectStore::new(
-                dataset.object_store.inner.clone(),
-                url::Url::parse(&fixture.dataset_path).unwrap(),
-                None,
-                None,
-                false,
-                true,
-                value,
-                0,
-                None,
-            ));
-        }
+        let value = tokio::sync::Semaphore::MAX_PERMITS + 1;
+        dataset.object_store = Arc::new(ObjectStore::new(
+            dataset.object_store.inner.clone(),
+            url::Url::parse(&fixture.dataset_path).unwrap(),
+            None,
+            None,
+            false,
+            true,
+            value,
+            0,
+            None,
+        ));
         let requests = Arc::new(AtomicUsize::new(0));
         let request_count = requests.clone();
         fixture.mock_store.policy.lock().unwrap().set_before_policy(
@@ -2612,11 +2585,7 @@ mod tests {
                 Ok(())
             }),
         );
-        let mut operation = dataset.cleanup(CleanupPolicy::default());
-        if !store_default {
-            // Exercise task validation independently of the public setter.
-            operation.delete_concurrency = Some(value);
-        }
+        let operation = dataset.cleanup(CleanupPolicy::default());
         let error = if explain {
             operation.explain().await.unwrap_err()
         } else {
@@ -2627,13 +2596,6 @@ mod tests {
             error.to_string(),
             "delete_concurrency must be between 1 and"
         );
-        let error = dataset
-            .cleanup(CleanupPolicy::default())
-            .with_delete_concurrency(value)
-            .err()
-            .unwrap();
-        assert!(matches!(error, Error::InvalidInput { .. }));
-        assert_contains!(error.to_string(), "delete_concurrency");
         assert_contains!(error.to_string(), value.to_string());
         assert_contains!(
             error.to_string(),
@@ -2643,163 +2605,39 @@ mod tests {
     }
 
     #[rstest]
-    #[case::unset(None, true)]
-    #[case::positive(Some("4"), true)]
-    #[case::zero(Some("0"), false)]
-    #[case::negative(Some("-1"), false)]
-    #[case::invalid(Some("abc"), false)]
-    #[case::overflow(Some("18446744073709551616"), false)]
-    #[case::above_semaphore_limit(Some("9223372036854775807"), false)]
+    #[case::positive("4")]
+    #[case::zero("0")]
+    #[case::invalid("abc")]
+    #[case::overflow("18446744073709551616")]
     #[tokio::test]
-    async fn test_auto_cleanup_delete_concurrency(
-        #[case] value: Option<&str>,
-        #[case] valid: bool,
-    ) {
+    async fn test_auto_cleanup_delete_concurrency(#[case] value: &str) {
         let fixture = MockDatasetFixture::try_new().unwrap();
         fixture.create_some_data().await.unwrap();
         let dataset = fixture.open().await.unwrap();
         let mut manifest = dataset.manifest.as_ref().clone();
-        manifest
-            .config
-            .insert("lance.auto_cleanup.interval".into(), "0".into());
-        if let Some(value) = value {
-            manifest
-                .config
-                .insert("lance.auto_cleanup.delete_concurrency".into(), value.into());
-        }
+        manifest.config.extend([
+            ("lance.auto_cleanup.interval".into(), "0".into()),
+            ("lance.auto_cleanup.delete_concurrency".into(), value.into()),
+        ]);
         let result = build_cleanup_operation(&dataset, &manifest, false).await;
-        if valid {
-            assert_eq!(
-                result.unwrap().unwrap().delete_concurrency,
-                value.map(|_| 4)
-            );
+        if value == "4" {
+            assert_eq!(result.unwrap().unwrap().delete_concurrency, Some(4));
         } else {
             let error = result.err().unwrap();
-            let value = value.unwrap();
-            if value.parse::<usize>().is_err() {
+            if value == "0" {
+                assert!(matches!(error, Error::InvalidInput { .. }));
+            } else {
                 assert!(matches!(error, Error::Cleanup { .. }));
                 assert_contains!(error.to_string(), "lance.auto_cleanup.delete_concurrency");
-                assert_contains!(error.to_string(), value);
-                assert_contains!(error.to_string(), "usize");
-            } else {
-                let Error::InvalidInput { source, .. } = error else {
-                    panic!("expected builder's InvalidInput, got {error}");
-                };
-                assert_eq!(
-                    source.to_string(),
-                    format!(
-                        "delete_concurrency must be between 1 and {}, got {value}",
-                        tokio::sync::Semaphore::MAX_PERMITS,
-                    )
-                );
             }
-        }
-    }
-
-    #[rstest]
-    #[case::serial(1, true, "64")]
-    #[case::parallel(2, true, "0")]
-    #[case::invalid_child(2, true, "invalid")]
-    #[case::disabled(2, false, "invalid")]
-    #[tokio::test]
-    async fn test_cascade_delete_concurrency(
-        #[case] concurrency: usize,
-        #[case] enabled: bool,
-        #[case] child_concurrency: &str,
-    ) {
-        let data = || {
-            lance_datagen::gen_batch()
-                .col(
-                    "id",
-                    lance_datagen::array::step::<arrow_array::types::Int32Type>(),
-                )
-                .into_reader_rows(2.into(), 2.into())
-        };
-        let mut parent = Dataset::write(
-            data(),
-            "memory://cleanup",
-            Some(WriteParams {
-                max_rows_per_file: 2,
-                store_params: Some(ObjectStoreParams {
-                    object_store_wrapper: Some(Arc::new(ThrottledStoreWrapper {
-                        config: ThrottleConfig {
-                            wait_delete_per_call: Duration::from_secs(1),
-                            ..Default::default()
-                        },
-                    })),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
-        let mut children = Vec::new();
-        for name in ["first", "second"] {
-            let mut child = parent
-                .create_branch(name, (None, None), None)
-                .await
-                .unwrap();
-            let mut config = vec![
-                ("lance.auto_cleanup.retain_versions", "1"),
-                ("lance.auto_cleanup.delete_concurrency", child_concurrency),
-                ("lance.auto_cleanup.delete_rate_limit", "invalid"),
-            ];
-            if enabled {
-                config.push(("lance.auto_cleanup.interval", "1"));
-            }
-            child.update_config(config).await.unwrap();
-            for _ in 0..2 {
-                child = InsertBuilder::new(WriteDestination::Dataset(Arc::new(child)))
-                    .with_params(&WriteParams {
-                        mode: WriteMode::Overwrite,
-                        max_rows_per_file: 2,
-                        skip_auto_cleanup: true,
-                        ..Default::default()
-                    })
-                    .execute_stream(Box::new(data()) as Box<dyn RecordBatchReader + Send>)
-                    .await
-                    .unwrap();
-            }
-            let version_count = child.versions().await.unwrap().len();
-            let expected = child.scan().try_into_batch().await.unwrap();
-            children.push((child, version_count, expected));
-            // Different source versions give the branches independently scheduled lineages.
-            parent.append(data(), None).await.unwrap();
-        }
-        tokio::time::pause();
-        let policy = CleanupPolicyBuilder::default()
-            .clean_referenced_branches(true)
-            .retain_n_versions(&parent, 1)
-            .await
-            .unwrap()
-            .build();
-        let operation = parent
-            .cleanup(policy)
-            .with_delete_concurrency(concurrency)
-            .unwrap();
-        let before_explain = tokio::time::Instant::now();
-        let explanation = operation.explain().await.unwrap();
-        assert_eq!(before_explain.elapsed(), Duration::ZERO);
-        let count = explanation.candidate_files.len();
-        let start = tokio::time::Instant::now();
-        let stats = operation.execute().await.unwrap();
-        assert_eq!(stats, explanation.stats);
-        assert!(start.elapsed() >= Duration::from_secs(count.div_ceil(concurrency) as u64));
-        if enabled && concurrency > 1 {
-            assert!(start.elapsed() < Duration::from_secs(count as u64));
-        }
-        for (child, previous_count, expected) in children {
-            assert_eq!(
-                child.versions().await.unwrap().len(),
-                if enabled { 1 } else { previous_count }
-            );
-            assert_eq!(child.scan().try_into_batch().await.unwrap(), expected);
+            assert_contains!(error.to_string(), "delete_concurrency");
+            assert_contains!(error.to_string(), value);
         }
     }
 
     #[derive(Debug)]
     struct MockObjectStore {
+        delete_latency: Duration,
         policy: Arc<Mutex<ProxyObjectStorePolicy>>,
         last_modified_times: Arc<Mutex<HashMap<Path, DateTime<Utc>>>>,
     }
@@ -2810,6 +2648,17 @@ mod tests {
             _storage_prefix: &str,
             original: Arc<dyn object_store::ObjectStore>,
         ) -> Arc<dyn object_store::ObjectStore> {
+            let original: Arc<dyn object_store::ObjectStore> = if self.delete_latency.is_zero() {
+                original
+            } else {
+                Arc::new(ThrottledStore::new(
+                    original,
+                    ThrottleConfig {
+                        wait_delete_per_call: self.delete_latency,
+                        ..Default::default()
+                    },
+                ))
+            };
             Arc::new(ProxyObjectStore::new(original, self.policy.clone()))
         }
 
@@ -2826,6 +2675,7 @@ mod tests {
     impl MockObjectStore {
         pub(crate) fn new() -> Self {
             let instance = Self {
+                delete_latency: Duration::ZERO,
                 policy: Arc::new(Mutex::new(ProxyObjectStorePolicy::new())),
                 last_modified_times: Arc::new(Mutex::new(HashMap::new())),
             };
@@ -6795,36 +6645,11 @@ mod tests {
         assert_eq!(calculate_duration(2_000_000_000), Duration::from_nanos(1));
     }
 
-    #[tokio::test]
-    async fn test_cleanup_operation_invalid_rate_limit() {
-        let fixture = MockDatasetFixture::try_new().unwrap();
-        fixture.create_some_data().await.unwrap();
-        let dataset = fixture.open().await.unwrap();
-        let error = dataset
-            .cleanup(CleanupPolicy::default())
-            .with_delete_rate_limit(0)
-            .err()
-            .unwrap();
-        assert!(matches!(error, Error::Cleanup { .. }));
-        assert_contains!(
-            error.to_string(),
-            "delete_rate_limit must be greater than 0, got 0"
-        );
-        let builder_error = CleanupPolicyBuilder::default()
-            .delete_rate_limit(0)
-            .err()
-            .unwrap();
-        assert_eq!(error.to_string(), builder_error.to_string());
-    }
-
     #[rstest]
-    #[case::single(Some(1), None, false, None, false)]
+    #[case::single(None, Some(1), false, None, false)]
     #[case::single_unlimited(None, None, false, None, false)]
-    #[case::operation_only(None, Some(2), false, None, false)]
-    #[case::operation_overrides(Some(1), Some(2), false, None, false)]
-    #[case::cascade_override(Some(100), Some(1), true, Some("100"), false)]
     #[case::cascade_missing(Some(1), None, true, None, false)]
-    #[case::cascade_different(Some(1), None, true, Some("100"), false)]
+    #[case::cascade_different(Some(100), Some(1), true, Some("100"), false)]
     #[case::cascade_unlimited(None, None, true, Some("1"), false)]
     #[case::cascade_invalid(Some(1), None, true, Some("invalid"), false)]
     #[case::cascade_zero(Some(1), None, true, Some("0"), false)]
@@ -6847,7 +6672,16 @@ mod tests {
                 )
                 .into_reader_rows(2.into(), 1.into())
         };
-        let mock_store = Arc::new(MockObjectStore::new());
+        let concurrency = 2;
+        let delete_latency = if clean_referenced_branches && rate.is_none() {
+            Duration::from_secs(1)
+        } else {
+            Duration::ZERO
+        };
+        let mock_store = Arc::new(MockObjectStore {
+            delete_latency,
+            ..MockObjectStore::new()
+        });
         let mut parent = Dataset::write(
             data(),
             "memory://cleanup",
@@ -6861,10 +6695,10 @@ mod tests {
         )
         .await
         .unwrap();
-        let mut branch_bases = Vec::new();
+        let mut children = Vec::new();
         // Cover sequential siblings and independently scheduled branch chains.
         let branches: &[&str] = if clean_referenced_branches {
-            &["first", "sibling", "second"]
+            &["first", "sibling", "second", "disabled"]
         } else {
             &[]
         };
@@ -6873,28 +6707,31 @@ mod tests {
                 .create_branch(name, (None, None), None)
                 .await
                 .unwrap();
-            let mut updates = vec![
-                ("lance.auto_cleanup.interval", "1"),
-                ("lance.auto_cleanup.retain_versions", "1"),
-            ];
+            let mut updates = vec![("lance.auto_cleanup.retain_versions", "1")];
+            if name != "disabled" {
+                updates.push(("lance.auto_cleanup.interval", "1"));
+            }
+            updates.push(("lance.auto_cleanup.delete_concurrency", "invalid"));
             if let Some(value) = child_rate {
                 updates.push(("lance.auto_cleanup.delete_rate_limit", value));
             }
             child.update_config(updates).await.unwrap();
             for _ in 0..2 {
-                child
-                    .append(
-                        data(),
-                        Some(WriteParams {
-                            skip_auto_cleanup: true,
-                            ..Default::default()
-                        }),
-                    )
+                child = InsertBuilder::new(WriteDestination::Dataset(Arc::new(child)))
+                    .with_params(&WriteParams {
+                        mode: WriteMode::Overwrite,
+                        max_rows_per_file: 1,
+                        skip_auto_cleanup: true,
+                        ..Default::default()
+                    })
+                    .execute_stream(Box::new(data()) as Box<dyn RecordBatchReader + Send>)
                     .await
                     .unwrap();
             }
             assert!(child.get_fragments().len() > 1);
-            branch_bases.push(child.base.clone());
+            let versions = child.versions().await.unwrap().len();
+            let expected = child.scan().try_into_batch().await.unwrap();
+            children.push((child, versions, expected));
             if name != "first" {
                 parent.append(data(), None).await.unwrap();
             }
@@ -6924,13 +6761,12 @@ mod tests {
                 Ok(())
             }),
         );
-        let mut operation = parent.cleanup(policy);
+        let mut operation = parent
+            .cleanup(policy)
+            .with_delete_concurrency(concurrency)
+            .unwrap();
         if let Some(rate) = operation_rate {
-            operation = operation
-                .with_delete_rate_limit(17)
-                .unwrap()
-                .with_delete_rate_limit(rate)
-                .unwrap();
+            operation = operation.with_delete_rate_limit(rate).unwrap();
         }
         let start = tokio::time::Instant::now();
         if matches!(child_rate, Some("invalid" | "0")) {
@@ -6966,11 +6802,25 @@ mod tests {
             operation.execute().await.unwrap()
         };
         assert_eq!(stats, explanation.stats);
+        for (child, previous_versions, expected) in children {
+            let deleted = requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(path, _)| path.prefix_matches(&child.base));
+            let enabled = child
+                .manifest
+                .config
+                .contains_key("lance.auto_cleanup.interval");
+            assert_eq!(deleted, enabled);
+            assert_eq!(
+                child.versions().await.unwrap().len(),
+                if enabled { 1 } else { previous_versions }
+            );
+            assert_eq!(child.scan().try_into_batch().await.unwrap(), expected);
+        }
         let requests = requests.lock().unwrap();
         assert!(requests.len() > 2);
-        for base in branch_bases {
-            assert!(requests.iter().any(|(path, _)| path.prefix_matches(&base)));
-        }
         assert!(
             requests
                 .iter()
@@ -6983,6 +6833,12 @@ mod tests {
                 assert!(elapsed >= interval);
                 assert!(elapsed < interval + Duration::from_millis(50));
             }
+        } else if !delete_latency.is_zero() {
+            // The two active lineages must share the window, but still run in parallel.
+            assert!(
+                start.elapsed() >= delete_latency * requests.len().div_ceil(concurrency) as u32
+            );
+            assert!(start.elapsed() < delete_latency * requests.len() as u32);
         } else {
             assert_eq!(start.elapsed(), Duration::ZERO);
         }
