@@ -131,9 +131,8 @@ public class CleanupPolicy {
     }
 
     /**
-     * Set the maximum delete operations per second shared with all cascaded branches for this
-     * cleanup call. An explicit operation-level rate overrides this value. Does not update table
-     * configuration.
+     * Set delete requests per second, shared with all cascaded branches. An explicit operation rate
+     * overrides this value.
      */
     public Builder withDeleteRateLimit(long deleteRateLimit) {
       this.deleteRateLimit = Optional.of(deleteRateLimit);

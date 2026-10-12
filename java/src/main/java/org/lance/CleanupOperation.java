@@ -42,10 +42,8 @@ public class CleanupOperation {
   /**
    * Set the maximum in-flight file deletes shared with all cascaded branches.
    *
-   * <p>Defaults to the initiating store's I/O parallelism. Must be between 1 and Tokio's semaphore
-   * limit (2^61 - 1 on 64-bit platforms), validated by Rust on execute. Applies only to this call,
-   * independently of QPS; does not update table configuration. Cascades ignore their own
-   * concurrency and QPS settings, including invalid values. Separate calls do not share limits.
+   * <p>Defaults to the object store's I/O parallelism. Must be positive (at most 2^61 - 1 on 64-bit
+   * platforms), validated on execute.
    *
    * <p>Example: {@code dataset.cleanup(policy).withDeleteConcurrency(32).execute()}.
    *
@@ -60,8 +58,8 @@ public class CleanupOperation {
   /**
    * Set delete requests per second, shared with all cascaded branches.
    *
-   * <p>Overrides the policy's rate; without an override, the policy's rate applies. Must be
-   * positive, validated by Rust on execute. Does not update table configuration.
+   * <p>Overrides the policy's rate. Must be positive, validated on execute. Without either setting,
+   * deletes are not rate limited.
    *
    * <p>Example: {@code dataset.cleanup(policy).withDeleteRateLimit(100).execute()}.
    *
