@@ -34,6 +34,7 @@ use lance_io::traits::Writer;
 use lance_table::format::{BasePath, DataFile, Fragment, IndexMetadata};
 use lance_table::io::commit::{CommitHandler, commit_handler_from_url};
 use lance_table::io::manifest::ManifestDescribing;
+use lance_table::transaction::{Operation, resolve_arrow_field_ids};
 use object_store::{ObjectStoreExt, path::Path};
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
@@ -1778,38 +1779,13 @@ pub(crate) async fn write_fragments_internal_with_file_row_counts(
         target_bases_info,
         file_row_counts,
         None,
+        false,
     )
     .await
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn write_fragments_internal_to_file(
-    storage_version: ConcreteFileVersion,
-    dataset: Option<&Dataset>,
-    object_store: Arc<ObjectStore>,
-    base_dir: &Path,
-    schema: Schema,
-    data: SendableRecordBatchStream,
-    params: WriteParams,
-    preassigned_data_file_name: Arc<String>,
-) -> Result<(Vec<Fragment>, Schema)> {
-    write_fragments_internal_impl(
-        storage_version,
-        dataset,
-        object_store,
-        base_dir,
-        schema,
-        data,
-        params,
-        None,
-        None,
-        Some(preassigned_data_file_name),
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn write_fragments_internal_impl(
+pub(crate) async fn write_fragments_internal_impl(
     storage_version: ConcreteFileVersion,
     dataset: Option<&Dataset>,
     object_store: Arc<ObjectStore>,
@@ -1820,6 +1796,7 @@ async fn write_fragments_internal_impl(
     target_bases_info: Option<Vec<TargetBaseInfo>>,
     file_row_counts: Option<Vec<usize>>,
     preassigned_data_file_name: Option<Arc<String>>,
+    keep_field_ids: bool,
 ) -> Result<(Vec<Fragment>, Schema)> {
     let mut params = params;
 
@@ -1839,6 +1816,7 @@ async fn write_fragments_internal_impl(
         target_bases_info,
         file_row_counts,
         preassigned_data_file_name,
+        keep_field_ids,
     )
     .await
 }
@@ -1848,7 +1826,7 @@ pub(super) fn promote_legacy_blob_schema(schema: &Schema) -> Result<Schema> {
     for field in &mut schema.fields {
         field.promote_blob_v2()?;
     }
-    schema.set_field_id(schema.max_field_id());
+    schema.try_set_field_id(schema.max_field_id())?;
     Ok(schema)
 }
 
@@ -1857,8 +1835,17 @@ pub(super) fn prepare_write_schema(
     normalized_converted_schema: Schema,
     params: &WriteParams,
     mut schema_compare_options: lance_core::datatypes::SchemaCompareOptions,
+    keep_field_ids: bool,
 ) -> Result<Schema> {
-    let schema = if let Some(dataset) = dataset
+    let schema = if dataset.is_none() {
+        let mut schema = normalized_converted_schema;
+        if keep_field_ids {
+            schema.try_set_field_id(None)?;
+        } else {
+            schema.try_reassign_field_ids(None)?;
+        }
+        schema
+    } else if let Some(dataset) = dataset
         && matches!(params.mode, WriteMode::Append | WriteMode::Create)
     {
         schema_compare_options.compare_nullability = NullabilityComparison::Ignore;
@@ -1917,6 +1904,28 @@ pub(super) fn prepare_write_schema(
             }
         }
         projected
+    } else if let Some(dataset) = dataset
+        && matches!(params.mode, WriteMode::Overwrite)
+        && dataset.manifest.uses_non_reusable_field_ids()
+    {
+        // Uncommitted fragment APIs return files without the schema used to
+        // write them, so their mappings must already use commit-time IDs.
+        // Resolve positional Arrow IDs before the schema enters the writer.
+        let mut operation = Operation::Overwrite {
+            fragments: Vec::new(),
+            schema: normalized_converted_schema,
+            config_upsert_values: None,
+            initial_bases: None,
+        };
+        resolve_arrow_field_ids(Some(&dataset.manifest), &mut operation)?;
+        match operation {
+            Operation::Overwrite { schema, .. } => schema,
+            _ => {
+                return Err(Error::internal(
+                    "Non-reusable field-ID canonicalization changed an Overwrite operation",
+                ));
+            }
+        }
     } else {
         normalized_converted_schema
     };
@@ -3352,7 +3361,7 @@ mod tests {
 
         let object_store = Arc::new(ObjectStore::memory());
         let base_path = Path::from("test");
-        let (fragments, _) = write_fragments_internal(
+        let (fragments, written_schema) = write_fragments_internal(
             ConcreteFileVersion::V1,
             None,
             object_store.clone(),
@@ -3368,7 +3377,16 @@ mod tests {
         assert_eq!(fragments.len(), 1);
         let fragment = &fragments[0];
         assert_eq!(fragment.files.len(), 1);
-        assert_eq!(fragment.files[0].fields.as_ref(), &[0, 1, 3]);
+        // New datasets canonicalize incoming field IDs before writing while
+        // preserving the schema's field order.
+        assert_eq!(
+            written_schema
+                .fields_pre_order()
+                .map(|field| field.id)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert_eq!(fragment.files[0].fields.as_ref(), &[0, 1, 2]);
 
         let path = base_path
             .clone()
@@ -3379,16 +3397,16 @@ mod tests {
             &path,
             file_reader,
             None,
-            schema.clone(),
+            written_schema.clone(),
             0,
             0,
-            3,
+            2,
             None,
         )
         .await
         .unwrap();
         assert_eq!(reader.num_batches(), 1);
-        let batch = reader.read_batch(0, .., &schema).await.unwrap();
+        let batch = reader.read_batch(0, .., &written_schema).await.unwrap();
         assert_eq!(batch, data);
     }
 
