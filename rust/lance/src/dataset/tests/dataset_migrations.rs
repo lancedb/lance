@@ -6,7 +6,8 @@ use std::sync::Arc;
 use std::vec;
 
 use crate::dataset::optimize::{CompactionOptions, compact_files};
-use crate::dataset::{ColumnAlteration, InsertBuilder, NewColumnTransform};
+use crate::dataset::transaction::Operation;
+use crate::dataset::{ColumnAlteration, CommitBuilder, InsertBuilder, NewColumnTransform};
 use crate::index::DatasetIndexExt;
 use crate::utils::test::copy_test_data_to_tmp;
 use crate::{Dataset, Result};
@@ -1155,6 +1156,57 @@ async fn test_new_dataset_keeps_supplied_field_ids() {
     assert_eq!(dataset.schema().field("d").unwrap().id, 5);
     let batch = dataset.scan().try_into_batch().await.unwrap();
     assert_eq!(batch.column_by_name("b").unwrap().null_count(), 0);
+}
+
+/// Overwriting a table with non-reusable IDs writes fresh IDs (`a`=2, `b`=3).
+/// A commit schema supplying them swapped is refused rather than applied.
+#[tokio::test]
+async fn test_overwrite_refuses_supplied_ids_that_permute_written_ones() {
+    let uri = TempStrDir::default();
+    let mut dataset = write_new_dataset(
+        uri.as_str(),
+        vec![
+            ArrowField::new("a", DataType::Int32, true),
+            ArrowField::new("b", DataType::Int32, true),
+        ],
+    )
+    .await
+    .unwrap();
+    dataset.migrate_to_non_reusable_field_ids().await.unwrap();
+
+    let supplied = Arc::new(ArrowSchema::new(vec![
+        field_with_id("a", 3),
+        field_with_id("b", 2),
+    ]));
+    let batch = RecordBatch::try_new(
+        supplied.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![10, 20])),
+            Arc::new(Int32Array::from(vec![100, 200])),
+        ],
+    )
+    .unwrap();
+    let params = WriteParams {
+        mode: WriteMode::Overwrite,
+        ..Default::default()
+    };
+    let dataset = Arc::new(dataset);
+    let mut transaction = InsertBuilder::new(dataset.clone())
+        .with_params(&params)
+        .execute_uncommitted(vec![batch])
+        .await
+        .unwrap();
+    let Operation::Overwrite { schema, .. } = &mut transaction.operation else {
+        panic!("expected Overwrite");
+    };
+    assert_eq!(schema.field_ids(), vec![2, 3]);
+    *schema = lance_core::datatypes::Schema::try_from(supplied.as_ref()).unwrap();
+
+    let err = CommitBuilder::new(dataset)
+        .execute(transaction)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("ambiguous"), "{err}");
 }
 
 #[tokio::test]

@@ -118,7 +118,7 @@ pub fn canonicalize_non_reusable_field_ids(
             schema, fragments, ..
         } => {
             let remap = canonicalize_schema(manifest, schema, None, false)?;
-            remap_fragment_field_ids(fragments, &remap, &HashSet::new());
+            resolve_fragment_field_ids(fragments, &remap, &HashSet::new(), schema)?;
         }
         Operation::Merge {
             schema, fragments, ..
@@ -1501,6 +1501,31 @@ mod tests {
         );
         assert_eq!(fragments[0].files[0].fields.as_ref(), &[1]);
         assert_eq!(fragments[0].files[1].fields.as_ref(), &[2]);
+    }
+
+    /// Files already written with the replacement IDs (`b`=1, `c`=2) under a
+    /// schema supplying them swapped: remapping would swap the columns.
+    #[test]
+    fn canonicalize_overwrite_rejects_supplied_ids_that_permute_written_ones() {
+        let manifest = activated_manifest();
+        let mut schema = LanceSchema::try_from(&ArrowSchema::new(vec![
+            ArrowField::new("b", DataType::Int32, true),
+            ArrowField::new("c", DataType::Int32, true),
+        ]))
+        .unwrap();
+        schema.fields[0].id = 2;
+        schema.fields[1].id = 1;
+        let mut operation = Operation::Overwrite {
+            fragments: vec![fragment_with_file_fields(0, "new.lance", vec![1, 2])],
+            schema,
+            config_upsert_values: None,
+            initial_bases: None,
+        };
+
+        let err =
+            canonicalize_non_reusable_field_ids(Some(&manifest), &mut operation, None).unwrap_err();
+
+        assert!(err.to_string().contains("ambiguous"), "{err}");
     }
 
     #[test]
