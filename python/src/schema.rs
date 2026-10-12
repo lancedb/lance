@@ -129,9 +129,9 @@ impl LanceSchema {
 
     /// Create a Lance schema from a PyArrow schema.
     ///
-    /// A field keeps the ID its `lance:field_id` metadata carries, as when the
-    /// schema is written; the rest are assigned in depth-first order above the
-    /// largest. Be aware this may not match the schema of a particular table.
+    /// Fields keep the ID in their `lance:field_id` metadata; fields without one
+    /// get IDs in depth-first order above the largest. These IDs may not match
+    /// an existing table's.
     #[staticmethod]
     pub fn from_pyarrow(schema: PyArrowType<ArrowSchema>) -> PyResult<Self> {
         let schema = Schema::try_from(&schema.0)

@@ -1159,7 +1159,8 @@ async fn test_new_dataset_keeps_supplied_field_ids() {
 }
 
 /// Overwriting a table with non-reusable IDs writes fresh IDs (`a`=2, `b`=3).
-/// A commit schema supplying them swapped is refused rather than applied.
+/// A commit schema supplying them swapped is refused instead of swapping the
+/// columns.
 #[tokio::test]
 async fn test_overwrite_refuses_supplied_ids_that_permute_written_ones() {
     let uri = TempStrDir::default();

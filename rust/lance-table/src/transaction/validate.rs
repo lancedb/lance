@@ -20,8 +20,8 @@ type DataFileIdentity = (Option<u32>, String);
 /// Resolve an Arrow-derived operation against the dataset it was read from.
 ///
 /// Overwrite assigns new IDs to every field, except that a new table keeps the
-/// IDs its fields carry. Merge matches fields by name and
-/// type, not positional Arrow IDs.
+/// IDs its fields carry. Merge matches fields by name and type, not positional
+/// Arrow IDs.
 /// Project may use explicit IDs for renames; its conversion must leave missing
 /// IDs unassigned. New file mappings follow the resolved schema; retained files
 /// are unchanged. Call this at the conversion boundary, before committing the
@@ -313,12 +313,10 @@ fn resolve_fragment_field_ids(
 ) -> Result<()> {
     let canonical_ids = schema.field_ids();
     for fragment in fragments {
-        // Raw Arrow overwrite fragments may have been written either by a
-        // standalone writer using the source schema IDs or by a
-        // dataset-aware writer using canonical IDs. Resolve that namespace
-        // once for the whole fragment so split files cannot disagree. If
-        // both interpretations are possible and produce different
-        // identities then there is no safe mapping without provenance.
+        // Overwrite fragments may have been written either with the schema's
+        // own IDs or with the replacement IDs. Decide once for the whole
+        // fragment so split files cannot disagree. If both readings are
+        // possible and give different IDs, there is no safe mapping.
         let fragment_field_ids = fragment
             .referenced_lance_files()
             .filter(|file| !retained_files.contains(&(file.base_id, file.path.clone())))
@@ -338,7 +336,7 @@ fn resolve_fragment_field_ids(
         match (canonical_source, raw_source, raw_changes_identity) {
             (true, true, true) => {
                 return Err(Error::invalid_input(format!(
-                    "Fragment {} has ambiguous raw Arrow field IDs; its file mappings can be interpreted as either source or canonical identities",
+                    "Fragment {} has ambiguous field IDs: its files can be read as using either the schema's IDs or the replacement IDs",
                     fragment.id
                 )));
             }
@@ -1503,8 +1501,8 @@ mod tests {
         assert_eq!(fragments[0].files[1].fields.as_ref(), &[2]);
     }
 
-    /// Files already written with the replacement IDs (`b`=1, `c`=2) under a
-    /// schema supplying them swapped: remapping would swap the columns.
+    /// The files already use the replacement IDs (`b`=1, `c`=2) but the schema
+    /// supplies them swapped, so remapping would swap the columns.
     #[test]
     fn canonicalize_overwrite_rejects_supplied_ids_that_permute_written_ones() {
         let manifest = activated_manifest();
@@ -1547,7 +1545,7 @@ mod tests {
 
         let err = resolve_arrow_field_ids(Some(&manifest), &mut operation).unwrap_err();
 
-        assert!(err.to_string().contains("ambiguous raw Arrow field IDs"));
+        assert!(err.to_string().contains("ambiguous field IDs"));
     }
 
     #[test]
@@ -1695,7 +1693,7 @@ mod tests {
 
         let err = resolve_arrow_field_ids(Some(&manifest), &mut operation).unwrap_err();
 
-        assert!(err.to_string().contains("ambiguous raw Arrow field IDs"));
+        assert!(err.to_string().contains("ambiguous field IDs"));
     }
 
     #[test]
