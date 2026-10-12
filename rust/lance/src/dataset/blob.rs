@@ -5216,6 +5216,7 @@ fn visit_managed_row(
     field: &LanceField,
     array: &dyn Array,
     row: usize,
+    sidecar_source: Option<(&Dataset, u64)>,
     visit: &mut impl FnMut(u32, Option<u32>, &str, Range<u64>) -> Result<()>,
 ) -> Result<()> {
     if array.is_null(row) {
@@ -5245,6 +5246,49 @@ fn visit_managed_row(
                 columns.positions.value(row)
                     ..columns.positions.value(row) + columns.sizes.value(row),
             )?;
+        } else if !columns.is_null_blob(row)
+            && matches!(
+                BlobKind::try_from(columns.kinds.value(row))?,
+                BlobKind::Packed | BlobKind::Dedicated
+            )
+            && let Some((dataset, row_addr)) = sidecar_source
+        {
+            let fragment = dataset
+                .get_fragment(RowAddress::from(row_addr).fragment_id() as usize)
+                .ok_or_else(|| Error::internal("Blob sidecar fragment is missing"))?;
+            let file = fragment
+                .data_file_for_field(field.id as u32)
+                .ok_or_else(|| Error::internal("Blob sidecar data file is missing"))?;
+            let Some(base_id) = file.base_id else {
+                return Ok(());
+            };
+            let root = dataset.blob_base_path(Some(base_id))?;
+            let path = blob_path(
+                &dataset.data_file_dir(file)?,
+                data_file_key_from_path(&file.path),
+                columns.blob_ids.value(row),
+            );
+            let uri = path
+                .prefix_match(&root)
+                .ok_or_else(|| {
+                    Error::internal(format!("Blob source {path} is outside base {root}"))
+                })?
+                .map(|part| part.as_ref().to_string())
+                .collect::<Vec<_>>()
+                .join("/");
+            let start = if columns.kinds.value(row) == BlobKind::Dedicated as u8 {
+                0
+            } else {
+                columns.positions.value(row)
+            };
+            let size = columns.sizes.value(row);
+            let end = start.checked_add(size).ok_or_else(|| {
+                Error::corrupt_file_named(&file.path, format!(
+                    "Blob sidecar range overflows u64 for field '{}': position={start}, size={size}",
+                    field.name,
+                ))
+            })?;
+            visit(field.id as u32, Some(base_id), &uri, start..end)?;
         }
         return Ok(());
     }
@@ -5259,7 +5303,7 @@ fn visit_managed_row(
                     .as_struct()
                     .column_by_name(&child.name)
                     .ok_or_else(|| Error::internal("Missing Blob child during reference scan"))?;
-                visit_managed_row(child, values.as_ref(), row, visit)?;
+                visit_managed_row(child, values.as_ref(), row, sidecar_source, visit)?;
             }
         }
         ArrowDataType::List(_) => {
@@ -5269,7 +5313,13 @@ fn visit_managed_row(
                 .first()
                 .ok_or_else(|| Error::internal("Missing Blob list item field"))?;
             for index in values.value_offsets()[row]..values.value_offsets()[row + 1] {
-                visit_managed_row(child, values.values().as_ref(), index as usize, visit)?;
+                visit_managed_row(
+                    child,
+                    values.values().as_ref(),
+                    index as usize,
+                    sidecar_source,
+                    visit,
+                )?;
             }
         }
         ArrowDataType::LargeList(_) => {
@@ -5279,7 +5329,13 @@ fn visit_managed_row(
                 .first()
                 .ok_or_else(|| Error::internal("Missing Blob list item field"))?;
             for index in values.value_offsets()[row]..values.value_offsets()[row + 1] {
-                visit_managed_row(child, values.values().as_ref(), index as usize, visit)?;
+                visit_managed_row(
+                    child,
+                    values.values().as_ref(),
+                    index as usize,
+                    sidecar_source,
+                    visit,
+                )?;
             }
         }
         _ => {
@@ -5296,6 +5352,7 @@ fn visit_managed_row(
 async fn managed_references(
     dataset: &Dataset,
     mut scan: super::scanner::Scanner,
+    include_registered_sidecars: bool,
 ) -> Result<HashSet<(Option<u32>, String)>> {
     let fields = dataset
         .schema()
@@ -5320,12 +5377,13 @@ async fn managed_references(
                 .column_by_name(&field.name)
                 .ok_or_else(|| Error::internal("Missing Blob column during reference scan"))?;
             for row in 0..batch.num_rows() {
+                let row_addr = batch[ROW_ADDR].as_primitive::<UInt64Type>().value(row);
                 visit_managed_row(
                     field,
                     values.as_ref(),
                     row,
+                    include_registered_sidecars.then_some((dataset, row_addr)),
                     &mut |field_id, id, uri, _range| {
-                        let row_addr = batch[ROW_ADDR].as_primitive::<UInt64Type>().value(row);
                         let id = resolve_managed_base_id(dataset, field_id, row_addr, id)?;
                         references.insert((id, uri.to_string()));
                         Ok(())
@@ -5343,7 +5401,7 @@ pub(super) async fn managed_paths(
     owner: &Dataset,
     scan: super::scanner::Scanner,
 ) -> Result<HashSet<Path>> {
-    let references = managed_references(dataset, scan).await?;
+    let references = managed_references(dataset, scan, false).await?;
     let mut paths = HashSet::new();
     let mut bases = HashMap::new();
     for (id, uri) in references {
@@ -5614,7 +5672,7 @@ mod tests {
         let expected_flags = if enabled { flag } else { 0 };
         assert_eq!(dataset.manifest.reader_feature_flags & flag, expected_flags);
         assert_eq!(dataset.manifest.writer_feature_flags & flag, expected_flags);
-        for (_, uri) in super::managed_references(&dataset, dataset.scan())
+        for (_, uri) in super::managed_references(&dataset, dataset.scan(), false)
             .await
             .unwrap()
         {
@@ -6217,7 +6275,8 @@ mod tests {
         let external_dir = TempDir::default();
         let external_path = external_dir.std_path().join("external.bin");
         std::fs::write(&external_path, b"external").unwrap();
-        let payload = vec![9; 100 * 1024];
+        let payload = vec![9; 16];
+        let dedicated_payload = vec![7; 32];
         let mut blobs = BlobArrayBuilder::new(6);
         for row in 0..6 {
             match row {
@@ -6230,7 +6289,17 @@ mod tests {
         }
         let schema = Arc::new(managed_blob_schema(vec![
             Field::new("id", DataType::Int32, false),
-            blob_field("blob", true),
+            blob_field("blob", true).with_metadata(HashMap::from([
+                (ARROW_EXT_NAME_KEY.to_string(), BLOB_V2_EXT_NAME.to_string()),
+                (
+                    BLOB_INLINE_SIZE_THRESHOLD_META_KEY.to_string(),
+                    "8".to_string(),
+                ),
+                (
+                    BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY.to_string(),
+                    "24".to_string(),
+                ),
+            ])),
         ]));
         let batch = RecordBatch::try_new(
             schema.clone(),
@@ -6260,6 +6329,38 @@ mod tests {
             .update_schema_metadata([(MANAGED_BLOBS_META_KEY, opt_in)])
             .await
             .unwrap();
+        if opt_in != Some("true") {
+            let mut blobs = BlobArrayBuilder::new(2);
+            blobs.push_bytes(&payload).unwrap();
+            blobs.push_bytes(&dedicated_payload).unwrap();
+            let schema = Arc::new(Schema::new_with_metadata(
+                vec![
+                    Field::new("id", DataType::Int32, false),
+                    blob_field("blob", true)
+                        .with_metadata(source.schema().field("blob").unwrap().metadata.clone()),
+                ],
+                source.schema().metadata.clone(),
+            ));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(vec![6, 7])),
+                    blobs.finish().unwrap(),
+                ],
+            )
+            .unwrap();
+            source = Dataset::write(
+                RecordBatchIterator::new([Ok(batch)], schema),
+                Arc::new(source.clone()),
+                Some(WriteParams {
+                    mode: WriteMode::Append,
+                    target_bases: registered.then_some(vec![7]),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        }
         let version = source.version_id();
         let mut cloned = if deep {
             source.deep_clone(&clone_dir, version, None).await.unwrap()
@@ -6313,12 +6414,13 @@ mod tests {
             assert_eq!(source.version_id(), version);
             assert_eq!(source.count_rows(None).await.unwrap(), 0);
         }
-        assert_eq!(cloned.count_rows(None).await.unwrap(), 3);
+        let num_rows = if opt_in == Some("true") { 3 } else { 5 };
+        assert_eq!(cloned.count_rows(None).await.unwrap(), num_rows);
         let blobs = Arc::new(cloned)
-            .take_blobs_by_indices(&[0, 1, 2], "blob")
+            .take_blobs_by_indices(&(0..num_rows as u64).collect::<Vec<_>>(), "blob")
             .await
             .unwrap();
-        let expected = [
+        let mut expected = vec![
             (
                 if deep || opt_in == Some("true") {
                     BlobKind::Managed
@@ -6330,6 +6432,26 @@ mod tests {
             (BlobKind::External, b"external".as_slice()),
             (BlobKind::Inline, b"inline".as_slice()),
         ];
+        if opt_in != Some("true") {
+            expected.extend([
+                (
+                    if deep && registered {
+                        BlobKind::Managed
+                    } else {
+                        BlobKind::Packed
+                    },
+                    payload.as_slice(),
+                ),
+                (
+                    if deep && registered {
+                        BlobKind::Managed
+                    } else {
+                        BlobKind::Dedicated
+                    },
+                    dedicated_payload.as_slice(),
+                ),
+            ]);
+        }
         for (blob, (kind, bytes)) in blobs.into_iter().zip(expected) {
             let blob = blob.unwrap();
             assert_eq!(blob.kind(), kind);
