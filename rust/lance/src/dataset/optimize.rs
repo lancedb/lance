@@ -3235,8 +3235,8 @@ fn append_row_lineage_columns(
     Box::pin(RecordBatchStreamAdapter::new(schema, batches))
 }
 
-/// Tasks that recorded moves keep them even without `defer_index_remap`, since Python's
-/// `Compaction.commit` may omit options.
+/// The tasks carry the recording intent, so those that recorded moves keep them even
+/// when the commit options omit `defer_index_remap`.
 async fn records_stable_row_id_moves(
     dataset: &Dataset,
     completed_tasks: &[RewriteResult],

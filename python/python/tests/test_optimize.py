@@ -12,7 +12,7 @@ import lance
 import numpy as np
 import pyarrow as pa
 import pytest
-from lance.lance import Compaction, _frag_reuse_with_stable_row_ids_enabled
+from lance.lance import Compaction
 from lance.optimize import RewriteResult
 from lance.vector import vec_to_table
 
@@ -543,9 +543,31 @@ def test_index_remapping_multiple_rewrite_tasks(tmp_path: Path):
     assert index_frag_ids[0] in frag_ids
 
 
-# False in CI, whose lance-table build has no debug assertions.
-SRID_RECORDING_ENABLED = _frag_reuse_with_stable_row_ids_enabled()
 SRID_RECORDING_REFUSED = "not supported by this build of Lance"
+
+
+@pytest.fixture(scope="module")
+def srid_recording_enabled() -> bool:
+    """Whether this build records row-address moves with stable row ids.
+
+    Found by compacting, as the gate is lance-table's debug assertions, which
+    CI's profile turns off for lance-table but not for pylance.
+    """
+    dataset = lance.write_dataset(
+        pa.table({"i": range(4)}),
+        "memory://srid_recording_probe",
+        max_rows_per_file=2,
+        enable_stable_row_ids=True,
+    )
+    try:
+        metrics = dataset.optimize.compact_files(defer_index_remap=True)
+    except OSError as error:
+        if SRID_RECORDING_REFUSED not in str(error):
+            raise
+        return False
+    assert metrics.fragments_removed == 2
+    assert any(idx.name == "__lance_frag_reuse" for idx in dataset.describe_indices())
+    return True
 
 
 def assert_nothing_recorded(base_dir: Path, version: int):
@@ -561,7 +583,10 @@ def assert_nothing_recorded(base_dir: Path, version: int):
     [(False, "BTREE"), (True, "ZONEMAP"), (True, None)],
 )
 def test_defer_index_remap(
-    tmp_path: Path, enable_stable_row_ids: bool, index_type: Optional[str]
+    tmp_path: Path,
+    enable_stable_row_ids: bool,
+    index_type: Optional[str],
+    srid_recording_enabled: bool,
 ):
     base_dir = tmp_path / "dataset"
     data = pa.table({"i": range(6_000), "val": range(6_000)})
@@ -581,7 +606,7 @@ def test_defer_index_remap(
     before = dataset.scanner(
         columns=["i"], with_row_id=True, with_row_address=True
     ).to_table()
-    if enable_stable_row_ids and not SRID_RECORDING_ENABLED:
+    if enable_stable_row_ids and not srid_recording_enabled:
         with pytest.raises(OSError, match=SRID_RECORDING_REFUSED):
             dataset.optimize.compact_files(**options)
         assert_nothing_recorded(base_dir, dataset.version)
@@ -609,7 +634,10 @@ def test_defer_index_remap(
 @pytest.mark.parametrize("enable_stable_row_ids", [False, True])
 @pytest.mark.parametrize("use_commit_options", [True, False])
 def test_defer_index_remap_via_commit_options(
-    tmp_path: Path, use_commit_options: bool, enable_stable_row_ids: bool
+    tmp_path: Path,
+    use_commit_options: bool,
+    enable_stable_row_ids: bool,
+    srid_recording_enabled: bool,
 ):
     """Compaction.commit respects defer_index_remap passed in options.
 
@@ -634,7 +662,7 @@ def test_defer_index_remap_via_commit_options(
         num_threads=1,
         defer_index_remap=enable_stable_row_ids,
     )
-    if enable_stable_row_ids and not SRID_RECORDING_ENABLED:
+    if enable_stable_row_ids and not srid_recording_enabled:
         with pytest.raises(OSError, match=SRID_RECORDING_REFUSED):
             Compaction.plan(dataset, options=plan_options)
         assert_nothing_recorded(base_dir, dataset.version)
@@ -664,7 +692,7 @@ def test_defer_index_remap_via_commit_options(
 
 
 def test_defer_index_remap_with_stable_row_ids_allows_only_address_indices(
-    tmp_path: Path,
+    tmp_path: Path, srid_recording_enabled: bool
 ):
     base_dir = tmp_path / "dataset"
     data = pa.table({"i": range(3_000), "category": ["a", "b", "c"] * 1_000})
@@ -673,12 +701,12 @@ def test_defer_index_remap_with_stable_row_ids_allows_only_address_indices(
     )
     dataset.create_scalar_index("category", "BITMAP")
     options = dict(target_rows_per_fragment=3_000, defer_index_remap=True)
-    refusal = "category_idx" if SRID_RECORDING_ENABLED else SRID_RECORDING_REFUSED
+    refusal = "category_idx" if srid_recording_enabled else SRID_RECORDING_REFUSED
     with pytest.raises(OSError, match=refusal):
         dataset.optimize.compact_files(**options)
 
     dataset.drop_index("category_idx")
-    if not SRID_RECORDING_ENABLED:
+    if not srid_recording_enabled:
         with pytest.raises(OSError, match=SRID_RECORDING_REFUSED):
             dataset.optimize.compact_files(**options)
         assert_nothing_recorded(base_dir, dataset.version)
