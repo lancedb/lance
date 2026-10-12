@@ -691,8 +691,48 @@ struct AimdHttpService {
     delete: Option<Arc<OperationThrottle>>,
 }
 
+/// Whether the request completes a multipart upload.
+///
+/// S3 and the GCS XML API complete with `POST ?uploadId=<id>` (no
+/// `partNumber`); Azure completes with `PUT ?comp=blocklist`. Upload
+/// initiation (`POST ?uploads`) is deliberately excluded.
 #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
-fn is_multipart_part_request(request: &HttpRequest) -> bool {
+fn is_multipart_complete_request(request: &HttpRequest) -> bool {
+    let Some(query) = request.uri().query() else {
+        return false;
+    };
+    let mut has_upload_id = false;
+    let mut has_part_number = false;
+    let mut is_blocklist = false;
+    for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+        if key.eq_ignore_ascii_case("uploadId") {
+            has_upload_id = true;
+        } else if key.eq_ignore_ascii_case("partNumber") {
+            has_part_number = true;
+        } else if key.eq_ignore_ascii_case("comp") && value.eq_ignore_ascii_case("blocklist") {
+            is_blocklist = true;
+        }
+    }
+    match *request.method() {
+        ::http::Method::POST => has_upload_id && !has_part_number,
+        ::http::Method::PUT => is_blocklist,
+        _ => false,
+    }
+}
+
+/// Whether the request carries one multipart upload's data: an uploaded part
+/// (S3/GCS `PUT ?partNumber=..&uploadId=..`, Azure `PUT ?comp=block`) or the
+/// complete request itself.
+///
+/// Completes are included because `MultipartUpload::complete` consumes the
+/// recorded part ids before issuing the request, so retries must happen here
+/// at the HTTP layer, where the request — including its serialized part list
+/// — can simply be re-sent.
+#[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+fn is_multipart_upload_request(request: &HttpRequest) -> bool {
+    if is_multipart_complete_request(request) {
+        return true;
+    }
     if request.method() != ::http::Method::PUT {
         return false;
     }
@@ -721,6 +761,17 @@ fn is_delete_request(request: &HttpRequest) -> bool {
                     || (key.eq_ignore_ascii_case("comp") && value.eq_ignore_ascii_case("batch"))
             })
         })
+}
+
+/// Whether a lowercased multipart-complete response body carries an S3-style
+/// `InternalError` payload. S3 can answer `CompleteMultipartUpload` with HTTP
+/// 200 and an error document; the tag may carry a namespace or attributes, so
+/// the match is on the opening-tag prefix rather than the exact `<error>`
+/// element. The success body (`<CompleteMultipartUploadResult>`) contains
+/// neither marker.
+#[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+fn is_retryable_complete_error_body(body: &str) -> bool {
+    body.contains("<error") && body.contains("internalerror")
 }
 
 #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
@@ -767,9 +818,10 @@ impl HttpService for AimdHttpService {
         let Some(write) = self.write.as_ref() else {
             return self.inner.execute(request).await;
         };
-        if !is_multipart_part_request(&request) {
+        if !is_multipart_upload_request(&request) {
             return self.inner.execute(request).await;
         }
+        let is_complete = is_multipart_complete_request(&request);
 
         for attempt in 0..=write.max_retries {
             write.acquire_token().await;
@@ -797,6 +849,13 @@ impl HttpService for AimdHttpService {
                             || body.contains("throttl");
                         is_retryable |= is_throttle_body;
                         is_throttle |= is_throttle_body;
+                        // S3 can answer a complete with HTTP 200 carrying an
+                        // error body. Retrying is safe: the request already
+                        // holds the serialized part list, so re-sending it
+                        // repeats the exact completion.
+                        if is_complete && is_retryable_complete_error_body(&body) {
+                            is_retryable = true;
+                        }
                         Ok(HttpResponse::from_parts(
                             parts,
                             HttpResponseBody::from(bytes),
@@ -837,7 +896,7 @@ impl HttpService for AimdHttpService {
                     attempt = attempt + 1,
                     max_retries = write.max_retries,
                     backoff_ms,
-                    "Retrying multipart upload part after retryable HTTP response"
+                    "Retrying multipart upload request after retryable HTTP response"
                 );
                 tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
                 continue;
@@ -852,7 +911,7 @@ impl HttpService for AimdHttpService {
 struct ThrottledMultipartUpload {
     target: Box<dyn MultipartUpload>,
     write: Arc<OperationThrottle>,
-    parts_throttled_at_http: bool,
+    requests_throttled_at_http: bool,
 }
 
 impl Debug for ThrottledMultipartUpload {
@@ -867,7 +926,7 @@ impl MultipartUpload for ThrottledMultipartUpload {
         // Call put_part synchronously to preserve part ordering regardless
         // of which futures are awaited first.
         let fut = self.target.put_part(data);
-        if self.parts_throttled_at_http {
+        if self.requests_throttled_at_http {
             return fut;
         }
         let write = Arc::clone(&self.write);
@@ -879,24 +938,24 @@ impl MultipartUpload for ThrottledMultipartUpload {
         })
     }
 
+    /// Completes the multipart upload by calling the target exactly once.
+    ///
+    /// `MultipartUpload::complete` consumes the recorded part ids before
+    /// sending the completion request, so a wrapper-level retry cannot repeat
+    /// it: the second call fails deterministically with "Missing part" and
+    /// masks the real error. Retries happen at the HTTP layer instead, which
+    /// re-sends the same serialized request.
     async fn complete(&mut self) -> OSResult<PutResult> {
-        let target = &mut self.target;
-        for attempt in 0..=self.write.max_retries {
-            self.write.acquire_token().await;
-            let result = target.complete().await;
-            self.write.observe_outcome(&result);
-
-            match &result {
-                Err(err) if is_throttle_error(err) && attempt < self.write.max_retries => {
-                    let backoff_ms = rand::rng()
-                        .random_range(self.write.min_backoff_ms..=self.write.max_backoff_ms);
-                    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
-                    continue;
-                }
-                _ => return result,
-            }
+        if self.requests_throttled_at_http {
+            // The HTTP connector acquires a token, observes the outcome and
+            // retries each attempt of the complete request; wrapping it here
+            // would double-count.
+            return self.target.complete().await;
         }
-        unreachable!()
+        self.write.acquire_token().await;
+        let result = self.target.complete().await;
+        self.write.observe_outcome(&result);
+        result
     }
 
     async fn abort(&mut self) -> OSResult<()> {
@@ -1082,7 +1141,7 @@ impl ObjectStore for AimdThrottledStore {
         Ok(Box::new(ThrottledMultipartUpload {
             target,
             write: Arc::clone(&self.write),
-            parts_throttled_at_http: self.native_http_throttling,
+            requests_throttled_at_http: self.native_http_throttling,
         }))
     }
 
@@ -1297,17 +1356,51 @@ mod tests {
 
     #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
     #[rstest]
-    #[case::s3("https://bucket/object?partNumber=1&uploadId=id", true)]
-    #[case::azure_block("https://account/object?comp=block&blockid=id", true)]
-    #[case::azure_block_list("https://account/object?comp=blocklist", false)]
-    #[case::ordinary_put("https://bucket/object", false)]
-    fn test_is_multipart_part_request(#[case] uri: &str, #[case] expected: bool) {
+    #[case::s3_part(
+        ::http::Method::PUT,
+        "https://bucket/object?partNumber=1&uploadId=id",
+        true
+    )]
+    #[case::s3_complete(::http::Method::POST, "https://bucket/object?uploadId=id", true)]
+    #[case::s3_initiate(::http::Method::POST, "https://bucket/object?uploads", false)]
+    #[case::azure_block(
+        ::http::Method::PUT,
+        "https://account/object?comp=block&blockid=id",
+        true
+    )]
+    #[case::azure_block_list(::http::Method::PUT, "https://account/object?comp=blocklist", true)]
+    #[case::s3_list_parts(::http::Method::GET, "https://bucket/object?uploadId=id", false)]
+    #[case::ordinary_put(::http::Method::PUT, "https://bucket/object", false)]
+    fn test_is_multipart_upload_request(
+        #[case] method: ::http::Method,
+        #[case] uri: &str,
+        #[case] expected: bool,
+    ) {
         let request = ::http::Request::builder()
-            .method(::http::Method::PUT)
+            .method(method)
             .uri(uri)
             .body(object_store::client::HttpRequestBody::empty())
             .unwrap();
-        assert_eq!(is_multipart_part_request(&request), expected);
+        assert_eq!(is_multipart_upload_request(&request), expected);
+    }
+
+    #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+    #[rstest]
+    #[case::plain_internal_error(
+        "<error><code>internalerror</code><message>internal error</message></error>",
+        true
+    )]
+    #[case::namespaced_internal_error(
+        "<error xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><code>internalerror</code></error>",
+        true
+    )]
+    #[case::success_result(
+        "<?xml version=\"1.0\"?><completemultipartuploadresult><etag>\"e\"</etag></completemultipartuploadresult>",
+        false
+    )]
+    #[case::other_error("<error><code>accessdenied</code></error>", false)]
+    fn test_is_retryable_complete_error_body(#[case] body: &str, #[case] expected: bool) {
+        assert_eq!(is_retryable_complete_error_body(body), expected);
     }
 
     #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
@@ -2717,6 +2810,9 @@ mod tests {
     struct MultipartRetryState {
         failures_remaining: AtomicUsize,
         part_uris: std::sync::Mutex<Vec<String>>,
+        complete_failures_remaining: AtomicUsize,
+        complete_calls: AtomicUsize,
+        complete_error_on_200: bool,
     }
 
     #[cfg(feature = "aws")]
@@ -2787,11 +2883,43 @@ mod tests {
                     (::http::StatusCode::OK, "", Some("\"part-etag\""))
                 }
             } else if method == ::http::Method::POST && query.contains("uploadId=") {
-                (
-                    ::http::StatusCode::OK,
-                    "<CompleteMultipartUploadResult><Location>https://bucket/object</Location><Bucket>bucket</Bucket><Key>object</Key><ETag>\"object-etag\"</ETag></CompleteMultipartUploadResult>",
-                    None,
-                )
+                self.state.complete_calls.fetch_add(1, Ordering::SeqCst);
+                let mut remaining = self
+                    .state
+                    .complete_failures_remaining
+                    .load(Ordering::SeqCst);
+                let should_fail = loop {
+                    let Some(next) = remaining.checked_sub(1) else {
+                        break false;
+                    };
+                    match self
+                        .state
+                        .complete_failures_remaining
+                        .compare_exchange_weak(remaining, next, Ordering::SeqCst, Ordering::SeqCst)
+                    {
+                        Ok(_) => break true,
+                        Err(actual) => remaining = actual,
+                    }
+                };
+                if !should_fail {
+                    (
+                        ::http::StatusCode::OK,
+                        "<CompleteMultipartUploadResult><Location>https://bucket/object</Location><Bucket>bucket</Bucket><Key>object</Key><ETag>\"object-etag\"</ETag></CompleteMultipartUploadResult>",
+                        None,
+                    )
+                } else if self.state.complete_error_on_200 {
+                    (
+                        ::http::StatusCode::OK,
+                        "<Error xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Code>InternalError</Code><Message>We encountered an internal error. Please try again.</Message></Error>",
+                        None,
+                    )
+                } else {
+                    (
+                        ::http::StatusCode::SERVICE_UNAVAILABLE,
+                        "<Error><Code>SlowDown</Code><Message>Please reduce your request rate.</Message></Error>",
+                        None,
+                    )
+                }
             } else {
                 (::http::StatusCode::BAD_REQUEST, "unexpected request", None)
             };
@@ -2818,6 +2946,9 @@ mod tests {
         let retry_state = Arc::new(MultipartRetryState {
             failures_remaining: AtomicUsize::new(3),
             part_uris: std::sync::Mutex::new(Vec::new()),
+            complete_failures_remaining: AtomicUsize::new(0),
+            complete_calls: AtomicUsize::new(0),
+            complete_error_on_200: false,
         });
         let throttle_state = AimdThrottleState::new(AimdThrottleConfig::default()).unwrap();
         let connector = AimdHttpConnector::new(
@@ -2849,6 +2980,131 @@ mod tests {
         assert_eq!(part_uris.len(), 4);
         assert!(part_uris.iter().all(|uri| uri == &part_uris[0]));
         assert!(part_uris[0].contains("partNumber=1"));
+    }
+
+    /// Runs one S3 multipart upload through the AIMD HTTP connector against a
+    /// mock whose first complete request fails, and returns how many complete
+    /// requests reached the mock.
+    #[cfg(feature = "aws")]
+    async fn complete_calls_after_one_failed_complete(complete_error_on_200: bool) -> usize {
+        use object_store::RetryConfig;
+        use object_store::aws::AmazonS3Builder;
+
+        let retry_state = Arc::new(MultipartRetryState {
+            failures_remaining: AtomicUsize::new(0),
+            part_uris: std::sync::Mutex::new(Vec::new()),
+            complete_failures_remaining: AtomicUsize::new(1),
+            complete_calls: AtomicUsize::new(0),
+            complete_error_on_200,
+        });
+        let throttle_state = AimdThrottleState::new(AimdThrottleConfig::default()).unwrap();
+        let connector = AimdHttpConnector::new(
+            MultipartRetryConnector {
+                state: Arc::clone(&retry_state),
+            },
+            Some(&throttle_state),
+        );
+        let store = AmazonS3Builder::new()
+            .with_bucket_name("bucket")
+            .with_region("us-east-1")
+            .with_skip_signature(true)
+            .with_retry(RetryConfig {
+                max_retries: 0,
+                ..Default::default()
+            })
+            .with_http_connector(connector)
+            .build()
+            .unwrap();
+
+        let mut upload = store.put_multipart(&Path::from("object")).await.unwrap();
+        upload
+            .put_part(PutPayload::from_static(b"payload"))
+            .await
+            .unwrap();
+        upload.complete().await.unwrap();
+
+        retry_state.complete_calls.load(Ordering::SeqCst)
+    }
+
+    /// `MultipartUpload::complete` consumes the recorded part ids before
+    /// sending, so it must be called exactly once; a throttled complete
+    /// request is retried at the HTTP layer, which re-sends the same request.
+    #[cfg(feature = "aws")]
+    #[tokio::test(start_paused = true)]
+    async fn test_multipart_http_retry_recovers_throttled_complete() {
+        assert_eq!(
+            complete_calls_after_one_failed_complete(false).await,
+            2,
+            "the throttled complete should be retried exactly once at the HTTP layer"
+        );
+    }
+
+    /// S3 can answer `CompleteMultipartUpload` with HTTP 200 and an
+    /// `InternalError` error document; the HTTP layer must retry that too.
+    #[cfg(feature = "aws")]
+    #[tokio::test(start_paused = true)]
+    async fn test_multipart_http_retry_recovers_200_internal_error_complete() {
+        assert_eq!(
+            complete_calls_after_one_failed_complete(true).await,
+            2,
+            "a 200 InternalError complete should be retried once at the HTTP layer"
+        );
+    }
+
+    /// The wrapper must surface the target's real error rather than retry
+    /// `complete` and mask it with "Missing part".
+    #[tokio::test(start_paused = true)]
+    async fn test_throttled_multipart_complete_calls_target_once() {
+        use object_store::PutResult;
+        use object_store::UploadPart;
+
+        #[derive(Debug)]
+        struct FailingComplete {
+            complete_calls: Arc<AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl MultipartUpload for FailingComplete {
+            fn put_part(&mut self, _data: PutPayload) -> UploadPart {
+                Box::pin(async { Ok(()) })
+            }
+
+            async fn complete(&mut self) -> OSResult<PutResult> {
+                self.complete_calls.fetch_add(1, Ordering::SeqCst);
+                Err(make_generic_error(
+                    "SlowDown: Please reduce your request rate",
+                ))
+            }
+
+            async fn abort(&mut self) -> OSResult<()> {
+                Ok(())
+            }
+        }
+
+        let state = AimdThrottleState::new(AimdThrottleConfig::default()).unwrap();
+        let complete_calls = Arc::new(AtomicUsize::new(0));
+        let mut upload = ThrottledMultipartUpload {
+            target: Box::new(FailingComplete {
+                complete_calls: Arc::clone(&complete_calls),
+            }),
+            write: Arc::clone(&state.write),
+            requests_throttled_at_http: false,
+        };
+
+        let err = upload.complete().await.unwrap_err();
+        assert_eq!(
+            complete_calls.load(Ordering::SeqCst),
+            1,
+            "complete must call the target exactly once"
+        );
+        assert!(
+            !err.to_string().contains("Missing part"),
+            "complete retry surfaced the masked error: {err}"
+        );
+        assert!(
+            is_throttle_error(&err),
+            "the target's throttle error should surface unchanged: {err}"
+        );
     }
 
     #[tokio::test]
