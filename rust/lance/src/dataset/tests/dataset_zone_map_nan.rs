@@ -15,17 +15,14 @@ use std::sync::Arc;
 use arrow::compute::concat_batches;
 use arrow_array::{
     Array, Float16Array, Float32Array, Float64Array, Int64Array, RecordBatch, RecordBatchIterator,
-    UInt32Array,
 };
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
-use bytes::Bytes;
 use futures::TryStreamExt;
 use lance_core::utils::tempfile::TempStrDir;
 use lance_encoding::decoder::FilterExpression;
 use lance_file::reader::{FileReader, FileReaderOptions};
 use lance_index::IndexType;
 use lance_index::optimize::OptimizeOptions;
-use lance_index::scalar::seed::SEED_META_KEY_PREFIX;
 use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
 use lance_io::ReadBatchParams;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
@@ -275,12 +272,8 @@ async fn read_all(reader: &FileReader) -> RecordBatch {
     concat_batches(&batches[0].schema(), &batches).unwrap()
 }
 
-/// The ZoneMap index file of `column`: its zone batch and the file schema
-/// metadata the index stores next to it.
-async fn index_file(
-    dataset: &Dataset,
-    column: &str,
-) -> (RecordBatch, std::collections::HashMap<String, String>) {
+/// The zone statistics read from the ZoneMap index file of `column`.
+async fn index_file(dataset: &Dataset, column: &str) -> RecordBatch {
     let field_id = dataset.schema().field(column).unwrap().id;
     let indices = dataset.load_indices().await.unwrap();
     let index = indices
@@ -292,32 +285,7 @@ async fn index_file(
         .join(index.uuid.to_string())
         .join("zonemap.lance");
     let reader = open_file(dataset, &path).await;
-    let metadata = reader.metadata().file_schema.metadata.clone();
-    (read_all(&reader).await, metadata)
-}
-
-/// The write seed for `column` in the data file of fragment `fragment`.
-async fn seed(dataset: &Dataset, fragment: usize, column: &str) -> Bytes {
-    let file = dataset.get_fragments()[fragment].metadata().files[0]
-        .path
-        .clone();
-    let path = dataset.data_dir().join(file);
-    let reader = open_file(dataset, &path).await;
-    let value = reader
-        .metadata()
-        .file_schema
-        .metadata
-        .get(&format!("{SEED_META_KEY_PREFIX}{column}"))
-        .unwrap()
-        .clone();
-    let buf_index: u32 = value.split(':').next().unwrap().parse().unwrap();
-    reader.read_global_buffer(buf_index).await.unwrap()
-}
-
-fn seed_batch(bytes: &Bytes) -> RecordBatch {
-    let mut reader =
-        arrow_ipc::reader::FileReader::try_new(std::io::Cursor::new(bytes.as_ref()), None).unwrap();
-    reader.next().unwrap().unwrap()
+    read_all(&reader).await
 }
 
 /// A NaN literal of the column's own type. A literal of another float type
@@ -450,83 +418,6 @@ async fn assert_index_matches_scan(dataset: &Dataset) {
     }
 }
 
-/// The `+NaN` max is a marker for a positive NaN only: a zone whose NaNs are
-/// all negative keeps its ordinary maximum (null without ordinary values), and
-/// `nan_count` is the only trace of its NaNs.
-#[tokio::test]
-async fn test_max_marks_positive_nan_only() {
-    let dir = TempStrDir::default();
-    let dataset = write_dataset(&dir).await;
-    for column in FLOAT_COLUMNS {
-        let (batch, _) = index_file(&dataset, column).await;
-        let max = batch.column_by_name("max").unwrap();
-        let nan_counts = batch
-            .column_by_name("nan_count")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<UInt32Array>()
-            .unwrap();
-        // Zone order follows `zones()` (per fragment of ten zones).
-        let expected: [(bool, u32); 10] = [
-            (false, 0), // ordinary only
-            (false, 2), // negative NaN with values: ordinary max stays
-            (true, 2),  // positive NaN with values
-            (true, 2),  // both signs
-            (true, 8),  // only positive NaN
-            (false, 8), // only negative NaN: no ordinary max at all
-            (false, 0), // only null
-            (false, 4), // null and negative NaN
-            (true, 4),  // null and positive NaN
-            (false, 0), // values and null
-        ];
-        for (i, (nan_max, nan_count)) in expected.iter().cycle().take(batch.num_rows()).enumerate()
-        {
-            assert_eq!(nan_counts.value(i), *nan_count, "{column} zone {i}");
-            assert_eq!(is_nan_at(max, i), *nan_max, "{column} zone {i} max {max:?}");
-        }
-        let seed = seed_batch(&seed(&dataset, 1, column).await);
-        let seed_max = seed.column_by_name("max").unwrap();
-        for (i, (nan_max, _)) in expected.iter().enumerate() {
-            assert_eq!(is_nan_at(seed_max, i), *nan_max, "{column} seed zone {i}");
-        }
-        assert!(
-            !is_nan_at(max, 1) && !max.is_null(1),
-            "{column}: negative-only zone lost its max"
-        );
-        assert!(
-            max.is_null(5),
-            "{column}: all-negative-NaN zone should have no max"
-        );
-    }
-}
-
-fn is_nan_at(array: &arrow_array::ArrayRef, i: usize) -> bool {
-    if array.is_null(i) {
-        return false;
-    }
-    match array.data_type() {
-        DataType::Float16 => array
-            .as_any()
-            .downcast_ref::<Float16Array>()
-            .unwrap()
-            .value(i)
-            .is_nan(),
-        DataType::Float32 => array
-            .as_any()
-            .downcast_ref::<Float32Array>()
-            .unwrap()
-            .value(i)
-            .is_nan(),
-        DataType::Float64 => array
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .unwrap()
-            .value(i)
-            .is_nan(),
-        other => panic!("unexpected {other:?}"),
-    }
-}
-
 /// Every predicate returns the rows a scan returns, with the index built by a
 /// scan and again after the appended fragment's seeds are harvested into it.
 #[tokio::test]
@@ -542,7 +433,7 @@ async fn test_nan_queries_match_scan() {
         .await
         .unwrap();
     for column in FLOAT_COLUMNS {
-        let (batch, _) = index_file(&dataset, column).await;
+        let batch = index_file(&dataset, column).await;
         assert_eq!(batch.num_rows(), 2 * zones().len(), "{column}");
     }
     assert_representative_queries_use_index(&dataset).await;

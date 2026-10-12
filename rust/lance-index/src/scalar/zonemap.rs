@@ -198,7 +198,7 @@ impl ZoneMapIndex {
     ///
     /// `None` when no zone has a finite bound, or when any zone holds a NaN:
     /// NaNs sit outside the finite range on either side under Arrow's total
-    /// order (and a zone with a positive NaN stores `max = +NaN`, hiding its
+    /// order (and a zone with any NaN stores `max = +NaN`, hiding its
     /// finite max), so no sound finite bound exists without a scan — folding
     /// only the finite extrema would yield a *subset* that prunes live rows.
     /// Folding raw zones (not each segment's `value_range`) keeps this exact
@@ -257,8 +257,8 @@ impl ZoneMapIndex {
     /// may match either side of any range and is always kept for range
     /// queries. Equality with an ordinary value cannot be satisfied by a NaN,
     /// so it still uses the bounds. A `+NaN` max is a marker that the zone
-    /// holds a positive NaN (older indices wrote it for any NaN), not the
-    /// zone's largest value: NaNs with different payloads sit at different
+    /// holds a NaN of either sign, not its exact largest value: NaNs with
+    /// different payloads sit at different
     /// positions in the total order. The marker hides the ordinary maximum,
     /// which keeps the ordinary check conservative.
     fn evaluate_zone_against_query(
@@ -1227,17 +1227,14 @@ impl ZoneMapProcessor {
     fn max_value_from_stats(
         value: Option<&ArrayRef>,
         data_type: &DataType,
-        positive_nan_count: u32,
+        nan_count: u32,
     ) -> Result<ScalarValue> {
-        if positive_nan_count > 0
+        if nan_count > 0
             && let Some(nan) = Self::nan_scalar(data_type)
         {
-            // The canonical `+NaN` is a marker that the zone holds a positive
-            // NaN, which sorts above every ordinary value; it is not the
-            // zone's largest NaN, since payloads order NaNs among themselves.
-            // A negative NaN sorts below every ordinary value and must not
-            // displace the ordinary maximum; it is visible only through
-            // `nan_count`.
+            // DataFusion's max accumulator surfaced NaN as the zone max.  Keep
+            // that stored zonemap shape while using arrow_stats so existing
+            // range/equality pruning remains conservative around NaN.
             return Ok(nan);
         }
         Self::scalar_value_from_stat(value, data_type)
@@ -1268,10 +1265,6 @@ impl ZoneProcessor for ZoneMapProcessor {
         }
 
         let nan_count = Self::stat_count_to_u32("nan_count", statistics.nan_count.unwrap_or(0))?;
-        let negative_nan_count = Self::stat_count_to_u32(
-            "negative_nan_count",
-            statistics.negative_nan_count.unwrap_or(0),
-        )?;
         Ok(ZoneMapStatistics {
             min: Self::scalar_value_from_stat(
                 statistics.min.as_ref().map(|scalar| scalar.as_array()),
@@ -1280,7 +1273,7 @@ impl ZoneProcessor for ZoneMapProcessor {
             max: Self::max_value_from_stats(
                 statistics.max.as_ref().map(|scalar| scalar.as_array()),
                 &self.data_type,
-                nan_count.saturating_sub(negative_nan_count),
+                nan_count,
             )?,
             null_count,
             nan_count,
@@ -5163,27 +5156,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_nan_zone_statistics() {
+    async fn test_nan_zone_statistics_preserve_existing_marker() {
         let index = signed_nan_index().await;
         assert_eq!(index.zones.len(), SHAPES.len());
+        assert_eq!(index.value_range(), None);
         let bits = |v: &ScalarValue| match v {
             ScalarValue::Float32(Some(f)) => Some(f.to_bits()),
             ScalarValue::Float32(None) => None,
             other => panic!("unexpected {other:?}"),
         };
         let nan = f32::NAN.to_bits();
-        // (min bits, max bits, null_count, nan_count). A positive NaN is
-        // marked by the canonical `+NaN` max; a negative NaN is below every
-        // ordinary value and leaves the ordinary max alone.
+        // (min bits, max bits, null_count, nan_count). The writer still stores
+        // the `+NaN` marker for either sign; the reader must use nan_count to
+        // keep matching rows even when the marker hides the ordinary maximum.
         let expected = [
             (Some(5.0f32.to_bits()), Some(8.0f32.to_bits()), 0, 0),
-            (Some(5.0f32.to_bits()), Some(5.0f32.to_bits()), 0, 1),
+            (Some(5.0f32.to_bits()), Some(nan), 0, 1),
             (Some(8.0f32.to_bits()), Some(nan), 0, 1),
             (None, Some(nan), 0, 2),
             (None, Some(nan), 0, 2),
-            (None, None, 0, 2),
+            (None, Some(nan), 0, 2),
             (None, None, 2, 0),
-            (None, None, 1, 1),
+            (None, Some(nan), 1, 1),
             (None, Some(nan), 1, 1),
         ];
         for (zone, (min, max, null_count, nan_count)) in index.zones.iter().zip(expected) {
@@ -5282,14 +5276,14 @@ mod tests {
             SargableQuery::Range(Unbounded, Included(f32_scalar(NEG_NAN)))
         ));
 
-        // Equality with an ordinary value cannot be met by a NaN, so the
-        // ordinary bounds decide. A negative NaN left the ordinary max intact,
-        // which lets `= 100` prune that zone; a positive NaN hides it.
+        // Equality with an ordinary value uses the ordinary bounds. The
+        // existing marker hides the ordinary maximum for either NaN sign,
+        // so zones with ordinary values can remain false positives.
         assert!(eval(
             Shape::NegativeNanWithValues,
             SargableQuery::Equals(f32_scalar(5.0))
         ));
-        assert!(!eval(
+        assert!(eval(
             Shape::NegativeNanWithValues,
             SargableQuery::Equals(f32_scalar(100.0))
         ));
