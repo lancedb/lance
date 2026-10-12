@@ -3441,7 +3441,8 @@ class LanceDataset(pa.dataset.Dataset):
             initiating dataset's object store I/O parallelism. Independent of
             ``delete_rate_limit``. Cascaded branches ignore their own concurrency
             and QPS settings, including invalid values. Separate calls do not
-            share limits.
+            share limits. Neither deletion argument updates the table config;
+            automatic cleanup uses its separately configured limits.
             For example, ``delete_concurrency=32`` allows 32 in-flight deletes.
 
         delete_rate_limit: int, optional

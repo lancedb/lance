@@ -604,6 +604,23 @@ of `delete_rate_limit`, which controls delete operations per second:
 dataset.cleanup_old_versions(delete_concurrency=32, delete_rate_limit=100)
 ```
 
+These arguments apply only to this cleanup call; they do not update the table
+configuration. In Rust, configure execution limits on `CleanupOperation`:
+
+```rust
+dataset
+    .cleanup(policy)
+    .with_delete_concurrency(32)?
+    .with_delete_rate_limit(100)?
+    .execute()
+    .await?;
+```
+
+Rust's existing `CleanupPolicy.delete_rate_limit` field remains supported.
+An operation's explicit rate overrides that field; otherwise the policy's rate
+applies. If neither is set, deletes are not rate limited. `CleanupPolicy` retains
+its existing fields, so exhaustive Rust struct literals remain compatible.
+
 The initiating cleanup and all cascaded branches share one deletion concurrency
 budget and one `delete_rate_limit` budget. Cascaded branches ignore their own
 concurrency and QPS settings, including invalid values. Branch cleanup eligibility

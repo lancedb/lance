@@ -483,22 +483,6 @@ impl BlockingDataset {
         Ok(())
     }
 
-    pub fn cleanup_with_policy(&mut self, policy: CleanupPolicy) -> Result<RemovalStats> {
-        Ok(block_on(self.inner.cleanup_with_policy(policy))?)
-    }
-
-    pub fn explain_cleanup_with_policy(
-        &self,
-        policy: CleanupPolicy,
-        max_candidate_files: Option<usize>,
-    ) -> Result<CleanupExplanation> {
-        let mut op = self.inner.cleanup(policy);
-        if let Some(limit) = max_candidate_files {
-            op = op.with_max_candidate_files(limit);
-        }
-        Ok(block_on(op.explain())?)
-    }
-
     pub fn close(&self) {}
 }
 
@@ -3663,12 +3647,15 @@ fn inner_cleanup_with_policy<'local>(
     jdataset: JObject,
     jpolicy: JObject,
 ) -> Result<JObject<'local>> {
-    let policy = extract_cleanup_policy(env, &jpolicy)?;
-
+    let (policy, delete_concurrency) = extract_cleanup_options(env, &jpolicy)?;
     let stats = {
-        let mut dataset =
+        let dataset =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }?;
-        dataset.cleanup_with_policy(policy)
+        let mut operation = dataset.inner.cleanup(policy);
+        if let Some(concurrency) = delete_concurrency {
+            operation = operation.with_delete_concurrency(concurrency)?;
+        }
+        block_on(operation.execute())
     }?;
 
     cleanup_stats_to_java(env, stats)
@@ -3693,7 +3680,7 @@ fn inner_explain_cleanup_with_policy<'local>(
     jpolicy: JObject,
     jmax_candidate_files: JObject,
 ) -> Result<JObject<'local>> {
-    let policy = extract_cleanup_policy(env, &jpolicy)?;
+    let (policy, delete_concurrency) = extract_cleanup_options(env, &jpolicy)?;
     let max_candidate_files = env
         .get_optional(&jmax_candidate_files, |env, inner| {
             Ok(env.call_method(inner, "longValue", "()J", &[])?.j()?)
@@ -3711,13 +3698,23 @@ fn inner_explain_cleanup_with_policy<'local>(
     let explanation = {
         let dataset =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }?;
-        dataset.explain_cleanup_with_policy(policy, max_candidate_files)
+        let mut operation = dataset.inner.cleanup(policy);
+        if let Some(concurrency) = delete_concurrency {
+            operation = operation.with_delete_concurrency(concurrency)?;
+        }
+        if let Some(limit) = max_candidate_files {
+            operation = operation.with_max_candidate_files(limit);
+        }
+        block_on(operation.explain())
     }?;
 
     cleanup_explanation_to_java(env, explanation)
 }
 
-fn extract_cleanup_policy(env: &mut JNIEnv<'_>, jpolicy: &JObject) -> Result<CleanupPolicy> {
+fn extract_cleanup_options(
+    env: &mut JNIEnv<'_>,
+    jpolicy: &JObject,
+) -> Result<(CleanupPolicy, Option<usize>)> {
     let before_ts_millis = env.get_optional_u64_from_method(jpolicy, "getBeforeTimestampMillis")?;
     let before_timestamp = before_ts_millis.map(|millis| {
         let st = UNIX_EPOCH + Duration::from_millis(millis);
@@ -3758,12 +3755,12 @@ fn extract_cleanup_policy(env: &mut JNIEnv<'_>, jpolicy: &JObject) -> Result<Cle
             let value = env.call_method(obj, "longValue", "()J", &[])?.j()?;
             usize::try_from(value).map_err(|_| {
                 Error::input_error(format!(
-                    "delete_concurrency must fit usize and be positive, got {value}"
+                    "delete_concurrency is out of range for usize, got {value}"
                 ))
             })
         })?;
 
-    Ok(CleanupPolicy {
+    let policy = CleanupPolicy {
         before_timestamp,
         before_version,
         versions,
@@ -3771,8 +3768,8 @@ fn extract_cleanup_policy(env: &mut JNIEnv<'_>, jpolicy: &JObject) -> Result<Cle
         error_if_tagged_old_versions,
         clean_referenced_branches,
         delete_rate_limit,
-        delete_concurrency,
-    })
+    };
+    Ok((policy, delete_concurrency))
 }
 
 fn cleanup_stats_to_java<'local>(

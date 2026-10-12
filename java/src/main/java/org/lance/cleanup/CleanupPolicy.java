@@ -142,7 +142,10 @@ public class CleanupPolicy {
       return this;
     }
 
-    /** Set the maximum delete operations per second shared with all cascaded branches. */
+    /**
+     * Set the maximum delete operations per second shared with all cascaded branches for this
+     * cleanup call. Does not update table configuration.
+     */
     public Builder withDeleteRateLimit(long deleteRateLimit) {
       this.deleteRateLimit = Optional.of(deleteRateLimit);
       return this;
@@ -151,7 +154,8 @@ public class CleanupPolicy {
     /**
      * Set the maximum in-flight file deletes shared with all cascaded branches, independently of
      * QPS. Cascaded branches ignore their own concurrency and QPS settings, including invalid
-     * values. Separate cleanup calls do not share limits. For example: {@code
+     * values. Separate cleanup calls do not share limits. This setting does not update table
+     * configuration. For example: {@code
      * CleanupPolicy.builder().withDeleteConcurrency(32).build()}. Omission uses the initiating
      * dataset's object store I/O parallelism. Must be between 1 and Tokio's semaphore limit (2^61 -
      * 1 on 64-bit platforms). Validated when cleanup executes or is explained.

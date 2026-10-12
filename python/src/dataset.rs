@@ -835,7 +835,7 @@ pub struct Dataset {
 
 impl Dataset {
     #[allow(clippy::too_many_arguments)]
-    async fn cleanup_policy(
+    async fn cleanup_operation(
         &self,
         older_than_micros: Option<i64>,
         retain_versions: Option<usize>,
@@ -844,11 +844,8 @@ impl Dataset {
         delete_rate_limit: Option<u64>,
         versions: Option<Vec<u64>>,
         delete_concurrency: Option<usize>,
-    ) -> lance_core::Result<lance::dataset::cleanup::CleanupPolicy> {
+    ) -> lance_core::Result<lance::dataset::cleanup::CleanupOperation<'_>> {
         let mut builder = CleanupPolicyBuilder::default();
-        if let Some(v) = delete_concurrency {
-            builder = builder.delete_concurrency(v)?;
-        }
         if let Some(v) = older_than_micros {
             let older_than = Duration::microseconds(v);
             builder = builder.before_timestamp(Utc::now() - older_than);
@@ -862,13 +859,17 @@ impl Dataset {
         if let Some(v) = error_if_tagged_old_versions {
             builder = builder.error_if_tagged_old_versions(v);
         }
-        if let Some(v) = delete_rate_limit {
-            builder = builder.delete_rate_limit(v)?;
-        }
         if let Some(v) = versions {
             builder = builder.versions(v)?;
         }
-        Ok(builder.build())
+        let mut operation = self.ds.cleanup(builder.build());
+        if let Some(v) = delete_concurrency {
+            operation = operation.with_delete_concurrency(v)?;
+        }
+        if let Some(v) = delete_rate_limit {
+            operation = operation.with_delete_rate_limit(v)?;
+        }
+        Ok(operation)
     }
 }
 
@@ -2317,8 +2318,8 @@ impl Dataset {
     ) -> PyResult<CleanupStats> {
         let stats = rt()
             .block_on(None, async {
-                let policy = self
-                    .cleanup_policy(
+                let operation = self
+                    .cleanup_operation(
                         older_than_micros,
                         retain_versions,
                         delete_unverified,
@@ -2328,7 +2329,7 @@ impl Dataset {
                         delete_concurrency,
                     )
                     .await?;
-                self.ds.cleanup_with_policy(policy).await
+                operation.execute().await
             })?
             .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
         Ok(cleanup_stats(stats))
@@ -2351,8 +2352,8 @@ impl Dataset {
     ) -> PyResult<CleanupExplanation> {
         let explanation = rt()
             .block_on(None, async {
-                let policy = self
-                    .cleanup_policy(
+                let operation = self
+                    .cleanup_operation(
                         older_than_micros,
                         retain_versions,
                         delete_unverified,
@@ -2362,8 +2363,7 @@ impl Dataset {
                         delete_concurrency,
                     )
                     .await?;
-                self.ds
-                    .cleanup(policy)
+                operation
                     .with_max_candidate_files(max_files)
                     .explain()
                     .await
