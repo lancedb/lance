@@ -10662,10 +10662,11 @@ mod tests {
     }
 
     /// Merge-only deferred compaction, then a PHYSICAL remap + FRI trim. Asserts
-    /// the index is rebuilt, the fragment-reuse index trims to zero versions,
-    /// and KNN stays consistent with the pre-compaction answer through both the
-    /// FRI window and the physical remap. (HNSW rebuilds its graph on physical
-    /// remap, so the overlap is recall-tolerant.)
+    /// the index is rebuilt with its details kept, the fragment-reuse index
+    /// trims to zero versions, and KNN stays consistent with the
+    /// pre-compaction answer through both the FRI window and the physical
+    /// remap. (HNSW rebuilds its graph on physical remap, so the overlap is
+    /// recall-tolerant.)
     async fn check_vector_remap_and_trim(
         params: VectorIndexParams,
         k: usize,
@@ -10696,12 +10697,12 @@ mod tests {
             )
             .await
             .unwrap();
-        let original_uuid = dataset
+        let original = dataset
             .load_index_by_name("vec_idx")
             .await
             .unwrap()
-            .unwrap()
-            .uuid;
+            .unwrap();
+        let original_uuid = original.uuid;
 
         // Sample queries from stored vectors + capture the pre-compaction answer.
         let mut rows: Vec<Vec<f32>> = Vec::new();
@@ -10768,15 +10769,18 @@ mod tests {
             .unwrap();
         cleanup_frag_reuse_index(&mut dataset).await.unwrap();
 
-        let remapped_uuid = dataset
+        let remapped = dataset
             .load_index_by_name("vec_idx")
             .await
             .unwrap()
-            .unwrap()
-            .uuid;
+            .unwrap();
         assert_ne!(
-            remapped_uuid, original_uuid,
+            remapped.uuid, original_uuid,
             "index should have been physically remapped"
+        );
+        assert_eq!(
+            remapped.index_details, original.index_details,
+            "a remap keeps the index's details"
         );
         if let Some(meta) = dataset
             .load_index_by_name(FRAG_REUSE_INDEX_NAME)
@@ -10829,6 +10833,28 @@ mod tests {
         let params = VectorIndexParams::with_ivf_pq_params(
             DistanceType::L2,
             small_ivf(),
+            PQBuildParams {
+                max_iters: 2,
+                num_sub_vectors: 2,
+                ..Default::default()
+            },
+        );
+        // Boxed for CI clippy `large_futures`: the remap future grew past 16 KiB.
+        Box::pin(check_vector_remap_and_trim(params, 10, 8, Some(8))).await;
+    }
+
+    /// Details a remap must carry over: a metric other than the default and a
+    /// partition size the build was given.
+    #[tokio::test]
+    async fn test_ivf_pq_cosine_with_target_partition_size_remap_and_trim() {
+        use lance_index::vector::pq::PQBuildParams;
+        let params = VectorIndexParams::with_ivf_pq_params(
+            DistanceType::Cosine,
+            lance_index::vector::ivf::IvfBuildParams {
+                num_partitions: None,
+                target_partition_size: Some(128),
+                ..small_ivf()
+            },
             PQBuildParams {
                 max_iters: 2,
                 num_sub_vectors: 2,
