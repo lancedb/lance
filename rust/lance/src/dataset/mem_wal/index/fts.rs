@@ -45,6 +45,8 @@
 //! into one builder. The on-disk format is unchanged from Lance's existing
 //! inverted index.
 
+#![allow(clippy::type_complexity)]
+
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -55,22 +57,33 @@ use arrow_array::{Array, RecordBatch, UInt64Array};
 use crossbeam_skiplist::SkipMap;
 use fst::{Map, Streamer};
 use lance_bitpacking::{BitPacker, BitPacker4x};
+use lance_core::cache::LanceCache;
 use lance_core::datatypes::Schema as LanceSchema;
 use lance_core::{Error, Result};
+use lance_index::scalar::IndexStore as _;
 use lance_index::scalar::InvertedIndexParams;
 use lance_index::scalar::inverted::query::{FtsQuery, Operator, Tokens};
 use lance_index::scalar::inverted::tokenizer::document_tokenizer::{DocType, LanceTokenizer};
 use lance_index::scalar::inverted::{DocSet, MemBM25Scorer, Scorer, TokenSet};
+use lance_table::format::IndexMetadata;
 use lance_tokenizer::TokenStream;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use super::RowPosition;
-use crate::index::scalar::inverted::{ResolvedFtsField, resolve_fts_field};
+use lance_index::IndexType;
+use lance_index::pbold;
+use lance_index::scalar::inverted::INVERTED_INDEX_VERSION_V3;
+use lance_index::scalar::lance_format::LanceIndexStore;
+use lance_index::scalar::registry::{TrainingCriteria, TrainingOrdering};
+use prost::Message as _;
 
-// ============================================================================
-// Public types preserved from previous API
-// ============================================================================
+use super::RowPosition;
+use super::plugin::{
+    FlushContext, FlushOutcome, MemIndex, MemIndexBuildContext, MemIndexPlugin, MemIndexSpec,
+    ResolveContext, ResolvedIndex,
+};
+use super::query::{FtsMemQuery, MemMatches, MemQuery, RankedMatch, SearchContext};
+use crate::index::scalar::inverted::{ResolvedFtsField, resolve_fts_field};
 
 /// In-memory FTS index entry returned from search.
 #[derive(Debug, Clone)]
@@ -122,6 +135,9 @@ fn public_doc_index(coordinates: &[u32]) -> Option<Vec<u32>> {
 pub enum FtsQueryExpr {
     /// Simple term match query.
     Match {
+        /// Column this leaf searches. `None` binds to the query's single column;
+        /// a tree whose leaves name different columns carries `Some` on each.
+        column: Option<String>,
         /// The search query string.
         query: String,
         /// The operator used to combine tokenized query terms.
@@ -131,6 +147,9 @@ pub enum FtsQueryExpr {
     },
     /// Phrase query with optional slop.
     Phrase {
+        /// Column this leaf searches. `None` binds to the query's single column;
+        /// a tree whose leaves name different columns carries `Some` on each.
+        column: Option<String>,
         /// The phrase to search for.
         query: String,
         /// Maximum allowed distance between consecutive tokens.
@@ -140,6 +159,9 @@ pub enum FtsQueryExpr {
     },
     /// Fuzzy match query with typo tolerance.
     Fuzzy {
+        /// Column this leaf searches. `None` binds to the query's single column;
+        /// a tree whose leaves name different columns carries `Some` on each.
+        column: Option<String>,
         /// The search query string.
         query: String,
         /// Maximum edit distance (Levenshtein distance).
@@ -167,9 +189,21 @@ pub enum FtsQueryExpr {
         positive: Box<Self>,
         /// Optional query whose matches are demoted.
         negative: Option<Box<Self>>,
-        /// Multiplier applied to documents matching `negative` (typically
-        /// `< 1.0` to demote).
+        /// How strongly a document matching `negative` is demoted: its score
+        /// becomes `positive - negative_boost * negative_score`. `0.0` is no
+        /// demotion, and larger values demote harder — the same contract the
+        /// compound scorer applies to committed data, so both tiers rank a
+        /// boost query identically. Scores may go negative.
         negative_boost: f32,
+    },
+    /// Disjunction scored by the best child: a document's score is the highest
+    /// among the children that match it (`DisjunctionScore::Max`), which is how
+    /// the compound scorer ranks a multi-match over committed data. The
+    /// children are the leaves of an index-level multi-match, each bound to its
+    /// own column, so a tree spanning fields still routes leaf by leaf.
+    MultiMatch {
+        /// The alternatives, scored independently.
+        children: Vec<Self>,
     },
 }
 
@@ -249,6 +283,7 @@ impl FtsQueryExpr {
 
     pub fn match_query_with_operator(query: impl Into<String>, operator: Operator) -> Self {
         Self::Match {
+            column: None,
             query: query.into(),
             operator,
             boost: 1.0,
@@ -257,6 +292,7 @@ impl FtsQueryExpr {
 
     pub fn phrase(query: impl Into<String>) -> Self {
         Self::Phrase {
+            column: None,
             query: query.into(),
             slop: 0,
             boost: 1.0,
@@ -265,6 +301,7 @@ impl FtsQueryExpr {
 
     pub fn phrase_with_slop(query: impl Into<String>, slop: u32) -> Self {
         Self::Phrase {
+            column: None,
             query: query.into(),
             slop,
             boost: 1.0,
@@ -273,6 +310,7 @@ impl FtsQueryExpr {
 
     pub fn fuzzy(query: impl Into<String>) -> Self {
         Self::Fuzzy {
+            column: None,
             query: query.into(),
             fuzziness: None,
             prefix_length: 0,
@@ -283,6 +321,7 @@ impl FtsQueryExpr {
 
     pub fn fuzzy_with_distance(query: impl Into<String>, fuzziness: u32) -> Self {
         Self::Fuzzy {
+            column: None,
             query: query.into(),
             fuzziness: Some(fuzziness),
             prefix_length: 0,
@@ -298,6 +337,7 @@ impl FtsQueryExpr {
         max_expansions: usize,
     ) -> Self {
         Self::Fuzzy {
+            column: None,
             query: query.into(),
             fuzziness,
             prefix_length,
@@ -329,31 +369,239 @@ impl FtsQueryExpr {
     pub fn with_boost(self, boost: f32) -> Self {
         match self {
             Self::Match {
-                query, operator, ..
+                column,
+                query,
+                operator,
+                ..
             } => Self::Match {
+                column,
                 query,
                 operator,
                 boost,
             },
-            Self::Phrase { query, slop, .. } => Self::Phrase { query, slop, boost },
+            Self::Phrase {
+                column,
+                query,
+                slop,
+                ..
+            } => Self::Phrase {
+                column,
+                query,
+                slop,
+                boost,
+            },
             Self::Fuzzy {
+                column,
                 query,
                 fuzziness,
                 prefix_length,
                 max_expansions,
                 ..
             } => Self::Fuzzy {
+                column,
                 query,
                 fuzziness,
                 prefix_length,
                 max_expansions,
                 boost,
             },
-            // Boolean and Boost don't carry a top-level boost field today.
+            // Compound nodes don't carry a top-level boost field today.
             // Preserved as-is to keep behavior identical to the previous impl.
-            other @ (Self::Boolean { .. } | Self::Boost { .. }) => other,
+            other @ (Self::Boolean { .. } | Self::Boost { .. } | Self::MultiMatch { .. }) => other,
         }
     }
+
+    /// Bind this leaf to `column`. Compound nodes carry no binding of their
+    /// own; bind their leaves instead.
+    pub fn with_column(self, column: impl Into<String>) -> Self {
+        let bound = Some(column.into());
+        match self {
+            Self::Match {
+                query,
+                operator,
+                boost,
+                ..
+            } => Self::Match {
+                column: bound,
+                query,
+                operator,
+                boost,
+            },
+            Self::Phrase {
+                query, slop, boost, ..
+            } => Self::Phrase {
+                column: bound,
+                query,
+                slop,
+                boost,
+            },
+            Self::Fuzzy {
+                query,
+                fuzziness,
+                prefix_length,
+                max_expansions,
+                boost,
+                ..
+            } => Self::Fuzzy {
+                column: bound,
+                query,
+                fuzziness,
+                prefix_length,
+                max_expansions,
+                boost,
+            },
+            other @ (Self::Boolean { .. } | Self::Boost { .. } | Self::MultiMatch { .. }) => other,
+        }
+    }
+
+    /// The column this leaf searches, or `None` for a compound node or an
+    /// unbound leaf.
+    pub fn column(&self) -> Option<&str> {
+        match self {
+            Self::Match { column, .. }
+            | Self::Phrase { column, .. }
+            | Self::Fuzzy { column, .. } => column.as_deref(),
+            Self::Boolean { .. } | Self::Boost { .. } | Self::MultiMatch { .. } => None,
+        }
+    }
+
+    /// Bind every leaf that names no column to `column`, leaving bound leaves
+    /// alone. Lets a tree built from bare terms be attached to one field.
+    pub fn bind_unbound_leaves(self, column: &str) -> Self {
+        match self {
+            Self::Boolean {
+                must,
+                should,
+                must_not,
+            } => Self::Boolean {
+                must: bind_all(must, column),
+                should: bind_all(should, column),
+                must_not: bind_all(must_not, column),
+            },
+            Self::Boost {
+                positive,
+                negative,
+                negative_boost,
+            } => Self::Boost {
+                positive: Box::new(positive.bind_unbound_leaves(column)),
+                negative: negative.map(|n| Box::new(n.bind_unbound_leaves(column))),
+                negative_boost,
+            },
+            Self::MultiMatch { children } => Self::MultiMatch {
+                children: bind_all(children, column),
+            },
+            leaf if leaf.column().is_some() => leaf,
+            leaf => leaf.with_column(column),
+        }
+    }
+
+    /// Whether any leaf of this tree names no column. Cross-column routing has
+    /// no single column to fall back to, so such a tree cannot be evaluated.
+    pub fn has_unbound_leaf(&self) -> bool {
+        match self {
+            Self::Boolean {
+                must,
+                should,
+                must_not,
+            } => must
+                .iter()
+                .chain(should)
+                .chain(must_not)
+                .any(Self::has_unbound_leaf),
+            Self::Boost {
+                positive, negative, ..
+            } => {
+                positive.has_unbound_leaf()
+                    || negative.as_ref().is_some_and(|n| n.has_unbound_leaf())
+            }
+            Self::MultiMatch { children } => children.iter().any(Self::has_unbound_leaf),
+            leaf => leaf.column().is_none(),
+        }
+    }
+
+    /// Every leaf that names a column, with that column, in tree order.
+    pub fn bound_leaves(&self) -> Vec<(&str, &Self)> {
+        fn visit<'a>(expr: &'a FtsQueryExpr, out: &mut Vec<(&'a str, &'a FtsQueryExpr)>) {
+            match expr {
+                FtsQueryExpr::Boolean {
+                    must,
+                    should,
+                    must_not,
+                } => must
+                    .iter()
+                    .chain(should)
+                    .chain(must_not)
+                    .for_each(|child| visit(child, out)),
+                FtsQueryExpr::Boost {
+                    positive, negative, ..
+                } => {
+                    visit(positive, out);
+                    if let Some(negative) = negative {
+                        visit(negative, out);
+                    }
+                }
+                FtsQueryExpr::MultiMatch { children } => {
+                    children.iter().for_each(|child| visit(child, out))
+                }
+                leaf => {
+                    if let Some(column) = leaf.column() {
+                        out.push((column, leaf));
+                    }
+                }
+            }
+        }
+        let mut out = Vec::new();
+        visit(self, &mut out);
+        out
+    }
+
+    /// Distinct columns this tree's leaves name, in tree order. An unbound leaf
+    /// contributes nothing, so an all-unbound tree yields an empty vec.
+    pub fn columns(&self) -> Vec<&str> {
+        fn visit<'a>(expr: &'a FtsQueryExpr, out: &mut Vec<&'a str>) {
+            match expr {
+                FtsQueryExpr::Boolean {
+                    must,
+                    should,
+                    must_not,
+                } => {
+                    for child in must.iter().chain(should).chain(must_not) {
+                        visit(child, out);
+                    }
+                }
+                FtsQueryExpr::Boost {
+                    positive, negative, ..
+                } => {
+                    visit(positive, out);
+                    if let Some(negative) = negative {
+                        visit(negative, out);
+                    }
+                }
+                FtsQueryExpr::MultiMatch { children } => {
+                    for child in children {
+                        visit(child, out);
+                    }
+                }
+                leaf => {
+                    if let Some(column) = leaf.column()
+                        && !out.contains(&column)
+                    {
+                        out.push(column);
+                    }
+                }
+            }
+        }
+        let mut out = Vec::new();
+        visit(self, &mut out);
+        out
+    }
+}
+
+fn bind_all(exprs: Vec<FtsQueryExpr>, column: &str) -> Vec<FtsQueryExpr> {
+    exprs
+        .into_iter()
+        .map(|expr| expr.bind_unbound_leaves(column))
+        .collect()
 }
 
 /// Auto-fuzziness based on token length:
@@ -990,7 +1238,7 @@ impl IndexState {
 /// model and visibility contract.
 pub struct FtsMemIndex {
     field_id: i32,
-    source_column_name: String,
+    column: String,
     params: InvertedIndexParams,
     resolved_field: OnceLock<ResolvedFtsField>,
 
@@ -1126,7 +1374,7 @@ impl QueryLocalFtsIndex {
         Self {
             inner: FtsMemIndex {
                 field_id: self.inner.field_id,
-                source_column_name: self.inner.source_column_name.clone(),
+                column: self.inner.column.clone(),
                 params: self.inner.params.clone(),
                 resolved_field,
                 tokenizer_pool: self.inner.tokenizer_pool.clone(),
@@ -1198,7 +1446,7 @@ impl std::fmt::Debug for FtsMemIndex {
         let st = self.state.load();
         f.debug_struct("FtsMemIndex")
             .field("field_id", &self.field_id)
-            .field("source_column_name", &self.source_column_name)
+            .field("column", &self.column_name())
             .field("doc_count", &self.doc_count())
             .field("partitions", &st.partitions.len())
             .field("params", &self.params)
@@ -1207,6 +1455,73 @@ impl std::fmt::Debug for FtsMemIndex {
 }
 
 impl FtsMemIndex {
+    async fn write_fts_metadata(
+        &self,
+        index_store: &lance_index::scalar::lance_format::LanceIndexStore,
+        partition_id: u64,
+    ) -> Result<()> {
+        use arrow_array::{RecordBatch, StringArray};
+        use arrow_schema::{DataType, Field, Schema};
+        use std::sync::Arc;
+
+        use lance_index::scalar::inverted::{
+            FTS_FORMAT_VERSION_KEY, POSITIONS_CODEC_KEY, POSITIONS_LAYOUT_KEY,
+            POSITIONS_LAYOUT_SHARED_STREAM_V2, POSTING_BLOCK_SIZE_KEY, POSTING_TAIL_CODEC_KEY,
+            TOKEN_SET_FORMAT_KEY, TokenSetFormat,
+        };
+
+        // The reader takes params and partitions from the schema metadata.
+        let params_json = serde_json::to_string(&self.params)?;
+        let partitions_json = serde_json::to_string(&[partition_id])?;
+        let token_set_format = TokenSetFormat::default().to_string();
+        let format_version = self.params.resolved_format_version();
+        let mut metadata = [
+            ("params".to_string(), params_json),
+            ("partitions".to_string(), partitions_json),
+            (TOKEN_SET_FORMAT_KEY.to_string(), token_set_format),
+            (
+                POSTING_TAIL_CODEC_KEY.to_string(),
+                format_version.posting_tail_codec().as_str().to_string(),
+            ),
+            (
+                FTS_FORMAT_VERSION_KEY.to_string(),
+                format_version.index_version().to_string(),
+            ),
+            (
+                POSTING_BLOCK_SIZE_KEY.to_string(),
+                self.params.posting_block_size().to_string(),
+            ),
+        ]
+        .into_iter()
+        .collect::<std::collections::HashMap<_, _>>();
+        if self.params.has_positions()
+            && let Some(codec) = format_version
+                .position_codec()
+                .filter(|_| format_version.uses_shared_position_stream())
+        {
+            metadata.insert(
+                POSITIONS_LAYOUT_KEY.to_string(),
+                POSITIONS_LAYOUT_SHARED_STREAM_V2.to_string(),
+            );
+            metadata.insert(POSITIONS_CODEC_KEY.to_string(), codec.as_str().to_string());
+        }
+
+        let schema = Arc::new(
+            Schema::new(vec![Field::new("_placeholder", DataType::Utf8, true)])
+                .with_metadata(metadata),
+        );
+
+        // A placeholder row; only the schema metadata is read.
+        let placeholder_array = Arc::new(StringArray::from(vec![None::<&str>]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![placeholder_array])?;
+
+        let mut writer = index_store.new_index_file("metadata.lance", schema).await?;
+        writer.write_record_batch(batch).await?;
+        writer.finish().await?;
+
+        Ok(())
+    }
+
     /// Default reader-tokenizer pool capacity. Small but enough to absorb
     /// short bursts of concurrent search calls without thrashing.
     const DEFAULT_TOKENIZER_POOL_CAP: usize = 8;
@@ -1277,7 +1592,7 @@ impl FtsMemIndex {
         let writer_tokenizer = pool.template.box_clone();
         Self {
             field_id,
-            source_column_name: column_name,
+            column: column_name,
             params,
             resolved_field: OnceLock::new(),
             tokenizer_pool: Arc::new(pool),
@@ -1316,11 +1631,7 @@ impl FtsMemIndex {
     }
 
     pub fn column_name(&self) -> &str {
-        &self.source_column_name
-    }
-
-    pub fn source_column_name(&self) -> &str {
-        &self.source_column_name
+        &self.column
     }
 
     pub fn params(&self) -> &InvertedIndexParams {
@@ -1484,7 +1795,7 @@ impl FtsMemIndex {
             let schema = LanceSchema::try_from(batch.schema().as_ref())?;
             let resolved = resolve_fts_field(
                 &schema,
-                &self.source_column_name,
+                self.column_name(),
                 self.params.get_document_granularity(),
             )?;
             let _ = self.resolved_field.set(resolved);
@@ -1633,6 +1944,11 @@ impl FtsMemIndex {
                         visit(index, query, terms)?;
                     }
                 }
+                FtsQuery::CombinedFields(_) => {
+                    return Err(Error::invalid_input(
+                        "residual compound FTS does not support combined_fields (BM25F) leaves",
+                    ));
+                }
             }
             Ok(())
         }
@@ -1702,6 +2018,11 @@ impl FtsMemIndex {
                     {
                         visit(index, query, scorer, leaves)?;
                     }
+                }
+                FtsQuery::CombinedFields(_) => {
+                    return Err(Error::invalid_input(
+                        "residual compound FTS does not support combined_fields (BM25F) leaves",
+                    ));
                 }
             }
             Ok(())
@@ -2300,8 +2621,9 @@ impl FtsMemIndex {
     }
 
     /// `limit` is the caller's top-k, threaded down so a top-level `Match`
-    /// leaf can prune with WAND. Compound branches (`Boolean`/`Boost`) need
-    /// their children's full result sets, so they pass `None` downward.
+    /// leaf can prune with WAND. Compound branches (`Boolean`/`Boost`/
+    /// `MultiMatch`) need their children's full result sets, so they pass
+    /// `None` downward.
     /// `include_tail` selects read-your-writes vs immutable-only (see
     /// [`SearchOptions::include_tail`]) and is threaded uniformly to every leaf.
     fn search_query_with_state(
@@ -2313,10 +2635,37 @@ impl FtsMemIndex {
         tail_skip: bool,
     ) -> Vec<FtsEntry> {
         match query {
+            FtsQueryExpr::Boolean { .. }
+            | FtsQueryExpr::Boost { .. }
+            | FtsQueryExpr::MultiMatch { .. } => {
+                // Every leaf of this subtree searches this index, so the leaf
+                // evaluator ignores the binding and keeps the one snapshot.
+                combine_compound(query, &|leaf| {
+                    self.search_leaf_with_state(leaf, st, None, include_tail, true)
+                })
+            }
+            leaf => self.search_leaf_with_state(leaf, st, limit, include_tail, tail_skip),
+        }
+    }
+
+    /// Score one `Match` / `Phrase` / `Fuzzy` leaf against this index.
+    ///
+    /// The leaf's own column binding is not consulted: the caller routes a leaf
+    /// to the index holding its column.
+    fn search_leaf_with_state(
+        &self,
+        leaf: &FtsQueryExpr,
+        st: &IndexState,
+        limit: Option<usize>,
+        include_tail: bool,
+        tail_skip: bool,
+    ) -> Vec<FtsEntry> {
+        match leaf {
             FtsQueryExpr::Match {
                 query,
                 operator,
                 boost,
+                ..
             } => {
                 let tokens = self.analyze_for_search(query);
                 let mut results =
@@ -2324,7 +2673,9 @@ impl FtsMemIndex {
                 apply_boost(&mut results, *boost);
                 results
             }
-            FtsQueryExpr::Phrase { query, slop, boost } => {
+            FtsQueryExpr::Phrase {
+                query, slop, boost, ..
+            } => {
                 let tokens = self.analyze_for_search(query);
                 let mut results = self.search_phrase_tokens(st, &tokens, *slop, include_tail);
                 apply_boost(&mut results, *boost);
@@ -2336,6 +2687,7 @@ impl FtsMemIndex {
                 prefix_length,
                 max_expansions,
                 boost,
+                ..
             } => {
                 let tokens = self.tokenize_for_search(query);
                 let mut results = self.search_fuzzy_tokens(
@@ -2349,22 +2701,11 @@ impl FtsMemIndex {
                 apply_boost(&mut results, *boost);
                 results
             }
-            FtsQueryExpr::Boolean {
-                must,
-                should,
-                must_not,
-            } => self.search_boolean(must, should, must_not, st, include_tail),
-            FtsQueryExpr::Boost {
-                positive,
-                negative,
-                negative_boost,
-            } => self.search_boost(
-                positive,
-                negative.as_deref(),
-                *negative_boost,
-                st,
-                include_tail,
-            ),
+            // `combine_compound` routes compound nodes itself and only ever
+            // hands a leaf here.
+            FtsQueryExpr::Boolean { .. }
+            | FtsQueryExpr::Boost { .. }
+            | FtsQueryExpr::MultiMatch { .. } => Vec::new(),
         }
     }
 
@@ -2394,12 +2735,12 @@ impl FtsMemIndex {
         if options.wand_factor < 1.0 {
             if let Some(limit) = options.limit {
                 if results.len() > limit {
-                    let top_k_score = results[limit - 1].score;
-                    let threshold = top_k_score * options.wand_factor;
+                    let threshold =
+                        relaxed_score_threshold(results[limit - 1].score, options.wand_factor);
                     results.retain(|e| e.score >= threshold);
                 }
             } else if let Some(max_entry) = results.first() {
-                let threshold = max_entry.score * options.wand_factor;
+                let threshold = relaxed_score_threshold(max_entry.score, options.wand_factor);
                 results.retain(|e| e.score >= threshold);
             }
         }
@@ -2407,93 +2748,6 @@ impl FtsMemIndex {
             results.truncate(limit);
         }
         results
-    }
-
-    fn search_boost(
-        &self,
-        positive: &FtsQueryExpr,
-        negative: Option<&FtsQueryExpr>,
-        negative_boost: f32,
-        st: &IndexState,
-        include_tail: bool,
-    ) -> Vec<FtsEntry> {
-        let mut results = self.search_query_with_state(positive, st, None, include_tail, true);
-        let Some(neg) = negative else {
-            return results;
-        };
-        let negative_results = self.search_query_with_state(neg, st, None, include_tail, true);
-        let negative_set: HashSet<DocumentKey> =
-            negative_results.iter().map(FtsEntry::key).collect();
-        for entry in &mut results {
-            if negative_set.contains(&entry.key()) {
-                entry.score *= negative_boost;
-            }
-        }
-        results
-    }
-
-    fn search_boolean(
-        &self,
-        must: &[FtsQueryExpr],
-        should: &[FtsQueryExpr],
-        must_not: &[FtsQueryExpr],
-        st: &IndexState,
-        include_tail: bool,
-    ) -> Vec<FtsEntry> {
-        let excluded: HashSet<DocumentKey> = must_not
-            .iter()
-            .flat_map(|q| self.search_query_with_state(q, st, None, include_tail, true))
-            .map(|entry| entry.key())
-            .collect();
-
-        let mut result_map: HashMap<DocumentKey, f32> = if must.is_empty() {
-            let mut map: HashMap<DocumentKey, f32> = HashMap::new();
-            for q in should {
-                for entry in self.search_query_with_state(q, st, None, include_tail, true) {
-                    *map.entry(entry.key()).or_default() += entry.score;
-                }
-            }
-            map
-        } else {
-            let first_results =
-                self.search_query_with_state(&must[0], st, None, include_tail, true);
-            let mut map: HashMap<DocumentKey, f32> = first_results
-                .into_iter()
-                .map(|entry| (entry.key(), entry.score))
-                .collect();
-            for q in must.iter().skip(1) {
-                let results = self.search_query_with_state(q, st, None, include_tail, true);
-                let result_set: HashMap<DocumentKey, f32> = results
-                    .into_iter()
-                    .map(|entry| (entry.key(), entry.score))
-                    .collect();
-                map = map
-                    .into_iter()
-                    .filter_map(|(pos, score)| result_set.get(&pos).map(|s| (pos, score + s)))
-                    .collect();
-            }
-            for q in should {
-                for entry in self.search_query_with_state(q, st, None, include_tail, true) {
-                    if let Some(score) = map.get_mut(&entry.key()) {
-                        *score += entry.score;
-                    }
-                }
-            }
-            map
-        };
-
-        for pos in &excluded {
-            result_map.remove(pos);
-        }
-
-        result_map
-            .into_iter()
-            .map(|(key, score)| FtsEntry {
-                row_position: key.row_position,
-                doc_index: public_doc_index(&key.doc_index),
-                score,
-            })
-            .collect()
     }
 
     fn tokenize_for_search(&self, text: &str) -> Vec<String> {
@@ -3246,69 +3500,205 @@ fn phrase_from_position<T: AsRef<[u32]>>(positions: &[T], first_pos: u32, slop: 
     true
 }
 
+/// Loosen `anchor` by `factor`, in the direction that admits *more* results
+/// whatever the sign.
+///
+/// For a non-negative anchor this is exactly `anchor * factor`, the form this
+/// has always used — `|x| == x` there, so `anchor - (1 - f) * anchor == anchor *
+/// f`. The two only diverge once scores can be negative, which a boost query's
+/// `positive - negative_boost * negative` makes reachable: multiplying a
+/// negative anchor by a factor below one moves the threshold *up*, tightening
+/// the filter rather than loosening it, and can then discard the entire top-k.
+fn relaxed_score_threshold(anchor: f32, factor: f32) -> f32 {
+    anchor - (1.0 - factor) * anchor.abs()
+}
+
+/// Evaluate a query tree, combining its clauses over leaves scored by
+/// `eval_leaf`.
+///
+/// The clause algebra is the contract the committed compound scorer applies:
+/// MUST intersects and sums (`RequiredConjunctionScorer`), SHOULD sums into the
+/// surviving set (`DisjunctionScore::Sum`), MUST_NOT excludes, a boost
+/// subtracts `negative_boost * negative_score`, and a multi-match keeps each
+/// document's best child (`DisjunctionScore::Max`). It is the same whether the
+/// leaves all come from one index or from one index per column — only
+/// `eval_leaf` differs.
+fn combine_compound<F>(expr: &FtsQueryExpr, eval_leaf: &F) -> Vec<FtsEntry>
+where
+    F: Fn(&FtsQueryExpr) -> Vec<FtsEntry>,
+{
+    match expr {
+        FtsQueryExpr::Boolean {
+            must,
+            should,
+            must_not,
+        } => combine_boolean(must, should, must_not, eval_leaf),
+        FtsQueryExpr::Boost {
+            positive,
+            negative,
+            negative_boost,
+        } => combine_boost(positive, negative.as_deref(), *negative_boost, eval_leaf),
+        FtsQueryExpr::MultiMatch { children } => combine_multi_match(children, eval_leaf),
+        leaf => eval_leaf(leaf),
+    }
+}
+
+fn combine_multi_match<F>(children: &[FtsQueryExpr], eval_leaf: &F) -> Vec<FtsEntry>
+where
+    F: Fn(&FtsQueryExpr) -> Vec<FtsEntry>,
+{
+    // A document matching several children is in several result sets and
+    // comes back once, at the highest of its scores.
+    let mut best: HashMap<DocumentKey, f32> = HashMap::new();
+    for child in children {
+        for entry in combine_compound(child, eval_leaf) {
+            best.entry(entry.key())
+                .and_modify(|score| *score = score.max(entry.score))
+                .or_insert(entry.score);
+        }
+    }
+    best.into_iter()
+        .map(|(key, score)| FtsEntry {
+            row_position: key.row_position,
+            doc_index: public_doc_index(&key.doc_index),
+            score,
+        })
+        .collect()
+}
+
+fn combine_boost<F>(
+    positive: &FtsQueryExpr,
+    negative: Option<&FtsQueryExpr>,
+    negative_boost: f32,
+    eval_leaf: &F,
+) -> Vec<FtsEntry>
+where
+    F: Fn(&FtsQueryExpr) -> Vec<FtsEntry>,
+{
+    let mut results = combine_compound(positive, eval_leaf);
+    let Some(neg) = negative else {
+        return results;
+    };
+    let negative_results = combine_compound(neg, eval_leaf);
+    // Subtractive, matching the compound scorer's contract exactly:
+    // `positive - negative_boost * negative_score` for a document the
+    // negative clause also matches, `positive` otherwise
+    // (`BoostScorer::score`). The negative *score* is needed, not just
+    // membership, which is why this keeps a map rather than a set.
+    //
+    // Scores may go negative; only non-finite values are an error upstream
+    // (`checked_score`), so nothing is clamped here.
+    let negative_scores: HashMap<DocumentKey, f32> = negative_results
+        .iter()
+        .map(|entry| (entry.key(), entry.score))
+        .collect();
+    for entry in &mut results {
+        if let Some(negative) = negative_scores.get(&entry.key()) {
+            entry.score -= negative_boost * negative;
+        }
+    }
+    results
+}
+
+fn combine_boolean<F>(
+    must: &[FtsQueryExpr],
+    should: &[FtsQueryExpr],
+    must_not: &[FtsQueryExpr],
+    eval_leaf: &F,
+) -> Vec<FtsEntry>
+where
+    F: Fn(&FtsQueryExpr) -> Vec<FtsEntry>,
+{
+    let excluded: HashSet<DocumentKey> = must_not
+        .iter()
+        .flat_map(|q| combine_compound(q, eval_leaf))
+        .map(|entry| entry.key())
+        .collect();
+
+    let mut result_map: HashMap<DocumentKey, f32> = if must.is_empty() {
+        let mut map: HashMap<DocumentKey, f32> = HashMap::new();
+        for q in should {
+            for entry in combine_compound(q, eval_leaf) {
+                *map.entry(entry.key()).or_default() += entry.score;
+            }
+        }
+        map
+    } else {
+        let first_results = combine_compound(&must[0], eval_leaf);
+        let mut map: HashMap<DocumentKey, f32> = first_results
+            .into_iter()
+            .map(|entry| (entry.key(), entry.score))
+            .collect();
+        for q in must.iter().skip(1) {
+            let results = combine_compound(q, eval_leaf);
+            let result_set: HashMap<DocumentKey, f32> = results
+                .into_iter()
+                .map(|entry| (entry.key(), entry.score))
+                .collect();
+            map = map
+                .into_iter()
+                .filter_map(|(pos, score)| result_set.get(&pos).map(|s| (pos, score + s)))
+                .collect();
+        }
+        for q in should {
+            for entry in combine_compound(q, eval_leaf) {
+                if let Some(score) = map.get_mut(&entry.key()) {
+                    *score += entry.score;
+                }
+            }
+        }
+        map
+    };
+
+    for pos in &excluded {
+        result_map.remove(pos);
+    }
+
+    result_map
+        .into_iter()
+        .map(|(key, score)| FtsEntry {
+            row_position: key.row_position,
+            doc_index: public_doc_index(&key.doc_index),
+            score,
+        })
+        .collect()
+}
+
+/// Evaluate a tree whose leaves may name different columns: `eval_leaf`
+/// answers each leaf from the index on its column, and the first error it
+/// returns fails the search.
+pub fn search_cross_column<F>(expr: &FtsQueryExpr, eval_leaf: F) -> Result<Vec<FtsEntry>>
+where
+    F: Fn(&str, &FtsQueryExpr) -> Result<Vec<FtsEntry>>,
+{
+    if expr.has_unbound_leaf() {
+        return Err(Error::invalid_input(
+            "cross-column full-text search needs every leaf bound to a column".to_string(),
+        ));
+    }
+    let failure: std::cell::RefCell<Option<Error>> = std::cell::RefCell::new(None);
+    let combined = combine_compound(expr, &|leaf| {
+        let Some(column) = leaf.column() else {
+            debug_assert!(false, "every leaf was checked to be bound");
+            return Vec::new();
+        };
+        eval_leaf(column, leaf).unwrap_or_else(|error| {
+            failure.borrow_mut().get_or_insert(error);
+            Vec::new()
+        })
+    });
+    match failure.into_inner() {
+        Some(error) => Err(error),
+        None => Ok(combined),
+    }
+}
+
 fn apply_boost(results: &mut [FtsEntry], boost: f32) {
     if boost == 1.0 {
         return;
     }
     for r in results.iter_mut() {
         r.score *= boost;
-    }
-}
-
-// ============================================================================
-// Configuration
-// ============================================================================
-
-/// Configuration for a Full-Text Search index.
-#[derive(Debug, Clone)]
-pub struct FtsIndexConfig {
-    pub name: String,
-    pub field_id: i32,
-    pub column: String,
-    pub params: InvertedIndexParams,
-    pub(crate) resolved_field: Option<Arc<ResolvedFtsField>>,
-}
-
-impl FtsIndexConfig {
-    pub fn new(name: String, field_id: i32, column: String) -> Self {
-        Self {
-            name,
-            field_id,
-            column,
-            params: InvertedIndexParams::default(),
-            resolved_field: None,
-        }
-    }
-
-    pub fn with_params(
-        name: String,
-        field_id: i32,
-        column: String,
-        params: InvertedIndexParams,
-    ) -> Self {
-        Self::try_with_params(name, field_id, column, params)
-            .expect("invalid MemWAL FTS index config parameters")
-    }
-
-    pub fn try_with_params(
-        name: String,
-        field_id: i32,
-        column: String,
-        params: InvertedIndexParams,
-    ) -> Result<Self> {
-        params.validate_format_version()?;
-        Ok(Self {
-            name,
-            field_id,
-            column,
-            params,
-            resolved_field: None,
-        })
-    }
-
-    pub(crate) fn with_resolved_field(mut self, resolved_field: ResolvedFtsField) -> Self {
-        self.resolved_field = Some(Arc::new(resolved_field));
-        self
     }
 }
 
@@ -4637,9 +5027,272 @@ impl<'a> PostingCursor<'a> {
     }
 }
 
-// ============================================================================
-// Tests
-// ============================================================================
+#[async_trait::async_trait]
+impl MemIndex for FtsMemIndex {
+    fn columns(&self) -> &[String] {
+        std::slice::from_ref(&self.column)
+    }
+
+    /// Answers only a query at the granularity this index was built for.
+    fn can_answer(&self, query: &dyn MemQuery) -> bool {
+        self.text_query(query).is_some()
+    }
+
+    fn insert(&self, batch: &RecordBatch, row_offset: RowPosition) -> Result<()> {
+        Self::insert(self, batch, row_offset)
+    }
+
+    fn resident_bytes(&self) -> usize {
+        Self::resident_bytes(self)
+    }
+
+    /// A limit in the query's options applies before rows past
+    /// [`SearchContext::max_visible`] are dropped; set one only when every row
+    /// is visible.
+    fn search(&self, query: &dyn MemQuery, ctx: &SearchContext) -> Result<Option<MemMatches>> {
+        let Some(query) = self.text_query(query) else {
+            return Ok(None);
+        };
+        Ok(Some(MemMatches::Ranked(
+            self.search_with_options(&query.expr, query.options.clone())
+                .into_iter()
+                .filter(|entry| entry.row_position <= ctx.max_visible)
+                .map(RankedMatch::from)
+                .collect(),
+        )))
+    }
+
+    /// Writes the inverted index from the partitions it holds.
+    async fn flush(&self, ctx: &FlushContext<'_>) -> Result<FlushOutcome> {
+        let generation = ctx.generation()?;
+        if self.is_empty() {
+            return Ok(FlushOutcome::Skip);
+        }
+
+        let partition_id = uuid::Uuid::new_v4().as_u64_pair().0;
+        let mut builder = self.to_index_builder(partition_id, generation.total_rows)?;
+        let (uuid, dir) = generation.new_index_dir();
+        let store = LanceIndexStore::new(
+            generation.object_store.clone(),
+            dir,
+            Arc::new(LanceCache::no_cache()),
+        );
+        builder.write(&store).await?;
+        self.write_fts_metadata(&store, partition_id).await?;
+
+        let details =
+            prost_types::Any::from_msg(&pbold::InvertedIndexDetails::try_from(&self.params)?)
+                .map_err(|e| Error::internal(format!("failed to encode index details: {e}")))?;
+        let index_version = if self.params.get_document_granularity().is_list_element() {
+            INVERTED_INDEX_VERSION_V3
+        } else {
+            self.params.resolved_format_version().index_version()
+        };
+        Ok(FlushOutcome::Wrote(Box::new(generation.index_metadata(
+            uuid,
+            vec![self.field_id],
+            details,
+            index_version as i32,
+        ))))
+    }
+}
+
+impl FtsMemIndex {
+    /// `query` as a full-text search at this index's granularity.
+    fn text_query<'a>(&self, query: &'a dyn MemQuery) -> Option<&'a FtsMemQuery> {
+        query
+            .as_any()
+            .downcast_ref::<FtsMemQuery>()
+            .filter(|query| query.granularity == self.document_granularity())
+    }
+}
+
+impl From<FtsEntry> for RankedMatch {
+    fn from(entry: FtsEntry) -> Self {
+        Self {
+            position: entry.row_position,
+            score: entry.score,
+            element: entry.doc_index,
+        }
+    }
+}
+
+impl From<RankedMatch> for FtsEntry {
+    fn from(hit: RankedMatch) -> Self {
+        Self {
+            row_position: hit.position,
+            doc_index: hit.element,
+            score: hit.score,
+        }
+    }
+}
+
+/// Declares the built-in full-text memtable index.
+#[derive(Debug, Default)]
+pub struct FtsMemIndexPlugin;
+
+#[async_trait::async_trait]
+impl MemIndexPlugin for FtsMemIndexPlugin {
+    fn name(&self) -> &str {
+        "Inverted"
+    }
+
+    fn details_message(&self) -> &str {
+        "InvertedIndexDetails"
+    }
+
+    fn flush_index_type(&self) -> IndexType {
+        IndexType::Inverted
+    }
+
+    fn training_criteria(&self) -> TrainingCriteria {
+        // Unused: this index writes its own file at flush.
+        TrainingCriteria::new(TrainingOrdering::None)
+    }
+
+    async fn resolve(&self, ctx: &ResolveContext<'_>) -> Result<ResolvedIndex> {
+        Self::resolve_from_metadata(ctx.name, ctx.schema, ctx.index_meta)
+    }
+
+    fn validate(&self, ctx: &MemIndexBuildContext<'_>) -> Result<()> {
+        let (column, field_id) = ctx.single_column()?;
+        let params = ctx.params::<FtsParams>()?;
+        params
+            .params
+            .validate_format_version()
+            .map_err(|error| Error::invalid_input(format!("FTS index '{}': {error}", ctx.name)))?;
+
+        // Resolved at open, so an index that cannot be built fails the open
+        // rather than a durable write.
+        let resolved = match &params.resolved_field {
+            Some(resolved) => resolved.clone(),
+            None => resolve_fts_field(ctx.schema, column, params.params.get_document_granularity())
+                .map_err(|error| {
+                    Error::invalid_input(format!(
+                        "FTS index '{}' is invalid for field path '{column}': {error}",
+                        ctx.name
+                    ))
+                })?,
+        };
+
+        if resolved.final_field_id != field_id {
+            return Err(Error::invalid_input(format!(
+                "index '{}' is configured with field_id {field_id} but its field path \
+                 '{column}' has final field_id {} in the shard schema",
+                ctx.name, resolved.final_field_id,
+            )));
+        }
+        Ok(())
+    }
+
+    fn create(&self, ctx: &MemIndexBuildContext<'_>) -> Result<Arc<dyn MemIndex>> {
+        let (column, field_id) = ctx.single_column()?;
+        let params = ctx.params::<FtsParams>()?;
+        let index = match &params.resolved_field {
+            Some(resolved) => FtsMemIndex::try_with_resolved_field(
+                field_id,
+                column.to_string(),
+                params.params.clone(),
+                resolved.clone(),
+            )?,
+            None => {
+                FtsMemIndex::try_with_params(field_id, column.to_string(), params.params.clone())?
+            }
+        };
+        Ok(Arc::new(index))
+    }
+}
+
+impl FtsMemIndexPlugin {
+    /// What a full-text index covers and needs, read from the base-table index
+    /// entry and the schema alone.
+    pub(crate) fn resolve_from_metadata(
+        name: &str,
+        schema: &LanceSchema,
+        index_meta: &IndexMetadata,
+    ) -> Result<ResolvedIndex> {
+        let [field_id] = index_meta.fields.as_slice() else {
+            return Err(Error::invalid_input(format!(
+                "index '{name}' covers {} columns, but this kind covers exactly one",
+                index_meta.fields.len()
+            )));
+        };
+
+        let details = match &index_meta.index_details {
+            Some(details) => pbold::InvertedIndexDetails::decode(details.value.as_slice())
+                .map_err(|err| {
+                    Error::io(format!(
+                        "failed to decode InvertedIndexDetails for MemWAL FTS index \
+                         '{name}': {err}"
+                    ))
+                })?,
+            None => pbold::InvertedIndexDetails::default(),
+        };
+        let details =
+            crate::index::scalar::inverted::normalize_inverted_details(index_meta, details)?;
+        let params = InvertedIndexParams::try_from(&details)?;
+
+        // The index covers the resolved path, the name a query uses.
+        let resolved = crate::index::scalar::inverted::resolve_fts_field_by_id(
+            schema,
+            *field_id,
+            params.get_document_granularity(),
+        )?;
+
+        let field_id = resolved.final_field_id;
+        Ok(ResolvedIndex::with_params(
+            vec![resolved.canonical_path.clone()],
+            FtsParams {
+                params,
+                resolved_field: Some(resolved),
+            },
+        )
+        .with_field_ids(vec![field_id]))
+    }
+}
+
+/// What an in-memory full-text index needs before it takes a row.
+#[derive(Debug, Clone)]
+pub struct FtsParams {
+    /// Tokenizer, granularity and format, from the base-table index.
+    pub params: InvertedIndexParams,
+    /// The path through nested types the index covers; `None` resolves it
+    /// from the first batch.
+    pub(crate) resolved_field: Option<ResolvedFtsField>,
+}
+
+/// Compares `params` only: `resolved_field` caches a schema lookup.
+impl PartialEq for FtsParams {
+    fn eq(&self, other: &Self) -> bool {
+        self.params == other.params
+    }
+}
+
+impl MemIndexSpec {
+    /// A full-text index over one column, with default parameters.
+    pub fn fts(name: impl Into<String>, field_id: i32, column: impl Into<String>) -> Self {
+        Self::fts_with_params(name, field_id, column, Default::default())
+    }
+
+    /// A full-text index over one column.
+    pub fn fts_with_params(
+        name: impl Into<String>,
+        field_id: i32,
+        column: impl Into<String>,
+        params: InvertedIndexParams,
+    ) -> Self {
+        Self::single_column(
+            name,
+            field_id,
+            column,
+            Arc::new(FtsMemIndexPlugin),
+            Arc::new(FtsParams {
+                params,
+                resolved_field: None,
+            }),
+        )
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -4849,7 +5502,6 @@ mod tests {
             .unwrap()
             .with_freeze_threshold_rows(1);
         assert_eq!(index.column_name(), "tags");
-        assert_eq!(index.source_column_name(), "tags");
 
         index.insert(&create_element_test_batch(), 0).unwrap();
         assert_eq!(index.doc_count(), 6);
@@ -5496,6 +6148,64 @@ mod tests {
         assert!(positions.contains(&3));
     }
 
+    /// A multi-match keeps each document's best child — the compound scorer's
+    /// `DisjunctionScore::Max` — rather than the sum a SHOULD would give.
+    #[test]
+    fn test_multi_match_scores_best_child() {
+        let schema = create_test_schema();
+        let index = FtsMemIndex::new(1, "description".to_string());
+        index
+            .insert(&create_boolean_test_batch(&schema), 0)
+            .unwrap();
+
+        let rust = FtsQueryExpr::match_query("rust");
+        let programming = FtsQueryExpr::match_query("programming").with_boost(3.0);
+        // Row 0 matches both children; row 2 matches `rust` alone.
+        let rust_at_0 = index
+            .search_query(&rust)
+            .into_iter()
+            .find(|entry| entry.row_position == 0)
+            .unwrap()
+            .score;
+        let programming_at_0 = index
+            .search_query(&programming)
+            .into_iter()
+            .find(|entry| entry.row_position == 0)
+            .unwrap()
+            .score;
+        let rust_at_2 = index
+            .search_query(&rust)
+            .into_iter()
+            .find(|entry| entry.row_position == 2)
+            .unwrap()
+            .score;
+
+        let query = FtsQueryExpr::MultiMatch {
+            children: vec![rust, programming],
+        };
+        let entries = index.search_query(&query);
+        let mut positions: Vec<_> = entries.iter().map(|e| e.row_position).collect();
+        positions.sort_unstable();
+        assert_eq!(
+            positions,
+            vec![0, 1, 2, 4],
+            "every child's matches, each row once"
+        );
+        let at = |row| {
+            entries
+                .iter()
+                .find(|e| e.row_position == row)
+                .unwrap()
+                .score
+        };
+        assert!(
+            (at(0) - rust_at_0.max(programming_at_0)).abs() < 1e-6,
+            "best child, not the sum: {} vs {rust_at_0} / {programming_at_0}",
+            at(0)
+        );
+        assert!((at(2) - rust_at_2).abs() < 1e-6);
+    }
+
     #[test]
     fn test_boolean_must_not_only() {
         let schema = create_test_schema();
@@ -5940,7 +6650,7 @@ mod tests {
         let batch = create_boost_test_batch(&schema);
         index.insert(&batch, 0).unwrap();
 
-        let query_no_demote = FtsQueryExpr::boosting_with_negative(
+        let query_full_demote = FtsQueryExpr::boosting_with_negative(
             FtsQueryExpr::match_query("programming"),
             FtsQueryExpr::match_query("python"),
             1.0,
@@ -5956,7 +6666,7 @@ mod tests {
             0.0,
         );
 
-        let r_no = index.search_query(&query_no_demote);
+        let r_no = index.search_query(&query_full_demote);
         let r_half = index.search_query(&query_half_demote);
         let r_zero = index.search_query(&query_zero_demote);
 
@@ -5964,8 +6674,28 @@ mod tests {
         let s_half = r_half.iter().find(|e| e.row_position == 1).unwrap().score;
         let s_zero = r_zero.iter().find(|e| e.row_position == 1).unwrap().score;
 
-        assert!((s_half - s_no * 0.5).abs() < 0.001);
-        assert!(s_zero.abs() < 0.001);
+        // Subtractive: `positive - negative_boost * negative`. `0.0` leaves the
+        // positive score untouched and larger factors demote further, so the
+        // three are evenly spaced by the negative score.
+        let positive = index
+            .search_query(&FtsQueryExpr::match_query("programming"))
+            .into_iter()
+            .find(|e| e.row_position == 1)
+            .unwrap()
+            .score;
+        let negative = index
+            .search_query(&FtsQueryExpr::match_query("python"))
+            .into_iter()
+            .find(|e| e.row_position == 1)
+            .unwrap()
+            .score;
+        assert!((s_zero - positive).abs() < 0.001, "0.0 must not demote");
+        assert!((s_half - (positive - 0.5 * negative)).abs() < 0.001);
+        assert!((s_no - (positive - negative)).abs() < 0.001);
+        assert!(
+            s_no < s_half && s_half < s_zero,
+            "larger factor demotes more"
+        );
     }
 
     #[test]
@@ -6066,6 +6796,61 @@ mod tests {
         full.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
         assert_eq!(results[0].row_position, full[0].row_position);
         assert_eq!(results[1].row_position, full[1].row_position);
+    }
+
+    /// Boost makes negative scores reachable, and the factor threshold has to
+    /// stay a *relaxation* at that point. Multiplying a negative k-th score by a
+    /// factor below one moves the threshold toward zero — tightening the filter
+    /// — which can drop every result including the actual top-k.
+    #[test]
+    fn boost_negative_scores_preserve_top_k_with_wand_factor() {
+        let schema = create_test_schema();
+        let index = FtsMemIndex::new(1, "description".to_string());
+        let batch = create_boost_test_batch(&schema);
+        index.insert(&batch, 0).unwrap();
+
+        // Same clause on both sides with a factor above 1 drives every match
+        // negative: `positive - 2.0 * positive`.
+        let query = FtsQueryExpr::boosting_with_negative(
+            FtsQueryExpr::match_query("programming"),
+            FtsQueryExpr::match_query("programming"),
+            2.0,
+        );
+        let exhaustive = index.search_with_options(&query, SearchOptions::default());
+        assert!(
+            exhaustive.iter().all(|entry| entry.score < 0.0),
+            "fixture must actually produce negative scores"
+        );
+
+        let limited = index.search_with_options(
+            &query,
+            SearchOptions::new().with_limit(1).with_wand_factor(0.5),
+        );
+        assert_eq!(limited.len(), 1, "factor pruning removed the actual top-k");
+        // Compare scores, not keys: the fixture's two best documents tie, so
+        // which one a stable sort surfaces is not a property of pruning.
+        assert_eq!(
+            limited[0].score, exhaustive[0].score,
+            "the surviving result must be a best-scoring one"
+        );
+    }
+
+    /// The relaxation is bit-identical to the old `anchor * factor` wherever
+    /// scores are non-negative, which is every query but boost.
+    #[test]
+    fn relaxed_score_threshold_matches_multiplication_when_non_negative() {
+        for anchor in [0.0f32, 0.25, 1.0, 12.5] {
+            for factor in [0.0f32, 0.25, 0.5, 0.99] {
+                assert_eq!(
+                    relaxed_score_threshold(anchor, factor),
+                    anchor * factor,
+                    "anchor={anchor} factor={factor}"
+                );
+            }
+        }
+        // Negative anchors relax downward instead of upward.
+        assert!(relaxed_score_threshold(-0.3, 0.5) < -0.3);
+        assert_eq!(relaxed_score_threshold(-0.3, 1.0), -0.3);
     }
 
     #[test]
