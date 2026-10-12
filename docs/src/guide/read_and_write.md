@@ -594,55 +594,25 @@ dataset.cleanup_old_versions(
     is **extremely dangerous** — if any other operation is in-progress at all,
     its data files may be deleted, leading to dataset corruption.
 
-Use `delete_concurrency` to set a positive maximum number of in-flight file
-deletions for a cleanup task. If omitted, cleanup uses object store I/O
-parallelism (including `LANCE_IO_THREADS`). An explicit value overrides that
-default without changing listing or manifest-read concurrency. This is independent
-of `delete_rate_limit`, which controls delete operations per second:
+Control file deletion throughput with two independent options:
+
+- `delete_concurrency`: maximum concurrent deletes. Defaults to the object store's
+  I/O parallelism; an explicit value overrides it, including `LANCE_IO_THREADS`.
+- `delete_rate_limit`: maximum delete requests per second. Unlimited when omitted.
+
+Both values must be positive integers.
 
 ```python
 dataset.cleanup_old_versions(delete_concurrency=32, delete_rate_limit=100)
 ```
 
-These arguments apply only to this cleanup call; they do not update the table
-configuration. In Rust, configure execution limits on `CleanupOperation`:
+One cleanup and all cascaded branches share these limits. Cascaded branches ignore
+their own deletion limits but retain their own cleanup eligibility and retention
+settings. Separate cleanup calls have independent limits.
 
-```rust
-dataset
-    .cleanup(policy)
-    .with_delete_concurrency(32)?
-    .with_delete_rate_limit(100)?
-    .execute()
-    .await?;
-```
-
-Java uses the same operation-level execution settings:
-
-```java
-dataset.cleanup(policy)
-    .withDeleteConcurrency(32)
-    .withDeleteRateLimit(100)
-    .execute();
-```
-
-Java's existing policy QPS setting remains supported; an explicit operation rate
-overrides it. Python's keyword arguments configure the Rust operation directly.
-
-Rust's existing `CleanupPolicy.delete_rate_limit` field remains supported.
-An operation's explicit rate overrides that field; otherwise the policy's rate
-applies. If neither is set, deletes are not rate limited. `CleanupPolicy` retains
-its existing fields, so exhaustive Rust struct literals remain compatible.
-
-The initiating cleanup and all cascaded branches share one deletion concurrency
-budget and one `delete_rate_limit` budget. Cascaded branches ignore their own
-concurrency and QPS settings, including invalid values. Branch cleanup eligibility
-and retention still use each branch's own automatic cleanup settings. Cleaning a
-branch independently uses and validates its own settings. Separate cleanup calls
-do not share limits.
-
-`delete_concurrency` must be between 1 and Tokio's `Semaphore::MAX_PERMITS`
-(`2**61 - 1` on 64-bit platforms). Values outside this range return an error.
-Explain only previews the cleanup scope; deletion concurrency and QPS do not apply.
+The limits apply only to file deletion during this call and do not update table
+configuration. Explain ignores them. In Rust and Java, set them on
+`CleanupOperation`; an explicit operation rate overrides the policy's rate.
 
 ### Automatic cleanup
 
@@ -694,6 +664,7 @@ ds.update_config({
     "lance.auto_cleanup.interval": "20",
     "lance.auto_cleanup.older_than": "3600s",
     "lance.auto_cleanup.delete_concurrency": "32",
+    "lance.auto_cleanup.delete_rate_limit": "100",
 })
 ```
 
