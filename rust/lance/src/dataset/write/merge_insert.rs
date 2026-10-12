@@ -986,10 +986,14 @@ impl MergeInsertBuilder {
     ///
     /// The file version and the bases new files go to are set on this builder
     /// ([`Self::data_storage_version`], [`Self::target_bases`] and its
-    /// siblings), so [`Self::try_build`] refuses parameters that set them. It
-    /// also refuses `ExternalBlobMode::Ingest`, which merge insert does not
-    /// support. Fields that describe a whole write, such as `mode`, do not
-    /// apply.
+    /// siblings), so [`Self::try_build`] refuses parameters that set them.
+    /// `mode` must stay at its default, `WriteMode::Create`: merge insert
+    /// decides how its files are written, and another mode would change the
+    /// schema they are written with (`Overwrite`) or start index seeds the
+    /// merge does not commit (`Append`). `try_build` also refuses
+    /// `ExternalBlobMode::Ingest`, which merge insert does not support. Fields
+    /// that only shape a commit or a new dataset, such as
+    /// `transaction_properties` or `enable_stable_row_ids`, do not apply.
     ///
     /// ```
     /// # use std::sync::Arc;
@@ -1093,10 +1097,18 @@ impl MergeInsertBuilder {
     }
 }
 
-/// Refuse write parameters a merge insert cannot honor: the file version and
-/// the target bases are the builder's own options, and the job has no ingest
-/// path for external Blob URIs.
+/// Refuse write parameters a merge insert cannot honor: the write mode, the
+/// file version and the target bases are the job's own, and the job has no
+/// ingest path for external Blob URIs.
 fn validate_merge_insert_write_params(params: &WriteParams) -> Result<()> {
+    // The fragment writers prepare their schema and index seeds by mode; merge
+    // insert has always written with `Create` and commits that result.
+    if !matches!(params.mode, WriteMode::Create) {
+        return Err(Error::invalid_input(format!(
+            "Merge insert write params set mode={:?}; leave mode at its default, WriteMode::Create, since merge insert decides how its files are written",
+            params.mode
+        )));
+    }
     if let Some(version) = params.data_storage_version {
         return Err(Error::invalid_input(format!(
             "Merge insert write params set data_storage_version={version:?}; use MergeInsertBuilder::data_storage_version instead",
@@ -16495,6 +16507,20 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
             .unwrap(),
         );
         for (params, needle) in [
+            (
+                WriteParams {
+                    mode: WriteMode::Overwrite,
+                    ..Default::default()
+                },
+                "mode=Overwrite",
+            ),
+            (
+                WriteParams {
+                    mode: WriteMode::Append,
+                    ..Default::default()
+                },
+                "mode=Append",
+            ),
             (
                 WriteParams {
                     data_storage_version: Some(LanceFileVersion::V2_2),
