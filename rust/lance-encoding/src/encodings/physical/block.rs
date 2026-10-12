@@ -141,6 +141,23 @@ impl FromStr for CompressionScheme {
 pub trait BufferCompressor: std::fmt::Debug + Send + Sync {
     fn compress(&self, input_buf: &[u8], output_buf: &mut Vec<u8>) -> Result<()>;
     fn decompress(&self, input_buf: &[u8], output_buf: &mut Vec<u8>) -> Result<()>;
+
+    fn decompress_exact(
+        &self,
+        input_buf: &[u8],
+        output_buf: &mut Vec<u8>,
+        expected_bytes: usize,
+    ) -> Result<()> {
+        self.decompress(input_buf, output_buf)?;
+        if output_buf.len() != expected_bytes {
+            return Err(Error::invalid_input(format!(
+                "General compression produced {} bytes, expected {expected_bytes}",
+                output_buf.len()
+            )));
+        }
+        Ok(())
+    }
+
     fn config(&self) -> CompressionConfig;
 }
 
@@ -290,6 +307,65 @@ mod zstd {
             Ok(())
         }
 
+        fn decompress_exact(
+            &self,
+            input_buf: &[u8],
+            output_buf: &mut Vec<u8>,
+            expected_bytes: usize,
+        ) -> Result<()> {
+            if input_buf.is_empty() {
+                if expected_bytes == 0 {
+                    return Ok(());
+                }
+                return Err(Error::invalid_input(format!(
+                    "Zstd payload is empty, expected {expected_bytes} output bytes"
+                )));
+            }
+            let compressed = if self.is_raw_stream_format(input_buf) {
+                input_buf
+            } else {
+                let declared = u64::from_le_bytes(input_buf[..8].try_into().map_err(|_| {
+                    Error::invalid_input("Zstd payload is shorter than its 8-byte length prefix")
+                })?);
+                let declared = usize::try_from(declared).map_err(|_| {
+                    Error::invalid_input("Zstd declared output length does not fit usize")
+                })?;
+                if declared != expected_bytes {
+                    return Err(Error::invalid_input(format!(
+                        "Zstd declares {declared} output bytes, expected {expected_bytes}"
+                    )));
+                }
+                &input_buf[8..]
+            };
+            let start = output_buf.len();
+            let end = start
+                .checked_add(expected_bytes)
+                .ok_or_else(|| Error::invalid_input("Zstd output buffer length overflows usize"))?;
+            output_buf
+                .try_reserve_exact(expected_bytes)
+                .map_err(|error| {
+                    Error::invalid_input(format!(
+                        "Zstd could not reserve {expected_bytes} output bytes: {error}"
+                    ))
+                })?;
+            output_buf.resize(end, 0);
+            let decoded = decompress_to_buffer(compressed, &mut output_buf[start..]);
+            let decoded = match decoded {
+                Ok(decoded) => decoded,
+                Err(error) => {
+                    output_buf.truncate(start);
+                    return Err(error.into());
+                }
+            };
+            if decoded != expected_bytes {
+                output_buf.truncate(start);
+                return Err(Error::invalid_input(format!(
+                    "Zstd produced {decoded} bytes, expected {expected_bytes}"
+                )));
+            }
+            Ok(())
+        }
+
         fn config(&self) -> CompressionConfig {
             CompressionConfig {
                 scheme: CompressionScheme::Zstd,
@@ -333,7 +409,9 @@ mod lz4 {
             // When prepend_size is true, LZ4 stores the uncompressed size in the first 4 bytes
             // We can read this to know exactly how much space we need
             if input_buf.len() < 4 {
-                return Err(Error::internal("LZ4 compressed data too short".to_string()));
+                return Err(Error::invalid_input(
+                    "LZ4 buffer is missing its length prefix",
+                ));
             }
 
             // Read the uncompressed size from the first 4 bytes (little-endian)
@@ -358,6 +436,56 @@ mod lz4 {
             Ok(())
         }
 
+        fn decompress_exact(
+            &self,
+            input_buf: &[u8],
+            output_buf: &mut Vec<u8>,
+            expected_bytes: usize,
+        ) -> Result<()> {
+            let declared = input_buf.get(..4).ok_or_else(|| {
+                Error::invalid_input("LZ4 payload is shorter than its 4-byte length prefix")
+            })?;
+            let declared =
+                u32::from_le_bytes(declared.try_into().map_err(|_| {
+                    Error::invalid_input("LZ4 payload has an invalid length prefix")
+                })?) as usize;
+            if declared != expected_bytes {
+                return Err(Error::invalid_input(format!(
+                    "LZ4 declares {declared} output bytes, expected {expected_bytes}"
+                )));
+            }
+            let start = output_buf.len();
+            let end = start
+                .checked_add(expected_bytes)
+                .ok_or_else(|| Error::invalid_input("LZ4 output buffer length overflows usize"))?;
+            output_buf
+                .try_reserve_exact(expected_bytes)
+                .map_err(|error| {
+                    Error::invalid_input(format!(
+                        "LZ4 could not reserve {expected_bytes} output bytes: {error}"
+                    ))
+                })?;
+            output_buf.resize(end, 0);
+            let decoded =
+                ::lz4::block::decompress_to_buffer(input_buf, None, &mut output_buf[start..]);
+            let decoded = match decoded {
+                Ok(decoded) => decoded,
+                Err(error) => {
+                    output_buf.truncate(start);
+                    return Err(Error::invalid_input(format!(
+                        "LZ4 decompression error: {error}"
+                    )));
+                }
+            };
+            if decoded != expected_bytes {
+                output_buf.truncate(start);
+                return Err(Error::invalid_input(format!(
+                    "LZ4 produced {decoded} bytes, expected {expected_bytes}"
+                )));
+            }
+            Ok(())
+        }
+
         fn config(&self) -> CompressionConfig {
             CompressionConfig {
                 scheme: CompressionScheme::Lz4,
@@ -377,6 +505,22 @@ impl BufferCompressor for NoopBufferCompressor {
     }
 
     fn decompress(&self, input_buf: &[u8], output_buf: &mut Vec<u8>) -> Result<()> {
+        output_buf.extend_from_slice(input_buf);
+        Ok(())
+    }
+
+    fn decompress_exact(
+        &self,
+        input_buf: &[u8],
+        output_buf: &mut Vec<u8>,
+        expected_bytes: usize,
+    ) -> Result<()> {
+        if input_buf.len() != expected_bytes {
+            return Err(Error::invalid_input(format!(
+                "Uncompressed payload has {} bytes, expected {expected_bytes}",
+                input_buf.len()
+            )));
+        }
         output_buf.extend_from_slice(input_buf);
         Ok(())
     }
@@ -722,6 +866,21 @@ mod tests {
         }
 
         #[test]
+        fn test_zstd_exact_output_rejects_declared_length() {
+            let compressor = ZstdBufferCompressor::new(0);
+            let mut compressed = Vec::new();
+            compressor.compress(b"bounded", &mut compressed).unwrap();
+            compressed[..8].copy_from_slice(&u64::MAX.to_le_bytes());
+
+            let mut output = Vec::new();
+            let error = compressor
+                .decompress_exact(&compressed, &mut output, 7)
+                .unwrap_err();
+            assert!(error.to_string().contains("expected 7"));
+            assert!(output.is_empty());
+        }
+
+        #[test]
         fn test_zstd_compress_decompress_multiple_times() {
             let compressor = ZstdBufferCompressor::new(0);
             let (input_data_1, input_data_2) = (b"Hello ", b"World");
@@ -804,7 +963,10 @@ mod tests {
                 STRUCTURAL_ENCODING_META_KEY,
             },
             encodings::physical::block::lz4::Lz4BufferCompressor,
-            testing::{FnArrayGeneratorProvider, TestCases, check_round_trip_encoding_generated},
+            testing::{
+                FnArrayGeneratorProvider, TestCases, TestEncoding,
+                check_round_trip_encoding_generated,
+            },
         };
 
         #[test]
@@ -823,49 +985,74 @@ mod tests {
             assert_eq!(input_data, decompressed_data.as_slice());
         }
 
+        #[test]
+        fn test_lz4_exact_output_rejects_declared_length() {
+            let compressor = Lz4BufferCompressor::default();
+            let mut compressed = Vec::new();
+            compressor.compress(b"bounded", &mut compressed).unwrap();
+            compressed[..4].copy_from_slice(&u32::MAX.to_le_bytes());
+
+            let mut output = Vec::new();
+            let error = compressor
+                .decompress_exact(&compressed, &mut output, 7)
+                .unwrap_err();
+            assert!(error.to_string().contains("declares"));
+            assert!(output.is_empty());
+        }
+
+        #[rstest::rstest]
         #[test_log::test(tokio::test)]
-        async fn test_lz4_compress_round_trip() {
-            for data_type in &[
+        async fn test_lz4_compress_round_trip(
+            #[values(
                 DataType::Utf8,
                 DataType::LargeUtf8,
                 DataType::Binary,
-                DataType::LargeBinary,
-            ] {
-                let field = Field::new("", data_type.clone(), false);
-                let mut field_meta = HashMap::new();
-                field_meta.insert(COMPRESSION_META_KEY.to_string(), "lz4".to_string());
-                // Some bad cardinality estimatation causes us to use dictionary encoding currently
-                // which causes the expected encoding check to fail.
-                field_meta.insert(DICT_DIVISOR_META_KEY.to_string(), "100000".to_string());
-                field_meta.insert(DICT_SIZE_RATIO_META_KEY.to_string(), "0.0001".to_string());
-                // Also disable size-based dictionary encoding
-                field_meta.insert(
-                    STRUCTURAL_ENCODING_META_KEY.to_string(),
-                    STRUCTURAL_ENCODING_FULLZIP.to_string(),
-                );
-                let field = field.with_metadata(field_meta);
-                let test_cases = TestCases::basic()
-                    // Need to use large pages as small pages might be too small to compress
-                    .with_page_sizes(vec![1024 * 1024])
-                    .with_expected_encoding("zstd")
-                    .with_structural_encodings();
+                DataType::LargeBinary
+            )]
+            data_type: DataType,
+            #[values(
+                TestEncoding::StructuralU16,
+                TestEncoding::StructuralU32,
+                TestEncoding::StructuralSparse
+            )]
+            encoding: TestEncoding,
+            #[values(false, true)] use_slicing: bool,
+        ) {
+            let field = Field::new("", data_type.clone(), false);
+            let mut field_meta = HashMap::new();
+            field_meta.insert(COMPRESSION_META_KEY.to_string(), "lz4".to_string());
+            // Some bad cardinality estimatation causes us to use dictionary encoding currently
+            // which causes the expected encoding check to fail.
+            field_meta.insert(DICT_DIVISOR_META_KEY.to_string(), "100000".to_string());
+            field_meta.insert(DICT_SIZE_RATIO_META_KEY.to_string(), "0.0001".to_string());
+            // Also disable size-based dictionary encoding
+            field_meta.insert(
+                STRUCTURAL_ENCODING_META_KEY.to_string(),
+                STRUCTURAL_ENCODING_FULLZIP.to_string(),
+            );
+            let field = field.with_metadata(field_meta);
+            let test_cases = TestCases::basic()
+                // Need to use large pages as small pages might be too small to compress
+                .with_page_sizes(vec![1024 * 1024])
+                .with_expected_encoding("zstd")
+                .with_encoding(encoding)
+                .with_slicing_modes([use_slicing]);
 
-                // Can't use the default random provider because random data isn't compressible
-                // and we will fallback to uncompressed encoding
-                let datagen = Box::new(FnArrayGeneratorProvider::new(move || match data_type {
-                    DataType::Utf8 => utf8_prefix_plus_counter("compressme", false),
-                    DataType::Binary => {
-                        binary_prefix_plus_counter(Arc::from(b"compressme".to_owned()), false)
-                    }
-                    DataType::LargeUtf8 => utf8_prefix_plus_counter("compressme", true),
-                    DataType::LargeBinary => {
-                        binary_prefix_plus_counter(Arc::from(b"compressme".to_owned()), true)
-                    }
-                    _ => panic!("Unsupported data type: {:?}", data_type),
-                }));
+            // Can't use the default random provider because random data isn't compressible
+            // and we will fallback to uncompressed encoding
+            let datagen = Box::new(FnArrayGeneratorProvider::new(move || match data_type {
+                DataType::Utf8 => utf8_prefix_plus_counter("compressme", false),
+                DataType::Binary => {
+                    binary_prefix_plus_counter(Arc::from(b"compressme".to_owned()), false)
+                }
+                DataType::LargeUtf8 => utf8_prefix_plus_counter("compressme", true),
+                DataType::LargeBinary => {
+                    binary_prefix_plus_counter(Arc::from(b"compressme".to_owned()), true)
+                }
+                _ => panic!("Unsupported data type: {:?}", data_type),
+            }));
 
-                check_round_trip_encoding_generated(field, datagen, test_cases).await;
-            }
+            check_round_trip_encoding_generated(field, datagen, test_cases).await;
         }
     }
 }

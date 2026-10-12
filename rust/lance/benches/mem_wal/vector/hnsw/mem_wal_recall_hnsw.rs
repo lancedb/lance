@@ -15,7 +15,6 @@
 //!       truth) vs HNSW top-k via `MemTableScanner::nearest`.
 //!     * Recall@k = |brute ∩ hnsw| / k aggregated over queries.
 
-#![recursion_limit = "256"]
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
 use std::sync::Arc;
@@ -589,6 +588,7 @@ async fn run_checkpoint(
                     upper_bound: None,
                     minimum_nprobes: 1,
                     maximum_nprobes: Some(1),
+                    search_effort: 0.5,
                     ef: Some(ef),
                     refine_factor: None,
                     metric_type: Some(DistanceType::Cosine),

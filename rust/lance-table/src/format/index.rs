@@ -139,10 +139,21 @@ impl IndexMetadata {
     ///
     /// Such an index cannot follow its data through a rewrite: the addresses it stores
     /// name fragments and offsets, and neither kind supports remap.
+    ///
+    /// Currently this is a rather short list.  We will soon be migrating the remaining
+    /// row-id-domain indexes to use row addresses.  At that point this list will grow and
+    /// likely turn from an allow-list into a block-list.
     pub fn results_are_row_addrs(&self) -> bool {
         self.index_details.as_ref().is_some_and(|details| {
+            let is_fm = details
+                .type_url
+                .rsplit_once('/')
+                .is_some_and(|(_, details_type_name)| {
+                    details_type_name.eq_ignore_ascii_case("lance.index.pb.FMIndexDetails")
+                });
             details.type_url.ends_with("ZoneMapIndexDetails")
                 || details.type_url.ends_with("BloomFilterIndexDetails")
+                || is_fm
         })
     }
 
@@ -248,6 +259,19 @@ impl DeepSizeOf for IndexMetadata {
                 .map(|fragment_bitmap| fragment_bitmap.serialized_size())
                 .unwrap_or(0)
             + self.files.deep_size_of_children(context)
+            + self
+                .index_details
+                .as_ref()
+                .map(|details| {
+                    if context.mark_seen(Arc::as_ptr(details) as usize) {
+                        std::mem::size_of::<prost_types::Any>()
+                            + details.type_url.capacity()
+                            + details.value.capacity()
+                    } else {
+                        0
+                    }
+                })
+                .unwrap_or(0)
     }
 }
 
@@ -312,13 +336,20 @@ impl TryFrom<pb::IndexMetadata> for IndexMetadata {
 impl From<&IndexMetadata> for pb::IndexMetadata {
     fn from(idx: &IndexMetadata) -> Self {
         let mut fragment_bitmap = Vec::new();
-        if let Some(bitmap) = &idx.fragment_bitmap
-            && let Err(e) = bitmap.serialize_into(&mut fragment_bitmap)
-        {
-            // In theory, this should never error. But if we do, just
-            // recover gracefully.
-            log::error!("Failed to serialize fragment bitmap: {}", e);
-            fragment_bitmap.clear();
+        if let Some(bitmap) = &idx.fragment_bitmap {
+            // Fragment ids are allocated monotonically, so index coverage is
+            // highly contiguous. Run containers are part of the standard
+            // roaring serialization format, so converting eligible containers
+            // to runs before writing shrinks the bitmap from O(fragments) to
+            // O(runs) bytes.
+            let mut bitmap = bitmap.clone();
+            bitmap.optimize();
+            if let Err(e) = bitmap.serialize_into(&mut fragment_bitmap) {
+                // In theory, this should never error. But if we do, just
+                // recover gracefully.
+                log::error!("Failed to serialize fragment bitmap: {}", e);
+                fragment_bitmap.clear();
+            }
         }
 
         let files = idx
@@ -432,6 +463,87 @@ mod tests {
     use super::*;
     use rstest::rstest;
     use std::collections::HashMap;
+
+    #[test]
+    fn test_fragment_bitmap_serialized_run_optimized() {
+        let bitmap = RoaringBitmap::from_sorted_iter(0..1_000_000).unwrap();
+        let unoptimized_size = bitmap.serialized_size();
+
+        let metadata = IndexMetadata {
+            uuid: Uuid::new_v4(),
+            name: "my_index".to_string(),
+            fields: vec![0],
+            covering_fields: vec![],
+            dataset_version: 1,
+            fragment_bitmap: Some(bitmap.clone()),
+            index_details: None,
+            index_version: 1,
+            created_at: None,
+            base_id: None,
+            files: None,
+        };
+
+        let proto = pb::IndexMetadata::from(&metadata);
+        assert!(
+            proto.fragment_bitmap.len() < unoptimized_size / 100,
+            "expected run-optimized bitmap ({} bytes) to be <1% of the \
+             unoptimized serialization ({} bytes)",
+            proto.fragment_bitmap.len(),
+            unoptimized_size
+        );
+
+        let recovered = IndexMetadata::try_from(proto).unwrap();
+        assert_eq!(recovered.fragment_bitmap, Some(bitmap));
+    }
+
+    #[test]
+    fn test_deep_size_counts_index_details() {
+        // Spare capacity on both buffers, so counting `len()` instead of `capacity()` fails.
+        fn details() -> Arc<prost_types::Any> {
+            let mut type_url = String::with_capacity(128);
+            type_url.push_str("/lance.table.FragmentReuseIndexDetails");
+            let mut value = Vec::with_capacity(12_000);
+            value.resize(10_000, 0u8);
+            assert_eq!((type_url.capacity(), value.capacity()), (128, 12_000));
+            Arc::new(prost_types::Any { type_url, value })
+        }
+        // `Any` struct + `type_url` heap + `value` heap.
+        let details_size = std::mem::size_of::<prost_types::Any>() + 128 + 12_000;
+
+        let meta = IndexMetadata {
+            uuid: Uuid::new_v4(),
+            name: "__lance_frag_reuse".to_string(),
+            fields: vec![],
+            covering_fields: vec![],
+            dataset_version: 1,
+            fragment_bitmap: None,
+            index_details: None,
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+            files: None,
+        };
+        let with = |details: Arc<prost_types::Any>| IndexMetadata {
+            index_details: Some(details),
+            ..meta.clone()
+        };
+
+        assert_eq!(
+            with(details()).deep_size_of() - meta.deep_size_of(),
+            details_size
+        );
+
+        let two_without = vec![meta.clone(), meta.clone()].deep_size_of();
+
+        // A shared Arc is charged once per measured value.
+        let shared = details();
+        let shared = vec![with(shared.clone()), with(shared)];
+        assert_eq!(shared.deep_size_of() - two_without, details_size);
+
+        // Independent Arcs are each charged.
+        let independent = vec![with(details()), with(details())];
+        assert_eq!(independent.deep_size_of() - two_without, 2 * details_size);
+    }
 
     /// Demonstrates the pattern a disk-backed cache backend would use:
     /// serialize entries to bytes, store in a key-value map, then
@@ -594,6 +706,23 @@ mod tests {
             base_id: None,
             files: None,
         }
+    }
+
+    #[rstest]
+    #[case::zone_map("type.googleapis.com/lance.table.ZoneMapIndexDetails", true)]
+    #[case::bloom_filter("type.googleapis.com/lance.index.pb.BloomFilterIndexDetails", true)]
+    #[case::fm("type.googleapis.com/lance.index.pb.FMIndexDetails", true)]
+    #[case::fm_case_insensitive("type.googleapis.com/LANCE.INDEX.PB.FMINDEXDETAILS", true)]
+    #[case::foreign_fm_terminal_name("type.googleapis.com/example.FMIndexDetails", false)]
+    #[case::btree("type.googleapis.com/lance.table.BTreeIndexDetails", false)]
+    fn test_results_are_row_addrs(#[case] type_url: &str, #[case] expected: bool) {
+        let mut metadata = index_metadata_with(vec![0], vec![]);
+        metadata.index_details = Some(Arc::new(prost_types::Any {
+            type_url: type_url.to_string(),
+            value: Vec::new(),
+        }));
+
+        assert_eq!(metadata.results_are_row_addrs(), expected);
     }
 
     #[rstest]
