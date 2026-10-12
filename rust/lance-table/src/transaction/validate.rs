@@ -19,7 +19,8 @@ type DataFileIdentity = (Option<u32>, String);
 
 /// Resolve an Arrow-derived operation against the dataset it was read from.
 ///
-/// Overwrite assigns new IDs to every field. Merge matches fields by name and
+/// Overwrite assigns new IDs to every field, except that a new table keeps the
+/// IDs its fields carry. Merge matches fields by name and
 /// type, not positional Arrow IDs.
 /// Project may use explicit IDs for renames; its conversion must leave missing
 /// IDs unassigned. New file mappings follow the resolved schema; retained files
@@ -55,7 +56,11 @@ pub fn resolve_arrow_field_ids(
         Operation::Overwrite {
             schema, fragments, ..
         } => {
-            let field_id_remap = canonicalize_schema(manifest, schema, None, true)?;
+            let Some(manifest) = manifest else {
+                schema.try_assign_new_table_field_ids()?;
+                return schema.verify_primary_key();
+            };
+            let field_id_remap = canonicalize_schema(Some(manifest), schema, None, true)?;
             resolve_fragment_field_ids(fragments, &field_id_remap, &HashSet::new(), schema)?;
         }
         Operation::Project { schema, .. } => {
@@ -1238,6 +1243,29 @@ mod tests {
                     .contains("greater than the high-water mark 0")
             );
         }
+    }
+
+    #[test]
+    fn resolve_new_table_overwrite_keeps_supplied_field_ids() {
+        let mut schema = one_field_schema();
+        schema.fields[0].id = 5;
+        let mut operation = Operation::Overwrite {
+            fragments: vec![fragment_with_file_fields(0, "new.lance", vec![5])],
+            schema,
+            config_upsert_values: None,
+            initial_bases: None,
+        };
+
+        resolve_arrow_field_ids(None, &mut operation).unwrap();
+
+        let Operation::Overwrite {
+            schema, fragments, ..
+        } = operation
+        else {
+            unreachable!();
+        };
+        assert_eq!(schema.fields[0].id, 5);
+        assert_eq!(fragments[0].files[0].fields.as_ref(), &[5]);
     }
 
     #[test]

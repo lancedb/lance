@@ -1091,31 +1091,59 @@ async fn test_non_reusable_field_id_multi_cast_uses_schema_order() {
     );
 }
 
+fn field_with_id(name: &str, id: i32) -> ArrowField {
+    ArrowField::new(name, DataType::Int32, true).with_metadata(HashMap::from([(
+        "lance:field_id".to_string(),
+        id.to_string(),
+    )]))
+}
+
+async fn write_new_dataset(uri: &str, fields: Vec<ArrowField>) -> Result<Dataset> {
+    let schema = Arc::new(ArrowSchema::new(fields));
+    let columns = (0..schema.fields().len())
+        .map(|_| Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef)
+        .collect();
+    let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
+    Dataset::write(RecordBatchIterator::new(vec![Ok(batch)], schema), uri, None).await
+}
+
 #[tokio::test]
-async fn test_new_dataset_ignores_hostile_arrow_field_id() {
-    let source_uri = TempStrDir::default();
-    let schema = Arc::new(ArrowSchema::new(vec![
-        ArrowField::new("a", DataType::Int32, false).with_metadata(HashMap::from([(
-            "lance:field_id".to_string(),
-            i32::MAX.to_string(),
-        )])),
-    ]));
-    let batch =
-        RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1, 2]))]).unwrap();
-    let mut dataset = Dataset::write(
-        RecordBatchIterator::new(vec![Ok(batch)], schema),
-        source_uri.as_str(),
-        None,
+async fn test_new_dataset_keeps_supplied_field_ids() {
+    let uri = TempStrDir::default();
+    let mut dataset = write_new_dataset(
+        uri.as_str(),
+        vec![
+            field_with_id("a", 0),
+            field_with_id("b", 3),
+            ArrowField::new("c", DataType::Int32, true),
+        ],
     )
     .await
     .unwrap();
 
-    assert_eq!(dataset.schema().field("a").unwrap().id, 0);
-    assert_eq!(dataset.manifest.max_allocated_field_id, None);
+    let ids = |dataset: &Dataset| {
+        dataset
+            .schema()
+            .fields
+            .iter()
+            .map(|field| (field.name.clone(), field.id))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        ids(&dataset),
+        vec![
+            ("a".to_string(), 0),
+            ("b".to_string(), 3),
+            ("c".to_string(), 4)
+        ]
+    );
+    let fragment = dataset.get_fragments()[0].metadata().clone();
+    assert_eq!(fragment.files[0].fields.as_ref(), &[0, 3, 4]);
+
     dataset
         .add_columns(
             NewColumnTransform::AllNulls(Arc::new(ArrowSchema::new(vec![ArrowField::new(
-                "b",
+                "d",
                 DataType::Int32,
                 true,
             )]))),
@@ -1124,7 +1152,18 @@ async fn test_new_dataset_ignores_hostile_arrow_field_id() {
         )
         .await
         .unwrap();
-    assert_eq!(dataset.schema().field("b").unwrap().id, 1);
+    assert_eq!(dataset.schema().field("d").unwrap().id, 5);
+    let batch = dataset.scan().try_into_batch().await.unwrap();
+    assert_eq!(batch.column_by_name("b").unwrap().null_count(), 0);
+}
+
+#[tokio::test]
+async fn test_new_dataset_rejects_a_field_id_that_leaves_no_room() {
+    let uri = TempStrDir::default();
+    let err = write_new_dataset(uri.as_str(), vec![field_with_id("a", i32::MAX)])
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("leaves no ID"), "{err}");
 }
 
 #[tokio::test]

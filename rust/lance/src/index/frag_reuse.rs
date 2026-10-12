@@ -5000,7 +5000,6 @@ mod tests {
                 clone.manifest_location.naming_scheme,
                 dataset.metadata_cache.as_ref(),
                 dataset.session.clone(),
-                false,
             )
             .await
             .unwrap_err();

@@ -57,7 +57,6 @@ pub struct CommitBuilder<'a> {
     activate_non_reusable_field_ids: bool,
     /// Set only by `Dataset::deep_clone`, after it has copied the source files.
     deep_clone_files_copied: bool,
-    keep_field_ids: bool,
 }
 
 /// Default timeout applied to [`CommitBuilder::execute`] when none is set.
@@ -84,7 +83,6 @@ impl<'a> CommitBuilder<'a> {
             migration_next_row_id: None,
             activate_non_reusable_field_ids: false,
             deep_clone_files_copied: false,
-            keep_field_ids: false,
         }
     }
 
@@ -300,13 +298,6 @@ impl<'a> CommitBuilder<'a> {
         self
     }
 
-    /// Create the dataset with the field ids its schema already carries; see
-    /// [`InsertBuilder::with_table_field_ids`](super::InsertBuilder::with_table_field_ids).
-    pub(crate) fn with_table_field_ids(mut self) -> Self {
-        self.keep_field_ids = true;
-        self
-    }
-
     pub async fn execute(self, transaction: Transaction) -> Result<Dataset> {
         let timeout = self.timeout;
         if let Some(t) = timeout
@@ -514,7 +505,6 @@ impl<'a> CommitBuilder<'a> {
                 manifest_naming_scheme,
                 metadata_cache.as_ref(),
                 session.clone(),
-                self.keep_field_ids,
             )
             .await?
         };
@@ -680,13 +670,13 @@ mod tests {
             .execute(transaction)
             .await
             .unwrap();
-        assert_eq!(dataset.schema().field("a").unwrap().id, 0);
+        assert_eq!(dataset.schema().field("a").unwrap().id, 42);
         assert_eq!(dataset.schema().metadata, metadata);
         let committed = dataset.read_transaction().await.unwrap().unwrap();
         let Operation::Overwrite { schema, .. } = committed.operation else {
             panic!("expected Overwrite");
         };
-        assert_eq!(schema.field("a").unwrap().id, 0);
+        assert_eq!(schema.field("a").unwrap().id, 42);
         assert_eq!(schema.metadata, metadata);
     }
 

@@ -54,7 +54,6 @@ pub struct InsertBuilder<'a> {
     params: Option<&'a WriteParams>,
     write_progress: Option<WriteProgressFn>,
     preassigned_data_file_name: Option<Arc<String>>,
-    keep_field_ids: bool,
 }
 
 impl<'a> InsertBuilder<'a> {
@@ -64,7 +63,6 @@ impl<'a> InsertBuilder<'a> {
             params: None,
             write_progress: None,
             preassigned_data_file_name: None,
-            keep_field_ids: false,
         }
     }
 
@@ -78,15 +76,6 @@ impl<'a> InsertBuilder<'a> {
         preassigned_data_file_name: impl Into<String>,
     ) -> Self {
         self.preassigned_data_file_name = Some(Arc::new(preassigned_data_file_name.into()));
-        self
-    }
-
-    /// Keep the field ids the input schema carries when creating a dataset,
-    /// instead of numbering its fields afresh.
-    ///
-    /// For a MemWAL generation, whose columns must keep the base table's ids.
-    pub(crate) fn with_table_field_ids(mut self) -> Self {
-        self.keep_field_ids = true;
         self
     }
 
@@ -107,7 +96,7 @@ impl<'a> InsertBuilder<'a> {
     /// This writes the data fragments and commits them into the dataset.
     pub async fn execute(&self, data: Vec<RecordBatch>) -> Result<Dataset> {
         let (transaction, context) = self.write_uncommitted_impl(data).await?;
-        self.do_commit(&context, transaction).await
+        Self::do_commit(&context, transaction).await
     }
 
     /// Execute the insert operation with the given stream.
@@ -124,7 +113,7 @@ impl<'a> InsertBuilder<'a> {
         schema: Schema,
     ) -> Result<Dataset> {
         let (transaction, context) = self.write_uncommitted_stream_impl(stream, schema).await?;
-        self.do_commit(&context, transaction).await
+        Self::do_commit(&context, transaction).await
     }
 
     /// Write data files, but don't commit the transaction yet.
@@ -155,11 +144,7 @@ impl<'a> InsertBuilder<'a> {
         self.write_uncommitted_impl(data).await.map(|(t, _)| t)
     }
 
-    async fn do_commit(
-        &self,
-        context: &WriteContext<'_>,
-        transaction: Transaction,
-    ) -> Result<Dataset> {
+    async fn do_commit(context: &WriteContext<'_>, transaction: Transaction) -> Result<Dataset> {
         let mut commit_builder = CommitBuilder::new(context.dest.clone())
             .use_stable_row_ids(context.params.enable_stable_row_ids)
             .with_exact_storage_format(context.storage_version)
@@ -174,9 +159,6 @@ impl<'a> InsertBuilder<'a> {
 
         if let Some(session) = context.params.session.as_ref() {
             commit_builder = commit_builder.with_session(session.clone());
-        }
-        if self.keep_field_ids {
-            commit_builder = commit_builder.with_table_field_ids();
         }
 
         commit_builder.execute(transaction).await
@@ -258,7 +240,6 @@ impl<'a> InsertBuilder<'a> {
             target_base_info,
             None,
             self.preassigned_data_file_name.clone(),
-            self.keep_field_ids,
         ))
         .await?;
 

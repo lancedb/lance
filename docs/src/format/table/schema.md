@@ -205,11 +205,11 @@ from 0, or takes the IDs supplied with the input schema, such as the Arrow field
 `lance:field_id`. When the input supplies IDs, a field without one receives an ID greater than the
 largest supplied ID, in depth-first order.
 
-Supplied IDs must be 0 or greater, unique across all fields including nested fields, and less than
-2147483647, so that a field added later can still receive an ID. A writer that takes supplied IDs
-rejects input that breaks these rules instead of renumbering it. It cannot tell where they came
-from: a schema copied from another table carries that table's IDs, so a caller that does not intend
-them must not supply them.
+A negative supplied ID counts as no ID. Supplied IDs must be unique across all fields including
+nested fields, and every ID must be less than 2147483647, so that a field added later can still
+receive an ID. A writer that takes supplied IDs rejects input that breaks these rules instead of
+renumbering it. It cannot tell where they came from: a schema copied from another table carries
+that table's IDs, so a caller that does not intend them must not supply them.
 
 These rules apply only when a table is created. A field added to an existing table receives its ID
 as described under "New field assignment", and an Overwrite assigns IDs as described in
