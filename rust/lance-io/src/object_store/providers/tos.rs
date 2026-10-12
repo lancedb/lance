@@ -12,8 +12,7 @@ use crate::object_store::dynamic_opendal::DynamicOpenDalStore;
 use crate::object_store::opendal_store::OpendalStore;
 use crate::object_store::{
     DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE,
-    DirectoryOperations, DirectoryRemoval, ObjectStore, ObjectStoreParams, ObjectStoreProvider,
-    StorageOptions,
+    DirectoryOperations, ObjectStore, ObjectStoreParams, ObjectStoreProvider, StorageOptions,
 };
 use lance_core::error::{Error, Result};
 
@@ -142,10 +141,6 @@ impl ObjectStoreProvider for TosStoreProvider {
             url.set_path(&format!("{}/", url.path()));
         }
 
-        let directory_operations = DirectoryRemoval {
-            operations: directory_operations,
-            native_listing_store: Some(Arc::downgrade(&inner)),
-        };
         Ok(ObjectStore {
             scheme: "tos".to_string(),
             inner,
@@ -167,7 +162,6 @@ impl ObjectStoreProvider for TosStoreProvider {
 #[cfg(test)]
 mod tests {
     use http::{Method, Request, Response};
-    use object_store::list::PaginatedListStore;
     use object_store::path::Path;
     use object_store::{ObjectStoreExt as _, memory::InMemory};
     use opendal::{Buffer, HttpBody, HttpTransport, HttpTransporter, OperationContext, Operator};
@@ -180,21 +174,15 @@ mod tests {
     use super::{Tos, TosStoreProvider};
     use crate::object_store::dynamic_opendal::DynamicOpenDalStore;
     use crate::object_store::test_utils::StaticMockStorageOptionsProvider;
-    use crate::object_store::tracing::ObjectStoreTracingExt;
-    use crate::object_store::{DirectoryRemoval, ObjectStore, opendal_store::OpendalStore};
-    use crate::object_store::{
-        ObjectStoreParams, ObjectStoreProvider, ObjectStoreRegistry, StorageOptionsAccessor,
-        WrappingObjectStore,
-    };
+    use crate::object_store::{ObjectStore, opendal_store::OpendalStore};
+    use crate::object_store::{ObjectStoreProvider, StorageOptionsAccessor};
     use url::Url;
 
-    #[derive(Debug, Clone, Default)]
+    #[derive(Clone, Default)]
     struct HierarchicalTos {
         keys: Arc<Mutex<BTreeSet<String>>>,
         deleted: Arc<Mutex<Vec<String>>>,
         fail_delete: Option<String>,
-        list_requests: Arc<Mutex<usize>>,
-        page_size: Option<usize>,
     }
 
     impl HttpTransport for HierarchicalTos {
@@ -207,28 +195,10 @@ mod tests {
                     .find(|(key, _)| key == "prefix")
                     .unwrap()
                     .1;
-                *self.list_requests.lock().unwrap() += 1;
-                let token = url
-                    .query_pairs()
-                    .find(|(key, _)| key == "continuation-token")
-                    .map(|(_, value)| value.into_owned());
-                let mut remaining = keys.iter().filter(|key| {
-                    key.starts_with(prefix.as_ref())
-                        && token.as_ref().is_none_or(|token| *key > token)
-                });
-                let page = remaining
-                    .by_ref()
-                    .take(self.page_size.unwrap_or(usize::MAX))
-                    .collect::<Vec<_>>();
-                let is_truncated = remaining.next().is_some();
-                let next_token = page.last().copied();
-                let contents = page.iter().map(|key| {
+                let contents = keys.iter().filter(|key| key.starts_with(prefix.as_ref())).map(|key| {
                     json!({"Key": key, "Size": 0, "LastModified": "2026-10-09T00:00:00Z"})
                 }).collect::<Vec<_>>();
-                (
-                    200,
-                    json!({"Contents": contents, "IsTruncated": is_truncated, "NextContinuationToken": next_token}),
-                )
+                (200, json!({"Contents": contents, "IsTruncated": false}))
             } else {
                 assert_eq!(
                     request.method(),
@@ -288,10 +258,7 @@ mod tests {
         let (mut store, _) = ObjectStore::from_uri("memory://").await.unwrap();
         let store_mut = Arc::get_mut(&mut store).unwrap();
         store_mut.inner = native.clone();
-        store_mut.directory_operations = Some(DirectoryRemoval {
-            operations: native,
-            native_listing_store: Some(Arc::downgrade(&store_mut.inner)),
-        });
+        store_mut.directory_operations = Some(native);
         store
     }
 
@@ -327,7 +294,6 @@ mod tests {
         };
         let store = hierarchical_store(mock.clone()).await;
         store.remove_dir_all(base.clone()).await.unwrap();
-        assert_eq!(*mock.list_requests.lock().unwrap(), 1);
         assert_eq!(
             *mock.keys.lock().unwrap(),
             BTreeSet::from([format!("{prefix}-other/keep")])
@@ -341,101 +307,6 @@ mod tests {
             }
         }
         store.remove_dir_all(base).await.unwrap();
-    }
-
-    #[derive(Debug)]
-    struct MockTosProvider(HierarchicalTos);
-
-    #[async_trait::async_trait]
-    impl ObjectStoreProvider for MockTosProvider {
-        async fn new_store(
-            &self,
-            _base_path: Url,
-            _params: &ObjectStoreParams,
-        ) -> lance_core::Result<ObjectStore> {
-            Ok(hierarchical_store(self.0.clone()).await.as_ref().clone())
-        }
-    }
-
-    #[derive(Debug)]
-    struct TracingWrapper;
-
-    impl WrappingObjectStore for TracingWrapper {
-        fn wrap(
-            &self,
-            _store_prefix: &str,
-            original: Arc<dyn object_store::ObjectStore>,
-        ) -> Arc<dyn object_store::ObjectStore> {
-            original.traced()
-        }
-
-        fn wrap_paginated(
-            &self,
-            _store_prefix: &str,
-            original: Arc<dyn PaginatedListStore>,
-        ) -> Option<Arc<dyn PaginatedListStore>> {
-            Some(original)
-        }
-    }
-
-    #[derive(Clone, Copy)]
-    enum WrapperPlacement {
-        None,
-        DuringConstruction,
-        AfterConstruction,
-    }
-
-    #[rstest]
-    #[case::native_hierarchical(true, WrapperPlacement::None)]
-    #[case::wrapped_hierarchical(true, WrapperPlacement::DuringConstruction)]
-    #[case::late_wrapped_hierarchical(true, WrapperPlacement::AfterConstruction)]
-    #[case::native_flat(false, WrapperPlacement::None)]
-    #[case::wrapped_flat(false, WrapperPlacement::DuringConstruction)]
-    #[case::late_wrapped_flat(false, WrapperPlacement::AfterConstruction)]
-    #[tokio::test]
-    async fn test_remove_dir_all_lists_each_page_once_without_custom_wrapper(
-        #[case] hierarchical: bool,
-        #[case] wrapper_placement: WrapperPlacement,
-    ) {
-        let mut keys = (0..5)
-            .map(|index| format!("dataset/data/file{index}"))
-            .collect::<BTreeSet<_>>();
-        if hierarchical {
-            keys.extend(["dataset/".to_string(), "dataset/data/".to_string()]);
-        }
-        let pages = keys.len().div_ceil(2);
-        let mock = HierarchicalTos {
-            keys: Arc::new(Mutex::new(keys)),
-            page_size: Some(2),
-            ..Default::default()
-        };
-        let params = ObjectStoreParams {
-            object_store_wrapper: matches!(wrapper_placement, WrapperPlacement::DuringConstruction)
-                .then(|| Arc::new(TracingWrapper) as Arc<dyn WrappingObjectStore>),
-            ..Default::default()
-        };
-        let mut store = ObjectStoreRegistry::empty()
-            .build_store(
-                Arc::new(MockTosProvider(mock.clone())),
-                Url::parse("tos://test-bucket/dataset").unwrap(),
-                &params,
-                "test-tos",
-            )
-            .await
-            .unwrap();
-        if matches!(wrapper_placement, WrapperPlacement::AfterConstruction) {
-            Arc::get_mut(&mut store)
-                .unwrap()
-                .apply_wrapper(&TracingWrapper);
-        }
-        store.remove_dir_all("dataset").await.unwrap();
-        assert!(mock.keys.lock().unwrap().is_empty());
-        let passes = if matches!(wrapper_placement, WrapperPlacement::None) {
-            1
-        } else {
-            2
-        };
-        assert_eq!(*mock.list_requests.lock().unwrap(), pages * passes);
     }
 
     #[rstest]
