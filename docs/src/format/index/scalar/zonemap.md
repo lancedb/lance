@@ -13,6 +13,38 @@ require predicate rechecking.
 The index stores its zone records in `zonemap.lance`. A complete optional null
 bitmap can answer `IS NULL` exactly; without it, null counts identify candidates.
 
+## Comparison ordering
+
+ZoneMap bounds and data-file write seeds use **Arrow Rust's ascending value
+ordering** for the column's declared type. Writers must collect bounds and
+readers must interpret them using the same rules:
+
+- Signed and unsigned integers compare by numeric value within their type.
+- Booleans use `false < true`.
+- Decimals compare their signed, unscaled integers within the declared scale.
+- Dates, times, timestamps, and durations compare their underlying integer
+  values within the declared type and unit. Timestamp timezone metadata does
+  not change this comparison.
+- Strings compare lexicographically by their UTF-8 bytes; binary values compare
+  lexicographically by their bytes. A shorter prefix precedes a longer value.
+  There is no locale collation, case folding, or whitespace normalization.
+- Floating-point values use IEEE 754 `totalOrder`, as implemented by Arrow
+  Rust: negative NaNs precede negative infinity, positive NaNs follow positive
+  infinity, and `-0.0 < +0.0`. Same-sign NaNs are also ordered by their bit
+  representation, including their payload.
+
+Null placement and descending sort options do not change these bounds: nulls
+are counted separately, and bounds always describe ascending value order.
+Version 1 also counts NaNs separately rather than storing them as bounds, as
+defined below. An ordering rule does not require an implementation to collect
+bounds for every Arrow type; unavailable bounds remain unknown.
+
+These rules are a format contract, not permission to adopt a different order
+when updating an Arrow dependency. Dependency upgrades must preserve the
+contract; a change requires format review and compatibility handling. A reader
+whose predicate comparison differs must not use these bounds to exclude rows
+unless it can prove the exclusion remains valid under its predicate semantics.
+
 ## Statistics versions
 
 - **Version 0:** the existing format. It has no signed NaN count and writes a
@@ -67,9 +99,8 @@ records write zero for both NaN counts. A null sign count is allowed only when
 carrying statistics whose sign split is unknown, as described below. It never
 means zero.
 
-Floating-point comparisons follow Arrow Rust's IEEE total ordering, including
-`-0.0 < +0.0`. Infinities are ordinary values. Negative NaNs precede all ordinary
-values; positive NaNs follow them. Same-sign NaNs are also ordered by payload.
+Infinities are ordinary values. Floating-point comparisons, including NaN query
+boundaries, use the comparison ordering defined above.
 
 The counts must satisfy:
 
