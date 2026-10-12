@@ -138,11 +138,12 @@ impl<'a> CreateIndexBuilder<'a> {
     }
 
     /// Train from rows already in the B-tree's shape: sorted by value, each
-    /// with its row id. An index that trains from another shape is refused.
+    /// with its row address. An index that trains from another shape is
+    /// refused.
     pub fn preprocessed_data(self, reader: Box<dyn RecordBatchReader + Send + 'static>) -> Self {
         self.preprocessed_stream(
             reader_to_stream(reader),
-            TrainingCriteria::new(TrainingOrdering::Values).with_row_id(),
+            TrainingCriteria::new(TrainingOrdering::Values).with_row_addr(),
         )
     }
 
@@ -2220,16 +2221,14 @@ mod tests {
             RecordBatchIterator::new(sorted_batches.into_iter().map(Ok), train_schema);
 
         // Build one self-contained segment directly from the sorted reader.
-        // `preprocessed_data` declares the generic (row-id) shape most index
-        // types train from; BTree now trains from row addresses, so this
-        // goes through `preprocessed_stream` directly with that criteria.
+        // This is also what the Java binding's generic preprocessed-data path
+        // exercises for a BTree index (see `execute_create_index` in
+        // `java/lance-jni/src/blocking_dataset.rs`), so this doubles as that
+        // path's regression coverage.
         let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::BTree);
         let segment = CreateIndexBuilder::new(&mut dataset, &["id"], IndexType::BTree, &params)
             .name("id_btree".to_string())
-            .preprocessed_stream(
-                reader_to_stream(Box::new(sorted_reader)),
-                TrainingCriteria::new(TrainingOrdering::Values).with_row_addr(),
-            )
+            .preprocessed_data(Box::new(sorted_reader))
             .execute_uncommitted()
             .await
             .unwrap();
