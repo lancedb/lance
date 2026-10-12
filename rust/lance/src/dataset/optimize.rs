@@ -136,6 +136,7 @@ use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
 use lance_index::frag_reuse::{FRAG_REUSE_INDEX_NAME, FragReuseGroup};
 use lance_index::is_system_index;
 use lance_index::metrics::NoOpMetricsCollector;
+use lance_table::feature_flags::managed_blobs_enabled;
 use lance_table::format::overlay::TOMBSTONE_FIELD_ID;
 use lance_table::format::{
     Fragment, IndexMetadata, ROW_CREATED_AT_VERSION_FIELD_ID, ROW_ID_FIELD_ID,
@@ -2625,10 +2626,11 @@ async fn rewrite_files(
                 dataset.schema(),
                 schema.as_ref(),
                 false,
-                matches!(
-                    write_version,
-                    ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3
-                ),
+                managed_blobs_enabled(dataset.schema())?
+                    && matches!(
+                        write_version,
+                        ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3
+                    ),
             )?);
             let transformed_schema = rewrite_plan.output_schema.clone();
             let transformed = reader_with_progress.then(move |batch_result| {
@@ -3810,6 +3812,7 @@ async fn cleanup_compaction_files_after_reservation_failure(
 mod tests {
 
     mod binary_copy;
+    mod concurrent_reindex;
     use self::remapping::RemappedIndex;
     use super::*;
     use crate::dataset::WriteDestination;

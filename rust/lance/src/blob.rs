@@ -8,6 +8,12 @@
 //! complete shape, `position` and `size` select a non-empty range within an external `uri` and
 //! must be set together. Every non-null row must set exactly one of `data` and `uri`. File-level
 //! blob preparation produces a kind-aware writer intermediate with `blob_id` and range fields.
+//!
+//! Managed blob writes and compaction reuse are opt-in. Set Arrow schema metadata
+//! `lance.blob.managed` to `true` to enable them. Committing this opt-in
+//! permanently requires Managed-aware readers and maintenance clients. Without
+//! this metadata, logical writes use Inline, Packed, and Dedicated descriptors;
+//! prepared Managed descriptors are rejected.
 
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
@@ -1732,6 +1738,37 @@ mod tests {
         assert_eq!(normalized.fields[1].children[1].name, "uri");
         assert!(normalized.fields[1].children[0].id >= 0);
         assert!(normalized.fields[1].children[1].id >= 0);
+    }
+
+    #[test]
+    fn blob_runtime_and_descriptor_fields_do_not_enter_logical_field_id_space() {
+        let mut metadata = HashMap::new();
+        metadata.insert(ARROW_EXT_NAME_KEY.to_string(), BLOB_V2_EXT_NAME.to_string());
+        let prepared_field = prepared_blob_field_with_metadata("blob", true, metadata);
+        let prepared = LanceSchema::try_from(&ArrowSchema::new(vec![prepared_field])).unwrap();
+
+        // Prepared-only children such as `blob_id` and `blob_size` are writer
+        // representation details. Normalization retains IDs only for the
+        // persistent logical identities (`blob`, `data`, and `uri`).
+        let logical = prepared_to_logical_blob_schema(&prepared).unwrap();
+        assert_eq!(logical.fields[0].id, 0);
+        assert_eq!(logical.fields[0].children[0].id, 2);
+        assert_eq!(logical.fields[0].children[1].id, 3);
+        assert_eq!(logical.max_field_id(), Some(3));
+
+        // Descriptor projection creates a file/read-local representation. Its
+        // children deliberately remain synthetic and cannot advance a manifest
+        // field-ID high-water mark.
+        let mut descriptor = logical;
+        descriptor.fields[0].unloaded_mut();
+        assert_eq!(descriptor.fields[0].id, 0);
+        assert!(
+            descriptor.fields[0]
+                .children
+                .iter()
+                .all(|child| child.id == -1)
+        );
+        assert_eq!(descriptor.max_field_id(), Some(0));
     }
 
     #[test]
