@@ -10,7 +10,7 @@
 //! blob preparation produces a kind-aware writer intermediate with `blob_id` and range fields.
 //!
 //! Managed blob writes and compaction reuse are opt-in. Set Arrow schema metadata
-//! `lance.blob.managed` to `true` to enable them. The next Blob data-file commit
+//! `lance.blob.managed` to `true` to enable them. Committing this opt-in
 //! permanently requires Managed-aware readers and maintenance clients. Without
 //! this metadata, logical writes use Inline, Packed, and Dedicated descriptors;
 //! prepared Managed descriptors are rejected.

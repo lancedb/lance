@@ -6082,7 +6082,7 @@ mod tests {
             )])
             .await
             .unwrap();
-        assert!(!dataset.manifest.has_managed_blobs());
+        assert_eq!(dataset.manifest.has_managed_blobs(), enabled);
         let metadata = dataset.schema().field("blob").unwrap().metadata.clone();
         let schema = Arc::new(Schema::new_with_metadata(
             vec![blob_field("blob", true).with_metadata(metadata)],
@@ -6190,6 +6190,10 @@ mod tests {
         } else {
             dataset.drop_columns(&["blob"]).await.unwrap();
         }
+        dataset
+            .update_schema_metadata([(MANAGED_BLOBS_META_KEY, "false")])
+            .await
+            .unwrap();
         dataset
             .update_config([("test", "metadata-only")])
             .await

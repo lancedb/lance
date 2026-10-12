@@ -104,7 +104,7 @@ def test_managed_blob_activation_and_restore_fence(venv_factory, tmp_path, versi
     dataset.update_config({"test": "metadata-only"})
     released.execute_method(case, "check_unflagged")
     dataset.update_schema_metadata({"lance.blob.managed": "true"})
-    released.execute_method(case, "check_unflagged")
+    released.execute_method(case, "check_fenced")
     dataset.optimize.compact_files(
         target_rows_per_fragment=100, data_storage_version="2.2"
     )

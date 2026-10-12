@@ -101,7 +101,7 @@ pub const FLAG_INDEPENDENT_COVERING_FIELDS: u64 = 1 << 13;
 pub const FLAG_MANAGED_BLOBS: u64 = 1 << 14;
 
 /// Schema metadata that explicitly opts writes and compaction into Managed blobs.
-/// Set `lance.blob.managed` to `true` before publishing new Blob v2 data files.
+/// Set `lance.blob.managed` to `true` to activate the sticky table capability.
 /// This requires Managed-aware readers and maintenance clients thereafter.
 pub const MANAGED_BLOBS_META_KEY: &str = "lance.blob.managed";
 
