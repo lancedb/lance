@@ -1210,6 +1210,66 @@ async fn test_overwrite_refuses_supplied_ids_that_permute_written_ones() {
     assert!(err.to_string().contains("ambiguous"), "{err}");
 }
 
+/// A MemWAL flush keeps its base table's field IDs even at or past the new-table
+/// limit: the generation's own column can get an ID at the limit, and a column
+/// added to the base table can already have one.
+#[rstest::rstest]
+#[case::at_the_limit(lance_core::datatypes::NEW_TABLE_FIELD_ID_LIMIT - 1, false)]
+#[case::added_column_past_the_limit(lance_core::datatypes::NEW_TABLE_FIELD_ID_LIMIT - 1, true)]
+#[case::ordinary(42, false)]
+#[tokio::test]
+async fn test_memwal_flush_keeps_base_ids_past_the_new_table_limit(
+    #[case] supplied_id: i32,
+    #[case] add_column: bool,
+) {
+    use crate::dataset::mem_wal::{DatasetMemWalExt, write::ShardWriterConfig};
+    use std::time::Duration;
+
+    let uri = TempStrDir::default();
+    let mut dataset = write_new_dataset(uri.as_str(), vec![field_with_id("id", supplied_id)])
+        .await
+        .unwrap();
+    if add_column {
+        dataset
+            .add_columns(
+                NewColumnTransform::AllNulls(Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                    "value",
+                    DataType::Int32,
+                    true,
+                )]))),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            dataset.schema().field("value").unwrap().id,
+            lance_core::datatypes::NEW_TABLE_FIELD_ID_LIMIT
+        );
+    }
+    dataset.initialize_mem_wal().execute().await.unwrap();
+    let shard_id = uuid::Uuid::new_v4();
+    let writer = dataset
+        .mem_wal_writer(
+            shard_id,
+            ShardWriterConfig::new(shard_id).with_max_wal_flush_interval(Duration::from_millis(5)),
+        )
+        .await
+        .unwrap();
+    let schema = Arc::new(ArrowSchema::from(dataset.schema()));
+    let columns = (0..schema.fields().len())
+        .map(|_| Arc::new(Int32Array::from(vec![7])) as ArrayRef)
+        .collect();
+    writer
+        .put(vec![RecordBatch::try_new(schema, columns).unwrap()])
+        .await
+        .unwrap();
+    let fence = writer.force_seal_active().await.unwrap();
+    let flushed = fence.wait().await;
+    writer.abort().await.unwrap();
+    flushed.unwrap();
+}
+
 #[tokio::test]
 async fn test_new_dataset_rejects_a_field_id_that_leaves_no_room() {
     let uri = TempStrDir::default();

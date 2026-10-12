@@ -1784,6 +1784,7 @@ pub(crate) async fn write_fragments_internal_with_file_row_counts(
         target_bases_info,
         file_row_counts,
         None,
+        false,
     )
     .await
 }
@@ -1800,6 +1801,7 @@ pub(crate) async fn write_fragments_internal_impl(
     target_bases_info: Option<Vec<TargetBaseInfo>>,
     file_row_counts: Option<Vec<usize>>,
     preassigned_data_file_name: Option<Arc<String>>,
+    inherited_field_ids: bool,
 ) -> Result<(Vec<Fragment>, Schema)> {
     let mut params = params;
 
@@ -1819,6 +1821,7 @@ pub(crate) async fn write_fragments_internal_impl(
         target_bases_info,
         file_row_counts,
         preassigned_data_file_name,
+        inherited_field_ids,
     )
     .await
 }
@@ -1832,15 +1835,26 @@ pub(super) fn promote_legacy_blob_schema(schema: &Schema) -> Result<Schema> {
     Ok(schema)
 }
 
+/// Give a new table its field IDs. `inherited` IDs are an existing table's,
+/// such as a MemWAL generation's, and may exceed the new-table limit.
+pub(crate) fn assign_new_table_field_ids(schema: &mut Schema, inherited: bool) -> Result<()> {
+    if inherited {
+        schema.try_keep_field_ids()
+    } else {
+        schema.try_assign_new_table_field_ids()
+    }
+}
+
 pub(super) fn prepare_write_schema(
     dataset: Option<&Dataset>,
     normalized_converted_schema: Schema,
     params: &WriteParams,
     mut schema_compare_options: lance_core::datatypes::SchemaCompareOptions,
+    inherited_field_ids: bool,
 ) -> Result<Schema> {
     let schema = if dataset.is_none() {
         let mut schema = normalized_converted_schema;
-        schema.try_assign_new_table_field_ids()?;
+        assign_new_table_field_ids(&mut schema, inherited_field_ids)?;
         schema
     } else if let Some(dataset) = dataset
         && matches!(params.mode, WriteMode::Append | WriteMode::Create)

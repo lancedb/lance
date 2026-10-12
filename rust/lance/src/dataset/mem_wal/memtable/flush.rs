@@ -467,8 +467,10 @@ impl MemTableFlusher {
             ..Default::default()
         };
         // The batches carry the base table's field ids and the new table keeps
-        // them: reads and the merge into base find columns by id.
-        let mut builder = InsertBuilder::new(uri.as_str()).with_params(&write_params);
+        // them, however large: reads and the merge into base find columns by id.
+        let mut builder = InsertBuilder::new(uri.as_str())
+            .with_params(&write_params)
+            .with_inherited_field_ids();
         if let Some(preassigned_data_file_name) = preassigned_data_file_name {
             builder = builder.with_preassigned_data_file_name(preassigned_data_file_name);
         }

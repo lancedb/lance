@@ -752,7 +752,7 @@ impl Schema {
     /// Fails when two fields share an ID, or when an ID is not below
     /// [`NEW_TABLE_FIELD_ID_LIMIT`], so the table has room for fields added later.
     pub fn try_assign_new_table_field_ids(&mut self) -> Result<()> {
-        self.try_set_field_id(None)?;
+        self.try_keep_field_ids()?;
         if let Some(max_id) = self.max_field_id()
             && max_id >= NEW_TABLE_FIELD_ID_LIMIT
         {
@@ -761,6 +761,17 @@ impl Schema {
                  {NEW_TABLE_FIELD_ID_LIMIT} to leave room for fields added later"
             )));
         }
+        Ok(())
+    }
+
+    /// Keep the IDs the fields carry and give each field without one an ID
+    /// above the largest. Unlike [`Self::try_assign_new_table_field_ids`] there
+    /// is no upper limit, for IDs an existing table already uses, which may be
+    /// past [`NEW_TABLE_FIELD_ID_LIMIT`].
+    ///
+    /// Fails when two fields share an ID.
+    pub fn try_keep_field_ids(&mut self) -> Result<()> {
+        self.try_set_field_id(None)?;
         self.validate()
     }
 
