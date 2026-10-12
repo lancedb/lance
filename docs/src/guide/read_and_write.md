@@ -616,6 +616,18 @@ dataset
     .await?;
 ```
 
+Java uses the same operation-level execution settings:
+
+```java
+dataset.cleanup(policy)
+    .withDeleteConcurrency(32)
+    .withDeleteRateLimit(100)
+    .execute();
+```
+
+Java's existing policy QPS setting remains supported; an explicit operation rate
+overrides it. Python's keyword arguments configure the Rust operation directly.
+
 Rust's existing `CleanupPolicy.delete_rate_limit` field remains supported.
 An operation's explicit rate overrides that field; otherwise the policy's rate
 applies. If neither is set, deletes are not rate limited. `CleanupPolicy` retains
