@@ -24,6 +24,7 @@ use lance_core::{ROW_ADDR, ROW_ID};
 use crate::Dataset;
 use crate::dataset::transaction::UpdateMode::RewriteColumns;
 use crate::dataset::transaction::{Operation, Transaction};
+use crate::dataset::write::WriteParams;
 use crate::dataset::write::merge_insert::assign_action::Action;
 use crate::dataset::write::merge_insert::{
     MERGE_ACTION_COLUMN, MERGE_SOURCE_SENTINEL, MergeInsertJob, MergeInsertParams, MergeStats,
@@ -62,6 +63,9 @@ pub struct InPlaceMergeInsertExec {
     /// mode. Counted there rather than here, so it has to be folded into the
     /// stats this node reports.
     source_skipped_duplicates: Arc<AtomicU64>,
+    /// The caller's write parameters, for the new fragments `update_fragments`
+    /// would write. Eligibility forbids inserts here, so none are expected.
+    write_params: Arc<WriteParams>,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
     merge_stats: Arc<Mutex<Option<MergeStats>>>,
@@ -74,6 +78,7 @@ impl InPlaceMergeInsertExec {
         dataset: Arc<Dataset>,
         params: MergeInsertParams,
         source_skipped_duplicates: Arc<AtomicU64>,
+        write_params: Arc<WriteParams>,
     ) -> DFResult<Self> {
         let empty_schema = Arc::new(Schema::empty());
         let properties = Arc::new(PlanProperties::new(
@@ -88,6 +93,7 @@ impl InPlaceMergeInsertExec {
             dataset,
             params,
             source_skipped_duplicates,
+            write_params,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
             merge_stats: Arc::new(Mutex::new(None)),
@@ -393,6 +399,7 @@ impl ExecutionPlan for InPlaceMergeInsertExec {
             dataset: self.dataset.clone(),
             params: self.params.clone(),
             source_skipped_duplicates: self.source_skipped_duplicates.clone(),
+            write_params: self.write_params.clone(),
             properties: self.properties.clone(),
             metrics: self.metrics.clone(),
             merge_stats: self.merge_stats.clone(),
@@ -437,6 +444,7 @@ impl ExecutionPlan for InPlaceMergeInsertExec {
         let transaction_holder = self.transaction.clone();
         let compacted_sstables = self.params.compacted_sstables.clone();
         let source_skipped_duplicates = self.source_skipped_duplicates.clone();
+        let write_params = self.write_params.clone();
 
         let result_stream = stream::once(async move {
             let target_bases_info = resolve_target_bases(&dataset, &params).await?;
@@ -456,6 +464,7 @@ impl ExecutionPlan for InPlaceMergeInsertExec {
                 target_bases_info,
                 params.write_version(&dataset),
                 &params.on,
+                write_params,
             )
             .await?;
 

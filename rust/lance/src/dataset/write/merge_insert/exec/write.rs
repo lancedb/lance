@@ -228,6 +228,8 @@ pub struct FullSchemaMergeInsertExec {
     inserted_rows_filter: Arc<Mutex<Option<KeyExistenceFilter>>>,
     source_skipped_duplicates: Arc<AtomicU64>,
     source_blob_columns: Vec<String>,
+    /// The caller's write parameters for the data files this node writes.
+    write_params: Arc<WriteParams>,
     /// Whether the ON columns match the schema's unenforced primary key.
     /// If true, inserted_rows_filter will be included in the transaction for conflict detection.
     is_primary_key: bool,
@@ -240,6 +242,7 @@ impl FullSchemaMergeInsertExec {
         params: MergeInsertParams,
         source_skipped_duplicates: Arc<AtomicU64>,
         source_blob_columns: Vec<String>,
+        write_params: Arc<WriteParams>,
     ) -> DFResult<Self> {
         let empty_schema = Arc::new(arrow_schema::Schema::empty());
         let properties = Arc::new(PlanProperties::new(
@@ -275,6 +278,7 @@ impl FullSchemaMergeInsertExec {
             inserted_rows_filter: Arc::new(Mutex::new(None)),
             source_skipped_duplicates,
             source_blob_columns,
+            write_params,
             is_primary_key,
         })
     }
@@ -884,6 +888,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
             inserted_rows_filter: self.inserted_rows_filter.clone(),
             source_skipped_duplicates: self.source_skipped_duplicates.clone(),
             source_blob_columns: self.source_blob_columns.clone(),
+            write_params: self.write_params.clone(),
             is_primary_key: self.is_primary_key,
         }))
     }
@@ -987,6 +992,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
         let compacted_sstables = self.params.compacted_sstables.clone();
         let source_skipped_duplicates = self.source_skipped_duplicates.clone();
         let source_blob_columns = self.source_blob_columns.clone();
+        let caller_write_params = self.write_params.clone();
         let is_primary_key = self.is_primary_key;
         let updating_row_ids = {
             let state = merge_state.lock().unwrap();
@@ -998,13 +1004,17 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
             let target_bases_info = resolve_target_bases(&dataset, &params).await?;
             // Keep a copy so failures after the write can clean up routed files.
             let cleanup_bases = target_bases_info.clone();
+            // Existing target references may be outside the current bases, so
+            // the writer admits them; source-provided blob columns are checked
+            // below unless the caller allows references outside the bases.
+            let allow_source_outside_bases = caller_write_params.allow_external_blob_outside_bases;
             let write_params = WriteParams {
-                allow_external_blob_outside_bases: has_blob_v2_columns,
-                ..Default::default()
+                allow_external_blob_outside_bases: allow_source_outside_bases
+                    || has_blob_v2_columns,
+                ..caller_write_params.as_ref().clone()
             };
-            // Existing target references may be outside the current bases. Check
-            // only source-provided blob columns before allowing them through.
-            let write_data_stream = if source_blob_columns.is_empty() {
+            let write_data_stream = if source_blob_columns.is_empty() || allow_source_outside_bases
+            {
                 write_data_stream
             } else {
                 let resolver =
@@ -1243,6 +1253,7 @@ mod tests {
             job.params.clone(),
             Arc::new(std::sync::atomic::AtomicU64::new(0)),
             Vec::new(),
+            Arc::new(WriteParams::default()),
         )
         .unwrap();
 

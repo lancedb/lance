@@ -20,7 +20,7 @@ use crate::Dataset;
 use crate::dataset::write::merge_insert::exec::{
     DeleteOnlyMergeInsertExec, FullSchemaMergeInsertExec, InPlaceMergeInsertExec,
 };
-use crate::dataset::{WhenMatched, WhenNotMatchedBySource};
+use crate::dataset::{WhenMatched, WhenNotMatchedBySource, WriteParams};
 
 use super::{MERGE_ACTION_COLUMN, MERGE_SOURCE_SENTINEL, MergeInsertParams};
 
@@ -259,7 +259,11 @@ impl UserDefinedLogicalNodeCore for MergeInsertWriteNode {
 }
 
 /// Physical planner for MergeInsertWriteNode.
-pub struct MergeInsertPlanner {}
+pub struct MergeInsertPlanner {
+    /// The job's write parameters for the data files the planned node writes.
+    /// They live on the planner because the logical node must stay comparable.
+    pub(crate) write_params: Arc<WriteParams>,
+}
 
 impl MergeInsertPlanner {
     /// Check if this is a delete-only operation that can use the optimized path.
@@ -306,6 +310,7 @@ impl ExtensionPlanner for MergeInsertPlanner {
                         write_node.dataset.clone(),
                         write_node.params.clone(),
                         write_node.source_skipped_duplicates.clone(),
+                        self.write_params.clone(),
                     )?)
                 } else {
                     Arc::new(FullSchemaMergeInsertExec::try_new(
@@ -314,6 +319,7 @@ impl ExtensionPlanner for MergeInsertPlanner {
                         write_node.params.clone(),
                         write_node.source_skipped_duplicates.clone(),
                         write_node.source_blob_columns.clone(),
+                        self.write_params.clone(),
                     )?)
                 };
                 Some(exec)
