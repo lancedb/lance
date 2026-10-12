@@ -457,18 +457,8 @@ impl<'a> CleanupOperation<'a> {
     /// policy's rate applies. If neither is set, deletes are not rate limited.
     /// Cascades ignore their own concurrency and QPS config, including invalid values.
     /// This setting is independent of concurrency and is not persisted in dataset config.
-    /// Returns a cleanup error if `rate` is zero. For example:
-    ///
-    /// ```
-    /// # use lance::{Dataset, Result};
-    /// # use lance::dataset::cleanup::CleanupPolicy;
-    /// # async fn example(dataset: &Dataset) -> Result<()> {
-    /// dataset.cleanup(CleanupPolicy::default())
-    ///     .with_delete_rate_limit(100)?
-    ///     .execute().await?;
-    /// # Ok(())
-    /// # }
-    /// ```
+    /// Returns a cleanup error if `rate` is zero. See [`Self::with_delete_concurrency`]
+    /// for an example configuring both limits.
     pub fn with_delete_rate_limit(mut self, rate: u64) -> Result<Self> {
         validate_delete_rate_limit(rate)?;
         self.delete_rate_limit = Some(rate);
@@ -2215,14 +2205,11 @@ pub async fn auto_cleanup_hook(
     dataset: &Dataset,
     manifest: &Manifest,
 ) -> Result<Option<RemovalStats>> {
-    let operation = build_cleanup_operation(dataset, manifest, false).await?;
-    if let Some(operation) = operation {
-        // Preserve the boxed future boundary formerly provided by cleanup_with_policy:
-        // commit callers should not inherit the cleanup future's full type depth.
-        Ok(Some(operation.execute().boxed().await?))
-    } else {
-        Ok(None)
-    }
+    let Some(operation) = build_cleanup_operation(dataset, manifest, false).await? else {
+        return Ok(None);
+    };
+    // Bound the cleanup future's type depth in commit callers.
+    Ok(Some(operation.execute().boxed().await?))
 }
 
 /// This is trigger when a parent branch is cleaning and `clean_referenced_branches` is set as true
@@ -2358,21 +2345,12 @@ async fn build_cleanup_operation<'a>(
     if !cascade
         && let Some(delete_rate_limit) = manifest.config.get("lance.auto_cleanup.delete_rate_limit")
     {
-        let rate: u64 = match delete_rate_limit.parse() {
-            Ok(r) => r,
-            Err(e) => {
-                return Err(Error::Cleanup {
-                    message: format!(
-                        "Error encountered while parsing lance.auto_cleanup.delete_rate_limit as u64: {}",
-                        e
-                    ),
-                });
-            }
-        };
-        builder = match builder.delete_rate_limit(rate) {
-            Ok(b) => b,
-            Err(e) => return Err(e),
-        };
+        let rate: u64 = delete_rate_limit.parse().map_err(|error| Error::Cleanup {
+            message: format!(
+                "Error encountered while parsing lance.auto_cleanup.delete_rate_limit as u64: {error}"
+            ),
+        })?;
+        builder = builder.delete_rate_limit(rate)?;
     }
 
     let mut operation = dataset.cleanup(builder.build());
@@ -2424,7 +2402,6 @@ mod tests {
 
     use super::*;
     use crate::blob::{BlobArrayBuilder, blob_field};
-    use crate::dataset::{InsertBuilder, WriteDestination};
     use crate::index::DatasetIndexExt;
     use crate::{
         dataset::transaction::{Operation, Transaction},
@@ -2490,15 +2467,17 @@ mod tests {
         .await
         .unwrap();
         dataset.append(data(), None).await.unwrap();
-        dataset = InsertBuilder::new(WriteDestination::Dataset(Arc::new(dataset)))
-            .with_params(&WriteParams {
+        dataset = Dataset::write(
+            data(),
+            Arc::new(dataset),
+            Some(WriteParams {
                 mode: WriteMode::Overwrite,
                 max_rows_per_file: 2,
                 ..Default::default()
-            })
-            .execute_stream(Box::new(data()) as Box<dyn RecordBatchReader + Send>)
-            .await
-            .unwrap();
+            }),
+        )
+        .await
+        .unwrap();
         let expected = dataset.scan().try_into_batch().await.unwrap();
         // A small store default exercises explicit windows both below and above it.
         dataset.object_store = Arc::new(ObjectStore::new(
@@ -2851,14 +2830,6 @@ mod tests {
         async fn run_cleanup_with_policy(&self, policy: CleanupPolicy) -> Result<RemovalStats> {
             let db = self.open().await?;
             cleanup_old_versions(&db, policy).await
-        }
-
-        async fn explain_cleanup_with_policy(
-            &self,
-            policy: CleanupPolicy,
-        ) -> Result<CleanupExplanation> {
-            let db = self.open().await?;
-            db.cleanup(policy).explain().await
         }
 
         async fn run_cleanup_with_override(
@@ -3474,8 +3445,9 @@ mod tests {
             .build();
 
         let dataset = fixture.open().await.unwrap();
+        let operation = dataset.cleanup(policy);
         let preview = CleanupTask::new(
-            &dataset.cleanup(policy.clone()),
+            &operation,
             CleanupAction::Explain {
                 max_candidate_files: 1000,
             },
@@ -3483,10 +3455,7 @@ mod tests {
         .unwrap();
         assert!(preview.delete_execution.is_none());
 
-        let explanation = fixture
-            .explain_cleanup_with_policy(policy.clone())
-            .await
-            .unwrap();
+        let explanation = operation.explain().await.unwrap();
         let after_preview_count = fixture.count_files().await.unwrap();
 
         // Files are not actually removed when explaining cleanup.
@@ -3501,7 +3470,7 @@ mod tests {
 
         // Running cleanup with the same policy should remove the same files the
         // explanation reported for this unchanged dataset.
-        let removed = fixture.run_cleanup_with_policy(policy).await.unwrap();
+        let removed = operation.execute().await.unwrap();
         let after_cleanup_count = fixture.count_files().await.unwrap();
 
         assert_eq!(
@@ -6679,16 +6648,18 @@ mod tests {
             }
             child.update_config(updates).await.unwrap();
             for _ in 0..2 {
-                child = InsertBuilder::new(WriteDestination::Dataset(Arc::new(child)))
-                    .with_params(&WriteParams {
+                child = Dataset::write(
+                    data(),
+                    Arc::new(child),
+                    Some(WriteParams {
                         mode: WriteMode::Overwrite,
                         max_rows_per_file: 1,
                         skip_auto_cleanup: true,
                         ..Default::default()
-                    })
-                    .execute_stream(Box::new(data()) as Box<dyn RecordBatchReader + Send>)
-                    .await
-                    .unwrap();
+                    }),
+                )
+                .await
+                .unwrap();
             }
             assert!(child.get_fragments().len() > 1);
             let versions = child.versions().await.unwrap().len();
