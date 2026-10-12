@@ -3480,7 +3480,6 @@ class LanceDataset(pa.dataset.Dataset):
         versions: Optional[List[int]] = None,
         include_files: bool = False,
         max_files: int = 1000,
-        delete_concurrency: Optional[int] = None,
     ) -> CleanupExplanation:
         """
         Explain what :meth:`cleanup_old_versions` would remove without deleting files.
@@ -3502,14 +3501,8 @@ class LanceDataset(pa.dataset.Dataset):
             If set to `True`, an exception will be raised if any tagged versions
             match the parameters. Otherwise, tagged versions will be ignored.
 
-        delete_concurrency: int, optional
-            Accepted for parity with :meth:`cleanup_old_versions`. Must be
-            within the supported concurrency range; explain validates it without
-            deleting files.
-
         delete_rate_limit: int, optional
-            Accepted for parity with :meth:`cleanup_old_versions`; no deletes are
-            issued by explain.
+            Retained for compatibility; ignored because explain does not delete files.
 
         versions: list[int], optional
             Explain cleanup only for the specified dataset versions.
@@ -3536,7 +3529,6 @@ class LanceDataset(pa.dataset.Dataset):
             versions,
             include_files,
             max_files,
-            delete_concurrency,
         )
 
     def _prepare_scalar_index_request(

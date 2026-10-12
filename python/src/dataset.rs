@@ -834,16 +834,13 @@ pub struct Dataset {
 }
 
 impl Dataset {
-    #[allow(clippy::too_many_arguments)]
     async fn cleanup_operation(
         &self,
         older_than_micros: Option<i64>,
         retain_versions: Option<usize>,
         delete_unverified: Option<bool>,
         error_if_tagged_old_versions: Option<bool>,
-        delete_rate_limit: Option<u64>,
         versions: Option<Vec<u64>>,
-        delete_concurrency: Option<usize>,
     ) -> lance_core::Result<lance::dataset::cleanup::CleanupOperation<'_>> {
         let mut builder = CleanupPolicyBuilder::default();
         if let Some(v) = older_than_micros {
@@ -862,14 +859,7 @@ impl Dataset {
         if let Some(v) = versions {
             builder = builder.versions(v)?;
         }
-        let mut operation = self.ds.cleanup(builder.build());
-        if let Some(v) = delete_concurrency {
-            operation = operation.with_delete_concurrency(v)?;
-        }
-        if let Some(v) = delete_rate_limit {
-            operation = operation.with_delete_rate_limit(v)?;
-        }
-        Ok(operation)
+        Ok(self.ds.cleanup(builder.build()))
     }
 }
 
@@ -2318,17 +2308,21 @@ impl Dataset {
     ) -> PyResult<CleanupStats> {
         let stats = rt()
             .block_on(None, async {
-                let operation = self
+                let mut operation = self
                     .cleanup_operation(
                         older_than_micros,
                         retain_versions,
                         delete_unverified,
                         error_if_tagged_old_versions,
-                        delete_rate_limit,
                         versions,
-                        delete_concurrency,
                     )
                     .await?;
+                if let Some(value) = delete_concurrency {
+                    operation = operation.with_delete_concurrency(value)?;
+                }
+                if let Some(value) = delete_rate_limit {
+                    operation = operation.with_delete_rate_limit(value)?;
+                }
                 operation.execute().await
             })?
             .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
@@ -2337,7 +2331,7 @@ impl Dataset {
 
     /// Explain cleanup old versions from the dataset without deleting files
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (older_than_micros = None, retain_versions = None, delete_unverified = None, error_if_tagged_old_versions = None, delete_rate_limit = None, versions = None, include_files = false, max_files = 1000, delete_concurrency = None))]
+    #[pyo3(signature = (older_than_micros = None, retain_versions = None, delete_unverified = None, error_if_tagged_old_versions = None, delete_rate_limit = None, versions = None, include_files = false, max_files = 1000))]
     fn explain_cleanup_old_versions(
         &self,
         older_than_micros: Option<i64>,
@@ -2348,8 +2342,8 @@ impl Dataset {
         versions: Option<Vec<u64>>,
         include_files: bool,
         max_files: usize,
-        delete_concurrency: Option<usize>,
     ) -> PyResult<CleanupExplanation> {
+        let _ = delete_rate_limit; // Retained in the signature for existing callers.
         let explanation = rt()
             .block_on(None, async {
                 let operation = self
@@ -2358,9 +2352,7 @@ impl Dataset {
                         retain_versions,
                         delete_unverified,
                         error_if_tagged_old_versions,
-                        delete_rate_limit,
                         versions,
-                        delete_concurrency,
                     )
                     .await?;
                 operation

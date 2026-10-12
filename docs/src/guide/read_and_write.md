@@ -641,8 +641,8 @@ branch independently uses and validates its own settings. Separate cleanup calls
 do not share limits.
 
 `delete_concurrency` must be between 1 and Tokio's `Semaphore::MAX_PERMITS`
-(`2**61 - 1` on 64-bit platforms). Values outside this range return an error,
-including when explaining cleanup without executing it.
+(`2**61 - 1` on 64-bit platforms). Values outside this range return an error.
+Explain only previews the cleanup scope; deletion concurrency and QPS do not apply.
 
 ### Automatic cleanup
 

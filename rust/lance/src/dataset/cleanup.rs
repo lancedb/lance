@@ -301,13 +301,13 @@ fn remove_prefix(path: &Path, prefix: &Path) -> Path {
 #[derive(Debug)]
 struct DeleteExecution {
     concurrency: usize,
-    permits: Option<tokio::sync::Semaphore>,
+    permits: tokio::sync::Semaphore,
     limiter: Option<tokio::sync::Mutex<tokio::time::Interval>>,
 }
 
 #[derive(Clone, Debug)]
 struct CleanupTask<'a> {
-    delete_execution: Arc<DeleteExecution>,
+    delete_execution: Option<Arc<DeleteExecution>>,
     dataset: &'a Dataset,
     policy: CleanupPolicy,
     action: CleanupAction,
@@ -485,6 +485,7 @@ impl<'a> CleanupOperation<'a> {
     }
 
     /// Explain what cleanup would remove without deleting files.
+    /// Deletion concurrency and rate limits do not affect this preview.
     pub async fn explain(&self) -> Result<CleanupExplanation> {
         let cleanup = CleanupTask::new(
             self,
@@ -541,29 +542,23 @@ impl<'a> CleanupTask<'a> {
         ignored_manifests: HashSet<Path>,
         track_removed_manifests: bool,
         include_referenced_branches: bool,
-        delete_execution: Option<Arc<DeleteExecution>>,
+        mut delete_execution: Option<Arc<DeleteExecution>>,
     ) -> Result<Self> {
-        let delete_execution = match delete_execution {
-            Some(execution) => execution,
-            None => {
-                let concurrency = operation
-                    .delete_concurrency
-                    .unwrap_or_else(|| operation.dataset.object_store.io_parallelism());
-                validate_delete_concurrency(concurrency)?;
-                Arc::new(DeleteExecution {
-                    concurrency,
-                    permits: action
-                        .deletes_files()
-                        .then(|| tokio::sync::Semaphore::new(concurrency)),
-                    limiter: create_delete_limiter(
-                        operation
-                            .delete_rate_limit
-                            .or(operation.policy.delete_rate_limit)
-                            .filter(|_| action.deletes_files()),
-                    ),
-                })
-            }
-        };
+        if action.deletes_files() && delete_execution.is_none() {
+            let concurrency = operation
+                .delete_concurrency
+                .unwrap_or_else(|| operation.dataset.object_store.io_parallelism());
+            validate_delete_concurrency(concurrency)?;
+            delete_execution = Some(Arc::new(DeleteExecution {
+                concurrency,
+                permits: tokio::sync::Semaphore::new(concurrency),
+                limiter: create_delete_limiter(
+                    operation
+                        .delete_rate_limit
+                        .or(operation.policy.delete_rate_limit),
+                ),
+            }));
+        }
         Ok(Self {
             delete_execution,
             dataset: operation.dataset,
@@ -1145,25 +1140,19 @@ impl<'a> CleanupTask<'a> {
             Ok(file)
         });
 
-        if deletes_files {
+        if let Some(execution) = &self.delete_execution {
             // Deleting here rather than through `remove_stream` keeps each outcome
             // attached to its file, which is what lets the stats below count what was
             // actually removed instead of what was merely attempted.
             let store = &self.dataset.object_store;
-            let execution = &self.delete_execution;
             all_files_to_remove
                 .map(|file| async move {
                     let file = file?;
                     // Acquire concurrency before QPS so queued deletes cannot spend
                     // rate permits early and then start together when a slot opens.
-                    let _permit = match &execution.permits {
-                        Some(permits) => Some(permits.acquire().await.map_err(|error| {
-                            Error::invalid_input(format!(
-                                "cleanup delete semaphore closed: {error}"
-                            ))
-                        })?),
-                        None => None,
-                    };
+                    let _permit = execution.permits.acquire().await.map_err(|error| {
+                        Error::invalid_input(format!("cleanup delete semaphore closed: {error}"))
+                    })?;
                     if let Some(limiter) = &execution.limiter {
                         let mut ticker = limiter.lock().await;
                         ticker.tick().await;
@@ -1678,7 +1667,7 @@ impl<'a> CleanupTask<'a> {
                                 operation,
                                 action,
                                 ignored_manifests,
-                                Some(self.delete_execution.clone()),
+                                self.delete_execution.clone(),
                             )
                             .await?;
                             final_result
@@ -3483,6 +3472,16 @@ mod tests {
         let policy = CleanupPolicyBuilder::default()
             .before_timestamp(utc_now())
             .build();
+
+        let dataset = fixture.open().await.unwrap();
+        let preview = CleanupTask::new(
+            &dataset.cleanup(policy.clone()),
+            CleanupAction::Explain {
+                max_candidate_files: 1000,
+            },
+        )
+        .unwrap();
+        assert!(preview.delete_execution.is_none());
 
         let explanation = fixture
             .explain_cleanup_with_policy(policy.clone())

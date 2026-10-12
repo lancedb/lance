@@ -1686,7 +1686,7 @@ def test_explain_cleanup_old_versions(tmp_path):
         older_than=(datetime.now() - moment),
         include_files=True,
         max_files=1000,
-        delete_concurrency=2,
+        delete_rate_limit=0,
     )
 
     assert explanation.read_version == dataset.version

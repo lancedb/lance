@@ -3660,8 +3660,24 @@ fn inner_cleanup_with_policy<'local>(
     jdelete_concurrency: JObject,
     jdelete_rate_limit: JObject,
 ) -> Result<JObject<'local>> {
-    let (policy, delete_concurrency, delete_rate_limit) =
-        extract_cleanup_options(env, &jpolicy, &jdelete_concurrency, &jdelete_rate_limit)?;
+    let policy = extract_cleanup_policy(env, &jpolicy)?;
+    let delete_concurrency = env.get_optional(&jdelete_concurrency, |env, obj| {
+        let value = env.call_method(obj, "longValue", "()J", &[])?.j()?;
+        usize::try_from(value).map_err(|_| {
+            Error::input_error(format!(
+                "delete_concurrency is out of range for usize, got {value}"
+            ))
+        })
+    })?;
+
+    let delete_rate_limit = env.get_optional(&jdelete_rate_limit, |env, obj| {
+        let value = env.call_method(obj, "longValue", "()J", &[])?.j()?;
+        u64::try_from(value).map_err(|_| {
+            Error::input_error(format!(
+                "delete_rate_limit is out of range for u64, got {value}"
+            ))
+        })
+    })?;
     let stats = {
         let dataset =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }?;
@@ -3684,19 +3700,10 @@ pub extern "system" fn Java_org_lance_Dataset_nativeExplainCleanupWithPolicy<'lo
     jdataset: JObject,
     jpolicy: JObject,
     jmax_candidate_files: JObject,
-    jdelete_concurrency: JObject,
-    jdelete_rate_limit: JObject,
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
-        inner_explain_cleanup_with_policy(
-            &mut env,
-            jdataset,
-            jpolicy,
-            jmax_candidate_files,
-            jdelete_concurrency,
-            jdelete_rate_limit
-        )
+        inner_explain_cleanup_with_policy(&mut env, jdataset, jpolicy, jmax_candidate_files)
     )
 }
 
@@ -3705,11 +3712,8 @@ fn inner_explain_cleanup_with_policy<'local>(
     jdataset: JObject,
     jpolicy: JObject,
     jmax_candidate_files: JObject,
-    jdelete_concurrency: JObject,
-    jdelete_rate_limit: JObject,
 ) -> Result<JObject<'local>> {
-    let (policy, delete_concurrency, delete_rate_limit) =
-        extract_cleanup_options(env, &jpolicy, &jdelete_concurrency, &jdelete_rate_limit)?;
+    let policy = extract_cleanup_policy(env, &jpolicy)?;
     let max_candidate_files = env
         .get_optional(&jmax_candidate_files, |env, inner| {
             Ok(env.call_method(inner, "longValue", "()J", &[])?.j()?)
@@ -3728,12 +3732,6 @@ fn inner_explain_cleanup_with_policy<'local>(
         let dataset =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }?;
         let mut operation = dataset.inner.cleanup(policy);
-        if let Some(concurrency) = delete_concurrency {
-            operation = operation.with_delete_concurrency(concurrency)?;
-        }
-        if let Some(rate) = delete_rate_limit {
-            operation = operation.with_delete_rate_limit(rate)?;
-        }
         if let Some(limit) = max_candidate_files {
             operation = operation.with_max_candidate_files(limit);
         }
@@ -3743,12 +3741,7 @@ fn inner_explain_cleanup_with_policy<'local>(
     cleanup_explanation_to_java(env, explanation)
 }
 
-fn extract_cleanup_options(
-    env: &mut JNIEnv<'_>,
-    jpolicy: &JObject,
-    jdelete_concurrency: &JObject,
-    jdelete_rate_limit: &JObject,
-) -> Result<(CleanupPolicy, Option<usize>, Option<u64>)> {
+fn extract_cleanup_policy(env: &mut JNIEnv<'_>, jpolicy: &JObject) -> Result<CleanupPolicy> {
     let before_ts_millis = env.get_optional_u64_from_method(jpolicy, "getBeforeTimestampMillis")?;
     let before_timestamp = before_ts_millis.map(|millis| {
         let st = UNIX_EPOCH + Duration::from_millis(millis);
@@ -3784,16 +3777,8 @@ fn extract_cleanup_options(
         .unwrap_or(false);
 
     let delete_rate_limit = env.get_optional_u64_from_method(jpolicy, "getDeleteRateLimit")?;
-    let delete_concurrency = env.get_optional(jdelete_concurrency, |env, obj| {
-        let value = env.call_method(obj, "longValue", "()J", &[])?.j()?;
-        usize::try_from(value).map_err(|_| {
-            Error::input_error(format!(
-                "delete_concurrency is out of range for usize, got {value}"
-            ))
-        })
-    })?;
 
-    let policy = CleanupPolicy {
+    Ok(CleanupPolicy {
         before_timestamp,
         before_version,
         versions,
@@ -3801,16 +3786,7 @@ fn extract_cleanup_options(
         error_if_tagged_old_versions,
         clean_referenced_branches,
         delete_rate_limit,
-    };
-    let rate_override = env.get_optional(jdelete_rate_limit, |env, obj| {
-        let value = env.call_method(obj, "longValue", "()J", &[])?.j()?;
-        u64::try_from(value).map_err(|_| {
-            Error::input_error(format!(
-                "delete_rate_limit is out of range for u64, got {value}"
-            ))
-        })
-    })?;
-    Ok((policy, delete_concurrency, rate_override))
+    })
 }
 
 fn cleanup_stats_to_java<'local>(

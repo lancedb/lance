@@ -106,7 +106,8 @@ public class CleanupTest {
 
       try (Dataset dataset = testDataset.write(3, 10)) {
         CleanupPolicy policy = CleanupPolicy.builder().withBeforeVersion(3L).build();
-        CleanupOperation cleanup = dataset.cleanup(policy).withDeleteConcurrency(2L);
+        CleanupOperation cleanup =
+            dataset.cleanup(policy).withDeleteConcurrency(0L).withDeleteRateLimit(0L);
         CleanupExplanation explanation = cleanup.explain();
 
         assertEquals(2L, explanation.getStats().getOldVersions());
@@ -119,7 +120,7 @@ public class CleanupTest {
         List<Version> versions = dataset.listVersions();
         assertEquals(4, versions.size());
 
-        RemovalStats stats = cleanup.execute();
+        RemovalStats stats = cleanup.withDeleteConcurrency(2L).withDeleteRateLimit(100L).execute();
         assertEquals(explanation.getStats().getOldVersions(), stats.getOldVersions());
       }
     }
