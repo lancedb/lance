@@ -606,14 +606,6 @@ Both values must be positive integers.
 dataset.cleanup_old_versions(delete_concurrency=32, delete_rate_limit=100)
 ```
 
-One cleanup and all cascaded branches share these limits. Cascaded branches ignore
-their own deletion limits but retain their own cleanup eligibility and retention
-settings. Separate cleanup calls have independent limits.
-
-The limits apply only to file deletion during this call and do not update table
-configuration. Explain ignores them. In Rust and Java, set them on
-`CleanupOperation`; an explicit operation rate overrides the policy's rate.
-
 ### Automatic cleanup
 
 Instead of calling `cleanup_old_versions` manually, you can configure Lance to
