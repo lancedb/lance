@@ -53,6 +53,7 @@ use lance_core::datatypes::{
 use lance_core::utils::blob::blob_path;
 use lance_core::{Error, ROW_ADDR, Result, utils::address::RowAddress};
 use lance_io::traits::Reader;
+use lance_table::feature_flags::MANAGED_BLOBS_META_KEY;
 
 const INLINE_MAX: usize = 64 * 1024; // 64KB inline cutoff
 const DEDICATED_THRESHOLD: usize = 4 * 1024 * 1024; // 4MB dedicated cutoff
@@ -1113,6 +1114,19 @@ impl BlobPreprocessor {
                     .expect("validated prepared base")
                     .as_primitive::<UInt32Type>();
                 for row in 0..values.len() {
+                    if !values.is_null(row)
+                        && matches!(
+                            BlobKind::try_from(kinds.value(row))?,
+                            BlobKind::Managed | BlobKind::ManagedWithBase
+                        )
+                        && self.managed_base.is_none()
+                    {
+                        return Err(Error::invalid_input(format!(
+                            "Managed blob field '{}' row {row} requires schema metadata {}=true",
+                            field.name(),
+                            MANAGED_BLOBS_META_KEY,
+                        )));
+                    }
                     if !values.is_null(row)
                         && kinds.is_valid(row)
                         && kinds.value(row) == BlobKind::ManagedWithBase as u8
@@ -5479,6 +5493,7 @@ mod tests {
         ObjectStore, ObjectStoreParams, ObjectStoreRegistry, StorageOptionsAccessor,
     };
     use lance_io::stream::RecordBatchStream;
+    use lance_table::feature_flags::{FLAG_MANAGED_BLOBS, MANAGED_BLOBS_META_KEY};
     use lance_table::format::BasePath;
     use object_store::{
         Attributes, CopyOptions, GetOptions, GetRange, GetResult, GetResultPayload, ListResult,
@@ -5519,6 +5534,13 @@ mod tests {
         utils::test::TestDatasetGenerator,
     };
 
+    fn managed_blob_schema(fields: Vec<Field>) -> Schema {
+        Schema::new_with_metadata(
+            fields,
+            HashMap::from([(MANAGED_BLOBS_META_KEY.to_string(), "true".to_string())]),
+        )
+    }
+
     struct BlobTestFixture {
         _test_dir: TempStrDir,
         dataset: Arc<Dataset>,
@@ -5532,13 +5554,14 @@ mod tests {
     }
 
     #[rstest]
-    #[case::inline(1024, BlobKind::Inline)]
-    #[case::packed(100 * 1024, BlobKind::Managed)]
-    #[case::dedicated(8 * 1024 * 1024, BlobKind::Managed)]
+    #[case::inline(6, BlobKind::Inline)]
+    #[case::packed(16, BlobKind::Packed)]
+    #[case::dedicated(32, BlobKind::Dedicated)]
     #[tokio::test]
     async fn managed_write_read(
         #[case] size: usize,
         #[case] kind: BlobKind,
+        #[values(false, true)] enabled: bool,
         #[values(false, true)] maximum_base_id: bool,
         #[values(false, true)] primary_write: bool,
         #[values(LanceFileVersion::V2_2, LanceFileVersion::V2_3)] version: LanceFileVersion,
@@ -5549,7 +5572,22 @@ mod tests {
         blobs.push_bytes(&payload).unwrap();
         blobs.push_bytes(b"").unwrap();
         blobs.push_null().unwrap();
-        let schema = Arc::new(Schema::new(vec![blob_field("blob", true)]));
+        let field = blob_field("blob", true).with_metadata(HashMap::from([
+            (ARROW_EXT_NAME_KEY.to_string(), BLOB_V2_EXT_NAME.to_string()),
+            (
+                BLOB_INLINE_SIZE_THRESHOLD_META_KEY.to_string(),
+                "8".to_string(),
+            ),
+            (
+                BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY.to_string(),
+                "24".to_string(),
+            ),
+        ]));
+        let schema = Arc::new(if enabled {
+            managed_blob_schema(vec![field])
+        } else {
+            Schema::new(vec![field])
+        });
         let batch = RecordBatch::try_new(schema.clone(), vec![blobs.finish().unwrap()]).unwrap();
         let dataset = Arc::new(
             Dataset::write(
@@ -5572,9 +5610,10 @@ mod tests {
             .await
             .unwrap(),
         );
-        let flag = lance_table::feature_flags::FLAG_MANAGED_BLOBS;
-        assert_ne!(dataset.manifest.reader_feature_flags & flag, 0);
-        assert_ne!(dataset.manifest.writer_feature_flags & flag, 0);
+        let flag = FLAG_MANAGED_BLOBS;
+        let expected_flags = if enabled { flag } else { 0 };
+        assert_eq!(dataset.manifest.reader_feature_flags & flag, expected_flags);
+        assert_eq!(dataset.manifest.writer_feature_flags & flag, expected_flags);
         for (_, uri) in super::managed_references(&dataset, dataset.scan())
             .await
             .unwrap()
@@ -5595,6 +5634,11 @@ mod tests {
             .take_blobs_by_indices(&[0, 1, 2], "blob")
             .await
             .unwrap();
+        let kind = if enabled && kind != BlobKind::Inline {
+            BlobKind::Managed
+        } else {
+            kind
+        };
         assert_eq!(values[0].as_ref().unwrap().kind(), kind);
         assert_eq!(
             values[0].as_ref().unwrap().read().await.unwrap().as_ref(),
@@ -5638,7 +5682,7 @@ mod tests {
         let make_reader = || {
             let mut blobs = BlobArrayBuilder::new(1);
             blobs.push_bytes(&payload).unwrap();
-            let schema = Arc::new(Schema::new(vec![blob_field("blob", false)]));
+            let schema = Arc::new(managed_blob_schema(vec![blob_field("blob", false)]));
             let batch =
                 RecordBatch::try_new(schema.clone(), vec![blobs.finish().unwrap()]).unwrap();
             RecordBatchIterator::new(vec![Ok(batch)], schema)
@@ -5680,7 +5724,7 @@ mod tests {
             assert_eq!(blob.unwrap().read().await.unwrap().as_ref(), payload);
         }
         assert_eq!(dataset.manifest.base_paths.len(), 1);
-        let flags = lance_table::feature_flags::FLAG_MANAGED_BLOBS
+        let flags = FLAG_MANAGED_BLOBS
             | lance_table::feature_flags::FLAG_BASE_PATHS
             | lance_table::feature_flags::FLAG_MIXED_DATA_FILE_VERSIONS;
         assert_eq!(dataset.manifest.reader_feature_flags & flags, flags);
@@ -5706,6 +5750,7 @@ mod tests {
         #[case] base_id: Option<u32>,
         #[values(false, true)] registered: bool,
         #[values(false, true)] nested: bool,
+        #[values(false, true)] enabled: bool,
     ) {
         let table = TempStrDir::default();
         let objects = TempStrDir::default();
@@ -5739,7 +5784,11 @@ mod tests {
         } else {
             (field, values)
         };
-        let schema = Arc::new(Schema::new(vec![field]));
+        let schema = Arc::new(if enabled {
+            managed_blob_schema(vec![field])
+        } else {
+            Schema::new(vec![field])
+        });
         let batch = RecordBatch::try_new(schema.clone(), vec![values]).unwrap();
         let result = Dataset::write(
             RecordBatchIterator::new([Ok(batch)], schema),
@@ -5753,10 +5802,15 @@ mod tests {
             }),
         )
         .await;
-        if base_id.is_some() && !registered {
+        if !enabled || (base_id.is_some() && !registered) {
             let error = result.unwrap_err();
             assert!(matches!(error, Error::InvalidInput { .. }));
-            assert!(error.to_string().contains("unknown base_id"), "{error}");
+            let message = if enabled {
+                "unknown base_id"
+            } else {
+                "lance.blob.managed=true"
+            };
+            assert!(error.to_string().contains(message), "{error}");
         } else {
             let dataset = Arc::new(result.unwrap());
             assert_eq!(
@@ -5821,7 +5875,7 @@ mod tests {
             ),
         ]));
         field = field.with_metadata(metadata);
-        let schema = Arc::new(Schema::new(vec![field]));
+        let schema = Arc::new(managed_blob_schema(vec![field]));
         let batch = RecordBatch::try_new(schema.clone(), vec![blobs.finish().unwrap()]).unwrap();
         let old_data = crate::utils::test::copy_test_data_to_tmp("v11.0.0/blob_sidecars").unwrap();
         let mut dataset = if released {
@@ -5832,6 +5886,10 @@ mod tests {
                 .await
                 .unwrap();
             assert!(!dataset.manifest.has_managed_blobs());
+            dataset
+                .update_schema_metadata([(MANAGED_BLOBS_META_KEY, "true")])
+                .await
+                .unwrap();
             dataset
         } else {
             Dataset::write(
@@ -5977,16 +6035,17 @@ mod tests {
         let mut dataset = Dataset::open(&dir.path_str()).await.unwrap();
         let mut old = dataset.checkout_version(1).await.unwrap();
         assert!(!old.manifest.has_managed_blobs());
+        dataset
+            .update_schema_metadata([(MANAGED_BLOBS_META_KEY, "true")])
+            .await
+            .unwrap();
         crate::dataset::optimize::compact_files(&mut dataset, Default::default(), None)
             .await
             .unwrap();
         assert!(dataset.manifest.has_managed_blobs());
         old.restore().await.unwrap();
         assert!(old.manifest.has_managed_blobs());
-        assert_ne!(
-            old.manifest.writer_feature_flags & lance_table::feature_flags::FLAG_MANAGED_BLOBS,
-            0
-        );
+        assert_ne!(old.manifest.writer_feature_flags & FLAG_MANAGED_BLOBS, 0);
         let values = Arc::new(old)
             .take_blobs_by_indices(&[0, 4], "blob")
             .await
@@ -6003,7 +6062,11 @@ mod tests {
     #[case::append(WriteMode::Append)]
     #[case::overwrite(WriteMode::Overwrite)]
     #[tokio::test]
-    async fn managed_flag_activates_on_blob_write(#[case] mode: WriteMode) {
+    async fn managed_flag_activates_only_on_opted_in_blob_write(
+        #[case] mode: WriteMode,
+        #[values(false, true)] enabled: bool,
+        #[values(6, 16, 32)] size: usize,
+    ) {
         let dir = crate::utils::test::copy_test_data_to_tmp("v11.0.0/blob_sidecars").unwrap();
         let mut dataset = Dataset::open(&dir.path_str()).await.unwrap();
         let files = dataset.manifest.fragments[0].files.clone();
@@ -6012,14 +6075,22 @@ mod tests {
         assert_eq!(dataset.manifest.fragments[0].files, files);
         assert!(dataset.manifest.fragments[0].deletion_file.is_some());
 
-        // Preserve the released field's thresholds when appending. Even an
-        // inline-only batch publishes new Blob descriptors and activates the fence.
+        dataset
+            .update_schema_metadata([(
+                MANAGED_BLOBS_META_KEY,
+                if enabled { "true" } else { "false" },
+            )])
+            .await
+            .unwrap();
+        assert!(!dataset.manifest.has_managed_blobs());
         let metadata = dataset.schema().field("blob").unwrap().metadata.clone();
-        let schema = Arc::new(Schema::new(vec![
-            blob_field("blob", true).with_metadata(metadata),
-        ]));
+        let schema = Arc::new(Schema::new_with_metadata(
+            vec![blob_field("blob", true).with_metadata(metadata)],
+            dataset.schema().metadata.clone(),
+        ));
+        let payload = vec![b'p'; size];
         let mut blobs = BlobArrayBuilder::new(1);
-        blobs.push_bytes(b"inline").unwrap();
+        blobs.push_bytes(&payload).unwrap();
         let batch = RecordBatch::try_new(schema.clone(), vec![blobs.finish().unwrap()]).unwrap();
         let dataset = Dataset::write(
             RecordBatchIterator::new([Ok(batch)], schema),
@@ -6032,15 +6103,49 @@ mod tests {
         )
         .await
         .unwrap();
-        let flag = lance_table::feature_flags::FLAG_MANAGED_BLOBS;
-        assert_eq!(dataset.manifest.reader_feature_flags & flag, flag);
-        assert_eq!(dataset.manifest.writer_feature_flags & flag, flag);
+        let flag = FLAG_MANAGED_BLOBS;
+        let expected_flags = if enabled { flag } else { 0 };
+        assert_eq!(dataset.manifest.reader_feature_flags & flag, expected_flags);
+        assert_eq!(dataset.manifest.writer_feature_flags & flag, expected_flags);
         let mut scan = dataset.scan();
         scan.blob_handling(BlobHandling::AllBinary);
         let batch = scan.try_into_batch().await.unwrap();
         assert_eq!(
             batch["blob"].as_binary::<i64>().value(batch.num_rows() - 1),
-            b"inline"
+            payload.as_slice()
+        );
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn blob_compaction_does_not_enable_managed_by_default(
+        #[values(LanceFileVersion::V2_2, LanceFileVersion::V2_3)] version: LanceFileVersion,
+    ) {
+        let dir = crate::utils::test::copy_test_data_to_tmp("v11.0.0/blob_sidecars").unwrap();
+        let mut dataset = Dataset::open(&dir.path_str()).await.unwrap();
+        crate::dataset::optimize::compact_files(
+            &mut dataset,
+            crate::dataset::optimize::CompactionOptions {
+                data_storage_version: Some(version),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.manifest.fragments.len(), 1);
+        let flag = FLAG_MANAGED_BLOBS;
+        assert_eq!(dataset.manifest.reader_feature_flags & flag, 0);
+        assert_eq!(dataset.manifest.writer_feature_flags & flag, 0);
+        let blobs = Arc::new(dataset)
+            .take_blobs_by_indices(&[0, 4], "blob")
+            .await
+            .unwrap();
+        assert_eq!(blobs[0].as_ref().unwrap().kind(), BlobKind::Packed);
+        assert_eq!(blobs[1].as_ref().unwrap().kind(), BlobKind::Dedicated);
+        assert_eq!(
+            blobs[0].as_ref().unwrap().read().await.unwrap().as_ref(),
+            b"pppppppppppppppp"
         );
     }
 
@@ -6051,7 +6156,7 @@ mod tests {
     async fn managed_flag_survives_removing_blob_columns(#[case] overwrite: bool) {
         let mut blobs = BlobArrayBuilder::new(1);
         blobs.push_bytes(b"inline").unwrap();
-        let schema = Arc::new(Schema::new(vec![
+        let schema = Arc::new(managed_blob_schema(vec![
             Field::new("id", DataType::Int32, false),
             blob_field("blob", false),
         ]));
@@ -6089,7 +6194,7 @@ mod tests {
             .update_config([("test", "metadata-only")])
             .await
             .unwrap();
-        let flag = lance_table::feature_flags::FLAG_MANAGED_BLOBS;
+        let flag = FLAG_MANAGED_BLOBS;
         assert_eq!(dataset.manifest.reader_feature_flags & flag, flag);
         assert_eq!(dataset.manifest.writer_feature_flags & flag, flag);
         assert!(dataset.schema().field("blob").is_none());
@@ -6118,7 +6223,7 @@ mod tests {
                 _ => blobs.push_bytes(&payload).unwrap(),
             }
         }
-        let schema = Arc::new(Schema::new(vec![
+        let schema = Arc::new(managed_blob_schema(vec![
             Field::new("id", DataType::Int32, false),
             blob_field("blob", true),
         ]));
@@ -8296,7 +8401,7 @@ mod tests {
                 .unwrap()
                 .as_primitive::<UInt8Type>()
                 .value(1),
-            BlobKind::Managed as u8
+            BlobKind::Packed as u8
         );
 
         let blobs = dataset
@@ -8392,7 +8497,7 @@ mod tests {
                 .unwrap()
                 .as_primitive::<UInt8Type>()
                 .value(1),
-            BlobKind::Managed as u8
+            BlobKind::Packed as u8
         );
 
         let blobs = dataset
@@ -8514,7 +8619,7 @@ mod tests {
             .unwrap()
             .as_primitive::<UInt8Type>();
         assert_eq!(kinds.value(0), BlobKind::Inline as u8);
-        assert_eq!(kinds.value(2), BlobKind::Managed as u8);
+        assert_eq!(kinds.value(2), BlobKind::Packed as u8);
         assert_eq!(kinds.value(3), BlobKind::Inline as u8);
 
         let filtered = dataset
@@ -9632,8 +9737,8 @@ mod tests {
 
     #[rstest]
     #[case::inline(BlobKind::Inline, 1024 * 1024, 1024 * 1024)]
-    #[case::packed(BlobKind::Managed, 0, 1024 * 1024)]
-    #[case::dedicated(BlobKind::Managed, 0, 1)]
+    #[case::packed(BlobKind::Packed, 0, 1024 * 1024)]
+    #[case::dedicated(BlobKind::Dedicated, 0, 1)]
     #[tokio::test]
     async fn test_read_blob_ranges_avoids_whole_value_read_amplification_end_to_end(
         #[case] kind: BlobKind,
@@ -9830,7 +9935,7 @@ mod tests {
 
         assert_eq!(blobs.len(), 1);
         let blob = blobs[0].as_ref().unwrap();
-        assert_eq!(blob.kind(), BlobKind::Managed);
+        assert_eq!(blob.kind(), BlobKind::Packed);
         assert_eq!(
             blob.read().await.unwrap().as_ref(),
             fixture.expected.as_slice()
@@ -9849,7 +9954,7 @@ mod tests {
 
         assert_eq!(blobs.len(), 1);
         let blob = blobs[0].as_ref().unwrap();
-        assert_eq!(blob.kind(), BlobKind::Managed);
+        assert_eq!(blob.kind(), BlobKind::Dedicated);
         assert_eq!(
             blob.read().await.unwrap().as_ref(),
             fixture.expected.as_slice()
@@ -9870,7 +9975,7 @@ mod tests {
 
         assert_eq!(blobs.len(), 1);
         let blob = blobs[0].as_ref().unwrap();
-        assert_eq!(blob.kind(), BlobKind::Managed);
+        assert_eq!(blob.kind(), BlobKind::Packed);
         assert_eq!(
             blob.read().await.unwrap().as_ref(),
             fixture.expected.as_slice()
@@ -10562,13 +10667,13 @@ mod tests {
                 .unwrap()
                 .as_primitive::<UInt8Type>()
                 .value(0),
-            BlobKind::Managed as u8
+            BlobKind::Packed as u8
         );
 
         let blobs = dataset.take_blobs_by_indices(&[0], "blob").await.unwrap();
         assert_eq!(blobs.len(), 1);
         let blob = blobs[0].as_ref().unwrap();
-        assert_eq!(blob.kind(), BlobKind::Managed);
+        assert_eq!(blob.kind(), BlobKind::Packed);
         assert_eq!(blob.read().await.unwrap().as_ref(), payload.as_slice());
     }
 
@@ -10613,7 +10718,7 @@ mod tests {
         let blobs = dataset.take_blobs_by_indices(&[0], "blob").await.unwrap();
         assert_eq!(blobs.len(), 1);
         let blob = blobs[0].as_ref().unwrap();
-        assert_eq!(blob.kind(), BlobKind::Managed);
+        assert_eq!(blob.kind(), BlobKind::Packed);
         assert_eq!(blob.read().await.unwrap().as_ref(), payload.as_slice());
     }
 
@@ -10662,13 +10767,13 @@ mod tests {
                 .unwrap()
                 .as_primitive::<UInt8Type>()
                 .value(0),
-            BlobKind::Managed as u8
+            BlobKind::Dedicated as u8
         );
 
         let blobs = dataset.take_blobs_by_indices(&[0], "blob").await.unwrap();
         assert_eq!(blobs.len(), 1);
         let blob = blobs[0].as_ref().unwrap();
-        assert_eq!(blob.kind(), BlobKind::Managed);
+        assert_eq!(blob.kind(), BlobKind::Dedicated);
         assert_eq!(blob.read().await.unwrap().as_ref(), payload.as_slice());
     }
 

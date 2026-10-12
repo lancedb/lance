@@ -31,6 +31,7 @@ use lance_io::object_store::{
     ObjectStore, ObjectStoreParams, ObjectStoreRegistry, parse_base_scoped_key,
 };
 use lance_io::traits::Writer;
+use lance_table::feature_flags::managed_blobs_enabled;
 use lance_table::format::{BasePath, DataFile, Fragment, IndexMetadata};
 use lance_table::io::commit::{CommitHandler, commit_handler_from_url};
 use lance_table::io::manifest::ManifestDescribing;
@@ -118,8 +119,10 @@ impl Dataset {
 
     /// Encode one managed part and return its serializable description.
     ///
-    /// Lance generates a unique staging name in the target's base. Managed Blob
-    /// payloads use independent `_blobs/<uuid>.blob` objects in that base. Every
+    /// Lance generates a unique staging name in the target's base. With schema
+    /// metadata `lance.blob.managed=true`, Managed Blob payloads use independent
+    /// `_blobs/<uuid>.blob` objects in that base. Otherwise payloads use sidecars
+    /// addressed relative to the final data file. Every
     /// non-empty logical Inline value is spilled so final concatenation never
     /// copies Blob payload bytes. Parts still require disjoint `blob_ids`
     /// reservations; Managed descriptors encode base IDs rather than these IDs.
@@ -199,7 +202,9 @@ impl Dataset {
         } else {
             None
         };
-        if let Some(writer) = preprocessor.take() {
+        if managed_blobs_enabled(target.schema.as_ref())?
+            && let Some(writer) = preprocessor.take()
+        {
             let root = self.blob_base_path(target.base_id)?;
             preprocessor = Some(writer.with_managed_base(target.base_id, root));
         }
@@ -2459,10 +2464,12 @@ where
         source_store_params,
         blob_pack_file_size_threshold,
     )?;
-    if matches!(
-        version,
-        ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3
-    ) {
+    if managed_blobs_enabled(schema)?
+        && matches!(
+            version,
+            ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3
+        )
+    {
         preprocessor = preprocessor.with_managed_base(base_id, base_dir.clone());
     }
     Ok(Box::new(V2WriterAdapter::new(

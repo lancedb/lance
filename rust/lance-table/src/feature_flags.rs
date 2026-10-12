@@ -4,7 +4,7 @@
 //! Feature flags
 
 use crate::format::Manifest;
-use lance_core::{Error, Result};
+use lance_core::{Error, Result, datatypes::Schema};
 
 /// Fragments may contain deletion files, which record the tombstones of
 /// soft-deleted rows.
@@ -99,6 +99,12 @@ pub const FLAG_INDEPENDENT_COVERING_FIELDS: u64 = 1 << 13;
 /// must resolve their explicit bases and writers/GC must preserve those references.
 /// This capability is sticky, including across restore, and requires both words.
 pub const FLAG_MANAGED_BLOBS: u64 = 1 << 14;
+
+/// Schema metadata that explicitly opts writes and compaction into Managed blobs.
+/// Set `lance.blob.managed` to `true` before publishing new Blob v2 data files.
+/// This requires Managed-aware readers and maintenance clients thereafter.
+pub const MANAGED_BLOBS_META_KEY: &str = "lance.blob.managed";
+
 /// Field IDs are allocated from a persistent high-water mark and are never reused.
 /// Writers must understand this allocation contract. It does not change how
 /// readers interpret the schema or data files.
@@ -251,6 +257,32 @@ pub fn inherit_sticky_feature_flags(destination: &mut Manifest, source: &Manifes
     destination.writer_feature_flags |=
         sticky_flags | (source.writer_feature_flags & FLAG_NON_REUSABLE_FIELD_IDS);
     Ok(())
+}
+
+/// Whether a schema explicitly requests Managed blob storage. Absent or `false`
+/// keeps the existing Inline/Packed/Dedicated storage layout, in all build profiles.
+///
+/// ```
+/// use lance_core::datatypes::Schema;
+/// use lance_table::feature_flags::{MANAGED_BLOBS_META_KEY, managed_blobs_enabled};
+/// let mut schema = Schema::default();
+/// assert!(!managed_blobs_enabled(&schema)?);
+/// schema.metadata.insert(MANAGED_BLOBS_META_KEY.to_string(), "true".to_string());
+/// assert!(managed_blobs_enabled(&schema)?);
+/// # Ok::<(), lance_core::Error>(())
+/// ```
+pub fn managed_blobs_enabled(schema: &Schema) -> Result<bool> {
+    match schema
+        .metadata
+        .get(MANAGED_BLOBS_META_KEY)
+        .map(String::as_str)
+    {
+        None | Some("false") => Ok(false),
+        Some("true") => Ok(true),
+        Some(value) => Err(Error::invalid_input(format!(
+            "Schema metadata {MANAGED_BLOBS_META_KEY} must be true or false, got {value:?}"
+        ))),
+    }
 }
 
 /// Whether this build understands data overlay files: always in debug builds,
@@ -433,6 +465,35 @@ fn validated_sticky_paired_flags(manifest: &Manifest) -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
+    #[rstest::rstest]
+    #[case::absent(None, false)]
+    #[case::disabled(Some("false"), false)]
+    #[case::enabled(Some("true"), true)]
+    fn managed_blobs_require_explicit_opt_in(#[case] value: Option<&str>, #[case] enabled: bool) {
+        let mut schema = empty_manifest().schema;
+        if let Some(value) = value {
+            schema
+                .metadata
+                .insert(MANAGED_BLOBS_META_KEY.to_string(), value.to_string());
+        }
+        assert_eq!(managed_blobs_enabled(&schema).unwrap(), enabled);
+    }
+
+    #[test]
+    fn managed_blobs_reject_invalid_opt_in() {
+        let mut schema = empty_manifest().schema;
+        schema
+            .metadata
+            .insert(MANAGED_BLOBS_META_KEY.to_string(), "invalid".to_string());
+        let error = managed_blobs_enabled(&schema).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("lance.blob.managed must be true or false")
+        );
+    }
+
     #[test]
     fn tagged_fri_flag_is_supported_and_sticky() {
         let flag = super::FLAG_FRAGMENT_REUSE_INDEX;

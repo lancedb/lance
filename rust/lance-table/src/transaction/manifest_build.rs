@@ -14,7 +14,7 @@ use crate::feature_flags::{
     FLAG_COVERED_INDEX_METADATA, FLAG_FRAGMENT_REUSE_INDEX, FLAG_MANAGED_BLOBS,
     FLAG_NON_REUSABLE_FIELD_IDS, FLAG_STABLE_ROW_IDS, apply_feature_flags,
     ensure_can_read_manifest, ensure_can_write_manifest, inherit_sticky_feature_flags,
-    validate_non_reusable_field_id_flags,
+    managed_blobs_enabled, validate_non_reusable_field_id_flags,
 };
 use crate::format::overlay::{OverlayCoverage, TOMBSTONE_FIELD_ID};
 use crate::format::{
@@ -1756,7 +1756,7 @@ impl Transaction {
             .filter(|field| field.is_blob_v2())
             .map(|field| field.id)
             .collect();
-        if !blob_fields.is_empty() {
+        if !blob_fields.is_empty() && managed_blobs_enabled(&manifest.schema)? {
             let old_files: HashSet<_> = current_manifest
                 .into_iter()
                 .flat_map(|manifest| manifest.fragments.iter())
