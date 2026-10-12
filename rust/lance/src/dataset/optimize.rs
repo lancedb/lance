@@ -9692,7 +9692,6 @@ mod tests {
     enum RaceOutcome {
         Committed,
         Rejected,
-        ConflictThenCommitted,
         ConflictThenRejected,
     }
 
@@ -9748,17 +9747,18 @@ mod tests {
     ) {
         let is_in_memory = first_commit_seen_as == FirstCommitSeenAs::InMemory;
         let is_separate_session = first_commit_seen_as == FirstCommitSeenAs::SeparateSession;
-        let expected = match (index_type, index_commits_first, is_disjoint, is_in_memory) {
-            (IndexType::Bitmap, true, _, _) => RaceOutcome::ConflictThenRejected,
-            (IndexType::Bitmap, false, false, false) => RaceOutcome::ConflictThenRejected,
-            (IndexType::Bitmap, _, _, _) => RaceOutcome::Rejected,
-            (_, false, false, false) => RaceOutcome::ConflictThenCommitted,
+        // How the rebase sees the compaction does not matter: an index rebasing
+        // past it finds the moves recorded in the latest manifest's reuse index.
+        let expected = match (index_type, index_commits_first) {
+            (IndexType::Bitmap, true) => RaceOutcome::ConflictThenRejected,
+            (IndexType::Bitmap, false) => RaceOutcome::Rejected,
             _ => RaceOutcome::Committed,
         };
         let dir = TempStrDir::default();
         let mut dataset = stable_row_id_dataset(dir.as_str(), 3).await;
         dataset.commit_handler = Arc::new(RenameCommitHandler);
         dataset.delete("i IN (1, 2)").await.unwrap();
+        let before = rows_by_addr(&dataset).await;
         let mut other = if is_separate_session {
             let mut other = Dataset::open(dir.as_str()).await.unwrap();
             other.commit_handler = Arc::new(RenameCommitHandler);
@@ -9906,19 +9906,7 @@ mod tests {
                 ),
                 is_in_memory
             );
-            if matches!(
-                expected,
-                RaceOutcome::ConflictThenCommitted | RaceOutcome::ConflictThenRejected
-            ) {
-                assert!(
-                    matches!(result, Err(Error::RetryableCommitConflict { .. })),
-                    "{result:?}"
-                );
-                other.checkout_latest().await.unwrap();
-                create_index(&mut other).await
-            } else {
-                result
-            }
+            result
         };
 
         let latest = Dataset::open(dir.as_str()).await.unwrap();
@@ -9929,9 +9917,10 @@ mod tests {
             .map(|index| index.name.clone())
             .collect::<HashSet<_>>();
         match expected {
-            RaceOutcome::Committed | RaceOutcome::ConflictThenCommitted => {
+            RaceOutcome::Committed => {
                 result.unwrap();
                 assert!(names.contains(FRAG_REUSE_INDEX_NAME) && names.contains("i_idx"));
+                assert_moves_keep_row_identity(&before, &latest).await;
                 for use_scalar_index in [false, true] {
                     assert_eq!(
                         values_matching(&latest, "i", "i > 3", use_scalar_index).await,
@@ -9949,6 +9938,11 @@ mod tests {
                     names.contains("i_idx"),
                     "{names:?}"
                 );
+                if names.contains(FRAG_REUSE_INDEX_NAME) {
+                    assert_moves_keep_row_identity(&before, &latest).await;
+                } else {
+                    assert_eq!(rows_by_addr(&latest).await, before);
+                }
             }
         }
     }
