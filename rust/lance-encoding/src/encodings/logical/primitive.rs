@@ -11718,6 +11718,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_constant_layout_null_padded_large_value_v2_2() {
+        use crate::format::pb21::page_layout::Layout;
+
+        // One large non-null value plus many nulls still qualifies for constant
+        // encoding.  Materializing the scalar for every slot (including nulls)
+        // would require 32 MiB * 1000 = 32 GiB, overflowing i32 utf8 offsets
+        // even within a single decode task.
+        let big = "x".repeat(32 * 1024 * 1024);
+        let mut values: Vec<Option<&str>> = vec![None; 1000];
+        values[17] = Some(big.as_str());
+        let arr: ArrayRef = Arc::new(arrow_array::StringArray::from(values));
+        let field = arrow_schema::Field::new("c", DataType::Utf8, true);
+        let page = encode_first_page(field, arr.clone(), TestEncoding::StructuralU32).await;
+
+        let PageEncoding::Structural(layout) = &page.description else {
+            panic!("Expected structural encoding");
+        };
+        let Layout::ConstantLayout(layout) = layout.layout.as_ref().unwrap() else {
+            panic!("Expected constant layout in slot 2");
+        };
+        assert!(layout.inline_value.is_none());
+
+        let test_cases = TestCases::default().with_encoding(TestEncoding::StructuralU32);
+        check_round_trip_encoding_of_data(vec![arr], &test_cases, HashMap::new()).await;
+    }
+
+    #[tokio::test]
+    async fn test_constant_layout_null_padded_binary_v2_2() {
+        use crate::format::pb21::page_layout::Layout;
+
+        let big = vec![0xCDu8; 32 * 1024 * 1024];
+        let mut values: Vec<Option<&[u8]>> = vec![None; 1200];
+        values[0] = Some(big.as_slice());
+        values[599] = Some(big.as_slice());
+        let arr: ArrayRef = Arc::new(arrow_array::BinaryArray::from(values));
+        let field = arrow_schema::Field::new("c", DataType::Binary, true);
+        let page = encode_first_page(field, arr.clone(), TestEncoding::StructuralU32).await;
+
+        let PageEncoding::Structural(layout) = &page.description else {
+            panic!("Expected structural encoding");
+        };
+        let Layout::ConstantLayout(layout) = layout.layout.as_ref().unwrap() else {
+            panic!("Expected constant layout in slot 2");
+        };
+        assert!(layout.inline_value.is_none());
+
+        let test_cases = TestCases::default().with_encoding(TestEncoding::StructuralU32);
+        check_round_trip_encoding_of_data(vec![arr], &test_cases, HashMap::new()).await;
+    }
+
+    #[tokio::test]
     async fn test_constant_layout_nullable_item_v2_2() {
         use crate::format::pb21::page_layout::Layout;
 
