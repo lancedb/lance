@@ -168,8 +168,8 @@ pub trait ObjectStoreExt {
 }
 
 #[async_trait]
-pub(super) trait DirectoryOperations: std::fmt::Debug + Send + Sync {
-    async fn remove_dir_all(&self, path: &Path, store: &ObjectStore) -> Result<()>;
+pub(super) trait LocalDirOperations: std::fmt::Debug + Send + Sync {
+    async fn remove_dir_all(&self, path: &Path) -> Result<()>;
 }
 
 #[async_trait]
@@ -203,8 +203,8 @@ impl<O: OSObjectStore + ?Sized> ObjectStoreExt for O {
 pub struct ObjectStore {
     // Inner object store
     pub inner: Arc<dyn OSObjectStore>,
-    // Provider-owned operations that preserve native directory semantics.
-    directory_operations: Option<Arc<dyn DirectoryOperations>>,
+    // Provider-owned native directory operations for rooted local stores.
+    local_dir_operations: Option<Arc<dyn LocalDirOperations>>,
     scheme: String,
     block_size: usize,
     max_iop_size: u64,
@@ -683,7 +683,7 @@ impl ObjectStore {
 
             let store = Self {
                 inner: tracked_store,
-                directory_operations: None,
+                local_dir_operations: None,
                 scheme: path.scheme().to_string(),
                 block_size: params.resolved_block_size()?.unwrap_or(64 * 1024),
                 max_iop_size: *DEFAULT_MAX_IOP_SIZE,
@@ -1522,8 +1522,11 @@ impl ObjectStore {
         let path = dir_path.into();
         let path = Path::parse(&path)?;
 
-        if let Some(directory_operations) = &self.directory_operations {
-            return directory_operations.remove_dir_all(&path, self).await;
+        if let Some(local_dir_operations) = &self.local_dir_operations {
+            let metrics = self.io_tracker.begin_io("delete");
+            let result = local_dir_operations.remove_dir_all(&path).await;
+            metrics.record(&result, 0);
+            return result;
         }
         if self.has_direct_local_paths() {
             // The local file system provider needs to delete both files and directories.
@@ -1534,15 +1537,30 @@ impl ObjectStore {
             metrics.record(&result, 0);
             return result;
         }
-        let sub_entries = self
-            .inner
-            .list(Some(&path))
-            .map(|m| m.map(|meta| meta.location))
-            .boxed();
-        self.inner
-            .delete_stream(sub_entries)
-            .try_collect::<Vec<_>>()
-            .await?;
+        // Bound file batches to the S3 batch limit while retaining provider batching.
+        let mut entries = self.inner.list(Some(&path)).try_chunks(1000);
+        let mut deferred = Vec::new();
+        while let Some(chunk) = entries.next().await {
+            let chunk = chunk.map_err(|error| error.1)?;
+            let mut files = Vec::with_capacity(chunk.len());
+            for entry in chunk {
+                // OpenDAL directory entries have size zero. Deferring empty files too
+                // is safe: every child path is longer than its parent directory.
+                if entry.size == 0 {
+                    deferred.push(entry.location);
+                } else {
+                    files.push(Ok(entry.location));
+                }
+            }
+            self.inner
+                .delete_stream(futures::stream::iter(files).boxed())
+                .try_for_each(|_| future::ready(Ok(())))
+                .await?;
+        }
+        deferred.sort_unstable_by_key(|location| std::cmp::Reverse(location.as_ref().len()));
+        for location in deferred {
+            self.inner.delete(&location).await?;
+        }
         if self.scheme == "file-object-store" {
             // file-object-store tries to do everything as similarly as possible to the remote
             // object stores. But we still have to delete the directory entries afterwards.
@@ -1856,7 +1874,7 @@ impl ObjectStore {
 
         Self {
             inner: tracked_store,
-            directory_operations: None,
+            local_dir_operations: None,
             scheme: scheme.into(),
             block_size,
             max_iop_size: *DEFAULT_MAX_IOP_SIZE,

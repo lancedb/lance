@@ -222,7 +222,7 @@ impl ObjectStoreProvider for HuggingfaceStoreProvider {
         Ok(ObjectStore {
             scheme: "hf".to_string(),
             inner,
-            directory_operations: None,
+            local_dir_operations: None,
             block_size,
             max_iop_size: *DEFAULT_MAX_IOP_SIZE,
             use_constant_size_upload_parts: params.use_constant_size_upload_parts,

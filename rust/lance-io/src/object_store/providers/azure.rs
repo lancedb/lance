@@ -295,7 +295,7 @@ impl ObjectStoreProvider for AzureBlobStoreProvider {
 
         Ok(ObjectStore {
             inner,
-            directory_operations: None,
+            local_dir_operations: None,
             scheme,
             block_size,
             max_iop_size: *DEFAULT_MAX_IOP_SIZE,

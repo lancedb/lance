@@ -11,8 +11,8 @@ use url::Url;
 use crate::object_store::dynamic_opendal::DynamicOpenDalStore;
 use crate::object_store::opendal_store::OpendalStore;
 use crate::object_store::{
-    DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE,
-    DirectoryOperations, ObjectStore, ObjectStoreParams, ObjectStoreProvider, StorageOptions,
+    DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE, ObjectStore,
+    ObjectStoreParams, ObjectStoreProvider, StorageOptions,
 };
 use lance_core::error::{Error, Result};
 
@@ -116,9 +116,9 @@ impl ObjectStoreProvider for TosStoreProvider {
         let base_options = Self::base_tos_options(&base_path, &storage_options)?;
         let accessor = params.get_accessor();
 
-        let (inner, directory_operations): (Arc<dyn OSObjectStore>, Arc<dyn DirectoryOperations>) =
+        let inner: Arc<dyn OSObjectStore> =
             if let Some(accessor) = accessor.filter(|a| a.has_provider()) {
-                let store = Arc::new(
+                Arc::new(
                     DynamicOpenDalStore::new(
                         format!("tos:{}", base_path),
                         base_options,
@@ -127,13 +127,11 @@ impl ObjectStoreProvider for TosStoreProvider {
                         Self::build_tos_store,
                     )
                     .with_protected_keys(["bucket", "root"]),
-                );
-                (store.clone(), store)
+                )
             } else {
-                let store = Arc::new(Self::build_tos_store(Self::normalize_tos_config(
+                Arc::new(Self::build_tos_store(Self::normalize_tos_config(
                     &base_options,
-                )?)?);
-                (store.clone(), store)
+                )?)?)
             };
 
         let mut url = base_path;
@@ -144,7 +142,7 @@ impl ObjectStoreProvider for TosStoreProvider {
         Ok(ObjectStore {
             scheme: "tos".to_string(),
             inner,
-            directory_operations: Some(directory_operations),
+            local_dir_operations: None,
             block_size,
             max_iop_size: *DEFAULT_MAX_IOP_SIZE,
             use_constant_size_upload_parts: params.use_constant_size_upload_parts,
@@ -183,6 +181,8 @@ mod tests {
         keys: Arc<Mutex<BTreeSet<String>>>,
         deleted: Arc<Mutex<Vec<String>>>,
         fail_delete: Option<String>,
+        list_requests: Arc<Mutex<usize>>,
+        page_size: Option<usize>,
     }
 
     impl HttpTransport for HierarchicalTos {
@@ -195,10 +195,33 @@ mod tests {
                     .find(|(key, _)| key == "prefix")
                     .unwrap()
                     .1;
-                let contents = keys.iter().filter(|key| key.starts_with(prefix.as_ref())).map(|key| {
-                    json!({"Key": key, "Size": 0, "LastModified": "2026-10-09T00:00:00Z"})
-                }).collect::<Vec<_>>();
-                (200, json!({"Contents": contents, "IsTruncated": false}))
+                *self.list_requests.lock().unwrap() += 1;
+                let token = url
+                    .query_pairs()
+                    .find(|(key, _)| key == "continuation-token")
+                    .map(|(_, value)| value.into_owned());
+                let mut remaining = keys.iter().filter(|key| {
+                    key.starts_with(prefix.as_ref())
+                        && token.as_ref().is_none_or(|token| *key > token)
+                });
+                let page = remaining
+                    .by_ref()
+                    .take(self.page_size.unwrap_or(usize::MAX))
+                    .collect::<Vec<_>>();
+                let is_truncated = remaining.next().is_some();
+                let next_token = page.last().copied();
+                let contents = page
+                    .iter()
+                    .map(|key| {
+                        // Include both nonempty files and zero-byte files alongside directories.
+                        let size = if key.ends_with("part.lance") { 128 } else { 0 };
+                        json!({"Key": key, "Size": size, "LastModified": "2026-10-09T00:00:00Z"})
+                    })
+                    .collect::<Vec<_>>();
+                (
+                    200,
+                    json!({"Contents": contents, "IsTruncated": is_truncated, "NextContinuationToken": next_token}),
+                )
             } else {
                 assert_eq!(
                     request.method(),
@@ -257,8 +280,7 @@ mod tests {
         let native = Arc::new(OpendalStore::new(operator));
         let (mut store, _) = ObjectStore::from_uri("memory://").await.unwrap();
         let store_mut = Arc::get_mut(&mut store).unwrap();
-        store_mut.inner = native.clone();
-        store_mut.directory_operations = Some(native);
+        store_mut.inner = native;
         store
     }
 
@@ -271,6 +293,7 @@ mod tests {
     async fn test_remove_dir_all_preserves_directory_semantics(
         #[case] base_url: &str,
         #[case] hierarchical: bool,
+        #[values(None, Some(2))] page_size: Option<usize>,
     ) {
         let base = Path::from_url_path(base_url).unwrap();
         let prefix = opendal::raw::percent_decode_path(base.as_ref());
@@ -289,16 +312,22 @@ mod tests {
             ]);
         }
         let mock = HierarchicalTos {
+            page_size,
             keys: Arc::new(Mutex::new(keys)),
             ..Default::default()
         };
+        let entry_count = mock.keys.lock().unwrap().len() - 1;
         let store = hierarchical_store(mock.clone()).await;
         store.remove_dir_all(base.clone()).await.unwrap();
+        assert_eq!(
+            *mock.list_requests.lock().unwrap(),
+            entry_count.div_ceil(page_size.unwrap_or(entry_count))
+        );
         assert_eq!(
             *mock.keys.lock().unwrap(),
             BTreeSet::from([format!("{prefix}-other/keep")])
         );
-        // The listing contains zero-byte files, which must not be treated as directories.
+        // Zero-byte files must also be deleted before their parent directories.
         {
             let deleted = mock.deleted.lock().unwrap();
             assert_eq!(deleted.len(), if hierarchical { 7 } else { 2 });
@@ -328,11 +357,17 @@ mod tests {
     }
 
     #[rstest]
-    #[case::file("dataset/file")]
+    #[case::empty_file("dataset/file")]
+    #[case::nonempty_file("dataset/part.lance")]
     #[case::directory("dataset")]
     #[tokio::test]
     async fn test_remove_dir_all_propagates_deletion_failure(#[case] fail_delete: &str) {
-        let keys = BTreeSet::from(["dataset/".to_string(), "dataset/file".to_string()]);
+        let file = if fail_delete == "dataset/part.lance" {
+            fail_delete
+        } else {
+            "dataset/file"
+        };
+        let keys = BTreeSet::from(["dataset/".to_string(), file.to_string()]);
         let mock = HierarchicalTos {
             keys: Arc::new(Mutex::new(keys.clone())),
             fail_delete: Some(fail_delete.to_string()),
@@ -345,9 +380,9 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, lance_core::Error::IO { .. }));
         assert!(error.to_string().contains("Deletion denied"), "{error}");
-        if fail_delete == "dataset/file" {
+        if fail_delete == file {
             assert_eq!(*mock.keys.lock().unwrap(), keys);
-            assert_eq!(*mock.deleted.lock().unwrap(), ["dataset/file"]);
+            assert_eq!(*mock.deleted.lock().unwrap(), [file]);
         } else {
             assert_eq!(
                 *mock.keys.lock().unwrap(),
@@ -380,6 +415,35 @@ mod tests {
         ));
         assert!(mock.deleted.lock().unwrap().is_empty());
         assert!(mock.keys.lock().unwrap().contains("dataset/hidden"));
+    }
+
+    #[tokio::test]
+    async fn test_remove_dir_all_respects_rewritten_paths() {
+        let mock = HierarchicalTos {
+            keys: Arc::new(Mutex::new(BTreeSet::from([
+                "tenant/dataset/".to_string(),
+                "tenant/dataset/data/".to_string(),
+                "tenant/dataset/data/part.lance".to_string(),
+                "tenant/dataset/data/empty".to_string(),
+                "tenant/other/keep".to_string(),
+            ]))),
+            ..Default::default()
+        };
+        let mut store = hierarchical_store(mock.clone()).await;
+        let store_mut = Arc::get_mut(&mut store).unwrap();
+        store_mut.inner = Arc::new(object_store::prefix::PrefixStore::new(
+            store_mut.inner.clone(),
+            "tenant",
+        ));
+        store.remove_dir_all("dataset").await.unwrap();
+        assert_eq!(
+            *mock.keys.lock().unwrap(),
+            BTreeSet::from(["tenant/other/keep".to_string()])
+        );
+        assert_eq!(*mock.list_requests.lock().unwrap(), 1);
+        let deleted = mock.deleted.lock().unwrap();
+        assert_eq!(deleted.first().unwrap(), "tenant/dataset/data/part.lance");
+        assert_eq!(deleted.last().unwrap(), "tenant/dataset");
     }
 
     #[test]

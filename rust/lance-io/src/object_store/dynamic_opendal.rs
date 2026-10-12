@@ -16,8 +16,8 @@ use object_store::{
 };
 use tokio::sync::RwLock;
 
+use crate::object_store::StorageOptionsAccessor;
 use crate::object_store::opendal_store::OpendalStore;
-use crate::object_store::{DirectoryOperations, ObjectStore, StorageOptionsAccessor};
 use lance_core::Result;
 
 type NormalizeConfigFn = fn(&HashMap<String, String>) -> Result<HashMap<String, String>>;
@@ -130,16 +130,6 @@ impl DynamicOpenDalStore {
 impl fmt::Display for DynamicOpenDalStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "DynamicOpenDalStore({})", self.name)
-    }
-}
-
-#[async_trait::async_trait]
-impl DirectoryOperations for DynamicOpenDalStore {
-    async fn remove_dir_all(&self, path: &Path, store: &ObjectStore) -> Result<()> {
-        self.current_store()
-            .await?
-            .remove_dir_all(path, store)
-            .await
     }
 }
 
@@ -268,6 +258,7 @@ mod tests {
     use opendal::{Operator, services::Memory};
 
     use super::*;
+    use crate::object_store::ObjectStore;
     use crate::object_store::test_utils::StaticMockStorageOptionsProvider;
 
     #[tokio::test]
@@ -307,7 +298,6 @@ mod tests {
         let (mut object_store, _) = ObjectStore::from_uri("memory://").await.unwrap();
         let object_store_mut = Arc::get_mut(&mut object_store).unwrap();
         object_store_mut.inner = dynamic.clone();
-        object_store_mut.directory_operations = Some(dynamic);
         first
             .put(
                 &Path::from("dataset/file"),
