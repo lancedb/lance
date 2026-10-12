@@ -172,6 +172,9 @@ impl IndexStore {
             "a primary-key index must be enabled before any row is inserted"
         );
         self.pk_index = PkIndex::new(self, pk_columns);
+        if let Some(PkIndex::Owned(OwnedPk::Single(index))) = &self.pk_index {
+            self.filter_catalog.add_own_key_index(index.column_name());
+        }
     }
 
     /// Whether the memtable has a primary-key index.

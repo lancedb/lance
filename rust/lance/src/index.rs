@@ -2079,10 +2079,13 @@ pub(crate) async fn remap_index(
             .await?;
 
             CreatedIndex {
-                index_details: prost_types::Any::from_msg(
-                    &lance_index::pb::VectorIndexDetails::default(),
-                )
-                .unwrap(),
+                // A remap keeps the IVF model, quantizer and sub-index; only row
+                // addresses change, so the details carry over.
+                index_details: matched
+                    .index_details
+                    .as_deref()
+                    .cloned()
+                    .unwrap_or_else(vector_index_details_default),
                 index_version,
                 files: table_files_to_index(files),
             }

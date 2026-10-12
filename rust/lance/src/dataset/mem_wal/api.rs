@@ -15,15 +15,16 @@
 //! A writer that is already open keeps the set it opened with until something
 //! calls [`DatasetMemWalExt::refresh_mem_wal_index_configs`].
 //!
-//! A rename reaches sealed generations and replay, but not the active MemTable,
-//! which keeps its original names until its writer reopens.
+//! A rename reaches every MemTable, sealed generation and replayed entry: each
+//! is read by field id.
 //!
 //! # Upgrading
 //!
 //! Generations are read by field id. Ones flushed before that carry positional
 //! ids instead, which mispair against a table whose ids have gaps, and nothing
 //! records which scheme a generation used. Compact generations into base before
-//! upgrading. Durable WAL entries are unaffected: they carry no ids.
+//! upgrading. Durable WAL entries are unaffected: one without ids is matched by
+//! name.
 //!
 //! # Known gaps
 //!
@@ -1981,6 +1982,120 @@ mod tests {
                 .is_none(),
             "a second pass over an unchanged table seals nothing"
         );
+        writer.close().await.unwrap();
+    }
+
+    /// A base vector index rewritten without changing what the memtable builds
+    /// from is the same maintained index, so the writer keeps its memtable;
+    /// one rebuilt with another distance type is not.
+    #[tokio::test]
+    async fn refresh_seals_only_when_a_maintained_index_changes_its_settings() {
+        use crate::dataset::optimize::remapping::remap_column_index;
+        use crate::dataset::optimize::{CompactionOptions, compact_files};
+        use crate::index::vector::VectorIndexParams;
+        use lance_linalg::distance::DistanceType;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let uri = format!("{}/base", tmp.path().to_str().unwrap());
+        let mut dataset = dataset_with_vector_index(&uri, DataType::Float32).await;
+        // A second fragment under the index, so compaction merges two and the
+        // index has to be remapped.
+        let rows = dataset.scan().try_into_batch().await.unwrap();
+        let ids = Int32Array::from_iter_values(1000..1000 + rows.num_rows() as i32);
+        let rows = RecordBatch::try_new(rows.schema(), vec![Arc::new(ids), rows.column(1).clone()])
+            .unwrap();
+        let schema = rows.schema();
+        dataset
+            .append(RecordBatchIterator::new([Ok(rows)], schema), None)
+            .await
+            .unwrap();
+        let rebuild = async |dataset: &mut Dataset, params: VectorIndexParams| {
+            dataset
+                .create_index(
+                    &["vector"],
+                    IndexType::Vector,
+                    Some("vector_idx".to_string()),
+                    &params,
+                    true,
+                )
+                .await
+                .unwrap();
+        };
+        let flat = |distance_type| VectorIndexParams::ivf_flat(1, distance_type);
+        rebuild(&mut dataset, flat(DistanceType::L2)).await;
+        dataset
+            .initialize_mem_wal()
+            .unsharded()
+            .execute()
+            .await
+            .unwrap();
+        let shard_id = Uuid::new_v4();
+        let writer = dataset
+            .mem_wal_writer(shard_id, ShardWriterConfig::new(shard_id))
+            .await
+            .unwrap();
+        let details = async |dataset: &Dataset| {
+            dataset.load_indices_by_name("vector_idx").await.unwrap()[0]
+                .index_details
+                .clone()
+        };
+
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        remap_column_index(&mut dataset, &["vector"], Some("vector_idx".to_string()))
+            .await
+            .unwrap();
+        assert!(
+            dataset
+                .refresh_mem_wal_index_configs(&writer)
+                .await
+                .unwrap()
+                .is_none(),
+            "a remap keeps the index's settings"
+        );
+
+        rebuild(&mut dataset, flat(DistanceType::L2)).await;
+        assert!(
+            dataset
+                .refresh_mem_wal_index_configs(&writer)
+                .await
+                .unwrap()
+                .is_none(),
+            "a rebuild with the same settings is the same index"
+        );
+
+        // The memtable index uses only the metric; compression belongs to the
+        // base index.
+        let flat_details = details(&dataset).await;
+        rebuild(
+            &mut dataset,
+            VectorIndexParams::ivf_pq(1, 8, 2, DistanceType::L2, 2),
+        )
+        .await;
+        assert_ne!(details(&dataset).await, flat_details);
+        assert!(
+            dataset
+                .refresh_mem_wal_index_configs(&writer)
+                .await
+                .unwrap()
+                .is_none(),
+            "a rebuild that changes only the base index's compression is the same index"
+        );
+
+        rebuild(&mut dataset, flat(DistanceType::Cosine)).await;
+        dataset
+            .refresh_mem_wal_index_configs(&writer)
+            .await
+            .unwrap()
+            .expect("another distance type is another index");
         writer.close().await.unwrap();
     }
 
