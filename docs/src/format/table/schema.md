@@ -206,10 +206,11 @@ from 0, or takes the IDs supplied with the input schema, such as the Arrow field
 largest supplied ID, in depth-first order.
 
 A negative supplied ID counts as no ID. Supplied IDs must be unique across all fields including
-nested fields, and every ID must be less than 2147483647, so that a field added later can still
-receive an ID. A writer that takes supplied IDs rejects input that breaks these rules instead of
-renumbering it. It cannot tell where they came from: a schema copied from another table carries
-that table's IDs, so a caller that does not intend them must not supply them.
+nested fields, and every field ID of the new table must be less than 2^30 (1073741824), which
+leaves room for about a billion fields added later. A writer that takes supplied IDs rejects input
+that breaks these rules instead of renumbering it. It cannot tell where they came from: a schema
+copied from another table carries that table's IDs, so a caller that does not intend them must not
+supply them.
 
 These rules apply only when a table is created. A field added to an existing table receives its ID
 as described under "New field assignment", and an Overwrite assigns IDs as described in

@@ -1213,10 +1213,13 @@ async fn test_overwrite_refuses_supplied_ids_that_permute_written_ones() {
 #[tokio::test]
 async fn test_new_dataset_rejects_a_field_id_that_leaves_no_room() {
     let uri = TempStrDir::default();
-    let err = write_new_dataset(uri.as_str(), vec![field_with_id("a", i32::MAX)])
+    let err = write_new_dataset(uri.as_str(), vec![field_with_id("a", 1 << 30)])
         .await
         .unwrap_err();
-    assert!(err.to_string().contains("leaves no ID"), "{err}");
+    assert!(
+        err.to_string().contains("too large for a new table"),
+        "{err}"
+    );
 }
 
 #[tokio::test]

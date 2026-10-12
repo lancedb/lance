@@ -137,6 +137,10 @@ pub fn validate_fixed_size_list_dimensions(field_name: &str, data_type: &DataTyp
     Ok(())
 }
 
+/// Field IDs of a new table must be below this (2^30), leaving room for about a
+/// billion fields added later.
+pub const NEW_TABLE_FIELD_ID_LIMIT: i32 = 1 << 30;
+
 impl Schema {
     /// The unenforced primary key fields in the schema, ordered by position.
     ///
@@ -745,14 +749,16 @@ impl Schema {
     /// Assign field IDs for a new table: keep the IDs the fields carry and give
     /// each field without one an ID above the largest.
     ///
-    /// Fails when two fields share an ID, or when an ID is `i32::MAX`, which
-    /// leaves no ID for a field added later.
+    /// Fails when two fields share an ID, or when an ID is not below
+    /// [`NEW_TABLE_FIELD_ID_LIMIT`], so the table has room for fields added later.
     pub fn try_assign_new_table_field_ids(&mut self) -> Result<()> {
         self.try_set_field_id(None)?;
-        if self.max_field_id() == Some(i32::MAX) {
+        if let Some(max_id) = self.max_field_id()
+            && max_id >= NEW_TABLE_FIELD_ID_LIMIT
+        {
             return Err(Error::invalid_input(format!(
-                "field ID {} leaves no ID for a field added later",
-                i32::MAX
+                "field ID {max_id} is too large for a new table: field IDs must be below \
+                 {NEW_TABLE_FIELD_ID_LIMIT} to leave room for fields added later"
             )));
         }
         self.validate()
@@ -2648,8 +2654,9 @@ mod tests {
     }
 
     #[rstest::rstest]
-    #[case::at_the_limit(vec![i32::MAX])]
-    #[case::filled_up_to_the_limit(vec![i32::MAX - 1, -1])]
+    #[case::at_the_limit(vec![NEW_TABLE_FIELD_ID_LIMIT])]
+    #[case::filled_up_to_the_limit(vec![NEW_TABLE_FIELD_ID_LIMIT - 1, -1])]
+    #[case::largest_possible(vec![i32::MAX])]
     #[case::shared(vec![1, 1])]
     fn test_new_table_rejects_unusable_field_ids(#[case] ids: Vec<i32>) {
         let fields: Vec<ArrowField> = (0..ids.len())
