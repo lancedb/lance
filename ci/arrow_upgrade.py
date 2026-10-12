@@ -5,7 +5,7 @@ Lance inherits its comparison semantics from Arrow Rust (sort kernels,
 comparators, the row encoding), from DataFusion (ScalarValue, SortExec and the
 merge cursors) and from `half` (f16::total_cmp). A version change in any of
 them is the moment to run the fixed ordering fixtures in
-rust/lance-compat/tests/arrow_ordering.rs against the new code, so this
+rust/lance/tests/arrow_ordering.rs against the new code, so this
 script answers "did one of those crates change?" for the CI job that does so.
 
 Usage: arrow_upgrade.py BASE_LOCK HEAD_LOCK
@@ -24,7 +24,7 @@ ARROW_RELEASES = "https://github.com/apache/arrow-rs/releases/tag/"
 DATAFUSION_RELEASES = "https://github.com/apache/datafusion/releases/tag/"
 HALF_RELEASES = "https://github.com/VoidStarKat/half-rs/releases/tag/v"
 
-FIXTURE_PATH = "rust/lance-compat/tests/arrow_ordering.rs"
+FIXTURE_PATH = "rust/lance/tests/arrow_ordering.rs"
 
 
 def is_ordering_crate(name):

@@ -4510,6 +4510,8 @@ dependencies = [
  "humantime",
  "itertools 0.14.0",
  "lance-arrow",
+ "lance-arrow-scalar",
+ "lance-arrow-stats",
  "lance-bitpacking",
  "lance-core",
  "lance-datafusion",
@@ -4622,28 +4624,6 @@ dependencies = [
  "crunchy",
  "paste",
  "seq-macro",
-]
-
-[[package]]
-name = "lance-compat"
-version = "14.0.0-beta.10"
-dependencies = [
- "arrow",
- "arrow-array",
- "arrow-ord",
- "arrow-row",
- "arrow-schema",
- "arrow-select",
- "datafusion",
- "datafusion-common",
- "futures",
- "half",
- "lance-arrow-scalar",
- "lance-arrow-stats",
- "lance-datafusion",
- "lance-index",
- "rstest",
- "tokio",
 ]
 
 [[package]]
