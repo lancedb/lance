@@ -682,13 +682,14 @@ pub(crate) async fn open_scalar_index_with_plan(
     });
 
     if batch_remapping.is_some() {
-        lance_index::scalar::registry::single_flight_store_bound_open(
+        lance_index::scalar::registry::single_flight_store_bound_open_with_snapshot(
             index_store,
             &index_cache,
             load,
             // Batch remappers bind external mapping readers to their store;
             // reload them when the storage binding changes.
             |_| async { Ok(None) },
+            |index| plugin.cache_snapshot(index),
         )
         .await
     } else {
