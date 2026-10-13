@@ -224,6 +224,25 @@ pub enum Error {
         #[snafu(implicit)]
         backtrace: MaybeBacktrace,
     },
+    /// A transaction committed after our read version already carries some
+    /// of our idempotency keys. Not retryable: committing would apply the
+    /// same work twice.
+    ///
+    /// `version` is the version that carries `keys`, the keys it shares with
+    /// this commit. It may be the caller's own earlier commit, when a commit
+    /// that already landed is retried.
+    #[snafu(display(
+        "Duplicate transaction: version {version} already applied {} of this commit's idempotency keys, {location}",
+        keys.len()
+    ))]
+    DuplicateTransaction {
+        version: u64,
+        keys: Vec<String>,
+        #[snafu(implicit)]
+        location: Location,
+        #[snafu(implicit)]
+        backtrace: MaybeBacktrace,
+    },
     #[snafu(display("Retryable commit conflict for version {version}: {source}, {location}"))]
     RetryableCommitConflict {
         version: u64,
@@ -441,6 +460,7 @@ impl Error {
             | Self::CommitConflict { backtrace, .. }
             | Self::IncompatibleTransaction { backtrace, .. }
             | Self::RetryableCommitConflict { backtrace, .. }
+            | Self::DuplicateTransaction { backtrace, .. }
             | Self::TooMuchWriteContention { backtrace, .. }
             | Self::Internal { backtrace, .. }
             | Self::PrerequisiteFailed { backtrace, .. }
@@ -758,6 +778,11 @@ impl Error {
             Self::Wrapped { error, .. }
                 if error.downcast_ref::<CommitStatusUnknownError>().is_some()
         )
+    }
+
+    #[track_caller]
+    pub fn duplicate_transaction(version: u64, keys: Vec<String>) -> Self {
+        DuplicateTransactionSnafu { version, keys }.build()
     }
 
     #[track_caller]

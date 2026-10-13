@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,6 +14,7 @@ use lance_table::{
 };
 
 use crate::io::commit::default_commit_retry_timeout;
+use crate::io::commit::idempotency::{self, IDEMPOTENCY_KEYS_PROPERTY};
 use crate::{
     Dataset, Error, Result,
     dataset::{
@@ -58,6 +59,11 @@ pub struct CommitBuilder<'a> {
     /// Set only by `Dataset::deep_clone`, after it has copied the source files.
     deep_clone_files_copied: bool,
     keep_field_ids: bool,
+    /// Keys added to the transaction's idempotency keys; see
+    /// [`Self::with_idempotency_keys`].
+    idempotency_keys: Option<BTreeSet<String>>,
+    /// See [`Self::with_idempotency_property`].
+    idempotency_property: Option<String>,
 }
 
 /// Default timeout applied to [`CommitBuilder::execute`] when none is set.
@@ -85,6 +91,8 @@ impl<'a> CommitBuilder<'a> {
             activate_non_reusable_field_ids: false,
             deep_clone_files_copied: false,
             keep_field_ids: false,
+            idempotency_keys: None,
+            idempotency_property: None,
         }
     }
 
@@ -231,6 +239,97 @@ impl<'a> CommitBuilder<'a> {
         self
     }
 
+    /// Apply this commit at most once per idempotency key.
+    ///
+    /// Each key identifies a unit of work the commit applies, such as a queue
+    /// message id. If a transaction committed after the read version already
+    /// carries any of the keys, the commit fails with
+    /// [`Error::DuplicateTransaction`] naming that version and the shared
+    /// keys, instead of rebasing over it. That version can be the caller's
+    /// own earlier commit, when a commit that already landed (for example
+    /// one reported as status unknown) is retried. Versions at or before the
+    /// read version are not checked; the caller observed them when it read
+    /// the table.
+    ///
+    /// The keys are added to any the transaction already carries and are
+    /// persisted in its
+    /// [`IDEMPOTENCY_KEYS_PROPERTY`](crate::io::commit::idempotency::IDEMPOTENCY_KEYS_PROPERTY)
+    /// property. Keys must be non-empty, and a transaction may carry at most
+    /// [`MAX_IDEMPOTENCY_KEYS`](crate::io::commit::idempotency::MAX_IDEMPOTENCY_KEYS)
+    /// keys totalling
+    /// [`MAX_IDEMPOTENCY_KEY_BYTES`](crate::io::commit::idempotency::MAX_IDEMPOTENCY_KEY_BYTES)
+    /// bytes; otherwise [`Self::execute`] fails with [`Error::InvalidInput`].
+    /// Detached commits reject keys. Cannot be combined with
+    /// [`Self::with_idempotency_property`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use lance::{Dataset, Error, Result};
+    /// # use lance::dataset::CommitBuilder;
+    /// # use lance::dataset::transaction::Transaction;
+    /// # async fn test(dataset: Arc<Dataset>, transaction: Transaction) -> Result<()> {
+    /// match CommitBuilder::new(dataset)
+    ///     .with_idempotency_keys(["message-17", "message-18"])
+    ///     .execute(transaction)
+    ///     .await
+    /// {
+    ///     Ok(_) => {}
+    ///     // The work was already applied (by `version`, for `keys`): acknowledge
+    ///     // the messages instead of applying them again.
+    ///     Err(Error::DuplicateTransaction { .. }) => {}
+    ///     Err(err) => return Err(err),
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_idempotency_keys(
+        mut self,
+        keys: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.idempotency_keys = Some(keys.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// Check this commit's idempotency keys, read from the transaction
+    /// property `property`, against every transaction committed after the
+    /// read version.
+    ///
+    /// `property` must be set on the transaction being committed and hold a
+    /// JSON array of strings; otherwise [`Self::execute`] fails with
+    /// [`Error::InvalidInput`]. The keys are also stored as the transaction's
+    /// idempotency keys, and other transactions' keys are read from both
+    /// `property` and the idempotency keys, so writers using this method and
+    /// writers using [`Self::with_idempotency_keys`] see each other's keys.
+    /// Transactions without either are not affected. Otherwise behaves as
+    /// [`Self::with_idempotency_keys`].
+    ///
+    /// Prefer [`Self::with_idempotency_keys`]. This method exists for writers
+    /// that already keep their keys in a transaction property of their own,
+    /// and is needed only while writers that read nothing but that property
+    /// share the table.
+    pub fn with_idempotency_property(mut self, property: impl Into<String>) -> Self {
+        self.idempotency_property = Some(property.into());
+        self
+    }
+
+    /// Add the idempotency keys configured on this builder to `transaction`.
+    fn add_idempotency_keys(&self, transaction: &mut Transaction) -> Result<()> {
+        match (&self.idempotency_keys, &self.idempotency_property) {
+            (Some(_), Some(property)) => Err(Error::invalid_input(format!(
+                "with_idempotency_keys and with_idempotency_property('{property}') are \
+                 mutually exclusive; pass the keys through one of them"
+            ))),
+            (Some(keys), None) => idempotency::add_keys(transaction, keys.iter().cloned()),
+            (None, Some(property)) => {
+                let keys = idempotency::caller_property_keys(transaction, property)?;
+                idempotency::add_keys(transaction, keys)
+            }
+            (None, None) => Ok(()),
+        }
+    }
+
     pub fn with_skip_auto_cleanup(mut self, skip_auto_cleanup: bool) -> Self {
         self.commit_config.skip_auto_cleanup = skip_auto_cleanup;
         self
@@ -333,7 +432,8 @@ impl<'a> CommitBuilder<'a> {
         }
     }
 
-    async fn execute_inner(self, transaction: Transaction) -> Result<Dataset> {
+    async fn execute_inner(self, mut transaction: Transaction) -> Result<Dataset> {
+        self.add_idempotency_keys(&mut transaction)?;
         if matches!(
             transaction.operation,
             Operation::Clone {
@@ -494,6 +594,7 @@ impl<'a> CommitBuilder<'a> {
                     self.retry_timeout,
                     manifest_naming_scheme,
                     self.affected_rows.as_ref(),
+                    self.idempotency_property.as_deref(),
                 )
                 .await?
             }
@@ -579,6 +680,46 @@ impl<'a> CommitBuilder<'a> {
         }
     }
 
+    /// The properties of a batch's merged transaction: the union of the
+    /// transactions' idempotency keys, also under the caller-named property
+    /// when one is set, so writers reading only that property see them.
+    /// `None` when no transaction carries keys.
+    ///
+    /// Fails when two transactions of the batch share a key: committing the
+    /// batch would apply that work twice.
+    fn batch_idempotency_properties(
+        &self,
+        transactions: &[Transaction],
+    ) -> Result<Option<Arc<HashMap<String, String>>>> {
+        let mut all = BTreeSet::new();
+        for (index, transaction) in transactions.iter().enumerate() {
+            let mut keys = idempotency::transaction_keys(transaction)?;
+            if let Some(property) = &self.idempotency_property {
+                keys.extend(idempotency::caller_property_keys(transaction, property)?);
+            }
+            if let Some(key) = keys.iter().find(|key| all.contains(*key)) {
+                return Err(Error::invalid_input(format!(
+                    "batch transaction {index} (uuid {}) shares the idempotency key '{key}' \
+                     with an earlier transaction of the batch",
+                    transaction.uuid
+                )));
+            }
+            all.extend(keys);
+        }
+        if all.is_empty() {
+            return Ok(None);
+        }
+        let encoded = idempotency::encode_keys(all);
+        let mut properties = HashMap::from([(IDEMPOTENCY_KEYS_PROPERTY.to_string(), encoded)]);
+        if let Some(property) = &self.idempotency_property {
+            properties.insert(
+                property.clone(),
+                properties[IDEMPOTENCY_KEYS_PROPERTY].clone(),
+            );
+        }
+        Ok(Some(Arc::new(properties)))
+    }
+
     /// Commit a set of transactions as a single new version.
     ///
     /// <div class="warning">
@@ -601,6 +742,7 @@ impl<'a> CommitBuilder<'a> {
         }
 
         let read_version = transactions.iter().map(|t| t.read_version).min().unwrap();
+        let transaction_properties = self.batch_idempotency_properties(&transactions)?;
 
         let merged = Transaction {
             uuid: uuid::Uuid::new_v4().hyphenated().to_string(),
@@ -615,7 +757,7 @@ impl<'a> CommitBuilder<'a> {
             },
             read_version,
             tag: None,
-            transaction_properties: None,
+            transaction_properties,
         };
         let dataset = self.execute(merged.clone()).await?;
         Ok(BatchCommitResult { dataset, merged })
@@ -878,8 +1020,11 @@ mod tests {
         assert_io_eq!(io_stats, write_iops, 2, "write txn + manifest");
     }
 
+    /// Keys add no IO: they are checked against transactions the commit
+    /// loads anyway.
+    #[rstest::rstest]
     #[tokio::test]
-    async fn test_commit_iops() {
+    async fn test_commit_iops(#[values(false, true)] has_keys: bool) {
         // If there's no conflicts, we should be able to commit in 2 io requests:
         // * write txn file (this could be optional one day)
         // * write manifest
@@ -905,7 +1050,11 @@ mod tests {
 
         dataset.object_store.as_ref().io_stats_incremental(); // Reset the stats
         let read_version = dataset.manifest().version;
-        let new_ds = CommitBuilder::new(Arc::new(dataset))
+        let mut builder = CommitBuilder::new(Arc::new(dataset));
+        if has_keys {
+            builder = builder.with_idempotency_keys(["key"]);
+        }
+        let new_ds = builder
             .execute(sample_transaction(read_version))
             .await
             .unwrap();
@@ -924,7 +1073,10 @@ mod tests {
 
     #[tokio::test]
     #[rstest::rstest]
-    async fn test_commit_conflict_iops(#[values(true, false)] use_cache: bool) {
+    async fn test_commit_conflict_iops(
+        #[values(true, false)] use_cache: bool,
+        #[values(false, true)] has_keys: bool,
+    ) {
         let cache_size = if use_cache { 1_000_000 } else { 0 };
         let session = Arc::new(Session::new(0, cache_size, Default::default()));
         // We need throttled to correctly count num hops. Otherwise, memory store
@@ -963,15 +1115,23 @@ mod tests {
 
         // Create 3 other transactions that happen concurrently.
         let num_other_txns = 3;
-        for _ in 0..num_other_txns {
-            dataset = CommitBuilder::new(original_dataset.clone())
+        for other in 0..num_other_txns {
+            let mut builder = CommitBuilder::new(original_dataset.clone());
+            if has_keys {
+                builder = builder.with_idempotency_keys([format!("other-{other}")]);
+            }
+            dataset = builder
                 .execute(sample_transaction(dataset.manifest().version))
                 .await
                 .unwrap();
         }
         dataset.object_store.as_ref().io_stats_incremental();
 
-        let new_ds = CommitBuilder::new(original_dataset.clone())
+        let mut builder = CommitBuilder::new(original_dataset.clone());
+        if has_keys {
+            builder = builder.with_idempotency_keys(["ours"]);
+        }
+        let new_ds = builder
             .execute(sample_transaction(original_dataset.manifest().version))
             .await
             .unwrap();
