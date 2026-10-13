@@ -3,7 +3,7 @@
 Clustering organizes data to improve query pruning. Lance records the table's
 current policy separately from information about individual outputs. Providers
 choose the layout and maintenance logic. This proposal defines the format in
-`clustering.proto`; the writer feature remains unsupported until implemented.
+`clustering.proto`.
 
 ## Stored Information
 
