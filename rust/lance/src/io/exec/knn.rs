@@ -18,7 +18,11 @@ use arrow_array::{
     cast::AsArray,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use datafusion::common::tree_node::TreeNodeRecursion;
+use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_plan::ChildStats;
 use datafusion::physical_plan::PlanProperties;
+use datafusion::physical_plan::StatisticsArgs;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, SendableRecordBatchStream,
@@ -959,6 +963,13 @@ impl ExecutionPlan for KNNVectorDistanceExec {
         vec![&self.input]
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         mut children: Vec<Arc<dyn ExecutionPlan>>,
@@ -1065,8 +1076,16 @@ impl ExecutionPlan for KNNVectorDistanceExec {
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
     }
 
-    fn partition_statistics(&self, partition: Option<usize>) -> DataFusionResult<Arc<Statistics>> {
-        let inner_stats = self.input.partition_statistics(partition)?;
+    fn child_stats_requests(&self, partition: Option<usize>) -> Vec<ChildStats> {
+        vec![ChildStats::At(partition)]
+    }
+
+    fn statistics_from_inputs(
+        &self,
+        input_stats: &[Arc<Statistics>],
+        _args: &StatisticsArgs,
+    ) -> DataFusionResult<Arc<Statistics>> {
+        let inner_stats = &input_stats[0];
         let input_schema = self.input.schema();
         let input_stats_by_name = inner_stats
             .column_statistics
@@ -1419,6 +1438,13 @@ impl ExecutionPlan for ANNIvfPartitionExec {
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
     }
 
     fn with_new_children(
@@ -2222,6 +2248,13 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
             .collect()
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         mut children: Vec<Arc<dyn ExecutionPlan>>,
@@ -2452,20 +2485,22 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
         )))
     }
 
-    fn partition_statistics(
+    fn child_stats_requests(&self, partition: Option<usize>) -> Vec<ChildStats> {
+        let mut requests = vec![ChildStats::Skip; self.children().len()];
+        requests[0] = ChildStats::At(partition);
+        requests
+    }
+
+    fn statistics_from_inputs(
         &self,
-        partition: Option<usize>,
-    ) -> DataFusionResult<Arc<datafusion::physical_plan::Statistics>> {
+        input_stats: &[Arc<Statistics>],
+        _args: &StatisticsArgs,
+    ) -> DataFusionResult<Arc<Statistics>> {
         Ok(Arc::new(Statistics {
             num_rows: Precision::Exact(
                 self.query.k
                     * self.query.refine_factor.unwrap_or(1) as usize
-                    * self
-                        .input
-                        .partition_statistics(partition)?
-                        .num_rows
-                        .get_value()
-                        .unwrap_or(&1),
+                    * input_stats[0].num_rows.get_value().unwrap_or(&1),
             ),
             ..Statistics::new_unknown(self.schema().as_ref())
         }))
@@ -2655,6 +2690,13 @@ impl ExecutionPlan for ANNIvfBatchExec {
             .iter()
             .map(|_| Distribution::SinglePartition)
             .collect()
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
     }
 
     fn with_new_children(
@@ -2934,6 +2976,13 @@ impl ExecutionPlan for MultivectorScoringExec {
             .collect()
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
@@ -3064,6 +3113,8 @@ impl ExecutionPlan for MultivectorScoringExec {
 mod tests {
     use super::adaptive_probe::AutoProbeConfig;
     use super::*;
+    use datafusion::physical_plan::StatisticsArgs;
+    use datafusion::physical_plan::StatisticsContext;
 
     use std::any::Any;
 
@@ -4522,7 +4573,9 @@ mod tests {
             },
         )
         .unwrap();
-        let stats = plan.partition_statistics(None).unwrap();
+        let stats = StatisticsContext::new()
+            .compute(&plan, &StatisticsArgs::new())
+            .unwrap();
         assert_eq!(
             stats.column_statistics.len(),
             plan.schema().fields().len(),

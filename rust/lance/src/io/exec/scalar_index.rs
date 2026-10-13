@@ -19,6 +19,8 @@ use arrow_array::{Array, ArrayRef, RecordBatch, UInt64Array, cast::AsArray, type
 use arrow_schema::{Schema, SchemaRef};
 use async_recursion::async_recursion;
 use async_trait::async_trait;
+use datafusion::common::tree_node::TreeNodeRecursion;
+use datafusion::physical_expr::PhysicalExpr;
 use datafusion::{
     execution::memory_pool::{MemoryConsumer, MemoryReservation},
     physical_plan::{
@@ -321,6 +323,13 @@ impl ExecutionPlan for ScalarIndexExec {
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> datafusion::error::Result<TreeNodeRecursion>,
+    ) -> datafusion::error::Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
     }
 
     fn with_new_children(
@@ -819,6 +828,13 @@ impl ExecutionPlan for MapIndexExec {
         vec![&self.input]
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> datafusion::error::Result<TreeNodeRecursion>,
+    ) -> datafusion::error::Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
@@ -1139,6 +1155,13 @@ impl ExecutionPlan for MaterializeIndexExec {
         vec![]
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> datafusion::error::Result<TreeNodeRecursion>,
+    ) -> datafusion::error::Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
@@ -1198,6 +1221,8 @@ impl ExecutionPlan for MaterializeIndexExec {
 
 #[cfg(test)]
 mod tests {
+    use datafusion::physical_plan::StatisticsArgs;
+    use datafusion::physical_plan::StatisticsContext;
     use std::{ops::Bound, sync::Arc};
 
     use crate::index::DatasetIndexExt;
@@ -1449,7 +1474,8 @@ mod tests {
         let verify = async |plan: ScalarIndexExec, schema: Arc<Schema>| {
             assert_eq!(plan.schema(), schema);
             assert_eq!(
-                plan.partition_statistics(None)
+                StatisticsContext::new()
+                    .compute(&plan, &StatisticsArgs::new())
                     .unwrap()
                     .column_statistics
                     .len(),

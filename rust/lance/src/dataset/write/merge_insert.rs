@@ -76,6 +76,7 @@ use arrow_select::take::take_record_batch;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{Column as DFColumn, NullEquality, TableReference};
 use datafusion::error::DataFusionError;
+use datafusion::physical_plan::replace_children_if_necessary;
 use datafusion::{
     catalog::{TableProvider, streaming::StreamingTable},
     datasource::MemTable,
@@ -1697,7 +1698,7 @@ impl MergeInsertJob {
                                 as Arc<dyn ExecutionPlan>
                         })
                         .collect();
-                    let new_node = node.with_new_children(new_children)?;
+                    let new_node = replace_children_if_necessary(node, new_children)?;
                     Ok(Transformed::yes(new_node))
                 } else {
                     Ok(Transformed::no(node))
@@ -3918,6 +3919,10 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
     use arrow_select::concat::concat_batches;
     use datafusion::common::Column;
+    use datafusion::physical_plan::ChildrenPropertiesMode;
+    use datafusion::physical_plan::ReplaceChildrenOptions;
+    use datafusion::physical_plan::StatisticsArgs;
+    use datafusion::physical_plan::StatisticsContext;
     use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
     use futures::{FutureExt, StreamExt, TryStreamExt, future::try_join_all};
     use lance_arrow::FixedSizeListArrayExt;
@@ -6796,8 +6801,11 @@ mod tests {
         );
 
         let rebuilt = plan
-            .with_new_children(vec![dummy_input.clone()])
-            .expect("with_new_children must accept exactly one child");
+            .replace_children(
+                vec![dummy_input.clone()],
+                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+            )
+            .expect("replace_children must accept exactly one child");
         let rebuilt_rendered = format!("{}", displayable(rebuilt.as_ref()).indent(false));
         assert!(
             rebuilt_rendered.contains("IndexedLookup [a, b]"),
@@ -15721,7 +15729,7 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
     }
 
     fn collect_exact_row_counts(plan: &Arc<dyn ExecutionPlan>, out: &mut Vec<usize>) {
-        if let Ok(stats) = plan.partition_statistics(None)
+        if let Ok(stats) = StatisticsContext::new().compute(plan.as_ref(), &StatisticsArgs::new())
             && let datafusion::common::stats::Precision::Exact(n) = stats.num_rows
         {
             out.push(n);

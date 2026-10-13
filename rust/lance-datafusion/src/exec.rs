@@ -15,6 +15,10 @@ use chrono::{DateTime, Utc};
 
 use arrow_array::RecordBatch;
 use arrow_schema::Schema as ArrowSchema;
+use datafusion::common::tree_node::TreeNodeRecursion;
+use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_plan::ChildStats;
+use datafusion::physical_plan::StatisticsArgs;
 use datafusion::{
     catalog::{TableProvider, streaming::StreamingTable},
     dataframe::DataFrame,
@@ -39,7 +43,9 @@ use datafusion::{
     },
 };
 use datafusion::{execution::memory_pool::TrackConsumersPool, physical_plan::metrics::MetricType};
-use datafusion_common::{DataFusionError, Statistics, utils::get_available_parallelism};
+use datafusion_common::{
+    DataFusionError, Statistics, config::ConfigNonZeroUsize, utils::get_available_parallelism,
+};
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
 
 use futures::{StreamExt, stream};
@@ -164,6 +170,13 @@ impl ExecutionPlan for OneShotExec {
         vec![]
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> datafusion_common::Result<TreeNodeRecursion>,
+    ) -> datafusion_common::Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
@@ -249,6 +262,13 @@ impl ExecutionPlan for TracedExec {
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![&self.input]
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> datafusion_common::Result<TreeNodeRecursion>,
+    ) -> datafusion_common::Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
     }
 
     fn with_new_children(
@@ -491,17 +511,22 @@ pub fn get_session_context(options: &LanceExecutionOptions) -> SessionContext {
 fn get_task_context(
     session_ctx: &SessionContext,
     options: &LanceExecutionOptions,
-) -> Arc<TaskContext> {
+) -> Result<Arc<TaskContext>> {
     // Build from the session state in place. `SessionContext::state` would clone
     // the whole state (every function map, rule list and option) only to drop
     // it, which is a measurable share of CPU for short queries.
     let task_ctx = TaskContext::from(session_ctx);
     let Some(batch_size) = options.batch_size else {
-        return Arc::new(task_ctx);
+        return Ok(Arc::new(task_ctx));
     };
+    let batch_size = ConfigNonZeroUsize::try_new(batch_size).map_err(|_| {
+        Error::invalid_input(format!(
+            "LanceExecutionOptions.batch_size must be greater than 0, got {batch_size}"
+        ))
+    })?;
     let mut session_config = task_ctx.session_config().clone();
     session_config.options_mut().execution.batch_size = batch_size;
-    Arc::new(task_ctx.with_session_config(session_config))
+    Ok(Arc::new(task_ctx.with_session_config(session_config)))
 }
 
 #[derive(Default, Clone, Debug, PartialEq, Eq)]
@@ -749,7 +774,7 @@ pub fn execute_plan(
         Arc::new(CoalescePartitionsExec::new(plan))
     };
 
-    let stream = plan.execute(0, get_task_context(&session_ctx, &options))?;
+    let stream = plan.execute(0, get_task_context(&session_ctx, &options)?)?;
 
     let schema = stream.schema();
     let stream = stream.finally(move || {
@@ -786,17 +811,17 @@ pub async fn analyze_plan_with_context(
 
     let schema = plan.schema();
     // TODO(tsaucer) I chose SUMMARY here but do we also want DEV?
-    let analyze = Arc::new(AnalyzeExec::new(
-        true,
-        true,
-        vec![MetricType::Summary],
-        None,
-        plan,
-        schema,
-    ));
+    let analyze = Arc::new(
+        AnalyzeExec::builder(true, true, plan, schema)
+            .with_metric_types(vec![MetricType::Summary])
+            .build(),
+    );
 
     let session_ctx = get_session_context(&options);
-    let task_context = task_context.unwrap_or_else(|| get_task_context(&session_ctx, &options));
+    let task_context = match task_context {
+        Some(task_context) => task_context,
+        None => get_task_context(&session_ctx, &options)?,
+    };
     assert_eq!(analyze.properties().partitioning.partition_count(), 1);
     let mut stream = analyze
         .execute(0, task_context)
@@ -1096,6 +1121,13 @@ impl ExecutionPlan for StrictBatchSizeExec {
         vec![&self.input]
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> datafusion_common::Result<TreeNodeRecursion>,
+    ) -> datafusion_common::Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
@@ -1125,11 +1157,16 @@ impl ExecutionPlan for StrictBatchSizeExec {
         vec![false]
     }
 
-    fn partition_statistics(
+    fn child_stats_requests(&self, partition: Option<usize>) -> Vec<ChildStats> {
+        vec![ChildStats::At(partition)]
+    }
+
+    fn statistics_from_inputs(
         &self,
-        partition: Option<usize>,
-    ) -> datafusion_common::Result<std::sync::Arc<Statistics>> {
-        self.input.partition_statistics(partition)
+        input_stats: &[Arc<Statistics>],
+        _args: &StatisticsArgs,
+    ) -> datafusion_common::Result<Arc<Statistics>> {
+        Ok(Arc::clone(&input_stats[0]))
     }
 
     fn cardinality_effect(&self) -> CardinalityEffect {
@@ -1200,6 +1237,13 @@ impl ExecutionPlan for HardCapBatchSizeExec {
         vec![&self.input]
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> datafusion_common::Result<TreeNodeRecursion>,
+    ) -> datafusion_common::Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
@@ -1250,11 +1294,16 @@ impl ExecutionPlan for HardCapBatchSizeExec {
         vec![false]
     }
 
-    fn partition_statistics(
+    fn child_stats_requests(&self, partition: Option<usize>) -> Vec<ChildStats> {
+        vec![ChildStats::At(partition)]
+    }
+
+    fn statistics_from_inputs(
         &self,
-        partition: Option<usize>,
-    ) -> datafusion_common::Result<std::sync::Arc<Statistics>> {
-        self.input.partition_statistics(partition)
+        input_stats: &[Arc<Statistics>],
+        _args: &StatisticsArgs,
+    ) -> datafusion_common::Result<Arc<Statistics>> {
+        Ok(Arc::clone(&input_stats[0]))
     }
 
     fn cardinality_effect(&self) -> CardinalityEffect {
@@ -1269,7 +1318,9 @@ impl ExecutionPlan for HardCapBatchSizeExec {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion::common::tree_node::TreeNodeRecursion;
     use datafusion::execution::memory_pool::MemoryConsumer;
+    use datafusion::physical_expr::PhysicalExpr;
 
     use arrow_array::{Int32Array, cast::AsArray, record_batch, types::Int32Type};
     use arrow_select::concat::concat_batches;
@@ -1412,11 +1463,11 @@ mod tests {
 
         let default_options = LanceExecutionOptions::default();
         let session_ctx = get_session_context(&default_options);
-        let task_ctx = get_task_context(&session_ctx, &default_options);
+        let task_ctx = get_task_context(&session_ctx, &default_options).unwrap();
         // Lance operators key per-execution state on the task context's identity.
         assert!(!Arc::ptr_eq(
             &task_ctx,
-            &get_task_context(&session_ctx, &default_options)
+            &get_task_context(&session_ctx, &default_options).unwrap()
         ));
         assert_eq!(task_ctx.session_id(), session_ctx.session_id());
         assert_eq!(
@@ -1437,7 +1488,7 @@ mod tests {
             ..Default::default()
         };
         let spill_session_ctx = get_session_context(&spill_options);
-        let spill_task_ctx = get_task_context(&spill_session_ctx, &spill_options);
+        let spill_task_ctx = get_task_context(&spill_session_ctx, &spill_options).unwrap();
         assert_eq!(spill_task_ctx.session_config().batch_size(), 17);
         assert_eq!(spill_task_ctx.session_config().target_partitions(), 3);
         assert!(
@@ -1488,6 +1539,20 @@ mod tests {
             sorted["x"].as_primitive::<Int32Type>(),
             &Int32Array::from(vec![0, 1, 2, 3, 4, 5])
         );
+    }
+
+    #[test]
+    fn test_execute_plan_rejects_zero_batch_size() {
+        let batch = record_batch!(("x", Int32, [1, 2])).unwrap();
+        let options = LanceExecutionOptions {
+            batch_size: Some(0),
+            ..Default::default()
+        };
+        let Err(err) = execute_plan(Arc::new(OneShotExec::from_batch(batch)), options) else {
+            panic!("a zero batch_size must be rejected");
+        };
+        assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
+        assert!(err.to_string().contains("batch_size"), "{err}");
     }
 
     #[test]
@@ -1605,6 +1670,15 @@ mod tests {
         fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
             vec![]
         }
+        fn apply_expressions(
+            &self,
+            _f: &mut dyn FnMut(
+                &Arc<dyn PhysicalExpr>,
+            ) -> datafusion_common::Result<TreeNodeRecursion>,
+        ) -> datafusion_common::Result<TreeNodeRecursion> {
+            Ok(TreeNodeRecursion::Continue)
+        }
+
         fn with_new_children(
             self: Arc<Self>,
             _children: Vec<Arc<dyn ExecutionPlan>>,

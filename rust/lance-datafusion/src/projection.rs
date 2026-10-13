@@ -3,7 +3,10 @@
 
 use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
-use datafusion::{logical_expr::Expr, physical_plan::projection::ProjectionExec};
+use datafusion::{
+    logical_expr::{Expr, physical_planning_context::PhysicalPlanningContext},
+    physical_plan::projection::ProjectionExec,
+};
 use datafusion_common::{Column, DFSchema};
 use datafusion_physical_expr::PhysicalExpr;
 use futures::TryStreamExt;
@@ -429,6 +432,7 @@ impl ProjectionPlan {
                         &expr,
                         physical_df_schema.as_ref(),
                         &Default::default(),
+                        &PhysicalPlanningContext::default(),
                     )?,
                     output_column.name.clone(),
                 ))
