@@ -202,9 +202,7 @@ impl Display for Value<'_> {
                     if i > 0 {
                         write!(f, ",")?;
                     }
-                    write!(f, "\"")?;
-                    write!(f, "{k}")?;
-                    write!(f, "\"")?;
+                    write!(f, "{k:?}")?;
                     write!(f, ":")?;
                     write!(f, "{v}")?;
                 }
