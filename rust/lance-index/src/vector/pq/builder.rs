@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use crate::vector::quantizer::QuantizerBuildParams;
 use arrow::array::PrimitiveBuilder;
+use arrow::compute::cast;
 use arrow_array::types::{Float16Type, Float64Type};
 use arrow_array::{Array, ArrayRef, cast::AsArray, types::Float32Type};
 use arrow_array::{ArrowNumericType, FixedSizeListArray, PrimitiveArray};
@@ -16,6 +17,7 @@ use lance_arrow::FixedSizeListArrayExt;
 use lance_core::{Error, Result};
 use lance_linalg::distance::DistanceType;
 use lance_linalg::distance::{Dot, L2, Normalize};
+use rayon::prelude::*;
 
 use super::ProductQuantizer;
 use super::utils::divide_to_subvectors;
@@ -145,8 +147,11 @@ impl PQBuildParams {
         let dimension = data.value_length() as usize;
         let sub_vector_dimension = dimension / self.num_sub_vectors;
 
+        // One k-means per sub-vector; they are independent and each is a small
+        // problem (sample × sub_vector_dimension), so run them side by side rather
+        // than one after another.
         let d = sub_vectors
-            .into_iter()
+            .into_par_iter()
             .enumerate()
             .map(|(sub_vec_idx, sub_vec)| {
                 let params = KMeansParams::new(
@@ -234,7 +239,42 @@ impl PQBuildParams {
 
         // TODO: support bf16 later.
         match fsl.value_type() {
-            DataType::Float16 => self.build_from_fsl::<Float16Type>(fsl, distance_type),
+            DataType::Float16 => {
+                // Half-precision k-means scores sub-vectors one centroid at a time
+                // through a scalar f16 path and accumulates centroids in f16; train on
+                // a widened copy of the sample and narrow the codebook back to the
+                // column's type for storage.
+                let widen = |fsl: &FixedSizeListArray| -> Result<FixedSizeListArray> {
+                    let values = cast(fsl.values(), &DataType::Float32)?;
+                    Ok(FixedSizeListArray::try_new_from_values(
+                        values.as_primitive::<Float32Type>().clone(),
+                        fsl.value_length(),
+                    )?)
+                };
+                let codebook = match self.codebook.as_ref() {
+                    Some(codebook) => {
+                        Some(Arc::new(widen(codebook.as_fixed_size_list())?) as ArrayRef)
+                    }
+                    None => None,
+                };
+                let params = Self {
+                    codebook,
+                    ..self.clone()
+                };
+                let pq = params.build_from_fsl::<Float32Type>(&widen(fsl)?, distance_type)?;
+                let codebook = cast(pq.codebook.values(), &DataType::Float16)?;
+                let codebook = FixedSizeListArray::try_new_from_values(
+                    codebook.as_primitive::<Float16Type>().clone(),
+                    pq.codebook.value_length(),
+                )?;
+                Ok(ProductQuantizer::new(
+                    pq.num_sub_vectors,
+                    pq.num_bits,
+                    pq.dimension,
+                    codebook,
+                    pq.distance_type,
+                ))
+            }
             DataType::Float32 => self.build_from_fsl::<Float32Type>(fsl, distance_type),
             DataType::Float64 => self.build_from_fsl::<Float64Type>(fsl, distance_type),
             _ => Err(Error::index(format!(
@@ -311,6 +351,69 @@ mod tests {
         assert_eq!(
             pq.codebook.values().as_primitive::<Float32Type>().values(),
             expected.as_slice()
+        );
+    }
+
+    /// An f16 column is trained on a widened copy and gets an f16 codebook back:
+    /// the same values as training on the f32 copy and narrowing the result.
+    #[test]
+    fn test_build_f16_trains_widened_and_narrows_codebook() {
+        const N: usize = 1024;
+        const DIM: usize = 8;
+        const NUM_SUB_VECTORS: usize = 2;
+        const NUM_BITS: usize = 2;
+        const K: usize = 1 << NUM_BITS;
+        const SUB_DIM: usize = DIM / NUM_SUB_VECTORS;
+
+        let values = Float32Array::from_iter((0..N).flat_map(|row| {
+            let cluster = row % K;
+            (0..DIM).map(move |col| (cluster * 100 + col) as f32 + (row % 7) as f32 * 0.25)
+        }));
+        let f16_values = cast(&values, &DataType::Float16).unwrap();
+        let f16_data = FixedSizeListArray::try_new_from_values(
+            f16_values.as_primitive::<Float16Type>().clone(),
+            DIM as i32,
+        )
+        .unwrap();
+        let widened = cast(&f16_values, &DataType::Float32).unwrap();
+        let f32_data = FixedSizeListArray::try_new_from_values(
+            widened.as_primitive::<Float32Type>().clone(),
+            DIM as i32,
+        )
+        .unwrap();
+
+        let init_values: Vec<f32> = (0..NUM_SUB_VECTORS * K)
+            .flat_map(|i| (0..SUB_DIM).map(move |col| (i % K * 100 + col) as f32))
+            .collect();
+        let init_f32: ArrayRef = Arc::new(
+            FixedSizeListArray::try_new_from_values(Float32Array::from(init_values), DIM as i32)
+                .unwrap(),
+        );
+        let init_f16 = cast(
+            &init_f32,
+            &DataType::FixedSizeList(
+                Arc::new(arrow_schema::Field::new("item", DataType::Float16, true)),
+                DIM as i32,
+            ),
+        )
+        .unwrap();
+
+        let pq_f16 = PQBuildParams::with_codebook(NUM_SUB_VECTORS, NUM_BITS, init_f16)
+            .build(&f16_data, DistanceType::L2)
+            .unwrap();
+        let pq_f32 = PQBuildParams::with_codebook(NUM_SUB_VECTORS, NUM_BITS, init_f32)
+            .build(&f32_data, DistanceType::L2)
+            .unwrap();
+
+        assert_eq!(pq_f16.codebook.value_type(), DataType::Float16);
+        let narrowed = cast(pq_f32.codebook.values(), &DataType::Float16).unwrap();
+        assert_eq!(
+            pq_f16
+                .codebook
+                .values()
+                .as_primitive::<Float16Type>()
+                .values(),
+            narrowed.as_primitive::<Float16Type>().values()
         );
     }
 
