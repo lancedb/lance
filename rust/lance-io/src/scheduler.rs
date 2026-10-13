@@ -1171,7 +1171,8 @@ pub struct FileScheduler {
 
 fn is_close_together(range1: &Range<u64>, range2: &Range<u64>, block_size: u64) -> bool {
     // Note that range1.end <= range2.start is possible (e.g. when decoding string arrays)
-    range2.start <= (range1.end + block_size)
+    // A gap from `FileScheduler::with_block_size` may be as large as `u64::MAX`.
+    range2.start <= range1.end.saturating_add(block_size)
 }
 
 fn is_overlapping(range1: &Range<u64>, range2: &Range<u64>) -> bool {
@@ -1290,13 +1291,16 @@ impl FileScheduler {
                         let mut merged_bytes = Vec::with_capacity(orig_size as usize);
                         merged_bytes.extend_from_slice(&bytes_vec[updated_index].slice(start..));
                         let mut copy_offset = merged_bytes.len() as u64;
+                        // Later ranges may overlap this one, so keep their search
+                        // cursor at this range's first chunk while copying its tail.
+                        let mut copy_index = updated_index;
                         while copy_offset < orig_size {
-                            updated_index += 1;
-                            let next_range = &updated_requests[updated_index];
+                            copy_index += 1;
+                            let next_range = &updated_requests[copy_index];
                             let bytes_to_take =
                                 (orig_size - copy_offset).min(next_range.end - next_range.start);
                             merged_bytes.extend_from_slice(
-                                &bytes_vec[updated_index].slice(0..bytes_to_take as usize),
+                                &bytes_vec[copy_index].slice(0..bytes_to_take as usize),
                             );
                             copy_offset += bytes_to_take;
                         }
@@ -1336,6 +1340,21 @@ impl FileScheduler {
     pub fn with_io_stats(&self, stats: Arc<dyn IoStatsRecorder>) -> Self {
         Self {
             extra_stats: Some(stats),
+            ..self.clone()
+        }
+    }
+
+    /// Returns a copy of this scheduler that merges the ranges of a request
+    /// that are at most `block_size` bytes apart into one I/O, instead of
+    /// using the object store's block size.
+    ///
+    /// Each requested range is still cut back out of the merged read, so the
+    /// bytes returned are the same for every gap; only the number and size of
+    /// the I/Os change. A wider gap trades extra bytes for fewer requests,
+    /// which pays off where every request is a round trip to remote storage.
+    pub fn with_block_size(&self, block_size: u64) -> Self {
+        Self {
+            block_size,
             ..self.clone()
         }
     }
@@ -1713,6 +1732,84 @@ mod tests {
             );
         }
         assert_eq!(11, scheduler.stats().iops);
+
+        // A gap set on the file scheduler replaces the store's 4KiB block
+        // size: gap 0 merges only touching ranges, a wider gap merges every
+        // range it reaches, and `u64::MAX` merges them all. Each range still
+        // gets exactly its own bytes.
+        let reads = vec![
+            50_000..51_000,
+            52_000..53_000,
+            150_000..151_000,
+            151_000..152_000,
+        ];
+        for (gap, expected_iops) in [(0, 3), (4 * 1024, 2), (100_000, 1), (u64::MAX, 1)] {
+            let iops_before = scheduler.stats().iops;
+            let bytes = file_scheduler
+                .with_block_size(gap)
+                .submit_request(reads.clone(), 0)
+                .await
+                .unwrap();
+            assert_eq!(bytes.len(), reads.len(), "gap={gap}");
+            for (range, bytes) in reads.iter().zip(&bytes) {
+                let expected = &some_data[range.start as usize..range.end as usize];
+                assert_eq!(bytes, expected, "gap={gap} range={range:?}");
+            }
+            assert_eq!(
+                scheduler.stats().iops - iops_before,
+                expected_iops,
+                "gap={gap}"
+            );
+        }
+        // The scheduler the gap was set on keeps the store's block size.
+        let iops_before = scheduler.stats().iops;
+        file_scheduler.submit_request(reads, 0).await.unwrap();
+        assert_eq!(scheduler.stats().iops - iops_before, 2);
+    }
+
+    #[rstest]
+    #[case::nested(vec![0..15, 5..6, 24..25])]
+    #[case::overlapping(vec![0..15, 5..20, 24..25])]
+    #[case::duplicate(vec![0..15, 0..15, 24..25])]
+    #[case::spanning(vec![0..31, 5..7, 20..25, 40..41])]
+    #[case::disjoint(vec![0..15, 24..25])]
+    #[tokio::test]
+    async fn test_coalesce_overlapping_ranges(
+        #[case] ranges: Vec<Range<u64>>,
+        #[values(0, 4, 256 * 1024, u64::MAX)] gap: u64,
+        #[values(false, true)] use_lite_scheduler: bool,
+    ) {
+        let path = Path::parse("overlapping-ranges").unwrap();
+        let source = (0_u8..64).collect::<Vec<_>>();
+        let object_store = Arc::new(ObjectStore::memory());
+        object_store.put(&path, &source).await.unwrap();
+        let scheduler = ScanScheduler::new(
+            object_store,
+            SchedulerConfig {
+                use_lite_scheduler: Some(use_lite_scheduler),
+                ..SchedulerConfig::default_for_testing()
+            },
+        );
+        let mut file_scheduler = scheduler
+            .open_file(&path, &CachedFileSize::unknown())
+            .await
+            .unwrap()
+            .with_block_size(gap);
+        // Preserve the production split/reassembly boundary with a tiny fixture.
+        file_scheduler.max_iop_size = 16;
+
+        let bytes = file_scheduler
+            .submit_request(ranges.clone(), 0)
+            .await
+            .unwrap();
+
+        assert_eq!(bytes.len(), ranges.len());
+        for (bytes, range) in bytes.iter().zip(&ranges) {
+            assert_eq!(
+                bytes.as_ref(),
+                &source[range.start as usize..range.end as usize]
+            );
+        }
     }
 
     #[rstest]
