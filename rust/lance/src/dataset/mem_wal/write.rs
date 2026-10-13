@@ -4635,11 +4635,10 @@ impl MessageHandler<TriggerWalFlush> for WalFlushHandler {
 
         let result = self.do_flush(source, end_batch_position).await;
 
-        // Propagate the just-appended WAL entry position back into the
-        // writer state so a subsequent MemTable freeze can stamp the
-        // correct `covered_wal_entry_position` into the manifest. Without
-        // this, `replay_after_wal_entry_position` stays at 0 and replay
-        // re-reads already-flushed entries after restart.
+        // Record the just-appended WAL entry position in the writer state. A
+        // freeze stamps it on the outgoing memtable, and the memtable flush
+        // falls back to that stamp when the memtable's store recorded no
+        // append of its own.
         //
         // Always update state before signalling the completion cell so any
         // waiter that reads state immediately after the cell fires sees

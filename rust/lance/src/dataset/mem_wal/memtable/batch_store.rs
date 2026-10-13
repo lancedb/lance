@@ -711,14 +711,14 @@ impl BatchStore {
     }
 
     /// Record that the WAL entry at `position` holds batches of this store.
-    pub fn record_wal_entry_position(&self, position: u64) {
+    pub(crate) fn record_wal_entry_position(&self, position: u64) {
         self.last_wal_entry_position
             .fetch_max(position, Ordering::AcqRel);
     }
 
     /// Highest WAL entry position holding batches of this store, or `None`
     /// if none has been recorded.
-    pub fn last_wal_entry_position(&self) -> Option<u64> {
+    pub(crate) fn last_wal_entry_position(&self) -> Option<u64> {
         match self.last_wal_entry_position.load(Ordering::Acquire) {
             0 => None,
             position => Some(position),
