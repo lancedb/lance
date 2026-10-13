@@ -583,10 +583,9 @@ class LsmVectorSearchPlanner:
             Columns to project.  Returns all columns + ``_distance`` if
             omitted.
         refine_base_table : bool, optional
-            When true, the base-table arm re-ranks its candidates with exact
-            distances.  Useful when the base index is approximate (e.g.
-            IVF-PQ).  Memtable arms use exact HNSW and are unaffected.
-            Auto-enabled whenever stale filtering is on (see ``overfetch_factor``).
+            When true, the base-table and SSTable arms re-rank their candidates
+            with exact distances. Auto-enabled when a newer generation blocks
+            the base table.
         overfetch_factor : float, optional
             Over-fetch multiple for sources with rows superseded by newer
             generations. Must be at least ``1.0``. At ``1.0`` each affected
