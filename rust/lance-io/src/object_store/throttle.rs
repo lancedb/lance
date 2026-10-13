@@ -763,15 +763,110 @@ fn is_delete_request(request: &HttpRequest) -> bool {
         })
 }
 
-/// Whether a lowercased multipart-complete response body carries an S3-style
-/// `InternalError` payload. S3 can answer `CompleteMultipartUpload` with HTTP
-/// 200 and an error document; the tag may carry a namespace or attributes, so
-/// the match is on the opening-tag prefix rather than the exact `<error>`
-/// element. The success body (`<CompleteMultipartUploadResult>`) contains
-/// neither marker.
+/// The `Code` of an XML error document — a root `Error` element, optionally
+/// namespaced or carrying attributes, whose first `Code` child holds the error
+/// code — or `None` when `body` is not one.
+///
+/// S3, GCS and Azure all answer errors with this shape. Success documents
+/// (e.g. `CompleteMultipartUploadResult`) return `None` whatever text they
+/// carry, so an object key echoed in `<Key>` or `<Location>` cannot be
+/// mistaken for an error code.
 #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
-fn is_retryable_complete_error_body(body: &str) -> bool {
-    body.contains("<error") && body.contains("internalerror")
+fn error_document_code(body: &str) -> Option<&str> {
+    /// The local name of the element whose tag starts `tag` (after `<`).
+    fn local_name(tag: &str) -> &str {
+        let end = tag
+            .find(|c: char| c.is_ascii_whitespace() || c == '>' || c == '/')
+            .unwrap_or(tag.len());
+        let name = &tag[..end];
+        name.rsplit_once(':').map_or(name, |(_, local)| local)
+    }
+
+    let mut rest = body.trim_start_matches('\u{feff}').trim_start();
+    if rest.starts_with("<?") {
+        rest = rest[rest.find("?>")? + 2..].trim_start();
+    }
+    let root = rest.strip_prefix('<')?;
+    if !local_name(root).eq_ignore_ascii_case("Error") {
+        return None;
+    }
+    let root_end = root.find('>')?;
+    if root[..root_end].ends_with('/') {
+        return None;
+    }
+
+    // Walk the root's content, tracking depth so only a direct child counts.
+    let mut rest = &root[root_end + 1..];
+    let mut depth = 0usize;
+    while let Some(start) = rest.find('<') {
+        let tag = &rest[start + 1..];
+        let end = tag.find('>')?;
+        let content = &tag[end + 1..];
+        if tag.starts_with('/') {
+            // At depth 0 this closes the root, which had no `Code` child.
+            depth = depth.checked_sub(1)?;
+        } else if !tag.starts_with(['!', '?']) && !tag[..end].ends_with('/') {
+            if depth == 0 && local_name(tag).eq_ignore_ascii_case("Code") {
+                let code = content[..content.find('<')?].trim();
+                return (!code.is_empty()).then_some(code);
+            }
+            depth += 1;
+        }
+        rest = content;
+    }
+    None
+}
+
+/// Whether an error code reports throttling or overload.
+#[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+fn is_throttle_error_code(code: &str) -> bool {
+    code.eq_ignore_ascii_case("RequestTimeout")
+        || code.eq_ignore_ascii_case("SlowDown")
+        || code.eq_ignore_ascii_case("ServerBusy")
+        || code.to_ascii_lowercase().contains("throttl")
+}
+
+/// What a multipart request's response body says beyond its status.
+#[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct BodyVerdict {
+    retryable: bool,
+    throttle: bool,
+}
+
+/// Classifies a multipart request's response body.
+///
+/// An XML error document is judged by its `Code` alone. A complete answered
+/// with `InternalError` is retryable even under HTTP 200: S3 can report a
+/// failed `CompleteMultipartUpload` that way, and re-sending the request
+/// repeats the exact completion because it carries the serialized part list.
+/// A 2xx body that is not an error document is a success. Any other body on
+/// an error status falls back to matching throttle markers anywhere in it.
+#[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+fn classify_multipart_response_body(
+    status: ::http::StatusCode,
+    body: &str,
+    is_complete: bool,
+) -> BodyVerdict {
+    if let Some(code) = error_document_code(body) {
+        let throttle = is_throttle_error_code(code);
+        return BodyVerdict {
+            retryable: throttle || (is_complete && code.eq_ignore_ascii_case("InternalError")),
+            throttle,
+        };
+    }
+    if status.is_success() {
+        return BodyVerdict::default();
+    }
+    let body = body.to_ascii_lowercase();
+    let throttle = body.contains("requesttimeout")
+        || body.contains("slowdown")
+        || body.contains("serverbusy")
+        || body.contains("throttl");
+    BodyVerdict {
+        retryable: throttle,
+        throttle,
+    }
 }
 
 #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
@@ -842,20 +937,13 @@ impl HttpService for AimdHttpService {
                 let (parts, body) = response.into_parts();
                 result = match body.bytes().await {
                     Ok(bytes) => {
-                        let body = String::from_utf8_lossy(&bytes).to_ascii_lowercase();
-                        let is_throttle_body = body.contains("requesttimeout")
-                            || body.contains("slowdown")
-                            || body.contains("serverbusy")
-                            || body.contains("throttl");
-                        is_retryable |= is_throttle_body;
-                        is_throttle |= is_throttle_body;
-                        // S3 can answer a complete with HTTP 200 carrying an
-                        // error body. Retrying is safe: the request already
-                        // holds the serialized part list, so re-sending it
-                        // repeats the exact completion.
-                        if is_complete && is_retryable_complete_error_body(&body) {
-                            is_retryable = true;
-                        }
+                        let verdict = classify_multipart_response_body(
+                            status,
+                            &String::from_utf8_lossy(&bytes),
+                            is_complete,
+                        );
+                        is_retryable |= verdict.retryable;
+                        is_throttle |= verdict.throttle;
                         Ok(HttpResponse::from_parts(
                             parts,
                             HttpResponseBody::from(bytes),
@@ -1386,21 +1474,113 @@ mod tests {
 
     #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
     #[rstest]
-    #[case::plain_internal_error(
-        "<error><code>internalerror</code><message>internal error</message></error>",
-        true
+    #[case::plain(
+        "<Error><Code>InternalError</Code><Message>internal error</Message></Error>",
+        Some("InternalError")
     )]
-    #[case::namespaced_internal_error(
-        "<error xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><code>internalerror</code></error>",
-        true
+    #[case::namespaced(
+        "<Error xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Code>SlowDown</Code></Error>",
+        Some("SlowDown")
     )]
-    #[case::success_result(
-        "<?xml version=\"1.0\"?><completemultipartuploadresult><etag>\"e\"</etag></completemultipartuploadresult>",
+    #[case::prefixed(
+        "<s3:Error><s3:Code>ServerBusy</s3:Code></s3:Error>",
+        Some("ServerBusy")
+    )]
+    #[case::declaration_and_bom(
+        "\u{feff}<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error>\n  <Code> RequestTimeout </Code>\n</Error>",
+        Some("RequestTimeout")
+    )]
+    #[case::code_after_other_children(
+        "<Error><Message>m</Message><Code>AccessDenied</Code></Error>",
+        Some("AccessDenied")
+    )]
+    #[case::nested_code_is_not_a_child(
+        "<Error><Details><Code>SlowDown</Code></Details></Error>",
+        None
+    )]
+    #[case::success_document_with_throttle_words(
+        "<?xml version=\"1.0\"?><CompleteMultipartUploadResult><Location>https://bucket/slowdown/object</Location><Key>throttle-demo/object</Key><Code>SlowDown</Code></CompleteMultipartUploadResult>",
+        None
+    )]
+    #[case::error_without_code("<Error><Message>SlowDown</Message></Error>", None)]
+    #[case::empty_code("<Error><Code></Code></Error>", None)]
+    #[case::self_closing_root("<Error/>", None)]
+    #[case::not_xml("SlowDown: Please reduce your request rate", None)]
+    #[case::empty("", None)]
+    fn test_error_document_code(#[case] body: &str, #[case] expected: Option<&str>) {
+        assert_eq!(error_document_code(body), expected);
+    }
+
+    #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+    #[rstest]
+    #[case::complete_success_key_with_throttle_word(
+        200,
+        "<CompleteMultipartUploadResult><Key>throttle-demo/object</Key></CompleteMultipartUploadResult>",
+        true,
+        false,
         false
     )]
-    #[case::other_error("<error><code>accessdenied</code></error>", false)]
-    fn test_is_retryable_complete_error_body(#[case] body: &str, #[case] expected: bool) {
-        assert_eq!(is_retryable_complete_error_body(body), expected);
+    #[case::complete_200_internal_error(
+        200,
+        "<Error xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Code>InternalError</Code></Error>",
+        true,
+        true,
+        false
+    )]
+    #[case::part_200_internal_error(
+        200,
+        "<Error><Code>InternalError</Code></Error>",
+        false,
+        false,
+        false
+    )]
+    #[case::complete_200_slowdown(200, "<Error><Code>SlowDown</Code></Error>", true, true, true)]
+    #[case::part_503_slowdown(503, "<Error><Code>SlowDown</Code></Error>", false, true, true)]
+    #[case::azure_throttled_code(
+        503,
+        "<Error><Code>OperationTimedOutThrottled</Code></Error>",
+        false,
+        true,
+        true
+    )]
+    #[case::other_code_with_throttle_word_in_key(
+        404,
+        "<Error><Code>NoSuchUpload</Code><Key>slowdown/object</Key></Error>",
+        true,
+        false,
+        false
+    )]
+    #[case::success_not_xml(200, "slowdown", false, false, false)]
+    #[case::error_not_xml_fallback(
+        503,
+        "SlowDown: Please reduce your request rate",
+        false,
+        true,
+        true
+    )]
+    #[case::error_other_document_fallback(
+        400,
+        "<html><body>Request throttled</body></html>",
+        true,
+        true,
+        true
+    )]
+    #[case::error_without_marker(400, "bad request", false, false, false)]
+    fn test_classify_multipart_response_body(
+        #[case] status: u16,
+        #[case] body: &str,
+        #[case] is_complete: bool,
+        #[case] retryable: bool,
+        #[case] throttle: bool,
+    ) {
+        let status = ::http::StatusCode::from_u16(status).unwrap();
+        assert_eq!(
+            classify_multipart_response_body(status, body, is_complete),
+            BodyVerdict {
+                retryable,
+                throttle
+            }
+        );
     }
 
     #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
@@ -3049,6 +3229,67 @@ mod tests {
             2,
             "a 200 InternalError complete should be retried once at the HTTP layer"
         );
+    }
+
+    /// A successful complete echoes the object key in `<Key>`; a key holding a
+    /// throttle word must not trigger a retry, which would replay an upload
+    /// that already completed and fail with `NoSuchUpload`.
+    #[cfg(feature = "aws")]
+    #[tokio::test(start_paused = true)]
+    #[rstest]
+    #[case::throttle("throttle-demo/object")]
+    #[case::slowdown("slowdown/object")]
+    #[case::serverbusy("serverbusy/object")]
+    #[case::requesttimeout("requesttimeout/object")]
+    #[case::ordinary("data/object")]
+    async fn test_gate_successful_completion_response(#[case] key: &str) {
+        #[derive(Debug)]
+        struct Completed {
+            key: String,
+            calls: Arc<AtomicUsize>,
+        }
+        #[async_trait]
+        impl HttpService for Completed {
+            async fn call(&self, _: HttpRequest) -> Result<HttpResponse, HttpError> {
+                let (status, body) = if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    (
+                        ::http::StatusCode::OK,
+                        format!(
+                            "<CompleteMultipartUploadResult><Location>https://bucket/{0}</Location><Key>{0}</Key><ETag>\"etag\"</ETag></CompleteMultipartUploadResult>",
+                            self.key
+                        ),
+                    )
+                } else {
+                    (
+                        ::http::StatusCode::NOT_FOUND,
+                        "<Error><Code>NoSuchUpload</Code></Error>".to_string(),
+                    )
+                };
+                Ok(::http::Response::builder()
+                    .status(status)
+                    .body(HttpResponseBody::from(body))
+                    .unwrap())
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let state = AimdThrottleState::new(AimdThrottleConfig::default()).unwrap();
+        let service = AimdHttpService {
+            inner: HttpClient::new(Completed {
+                key: key.to_string(),
+                calls: Arc::clone(&calls),
+            }),
+            write: Some(state.write),
+            delete: None,
+        };
+        let request = ::http::Request::builder()
+            .method(::http::Method::POST)
+            .uri(format!("https://bucket/{key}?uploadId=id"))
+            .body(object_store::client::HttpRequestBody::empty())
+            .unwrap();
+        let response = service.call(request).await.unwrap();
+        assert_eq!(response.status(), ::http::StatusCode::OK);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     /// The wrapper must surface the target's real error rather than retry
