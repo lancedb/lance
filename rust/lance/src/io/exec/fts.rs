@@ -288,7 +288,7 @@ async fn open_fts_segment(
 ///
 /// Exact multi-segment BM25 still needs every segment's local corpus statistics, so the
 /// current correctness-first path opens each committed segment before scoring.
-async fn open_fts_segments(
+pub(crate) async fn open_fts_segments(
     dataset: &Dataset,
     column: &str,
     segments: &[IndexMetadata],
@@ -2264,13 +2264,13 @@ impl ExecutionPlan for CrossColumnCompoundQueryExec {
 }
 
 /// Fall back to the default simple tokenizer when no on-disk FTS segment exists.
-fn default_text_tokenizer() -> Box<dyn LanceTokenizer> {
+pub(crate) fn default_text_tokenizer() -> Box<dyn LanceTokenizer> {
     Box::new(TextTokenizer::new(
         TextAnalyzer::builder(SimpleTokenizer::default()).build(),
     ))
 }
 
-fn tokenizer_for_match_query(
+pub(crate) fn tokenizer_for_match_query(
     index: &InvertedIndex,
     fuzziness: Option<u32>,
 ) -> Box<dyn LanceTokenizer> {

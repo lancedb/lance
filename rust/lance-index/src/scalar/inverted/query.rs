@@ -1041,7 +1041,7 @@ impl FtsQueryNode for BooleanQuery {
     }
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct Tokens {
     tokens: Vec<String>,
     positions: Vec<u32>,

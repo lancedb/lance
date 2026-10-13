@@ -8,6 +8,7 @@ mod compound;
 mod cross_column;
 mod documents;
 mod encoding;
+pub mod highlight;
 mod impact;
 mod index;
 mod iter;
