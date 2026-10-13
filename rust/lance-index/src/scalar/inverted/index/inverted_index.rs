@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::scalar::RowAddrTranslatorRef;
+use crate::scalar::inverted::documents::DocumentRemapping;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_index_core::remapping::RowAddrTranslator;
 
@@ -238,7 +239,7 @@ impl InvertedIndex {
     pub(in super::super) fn with_store(
         &self,
         store: Arc<dyn IndexStore>,
-        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        remapping: Option<DocumentRemapping>,
     ) -> Result<Option<Self>> {
         if self.is_legacy() || self.partitions.iter().any(|part| part.is_legacy()) {
             return Ok(None);
@@ -258,7 +259,7 @@ impl InvertedIndex {
                         .with_store(store.clone(), posting_file_path(part.id))?,
                 ),
                 docs: PartitionDocumentStore::Modern(Arc::new(
-                    docs.with_store(store, frag_reuse_index.clone()),
+                    docs.with_store(store, remapping.clone()),
                 )),
                 token_set_format: part.token_set_format,
             }));

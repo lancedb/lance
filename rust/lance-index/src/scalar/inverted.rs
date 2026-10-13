@@ -42,6 +42,7 @@ pub use compound::{
 #[doc(hidden)]
 pub use cross_column::cross_column_compound_search;
 use datafusion::execution::SendableRecordBatchStream;
+use documents::DocumentRemapping;
 pub use index::*;
 use lance_core::{Result, cache::LanceCache};
 pub use lance_tokenizer::Language;
@@ -678,7 +679,7 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
                     .downcast_ref::<InvertedIndex>()
                     .ok_or_else(|| Error::internal("cached FTS index has an unexpected type"))?;
                 index
-                    .with_store(rebind_store, frag_reuse_index)
+                    .with_store(rebind_store, frag_reuse_index.map(DocumentRemapping::Sync))
                     .map(|index| index.map(|index| Arc::new(index) as Arc<dyn ScalarIndex>))
             },
             |index| self.cache_snapshot(index),
@@ -715,6 +716,21 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
             .map(|index| index.map(|index| Arc::new(index) as Arc<dyn ScalarIndex>))
     }
 
+    fn rebind_with_remapping(
+        &self,
+        index: &dyn ScalarIndex,
+        index_store: Arc<dyn IndexStore>,
+        remapping: Option<Arc<dyn BatchRowIdRemapper>>,
+    ) -> Result<Option<Arc<dyn ScalarIndex>>> {
+        lance_index_core::remapping::check_batch_remapping_entry()?;
+        index
+            .as_any()
+            .downcast_ref::<InvertedIndex>()
+            .ok_or_else(|| Error::internal("cached FTS index has an unexpected type"))?
+            .with_store(index_store, remapping.map(DocumentRemapping::Batch))
+            .map(|index| index.map(|index| Arc::new(index) as Arc<dyn ScalarIndex>))
+    }
+
     async fn get_from_cache(
         &self,
         index_store: Arc<dyn IndexStore>,
@@ -732,7 +748,7 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
             .as_any()
             .downcast_ref::<InvertedIndex>()
             .ok_or_else(|| Error::internal("cached FTS index has an unexpected type"))?
-            .with_store(index_store, frag_reuse_index)
+            .with_store(index_store, frag_reuse_index.map(DocumentRemapping::Sync))
             .map(|index| index.map(|index| Arc::new(index) as Arc<dyn ScalarIndex>))
     }
 

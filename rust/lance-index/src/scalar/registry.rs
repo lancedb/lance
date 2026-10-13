@@ -266,6 +266,25 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
         Ok(None)
     }
 
+    /// Reconstruct cached state with the current store and batch row-ID remapper.
+    ///
+    /// The caller scopes the state to an immutable index and fragment-reuse
+    /// namespace. Implementations may share decoded and prewarmed data, but must
+    /// replace request-owned readers and remappers. Returning `None` falls back
+    /// to [`load_index_with_remapping`](Self::load_index_with_remapping).
+    /// Plugins providing a [`cache_snapshot`](Self::cache_snapshot) for batch
+    /// remapping should override this to preserve that state across requests.
+    ///
+    /// See [`single_flight_store_bound_open_with_snapshot`] for an example.
+    fn rebind_with_remapping(
+        &self,
+        _index: &dyn ScalarIndex,
+        _index_store: Arc<dyn IndexStore>,
+        _remapping: Option<Arc<dyn BatchRowIdRemapper>>,
+    ) -> Result<Option<Arc<dyn ScalarIndex>>> {
+        Ok(None)
+    }
+
     /// Open an index through the cache, awaiting `load` only on a miss.
     ///
     /// The default read-through / write-back over
@@ -446,10 +465,16 @@ where
 /// # use lance_index::scalar::{IndexStore, ScalarIndex};
 /// # use lance_index::scalar::registry::{ScalarIndexLoad, ScalarIndexPlugin,
 /// #     single_flight_store_bound_open_with_snapshot};
+/// # use lance_index_core::remapping::BatchRowIdRemapper;
 /// # async fn open(plugin: &dyn ScalarIndexPlugin, store: Arc<dyn IndexStore>,
-/// #     cache: &LanceCache, load: ScalarIndexLoad<'_>) -> Result<Arc<dyn ScalarIndex>> {
+/// #     cache: &LanceCache, load: ScalarIndexLoad<'_>,
+/// #     remapping: Arc<dyn BatchRowIdRemapper>) -> Result<Arc<dyn ScalarIndex>> {
+/// let rebind_store = store.clone();
 /// single_flight_store_bound_open_with_snapshot(
-///     store, cache, load, |_| async { Ok(None) },
+///     store, cache, load,
+///     |index| async move {
+///         plugin.rebind_with_remapping(index.as_ref(), rebind_store, Some(remapping))
+///     },
 ///     |index| plugin.cache_snapshot(index),
 /// ).await
 /// # }
