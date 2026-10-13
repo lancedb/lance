@@ -569,6 +569,16 @@ async fn write_sq_storage(
     };
     let row_ids = column(ROW_ID)?;
     let vectors = column(FLAT_COLUMN)?;
+    // Cosine search ranks L2 against a normalized query, so stored vectors must
+    // be normalized. The graph is unaffected: raw cosine and normalized L2 order
+    // neighbors identically.
+    let vectors: Arc<dyn Array> = if distance_type == DistanceType::Cosine {
+        Arc::new(lance_linalg::kernels::normalize_fsl(
+            vectors.as_fixed_size_list(),
+        )?)
+    } else {
+        vectors
+    };
     let vectors = vectors.as_fixed_size_list();
     let mut sq = ScalarQuantizer::new(8, dim);
     let bounds: Range<f64> = sq.update_bounds::<Float32Type>(vectors)?;
