@@ -11,6 +11,11 @@ false positives that require rechecking.
 In addition, since finding NULLs is a common query pattern, the index also maintains a
 bitmap of null rows which allows it to return exact results for IS NULL queries.
 
+Statistics collected during data-file writes are described in
+[Zone-level Column Statistics](../../file/column_statistics.md). These write seeds
+have their own format and version, separate from the index file described below.
+An index builder may reuse compatible seeds instead of scanning column values.
+
 ## Index Details
 
 ```protobuf
