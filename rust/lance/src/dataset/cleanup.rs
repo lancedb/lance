@@ -430,8 +430,6 @@ impl<'a> CleanupOperation<'a> {
     /// Set the maximum in-flight file deletes shared with all cascaded branches.
     ///
     /// If unset, the initiating dataset's object store I/O parallelism is used.
-    /// Independent calls to execute do not share limits. This setting does not
-    /// affect listing or manifest reads and is not persisted in dataset config.
     /// Returns an invalid-input error outside `1..=tokio::sync::Semaphore::MAX_PERMITS`.
     ///
     /// ```
@@ -455,8 +453,6 @@ impl<'a> CleanupOperation<'a> {
     ///
     /// Overrides [`CleanupPolicy::delete_rate_limit`]; without an override, the
     /// policy's rate applies. If neither is set, deletes are not rate limited.
-    /// Cascades ignore their own concurrency and QPS config, including invalid values.
-    /// This setting is independent of concurrency and is not persisted in dataset config.
     /// Returns a cleanup error if `rate` is zero. See [`Self::with_delete_concurrency`]
     /// for an example configuring both limits.
     pub fn with_delete_rate_limit(mut self, rate: u64) -> Result<Self> {
@@ -1130,7 +1126,11 @@ impl<'a> CleanupTask<'a> {
             Ok(file)
         });
 
-        if let Some(execution) = &self.delete_execution {
+        if deletes_files {
+            let execution = self
+                .delete_execution
+                .as_ref()
+                .expect("execute requires a deletion context");
             // Deleting here rather than through `remove_stream` keeps each outcome
             // attached to its file, which is what lets the stats below count what was
             // actually removed instead of what was merely attempted.
@@ -3455,7 +3455,22 @@ mod tests {
         .unwrap();
         assert!(preview.delete_execution.is_none());
 
+        // Explain must remain read-only even if a caller forwards an execution context.
+        let execution = CleanupTask::new(&operation, CleanupAction::Execute).unwrap();
+        let preview = CleanupTask::new_with_ignored_manifests(
+            &operation,
+            preview.action,
+            HashSet::new(),
+            false,
+            true,
+            execution.delete_execution,
+        )
+        .unwrap()
+        .run()
+        .await
+        .unwrap();
         let explanation = operation.explain().await.unwrap();
+        assert_eq!(preview.stats, explanation.stats);
         let after_preview_count = fixture.count_files().await.unwrap();
 
         // Files are not actually removed when explaining cleanup.

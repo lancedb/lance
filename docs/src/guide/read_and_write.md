@@ -596,8 +596,8 @@ dataset.cleanup_old_versions(
 
 Control file deletion throughput with two independent options:
 
-- `delete_concurrency`: maximum concurrent deletes. Defaults to the object store's
-  I/O parallelism; an explicit value overrides it, including `LANCE_IO_THREADS`.
+- `delete_concurrency`: maximum concurrent file deletes. If omitted, uses the object
+  store's I/O parallelism, configurable via the `LANCE_IO_THREADS` environment variable.
 - `delete_rate_limit`: maximum delete requests per second. Unlimited when omitted.
 
 Both values must be positive integers.
