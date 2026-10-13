@@ -5,6 +5,7 @@ use std::collections::{HashMap, hash_map::Entry};
 use std::sync::Arc;
 
 use futures::{FutureExt, TryStreamExt};
+use lance_core::utils::address::RowAddress;
 use lance_core::{Error, Result};
 use lance_file::reader::FileReaderOptions;
 use lance_file::versions::data_file_columns;
@@ -39,7 +40,8 @@ use super::vector::{LogicalVectorIndex, VectorIndexParams, details, fresh_vector
 use super::{CreateIndexBuilder, DatasetIndexExt, DatasetIndexInternalExt};
 use crate::dataset::Dataset;
 use crate::dataset::index::LanceIndexStoreExt;
-use crate::dataset::rowids::load_row_id_sequences;
+use crate::dataset::overlay::{collect_overlay_stale_rows_for_segment, overlaid_fragments};
+use crate::dataset::rowids::{load_row_id_sequences, translate_addr_treemap_to_row_ids};
 use crate::index::scalar::{
     IndexDetails, TrainingRows, fetch_index_details, load_fts_training_data, load_training_data,
     scan_training_data,
@@ -383,6 +385,90 @@ pub async fn build_per_segment_filters(
         filters.push(build_old_data_filter(dataset, &effective, &deleted, address_domain).await?);
     }
     Ok((effective_union, filters))
+}
+
+/// What a remapping merge re-reads. Returns the stale rows, those an overlay replaced after
+/// the source segment covering them was built, which are dropped from each source's
+/// carried-over entries, and the scan selection: those rows and every row of the unindexed
+/// fragments, as one selection so the scan sorts them together. Both are keyed like the
+/// old-data filters ([`OldIndexDataFilter`]): row ids under stable row ids, addresses
+/// otherwise.
+async fn overlay_rescan(
+    dataset: &Dataset,
+    selected_old_indices: &[&IndexMetadata],
+    effective_old_frags: &RoaringBitmap,
+    unindexed: &[Fragment],
+) -> Result<(RowAddrTreeMap, TrainingRows)> {
+    // The same per-row, field-aware, version-gated check the scanner masks by.
+    let overlaid = overlaid_fragments(&dataset.manifest.fragments);
+    let mut stale_offsets: HashMap<u32, RoaringBitmap> = HashMap::new();
+    for segment in selected_old_indices {
+        collect_overlay_stale_rows_for_segment(
+            segment,
+            &overlaid,
+            &mut stale_offsets,
+            dataset.schema(),
+        )?;
+    }
+    let mut stale_rows = RowAddrTreeMap::new();
+    for (fragment_id, offsets) in stale_offsets {
+        if effective_old_frags.contains(fragment_id) {
+            stale_rows.insert_bitmap(fragment_id, offsets);
+        }
+    }
+    if stale_rows.is_empty() {
+        return Ok((stale_rows, TrainingRows::Fragments(unindexed.to_vec())));
+    }
+    let mut selection = stale_rows.clone();
+    for fragment in unindexed {
+        selection.insert_fragment(fragment.id as u32);
+    }
+    if dataset.manifest.uses_stable_row_ids() {
+        stale_rows = translate_addr_treemap_to_row_ids(dataset, &stale_rows).await?;
+        selection = translate_addr_treemap_to_row_ids(dataset, &selection).await?;
+    }
+    Ok((stale_rows, TrainingRows::Rows(selection)))
+}
+
+/// Remove `stale_rows` from a segment's old-data filter ([`OldIndexDataFilter`]): the rows
+/// an overlay replaced after the segment was built, keyed like the filter (row ids under
+/// stable row ids, addresses otherwise). The merge re-reads them.
+fn block_stale_rows(
+    dataset: &Dataset,
+    filter: Option<OldIndexDataFilter>,
+    stale_rows: &RowAddrTreeMap,
+) -> Option<OldIndexDataFilter> {
+    match filter {
+        // `to_remove` is bookkeeping no scalar merge reads.
+        Some(OldIndexDataFilter::Fragments {
+            to_keep,
+            to_remove: _,
+        }) if stale_rows
+            .iter()
+            .any(|(fragment_id, _)| to_keep.contains(*fragment_id)) =>
+        {
+            // Every row of the kept fragments, one run each, minus the stale ones.
+            let mut allow = RowAddrTreeMap::new();
+            for fragment_id in to_keep.iter() {
+                let physical_rows = dataset
+                    .get_fragment(fragment_id as usize)
+                    .and_then(|fragment| fragment.metadata().physical_rows);
+                match physical_rows {
+                    Some(physical_rows) => {
+                        let start = u64::from(RowAddress::new_from_parts(fragment_id, 0));
+                        allow.insert_range(start..start + physical_rows as u64);
+                    }
+                    None => allow.insert_fragment(fragment_id),
+                }
+            }
+            allow -= stale_rows;
+            Some(OldIndexDataFilter::RowIds(allow))
+        }
+        Some(OldIndexDataFilter::RowIds(valid)) => {
+            Some(OldIndexDataFilter::RowIds(valid - stale_rows))
+        }
+        other => other,
+    }
 }
 
 /// Attempt to read seed buffers for `index` from `fragments`' data files.
@@ -730,6 +816,26 @@ async fn merge_scalar_indices<'a>(
         None => split_segment_coverage(dataset.as_ref(), selected_old_indices.iter().copied()),
     };
 
+    // A remapping merge is stamped with the manifest it read (below): its sources were
+    // translated through the fragment-reuse index, so the trim may retire the versions they
+    // predate, and overlay masking will trust it for every overlay up to that manifest.
+    // Entries carried over from a source never incorporate overlays committed after it was
+    // built, so those rows are dropped from the carried-over data and re-read instead.
+    let (stale_rows, scan_selection) = if reference_index.can_remap() {
+        overlay_rescan(
+            dataset.as_ref(),
+            &selected_old_indices,
+            &effective_old_frags,
+            unindexed,
+        )
+        .await?
+    } else {
+        (
+            RowAddrTreeMap::new(),
+            TrainingRows::Fragments(unindexed.to_vec()),
+        )
+    };
+
     // The fragments a from-scratch rebuild must scan: everything the merged
     // segment will answer for, all of it live.
     let mut rebuild_frags = base_unindexed_bitmap.clone();
@@ -823,8 +929,9 @@ async fn merge_scalar_indices<'a>(
         let details = IndexDetails(index_details.clone());
         let plugin = details.get_plugin()?;
         // Only open data files looking for seeds when the plugin confirms this
-        // index type and configuration can actually produce them.
-        let maybe_created = if plugin.might_use_seeds(&index_details) {
+        // index type and configuration can actually produce them, and never when
+        // overlaid rows must be read: a seed predates any overlay.
+        let maybe_created = if plugin.might_use_seeds(&index_details) && stale_rows.is_empty() {
             if let Some(seeds) =
                 try_harvest_seeds(dataset.as_ref(), unindexed, reference_idx).await?
             {
@@ -845,9 +952,15 @@ async fn merge_scalar_indices<'a>(
                 dataset.as_ref(),
                 field_path,
                 &update_criteria,
-                TrainingRows::Fragments(unindexed.to_vec()),
+                scan_selection,
             )
             .await?;
+            let per_segment_filters = |filters: Vec<Option<OldIndexDataFilter>>| {
+                filters
+                    .into_iter()
+                    .map(|filter| block_stale_rows(dataset.as_ref(), filter, &stale_rows))
+                    .collect::<Vec<_>>()
+            };
 
             match index_type {
                 IndexType::BTree => {
@@ -858,6 +971,7 @@ async fn merge_scalar_indices<'a>(
                         true,
                     )
                     .await?;
+                    let old_data_filters = per_segment_filters(old_data_filters);
                     crate::index::scalar::btree::open_and_merge_segments(
                         dataset.as_ref(),
                         field_path,
@@ -877,6 +991,7 @@ async fn merge_scalar_indices<'a>(
                         false,
                     )
                     .await?;
+                    let old_data_filters = per_segment_filters(old_data_filters);
                     crate::index::scalar::bitmap::open_and_merge_segments(
                         dataset.as_ref(),
                         field_path,
@@ -896,6 +1011,7 @@ async fn merge_scalar_indices<'a>(
                         false,
                     )
                     .await?;
+                    let old_data_filters = per_segment_filters(old_data_filters);
                     crate::index::scalar::ngram::open_and_merge_segments(
                         dataset.as_ref(),
                         &selected_old_indices,
@@ -914,18 +1030,24 @@ async fn merge_scalar_indices<'a>(
                         false,
                     )
                     .await?;
+                    let old_data_filter =
+                        block_stale_rows(dataset.as_ref(), old_data_filter, &stale_rows);
                     reference_index
                         .update(new_data_stream, &new_store, old_data_filter)
                         .await?
                 }
             }
         };
-        let source_dataset_version = selected_old_indices
-            .iter()
-            .map(|index| index.dataset_version)
-            .min()
-            .unwrap_or(dataset.manifest.version);
-        (created_index, source_dataset_version)
+        let new_dataset_version = if reference_index.can_remap() {
+            dataset.manifest.version
+        } else {
+            selected_old_indices
+                .iter()
+                .map(|index| index.dataset_version)
+                .min()
+                .unwrap_or(dataset.manifest.version)
+        };
+        (created_index, new_dataset_version)
     };
 
     Ok(Some((

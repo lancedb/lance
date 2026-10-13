@@ -149,7 +149,6 @@ pub(crate) enum TrainingRows {
     /// merge uses this to re-read the rows an overlay replaced after a source
     /// segment was built, together with the appended fragments, in one sorted
     /// scan.
-    #[allow(dead_code)] // No caller selects by row yet.
     Rows(RowAddrTreeMap),
 }
 

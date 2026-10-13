@@ -16,22 +16,27 @@ use arrow_array::{ArrayRef, Int32Array, RecordBatch, RecordBatchIterator, String
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use lance_core::utils::address::RowAddress;
 use lance_index::IndexType;
+use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::BuiltinIndexType;
 use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::ScalarIndexParams;
+use lance_index::scalar::TextQuery;
 use lance_index::scalar::inverted::query::{
     BooleanQuery, FtsQuery, MatchQuery, MultiMatchQuery, Occur, PhraseQuery,
 };
 use lance_index::scalar::inverted::{DocumentGranularity, InvertedIndexParams};
 use lance_index::scalar::minhash_lsh::MinHashQuery;
+use lance_index::scalar::{AnyQuery, SargableQuery};
 use lance_io::utils::CachedFileSize;
 use lance_linalg::distance::MetricType;
-use lance_table::format::DataFile;
+use lance_select::RowSetOps;
 use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
+use lance_table::format::{DataFile, IndexMetadata};
 use roaring::RoaringBitmap;
 use rstest::rstest;
 
+use datafusion::scalar::ScalarValue;
 use lance_file::writer::FileWriterOptions;
 
 use crate::Dataset;
@@ -202,6 +207,113 @@ async fn commit_single_fragment_segments(
         .await
         .unwrap();
     source_version
+}
+
+/// Merges `name`'s segments and the unindexed fragments into one segment that covers
+/// `fragments` and is stamped with the manifest the merge read.
+async fn optimize_into_one_segment(
+    dataset: &mut Dataset,
+    name: &str,
+    options: &OptimizeOptions,
+    fragments: &[u32],
+) -> IndexMetadata {
+    let built_from = dataset.manifest.version;
+    dataset.optimize_indices(options).await.unwrap();
+    let committed = dataset.load_indices_by_name(name).await.unwrap();
+    assert_eq!(committed.len(), 1, "{committed:?}");
+    assert_eq!(
+        committed[0].fragment_bitmap,
+        Some(fragments.iter().copied().collect())
+    );
+    assert_eq!(committed[0].dataset_version, built_from);
+    committed[0].clone()
+}
+
+/// One segment and nothing unindexed: another optimize leaves `segment` as it is.
+async fn assert_optimize_is_noop(
+    dataset: &mut Dataset,
+    options: &OptimizeOptions,
+    segment: &IndexMetadata,
+) {
+    let steady_version = dataset.manifest.version;
+    dataset.optimize_indices(options).await.unwrap();
+    assert_eq!(dataset.manifest.version, steady_version);
+    let again = dataset.load_indices_by_name(&segment.name).await.unwrap();
+    assert_eq!(again.len(), 1);
+    assert_eq!(again[0].uuid, segment.uuid);
+    assert_eq!(again[0].dataset_version, segment.dataset_version);
+    assert_eq!(again[0].fragment_bitmap, segment.fragment_bitmap);
+}
+
+/// Rows the index files themselves hold for `query`, before the scanner applies coverage or
+/// masks: what the merge wrote, not what a query returns.
+async fn scalar_index_hits(
+    dataset: &Dataset,
+    column: &str,
+    index_name: &str,
+    query: &dyn AnyQuery,
+) -> u64 {
+    let index = crate::index::scalar_logical::open_named_scalar_index(
+        dataset,
+        column,
+        index_name,
+        &NoOpMetricsCollector,
+    )
+    .await
+    .unwrap();
+    let result = index.search(query, &NoOpMetricsCollector).await.unwrap();
+    result.row_addrs().true_rows().len().unwrap()
+}
+
+/// [`scalar_index_hits`] for `age = value` on the `age_idx` index.
+async fn age_hits(dataset: &Dataset, value: i32) -> u64 {
+    scalar_index_hits(
+        dataset,
+        "age",
+        "age_idx",
+        &SargableQuery::Equals(ScalarValue::Int32(Some(value))),
+    )
+    .await
+}
+
+/// The indexed scan and the index-disabled scan both return exactly `expected`. The flat path
+/// reads overlays and deletion vectors itself, so it is the oracle for what the index returns.
+async fn assert_ids_match_oracle(dataset: &Dataset, filter: &str, expected: &[i32]) {
+    assert_eq!(
+        ids_matching(dataset, filter).await,
+        expected,
+        "indexed scan: {filter}"
+    );
+    let mut scanner = dataset.scan();
+    scanner
+        .filter(filter)
+        .unwrap()
+        .project(&["id"])
+        .unwrap()
+        .use_scalar_index(false);
+    let batch = scanner.try_into_batch().await.unwrap();
+    let mut ids = ids_from_batches(std::slice::from_ref(&batch));
+    ids.sort_unstable();
+    assert_eq!(ids, expected, "index-disabled scan: {filter}");
+}
+
+/// The plan for `filter` answers from the index for every fragment: a fragment no segment
+/// covers would add a `LanceScan` branch for it.
+async fn assert_answered_by_index(dataset: &Dataset, filter: &str) {
+    let plan = dataset
+        .scan()
+        .filter(filter)
+        .unwrap()
+        .project(&["id"])
+        .unwrap()
+        .explain_plan(false)
+        .await
+        .unwrap();
+    assert!(plan.contains("ScalarIndexQuery"), "{filter}: {plan}");
+    assert!(
+        !plan.contains("LanceScan"),
+        "{filter}: a fragment fell back to a scan: {plan}"
+    );
 }
 
 /// Sorted `id` values returned by a filtered scan.
@@ -986,12 +1098,24 @@ async fn fts_ids_matching(dataset: &Dataset, term: &str) -> Vec<i32> {
     fts_ids(dataset, FullTextSearchQuery::new(term.to_owned())).await
 }
 
+/// [`scalar_index_hits`] for `contains(text, pattern)` on the `text_ngram` index.
+async fn ngram_index_hits(dataset: &Dataset, pattern: &str) -> u64 {
+    let query = TextQuery::StringContains(pattern.to_string());
+    scalar_index_hits(dataset, "text", "text_ngram", &query).await
+}
+
+/// The NGram merge primitive gets the stale rows too: the merged file holds the post-overlay
+/// text only and covers both fragments.
+#[rstest]
 #[tokio::test]
-async fn test_ngram_optimize_preserves_overlay_staleness() {
-    let mut dataset = create_text_dataset(false).await;
+async fn test_ngram_merge_rescans_overlay_stale_fragment(
+    #[values(false, true)] stable_row_ids: bool,
+) {
+    let mut dataset = create_text_dataset(stable_row_ids).await;
     let source_version =
         commit_single_fragment_segments(&mut dataset, "text", IndexType::NGram, "text_ngram").await;
 
+    // Fragment 0, row 1: "apple banana" -> "cherry mango", committed after the segments.
     let mut dataset = commit_overlay(
         dataset,
         "ngram_text_overlay",
@@ -1001,22 +1125,23 @@ async fn test_ngram_optimize_preserves_overlay_staleness() {
         vec![Arc::new(StringArray::from(vec![Some("cherry mango")]))],
     )
     .await;
-    dataset
-        .optimize_indices(&OptimizeOptions::merge(2))
-        .await
-        .unwrap();
 
-    let committed = dataset.load_indices_by_name("text_ngram").await.unwrap();
-    assert_eq!(committed.len(), 1);
-    assert_eq!(committed[0].dataset_version, source_version);
-    assert_eq!(
-        ids_matching(&dataset, "contains(text, 'apple')").await,
-        vec![0]
-    );
-    assert_eq!(
-        ids_matching(&dataset, "contains(text, 'mango')").await,
-        vec![1, 6]
-    );
+    let merge = OptimizeOptions::merge(2);
+    let merged = optimize_into_one_segment(&mut dataset, "text_ngram", &merge, &[0, 1]).await;
+    assert!(merged.dataset_version > source_version);
+    // Row 1 was re-read with the overlay applied: its "apple" and "banana" are gone, its
+    // "cherry" and "mango" join the base rows that hold them; fragment 1 was carried over.
+    assert_eq!(ngram_index_hits(&dataset, "apple").await, 1);
+    assert_eq!(ngram_index_hits(&dataset, "banana").await, 1);
+    assert_eq!(ngram_index_hits(&dataset, "cherry").await, 2);
+    assert_eq!(ngram_index_hits(&dataset, "mango").await, 2);
+    assert_eq!(ngram_index_hits(&dataset, "pear").await, 1);
+    assert_ids_match_oracle(&dataset, "contains(text, 'apple')", &[0]).await;
+    assert_ids_match_oracle(&dataset, "contains(text, 'banana')", &[3]).await;
+    assert_ids_match_oracle(&dataset, "contains(text, 'mango')", &[1, 6]).await;
+    assert_ids_match_oracle(&dataset, "contains(text, 'cherry')", &[1, 2]).await;
+    assert_answered_by_index(&dataset, "contains(text, 'mango')").await;
+    assert_optimize_is_noop(&mut dataset, &merge, &merged).await;
 }
 
 #[tokio::test]
@@ -2797,15 +2922,12 @@ async fn append_age_fragment(dataset: &mut Dataset, ids: std::ops::Range<i32>) {
         .unwrap();
 }
 
-// `OptimizeIndices` merges an index's delta segments without re-reading data overlays, so the
-// merged segment carries the old segments' pre-overlay entries. What keeps those entries masked
-// is that the merge stamps the new segment with the *oldest* merged segment's `dataset_version`
-// rather than the current one, leaving the mask's version gate
-// (`overlay.committed_version > segment.dataset_version`) on.
-//
-// That invariant is easy to break by accident -- stamping the current version un-masks every
-// carried-over entry -- and nothing else asserts it end to end. The following tests pin it down
-// for each index type.
+// `OptimizeIndices` merges an index's delta segments. A type that can remap through the
+// fragment-reuse index (BTree, Bitmap) is stamped with the manifest the merge read and
+// re-reads the overlaid rows, so the merged file holds current values. One that cannot
+// (ZoneMap) carries the pre-overlay entries and keeps them masked by stamping the oldest
+// source's `dataset_version`, which keeps the mask's version gate on. Either way the overlaid
+// value must win end to end; the following tests pin it down per index type.
 
 /// Scalar (BTree, Bitmap, ZoneMap): a range query over the indexed column after an overlay +
 /// optimize must still drop the stale value and surface the overlaid one.
@@ -2814,6 +2936,8 @@ async fn append_age_fragment(dataset: &mut Dataset, ids: std::ops::Range<i32>) {
 /// pre-overlay zone summaries out of the merged segment. Breaking the version gate shows up here
 /// as a false *negative* -- the stale zone prunes the overlaid value -- rather than the resurfaced
 /// stale entry the other two produce.
+///
+/// With one segment and nothing unindexed the optimize is a no-op and the overlay stays masked.
 #[rstest]
 #[case::btree(IndexType::BTree)]
 #[case::bitmap(IndexType::Bitmap)]
@@ -2825,6 +2949,7 @@ async fn test_optimize_preserves_scalar_overlay_masking(#[case] index_type: Inde
         .create_index(&["age"], index_type, None, &scalar_params(index_type), true)
         .await
         .unwrap();
+    let source = dataset.load_indices_by_name("age_idx").await.unwrap()[0].clone();
 
     // Overlay fragment 0, offset 1 (id=1): age 10 -> 999, committed after the index.
     let mut dataset = commit_overlay(
@@ -2841,15 +2966,20 @@ async fn test_optimize_preserves_scalar_overlay_masking(#[case] index_type: Inde
     assert_eq!(ids_matching(&dataset, "age = 10").await, Vec::<i32>::new());
     assert_eq!(ids_matching(&dataset, "age = 999").await, vec![1]);
 
+    assert_optimize_is_noop(&mut dataset, &OptimizeOptions::merge(1), &source).await;
+    assert_eq!(ids_matching(&dataset, "age = 10").await, Vec::<i32>::new());
+    assert_eq!(ids_matching(&dataset, "age = 999").await, vec![1]);
+
     // Append an unindexed fragment so the merge does real work, then merge all deltas.
     append_age_fragment(&mut dataset, 12..18).await;
+    let built_from = dataset.manifest.version;
     dataset
         .optimize_indices(&OptimizeOptions::merge(10))
         .await
         .unwrap();
 
-    // Still masked: the stale age=10 entry stays dropped and the overlaid age=999 value stays
-    // visible, because the merged segment kept the old segment's `dataset_version`.
+    // Still correct, whether the merge kept the old stamp (ZoneMap) or re-read the overlaid
+    // row (BTree, Bitmap).
     assert_eq!(
         ids_matching(&dataset, "age = 10").await,
         Vec::<i32>::new(),
@@ -2862,6 +2992,23 @@ async fn test_optimize_preserves_scalar_overlay_masking(#[case] index_type: Inde
     );
     // A row untouched by the overlay is unaffected.
     assert_eq!(ids_matching(&dataset, "age = 20").await, vec![2]);
+
+    let merged = dataset.load_indices_by_name("age_idx").await.unwrap();
+    assert_eq!(merged.len(), 1);
+    assert_eq!(
+        merged[0].fragment_bitmap,
+        Some(RoaringBitmap::from_iter([0u32, 1, 2]))
+    );
+    if index_type == IndexType::ZoneMap {
+        assert_eq!(
+            merged[0].dataset_version, source.dataset_version,
+            "a type that cannot remap keeps the oldest source's stamp"
+        );
+    } else {
+        assert_eq!(merged[0].dataset_version, built_from);
+        assert_eq!(age_hits(&dataset, 999).await, 1);
+        assert_eq!(age_hits(&dataset, 10).await, 0);
+    }
 }
 
 /// ZoneMap seed path: an *unindexed* fragment carrying an overlay gets folded into the merged
