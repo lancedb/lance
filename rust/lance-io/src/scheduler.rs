@@ -1291,13 +1291,16 @@ impl FileScheduler {
                         let mut merged_bytes = Vec::with_capacity(orig_size as usize);
                         merged_bytes.extend_from_slice(&bytes_vec[updated_index].slice(start..));
                         let mut copy_offset = merged_bytes.len() as u64;
+                        // Later ranges may overlap this one, so keep their search
+                        // cursor at this range's first chunk while copying its tail.
+                        let mut copy_index = updated_index;
                         while copy_offset < orig_size {
-                            updated_index += 1;
-                            let next_range = &updated_requests[updated_index];
+                            copy_index += 1;
+                            let next_range = &updated_requests[copy_index];
                             let bytes_to_take =
                                 (orig_size - copy_offset).min(next_range.end - next_range.start);
                             merged_bytes.extend_from_slice(
-                                &bytes_vec[updated_index].slice(0..bytes_to_take as usize),
+                                &bytes_vec[copy_index].slice(0..bytes_to_take as usize),
                             );
                             copy_offset += bytes_to_take;
                         }
@@ -1762,6 +1765,51 @@ mod tests {
         let iops_before = scheduler.stats().iops;
         file_scheduler.submit_request(reads, 0).await.unwrap();
         assert_eq!(scheduler.stats().iops - iops_before, 2);
+    }
+
+    #[rstest]
+    #[case::nested(vec![0..15, 5..6, 24..25])]
+    #[case::overlapping(vec![0..15, 5..20, 24..25])]
+    #[case::duplicate(vec![0..15, 0..15, 24..25])]
+    #[case::spanning(vec![0..31, 5..7, 20..25, 40..41])]
+    #[case::disjoint(vec![0..15, 24..25])]
+    #[tokio::test]
+    async fn test_coalesce_overlapping_ranges(
+        #[case] ranges: Vec<Range<u64>>,
+        #[values(0, 4, 256 * 1024, u64::MAX)] gap: u64,
+        #[values(false, true)] use_lite_scheduler: bool,
+    ) {
+        let path = Path::parse("overlapping-ranges").unwrap();
+        let source = (0_u8..64).collect::<Vec<_>>();
+        let object_store = Arc::new(ObjectStore::memory());
+        object_store.put(&path, &source).await.unwrap();
+        let scheduler = ScanScheduler::new(
+            object_store,
+            SchedulerConfig {
+                use_lite_scheduler: Some(use_lite_scheduler),
+                ..SchedulerConfig::default_for_testing()
+            },
+        );
+        let mut file_scheduler = scheduler
+            .open_file(&path, &CachedFileSize::unknown())
+            .await
+            .unwrap()
+            .with_block_size(gap);
+        // Preserve the production split/reassembly boundary with a tiny fixture.
+        file_scheduler.max_iop_size = 16;
+
+        let bytes = file_scheduler
+            .submit_request(ranges.clone(), 0)
+            .await
+            .unwrap();
+
+        assert_eq!(bytes.len(), ranges.len());
+        for (bytes, range) in bytes.iter().zip(&ranges) {
+            assert_eq!(
+                bytes.as_ref(),
+                &source[range.start as usize..range.end as usize]
+            );
+        }
     }
 
     #[rstest]
