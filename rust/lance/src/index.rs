@@ -2689,7 +2689,7 @@ impl DatasetIndexExt for Dataset {
                     // call. The raw ledger and mapping readers are already cached
                     // by frag_reuse_reader; this caches its derived output.
                     let derived_key = DerivedIndexListingKey {
-                        version: self.version().version,
+                        version: self.manifest.version,
                         store_identity: &self.object_store.store_prefix,
                         e_tag: self.manifest_location.e_tag.as_deref(),
                     };
@@ -3782,7 +3782,7 @@ pub(crate) fn warn_about_unsupported_indices(indices: &[IndexMetadata]) {
 /// second question too: a name it cannot see is a name it will hand out twice.
 pub(crate) async fn load_all_indices(dataset: &Dataset) -> Result<Arc<Vec<IndexMetadata>>> {
     let metadata_key = IndexMetadataKey {
-        version: dataset.version().version,
+        version: dataset.manifest.version,
         store_identity: &dataset.object_store.store_prefix,
         e_tag: dataset.manifest_location.e_tag.as_deref(),
     };
