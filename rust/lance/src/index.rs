@@ -917,11 +917,11 @@ async fn prune_stale_segment_coverage(
 /// records every link from the build's fragments and the indexed data is shown
 /// unchanged along them ([`fresh_fragments`]). Coverage a cleanup trimmed the
 /// links of, or whose data changed since, is left out and its rows are
-/// scanned. So is coverage no record ever carried, such as an eager
-/// compaction's inline remap of a committed segment: nothing here tells it
-/// from coverage whose record was trimmed. Tagged histories are replayed
-/// instead ([`replay_staged_segments`]); without a fragment reuse index nothing
-/// is translated.
+/// scanned, as is all of it on a table with no fragment reuse index, never
+/// created or since dropped. So is coverage no record ever carried, such as an
+/// eager compaction's inline remap of a committed segment: nothing here tells
+/// it from coverage whose record was trimmed. Fragments the build held need no
+/// history. Tagged histories are replayed instead ([`replay_staged_segments`]).
 async fn withdraw_untranslated_coverage(
     dataset: &Dataset,
     index_name: &str,
@@ -930,14 +930,14 @@ async fn withdraw_untranslated_coverage(
     if segments
         .iter()
         .all(|segment| segment.dataset_version() >= dataset.manifest.version)
-        || !find_frag_reuse_index_meta(dataset)
-            .await?
-            .is_some_and(|entry| entry.index_version == 0)
     {
         return Ok(());
     }
-    let Some(frag_reuse_index) = dataset.open_frag_reuse_index(&NoOpMetricsCollector).await? else {
-        return Ok(());
+    // A missing entry translates nothing, like an emptied one.
+    let frag_reuse_index = match find_frag_reuse_index_meta(dataset).await? {
+        Some(entry) if entry.index_version != 0 => return Ok(()),
+        Some(_) => dataset.open_frag_reuse_index(&NoOpMetricsCollector).await?,
+        None => None,
     };
     let mut history = History::new(dataset).await?;
     let mut produced_since_build = Vec::with_capacity(segments.len());
@@ -957,11 +957,16 @@ async fn withdraw_untranslated_coverage(
     if produced_since_build.iter().all(RoaringBitmap::is_empty) {
         return Ok(());
     }
-    let views = segments
-        .iter()
-        .map(|segment| segment.clone().into_metadata(index_name))
-        .collect::<Vec<_>>();
-    let fresh = fresh_fragments(dataset, &mut history, &frag_reuse_index, &views).await?;
+    let fresh = match &frag_reuse_index {
+        Some(frag_reuse_index) => {
+            let views = segments
+                .iter()
+                .map(|segment| segment.clone().into_metadata(index_name))
+                .collect::<Vec<_>>();
+            fresh_fragments(dataset, &mut history, frag_reuse_index, &views).await?
+        }
+        None => RoaringBitmap::new(),
+    };
     let mut withdrawn = 0;
     for (segment, produced) in segments.iter_mut().zip(produced_since_build) {
         let untranslated = produced - &fresh;
@@ -998,8 +1003,9 @@ async fn v0_reuse_versions(dataset: &Dataset) -> Result<Option<Vec<FragReuseVers
 
 /// Refuses, as retryable, a CreateIndex whose segments cover fragments
 /// compaction produced after they were built through fragment reuse records
-/// held at `read_version` that a cleanup committed since trimmed: readers could
-/// no longer translate the segments' rows there. Published again from the
+/// held at `read_version` that a cleanup committed since trimmed, or that went
+/// with a fragment reuse index dropped since: readers could no longer
+/// translate the segments' rows there. Published again from the
 /// latest version the segments leave that coverage out
 /// ([`build_index_metadata_from_segments`]). Coverage no record ever carried,
 /// such as a segment's inline remap, is left as it was.
@@ -1057,9 +1063,10 @@ pub(crate) async fn check_coverage_still_translated(
                     dataset.manifest.version,
                     format!(
                         "Index segment {} of '{}', built at version {version}, covers fragment \
-                         {fragment} through fragment reuse records that a cleanup committed \
-                         after version {read_version}, the version this commit read, \
-                         trimmed. Commit the segments again from the latest version.",
+                         {fragment} through fragment reuse records that were trimmed, or \
+                         dropped with the fragment reuse index, after version \
+                         {read_version}, the version this commit read. Commit the segments \
+                         again from the latest version.",
                         index.uuid, index.name
                     )
                     .into(),

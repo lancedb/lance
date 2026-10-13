@@ -15,6 +15,7 @@ use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use lance_core::Error;
 use lance_core::utils::tempfile::TempStrDir;
 use lance_index::IndexType;
+use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
 use lance_index::scalar::BuiltinIndexType;
 use lance_index::scalar::ScalarIndexParams;
 use lance_table::format::IndexMetadata;
@@ -1698,57 +1699,83 @@ async fn saved_segment_over_a_compaction(
     (saved, compacted)
 }
 
-/// Trims every record of the fragment reuse history, which no index needs.
-async fn trim_history(uri: &str) -> Dataset {
-    let mut cleaner = Dataset::open(uri).await.unwrap();
-    cleanup_frag_reuse_index(&mut cleaner).await.unwrap();
-    let history = cleaner.frag_reuse_index().await.unwrap().unwrap();
-    assert!(history.details.versions.is_empty());
-    cleaner
+/// What becomes of the compaction's record once no index in the manifest
+/// needs it.
+#[derive(Clone, Copy, Debug)]
+enum Record {
+    Kept,
+    /// Cleanup trimmed it and kept the emptied history.
+    Trimmed,
+    /// The whole fragment reuse index was dropped with it.
+    Dropped,
+}
+
+/// Loses the compaction's record as `record` says, through a handle of its
+/// own, and returns that handle.
+async fn lose_record(uri: &str, record: Record) -> Dataset {
+    let mut writer = Dataset::open(uri).await.unwrap();
+    match record {
+        Record::Kept => {}
+        Record::Trimmed => {
+            cleanup_frag_reuse_index(&mut writer).await.unwrap();
+            let history = writer.frag_reuse_index().await.unwrap().unwrap();
+            assert!(history.details.versions.is_empty());
+        }
+        Record::Dropped => {
+            writer.drop_index(FRAG_REUSE_INDEX_NAME).await.unwrap();
+            assert!(writer.frag_reuse_index().await.unwrap().is_none());
+        }
+    }
+    writer
 }
 
 /// A saved segment committed again from a fresh handle still holds the rows'
 /// addresses from before the compaction, which only the compaction's record
 /// translates. While the record is kept the segment covers the output and
-/// lookups go through it; once cleanup trimmed the record the output is left
-/// out and its rows are scanned. Either way lookups match a scan.
+/// lookups go through it. Once cleanup trimmed the record, or the fragment
+/// reuse index was dropped with it, the output is left out and its rows are
+/// scanned. Either way lookups match a scan.
 #[rstest]
 #[tokio::test]
 async fn test_republished_segment_covers_only_what_the_history_translates(
     #[values(IndexType::BTree, IndexType::ZoneMap)] index_type: IndexType,
-    #[values(false, true)] trimmed: bool,
+    #[values(Record::Kept, Record::Trimmed, Record::Dropped)] record: Record,
 ) {
     let dir = TempStrDir::default();
     let uri = dir.as_str();
     let (saved, compacted) = saved_segment_over_a_compaction(uri, index_type).await;
-    if trimmed {
-        trim_history(uri).await;
-    }
+    lose_record(uri, record).await;
 
     let mut dataset = Dataset::open(uri).await.unwrap();
     dataset
         .commit_existing_index_segments("val_idx", "val", saved)
         .await
         .unwrap();
-    if trimmed {
-        assert!(val_idx_coverage(&dataset).await.is_empty());
-    } else {
+    if matches!(record, Record::Kept) {
         assert_eq!(
             val_idx_coverage(&dataset).await,
             RoaringBitmap::from_iter([compacted])
         );
         assert_uses_val_idx(&dataset, "val < 100").await;
+    } else {
+        assert!(val_idx_coverage(&dataset).await.is_empty());
     }
-    assert_val_lookups_match_scan(&dataset, (0..24).map(|id| id * 10), "").await;
+    let trace = format!("{record:?}");
+    assert_val_lookups_match_scan(&dataset, (0..24).map(|id| id * 10), &trace).await;
 }
 
-/// The same, merged before the commit.
+/// The same, merged before the commit: the merge has no record to move the
+/// coverage through either, and the commit leaves it out.
+#[rstest]
 #[tokio::test]
-async fn test_merged_republished_segment_covers_nothing_once_its_record_is_trimmed() {
+async fn test_merged_republished_segment_covers_nothing_once_its_record_is_gone(
+    #[values(IndexType::BTree, IndexType::ZoneMap)] index_type: IndexType,
+    #[values(Record::Trimmed, Record::Dropped)] record: Record,
+) {
     let dir = TempStrDir::default();
     let uri = dir.as_str();
-    let (saved, _) = saved_segment_over_a_compaction(uri, IndexType::BTree).await;
-    let mut dataset = trim_history(uri).await;
+    let (saved, _) = saved_segment_over_a_compaction(uri, index_type).await;
+    let mut dataset = lose_record(uri, record).await;
 
     let merged = dataset.merge_existing_index_segments(saved).await.unwrap();
     dataset
@@ -1756,19 +1783,24 @@ async fn test_merged_republished_segment_covers_nothing_once_its_record_is_trimm
         .await
         .unwrap();
     assert!(val_idx_coverage(&dataset).await.is_empty());
-    assert_val_lookups_match_scan(&dataset, (0..24).map(|id| id * 10), "").await;
+    let trace = format!("{record:?}");
+    assert_val_lookups_match_scan(&dataset, (0..24).map(|id| id * 10), &trace).await;
 }
 
-/// A cleanup trims the record a saved segment needs while the segment is
-/// committed from a handle that read it: the commit is refused as retryable,
-/// and committed again from the latest version the segment covers nothing.
+/// The record a saved segment needs is lost, trimmed by a cleanup or dropped
+/// with the fragment reuse index, while the segment is committed from a
+/// handle that read it: the commit is refused as retryable, and committed
+/// again from the latest version the segment covers nothing.
+#[rstest]
 #[tokio::test]
-async fn test_republished_segment_racing_a_cleanup_is_retried() {
+async fn test_republished_segment_racing_the_loss_of_its_record_is_retried(
+    #[values(Record::Trimmed, Record::Dropped)] record: Record,
+) {
     let dir = TempStrDir::default();
     let uri = dir.as_str();
     let (saved, _) = saved_segment_over_a_compaction(uri, IndexType::BTree).await;
     let mut stale = Dataset::open(uri).await.unwrap();
-    let cleaner = trim_history(uri).await;
+    let writer = lose_record(uri, record).await;
 
     let error = stale
         .commit_existing_index_segments("val_idx", "val", saved.clone())
@@ -1779,13 +1811,42 @@ async fn test_republished_segment_racing_a_cleanup_is_retried() {
         "{error}"
     );
     let mut latest = Dataset::open(uri).await.unwrap();
-    assert_eq!(latest.manifest.version, cleaner.manifest.version);
+    assert_eq!(latest.manifest.version, writer.manifest.version);
     latest
         .commit_existing_index_segments("val_idx", "val", saved)
         .await
         .unwrap();
     assert!(val_idx_coverage(&latest).await.is_empty());
-    assert_val_lookups_match_scan(&latest, (0..24).map(|id| id * 10), "").await;
+    let trace = format!("{record:?}");
+    assert_val_lookups_match_scan(&latest, (0..24).map(|id| id * 10), &trace).await;
+}
+
+/// A table that never had a fragment reuse index: a saved segment committed
+/// again after a later commit keeps the fragments it was built on, which need
+/// no history, and lookups go through it.
+#[rstest]
+#[tokio::test]
+async fn test_republished_segment_keeps_its_build_fragments_without_a_history(
+    #[values(IndexType::BTree, IndexType::ZoneMap)] index_type: IndexType,
+) {
+    let dir = TempStrDir::default();
+    let mut dataset = val_table(dir.as_str(), 4).await;
+    commit_val_idx(&mut dataset, index_type).await;
+    let saved = dataset.load_indices_by_name("val_idx").await.unwrap();
+    dataset.drop_index("val_idx").await.unwrap();
+    assert!(dataset.frag_reuse_index().await.unwrap().is_none());
+    assert!(saved[0].dataset_version < dataset.manifest.version);
+
+    dataset
+        .commit_existing_index_segments("val_idx", "val", saved)
+        .await
+        .unwrap();
+    assert_eq!(
+        val_idx_coverage(&dataset).await,
+        RoaringBitmap::from_iter(0..4)
+    );
+    assert_uses_val_idx(&dataset, "val < 100").await;
+    assert_val_lookups_match_scan(&dataset, (0..24).map(|id| id * 10), "").await;
 }
 
 /// [`test_merge_does_not_cover_a_fragment_behind_a_trimmed_link`], committing
