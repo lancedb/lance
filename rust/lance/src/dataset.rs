@@ -1330,14 +1330,18 @@ impl Dataset {
     /// dataset. `version` is a version number on this dataset's current branch.
     ///
     /// When `version` is the version this handle is checked out at, the
-    /// in-memory manifest is used and the transaction is served exactly like
-    /// [`Self::read_transaction`] (consulting and populating the session
-    /// transaction cache). Otherwise the version's manifest is read
-    /// transiently: no historical `Dataset` is constructed, no `IndexSection`
-    /// is decoded, and no session cache is written, so scanning many
-    /// historical versions does not fill the shared caches. A manifest that
-    /// the session cache already holds (for example after `checkout_version`)
-    /// is reused instead of being downloaded again.
+    /// in-memory manifest is used and the transaction is read directly from
+    /// storage, so no manifest download is needed. Otherwise the version's
+    /// manifest is read transiently: no historical `Dataset` is constructed,
+    /// no `IndexSection` is decoded, and no session cache is written, so
+    /// scanning many historical versions does not fill the shared caches. A
+    /// manifest that the session cache already holds (for example after
+    /// `checkout_version`) is reused instead of being downloaded again.
+    ///
+    /// Neither path consults or populates the session's transaction cache
+    /// (unlike [`Self::read_transaction`]): that cache is keyed only by
+    /// version number, which is not safe to reuse across a dataset dropped
+    /// and recreated at the same URI within the same session (see #8916).
     ///
     /// Returns an error if the version does not exist (for example, if it has
     /// been cleaned up).
@@ -1355,10 +1359,13 @@ impl Dataset {
     /// ```
     pub async fn read_version_transaction(&self, version: u64) -> Result<VersionTransaction> {
         if version == self.manifest.version {
+            let transaction = self
+                .read_transaction_from_storage(&self.manifest, &self.manifest_location)
+                .await?;
             return Ok(VersionTransaction {
                 version,
                 timestamp: self.manifest.timestamp(),
-                transaction: self.read_transaction().await?,
+                transaction,
             });
         }
 
