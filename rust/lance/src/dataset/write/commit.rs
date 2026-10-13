@@ -255,10 +255,12 @@ impl<'a> CommitBuilder<'a> {
     /// persisted in its
     /// [`IDEMPOTENCY_KEYS_PROPERTY`](crate::io::commit::idempotency::IDEMPOTENCY_KEYS_PROPERTY)
     /// property. Keys must be non-empty, and a transaction may carry at most
-    /// [`MAX_IDEMPOTENCY_KEYS`](crate::io::commit::idempotency::MAX_IDEMPOTENCY_KEYS)
+    /// [`DEFAULT_MAX_IDEMPOTENCY_KEYS`](crate::io::commit::idempotency::DEFAULT_MAX_IDEMPOTENCY_KEYS)
     /// keys totalling
-    /// [`MAX_IDEMPOTENCY_KEY_BYTES`](crate::io::commit::idempotency::MAX_IDEMPOTENCY_KEY_BYTES)
-    /// bytes; otherwise [`Self::execute`] fails with [`Error::InvalidInput`].
+    /// [`DEFAULT_MAX_IDEMPOTENCY_KEY_BYTES`](crate::io::commit::idempotency::DEFAULT_MAX_IDEMPOTENCY_KEY_BYTES)
+    /// bytes, unless the `LANCE_MAX_IDEMPOTENCY_KEYS` and
+    /// `LANCE_MAX_IDEMPOTENCY_KEY_BYTES` env vars set other limits; otherwise
+    /// [`Self::execute`] fails with [`Error::InvalidInput`].
     /// Detached commits reject keys. Cannot be combined with
     /// [`Self::with_idempotency_property`].
     ///

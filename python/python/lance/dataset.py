@@ -5035,8 +5035,10 @@ class LanceDataset(pa.dataset.Dataset):
             and the shared keys instead of rebasing over it. That version may
             be this writer's own earlier commit, when a commit that already
             landed is retried. Versions at or before the read version are not
-            checked. Keys must be non-empty; a transaction may carry at most
-            4096 keys totalling 256 KiB. Detached commits reject keys.
+            checked. Keys must be non-empty. By default a transaction may carry
+            at most 4096 keys totalling 256 KiB; the ``LANCE_MAX_IDEMPOTENCY_KEYS``
+            and ``LANCE_MAX_IDEMPOTENCY_KEY_BYTES`` environment variables change
+            the limits. Detached commits reject keys.
         idempotency_property : str, optional
             Name of a transaction property that already holds this commit's
             idempotency keys as a JSON array of strings; it must be set on this

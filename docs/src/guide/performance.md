@@ -301,6 +301,20 @@ Common sources of conflicts include:
 For more details on which operations conflict with each other, see
 [conflict resolution](../format/table/transaction.md#conflict-resolution).
 
+### Idempotency Keys
+
+A commit with [idempotency keys](../format/table/transaction.md#idempotency-keys) compares its keys with
+the keys of every transaction committed after its read version. The keys are stored with the transaction,
+so each later keyed commit in the same window reads them again. To bound this cost, Lance limits the keys
+of one transaction. A commit that exceeds a limit fails with an invalid input error. These environment
+variables change the limits for the process. They are read once, when the first keyed commit is made.
+An invalid value logs a warning and uses the default.
+
+| Limit                          | Environment Variable              | Default          |
+|--------------------------------|-----------------------------------|------------------|
+| Distinct keys per transaction  | `LANCE_MAX_IDEMPOTENCY_KEYS`      | 4096             |
+| Total key bytes (UTF-8)        | `LANCE_MAX_IDEMPOTENCY_KEY_BYTES` | 262144 (256 KiB) |
+
 ### Fragment Reuse Index
 
 Compaction is one of the most expensive write operations because it rewrites data files and, by

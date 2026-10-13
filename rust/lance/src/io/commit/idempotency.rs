@@ -35,7 +35,7 @@
 //! [`WriteParams::with_idempotency_keys`]: crate::dataset::WriteParams::with_idempotency_keys
 
 use std::collections::{BTreeSet, HashMap};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use lance_core::{Error, Result};
 
@@ -45,19 +45,72 @@ use crate::dataset::transaction::Transaction;
 /// a JSON array of strings.
 pub const IDEMPOTENCY_KEYS_PROPERTY: &str = "__lance_idempotency_keys";
 
-/// Most distinct idempotency keys one transaction may carry.
+/// Default for the most distinct idempotency keys one transaction may carry;
+/// override with [`MAX_IDEMPOTENCY_KEYS_ENV`].
 ///
 /// A keyed commit compares its keys with those of every transaction committed
 /// since its read version, and the keys are persisted with the transaction,
 /// so every later conflict check in the window reads them again. The limits
 /// keep that cost bounded while leaving room for a batch of a few thousand
 /// work items (e.g. queue messages) per commit.
-pub const MAX_IDEMPOTENCY_KEYS: usize = 4096;
+pub const DEFAULT_MAX_IDEMPOTENCY_KEYS: usize = 4096;
 
-/// Most bytes of idempotency keys (UTF-8, summed over the distinct keys) one
-/// transaction may carry: [`MAX_IDEMPOTENCY_KEYS`] keys of 64 bytes, enough
-/// for UUIDs or queue message ids with a prefix.
-pub const MAX_IDEMPOTENCY_KEY_BYTES: usize = 256 * 1024;
+/// Default for the most bytes of idempotency keys (UTF-8, summed over the
+/// distinct keys) one transaction may carry; override with
+/// [`MAX_IDEMPOTENCY_KEY_BYTES_ENV`]. [`DEFAULT_MAX_IDEMPOTENCY_KEYS`] keys of
+/// 64 bytes, enough for UUIDs or queue message ids with a prefix.
+pub const DEFAULT_MAX_IDEMPOTENCY_KEY_BYTES: usize = 256 * 1024;
+
+/// Env var overriding [`DEFAULT_MAX_IDEMPOTENCY_KEYS`] process-wide, as a
+/// positive integer.
+pub const MAX_IDEMPOTENCY_KEYS_ENV: &str = "LANCE_MAX_IDEMPOTENCY_KEYS";
+
+/// Env var overriding [`DEFAULT_MAX_IDEMPOTENCY_KEY_BYTES`] process-wide, as
+/// a positive integer.
+pub const MAX_IDEMPOTENCY_KEY_BYTES_ENV: &str = "LANCE_MAX_IDEMPOTENCY_KEY_BYTES";
+
+/// The most distinct idempotency keys one transaction may carry:
+/// [`MAX_IDEMPOTENCY_KEYS_ENV`] if valid, otherwise
+/// [`DEFAULT_MAX_IDEMPOTENCY_KEYS`]. Read once per process.
+pub(crate) fn max_idempotency_keys() -> usize {
+    static LIMIT: OnceLock<usize> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        parse_limit(
+            MAX_IDEMPOTENCY_KEYS_ENV,
+            std::env::var(MAX_IDEMPOTENCY_KEYS_ENV).ok().as_deref(),
+            DEFAULT_MAX_IDEMPOTENCY_KEYS,
+        )
+    })
+}
+
+/// The most bytes of idempotency keys one transaction may carry:
+/// [`MAX_IDEMPOTENCY_KEY_BYTES_ENV`] if valid, otherwise
+/// [`DEFAULT_MAX_IDEMPOTENCY_KEY_BYTES`]. Read once per process.
+pub(crate) fn max_idempotency_key_bytes() -> usize {
+    static LIMIT: OnceLock<usize> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        parse_limit(
+            MAX_IDEMPOTENCY_KEY_BYTES_ENV,
+            std::env::var(MAX_IDEMPOTENCY_KEY_BYTES_ENV).ok().as_deref(),
+            DEFAULT_MAX_IDEMPOTENCY_KEY_BYTES,
+        )
+    })
+}
+
+/// Parse the value of the limit env var `name`; `None` means unset. Anything
+/// that is not a positive integer warns and falls back to `default`.
+fn parse_limit(name: &str, raw: Option<&str>, default: usize) -> usize {
+    let Some(raw) = raw else {
+        return default;
+    };
+    match raw.trim().parse::<usize>() {
+        Ok(limit) if limit > 0 => limit,
+        _ => {
+            log::warn!("ignoring invalid {name}={raw:?}; using the default of {default}");
+            default
+        }
+    }
+}
 
 /// The idempotency keys of the transaction being committed, and where to look
 /// for the keys of the transactions it is checked against.
@@ -207,22 +260,32 @@ fn malformed(property: &str, err: serde_json::Error) -> Error {
 }
 
 fn validate(keys: &BTreeSet<String>) -> Result<()> {
+    validate_with_limits(keys, max_idempotency_keys(), max_idempotency_key_bytes())
+}
+
+fn validate_with_limits(
+    keys: &BTreeSet<String>,
+    max_keys: usize,
+    max_key_bytes: usize,
+) -> Result<()> {
     if keys.contains("") {
         return Err(Error::invalid_input(
             "idempotency keys must be non-empty strings, got an empty key",
         ));
     }
-    if keys.len() > MAX_IDEMPOTENCY_KEYS {
+    if keys.len() > max_keys {
         return Err(Error::invalid_input(format!(
-            "a transaction may carry at most {MAX_IDEMPOTENCY_KEYS} idempotency keys, got {}",
+            "a transaction may carry at most {max_keys} idempotency keys, got {}; set \
+             {MAX_IDEMPOTENCY_KEYS_ENV} to change the limit",
             keys.len()
         )));
     }
     let total_bytes: usize = keys.iter().map(String::len).sum();
-    if total_bytes > MAX_IDEMPOTENCY_KEY_BYTES {
+    if total_bytes > max_key_bytes {
         return Err(Error::invalid_input(format!(
-            "a transaction's idempotency keys may total at most {MAX_IDEMPOTENCY_KEY_BYTES} \
-             bytes, got {total_bytes} bytes in {} keys",
+            "a transaction's idempotency keys may total at most {max_key_bytes} bytes, got \
+             {total_bytes} bytes in {} keys; set {MAX_IDEMPOTENCY_KEY_BYTES_ENV} to change the \
+             limit",
             keys.len()
         )));
     }
@@ -399,14 +462,17 @@ mod tests {
         }
     }
 
+    /// The default limits apply when the env vars are unset (as in tests).
     #[rstest]
     #[case::too_many_keys(
-        (0..=MAX_IDEMPOTENCY_KEYS).map(|i| i.to_string()).collect(),
-        "at most 4096 idempotency keys, got 4097"
+        (0..=DEFAULT_MAX_IDEMPOTENCY_KEYS).map(|i| i.to_string()).collect(),
+        "at most 4096 idempotency keys, got 4097; set LANCE_MAX_IDEMPOTENCY_KEYS"
     )]
     #[case::too_many_bytes(
-        (0..3).map(|i| format!("{i}{}", "x".repeat(MAX_IDEMPOTENCY_KEY_BYTES / 3))).collect(),
-        "at most 262144 bytes"
+        (0..3)
+            .map(|i| format!("{i}{}", "x".repeat(DEFAULT_MAX_IDEMPOTENCY_KEY_BYTES / 3)))
+            .collect(),
+        "at most 262144 bytes, got 262146 bytes in 3 keys; set LANCE_MAX_IDEMPOTENCY_KEY_BYTES"
     )]
     fn test_limits(#[case] keys: Vec<String>, #[case] message: &str) {
         let encoded = encode_keys(keys);
@@ -416,12 +482,12 @@ mod tests {
 
     #[test]
     fn test_limits_are_inclusive() {
-        let keys = (0..MAX_IDEMPOTENCY_KEYS)
+        let keys = (0..DEFAULT_MAX_IDEMPOTENCY_KEYS)
             .map(|i| format!("{i:064}"))
             .collect::<Vec<_>>();
         assert_eq!(
             keys.iter().map(String::len).sum::<usize>(),
-            MAX_IDEMPOTENCY_KEY_BYTES
+            DEFAULT_MAX_IDEMPOTENCY_KEY_BYTES
         );
         let encoded = encode_keys(keys);
         let transaction = append(1, &[(IDEMPOTENCY_KEYS_PROPERTY, &encoded)]);
@@ -430,6 +496,35 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    #[rstest]
+    #[case::raised(3, 100, Ok(()))]
+    #[case::fewer_keys(2, 100, Err("at most 2 idempotency keys, got 3"))]
+    #[case::fewer_bytes(3, 2, Err("at most 2 bytes, got 3 bytes in 3 keys"))]
+    fn test_configured_limits(
+        #[case] max_keys: usize,
+        #[case] max_key_bytes: usize,
+        #[case] expected: std::result::Result<(), &str>,
+    ) {
+        let keys = ["a", "b", "c"].map(str::to_string).into_iter().collect();
+        let result = validate_with_limits(&keys, max_keys, max_key_bytes);
+        match expected {
+            Ok(()) => result.unwrap(),
+            Err(message) => assert_invalid_input(result, message),
+        }
+    }
+
+    #[rstest]
+    #[case::unset(None, 7)]
+    #[case::value(Some("100000"), 100000)]
+    #[case::padded(Some(" 12 "), 12)]
+    #[case::zero(Some("0"), 7)]
+    #[case::negative(Some("-1"), 7)]
+    #[case::not_a_number(Some("many"), 7)]
+    #[case::empty(Some(""), 7)]
+    fn test_parse_limit(#[case] raw: Option<&str>, #[case] expected: usize) {
+        assert_eq!(parse_limit("LANCE_TEST_LIMIT", raw, 7), expected);
     }
 
     /// A transaction committed after the read version that shares a key
