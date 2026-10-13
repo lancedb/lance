@@ -27,7 +27,7 @@ use lance_index::scalar::inverted::query::{
 };
 use lance_index::scalar::inverted::{DocumentGranularity, InvertedIndexParams};
 use lance_index::scalar::minhash_lsh::MinHashQuery;
-use lance_index::scalar::{AnyQuery, SargableQuery};
+use lance_index::scalar::{AnyQuery, LabelListQuery, SargableQuery};
 use lance_io::utils::CachedFileSize;
 use lance_linalg::distance::MetricType;
 use lance_select::RowSetOps;
@@ -37,6 +37,7 @@ use roaring::RoaringBitmap;
 use rstest::rstest;
 
 use datafusion::scalar::ScalarValue;
+use lance_file::version::LanceFileVersion;
 use lance_file::writer::FileWriterOptions;
 
 use crate::Dataset;
@@ -45,7 +46,7 @@ use crate::dataset::scanner::RowAddrTreeMap;
 use crate::dataset::transaction::{DataOverlayGroup, Operation};
 use crate::dataset::{WriteDestination, WriteParams};
 use crate::index::vector::VectorIndexParams;
-use crate::index::{CreateIndexBuilder, DatasetIndexExt};
+use crate::index::{CreateIndexBuilder, DatasetIndexExt, DatasetIndexInternalExt};
 use crate::io::exec::filtered_read::FilteredReadExec;
 use crate::io::exec::fts::FlatMatchQueryExec;
 
@@ -207,6 +208,24 @@ async fn commit_single_fragment_segments(
         .await
         .unwrap();
     source_version
+}
+
+/// [`commit_overlay`] of `age` (field 1) for the given `(offset, value)` rows of `fragment_id`.
+async fn overlay_age(
+    dataset: Dataset,
+    name: &str,
+    fragment_id: u64,
+    rows: &[(u32, Option<i32>)],
+) -> Dataset {
+    commit_overlay(
+        dataset,
+        name,
+        fragment_id,
+        &[1],
+        OverlayCoverage::dense(rows.iter().map(|(offset, _)| *offset).collect()),
+        vec![i32_array(rows.iter().map(|(_, value)| *value))],
+    )
+    .await
 }
 
 /// Merges `name`'s segments and the unindexed fragments into one segment that covers
@@ -1142,6 +1161,321 @@ async fn test_ngram_merge_rescans_overlay_stale_fragment(
     assert_ids_match_oracle(&dataset, "contains(text, 'cherry')", &[1, 2]).await;
     assert_answered_by_index(&dataset, "contains(text, 'mango')").await;
     assert_optimize_is_noop(&mut dataset, &merge, &merged).await;
+}
+
+/// A remapping merge re-reads the rows an overlay replaced after their segment was built, in
+/// the one pass that indexes the appended fragment: full coverage, the manifest's stamp,
+/// current values (NULL override included), nothing listed twice. The appended fragment is
+/// overlaid too, to catch a stale set that is not limited to the carried-over coverage.
+#[rstest]
+#[case::btree(IndexType::BTree)]
+#[case::bitmap(IndexType::Bitmap)]
+#[tokio::test]
+async fn test_remapping_merge_rescans_overlay_stale_fragment(
+    #[case] index_type: IndexType,
+    #[values(false, true)] stable_row_ids: bool,
+) {
+    let mut dataset = create_base_dataset_with(stable_row_ids).await;
+    commit_single_fragment_segments(&mut dataset, "age", index_type, "age_idx").await;
+
+    // Fragment 0: id 1 age 10 -> 999, id 2 age 20 -> NULL, committed after the segments.
+    let mut dataset = overlay_age(dataset, "age_stale", 0, &[(1, Some(999)), (2, None)]).await;
+    append_age_fragment(&mut dataset, 12..18).await;
+    // Fragment 2 is unindexed and overlaid: id 12 age 120 -> 555.
+    let mut dataset = overlay_age(dataset, "age_unindexed", 2, &[(0, Some(555))]).await;
+
+    let merge = OptimizeOptions::merge(2);
+    let merged = optimize_into_one_segment(&mut dataset, "age_idx", &merge, &[0, 1, 2]).await;
+    assert!(
+        dataset
+            .unindexed_fragments("age_idx")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    assert_eq!(age_hits(&dataset, 999).await, 1);
+    assert_eq!(age_hits(&dataset, 10).await, 0);
+    assert_eq!(
+        scalar_index_hits(&dataset, "age", "age_idx", &SargableQuery::IsNull()).await,
+        1
+    );
+    assert_eq!(age_hits(&dataset, 20).await, 0);
+    assert_eq!(
+        age_hits(&dataset, 30).await,
+        1,
+        "fragment 0 must be scanned once, not scanned and carried over"
+    );
+    assert_eq!(
+        age_hits(&dataset, 60).await,
+        1,
+        "fragment 1 is carried over"
+    );
+    assert_eq!(age_hits(&dataset, 555).await, 1);
+    assert_eq!(age_hits(&dataset, 120).await, 0);
+    assert_eq!(
+        age_hits(&dataset, 130).await,
+        1,
+        "the appended fragment must be scanned once"
+    );
+
+    assert_ids_match_oracle(&dataset, "age = 10", &[]).await;
+    assert_ids_match_oracle(&dataset, "age = 999", &[1]).await;
+    assert_ids_match_oracle(&dataset, "age = 20", &[]).await;
+    assert_ids_match_oracle(&dataset, "age IS NULL", &[2]).await;
+    assert_ids_match_oracle(&dataset, "age = 30", &[3]).await;
+    assert_ids_match_oracle(&dataset, "age = 60", &[6]).await;
+    assert_ids_match_oracle(&dataset, "age = 555", &[12]).await;
+    assert_ids_match_oracle(&dataset, "age = 120", &[]).await;
+    assert_ids_match_oracle(&dataset, "age >= 100", &[1, 10, 11, 12, 13, 14, 15, 16, 17]).await;
+    let not_null = (0..18).filter(|id| *id != 2).collect::<Vec<i32>>();
+    assert_ids_match_oracle(&dataset, "age IS NOT NULL", &not_null).await;
+    assert_answered_by_index(&dataset, "age = 999").await;
+    assert_answered_by_index(&dataset, "age IS NULL").await;
+    assert_optimize_is_noop(&mut dataset, &merge, &merged).await;
+}
+
+/// `id` 0..6 with a `List<Utf8>` `tags` column, three rows per fragment (fragments 0 and 1).
+async fn create_tags_dataset() -> Dataset {
+    let ids = Arc::new(Int32Array::from_iter_values(0..6)) as ArrayRef;
+    let tags = string_lists(&[
+        &["red", "big"],
+        &["blue"],
+        &["red"],
+        &["green"],
+        &["blue", "small"],
+        &["red"],
+    ]);
+    let batch = RecordBatch::try_from_iter(vec![("id", ids), ("tags", tags)]).unwrap();
+    let schema = batch.schema();
+    Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 3,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap()
+}
+
+/// LabelList merges through the single-segment `update` arm, whose old-data filter is built
+/// apart from the others: the stale fragment must be in the scan and out of that filter.
+#[tokio::test]
+async fn test_label_list_update_rescans_overlay_stale_fragment() {
+    let mut dataset = create_tags_dataset().await;
+    dataset
+        .create_index(
+            &["tags"],
+            IndexType::LabelList,
+            Some("tags_idx".to_string()),
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+
+    // Fragment 0 offset 1 (id 1): ["blue"] -> ["green", "tiny"], committed after the index.
+    let mut dataset = commit_overlay(
+        dataset,
+        "tags_overlay",
+        0,
+        &[1],
+        OverlayCoverage::dense(RoaringBitmap::from_iter([1])),
+        vec![string_lists(&[&["green", "tiny"]])],
+    )
+    .await;
+    // Fragment 2: ids 6, 7, 8.
+    let ids = Arc::new(Int32Array::from_iter_values(6..9)) as ArrayRef;
+    let tags = string_lists(&[&["blue"], &["tiny"], &["red"]]);
+    let batch = RecordBatch::try_from_iter(vec![("id", ids), ("tags", tags)]).unwrap();
+    let schema = batch.schema();
+    dataset
+        .append(RecordBatchIterator::new(vec![Ok(batch)], schema), None)
+        .await
+        .unwrap();
+
+    optimize_into_one_segment(
+        &mut dataset,
+        "tags_idx",
+        &OptimizeOptions::merge(1),
+        &[0, 1, 2],
+    )
+    .await;
+
+    async fn label_hits(dataset: &Dataset, label: &str) -> u64 {
+        let query = LabelListQuery::HasAnyLabel(vec![ScalarValue::Utf8(Some(label.to_string()))]);
+        scalar_index_hits(dataset, "tags", "tags_idx", &query).await
+    }
+    assert_eq!(
+        label_hits(&dataset, "blue").await,
+        2,
+        "rows 4 and 6; row 1 no longer"
+    );
+    assert_eq!(label_hits(&dataset, "tiny").await, 2, "rows 1 and 7");
+    assert_eq!(
+        label_hits(&dataset, "red").await,
+        4,
+        "rows 0, 2, 5, 8: fragment 0 once"
+    );
+    assert_eq!(label_hits(&dataset, "green").await, 2, "rows 1 and 3");
+    assert_ids_match_oracle(&dataset, "array_has_any(tags, ['blue'])", &[4, 6]).await;
+    assert_ids_match_oracle(&dataset, "array_has_any(tags, ['tiny'])", &[1, 7]).await;
+    assert_ids_match_oracle(&dataset, "array_has_any(tags, ['green'])", &[1, 3]).await;
+    assert_ids_match_oracle(&dataset, "array_has_all(tags, ['red', 'big'])", &[0]).await;
+    assert_answered_by_index(&dataset, "array_has_any(tags, ['tiny'])").await;
+}
+
+/// Staleness is collected over the selected segments only: a stale fragment under a segment
+/// `merge(1)` leaves alone keeps its segment, stamp and mask, and is not covered twice.
+#[tokio::test]
+async fn test_remapping_merge_leaves_unselected_stale_segment_alone() {
+    let mut dataset = create_base_dataset().await;
+    let source_version =
+        commit_single_fragment_segments(&mut dataset, "age", IndexType::BTree, "age_idx").await;
+    // Segments commit in fragment order: `merge(1)` selects fragment 1's, fragment 0's stays.
+    let untouched = dataset.load_indices_by_name("age_idx").await.unwrap()[0].clone();
+    assert_eq!(
+        untouched.fragment_bitmap,
+        Some(RoaringBitmap::from_iter([0u32]))
+    );
+
+    // Fragment 0 offset 1 (id 1): 10 -> 999.
+    let mut dataset = overlay_age(dataset, "age_unselected", 0, &[(1, Some(999))]).await;
+    append_age_fragment(&mut dataset, 12..18).await;
+
+    let built_from = dataset.manifest.version;
+    dataset
+        .optimize_indices(&OptimizeOptions::merge(1))
+        .await
+        .unwrap();
+    let after = dataset.load_indices_by_name("age_idx").await.unwrap();
+    assert_eq!(after.len(), 2);
+    let kept = after
+        .iter()
+        .find(|segment| segment.uuid == untouched.uuid)
+        .expect("the unselected segment survives untouched");
+    assert_eq!(kept.dataset_version, source_version);
+    assert_eq!(kept.fragment_bitmap, untouched.fragment_bitmap);
+    let merged = after
+        .iter()
+        .find(|segment| segment.uuid != untouched.uuid)
+        .unwrap();
+    assert_eq!(merged.dataset_version, built_from);
+    assert_eq!(
+        merged.fragment_bitmap,
+        Some(RoaringBitmap::from_iter([1u32, 2])),
+        "no fragment is covered twice: {after:?}"
+    );
+
+    // The untouched segment's pre-overlay entry stays in its file, masked by its stamp.
+    assert_eq!(age_hits(&dataset, 10).await, 1);
+    assert_eq!(age_hits(&dataset, 999).await, 0);
+    assert_eq!(age_hits(&dataset, 20).await, 1);
+    assert_ids_match_oracle(&dataset, "age = 999", &[1]).await;
+    assert_ids_match_oracle(&dataset, "age = 10", &[]).await;
+    assert_ids_match_oracle(&dataset, "age = 20", &[2]).await;
+}
+
+/// `id` = 0..rows and `age` = id * 10 in ONE v2.1 fragment, so the `age` column spans
+/// several mini-block chunks (at most 4096 values each).
+async fn create_wide_age_dataset(rows: i32) -> Dataset {
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, true),
+        ArrowField::new("age", DataType::Int32, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from_iter_values(0..rows)),
+            Arc::new(Int32Array::from_iter_values((0..rows).map(|v| v * 10))),
+        ],
+    )
+    .unwrap();
+    let write_params = WriteParams {
+        max_rows_per_file: rows as usize * 2,
+        data_storage_version: Some(LanceFileVersion::V2_1),
+        ..Default::default()
+    };
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+    let dataset = Dataset::write(reader, "memory://", Some(write_params))
+        .await
+        .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 1);
+    dataset
+}
+
+/// One overlaid row in a fragment whose indexed column spans ~10 chunks: the merge reads a
+/// fraction of its file, and the appended fragment in full.
+#[tokio::test]
+async fn test_remapping_merge_reads_only_overlaid_rows() {
+    let mut dataset = create_wide_age_dataset(40_000).await;
+    dataset
+        .create_index(
+            &["age"],
+            IndexType::BTree,
+            Some("age_idx".to_string()),
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+
+    // Fragment 0 offset 20_000 (id 20000): 200000 -> 999, committed after the index.
+    let mut dataset = overlay_age(dataset, "age_wide", 0, &[(20_000, Some(999))]).await;
+    append_age_fragment(&mut dataset, 40_000..40_006).await;
+
+    let base_file = dataset.get_fragment(0).unwrap().metadata().files[0].clone();
+    let base_size = base_file
+        .file_size_bytes
+        .get()
+        .expect("the writer records the data file size")
+        .get();
+    let appended_file = dataset.get_fragment(1).unwrap().metadata().files[0].clone();
+    dataset.object_store.as_ref().io_stats_incremental(); // Reset
+    optimize_into_one_segment(&mut dataset, "age_idx", &OptimizeOptions::merge(2), &[0, 1]).await;
+    let requests = dataset
+        .object_store
+        .as_ref()
+        .io_stats_incremental()
+        .requests;
+    let base_reads = requests
+        .iter()
+        .filter(|request| request.path.as_ref().ends_with(base_file.path.as_str()))
+        .collect::<Vec<_>>();
+    // A read without a range is a whole-file read.
+    let base_bytes = base_reads
+        .iter()
+        .map(|request| {
+            request
+                .range
+                .as_ref()
+                .map_or(base_size, |range| range.end - range.start)
+        })
+        .sum::<u64>();
+    // Observed: a 167_044-byte file, of which the merge reads one 2_320-byte range (the chunk
+    // holding the overlaid row; the footer comes from the metadata cache).
+    assert!(
+        base_bytes * 3 < base_size,
+        "the merge read {base_bytes} of {base_size} bytes of the stale fragment in {} \
+         requests: {base_reads:?}",
+        base_reads.len()
+    );
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.path.as_ref().ends_with(appended_file.path.as_str())),
+        "the appended fragment must be scanned: {requests:?}"
+    );
+
+    assert_eq!(age_hits(&dataset, 999).await, 1);
+    assert_eq!(age_hits(&dataset, 200_000).await, 0);
+    assert_eq!(age_hits(&dataset, 199_990).await, 1);
+    assert_ids_match_oracle(&dataset, "age = 999", &[20_000]).await;
+    assert_ids_match_oracle(&dataset, "age = 200000", &[]).await;
+    assert_ids_match_oracle(&dataset, "age = 199990", &[19_999]).await;
+    assert_ids_match_oracle(&dataset, "age = 400050", &[40_005]).await;
 }
 
 #[tokio::test]
