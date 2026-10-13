@@ -378,6 +378,14 @@ pub trait DatasetIndexExt {
     ) -> Result<IndexMetadata>;
 
     /// Commit one or more existing physical index segments as a logical index.
+    ///
+    /// Each segment's coverage is checked against this dataset version first.
+    /// A covered fragment whose indexed data changed since the segment was
+    /// built is left out. So is a fragment compaction produced since, unless
+    /// the fragment reuse index still records every rewrite from the
+    /// segment's build to it and the indexed data is unchanged along them: the
+    /// segment holds those rows' addresses from its build. Rows left out are
+    /// scanned.
     async fn commit_existing_index_segments(
         &mut self,
         index_name: &str,

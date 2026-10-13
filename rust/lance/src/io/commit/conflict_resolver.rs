@@ -2964,6 +2964,18 @@ impl<'a> TransactionRebase<'a> {
                 }
             }
 
+            // A cleanup in the window may have trimmed reuse records the
+            // segments' coverage was translated through when they were read.
+            // Boxed so the check's history does not grow every commit's future.
+            if dataset.manifest.version != self.transaction.read_version {
+                Box::pin(crate::index::check_coverage_still_translated(
+                    dataset,
+                    self.transaction.read_version,
+                    new_indices,
+                ))
+                .await?;
+            }
+
             Ok(self.transaction)
         } else {
             Err(wrong_operation_err(&self.transaction.operation))

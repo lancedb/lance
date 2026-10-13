@@ -255,7 +255,8 @@ async fn remap_merged_segment_coverage(
 
     // Coverage is kept, through compactions or not, only on fragments whose
     // indexed data is shown unchanged since the segments were built.
-    let fresh = fresh_fragments(dataset, &frag_reuse_index, segments).await?;
+    let mut history = History::new(dataset).await?;
+    let fresh = fresh_fragments(dataset, &mut history, &frag_reuse_index, segments).await?;
 
     let mut merged_coverage = staged_coverage.clone();
     frag_reuse_index.remap_fragment_bitmap(&mut merged_coverage)?;
@@ -475,8 +476,8 @@ impl<'a> History<'a> {
             .await
             .map_err(|error| {
                 Error::io(format!(
-                    "merge_existing_index_segments: cannot read dataset version {version} to \
-                     check merged index coverage: {error}"
+                    "cannot read dataset version {version} to check index segment coverage: \
+                     {error}"
                 ))
             })?;
         let snapshot = Arc::new(Snapshot::new(dataset));
@@ -683,6 +684,7 @@ async fn build_provenance(
 /// needs that was cleaned up, leaves out every fragment its group produced.
 async fn fresh_fragments(
     dataset: &Dataset,
+    history: &mut History<'_>,
     frag_reuse_index: &CompactFragReuseIndex,
     segments: &[IndexMetadata],
 ) -> Result<RoaringBitmap> {
@@ -690,9 +692,8 @@ async fn fresh_fragments(
     for segment in segments {
         indexed.extend(indexed_field_ids(dataset, &segment.fields)?);
     }
-    let mut history = History::new(dataset).await?;
     // Each followed fragment's version, or `None` once it cannot be shown fresh.
-    let mut following = build_provenance(&mut history, frag_reuse_index, segments).await?;
+    let mut following = build_provenance(history, frag_reuse_index, segments).await?;
 
     let mut versions = frag_reuse_index.details.versions.iter().collect::<Vec<_>>();
     versions.sort_by_key(|version| version.dataset_version);
@@ -903,6 +904,166 @@ async fn prune_stale_segment_coverage(
                 .collect::<Vec<_>>();
             for fragment_id in stale_fragments {
                 segment.fragment_bitmap_mut().remove(fragment_id);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Withdraws coverage the fragment reuse history cannot vouch for: fragments
+/// compaction produced after a segment was built. The segment's entries hold
+/// those rows' addresses from its build, which readers translate through the
+/// recorded rewrites, so the coverage is kept only while the reuse index still
+/// records every link from the build's fragments and the indexed data is shown
+/// unchanged along them ([`fresh_fragments`]). Coverage a cleanup trimmed the
+/// links of, or whose data changed since, is left out and its rows are
+/// scanned. So is coverage no record ever carried, such as an eager
+/// compaction's inline remap of a committed segment: nothing here tells it
+/// from coverage whose record was trimmed. Tagged histories are replayed
+/// instead ([`replay_staged_segments`]); without a fragment reuse index nothing
+/// is translated.
+async fn withdraw_untranslated_coverage(
+    dataset: &Dataset,
+    index_name: &str,
+    segments: &mut [IndexSegment],
+) -> Result<()> {
+    if segments
+        .iter()
+        .all(|segment| segment.dataset_version() >= dataset.manifest.version)
+        || !find_frag_reuse_index_meta(dataset)
+            .await?
+            .is_some_and(|entry| entry.index_version == 0)
+    {
+        return Ok(());
+    }
+    let Some(frag_reuse_index) = dataset.open_frag_reuse_index(&NoOpMetricsCollector).await? else {
+        return Ok(());
+    };
+    let mut history = History::new(dataset).await?;
+    let mut produced_since_build = Vec::with_capacity(segments.len());
+    for segment in segments.iter() {
+        let mut produced = RoaringBitmap::new();
+        if segment.dataset_version() < dataset.manifest.version
+            && let Some(built_at) = history.at(segment.dataset_version()).await?
+        {
+            produced = segment
+                .fragment_bitmap()
+                .iter()
+                .filter(|fragment| built_at.fragment(*fragment).is_none())
+                .collect();
+        }
+        produced_since_build.push(produced);
+    }
+    if produced_since_build.iter().all(RoaringBitmap::is_empty) {
+        return Ok(());
+    }
+    let views = segments
+        .iter()
+        .map(|segment| segment.clone().into_metadata(index_name))
+        .collect::<Vec<_>>();
+    let fresh = fresh_fragments(dataset, &mut history, &frag_reuse_index, &views).await?;
+    let mut withdrawn = 0;
+    for (segment, produced) in segments.iter_mut().zip(produced_since_build) {
+        let untranslated = produced - &fresh;
+        withdrawn += untranslated.len();
+        *segment.fragment_bitmap_mut() -= untranslated;
+    }
+    if withdrawn > 0 {
+        tracing::warn!(
+            index_name,
+            withdrawn_fragments = withdrawn,
+            "Index segments cover fragments compaction produced after they were built, \
+             which the fragment reuse history no longer translates their rows into, or \
+             whose indexed data changed since: those rows fall back to a flat scan. \
+             Rebuild the segments to cover them."
+        );
+    }
+    Ok(())
+}
+
+/// The v0 fragment reuse history of `dataset`: `Ok(None)` when its history is
+/// tagged, empty when it has none.
+async fn v0_reuse_versions(dataset: &Dataset) -> Result<Option<Vec<FragReuseVersion>>> {
+    match find_frag_reuse_index_meta(dataset).await? {
+        None => Ok(Some(Vec::new())),
+        Some(entry) if entry.index_version != 0 => Ok(None),
+        Some(entry) => Ok(Some(
+            load_frag_reuse_index_details(dataset, &entry)
+                .await?
+                .versions
+                .clone(),
+        )),
+    }
+}
+
+/// Refuses, as retryable, a CreateIndex whose segments cover fragments
+/// compaction produced after they were built through fragment reuse records
+/// held at `read_version` that a cleanup committed since trimmed: readers could
+/// no longer translate the segments' rows there. Published again from the
+/// latest version the segments leave that coverage out
+/// ([`build_index_metadata_from_segments`]). Coverage no record ever carried,
+/// such as a segment's inline remap, is left as it was.
+pub(crate) async fn check_coverage_still_translated(
+    dataset: &Dataset,
+    read_version: u64,
+    new_indices: &[IndexMetadata],
+) -> Result<()> {
+    let candidates = new_indices
+        .iter()
+        .filter(|index| !is_system_index(index) && index.dataset_version < read_version)
+        .filter(|index| {
+            index
+                .fragment_bitmap
+                .as_ref()
+                .is_some_and(|bitmap| !bitmap.is_empty())
+        })
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return Ok(());
+    }
+    let Some(current_versions) = v0_reuse_versions(dataset).await? else {
+        return Ok(());
+    };
+    let mut history = History::new(dataset).await?;
+    let current = history.current();
+    let mut read_versions = None;
+    for index in candidates {
+        let version = index.dataset_version;
+        let Some(built_at) = history.at(version).await? else {
+            continue;
+        };
+        let is_built = |id: u32| built_at.fragment(id).is_some();
+        for fragment in index.fragment_bitmap.iter().flatten() {
+            if is_built(fragment)
+                || current.fragment(fragment).is_none()
+                || sources_at_build(&current_versions, version, fragment, is_built).is_some()
+            {
+                continue;
+            }
+            if read_versions.is_none() {
+                read_versions = Some(match history.at(read_version).await? {
+                    Some(read) => v0_reuse_versions(&read.dataset).await?,
+                    None => None,
+                });
+            }
+            let was_translated = read_versions
+                .as_ref()
+                .and_then(|versions| versions.as_ref())
+                .is_none_or(|versions| {
+                    sources_at_build(versions, version, fragment, is_built).is_some()
+                });
+            if was_translated {
+                return Err(Error::retryable_commit_conflict_source(
+                    dataset.manifest.version,
+                    format!(
+                        "Index segment {} of '{}', built at version {version}, covers fragment \
+                         {fragment} through fragment reuse records that a cleanup committed \
+                         after version {read_version}, the version this commit read, \
+                         trimmed. Commit the segments again from the latest version.",
+                        index.uuid, index.name
+                    )
+                    .into(),
+                ));
             }
         }
     }
@@ -1126,6 +1287,13 @@ pub(crate) async fn build_index_metadata_from_segments(
 
     prune_stale_segment_coverage(dataset, &mut segments, false, &RoaringBitmap::new(), false)
         .await?;
+    // Boxed: commits await this, and it holds a version history across awaits.
+    Box::pin(withdraw_untranslated_coverage(
+        dataset,
+        index_name,
+        &mut segments,
+    ))
+    .await?;
 
     let new_indices = futures::stream::iter(segments.into_iter().map(|segment| async move {
         let (

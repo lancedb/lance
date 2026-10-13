@@ -12,6 +12,7 @@ use arrow_array::cast::AsArray;
 use arrow_array::types::Int32Type;
 use arrow_array::{ArrayRef, Int32Array, RecordBatch, RecordBatchIterator};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+use lance_core::Error;
 use lance_core::utils::tempfile::TempStrDir;
 use lance_index::IndexType;
 use lance_index::scalar::BuiltinIndexType;
@@ -1667,6 +1668,183 @@ async fn test_merge_covers_shared_sources_only_through_kept_links(
     assert_eq!(merged.fragment_bitmap.clone().unwrap(), covered);
     dataset
         .commit_existing_index_segments("val_idx", "val", vec![merged])
+        .await
+        .unwrap();
+    assert_eq!(val_idx_coverage(&dataset).await, covered);
+    assert_uses_val_idx(&dataset, "val >= 180").await;
+    assert_val_lookups_match_scan(&dataset, (0..24).map(|id| id * 10), "").await;
+}
+
+/// The `val_idx` segment of a [`val_table`], saved after a deferred compaction
+/// of every fragment moved its coverage onto the output, with the index then
+/// dropped. `id_idx` is caught up, so nothing else needs the compaction's
+/// record. Returns the saved segment and the compaction's output.
+async fn saved_segment_over_a_compaction(
+    uri: &str,
+    index_type: IndexType,
+) -> (Vec<IndexMetadata>, u32) {
+    let mut dataset = val_table(uri, 4).await;
+    commit_val_idx(&mut dataset, index_type).await;
+    let compacted = compact_deferred(&mut dataset, &[0, 1, 2, 3]).await;
+    remap_column_index(&mut dataset, &["id"], Some("id_idx".into()))
+        .await
+        .unwrap();
+    let saved = dataset.load_indices_by_name("val_idx").await.unwrap();
+    assert_eq!(
+        saved[0].fragment_bitmap.clone().unwrap(),
+        RoaringBitmap::from_iter([compacted])
+    );
+    dataset.drop_index("val_idx").await.unwrap();
+    (saved, compacted)
+}
+
+/// Trims every record of the fragment reuse history, which no index needs.
+async fn trim_history(uri: &str) -> Dataset {
+    let mut cleaner = Dataset::open(uri).await.unwrap();
+    cleanup_frag_reuse_index(&mut cleaner).await.unwrap();
+    let history = cleaner.frag_reuse_index().await.unwrap().unwrap();
+    assert!(history.details.versions.is_empty());
+    cleaner
+}
+
+/// A saved segment committed again from a fresh handle still holds the rows'
+/// addresses from before the compaction, which only the compaction's record
+/// translates. While the record is kept the segment covers the output and
+/// lookups go through it; once cleanup trimmed the record the output is left
+/// out and its rows are scanned. Either way lookups match a scan.
+#[rstest]
+#[tokio::test]
+async fn test_republished_segment_covers_only_what_the_history_translates(
+    #[values(IndexType::BTree, IndexType::ZoneMap)] index_type: IndexType,
+    #[values(false, true)] trimmed: bool,
+) {
+    let dir = TempStrDir::default();
+    let uri = dir.as_str();
+    let (saved, compacted) = saved_segment_over_a_compaction(uri, index_type).await;
+    if trimmed {
+        trim_history(uri).await;
+    }
+
+    let mut dataset = Dataset::open(uri).await.unwrap();
+    dataset
+        .commit_existing_index_segments("val_idx", "val", saved)
+        .await
+        .unwrap();
+    if trimmed {
+        assert!(val_idx_coverage(&dataset).await.is_empty());
+    } else {
+        assert_eq!(
+            val_idx_coverage(&dataset).await,
+            RoaringBitmap::from_iter([compacted])
+        );
+        assert_uses_val_idx(&dataset, "val < 100").await;
+    }
+    assert_val_lookups_match_scan(&dataset, (0..24).map(|id| id * 10), "").await;
+}
+
+/// The same, merged before the commit.
+#[tokio::test]
+async fn test_merged_republished_segment_covers_nothing_once_its_record_is_trimmed() {
+    let dir = TempStrDir::default();
+    let uri = dir.as_str();
+    let (saved, _) = saved_segment_over_a_compaction(uri, IndexType::BTree).await;
+    let mut dataset = trim_history(uri).await;
+
+    let merged = dataset.merge_existing_index_segments(saved).await.unwrap();
+    dataset
+        .commit_existing_index_segments("val_idx", "val", vec![merged])
+        .await
+        .unwrap();
+    assert!(val_idx_coverage(&dataset).await.is_empty());
+    assert_val_lookups_match_scan(&dataset, (0..24).map(|id| id * 10), "").await;
+}
+
+/// A cleanup trims the record a saved segment needs while the segment is
+/// committed from a handle that read it: the commit is refused as retryable,
+/// and committed again from the latest version the segment covers nothing.
+#[tokio::test]
+async fn test_republished_segment_racing_a_cleanup_is_retried() {
+    let dir = TempStrDir::default();
+    let uri = dir.as_str();
+    let (saved, _) = saved_segment_over_a_compaction(uri, IndexType::BTree).await;
+    let mut stale = Dataset::open(uri).await.unwrap();
+    let cleaner = trim_history(uri).await;
+
+    let error = stale
+        .commit_existing_index_segments("val_idx", "val", saved.clone())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, Error::RetryableCommitConflict { .. }),
+        "{error}"
+    );
+    let mut latest = Dataset::open(uri).await.unwrap();
+    assert_eq!(latest.manifest.version, cleaner.manifest.version);
+    latest
+        .commit_existing_index_segments("val_idx", "val", saved)
+        .await
+        .unwrap();
+    assert!(val_idx_coverage(&latest).await.is_empty());
+    assert_val_lookups_match_scan(&latest, (0..24).map(|id| id * 10), "").await;
+}
+
+/// [`test_merge_does_not_cover_a_fragment_behind_a_trimmed_link`], committing
+/// the saved segment as it is.
+#[tokio::test]
+async fn test_republished_segment_does_not_cover_a_fragment_behind_a_trimmed_link() {
+    let dir = TempStrDir::default();
+    let (saved, _) = segment_saved_behind_a_trimmed_link(dir.as_str()).await;
+    let mut dataset = Dataset::open(dir.as_str()).await.unwrap();
+
+    dataset
+        .commit_existing_index_segments("val_idx", "val", saved)
+        .await
+        .unwrap();
+    assert_eq!(
+        val_idx_coverage(&dataset).await,
+        RoaringBitmap::from_iter([2])
+    );
+    assert_uses_val_idx(&dataset, "val >= 120 AND val < 180").await;
+    assert_val_lookups_match_scan(&dataset, (0..24).map(|id| id * 10), "").await;
+}
+
+/// The compaction output a saved segment reaches through a kept record is
+/// rewritten after the save: the segment's values for it are stale, so its
+/// commit leaves the output out although the history still translates it.
+#[tokio::test]
+async fn test_republished_segment_does_not_cover_an_output_rewritten_since() {
+    let dir = TempStrDir::default();
+    let uri = dir.as_str();
+    let (saved, compacted) = saved_segment_over_a_compaction(uri, IndexType::BTree).await;
+    let dataset = Dataset::open(uri).await.unwrap();
+    let replaced = Arc::new(Int32Array::from_iter_values((0..24).map(|_| 999))) as ArrayRef;
+    let mut dataset = replace_column(dataset, compacted as u64, "val", replaced).await;
+
+    dataset
+        .commit_existing_index_segments("val_idx", "val", saved)
+        .await
+        .unwrap();
+    assert!(val_idx_coverage(&dataset).await.is_empty());
+    let probes = (0..24).map(|id| id * 10).chain([999]);
+    assert_val_lookups_match_scan(&dataset, probes, "").await;
+}
+
+/// [`test_merge_covers_shared_sources_only_through_kept_links`], committing
+/// the saved segment as it is.
+#[rstest]
+#[tokio::test]
+async fn test_republished_segment_covers_shared_sources_only_through_kept_links(
+    #[values(IndexType::BTree, IndexType::ZoneMap)] index_type: IndexType,
+    #[values(false, true)] trimmed: bool,
+) {
+    let dir = TempStrDir::default();
+    let uri = dir.as_str();
+    let saved = segment_saved_over_shared_sources(uri, index_type, trimmed).await;
+    let covered = RoaringBitmap::from_iter(if trimmed { vec![7] } else { vec![4, 7, 8, 9] });
+
+    let mut dataset = Dataset::open(uri).await.unwrap();
+    dataset
+        .commit_existing_index_segments("val_idx", "val", saved)
         .await
         .unwrap();
     assert_eq!(val_idx_coverage(&dataset).await, covered);
