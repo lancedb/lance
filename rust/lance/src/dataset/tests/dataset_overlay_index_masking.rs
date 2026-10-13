@@ -162,6 +162,48 @@ pub(super) async fn commit_overlay(
     .unwrap()
 }
 
+fn scalar_params(index_type: IndexType) -> ScalarIndexParams {
+    match index_type {
+        IndexType::Bitmap => ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap),
+        IndexType::ZoneMap => ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap),
+        IndexType::NGram => ScalarIndexParams::for_builtin(BuiltinIndexType::NGram),
+        _ => ScalarIndexParams::default(),
+    }
+}
+
+/// One uncommitted segment per live fragment, committed together under `name`. Returns the
+/// manifest version the segments were built from (their `dataset_version`).
+async fn commit_single_fragment_segments(
+    dataset: &mut Dataset,
+    column: &str,
+    index_type: IndexType,
+    name: &str,
+) -> u64 {
+    let params = scalar_params(index_type);
+    let fragment_ids = dataset
+        .get_fragments()
+        .into_iter()
+        .map(|fragment| fragment.id() as u32)
+        .collect::<Vec<_>>();
+    let mut segments = Vec::with_capacity(fragment_ids.len());
+    for fragment_id in fragment_ids {
+        segments.push(
+            CreateIndexBuilder::new(dataset, &[column], index_type, &params)
+                .name(name.to_string())
+                .fragments(vec![fragment_id])
+                .execute_uncommitted()
+                .await
+                .unwrap(),
+        );
+    }
+    let source_version = segments[0].dataset_version;
+    dataset
+        .commit_existing_index_segments(name, column, segments)
+        .await
+        .unwrap();
+    source_version
+}
+
 /// Sorted `id` values returned by a filtered scan.
 pub(super) async fn ids_matching(dataset: &Dataset, filter: &str) -> Vec<i32> {
     ids_matching_opts(dataset, filter, false).await
@@ -947,28 +989,8 @@ async fn fts_ids_matching(dataset: &Dataset, term: &str) -> Vec<i32> {
 #[tokio::test]
 async fn test_ngram_optimize_preserves_overlay_staleness() {
     let mut dataset = create_text_dataset(false).await;
-    let params = ScalarIndexParams::for_builtin(BuiltinIndexType::NGram);
-    let fragment_ids = dataset
-        .get_fragments()
-        .into_iter()
-        .map(|fragment| fragment.id() as u32)
-        .collect::<Vec<_>>();
-    let mut segments = Vec::with_capacity(fragment_ids.len());
-    for fragment_id in fragment_ids {
-        segments.push(
-            CreateIndexBuilder::new(&mut dataset, &["text"], IndexType::NGram, &params)
-                .name("text_ngram".to_string())
-                .fragments(vec![fragment_id])
-                .execute_uncommitted()
-                .await
-                .unwrap(),
-        );
-    }
-    let source_version = segments[0].dataset_version;
-    dataset
-        .commit_existing_index_segments("text_ngram", "text", segments)
-        .await
-        .unwrap();
+    let source_version =
+        commit_single_fragment_segments(&mut dataset, "text", IndexType::NGram, "text_ngram").await;
 
     let mut dataset = commit_overlay(
         dataset,
@@ -2798,18 +2820,9 @@ async fn append_age_fragment(dataset: &mut Dataset, ids: std::ops::Range<i32>) {
 #[case::zonemap(IndexType::ZoneMap)]
 #[tokio::test]
 async fn test_optimize_preserves_scalar_overlay_masking(#[case] index_type: IndexType) {
-    use crate::index::DatasetIndexExt;
-    use lance_index::optimize::OptimizeOptions;
-    use lance_index::scalar::BuiltinIndexType;
-
-    let params = match index_type {
-        IndexType::Bitmap => ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap),
-        IndexType::ZoneMap => ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap),
-        _ => ScalarIndexParams::default(),
-    };
     let mut dataset = create_base_dataset().await;
     dataset
-        .create_index(&["age"], index_type, None, &params, true)
+        .create_index(&["age"], index_type, None, &scalar_params(index_type), true)
         .await
         .unwrap();
 
