@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Process-wide diagnostics of the lazy layered full-precision scan.
+//! Process-wide RaBitQ storage and optional scan-extension diagnostics.
 //!
-//! The counters only advance while a query runs the lazy scan (or is checked
-//! for it), so production queries with the scan disabled touch at most the
-//! `ineligible_disabled` counter. Readers take deltas with
-//! [`snapshot_and_reset`].
+//! Storage counters advance when indices load resident columns, attach cached
+//! bodies, repack codes or read plane-row files. Scan-extension counters advance
+//! only when an installed executor updates them; these diagnostics do not install
+//! or configure an executor. Ordinary Lance sessions use the Full scan.
+//! Readers take deltas with [`snapshot_and_reset`].
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -171,11 +172,10 @@ layered_lazy_counters! {
         /// Deferred issues released only when every earlier probe was scored.
         serial_waits,
         /// Gathers issued before the heap was full and before their turn,
-        /// selecting every accepted row; see `LANCE_RQ_LAZY_EAGER_BEFORE_FULL`.
+        /// selecting every accepted row.
         eager_before_full,
         /// Sparse gathers of planes the persistent tier did not hold that
-        /// loaded the whole plane instead of more origin row runs than
-        /// `LANCE_RQ_LAZY_ORIGIN_MAX_RUNS` (unlimited by default).
+        /// loaded the whole plane after exceeding the executor's origin-run limit.
         origin_whole_fallbacks,
         /// Loading sign planes.
         sign_load_ns,
@@ -227,12 +227,10 @@ layered_lazy_counters! {
         empty,
         /// Probes of non-empty partitions whose ex planes were not both
         /// resident, predicted from `k` and the partition sizes to be
-        /// gathered whole, and so loaded and scored by the eager scan; see
-        /// `LANCE_RQ_LAZY_DENSE_TO_EAGER`.
+        /// gathered whole, and so routed to the eager scan by the executor.
         dense_to_eager,
         /// Lazy probes issued at once because the rows of all earlier probes
-        /// cannot fill the heap. The probes of queries that
-        /// `LANCE_RQ_LAZY_DENSE_TO_EAGER` routes are counted in
+        /// cannot fill the heap. Probes routed to eager scoring are counted in
         /// `dense_to_eager` instead.
         certain_dense,
         /// High planes served from RAM.
@@ -270,7 +268,6 @@ layered_lazy_counters! {
 }
 
 static COUNTERS: LayeredLazyCounters = LayeredLazyCounters::new();
-static PROMOTIONS_IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
 
 /// The live counters, for recording.
 pub fn counters() -> &'static LayeredLazyCounters {
@@ -280,19 +277,6 @@ pub fn counters() -> &'static LayeredLazyCounters {
 /// Read and zero every counter.
 pub fn snapshot_and_reset() -> LayeredLazyStats {
     COUNTERS.take()
-}
-
-/// Background promotions currently running. A gauge, not reset by snapshots.
-pub fn promotions_in_flight() -> u64 {
-    PROMOTIONS_IN_FLIGHT.load(Ordering::Relaxed)
-}
-
-pub(crate) fn promotion_started() {
-    PROMOTIONS_IN_FLIGHT.fetch_add(1, Ordering::Relaxed);
-}
-
-pub(crate) fn promotion_finished() {
-    PROMOTIONS_IN_FLIGHT.fetch_sub(1, Ordering::Relaxed);
 }
 
 #[cfg(test)]
