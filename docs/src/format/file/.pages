@@ -2,3 +2,4 @@ nav:
   - Specification: index.md
   - Encoding Strategy: encoding.md
   - Versioning: versioning.md
+  - Zone-level Column Statistics: column_statistics.md

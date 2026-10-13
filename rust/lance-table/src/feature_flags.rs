@@ -103,12 +103,12 @@ pub const FLAG_MANAGED_BLOBS: u64 = 1 << 14;
 /// Writers must understand this allocation contract. It does not change how
 /// readers interpret the schema or data files.
 pub const FLAG_NON_REUSABLE_FIELD_IDS: u64 = 1 << 15;
-/// Required for version 1 ZoneMap indices and write seeds, where min/max
-/// exclude NaNs and separate counts record NaN signs. Set in both reader and
-/// writer feature flags, and preserve across commits.
+/// Required for data files containing version 1 zone-level statistics seeds.
+/// Their min/max exclude NaNs, which are counted separately by sign. Set in
+/// both reader and writer feature flags and preserve across commits.
 ///
-/// Reserved: this implementation cannot read or write version 1 statistics yet.
-pub const FLAG_ZONEMAP_SIGNED_NAN_STATS: u64 = 1 << 16;
+/// Reserved: support for these seeds is not implemented yet.
+pub const FLAG_ZONE_STATISTICS_SEEDS: u64 = 1 << 16;
 /// The first bit that is unknown as a feature flag
 pub const FLAG_UNKNOWN: u64 = 1 << 17;
 
@@ -127,12 +127,12 @@ const _: () = assert!(FLAG_FRAGMENT_TREE < FLAG_UNKNOWN);
 const _: () = assert!(FLAG_INDEPENDENT_COVERING_FIELDS < FLAG_UNKNOWN);
 
 const _: () = assert!(FLAG_MANAGED_BLOBS < FLAG_UNKNOWN);
-const _: () = assert!(FLAG_ZONEMAP_SIGNED_NAN_STATS < FLAG_UNKNOWN);
+const _: () = assert!(FLAG_ZONE_STATISTICS_SEEDS < FLAG_UNKNOWN);
 
 pub(crate) const STICKY_PAIRED_FLAGS: u64 = FLAG_MIXED_DATA_FILE_VERSIONS
     | FLAG_FRAGMENT_REUSE_INDEX
     | FLAG_MANAGED_BLOBS
-    | FLAG_ZONEMAP_SIGNED_NAN_STATS;
+    | FLAG_ZONE_STATISTICS_SEEDS;
 pub(crate) const STICKY_READER_FLAGS: u64 = STICKY_PAIRED_FLAGS;
 pub(crate) const STICKY_WRITER_FLAGS: u64 = STICKY_PAIRED_FLAGS | FLAG_NON_REUSABLE_FIELD_IDS;
 
@@ -318,7 +318,7 @@ fn supported_flags_when(
     // Reserved, not implemented: see the flag's doc comment.
     mark_supported(&mut supported, FLAG_FRAGMENT_TREE, false);
     mark_supported(&mut supported, FLAG_INDEPENDENT_COVERING_FIELDS, false);
-    mark_supported(&mut supported, FLAG_ZONEMAP_SIGNED_NAN_STATS, false);
+    mark_supported(&mut supported, FLAG_ZONE_STATISTICS_SEEDS, false);
     supported
 }
 
@@ -397,7 +397,7 @@ pub fn validate_paired_feature_flags(manifest: &Manifest) -> Result<()> {
     for (flag, name) in [
         (FLAG_MIXED_DATA_FILE_VERSIONS, "mixed data-file-version"),
         (FLAG_MANAGED_BLOBS, "Managed Blob"),
-        (FLAG_ZONEMAP_SIGNED_NAN_STATS, "signed NaN statistics"),
+        (FLAG_ZONE_STATISTICS_SEEDS, "zone-statistics seed"),
     ] {
         let reader = manifest.reader_feature_flags & flag != 0;
         let writer = manifest.writer_feature_flags & flag != 0;
@@ -482,17 +482,17 @@ mod tests {
     use crate::format::BasePath;
 
     #[test]
-    fn test_signed_nan_statistics_flag_is_reserved_and_sticky() {
-        assert_eq!(FLAG_ZONEMAP_SIGNED_NAN_STATS, 1 << 16);
-        assert!(!can_read_dataset(FLAG_ZONEMAP_SIGNED_NAN_STATS));
-        assert!(!can_write_dataset(FLAG_ZONEMAP_SIGNED_NAN_STATS));
+    fn test_zone_statistics_seed_flag_is_reserved_and_sticky() {
+        assert_eq!(FLAG_ZONE_STATISTICS_SEEDS, 1 << 16);
+        assert!(!can_read_dataset(FLAG_ZONE_STATISTICS_SEEDS));
+        assert!(!can_write_dataset(FLAG_ZONE_STATISTICS_SEEDS));
 
         let mut manifest = empty_manifest();
-        manifest.reader_feature_flags = FLAG_ZONEMAP_SIGNED_NAN_STATS;
-        manifest.writer_feature_flags = FLAG_ZONEMAP_SIGNED_NAN_STATS;
+        manifest.reader_feature_flags = FLAG_ZONE_STATISTICS_SEEDS;
+        manifest.writer_feature_flags = FLAG_ZONE_STATISTICS_SEEDS;
         apply_feature_flags(&mut manifest, false, false).unwrap();
-        assert_eq!(manifest.reader_feature_flags, FLAG_ZONEMAP_SIGNED_NAN_STATS);
-        assert_eq!(manifest.writer_feature_flags, FLAG_ZONEMAP_SIGNED_NAN_STATS);
+        assert_eq!(manifest.reader_feature_flags, FLAG_ZONE_STATISTICS_SEEDS);
+        assert_eq!(manifest.writer_feature_flags, FLAG_ZONE_STATISTICS_SEEDS);
 
         let read_error = ensure_can_read_manifest(&manifest).unwrap_err();
         assert!(matches!(read_error, Error::NotSupported { .. }));
@@ -503,33 +503,27 @@ mod tests {
 
         let mut destination = empty_manifest();
         inherit_sticky_feature_flags(&mut destination, &manifest).unwrap();
-        assert_eq!(
-            destination.reader_feature_flags,
-            FLAG_ZONEMAP_SIGNED_NAN_STATS
-        );
-        assert_eq!(
-            destination.writer_feature_flags,
-            FLAG_ZONEMAP_SIGNED_NAN_STATS
-        );
+        assert_eq!(destination.reader_feature_flags, FLAG_ZONE_STATISTICS_SEEDS);
+        assert_eq!(destination.writer_feature_flags, FLAG_ZONE_STATISTICS_SEEDS);
     }
 
     #[test]
-    fn test_signed_nan_statistics_requires_both_feature_bits() {
+    fn test_zone_statistics_seeds_require_both_feature_bits() {
         for (reader, writer) in [(true, false), (false, true)] {
             let mut manifest = empty_manifest();
             manifest.reader_feature_flags = if reader {
-                FLAG_ZONEMAP_SIGNED_NAN_STATS
+                FLAG_ZONE_STATISTICS_SEEDS
             } else {
                 0
             };
             manifest.writer_feature_flags = if writer {
-                FLAG_ZONEMAP_SIGNED_NAN_STATS
+                FLAG_ZONE_STATISTICS_SEEDS
             } else {
                 0
             };
             let error = validate_paired_feature_flags(&manifest).unwrap_err();
             assert!(matches!(error, Error::CorruptFile { .. }));
-            assert!(error.to_string().contains("signed NaN statistics"));
+            assert!(error.to_string().contains("zone-statistics seed"));
         }
     }
 
