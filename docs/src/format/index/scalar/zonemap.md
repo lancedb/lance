@@ -1,8 +1,16 @@
 # Zone Map Index
 
-Zone maps summarize small groups of physical rows in a column. Readers use the
-summaries to skip zones that cannot match a predicate. Candidate rows still
-require predicate rechecking.
+Zone maps are a columnar database technique for predicate pushdown and scan pruning.
+They break data into fixed-size chunks called "zones" and maintain summary statistics
+(min, max, null count) for each zone, enabling efficient filtering by eliminating
+zones that cannot contain matching values.
+
+Zone maps are "inexact" filters - they can definitively exclude zones but may include
+false positives that require rechecking.
+
+In addition, since finding NULLs is a common query pattern, the index can also maintain a
+bitmap of null rows. A complete bitmap allows exact results for IS NULL queries;
+without it, null counts select candidate zones whose rows require rechecking.
 
 ## Index Details
 
@@ -10,8 +18,48 @@ require predicate rechecking.
 %%% proto.message.ZoneMapIndexDetails %%%
 ```
 
-The index stores its zone records in `zonemap.lance`. A complete optional null
-bitmap can answer `IS NULL` exactly; without it, null counts identify candidates.
+## Storage Layout
+
+The zone map index stores zone statistics in a single file:
+
+1. `zonemap.lance` - Zone statistics for query pruning
+
+### Zone Statistics File Schema (Version 0)
+
+| Column        | Type       | Nullable | Description                             |
+|---------------|------------|----------|-----------------------------------------|
+| `min`         | {DataType} | true     | Minimum value in the zone               |
+| `max`         | {DataType} | true     | Maximum value in the zone               |
+| `null_count`  | UInt32     | false    | Number of null values in the zone       |
+| `nan_count`   | UInt32     | false    | Number of NaN values (for float types)  |
+| `fragment_id` | UInt64     | false    | Fragment containing this zone           |
+| `zone_start`  | UInt64     | false    | Starting row offset within the fragment |
+| `zone_length` | UInt64     | false    | Number of rows in this zone             |
+
+### Schema Metadata
+
+| Key                 | Type   | Description                               |
+|---------------------|--------|-------------------------------------------|
+| `rows_per_zone`     | String | Number of rows per zone (default: "8192") |
+| `null_bitmap`       | UInt32 | Index of null bitmap global buffer        |
+
+### Global Buffers
+
+| Metadata Key        | Description                                                |
+|---------------------|------------------------------------------------------------|
+| `null_bitmap`       | A serialized RowAddrTreeMap specifying which rows are null |
+
+## Accelerated Queries
+
+The zone map index provides inexact results for the following query types. IS NULL
+returns exact results when a complete null bitmap is available.
+
+| Query Type | Description               | Operation                                   | Result Type |
+|------------|---------------------------|---------------------------------------------|-------------|
+| **Equals** | `column = value`          | Includes zones whose bounds or NaN counts permit the value      | AtMost      |
+| **Range**  | `column BETWEEN a AND b`  | Includes zones whose ordinary bounds or possible NaNs overlap the range         | AtMost      |
+| **IsIn**   | `column IN (v1, v2, ...)` | Includes zones that could contain any value | AtMost      |
+| **IsNull** | `column IS NULL`          | Uses a complete null bitmap, or selects zones where null_count > 0 | Exact with bitmap; otherwise AtMost |
 
 ## Comparison ordering
 
@@ -209,10 +257,3 @@ seed version must not be harvested; the index builder may scan the column.
 Optional IPC schema metadata `seed_null_bitmap` contains a hex-encoded Roaring
 bitmap of null row offsets. Missing metadata means exact offsets are unknown,
 not that no nulls exist. This proposal does not change that bitmap encoding.
-
-## Index metadata and global buffers
-
-`rows_per_zone` is stored as a decimal string. Optional schema metadata
-`null_bitmap` stores a decimal global-buffer index pointing to a serialized
-`RowAddrTreeMap` of exact null row addresses. Missing metadata means no complete
-null bitmap is available. These fields and the bitmap encoding are unchanged.

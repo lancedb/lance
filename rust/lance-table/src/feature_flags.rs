@@ -103,12 +103,11 @@ pub const FLAG_MANAGED_BLOBS: u64 = 1 << 14;
 /// Writers must understand this allocation contract. It does not change how
 /// readers interpret the schema or data files.
 pub const FLAG_NON_REUSABLE_FIELD_IDS: u64 = 1 << 15;
-/// Version 1 ZoneMap statistics use ordinary bounds without NaN markers and
-/// carry a separate negative NaN count. Both readers and writers must understand
-/// the contract, including data-file write seeds. The capability is sticky.
+/// Required for version 1 ZoneMap indices and write seeds, where min/max
+/// exclude NaNs and separate counts record NaN signs. Set in both reader and
+/// writer feature flags, and preserve across commits.
 ///
-/// Reserved by the format proposal; readers and writers reject it until the
-/// complete statistics implementation lands.
+/// Reserved: this implementation cannot read or write version 1 statistics yet.
 pub const FLAG_ZONEMAP_SIGNED_NAN_STATS: u64 = 1 << 16;
 /// The first bit that is unknown as a feature flag
 pub const FLAG_UNKNOWN: u64 = 1 << 17;
