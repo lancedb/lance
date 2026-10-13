@@ -52,6 +52,22 @@ pub async fn filtered_read_exec_to_proto(
     state: &SessionState,
 ) -> Result<pb::FilteredReadExecProto> {
     let table = table_identifier_from_dataset(exec.dataset()).await?;
+    filtered_read_exec_to_proto_with_table(exec, state, table)
+}
+
+/// Encode a [`FilteredReadExec`] whose table identifier the caller has already
+/// resolved.
+///
+/// [`filtered_read_exec_to_proto`] is async only because it resolves the
+/// dataset's latest storage options into the identifier. A caller that holds
+/// the identifier (or the storage options) can encode synchronously, for
+/// example from a DataFusion `PhysicalExtensionCodec`, whose `try_encode` is
+/// not async.
+pub fn filtered_read_exec_to_proto_with_table(
+    exec: &FilteredReadExec,
+    state: &SessionState,
+    table: pb::TableIdentifier,
+) -> Result<pb::FilteredReadExecProto> {
     // Use the pruned dataset schema for filter encoding — filters can reference columns
     // outside the projection (e.g. SELECT name WHERE age > 10), and some dataset columns
     // may have types that Substrait cannot serialize (e.g. FixedSizeList, Float16).
