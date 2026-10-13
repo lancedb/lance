@@ -73,7 +73,7 @@ use arrow_array::{
     BooleanArray, RecordBatch, RecordBatchIterator, StructArray, UInt32Array, UInt64Array,
     cast::AsArray, types::UInt64Type,
 };
-use arrow_schema::{ArrowError, DataType, Field, Schema};
+use arrow_schema::{ArrowError, DataType, Field, Fields, Schema};
 use arrow_select::take::take_record_batch;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{Column as DFColumn, NullEquality, TableReference};
@@ -301,39 +301,106 @@ fn subtree_has_blob(field: &lance_core::datatypes::Field) -> bool {
     field.is_blob() || field.children.iter().any(subtree_has_blob)
 }
 
-// "update if" expressions typically compare fields from the source table to the target table.
-// These tables have the same schema and so filter expressions need to differentiate.  To do that
-// we wrap the left side and the right side in a struct and make a single "combined schema"
-fn combined_schema(schema: &Schema) -> Schema {
-    let target = Field::new("target", DataType::Struct(schema.fields.clone()), false);
-    let source = Field::new("source", DataType::Struct(schema.fields.clone()), false);
-    Schema::new(vec![source, target])
+// Schema an "update if" condition is planned against: a `source` struct and a `target` struct.
+// Every child is nullable; the source schema's nullability does not describe the target data.
+fn combined_schema(source: &Schema, target: &Schema) -> Schema {
+    let nullable = |schema: &Schema| -> Fields {
+        schema
+            .fields
+            .iter()
+            .map(|f| f.as_ref().clone().with_nullable(true))
+            .collect()
+    };
+    Schema::new(vec![
+        Field::new("source", DataType::Struct(nullable(source)), false),
+        Field::new("target", DataType::Struct(nullable(target)), false),
+    ])
 }
 
-// This takes a double-wide table (e.g. the result of the outer join below) and takes the left
-// half, puts it into a struct, then takes the right half, and puts that into a struct.  This
-// makes the table match the "combined schema" so we can apply an "update if" expression
-fn unzip_batch(batch: &RecordBatch, schema: &Schema) -> RecordBatch {
-    // The schema of the combined batches will be:
-    // target_data_keys, target_data_non_keys, target_data_row_id, source_data_keys, source_data_non_keys
-    // The keys and non_keys on both sides will be equal
-    let num_fields = batch.num_columns();
-    debug_assert_eq!(num_fields % 2, 1);
-    let half_num_fields = num_fields / 2;
-    let row_id_col = num_fields - 1;
+/// Index of the target-side column `target_<name>` in a joined schema; the source
+/// columns come first, so the search starts after them.
+fn target_column_index(joined: &Schema, name: &str, num_source_columns: usize) -> Option<usize> {
+    let target_name = format!("target_{name}");
+    joined
+        .fields()
+        .iter()
+        .skip(num_source_columns)
+        .position(|f| f.name() == &target_name)
+        .map(|i| num_source_columns + i)
+}
 
-    let source_arrays = batch.columns()[0..half_num_fields].to_vec();
-    let source = StructArray::new(schema.fields.clone(), source_arrays, None);
+/// The target side of an "update if" condition: each source column's `target_<name>`
+/// field as the join emits it (the indexed take projects nested children to the source's
+/// subset), renamed and in source order.
+fn target_schema_for(source: &Schema, joined: &Schema) -> Result<Schema> {
+    let width = source.fields.len();
+    let fields = source
+        .fields
+        .iter()
+        .map(|f| {
+            target_column_index(joined, f.name(), width)
+                .map(|i| joined.field(i).as_ref().clone().with_name(f.name()))
+                .ok_or_else(|| {
+                    Error::internal(format!(
+                        "merge insert join is missing column 'target_{}'",
+                        f.name()
+                    ))
+                })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Schema::new(fields))
+}
 
-    let target_arrays = batch.columns()[half_num_fields..row_id_col].to_vec();
-    let target = StructArray::new(schema.fields.clone(), target_arrays, None);
+/// Physical "when matched update if" condition with the schema it evaluates against.
+#[derive(Debug, Clone)]
+struct MatchFilter {
+    schema: Arc<Schema>,
+    expr: Arc<dyn PhysicalExpr>,
+}
 
-    let combined_schema = combined_schema(schema);
-    RecordBatch::try_new(
-        Arc::new(combined_schema),
+// Splits a joined batch (source columns, `target_`-prefixed target columns, `_rowid`,
+// optionally `_rowaddr`) into the two structs of `combined_schema`. Columns are matched by
+// name: the target side comes back in dataset order, not the source's.
+fn unzip_batch(batch: &RecordBatch, combined: &Schema) -> Result<RecordBatch> {
+    let missing =
+        |name: &str| Error::internal(format!("merge insert join is missing column '{name}'"));
+    let struct_fields = |idx: usize| -> Result<Fields> {
+        match combined.field(idx).data_type() {
+            DataType::Struct(fields) => Ok(fields.clone()),
+            other => Err(Error::internal(format!(
+                "merge insert condition schema holds {other} where a struct was expected"
+            ))),
+        }
+    };
+
+    let source_fields = struct_fields(0)?;
+    let width = source_fields.len();
+    let source_arrays = source_fields
+        .iter()
+        .map(|f| {
+            batch
+                .column_by_name(f.name())
+                .cloned()
+                .ok_or_else(|| missing(f.name()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let source = StructArray::try_new(source_fields, source_arrays, None)?;
+
+    let target_fields = struct_fields(1)?;
+    let target_arrays = target_fields
+        .iter()
+        .map(|f| {
+            target_column_index(batch.schema_ref(), f.name(), width)
+                .map(|i| batch.column(i).clone())
+                .ok_or_else(|| missing(&format!("target_{}", f.name())))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let target = StructArray::try_new(target_fields, target_arrays, None)?;
+
+    Ok(RecordBatch::try_new(
+        Arc::new(combined.clone()),
         vec![Arc::new(source), Arc::new(target)],
-    )
-    .unwrap()
+    )?)
 }
 
 /// Format key values for error messages via extracting "on" column values from the given RecordBatch.
@@ -2928,6 +2995,7 @@ impl MergeInsertJob {
         let merger = Merger::try_new(
             self.params.clone(),
             source_schema,
+            joined.schema().as_ref(),
             !is_full_schema,
             self.dataset.manifest.uses_stable_row_ids(),
         )?;
@@ -3482,12 +3550,10 @@ struct Merger {
     delete_expr: Option<Arc<dyn PhysicalExpr>>,
     // User statistics for merging
     merge_stats: Arc<Mutex<MergeStats>>,
-    // Physical "when matched update if" expression, only set if params.when_matched is UpdateIf
-    match_filter_expr: Option<Arc<dyn PhysicalExpr>>,
+    // Only set if params.when_matched is UpdateIf
+    match_filter: Option<MatchFilter>,
     // The parameters controlling the merge
     params: MergeInsertParams,
-    // The schema of the input data, used to recover nullability information
-    schema: Arc<Schema>,
     /// Whether the output schema should include a row address column
     with_row_addr: bool,
     /// The output schema of the stream.
@@ -3505,6 +3571,7 @@ impl Merger {
     fn try_new(
         params: MergeInsertParams,
         schema: Arc<Schema>,
+        joined_schema: &Schema,
         with_row_addr: bool,
         enable_stable_row_ids: bool,
     ) -> Result<Self> {
@@ -3525,9 +3592,10 @@ impl Merger {
         } else {
             None
         };
-        let match_filter_expr = match &params.when_matched {
+        let match_filter = match &params.when_matched {
             WhenMatched::UpdateIf(_) | WhenMatched::UpdateIfExpr(_) => {
-                let combined_schema = Arc::new(combined_schema(&schema));
+                let target_schema = target_schema_for(&schema, joined_schema)?;
+                let combined_schema = Arc::new(combined_schema(&schema, &target_schema));
                 let planner = Planner::new(combined_schema.clone());
                 let expr = match &params.when_matched {
                     WhenMatched::UpdateIf(expr_str) => planner.parse_filter(expr_str)?,
@@ -3543,14 +3611,17 @@ impl Merger {
                         expr, data_type
                     )));
                 }
-                Some(match_expr)
+                Some(MatchFilter {
+                    schema: combined_schema,
+                    expr: match_expr,
+                })
             }
             _ => None,
         };
         let output_schema = if with_row_addr {
             Arc::new(schema.try_with_column(ROW_ADDR_FIELD.clone())?)
         } else {
-            schema.clone()
+            schema
         };
 
         Ok(Self {
@@ -3558,9 +3629,8 @@ impl Merger {
             updating_row_ids: Arc::new(Mutex::new(CapturedRowIds::new(enable_stable_row_ids))),
             delete_expr,
             merge_stats: Arc::new(Mutex::new(MergeStats::default())),
-            match_filter_expr,
+            match_filter,
             params,
-            schema,
             with_row_addr,
             output_schema,
             enable_stable_row_ids,
@@ -3700,7 +3770,7 @@ impl Merger {
 
         // Each `WhenMatched` variant handles the matched rows (`in_both`)
         // differently.
-        let match_filter_expr = self.match_filter_expr;
+        let match_filter = self.match_filter;
         match &self.params.when_matched {
             WhenMatched::DoNothing => {}
             WhenMatched::Delete => {
@@ -3747,9 +3817,9 @@ impl Merger {
             WhenMatched::UpdateAll | WhenMatched::UpdateIf(_) | WhenMatched::UpdateIfExpr(_) => {
                 let mut matched = arrow::compute::filter_record_batch(&batch, &in_both)?;
 
-                if let Some(match_filter) = match_filter_expr {
-                    let unzipped = unzip_batch(&matched, &self.schema);
-                    let filtered = match_filter.evaluate(&unzipped)?;
+                if let Some(match_filter) = match_filter {
+                    let unzipped = unzip_batch(&matched, &match_filter.schema)?;
+                    let filtered = match_filter.expr.evaluate(&unzipped)?;
                     match filtered {
                         ColumnarValue::Array(mask) => {
                             // Some rows matched, filter down and replace those rows
@@ -3937,7 +4007,7 @@ mod tests {
         NullArray, RecordBatchIterator, RecordBatchReader, StringArray, StructArray, UInt32Array,
         types::{Int32Type, UInt32Type},
     };
-    use arrow_array::{RecordBatch, record_batch};
+    use arrow_array::{ArrayRef, RecordBatch, record_batch};
     use arrow_buffer::{OffsetBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Field, Schema};
     use arrow_select::concat::concat_batches;
@@ -17118,5 +17188,357 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
                 "{plan}"
             );
         }
+    }
+
+    /// Four rows keyed by `interval_idx` with `cells` (a `list<struct>`) null,
+    /// and a BTree index on the key so the merge takes the indexed join path.
+    async fn indexed_list_struct_dataset(target_keys: &[i64]) -> Dataset {
+        let cells_type = DataType::List(Arc::new(Field::new(
+            "item",
+            DataType::Struct(
+                vec![
+                    Field::new("log_time", DataType::Int64, true),
+                    Field::new(
+                        "header",
+                        DataType::Struct(
+                            vec![
+                                Field::new("seq", DataType::UInt32, true),
+                                Field::new("frame_id", DataType::Utf8, true),
+                            ]
+                            .into(),
+                        ),
+                        true,
+                    ),
+                    Field::new("data", DataType::LargeBinary, true),
+                ]
+                .into(),
+            ),
+            true,
+        )));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("recording_id", DataType::Utf8, true),
+            Field::new("interval_idx", DataType::Int64, true),
+            Field::new("t_start", DataType::Int64, true),
+            Field::new("duration_ns", DataType::Int64, true),
+            Field::new("cells", cells_type.clone(), true),
+        ]));
+        let num_rows = target_keys.len();
+        let target = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["rec"; num_rows])),
+                Arc::new(Int64Array::from(target_keys.to_vec())),
+                Arc::new(Int64Array::from(vec![0i64; num_rows])),
+                Arc::new(Int64Array::from(vec![1i64; num_rows])),
+                arrow_array::new_null_array(&cells_type, num_rows),
+            ],
+        )
+        .unwrap();
+        let mut ds = Dataset::write(
+            RecordBatchIterator::new([Ok(target)], schema),
+            "memory://",
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        ds.create_index(
+            &["interval_idx"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+        ds
+    }
+
+    /// Two `cells` values, one cell each (`data` = "a" and "bb"). With
+    /// `reverse_nested` the struct children are declared in the reverse of
+    /// the dataset's order.
+    fn list_struct_cells(reverse_nested: bool) -> ListArray {
+        use arrow_array::{LargeBinaryArray, UInt32Array};
+        let mut header_fields = vec![
+            Field::new("seq", DataType::UInt32, true),
+            Field::new("frame_id", DataType::Utf8, true),
+        ];
+        let mut header_arrays: Vec<ArrayRef> = vec![
+            Arc::new(UInt32Array::from(vec![7, 8])),
+            Arc::new(StringArray::from(vec!["base", "map"])),
+        ];
+        if reverse_nested {
+            header_fields.reverse();
+            header_arrays.reverse();
+        }
+        let header = StructArray::new(header_fields.into(), header_arrays, None);
+        let mut cell_fields = vec![
+            Field::new("log_time", DataType::Int64, true),
+            Field::new("header", header.data_type().clone(), true),
+            Field::new("data", DataType::LargeBinary, true),
+        ];
+        let mut cell_arrays: Vec<ArrayRef> = vec![
+            Arc::new(Int64Array::from(vec![100, 200])),
+            Arc::new(header),
+            Arc::new(LargeBinaryArray::from(vec![&b"a"[..], &b"bb"[..]])),
+        ];
+        if reverse_nested {
+            cell_fields.reverse();
+            cell_arrays.reverse();
+        }
+        let cells = StructArray::new(cell_fields.into(), cell_arrays, None);
+        ListArray::new(
+            Arc::new(Field::new("item", cells.data_type().clone(), true)),
+            OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 1, 2])),
+            Arc::new(cells),
+            None,
+        )
+    }
+
+    async fn merge_indexed(
+        ds: Dataset,
+        source: RecordBatch,
+        when_matched: WhenMatched,
+        use_index: bool,
+    ) -> Result<(Arc<Dataset>, MergeStats)> {
+        let schema = source.schema();
+        MergeInsertBuilder::try_new(Arc::new(ds), vec!["interval_idx".into()])?
+            .when_matched(when_matched)
+            .when_not_matched(WhenNotMatched::DoNothing)
+            .write_mode(MergeInsertWriteMode::RewriteColumns)
+            .use_index(use_index)
+            .try_build()?
+            .execute_reader(RecordBatchIterator::new([Ok(source)], schema))
+            .await
+    }
+
+    /// Keys 0 and 1 must hold the cells "a" and "bb"; every other key stays null.
+    async fn assert_cells_filled(ds: &Dataset) {
+        let after = ds
+            .scan()
+            .project(&["interval_idx", "cells"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let keys = after["interval_idx"].as_primitive::<arrow_array::types::Int64Type>();
+        let cells = after["cells"].as_list::<i32>();
+        for row in 0..after.num_rows() {
+            let key = keys.value(row);
+            assert_eq!(cells.is_valid(row), key < 2, "row {row} key {key}");
+            if key < 2 {
+                let cell = cells.value(row);
+                let data = cell.as_struct()["data"]
+                    .as_binary::<i64>()
+                    .value(0)
+                    .to_vec();
+                assert_eq!(
+                    data,
+                    if key == 0 {
+                        b"a".to_vec()
+                    } else {
+                        b"bb".to_vec()
+                    }
+                );
+            }
+        }
+    }
+
+    /// A partial-schema source joined through the scalar index carries
+    /// `_rowaddr` next to `_rowid`; splitting the matched batch at its midpoint
+    /// built the `update_if` target struct from the wrong columns.
+    #[rstest::rstest]
+    #[case::unique_keys(vec![0, 1, 2, 3], true)]
+    #[case::unique_keys_no_condition(vec![0, 1, 2, 3], false)]
+    #[case::duplicate_keys(vec![0, 0, 1, 1], true)]
+    #[case::duplicate_keys_no_condition(vec![0, 0, 1, 1], false)]
+    #[tokio::test]
+    async fn test_indexed_partial_update_if_list_struct(
+        #[case] target_keys: Vec<i64>,
+        #[case] with_condition: bool,
+    ) {
+        let ds = indexed_list_struct_dataset(&target_keys).await;
+        let cells = list_struct_cells(false);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("interval_idx", DataType::Int64, true),
+            Field::new("cells", cells.data_type().clone(), true),
+        ]));
+        let source = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from(vec![0i64, 1])), Arc::new(cells)],
+        )
+        .unwrap();
+        let when_matched = if with_condition {
+            WhenMatched::update_if(&ds, "target.cells IS NULL").unwrap()
+        } else {
+            WhenMatched::UpdateAll
+        };
+        let (ds, stats) = merge_indexed(ds, source, when_matched, true).await.unwrap();
+        let expected_updates = target_keys.iter().filter(|k| **k < 2).count();
+        assert_eq!(stats.num_updated_rows, expected_updates as u64);
+        assert_cells_filled(&ds).await;
+    }
+
+    /// The `update_if` target struct is assembled by name with the dataset's
+    /// field types: the joined target columns come back in dataset order, and
+    /// a source may declare a column non-nullable or order a nested struct's
+    /// children differently from the dataset.
+    ///
+    /// The non-nullable case rewrites every target row: the column patch path
+    /// cannot yet fill a non-nullable source column with a fragment's nulls.
+    #[rstest::rstest]
+    #[case::column_order(false, true, vec![0, 1, 2, 3])]
+    #[case::non_nullable(false, false, vec![0, 0, 1, 1])]
+    #[case::nested_field_order(true, true, vec![0, 1, 2, 3])]
+    #[tokio::test]
+    async fn test_indexed_partial_update_if_source_shape(
+        #[case] reverse_nested: bool,
+        #[case] nullable: bool,
+        #[case] target_keys: Vec<i64>,
+        #[values(false, true)] use_index: bool,
+    ) {
+        let ds = indexed_list_struct_dataset(&target_keys).await;
+        let cells = list_struct_cells(reverse_nested);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("cells", cells.data_type().clone(), nullable),
+            Field::new("interval_idx", DataType::Int64, true),
+        ]));
+        let source = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(cells), Arc::new(Int64Array::from(vec![0i64, 1]))],
+        )
+        .unwrap();
+        let condition = WhenMatched::update_if(&ds, "target.cells IS NULL").unwrap();
+        let (ds, stats) = merge_indexed(ds, source, condition, use_index)
+            .await
+            .unwrap();
+        let expected_updates = target_keys.iter().filter(|k| **k < 2).count();
+        assert_eq!(stats.num_updated_rows, expected_updates as u64);
+        assert_cells_filled(&ds).await;
+    }
+
+    /// With same-typed columns a positional split would silently read the
+    /// wrong target column: here `target.duration_ns` must not read
+    /// `interval_idx`, which sits first in dataset order.
+    #[tokio::test]
+    async fn test_indexed_partial_update_if_same_type_column_order() {
+        let ds = indexed_list_struct_dataset(&[0, 1, 2, 3]).await;
+        let source = record_batch!(
+            ("duration_ns", Int64, [5, 5]),
+            ("t_start", Int64, [9, 9]),
+            ("interval_idx", Int64, [0, 1])
+        )
+        .unwrap();
+        let condition = WhenMatched::update_if(&ds, "target.duration_ns = 1").unwrap();
+        let (ds, stats) = merge_indexed(ds, source, condition, true).await.unwrap();
+        assert_eq!(stats.num_updated_rows, 2);
+        let after = ds
+            .scan()
+            .project(&["interval_idx", "duration_ns"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let keys = after["interval_idx"].as_primitive::<arrow_array::types::Int64Type>();
+        let durations = after["duration_ns"].as_primitive::<arrow_array::types::Int64Type>();
+        for row in 0..after.num_rows() {
+            let expected = if keys.value(row) < 2 { 5 } else { 1 };
+            assert_eq!(durations.value(row), expected, "row {row}");
+        }
+    }
+
+    /// The indexed take projects `cells` to the children the source supplies, so
+    /// the joined `target_cells` is `list<struct<idx, data>>` while the dataset
+    /// holds `list<struct<idx, timestamp, data>>`. The condition must be planned
+    /// against the type the join emits.
+    #[rstest::rstest]
+    #[case::update_all(false)]
+    #[case::with_condition(true)]
+    #[tokio::test]
+    async fn test_indexed_partial_update_if_nested_subset(#[case] with_condition: bool) {
+        use arrow_array::{Int32Array, LargeBinaryArray};
+        let list_of = |fields: Vec<Field>| {
+            DataType::List(Arc::new(Field::new(
+                "item",
+                DataType::Struct(fields.into()),
+                true,
+            )))
+        };
+        let full = list_of(vec![
+            Field::new("idx", DataType::Int32, true),
+            Field::new("timestamp", DataType::Int64, true),
+            Field::new("data", DataType::LargeBinary, true),
+        ]);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("interval_idx", DataType::Int64, true),
+            Field::new("t_start", DataType::Int64, true),
+            Field::new("cells", full.clone(), true),
+        ]));
+        let target = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![0i64, 1, 2, 3])),
+                Arc::new(Int64Array::from(vec![0i64; 4])),
+                arrow_array::new_null_array(&full, 4),
+            ],
+        )
+        .unwrap();
+        let mut ds = Dataset::write(
+            RecordBatchIterator::new([Ok(target)], schema),
+            "memory://",
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        ds.create_index(
+            &["interval_idx"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+
+        let subset = StructArray::new(
+            vec![
+                Field::new("idx", DataType::Int32, true),
+                Field::new("data", DataType::LargeBinary, true),
+            ]
+            .into(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(LargeBinaryArray::from(vec![&b"a"[..], &b"bb"[..]])),
+            ],
+            None,
+        );
+        let cells = ListArray::new(
+            Arc::new(Field::new("item", subset.data_type().clone(), true)),
+            OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 1, 2])),
+            Arc::new(subset),
+            None,
+        );
+        let source_schema = Arc::new(Schema::new(vec![
+            Field::new("interval_idx", DataType::Int64, true),
+            Field::new("cells", cells.data_type().clone(), true),
+        ]));
+        let source = RecordBatch::try_new(
+            source_schema,
+            vec![Arc::new(Int64Array::from(vec![0i64, 1])), Arc::new(cells)],
+        )
+        .unwrap();
+        let when_matched = if with_condition {
+            WhenMatched::update_if(&ds, "target.cells IS NULL").unwrap()
+        } else {
+            WhenMatched::UpdateAll
+        };
+        let (ds, stats) = merge_indexed(ds, source, when_matched, true).await.unwrap();
+        assert_eq!(stats.num_updated_rows, 2);
+        assert_cells_filled(&ds).await;
     }
 }
