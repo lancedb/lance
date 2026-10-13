@@ -1412,7 +1412,7 @@ impl FileFragment {
         let data_file_schema = Arc::new(data_file.schema(full_schema));
         let projection = projection.unwrap_or(full_schema);
         let schema_per_file =
-            Arc::new(projection.intersection_ignore_types(data_file_schema.as_ref())?);
+            Arc::new(data_file_projection(projection, data_file_schema.as_ref())?);
         if schema_per_file.fields.is_empty() {
             return Ok(None);
         }
@@ -3430,6 +3430,51 @@ impl std::fmt::Display for FragmentReader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "FragmentReader(id={})", self.fragment_id)
     }
+}
+
+/// `projection` intersected with a data file's schema. A nested field none of
+/// whose projected children are in the file keeps one file leaf, which still
+/// carries its validity and offsets; the final projection drops it.
+fn data_file_projection(projection: &Schema, file_schema: &Schema) -> Result<Schema> {
+    fn keep_a_leaf(field: &mut lance_core::datatypes::Field, file_schema: &Schema) -> Result<()> {
+        if field.is_blob() || field.is_packed_struct() {
+            return Ok(());
+        }
+        if !field.children.is_empty() {
+            return field
+                .children
+                .iter_mut()
+                .try_for_each(|child| keep_a_leaf(child, file_schema));
+        }
+        let Some(file_field) = file_schema.field_by_id(field.id) else {
+            return Ok(());
+        };
+        if file_field.children.is_empty() {
+            return Ok(());
+        }
+        let path =
+            crate::io::exec::filtered_read::validity_leaf_path(file_field).unwrap_or_else(|| {
+                // No fixed-width leaf: any leaf carries the validity.
+                let mut path = vec![];
+                let mut node = file_field;
+                while !(node.is_blob()
+                    || node.is_packed_struct()
+                    || matches!(node.data_type(), DataType::Map(..)))
+                    && let Some(child) = node.children.first()
+                {
+                    path.push(child.name.as_str());
+                    node = child;
+                }
+                path
+            });
+        *field = file_field.project(&path)?;
+        Ok(())
+    }
+    let mut schema = projection.intersection_ignore_types(file_schema)?;
+    for field in &mut schema.fields {
+        keep_a_leaf(field, file_schema)?;
+    }
+    Ok(schema)
 }
 
 fn merge_batches(batches: &[RecordBatch]) -> Result<RecordBatch> {
