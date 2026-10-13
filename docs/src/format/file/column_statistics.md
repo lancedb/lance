@@ -37,21 +37,35 @@ change them. A consumer using different predicate comparisons must not exclude
 rows unless it can prove that the statistics remain conservative for those
 comparisons.
 
-## Statistics fields
+## Version 1 statistics fields
 
 - `min` and `max` bound all non-null, non-NaN values in the zone. Bounds may be
   wider than the exact extrema but must never exclude such a value. Infinities
-  are ordinary values.
+  are ordinary values. For types without supported value bounds, such as whole
+  `List`, `FixedSizeList`, or `Struct` values, both bounds are null. This means
+  the bounds are unavailable, not that every value is null. Such seeds can still
+  contain an exact `null_count` and an optional null-row bitmap.
 - `null_count` is the exact number of null physical rows.
 - `nan_count` is the exact number of NaNs of either sign.
 - `negative_nan_count` is the exact number of NaNs with the sign bit set.
   Positive NaNs number `nan_count - negative_nan_count`.
-- `zone_length` is the number of physical rows summarized by the record.
+- `zone_length` is the actual number of physical rows summarized by the record,
+  as in version 0. The locator's `rows_per_zone` gives the configured zone size;
+  the final record can be shorter. For example, 10,000 rows at 8,192 rows per
+  zone produce records with lengths 8,192 and 1,808.
 
 Counts describe the values written to the file, before later deletion filtering.
 Version 1 seeds are newly collected records: both NaN counts are non-nullable.
 Non-float columns write zero for both counts. Counts must fit their declared
 types; writers must not truncate or saturate them.
+
+Statistics describe the column value at each row, not values nested inside it.
+For example, a `List<Float64>` zone containing `null`, `[1.0, null, NaN]`, and
+`[]` has null `min` and `max`, `null_count = 1`, and both NaN counts equal to
+zero. If present, its null bitmap marks only the first row. The second row is
+a non-null list; its child null and NaN are not counted. Likewise, a non-null
+struct containing a null field is not itself null. These seeds do not provide
+statistics for individual child fields.
 
 Each record must satisfy `null_count + nan_count <= zone_length` and
 `negative_nan_count <= nan_count`. Arithmetic used to validate these constraints
