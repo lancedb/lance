@@ -1,121 +1,138 @@
 # Clustering Metadata
 
-Clustering organizes data to improve query pruning. A **provider** is the
-implementation that chooses the layout and how to maintain it. Lance records
-the table's current policy separately from the layout information on fragments
-and index segments. This proposal defines the format in `clustering.proto`.
+Clustering puts rows with similar values close together. For example, grouping
+rows by time helps a query for one day skip data from other days. Column
+statistics tell queries which fragments, index segments, or smaller row groups
+can be skipped. Writes can use the same information to reduce the data
+they need to inspect.
 
-## Stored Information
+Lance does not choose a clustering algorithm or provide a default clustering
+implementation. Instead, it defines metadata that different implementations can
+use. Each implementation is called a **provider**. Contributors can build and
+maintain their own providers.
 
-`Manifest.clustering` holds the current `Clustering` configuration:
+The provider decides how to organize data during writes. Readers do not need to
+know that algorithm: they use column statistics to skip data. These statistics
+can come from zone-level write seeds, a ZoneMap index, or fragment and segment
+summaries built from the seeds.
 
-- `columns`: an ordered, non-empty list of distinct, non-negative schema field
-  IDs for existing clustering columns.
-- `provider`: a non-empty, case-sensitive implementation name.
-- `version`: a non-zero, provider-assigned layout/configuration identifier.
-- `provider_metadata`: `map<string, string>` containing provider configuration.
+## What Lance Stores
 
-`DataFragment.clustering` and `IndexMetadata.clustering` each hold optional
-`ClusteringInfo`: `provider`, `version`, and `metadata: map<string, string>`.
-Providers define keys and string encodings, such as bucket, range, or group
-identifiers. Empty maps are valid. A segment's information describes its own
-grouping; it does not relabel its input fragments.
+### Table Configuration
 
-`version` is not a dataset version or software release. Within a table, including
-branches, `(provider, version)` must keep the same layout meaning. Layout changes
-use a new version; providers manage any history they need. An unknown old version
-must not be interpreted using a different current configuration.
+`Manifest.clustering` stores the table's current clustering settings:
 
-## Main Rules
+- `columns`: the clustering columns, in order. Store their schema field IDs;
+  the list must be non-empty, with no duplicate or negative IDs, and every ID
+  must exist in the schema.
+- `provider`: the provider's non-empty, case-sensitive name.
+- `version`: a non-zero version assigned by the provider to these layout rules.
+- `provider_metadata`: provider configuration as `map<string, string>`.
 
-- Enabling clustering does not require every append to cluster its output or
-  impose a deadline for organizing existing data.
-- Changing or removing configuration does not rewrite history or erase existing
-  fragment and segment information. Historical reclustering is a separate operation.
-- Providers may take over other providers' fragments, recluster them, and write
-  their own information on the outputs. Lance imposes no provider ownership boundary.
+### Fragment and Index Segment Information
+
+Each fragment and index segment can also record how it was organized.
+`DataFragment.clustering` and `IndexMetadata.clustering` store optional
+`ClusteringInfo`:
+
+- `provider`: who organized it.
+- `version`: which version of that provider's layout rules was used.
+- `metadata`: extra layout details as `map<string, string>`.
+
+The provider defines the map's keys and string values, such as bucket, range, or
+group IDs. Maps may be empty. A segment's metadata describes its own grouping;
+it does not change the metadata on its input fragments.
+
+## What Providers Do
+
+Providers decide which fragments to process together, do the work, and write
+metadata for the results:
+
+- **Clustering:** choose fragments, reorganize their rows, and write new
+  fragments with clustering metadata.
+- **Compaction:** choose fragments to compact together and write the compacted
+  fragments with clustering metadata.
+- **Indexing:** choose groups for each index, build one segment per group, and
+  write segment clustering metadata. Different indices can group the same
+  fragments differently.
+
+Providers can reuse Lance's builders. Lance checks the inputs and conflicting
+concurrent changes, then commits the new files and metadata together. The
+provider API is outside this format proposal.
+
+### When No Provider Strategy Is Available
+
+- **Fragments without clustering metadata:** normal Lance compaction and
+  indexing apply, unless a provider chooses to process them.
+- **Compaction of fragments with clustering metadata:** use the provider's
+  strategy if available. Otherwise, skip them by default. Users may explicitly
+  request normal compaction; its new fragments have no clustering metadata.
+- **Indexing of fragments with clustering metadata:** use the provider's strategy
+  if available. Otherwise, normal indexing can still run; its new segments have
+  no clustering metadata.
+
+If a provider fails, return an error. Do not silently switch to normal maintenance.
+
+## What Happens During Maintenance
+
+- **Nothing changed:** keep the table settings and metadata on unchanged
+  fragments and segments, including keys and values the writer does not recognize.
+- **Normal data rewrite:** clear clustering metadata on the rewritten fragments.
+  Column replacement, refresh, and overlays follow this rule even if the fragment
+  ID stays the same or the changed column is not a clustering key. There is no
+  need to decide whether the layout was affected.
+- **Only deletion vectors changed:** keep the fragment's clustering metadata.
+  Providers must account for deleted rows when planning later maintenance.
+- **Index merge:** the provider decides how to merge and writes the new segments'
+  clustering metadata. A normal merge without a provider strategy produces
+  segments with no clustering metadata.
+- **Index remap or rebuild:** keep the segment's clustering metadata.
+- **New provider-created layout:** the provider writes its own metadata. Lance
+  does not copy or combine the input maps automatically.
+
+Index maintenance does not change the data fragments' clustering metadata.
+
+## How Readers Benefit
+
+Providers should compare clustering values using Lance's defined Arrow Rust
+ordering rules, because readers use those rules for column statistics. Sorting
+values differently can make the min/max ranges wider and reduce pruning. It does
+not change the reader's rules.
+
+Clustering writes collect zone-level write seeds for clustering columns using
+the same rules. Readers can use zone statistics or combine them into fragment
+and segment summaries. This does not require a particular statistics index. If
+statistics are missing or unusable, keep the data as a query candidate.
+
+Readers can ignore clustering metadata. A provider's metadata is not proof that
+data can be skipped: readers still need valid statistics and index coverage.
+FRI address translation and deletion handling follow their own rules. Clustering
+metadata must not add hidden requirements for correct reads or normal writes.
+
+## Reader and Writer Compatibility
+
+Set `FLAG_CLUSTERING_METADATA` (`1 << 17`) in a snapshot's `writer_feature_flags`
+if it contains any of the following:
+
+- Table clustering configuration.
+- Fragment clustering information, including records in a fragment metadata tree.
+- Index segment clustering information, including records in the index section.
+
+Readers need no clustering flag because they can ignore this metadata. Writers
+that do not support the feature must refuse writes. Writers that do support it
+follow the rules above; they do not need to understand every provider.
+
+Clear the flag only when all three are absent. Removing the table configuration
+alone is not enough. All providers and layout versions use this one flag. FRI
+and write seeds have separate feature requirements. Reserving this flag does
+not implement clustering APIs or metadata-aware writes.
 
 ### Legacy Column-Level Hints
 
-Preserve `Field.unenforced_clustering_key_position` and
-`Field.unenforced_clustering_key` under their existing rules. These are **legacy
-column-level hints**, not fields to clear or synchronize with the new configuration.
-When `Manifest.clustering` is present, supporting implementations use its `columns`
-as the clustering keys instead. Otherwise, the legacy hints retain their existing
-meaning.
+`Field.unenforced_clustering_key_position` and `Field.unenforced_clustering_key`
+are **legacy column-level hints**. Keep their existing rules. Do not remove them
+or change them to match the new configuration.
 
-## Clustering, Compaction, and Indexing
-
-Providers choose the fragments to process and return groups of fragments:
-
-- **Clustering:** the provider chooses which fragments to recluster together,
-  reorganizes their rows, and writes its information on the new fragments.
-- **Compaction:** the provider compacts each group and writes clustering
-  information for the new fragments.
-- **Indexing:** each index has its own groups. The provider builds each segment
-  and writes its clustering information; different index types may use different
-  grouping sizes over the same fragment layout.
-
-Providers may reuse Lance's builders. Lance validates inputs against concurrent
-changes and commits the outputs and metadata atomically. Runtime interface
-signatures are outside this format contract.
-
-The presence of fragment clustering information determines default maintenance:
-
-- **Without clustering information:** use normal Lance compaction and indexing,
-  unless a provider selects the fragments for its own operations.
-- **With clustering information:** use the provider's available maintenance
-  strategy. Without a compaction strategy, default compaction skips these
-  fragments. Explicit ordinary compaction may override this and produces
-  fragments without clustering information. Without an indexing strategy, normal
-  indexing remains available and produces segments without clustering information.
-
-Provider failures are reported, not silently retried with a different strategy.
-
-## Ordinary Maintenance
-
-- Unrelated commits preserve configuration and unchanged fragments' and
-  segments' information, including unknown metadata keys and values.
-- Ordinary data rewrites produce fragments without clustering information.
-  Column replacement and overlays clear it even when the fragment ID stays the
-  same or only non-clustering columns change. No layout-impact analysis is needed.
-- Deletion-vector-only changes preserve the original fragment's information.
-  Providers must tolerate deleted rows and revalidate maintenance bookkeeping.
-- Ordinary index merge, rebuild, and remap produce segments without clustering
-  information. Data fragments' clustering information is unaffected.
-- Provider operations set their outputs' information. Metadata maps are not
-  automatically copied or merged from inputs.
-
-Dropping a clustering field or changing its type removes the current configuration.
-Renaming while retaining field IDs and types preserves it. Overwrite may retain
-configuration only when its field IDs and types remain compatible. Clearing output
-information does not otherwise disable the policy. Restore restores the selected
-snapshot's information; clone or import preserves layout identity or clears
-conflicting claims. Metadata paths acquire no file-retention or clone semantics.
-
-## Statistics and Reads
-
-Clustering writes collect zone-level write seeds for clustering columns using
-Lance's defined Arrow Rust comparison semantics. Consumers may use zones directly
-or aggregate them into fragment or segment statistics; no particular statistics
-index is required. Missing or unusable statistics keep the data as a query candidate.
-
-Readers may ignore clustering information. Provider metadata alone cannot prove
-row order or justify pruning. Statistics, index coverage, FRI translation, and
-deletions retain their own contracts. Metadata cannot impose hidden requirements
-for correct queries or ordinary writes.
-
-## Compatibility
-
-A snapshot referencing table configuration, any fragment clustering information,
-or any index segment clustering information must set `FLAG_CLUSTERING_METADATA`
-(`1 << 17`) in `writer_feature_flags`, not `reader_feature_flags`. This includes
-fragments in a fragment metadata tree and indices in the index section.
-
-Older writers must refuse to write; readers need no clustering capability.
-Supporting writers preserve or clear information using the rules above without
-understanding every provider. Clear the flag only when all three kinds of
-information are absent; disabling table clustering alone is insufficient.
-Providers share one flag, independent of layout version. FRI and write seeds
-keep their own feature requirements. This reservation does not enable clustering
-APIs or metadata-aware writes.
+When `Manifest.clustering` is present, implementations supporting this proposal
+use its `columns` as the clustering keys instead of the legacy hints. Otherwise,
+the hints keep their existing meaning.
