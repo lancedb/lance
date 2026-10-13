@@ -151,6 +151,19 @@ impl Debug for Value<'_> {
     }
 }
 
+/// Writes `s` as a JSON string literal (quotes included), using spec-compliant
+/// escaping.
+///
+/// Rust's `Debug` escaping for `str` is not valid JSON: it writes control
+/// characters without a short escape as `\u{N}` (braced, variable-width) and
+/// NUL as `\0`, where JSON requires `\u0000`-style escapes. `serde_json`
+/// already implements correct JSON string escaping, so we reuse it here
+/// instead of duplicating that logic.
+fn write_json_string(f: &mut Formatter<'_>, s: &str) -> std::fmt::Result {
+    let escaped = serde_json::to_string(s).map_err(|_| std::fmt::Error)?;
+    write!(f, "{escaped}")
+}
+
 impl Display for Value<'_> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -163,9 +176,7 @@ impl Display for Value<'_> {
                 }
             }
             Value::Number(v) => write!(f, "{}", v),
-            Value::String(v) => {
-                write!(f, "{:?}", v)
-            }
+            Value::String(v) => write_json_string(f, v),
             Value::Binary(v) => {
                 write!(f, "\"")?;
                 for c in *v {
@@ -202,7 +213,7 @@ impl Display for Value<'_> {
                     if i > 0 {
                         write!(f, ",")?;
                     }
-                    write!(f, "{k:?}")?;
+                    write_json_string(f, k)?;
                     write!(f, ":")?;
                     write!(f, "{v}")?;
                 }
@@ -270,5 +281,42 @@ mod tests {
         // The displayed form must itself be valid JSON that round-trips.
         let reparsed: serde_json::Value = serde_json::from_str(&displayed).unwrap();
         assert_eq!(reparsed, serde_json::json!({"line\nbreak": false}));
+    }
+
+    /// Rust's `Debug` escaping (used by both `Value::String` and the
+    /// `Value::Object` key display) writes control characters without a
+    /// short escape (like `\x01`) as a braced, variable-width escape, and
+    /// writes NUL as a two-character escape. Neither form is valid JSON,
+    /// which requires fixed 4-digit `\u` escapes for both.
+    #[test]
+    fn test_display_string_control_char_is_valid_json() {
+        let value = Value::String(Cow::Borrowed("\u{1}"));
+        let displayed = format!("{value}");
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&displayed).is_ok(),
+            "{displayed:?} is not valid JSON"
+        );
+    }
+
+    #[test]
+    fn test_display_string_nul_is_valid_json() {
+        let value = Value::String(Cow::Borrowed("\0"));
+        let displayed = format!("{value}");
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&displayed).is_ok(),
+            "{displayed:?} is not valid JSON"
+        );
+    }
+
+    #[test]
+    fn test_display_object_key_control_char_is_valid_json() {
+        let mut obj = Object::new();
+        obj.insert("\u{1}".to_string(), Value::Null);
+        let value = Value::Object(obj);
+
+        let displayed = format!("{value}");
+        let reparsed: Result<serde_json::Value, _> = serde_json::from_str(&displayed);
+        assert!(reparsed.is_ok(), "{displayed:?} is not valid JSON");
+        assert_eq!(reparsed.unwrap(), serde_json::json!({"\u{1}": null}),);
     }
 }
