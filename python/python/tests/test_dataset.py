@@ -1604,6 +1604,10 @@ def test_fragment_ids(tmp_path: Path):
     dataset = lance.dataset(tmp_path)
     assert list(dataset.fragment_ids()) == [0, 1, 2, 3, 4]
 
+    ids = dataset.fragment_ids()
+    ids.add(100)
+    assert list(dataset.fragment_ids()) == [0, 1, 2, 3, 4]
+
     dataset.delete("a < 4")
     assert list(dataset.fragment_ids()) == [2, 3, 4]
 

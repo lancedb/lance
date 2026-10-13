@@ -2975,7 +2975,7 @@ impl Dataset {
     }
 
     fn fragment_ids(&self) -> crate::bitmap::PyBitmap {
-        crate::bitmap::PyBitmap::new(self.ds.iter_fragments().map(|f| f.id as u32).collect())
+        crate::bitmap::PyBitmap(self.ds.fragment_bitmap().clone())
     }
 
     fn num_small_files(&self, max_rows_per_group: usize) -> PyResult<usize> {
