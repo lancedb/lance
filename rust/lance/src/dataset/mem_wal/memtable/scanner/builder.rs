@@ -454,20 +454,13 @@ fn to_local_expr(query: &IndexFtsQuery) -> Result<FtsQueryExpr> {
                 // `Some(0)` is an exact match in the index model.
                 Some(0) => FtsQueryExpr::match_query_with_operator(m.terms.clone(), m.operator)
                     .with_boost(m.boost),
-                // The fuzzy path expands each term independently and unions the
-                // expansions, so it cannot also require every term to match.
-                _ if m.operator != Operator::Or => {
-                    return Err(Error::not_supported(
-                        "MemTable fuzzy full-text search only supports OR match operators"
-                            .to_string(),
-                    ));
-                }
                 fuzziness => FtsQueryExpr::fuzzy_with_options(
                     m.terms.clone(),
                     fuzziness,
                     m.prefix_length,
                     m.max_expansions,
                 )
+                .with_operator(m.operator)
                 .with_boost(m.boost),
             },
             m.column.as_ref(),
@@ -2012,6 +2005,7 @@ mod tests {
         );
     }
 
+    /// Each index query shape maps to its local form; a leaf without a column is rejected.
     #[test]
     fn local_fts_query_maps_leaf_shapes_and_rejects_the_rest() {
         use lance_index::scalar::inverted::query::{
@@ -2109,9 +2103,17 @@ mod tests {
                 .with_fuzziness(Some(1))
                 .with_column(Some("text".to_string())),
         ));
+        let local = local_fts_query(fuzzy_and, None).unwrap();
         assert!(
-            local_fts_query(fuzzy_and, None).is_err(),
-            "fuzzy AND cannot be represented by the local memtable query"
+            matches!(
+                local.expr,
+                FtsQueryExpr::Fuzzy {
+                    operator: Operator::And,
+                    fuzziness: Some(1),
+                    ..
+                }
+            ),
+            "fuzzy AND maps to a conjunctive Fuzzy leaf"
         );
 
         // Phrase -> local Phrase.
