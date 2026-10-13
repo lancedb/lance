@@ -147,9 +147,7 @@ impl PQBuildParams {
         let dimension = data.value_length() as usize;
         let sub_vector_dimension = dimension / self.num_sub_vectors;
 
-        // One k-means per sub-vector; they are independent and each is a small
-        // problem (sample × sub_vector_dimension), so run them side by side rather
-        // than one after another.
+        // One independent k-means per sub-vector, run side by side.
         let d = sub_vectors
             .into_par_iter()
             .enumerate()
@@ -240,28 +238,24 @@ impl PQBuildParams {
         // TODO: support bf16 later.
         match fsl.value_type() {
             DataType::Float16 => {
-                // Half-precision k-means scores sub-vectors one centroid at a time
-                // through a scalar f16 path and accumulates centroids in f16; train on
-                // a widened copy of the sample and narrow the codebook back to the
-                // column's type for storage.
-                let widen = |fsl: &FixedSizeListArray| -> Result<FixedSizeListArray> {
-                    let values = cast(fsl.values(), &DataType::Float32)?;
-                    Ok(FixedSizeListArray::try_new_from_values(
-                        values.as_primitive::<Float32Type>().clone(),
-                        fsl.value_length(),
-                    )?)
-                };
-                let codebook = match self.codebook.as_ref() {
-                    Some(codebook) => {
-                        Some(Arc::new(widen(codebook.as_fixed_size_list())?) as ArrayRef)
-                    }
-                    None => None,
-                };
+                // f16 k-means is scalar and accumulates in half precision: train on a
+                // widened copy of the training rows, store the codebook narrowed back.
+                let f32_list = DataType::FixedSizeList(
+                    Arc::new(arrow_schema::Field::new("item", DataType::Float32, true)),
+                    fsl.value_length(),
+                );
                 let params = Self {
-                    codebook,
+                    codebook: self
+                        .codebook
+                        .as_ref()
+                        .map(|codebook| cast(codebook, &f32_list))
+                        .transpose()?,
                     ..self.clone()
                 };
-                let pq = params.build_from_fsl::<Float32Type>(&widen(fsl)?, distance_type)?;
+                let training_rows = fsl.len().min(self.try_sample_size()?);
+                let training = cast(&fsl.slice(0, training_rows), &f32_list)?;
+                let pq = params
+                    .build_from_fsl::<Float32Type>(training.as_fixed_size_list(), distance_type)?;
                 let codebook = cast(pq.codebook.values(), &DataType::Float16)?;
                 let codebook = FixedSizeListArray::try_new_from_values(
                     codebook.as_primitive::<Float16Type>().clone(),

@@ -445,19 +445,12 @@ impl MaybeF32 for Float32Type {
 impl MaybeF32 for Float16Type {}
 impl MaybeF32 for Float64Type {}
 
-/// Largest centroid table, in bytes, scored through [`L2Prepared`] (SoA, all
-/// centroids of a vector in one pass). Sized to the L1 data cache: PQ codebooks
-/// (256 centroids × 4–16 dimensions) fit, IVF centroid tables do not and keep
-/// the per-centroid kernels, whose AoS locality wins once the table streams
-/// from L2 or memory.
+/// [`L2Prepared`] (SoA, all centroids of a vector in one pass) is used only for
+/// PQ sub-vectors: at most 16 dimensions, where the per-centroid kernels are
+/// dominated by call overhead (a 16 × 512 IVF node ran 4× slower through SoA),
+/// and a table that fits the L1 data cache.
+const L2_PREPARED_MAX_DIMENSION: usize = 16;
 const L2_PREPARED_MAX_BYTES: usize = 32 * 1024;
-
-/// Largest centroid table, in bytes, that the centroid update sums in one pass
-/// over the data with a partial table per data chunk (see `to_kmeans`). Every
-/// PQ codebook and hierarchical IVF node is far below it; a flat k-means on
-/// very wide vectors keeps the centroid-split update, whose memory is one table
-/// however many chunks there are.
-const SINGLE_PASS_SUMS_MAX_BYTES: usize = 1024 * 1024;
 
 /// Per-thread score-buffer budget for [`dot_membership_amx_f16`], in f32
 /// values: 256 KB, sized to stay within a typical private L2 alongside the
@@ -582,11 +575,13 @@ where
             None => match distance_type {
                 DistanceType::L2 => match T::as_f32_slice(centroids)
                     .zip(T::as_f32_slice(data))
-                    .filter(|_| centroids.len() * size_of::<f32>() <= L2_PREPARED_MAX_BYTES)
-                {
-                    // Small tables (PQ sub-vector codebooks): one SoA pass per vector
-                    // instead of one kernel call per centroid, whose call and dispatch
-                    // overhead dominates at 4–16 dimensions.
+                    .filter(|_| {
+                        dimension <= L2_PREPARED_MAX_DIMENSION
+                            && centroids.len() * size_of::<f32>() <= L2_PREPARED_MAX_BYTES
+                    }) {
+                    // PQ sub-vector codebooks: one SoA pass per vector instead of one
+                    // kernel call per centroid, whose call and dispatch overhead
+                    // dominates at these dimensions.
                     Some((centroids, data)) => {
                         let prepared = L2Prepared::new(centroids, dimension);
                         data.par_chunks(dimension)
@@ -658,63 +653,29 @@ where
         distance_type: DistanceType,
         loss: f64,
     ) -> KMeans {
-        let mut centroids = if k * dimension * size_of::<T::Native>() <= SINGLE_PASS_SUMS_MAX_BYTES
-        {
-            // One pass over the data: each chunk sums into its own table and the
-            // tables are added up. Splitting the centroids across workers instead
-            // would make every worker re-read all of the data.
-            let rows_per_chunk =
-                (MEMBERSHIP_CHUNK_BYTES / (dimension * size_of::<T::Native>())).max(1);
-            data.par_chunks(rows_per_chunk * dimension)
-                .zip(membership.par_chunks(rows_per_chunk))
-                .map(|(vectors, members)| {
-                    let mut sums = vec![T::Native::zero(); k * dimension];
-                    for (vector, cluster_id) in vectors.chunks(dimension).zip(members) {
-                        if let Some(cluster_id) = cluster_id {
-                            let centroid =
-                                &mut sums[*cluster_id as usize * dimension..][..dimension];
-                            centroid.iter_mut().zip(vector).for_each(|(c, v)| *c += *v);
-                        }
+        // One pass: a partial table per chunk, at most one chunk per worker.
+        let row_bytes = dimension * size_of::<T::Native>();
+        let rows_per_chunk = (MEMBERSHIP_CHUNK_BYTES / row_bytes)
+            .max(membership.len().div_ceil(get_num_compute_intensive_cpus()))
+            .max(1);
+        let mut centroids = data
+            .par_chunks(rows_per_chunk * dimension)
+            .zip(membership.par_chunks(rows_per_chunk))
+            .map(|(vectors, members)| {
+                let mut sums = vec![T::Native::zero(); k * dimension];
+                for (vector, cluster_id) in vectors.chunks(dimension).zip(members) {
+                    if let Some(cluster_id) = cluster_id {
+                        let centroid = &mut sums[*cluster_id as usize * dimension..][..dimension];
+                        centroid.iter_mut().zip(vector).for_each(|(c, v)| *c += *v);
                     }
-                    sums
-                })
-                .reduce_with(|mut total, sums| {
-                    total.iter_mut().zip(sums).for_each(|(t, s)| *t += s);
-                    total
-                })
-                .unwrap_or_else(|| vec![T::Native::zero(); k * dimension])
-        } else {
-            // A table too large to hold per chunk: each worker owns a range of
-            // centroids and scans the data for its members.
-            let mut centroids = vec![T::Native::zero(); k * dimension];
-            let mut num_cpus = get_num_compute_intensive_cpus();
-            if k < num_cpus || k < 16 {
-                num_cpus = 1;
-            }
-            let chunk_size = k / num_cpus;
-            centroids
-                .par_chunks_mut(dimension * chunk_size)
-                .enumerate()
-                .with_max_len(1)
-                .for_each(|(i, centroids)| {
-                    let start = i * chunk_size;
-                    let end = ((i + 1) * chunk_size).min(k);
-                    data.chunks(dimension)
-                        .zip(membership.iter())
-                        .filter_map(|(vector, cluster_id)| {
-                            cluster_id.map(|cluster_id| (vector, cluster_id as usize))
-                        })
-                        .for_each(|(vector, cluster_id)| {
-                            if start <= cluster_id && cluster_id < end {
-                                let local_id = cluster_id - start;
-                                let centroid = &mut centroids
-                                    [local_id * dimension..(local_id + 1) * dimension];
-                                centroid.iter_mut().zip(vector).for_each(|(c, v)| *c += *v);
-                            }
-                        });
-                });
-            centroids
-        };
+                }
+                sums
+            })
+            .reduce_with(|mut total, sums| {
+                total.iter_mut().zip(sums).for_each(|(t, s)| *t += s);
+                total
+            })
+            .unwrap_or_else(|| vec![T::Native::zero(); k * dimension]);
 
         centroids
             .par_chunks_mut(dimension)
@@ -2343,48 +2304,31 @@ mod tests {
                 None,
                 None,
             );
-        let widen = |array: &Float32Array| {
-            arrow::compute::cast(array, &DataType::Float64)
-                .unwrap()
-                .as_primitive::<Float64Type>()
-                .clone()
-        };
+        let widen = |array: &Float32Array| arrow::compute::cast(array, &DataType::Float64).unwrap();
         let (reference, reference_dists) =
             KMeansAlgoFloat::<Float64Type>::compute_membership_and_dist(
-                widen(&centroids).values(),
-                widen(&data).values(),
+                widen(&centroids).as_primitive::<Float64Type>().values(),
+                widen(&data).as_primitive::<Float64Type>().values(),
                 DIM,
                 DistanceType::L2,
                 0.0,
                 None,
                 None,
             );
-        for (row, ((chosen, dist), (expected, expected_dist))) in prepared
-            .iter()
-            .zip(&prepared_dists)
-            .zip(reference.iter().zip(&reference_dists))
-            .enumerate()
-        {
-            let (dist, expected_dist) = (dist.unwrap(), expected_dist.unwrap());
+        assert_eq!(prepared, reference);
+        for (dist, expected) in prepared_dists.iter().zip(&reference_dists) {
+            let (dist, expected) = (dist.unwrap(), expected.unwrap());
             assert!(
-                (dist - expected_dist).abs() <= 1e-4 * expected_dist.max(1.0),
-                "row {row}: chose {chosen:?} at {dist}, reference {expected:?} at {expected_dist}"
+                (dist - expected).abs() <= 1e-4 * expected.max(1.0),
+                "{dist} vs {expected}"
             );
         }
     }
 
-    /// Both centroid-update strategies (one pass with partial tables, and one
-    /// worker per centroid range for tables too large to replicate) must return
-    /// the member means.
-    #[rstest::rstest]
-    #[case::single_pass(3, 2)]
-    #[case::centroid_split(256, 1025)]
-    fn test_to_kmeans_centroids_are_member_means(#[case] k: usize, #[case] dim: usize) {
-        assert_eq!(
-            k * dim * size_of::<f32>() <= SINGLE_PASS_SUMS_MAX_BYTES,
-            k == 3,
-            "the cases must cover both update strategies"
-        );
+    /// The chunked centroid update must return the member means.
+    #[test]
+    fn test_to_kmeans_centroids_are_member_means() {
+        let (k, dim) = (3, 2);
         let rows = 2 * k;
         let data: Vec<f32> = (0..rows).flat_map(|row| vec![row as f32; dim]).collect();
         let membership: Vec<Option<u32>> = (0..rows).map(|row| Some((row % k) as u32)).collect();
