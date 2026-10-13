@@ -871,12 +871,12 @@ async fn test_read_version_transaction_same_version_skips_manifest_read() {
     assert_eq!(same_version.timestamp, ds.version().timestamp);
     assert_eq!(same_version.transaction, expected_transaction);
     assert!(same_version.transaction.is_some());
-    // The transaction is now cached for the handle's own version, so
-    // `read_transaction()` costs nothing more.
+    // The session transaction cache is keyed only by version, so it is not
+    // populated: `read_transaction()` still pays its own storage read.
     assert_eq!(ds.read_transaction().await.unwrap(), expected_transaction);
     let stats = ds.object_store.io_stats_incremental();
-    assert_eq!(stats.read_iops, 0);
-    assert_eq!(stats.read_bytes, 0);
+    assert_eq!(stats.read_iops, yardstick_stats.read_iops);
+    assert_eq!(stats.read_bytes, yardstick_stats.read_bytes);
 
     // The fallback path (a handle at another version, fresh session so nothing
     // is cached) reads the whole manifest and must agree with the fast path.
@@ -984,6 +984,61 @@ async fn test_read_version_transaction_same_version_skips_manifest_read() {
         via_uncached_manifest.timestamp,
         via_cached_manifest.timestamp
     );
+}
+
+/// A table dropped and recreated at the same URI can reuse a version number
+/// that a long-lived session already holds a cached transaction for. Reading
+/// the recreated table's own version must return its transaction, not the
+/// stale cached one.
+#[tokio::test]
+async fn test_read_version_transaction_after_recreate_at_same_uri() {
+    let uri = TempStrDir::default();
+    let first = write_versions(&uri, 1, true).await;
+    let session = Arc::new(Session::default());
+    let old_reader = DatasetBuilder::from_uri(&uri)
+        .with_session(session.clone())
+        .load()
+        .await
+        .unwrap();
+    let old_tx = old_reader.read_transaction().await.unwrap().unwrap();
+    assert_eq!(old_tx, first.read_transaction().await.unwrap().unwrap());
+    std::fs::remove_dir_all(uri.as_str()).unwrap();
+
+    // Keep the new transaction outside the manifest tail read so loading the
+    // recreated table cannot overwrite the session's cached transaction.
+    let schema = Arc::new(ArrowSchema::new_with_metadata(
+        vec![ArrowField::new("key", DataType::Int32, false)],
+        HashMap::from([("padding".to_owned(), "x".repeat(MANIFEST_PADDING_BYTES))]),
+    ));
+    let batch =
+        RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![42]))]).unwrap();
+    let recreated = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        &uri,
+        Some(WriteParams {
+            enable_v2_manifest_paths: true,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let expected = recreated.read_transaction().await.unwrap().unwrap();
+    assert_ne!(expected.uuid, old_tx.uuid);
+
+    let reopened = DatasetBuilder::from_uri(&uri)
+        .with_session(session)
+        .load()
+        .await
+        .unwrap();
+    assert_eq!(reopened.version().version, 1);
+    assert_ne!(
+        reopened.manifest_location.e_tag,
+        old_reader.manifest_location.e_tag
+    );
+
+    let actual = reopened.read_version_transaction(1).await.unwrap();
+    assert_eq!(actual.timestamp, reopened.version().timestamp);
+    assert_eq!(actual.transaction.unwrap().uuid, expected.uuid);
 }
 
 #[tokio::test]
