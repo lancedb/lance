@@ -1,9 +1,9 @@
 # Clustering Metadata
 
-Clustering organizes data to improve query pruning. Lance records the table's
-current policy separately from information about individual outputs. Providers
-choose the layout and maintenance logic. This proposal defines the format in
-`clustering.proto`.
+Clustering organizes data to improve query pruning. A **provider** is the
+implementation that chooses the layout and how to maintain it. Lance records
+the table's current policy separately from the layout information on fragments
+and index segments. This proposal defines the format in `clustering.proto`.
 
 ## Stored Information
 
@@ -34,11 +34,15 @@ must not be interpreted using a different current configuration.
   fragment and segment information. Historical reclustering is a separate operation.
 - Providers may take over other providers' fragments, recluster them, and write
   their own information on the outputs. Lance imposes no provider ownership boundary.
-- When `Manifest.clustering` is present, implementations supporting this contract
-  use its `columns` as the clustering keys, taking precedence over existing
-  `Field.unenforced_clustering_key_position` and `Field.unenforced_clustering_key`
-  hints. Preserve those hints under their existing rules rather than clearing or
-  synchronizing them. Without the new configuration, their existing semantics apply.
+
+### Legacy Column-Level Hints
+
+Preserve `Field.unenforced_clustering_key_position` and
+`Field.unenforced_clustering_key` under their existing rules. These are **legacy
+column-level hints**, not fields to clear or synchronize with the new configuration.
+When `Manifest.clustering` is present, supporting implementations use its `columns`
+as the clustering keys instead. Otherwise, the legacy hints retain their existing
+meaning.
 
 ## Clustering, Compaction, and Indexing
 
@@ -56,25 +60,29 @@ Providers may reuse Lance's builders. Lance validates inputs against concurrent
 changes and commits the outputs and metadata atomically. Runtime interface
 signatures are outside this format contract.
 
-Without an available provider compaction strategy, default compaction skips
-clustered fragments and processes unclustered ones normally. An explicit ordinary
-compaction may override this; its output is unmarked. Provider failures are
-reported rather than silently switching strategies. Without a provider indexing
-strategy, normal index building remains available, producing unmarked segments.
-Fragments without clustering information use Lance's default compaction and
-indexing unless a provider selects them for its own operations.
+The presence of fragment clustering information determines default maintenance:
+
+- **Without clustering information:** use normal Lance compaction and indexing,
+  unless a provider selects the fragments for its own operations.
+- **With clustering information:** use the provider's available maintenance
+  strategy. Without a compaction strategy, default compaction skips these
+  fragments. Explicit ordinary compaction may override this and produces
+  fragments without clustering information. Without an indexing strategy, normal
+  indexing remains available and produces segments without clustering information.
+
+Provider failures are reported, not silently retried with a different strategy.
 
 ## Ordinary Maintenance
 
 - Unrelated commits preserve configuration and unchanged fragments' and
   segments' information, including unknown metadata keys and values.
-- Ordinary data rewrites do not inherit fragment clustering information.
-  Column replacement and overlays clear it even when the fragment ID remains
-  unchanged or only non-clustering columns change. No layout-impact analysis is needed.
+- Ordinary data rewrites produce fragments without clustering information.
+  Column replacement and overlays clear it even when the fragment ID stays the
+  same or only non-clustering columns change. No layout-impact analysis is needed.
 - Deletion-vector-only changes preserve the original fragment's information.
   Providers must tolerate deleted rows and revalidate maintenance bookkeeping.
-- Ordinary index merge, rebuild, and remap do not inherit information on the
-  rewritten segments. Data fragments' clustering information is unaffected.
+- Ordinary index merge, rebuild, and remap produce segments without clustering
+  information. Data fragments' clustering information is unaffected.
 - Provider operations set their outputs' information. Metadata maps are not
   automatically copied or merged from inputs.
 
