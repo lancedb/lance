@@ -1791,12 +1791,8 @@ impl PreFilter for SegmentPreFilter {
     }
 }
 
-/// Rows `index` owns at the dataset's version, built once per `(segment,
-/// version)` and served from the index cache afterwards.
-///
-/// `None` means the segment needs no restriction. The mask is derived from the
-/// manifest alone, so one entry serves every query on the handle and both exec
-/// nodes of a search; building it walks every fragment of the dataset.
+/// The cached [`SegmentOwnershipMaskKey`] entry of `index` at the dataset's
+/// version; `None` when the segment needs no restriction.
 async fn segment_ownership_mask(
     dataset: &Arc<Dataset>,
     index: &IndexMetadata,
@@ -1814,11 +1810,12 @@ async fn segment_ownership_mask(
     let mask = dataset
         .index_cache
         .get_or_insert_with_key(key, || async move {
-            match DatasetPreFilter::create_restricted_deletion_mask(loader_dataset, owned_fragments)
-            {
-                Some(mask) => Ok(Some(mask.await?)),
-                None => Ok(None),
-            }
+            futures::future::OptionFuture::from(DatasetPreFilter::create_restricted_deletion_mask(
+                loader_dataset,
+                owned_fragments,
+            ))
+            .await
+            .transpose()
         })
         .await?;
     Ok((*mask).clone())

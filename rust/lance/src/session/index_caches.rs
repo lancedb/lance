@@ -158,11 +158,9 @@ impl CacheKey for FragReuseDetailsKey<'_> {
     }
 }
 
-/// Rows a vector index segment owns at one dataset version: the restricted
-/// deletion mask built from the segment's fragment bitmap, or `None` when the
-/// segment needs no restriction. Building it walks every fragment of the
-/// dataset, so it is kept per `(segment, dataset version)` and shared by every
-/// query and by both exec nodes of a search.
+/// Restricted deletion mask of a vector index segment at one dataset version
+/// (`None`: the segment needs no restriction). Building it walks every
+/// fragment of the dataset, hence the cache entry.
 #[derive(Debug)]
 pub struct SegmentOwnershipMaskKey<'a> {
     pub uuid: &'a Uuid,
