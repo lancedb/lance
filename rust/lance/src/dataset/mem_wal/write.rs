@@ -1529,7 +1529,6 @@ async fn replay_memtable_from_wal(
                     .generation
                     .is_some_and(|generation| generation < base_generation);
                 if let (Some(generation), Some(last)) = (entry.generation, last_replayed_generation)
-                    && !already_flushed
                     && generation < last
                 {
                     return Err(Error::io(format!(
@@ -10503,17 +10502,6 @@ mod tests {
 
     const COVERED_TEST_ROW_CAP: usize = 16;
 
-    /// Config for the covered-position tests: appends happen only when a test
-    /// drives them, and a memtable holds at most `COVERED_TEST_ROW_CAP` rows.
-    fn covered_position_test_config(shard_id: Uuid) -> ShardWriterConfig {
-        ShardWriterConfig {
-            durable_write: false,
-            max_wal_flush_interval: None,
-            max_memtable_rows: COVERED_TEST_ROW_CAP,
-            ..memtable_config_with_pk(shard_id)
-        }
-    }
-
     /// Append the active memtable's un-appended batches to the WAL without
     /// going through the flush handler, so the writer state does not learn the
     /// new entry position: the window between an append and its bookkeeping.
@@ -10544,12 +10532,19 @@ mod tests {
         let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
         let schema = schema_with_pk();
         let shard_id = Uuid::new_v4();
+        // Appends happen only when the test drives them.
+        let config = ShardWriterConfig {
+            durable_write: false,
+            max_wal_flush_interval: None,
+            max_memtable_rows: COVERED_TEST_ROW_CAP,
+            ..memtable_config_with_pk(shard_id)
+        };
 
         let writer_a = ShardWriter::open(
             store.clone(),
             base_path.clone(),
             base_uri.clone(),
-            covered_position_test_config(shard_id),
+            config.clone(),
             schema.clone(),
             vec![],
         )
@@ -10584,7 +10579,7 @@ mod tests {
             store,
             base_path,
             base_uri.clone(),
-            covered_position_test_config(shard_id),
+            config,
             schema.clone(),
             vec![],
         )
@@ -10692,7 +10687,7 @@ mod tests {
         let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
         let schema = schema_with_pk();
         let shard_id = Uuid::new_v4();
-        let config = covered_position_test_config(shard_id);
+        let config = memtable_config_with_pk(shard_id);
 
         let writer_a = ShardWriter::open(
             store.clone(),

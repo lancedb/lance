@@ -777,11 +777,7 @@ impl MemTableFlusher {
 
                 ShardManifest {
                     version: current.next_version(),
-                    // Never move backwards: replay would re-read entries
-                    // an earlier generation already holds.
-                    replay_after_wal_entry_position: current
-                        .replay_after_wal_entry_position
-                        .max(covered_wal_entry_position),
+                    replay_after_wal_entry_position: covered_wal_entry_position,
                     wal_entry_position_last_seen: current
                         .wal_entry_position_last_seen
                         .max(covered_wal_entry_position),
