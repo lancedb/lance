@@ -1521,10 +1521,8 @@ async fn replay_memtable_from_wal(
                         position, entry.writer_epoch, target.creator_epoch
                     )));
                 }
-                // An entry recorded under a generation replay starts past is
-                // already in that generation's SSTable. A manifest can point
-                // replay at it when the flush that wrote the SSTable recorded
-                // a covered position one entry short.
+                // An entry of a generation below the one replay starts from is
+                // already in that generation's SSTable.
                 let already_flushed = entry
                     .generation
                     .is_some_and(|generation| generation < base_generation);
@@ -4946,13 +4944,10 @@ impl MemTableFlushHandler {
 
             // Step 2: Flush the memtable to Lance storage. The covered WAL
             // entry position is the last entry holding this memtable's
-            // batches, recorded on its store by the append itself. The
-            // freeze-time marker can lag it: an append can land before the
-            // writer state records its position, and a freeze in that gap
-            // triggers no append of its own. The marker is only the fallback
-            // for a memtable nothing was appended for. Stamping this into the
-            // manifest is what lets replay-on-reopen skip entries this
-            // generation covers.
+            // batches, recorded on its store by the append. A memtable nothing
+            // was appended for, such as one rebuilt by replay, falls back to
+            // its freeze-time marker. Stamping this into the manifest is what
+            // lets replay-on-reopen skip entries this generation covers.
             let covered_wal_entry_position = memtable
                 .batch_store()
                 .last_wal_entry_position()
@@ -10523,10 +10518,8 @@ mod tests {
     }
 
     /// A memtable frozen after its batches were appended, but before the
-    /// writer state recorded that append, must still record the append's WAL
-    /// position as covered. Otherwise reopen replays that entry into the next
-    /// generation: its rows come back twice, and with the next generation
-    /// near its row cap the open fails outright.
+    /// writer state recorded that append, records the append's WAL position
+    /// as covered, so reopen replays only the generation after it.
     #[tokio::test]
     async fn test_flush_covers_append_not_yet_recorded_in_writer_state() {
         let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
@@ -10598,9 +10591,8 @@ mod tests {
         writer_b.close().await.unwrap();
     }
 
-    /// A manifest whose replay cursor points one entry too early, at an entry
-    /// of a generation already flushed, must still open: replay skips that
-    /// entry instead of loading it into the next generation's memtable.
+    /// A manifest whose replay cursor points at an entry of a generation
+    /// already flushed opens, and replay skips that entry.
     #[tokio::test]
     async fn test_replay_skips_entry_of_already_flushed_generation() {
         use crate::dataset::mem_wal::ShardManifestStore;
@@ -10678,8 +10670,7 @@ mod tests {
     }
 
     /// Past the generation replay starts from, WAL generations only move
-    /// forward. An entry going backwards is corruption, not data to load into
-    /// whichever memtable is active.
+    /// forward; an entry whose generation goes backwards fails the open.
     #[tokio::test]
     async fn test_replay_rejects_backwards_generation() {
         use crate::dataset::mem_wal::ShardManifestStore;

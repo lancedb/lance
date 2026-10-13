@@ -913,9 +913,9 @@ impl WalFlusher {
             .await?;
         let wal_io_duration = start.elapsed();
 
-        // Record the entry on the store before publishing durability: a freeze
-        // that sees these batches as appended relies on the store, not on the
-        // writer state updated after this returns, for the position it covers.
+        // Record the entry on the store before advancing the durability
+        // cursor: a freeze that finds these batches durable takes its covered
+        // position from the store.
         batch_store.record_wal_entry_position(append_result.entry_position);
 
         // Advance the writer-global durability cursor and wake waiters. The range
