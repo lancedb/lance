@@ -4510,6 +4510,8 @@ dependencies = [
  "humantime",
  "itertools 0.14.0",
  "lance-arrow",
+ "lance-arrow-scalar",
+ "lance-arrow-stats",
  "lance-bitpacking",
  "lance-core",
  "lance-datafusion",
