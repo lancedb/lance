@@ -84,6 +84,25 @@ the containing data file. The locator is unchanged; its default zone size is
 8,192 rows.
 
 The buffer contains a complete Arrow IPC file, with its own schema and metadata.
+For a column named `price`, the layout of a version 1 seed is:
+
+```text
+Data file
+|-- Data-file schema metadata
+|   `-- lance.seed.price = "7:8192"
+|       Buffer index 7; configured zone size 8,192 rows
+`-- Global buffer 7: Arrow IPC seed file
+    |-- IPC schema metadata
+    |   |-- version = "1": seed statistics version
+    |   `-- seed_null_bitmap = <hex>: optional null row offsets
+    `-- Statistics records: one record per zone
+        min, max, null_count, nan_count, negative_nan_count, zone_length
+```
+
+The zone size is stored in the outer locator, not as a separate
+`rows_per_zone` key in the seed's IPC schema metadata. The bitmap, when present,
+covers the seed's physical row sequence; `null_count` is stored per zone.
+
 The column's Arrow type is `value_type` in the schemas below. Seeds contain no
 fragment ID or zone-start field. Record order determines the zone's local row
 offset: the zero-based record number times `rows_per_zone`. The last zone may
