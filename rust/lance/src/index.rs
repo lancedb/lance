@@ -462,6 +462,14 @@ impl<'a> History<'a> {
         self.snapshots[&self.dataset.manifest.version].clone()
     }
 
+    /// Adds `dataset`'s version as `dataset` holds it, so it is found even
+    /// after a cleanup removed it from storage.
+    fn know(&mut self, dataset: &Dataset) {
+        self.snapshots
+            .entry(dataset.manifest.version)
+            .or_insert_with(|| Arc::new(Snapshot::new(dataset.clone())));
+    }
+
     /// The dataset at `version`, or `None` once cleanup has removed it.
     async fn at(&mut self, version: u64) -> Result<Option<Arc<Snapshot>>> {
         if let Some(snapshot) = self.snapshots.get(&version) {
@@ -926,8 +934,10 @@ async fn prune_stale_segment_coverage(
 ///
 /// Without any history, a segment of stable row ids on a table that has them
 /// keeps that coverage: compaction leaves the ids valid, so they need no
-/// translation. Fragments the build held need none either. Tagged histories
-/// are replayed instead ([`replay_staged_segments`]).
+/// translation. Fragments the build held need none either. A segment whose
+/// build version has been cleaned up keeps none of its coverage, since nothing
+/// then shows which fragments its build held. Tagged histories are replayed
+/// instead ([`replay_staged_segments`]).
 async fn withdraw_untranslated_coverage(
     dataset: &Dataset,
     index_name: &str,
@@ -958,13 +968,15 @@ async fn withdraw_untranslated_coverage(
         let mut produced = RoaringBitmap::new();
         if segment.dataset_version() < dataset.manifest.version
             && (frag_reuse_index.is_some() || !stores_stable_row_ids(view))
-            && let Some(built_at) = history.at(segment.dataset_version()).await?
         {
-            produced = segment
-                .fragment_bitmap()
-                .iter()
-                .filter(|fragment| built_at.fragment(*fragment).is_none())
-                .collect();
+            produced = match history.at(segment.dataset_version()).await? {
+                Some(built_at) => segment
+                    .fragment_bitmap()
+                    .iter()
+                    .filter(|fragment| built_at.fragment(*fragment).is_none())
+                    .collect(),
+                None => segment.fragment_bitmap().clone(),
+            };
         }
         produced_since_build.push(produced);
     }
@@ -1011,22 +1023,43 @@ async fn v0_reuse_versions(dataset: &Dataset) -> Result<Option<Vec<FragReuseVers
     }
 }
 
-/// Refuses, as retryable, a CreateIndex whose segments cover fragments
-/// compaction produced after they were built through fragment reuse records
-/// held at `read_version` that a cleanup committed since trimmed, or that went
-/// with a fragment reuse index dropped since: readers could no longer
-/// translate the segments' rows there. Published again from the
-/// latest version the segments leave that coverage out
-/// ([`build_index_metadata_from_segments`]). Coverage no record ever carried,
-/// such as a segment's inline remap, is left as it was.
-pub(crate) async fn check_coverage_still_translated(
-    dataset: &Dataset,
-    read_version: u64,
-    new_indices: &[IndexMetadata],
+/// Refuses a CreateIndex whose new segments cover a fragment nothing vouches
+/// for, checked against `base`, the manifest the commit replaces. A segment's
+/// entries hold the row addresses of its build, so its coverage of a fragment
+/// compaction produced since is valid only while the fragment reuse history
+/// translates those addresses there. Every commit attempt runs this, detached
+/// or not, so metadata saved while a history translated it cannot be published
+/// once the history no longer does. [`withdraw_untranslated_coverage`]
+/// prepares segments to pass it.
+///
+/// A covered fragment is vouched for when the segment's build version held
+/// it, or the history translates it to fragments that version held; when a
+/// segment of the same index that the commit removes covered it, as a merge or
+/// a remap carries its sources' coverage; or when the commit replaces segments
+/// of the index and none of them covered it, as an optimize indexes new rows.
+/// A build version that has been cleaned up vouches for nothing. Segments of
+/// stable row ids on a table without history, and tagged histories, are
+/// exempt as in [`withdraw_untranslated_coverage`].
+///
+/// Refused as retryable when the commit read an earlier version that may
+/// still have vouched for the coverage: a cleanup since trimmed or dropped the
+/// records, or removed the build version. Otherwise the submitted coverage is
+/// invalid.
+pub(crate) async fn check_published_coverage(
+    base: &Dataset,
+    read: Option<&Dataset>,
+    transaction: &Transaction,
 ) -> Result<()> {
+    let Operation::CreateIndex {
+        new_indices,
+        removed_indices,
+    } = &transaction.operation
+    else {
+        return Ok(());
+    };
     let candidates = new_indices
         .iter()
-        .filter(|index| !is_system_index(index) && index.dataset_version < read_version)
+        .filter(|index| !is_system_index(index) && index.dataset_version < base.manifest.version)
         .filter(|index| {
             index
                 .fragment_bitmap
@@ -1037,52 +1070,141 @@ pub(crate) async fn check_coverage_still_translated(
     if candidates.is_empty() {
         return Ok(());
     }
-    let Some(current_versions) = v0_reuse_versions(dataset).await? else {
+    let base_indices = load_all_indices(base).await?;
+    let frag_reuse_entry = base_indices
+        .iter()
+        .find(|index| index.name == FRAG_REUSE_INDEX_NAME);
+    if frag_reuse_entry.is_some_and(|entry| entry.index_version != 0) {
         return Ok(());
-    };
-    let mut history = History::new(dataset).await?;
-    let current = history.current();
-    let mut read_versions = None;
+    }
+    let removed = removed_indices
+        .iter()
+        .map(|index| index.uuid)
+        .collect::<HashSet<_>>();
+    let mut history: Option<(History<'_>, Vec<FragReuseVersion>)> = None;
     for index in candidates {
-        let version = index.dataset_version;
-        let Some(built_at) = history.at(version).await? else {
+        if base.manifest.uses_stable_row_ids()
+            && !index.results_are_row_addrs()
+            && frag_reuse_entry.is_none()
+        {
             continue;
-        };
-        let is_built = |id: u32| built_at.fragment(id).is_some();
-        for fragment in index.fragment_bitmap.iter().flatten() {
-            if is_built(fragment)
-                || current.fragment(fragment).is_none()
-                || sources_at_build(&current_versions, version, fragment, is_built).is_some()
-            {
-                continue;
-            }
-            if read_versions.is_none() {
-                read_versions = Some(match history.at(read_version).await? {
-                    Some(read) => v0_reuse_versions(&read.dataset).await?,
-                    None => None,
-                });
-            }
-            let was_translated = read_versions
-                .as_ref()
-                .and_then(|versions| versions.as_ref())
-                .is_none_or(|versions| {
-                    sources_at_build(versions, version, fragment, is_built).is_some()
-                });
-            if was_translated {
-                return Err(Error::retryable_commit_conflict_source(
-                    dataset.manifest.version,
-                    format!(
-                        "Index segment {} of '{}', built at version {version}, covers fragment \
-                         {fragment} through fragment reuse records that were trimmed, or \
-                         dropped with the fragment reuse index, after version \
-                         {read_version}, the version this commit read. Commit the segments \
-                         again from the latest version.",
-                        index.uuid, index.name
-                    )
-                    .into(),
-                ));
-            }
         }
+        let mut pending = index.fragment_bitmap.clone().unwrap_or_default();
+        pending &= base.fragment_bitmap.as_ref();
+        let mut indexed = RoaringBitmap::new();
+        let mut replaces = false;
+        for existing in base_indices
+            .iter()
+            .filter(|existing| existing.name == index.name)
+        {
+            let coverage = existing.fragment_bitmap.clone().unwrap_or_default();
+            if removed.contains(&existing.uuid) {
+                replaces = true;
+                pending -= &coverage;
+            }
+            indexed |= coverage;
+        }
+        if replaces {
+            pending &= indexed;
+        }
+        let version = index.dataset_version;
+        if let Some(read) = read.filter(|read| read.manifest.version == version) {
+            let read = Snapshot::new(read.clone());
+            pending = pending
+                .iter()
+                .filter(|fragment| read.fragment(*fragment).is_none())
+                .collect();
+        }
+        if pending.is_empty() {
+            continue;
+        }
+
+        // Read on demand: most commits are settled above without them.
+        if history.is_none() {
+            let mut base_history = History::new(base).await?;
+            if let Some(read) = read {
+                base_history.know(read);
+            }
+            let versions = match frag_reuse_entry {
+                Some(entry) => load_frag_reuse_index_details(base, entry)
+                    .await?
+                    .versions
+                    .clone(),
+                None => Vec::new(),
+            };
+            history = Some((base_history, versions));
+        }
+        let (history, versions) = history.as_mut().expect("read above");
+        let built_at = history.at(version).await?;
+        let is_built = |id: u32| {
+            built_at
+                .as_ref()
+                .is_some_and(|built_at| built_at.fragment(id).is_some())
+        };
+        let unvouched = pending
+            .iter()
+            .filter(|fragment| {
+                !is_built(*fragment)
+                    && sources_at_build(versions, version, *fragment, is_built).is_none()
+            })
+            .collect::<RoaringBitmap>();
+        if unvouched.is_empty() {
+            continue;
+        }
+
+        // Whether the version the commit read still vouched for it. Without
+        // the build version, or the read version's own history, nothing says
+        // it did not.
+        let read_version = transaction.read_version;
+        let read_versions = if read_version == base.manifest.version || built_at.is_none() {
+            None
+        } else {
+            match history.at(read_version).await? {
+                Some(read) => v0_reuse_versions(&read.dataset).await?,
+                None => None,
+            }
+        };
+        let raced = read_version != base.manifest.version
+            && read_versions.is_none_or(|read_versions| {
+                unvouched.iter().all(|fragment| {
+                    sources_at_build(&read_versions, version, fragment, |id| {
+                        built_at
+                            .as_ref()
+                            .is_some_and(|built_at| built_at.fragment(id).is_some())
+                    })
+                    .is_some()
+                })
+            });
+        let fragments = unvouched.iter().take(8).collect::<Vec<_>>();
+        let reason = if built_at.is_some() {
+            format!(
+                "covers fragments {fragments:?}, which compaction produced after its build \
+                 at version {version}, through fragment reuse records the history no longer \
+                 holds"
+            )
+        } else {
+            format!(
+                "covers fragments {fragments:?}, but its build version {version} has been \
+                 cleaned up, so nothing shows they hold the rows it indexed"
+            )
+        };
+        let segment = format!("Index segment {} of '{}'", index.uuid, index.name);
+        return Err(if raced {
+            Error::retryable_commit_conflict_source(
+                base.manifest.version,
+                format!(
+                    "{segment} {reason}. This may have changed after version {read_version}, \
+                     the version this commit read: commit the segments again from the latest \
+                     version."
+                )
+                .into(),
+            )
+        } else {
+            Error::invalid_input(format!(
+                "{segment} {reason}. Commit it with commit_existing_index_segments, which \
+                 leaves that coverage out, or rebuild it."
+            ))
+        });
     }
     Ok(())
 }

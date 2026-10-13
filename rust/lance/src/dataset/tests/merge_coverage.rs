@@ -16,6 +16,7 @@ use lance_core::Error;
 use lance_core::utils::tempfile::TempStrDir;
 use lance_index::IndexType;
 use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
+use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::BuiltinIndexType;
 use lance_index::scalar::ScalarIndexParams;
 use lance_table::format::IndexMetadata;
@@ -30,12 +31,13 @@ use crate::Dataset;
 use crate::dataset::index::frag_reuse::cleanup_frag_reuse_index;
 use crate::dataset::optimize::remapping::remap_column_index;
 use crate::dataset::optimize::{CompactionOptions, compact_files};
-use crate::dataset::transaction::Operation;
+use crate::dataset::transaction::{Operation, Transaction};
+use crate::dataset::write::CommitBuilder;
 use crate::dataset::{
     MergeInsertBuilder, MergeInsertWriteMode, WhenMatched, WhenNotMatched, WriteDestination,
     WriteParams,
 };
-use crate::index::DatasetIndexExt;
+use crate::index::{DatasetIndexExt, IntoIndexSegment, build_index_metadata_from_segments};
 use crate::utils::test::compact_into_two;
 #[cfg(feature = "geo")]
 use crate::utils::test::geo;
@@ -1980,4 +1982,221 @@ async fn test_republished_segment_covers_shared_sources_only_through_kept_links(
     assert_eq!(val_idx_coverage(&dataset).await, covered);
     assert_uses_val_idx(&dataset, "val >= 180").await;
     assert_val_lookups_match_scan(&dataset, (0..24).map(|id| id * 10), "").await;
+}
+
+/// Commits `new_indices` as a raw `CreateIndex` read at `read_version`, the
+/// way a [`CommitBuilder`] caller can, without the preparation
+/// [`DatasetIndexExt::commit_existing_index_segments`] gives segments.
+async fn commit_raw(
+    dataset: &Dataset,
+    read_version: u64,
+    new_indices: Vec<IndexMetadata>,
+    detached: bool,
+) -> lance_core::Result<Dataset> {
+    CommitBuilder::new(Arc::new(dataset.clone()))
+        .with_detached(detached)
+        .execute(Transaction::new(
+            read_version,
+            Operation::CreateIndex {
+                new_indices,
+                removed_indices: vec![],
+            },
+            None,
+        ))
+        .await
+}
+
+/// A saved segment published again by a raw `CreateIndex` needs the record
+/// that translates its coverage of the compaction's output. With the record
+/// kept the commit goes through and lookups use the segment. Once a cleanup
+/// trimmed it, or the fragment reuse index was dropped with it, the commit is
+/// refused: as invalid when it reads a version that already lacks the record,
+/// and as retryable when it is detached from a version that still had it.
+/// Either way the table is left as it was.
+#[rstest]
+#[tokio::test]
+async fn test_raw_republished_segment_needs_its_record(
+    #[values(IndexType::BTree, IndexType::ZoneMap)] index_type: IndexType,
+    #[values(Record::Kept, Record::Trimmed, Record::Dropped)] record: Record,
+    #[values(false, true)] detached: bool,
+) {
+    let dir = TempStrDir::default();
+    let uri = dir.as_str();
+    let (saved, compacted) = saved_segment_over_a_compaction(uri, index_type).await;
+    let read_before_loss = Dataset::open(uri).await.unwrap().manifest.version;
+    let dataset = lose_record(uri, record).await;
+    let read_version = if detached {
+        read_before_loss
+    } else {
+        dataset.manifest.version
+    };
+
+    let result = commit_raw(&dataset, read_version, saved, detached).await;
+    let trace = format!("{index_type:?} {record:?} detached={detached}");
+    let probes = || (0..24).map(|id| id * 10);
+    if matches!(record, Record::Kept) {
+        let published = result.unwrap();
+        assert_eq!(
+            val_idx_coverage(&published).await,
+            RoaringBitmap::from_iter([compacted])
+        );
+        assert_uses_val_idx(&published, "val < 100").await;
+        assert_val_lookups_match_scan(&published, probes(), &trace).await;
+        return;
+    }
+    if let Ok(published) = &result {
+        // What the refusal prevents: entries that no longer translate.
+        assert_val_lookups_match_scan(published, probes(), &trace).await;
+    }
+    let error = result.expect_err(&trace);
+    if detached {
+        assert!(
+            matches!(error, Error::RetryableCommitConflict { .. }),
+            "{trace}: {error}"
+        );
+    } else {
+        assert!(
+            matches!(error, Error::InvalidInput { .. }),
+            "{trace}: {error}"
+        );
+    }
+    let latest = Dataset::open(uri).await.unwrap();
+    assert_eq!(latest.manifest.version, dataset.manifest.version);
+    assert!(
+        latest
+            .load_indices_by_name("val_idx")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_val_lookups_match_scan(&latest, probes(), &trace).await;
+}
+
+/// A segment prepared while the history translates its coverage of the
+/// compaction's output loses that record to a cleanup before it is committed,
+/// and in one case its build version is cleaned up too. The commit is refused
+/// as retryable either way. Committed again from the latest version, the
+/// segment covers nothing and lookups match a scan.
+#[rstest]
+#[tokio::test]
+async fn test_prepared_segment_losing_its_record_is_retried(
+    #[values(IndexType::BTree, IndexType::ZoneMap)] index_type: IndexType,
+    #[values(false, true)] build_version_cleaned_up: bool,
+) {
+    let dir = TempStrDir::default();
+    let uri = dir.as_str();
+    let (saved, compacted) = saved_segment_over_a_compaction(uri, index_type).await;
+    let publisher = Dataset::open(uri).await.unwrap();
+    let field_id = publisher.schema().field("val").unwrap().id;
+    let segments = saved
+        .iter()
+        .cloned()
+        .map(IntoIndexSegment::into_index_segment)
+        .collect::<lance_core::Result<Vec<_>>>()
+        .unwrap();
+    let prepared = build_index_metadata_from_segments(&publisher, "val_idx", field_id, segments)
+        .await
+        .unwrap();
+    assert_eq!(
+        prepared[0].fragment_bitmap.clone().unwrap(),
+        RoaringBitmap::from_iter([compacted])
+    );
+
+    let writer = lose_record(uri, Record::Trimmed).await;
+    if build_version_cleaned_up {
+        clean_up(&writer, vec![saved[0].dataset_version]).await;
+    }
+    let result = commit_raw(&publisher, publisher.manifest.version, prepared, false).await;
+    let trace = format!("{index_type:?} build_version_cleaned_up={build_version_cleaned_up}");
+    let probes = || (0..24).map(|id| id * 10);
+    if let Ok(published) = &result {
+        assert_val_lookups_match_scan(published, probes(), &trace).await;
+    }
+    let error = result.expect_err(&trace);
+    assert!(
+        matches!(error, Error::RetryableCommitConflict { .. }),
+        "{trace}: {error}"
+    );
+
+    let mut latest = Dataset::open(uri).await.unwrap();
+    assert_eq!(latest.manifest.version, writer.manifest.version);
+    latest
+        .commit_existing_index_segments("val_idx", "val", saved)
+        .await
+        .unwrap();
+    assert!(val_idx_coverage(&latest).await.is_empty(), "{trace}");
+    assert_val_lookups_match_scan(&latest, probes(), &trace).await;
+}
+
+/// A saved segment whose build version a cleanup removed is committed again
+/// from a fresh handle. No compaction touched its fragments, but without the
+/// build version nothing shows which fragments it was built over, so it covers
+/// nothing and its rows are scanned.
+#[tokio::test]
+async fn test_republished_segment_whose_build_version_is_gone_covers_nothing() {
+    let dir = TempStrDir::default();
+    let mut dataset = val_table(dir.as_str(), 4).await;
+    commit_val_idx(&mut dataset, IndexType::BTree).await;
+    let saved = dataset.load_indices_by_name("val_idx").await.unwrap();
+    dataset.drop_index("val_idx").await.unwrap();
+    clean_up(&dataset, vec![saved[0].dataset_version]).await;
+
+    let mut dataset = Dataset::open(dir.as_str()).await.unwrap();
+    dataset
+        .commit_existing_index_segments("val_idx", "val", saved)
+        .await
+        .unwrap();
+    assert!(val_idx_coverage(&dataset).await.is_empty());
+    assert_val_lookups_match_scan(&dataset, (0..24).map(|id| id * 10), "").await;
+}
+
+/// An optimize merges `val_idx`, which an eager compaction carried onto its
+/// output without a record, with rows appended since. The merged segment keeps
+/// its source's build version, but it carries that source's coverage of the
+/// output and indexes the appended rows itself, so it commits with all of it.
+#[tokio::test]
+async fn test_optimized_segment_keeps_coverage_an_eager_compaction_carried() {
+    let dir = TempStrDir::default();
+    let mut dataset = val_table(dir.as_str(), 4).await;
+    commit_val_idx(&mut dataset, IndexType::BTree).await;
+    let options = CompactionOptions {
+        target_rows_per_fragment: 1_000,
+        excluded_fragment_ids: vec![2, 3],
+        ..Default::default()
+    };
+    compact_files(&mut dataset, options, None).await.unwrap();
+    assert!(dataset.frag_reuse_index().await.unwrap().is_none());
+    assert_eq!(
+        val_idx_coverage(&dataset).await,
+        RoaringBitmap::from_iter([2, 3, 4])
+    );
+    let built = dataset.load_indices_by_name("val_idx").await.unwrap()[0].dataset_version;
+
+    let ids = (4 * ROWS..5 * ROWS).collect::<Vec<_>>();
+    let schema = Arc::new(ArrowSchema::from(dataset.schema()));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from(ids.clone())) as ArrayRef,
+            Arc::new(Int32Array::from_iter_values(ids.iter().map(|id| id * 10))),
+            Arc::new(Int32Array::from(vec![42; ids.len()])),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new([Ok(batch.clone())], batch.schema());
+    dataset.append(reader, None).await.unwrap();
+    dataset
+        .optimize_indices(&OptimizeOptions::merge(1))
+        .await
+        .unwrap();
+
+    let segments = dataset.load_indices_by_name("val_idx").await.unwrap();
+    assert_eq!(segments.len(), 1);
+    assert_eq!(segments[0].dataset_version, built);
+    assert_eq!(
+        val_idx_coverage(&dataset).await,
+        RoaringBitmap::from_iter([2, 3, 4, 5])
+    );
+    assert_uses_val_idx(&dataset, "val = 0").await;
+    assert_val_lookups_match_scan(&dataset, (0..30).map(|id| id * 10), "").await;
 }
