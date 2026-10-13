@@ -377,13 +377,14 @@ pub(crate) async fn plan_optimize_indices_or_skip(
         let unindexed = dataset.unindexed_fragments(&name).await?;
         // Without an N:1 merge the single-process optimize rebuilds the
         // absorbed segments from scratch, and the only split that reproduces
-        // it is none.
-        let split = bounded && segment_has_merge_primitive(last);
+        // it is none. Inverted stays unsplit under stable row ids until its
+        // merge drops stale postings (issue #8085).
+        let split = bounded
+            && segment_has_merge_primitive(last)
+            && !(segment_has_inverted_details(last) && dataset.manifest.uses_stable_row_ids());
         if !split {
             if bounded {
-                log::warn!(
-                    "Index '{name}': its kind has no segment merge, so it is optimized in one task"
-                );
+                log::warn!("Index '{name}' is not split, so it is optimized in one task");
             }
             plan_unsplit_index(&mut plan, dataset, &name, &segments, unindexed, options).await?;
             continue;
