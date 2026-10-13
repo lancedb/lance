@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+mod condition;
 mod delete;
 mod in_place;
 mod write;
@@ -13,6 +14,7 @@ use futures::StreamExt;
 use lance_table::format::Fragment;
 use roaring::RoaringTreemap;
 
+pub use condition::MergeConditionExec;
 pub use delete::DeleteOnlyMergeInsertExec;
 pub use in_place::InPlaceMergeInsertExec;
 pub use write::FullSchemaMergeInsertExec;
