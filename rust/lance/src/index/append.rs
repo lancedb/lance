@@ -41,7 +41,8 @@ use crate::dataset::Dataset;
 use crate::dataset::index::LanceIndexStoreExt;
 use crate::dataset::rowids::load_row_id_sequences;
 use crate::index::scalar::{
-    IndexDetails, fetch_index_details, load_fts_training_data, load_training_data,
+    IndexDetails, TrainingRows, fetch_index_details, load_fts_training_data, load_training_data,
+    scan_training_data,
 };
 use crate::index::vector_index_details_default;
 
@@ -519,20 +520,18 @@ async fn load_unindexed_training_data(
     dataset: &Dataset,
     field_path: &str,
     update_criteria: &lance_index::scalar::UpdateCriteria,
-    unindexed: &[Fragment],
+    unindexed: TrainingRows,
 ) -> Result<datafusion::execution::SendableRecordBatchStream> {
-    let fragments = if update_criteria.requires_old_data {
+    let selection = if update_criteria.requires_old_data {
         None
     } else {
-        Some(unindexed.to_vec())
+        Some(unindexed)
     };
-    load_training_data(
+    scan_training_data(
         dataset,
         field_path,
         &update_criteria.data_criteria,
-        fragments,
-        true,
-        None,
+        selection,
     )
     .await
 }
@@ -846,7 +845,7 @@ async fn merge_scalar_indices<'a>(
                 dataset.as_ref(),
                 field_path,
                 &update_criteria,
-                unindexed,
+                TrainingRows::Fragments(unindexed.to_vec()),
             )
             .await?;
 
