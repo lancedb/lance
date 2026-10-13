@@ -17,7 +17,7 @@ import re
 import sys
 from urllib.parse import urlsplit
 
-from backends.base import OPTIONS, STATES, BackendError
+from backends.base import OPTIONS, RANGES, STATES, BackendError
 
 BACKENDS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "backends")
 # "." and ".." would name a directory outside the one that holds the jobs.
@@ -71,13 +71,15 @@ def load_job(path: str) -> dict:
         if name not in OPTIONS[operation]:
             raise invalid(f"unknown option: {name}")
         check_type(name, value, OPTIONS[operation][name])
+        if name in RANGES:
+            low, high = RANGES[name]
+            if value < low:
+                raise invalid(f"option {name} must be at least {low}")
+            if value > high:
+                raise invalid(f"option {name} must be at most {high}")
     if operation == "cleanup":
         if "older_than_seconds" not in options and "retain_versions" not in options:
             raise invalid("cleanup needs older_than_seconds or retain_versions")
-        if options.get("retain_versions", 1) < 1:
-            raise invalid("retain_versions must be at least 1")
-        if options.get("older_than_seconds", 0) < 0:
-            raise invalid("older_than_seconds must not be negative")
 
     table = job.get("table")
     if not isinstance(table, str) or not table:

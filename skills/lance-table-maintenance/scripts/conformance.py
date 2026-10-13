@@ -43,8 +43,16 @@ class Checker:
         """Returns (exit code, the JSON object printed, or None if it is not one)."""
         args = [sys.executable, MAINTAIN, command, target, "--backend", self.backend]
         started = time.monotonic()
-        done = subprocess.run(args, capture_output=True, text=True)
+        try:
+            done = subprocess.run(
+                args, capture_output=True, text=True, timeout=CALL_LIMIT
+            )
+        except subprocess.TimeoutExpired:
+            done = None
         self.slowest = max(self.slowest, time.monotonic() - started)
+        if done is None:
+            self.report("FAIL", f"{command} returns within {CALL_LIMIT}s", target)
+            return None, {}
         try:
             output = json.loads(done.stdout)
         except ValueError:

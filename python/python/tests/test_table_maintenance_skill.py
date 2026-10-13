@@ -48,7 +48,11 @@ def wait(env, job_id):
 
 @pytest.fixture
 def env(tmp_path):
-    return {**os.environ, "LANCE_MAINTENANCE_HOME": str(tmp_path / "state")}
+    # Settings of this machine, such as a fragment budget, change what a job does.
+    env = {
+        k: v for k, v in os.environ.items() if not k.startswith("LANCE_MAINTENANCE_")
+    }
+    return {**env, "LANCE_MAINTENANCE_HOME": str(tmp_path / "state")}
 
 
 @pytest.fixture
@@ -127,11 +131,15 @@ def test_jobs_in_the_recommended_order_leave_the_table_healthy(env, table, tmp_p
             "operation": "compact",
             "options": {},
         },
+        {"operation": "compact", "options": {"materialize_deletions_threshold": -1}},
+        {"operation": "cleanup", "options": {"older_than_seconds": 9e12}},
     ],
     ids=[
         "misspelled option",
         "cleanup without retention",
         "credentials in the table URI",
+        "number out of range",
+        "retention that overflows in Lance",
     ],
 )
 def test_maintain_rejects_a_job_it_cannot_run_safely(env, table, tmp_path, bad):

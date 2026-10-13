@@ -58,14 +58,14 @@ not set it.
 
 | `operation` | Option | Type | Meaning |
 | --- | --- | --- | --- |
-| `compact` | `target_rows_per_fragment` | integer | Rows a fragment should have. Default 1048576 |
-| `compact` | `max_bytes_per_file` | integer | Upper size of a data file |
+| `compact` | `target_rows_per_fragment` | integer, at least 1 | Rows a fragment should have. Default 1048576 |
+| `compact` | `max_bytes_per_file` | integer, at least 1 | Upper size of a data file |
 | `compact` | `materialize_deletions` | boolean | Also rewrite fragments that are not small but have many deleted rows, to drop those rows. Default true. Small fragments that are merged lose their deleted rows either way |
-| `compact` | `materialize_deletions_threshold` | number | Share of deleted rows above which a fragment is rewritten. Default 0.1 |
+| `compact` | `materialize_deletions_threshold` | number from 0 to 1 | Share of deleted rows above which a fragment is rewritten. Default 0.1 |
 | `optimize_indices` | `index_names` | list of strings | Indices to update. Default all |
-| `optimize_indices` | `num_indices_to_merge` | integer | How many segments to merge. Needed to merge the segments of an index that already covers every row; set it to the index's `num_segments`. An index with fewer segments keeps the segments it has |
+| `optimize_indices` | `num_indices_to_merge` | integer, at least 0 | How many segments to merge. Needed to merge the segments of an index that already covers every row; set it to the index's `num_segments`. An index with fewer segments keeps the segments it has |
 | `optimize_indices` | `retrain` | boolean | Vector indices only: rebuild the index from all rows. Expensive. Has no effect on scalar indices |
-| `cleanup` | `older_than_seconds` | number | Only delete versions older than this |
+| `cleanup` | `older_than_seconds` | number from 0 to 3153600000 (100 years) | Only delete versions older than this |
 | `cleanup` | `retain_versions` | integer, at least 1 | Keep this many of the latest versions |
 | `cleanup` | `error_if_tagged_old_versions` | boolean | Fail if a tagged version would be deleted. Default true. When false, tagged versions are kept and the other old versions are deleted |
 

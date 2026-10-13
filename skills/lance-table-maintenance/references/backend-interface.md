@@ -151,6 +151,7 @@ A backend can rely on these and does not have to repeat them.
 | Rule | What it prevents |
 | --- | --- |
 | A job with an unknown field, an unknown option or a value of the wrong type is rejected with `invalid_input` | A misspelled `retain_version` is ignored and a cleanup that cannot be undone runs with the wrong retention |
+| Every number in the options is within the range in `references/operations.md` | A negative count that Lance rejects only once the job runs, a negative deletion threshold that rewrites every fragment, and a retention so long that Lance overflows |
 | A `cleanup` job has `older_than_seconds` or `retain_versions`, and `retain_versions` is at least 1 | Without either, Lance's bindings behave differently: Python keeps 14 days, Rust and Java delete every version except the latest and tagged ones. The same job would delete different data on different backends |
 | A local `table` path is made absolute. A `table` with a user name or password in it is rejected | Secrets written to disk |
 | A job id passed to `status` or `cancel` follows the rules for `job_id` | Quoting problems and path traversal |

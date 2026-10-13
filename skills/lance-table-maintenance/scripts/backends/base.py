@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Protocol
 
 STATES = ("queued", "running", "succeeded", "failed", "canceled")
@@ -36,6 +37,18 @@ OPTIONS = {
         "retain_versions": int,
         "error_if_tagged_old_versions": bool,
     },
+}
+
+# Values a number in a job may take. Outside them Lance fails only once the
+# job runs, overflows, or does what nobody asked for: a negative deletion
+# threshold rewrites every fragment.
+RANGES = {
+    "target_rows_per_fragment": (1, math.inf),
+    "max_bytes_per_file": (1, math.inf),
+    "materialize_deletions_threshold": (0, 1),
+    "num_indices_to_merge": (0, math.inf),
+    "older_than_seconds": (0, 100 * 365 * 24 * 3600),  # 100 years
+    "retain_versions": (1, math.inf),
 }
 
 # Table config keys that start with this prefix set compaction options.

@@ -171,7 +171,14 @@ def classify(exc: BaseException) -> str:
     # An object store that is reached without its endpoint or region.
     if re.search(r"bucket '[^']*' not found", message):
         return "table_not_found"
-    if "commit conflict" in message or "too many concurrent writers" in message:
+    # Lance cannot retry an incompatible transaction on its own, but a job
+    # planned again on the new version of the table can run.
+    conflicts = (
+        "commit conflict",
+        "incompatible transaction",
+        "too many concurrent writers",
+    )
+    if any(text in message for text in conflicts):
         return "conflict"
     denied = (
         "permission denied",
@@ -213,12 +220,15 @@ def budgets(ds, max_source_fragments: int | None) -> dict:
     return found
 
 
+def with_budgets(options: dict, found: dict) -> dict:
+    return {**options, **{k: v for k, (v, _) in found.items()}}
+
+
 def plan(ds, options: dict, max_source_fragments: int | None) -> dict:
     from lance.optimize import Compaction
 
     found = budgets(ds, max_source_fragments)
-    effective = {**options, **{k: v for k, (v, _) in found.items()}}
-    compaction = Compaction.plan(ds, effective)
+    compaction = Compaction.plan(ds, with_budgets(options, found))
     tasks = compaction.num_tasks()
     unbudgeted = tasks
     if found:
@@ -227,7 +237,6 @@ def plan(ds, options: dict, max_source_fragments: int | None) -> dict:
             ds, {**options, **dict.fromkeys(found)}
         ).num_tasks()
     return {
-        "options": effective,
         "plan": compaction,
         "tasks": tasks,
         "tasks_without_budget": unbudgeted,
@@ -260,11 +269,14 @@ def rewrite(compaction) -> dict:
 
 def check_index_names(ds, options: dict) -> None:
     # optimize_indices silently does nothing for a name it does not know.
+    names = options.get("index_names")
+    if not names:
+        return
     if hasattr(ds, "describe_indices"):
         known = {index.name for index in ds.describe_indices()}
     else:
         known = {index["name"] for index in ds.list_indices()}
-    unknown = [n for n in options.get("index_names") or [] if n not in known]
+    unknown = [n for n in names if n not in known]
     if unknown:
         raise BackendError("invalid_input", f"unknown index: {', '.join(unknown)}")
 
@@ -272,13 +284,7 @@ def check_index_names(ds, options: dict) -> None:
 def cleanup_arguments(options: dict) -> dict:
     arguments = {k: v for k, v in options.items() if k != "older_than_seconds"}
     if "older_than_seconds" in options:
-        try:
-            older_than = timedelta(seconds=options["older_than_seconds"])
-        except OverflowError as e:
-            raise BackendError(
-                "invalid_input", "older_than_seconds is too large"
-            ) from e
-        arguments["older_than"] = older_than
+        arguments["older_than"] = timedelta(seconds=options["older_than_seconds"])
     return arguments
 
 
@@ -329,14 +335,20 @@ def run_operation(
     ds = lance.dataset(job["table"], storage_options=storage)
     options = job["options"]
     if job["operation"] == "compact":
-        planned = plan(ds, options, max_source_fragments)
-        if planned["tasks"] == 0 and planned["tasks_without_budget"] > 0:
-            raise BackendError(
-                "invalid_input",
-                "the per-run budget is smaller than the first compaction task, "
-                f"so nothing would be compacted: {planned['budgets']}",
-            )
-        return fields(ds.optimize.compact_files(**planned["options"]))
+        found = budgets(ds, max_source_fragments)
+        # compact_files plans on its own and commits nothing without a task.
+        # Planning again only tells a budget that stops every task from a
+        # table with nothing to compact.
+        metrics = ds.optimize.compact_files(**with_budgets(options, found))
+        if found and metrics.fragments_removed == 0:
+            planned = plan(ds, options, max_source_fragments)
+            if planned["tasks_without_budget"] > 0:
+                raise BackendError(
+                    "invalid_input",
+                    "the per-run budget is smaller than the first compaction task, "
+                    f"so nothing was compacted: {planned['budgets']}",
+                )
+        return fields(metrics)
     if job["operation"] == "optimize_indices":
         check_index_names(ds, options)
         ds.optimize.optimize_indices(**options)
