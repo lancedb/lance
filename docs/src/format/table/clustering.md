@@ -34,9 +34,11 @@ must not be interpreted using a different current configuration.
   fragment and segment information. Historical reclustering is a separate operation.
 - Providers may take over other providers' fragments, recluster them, and write
   their own information on the outputs. Lance imposes no provider ownership boundary.
-- When configuration is present, `columns` defines the clustering keys. Writers
-  clear the older `Field.unenforced_clustering_key_position` and
-  `Field.unenforced_clustering_key` hints to avoid conflicting definitions.
+- When `Manifest.clustering` is present, implementations supporting this contract
+  use its `columns` as the clustering keys, taking precedence over existing
+  `Field.unenforced_clustering_key_position` and `Field.unenforced_clustering_key`
+  hints. Preserve those hints under their existing rules rather than clearing or
+  synchronizing them. Without the new configuration, their existing semantics apply.
 
 ## Clustering, Compaction, and Indexing
 
