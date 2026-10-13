@@ -85,7 +85,8 @@ pub struct TransactionRebase<'a> {
     staged_replay: bool,
     /// The transaction's idempotency keys, `None` when it carries none.
     /// Every transaction it is checked against must not share any of them.
-    idempotency_keys: Option<IdempotencyKeys>,
+    /// Boxed: the commit loop holds the rebase across awaits.
+    idempotency_keys: Option<Box<IdempotencyKeys>>,
 }
 
 /// Whether a fragment-reuse index would corrupt `index` rather than repair it.
@@ -251,7 +252,7 @@ impl<'a> TransactionRebase<'a> {
         transaction: Transaction,
         affected_rows: Option<&'a RowAddrTreeMap>,
     ) -> Result<Self> {
-        let idempotency_keys = IdempotencyKeys::from_transaction(&transaction)?;
+        let idempotency_keys = IdempotencyKeys::from_transaction(&transaction)?.map(Box::new);
         match &transaction.operation {
             // These operations add new fragments or don't modify any.
             Operation::Append { .. }
@@ -652,7 +653,7 @@ impl<'a> TransactionRebase<'a> {
     pub(crate) fn with_idempotency_property(mut self, property: Option<&str>) -> Self {
         self.idempotency_keys = self
             .idempotency_keys
-            .map(|keys| keys.with_caller_property(property));
+            .map(|keys| Box::new(keys.with_caller_property(property)));
         self
     }
 
