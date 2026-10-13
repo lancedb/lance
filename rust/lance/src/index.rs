@@ -1033,13 +1033,16 @@ async fn v0_reuse_versions(dataset: &Dataset) -> Result<Option<Vec<FragReuseVers
 /// prepares segments to pass it.
 ///
 /// A covered fragment is vouched for when the segment's build version held
-/// it, or the history translates it to fragments that version held; when a
-/// segment of the same index that the commit removes covered it, as a merge or
-/// a remap carries its sources' coverage; or when the commit replaces segments
-/// of the index and none of them covered it, as an optimize indexes new rows.
-/// A build version that has been cleaned up vouches for nothing. Segments of
-/// stable row ids on a table without history, and tagged histories, are
-/// exempt as in [`withdraw_untranslated_coverage`].
+/// it, or the history translates it to fragments that version held. A build
+/// version that has been cleaned up vouches for nothing. The segments a commit
+/// replaces say nothing of the entries a segment it supplies holds, except
+/// for the segments `optimize_indices` built (`optimized`): it merged them
+/// from the segments the commit removes, reading those through the history,
+/// and indexed the fragments its read version left unindexed itself, so
+/// coverage of either is vouched for too. The history checked is the one
+/// `base` holds, so a commit that also changes the fragment reuse index is
+/// refused. Segments of stable row ids on a table without history, and
+/// tagged histories, are exempt as in [`withdraw_untranslated_coverage`].
 ///
 /// Refused as retryable when the commit read an earlier version that may
 /// still have vouched for the coverage: a cleanup since trimmed or dropped the
@@ -1049,6 +1052,7 @@ pub(crate) async fn check_published_coverage(
     base: &Dataset,
     read: Option<&Dataset>,
     transaction: &Transaction,
+    optimized: bool,
 ) -> Result<()> {
     let Operation::CreateIndex {
         new_indices,
@@ -1070,6 +1074,20 @@ pub(crate) async fn check_published_coverage(
     if candidates.is_empty() {
         return Ok(());
     }
+    if let Some(entry) = new_indices
+        .iter()
+        .chain(removed_indices)
+        .find(|index| index.name == FRAG_REUSE_INDEX_NAME)
+    {
+        let segment = candidates[0];
+        return Err(Error::invalid_input(format!(
+            "CreateIndex: index segment {} of '{}' was built at version {}, and its coverage \
+             is checked against the fragment reuse index, which this commit also changes \
+             (entry {}). Commit the segments and the change to the fragment reuse index \
+             separately.",
+            segment.uuid, segment.name, segment.dataset_version, entry.uuid
+        )));
+    }
     let base_indices = load_all_indices(base).await?;
     let frag_reuse_entry = base_indices
         .iter()
@@ -1081,6 +1099,7 @@ pub(crate) async fn check_published_coverage(
         .iter()
         .map(|index| index.uuid)
         .collect::<HashSet<_>>();
+    let mut read_indices = None;
     let mut history: Option<(History<'_>, Vec<FragReuseVersion>)> = None;
     for index in candidates {
         if base.manifest.uses_stable_row_ids()
@@ -1091,21 +1110,34 @@ pub(crate) async fn check_published_coverage(
         }
         let mut pending = index.fragment_bitmap.clone().unwrap_or_default();
         pending &= base.fragment_bitmap.as_ref();
-        let mut indexed = RoaringBitmap::new();
-        let mut replaces = false;
-        for existing in base_indices
-            .iter()
-            .filter(|existing| existing.name == index.name)
-        {
-            let coverage = existing.fragment_bitmap.clone().unwrap_or_default();
-            if removed.contains(&existing.uuid) {
-                replaces = true;
-                pending -= &coverage;
+        if optimized {
+            // What the removed segments cover in `base` is what their
+            // entries, merged into this one, answer for under its history.
+            for existing in base_indices
+                .iter()
+                .filter(|existing| existing.name == index.name && removed.contains(&existing.uuid))
+            {
+                if let Some(coverage) = &existing.fragment_bitmap {
+                    pending -= coverage;
+                }
             }
-            indexed |= coverage;
-        }
-        if replaces {
-            pending &= indexed;
+            // The fragments its read version left unindexed it indexed itself.
+            if let Some(read) = read.filter(|_| !pending.is_empty()) {
+                if read_indices.is_none() {
+                    read_indices = Some(load_all_indices(read).await?);
+                }
+                let mut unindexed = read.fragment_bitmap.as_ref().clone();
+                for existing in read_indices
+                    .iter()
+                    .flat_map(|indices| indices.iter())
+                    .filter(|existing| existing.name == index.name)
+                {
+                    if let Some(coverage) = &existing.fragment_bitmap {
+                        unindexed -= coverage;
+                    }
+                }
+                pending -= unindexed;
+            }
         }
         let version = index.dataset_version;
         if let Some(read) = read.filter(|read| read.manifest.version == version) {
@@ -3749,8 +3781,12 @@ impl DatasetIndexExt for Dataset {
         .transaction_properties(options.transaction_properties.clone())
         .build();
 
-        self.apply_commit(transaction, &Default::default(), &Default::default())
-            .await?;
+        self.apply_commit(
+            transaction,
+            &crate::dataset::ManifestWriteConfig::default().with_optimized_index_segments(),
+            &Default::default(),
+        )
+        .await?;
 
         Ok(())
     }

@@ -1308,6 +1308,7 @@ pub(crate) async fn do_commit_detached_transaction(
         dataset,
         None,
         transaction,
+        write_config.optimized_index_segments(),
     ))
     .await?;
     // Detached commits skip the rebase pipeline, so a rewrite's transition
@@ -1835,6 +1836,7 @@ pub(crate) async fn commit_transaction(
             &dataset,
             Some(&read_version_dataset),
             &attempt_transaction,
+            write_config.optimized_index_segments(),
         ))
         .await?;
 

@@ -15,7 +15,7 @@ use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use lance_core::Error;
 use lance_core::utils::tempfile::TempStrDir;
 use lance_index::IndexType;
-use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
+use lance_index::frag_reuse::{FRAG_REUSE_INDEX_NAME, FragReuseIndexDetails};
 use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::BuiltinIndexType;
 use lance_index::scalar::ScalarIndexParams;
@@ -1452,12 +1452,16 @@ async fn test_rtree_merge_covers_nothing_once_its_build_version_is_gone() {
     assert!(merged.fragment_bitmap.as_ref().unwrap().is_empty());
 }
 
-/// Commits `val_idx` over every fragment of a [`val_table`].
-async fn commit_val_idx(dataset: &mut Dataset, index_type: IndexType) {
-    let params = match index_type {
+fn val_idx_params(index_type: IndexType) -> ScalarIndexParams {
+    match index_type {
         IndexType::ZoneMap => ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap),
         _ => ScalarIndexParams::default(),
-    };
+    }
+}
+
+/// Commits `val_idx` over every fragment of a [`val_table`].
+async fn commit_val_idx(dataset: &mut Dataset, index_type: IndexType) {
+    let params = val_idx_params(index_type);
     dataset
         .create_index(&["val"], index_type, Some("val_idx".into()), &params, false)
         .await
@@ -1984,13 +1988,15 @@ async fn test_republished_segment_covers_shared_sources_only_through_kept_links(
     assert_val_lookups_match_scan(&dataset, (0..24).map(|id| id * 10), "").await;
 }
 
-/// Commits `new_indices` as a raw `CreateIndex` read at `read_version`, the
-/// way a [`CommitBuilder`] caller can, without the preparation
-/// [`DatasetIndexExt::commit_existing_index_segments`] gives segments.
+/// Commits `new_indices` in place of `removed_indices` as a raw `CreateIndex`
+/// read at `read_version`, the way a [`CommitBuilder`] caller can, without the
+/// preparation [`DatasetIndexExt::commit_existing_index_segments`] gives
+/// segments.
 async fn commit_raw(
     dataset: &Dataset,
     read_version: u64,
     new_indices: Vec<IndexMetadata>,
+    removed_indices: Vec<IndexMetadata>,
     detached: bool,
 ) -> lance_core::Result<Dataset> {
     CommitBuilder::new(Arc::new(dataset.clone()))
@@ -1999,7 +2005,7 @@ async fn commit_raw(
             read_version,
             Operation::CreateIndex {
                 new_indices,
-                removed_indices: vec![],
+                removed_indices,
             },
             None,
         ))
@@ -2031,7 +2037,7 @@ async fn test_raw_republished_segment_needs_its_record(
         dataset.manifest.version
     };
 
-    let result = commit_raw(&dataset, read_version, saved, detached).await;
+    let result = commit_raw(&dataset, read_version, saved, vec![], detached).await;
     let trace = format!("{index_type:?} {record:?} detached={detached}");
     let probes = || (0..24).map(|id| id * 10);
     if matches!(record, Record::Kept) {
@@ -2106,7 +2112,14 @@ async fn test_prepared_segment_losing_its_record_is_retried(
     if build_version_cleaned_up {
         clean_up(&writer, vec![saved[0].dataset_version]).await;
     }
-    let result = commit_raw(&publisher, publisher.manifest.version, prepared, false).await;
+    let result = commit_raw(
+        &publisher,
+        publisher.manifest.version,
+        prepared,
+        vec![],
+        false,
+    )
+    .await;
     let trace = format!("{index_type:?} build_version_cleaned_up={build_version_cleaned_up}");
     let probes = || (0..24).map(|id| id * 10);
     if let Ok(published) = &result {
@@ -2172,19 +2185,7 @@ async fn test_optimized_segment_keeps_coverage_an_eager_compaction_carried() {
     );
     let built = dataset.load_indices_by_name("val_idx").await.unwrap()[0].dataset_version;
 
-    let ids = (4 * ROWS..5 * ROWS).collect::<Vec<_>>();
-    let schema = Arc::new(ArrowSchema::from(dataset.schema()));
-    let batch = RecordBatch::try_new(
-        schema,
-        vec![
-            Arc::new(Int32Array::from(ids.clone())) as ArrayRef,
-            Arc::new(Int32Array::from_iter_values(ids.iter().map(|id| id * 10))),
-            Arc::new(Int32Array::from(vec![42; ids.len()])),
-        ],
-    )
-    .unwrap();
-    let reader = RecordBatchIterator::new([Ok(batch.clone())], batch.schema());
-    dataset.append(reader, None).await.unwrap();
+    append_val_fragment(&mut dataset).await;
     dataset
         .optimize_indices(&OptimizeOptions::merge(1))
         .await
@@ -2199,4 +2200,261 @@ async fn test_optimized_segment_keeps_coverage_an_eager_compaction_carried() {
     );
     assert_uses_val_idx(&dataset, "val = 0").await;
     assert_val_lookups_match_scan(&dataset, (0..30).map(|id| id * 10), "").await;
+}
+
+/// Appends a fragment of the next [`ROWS`] ids to a [`val_table`]; returns its
+/// id.
+async fn append_val_fragment(dataset: &mut Dataset) -> u32 {
+    let first = dataset.count_rows(None).await.unwrap() as i32;
+    let ids = (first..first + ROWS).collect::<Vec<_>>();
+    let schema = Arc::new(ArrowSchema::from(dataset.schema()));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from(ids.clone())) as ArrayRef,
+            Arc::new(Int32Array::from_iter_values(ids.iter().map(|id| id * 10))),
+            Arc::new(Int32Array::from(vec![42; ids.len()])),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new([Ok(batch.clone())], batch.schema());
+    dataset.append(reader, None).await.unwrap();
+    fragment_ids(dataset).into_iter().max().unwrap()
+}
+
+/// The `val_idx` segment of a [`val_table`], saved after a deferred compaction
+/// of fragments 0 and 1 moved its coverage of them onto the output, with the
+/// index then dropped. `id_idx` is caught up, so nothing else needs the
+/// compaction's record. Returns the saved segment, which covers fragments 2
+/// and 3 and the output, and the output.
+async fn saved_segment_beside_a_compaction(
+    uri: &str,
+    index_type: IndexType,
+) -> (Vec<IndexMetadata>, u32) {
+    let mut dataset = val_table(uri, 4).await;
+    commit_val_idx(&mut dataset, index_type).await;
+    let compacted = compact_deferred(&mut dataset, &[0, 1]).await;
+    remap_column_index(&mut dataset, &["id"], Some("id_idx".into()))
+        .await
+        .unwrap();
+    let saved = dataset.load_indices_by_name("val_idx").await.unwrap();
+    assert_eq!(
+        saved[0].fragment_bitmap.clone().unwrap(),
+        RoaringBitmap::from_iter([2, 3, compacted])
+    );
+    dataset.drop_index("val_idx").await.unwrap();
+    (saved, compacted)
+}
+
+/// What the current `val_idx` a raw `CreateIndex` replaces covers.
+#[derive(Clone, Copy, Debug)]
+enum Replaced {
+    /// Every current fragment, the compaction's output included.
+    Everything,
+    /// Only the fragments the compaction left alone.
+    Unaffected,
+}
+
+/// A raw `CreateIndex` publishes a saved segment in place of a `val_idx`
+/// built after the compaction. That the commit replaces an index covering the
+/// same fragments, or leaves the output to the saved segment alone, says
+/// nothing of the saved entries, which still hold the addresses the output's
+/// rows had before the compaction. With the record kept they translate and the
+/// commit goes through. Once a cleanup trimmed the record, or the fragment
+/// reuse index was dropped with it, the commit is refused as invalid, detached
+/// or not, and the current index stays.
+#[rstest]
+#[tokio::test]
+async fn test_raw_replacement_does_not_vouch_for_a_saved_segment(
+    #[values(IndexType::BTree, IndexType::ZoneMap)] index_type: IndexType,
+    #[values(Record::Kept, Record::Trimmed, Record::Dropped)] record: Record,
+    #[values(Replaced::Everything, Replaced::Unaffected)] replaced: Replaced,
+    #[values(false, true)] detached: bool,
+) {
+    let dir = TempStrDir::default();
+    let uri = dir.as_str();
+    let (saved, compacted) = saved_segment_beside_a_compaction(uri, index_type).await;
+    let mut dataset = lose_record(uri, record).await;
+    match replaced {
+        Replaced::Everything => commit_val_idx(&mut dataset, index_type).await,
+        Replaced::Unaffected => {
+            let params = val_idx_params(index_type);
+            let segments = crate::utils::test::stage_index_segments(
+                &mut dataset,
+                "val",
+                index_type,
+                &params,
+                "val_idx",
+                vec![2, 3],
+            )
+            .await;
+            dataset
+                .commit_existing_index_segments("val_idx", "val", segments)
+                .await
+                .unwrap();
+        }
+    }
+    let current = dataset.load_indices_by_name("val_idx").await.unwrap();
+
+    let result = commit_raw(
+        &dataset,
+        dataset.manifest.version,
+        saved,
+        current.to_vec(),
+        detached,
+    )
+    .await;
+    let trace = format!("{index_type:?} {record:?} {replaced:?} detached={detached}");
+    let probes = || (0..24).map(|id| id * 10);
+    if matches!(record, Record::Kept) {
+        let published = result.unwrap();
+        assert_eq!(
+            val_idx_coverage(&published).await,
+            RoaringBitmap::from_iter([2, 3, compacted])
+        );
+        assert_uses_val_idx(&published, "val < 100").await;
+        assert_val_lookups_match_scan(&published, probes(), &trace).await;
+        return;
+    }
+    if let Ok(published) = &result {
+        // What the refusal prevents: entries that no longer translate.
+        assert_val_lookups_match_scan(published, probes(), &trace).await;
+    }
+    let error = result.expect_err(&trace);
+    assert!(
+        matches!(error, Error::InvalidInput { .. }),
+        "{trace}: {error}"
+    );
+    let latest = Dataset::open(uri).await.unwrap();
+    assert_eq!(latest.manifest.version, dataset.manifest.version);
+    let kept = latest.load_indices_by_name("val_idx").await.unwrap();
+    assert_eq!(
+        kept.iter().map(|segment| segment.uuid).collect::<Vec<_>>(),
+        current
+            .iter()
+            .map(|segment| segment.uuid)
+            .collect::<Vec<_>>()
+    );
+    assert_val_lookups_match_scan(&latest, probes(), &trace).await;
+}
+
+/// After such a refusal the table is maintained as usual: an optimize merges
+/// the current `val_idx` with rows appended since, which neither its build
+/// version holds nor any history records. The optimize indexed them itself, so
+/// the merged segment commits covering them, under the build version it keeps.
+#[rstest]
+#[tokio::test]
+async fn test_optimize_after_a_refused_replacement_indexes_appended_rows(
+    #[values(IndexType::BTree, IndexType::ZoneMap)] index_type: IndexType,
+    #[values(Record::Trimmed, Record::Dropped)] record: Record,
+) {
+    let dir = TempStrDir::default();
+    let uri = dir.as_str();
+    let (saved, compacted) = saved_segment_beside_a_compaction(uri, index_type).await;
+    let mut dataset = lose_record(uri, record).await;
+    commit_val_idx(&mut dataset, index_type).await;
+    let current = dataset.load_indices_by_name("val_idx").await.unwrap();
+    let trace = format!("{index_type:?} {record:?}");
+    let refused = commit_raw(
+        &dataset,
+        dataset.manifest.version,
+        saved,
+        current.to_vec(),
+        false,
+    )
+    .await;
+    assert!(refused.is_err(), "{trace}");
+
+    let appended = append_val_fragment(&mut dataset).await;
+    dataset
+        .optimize_indices(&OptimizeOptions::merge(1))
+        .await
+        .unwrap();
+    let segments = dataset.load_indices_by_name("val_idx").await.unwrap();
+    assert_eq!(segments.len(), 1, "{trace}");
+    assert_eq!(segments[0].dataset_version, current[0].dataset_version);
+    assert_eq!(
+        val_idx_coverage(&dataset).await,
+        RoaringBitmap::from_iter([2, 3, compacted, appended])
+    );
+    assert_uses_val_idx(&dataset, "val >= 240").await;
+    assert_val_lookups_match_scan(&dataset, (0..30).map(|id| id * 10), &trace).await;
+}
+
+/// How a raw `CreateIndex` publishing a saved segment also changes the
+/// fragment reuse index.
+#[derive(Clone, Copy, Debug)]
+enum HistoryChange {
+    Removed,
+    /// Replaced by an entry with every record trimmed.
+    Emptied,
+}
+
+/// A raw `CreateIndex` publishes a saved segment whose coverage of the
+/// compaction's output only the fragment reuse history translates, and in the
+/// same commit removes that history or replaces it with an emptied one. The
+/// manifest it would publish could not translate the segment's entries, so it
+/// is refused as invalid, detached or not, and the table stays as it was.
+#[rstest]
+#[tokio::test]
+async fn test_raw_commit_cannot_change_the_history_its_segments_rely_on(
+    #[values(IndexType::BTree, IndexType::ZoneMap)] index_type: IndexType,
+    #[values(HistoryChange::Removed, HistoryChange::Emptied)] change: HistoryChange,
+    #[values(false, true)] detached: bool,
+) {
+    let dir = TempStrDir::default();
+    let uri = dir.as_str();
+    let (mut new_indices, _) = saved_segment_beside_a_compaction(uri, index_type).await;
+    let dataset = Dataset::open(uri).await.unwrap();
+    let history = dataset
+        .load_indices()
+        .await
+        .unwrap()
+        .iter()
+        .find(|index| index.name == FRAG_REUSE_INDEX_NAME)
+        .unwrap()
+        .clone();
+    if matches!(change, HistoryChange::Emptied) {
+        let emptied = crate::index::frag_reuse::build_frag_reuse_index_metadata(
+            &dataset,
+            Some(&history),
+            FragReuseIndexDetails { versions: vec![] },
+            RoaringBitmap::new(),
+        )
+        .await
+        .unwrap();
+        new_indices.push(emptied);
+    }
+
+    let result = commit_raw(
+        &dataset,
+        dataset.manifest.version,
+        new_indices,
+        vec![history],
+        detached,
+    )
+    .await;
+    let trace = format!("{index_type:?} {change:?} detached={detached}");
+    let probes = || (0..24).map(|id| id * 10);
+    if let Ok(published) = &result {
+        // What the refusal prevents: entries that no longer translate.
+        assert_val_lookups_match_scan(published, probes(), &trace).await;
+    }
+    let error = result.expect_err(&trace);
+    assert!(
+        matches!(error, Error::InvalidInput { .. }),
+        "{trace}: {error}"
+    );
+    let latest = Dataset::open(uri).await.unwrap();
+    assert_eq!(latest.manifest.version, dataset.manifest.version);
+    assert!(
+        latest
+            .load_indices_by_name("val_idx")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let kept = latest.frag_reuse_index().await.unwrap().unwrap();
+    assert_eq!(kept.details.versions.len(), 1, "{trace}");
+    assert_val_lookups_match_scan(&latest, probes(), &trace).await;
 }
