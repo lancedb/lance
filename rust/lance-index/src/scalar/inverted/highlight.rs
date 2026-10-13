@@ -13,7 +13,7 @@ use icu_segmenter::GraphemeClusterSegmenter;
 use lance_core::{Error, Result};
 use lance_tokenizer::Token;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -171,15 +171,17 @@ impl PreparedHighlightQuery {
                 "highlight prepared leaf count does not match query",
             ));
         }
+        let mut ranges_by_value = BTreeMap::<(&str, usize), Vec<Range<usize>>>::new();
+        for hit in &evidence {
+            ranges_by_value
+                .entry((&hit.field, hit.value))
+                .or_default()
+                .push(hit.range.clone());
+        }
         let mut values = Vec::new();
         for doc in documents {
             for (index, value) in doc.values.iter().enumerate() {
-                let ranges = evidence
-                    .iter()
-                    .filter(|hit| hit.field == doc.field && hit.value == index)
-                    .map(|hit| hit.range.clone())
-                    .collect::<Vec<_>>();
-                if !ranges.is_empty() {
+                if let Some(ranges) = ranges_by_value.remove(&(doc.field.as_str(), index)) {
                     values.push(HighlightedValue {
                         field: doc.field.clone(),
                         value_index: value.value_index.clone(),
@@ -383,21 +385,15 @@ fn match_leaf(leaf: &HighlightLeaf, documents: &[AnalyzedDocument]) -> Result<Ma
         }
         let ranges = if let Some(slop) = leaf.phrase_slop {
             phrase_ranges(tokens, &occurrences, slop)
-                .into_iter()
-                .map(|range| (range, 0))
-                .collect::<Vec<_>>()
         } else {
             occurrences
                 .iter()
-                .enumerate()
-                .flat_map(|(i, hits)| {
-                    hits.iter()
-                        .map(move |hit| (hit.range.clone(), tokens.position(i)))
-                })
+                .flatten()
+                .map(|hit| hit.range.clone())
                 .collect()
         };
         matched_phrase |= leaf.phrase_slop.is_some() && !ranges.is_empty();
-        for (range, _) in ranges {
+        for range in ranges {
             let first = doc
                 .offsets
                 .partition_point(|source| source.end <= range.start);
@@ -885,5 +881,16 @@ mod tests {
             ),
             vec!["bat", "cat", "elephant"]
         );
+    }
+    #[test]
+    fn all_array_values_keep_their_coordinates() {
+        let matcher = PreparedHighlightQuery::new(term("rust"), vec![leaf("rust", None, 0, 1)]);
+        let sources = vec!["rust"; 1000];
+        let values = matcher.highlight(&documents(&sources)).unwrap();
+        assert_eq!(values.len(), sources.len());
+        for (i, value) in values.iter().enumerate() {
+            assert_eq!(value.value_index, vec![i as u32]);
+            assert_eq!(value.matches, vec![HighlightMatch { start: 0, end: 4 }]);
+        }
     }
 }
