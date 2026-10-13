@@ -40,8 +40,10 @@ they should return an "unsupported" error on any read or write operation.
 | `2^14`   | `FLAG_MANAGED_BLOBS`            | Yes             | Yes             | Blob descriptors independently address owned objects. Readers resolve the descriptor's base and path; cleanup preserves objects referenced by protected snapshots, independently of the original data file. Both bits remain set on later versions, including restores. |
 | `2^15`   | `FLAG_NON_REUSABLE_FIELD_IDS`    | No              | Yes             | The manifest sets `max_allocated_field_id`, and a writer must assign new field IDs above it. Before activation, all clients that can write to the dataset must enforce writer feature flags. See [Field IDs](schema.md#field-ids). |
 
+| `2^17`   | `FLAG_CLUSTERING_METADATA`     | No              | Yes             | The snapshot references [clustering configuration or fragment/index segment information](clustering.md). Reserved, unsupported until writers implement its maintenance rules. Readers may ignore clustering metadata. |
+
 </div>
 
-Bits at positions 16 and above (`2^16`, `2^17`, and so on) are unknown; unknown flags cause implementations to reject the dataset with an "unsupported" error. The paired mixed-version and Managed Blob reader and writer bits must each either both be set or both be clear; a half-set manifest is invalid.
+Bit 17 is reserved for clustering metadata but remains unsupported. Other bits at positions 16 and above are unknown. Unknown or unsupported flags cause implementations to reject the corresponding read or write operation with an "unsupported" error. The paired mixed-version and Managed Blob reader and writer bits must each either both be set or both be clear; a half-set manifest is invalid.
 
 Publishing a new data file containing a Blob v2 field activates the Managed Blob capability, including files containing only inline values. Metadata-only updates and deletion vectors on existing files do not activate it. Once activated, removing Blob fields or restoring an older snapshot does not clear it. Before activation, all maintenance clients must support Managed Blobs: the flag cannot revoke old handles or prevent older clients from running cleanup through an unflagged historical snapshot. See [client compatibility](../../guide/blob.md#managed-objects-and-client-compatibility).

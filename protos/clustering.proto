@@ -1,0 +1,34 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
+syntax = "proto3";
+
+package lance.table;
+
+// Current table-level clustering configuration. Providers manage layout history.
+message Clustering {
+  // Ordered, non-empty list of distinct, existing schema field IDs.
+  repeated int32 columns = 1;
+  // Non-empty, case-sensitive clustering implementation name.
+  string provider = 2;
+  // Non-zero layout/configuration identifier, not a dataset or software version.
+  uint64 version = 3;
+  /* Provider-defined configuration. Empty is valid. Providers define keys and
+   * value encodings; unrelated writes preserve unknown keys and values.
+   */
+  map<string, string> provider_metadata = 4;
+}
+
+// Clustering information shared by fragments and index segments.
+message ClusteringInfo {
+  // Non-empty, case-sensitive implementation name that organized this output.
+  string provider = 1;
+  // Non-zero identifier of the provider's layout/configuration for this output.
+  uint64 version = 2;
+  /* Provider-defined information, such as group, bucket, or range identifiers.
+   * Empty is valid. It is not proof of index coverage, statistics, or row order.
+   * Ordinary rewrites do not inherit this information; provider operations set
+   * it for their outputs. Unchanged objects preserve unknown keys and values.
+   */
+  map<string, string> metadata = 3;
+}

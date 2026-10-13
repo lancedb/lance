@@ -5,6 +5,8 @@ syntax = "proto3";
 
 package lance.table;
 
+import "clustering.proto";
+
 /* A DataFragment is a set of files which represent the different columns of the same
  * rows. If column exists in the schema of a dataset, but the file for that column does
  * not exist within a DataFragment of that dataset, that column consists entirely of
@@ -85,6 +87,12 @@ message DataFragment {
    * `deletion_file.num_deleted_rows` from this value.
    */
   uint64 physical_rows = 4;
+
+  /* Optional provider, layout version, and metadata for this fragment.
+   * Ordinary rewrites do not inherit it; deletion-vector-only changes preserve
+   * it. Absence makes no clustering claim. Requires writer flag 1 << 17.
+   */
+  ClusteringInfo clustering = 15;
 }
 
 message DataFile {

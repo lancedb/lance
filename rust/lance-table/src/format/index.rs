@@ -378,6 +378,7 @@ impl From<&IndexMetadata> for pb::IndexMetadata {
                 .as_ref()
                 .map(|details| details.as_ref().clone()),
             index_version: Some(idx.index_version),
+            clustering: None,
             created_at: idx.created_at.map(|dt| dt.timestamp_millis() as u64),
             base_id: idx.base_id,
             files,

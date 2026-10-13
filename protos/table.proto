@@ -8,6 +8,7 @@ package lance.table;
 import "google/protobuf/any.proto";
 import "google/protobuf/timestamp.proto";
 import "file.proto";
+import "clustering.proto";
 import public "fragment_metadata.proto";
 
 /*
@@ -290,6 +291,12 @@ message Manifest {
    * both be set or both be absent. A mismatch is invalid.
    */
   optional int32 max_allocated_field_id = 24;
+
+  /* Optional current clustering policy. Absence disables new clustering work
+   * without clearing fragment or index segment information. Requires the
+   * clustering writer feature flag (1 << 17); no clustering reader flag.
+   */
+  Clustering clustering = 25;
 } // Manifest
 
 // external dataset base path
@@ -415,6 +422,12 @@ message IndexMetadata {
    * withdraw the payload while leaving this declaration in place.
    */
   repeated int32 covering_fields = 11;
+
+  /* Optional clustering information for this segment's grouping. Ordinary
+   * merge, rebuild, and remap do not inherit it; provider operations set it for
+   * their outputs. Absence makes no clustering claim. Requires writer flag 1 << 17.
+   */
+  ClusteringInfo clustering = 12;
 }
 
 // Metadata about a single file within an index segment.
