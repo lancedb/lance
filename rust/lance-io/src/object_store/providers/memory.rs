@@ -23,16 +23,21 @@ impl ObjectStoreProvider for MemoryStoreProvider {
         let download_retry_count = storage_options.download_retry_count();
         Ok(ObjectStore {
             inner: Arc::new(InMemory::new()),
+            local_dir_operations: None,
             scheme: String::from("memory"),
             block_size,
             max_iop_size: *DEFAULT_MAX_IOP_SIZE,
             use_constant_size_upload_parts: false,
+            supports_conditional_multipart_put: true,
             list_is_lexically_ordered: true,
             io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
             download_retry_count,
             io_tracker: Default::default(),
             store_prefix: self
                 .calculate_object_store_prefix(&base_path, params.storage_options())?,
+            // Listed in full: the store is already in memory, so a page costs no less than
+            // the directory does.
+            paginated_lister: None,
         })
     }
 
