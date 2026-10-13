@@ -1,61 +1,46 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::HashMap;
-use std::sync::Arc;
-
-use datafusion::physical_plan::{ExecutionPlan, metrics::ExecutionPlanMetricsSet};
-use lance_core::datatypes::LogicalType;
-use lance_index::IndexCriteria;
+use super::Scanner;
+use crate::index::scalar::inverted::{ResolvedFtsField, resolve_fts_analyzer, resolve_fts_field};
+use crate::io::exec::fts::default_text_tokenizer;
+use crate::io::exec::highlight::HighlightExec;
+use crate::{Error, Result};
+use datafusion::physical_plan::ExecutionPlan;
+use lance_core::datatypes::{LogicalType, OnMissing};
 use lance_index::scalar::FullTextSearchQuery;
-use lance_index::scalar::inverted::highlight::{
-    HighlightLeaf, HighlightOptions, HighlightTerms, PreparedHighlightQuery,
-};
+use lance_index::scalar::inverted::highlight::{HighlightLeaf, PreparedHighlightQuery};
 use lance_index::scalar::inverted::query::{
     FtsQuery, FtsSearchParams, Operator, try_collect_query_tokens,
 };
-use lance_index::scalar::inverted::tokenizer::document_tokenizer::{DocType, LanceTokenizer};
-use lance_index::scalar::inverted::{DocumentGranularity, InvertedIndex};
-use roaring::RoaringBitmap;
-
-use super::{FtsOverlayPlan, Scanner};
-use crate::index::scalar::inverted::{load_segment_details, load_segments, resolve_fts_field};
-use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
-use crate::io::exec::fts::{default_text_tokenizer, open_fts_segments, tokenizer_for_match_query};
-use crate::io::exec::highlight::{HighlightExec, HighlightSource};
-use crate::io::exec::utils::IndexMetrics;
-use crate::{Error, Result};
-use lance_core::datatypes::OnMissing;
+use lance_index::scalar::inverted::tokenizer::document_tokenizer::{
+    DocType, LanceTokenizer, TextTokenizer,
+};
+use lance_tokenizer::{SimpleTokenizer, TextAnalyzer};
+use std::collections::HashMap;
+use std::sync::Arc;
 
 struct PreparedField {
-    source: HighlightSource,
-    tokenizer: Arc<dyn LanceTokenizer>,
-    indices: Vec<Arc<InvertedIndex>>,
+    source: ResolvedFtsField,
+    analyzer: Option<Arc<dyn LanceTokenizer>>,
 }
-
 impl Scanner {
     pub(super) async fn highlight_plan(
         &self,
         input: Arc<dyn ExecutionPlan>,
         query: &FullTextSearchQuery,
-        mut options: HighlightOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let granularity = self.fts_document_granularity(&query.query)?;
         let canonical = |column: &str| {
             Ok(resolve_fts_field(self.dataset.schema(), column, granularity)?.canonical_path)
         };
         let query = canonicalize_fields(query.query.clone(), &canonical)?;
-        options.fields = options
-            .fields
-            .iter()
-            .map(|field| canonical(field))
-            .collect::<Result<_>>()?;
         let mut queries = Vec::new();
         collect_leaves(&query, &mut queries);
         let mut fields = HashMap::<String, PreparedField>::new();
         let mut leaves = Vec::with_capacity(queries.len());
-        for query in queries {
-            let (columns, text, operator, slop, params) = match &query {
+        for leaf in queries {
+            let (columns, text, operator, slop, params) = match &leaf {
                 FtsQuery::Match(query) => (
                     vec![query.column.clone().ok_or_else(|| {
                         Error::internal("highlight Match column was not resolved")
@@ -65,8 +50,7 @@ impl Scanner {
                     None,
                     FtsSearchParams::new()
                         .with_fuzziness(query.fuzziness)
-                        .with_prefix_length(query.prefix_length)
-                        .with_max_expansions(query.max_expansions),
+                        .with_prefix_length(query.prefix_length),
                 ),
                 FtsQuery::Phrase(query) => (
                     vec![query.column.clone().ok_or_else(|| {
@@ -75,161 +59,87 @@ impl Scanner {
                     query.terms.as_str(),
                     Operator::And,
                     Some(query.slop),
-                    FtsSearchParams::new(),
+                    FtsSearchParams::new().with_fuzziness(Some(0)),
                 ),
                 FtsQuery::CombinedFields(query) => (
                     query.column_names().map(str::to_owned).collect(),
                     query.terms(),
                     query.operator(),
                     None,
-                    FtsSearchParams::new(),
+                    FtsSearchParams::new().with_fuzziness(Some(0)),
                 ),
                 _ => return Err(Error::internal("highlight expected a lexical leaf")),
             };
             for column in &columns {
                 if !fields.contains_key(column) {
-                    fields.insert(
-                        column.clone(),
-                        self.prepare_highlight_field(column, granularity).await?,
-                    );
+                    let source = resolve_fts_field(self.dataset.schema(), column, granularity)?;
+                    if self
+                        .dataset
+                        .schema()
+                        .field_by_id(source.final_field_id)
+                        .is_some_and(|field| field.logical_type == LogicalType::from("json"))
+                    {
+                        return Err(Error::not_supported_source(
+                            format!("highlight does not support JSON source field '{column}'")
+                                .into(),
+                        ));
+                    }
+                    let analyzer = resolve_fts_analyzer(&self.dataset, column, granularity)
+                        .await?
+                        .map(Arc::from);
+                    fields.insert(column.clone(), PreparedField { source, analyzer });
                 }
             }
-            let first = columns
+            // CombinedFields resolves one analyzer for the logical virtual document.
+            // Other clauses retain their own field analyzers, independent of row coverage.
+            let field = columns
                 .iter()
                 .filter_map(|column| fields.get(column))
                 .find(|field| {
-                    !matches!(query, FtsQuery::CombinedFields(_)) || !field.indices.is_empty()
+                    !matches!(leaf, FtsQuery::CombinedFields(_)) || field.analyzer.is_some()
                 })
-                .ok_or_else(|| Error::internal("highlight query has no source fields"))?;
-            // CombinedFields uses its first indexed field's analyzer even for
-            // fields with no index. Other leaves on those fields may use the
-            // default analyzer, so replay is shared per field and analyzer.
-            let tokenizer = first.tokenizer.clone();
-            let mut query_tokenizer = tokenizer.box_clone();
-            let flat_tokens = try_collect_query_tokens(text, &mut query_tokenizer)?;
-            let flat = HighlightTerms {
-                tokens: Arc::new(flat_tokens),
-                has_all_query_positions: true,
-            };
-            let indexed = if matches!(query, FtsQuery::Match(_)) && !first.indices.is_empty() {
-                let mut query_tokenizer =
-                    tokenizer_for_match_query(&first.indices[0], params.fuzziness);
-                let tokens = try_collect_query_tokens(text, &mut query_tokenizer)?;
-                HighlightTerms::for_indices(&first.indices, tokens, &params)?
+                .or_else(|| columns.first().and_then(|column| fields.get(column)))
+                .ok_or_else(|| Error::internal("highlight query has no source analyzer"))?;
+            let tokenizer = field
+                .analyzer
+                .clone()
+                .unwrap_or_else(|| Arc::from(default_text_tokenizer()));
+            if matches!(tokenizer.doc_type(), DocType::Json) {
+                return Err(Error::not_supported_source(
+                    "highlight does not support JSON analyzers".into(),
+                ));
+            }
+            let mut query_tokenizer: Box<dyn LanceTokenizer> = if matches!(params.fuzziness, Some(distance) if distance > 0)
+            {
+                Box::new(TextTokenizer::new(TextAnalyzer::from(
+                    SimpleTokenizer::default(),
+                )))
             } else {
-                flat.clone()
+                tokenizer.box_clone()
             };
-            leaves.push(HighlightLeaf {
-                fields: columns,
-                tokenizer,
-                flat,
-                indexed,
-                operator,
-                phrase_slop: slop,
-            });
+            let tokens = try_collect_query_tokens(text, &mut query_tokenizer)?;
+            leaves.push(HighlightLeaf::try_new(
+                columns, tokenizer, tokens, operator, slop, &params,
+            )?);
         }
         let mut sources = fields
             .into_values()
             .map(|field| field.source)
             .collect::<Vec<_>>();
-        sources.sort_by(|a, b| a.field.canonical_path.cmp(&b.field.canonical_path));
-        let roots = sources.iter().map(|source| {
-            lance_core::datatypes::format_field_path(&[source.field.root_column.as_str()])
-        });
+        sources.sort_by(|a, b| a.canonical_path.cmp(&b.canonical_path));
+        let roots = sources
+            .iter()
+            .map(|source| lance_core::datatypes::format_field_path(&[source.root_column.as_str()]));
         let projection = self
             .dataset
             .empty_projection()
-            .with_row_addr()
             .union_columns(roots, OnMissing::Error)?;
         let input = self.take(input, projection)?;
-        let query = PreparedHighlightQuery::try_new(query, leaves, options)?;
         Ok(Arc::new(HighlightExec::new(
             input,
-            Arc::new(query),
+            Arc::new(PreparedHighlightQuery::new(query, leaves)),
             Arc::new(sources),
         )))
-    }
-
-    async fn prepare_highlight_field(
-        &self,
-        column: &str,
-        granularity: DocumentGranularity,
-    ) -> Result<PreparedField> {
-        let field = resolve_fts_field(self.dataset.schema(), column, granularity)?;
-        if self
-            .dataset
-            .schema()
-            .field_by_id(field.final_field_id)
-            .is_some_and(|field| field.logical_type == LogicalType::from("json"))
-        {
-            return Err(Error::not_supported_source(
-                format!("highlight does not support JSON source field '{column}'").into(),
-            ));
-        }
-        let target = self
-            .fragments
-            .as_deref()
-            .unwrap_or_else(|| self.dataset.fragments());
-        let mut indexed_fragments = RoaringBitmap::new();
-        let mut stale_rows = HashMap::new();
-        let mut tokenizer: Arc<dyn LanceTokenizer> = default_text_tokenizer().into();
-        let mut indices = Vec::new();
-        if let Some(segments) = load_segments(&self.dataset, column, granularity).await? {
-            load_segment_details(&self.dataset, column, &segments).await?;
-            indices = open_fts_segments(
-                &self.dataset,
-                column,
-                &segments,
-                &IndexMetrics::new(&ExecutionPlanMetricsSet::new(), 0),
-            )
-            .await?;
-            if let Some(first) = indices.first() {
-                tokenizer = first.tokenizer().into();
-            }
-            let index = self
-                .dataset
-                .load_scalar_index(
-                    IndexCriteria::default()
-                        .for_column(column)
-                        .supports_fts()
-                        .with_fts_document_granularity(granularity),
-                )
-                .await?
-                .ok_or_else(|| Error::internal("highlight selected FTS index disappeared"))?;
-            let unindexed = self
-                .dataset
-                .unindexed_fragments(&index.name)
-                .await?
-                .iter()
-                .map(|fragment| fragment.id as u32)
-                .collect::<RoaringBitmap>();
-            indexed_fragments = target
-                .iter()
-                .map(|fragment| fragment.id as u32)
-                .filter(|id| !unindexed.contains(*id))
-                .collect();
-            match self.fts_overlay_plan(column, granularity, target).await? {
-                FtsOverlayPlan::Unchanged(_) => {}
-                FtsOverlayPlan::RowLevel {
-                    stale_rows: stale, ..
-                } => stale_rows = stale,
-                FtsOverlayPlan::FullScan => indexed_fragments.clear(),
-            }
-        }
-        if matches!(tokenizer.doc_type(), DocType::Json) {
-            return Err(Error::not_supported_source(
-                format!("highlight does not support JSON analyzer for '{column}'").into(),
-            ));
-        }
-        Ok(PreparedField {
-            source: HighlightSource {
-                field,
-                indexed_fragments,
-                stale_rows,
-            },
-            tokenizer,
-            indices,
-        })
     }
 }
 
@@ -301,8 +211,10 @@ mod tests {
     use super::*;
     use crate::Dataset;
     use crate::dataset::{WriteMode, WriteParams};
+    use crate::index::DatasetIndexExt;
     use arrow_array::{Array, RecordBatch, RecordBatchIterator, cast::AsArray, record_batch};
     use lance_index::IndexType;
+    use lance_index::scalar::inverted::DocumentGranularity;
     use lance_index::scalar::inverted::InvertedIndexParams;
     use lance_index::scalar::inverted::highlight::HIGHLIGHTS_COL;
     use lance_index::scalar::inverted::query::{
@@ -329,15 +241,25 @@ mod tests {
     }
 
     fn hits(batch: &RecordBatch, row: usize) -> Vec<String> {
-        let fragments = batch[HIGHLIGHTS_COL].as_list::<i32>().value(row);
-        let fragments = fragments.as_struct();
-        let text = fragments.column_by_name("text").unwrap().as_string::<i32>();
-        let matches = fragments
-            .column_by_name("matches")
+        let values = batch[HIGHLIGHTS_COL].as_list::<i32>().value(row);
+        let values = values.as_struct();
+        let fields = values.column_by_name("field").unwrap().as_string::<i32>();
+        let coordinates = values
+            .column_by_name("value_index")
             .unwrap()
             .as_list::<i32>();
-        (0..fragments.len())
+        let matches = values.column_by_name("matches").unwrap().as_list::<i32>();
+        (0..values.len())
             .flat_map(|i| {
+                let mut value = batch[fields.value(i)].slice(row, 1);
+                let path = coordinates.value(i);
+                for ordinal in path
+                    .as_primitive::<arrow_array::types::UInt32Type>()
+                    .values()
+                {
+                    value = value.as_list::<i32>().value(0).slice(*ordinal as usize, 1);
+                }
+                let text = value.as_string::<i32>().value(0);
                 let spans = matches.value(i);
                 let spans = spans.as_struct();
                 let starts = spans
@@ -349,9 +271,7 @@ mod tests {
                     .unwrap()
                     .as_primitive::<arrow_array::types::UInt64Type>();
                 (0..spans.len())
-                    .map(|j| {
-                        text.value(i)[starts.value(j) as usize..ends.value(j) as usize].to_owned()
-                    })
+                    .map(|j| text[starts.value(j) as usize..ends.value(j) as usize].to_owned())
                     .collect::<Vec<_>>()
             })
             .collect()
@@ -444,8 +364,7 @@ mod tests {
                 continue;
             }
             let baseline = scan.try_into_batch().await.unwrap();
-            scan.with_highlight(HighlightOptions::new(["body"]))
-                .unwrap();
+            scan.with_highlight();
             let highlighted = scan.try_into_batch().await.unwrap();
             assert_eq!(baseline.num_rows(), highlighted.num_rows());
             assert!(highlighted.column_by_name("body").is_none());
@@ -460,7 +379,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mixed_fuzzy_uses_each_retrieval_paths_vocabulary() {
+    async fn mixed_fuzzy_ranges_ignore_index_coverage() {
         let batch = record_batch!(("body", Utf8, ["bat cat"])).unwrap();
         let mut dataset = write(batch.clone(), None).await;
         dataset
@@ -492,12 +411,7 @@ mod tests {
             .unwrap()
             .with_row_id();
         let baseline = scan.try_into_batch().await.unwrap();
-        let highlighted = scan
-            .with_highlight(HighlightOptions::new(["body"]))
-            .unwrap()
-            .try_into_batch()
-            .await
-            .unwrap();
+        let highlighted = scan.with_highlight().try_into_batch().await.unwrap();
         assert_eq!(baseline.num_rows(), 2);
         assert_eq!(
             baseline.column_by_name("_score"),
@@ -507,7 +421,7 @@ mod tests {
             .map(|row| hits(&highlighted, row))
             .collect::<Vec<_>>();
         words.sort();
-        assert_eq!(words, vec![vec!["bat"], vec!["cat"]]);
+        assert_eq!(words, vec![vec!["bat", "cat"], vec!["bat", "cat"]]);
     }
 
     #[tokio::test]
@@ -537,14 +451,23 @@ mod tests {
             .unwrap()
             .project(&["id"])
             .unwrap();
-        let highlighted = scan
-            .with_highlight(HighlightOptions::new(["body"]))
-            .unwrap()
-            .try_into_batch()
-            .await
-            .unwrap();
+        let highlighted = scan.with_highlight().try_into_batch().await.unwrap();
         assert_eq!(highlighted.num_rows(), 1);
-        assert_eq!(hits(&highlighted, 0), vec!["gamma"]);
+        let values = highlighted[HIGHLIGHTS_COL].as_list::<i32>().value(0);
+        let matches = values.as_struct()["matches"].as_list::<i32>().value(0);
+        assert_eq!(
+            matches.as_struct()["start"]
+                .as_primitive::<arrow_array::types::UInt64Type>()
+                .value(0),
+            6
+        );
+        assert_eq!(
+            matches.as_struct()["end"]
+                .as_primitive::<arrow_array::types::UInt64Type>()
+                .value(0),
+            11
+        );
+        assert!(highlighted.column_by_name("body").is_none());
     }
     #[rstest]
     #[case::row(DocumentGranularity::Row)]
@@ -599,12 +522,7 @@ mod tests {
             .unwrap()
             .with_row_id();
         let baseline = scan.try_into_batch().await.unwrap();
-        let highlighted = scan
-            .with_highlight(HighlightOptions::new(["body"]).with_max_fragments(3))
-            .unwrap()
-            .try_into_batch()
-            .await
-            .unwrap();
+        let highlighted = scan.with_highlight().try_into_batch().await.unwrap();
         for field in baseline.schema().fields() {
             assert_eq!(
                 baseline.column_by_name(field.name()),
@@ -612,8 +530,8 @@ mod tests {
             );
         }
         assert_eq!(highlighted.num_rows(), 1);
-        let fragments = highlighted[HIGHLIGHTS_COL].as_list::<i32>().value(0);
-        let coordinates = fragments
+        let values = highlighted[HIGHLIGHTS_COL].as_list::<i32>().value(0);
+        let coordinates = values
             .as_struct()
             .column_by_name("value_index")
             .unwrap()
@@ -629,10 +547,10 @@ mod tests {
             .collect::<Vec<_>>();
         if granularity == DocumentGranularity::Row {
             assert_eq!(coordinates, vec![vec![0, 0], vec![0, 2], vec![1, 0]]);
-            assert_eq!(hits(&highlighted, 0), vec!["new", "york", "new york"]);
+            assert_eq!(hits(&highlighted, 0), vec!["new", "york", "new", "york"]);
         } else {
             assert_eq!(coordinates, vec![vec![1, 0]]);
-            assert_eq!(hits(&highlighted, 0), vec!["new york"]);
+            assert_eq!(hits(&highlighted, 0), vec!["new", "york"]);
         }
     }
 
@@ -670,8 +588,7 @@ mod tests {
         pinned
             .full_text_search(FullTextSearchQuery::new_query(text_match("needle", "body")))
             .unwrap()
-            .with_highlight(HighlightOptions::new(["body"]))
-            .unwrap();
+            .with_highlight();
         let result = UpdateBuilder::new(Arc::new(dataset))
             .update_where("id = 0")
             .unwrap()
@@ -698,12 +615,7 @@ mod tests {
             .unwrap()
             .with_row_id();
         let baseline = scan.try_into_batch().await.unwrap();
-        let highlighted = scan
-            .with_highlight(HighlightOptions::new(["body"]))
-            .unwrap()
-            .try_into_batch()
-            .await
-            .unwrap();
+        let highlighted = scan.with_highlight().try_into_batch().await.unwrap();
         assert_eq!(highlighted.num_rows(), 2);
         for field in baseline.schema().fields() {
             assert_eq!(
@@ -717,7 +629,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn limits_apply_only_after_final_selection() {
+    async fn highlight_preserves_filtered_pagination() {
         let batch = record_batch!(
             ("id", Int32, [0, 1, 2]),
             (
@@ -736,12 +648,7 @@ mod tests {
             .limit(Some(1), Some(1))
             .unwrap();
         let baseline = scan.try_into_batch().await.unwrap();
-        let highlighted = scan
-            .with_highlight(HighlightOptions::new(["body"]).with_max_analyzed_bytes(6))
-            .unwrap()
-            .try_into_batch()
-            .await
-            .unwrap();
+        let highlighted = scan.with_highlight().try_into_batch().await.unwrap();
         assert_eq!(highlighted.num_rows(), 1);
         assert_eq!(
             baseline.column_by_name("id"),
@@ -751,12 +658,11 @@ mod tests {
         let mut scan = dataset.scan();
         scan.full_text_search(FullTextSearchQuery::new_query(text_match("needle", "body")))
             .unwrap()
-            .with_highlight(HighlightOptions::new(["body"]).with_max_analyzed_bytes(6))
-            .unwrap()
+            .with_highlight()
             .filter("id = 1")
             .unwrap();
-        let error = scan.try_into_batch().await.unwrap_err();
-        assert!(error.to_string().contains("max_analyzed_bytes=6"));
+        let result = scan.try_into_batch().await.unwrap();
+        assert_eq!(hits(&result, 0), vec!["needle", "needle"]);
     }
 
     #[rstest]
@@ -785,8 +691,7 @@ mod tests {
         let mut scan = dataset.scan();
         scan.full_text_search(FullTextSearchQuery::new_query(text_match(query, "body")))
             .unwrap()
-            .with_highlight(HighlightOptions::new(["body"]))
-            .unwrap();
+            .with_highlight();
         let highlighted = scan.try_into_batch().await.unwrap();
         assert_eq!(highlighted.num_rows(), 1);
         let expected = if stem {
@@ -825,18 +730,90 @@ mod tests {
             .unwrap();
         let baseline = scan.try_into_batch().await.unwrap();
         assert_eq!(baseline.num_rows(), 1);
-        let highlighted = scan
-            .with_highlight(HighlightOptions::new(["TITLE"]))
-            .unwrap()
-            .try_into_batch()
-            .await
-            .unwrap();
+        let highlighted = scan.with_highlight().try_into_batch().await.unwrap();
         assert_eq!(hits(&highlighted, 0), vec!["Running"]);
         assert_eq!(
             highlighted.column_by_name("_score"),
             baseline.column_by_name("_score")
         );
     }
+    #[tokio::test]
+    async fn physical_layout_and_index_coverage_do_not_change_ranges() {
+        let batch = record_batch!(
+            ("id", Int32, [0, 1]),
+            ("body", Utf8, ["bat cat", "bat cat"])
+        )
+        .unwrap();
+        let mut dataset = write(
+            batch,
+            Some(WriteParams {
+                max_rows_per_file: 1,
+                max_rows_per_group: 1,
+                ..Default::default()
+            }),
+        )
+        .await;
+        for stage in 0..4 {
+            let mut scan = dataset.scan();
+            scan.full_text_search(FullTextSearchQuery::new_query(
+                MatchQuery::new("cat".into())
+                    .with_column(Some("body".into()))
+                    .with_fuzziness(Some(1))
+                    .with_max_expansions(1)
+                    .into(),
+            ))
+            .unwrap()
+            .with_highlight();
+            let result = scan.try_into_batch().await.unwrap();
+            assert_eq!(result.num_rows(), if stage < 2 { 2 } else { 3 });
+            for row in 0..result.num_rows() {
+                assert_eq!(hits(&result, row), vec!["bat", "cat"], "stage {stage}");
+            }
+            match stage {
+                0 => {
+                    dataset
+                        .create_index(
+                            &["body"],
+                            IndexType::Inverted,
+                            None,
+                            &InvertedIndexParams::default(),
+                            true,
+                        )
+                        .await
+                        .unwrap();
+                }
+                1 => {
+                    let appended =
+                        record_batch!(("id", Int32, [2]), ("body", Utf8, ["bat cat"])).unwrap();
+                    dataset
+                        .append(
+                            RecordBatchIterator::new([Ok(appended.clone())], appended.schema()),
+                            Some(WriteParams {
+                                mode: WriteMode::Append,
+                                ..Default::default()
+                            }),
+                        )
+                        .await
+                        .unwrap();
+                }
+                2 => {
+                    crate::dataset::optimize::compact_files(
+                        &mut dataset,
+                        crate::dataset::optimize::CompactionOptions {
+                            target_rows_per_fragment: 10,
+                            ..Default::default()
+                        },
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                    assert!(dataset.get_fragments().len() < 3);
+                }
+                _ => {}
+            }
+        }
+    }
+
     #[tokio::test]
     async fn flat_highlight_respects_the_retrieval_analyzer() {
         let dataset = write(record_batch!(("body", Utf8, ["Rust run"])).unwrap(), None).await;
@@ -847,8 +824,7 @@ mod tests {
         let mut scan = dataset.scan();
         scan.full_text_search(FullTextSearchQuery::new_query(query.into()))
             .unwrap()
-            .with_highlight(HighlightOptions::new(["body"]))
-            .unwrap();
+            .with_highlight();
         let highlighted = scan.try_into_batch().await.unwrap();
         assert_eq!(highlighted.num_rows(), 1);
         assert_eq!(hits(&highlighted, 0), vec!["run"]);

@@ -189,7 +189,7 @@ pub(super) fn phrase_matches_positions(
         let mut next_candidates = Vec::new();
         for &position in positions {
             if candidates.iter().any(|candidate| {
-                super::super::highlight::phrase_position_follows(
+                super::super::query::phrase_position_follows(
                     *candidate,
                     position,
                     query_delta,

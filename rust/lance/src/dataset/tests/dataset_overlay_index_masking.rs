@@ -1472,8 +1472,7 @@ async fn test_fts_overlay_flat_path_takes_only_stale_rows(
         "overlay-stale FTS rows must be re-evaluated through a targeted take"
     );
     let baseline = scan.try_into_batch().await.unwrap();
-    scan.with_highlight(lance_index::scalar::inverted::highlight::HighlightOptions::new(["text"]))
-        .unwrap();
+    scan.with_highlight();
     let highlighted = scan.try_into_batch().await.unwrap();
     assert_eq!(highlighted.num_rows(), baseline.num_rows());
     assert_eq!(
@@ -1488,24 +1487,21 @@ async fn test_fts_overlay_flat_path_takes_only_stale_rows(
     ids.sort_unstable();
     assert_eq!(ids, vec![1, 2]);
     for row in 0..highlighted.num_rows() {
-        let id = highlighted["id"]
-            .as_primitive::<arrow_array::types::Int32Type>()
-            .value(row);
-        let fragments = highlighted["_highlights"].as_list::<i32>().value(row);
-        let text = fragments
-            .as_struct()
-            .column_by_name("text")
-            .unwrap()
-            .as_string::<i32>()
-            .value(0);
+        let values = highlighted["_highlights"].as_list::<i32>().value(row);
+        let matches = values.as_struct()["matches"].as_list::<i32>().value(0);
         assert_eq!(
-            text,
-            if id == 1 {
-                "cherry mango"
-            } else {
-                "cherry cake"
-            }
+            matches.as_struct()["start"]
+                .as_primitive::<arrow_array::types::UInt64Type>()
+                .value(0),
+            0
         );
+        assert_eq!(
+            matches.as_struct()["end"]
+                .as_primitive::<arrow_array::types::UInt64Type>()
+                .value(0),
+            6
+        );
+        assert!(values.as_struct().column_by_name("text").is_none());
     }
 }
 

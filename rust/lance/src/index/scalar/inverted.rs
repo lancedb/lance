@@ -1244,6 +1244,19 @@ pub async fn load_segment_params(
     InvertedIndex::load_params(&store).await
 }
 
+/// Resolve the logical source analyzer from shared query metadata, without opening postings.
+pub(crate) async fn resolve_fts_analyzer(
+    dataset: &Dataset,
+    column: &str,
+    granularity: DocumentGranularity,
+) -> Result<Option<Box<dyn lance_index::scalar::inverted::document_tokenizer::LanceTokenizer>>> {
+    let Some(segments) = load_segments(dataset, column, granularity).await? else {
+        return Ok(None);
+    };
+    let details = load_segment_details(dataset, column, &segments).await?;
+    Ok(Some(InvertedIndexParams::try_from(&details)?.build()?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

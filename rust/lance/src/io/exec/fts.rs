@@ -288,7 +288,7 @@ async fn open_fts_segment(
 ///
 /// Exact multi-segment BM25 still needs every segment's local corpus statistics, so the
 /// current correctness-first path opens each committed segment before scoring.
-pub(crate) async fn open_fts_segments(
+async fn open_fts_segments(
     dataset: &Dataset,
     column: &str,
     segments: &[IndexMetadata],
@@ -2270,7 +2270,7 @@ pub(crate) fn default_text_tokenizer() -> Box<dyn LanceTokenizer> {
     ))
 }
 
-pub(crate) fn tokenizer_for_match_query(
+fn tokenizer_for_match_query(
     index: &InvertedIndex,
     fuzziness: Option<u32>,
 ) -> Box<dyn LanceTokenizer> {
