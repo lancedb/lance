@@ -1754,7 +1754,10 @@ impl FileFragment {
     /// Verifies:
     /// * All field ids in the fragment are distinct
     /// * Within each data file, field ids are in increasing order
-    /// * All data files exist and have the same length
+    /// * All data files holding user data exist and have the same length. A
+    ///   file kept only for the spilled row lineage it carries is not opened;
+    ///   [`Dataset::validate`] reads that lineage back, which checks its
+    ///   length.
     /// * Field ids are distinct between data files.
     /// * Deletion file exists and has rowids in the correct range
     /// * `Fragment.physical_rows` matches length of file
@@ -1821,14 +1824,28 @@ impl FileFragment {
             data_file.validate(&self.dataset.data_file_dir(data_file)?)?;
         }
 
-        // A file holding only row lineage columns has no dataset field to open
-        // it by; its length is checked against `physical_rows` when the
-        // sequences it carries are validated.
-        let user_data_files = self
-            .metadata
-            .files
-            .iter()
-            .filter(|data_file| data_file.fields.iter().any(|field| *field >= 0));
+        // A file that holds no field of the dataset schema is not opened when
+        // it holds no user field at all, or when the fragment keeps it for a
+        // spilled row lineage sequence it carries -- a data file whose user
+        // columns were all dropped or replaced after compaction wrote the
+        // lineage next to them. The sequences it carries are checked against
+        // `physical_rows` when they are validated. Any other file is opened,
+        // so a file listing only user fields the schema does not have is
+        // still reported.
+        let schema_field_ids = self
+            .dataset
+            .schema()
+            .fields_pre_order()
+            .map(|field| field.id)
+            .collect::<HashSet<_>>();
+        let spilled_field_ids = self.metadata.spilled_row_lineage_field_ids();
+        let user_data_files = self.metadata.files.iter().filter(|data_file| {
+            let fields = &data_file.fields;
+            let holds_schema_field = fields.iter().any(|id| schema_field_ids.contains(id));
+            let holds_user_field = fields.iter().any(|id| *id >= 0);
+            let holds_spilled_lineage = fields.iter().any(|id| spilled_field_ids.contains(id));
+            holds_schema_field || (holds_user_field && !holds_spilled_lineage)
+        });
         let get_lengths = user_data_files.clone().map(|data_file| async move {
             let data_file_dir = self.dataset.data_file_dir(data_file)?;
             let reader = self
@@ -2057,6 +2074,7 @@ impl FileFragment {
             let rewrite_plan = Arc::new(super::optimize::BlobV2BatchRewritePlan::try_new(
                 projection,
                 stream.schema().as_ref(),
+                false,
                 false,
             )?);
             Ok(stream
@@ -2297,7 +2315,6 @@ impl FileFragment {
         stream: impl RecordBatchReader + Send + 'static,
         left_on: &str,
         right_on: &str,
-        max_field_id: i32,
     ) -> Result<(Fragment, Schema)> {
         let stream = Box::new(stream);
         if self.schema().field(left_on).is_none() && left_on != ROW_ID && left_on != ROW_ADDR {
@@ -2332,7 +2349,8 @@ impl FileFragment {
         // Final schema is union of current schema, plus the RHS schema without
         // the right_on key.
         let mut new_schema: Schema = self.schema().merge(joiner.out_schema().as_ref())?;
-        new_schema.set_field_id(Some(max_field_id));
+        // Use the same starting id as the updater so schema and data file ids match.
+        new_schema.try_set_field_id(Some(self.dataset.manifest.max_field_id()))?;
 
         let new_fragment = self
             .clone()
@@ -3994,7 +4012,8 @@ mod tests {
     use arrow_arith::numeric::mul;
     use arrow_array::cast::AsArray;
     use arrow_array::{
-        ArrayRef, BooleanArray, Int32Array, Int64Array, RecordBatchIterator, StringArray,
+        ArrayRef, BinaryArray, BooleanArray, Int32Array, Int64Array, RecordBatchIterator,
+        StringArray,
     };
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use lance_core::ROW_ID;
@@ -5841,6 +5860,77 @@ mod tests {
         );
     }
 
+    /// The dataset declares `payload` non-nullable, so the blank restored for the
+    /// deleted row cannot be a null no matter how the update stream marks the field.
+    /// `test_write_schema_controls_blank_nullability` in `updater.rs` pins the value
+    /// itself; what matters here is that the rewritten data file still accounts for
+    /// every physical row, which is what `validate` checks.
+    #[tokio::test]
+    async fn test_update_columns_respects_dataset_nullability() {
+        let dataset_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("payload", DataType::Binary, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            dataset_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(BinaryArray::from(vec![&b"a"[..], &b"b"[..], &b"c"[..]])),
+            ],
+        )
+        .unwrap();
+
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], dataset_schema),
+            "memory://",
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_1),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset.delete("id = 2").await.unwrap();
+        let dataset = Arc::new(dataset);
+
+        // Update streams commonly carry nullable Arrow fields even when the dataset
+        // field is non-nullable.
+        let right_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("payload", DataType::Binary, true),
+        ]));
+        let right = RecordBatch::try_new(
+            right_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 3])),
+                Arc::new(BinaryArray::from(vec![&b"A"[..], &b"C"[..]])),
+            ],
+        )
+        .unwrap();
+
+        let mut fragment = dataset.get_fragments().pop().unwrap();
+        let (updated, _) = fragment
+            .update_columns(
+                RecordBatchIterator::new([Ok(right)], right_schema),
+                "id",
+                "id",
+            )
+            .await
+            .unwrap();
+
+        // `payload` moved to a new file, leaving a tombstone behind in the old one.
+        let layout = updated
+            .files
+            .iter()
+            .map(|file| file.fields.as_ref().to_vec())
+            .collect::<Vec<_>>();
+        assert_eq!(layout, vec![vec![0, -2], vec![1]]);
+        FileFragment::new(dataset, updated)
+            .validate()
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn test_fragment_update() {
         let test_dir = TempStrDir::default();
@@ -6897,6 +6987,116 @@ mod tests {
         );
     }
 
+    /// Stopping early is diagnosed as unread input, not as unmaterialized deletions:
+    /// the caller's remedy is to keep polling, not to run compaction. `finish` probes the
+    /// stream before consulting the restorer for exactly that reason -- otherwise which
+    /// message a caller saw would depend only on where the deletions happened to fall.
+    #[tokio::test]
+    async fn test_updater_finish_rejects_stopping_early() -> Result<()> {
+        let test_dir = TempStrDir::default();
+        let mut dataset = create_dataset(&test_dir, LanceFileVersion::Stable).await;
+        dataset.delete("i >= 5 AND i < 40").await?;
+
+        let fragment_id = dataset.manifest.fragments[0].id;
+        let fragment = dataset.get_fragment(fragment_id as usize).unwrap();
+        let mut updater = fragment.updater(Some(&["i"]), None, Some(5), None).await?;
+
+        let num_rows = updater.next().await?.unwrap().num_rows();
+        assert_eq!(num_rows, 5);
+        let new_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "double_i",
+            DataType::Int32,
+            true,
+        )]));
+        updater
+            .update(RecordBatch::try_new(
+                new_schema,
+                vec![Arc::new(Int32Array::from_iter_values(0..num_rows as i32))],
+            )?)
+            .await?;
+
+        let err = updater.finish().await.unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "{err:?}");
+        let message = err.to_string();
+        assert!(message.contains("cannot finish"), "{message}");
+        assert!(message.contains("unread input batches"), "{message}");
+        assert!(
+            !message.contains("run compaction"),
+            "stopping early is not a compaction problem: {message}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_updater_rejects_unpaired_and_unread_batches() -> Result<()> {
+        let test_dir = TempStrDir::default();
+        let dataset = create_dataset(&test_dir, LanceFileVersion::Stable).await;
+        let fragment = dataset.get_fragment(0).unwrap();
+        let mut updater = fragment.updater(Some(&["i"]), None, Some(5), None).await?;
+
+        let num_rows = updater.next().await?.unwrap().num_rows();
+        assert_eq!(num_rows, 5);
+
+        let error = updater.next().await.unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(
+            error.to_string().contains("previous input batch"),
+            "{error}"
+        );
+
+        let output_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "double_i",
+            DataType::Int32,
+            false,
+        )]));
+        let output = RecordBatch::try_new(
+            output_schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..num_rows as i32))],
+        )?;
+        updater.update(output.clone()).await?;
+
+        let error = updater.update(output).await.unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(error.to_string().contains("no input data"), "{error}");
+
+        let error = updater.finish().await.unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(
+            error.to_string().contains("unread input batches"),
+            "{error}"
+        );
+
+        // Probing must not consume a batch. In particular, repeatedly calling
+        // `finish` cannot walk the stream to its end and commit a short file.
+        let repeated = updater.finish().await.unwrap_err();
+        assert!(
+            repeated.to_string().contains("unread input batches"),
+            "{repeated}"
+        );
+
+        let mut rows_written = num_rows;
+        while let Some(input) = updater.next().await? {
+            if rows_written == num_rows {
+                let values = arrow_array::cast::as_primitive_array::<arrow_array::types::Int32Type>(
+                    input.column_by_name("i").unwrap().as_ref(),
+                );
+                assert_eq!(values.value(0), 5);
+            }
+            let rows = input.num_rows();
+            updater
+                .update(RecordBatch::try_new(
+                    output_schema.clone(),
+                    vec![Arc::new(Int32Array::from_iter_values(0..rows as i32))],
+                )?)
+                .await?;
+            rows_written += rows;
+        }
+        assert_eq!(rows_written, 40);
+        let updated = updater.finish().await?;
+        assert_eq!(updated.files.len(), 2);
+        Ok(())
+    }
+
     #[rstest]
     #[tokio::test]
     async fn test_merge_fragment(
@@ -6959,6 +7159,66 @@ mod tests {
             row_id += 1;
             i += 1;
         }
+    }
+
+    #[tokio::test]
+    async fn test_merge_columns_field_ids_match_data_file() {
+        let test_dir = TempStrDir::default();
+        let mut dataset = create_dataset(&test_dir, LanceFileVersion::Stable).await;
+        // The dropped column's id stays in the data files, so the manifest's
+        // max field id is larger than the schema's.
+        dataset.drop_columns(&["s"]).await.unwrap();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("i", DataType::Int32, true),
+            ArrowField::new("double_i", DataType::Int32, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..200)),
+                Arc::new(Int32Array::from_iter_values((0..400).step_by(2))),
+            ],
+        )
+        .unwrap();
+        let fragments = dataset.get_fragments();
+        let mut merged_fragments = Vec::with_capacity(fragments.len());
+        let mut merged_schema = dataset.schema().clone();
+        for mut frag in fragments {
+            let stream = RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone());
+            let (new_frag, new_schema) = frag.merge_columns(stream, "i", "i").await.unwrap();
+            let new_field_id = new_schema.field("double_i").unwrap().id;
+            assert_eq!(new_field_id, dataset.manifest.max_field_id() + 1);
+            assert_eq!(
+                new_frag.files.last().unwrap().fields.as_ref(),
+                &[new_field_id]
+            );
+            merged_fragments.push(new_frag);
+            merged_schema = new_schema;
+        }
+
+        let dataset = Dataset::commit(
+            &test_dir,
+            Operation::Merge {
+                fragments: merged_fragments,
+                schema: merged_schema,
+                preserves_nullability: true,
+            },
+            Some(dataset.manifest.version),
+            None,
+            None,
+            Default::default(),
+            false,
+        )
+        .await
+        .unwrap();
+        let actual = dataset
+            .scan()
+            .project(&["i", "double_i"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(actual, batch);
     }
 
     #[tokio::test]
