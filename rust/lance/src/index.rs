@@ -920,8 +920,14 @@ async fn prune_stale_segment_coverage(
 /// scanned, as is all of it on a table with no fragment reuse index, never
 /// created or since dropped. So is coverage no record ever carried, such as an
 /// eager compaction's inline remap of a committed segment: nothing here tells
-/// it from coverage whose record was trimmed. Fragments the build held need no
-/// history. Tagged histories are replayed instead ([`replay_staged_segments`]).
+/// it from coverage whose record was trimmed. Committed over the index it came
+/// from, such a segment is then refused for orphaning what was withdrawn;
+/// committed after that index is dropped, it leaves those rows to a scan.
+///
+/// Without any history, a segment of stable row ids on a table that has them
+/// keeps that coverage: compaction leaves the ids valid, so they need no
+/// translation. Fragments the build held need none either. Tagged histories
+/// are replayed instead ([`replay_staged_segments`]).
 async fn withdraw_untranslated_coverage(
     dataset: &Dataset,
     index_name: &str,
@@ -939,11 +945,19 @@ async fn withdraw_untranslated_coverage(
         Some(_) => dataset.open_frag_reuse_index(&NoOpMetricsCollector).await?,
         None => None,
     };
+    let views = segments
+        .iter()
+        .map(|segment| segment.clone().into_metadata(index_name))
+        .collect::<Vec<_>>();
+    let stores_stable_row_ids = |view: &IndexMetadata| {
+        dataset.manifest.uses_stable_row_ids() && !view.results_are_row_addrs()
+    };
     let mut history = History::new(dataset).await?;
     let mut produced_since_build = Vec::with_capacity(segments.len());
-    for segment in segments.iter() {
+    for (segment, view) in segments.iter().zip(&views) {
         let mut produced = RoaringBitmap::new();
         if segment.dataset_version() < dataset.manifest.version
+            && (frag_reuse_index.is_some() || !stores_stable_row_ids(view))
             && let Some(built_at) = history.at(segment.dataset_version()).await?
         {
             produced = segment
@@ -959,10 +973,6 @@ async fn withdraw_untranslated_coverage(
     }
     let fresh = match &frag_reuse_index {
         Some(frag_reuse_index) => {
-            let views = segments
-                .iter()
-                .map(|segment| segment.clone().into_metadata(index_name))
-                .collect::<Vec<_>>();
             fresh_fragments(dataset, &mut history, frag_reuse_index, &views).await?
         }
         None => RoaringBitmap::new(),
@@ -5325,7 +5335,7 @@ mod tests {
     use lance_datagen::gen_batch;
     use lance_datagen::{BatchCount, ByteCount, Dimension, RowCount, array};
     use lance_index::metrics::LocalMetricsCollector;
-    use lance_index::pbold::{BTreeIndexDetails, InvertedIndexDetails};
+    use lance_index::pbold::{BTreeIndexDetails, InvertedIndexDetails, ZoneMapIndexDetails};
     use lance_index::scalar::bitmap::BITMAP_LOOKUP_NAME;
     use lance_index::scalar::inverted::query::{FtsQuery, PhraseQuery};
     use lance_index::scalar::inverted::{
@@ -11941,6 +11951,74 @@ mod tests {
         assert_eq!(new_indices.len(), 1);
         assert_eq!(new_indices[0].fields, vec![vector_field_id, id_field_id]);
         assert_eq!(new_indices[0].covering_fields, vec![id_field_id]);
+    }
+
+    /// On a stable-row-id table without a fragment reuse index, a segment from
+    /// before a compaction keeps covering the compaction's output only if it
+    /// stores stable row ids, which the compaction leaves valid; a zone map's
+    /// physical addresses are not. The segment claims fragment 4, which an eager
+    /// compaction made of fragments 0 and 1 after its build, as one saved while
+    /// a history translated it would.
+    #[rstest]
+    #[case::stable_row_ids(IndexType::BTree, &[2, 3, 4])]
+    #[case::addresses(IndexType::ZoneMap, &[2, 3])]
+    #[tokio::test]
+    async fn test_missing_history_keeps_post_build_coverage_only_of_stable_row_ids(
+        #[case] index_type: IndexType,
+        #[case] covered: &[u32],
+    ) {
+        let test_dir = TempStrDir::default();
+        let reader = gen_batch()
+            .col("val", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(10), BatchCount::from(4));
+        let params = WriteParams {
+            max_rows_per_file: 10,
+            enable_stable_row_ids: true,
+            ..Default::default()
+        };
+        let mut dataset = Dataset::write(reader, test_dir.as_str(), Some(params))
+            .await
+            .unwrap();
+        let built = dataset.manifest.version;
+        let options = CompactionOptions {
+            target_rows_per_fragment: 1_000,
+            excluded_fragment_ids: vec![2, 3],
+            ..Default::default()
+        };
+        compact_files(&mut dataset, options, None).await.unwrap();
+        assert!(dataset.frag_reuse_index().await.unwrap().is_none());
+
+        let field_id = dataset.schema().field("val").unwrap().id;
+        let details = match index_type {
+            IndexType::BTree => prost_types::Any::from_msg(&BTreeIndexDetails::default()),
+            _ => prost_types::Any::from_msg(&ZoneMapIndexDetails::default()),
+        }
+        .unwrap();
+        let metadata = IndexMetadata {
+            uuid: Uuid::new_v4(),
+            name: "val_idx".to_string(),
+            fields: vec![field_id],
+            covering_fields: vec![],
+            dataset_version: built,
+            fragment_bitmap: Some(RoaringBitmap::from_iter([2, 3, 4])),
+            index_details: Some(Arc::new(details)),
+            index_version: index_type.version(),
+            created_at: None,
+            base_id: None,
+            files: None,
+        };
+        let new_indices = build_index_metadata_from_segments(
+            &dataset,
+            "val_idx",
+            field_id,
+            vec![segment_from_metadata(&metadata)],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            new_indices[0].fragment_bitmap,
+            Some(RoaringBitmap::from_iter(covered.iter().copied()))
+        );
     }
 
     /// A segment's carried columns can go stale independently of its keyed column,

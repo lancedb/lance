@@ -384,8 +384,11 @@ pub trait DatasetIndexExt {
     /// built is left out. So is a fragment compaction produced since, unless
     /// the fragment reuse index still records every rewrite from the
     /// segment's build to it and the indexed data is unchanged along them: the
-    /// segment holds those rows' addresses from its build. Rows left out are
-    /// scanned.
+    /// segment holds those rows' addresses from its build. Without a fragment
+    /// reuse index, a segment of stable row ids on a table that has them keeps
+    /// such a fragment, as compaction leaves the ids valid. Rows left out are
+    /// scanned, and a commit that would replace a segment still covering them
+    /// is refused.
     async fn commit_existing_index_segments(
         &mut self,
         index_name: &str,

@@ -1016,6 +1016,11 @@ impl Workload {
 /// `fragments` fragments of `id`, `val = id * 10` and `spare`, on disk, with a
 /// committed index on `id` so a deferred compaction records its groups.
 async fn val_table(uri: &str, fragments: i32) -> Dataset {
+    val_table_with(uri, fragments, false).await
+}
+
+/// A [`val_table`], with stable row ids if `enable_stable_row_ids`.
+async fn val_table_with(uri: &str, fragments: i32, enable_stable_row_ids: bool) -> Dataset {
     let rows = fragments * ROWS;
     let batch = RecordBatch::try_new(
         Arc::new(ArrowSchema::new(vec![
@@ -1033,6 +1038,7 @@ async fn val_table(uri: &str, fragments: i32) -> Dataset {
     let reader = RecordBatchIterator::new([Ok(batch.clone())], batch.schema());
     let params = WriteParams {
         max_rows_per_file: ROWS as usize,
+        enable_stable_row_ids,
         ..Default::default()
     };
     let mut dataset = Dataset::write(reader, uri, Some(params)).await.unwrap();
@@ -1846,6 +1852,69 @@ async fn test_republished_segment_keeps_its_build_fragments_without_a_history(
         RoaringBitmap::from_iter(0..4)
     );
     assert_uses_val_idx(&dataset, "val < 100").await;
+    assert_val_lookups_match_scan(&dataset, (0..24).map(|id| id * 10), "").await;
+}
+
+/// A `val_idx` BTree that an eager compaction of fragments 0 and 1 carried onto
+/// its output, fragment 4, on a table that never had a fragment reuse index, is
+/// committed again: over itself or after being dropped, as it is or merged
+/// first. With stable row ids its entries stay valid through the compaction,
+/// so it keeps covering the output and lookups go through it. Without them
+/// nothing tells that inline remap from coverage whose record is gone, so the
+/// output is withdrawn: committed over the index it came from, that would
+/// orphan the output and is refused; once the index is dropped, it commits
+/// without the output and those rows are scanned.
+#[rstest]
+#[tokio::test]
+async fn test_republished_segment_over_an_eager_compaction_without_a_history(
+    #[values(false, true)] stable_row_ids: bool,
+    #[values(false, true)] dropped: bool,
+    #[values(false, true)] merged: bool,
+) {
+    let dir = TempStrDir::default();
+    let mut dataset = val_table_with(dir.as_str(), 4, stable_row_ids).await;
+    commit_val_idx(&mut dataset, IndexType::BTree).await;
+    let options = CompactionOptions {
+        target_rows_per_fragment: 1_000,
+        excluded_fragment_ids: vec![2, 3],
+        ..Default::default()
+    };
+    compact_files(&mut dataset, options, None).await.unwrap();
+    assert!(dataset.frag_reuse_index().await.unwrap().is_none());
+    let covered = RoaringBitmap::from_iter([2, 3, 4]);
+    assert_eq!(val_idx_coverage(&dataset).await, covered);
+
+    let saved = dataset.load_indices_by_name("val_idx").await.unwrap();
+    let saved = if merged {
+        vec![dataset.merge_existing_index_segments(saved).await.unwrap()]
+    } else {
+        saved
+    };
+    if dropped {
+        dataset.drop_index("val_idx").await.unwrap();
+    }
+    let result = dataset
+        .commit_existing_index_segments("val_idx", "val", saved)
+        .await;
+    if stable_row_ids {
+        result.unwrap();
+        assert_eq!(val_idx_coverage(&dataset).await, covered);
+        assert_uses_val_idx(&dataset, "val = 0").await;
+    } else if dropped {
+        result.unwrap();
+        assert_eq!(
+            val_idx_coverage(&dataset).await,
+            RoaringBitmap::from_iter([2, 3])
+        );
+    } else {
+        let error = result.unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(
+            error.to_string().contains("would orphan fragments [4]"),
+            "{error}"
+        );
+        assert_eq!(val_idx_coverage(&dataset).await, covered);
+    }
     assert_val_lookups_match_scan(&dataset, (0..24).map(|id| id * 10), "").await;
 }
 
