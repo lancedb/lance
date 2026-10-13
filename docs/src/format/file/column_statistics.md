@@ -1,13 +1,17 @@
 # Zone-level Column Statistics
 
-A write seed stores column statistics collected while writing a data file.
-Each record summarizes a zone of physical rows, normally 8,192 rows. The records
-are embedded in the data file as an Arrow IPC buffer, separate from column data.
+A **write seed** is a saved summary of one column, collected while writing a
+data file. It divides the column into **zones**, normally 8,192 rows each, and
+stores one statistics record per zone in the same data file.
 
-Consumers can use these statistics to prune zones or aggregate them for fragment
-and index-segment pruning. They can also build statistics without scanning the
-column again. This specification changes only the write-seed format, not the
-ZoneMap index schema, index version, or query implementation.
+A reader can use these summaries to skip zones that cannot match a filter.
+Combining zone summaries gives fragment or index-segment summaries for pruning
+at a larger scale. An index builder can also reuse seeds instead of reading the
+column again.
+
+This proposal defines **version 1 of the write-seed format** and reserves its
+dataset feature bit. Writing and reading version 1 seeds requires a follow-up
+implementation. The existing ZoneMap index format and query behavior are unchanged.
 
 ## Arrow Rust ordering
 
@@ -32,20 +36,16 @@ Nulls are counted separately. Descending sort options and null placement do not
 change the ascending bounds. An ordering rule does not require bounds support
 for every Arrow type; an unavailable bound must remain unknown.
 
-These rules are a format contract. An Arrow dependency upgrade must not silently
-change them. A consumer using different predicate comparisons must not exclude
-rows unless it can prove that the statistics remain conservative for those
-comparisons.
+Writers and readers must keep these rules when upgrading Arrow. If a query uses
+different comparison rules, its reader may use these statistics to skip data
+only when it can prove that no matching rows will be lost.
 
 ## Version 1 statistics fields
 
-- `min` and `max` bound all non-null, non-NaN values in the zone. Bounds may be
-  wider than the exact extrema but must never exclude such a value. Infinities
-  are ordinary values. For types without supported value bounds, such as whole
-  `List`, `FixedSizeList`, or `Struct` values, both bounds are null. This means
-  the bounds are unavailable, not that every value is null. Such seeds can still
-  contain an exact `null_count` and an optional null-row bitmap.
-- `null_count` is the exact number of null physical rows.
+- `min` and `max` are lower and upper bounds on the zone's non-null, non-NaN
+  values. For values `5, 6, 7, 8`, bounds `[2, 10]` are valid; `[6, 7]` are not.
+  Positive and negative infinity are included in these bounds.
+- `null_count` is the exact number of null rows.
 - `nan_count` is the exact number of NaNs of either sign.
 - `negative_nan_count` is the exact number of NaNs with the sign bit set.
   Positive NaNs number `nan_count - negative_nan_count`.
@@ -54,10 +54,16 @@ comparisons.
   the final record can be shorter. For example, 10,000 rows at 8,192 rows per
   zone produce records with lengths 8,192 and 1,808.
 
-Counts describe the values written to the file, before later deletion filtering.
-Version 1 seeds are newly collected records: both NaN counts are non-nullable.
-Non-float columns write zero for both counts. Counts must fit their declared
-types; writers must not truncate or saturate them.
+All counts describe physical rows: the values written to the file, before any
+later row deletions. Both NaN counts are required in version 1. Non-float columns
+write zero for both. Counts must fit their declared types; writers must not
+truncate them or replace an overflowing count with the type's maximum.
+
+### When min/max are unavailable
+
+For types without supported value bounds, such as whole `List`, `FixedSizeList`,
+or `Struct` values, both bounds are null. These seeds can still store an exact
+`null_count` and an optional null-row bitmap.
 
 Statistics describe the column value at each row, not values nested inside it.
 For example, a `List<Float64>` zone containing `null`, `[1.0, null, NaN]`, and
@@ -67,21 +73,23 @@ a non-null list; its child null and NaN are not counted. Likewise, a non-null
 struct containing a null field is not itself null. These seeds do not provide
 statistics for individual child fields.
 
-Each record must satisfy `null_count + nan_count <= zone_length` and
-`negative_nan_count <= nan_count`. Arithmetic used to validate these constraints
-must not overflow.
+A null bound does not, by itself, mean that all rows are null. Use the counts:
 
-Null bounds mean there are no ordinary values when
-`zone_length = null_count + nan_count`. Otherwise a null bound means that side
-is unknown, for example because value bounds are unsupported for the type.
-An unknown bound cannot justify pruning.
+- If `zone_length = null_count + nan_count`, no non-null, non-NaN values remain.
+- Otherwise, a null bound means that bound is unknown. A reader cannot use it
+  to exclude values.
+
+Each record must satisfy `null_count + nan_count <= zone_length` and
+`negative_nan_count <= nan_count`. Readers must check these constraints without
+overflowing the arithmetic.
 
 ## Storage layout
 
-Data-file schema metadata `lance.seed.<column_name>` locates the seed as
-`<buffer_index>:<rows_per_zone>`. The buffer index addresses a global buffer in
-the containing data file. The locator is unchanged; its default zone size is
-8,192 rows.
+The data file's schema metadata tells the reader where to find each column's
+seed. The key is `lance.seed.<column_name>` and the value is
+`<buffer_index>:<rows_per_zone>`. For example, `lance.seed.price = "7:8192"`
+means: read the `price` statistics from global buffer 7 in this file, with a
+configured zone size of 8,192 rows. This locator is unchanged from version 0.
 
 The buffer contains a complete Arrow IPC file, with its own schema and metadata.
 For a column named `price`, the layout of a version 1 seed is:
@@ -109,9 +117,9 @@ offset: the zero-based record number times `rows_per_zone`. The last zone may
 be shorter. Consumers must place these ranges using the containing file's row
 coverage, not assume that every data file covers an entire fragment.
 
-### Seed buffer schema
+### Version 1 seed schema
 
-#### Version 1
+Each row in this schema is one zone's statistics record.
 
 ```python
 pa.schema([
@@ -124,44 +132,33 @@ pa.schema([
 ])
 ```
 
-#### Version 0 (legacy)
-
-```python
-pa.schema([
-    pa.field("min", value_type, nullable=True),
-    pa.field("max", value_type, nullable=True),
-    pa.field("null_count", pa.uint32(), nullable=False),
-    pa.field("nan_count", pa.uint32(), nullable=False),
-    pa.field("zone_length", pa.uint64(), nullable=False),
-])
-```
-
-Legacy seeds have no sign count. Their `max` may contain a `+NaN` marker when
-either NaN sign is present; it is not evidence of a positive NaN.
-
 ### Seed schema metadata
 
 - `version`: the decimal string `"1"` for version 1. Absence means legacy
   version 0. This versions the seed statistics, not the Arrow IPC format or
   the containing data file.
-- `seed_null_bitmap`: optional hex-encoded Roaring bitmap of null row offsets
-  in the seed's physical row sequence. Its encoding is unchanged. Absence means
-  exact offsets are unavailable, not that the data has no nulls.
+- `seed_null_bitmap`: an optional bitmap identifying exactly which rows are
+  null, stored as a hex-encoded Roaring bitmap. There is one bitmap per column's
+  seed buffer, covering all its zones. Offsets are relative to the seed's
+  physical row sequence. Its encoding is unchanged.
 
-The optional bitmap must agree with `null_count`. Version 1 does not require
-adding or removing a bitmap; min/max and counts do not depend on its presence.
+The bitmap lets an index builder obtain null positions without rereading the
+column. It must agree with each zone's `null_count`. If absent, the null counts
+are still available, but the exact positions are not. Version 1 keeps the
+bitmap optional; min/max and counts do not depend on it.
 
 ## Consuming and aggregating statistics
 
-Consumers must validate the seed version, column type, zone size, and actual row
-coverage before using it. Unsupported versions are unusable seeds; a consumer
-can scan the column instead. A malformed known version is an error, not a reason
-to reinterpret the buffer as version 0.
+Before using a seed, readers must check its version, column type, zone size,
+and which physical rows it describes. If the version is unsupported, they can
+read the column instead. A malformed seed of a known version is an error;
+readers must not try to interpret it as version 0.
 
-For zone pruning, ordinary values use the bounds. Negative NaNs may match below
-ordinary values; positive NaNs may match above them. Counts do not record NaN
-payloads, so predicates within a possible same-sign NaN group require
-conservative candidates and row rechecking. Counts are not row addresses.
+For pruning, use min/max for non-NaN values and the NaN counts separately.
+Negative NaNs sort below non-NaN values; positive NaNs sort above them. The
+counts do not identify individual NaN representations or their row positions.
+If a predicate distinguishes NaNs with the same sign, retain any zone that
+could match and check its rows.
 
 For a complete, non-overlapping collection of zones:
 
@@ -182,11 +179,28 @@ records verbatim into its unchanged format. It must explicitly adapt to that
 format's contract or decline the seed and scan the column. This proposal does
 not fix existing ZoneMap index reader behavior.
 
-## Reading legacy seeds
+## Version 0: existing seeds
 
-An absent version selects the legacy decoder. The total NaN count is known, but
-the sign split is unknown. If `nan_count > 0`, either sign remains possible.
-A legacy NaN bound must not be interpreted as an ordinary-value bound.
+Existing seeds have no `version` metadata entry. Readers must interpret those
+buffers as version 0, using this schema:
+
+```python
+pa.schema([
+    pa.field("min", value_type, nullable=True),
+    pa.field("max", value_type, nullable=True),
+    pa.field("null_count", pa.uint32(), nullable=False),
+    pa.field("nan_count", pa.uint32(), nullable=False),
+    pa.field("zone_length", pa.uint64(), nullable=False),
+])
+```
+
+Version 1 changes three things: it adds `version = "1"` to the seed's metadata,
+adds `negative_nan_count`, and keeps all NaNs out of min/max.
+
+Version 0 records only the total NaN count. Its `max` may contain a `+NaN`
+marker even when all NaNs are negative. Readers must not treat that marker as
+proof of a positive NaN, or as a bound on non-NaN values. When `nan_count > 0`,
+either sign remains possible.
 
 Existing buffers remain version 0. They must not be relabeled as version 1 or
 assigned invented sign counts. Recollecting the column values can produce a
@@ -195,13 +209,16 @@ explicitly while preserving the exact legacy total.
 
 ## Reader and writer compatibility
 
+The seed version tells a new reader how to decode the buffer. It cannot protect
+an old reader that ignores the version entry. Dataset feature flags provide
+that protection.
+
 The first commit referencing a data file with version 1 seeds must set
 `FLAG_ZONE_STATISTICS_SEEDS = 1 << 16` in both `Manifest.reader_feature_flags`
 and `Manifest.writer_feature_flags`, atomically with that reference.
 
-Clients that do not support the bit must refuse the dataset. The seed version
-alone cannot fence older consumers that ignore version metadata. This is an
-explicit capability upgrade; opening an existing table does not enable it.
+Clients that do not support the bit must refuse the dataset. Enabling version 1
+is an explicit upgrade; opening an existing table does not enable it.
 
 Both bits must be preserved in derived snapshots, including clone and restore.
 Dropping an index does not clear them: data files can still contain seeds.
