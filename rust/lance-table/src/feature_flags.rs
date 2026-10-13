@@ -4,7 +4,7 @@
 //! Feature flags
 
 use crate::format::Manifest;
-use lance_core::{Error, Result};
+use lance_core::{Error, Result, datatypes::Schema};
 
 /// Fragments may contain deletion files, which record the tombstones of
 /// soft-deleted rows.
@@ -100,14 +100,24 @@ pub const FLAG_INDEPENDENT_COVERING_FIELDS: u64 = 1 << 13;
 /// This capability is sticky, including across restore, and requires both words.
 pub const FLAG_MANAGED_BLOBS: u64 = 1 << 14;
 
+/// Schema metadata that explicitly opts writes and compaction into Managed blobs.
+/// Set `lance.blob.managed` to `true` to activate the sticky table capability.
+/// This requires Managed-aware readers and maintenance clients thereafter.
+pub const MANAGED_BLOBS_META_KEY: &str = "lance.blob.managed";
+
+/// Field IDs are allocated from a persistent high-water mark and are never reused.
+/// Writers must understand this allocation contract. It does not change how
+/// readers interpret the schema or data files.
+pub const FLAG_NON_REUSABLE_FIELD_IDS: u64 = 1 << 15;
 /// The first bit that is unknown as a feature flag
-pub const FLAG_UNKNOWN: u64 = 1 << 15;
+pub const FLAG_UNKNOWN: u64 = 1 << 16;
 
 const _: () = assert!(FLAG_COVERED_INDEX_METADATA < FLAG_UNKNOWN);
 // The fence needs a bit the current released build already refuses, which means
 // at or above the boundary that build shipped with (bit 7).
 const _: () = assert!(FLAG_COVERED_INDEX_METADATA >= 1 << 7);
 const _: () = assert!(FLAG_MIXED_DATA_FILE_VERSIONS < FLAG_UNKNOWN);
+const _: () = assert!(FLAG_NON_REUSABLE_FIELD_IDS < FLAG_UNKNOWN);
 // Same fence for this bit: v12.0.0 refuses bit 9 and up.
 const _: () = assert!(FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS >= 1 << 9);
 const _: () = assert!(FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS < FLAG_UNKNOWN);
@@ -120,6 +130,8 @@ const _: () = assert!(FLAG_MANAGED_BLOBS < FLAG_UNKNOWN);
 
 pub(crate) const STICKY_PAIRED_FLAGS: u64 =
     FLAG_MIXED_DATA_FILE_VERSIONS | FLAG_FRAGMENT_REUSE_INDEX | FLAG_MANAGED_BLOBS;
+pub(crate) const STICKY_READER_FLAGS: u64 = STICKY_PAIRED_FLAGS;
+pub(crate) const STICKY_WRITER_FLAGS: u64 = STICKY_PAIRED_FLAGS | FLAG_NON_REUSABLE_FIELD_IDS;
 
 /// Environment variable that opts a release build into reading and writing data
 /// overlay files before the feature is generally released.
@@ -138,14 +150,19 @@ pub fn apply_feature_flags(
     disable_transaction_file: bool,
 ) -> Result<()> {
     // Carried across the reset: a `Manifest` only points at its index section,
-    // so whether any index declares covering columns is not visible here. `build_manifest` decides it from the index list it is
-    // committing and sets the bit after calling this; without the carry the
-    // second call, from `write_manifest_file`, would clear that decision
-    // immediately before the write.
+    // so whether any index declares covering columns is not visible here.
+    // `build_manifest` decides it from the index list it is committing and sets
+    // the bit after calling this; without the carry the second call, from
+    // `write_manifest_file`, would clear that decision immediately before the
+    // write.
     let covered_index_metadata = (manifest.reader_feature_flags | manifest.writer_feature_flags)
         & FLAG_COVERED_INDEX_METADATA;
     let sticky_paired_flags = validated_sticky_paired_flags(manifest)?;
-
+    let non_reusable_field_ids = manifest.max_allocated_field_id.is_some();
+    if non_reusable_field_ids {
+        manifest.writer_feature_flags |= FLAG_NON_REUSABLE_FIELD_IDS;
+    }
+    validate_non_reusable_field_id_flags(manifest)?;
     // Reset flags
     manifest.reader_feature_flags = 0;
     manifest.writer_feature_flags = 0;
@@ -213,6 +230,10 @@ pub fn apply_feature_flags(
         manifest.writer_feature_flags |= FLAG_DISABLE_TRANSACTION_FILE;
     }
 
+    if non_reusable_field_ids {
+        manifest.writer_feature_flags |= FLAG_NON_REUSABLE_FIELD_IDS;
+    }
+
     manifest.reader_feature_flags |= covered_index_metadata;
     manifest.writer_feature_flags |= covered_index_metadata;
     manifest.reader_feature_flags |= sticky_paired_flags;
@@ -221,21 +242,47 @@ pub fn apply_feature_flags(
     Ok(())
 }
 
-/// Carry sticky paired capabilities from the manifest a new one is derived
-/// from.
+/// Carry sticky capabilities from the manifest a new one is derived from.
 ///
 /// [`apply_feature_flags`] carries these bits across its own reset, but it only
 /// ever sees one manifest. Constructors preserve these flags, and this helper
 /// also validates that the source is not half-set before a derived manifest is
 /// committed.
 ///
-/// A half-set state is refused rather than normalized: one bit set means a
-/// legacy reader or a legacy writer is still permitted, which is neither mode.
+/// Non-reusable field IDs are activated explicitly and only require writer support.
 pub fn inherit_sticky_feature_flags(destination: &mut Manifest, source: &Manifest) -> Result<()> {
     let sticky_flags = validated_sticky_paired_flags(source)?;
+    validate_non_reusable_field_id_flags(source)?;
     destination.reader_feature_flags |= sticky_flags;
-    destination.writer_feature_flags |= sticky_flags;
+    destination.writer_feature_flags |=
+        sticky_flags | (source.writer_feature_flags & FLAG_NON_REUSABLE_FIELD_IDS);
     Ok(())
+}
+
+/// Whether a schema explicitly requests Managed blob storage. Absent or `false`
+/// keeps the existing Inline/Packed/Dedicated storage layout, in all build profiles.
+///
+/// ```
+/// use lance_core::datatypes::Schema;
+/// use lance_table::feature_flags::{MANAGED_BLOBS_META_KEY, managed_blobs_enabled};
+/// let mut schema = Schema::default();
+/// assert!(!managed_blobs_enabled(&schema)?);
+/// schema.metadata.insert(MANAGED_BLOBS_META_KEY.to_string(), "true".to_string());
+/// assert!(managed_blobs_enabled(&schema)?);
+/// # Ok::<(), lance_core::Error>(())
+/// ```
+pub fn managed_blobs_enabled(schema: &Schema) -> Result<bool> {
+    match schema
+        .metadata
+        .get(MANAGED_BLOBS_META_KEY)
+        .map(String::as_str)
+    {
+        None | Some("false") => Ok(false),
+        Some("true") => Ok(true),
+        Some(value) => Err(Error::invalid_input(format!(
+            "Schema metadata {MANAGED_BLOBS_META_KEY} must be true or false, got {value:?}"
+        ))),
+    }
 }
 
 /// Whether this build understands data overlay files: always in debug builds,
@@ -317,6 +364,7 @@ pub fn can_write_dataset(writer_flags: u64) -> bool {
 /// not support or whose paired capabilities are inconsistent.
 pub fn ensure_can_read_manifest(manifest: &Manifest) -> Result<()> {
     validate_paired_feature_flags(manifest)?;
+    validate_non_reusable_field_id_flags(manifest)?;
     if !can_read_dataset(manifest.reader_feature_flags) {
         return Err(Error::not_supported_source(
             format!(
@@ -334,6 +382,7 @@ pub fn ensure_can_read_manifest(manifest: &Manifest) -> Result<()> {
 /// not support or whose paired capabilities are inconsistent.
 pub fn ensure_can_write_manifest(manifest: &Manifest) -> Result<()> {
     validate_paired_feature_flags(manifest)?;
+    validate_non_reusable_field_id_flags(manifest)?;
     if !can_write_dataset(manifest.writer_feature_flags) {
         return Err(Error::not_supported_source(
             format!(
@@ -385,6 +434,30 @@ pub fn validate_paired_feature_flags(manifest: &Manifest) -> Result<()> {
     Ok(())
 }
 
+/// Refuse a manifest whose non-reusable-field-ID marker and required flags disagree.
+///
+/// The high-water mark is the activation marker and always requires the writer
+/// bit. Non-reusable field IDs do not change read semantics, so the reader bit is not
+/// a valid activation mode.
+pub fn validate_non_reusable_field_id_flags(manifest: &Manifest) -> Result<()> {
+    let activated = manifest.max_allocated_field_id.is_some();
+    let reader = manifest.reader_feature_flags & FLAG_NON_REUSABLE_FIELD_IDS != 0;
+    let writer = manifest.writer_feature_flags & FLAG_NON_REUSABLE_FIELD_IDS != 0;
+    if activated != writer {
+        return Err(Error::corrupt_file_named(
+            "manifest",
+            "Manifest non-reusable-field-ID high-water mark and writer feature flag disagree",
+        ));
+    }
+    if reader {
+        return Err(Error::corrupt_file_named(
+            "manifest",
+            "Manifest has a non-reusable-field-ID reader feature flag, but non-reusable field IDs only require writer support",
+        ));
+    }
+    Ok(())
+}
+
 fn validated_sticky_paired_flags(manifest: &Manifest) -> Result<u64> {
     validate_paired_feature_flags(manifest)?;
     Ok(manifest.reader_feature_flags & STICKY_PAIRED_FLAGS)
@@ -392,6 +465,35 @@ fn validated_sticky_paired_flags(manifest: &Manifest) -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
+    #[rstest::rstest]
+    #[case::absent(None, false)]
+    #[case::disabled(Some("false"), false)]
+    #[case::enabled(Some("true"), true)]
+    fn managed_blobs_require_explicit_opt_in(#[case] value: Option<&str>, #[case] enabled: bool) {
+        let mut schema = empty_manifest().schema;
+        if let Some(value) = value {
+            schema
+                .metadata
+                .insert(MANAGED_BLOBS_META_KEY.to_string(), value.to_string());
+        }
+        assert_eq!(managed_blobs_enabled(&schema).unwrap(), enabled);
+    }
+
+    #[test]
+    fn managed_blobs_reject_invalid_opt_in() {
+        let mut schema = empty_manifest().schema;
+        schema
+            .metadata
+            .insert(MANAGED_BLOBS_META_KEY.to_string(), "invalid".to_string());
+        let error = managed_blobs_enabled(&schema).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("lance.blob.managed must be true or false")
+        );
+    }
+
     #[test]
     fn tagged_fri_flag_is_supported_and_sticky() {
         let flag = super::FLAG_FRAGMENT_REUSE_INDEX;
@@ -484,6 +586,8 @@ mod tests {
         assert!(can_read_dataset(super::FLAG_TABLE_CONFIG));
         assert!(can_read_dataset(super::FLAG_BASE_PATHS));
         assert!(can_read_dataset(super::FLAG_DISABLE_TRANSACTION_FILE));
+        assert!(can_read_dataset(super::FLAG_NON_REUSABLE_FIELD_IDS));
+        assert!(can_read_dataset(super::FLAG_MIXED_DATA_FILE_VERSIONS));
         // Overlay support is gated on the build profile / env opt-in, so the
         // flag is readable exactly when overlays are enabled (see
         // test_data_overlay_flag_release_gating for the full policy).
@@ -643,6 +747,8 @@ mod tests {
         assert!(can_write_dataset(super::FLAG_TABLE_CONFIG));
         assert!(can_write_dataset(super::FLAG_BASE_PATHS));
         assert!(can_write_dataset(super::FLAG_DISABLE_TRANSACTION_FILE));
+        assert!(can_write_dataset(super::FLAG_NON_REUSABLE_FIELD_IDS));
+        assert!(can_write_dataset(super::FLAG_MIXED_DATA_FILE_VERSIONS));
         // Overlay support is gated on the build profile / env opt-in, so the
         // flag is writable exactly when overlays are enabled (see
         // test_data_overlay_flag_release_gating for the full policy).
@@ -732,6 +838,25 @@ mod tests {
     }
 
     #[test]
+    fn inheriting_preserves_non_reusable_field_id_writer_gate() {
+        let mut source = empty_manifest();
+        source.activate_non_reusable_field_ids();
+        source.writer_feature_flags |= FLAG_NON_REUSABLE_FIELD_IDS;
+        let mut destination = empty_manifest();
+
+        inherit_sticky_feature_flags(&mut destination, &source).unwrap();
+
+        assert_eq!(
+            destination.reader_feature_flags & FLAG_NON_REUSABLE_FIELD_IDS,
+            0
+        );
+        assert_ne!(
+            destination.writer_feature_flags & FLAG_NON_REUSABLE_FIELD_IDS,
+            0
+        );
+    }
+
+    #[test]
     fn inheriting_refuses_a_half_set_source() {
         for (reader, writer) in [
             (FLAG_MIXED_DATA_FILE_VERSIONS, 0),
@@ -804,6 +929,75 @@ mod tests {
         let err = ensure_can_write_manifest(&manifest).unwrap_err();
         assert!(matches!(err, Error::NotSupported { .. }));
         assert!(err.to_string().contains("cannot be written"), "{err}");
+    }
+
+    #[rstest::rstest]
+    fn apply_feature_flags_sets_writer_gate_for_explicit_non_reusable_field_id_activation(
+        #[values(false, true)] managed_blobs: bool,
+    ) {
+        let mut manifest = empty_manifest();
+        let managed_blob_flags = if managed_blobs { FLAG_MANAGED_BLOBS } else { 0 };
+        manifest.reader_feature_flags = managed_blob_flags;
+        manifest.writer_feature_flags = managed_blob_flags;
+        manifest.activate_non_reusable_field_ids();
+
+        apply_feature_flags(&mut manifest, false, false).unwrap();
+
+        assert_eq!(
+            manifest.reader_feature_flags & FLAG_NON_REUSABLE_FIELD_IDS,
+            0
+        );
+        assert_ne!(
+            manifest.writer_feature_flags & FLAG_NON_REUSABLE_FIELD_IDS,
+            0
+        );
+        assert_eq!(
+            manifest.reader_feature_flags & FLAG_MANAGED_BLOBS,
+            managed_blob_flags
+        );
+        assert_eq!(
+            manifest.writer_feature_flags & FLAG_MANAGED_BLOBS,
+            managed_blob_flags
+        );
+    }
+
+    #[test]
+    fn apply_feature_flags_rejects_non_reusable_field_id_reader_flag() {
+        let mut manifest = empty_manifest();
+        manifest.activate_non_reusable_field_ids();
+        manifest.reader_feature_flags |= FLAG_NON_REUSABLE_FIELD_IDS;
+        manifest.writer_feature_flags |= FLAG_NON_REUSABLE_FIELD_IDS;
+
+        let err = apply_feature_flags(&mut manifest, false, false).unwrap_err();
+
+        assert!(
+            err.to_string().contains("only require writer support"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn non_reusable_field_id_marker_and_writer_gate_must_agree() {
+        let mut activated_without_gate = empty_manifest();
+        activated_without_gate.activate_non_reusable_field_ids();
+        assert!(validate_non_reusable_field_id_flags(&activated_without_gate).is_err());
+
+        let mut gate_without_marker = empty_manifest();
+        gate_without_marker.writer_feature_flags |= FLAG_NON_REUSABLE_FIELD_IDS;
+        assert!(validate_non_reusable_field_id_flags(&gate_without_marker).is_err());
+
+        let mut writer_only = empty_manifest();
+        writer_only.activate_non_reusable_field_ids();
+        writer_only.writer_feature_flags |= FLAG_NON_REUSABLE_FIELD_IDS;
+        validate_non_reusable_field_id_flags(&writer_only).unwrap();
+
+        let mut paired = writer_only.clone();
+        paired.reader_feature_flags |= FLAG_NON_REUSABLE_FIELD_IDS;
+        assert!(validate_non_reusable_field_id_flags(&paired).is_err());
+
+        let mut reader_without_activation = empty_manifest();
+        reader_without_activation.reader_feature_flags |= FLAG_NON_REUSABLE_FIELD_IDS;
+        assert!(validate_non_reusable_field_id_flags(&reader_without_activation).is_err());
     }
 
     #[rstest::rstest]

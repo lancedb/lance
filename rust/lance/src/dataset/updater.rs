@@ -294,7 +294,7 @@ impl Updater {
             // deleted run may not produce anything writable until a later batch.
             let output_schema = batch.schema();
             let mut final_schema = self.fragment.schema().merge(output_schema.as_ref())?;
-            final_schema.set_field_id(Some(self.fragment.dataset().manifest.max_field_id()));
+            final_schema.try_set_field_id(Some(self.fragment.dataset().manifest.max_field_id()))?;
             final_schema.validate()?;
             let write_schema = final_schema.project_by_schema(
                 output_schema.as_ref(),

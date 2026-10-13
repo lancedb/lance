@@ -1470,6 +1470,17 @@ impl<'a> CleanupTask<'a> {
                     Ok(None)
                 }
             }
+            // Local writers stage files in their destination directory before renaming
+            // them. These temporary files are never referenced by a manifest, even
+            // when they are inside a referenced blob sidecar directory.
+            _ if relative_path.as_ref().starts_with("data/")
+                && path
+                    .filename()
+                    .is_some_and(|filename| filename.starts_with(".tmp"))
+                && !maybe_in_progress =>
+            {
+                Ok(cleanup_file(path, CleanupFileKind::Data, true, size_bytes))
+            }
             _ => Ok(None),
         }
     }
@@ -2786,10 +2797,13 @@ mod tests {
                 "1".into(),
             ),
         ]));
-        let schema = Arc::new(ArrowSchema::new(vec![
-            Field::new("id", DataType::Int32, false),
-            field,
-        ]));
+        let schema = Arc::new(ArrowSchema::new_with_metadata(
+            vec![Field::new("id", DataType::Int32, false), field],
+            HashMap::from([(
+                lance_table::feature_flags::MANAGED_BLOBS_META_KEY.to_string(),
+                "true".to_string(),
+            )]),
+        ));
         RecordBatch::try_new(
             schema,
             vec![
@@ -2880,11 +2894,14 @@ mod tests {
     ) {
         let fixture = MockDatasetFixture::try_new().unwrap();
         let batch = managed_blob_batch();
-        let schema = Arc::new(ArrowSchema::new(vec![
-            batch.schema().field(0).clone(),
-            batch.schema().field(1).clone(),
-            batch.schema().field(1).clone().with_name("other"),
-        ]));
+        let schema = Arc::new(ArrowSchema::new_with_metadata(
+            vec![
+                batch.schema().field(0).clone(),
+                batch.schema().field(1).clone(),
+                batch.schema().field(1).clone().with_name("other"),
+            ],
+            batch.schema().metadata().clone(),
+        ));
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
@@ -3287,6 +3304,92 @@ mod tests {
             .unwrap();
 
         assert_eq!(fixture.count_blob_files().await.unwrap(), 0);
+    }
+
+    #[rstest]
+    #[case::recent(false, 1, false)]
+    #[case::at_threshold(false, 8, false)]
+    #[case::aged(false, 9, true)]
+    #[case::delete_unverified(true, 1, true)]
+    #[tokio::test]
+    async fn cleanup_temporary_data_files(
+        #[case] delete_unverified: bool,
+        #[case] cleanup_day: i64,
+        #[case] should_remove: bool,
+    ) {
+        MockClock::set_system_time(std::time::Duration::ZERO);
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        fixture.append_some_data().await.unwrap();
+        let dataset = fixture.open().await.unwrap();
+        assert_eq!(dataset.manifest.fragments.len(), 2);
+        let expected_rows = dataset.count_rows(None).await.unwrap();
+
+        let data_file = &dataset.manifest.fragments[0].files[0].path;
+        let data_file_key = data_file.strip_suffix(".lance").unwrap();
+        let temporary_paths = [
+            dataset.data_dir().join(".tmpAb3Xz9"),
+            dataset.data_dir().join("uncommitted").join(".tmpAb3Xz9"),
+            dataset.data_dir().join(data_file_key).join(".tmpAb3Xz9"),
+        ];
+        let preserved_paths = [
+            dataset.data_dir().join("unrelated"),
+            dataset.data_dir().join(".tmpDirectory").join("unrelated"),
+            dataset
+                .data_dir()
+                .join(data_file_key)
+                .join("10000000000000000000000000000000.blob"),
+            dataset.base.clone().join("database").join(".tmpAb3Xz9"),
+        ];
+
+        // The debris is newer than every retained manifest, as with an interrupted
+        // append. Its eligibility must depend on its own age, not the manifest age.
+        MockClock::set_system_time(TimeDelta::days(1).to_std().unwrap());
+        for path in temporary_paths.iter().chain(&preserved_paths) {
+            dataset.object_store.put(path, b"debris").await.unwrap();
+        }
+        MockClock::set_system_time(TimeDelta::days(cleanup_day).to_std().unwrap());
+
+        let policy = CleanupPolicyBuilder::default()
+            .before_timestamp(DateTime::<Utc>::UNIX_EPOCH)
+            .delete_unverified(delete_unverified)
+            .build();
+        let before_count = fixture.count_files().await.unwrap();
+        let explanation = dataset.cleanup(policy.clone()).explain().await.unwrap();
+        let expected_files = if should_remove {
+            temporary_paths.len() as u64
+        } else {
+            0
+        };
+        assert_eq!(explanation.stats.data_files_removed, expected_files);
+        assert_eq!(explanation.stats.bytes_removed, expected_files * 6);
+        assert_eq!(explanation.candidate_files.len() as u64, expected_files);
+        for file in &explanation.candidate_files {
+            assert_eq!(file.kind, CleanupFileKind::Data);
+            assert!(file.unverified);
+            assert!(
+                temporary_paths
+                    .iter()
+                    .any(|path| path.as_ref() == file.path)
+            );
+        }
+        assert_eq!(fixture.count_files().await.unwrap(), before_count);
+
+        let removed = dataset.cleanup(policy).execute().await.unwrap();
+        assert_eq!(removed.data_files_removed, expected_files);
+        assert_eq!(removed.bytes_removed, expected_files * 6);
+        assert_eq!(removed.old_versions, 0);
+        for path in &temporary_paths {
+            assert_eq!(
+                dataset.object_store.exists(path).await.unwrap(),
+                !should_remove,
+                "{path}"
+            );
+        }
+        for path in &preserved_paths {
+            assert!(dataset.object_store.exists(path).await.unwrap(), "{path}");
+        }
+        assert_eq!(fixture.count_rows().await.unwrap(), expected_rows);
     }
 
     #[tokio::test]
