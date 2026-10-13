@@ -633,6 +633,8 @@ class _Dataset:
         max_retries: Optional[int] = None,
         enable_stable_row_ids: Optional[bool] = None,
         commit_timeout: Optional[timedelta] = None,
+        idempotency_keys: Optional[List[str]] = None,
+        idempotency_property: Optional[str] = None,
         **kwargs,
     ) -> _Dataset: ...
     @staticmethod
@@ -645,6 +647,7 @@ class _Dataset:
         detached: Optional[bool] = None,
         max_retries: Optional[int] = None,
         commit_timeout: Optional[timedelta] = None,
+        idempotency_keys: Optional[List[str]] = None,
     ) -> Tuple[_Dataset, Transaction]: ...
     def validate(self): ...
     def migrate_manifest_paths_v2(self): ...
