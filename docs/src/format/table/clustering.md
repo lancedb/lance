@@ -1,7 +1,7 @@
 # Clustering Metadata
 
-Clustering organizes data to improve query pruning. Like Delta, Lance separates
-the table's current policy from information about individual outputs. Providers
+Clustering organizes data to improve query pruning. Lance records the table's
+current policy separately from information about individual outputs. Providers
 choose the layout and maintenance logic. This proposal defines the format in
 `clustering.proto`; the writer feature remains unsupported until implemented.
 
@@ -109,6 +109,3 @@ information are absent; disabling table clustering alone is insufficient.
 Providers share one flag, independent of layout version. FRI and write seeds
 keep their own feature requirements. This reservation does not enable clustering
 APIs or metadata-aware writes.
-
-Sources: [Delta clustered-table protocol](https://github.com/delta-io/delta/blob/ef3e91b509365cdc2b23c1afdbbab3b4d3828d63/PROTOCOL.md#clustered-table)
-and [changing clustering columns](https://docs.delta.io/delta-clustering/#change-clustering-columns).
