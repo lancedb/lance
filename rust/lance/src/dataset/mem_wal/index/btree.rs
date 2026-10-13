@@ -42,8 +42,8 @@ use lance_index::scalar::{SargableQuery, compute_next_prefix};
 use super::RowPosition;
 use super::arena_skiplist::{SkipListReader, SkipListWriter, new_skiplist};
 use super::plugin::{
-    FlushContext, FlushOutcome, MemIndex, MemIndexBuildContext, MemIndexPlugin, MemIndexSpec,
-    PrimaryKeyIndex,
+    FlushContext, FlushOutcome, MemIndex, MemIndexBuildContext, MemIndexParams, MemIndexPlugin,
+    MemIndexSpec, PrimaryKeyIndex,
 };
 use super::query::{MemMatches, MemQuery, MemSearchResult, PositionSet, SearchContext};
 
@@ -1453,7 +1453,7 @@ impl MemIndexPlugin for BTreeMemIndexPlugin {
     fn query_parser(
         &self,
         index_name: String,
-        _index_details: Option<&prost_types::Any>,
+        _params: &dyn MemIndexParams,
     ) -> Option<Box<dyn ScalarQueryParser>> {
         // The on-disk B-tree's parser, so both claim the same expressions.
         Some(Box::new(SargableQueryParser::new(
