@@ -253,3 +253,22 @@ impl<'a> Value<'a> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_display_escapes_object_keys() {
+        let mut obj = Object::new();
+        obj.insert("line\nbreak".to_string(), Value::Bool(false));
+        let value = Value::Object(obj);
+
+        let displayed = format!("{value}");
+        assert_eq!(displayed, "{\"line\\nbreak\":false}");
+
+        // The displayed form must itself be valid JSON that round-trips.
+        let reparsed: serde_json::Value = serde_json::from_str(&displayed).unwrap();
+        assert_eq!(reparsed, serde_json::json!({"line\nbreak": false}));
+    }
+}
