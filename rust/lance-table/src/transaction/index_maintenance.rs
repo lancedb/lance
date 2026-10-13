@@ -819,12 +819,20 @@ impl Transaction {
                 replacements.insert(start, new_fragments);
             } else {
                 for old_fragment in group.old_fragments.iter() {
-                    if let Some(&position) = positions.get(&old_fragment.id) {
-                        if removed[position] {
-                            return Err(Self::duplicate_rewrite_error(version, old_fragment.id));
-                        }
-                        removed[position] = true;
+                    let position = positions.get(&old_fragment.id).ok_or_else(|| {
+                        Error::commit_conflict_source(
+                            version,
+                            format!(
+                                "dataset does not contain a fragment a rewrite operation wants to replace: id={}",
+                                old_fragment.id
+                            )
+                            .into(),
+                        )
+                    })?;
+                    if removed[*position] {
+                        return Err(Self::duplicate_rewrite_error(version, old_fragment.id));
                     }
+                    removed[*position] = true;
                 }
                 appended.extend(new_fragments);
             }
@@ -961,6 +969,59 @@ mod tests {
         let error = result.unwrap_err();
         assert!(matches!(error, Error::CommitConflict { .. }));
         assert!(error.to_string().contains("id=7"));
+    }
+
+    #[test]
+    fn test_rewrite_fragments_non_contiguous_missing_fragment() {
+        // The group's first old fragment (1) exists, but it is not adjacent to
+        // the second old fragment (7), which does not exist. The group takes
+        // the non-contiguous path, which must still error instead of silently
+        // dropping fragment 7 from the rewrite.
+        let mut final_fragments: Vec<Fragment> = (0..4).map(Fragment::new).collect();
+        let rewrite_groups = vec![RewriteGroup {
+            old_fragments: vec![Fragment::new(1), Fragment::new(7)],
+            new_fragments: vec![Fragment::new(0)],
+        }];
+
+        let mut fragment_id = 10;
+        let result = Transaction::handle_rewrite_fragments(
+            &mut final_fragments,
+            &rewrite_groups,
+            &mut fragment_id,
+            42,
+            None,
+        );
+
+        let error = result.unwrap_err();
+        assert!(matches!(error, Error::CommitConflict { .. }));
+        assert!(error.to_string().contains("id=7"));
+    }
+
+    #[test]
+    fn test_rewrite_fragments_past_the_end() {
+        // The group's old fragments start near the end of the list and would
+        // index past it if the contiguity check were not bounds-checked.
+        let mut final_fragments: Vec<Fragment> = (0..4).map(Fragment::new).collect();
+        let rewrite_groups = vec![RewriteGroup {
+            old_fragments: vec![Fragment::new(3), Fragment::new(0)],
+            new_fragments: vec![Fragment::new(10)],
+        }];
+
+        let mut fragment_id = 11;
+        Transaction::handle_rewrite_fragments(
+            &mut final_fragments,
+            &rewrite_groups,
+            &mut fragment_id,
+            42,
+            None,
+        )
+        .unwrap();
+
+        // Non-contiguous: fragments 3 and 0 are removed, new fragment 10 is
+        // appended at the end.
+        let expected_fragments: Vec<Fragment> =
+            vec![Fragment::new(1), Fragment::new(2), Fragment::new(10)];
+        assert_eq!(final_fragments, expected_fragments);
     }
 
     #[test]
