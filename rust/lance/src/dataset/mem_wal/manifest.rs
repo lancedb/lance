@@ -22,10 +22,14 @@
 //!
 //! ## Read Protocol
 //!
-//! 1. Read `version_hint.json` for starting version (default: 1 if not found)
+//! 1. Start from the version `version_hint.json` names, or, when there is no
+//!    hint or that version is gone, from the newest listed version
 //! 2. Use HEAD requests to check existence of subsequent versions
 //! 3. Continue until a version is not found
 //! 4. Return the last found version
+//!
+//! The read never depends on versions before its starting point, so they can
+//! be deleted with [`ShardManifestStore::prune_versions_before`].
 
 use object_store::ObjectStoreExt;
 use std::collections::HashMap;
@@ -305,24 +309,15 @@ impl ShardManifestStore {
 
     /// Find the latest manifest version.
     ///
-    /// Uses HEAD requests starting from version hint, scanning forward
-    /// until a version is not found.
+    /// Starts from the hinted version, or from the newest listed one when there
+    /// is no hint or its version was pruned, then scans forward with HEAD
+    /// requests until a version is not found. Scanning from version 1 instead
+    /// would stop at the first pruned version and miss every later one.
     async fn find_latest_version(&self) -> Result<u64> {
-        // Start from version hint or 1
-        let hint = self.read_version_hint().await.unwrap_or(1);
-
-        // Scan forward from hint using HEAD requests
-        let mut latest_found = 0u64;
-
-        // First, check if hint version exists
-        if hint > 0 && self.version_exists(hint).await? {
-            latest_found = hint;
-        } else if hint > 1 {
-            // Hint might be stale, scan from beginning
-            if self.version_exists(1).await? {
-                latest_found = 1;
-            }
-        }
+        let mut latest_found = match self.read_version_hint().await? {
+            Some(hint) if hint > 0 && self.version_exists(hint).await? => hint,
+            _ => self.list_versions().await?.last().copied().unwrap_or(0),
+        };
 
         // Parallel scan forward with batches of HEAD requests
         let batch_size = self.manifest_scan_batch_size;
@@ -364,15 +359,25 @@ impl ShardManifestStore {
         }
     }
 
-    /// Read the version hint file.
-    async fn read_version_hint(&self) -> Option<u64> {
+    /// Read the version hint file: `None` when it is absent or unparsable,
+    /// an error when it could not be read.
+    async fn read_version_hint(&self) -> Result<Option<u64>> {
         let path = self.manifest_dir.clone().join("version_hint.json");
-
-        let data = self.object_store.inner.get(&path).await.ok()?;
-        let bytes = data.bytes().await.ok()?;
-        let hint: VersionHint = serde_json::from_slice(&bytes).ok()?;
-
-        Some(hint.version)
+        let read_error = |e: object_store::Error| {
+            Error::io(format!(
+                "Failed to read version hint for shard {}: {}",
+                self.shard_id, e
+            ))
+        };
+        let data = match self.object_store.inner.get(&path).await {
+            Ok(data) => data,
+            Err(object_store::Error::NotFound { .. }) => return Ok(None),
+            Err(e) => return Err(read_error(e)),
+        };
+        let bytes = data.bytes().await.map_err(read_error)?;
+        Ok(serde_json::from_slice::<VersionHint>(&bytes)
+            .ok()
+            .map(|hint| hint.version))
     }
 
     /// Write the version hint file (best-effort, failures logged but ignored).
@@ -400,35 +405,67 @@ impl ShardManifestStore {
         }
     }
 
-    /// List all manifest versions (for garbage collection or debugging).
+    /// List all manifest versions, in ascending order.
     pub async fn list_versions(&self) -> Result<Vec<u64>> {
         let mut versions = Vec::new();
+        let mut listing = self.object_store.inner.list(Some(&self.manifest_dir));
+        while let Some(item) = listing.next().await {
+            let meta = item.map_err(|e| {
+                Error::io(format!(
+                    "Failed to list manifest versions for shard {}: {}",
+                    self.shard_id, e
+                ))
+            })?;
+            if let Some(filename) = meta.location.filename()
+                && filename.ends_with(".binpb")
+                && let Some(version) = parse_bit_reversed_filename(filename)
+            {
+                versions.push(version);
+            }
+        }
+        versions.sort_unstable();
+        Ok(versions)
+    }
 
-        let list_result = self
+    /// Delete every manifest version below `keep_from` and return how many
+    /// were deleted. `keep_from` may not be past the latest version, so the
+    /// latest always survives.
+    pub async fn prune_versions_before(&self, keep_from: u64) -> Result<usize> {
+        let latest = self.find_latest_version().await?;
+        if keep_from > latest {
+            return Err(Error::invalid_input(format!(
+                "cannot prune manifest versions before {keep_from} of shard {}: the latest is {latest}",
+                self.shard_id
+            )));
+        }
+        let pruned: Vec<Path> = self
+            .list_versions()
+            .await?
+            .into_iter()
+            .take_while(|version| *version < keep_from)
+            .map(|version| {
+                self.manifest_dir
+                    .clone()
+                    .join(manifest_filename(version).as_str())
+            })
+            .collect();
+        let count = pruned.len();
+        let mut results = self
             .object_store
             .inner
-            .list(Some(&self.manifest_dir))
-            .collect::<Vec<_>>()
-            .await;
-
-        for item in list_result {
-            match item {
-                Ok(meta) => {
-                    if let Some(filename) = meta.location.filename()
-                        && filename.ends_with(".binpb")
-                        && let Some(version) = parse_bit_reversed_filename(filename)
-                    {
-                        versions.push(version);
-                    }
-                }
+            .delete_stream(futures::stream::iter(pruned.into_iter().map(Ok)).boxed());
+        while let Some(result) = results.next().await {
+            match result {
+                Ok(_) | Err(object_store::Error::NotFound { .. }) => {}
                 Err(e) => {
-                    warn!("Error listing manifest directory: {}", e);
+                    return Err(Error::io(format!(
+                        "Failed to prune manifest versions for shard {}: {}",
+                        self.shard_id, e
+                    )));
                 }
             }
         }
-
-        versions.sort_unstable();
-        Ok(versions)
+        Ok(count)
     }
 
     /// Get the shard ID.
@@ -1205,6 +1242,93 @@ mod tests {
             ours.cached().is_none(),
             "a collision must drop the position so the retry re-reads"
         );
+    }
+
+    /// Writes versions `1..=last` of one shard, the hint naming `last`.
+    async fn write_versions(store: &ShardManifestStore, shard_id: Uuid, last: u64) {
+        for version in 1..=last {
+            store
+                .write(&create_test_manifest(shard_id, version, 1))
+                .await
+                .unwrap();
+        }
+    }
+
+    fn hint_path(base_path: &Path, shard_id: &Uuid) -> Path {
+        shard_manifest_path(base_path, shard_id).join("version_hint.json")
+    }
+
+    /// Once old versions are pruned, the latest is still found with no hint
+    /// and with a hint naming a pruned version, and a claim builds on it.
+    #[tokio::test]
+    async fn the_latest_version_survives_pruned_history() {
+        let (store, base_path, _temp_dir) = create_local_store().await;
+        let shard_id = Uuid::new_v4();
+        let writer = ShardManifestStore::new(store.clone(), &base_path, shard_id, 2);
+        write_versions(&writer, shard_id, 20).await;
+        assert_eq!(writer.prune_versions_before(20).await.unwrap(), 19);
+        assert_eq!(writer.list_versions().await.unwrap(), vec![20]);
+
+        let hint = hint_path(&base_path, &shard_id);
+        store
+            .inner
+            .put(
+                &hint,
+                Bytes::from(serde_json::to_vec(&VersionHint { version: 3 }).unwrap()).into(),
+            )
+            .await
+            .unwrap();
+        let reader = ShardManifestStore::new(store.clone(), &base_path, shard_id, 2);
+        assert_eq!(reader.refresh_latest().await.unwrap().unwrap().version, 20);
+
+        store.inner.delete(&hint).await.unwrap();
+        let claimant = ShardManifestStore::new(store.clone(), &base_path, shard_id, 2);
+        let (epoch, claimed) = claimant.claim_epoch(0).await.unwrap();
+        assert_eq!((claimed.version, epoch), (21, 2));
+    }
+
+    /// Pruning keeps the latest version and refuses a bound past it.
+    #[tokio::test]
+    async fn pruning_never_removes_the_latest_version() {
+        let (store, base_path, _temp_dir) = create_local_store().await;
+        let shard_id = Uuid::new_v4();
+        let writer = ShardManifestStore::new(store.clone(), &base_path, shard_id, 2);
+        write_versions(&writer, shard_id, 5).await;
+
+        assert!(writer.prune_versions_before(6).await.is_err());
+        assert_eq!(writer.list_versions().await.unwrap(), vec![1, 2, 3, 4, 5]);
+        assert_eq!(writer.prune_versions_before(3).await.unwrap(), 2);
+        assert_eq!(writer.list_versions().await.unwrap(), vec![3, 4, 5]);
+    }
+
+    /// A hint that cannot be read is an error, not a missing hint: falling
+    /// back would hide the failure behind a slower, listing-based answer.
+    #[tokio::test]
+    async fn an_unreadable_hint_is_an_error() {
+        let (store, base_path, _temp_dir) = create_local_store().await;
+        let shard_id = Uuid::new_v4();
+        let writer = ShardManifestStore::new(store.clone(), &base_path, shard_id, 2);
+        write_versions(&writer, shard_id, 3).await;
+
+        let policy = Arc::new(Mutex::new(ProxyObjectStorePolicy::new()));
+        policy.lock().unwrap().set_before_policy(
+            "503",
+            Arc::new(|method: &str, path: &Path| {
+                if method == "get_opts" && path.as_ref().ends_with("version_hint.json") {
+                    return Err(object_store::Error::Generic {
+                        store: "test",
+                        source: "503 slow down".into(),
+                    }
+                    .into());
+                }
+                Ok(())
+            }),
+        );
+        let mut proxied = (*store).clone();
+        proxied.inner = Arc::new(ProxyObjectStore::new(store.inner.clone(), policy));
+        let reader = ShardManifestStore::new(Arc::new(proxied), &base_path, shard_id, 2);
+
+        assert!(reader.refresh_latest().await.is_err());
     }
 
     /// A HEAD that fails is not a version that is absent, and the scan must not
