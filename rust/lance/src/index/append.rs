@@ -5894,43 +5894,73 @@ mod tests {
             .unwrap();
     }
 
-    /// The oldest `dataset_version` across an index's segments, which is what a
-    /// segment merge carries over to the segment it produces. Checked here to
-    /// predate the current manifest, since otherwise it could not tell a merge
-    /// from a rebuild.
-    async fn oldest_segment_version(dataset: &Dataset, index_name: &str) -> u64 {
-        let oldest = dataset
+    /// Helper to determine whether `optimize_indices` merged the segments rather
+    /// than rebuilding the index from scratch. Call it right before the optimize
+    /// and pass the result to [`assert_merged_not_rebuilt`] after.
+    ///
+    /// Returns the base data files of every fragment the index's segments
+    /// already cover. A rebuild re-reads them to index every row; a merge copies
+    /// the segment entries and reads none of them. Also resets the object
+    /// store's IO counters so the assertion sees only the optimize's reads.
+    async fn indexed_data_files(dataset: &Dataset, index_name: &str) -> Vec<String> {
+        let covered = dataset
             .load_indices_by_name(index_name)
             .await
             .unwrap()
             .iter()
-            .map(|segment| segment.dataset_version)
-            .min()
-            .expect("the index must have at least one segment");
+            .filter_map(|segment| segment.fragment_bitmap.clone())
+            .fold(RoaringBitmap::new(), |covered, bitmap| covered | bitmap);
+        let files = dataset
+            .get_fragments()
+            .iter()
+            .filter(|fragment| covered.contains(fragment.id() as u32))
+            .flat_map(|fragment| {
+                fragment
+                    .metadata()
+                    .files
+                    .iter()
+                    .map(|file| file.path.clone())
+            })
+            .collect::<Vec<_>>();
         assert!(
-            oldest < dataset.manifest.version,
-            "the source segments must predate the manifest, or their version \
-             cannot distinguish a merge from a rebuild"
+            !files.is_empty(),
+            "the index must cover at least one fragment with data"
         );
-        oldest
+        dataset.object_store.as_ref().io_stats_incremental(); // Reset
+        files
     }
 
-    /// Pins that `optimize_indices` took the segment-merge path. A full rebuild
-    /// produces the same rows, so the row counts these tests check cannot tell
-    /// the two apart; the stamped `dataset_version` can, because the merge keeps
-    /// the oldest source segment's version while a rebuild stamps the manifest
-    /// version current at the time of the optimize.
-    async fn assert_merged_not_rebuilt(dataset: &Dataset, index_name: &str, oldest_source: u64) {
+    /// Pins that `optimize_indices` merged rather than rebuilt. Both produce the
+    /// same rows and stamp; only a rebuild reads the already-indexed data files.
+    /// `dataset` must be the handle that ran the optimize: the IO counters
+    /// belong to its object store.
+    async fn assert_merged_not_rebuilt(
+        dataset: &Dataset,
+        index_name: &str,
+        indexed_files: &[String],
+    ) {
+        let rescanned = dataset
+            .object_store
+            .as_ref()
+            .io_stats_incremental()
+            .requests
+            .into_iter()
+            .filter(|request| {
+                indexed_files
+                    .iter()
+                    .any(|file| request.path.as_ref().ends_with(file.as_str()))
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            rescanned.is_empty(),
+            "the optimize rebuilt the index instead of merging the segments: it read \
+             already-indexed data files {rescanned:?}"
+        );
         let segments = dataset.load_indices_by_name(index_name).await.unwrap();
         assert_eq!(
             segments.len(),
             1,
             "the optimize must consolidate every bitmap segment, got {segments:?}"
-        );
-        assert_eq!(
-            segments[0].dataset_version, oldest_source,
-            "the optimize rebuilt the index instead of merging the segments: a \
-             merged segment carries the oldest source segment's dataset version"
         );
     }
 
@@ -6028,14 +6058,14 @@ mod tests {
             .await
             .unwrap();
 
-        let oldest_source = oldest_segment_version(&dataset, "cat_idx").await;
+        let indexed_files = indexed_data_files(&dataset, "cat_idx").await;
         dataset
             .optimize_indices(&OptimizeOptions::merge(200))
             .await
             .unwrap();
+        assert_merged_not_rebuilt(&dataset, "cat_idx", &indexed_files).await;
 
         let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
-        assert_merged_not_rebuilt(&dataset, "cat_idx", oldest_source).await;
 
         // 48 rows cycling A/B/C/NULL: 12 of each.
         for cat in ["A", "B", "C"] {
@@ -6101,14 +6131,14 @@ mod tests {
             .await
             .unwrap();
 
-        let oldest_source = oldest_segment_version(&dataset, "cat_idx").await;
+        let indexed_files = indexed_data_files(&dataset, "cat_idx").await;
         dataset
             .optimize_indices(&OptimizeOptions::merge(200))
             .await
             .unwrap();
+        assert_merged_not_rebuilt(&dataset, "cat_idx", &indexed_files).await;
 
         let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
-        assert_merged_not_rebuilt(&dataset, "cat_idx", oldest_source).await;
         let segments = dataset.load_indices_by_name("cat_idx").await.unwrap();
         let expected_coverage = dataset
             .get_fragments()
@@ -6168,14 +6198,14 @@ mod tests {
             num_segments as usize
         );
 
-        let oldest_source = oldest_segment_version(&dataset, "cat_idx").await;
+        let indexed_files = indexed_data_files(&dataset, "cat_idx").await;
         dataset
             .optimize_indices(&OptimizeOptions::merge(num_segments as usize))
             .await
             .unwrap();
+        assert_merged_not_rebuilt(&dataset, "cat_idx", &indexed_files).await;
 
         let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
-        assert_merged_not_rebuilt(&dataset, "cat_idx", oldest_source).await;
         let segments = dataset.load_indices_by_name("cat_idx").await.unwrap();
         let expected_coverage = dataset
             .get_fragments()
@@ -6274,14 +6304,14 @@ mod tests {
             .await
             .unwrap();
 
-        let oldest_source = oldest_segment_version(&dataset, "cat_idx").await;
+        let indexed_files = indexed_data_files(&dataset, "cat_idx").await;
         dataset
             .optimize_indices(&OptimizeOptions::merge(200))
             .await
             .unwrap();
+        assert_merged_not_rebuilt(&dataset, "cat_idx", &indexed_files).await;
 
         let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
-        assert_merged_not_rebuilt(&dataset, "cat_idx", oldest_source).await;
         // 240 rows: A/B/C/NULL evenly when nullable, A/B/C otherwise.
         let (expected_per_cat, expected_nulls) = if nullable {
             ([60, 60, 60], 60)
@@ -6355,16 +6385,16 @@ mod tests {
             .unwrap();
         let mut dataset = res.new_dataset.as_ref().clone();
 
-        let oldest_source = oldest_segment_version(&dataset, "cat_idx").await;
+        let indexed_files = indexed_data_files(&dataset, "cat_idx").await;
         dataset
             .optimize_indices(&OptimizeOptions::default())
             .await
             .unwrap();
-
-        let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
         // Two segments went in, so this exercised the K-way path rather than the
         // single-segment `update` this change does not touch.
-        assert_merged_not_rebuilt(&dataset, "cat_idx", oldest_source).await;
+        assert_merged_not_rebuilt(&dataset, "cat_idx", &indexed_files).await;
+
+        let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
         // ids 0..25 are now 'Z'; the remaining A/B/C counts come from ids 25..100.
         assert_eq!(count_cat(&dataset, "Z").await, 25, "updated rows missing");
         for (cat, expected) in [("A", 25), ("B", 25), ("C", 25)] {
