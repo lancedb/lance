@@ -144,17 +144,6 @@ pub(crate) const STICKY_WRITER_FLAGS: u64 = STICKY_PAIRED_FLAGS | FLAG_NON_REUSA
 /// overlay files before the feature is generally released.
 pub const ENABLE_UNSTABLE_DATA_OVERLAY_FILES_ENV: &str = "LANCE_ENABLE_UNSTABLE_DATA_OVERLAY_FILES";
 
-/// Former opt-in environment variable for spilled row lineage.
-///
-/// Retained for source compatibility. This variable is no longer consulted:
-/// all builds support spilled row lineage, and writers use table configuration.
-#[deprecated(
-    since = "14.0.0",
-    note = "spilled row lineage no longer needs an environment opt-in"
-)]
-pub const ENABLE_UNSTABLE_SPILLED_ROW_LINEAGE_ENV: &str =
-    "LANCE_ENABLE_UNSTABLE_SPILLED_ROW_LINEAGE";
-
 /// Set the reader and writer feature flags in the manifest based on the contents of the manifest.
 pub fn apply_feature_flags(
     manifest: &mut Manifest,
@@ -301,14 +290,6 @@ pub fn managed_blobs_enabled(schema: &Schema) -> Result<bool> {
 /// and in release builds only when [`ENABLE_UNSTABLE_DATA_OVERLAY_FILES_ENV`] is set.
 fn data_overlay_files_enabled() -> bool {
     cfg!(debug_assertions) || std::env::var_os(ENABLE_UNSTABLE_DATA_OVERLAY_FILES_ENV).is_some()
-}
-
-/// Whether this build supports spilled row lineage. Always returns `true`.
-///
-/// Retained for source compatibility. Spilling remains opt-in per table.
-#[deprecated(since = "14.0.0", note = "spilled row lineage is always supported")]
-pub fn spilled_row_lineage_enabled() -> bool {
-    true
 }
 
 /// Debug builds only, with no environment override, until continuous recording
