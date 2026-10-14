@@ -508,8 +508,8 @@ impl<T: Send + Debug + 'static> TaskDispatcher<T> {
         // the WAL flusher and MemTable flusher both run on this loop,
         // and dropping their channels deadlocks all subsequent puts
         // (and panics any task waiting on the corresponding watch).
-        // Log and keep draining; the worst case for a transient flush
-        // failure is replay from the WAL on next open.
+        // Log and keep draining. Handlers latch terminal failures so later
+        // messages cannot publish past a failed generation; reopen replays WAL.
         let result = loop {
             if ticker_intervals.is_empty() {
                 tokio::select! {
@@ -2720,6 +2720,11 @@ enum WriterMode {
 }
 
 /// Main writer for a MemWAL shard.
+///
+/// An L0 flush failure poisons the writer: subsequent reads, writes, seals,
+/// drains, and close report a terminal error. Later generations cannot publish
+/// past that failure. Reopen the writer to recover durable rows through WAL
+/// replay; L0 flushes are not automatically retried.
 pub struct ShardWriter {
     config: ShardWriterConfig,
     epoch: u64,
@@ -3505,6 +3510,7 @@ impl ShardWriter {
             >= self.config.max_unflushed_memtable_bytes
         {
             let mut state = state_lock.write().await;
+            self.wal_flusher.check_poisoned()?;
             if writer_state.maybe_trigger_memtable_flush(&mut state, 1, 1)? == SealOutcome::Blocked
             {
                 return Err(seal_blocked_error());
@@ -3514,19 +3520,25 @@ impl ShardWriter {
         // Apply backpressure if needed (before acquiring main lock). The reading
         // carries whether this put needs a freeze, so a controller bounding the
         // tier below can refuse only the puts that would grow it.
-        backpressure
-            .maybe_apply_backpressure(
+        let cursors = self.wal_flusher.cursors();
+        tokio::select! {
+            biased;
+            result = backpressure.maybe_apply_backpressure(
                 ShardMemory::memtables(writer_state.memory.clone()).with_seal_required(
                     writer_state.seal_required(incoming_batches, incoming_rows),
                 ),
-            )
-            .await?;
+            ) => result?,
+            error = cursors.wait_for_failure() => return Err(error),
+        }
 
         let start = std::time::Instant::now();
 
         // Acquire write lock for entire operation (atomic approach)
         let (batch_positions, durable_watcher, batch_store, indexes) = {
             let mut state = state_lock.write().await;
+            // Failure is latched under this same lock. Recheck after admission
+            // and lock waits before preparing or inserting any more rows.
+            self.wal_flusher.check_poisoned()?;
 
             // 0. Seal first if this put would not fit: the row cap is a hard
             //    index capacity, so an overshoot cannot be undone afterwards.
@@ -3956,6 +3968,7 @@ impl ShardWriter {
         self.wal_flusher.check_poisoned()?;
 
         let mut state = state.write().await;
+        self.wal_flusher.check_poisoned()?;
         let current = Arc::clone(&state.schema);
         let next = Arc::new(next(&current)?);
         if next.is_equivalent(&current) {
@@ -4000,6 +4013,7 @@ impl ShardWriter {
         Ok(Some(SealFence {
             sealed_generation,
             watchers: state.frozen_flush_watchers.iter().cloned().collect(),
+            cursors: self.wal_flusher.cursors().clone(),
         }))
     }
 
@@ -4066,6 +4080,7 @@ impl ShardWriter {
                 self.check_fenced().await?;
                 self.wal_flusher.check_poisoned()?;
                 let mut state = state.write().await;
+                self.wal_flusher.check_poisoned()?;
                 let sealed_generation = if state.memtable.batch_count() == 0 {
                     None
                 } else {
@@ -4083,6 +4098,7 @@ impl ShardWriter {
                 Ok(SealFence {
                     sealed_generation,
                     watchers: state.frozen_flush_watchers.iter().cloned().collect(),
+                    cursors: self.wal_flusher.cursors().clone(),
                 })
             }
             WriterMode::WalOnly { .. } => Err(Error::invalid_input(
@@ -4146,13 +4162,20 @@ impl ShardWriter {
         loop {
             let watchers: Vec<DurabilityWatcher> = {
                 let st = state_lock.read().await;
+                self.wal_flusher.check_poisoned()?;
                 st.frozen_flush_watchers.iter().cloned().collect()
             };
             if watchers.is_empty() {
                 return Ok(());
             }
             for mut w in watchers {
-                match w.await_value().await {
+                let durability = tokio::select! {
+                    biased;
+                    durability = w.await_value() => durability,
+                    error = self.wal_flusher.cursors().wait_for_failure() => return Err(error),
+                };
+                self.wal_flusher.check_poisoned()?;
+                match durability {
                     Some(durability) => durability.into_result()?,
                     None => {
                         return Err(Error::io(
@@ -4253,6 +4276,10 @@ impl ShardWriter {
     #[instrument(name = "sw_close", level = "info", skip_all, fields(shard_id = %self.config.shard_id, epoch = self.epoch))]
     pub async fn close(self) -> Result<()> {
         info!("Closing ShardWriter for shard {}", self.config.shard_id);
+        if let Err(error) = self.wal_flusher.check_poisoned() {
+            let shutdown_result = self.task_executor.shutdown_all().await;
+            return Self::merge_close_stage(Err(error), "task shutdown", shutdown_result);
+        }
         let mut close_result: Result<()> = Ok(());
 
         match &self.mode {
@@ -4374,6 +4401,13 @@ impl ShardWriter {
         // Shutdown background tasks
         let shutdown_result = self.task_executor.shutdown_all().await;
         let close_result = Self::merge_close_stage(close_result, "task shutdown", shutdown_result);
+        // The failed flush may already have removed its watcher, or may have
+        // failed while close was draining. Its terminal state outlives both.
+        let close_result = Self::merge_close_stage(
+            self.wal_flusher.check_poisoned(),
+            "close drain",
+            close_result,
+        );
 
         match &close_result {
             Ok(()) => info!("ShardWriter closed for shard {}", self.config.shard_id),
@@ -4428,16 +4462,14 @@ pub struct WalStats {
 ///
 /// The set is fixed at seal time, so [`Self::wait`] is bounded no matter how
 /// many memtables freeze while it waits, and each entry reports the outcome of
-/// its own flush. That is why the fence is a captured watcher set and not a
-/// generation number compared against `ShardManifest::current_generation`: the
-/// manifest advances to `generation + 1` on every committed flush without
-/// checking for a gap, so a later generation's success moves it past a
-/// generation that failed and never reached L0 — the watermark would report
-/// durability that does not exist.
+/// its own flush. The captured set remains valid independently of manifest
+/// changes, including compaction and a successor writer's commits.
 #[derive(Debug)]
 pub struct SealFence {
     sealed_generation: Option<u64>,
     watchers: Vec<DurabilityWatcher>,
+    /// Keeps a typed terminal error observable after flush watchers retire.
+    cursors: Arc<WriterCursors>,
 }
 
 impl SealFence {
@@ -4451,11 +4483,18 @@ impl SealFence {
 
     /// Block until every flush this fence covers has landed in L0.
     ///
-    /// Errors if any of them reports `DurabilityResult::Failed`, or if the
-    /// flush handler exited without reporting.
+    /// Errors if the writer is poisoned, any flush reports
+    /// `DurabilityResult::Failed`, or the flush handler exited without reporting.
     pub async fn wait(self) -> Result<()> {
+        self.cursors.check_poisoned()?;
         for mut watcher in self.watchers {
-            match watcher.await_value().await {
+            let durability = tokio::select! {
+                biased;
+                durability = watcher.await_value() => durability,
+                error = self.cursors.wait_for_failure() => return Err(error),
+            };
+            self.cursors.check_poisoned()?;
+            match durability {
                 Some(durability) => durability.into_result()?,
                 None => {
                     return Err(Error::io(
@@ -4884,6 +4923,9 @@ impl MemTableFlushHandler {
         let start = Instant::now();
 
         let flush_result = async {
+            // A failed generation is sticky: later queued generations must
+            // stay in the WAL for replay rather than advance the replay cursor.
+            self.wal_flusher.check_poisoned()?;
             // Step 1: Wait for WAL flush completion (already queued at freeze time).
             // The TriggerWalFlush message was sent by freeze_memtable to ensure
             // strict ordering of WAL entries. If the freeze didn't trigger a
@@ -4969,14 +5011,27 @@ impl MemTableFlushHandler {
 
         // Step 3: Always signal completion (with the outcome) and drain
         // backpressure state for this memtable, even on failure.
-        let durability = match &flush_result {
-            Ok(_) => DurabilityResult::ok(),
-            Err(e) => DurabilityResult::err(e.to_string()),
-        };
-        memtable.signal_memtable_flush_complete(durability);
-
-        {
+        let flush_result = {
             let mut state = self.state.write().await;
+            // Serialize poison with write admission, and publish it before
+            // waking any fence or removing the failed generation's watcher.
+            let flush_result = flush_result.map_err(|error| {
+                let error = if error.fence_reason().is_some() {
+                    error
+                } else {
+                    Error::writer_poisoned(format!(
+                        "L0 flush failed for generation {}: {error}; reopen the writer to replay the WAL",
+                        memtable.generation()
+                    ))
+                };
+                self.wal_flusher.poison(&error);
+                error
+            });
+            let durability = match &flush_result {
+                Ok(_) => DurabilityResult::ok(),
+                Err(error) => DurabilityResult::err(error.to_string()),
+            };
+            memtable.signal_memtable_flush_complete(durability);
             // Backpressure drain: unconditional so `wait_for_flush_drain`
             // sees the watcher's error signal, not a dropped channel. Which
             // entry comes off the front does not matter — flushes complete out
@@ -5008,7 +5063,8 @@ impl MemTableFlushHandler {
             // memtable un-stamped and so still counted, which is the point: its
             // bytes are resident and only another flush can reclaim them.
             publish_memory(&self.memory, &state);
-        }
+            flush_result
+        };
 
         let result = flush_result?;
 
@@ -5314,7 +5370,7 @@ mod tests {
     use crate::blob::{
         BlobArrayBuilder, BlobFieldOptions, blob_field_with_options, blob_v2_layout,
     };
-    use crate::dataset::mem_wal::test_util::failing_memory_store;
+    use crate::dataset::mem_wal::test_util::{failing_memory_store, observable_store_params};
     use arrow_array::{
         Array, FixedSizeListArray, Float32Array, Int32Array, StringArray, StructArray, UInt8Array,
         UInt32Array,
@@ -5324,6 +5380,7 @@ mod tests {
     use lance_arrow::FixedSizeListArrayExt;
     use lance_core::FenceReason;
     use lance_core::datatypes::{BlobKind, BlobV2Layout, LANCE_FIELD_ID_KEY};
+    use lance_io::object_store::ObjectStoreRegistry;
     use object_store::ObjectStoreExt;
     use rstest::rstest;
     use std::collections::HashMap;
@@ -8846,6 +8903,68 @@ mod tests {
         );
     }
 
+    #[rstest]
+    #[case::parked_in_controller(false)]
+    #[case::waiting_for_state_lock(true)]
+    #[tokio::test]
+    async fn test_poison_interrupts_write_admission(#[case] release_admission: bool) {
+        #[derive(Debug, Default)]
+        struct ParkedController {
+            entered: tokio::sync::Notify,
+            release: tokio::sync::Notify,
+            exited: tokio::sync::Notify,
+        }
+
+        #[async_trait::async_trait]
+        impl BackpressureController for ParkedController {
+            async fn maybe_apply_backpressure(&self, _shard: ShardMemory) -> Result<()> {
+                self.entered.notify_one();
+                self.release.notified().await;
+                self.exited.notify_one();
+                Ok(())
+            }
+        }
+
+        let (store, base_path, base_uri, _temp) = create_local_store().await;
+        let controller = Arc::new(ParkedController::default());
+        let schema = create_test_schema();
+        let config = seal_fence_test_config(Uuid::new_v4()).with_backpressure(controller.clone());
+        let writer = Arc::new(
+            ShardWriter::open(store, base_path, base_uri, config, schema.clone(), vec![])
+                .await
+                .unwrap(),
+        );
+        let pending_writer = writer.clone();
+        let pending = tokio::spawn(async move {
+            pending_writer
+                .put(vec![create_test_batch(&schema, 0, 1)])
+                .await
+        });
+        controller.entered.notified().await;
+        let WriterMode::MemTable { state, .. } = &writer.mode else {
+            unreachable!();
+        };
+        let locked = state.write().await;
+        if release_admission {
+            controller.release.notify_one();
+            controller.exited.notified().await;
+        }
+        writer
+            .wal_flusher
+            .poison(&Error::writer_poisoned("L0 flush failed"));
+        drop(locked);
+
+        let error = tokio::time::timeout(Duration::from_secs(1), pending)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.fence_reason(), Some(FenceReason::PersistenceFailure));
+        assert!(error.to_string().contains("L0 flush failed"));
+        assert_eq!(writer.memtable_stats().await.unwrap().row_count, 0);
+        writer.abort().await.unwrap();
+    }
+
     /// `ShardMemory` must stay live across polls: a controller that delays is
     /// waiting for these bytes to fall, so a captured copy would spin forever.
     #[tokio::test]
@@ -10889,6 +11008,30 @@ mod tests {
         writer.close().await.unwrap();
     }
 
+    #[tokio::test]
+    async fn test_seal_fence_observes_poison_without_flush_completion() {
+        let completion = DurabilityCell::new();
+        let cursors = Arc::new(WriterCursors::new(true));
+        let fence = SealFence {
+            sealed_generation: Some(1),
+            watchers: vec![completion.reader()],
+            cursors: cursors.clone(),
+        };
+        let waiting = fence.wait();
+        tokio::pin!(waiting);
+        assert!(futures::poll!(&mut waiting).is_pending());
+
+        // No flush completion arrives, and its sender stays alive. The
+        // terminal state itself must wake an already waiting fence.
+        cursors.mark_terminal_failure(&Error::writer_poisoned("L0 flush failed"));
+        let error = tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.fence_reason(), Some(FenceReason::PersistenceFailure));
+        assert!(error.to_string().contains("L0 flush failed"));
+    }
+
     /// Durable writes so `put` returns only once the row is indexed and
     /// WAL-durable. Both fence tests tear the background tasks down before
     /// freezing, and a freeze still owing an index apply or a WAL append
@@ -10959,11 +11102,8 @@ mod tests {
         );
     }
 
-    /// The fence is tied to each flush's own outcome, never to
-    /// `ShardManifest::current_generation`. The manifest advances to
-    /// `generation + 1` on every committed flush without checking for a gap,
-    /// so a later generation's success moves it past one that failed — a
-    /// watermark comparison would report durability that does not exist.
+    /// The fence is tied to each flush's own outcome, independently of changes
+    /// to `ShardManifest::current_generation` made by other manifest users.
     #[tokio::test]
     async fn test_force_seal_active_fence_ignores_manifest_generation_advance() {
         let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
@@ -10990,8 +11130,7 @@ mod tests {
             .sealed_generation()
             .expect("the active memtable held rows");
 
-        // Advance the manifest past the sealed generation, as a later
-        // generation's successful flush would.
+        // Simulate a manifest change that did not flush this writer's memtable.
         writer
             .manifest_store
             .commit_update(writer.epoch(), |current| ShardManifest {
@@ -11212,10 +11351,7 @@ mod tests {
             .close()
             .await
             .expect_err("close must propagate the fenced MemTable flush");
-        assert!(
-            matches!(error, Error::IO { .. }),
-            "unexpected error: {error}"
-        );
+        assert_eq!(error.fence_reason(), Some(FenceReason::PeerClaimedEpoch));
         assert!(
             error.to_string().contains("Writer fenced"),
             "unexpected error: {error}"
@@ -11224,9 +11360,171 @@ mod tests {
         writer_b.close().await.unwrap();
     }
 
-    /// Regression: a transient flush failure must NOT reopen the
-    /// concurrent-read-vs-flush hole. The sealed generation stays in the
-    /// queryable set (rows intact) until a later flush or WAL replay.
+    /// A later generation cannot commit over a failed flush, even after storage
+    /// heals. Both generations must remain recoverable from the WAL.
+    #[tokio::test]
+    async fn test_l0_failure_is_sticky_and_replay_recovers_later_generations() {
+        let (_store, _base_path, base_uri, _temp) = create_local_store().await;
+        let (params, controls) = observable_store_params();
+        let (store, base_path) = ObjectStore::from_uri_and_params(
+            Arc::new(ObjectStoreRegistry::default()),
+            &base_uri,
+            &params,
+        )
+        .await
+        .unwrap();
+        let schema = create_test_schema();
+        let config = ShardWriterConfig {
+            store_params: Some(params),
+            ..seal_fence_test_config(Uuid::new_v4())
+        };
+        let writer = ShardWriter::open(
+            store.clone(),
+            base_path.clone(),
+            base_uri.clone(),
+            config.clone(),
+            schema.clone(),
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        writer
+            .put(vec![create_test_batch(&schema, 0, 1)])
+            .await
+            .unwrap();
+        writer
+            .force_seal_active()
+            .await
+            .unwrap()
+            .wait()
+            .await
+            .unwrap();
+        let before = writer
+            .manifest_store
+            .refresh_latest()
+            .await
+            .unwrap()
+            .unwrap();
+        let attempts_before = controls.sstable_attempts();
+
+        controls.hold_sstable_puts();
+        controls.fail_sstable_puts(1);
+        writer
+            .put(vec![create_test_batch(&schema, 1, 1)])
+            .await
+            .unwrap();
+        let first = writer.force_seal_active().await.unwrap();
+        writer
+            .put(vec![create_test_batch(&schema, 2, 1)])
+            .await
+            .unwrap();
+        let second = writer.force_seal_active().await.unwrap();
+        let mut last_flush = second.watchers.last().unwrap().clone();
+
+        // Only the first attempt fails. Storage is healthy for the queued
+        // generation, which used to commit and skip the failed row on reopen.
+        controls.release_sstable_puts();
+        tokio::time::timeout(Duration::from_secs(1), last_flush.await_value())
+            .await
+            .unwrap()
+            .unwrap();
+        let after = writer
+            .manifest_store
+            .refresh_latest()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.version, before.version);
+        assert_eq!(after.current_generation, before.current_generation);
+        assert_eq!(
+            after.replay_after_wal_entry_position,
+            before.replay_after_wal_entry_position
+        );
+        assert_eq!(after.sstables.len(), 1);
+        for result in [
+            first.wait().await,
+            second.wait().await,
+            writer.wait_for_flush_drain().await,
+            writer.wait_for_flush_drain().await,
+            writer.force_seal_active().await.map(|_| ()),
+            writer
+                .put(vec![create_test_batch(&schema, 3, 1)])
+                .await
+                .map(|_| ()),
+            writer.scan().await.map(|_| ()),
+        ] {
+            let error = result.unwrap_err();
+            assert_eq!(error.fence_reason(), Some(FenceReason::PersistenceFailure));
+            assert!(error.to_string().contains("injected SSTable write failure"));
+        }
+        assert_eq!(controls.sstable_attempts(), attempts_before + 1);
+        assert_eq!(writer.memtable_stats().await.unwrap().frozen_count, 2);
+
+        // Watchers have retired, but close must still report the typed failure
+        // and finish promptly. Recovery replays both uncommitted generations.
+        let error = tokio::time::timeout(Duration::from_secs(1), writer.close())
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.fence_reason(), Some(FenceReason::PersistenceFailure));
+        let shard_id = config.shard_id;
+        let reopened =
+            ShardWriter::open(store, base_path, base_uri.clone(), config, schema, vec![])
+                .await
+                .unwrap();
+        // Replay preserves generation boundaries: generation 2 is published
+        // while opening, and generation 3 remains in the active memtable.
+        let recovered = reopened
+            .manifest_store
+            .refresh_latest()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.sstables.len(), 2);
+        for (sstable, id) in recovered.sstables.iter().zip(0..2) {
+            let uri = format!("{base_uri}/_mem_wal/{shard_id}/{}", sstable.path);
+            let rows = Dataset::open(&uri)
+                .await
+                .unwrap()
+                .scan()
+                .try_into_batch()
+                .await
+                .unwrap();
+            assert_eq!(
+                rows["id"].as_ref(),
+                &Int32Array::from(vec![id]) as &dyn Array
+            );
+        }
+        assert_eq!(reopened.memtable_stats().await.unwrap().row_count, 1);
+        let rows = reopened
+            .scan()
+            .await
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(rows.num_rows(), 1);
+        assert_eq!(
+            rows["id"].as_ref(),
+            &Int32Array::from(vec![2]) as &dyn Array
+        );
+        let manifest_store = reopened.manifest_store.clone();
+        reopened.close().await.unwrap();
+        let committed = manifest_store.refresh_latest().await.unwrap().unwrap();
+        assert_eq!(committed.sstables.len(), 3);
+        assert_eq!(
+            committed
+                .sstables
+                .iter()
+                .map(|s| s.physical_rows.unwrap())
+                .sum::<u64>(),
+            3
+        );
+    }
+
+    /// A failed flush retains its rows and their memory charge for recovery,
+    /// while reads fail fast on the poisoned writer.
     /// Failure is induced deterministically by fencing the writer with a
     /// successor before the seal, so the flush's `check_fenced` rejects it.
     #[tokio::test]
@@ -11286,16 +11584,19 @@ mod tests {
             "fenced flush should fail the drain"
         );
 
-        // The hole did not reopen: the sealed generation is still queryable
-        // with its rows, alongside the new (empty) active generation.
-        let refs = writer_a.in_memory_memtable_refs().await.unwrap();
+        let error = writer_a.in_memory_memtable_refs().await.err().unwrap();
+        assert_eq!(error.fence_reason(), Some(FenceReason::PeerClaimedEpoch));
+        let WriterMode::MemTable { writer_state, .. } = &writer_a.mode else {
+            unreachable!();
+        };
+        let refs = writer_state.memory.load_full();
         assert_eq!(refs.frozen.len(), 1, "sealed generation must be retained");
         assert_eq!(refs.frozen[0].generation, initial_gen);
         assert!(
             !refs.frozen[0].batch_store.is_empty(),
             "retained sealed memtable must still hold its rows"
         );
-        assert_eq!(refs.active.generation, initial_gen + 1);
+        assert_eq!(refs.active.as_ref().unwrap().generation, initial_gen + 1);
 
         // Nor did it vanish from the accounting. A failed flush leaves its
         // memtable un-stamped, so it stays in the owed-to-flush set and keeps
