@@ -8197,6 +8197,7 @@ mod tests {
             uuid: Uuid::new_v4().hyphenated().to_string(),
             operation: Operation::DataReplacement {
                 replacements: vec![DataReplacementGroup(0, data_file)],
+                replaced_offsets: None,
             },
             tag: None,
             transaction_properties: None,
@@ -8380,6 +8381,7 @@ mod tests {
             uuid: Uuid::new_v4().hyphenated().to_string(),
             operation: Operation::DataReplacement {
                 replacements: vec![DataReplacementGroup(0, data_file)],
+                replaced_offsets: None,
             },
             tag: None,
             transaction_properties: None,
