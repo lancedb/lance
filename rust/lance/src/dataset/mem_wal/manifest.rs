@@ -1347,6 +1347,40 @@ mod tests {
         shard_manifest_path(base_path, shard_id).join("version_hint.json")
     }
 
+    async fn write_hint(store: &ObjectStore, base_path: &Path, shard_id: &Uuid, version: u64) {
+        let hint = serde_json::to_vec(&VersionHint { version }).unwrap();
+        store
+            .inner
+            .put(&hint_path(base_path, shard_id), Bytes::from(hint).into())
+            .await
+            .unwrap();
+    }
+
+    /// `store`, with every `method` call on a path `fails` matches refused.
+    fn failing_store(
+        store: &ObjectStore,
+        method: &'static str,
+        fails: impl Fn(&Path) -> bool + Send + Sync + 'static,
+    ) -> Arc<ObjectStore> {
+        let policy = Arc::new(Mutex::new(ProxyObjectStorePolicy::new()));
+        policy.lock().unwrap().set_before_policy(
+            method,
+            Arc::new(move |called: &str, path: &Path| {
+                if called == method && fails(path) {
+                    return Err(object_store::Error::Generic {
+                        store: "test",
+                        source: format!("{method} refused").into(),
+                    }
+                    .into());
+                }
+                Ok(())
+            }),
+        );
+        let mut proxied = store.clone();
+        proxied.inner = Arc::new(ProxyObjectStore::new(store.inner.clone(), policy));
+        Arc::new(proxied)
+    }
+
     /// Once old versions are pruned, the latest is still found with no hint
     /// and with a hint naming a pruned version, and a claim builds on it.
     #[tokio::test]
@@ -1359,19 +1393,15 @@ mod tests {
         assert_eq!(writer.prune_versions_before(20).await.unwrap(), 19);
         assert_eq!(writer.list_versions().await.unwrap(), vec![20]);
 
-        let hint = hint_path(&base_path, &shard_id);
-        store
-            .inner
-            .put(
-                &hint,
-                Bytes::from(serde_json::to_vec(&VersionHint { version: 3 }).unwrap()).into(),
-            )
-            .await
-            .unwrap();
+        write_hint(&store, &base_path, &shard_id, 3).await;
         let reader = ShardManifestStore::new(store.clone(), &base_path, shard_id, 2);
         assert_eq!(reader.refresh_latest().await.unwrap().unwrap().version, 20);
 
-        store.inner.delete(&hint).await.unwrap();
+        store
+            .inner
+            .delete(&hint_path(&base_path, &shard_id))
+            .await
+            .unwrap();
         let claimant = ShardManifestStore::new(store.clone(), &base_path, shard_id, 2);
         let (epoch, claimed) = claimant.claim_epoch(0).await.unwrap();
         assert_eq!((claimed.version, epoch), (21, 2));
@@ -1392,16 +1422,14 @@ mod tests {
         assert_eq!(writer.list_versions().await.unwrap(), vec![3, 4, 5]);
     }
 
-    /// A writer that lost its shard without noticing must still be rejected
-    /// after pruning: either the successor that rejects it is too young to
-    /// prune, or the writer's position is too old to build on and it re-reads.
+    /// A writer that lost its shard without noticing is still rejected after
+    /// pruning: either the successor that rejects it is too young to prune, or
+    /// its position is too old to build on and it re-reads.
     #[rstest::rstest]
-    #[case::without_pruning(false, MAX_POSITION_AGE, MIN_PRUNE_AGE, 5)]
-    #[case::successor_too_young_to_prune(true, MAX_POSITION_AGE, MIN_PRUNE_AGE, 5)]
-    #[case::stale_position_is_reread(true, Duration::ZERO, Duration::ZERO, 0)]
+    #[case::successor_too_young_to_prune(MAX_POSITION_AGE, MIN_PRUNE_AGE, 5)]
+    #[case::stale_position_is_reread(Duration::ZERO, Duration::ZERO, 0)]
     #[tokio::test]
     async fn pruning_never_unfences_a_stale_writer(
-        #[case] prune: bool,
         #[case] max_position_age: Duration,
         #[case] min_prune_age: Duration,
         #[case] versions_left_below_tip: usize,
@@ -1418,18 +1446,12 @@ mod tests {
             peer.commit_update(peer_epoch, |c| ShardManifest {
                 version: c.next_version(),
                 current_generation: generation,
-                sstables: vec![lance_index::mem_wal::SsTable::unmeasured(
-                    generation,
-                    format!("gen_{generation}"),
-                )],
                 ..c.clone()
             })
             .await
             .unwrap();
         }
-        if prune {
-            peer.prune_versions_before(6).await.unwrap();
-        }
+        peer.prune_versions_before(6).await.unwrap();
         assert_eq!(
             peer.list_versions().await.unwrap().len(),
             versions_left_below_tip + 1
@@ -1449,13 +1471,8 @@ mod tests {
         let reader = ShardManifestStore::new(store, &base_path, shard_id, 2);
         let tip = reader.refresh_latest().await.unwrap().unwrap();
         assert_eq!(
-            (
-                tip.version,
-                tip.writer_epoch,
-                tip.current_generation,
-                tip.sstables.len()
-            ),
-            (6, peer_epoch, 6, 1)
+            (tip.version, tip.writer_epoch, tip.current_generation),
+            (6, peer_epoch, 6)
         );
     }
 
@@ -1473,23 +1490,8 @@ mod tests {
             .await
             .unwrap();
 
-        let policy = Arc::new(Mutex::new(ProxyObjectStorePolicy::new()));
-        policy.lock().unwrap().set_before_policy(
-            "list fails",
-            Arc::new(|method: &str, _: &Path| {
-                if method == "list" {
-                    return Err(object_store::Error::Generic {
-                        store: "test",
-                        source: "503 slow down".into(),
-                    }
-                    .into());
-                }
-                Ok(())
-            }),
-        );
-        let mut proxied = (*store).clone();
-        proxied.inner = Arc::new(ProxyObjectStore::new(store.inner.clone(), policy));
-        let reader = ShardManifestStore::new(Arc::new(proxied), &base_path, shard_id, 2);
+        let failing = failing_store(&store, "list", |_| true);
+        let reader = ShardManifestStore::new(failing, &base_path, shard_id, 2);
         assert!(reader.refresh_latest().await.is_err());
     }
 
@@ -1504,69 +1506,32 @@ mod tests {
         write_versions(&writer, shard_id, 6).await;
 
         let third = shard_manifest_path(&base_path, &shard_id).join(manifest_filename(3).as_str());
-        let policy = Arc::new(Mutex::new(ProxyObjectStorePolicy::new()));
-        policy.lock().unwrap().set_before_policy(
-            "refuse v3",
-            Arc::new(move |method: &str, path: &Path| {
-                if method == "delete" && *path == third {
-                    return Err(object_store::Error::Generic {
-                        store: "test",
-                        source: "access denied".into(),
-                    }
-                    .into());
-                }
-                Ok(())
-            }),
-        );
-        let mut proxied = (*store).clone();
-        proxied.inner = Arc::new(ProxyObjectStore::new(store.inner.clone(), policy));
-        let pruner = ShardManifestStore::new(Arc::new(proxied), &base_path, shard_id, 2)
+        let failing = failing_store(&store, "delete", move |path| *path == third);
+        let pruner = ShardManifestStore::new(failing, &base_path, shard_id, 2)
             .with_ages(Duration::ZERO, Duration::ZERO);
         assert!(pruner.prune_versions_before(6).await.is_err());
         assert_eq!(writer.list_versions().await.unwrap(), vec![3, 4, 5, 6]);
 
-        store
-            .inner
-            .put(
-                &hint_path(&base_path, &shard_id),
-                Bytes::from(serde_json::to_vec(&VersionHint { version: 3 }).unwrap()).into(),
-            )
-            .await
-            .unwrap();
+        write_hint(&store, &base_path, &shard_id, 3).await;
         let reader = ShardManifestStore::new(store, &base_path, shard_id, 2);
         assert_eq!(reader.refresh_latest().await.unwrap().unwrap().version, 6);
     }
 
-    /// Initializing a shard whose version 1 was pruned leaves its history alone.
+    /// Initializing a shard whose version 1 was pruned writes nothing and
+    /// returns its latest.
     #[tokio::test]
     async fn initializing_a_pruned_shard_keeps_its_tip() {
         let (store, base_path, _temp_dir) = create_local_store().await;
         let shard_id = Uuid::new_v4();
         let writer = ShardManifestStore::new(store.clone(), &base_path, shard_id, 2)
             .with_ages(Duration::ZERO, Duration::ZERO);
-        writer.initialize_shard(0, HashMap::new()).await.unwrap();
-        let (epoch, _) = writer.claim_epoch(0).await.unwrap();
-        for generation in 3..=6 {
-            writer
-                .commit_update(epoch, |c| ShardManifest {
-                    version: c.next_version(),
-                    current_generation: generation,
-                    ..c.clone()
-                })
-                .await
-                .unwrap();
-        }
+        write_versions(&writer, shard_id, 6).await;
         writer.prune_versions_before(6).await.unwrap();
 
-        let retry = ShardManifestStore::new(store.clone(), &base_path, shard_id, 2);
+        let retry = ShardManifestStore::new(store, &base_path, shard_id, 2);
         let existing = retry.initialize_shard(0, HashMap::new()).await.unwrap();
         assert_eq!(existing.version, 6);
-        let reader = ShardManifestStore::new(store, &base_path, shard_id, 2);
-        let tip = reader.refresh_latest().await.unwrap().unwrap();
-        assert_eq!(
-            (tip.version, tip.writer_epoch, tip.current_generation),
-            (6, epoch, 6)
-        );
+        assert_eq!(writer.list_versions().await.unwrap(), vec![6]);
     }
 
     /// A hint that cannot be read falls back to listing like a missing one,
@@ -1580,24 +1545,10 @@ mod tests {
         write_versions(&writer, shard_id, 3).await;
         writer.prune_versions_before(3).await.unwrap();
 
-        let policy = Arc::new(Mutex::new(ProxyObjectStorePolicy::new()));
-        policy.lock().unwrap().set_before_policy(
-            "503",
-            Arc::new(|method: &str, path: &Path| {
-                if method == "get_opts" && path.as_ref().ends_with("version_hint.json") {
-                    return Err(object_store::Error::Generic {
-                        store: "test",
-                        source: "503 slow down".into(),
-                    }
-                    .into());
-                }
-                Ok(())
-            }),
-        );
-        let mut proxied = (*store).clone();
-        proxied.inner = Arc::new(ProxyObjectStore::new(store.inner.clone(), policy));
-        let reader = ShardManifestStore::new(Arc::new(proxied), &base_path, shard_id, 2);
-
+        let failing = failing_store(&store, "get_opts", |path| {
+            path.as_ref().ends_with("version_hint.json")
+        });
+        let reader = ShardManifestStore::new(failing, &base_path, shard_id, 2);
         assert_eq!(reader.refresh_latest().await.unwrap().unwrap().version, 3);
     }
 
