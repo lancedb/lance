@@ -572,6 +572,21 @@ impl IndexStore for LanceIndexStore {
         })
     }
 
+    fn with_io_buffer_size(&self, bytes: u64) -> Arc<dyn IndexStore> {
+        // Unlike `with_io_priority`, this cannot share `scheduler`: the budget belongs to the
+        // scheduler. The object store underneath is still shared.
+        Arc::new(Self {
+            scheduler: ScanScheduler::new(
+                self.object_store.clone(),
+                SchedulerConfig {
+                    io_buffer_size_bytes: bytes,
+                    ..SchedulerConfig::max_bandwidth(&self.object_store)
+                },
+            ),
+            ..self.clone()
+        })
+    }
+
     async fn open_index_file(&self, name: &str) -> Result<Arc<dyn IndexReader>> {
         let path = self.index_file_path(name)?;
         // Use cached file size if available, otherwise unknown (requires HEAD call)
@@ -1044,6 +1059,7 @@ mod tests {
             .load_index(
                 index_store,
                 &default_details::<pbold::BTreeIndexDetails>(),
+                0,
                 None,
                 &LanceCache::no_cache(),
             )
@@ -1109,6 +1125,7 @@ mod tests {
             .load_index(
                 index_store,
                 &default_details::<pbold::BTreeIndexDetails>(),
+                0,
                 None,
                 &LanceCache::no_cache(),
             )
@@ -1137,6 +1154,7 @@ mod tests {
             .load_index(
                 updated_index_store,
                 &default_details::<pbold::BTreeIndexDetails>(),
+                0,
                 None,
                 &LanceCache::no_cache(),
             )
@@ -1225,6 +1243,7 @@ mod tests {
             .load_index(
                 index_store,
                 &default_details::<pbold::BTreeIndexDetails>(),
+                0,
                 None,
                 &LanceCache::no_cache(),
             )
@@ -1467,6 +1486,7 @@ mod tests {
             .load_index(
                 index_store,
                 &default_details::<pbold::BTreeIndexDetails>(),
+                0,
                 None,
                 &LanceCache::no_cache(),
             )
@@ -1525,6 +1545,7 @@ mod tests {
             .load_index(
                 index_store,
                 &default_details::<pbold::BTreeIndexDetails>(),
+                0,
                 None,
                 &LanceCache::no_cache(),
             )
@@ -2132,6 +2153,7 @@ mod tests {
                     .load_index(
                         index_store,
                         &default_details::<pbold::LabelListIndexDetails>(),
+                        0,
                         None,
                         &LanceCache::no_cache(),
                     )
@@ -2241,6 +2263,7 @@ mod tests {
             .load_index(
                 index_store,
                 &default_details::<pbold::LabelListIndexDetails>(),
+                0,
                 None,
                 &LanceCache::no_cache(),
             )
@@ -2306,6 +2329,7 @@ mod tests {
             .load_index(
                 index_store,
                 &default_details::<pbold::LabelListIndexDetails>(),
+                0,
                 None,
                 &LanceCache::no_cache(),
             )

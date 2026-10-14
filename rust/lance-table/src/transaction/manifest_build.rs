@@ -11,9 +11,10 @@
 //! metadata it stamps, the validation that runs before it.
 
 use crate::feature_flags::{
-    FLAG_COVERED_INDEX_METADATA, FLAG_FRAGMENT_REUSE_INDEX, FLAG_STABLE_ROW_IDS,
-    apply_feature_flags, ensure_can_read_manifest, ensure_can_write_manifest,
-    inherit_sticky_feature_flags,
+    FLAG_COVERED_INDEX_METADATA, FLAG_FRAGMENT_REUSE_INDEX, FLAG_MANAGED_BLOBS,
+    FLAG_NON_REUSABLE_FIELD_IDS, FLAG_STABLE_ROW_IDS, apply_feature_flags,
+    ensure_can_read_manifest, ensure_can_write_manifest, inherit_sticky_feature_flags,
+    managed_blobs_enabled, validate_non_reusable_field_id_flags,
 };
 use crate::format::overlay::{OverlayCoverage, TOMBSTONE_FIELD_ID};
 use crate::format::{
@@ -189,6 +190,18 @@ impl Transaction {
         manifest.max_fragment_id = manifest
             .max_fragment_id
             .max(current_manifest.max_fragment_id);
+        if current_manifest.uses_non_reusable_field_ids() {
+            // Before activation, different fields could share an ID across versions.
+            // Keeping today's high-water mark cannot prevent restoring such a collision.
+            let Some(restored_max_field_id) = manifest.max_allocated_field_id else {
+                return Err(Error::invalid_input(format!(
+                    "Cannot restore version {version}: non-reusable field IDs were activated after that version"
+                )));
+            };
+            manifest.max_allocated_field_id =
+                Some(restored_max_field_id.max(current_manifest.max_field_id()));
+            manifest.writer_feature_flags |= FLAG_NON_REUSABLE_FIELD_IDS;
+        }
         // Row ids are a high-water mark like fragment ids: rewinding hands old ids to new rows.
         manifest.next_row_id = manifest.next_row_id.max(current_manifest.next_row_id);
         // Turning stable row ids off would revert `_rowid` to row addresses, whose
@@ -700,8 +713,7 @@ impl Transaction {
         let mut final_indices = prepared_indices;
 
         // Release builds refuse to publish a stable-row-id dataset with a fragment
-        // reuse index, and nothing needs it: compaction rejects deferred index
-        // remap there.
+        // reuse index, and no index needs it.
         if config.migration_next_row_id.is_some() {
             final_indices.retain(|idx| idx.name != FRAG_REUSE_INDEX_NAME);
         }
@@ -756,6 +768,13 @@ impl Transaction {
                 return Err(Error::internal(
                     "Clone operation should not enter build_manifest.".to_string(),
                 ));
+            }
+            Operation::Unknown { .. } => {
+                return Err(Error::not_supported(format!(
+                    "Transaction {} has an operation written by a newer version of Lance \
+                     and cannot be committed by this version",
+                    self.uuid
+                )));
             }
             Operation::Append { fragments } => {
                 final_fragments.extend(maybe_existing_fragments?.clone());
@@ -1189,33 +1208,62 @@ impl Transaction {
             Operation::Merge { fragments, .. } => {
                 let existing_fragments = maybe_existing_fragments?;
                 let mut merged_fragments = fragments.clone();
-                if next_row_id.is_some() {
-                    let prev_by_id: HashMap<u64, &Fragment> =
-                        existing_fragments.iter().map(|f| (f.id, f)).collect();
-                    for fragment in merged_fragments.iter_mut() {
-                        match prev_by_id.get(&fragment.id) {
-                            Some(prev) => {
-                                if merge_fragment_physically_rewritten(prev, fragment) {
-                                    crate::rowids::version::refresh_row_latest_update_meta_for_full_frag_rewrite_cols(
-                                        fragment,
-                                        new_version,
-                                    )?;
-                                }
-                            }
-                            None => {
-                                // Brand-new fragment ID not present in the previous manifest.
-                                // Set both last_updated and created version meta, consistent
-                                // with Append/Overwrite for genuinely new fragments.
-                                crate::rowids::version::refresh_row_latest_update_meta_for_full_frag_rewrite_cols(
-                                    fragment,
-                                    new_version,
-                                )?;
-                                fragment.created_at_version_meta =
-                                    fragment.last_updated_at_version_meta.clone();
-                            }
+
+                // For each previous id, the first occurrence in the list is the
+                // merged existing fragment; everything else is new (staged
+                // write_fragments output arrives with placeholder id 0, colliding
+                // with real fragment 0). merge_fragments_valid enforces this rule.
+                let prev_by_id: HashMap<u64, &Fragment> =
+                    existing_fragments.iter().map(|f| (f.id, f)).collect();
+                let mut seen_prev_ids = HashSet::new();
+                let is_new = merged_fragments
+                    .iter()
+                    .map(|f| !prev_by_id.contains_key(&f.id) || !seen_prev_ids.insert(f.id))
+                    .collect::<Vec<_>>();
+
+                // New fragments get Append's treatment: id assignment (0 means
+                // unassigned, non-zero pre-reserved) and, with stable row ids,
+                // row ids plus fresh version metadata.
+                for (fragment, is_new) in merged_fragments.iter_mut().zip(is_new.iter()) {
+                    if !*is_new {
+                        continue;
+                    }
+                    // Caller-supplied row ids are never checked against live
+                    // fragments or next_row_id, so keeping them could commit
+                    // duplicate or unallocated stable row ids.
+                    if fragment.row_id_meta.is_some() {
+                        return Err(Error::invalid_input(format!(
+                            "Merge operation includes new fragment (id {}) with row id \
+                             metadata. New fragments must not carry row ids; they are \
+                             assigned at commit time.",
+                            fragment.id
+                        )));
+                    }
+                    if fragment.id == 0 {
+                        fragment.id = fragment_id;
+                        fragment_id += 1;
+                    }
+                }
+
+                if let Some(next_row_id) = &mut next_row_id {
+                    for (fragment, is_new) in merged_fragments.iter_mut().zip(is_new.iter()) {
+                        if *is_new {
+                            Self::assign_row_ids(next_row_id, std::slice::from_mut(fragment))?;
+                            let version_meta = build_version_meta(fragment, new_version);
+                            fragment.last_updated_at_version_meta = version_meta.clone();
+                            fragment.created_at_version_meta = version_meta;
+                        } else if let Some(prev) = prev_by_id.get(&fragment.id)
+                            && merge_fragment_physically_rewritten(prev, fragment)
+                        {
+                            crate::rowids::version::refresh_row_latest_update_meta_for_full_frag_rewrite_cols(
+                                fragment,
+                                new_version,
+                            )?;
                         }
                     }
                 }
+                let remaining_field_ids = schema.field_ids().into_iter().collect::<HashSet<_>>();
+                Self::retain_relevant_overlays(&mut merged_fragments, &remaining_field_ids);
                 final_fragments.extend(merged_fragments);
 
                 // A Merge can rewrite a column's data file in place; the field stays
@@ -1245,6 +1293,7 @@ impl Transaction {
                         })
                     });
                 }
+                Self::retain_relevant_overlays(&mut final_fragments, &remaining_field_ids);
 
                 // Some fields that have indices may have been removed, so we should
                 // remove those indices as well.
@@ -1687,6 +1736,16 @@ impl Transaction {
             )
         };
 
+        if config.activate_non_reusable_field_ids {
+            let already_active = current_manifest
+                .map(|manifest| manifest.uses_non_reusable_field_ids())
+                .unwrap_or(false);
+            if !already_active {
+                manifest.activate_non_reusable_field_ids();
+                manifest.writer_feature_flags |= FLAG_NON_REUSABLE_FIELD_IDS;
+            }
+        }
+
         manifest.tag.clone_from(&self.tag);
 
         if config.auto_set_feature_flags {
@@ -1732,6 +1791,7 @@ impl Transaction {
         manifest.set_timestamp(config.timestamp_nanos);
 
         manifest.update_max_fragment_id();
+        manifest.update_max_field_id();
 
         match &self.operation {
             Operation::Overwrite {
@@ -1894,13 +1954,20 @@ impl Transaction {
                 // Assign a new ID if not already assigned
                 let mut base_to_add = new_base.clone();
                 if base_to_add.id == 0 {
-                    let next_id = manifest
-                        .base_paths
-                        .keys()
-                        .max()
-                        .map(|&id| id + 1)
-                        .unwrap_or(1);
-                    base_to_add.id = next_id;
+                    base_to_add.id = crate::format::BasePath::unused_id(
+                        manifest
+                            .base_paths
+                            .keys()
+                            .copied()
+                            .chain(std::iter::once(0)),
+                    )?;
+                } else if manifest.has_managed_blobs()
+                    && let Some(existing) = manifest.base_paths.get(&base_to_add.id)
+                {
+                    return Err(Error::invalid_input(format!(
+                        "Cannot replace base ID {} bound to {:?} with {:?}",
+                        base_to_add.id, existing.path, base_to_add.path
+                    )));
                 }
 
                 manifest.base_paths.insert(base_to_add.id, base_to_add);
@@ -1922,6 +1989,12 @@ impl Transaction {
             manifest.writer_feature_flags |= FLAG_FRAGMENT_REUSE_INDEX;
         }
 
+        if managed_blobs_enabled(&manifest.schema)? {
+            manifest.reader_feature_flags |= FLAG_MANAGED_BLOBS;
+            manifest.writer_feature_flags |= FLAG_MANAGED_BLOBS;
+        }
+
+        validate_non_reusable_field_id_flags(&manifest)?;
         Ok((manifest, final_indices))
     }
 
@@ -1935,6 +2008,20 @@ impl Transaction {
             });
         }
     }
+
+    /// Remove overlays that no longer supply any field in the schema.
+    fn retain_relevant_overlays(fragments: &mut [Fragment], remaining_field_ids: &HashSet<i32>) {
+        for fragment in fragments {
+            fragment.overlays.retain(|overlay| {
+                overlay
+                    .data_file
+                    .fields
+                    .iter()
+                    .any(|field_id| remaining_field_ids.contains(field_id))
+            });
+        }
+    }
+
     /// Coverage of an index that a rewrite invalidates: the rewritten fragments are
     /// removed and the fragments they became are *not* added.
     fn drop_rewritten_fragments(old: &RoaringBitmap, groups: &[RewriteGroup]) -> RoaringBitmap {
@@ -1960,14 +2047,16 @@ mod tests {
     };
     use crate::rowids::{RowIdSequence, write_row_ids};
     use crate::transaction::test_support::{
-        default_build_config, last_updated_at_versions, make_stable_row_id_manifest,
-        overlay_with_field, sample_index_metadata, sample_manifest, tagged_entry,
+        created_at_versions, default_build_config, last_updated_at_versions,
+        make_stable_row_id_manifest, overlay_with_field, sample_index_metadata, sample_manifest,
+        tagged_entry,
     };
     use crate::transaction::{DataOverlayGroup, UpdateMode, validate_operation};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use lance_core::datatypes::Schema as LanceSchema;
     use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
     use lance_io::utils::CachedFileSize;
+    use rstest::rstest;
     use std::collections::HashMap;
     use std::sync::Arc;
     use uuid::Uuid;
@@ -2509,16 +2598,58 @@ mod tests {
         assert_eq!(carried.fragment_bitmap, fri.fragment_bitmap);
     }
 
+    /// Recording MemWAL compaction progress on a tagged table replaces the
+    /// MemWAL entry and carries the history and the user segment through
+    /// unchanged.
+    #[test]
+    fn tagged_history_allows_mem_wal_state_update() {
+        let (manifest, fri) = tagged_sample_manifest();
+        let user = sample_index_metadata("id_idx");
+        let mem_wal = new_mem_wal_index_meta(manifest.version, Default::default()).unwrap();
+        let shard = Uuid::new_v4();
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::UpdateMemWalState {
+                compacted_sstables: vec![CompactedSsTable::new(shard, 3)],
+            },
+            None,
+        );
+        let (built, indices) = transaction
+            .build_manifest(
+                Some(&manifest),
+                vec![fri.clone(), user.clone(), mem_wal.clone()],
+                "txn",
+                &default_build_config(),
+            )
+            .unwrap();
+        assert_eq!(built.fragments.len(), manifest.fragments.len());
+        assert_eq!(indices.len(), 3);
+        let carried_fri = indices.iter().find(|idx| idx.uuid == fri.uuid).unwrap();
+        assert_eq!(carried_fri.index_details, fri.index_details);
+        assert_eq!(carried_fri.fragment_bitmap, fri.fragment_bitmap);
+        assert_eq!(carried_fri.index_version, fri.index_version);
+        let carried_user = indices.iter().find(|idx| idx.uuid == user.uuid).unwrap();
+        assert_eq!(carried_user.fragment_bitmap, user.fragment_bitmap);
+        assert_eq!(carried_user.dataset_version, user.dataset_version);
+        let updated = indices
+            .iter()
+            .find(|idx| idx.name == MEM_WAL_INDEX_NAME)
+            .unwrap();
+        assert_ne!(updated.uuid, mem_wal.uuid);
+        assert_eq!(updated.dataset_version, built.version);
+        let details = load_mem_wal_index_details(updated.clone()).unwrap();
+        assert_eq!(
+            details.compacted_sstables,
+            vec![CompactedSsTable::new(shard, 3)]
+        );
+    }
+
     #[rstest::rstest]
-    #[case::memwal("memwal")]
     #[case::bare_rewrite("bare_rewrite")]
     #[case::rewrite_with_v0_entry("rewrite_with_v0_entry")]
     fn tagged_history_rejects_unsupported_transactions(#[case] kind: &str) {
         let (manifest, fri) = tagged_sample_manifest();
         let operation = match kind {
-            "memwal" => Operation::UpdateMemWalState {
-                compacted_sstables: vec![],
-            },
             // A rewrite carrying no entry, or a v0 entry, would splice away
             // the tagged history; only a tagged entry may replace one. The
             // bare rewrite touches fragment 0, which the entry's bitmap
@@ -2547,11 +2678,21 @@ mod tests {
         let error = transaction
             .build_manifest(Some(&manifest), vec![fri], "txn", &default_build_config())
             .unwrap_err();
-        assert!(matches!(error, Error::NotSupported { .. }), "{error}");
-        assert!(
-            error.to_string().contains("Tagged FRI history maintenance"),
-            "{error}"
-        );
+        if kind == "bare_rewrite" {
+            assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+            assert!(
+                error
+                    .to_string()
+                    .contains("carries no fragment reuse transition"),
+                "{error}"
+            );
+        } else {
+            assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+            assert!(
+                error.to_string().contains("Tagged FRI history maintenance"),
+                "{error}"
+            );
+        }
     }
 
     #[rstest::rstest]
@@ -2735,6 +2876,149 @@ mod tests {
             new_manifest.reader_feature_flags & FLAG_FRAGMENT_REUSE_INDEX,
             0
         );
+    }
+
+    /// A tagged-table fixture for the CreateIndex gate: the manifest carries
+    /// the FRI flags and one tagged entry.
+    fn tagged_table_fixture() -> (Manifest, IndexMetadata) {
+        let mut manifest = sample_manifest();
+        manifest.reader_feature_flags |= FLAG_FRAGMENT_REUSE_INDEX;
+        manifest.writer_feature_flags |= FLAG_FRAGMENT_REUSE_INDEX;
+        let mut current =
+            sample_index_metadata(crate::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME);
+        current.fields.clear();
+        (manifest, current)
+    }
+
+    /// Build with the trim intent the maintenance path settles
+    /// (`FragReuseUpdate::Trim`), through the prepared entry.
+    fn build_trimmed(
+        transaction: &Transaction,
+        manifest: &Manifest,
+        indices: Vec<IndexMetadata>,
+    ) -> Result<(Manifest, Vec<IndexMetadata>)> {
+        let config = default_build_config();
+        let prepared = transaction.prepare_indices(
+            Some(manifest),
+            indices,
+            &config,
+            None,
+            FragReuseUpdate::Trim,
+        )?;
+        transaction.build_manifest_prepared(Some(manifest), prepared, "txn", &config, None)
+    }
+
+    /// A CreateIndex replacing a tagged entry without the maintenance path's
+    /// derivation intent is a hand-built (possibly stale) trim: rejected.
+    #[test]
+    fn tagged_trim_without_intent_rejected() {
+        let (manifest, current) = tagged_table_fixture();
+        let mut replacement =
+            sample_index_metadata(crate::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME);
+        replacement.fields.clear();
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![replacement],
+                removed_indices: vec![current.clone()],
+            },
+            None,
+        );
+        let error = transaction
+            .build_manifest(
+                Some(&manifest),
+                vec![current],
+                "txn",
+                &default_build_config(),
+            )
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(
+            error.to_string().contains("cleanup_frag_reuse_index"),
+            "{error}"
+        );
+    }
+
+    /// With the intent, exactly two shapes pass: the entry replaced, or the
+    /// entry removed outright (everything trimmed away; flags stay sticky).
+    #[rstest::rstest]
+    #[case::replace(true)]
+    #[case::remove(false)]
+    fn tagged_trim_with_intent_accepts_the_safe_shapes(#[case] replace: bool) {
+        let (manifest, current) = tagged_table_fixture();
+        let new_indices = if replace {
+            let mut replacement =
+                sample_index_metadata(crate::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME);
+            replacement.fields.clear();
+            vec![replacement]
+        } else {
+            vec![]
+        };
+        let expected_uuid = new_indices.first().map(|idx| idx.uuid);
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::CreateIndex {
+                new_indices,
+                removed_indices: vec![current.clone()],
+            },
+            None,
+        );
+        let (new_manifest, final_indices) =
+            build_trimmed(&transaction, &manifest, vec![current]).unwrap();
+        let entries: Vec<_> = final_indices
+            .iter()
+            .filter(|idx| idx.name == crate::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME)
+            .collect();
+        assert_eq!(entries.first().map(|idx| idx.uuid), expected_uuid);
+        // Sticky bits survive even full removal.
+        assert_ne!(
+            new_manifest.reader_feature_flags & FLAG_FRAGMENT_REUSE_INDEX,
+            0
+        );
+    }
+
+    /// Even with the intent, a trim whose removed identity no longer matches
+    /// the current entry was derived against a stale version: rejected, so a
+    /// replay cannot splice away a concurrent append.
+    #[test]
+    fn tagged_trim_with_stale_identity_rejected() {
+        let (manifest, current) = tagged_table_fixture();
+        let mut stale = current.clone();
+        stale.uuid = Uuid::new_v4();
+        let mut replacement =
+            sample_index_metadata(crate::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME);
+        replacement.fields.clear();
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![replacement],
+                removed_indices: vec![stale],
+            },
+            None,
+        );
+        let error = build_trimmed(&transaction, &manifest, vec![current]).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(error.to_string().contains("stale"), "{error}");
+    }
+
+    /// A trim mixing user indices into the same commit is not a shape the
+    /// maintenance path produces; rejected even with the intent.
+    #[test]
+    fn tagged_trim_mixed_with_user_indices_rejected() {
+        let (manifest, current) = tagged_table_fixture();
+        let mut replacement =
+            sample_index_metadata(crate::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME);
+        replacement.fields.clear();
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![replacement, sample_index_metadata("id_idx")],
+                removed_indices: vec![current.clone()],
+            },
+            None,
+        );
+        let error = build_trimmed(&transaction, &manifest, vec![current]).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
     }
 
     #[test]
@@ -3060,6 +3344,99 @@ mod tests {
             DataStorageFormat::new(ConcreteFileVersion::V2_0),
             HashMap::new(),
         )
+    }
+
+    #[rstest]
+    #[case::project(false)]
+    #[case::merge(true)]
+    fn test_schema_change_prunes_irrelevant_overlays(#[case] is_merge: bool) {
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, false),
+            ArrowField::new("b", DataType::Int32, false),
+            ArrowField::new("c", DataType::Int32, false),
+        ]);
+        let schema = LanceSchema::try_from(&arrow_schema).unwrap();
+        let mut projected_schema = schema.clone();
+        projected_schema.fields.retain(|field| field.name != "c");
+
+        let overlay = |path: &str, fields: Vec<i32>| DataOverlayFile {
+            data_file: DataFile::new_legacy_from_fields(path, fields, None),
+            coverage: OverlayCoverage::dense(RoaringBitmap::from_iter([0u32])),
+            committed_version: 1,
+        };
+        let mut fragment0 = Fragment::new(0);
+        fragment0.overlays = vec![
+            overlay("dropped-0.lance", vec![2]),
+            overlay("kept-mixed.lance", vec![0, 2]),
+        ];
+        let mut fragment1 = Fragment::new(1);
+        fragment1.overlays = vec![
+            overlay("dropped-1.lance", vec![2]),
+            overlay("kept-live.lance", vec![1]),
+        ];
+        let manifest = Manifest::new(
+            schema,
+            Arc::new(vec![fragment0, fragment1]),
+            DataStorageFormat::new(ConcreteFileVersion::V2_0),
+            HashMap::new(),
+        );
+
+        let operation = if is_merge {
+            Operation::Merge {
+                fragments: manifest.fragments.as_ref().clone(),
+                schema: projected_schema,
+                preserves_nullability: true,
+            }
+        } else {
+            Operation::Project {
+                schema: projected_schema,
+                preserves_nullability: true,
+            }
+        };
+        let transaction = Transaction::new(manifest.version, operation, None);
+        let (result, _) = transaction
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
+            .unwrap();
+
+        let overlay_paths = result
+            .fragments
+            .iter()
+            .flat_map(|fragment| &fragment.overlays)
+            .map(|overlay| overlay.data_file.path.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(overlay_paths, ["kept-mixed.lance", "kept-live.lance"]);
+    }
+
+    #[test]
+    fn activation_sets_writer_gate_when_auto_flags_are_disabled() {
+        let manifest = sample_manifest();
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::UpdateConfig {
+                config_updates: None,
+                table_metadata_updates: None,
+                schema_metadata_updates: None,
+                field_metadata_updates: HashMap::new(),
+            },
+            None,
+        );
+        let mut config = default_build_config();
+        config.auto_set_feature_flags = false;
+        config.activate_non_reusable_field_ids = true;
+
+        let (activated, _) = transaction
+            .build_manifest(Some(&manifest), vec![], "txn", &config)
+            .unwrap();
+
+        assert!(activated.uses_non_reusable_field_ids());
+        assert_eq!(
+            activated.reader_feature_flags & FLAG_NON_REUSABLE_FIELD_IDS,
+            0
+        );
+        assert_ne!(
+            activated.writer_feature_flags & FLAG_NON_REUSABLE_FIELD_IDS,
+            0
+        );
     }
 
     #[test]
@@ -3829,7 +4206,7 @@ mod tests {
             None,
         );
 
-        let pb_tx: pb::Transaction = pb::Transaction::from(&tx);
+        let pb_tx: pb::Transaction = pb::Transaction::try_from(&tx).unwrap();
 
         // Field 9 must be empty; field 10 must be populated.
         if let Some(pb::transaction::Operation::Update(ref update)) = pb_tx.operation {
@@ -4100,6 +4477,268 @@ mod tests {
         assert_eq!(seq.version_at(4).unwrap(), 1);
     }
 
+    fn merge_test_file(path: &str) -> DataFile {
+        DataFile::new(
+            path,
+            vec![0],
+            vec![0],
+            LanceFileVersion::Stable.resolve(),
+            None,
+            None,
+        )
+    }
+
+    /// Committed fragment carrying `row_ids`.
+    fn frag_with_row_ids(id: u64, path: &str, row_ids: &[u64]) -> Fragment {
+        Fragment {
+            id,
+            files: vec![merge_test_file(path)],
+            overlays: vec![],
+            deletion_file: None,
+            row_id_meta: Some(RowIdMeta::Inline(
+                write_row_ids(&RowIdSequence::from(row_ids)).into(),
+            )),
+            physical_rows: Some(row_ids.len()),
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
+        }
+    }
+
+    /// Fragment without row id metadata: staged write_fragments output, or a
+    /// committed fragment of a non-stable dataset.
+    fn frag_without_row_ids(id: u64, path: &str, physical_rows: usize) -> Fragment {
+        Fragment {
+            id,
+            files: vec![merge_test_file(path)],
+            overlays: vec![],
+            deletion_file: None,
+            row_id_meta: None,
+            physical_rows: Some(physical_rows),
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
+        }
+    }
+
+    /// Single-column manifest over `existing`; stable datasets get row id
+    /// flags and `next_row_id` = 100.
+    fn merge_test_manifest(existing: Vec<Fragment>, stable: bool) -> (Manifest, LanceSchema) {
+        use crate::feature_flags::FLAG_STABLE_ROW_IDS;
+
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new("id", DataType::Int32, false)]);
+        let lance_schema = LanceSchema::try_from(&arrow_schema).unwrap();
+        let mut manifest = Manifest::new(
+            lance_schema.clone(),
+            Arc::new(existing),
+            DataStorageFormat::new(ConcreteFileVersion::V2_0),
+            HashMap::new(),
+        );
+        if stable {
+            manifest.reader_feature_flags |= FLAG_STABLE_ROW_IDS;
+            manifest.next_row_id = 100;
+        }
+        (manifest, lance_schema)
+    }
+
+    /// Validate and build a Merge of `fragments` against `manifest`.
+    fn build_merge(
+        manifest: &Manifest,
+        schema: LanceSchema,
+        fragments: Vec<Fragment>,
+    ) -> Result<Manifest> {
+        let operation = Operation::Merge {
+            fragments,
+            schema,
+            preserves_nullability: true,
+        };
+        validate_operation(Some(manifest), &operation)?;
+        let tx = Transaction::new(manifest.version, operation, None);
+        let (out, _) = tx.build_manifest(Some(manifest), vec![], "txn", &default_build_config())?;
+        Ok(out)
+    }
+
+    #[rstest::rstest]
+    #[case::placeholder_id_0(0, vec![0, 1, 2], 2)]
+    #[case::pre_reserved_id_7(7, vec![0, 1, 7], 7)]
+    fn merge_build_manifest_assigns_ids_and_row_ids_to_staged_fragments(
+        #[case] staged_id: u64,
+        #[case] expected_ids: Vec<u64>,
+        #[case] new_id: u64,
+    ) {
+        // A placeholder id 0 gets a fresh fragment id; a pre-reserved id is
+        // kept. Either way the staged fragment's row ids come from
+        // next_row_id at commit time.
+        let existing = vec![
+            frag_with_row_ids(0, "frag0.lance", &[0, 1, 2]),
+            frag_with_row_ids(1, "frag1.lance", &[3, 4]),
+        ];
+        let (manifest, schema) = merge_test_manifest(existing.clone(), true);
+
+        let mut merge_list = existing.clone();
+        merge_list.push(frag_without_row_ids(staged_id, "staged.lance", 4));
+        let out = build_merge(&manifest, schema, merge_list).unwrap();
+
+        let ids: Vec<u64> = out.fragments.iter().map(|f| f.id).collect();
+        assert_eq!(ids, expected_ids);
+        assert_eq!(out.max_fragment_id, Some(new_id.max(1) as u32));
+
+        // Existing fragments keep their row id sequences byte-identical.
+        for prev in &existing {
+            let frag = out.fragments.iter().find(|f| f.id == prev.id).unwrap();
+            assert_eq!(frag.row_id_meta, prev.row_id_meta);
+        }
+
+        // The staged fragment was allocated row ids from next_row_id.
+        let new_frag = out.fragments.iter().find(|f| f.id == new_id).unwrap();
+        let Some(RowIdMeta::Inline(data)) = &new_frag.row_id_meta else {
+            panic!("staged fragment must have inline row id metadata");
+        };
+        let row_ids: Vec<u64> = crate::rowids::read_row_ids(data).unwrap().iter().collect();
+        assert_eq!(row_ids, vec![100, 101, 102, 103]);
+        assert_eq!(out.next_row_id, 104);
+
+        // Version metadata is stamped like Append.
+        assert_eq!(created_at_versions(&out, new_id), vec![2, 2, 2, 2]);
+        assert_eq!(last_updated_at_versions(&out, new_id), vec![2, 2, 2, 2]);
+    }
+
+    #[test]
+    fn merge_build_manifest_assigns_unique_ids_to_staged_fragments_non_stable() {
+        // Regression for the duplicate fragment id corruption: a staged
+        // fragment with placeholder id 0 must not be committed as-is.
+        let existing = vec![
+            frag_without_row_ids(0, "frag0.lance", 2),
+            frag_without_row_ids(1, "frag1.lance", 2),
+        ];
+        let (manifest, schema) = merge_test_manifest(existing.clone(), false);
+
+        let mut merge_list = existing;
+        merge_list.push(frag_without_row_ids(0, "staged.lance", 2));
+        let out = build_merge(&manifest, schema, merge_list).unwrap();
+
+        let ids: Vec<u64> = out.fragments.iter().map(|f| f.id).collect();
+        assert_eq!(ids, vec![0, 1, 2]);
+        assert!(out.fragments.iter().all(|f| f.row_id_meta.is_none()));
+    }
+
+    #[test]
+    fn merge_staged_fragment_is_not_a_rewrite_of_fragment_0() {
+        // The staged fragment's placeholder id 0 collides with fragment 0;
+        // it must not withdraw fragment 0 from index coverage.
+        let existing = vec![
+            frag_without_row_ids(0, "frag0.lance", 2),
+            frag_without_row_ids(1, "frag1.lance", 2),
+        ];
+        let mut merge_list = existing.clone();
+        merge_list.push(frag_without_row_ids(0, "staged.lance", 2));
+
+        assert!(Transaction::merge_rewritten_fields(&existing, &merge_list).is_empty());
+    }
+
+    #[rstest::rstest]
+    #[case::complete_stable(&[0, 1], true)]
+    #[case::partial_stable(&[0], true)]
+    #[case::complete_non_stable(&[0, 1], false)]
+    fn merge_build_manifest_rejects_row_ids_on_new_fragments(
+        #[case] supplied_row_ids: &[u64],
+        #[case] stable: bool,
+    ) {
+        // Supplied row ids duplicate the existing fragment's live ids; keeping
+        // them (or filling a partial prefix) would corrupt the row id index.
+        let existing = if stable {
+            frag_with_row_ids(0, "frag0.lance", &[0, 1])
+        } else {
+            frag_without_row_ids(0, "frag0.lance", 2)
+        };
+        let (mut manifest, schema) = merge_test_manifest(vec![existing.clone()], stable);
+        if stable {
+            manifest.next_row_id = 2;
+        }
+
+        let mut staged = frag_with_row_ids(0, "staged.lance", supplied_row_ids);
+        staged.physical_rows = Some(2);
+        let err = build_merge(&manifest, schema, vec![existing, staged]).unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "unexpected error variant: {}",
+            err
+        );
+        assert!(
+            err.to_string()
+                .contains("new fragment (id 0) with row id metadata"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn merge_validate_rejects_duplicate_nonzero_fragment_ids() {
+        let existing = vec![frag_without_row_ids(1, "frag1.lance", 2)];
+        let (manifest, schema) = merge_test_manifest(existing.clone(), false);
+
+        let mut merge_list = existing;
+        merge_list.push(frag_without_row_ids(1, "other.lance", 2));
+        let err = build_merge(&manifest, schema, merge_list).unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "unexpected error variant: {}",
+            err
+        );
+        assert!(
+            err.to_string().contains("duplicate fragment id 1"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn merge_validate_rejects_staged_fragment_listed_before_existing_non_stable() {
+        // With equal row counts and no row id metadata, a misordered staged
+        // fragment is indistinguishable by content from the fragment whose id
+        // it collides with; the order check must reject it on non-stable
+        // datasets too.
+        let existing = vec![
+            frag_without_row_ids(0, "frag0.lance", 2),
+            frag_without_row_ids(1, "frag1.lance", 2),
+        ];
+        let (manifest, schema) = merge_test_manifest(existing.clone(), false);
+
+        let mut merge_list = vec![frag_without_row_ids(0, "staged.lance", 2)];
+        merge_list.extend(existing);
+        let err = build_merge(&manifest, schema, merge_list).unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "unexpected error variant: {}",
+            err
+        );
+        assert!(
+            err.to_string().contains("after a new fragment"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn merge_validate_rejects_staged_fragment_listed_before_existing_stable() {
+        // A staged id-0 fragment listed before the real fragment 0 would be
+        // taken as the existing one; validation must reject the swap.
+        let existing = frag_with_row_ids(0, "frag0.lance", &[0, 1]);
+        let (manifest, schema) = merge_test_manifest(vec![existing.clone()], true);
+
+        let staged = frag_without_row_ids(0, "staged.lance", 2);
+        let err = build_merge(&manifest, schema, vec![staged, existing]).unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "unexpected error variant: {}",
+            err
+        );
+        assert!(
+            err.to_string()
+                .contains("dropped row id metadata for existing fragment 0"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
     #[test]
     fn merge_build_manifest_no_last_updated_refresh_without_stable_row_ids() {
         use crate::feature_flags::FLAG_STABLE_ROW_IDS;
@@ -4209,14 +4848,14 @@ mod tests {
         manifest.next_row_id = 100;
         manifest.version = 1;
 
-        // New fragment (id=1) not present in prev manifest — exercises the None branch
-        let row_ids_1 = RowIdSequence::from([20u64, 21, 22, 23].as_slice());
+        // New fragment (id=1) not present in prev manifest; row ids are
+        // allocated at commit time.
         let new_fragment = Fragment {
             id: 1,
             files: vec![mk_file("new.lance")],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&row_ids_1).into())),
+            row_id_meta: None,
             physical_rows: Some(4),
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
@@ -4239,6 +4878,12 @@ mod tests {
         assert_eq!(out.version, 2);
 
         let new_frag = out.fragments.iter().find(|f| f.id == 1).unwrap();
+        let Some(RowIdMeta::Inline(data)) = &new_frag.row_id_meta else {
+            panic!("new fragment must have inline row id metadata");
+        };
+        let row_ids: Vec<u64> = crate::rowids::read_row_ids(data).unwrap().iter().collect();
+        assert_eq!(row_ids, vec![100, 101, 102, 103]);
+        assert_eq!(out.next_row_id, 104);
 
         // last_updated_at_version must be set to the commit version
         let last_updated_seq = new_frag

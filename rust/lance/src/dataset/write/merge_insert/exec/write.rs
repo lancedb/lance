@@ -228,6 +228,7 @@ pub struct FullSchemaMergeInsertExec {
     inserted_rows_filter: Arc<Mutex<Option<KeyExistenceFilter>>>,
     source_skipped_duplicates: Arc<AtomicU64>,
     source_blob_columns: Vec<String>,
+    update_if_deferred: bool,
     /// Whether the ON columns match the schema's unenforced primary key.
     /// If true, inserted_rows_filter will be included in the transaction for conflict detection.
     is_primary_key: bool,
@@ -275,8 +276,15 @@ impl FullSchemaMergeInsertExec {
             inserted_rows_filter: Arc::new(Mutex::new(None)),
             source_skipped_duplicates,
             source_blob_columns,
+            update_if_deferred: false,
             is_primary_key,
         })
+    }
+
+    /// Marks the `UpdateIf` condition as evaluated by `MergeConditionExec`.
+    pub fn with_update_if_deferred(mut self) -> Self {
+        self.update_if_deferred = true;
+        self
     }
 
     /// Takes the merge statistics if the execution has completed.
@@ -814,18 +822,8 @@ impl DisplayAs for FullSchemaMergeInsertExec {
             datafusion::physical_plan::DisplayFormatType::Default
             | datafusion::physical_plan::DisplayFormatType::Verbose => {
                 let on_keys = self.params.on.join(", ");
-                let when_matched = match &self.params.when_matched {
-                    crate::dataset::WhenMatched::DoNothing => "DoNothing".to_string(),
-                    crate::dataset::WhenMatched::UpdateAll => "UpdateAll".to_string(),
-                    crate::dataset::WhenMatched::UpdateIf(condition) => {
-                        format!("UpdateIf({})", condition)
-                    }
-                    crate::dataset::WhenMatched::UpdateIfExpr(expr) => {
-                        format!("UpdateIf({})", expr.human_display())
-                    }
-                    crate::dataset::WhenMatched::Fail => "Fail".to_string(),
-                    crate::dataset::WhenMatched::Delete => "Delete".to_string(),
-                };
+                let when_matched =
+                    super::when_matched_label(&self.params.when_matched, self.update_if_deferred);
                 let when_not_matched = if self.params.insert_not_matched {
                     "InsertAll"
                 } else {
@@ -884,6 +882,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
             inserted_rows_filter: self.inserted_rows_filter.clone(),
             source_skipped_duplicates: self.source_skipped_duplicates.clone(),
             source_blob_columns: self.source_blob_columns.clone(),
+            update_if_deferred: self.update_if_deferred,
             is_primary_key: self.is_primary_key,
         }))
     }
@@ -936,6 +935,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
                     self.dataset.schema(),
                     input_schema.as_ref(),
                     true,
+                    false,
                 )
                 .map_err(|error| DataFusionError::External(Box::new(error)))?,
             );
