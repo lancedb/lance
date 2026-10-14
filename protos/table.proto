@@ -424,7 +424,8 @@ message IndexMetadata {
    */
   repeated int32 covering_fields = 11;
 
-  /* Optional non-zero ID in Manifest.clustering for this segment's grouping. Remap and
+  /* Optional non-zero ID in Manifest.clustering recording this segment's grouping,
+   * not a guarantee about the current values in its fragments. Remap and
    * rebuild of the existing group preserve it. Merges and rebuilds with different
    * groups use provider-written output information; without a provider strategy,
    * their outputs have no clustering information. Absence makes no clustering
@@ -433,6 +434,7 @@ message IndexMetadata {
   optional uint32 clustering_id = 12;
 
   /* Optional per-segment information. Each feature owns and maintains its keys.
+   * Fragment updates do not refresh these entries or prove their applicability.
    * Unchanged segments preserve all entries; new outputs do not inherit entries
    * unless their owner handles that operation. Clustering keys follow clustering_id
    * maintenance rules. Requires writer flag 1 << 17 while this map is nonempty.

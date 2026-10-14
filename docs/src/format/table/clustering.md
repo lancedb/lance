@@ -42,7 +42,7 @@ copies. The current manifest does not need the entire configuration history.
 
 ### Fragment and Index Segment Information
 
-Each fragment and index segment can record how it was organized:
+Each fragment and index segment can record how it was organized when created:
 
 - `clustering_id`: optional reference to a definition in the same manifest.
   Unset means no clustering claim; a present 0 or an unresolved ID is invalid.
@@ -51,8 +51,9 @@ Each fragment and index segment can record how it was organized:
 
 The clustering ID identifies shared rules, not a bucket. A segment's metadata
 describes its own grouping; it does not change its input fragments' metadata.
-Other features can also use the generic map. Each feature owns and maintains its
-keys; see [Object Metadata](index.md#object-metadata).
+Other features can also use the generic map. Fragment entries describe
+creation-time facts, not current layout guarantees; see
+[Object Metadata](index.md#object-metadata).
 
 ## What Providers Do
 
@@ -71,6 +72,13 @@ Providers can reuse Lance's builders. Lance checks the inputs and conflicting
 concurrent changes, then commits the new files and metadata together. The
 provider API is outside this format proposal.
 
+Providers may use clustering IDs and bucket/group metadata to select candidates
+for compaction or indexing. Column updates can move values outside the original
+bucket, and deletions can leave groups underfilled. To guarantee a current range,
+providers must use valid current statistics or inspect and reorganize the data;
+historical labels alone are not enough. Without that guarantee, grouping by old
+labels may still produce a correct index, but with wider ranges and weaker pruning.
+
 ### When No Provider Strategy Is Available
 
 - **Fragments without clustering metadata:** normal Lance compaction and
@@ -88,14 +96,12 @@ If a provider fails, return an error. Do not silently switch to normal maintenan
 
 - **Nothing changed:** keep definitions, references, and metadata on unchanged
   fragments and segments, including keys and values the writer does not recognize.
-- **Normal data rewrite:** clear `clustering_id` and provider-owned clustering
-  keys on the rewritten fragments. Column replacement, refresh, and overlays
-  follow this rule even if the fragment
-  ID stays the same or the changed column is not a clustering key. There is no
-  need to decide whether the layout was affected.
-- **Only deletion vectors changed:** keep the fragment's `clustering_id` and
-  provider-owned clustering keys. Providers must account for deleted rows when
-  planning later maintenance.
+- **Updates to the same fragment:** column replacement, refresh, overlays, and
+  deletions preserve `clustering_id` and all metadata entries. They describe the
+  fragment at creation, even if its current clustering is less effective.
+- **Compaction or rewrite creating new fragments:** do not automatically inherit
+  input IDs or metadata. The creator writes information about the new outputs;
+  ordinary outputs have no clustering ID.
 - **Index merge:** the provider decides how to merge and writes the new segments'
   clustering metadata. A normal merge without a provider strategy produces
   segments with no clustering metadata.
@@ -108,8 +114,9 @@ If a provider fails, return an error. Do not silently switch to normal maintenan
   groups and no provider strategy produces segments with no clustering metadata.
 
 Index maintenance does not change the data fragments' clustering metadata.
-These rules apply to clustering references and clustering-owned keys, not every
-entry in a generic map. Other key owners implement their own maintenance rules.
+The fragment preservation rule applies to both `clustering_id` and the generic
+map. The same-group index remap/rebuild rule applies to clustering-owned keys;
+other segment keys follow their owners' maintenance rules.
 
 ## How Readers Benefit
 

@@ -86,16 +86,19 @@ message DataFragment {
    */
   uint64 physical_rows = 4;
 
-  /* Optional non-zero ID of a definition in Manifest.clustering.
-   * Ordinary rewrites do not inherit it; deletion-vector-only changes preserve
-   * it. Absence makes no clustering claim. Requires writer flag 1 << 17.
+  /* Optional non-zero ID in Manifest.clustering describing how this fragment
+   * was organized when created, not a guarantee about its current values.
+   * Column replacement, overlays, and deletions preserve it. New fragments do
+   * not inherit it automatically; their creator sets it for their own layout.
+   * Absence makes no clustering claim. Requires writer flag 1 << 17.
    */
   optional uint32 clustering_id = 15;
 
-  /* Optional per-fragment information. Each feature owns and maintains its keys.
-   * Unchanged fragments preserve all entries. Rewrites, column replacements,
-   * overlays, and deletion changes do not inherit entries unless their owner
-   * handles that operation, even if the fragment ID stays the same.
+  /* Facts about this fragment when it was created. Each key owner defines its
+   * meaning so it remains true after column replacement, overlays, and deletions.
+   * Those operations preserve all entries, including unknown keys. Compaction
+   * and rewrites creating new fragments do not propagate input entries; the
+   * creator supplies metadata describing each new fragment.
    * Requires writer flag 1 << 17 while this map is nonempty.
    */
   map<string, string> metadata = 16;
