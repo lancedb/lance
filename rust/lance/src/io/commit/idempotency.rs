@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Idempotency keys: ids of work that a commit must apply at most once.
+//! Idempotency keys: duplicate detection within a commit's read-version window.
 //!
-//! A writer that must apply each unit of work at most once (for example, a
-//! queue consumer whose messages can be redelivered to another consumer)
-//! attaches the ids of that work to its transaction, through
+//! A writer attaches work ids to detect concurrent duplicate writes and
+//! retries that preserve the original read version, through
 //! [`CommitBuilder::with_idempotency_keys`] or
 //! [`WriteParams::with_idempotency_keys`]. They are stored in the reserved
 //! transaction property [`IDEMPOTENCY_KEYS_PROPERTY`] as a JSON array of
@@ -19,8 +18,12 @@
 //! A commit checks every transaction committed after its read version, and
 //! the manifest put is create-if-absent, so a successful commit has checked
 //! every version after its read version up to the version it created.
-//! Versions at or before the read version are the caller's responsibility:
-//! the caller observed them when it read the table.
+//! Versions at or before the read version are not checked. A fresh read
+//! after an earlier commit can therefore let the same work commit again.
+//! The caller must detect work in those earlier versions separately, or
+//! preserve a read version from before the first commit and retain the
+//! required history. These keys alone do not provide table-wide at-most-once
+//! execution.
 //!
 //! # Caller-named property
 //!

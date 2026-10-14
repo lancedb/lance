@@ -239,7 +239,7 @@ impl<'a> CommitBuilder<'a> {
         self
     }
 
-    /// Apply this commit at most once per idempotency key.
+    /// Reject duplicate keys in commits after this transaction's read version.
     ///
     /// Each key identifies a unit of work the commit applies, such as a queue
     /// message id. If a transaction committed after the read version already
@@ -248,8 +248,14 @@ impl<'a> CommitBuilder<'a> {
     /// keys, instead of rebasing over it. That version can be the caller's
     /// own earlier commit, when a commit that already landed (for example
     /// one reported as status unknown) is retried. Versions at or before the
-    /// read version are not checked; the caller observed them when it read
-    /// the table.
+    /// read version are not checked. A fresh read after a successful commit
+    /// can therefore let the same work commit again. The caller must detect
+    /// earlier duplicates separately, or preserve a read version from before
+    /// the first commit and retain the required history. This API alone does
+    /// not provide table-wide at-most-once execution.
+    ///
+    /// A duplicate error reports overlapping keys, not proof that every key
+    /// in a multi-key transaction was already applied.
     ///
     /// The keys are added to any the transaction already carries and are
     /// persisted in its
@@ -276,13 +282,13 @@ impl<'a> CommitBuilder<'a> {
     /// # use lance::dataset::transaction::Transaction;
     /// # async fn test(dataset: Arc<Dataset>, transaction: Transaction) -> Result<()> {
     /// match CommitBuilder::new(dataset)
-    ///     .with_idempotency_keys(["message-17", "message-18"])
+    ///     .with_idempotency_keys(["message-17"])
     ///     .execute(transaction)
     ///     .await
     /// {
     ///     Ok(_) => {}
-    ///     // The work was already applied (by `version`, for `keys`): acknowledge
-    ///     // the messages instead of applying them again.
+    ///     // This single-key transaction was already applied. Acknowledge
+    ///     // message-17 instead of applying it again.
     ///     Err(Error::DuplicateTransaction { .. }) => {}
     ///     Err(err) => return Err(err),
     /// }
