@@ -2800,7 +2800,7 @@ checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
 name = "fsst"
-version = "14.0.0-beta.12"
+version = "14.0.0-beta.15"
 dependencies = [
  "arrow-array",
  "rand 0.9.5",
@@ -3994,7 +3994,7 @@ checksum = "e037a2e1d8d5fdbd49b16a4ea09d5d6401c1f29eca5ff29d03d3824dba16256a"
 
 [[package]]
 name = "lance"
-version = "14.0.0-beta.12"
+version = "14.0.0-beta.15"
 dependencies = [
  "arc-swap",
  "arrow",
@@ -4043,7 +4043,7 @@ dependencies = [
  "lance-tokenizer",
  "log",
  "moka",
- "object_store 0.14.1",
+ "object_store 0.14.2",
  "permutation",
  "pin-project",
  "prost",
@@ -4067,7 +4067,7 @@ dependencies = [
 
 [[package]]
 name = "lance-arrow"
-version = "14.0.0-beta.12"
+version = "14.0.0-beta.15"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4110,7 +4110,7 @@ dependencies = [
 
 [[package]]
 name = "lance-bitpacking"
-version = "14.0.0-beta.12"
+version = "14.0.0-beta.15"
 dependencies = [
  "arrayref",
  "crunchy",
@@ -4120,7 +4120,7 @@ dependencies = [
 
 [[package]]
 name = "lance-core"
-version = "14.0.0-beta.12"
+version = "14.0.0-beta.15"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4139,7 +4139,7 @@ dependencies = [
  "log",
  "moka",
  "num_cpus",
- "object_store 0.14.1",
+ "object_store 0.14.2",
  "pin-project",
  "prost",
  "quick_cache",
@@ -4157,7 +4157,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datafusion"
-version = "14.0.0-beta.12"
+version = "14.0.0-beta.15"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4189,7 +4189,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datagen"
-version = "14.0.0-beta.12"
+version = "14.0.0-beta.15"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4206,7 +4206,7 @@ dependencies = [
 
 [[package]]
 name = "lance-derive"
-version = "14.0.0-beta.12"
+version = "14.0.0-beta.15"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4215,7 +4215,7 @@ dependencies = [
 
 [[package]]
 name = "lance-encoding"
-version = "14.0.0-beta.12"
+version = "14.0.0-beta.15"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -4248,7 +4248,7 @@ dependencies = [
 
 [[package]]
 name = "lance-file"
-version = "14.0.0-beta.12"
+version = "14.0.0-beta.15"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -4269,7 +4269,7 @@ dependencies = [
  "lance-io",
  "log",
  "num-traits",
- "object_store 0.14.1",
+ "object_store 0.14.2",
  "prost",
  "prost-build",
  "prost-types",
@@ -4280,7 +4280,7 @@ dependencies = [
 
 [[package]]
 name = "lance-geo"
-version = "14.0.0-beta.12"
+version = "14.0.0-beta.15"
 dependencies = [
  "datafusion",
  "geo-traits",
@@ -4294,7 +4294,7 @@ dependencies = [
 
 [[package]]
 name = "lance-index"
-version = "14.0.0-beta.12"
+version = "14.0.0-beta.15"
 dependencies = [
  "arc-swap",
  "arrow",
@@ -4344,7 +4344,7 @@ dependencies = [
  "log",
  "ndarray",
  "num-traits",
- "object_store 0.14.1",
+ "object_store 0.14.2",
  "prost",
  "prost-build",
  "prost-types",
@@ -4365,7 +4365,7 @@ dependencies = [
 
 [[package]]
 name = "lance-index-core"
-version = "14.0.0-beta.12"
+version = "14.0.0-beta.15"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -4388,7 +4388,7 @@ dependencies = [
 
 [[package]]
 name = "lance-io"
-version = "14.0.0-beta.12"
+version = "14.0.0-beta.15"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4408,7 +4408,7 @@ dependencies = [
  "log",
  "metrics",
  "moka",
- "object_store 0.14.1",
+ "object_store 0.14.2",
  "object_store_opendal",
  "opendal",
  "opendal-service-goosefs",
@@ -4430,7 +4430,7 @@ dependencies = [
 
 [[package]]
 name = "lance-jsonb"
-version = "14.0.0-beta.12"
+version = "14.0.0-beta.15"
 dependencies = [
  "byteorder",
  "ethnum",
@@ -4447,7 +4447,7 @@ dependencies = [
 
 [[package]]
 name = "lance-linalg"
-version = "14.0.0-beta.12"
+version = "14.0.0-beta.15"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -4461,7 +4461,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace"
-version = "14.0.0-beta.12"
+version = "14.0.0-beta.15"
 dependencies = [
  "arrow",
  "async-trait",
@@ -4475,7 +4475,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace-impls"
-version = "14.0.0-beta.12"
+version = "14.0.0-beta.15"
 dependencies = [
  "arc-swap",
  "arrow",
@@ -4495,7 +4495,7 @@ dependencies = [
  "lance-namespace",
  "lance-table",
  "log",
- "object_store 0.14.1",
+ "object_store 0.14.2",
  "rand 0.9.5",
  "reqwest 0.12.28",
  "roaring",
@@ -4524,7 +4524,7 @@ dependencies = [
 
 [[package]]
 name = "lance-select"
-version = "14.0.0-beta.12"
+version = "14.0.0-beta.15"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4538,7 +4538,7 @@ dependencies = [
 
 [[package]]
 name = "lance-table"
-version = "14.0.0-beta.12"
+version = "14.0.0-beta.15"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4559,7 +4559,7 @@ dependencies = [
  "lance-io",
  "lance-select",
  "log",
- "object_store 0.14.1",
+ "object_store 0.14.2",
  "prost",
  "prost-build",
  "prost-types",
@@ -4578,7 +4578,7 @@ dependencies = [
 
 [[package]]
 name = "lance-tokenizer"
-version = "14.0.0-beta.12"
+version = "14.0.0-beta.15"
 dependencies = [
  "frostem",
  "icu_segmenter",
@@ -4694,6 +4694,12 @@ checksum = "40fe164dbd47ea0c20e78a121c980ef673326905f1d4fba55e3645a20ef6717f"
 dependencies = [
  "rayon",
 ]
+
+[[package]]
+name = "libyaml-rs"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2e126dda6f34391ab7b444f9922055facc83c07a910da3eb16f1e4d9c45dc777"
 
 [[package]]
 name = "lindera"
@@ -5266,13 +5272,12 @@ dependencies = [
 
 [[package]]
 name = "object_store"
-version = "0.14.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d354792e39fa5f0009e47623cf8b15b099bf9a652fa55c6f817fe28ac84fea50"
+version = "0.14.2"
+source = "git+https://github.com/apache/arrow-rs-object-store.git?rev=c10758c207c0103355f940f0c736fb8ecb157b04#c10758c207c0103355f940f0c736fb8ecb157b04"
 dependencies = [
  "async-trait",
  "aws-lc-rs",
- "base64 0.22.1",
+ "base64 0.23.0",
  "bytes",
  "chrono",
  "crc-fast",
@@ -5318,7 +5323,7 @@ dependencies = [
  "bytes",
  "chrono",
  "futures",
- "object_store 0.14.1",
+ "object_store 0.14.2",
  "opendal",
  "pin-project",
  "tokio",
@@ -6138,7 +6143,7 @@ dependencies = [
 
 [[package]]
 name = "pylance"
-version = "14.0.0-beta.12"
+version = "14.0.0-beta.15"
 dependencies = [
  "alloc-stdlib",
  "arrow",
@@ -6172,7 +6177,7 @@ dependencies = [
  "log",
  "metrics",
  "metrics-util",
- "object_store 0.14.1",
+ "object_store 0.14.2",
  "prost",
  "prost-types",
  "pyo3",
@@ -6180,13 +6185,13 @@ dependencies = [
  "roaring",
  "serde",
  "serde_json",
- "serde_yaml",
  "tokio",
  "tracing",
  "tracing-chrome",
  "tracing-subscriber",
  "url",
  "uuid",
+ "yaml_serde",
 ]
 
 [[package]]
@@ -8386,7 +8391,7 @@ version = "2.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8464ec13c3691491391d9fce00f6416c9a48e46972f72d7865688be2080192c9"
 dependencies = [
- "rand 0.10.1",
+ "rand 0.9.5",
 ]
 
 [[package]]
@@ -9255,6 +9260,19 @@ name = "xxhash-rust"
 version = "0.8.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aee1b19627c7c60102ab80d3a9cbe18de90bfe03bfa6c3715447681f0e8c8af6"
+
+[[package]]
+name = "yaml_serde"
+version = "0.10.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "33b729a08a9a6be689bbad3e2bf8015926db54b6622cc89c3a5f7dc174b9e918"
+dependencies = [
+ "indexmap 2.14.0",
+ "itoa",
+ "libyaml-rs",
+ "ryu",
+ "serde",
+]
 
 [[package]]
 name = "yoke"

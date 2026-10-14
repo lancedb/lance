@@ -113,7 +113,7 @@ use crate::index::vector::utils::{
     default_distance_type_for, get_vector_dim, get_vector_type, validate_distance_type_for,
 };
 use crate::io::exec::filtered_read::{
-    FilteredReadExec, FilteredReadOptions, FilteredReadThreadingMode,
+    FilteredReadExec, FilteredReadOptions, FilteredReadThreadingMode, filter_read_columns,
 };
 use crate::io::exec::fts::{
     BoostQueryExec, CombinedFieldsQueryExec, CompoundQueryExec, CrossColumnCompoundQueryExec,
@@ -466,7 +466,7 @@ fn normalize_fts_zero_boosts(query: &mut FtsQuery) {
 /// unindexed rows. AUTO activation is deferred until OSS-2105 lands that
 /// current-row preparation atomically. Until then, recursively rewrite AUTO to
 /// exact while preserving explicit positive fuzziness.
-fn apply_dataset_planner_auto_fuzziness_compatibility_gate(query: &mut FtsQuery) {
+pub(crate) fn apply_dataset_planner_auto_fuzziness_compatibility_gate(query: &mut FtsQuery) {
     match query {
         FtsQuery::Match(query) => {
             query.fuzziness.get_or_insert(0);
@@ -3309,7 +3309,11 @@ impl Scanner {
         // Either that column is covered by an exact filter (e.g. string with bitmap/btree) and there is no
         // need for late materialization or that column is covered by an inexact filter (e.g. ngram) in which
         // case we are going to load the column anyways for the recheck.
-        let filter_columns = filter_plan.all_columns();
+        let filter_columns = filter_plan
+            .full_expr
+            .as_ref()
+            .map(|expr| filter_read_columns(expr, desired_projection))
+            .unwrap_or_default();
 
         let filter_schema = self
             .dataset
@@ -16901,6 +16905,564 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
                 .collect::<Vec<_>>()
         });
         assert_eq!(eager_children, Some(vec!["count"]), "{schema:?}");
+    }
+
+    #[tokio::test]
+    async fn test_null_filter_on_wide_nested_column_reads_narrow_leaf() {
+        // A structural column carries its validity in every leaf's definition levels, so a
+        // null check on `cells` is served by the narrow `idx` leaf without reading `data`.
+        let struct_fields = Fields::from(vec![
+            ArrowField::new("idx", DataType::Int32, true),
+            ArrowField::new("data", DataType::LargeBinary, true),
+        ]);
+        let item_field = Arc::new(ArrowField::new(
+            "item",
+            DataType::Struct(struct_fields.clone()),
+            true,
+        ));
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, true),
+            ArrowField::new("cells", DataType::List(item_field.clone()), true),
+        ]));
+        // Rows cycle through: null list, empty list, one null item, one item with a null idx,
+        // one plain item.  Only the first shape is `cells IS NULL`.
+        let num_rows = 200usize;
+        let value_len = 32 * 1024;
+        let mut offsets = vec![0i32];
+        let mut list_valid = Vec::with_capacity(num_rows);
+        let mut item_valid = vec![];
+        let mut idx = vec![];
+        let mut data: Vec<Vec<u8>> = vec![];
+        // Incompressible payload, so bytes read track bytes on disk.
+        let mut rng = 0x9E37_79B9_7F4A_7C15u64;
+        for row in 0..num_rows {
+            let kind = row % 5;
+            list_valid.push(kind != 0);
+            if kind >= 2 {
+                item_valid.push(kind != 2);
+                idx.push((kind != 3).then_some(row as i32));
+                data.push(
+                    std::iter::repeat_with(|| {
+                        rng ^= rng << 13;
+                        rng ^= rng >> 7;
+                        rng ^= rng << 17;
+                        rng as u8
+                    })
+                    .take(value_len)
+                    .collect(),
+                );
+            }
+            offsets.push(idx.len() as i32);
+        }
+        // Values under a null struct item are not written, so only count the rest.
+        let data_bytes = (item_valid.iter().filter(|valid| **valid).count() * value_len) as u64;
+        let items = StructArray::new(
+            struct_fields,
+            vec![
+                Arc::new(Int32Array::from(idx)) as ArrayRef,
+                Arc::new(arrow_array::LargeBinaryArray::from_iter_values(data.iter())),
+            ],
+            Some(arrow_buffer::NullBuffer::from(item_valid)),
+        );
+        let cells = arrow_array::ListArray::new(
+            item_field,
+            arrow_buffer::OffsetBuffer::new(offsets.into()),
+            Arc::new(items),
+            Some(arrow_buffer::NullBuffer::from(list_valid)),
+        );
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..num_rows as i32)),
+                Arc::new(cells),
+            ],
+        )
+        .unwrap();
+        let test_dir = TempStrDir::default();
+        let params = WriteParams {
+            max_rows_per_file: 50,
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        };
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        Dataset::write(reader, &test_dir, Some(params))
+            .await
+            .unwrap();
+
+        // Baseline: materializing the column costs at least its payload.
+        let dataset = Dataset::open(&test_dir).await.unwrap();
+        dataset.object_store.io_stats_incremental();
+        let full = dataset
+            .scan()
+            .project(&["cells"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(full.num_rows(), num_rows);
+        let full_bytes = dataset.object_store.io_stats_incremental().read_bytes;
+        assert!(full_bytes >= data_bytes, "{full_bytes} < {data_bytes}");
+
+        for (filter, wants_null) in [("cells IS NULL", true), ("cells IS NOT NULL", false)] {
+            let dataset = Dataset::open(&test_dir).await.unwrap();
+            let mut scan = dataset.scan();
+            scan.project(&["id"]).unwrap().filter(filter).unwrap();
+            let plan = scan.explain_plan(true).await.unwrap();
+            assert!(plan.contains("projection=[id, cells.item.idx]"), "{plan}");
+            dataset.object_store.io_stats_incremental();
+            let batch = scan.try_into_batch().await.unwrap();
+            let read_bytes = dataset.object_store.io_stats_incremental().read_bytes;
+            assert_eq!(batch.schema().fields().len(), 1, "{:?}", batch.schema());
+            let mut ids = batch
+                .column(0)
+                .as_primitive::<Int32Type>()
+                .values()
+                .to_vec();
+            ids.sort_unstable();
+            let expected = (0..num_rows as i32)
+                .filter(|id| (id % 5 == 0) == wants_null)
+                .collect::<Vec<_>>();
+            assert_eq!(ids, expected, "{filter}");
+            assert!(
+                read_bytes * 10 < full_bytes,
+                "{filter}: read {read_bytes} bytes of a {full_bytes} byte column"
+            );
+        }
+    }
+
+    /// Columns whose validity sits above a fixed-width leaf, with the rows that are null.
+    /// `null_structs` is off for formats that cannot encode struct validity (2.0).
+    fn null_check_shape_columns(
+        num_rows: usize,
+        null_structs: bool,
+    ) -> Vec<(ArrowField, ArrayRef, Vec<i32>)> {
+        let payload = |row: usize| vec![row as u8; 64];
+        let rows = 0..num_rows;
+        let valid = |pred: &dyn Fn(usize) -> bool| {
+            Some(arrow_buffer::NullBuffer::from(
+                rows.clone()
+                    .map(|r| !null_structs || pred(r))
+                    .collect::<Vec<_>>(),
+            ))
+        };
+        let binary = |rows: &[usize]| {
+            Arc::new(arrow_array::LargeBinaryArray::from_iter_values(
+                rows.iter().map(|r| payload(*r)),
+            )) as ArrayRef
+        };
+        let all_rows = rows.clone().collect::<Vec<_>>();
+
+        // list<struct<idx, data>>: null list, empty list, null item, null idx, plain item
+        let item_fields = Fields::from(vec![
+            ArrowField::new("idx", DataType::Int32, true),
+            ArrowField::new("data", DataType::LargeBinary, true),
+        ]);
+        let item_field = Arc::new(ArrowField::new(
+            "item",
+            DataType::Struct(item_fields.clone()),
+            true,
+        ));
+        let mut offsets = vec![0i32];
+        let mut list_valid = vec![];
+        let mut item_valid = vec![];
+        let mut idx = vec![];
+        let mut item_rows = vec![];
+        for row in rows.clone() {
+            let kind = row % 5;
+            list_valid.push(kind != 0);
+            if kind >= 2 {
+                item_valid.push(!null_structs || kind != 2);
+                idx.push((kind != 3).then_some(row as i32));
+                item_rows.push(row);
+            }
+            offsets.push(idx.len() as i32);
+        }
+        let items = StructArray::new(
+            item_fields,
+            vec![Arc::new(Int32Array::from(idx)), binary(&item_rows)],
+            Some(arrow_buffer::NullBuffer::from(item_valid)),
+        );
+        let los = arrow_array::ListArray::new(
+            item_field.clone(),
+            arrow_buffer::OffsetBuffer::new(offsets.into()),
+            Arc::new(items),
+            Some(arrow_buffer::NullBuffer::from(list_valid)),
+        );
+
+        // struct<inner: struct<idx, data>, wide>: null outer, null inner, null idx, plain
+        let inner_fields = Fields::from(vec![
+            ArrowField::new("idx", DataType::Int32, true),
+            ArrowField::new("data", DataType::LargeBinary, true),
+        ]);
+        let outer_fields = Fields::from(vec![
+            ArrowField::new("inner", DataType::Struct(inner_fields.clone()), true),
+            ArrowField::new("wide", DataType::LargeBinary, true),
+        ]);
+        let inner = StructArray::new(
+            inner_fields,
+            vec![
+                Arc::new(Int32Array::from_iter(
+                    rows.clone().map(|r| (r % 4 != 2).then_some(r as i32)),
+                )),
+                binary(&all_rows),
+            ],
+            valid(&|r| r % 4 != 1),
+        );
+        let sos = StructArray::new(
+            outer_fields,
+            vec![Arc::new(inner), binary(&all_rows)],
+            valid(&|r| r % 4 != 0),
+        );
+
+        // struct<idx NOT NULL, data>: a null struct whose non-nullable child has values
+        let nn_fields = Fields::from(vec![
+            ArrowField::new("idx", DataType::Int32, false),
+            ArrowField::new("data", DataType::LargeBinary, true),
+        ]);
+        let nn = StructArray::new(
+            nn_fields,
+            vec![
+                Arc::new(Int32Array::from_iter_values(rows.clone().map(|r| r as i32))),
+                binary(&all_rows),
+            ],
+            valid(&|r| r % 3 != 0),
+        );
+
+        // list<struct<idx, data> NOT NULL>: nullable list, non-nullable item
+        let lnn_item_fields = Fields::from(vec![
+            ArrowField::new("idx", DataType::Int32, true),
+            ArrowField::new("data", DataType::LargeBinary, true),
+        ]);
+        let lnn_item_field = Arc::new(ArrowField::new(
+            "item",
+            DataType::Struct(lnn_item_fields.clone()),
+            false,
+        ));
+        let mut offsets = vec![0i32];
+        let mut list_valid = vec![];
+        let mut idx = vec![];
+        let mut item_rows = vec![];
+        for row in rows.clone() {
+            let kind = row % 3;
+            list_valid.push(kind != 0);
+            if kind == 2 {
+                idx.push(Some(row as i32));
+                item_rows.push(row);
+            }
+            offsets.push(idx.len() as i32);
+        }
+        let lnn_items = StructArray::new(
+            lnn_item_fields,
+            vec![Arc::new(Int32Array::from(idx)), binary(&item_rows)],
+            None,
+        );
+        let lnn = arrow_array::ListArray::new(
+            lnn_item_field,
+            arrow_buffer::OffsetBuffer::new(offsets.into()),
+            Arc::new(lnn_items),
+            Some(arrow_buffer::NullBuffer::from(list_valid)),
+        );
+
+        let nulls = |pred: &dyn Fn(usize) -> bool| {
+            rows.clone()
+                .filter(|r| pred(*r))
+                .map(|r| r as i32)
+                .collect::<Vec<_>>()
+        };
+        let struct_nulls = |pred: &dyn Fn(usize) -> bool| {
+            if null_structs { nulls(pred) } else { vec![] }
+        };
+        vec![
+            (
+                ArrowField::new("los", DataType::List(item_field), true),
+                Arc::new(los) as ArrayRef,
+                nulls(&|r| r % 5 == 0),
+            ),
+            (
+                ArrowField::new("sos", sos.data_type().clone(), true),
+                Arc::new(sos),
+                struct_nulls(&|r| r % 4 == 0),
+            ),
+            (
+                ArrowField::new("nn", nn.data_type().clone(), true),
+                Arc::new(nn),
+                struct_nulls(&|r| r % 3 == 0),
+            ),
+            (
+                ArrowField::new("lnn", lnn.data_type().clone(), true),
+                Arc::new(lnn),
+                nulls(&|r| r % 3 == 0),
+            ),
+        ]
+    }
+
+    /// Sorted `id`s matching `filter`, asserting the batch carries nothing but `id`.
+    async fn ids_matching(dataset: &Dataset, filter: &str) -> Vec<i32> {
+        let batch = dataset
+            .scan()
+            .project(&["id"])
+            .unwrap()
+            .filter(filter)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(
+            batch.schema().fields().len(),
+            1,
+            "{filter}: {:?}",
+            batch.schema()
+        );
+        let mut ids = batch
+            .column(0)
+            .as_primitive::<Int32Type>()
+            .values()
+            .to_vec();
+        ids.sort_unstable();
+        ids
+    }
+
+    fn null_check_read_columns(dataset: &Arc<Dataset>, filter: &str) -> Vec<String> {
+        let planner = Planner::new(Arc::new(dataset.schema().into()));
+        let expr = planner.parse_filter(filter).unwrap();
+        filter_read_columns(&expr, &dataset.empty_projection())
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_null_check_narrow_leaf_across_formats(
+        #[values(
+            LanceFileVersion::Legacy,
+            LanceFileVersion::V2_0,
+            LanceFileVersion::V2_1,
+            LanceFileVersion::V2_2
+        )]
+        version: LanceFileVersion,
+    ) {
+        // The narrow leaf must answer the null check exactly as the whole column does.  From
+        // 2.1 on every validity layer is stored, so both also match the written data.
+        let num_rows = 60usize;
+        let stores_struct_validity =
+            !matches!(version, LanceFileVersion::Legacy | LanceFileVersion::V2_0);
+        let shapes = null_check_shape_columns(num_rows, version != LanceFileVersion::V2_0);
+        let mut fields = vec![ArrowField::new("id", DataType::Int32, true)];
+        let mut columns =
+            vec![Arc::new(Int32Array::from_iter_values(0..num_rows as i32)) as ArrayRef];
+        for (field, array, _) in &shapes {
+            fields.push(field.clone());
+            columns.push(array.clone());
+        }
+        let schema = Arc::new(ArrowSchema::new(fields));
+        let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let test_dir = TempStrDir::default();
+        let params = WriteParams {
+            max_rows_per_file: 25,
+            max_rows_per_group: 10,
+            data_storage_version: Some(version),
+            ..Default::default()
+        };
+        Dataset::write(reader, &test_dir, Some(params))
+            .await
+            .unwrap();
+        let dataset = Arc::new(Dataset::open(&test_dir).await.unwrap());
+
+        for (field, _, written_nulls) in &shapes {
+            let name = field.name();
+            if version == LanceFileVersion::Legacy && name == "lnn" {
+                // The v1 reader cannot read back a list with a non-nullable item at all.
+                continue;
+            }
+            let read_columns = null_check_read_columns(&dataset, &format!("{name} IS NULL"));
+            assert_eq!(read_columns.len(), 1, "{name}: {read_columns:?}");
+            assert!(
+                read_columns[0].ends_with(".idx"),
+                "{name}: {read_columns:?}"
+            );
+
+            let full = dataset
+                .scan()
+                .project(&["id", name])
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+            let full_col = full.column_by_name(name).unwrap();
+            let full_ids = full.column(0).as_primitive::<Int32Type>();
+            let mut nulls = (0..full.num_rows())
+                .filter(|i| full_col.is_null(*i))
+                .map(|i| full_ids.value(i))
+                .collect::<Vec<_>>();
+            nulls.sort_unstable();
+            if stores_struct_validity {
+                assert_eq!(
+                    &nulls, written_nulls,
+                    "{version:?} {name}: full column read"
+                );
+            }
+            let not_nulls = (0..num_rows as i32)
+                .filter(|id| !nulls.contains(id))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                ids_matching(&dataset, &format!("{name} IS NULL")).await,
+                nulls,
+                "{version:?} {name} IS NULL"
+            );
+            assert_eq!(
+                ids_matching(&dataset, &format!("{name} IS NOT NULL")).await,
+                not_nulls,
+                "{version:?} {name} IS NOT NULL"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_null_check_atomic_columns_read_whole() {
+        // Blobs, packed structs and maps are one physical column each, so a null check on
+        // them is not rewritten and still answers correctly.
+        let num_rows = 30usize;
+        let packed_fields = Fields::from(vec![
+            ArrowField::new("a", DataType::Int32, true),
+            ArrowField::new("b", DataType::LargeBinary, true),
+        ]);
+        let packed = StructArray::new(
+            packed_fields.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..num_rows as i32)) as ArrayRef,
+                Arc::new(arrow_array::LargeBinaryArray::from_iter_values(
+                    (0..num_rows).map(|r| vec![r as u8; 16]),
+                )),
+            ],
+            Some(arrow_buffer::NullBuffer::from(
+                (0..num_rows).map(|r| r % 3 != 0).collect::<Vec<_>>(),
+            )),
+        );
+        let mut blobs = BlobArrayBuilder::new(num_rows);
+        for r in 0..num_rows {
+            if r % 3 == 0 {
+                blobs.push_null().unwrap();
+            } else {
+                blobs.push_bytes(vec![r as u8; 16]).unwrap();
+            }
+        }
+        let legacy_blob = arrow_array::LargeBinaryArray::from_iter(
+            (0..num_rows).map(|r| (r % 3 != 0).then(|| vec![r as u8; 16])),
+        );
+        let map_keys = (0..num_rows).map(|r| r.to_string()).collect::<Vec<_>>();
+        let map_values = Int32Array::from_iter_values(0..num_rows as i32);
+        let map = arrow_array::MapArray::new_from_strings(
+            map_keys.iter().map(|s| s.as_str()),
+            &map_values,
+            &(0..=num_rows as u32).collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, true),
+            ArrowField::new("ps", DataType::Struct(packed_fields), true).with_metadata(
+                HashMap::from([("lance-encoding:packed".to_string(), "true".to_string())]),
+            ),
+            blob_field("blobs", true),
+            ArrowField::new("lb", DataType::LargeBinary, true).with_metadata(HashMap::from([(
+                "lance-encoding:blob".to_string(),
+                "true".to_string(),
+            )])),
+            ArrowField::new("m", map.data_type().clone(), true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..num_rows as i32)),
+                Arc::new(packed),
+                blobs.finish().unwrap(),
+                Arc::new(legacy_blob),
+                Arc::new(map),
+            ],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let test_dir = TempStrDir::default();
+        Dataset::write(reader, &test_dir, None).await.unwrap();
+        let dataset = Arc::new(Dataset::open(&test_dir).await.unwrap());
+
+        let nulls = (0..num_rows as i32)
+            .filter(|r| r % 3 == 0)
+            .collect::<Vec<_>>();
+        for (name, expected) in [
+            ("ps", &nulls),
+            ("blobs", &nulls),
+            ("lb", &nulls),
+            ("m", &vec![]),
+        ] {
+            let filter = format!("{name} IS NULL");
+            assert_eq!(null_check_read_columns(&dataset, &filter), vec![name]);
+            assert_eq!(&ids_matching(&dataset, &filter).await, expected, "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_null_check_with_late_materialized_column() {
+        // The null-checked column is also projected: the narrow leaf is read eagerly, the
+        // rest is taken after the filter, and the two halves merge back into the column.
+        let num_rows = 60usize;
+        let (field, array, nulls) = null_check_shape_columns(num_rows, true).remove(0);
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, true),
+            field,
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..num_rows as i32)),
+                array.clone(),
+            ],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let test_dir = TempStrDir::default();
+        let params = WriteParams {
+            max_rows_per_file: 25,
+            ..Default::default()
+        };
+        Dataset::write(reader, &test_dir, Some(params))
+            .await
+            .unwrap();
+        let dataset = Dataset::open(&test_dir).await.unwrap();
+
+        for (filter, wants_null) in [
+            ("los IS NULL", true),
+            ("los IS NOT NULL", false),
+            ("los IS NOT NULL AND id > 10", false),
+        ] {
+            let mut scan = dataset.scan();
+            scan.project(&["id", "los"])
+                .unwrap()
+                .filter(filter)
+                .unwrap();
+            let plan = scan.explain_plan(true).await.unwrap();
+            assert!(
+                plan.contains("projection=[id, los.item.idx]")
+                    && plan.contains("projection=[los], source=stream(_rowid)"),
+                "{filter}:\n{plan}"
+            );
+            let batch = scan.try_into_batch().await.unwrap();
+            let ids = batch.column(0).as_primitive::<Int32Type>();
+            let los = batch.column(1);
+            assert_eq!(los.data_type(), array.data_type(), "{filter}");
+            let expected_rows = (0..num_rows as i32)
+                .filter(|id| {
+                    nulls.contains(id) == wants_null && (!filter.contains("id >") || *id > 10)
+                })
+                .count();
+            assert_eq!(batch.num_rows(), expected_rows, "{filter}");
+            for i in 0..batch.num_rows() {
+                let id = ids.value(i) as usize;
+                assert_eq!(
+                    los.slice(i, 1).as_ref(),
+                    array.slice(id, 1).as_ref(),
+                    "{filter} row {id}"
+                );
+            }
+        }
     }
 
     #[rstest]

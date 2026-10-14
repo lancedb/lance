@@ -2797,10 +2797,13 @@ mod tests {
                 "1".into(),
             ),
         ]));
-        let schema = Arc::new(ArrowSchema::new(vec![
-            Field::new("id", DataType::Int32, false),
-            field,
-        ]));
+        let schema = Arc::new(ArrowSchema::new_with_metadata(
+            vec![Field::new("id", DataType::Int32, false), field],
+            HashMap::from([(
+                lance_table::feature_flags::MANAGED_BLOBS_META_KEY.to_string(),
+                "true".to_string(),
+            )]),
+        ));
         RecordBatch::try_new(
             schema,
             vec![
@@ -2891,11 +2894,14 @@ mod tests {
     ) {
         let fixture = MockDatasetFixture::try_new().unwrap();
         let batch = managed_blob_batch();
-        let schema = Arc::new(ArrowSchema::new(vec![
-            batch.schema().field(0).clone(),
-            batch.schema().field(1).clone(),
-            batch.schema().field(1).clone().with_name("other"),
-        ]));
+        let schema = Arc::new(ArrowSchema::new_with_metadata(
+            vec![
+                batch.schema().field(0).clone(),
+                batch.schema().field(1).clone(),
+                batch.schema().field(1).clone().with_name("other"),
+            ],
+            batch.schema().metadata().clone(),
+        ));
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![

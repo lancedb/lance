@@ -140,7 +140,7 @@ def _add_columns_blob_v2_values(tmp_path):
 def _assert_blob_v2_add_columns_result(dataset, column, payloads):
     desc = dataset.to_table(columns=[column]).column(column).chunk(0)
 
-    assert desc.field("kind").to_pylist() == [0, 4, 4, 3]
+    assert desc.field("kind").to_pylist() == [0, 1, 2, 3]
     assert desc.field("blob_id").to_pylist()[3] == 1
     assert desc.field("blob_uri").to_pylist()[3] == "external_blob.bin"
 
@@ -1654,7 +1654,7 @@ def test_blob_extension_inline_threshold_per_column(tmp_path):
 
     desc = ds.to_table(columns=["inline_blob", "packed_blob"])
     assert desc.column("inline_blob").chunk(0).field("kind").to_pylist() == [0]
-    assert desc.column("packed_blob").chunk(0).field("kind").to_pylist() == [4]
+    assert desc.column("packed_blob").chunk(0).field("kind").to_pylist() == [1]
 
 
 def test_blob_extension_threshold_metadata_persists_after_reopen(tmp_path):
@@ -1757,7 +1757,7 @@ def test_blob_extension_dedicated_threshold_precedes_inline_threshold(tmp_path):
     )
 
     desc = ds.to_table(columns=["blob"]).column("blob").chunk(0)
-    assert desc.field("kind").to_pylist() == [4]
+    assert desc.field("kind").to_pylist() == [2]
 
 
 def test_blob_extension_write_external(tmp_path):
@@ -1900,12 +1900,7 @@ def test_blob_extension_add_columns_record_batch_reader_failure_cleans_files(
     assert ds.version == 1
     files_after = _dataset_file_set(dataset_path)
     assert files_before <= files_after
-    orphans = files_after - files_before
-    assert orphans and all(
-        p.parts[0] == "_blobs" and p.suffix == ".blob" for p in orphans
-    )
-    # Independent payloads from failed writes follow the existing orphan policy.
-    # No concurrent writer is running here, so immediate unverified GC is safe.
+    assert files_after == files_before
     ds.cleanup_old_versions(delete_unverified=True)
     assert _dataset_file_set(dataset_path) == files_before
     assert external_blob_path.exists()
@@ -1939,12 +1934,7 @@ def test_blob_extension_add_columns_batch_udf_failure_cleans_files(tmp_path):
     assert ds.version == 1
     files_after = _dataset_file_set(dataset_path)
     assert files_before <= files_after
-    orphans = files_after - files_before
-    assert orphans and all(
-        p.parts[0] == "_blobs" and p.suffix == ".blob" for p in orphans
-    )
-    # Independent payloads from failed writes follow the existing orphan policy.
-    # No concurrent writer is running here, so immediate unverified GC is safe.
+    assert files_after == files_before
     ds.cleanup_old_versions(delete_unverified=True)
     assert _dataset_file_set(dataset_path) == files_before
     assert external_blob_path.exists()
@@ -2004,7 +1994,10 @@ def test_prepared_managed_blob_sharing_lifecycle(tmp_path, version, nested):
             )
         return pa.Table.from_arrays(
             [pa.array(ids, type=pa.int64()), values],
-            schema=pa.schema([pa.field("id", pa.int64()), field]),
+            schema=pa.schema(
+                [pa.field("id", pa.int64()), field],
+                metadata={"lance.blob.managed": "true"},
+            ),
         )
 
     initial = table(
@@ -2825,7 +2818,7 @@ def test_blob_v2_lazy_preserves_empty_and_null(tmp_path, values, has_sidecar):
         assert descriptions[0]["size"] == 0
     if has_sidecar:
         assert any(
-            description is not None and description["kind"] == 4
+            description is not None and description["kind"] == 1
             for description in descriptions
         )
         assert any(path.suffix == ".blob" for path in _dataset_file_set(dataset_path))
@@ -3084,7 +3077,7 @@ def test_write_nested_blob_v2_and_take_by_field_path(tmp_path):
     )
 
     desc = dataset.to_table(columns=["info.blob"]).column("info.blob").chunk(0)
-    assert desc.field("kind").to_pylist()[:2] == [0, 4]
+    assert desc.field("kind").to_pylist()[:2] == [0, 1]
 
     blobs = dataset.take_blobs("info.blob", indices=[0, 1])
     with blobs[0] as f:

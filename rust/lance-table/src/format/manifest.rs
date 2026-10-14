@@ -296,11 +296,14 @@ impl Manifest {
             // Kept unconditionally rather than derived from the cloned indexes:
             // over-fencing a clone is harmless, under-fencing one is not.
             // Sticky capabilities are also retained because the clone keeps the
-            // source file identities that require them.
+            // source file identities that require them. So are stable row ids:
+            // they are otherwise derived from the fragments, so a clone of a table
+            // whose rows were all deleted would lose them and stop assigning ids
+            // from `next_row_id`.
             reader_feature_flags: self.reader_feature_flags
-                & (FLAG_COVERED_INDEX_METADATA | STICKY_READER_FLAGS),
+                & (FLAG_COVERED_INDEX_METADATA | STICKY_READER_FLAGS | FLAG_STABLE_ROW_IDS),
             writer_feature_flags: self.writer_feature_flags
-                & (FLAG_COVERED_INDEX_METADATA | STICKY_WRITER_FLAGS),
+                & (FLAG_COVERED_INDEX_METADATA | STICKY_WRITER_FLAGS | FLAG_STABLE_ROW_IDS),
             max_fragment_id: self.max_fragment_id,
             max_allocated_field_id: self.max_allocated_field_id,
             transaction_file: Some(transaction_file),
