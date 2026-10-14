@@ -260,6 +260,15 @@ impl LsmDataSourceCollector {
             .collect()
     }
 
+    /// In-memory memtables sorted by shard id. The map's iteration order
+    /// changes between collectors, and a scan's output order (and so its
+    /// limit / offset paging) follows source order.
+    fn in_memory_memtables_by_shard(&self) -> Vec<(&Uuid, &InMemoryMemTables)> {
+        let mut by_shard: Vec<_> = self.in_memory_memtables.iter().collect();
+        by_shard.sort_by_key(|(shard_id, _)| **shard_id);
+        by_shard
+    }
+
     /// True when `generation` for `shard_id` is still pinned in memory as a
     /// frozen memtable. During the post-flush grace window a generation is both
     /// committed to the manifest (a flushed source) and held in memory (an
@@ -278,7 +287,8 @@ impl LsmDataSourceCollector {
     /// Returns sources in a consistent order:
     /// 1. Base table (gen=0), if configured
     /// 2. SSTables per shard, ordered by generation
-    /// 3. In-memory memtables per shard (active + frozen-awaiting-flush)
+    /// 3. In-memory memtables per shard (active + frozen-awaiting-flush),
+    ///    by shard id
     pub fn collect(&self) -> Result<Vec<LsmDataSource>> {
         let mut sources = Vec::new();
 
@@ -302,7 +312,7 @@ impl LsmDataSourceCollector {
             }
         }
 
-        for (shard_id, mems) in &self.in_memory_memtables {
+        for (shard_id, mems) in self.in_memory_memtables_by_shard() {
             sources.extend(Self::in_memory_sources(*shard_id, mems));
         }
 
@@ -343,7 +353,7 @@ impl LsmDataSourceCollector {
             }
         }
 
-        for (shard_id, mems) in &self.in_memory_memtables {
+        for (shard_id, mems) in self.in_memory_memtables_by_shard() {
             if !shard_ids.contains(shard_id) {
                 continue;
             }

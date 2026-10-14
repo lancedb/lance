@@ -1153,6 +1153,59 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    async fn test_lsm_scan_multi_shard_order_is_deterministic() {
+        let schema = create_pk_schema();
+        let shards = [(1u128, [1, 2, 3]), (2u128, [4, 5, 6])];
+        let scan_ids = |reverse_registration: bool| {
+            let schema = schema.clone();
+            let mut shards = shards.to_vec();
+            if reverse_registration {
+                shards.reverse();
+            }
+            async move {
+                let mut scanner = LsmScanner::without_base_table(
+                    schema.clone(),
+                    "memory://multi-shard-order",
+                    vec![],
+                    vec!["id".to_string()],
+                );
+                for (shard, ids) in shards {
+                    let (batch_store, index_store) =
+                        pk_indexed(&[create_test_batch(&schema, &ids, "active")]);
+                    scanner = scanner.with_in_memory_memtables(
+                        Uuid::from_u128(shard),
+                        InMemoryMemTables {
+                            active: InMemoryMemTableRef {
+                                batch_store,
+                                index_store,
+                                schema: schema.clone(),
+                                generation: 1,
+                            },
+                            frozen: vec![],
+                        },
+                    );
+                }
+                let batch = scanner.try_into_batch().await.unwrap();
+                let ids = batch["id"].as_any().downcast_ref::<Int32Array>().unwrap();
+                ids.values().to_vec()
+            }
+        };
+
+        // Shard memtables are held in hash maps; the scan must not inherit
+        // their iteration order, or an offset pages through a different
+        // row order on each read.
+        for reverse_registration in [false, true] {
+            for attempt in 0..10 {
+                assert_eq!(
+                    scan_ids(reverse_registration).await,
+                    vec![4, 5, 6, 1, 2, 3],
+                    "reverse_registration={reverse_registration}, attempt={attempt}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn test_lsm_scan_with_offset_without_limit() {
         let (base_dataset, shard_snapshots, active_memtable, pk_columns, _temp_path) =
             setup_multi_level_lsm().await;
