@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::Poll;
@@ -12,11 +12,11 @@ use std::{
 use arrow_array::cast::AsArray;
 use arrow_array::types::UInt64Type;
 use arrow_array::{Array, BooleanArray, RecordBatch, RecordBatchOptions, UInt32Array};
-use arrow_schema::{Schema as ArrowSchema, SchemaRef};
+use arrow_schema::{DataType, Schema as ArrowSchema, SchemaRef};
 use datafusion::catalog::Session;
 use datafusion::common::runtime::SpawnedTask;
 use datafusion::common::stats::Precision;
-use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
@@ -34,8 +34,8 @@ use datafusion_physical_plan::filter::FilterExec;
 use datafusion_physical_plan::metrics::{BaselineMetrics, Count, MetricsSet, Time};
 use futures::stream::BoxStream;
 use futures::{FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt, future};
-use lance_arrow::RecordBatchExt;
-use lance_core::datatypes::{OnMissing, Schema as LanceSchema};
+use lance_arrow::{DataTypeExt, RecordBatchExt};
+use lance_core::datatypes::{Field, OnMissing, Schema as LanceSchema, format_field_path_minimal};
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::utils::futures::FinallyStreamExt;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
@@ -72,7 +72,7 @@ use crate::dataset::scanner::{
 };
 use crate::dataset::versions;
 
-use super::utils::IoMetrics;
+use super::utils::{IoMetrics, estimated_bytes_per_row, estimated_total_byte_size};
 
 type MaterializedReadBatchFut = futures::future::BoxFuture<'static, Result<MaterializedBlobBatch>>;
 type MaterializedReadBatchesFut =
@@ -1507,7 +1507,7 @@ impl FilteredReadStream {
         };
 
         if let Some(filter) = &fragment_read_task.filter {
-            let filter_cols = Planner::column_names_in_expr(filter);
+            let filter_cols = filter_read_columns(filter, fragment_read_task.projection.as_ref());
             if !filter_cols.is_empty() {
                 fragment_read_task.projection = Arc::new(
                     fragment_read_task
@@ -1740,6 +1740,128 @@ impl FilteredReadStream {
     }
 }
 
+/// Columns a filter needs read, with a column that appears only as the operand
+/// of `IS NULL` / `IS NOT NULL` replaced by its narrowest fixed-width leaf.
+///
+/// A nested column's validity is carried by every leaf under it, so the check
+/// is answered from one narrow leaf instead of the whole column. A column with
+/// no such leaf (a bare `large_binary`, a blob) is read whole.
+pub(crate) fn filter_read_columns(filter: &Expr, projection: &Projection) -> Vec<String> {
+    let null_checked = null_check_only_columns(filter);
+    let schema = projection.base_schema();
+    Planner::column_names_in_expr(filter)
+        .into_iter()
+        .map(|column| {
+            if !null_checked.contains(&column) {
+                return column;
+            }
+            schema
+                .resolve(&column)
+                .and_then(|fields| validity_leaf(fields.last()?))
+                .map(|leaf| format!("{column}.{leaf}"))
+                .unwrap_or(column)
+        })
+        .collect()
+}
+
+/// Columns referenced only as the direct operand of a null check.
+fn null_check_only_columns(filter: &Expr) -> HashSet<String> {
+    let mut null_checked = HashSet::new();
+    let mut other = HashSet::new();
+    filter
+        .apply(|expr| {
+            match expr {
+                Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
+                    if let Expr::Column(column) = inner.as_ref() {
+                        null_checked.insert(column.name.clone());
+                        return Ok(TreeNodeRecursion::Jump);
+                    }
+                }
+                Expr::Column(column) => {
+                    other.insert(column.name.clone());
+                }
+                _ => {}
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })
+        .expect("infallible visitor");
+    null_checked.difference(&other).cloned().collect()
+}
+
+/// Path, relative to `field`, of its narrowest fixed-width leaf, preferring
+/// leaves under fewer list levels. `None` when `field` is a leaf, is stored as
+/// one physical column (blob, packed struct, map), or has no such leaf.
+fn validity_leaf(field: &Field) -> Option<String> {
+    fn fixed_width(data_type: &DataType) -> Option<usize> {
+        match data_type {
+            DataType::Boolean => Some(1),
+            other => other.byte_width_opt(),
+        }
+    }
+    fn is_atomic(field: &Field) -> bool {
+        field.is_blob()
+            || field.is_packed_struct()
+            || matches!(field.data_type(), DataType::Map(..))
+    }
+    fn walk(field: &Field, list_depth: usize) -> Option<((usize, usize), Vec<&str>)> {
+        if is_atomic(field) {
+            return None;
+        }
+        if let Some(width) = fixed_width(&field.data_type()) {
+            return Some(((list_depth, width), vec![]));
+        }
+        let child_depth = list_depth + usize::from(!field.data_type().is_struct());
+        field
+            .children
+            .iter()
+            .filter_map(|child| {
+                let (score, mut path) = walk(child, child_depth)?;
+                path.insert(0, child.name.as_str());
+                Some((score, path))
+            })
+            .min_by_key(|(score, _)| *score)
+    }
+    let (_, path) = walk(field, 0)?;
+    (!path.is_empty()).then(|| format_field_path_minimal(&path))
+}
+
+/// Top-level names of the projected fields, listing a partially projected
+/// nested field by the paths of its projected leaves.
+fn projected_column_names(projection: &Projection) -> Vec<String> {
+    fn leaf_count(field: &Field) -> usize {
+        if field.children.is_empty() {
+            1
+        } else {
+            field.children.iter().map(leaf_count).sum()
+        }
+    }
+    fn leaf_paths<'a>(field: &'a Field, prefix: &mut Vec<&'a str>, names: &mut Vec<String>) {
+        prefix.push(&field.name);
+        if field.children.is_empty() {
+            names.push(format_field_path_minimal(prefix));
+        } else {
+            for child in &field.children {
+                leaf_paths(child, prefix, names);
+            }
+        }
+        prefix.pop();
+    }
+    let base = projection.base_schema();
+    let mut names = Vec::new();
+    for field in &projection.to_bare_schema().fields {
+        let whole = field.is_blob()
+            || base
+                .field_by_id(field.id)
+                .is_none_or(|base_field| leaf_count(base_field) == leaf_count(field));
+        if whole {
+            names.push(field.name.clone());
+        } else {
+            leaf_paths(field, &mut Vec::new(), &mut names);
+        }
+    }
+    names
+}
+
 /// Options for a filtered read.
 #[derive(Debug, Clone)]
 pub struct FilteredReadOptions {
@@ -1868,6 +1990,15 @@ impl FilteredReadOptions {
                 "with_deleted_rows is not supported when there is a scan range".into(),
             ));
         }
+        if scan_range.start > scan_range.end {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "scan range start ({}) is greater than its end ({})",
+                    scan_range.start, scan_range.end
+                )
+                .into(),
+            ));
+        }
         self.scan_range_before_filter = Some(scan_range);
         Ok(self)
     }
@@ -1884,6 +2015,15 @@ impl FilteredReadOptions {
         if self.with_deleted_rows {
             return Err(Error::invalid_input_source(
                 "with_deleted_rows is not supported when there is a scan range".into(),
+            ));
+        }
+        if scan_range.start > scan_range.end {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "scan range start ({}) is greater than its end ({})",
+                    scan_range.start, scan_range.end
+                )
+                .into(),
             ));
         }
         self.scan_range_after_filter = Some(scan_range);
@@ -1981,6 +2121,8 @@ impl FilteredReadOptions {
 
     /// An alternative to [`Self::with_filter`] to set the filters from a FilterPlan if you already have one
     pub fn with_filter_plan(mut self, filter_plan: FilterPlan) -> Self {
+        // This infallible setter does not validate the refine/full pairing, so
+        // statistics must check for refine filters even without a full filter.
         self.physical_filters.clear();
         self.refine_filter = filter_plan.refine_expr;
         self.full_filter = filter_plan.full_expr;
@@ -2001,7 +2143,7 @@ impl FilteredReadOptions {
                 continue;
             }
 
-            let filter_columns = Planner::column_names_in_expr(filter);
+            let filter_columns = filter_read_columns(filter, &self.projection);
             let projection = self
                 .projection
                 .clone()
@@ -2042,10 +2184,10 @@ impl FilteredReadOptions {
     ) -> Result<Self> {
         self.projection = projection;
         for (filter, physical_filter) in &mut self.physical_filters {
-            let projection = self
-                .projection
-                .clone()
-                .union_columns(Planner::column_names_in_expr(filter), OnMissing::Error)?;
+            let projection = self.projection.clone().union_columns(
+                filter_read_columns(filter, &self.projection),
+                OnMissing::Error,
+            )?;
             let schema = public_blob_v2_binary_projection_schema(&projection);
             *physical_filter = physical_filter
                 .clone()
@@ -2115,6 +2257,8 @@ impl FilteredReadOptions {
 pub struct FilteredReadExec {
     dataset: Arc<Dataset>,
     options: FilteredReadOptions,
+    /// Cached from the output schema and dataset blob metadata at construction.
+    bytes_per_row: Option<f64>,
     materialization_context: Arc<BlobMaterializationContext>,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
@@ -2342,6 +2486,7 @@ impl FilteredReadExec {
                 &materialization_output_schema,
             ),
         ));
+        let bytes_per_row = estimated_bytes_per_row(output_schema.as_ref(), dataset.schema());
 
         // Row-stream reads preserve input order, but can drop identity columns.
         // Remap sort expressions to the output schema and retain only valid prefixes.
@@ -2424,6 +2569,7 @@ impl FilteredReadExec {
             options,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
+            bytes_per_row,
             input: RowSelector::RowStream(Arc::new(RowStreamSource {
                 plan: input,
                 key_column,
@@ -2496,6 +2642,7 @@ impl FilteredReadExec {
             }
         }
         let output_schema = public_blob_v2_binary_projection_schema(&options.projection);
+        let bytes_per_row = estimated_bytes_per_row(output_schema.as_ref(), dataset.schema());
         let num_partitions = match options.threading_mode {
             FilteredReadThreadingMode::OnePartitionMultipleThreads(_) => 1,
             FilteredReadThreadingMode::MultiplePartitions(n) => n,
@@ -2517,6 +2664,7 @@ impl FilteredReadExec {
             ),
             dataset,
             options,
+            bytes_per_row,
             properties,
             running_stream: Arc::new(AsyncMutex::new(None)),
             metrics,
@@ -3383,15 +3531,7 @@ impl DisplayAs for FilteredReadExec {
                 }
             };
         }
-        let columns = self
-            .options
-            .projection
-            .to_bare_schema()
-            .fields
-            .iter()
-            .map(|f| f.name.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
+        let columns = projected_column_names(&self.options.projection).join(", ");
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
                 write!(
@@ -3490,18 +3630,17 @@ impl ExecutionPlan for FilteredReadExec {
     ) -> datafusion::error::Result<Arc<Statistics>> {
         if let RowSelector::RowStream(source) = &self.input {
             // At most one output row per input row
+            let num_rows = source.plan.partition_statistics(partition)?.num_rows;
+            let num_rows = if self.options.physical_row_addr_prefilter.is_some() {
+                // Row-stream inputs may repeat keys, so bitmap cardinality is not
+                // an output bound. Filtering can only reduce the input estimate.
+                num_rows.to_inexact()
+            } else {
+                num_rows
+            };
             return Ok(Arc::new(Statistics {
-                num_rows: if self.options.physical_row_addr_prefilter.is_some() {
-                    // Row-stream inputs may repeat keys, so bitmap cardinality is not
-                    // an output bound. Filtering can only reduce the input estimate.
-                    source
-                        .plan
-                        .partition_statistics(partition)?
-                        .num_rows
-                        .to_inexact()
-                } else {
-                    source.plan.partition_statistics(partition)?.num_rows
-                },
+                num_rows,
+                total_byte_size: estimated_total_byte_size(num_rows, self.bytes_per_row),
                 ..Statistics::new_unknown(self.schema().as_ref())
             }));
         }
@@ -3546,6 +3685,16 @@ impl ExecutionPlan for FilteredReadExec {
                     total_rows
                 };
 
+            // Legal here alongside a row-set input, where it limits what the node
+            // returns from the rows the index selected.
+            let total_rows =
+                if let Some(scan_range_after_filter) = &self.options.scan_range_after_filter {
+                    let end = scan_range_after_filter.end.min(total_rows);
+                    end.saturating_sub(scan_range_after_filter.start)
+                } else {
+                    total_rows
+                };
+
             let total_rows = if partition.is_some() {
                 match self.options.threading_mode {
                     FilteredReadThreadingMode::MultiplePartitions(num_partitions) => {
@@ -3558,13 +3707,20 @@ impl ExecutionPlan for FilteredReadExec {
                 total_rows
             };
 
-            let num_rows = if self.options.physical_row_addr_prefilter.is_some() {
-                Precision::Inexact(total_rows as usize)
-            } else {
+            // An index search, a refine filter or a row-address prefilter can select
+            // rows without a full filter expression, so the fragment row count is then
+            // only an estimate.
+            let nothing_selects = self.input.row_set_plan().is_none()
+                && self.options.refine_filter.is_none()
+                && self.options.physical_row_addr_prefilter.is_none();
+            let num_rows = if nothing_selects {
                 Precision::Exact(total_rows as usize)
+            } else {
+                Precision::Inexact(total_rows as usize)
             };
             return Ok(Arc::new(Statistics {
                 num_rows,
+                total_byte_size: estimated_total_byte_size(num_rows, self.bytes_per_row),
                 ..datafusion::physical_plan::Statistics::new_unknown(self.schema().as_ref())
             }));
         };
@@ -3577,7 +3733,7 @@ impl ExecutionPlan for FilteredReadExec {
         // stats and basic filter shape)
 
         // Need to add in filter columns even though they aren't part of the projection
-        let filter_columns = Planner::column_names_in_expr(filter);
+        let filter_columns = filter_read_columns(filter, &self.options.projection);
         let read_projection = self
             .options
             .projection
@@ -3609,8 +3765,12 @@ impl ExecutionPlan for FilteredReadExec {
         // is applied in the mock input)
         let total_rows =
             if let Some(scan_range_after_filter) = &self.options.scan_range_after_filter {
+                // Saturating: the setters reject an inverted range, but the field
+                // is public, so the subtraction could still wrap.
                 df_stats.num_rows.min(&Precision::Exact(
-                    scan_range_after_filter.end as usize - scan_range_after_filter.start as usize,
+                    scan_range_after_filter
+                        .end
+                        .saturating_sub(scan_range_after_filter.start) as usize,
                 ))
             } else {
                 df_stats.num_rows
@@ -3638,6 +3798,10 @@ impl ExecutionPlan for FilteredReadExec {
                 false
             }
         });
+
+        // Recompute rather than keep what `FilterExec` derived: that figure covers
+        // the filter-only columns we just dropped and predates the range clamp above.
+        df_stats.total_byte_size = estimated_total_byte_size(df_stats.num_rows, self.bytes_per_row);
 
         Ok(Arc::new(df_stats))
     }
@@ -5056,13 +5220,36 @@ mod tests {
     async fn test_statistics() {
         let fixture = Arc::new(TestFixture::new().await);
 
-        let base_options = FilteredReadOptions::basic_full_read(&fixture.dataset);
+        let full_options = FilteredReadOptions::basic_full_read(&fixture.dataset);
+        let full_plan = fixture.make_plan(full_options.clone()).await;
+        // The fixture's utf8 column is seeded from the decoder's estimate, so the
+        // whole row reports a width rather than withdrawing.
+        assert_eq!(
+            full_plan
+                .partition_statistics(None)
+                .unwrap()
+                .total_byte_size,
+            Precision::Inexact(25282)
+        );
+
+        // Exclude the variable-width string. The remaining integers and vector
+        // use 33 bytes per row, including parent and child validity bits.
+        let projection = fixture
+            .dataset
+            .empty_projection()
+            .union_columns(
+                ["fully_indexed", "partly_indexed", "not_indexed", "vector"],
+                OnMissing::Error,
+            )
+            .unwrap();
+        let base_options = full_options.with_projection(projection);
 
         let plan = fixture.make_plan(base_options.clone()).await;
 
         let stats = plan.partition_statistics(None).unwrap();
         // With no filter and no range we have an exact count
         assert_eq!(stats.num_rows, Precision::Exact(250));
+        assert_eq!(stats.total_byte_size, Precision::Inexact(8250));
 
         // A physical selection can exclude rows within a fragment, so the
         // fragment row count is only an upper bound until the read is planned.
@@ -5109,7 +5296,7 @@ mod tests {
             Precision::Inexact(250)
         );
 
-        // No filter with range (before or after) is still exact
+        // An unfiltered scan with a before-filter range still has an exact count.
         let options = base_options
             .clone()
             .with_scan_range_before_filter(25..125)
@@ -5117,6 +5304,58 @@ mod tests {
         let plan = fixture.make_plan(options).await;
         let stats = plan.partition_statistics(None).unwrap();
         assert_eq!(stats.num_rows, Precision::Exact(100));
+        assert_eq!(stats.total_byte_size, Precision::Inexact(3300));
+
+        // A scalar-index input selects rows without any expression being set, so it
+        // reaches the no-filter branch above while producing a subset of what the
+        // fragments hold. The count there is an upper bound, not a promise.
+        let index_filter_plan = fixture.filter_plan("fully_indexed < 200", false).await;
+        let index_input = fixture
+            .index_input(&base_options.clone().with_filter_plan(index_filter_plan))
+            .await;
+        assert!(index_input.is_some(), "expected a scalar-index input");
+        let plan = FilteredReadExec::try_new(
+            fixture.dataset.clone(),
+            base_options.clone(),
+            index_input.clone(),
+        )
+        .unwrap();
+        assert!(plan.options().full_filter.is_none() && plan.options().refine_filter.is_none());
+        let stats = plan.partition_statistics(None).unwrap();
+        assert_eq!(stats.num_rows, Precision::Inexact(250));
+        assert_eq!(stats.total_byte_size, Precision::Inexact(8250));
+
+        // A range also caps an index-selected read without a filter expression.
+        let options = base_options
+            .clone()
+            .with_scan_range_after_filter(0..10)
+            .unwrap();
+        let plan =
+            FilteredReadExec::try_new(fixture.dataset.clone(), options, index_input).unwrap();
+        let stats = plan.partition_statistics(None).unwrap();
+        assert_eq!(stats.num_rows, Precision::Inexact(10));
+        assert_eq!(stats.total_byte_size, Precision::Inexact(330));
+
+        // `with_deleted_rows` emits the deleted rows as well, so the node produces
+        // the fragments' physical rows (300) and not the live ones (250) that
+        // `Fragment::num_rows` counts. Reporting the live count would under-report
+        // what a join above has to hold.
+        let options = base_options.clone().with_deleted_rows().unwrap();
+        let plan = fixture.make_plan(options).await;
+        let stats = plan.partition_statistics(None).unwrap();
+        assert_eq!(stats.num_rows, Precision::Exact(300));
+        // Keeping deleted rows also adds a nullable row id: 41.125 bytes per row.
+        assert_eq!(stats.total_byte_size, Precision::Inexact(12338));
+
+        // A range that starts past the end leaves nothing at all.
+        let options = base_options
+            .clone()
+            .with_scan_range_before_filter(300..400)
+            .unwrap();
+        let plan = fixture.make_plan(options).await;
+        let stats = plan.partition_statistics(None).unwrap();
+        assert_eq!(stats.num_rows, Precision::Exact(0));
+        assert_eq!(stats.total_byte_size, Precision::Inexact(0));
 
         // With a filter, we don't know the exact count but DF can make some guesses
 
@@ -5128,6 +5367,7 @@ mod tests {
         let plan = fixture.make_plan(options).await;
         let stats = plan.partition_statistics(None).unwrap();
         assert_eq!(stats.num_rows, Precision::Inexact(250));
+        assert_eq!(stats.total_byte_size, Precision::Inexact(8250));
 
         // In this case DF doesn't recognize the expression as simple and so it assumes a default
         // selectivity of 0.2
@@ -5137,6 +5377,19 @@ mod tests {
         let plan = fixture.make_plan(options).await;
         let stats = plan.partition_statistics(None).unwrap();
         assert_eq!(stats.num_rows, Precision::Inexact(50));
+        assert_eq!(stats.total_byte_size, Precision::Inexact(1650));
+
+        // An after-filter range is a limit: the count has to follow the rows the
+        // limit leaves, not the rows the unlimited scan would have read.
+        let options = base_options
+            .clone()
+            .with_filter_plan(fixture.filter_plan("random() < 0.5", false).await)
+            .with_scan_range_after_filter(0..10)
+            .unwrap();
+        let plan = fixture.make_plan(options).await;
+        let stats = plan.partition_statistics(None).unwrap();
+        assert_eq!(stats.num_rows, Precision::Inexact(10));
+        assert_eq!(stats.total_byte_size, Precision::Inexact(330));
 
         // Filter columns not part of projection, make sure statistics using correct input schema
         let options = base_options
@@ -5155,6 +5408,10 @@ mod tests {
         let stats = plan.partition_statistics(None).unwrap();
         assert_eq!(stats.num_rows, Precision::Inexact(250));
         assert_eq!(stats.column_statistics.len(), 1);
+        // Only the vector is projected, so only the vector is billed: 16 bytes of
+        // values, its own validity bit and one per float, or 16.625 a row.
+        // `not_indexed` is read to evaluate the filter but never output.
+        assert_eq!(stats.total_byte_size, Precision::Inexact(4157));
     }
 
     #[test_log::test(tokio::test)]
@@ -5412,6 +5669,75 @@ mod tests {
         let batches = stream.try_collect::<Vec<_>>().await.unwrap();
         let actual_values = get_fully_indexed_values(batches).await;
         assert_eq!(actual_values, (10..20).collect::<Vec<_>>());
+    }
+
+    /// Refine-only options must not expose an exact unfiltered row count that
+    /// DataFusion could fold into `COUNT(*)`.
+    #[tokio::test]
+    async fn a_refine_filter_alone_leaves_the_row_count_inexact() {
+        let fixture = Arc::new(TestFixture::new().await);
+        let base_options = FilteredReadOptions::basic_full_read(&fixture.dataset);
+
+        let unfiltered = fixture.make_plan(base_options.clone()).await;
+        let Precision::Exact(rows) = unfiltered.partition_statistics(None).unwrap().num_rows else {
+            panic!("a read with nothing selecting rows knows how many it returns");
+        };
+
+        // Public fields can bypass the pairing check in `with_filter` and the
+        // proto decoder.
+        let filter_plan = fixture.filter_plan("fully_indexed < 50", false).await;
+        let mut options = base_options;
+        options.refine_filter = filter_plan.full_expr.clone();
+        assert!(options.full_filter.is_none());
+        let plan = fixture.make_plan(options).await;
+        assert!(
+            plan.input.row_set_plan().is_none(),
+            "the refine filter has to be the only thing selecting rows here"
+        );
+
+        let stats = plan.partition_statistics(None).unwrap();
+        assert_eq!(stats.num_rows, Precision::Inexact(rows));
+    }
+
+    /// An inverted range is rejected where it is set, and cannot wrap the
+    /// subtraction that turns an after-filter range into a row cap.
+    #[tokio::test]
+    async fn an_inverted_scan_range_is_rejected_not_wrapped() {
+        let fixture = Arc::new(TestFixture::new().await);
+        let base_options = FilteredReadOptions::basic_full_read(&fixture.dataset);
+        // Built field by field because clippy rejects the literal form.
+        let inverted = Range {
+            start: 100u64,
+            end: 50,
+        };
+
+        for result in [
+            base_options
+                .clone()
+                .with_scan_range_before_filter(inverted.clone()),
+            base_options
+                .clone()
+                .with_scan_range_after_filter(inverted.clone()),
+        ] {
+            let error = result.expect_err("an inverted range is not a window over any rows");
+            assert!(matches!(error, Error::InvalidInput { .. }));
+            let message = error.to_string();
+            assert!(
+                message.contains("(100)") && message.contains("(50)"),
+                "the error should name both bounds, got: {message}"
+            );
+        }
+
+        // The field is public, so the statistics have to hold without the setter.
+        // A filter exercises the separate after-filter subtraction, which must
+        // saturate even when validation was bypassed.
+        let filter_plan = fixture.filter_plan("fully_indexed < 50", false).await;
+        let mut options = base_options.with_filter_plan(filter_plan);
+        options.scan_range_after_filter = Some(inverted);
+        let plan = fixture.make_plan(options).await;
+
+        let stats = plan.partition_statistics(None).unwrap();
+        assert_eq!(stats.num_rows, Precision::Inexact(0));
     }
 
     #[tokio::test]
@@ -7437,5 +7763,188 @@ mod tests {
             let plan = take_plan(&dataset, input, &["text"]).unwrap();
             plan.execute(0, Arc::new(TaskContext::default())).unwrap();
         }
+    }
+
+    fn null_check_schema() -> ArrowSchema {
+        use arrow_schema::{Field as ArrowField, Fields};
+        let narrow_wide = |narrow: ArrowField| {
+            DataType::Struct(Fields::from(vec![
+                narrow,
+                ArrowField::new("data", DataType::LargeBinary, true),
+            ]))
+        };
+        let list = |item: DataType| DataType::List(Arc::new(ArrowField::new("item", item, true)));
+        let idx = || ArrowField::new("idx", DataType::Int32, true);
+        ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, true),
+            ArrowField::new("cells", list(narrow_wide(idx())), true),
+            ArrowField::new(
+                "st",
+                DataType::Struct(Fields::from(vec![
+                    ArrowField::new("name", DataType::Utf8, true),
+                    ArrowField::new("flag", DataType::Boolean, true),
+                    ArrowField::new("data", DataType::LargeBinary, true),
+                ])),
+                true,
+            ),
+            ArrowField::new("deep", list(list(narrow_wide(idx()))), true),
+            // The leaf under no list wins over the narrower one under a list
+            ArrowField::new(
+                "mix",
+                DataType::Struct(Fields::from(vec![
+                    ArrowField::new("tags", list(DataType::Int8), true),
+                    ArrowField::new(
+                        "inner",
+                        narrow_wide(ArrowField::new("n", DataType::Int64, true)),
+                        true,
+                    ),
+                    ArrowField::new("blob", DataType::LargeBinary, true),
+                ])),
+                true,
+            ),
+            ArrowField::new("raw", DataType::LargeBinary, true),
+            ArrowField::new("rawlist", list(DataType::LargeBinary), true),
+            ArrowField::new(
+                "wide",
+                DataType::Struct(Fields::from(vec![
+                    ArrowField::new("a", DataType::Utf8, true),
+                    ArrowField::new("b", DataType::LargeBinary, true),
+                ])),
+                true,
+            ),
+            ArrowField::new(
+                "dict",
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                true,
+            ),
+            ArrowField::new(
+                "dstruct",
+                DataType::Struct(Fields::from(vec![
+                    ArrowField::new(
+                        "d",
+                        DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                        true,
+                    ),
+                    ArrowField::new("n", DataType::Int16, true),
+                ])),
+                true,
+            ),
+            ArrowField::new(
+                "vec",
+                DataType::FixedSizeList(
+                    Arc::new(ArrowField::new("item", DataType::Float32, true)),
+                    4,
+                ),
+                true,
+            ),
+            ArrowField::new(
+                "fsl",
+                DataType::FixedSizeList(
+                    Arc::new(ArrowField::new("item", narrow_wide(idx()), true)),
+                    2,
+                ),
+                true,
+            ),
+            ArrowField::new(
+                "dotted",
+                narrow_wide(ArrowField::new("a.b", DataType::Int32, true)),
+                true,
+            ),
+            ArrowField::new(
+                "tick",
+                narrow_wide(ArrowField::new("a`b", DataType::Int32, true)),
+                true,
+            ),
+            ArrowField::new("packed", narrow_wide(idx()), true).with_metadata(HashMap::from([(
+                "lance-encoding:packed".to_string(),
+                "true".to_string(),
+            )])),
+            ArrowField::new("lb", DataType::LargeBinary, true).with_metadata(HashMap::from([(
+                "lance-encoding:blob".to_string(),
+                "true".to_string(),
+            )])),
+            crate::blob::blob_field("b2", true),
+            ArrowField::new(
+                "m",
+                DataType::Map(
+                    Arc::new(ArrowField::new(
+                        "entries",
+                        DataType::Struct(Fields::from(vec![
+                            ArrowField::new("keys", DataType::Utf8, false),
+                            ArrowField::new("values", DataType::Int32, true),
+                        ])),
+                        false,
+                    )),
+                    false,
+                ),
+                true,
+            ),
+        ])
+    }
+
+    #[rstest]
+    #[case::list_of_struct("cells IS NULL", &["cells.item.idx"])]
+    #[case::is_not_null("cells IS NOT NULL", &["cells.item.idx"])]
+    #[case::negated("NOT (cells IS NULL)", &["cells.item.idx"])]
+    #[case::with_other_column("cells IS NULL OR id > 5", &["cells.item.idx", "id"])]
+    #[case::both_checks("cells IS NULL AND NOT (cells IS NOT NULL)", &["cells.item.idx"])]
+    #[case::referenced_elsewhere("st IS NULL AND st.name = 'x'", &["st", "st.name"])]
+    #[case::struct_only_boolean_leaf("st IS NULL", &["st.flag"])]
+    #[case::nested_lists("deep IS NULL", &["deep.item.item.idx"])]
+    #[case::fewer_lists_beats_narrower("mix IS NULL", &["mix.inner.n"])]
+    #[case::bare_binary("raw IS NULL", &["raw"])]
+    #[case::list_of_binary("rawlist IS NULL", &["rawlist"])]
+    #[case::struct_of_wide("wide IS NULL", &["wide"])]
+    #[case::dictionary("dict IS NULL", &["dict"])]
+    #[case::dictionary_sibling("dstruct IS NULL", &["dstruct.n"])]
+    #[case::fixed_size_list("vec IS NULL", &["vec"])]
+    #[case::fixed_size_list_of_struct("fsl IS NULL", &["fsl.item.idx"])]
+    #[case::dotted_leaf("dotted IS NULL", &["dotted.`a.b`"])]
+    #[case::backtick_leaf("tick IS NULL", &["tick.`a``b`"])]
+    #[case::packed_struct("packed IS NULL", &["packed"])]
+    #[case::legacy_blob("lb IS NULL", &["lb"])]
+    #[case::blob_v2("b2 IS NULL", &["b2"])]
+    #[case::map("m IS NULL", &["m"])]
+    fn test_filter_read_columns(#[case] filter: &str, #[case] expected: &[&str]) {
+        let arrow_schema = null_check_schema();
+        let schema = Arc::new(LanceSchema::try_from(&arrow_schema).unwrap());
+        let expr = Planner::new(Arc::new(arrow_schema))
+            .parse_filter(filter)
+            .unwrap();
+        let columns = filter_read_columns(&expr, &Projection::empty(schema.clone()));
+        assert_eq!(columns, expected);
+        for column in &columns {
+            assert!(
+                schema.resolve(column).is_some(),
+                "{column} does not resolve"
+            );
+        }
+    }
+
+    #[test]
+    fn test_filter_read_columns_projected_column_stays_whole() {
+        let arrow_schema = null_check_schema();
+        let schema = Arc::new(LanceSchema::try_from(&arrow_schema).unwrap());
+        let expr = Planner::new(Arc::new(arrow_schema))
+            .parse_filter("cells IS NULL")
+            .unwrap();
+        let projection = Projection::empty(schema.clone())
+            .union_column("cells", OnMissing::Error)
+            .unwrap();
+        let columns = filter_read_columns(&expr, &projection);
+        let read = projection
+            .clone()
+            .union_columns(columns, OnMissing::Error)
+            .unwrap();
+        assert_eq!(read.field_ids, projection.field_ids);
+        assert_eq!(projected_column_names(&read), vec!["cells"]);
+
+        let narrow = Projection::empty(schema)
+            .union_columns(["id", "cells.item.idx"], OnMissing::Error)
+            .unwrap();
+        assert_eq!(
+            projected_column_names(&narrow),
+            vec!["id", "cells.item.idx"]
+        );
     }
 }

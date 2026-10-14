@@ -52,6 +52,22 @@ pub async fn filtered_read_exec_to_proto(
     state: &SessionState,
 ) -> Result<pb::FilteredReadExecProto> {
     let table = table_identifier_from_dataset(exec.dataset()).await?;
+    filtered_read_exec_to_proto_with_table(exec, state, table)
+}
+
+/// Encode a [`FilteredReadExec`] whose table identifier the caller has already
+/// resolved.
+///
+/// [`filtered_read_exec_to_proto`] is async only because it resolves the
+/// dataset's latest storage options into the identifier. A caller that holds
+/// the identifier (or the storage options) can encode synchronously, for
+/// example from a DataFusion `PhysicalExtensionCodec`, whose `try_encode` is
+/// not async.
+pub fn filtered_read_exec_to_proto_with_table(
+    exec: &FilteredReadExec,
+    state: &SessionState,
+    table: pb::TableIdentifier,
+) -> Result<pb::FilteredReadExecProto> {
     // Use the pruned dataset schema for filter encoding — filters can reference columns
     // outside the projection (e.g. SELECT name WHERE age > 10), and some dataset columns
     // may have types that Substrait cannot serialize (e.g. FixedSizeList, Float16).
@@ -245,6 +261,14 @@ async fn fr_options_from_proto(
     // Filters — require filter_schema_ipc when filters are present
     let has_filters =
         proto.refine_filter_substrait.is_some() || proto.full_filter_substrait.is_some();
+    // The same pairing `FilteredReadOptions::with_filter` rejects. The two fields
+    // are assigned independently below, so without this a wire message carrying a
+    // refine filter alone would build options that setter would have refused.
+    if proto.refine_filter_substrait.is_some() && proto.full_filter_substrait.is_none() {
+        return Err(Error::invalid_input_source(
+            "refine_filter is set but full_filter is not".into(),
+        ));
+    }
     if has_filters {
         let filter_schema =
             schema_from_bytes(proto.filter_schema_ipc.as_ref().ok_or_else(|| {
@@ -754,6 +778,35 @@ mod tests {
         assert!(back.projection.with_row_id);
     }
 
+    /// Proto decoding must enforce the same filter pairing as `with_filter`.
+    #[tokio::test]
+    async fn test_options_from_proto_reject_refine_without_full_filter() {
+        let dataset = make_test_dataset().await;
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+        let filter_schema = Arc::new(prune_schema_for_substrait(&dataset.schema().into()));
+
+        let projection = dataset
+            .empty_projection()
+            .union_column("x", OnMissing::Error)
+            .unwrap();
+        let mut options = FilteredReadOptions::new(projection);
+        options.full_filter = Some(datafusion_expr::col("x").gt(datafusion_expr::lit(5i32)));
+        options.refine_filter = Some(datafusion_expr::col("x").lt(datafusion_expr::lit(100i32)));
+
+        let mut proto = fr_options_to_proto(&options, &filter_schema, &state).unwrap();
+        proto.full_filter_substrait = None;
+
+        let err = fr_options_from_proto(proto, &dataset, &state)
+            .await
+            .expect_err("a refine filter without a full filter is not a readable plan");
+        assert!(matches!(err, Error::InvalidInput { .. }));
+        assert!(
+            err.to_string().contains("refine_filter"),
+            "the error should name the field, got: {err}"
+        );
+    }
+
     #[tokio::test]
     async fn test_options_roundtrip_with_fragments() {
         let dataset = make_test_dataset().await;
@@ -891,6 +944,47 @@ mod tests {
             exec.options().projection.field_ids,
             back.options().projection.field_ids
         );
+    }
+
+    /// The synchronous encoder produces what the async one does, with the
+    /// caller's table identifier carried verbatim.
+    #[tokio::test]
+    async fn test_exec_to_proto_with_table_matches_async_encoding() {
+        let dataset = make_test_dataset().await;
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+
+        let filter = datafusion_expr::col("x").gt(datafusion_expr::lit(10_i32));
+        let options = FilteredReadOptions::basic_full_read(&dataset)
+            .with_filter(Some(filter.clone()), Some(filter))
+            .unwrap()
+            .with_scan_range_after_filter(5..30)
+            .unwrap();
+        let exec = FilteredReadExec::try_new(dataset.clone(), options, None).unwrap();
+
+        let from_async = filtered_read_exec_to_proto(&exec, &state).await.unwrap();
+        let table = pb::TableIdentifier {
+            uri: dataset.uri().to_string(),
+            version: dataset.manifest.version,
+            manifest_etag: dataset.manifest_location.e_tag.clone(),
+            serialized_manifest: None,
+            storage_options: [("region".to_string(), "test".to_string())].into(),
+        };
+        let from_sync =
+            filtered_read_exec_to_proto_with_table(&exec, &state, table.clone()).unwrap();
+
+        assert_eq!(from_sync.options, from_async.options);
+        assert_eq!(from_sync.plan, from_async.plan);
+        assert_eq!(from_sync.table, Some(table));
+
+        let back = filtered_read_exec_from_proto(from_sync, Some(dataset.clone()), None, &state)
+            .await
+            .unwrap();
+        assert_eq!(
+            exec.options().scan_range_after_filter,
+            back.options().scan_range_after_filter
+        );
+        assert_eq!(exec.options().full_filter, back.options().full_filter);
     }
 
     #[tokio::test]

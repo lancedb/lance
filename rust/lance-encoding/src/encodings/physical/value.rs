@@ -350,32 +350,14 @@ impl ValueEncoder {
     fn simple_per_value_fsl(fsl: FixedSizeListBlock) -> (PerValueDataBlock, CompressiveEncoding) {
         // The simple case is zero-copy, we just return the flattened inner buffer
         let encoding = Self::fsl_to_encoding(&fsl);
-        let num_values = fsl.num_values();
-        let mut child = *fsl.child;
-        let mut cum_dim = 1;
-        loop {
-            cum_dim *= fsl.dimension;
-            match child {
-                DataBlock::Nullable(nullable) => {
-                    child = *nullable.data;
-                }
-                DataBlock::FixedSizeList(inner) => {
-                    child = *inner.child;
-                }
-                DataBlock::FixedWidth(inner) => {
-                    let data = FixedWidthDataBlock {
-                        bits_per_value: inner.bits_per_value * cum_dim,
-                        num_values,
-                        data: inner.data,
-                        block_info: BlockInfo::new(),
-                    };
-                    return (PerValueDataBlock::Fixed(data), encoding);
-                }
-                _ => unreachable!(
-                    "Unexpected data block type in value encoder's simple_per_value_fsl"
-                ),
-            }
-        }
+        let Some(flat) = fsl.try_into_flat() else {
+            unreachable!("per_value_fsl only sends FSL blocks without nullable children here")
+        };
+        let data = FixedWidthDataBlock {
+            block_info: BlockInfo::new(),
+            ..flat
+        };
+        (PerValueDataBlock::Fixed(data), encoding)
     }
 
     fn nullable_per_value_fsl(fsl: FixedSizeListBlock) -> (PerValueDataBlock, CompressiveEncoding) {
@@ -892,8 +874,8 @@ mod tests {
     use std::{collections::HashMap, sync::Arc};
 
     use arrow_array::{
-        Array, ArrayRef, Decimal128Array, FixedSizeListArray, Int32Array, ListArray, UInt8Array,
-        make_array, new_null_array, types::UInt32Type,
+        Array, ArrayRef, Decimal128Array, FixedSizeListArray, Int32Array, ListArray, NullArray,
+        UInt8Array, make_array, new_null_array, types::UInt32Type,
     };
     use arrow_buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Field, TimeUnit};
@@ -1247,6 +1229,58 @@ mod tests {
         assert_eq!(decompressed.as_ref(), &sample_list);
     }
 
+    /// A null-free nested FSL is flattened by `simple_per_value_fsl`; each value
+    /// spans `outer * inner` leaves.
+    #[rstest::rstest]
+    #[case::outer_wider(22, 3)]
+    #[case::inner_wider(3, 22)]
+    fn test_nested_fsl_simple_per_value(#[case] outer_dim: i32, #[case] inner_dim: i32) {
+        let num_rows = 3;
+        let inner_field = Arc::new(Field::new("item", DataType::Int32, false));
+        let leaf = Arc::new(Int32Array::from_iter_values(
+            0..num_rows * outer_dim * inner_dim,
+        )) as ArrayRef;
+        let inner = Arc::new(FixedSizeListArray::new(
+            inner_field.clone(),
+            inner_dim,
+            leaf,
+            None,
+        )) as ArrayRef;
+        let outer = Arc::new(FixedSizeListArray::new(
+            Arc::new(Field::new(
+                "item",
+                DataType::FixedSizeList(inner_field, inner_dim),
+                false,
+            )),
+            outer_dim,
+            inner,
+            None,
+        )) as ArrayRef;
+
+        let encoder = ValueEncoder::default();
+        let (data, compression) =
+            PerValueCompressor::compress(&encoder, DataBlock::from_array(outer.clone())).unwrap();
+        let PerValueDataBlock::Fixed(data) = data else {
+            panic!()
+        };
+        assert_eq!(data.num_values, num_rows as u64);
+        assert_eq!(data.bits_per_value, 32 * (outer_dim * inner_dim) as u64);
+
+        let Compression::FixedSizeList(fsl) = compression.compression.unwrap() else {
+            panic!()
+        };
+        let decompressor = ValueDecompressor::from_fsl(fsl.as_ref()).unwrap();
+        let num_values = data.num_values;
+        let decompressed =
+            FixedPerValueDecompressor::decompress(&decompressor, data, num_values).unwrap();
+        let decompressed = make_array(
+            decompressed
+                .into_arrow(outer.data_type().clone(), true)
+                .unwrap(),
+        );
+        assert_eq!(decompressed.as_ref(), outer.as_ref());
+    }
+
     #[test_log::test(tokio::test)]
     async fn test_fsl_all_null() {
         let items = new_null_array(&DataType::Int32, 12);
@@ -1254,6 +1288,22 @@ mod tests {
         let list_nulls = BooleanBuffer::from(vec![true, false, false, false, true, true]);
         let list_array =
             FixedSizeListArray::new(items_field, 2, items, Some(NullBuffer::new(list_nulls)));
+
+        let test_cases = TestCases::default().with_structural_encodings();
+
+        check_round_trip_encoding_of_data(vec![Arc::new(list_array)], &test_cases, HashMap::new())
+            .await;
+    }
+
+    // A FixedSizeList of the Null type wrote fine but failed to read back, because the
+    // decoder gave the Null child a validity buffer, which arrow-rs rejects.
+    #[rstest::rstest]
+    #[test_log::test(tokio::test)]
+    async fn test_fsl_of_null_type(#[values(false, true)] has_outer_nulls: bool) {
+        let items_field = Arc::new(Field::new("item", DataType::Null, true));
+        let outer_nulls = has_outer_nulls.then(|| NullBuffer::from(vec![true, false, true]));
+        let list_array =
+            FixedSizeListArray::new(items_field, 2, Arc::new(NullArray::new(6)), outer_nulls);
 
         let test_cases = TestCases::default().with_structural_encodings();
 
