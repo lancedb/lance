@@ -605,6 +605,33 @@ When a concurrent transaction is detected, the rebase process:
 4. Accumulates fragment reuse index updates when concurrent Rewrites change fragment IDs
 5. Modifies the transaction if rebasable, or returns a retryable/incompatible conflict error
 
+### Idempotency Keys
+
+A transaction may carry idempotency keys: strings chosen by the application that identify units of work which must be applied to the table at most once.
+For example, a queue consumer whose messages can be redelivered to another consumer uses the message ids as keys.
+
+The keys are stored in the reserved transaction property `__lance_idempotency_keys` as a JSON array of strings.
+A transaction without this property has no keys.
+Readers that do not implement idempotency keys see an ordinary transaction property, so the property adds no requirement for readers.
+
+A writer that adds the property must satisfy these constraints:
+
+- Every key is a non-empty string.
+- The array is not empty; a transaction without keys omits the property.
+
+Implementations may limit the number of keys per transaction and their total size, because every later check in the window reads them again.
+
+Two transactions whose key sets intersect conflict, and the conflict is **incompatible**: rebasing would apply the same work twice.
+When a writer commits a transaction with a non-empty key set, it checks every transaction committed at a version after the transaction's `read_version` up to the version being created, before applying any other conflict rule to them.
+If any of those transactions carries one of the keys, the commit fails with a duplicate transaction error that names that version and the intersecting keys.
+A writer that cannot parse the property of such a transaction as a JSON array of strings must fail the commit rather than ignore the property.
+
+Because the manifest is written with put-if-not-exists, a successful commit has checked every version after its `read_version` up to the version it created.
+Versions at or before the `read_version` are not checked: the application observed them when it read the table, and is responsible for not committing work they already contain.
+An `Overwrite` with `read_version` 0 against an existing table does not depend on any earlier version, so its check starts at the latest version the writer loaded before committing.
+
+A detached transaction is not part of the version history, so no later transaction can be checked against it. Writers must reject idempotency keys on a detached commit.
+
 ### Conflict Scenarios
 
 #### Rebasable Conflict Example
