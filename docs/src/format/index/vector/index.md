@@ -442,9 +442,14 @@ if storage_metadata:
 
 ### Layered RaBitQ prefix planes
 
-Layered storage is opt-in (`layered: true` in `lance:rabit`) and requires a
-reader supporting the layered layout. The default, including missing `layered`,
-is the existing single-plane layout. A layered index supports every total width
+Layered storage (`layered: true` in `lance:rabit`) requires a reader supporting
+the layered layout. The optional `layered` build parameter distinguishes unset
+from explicit `true` or `false`: unset uses the product's build default (false
+in Lance OSS, true in LanceDB Enterprise), while an explicit value overrides
+that default. Widths 1 and 2 always use the single-plane layout, even when
+`layered` is explicitly true. Writers persist the resolved layout. For existing index metadata,
+missing `layered` always means the historical single-plane layout, independent
+of the reader's product or build default. A layered index supports every total width
 from 3 through 9 bits, with one sign bit and these fixed high/low widths:
 
 | Total bits | Sign | High | Low |
