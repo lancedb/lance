@@ -179,11 +179,9 @@ impl RQBuildParams {
 
 impl From<&RQBuildParams> for RabitQuantization {
     fn from(value: &RQBuildParams) -> Self {
-        use crate::pb::vector_index_details::rabit_quantization::{RotationType, RowLayout};
+        use crate::pb::vector_index_details::rabit_quantization::RotationType;
         Self {
             num_bits: value.num_bits as u32,
-            layered: None,
-            row_layout: RowLayout::Columns as i32,
             rotation_type: match value.rotation_type {
                 RQRotationType::Fast => RotationType::Fast as i32,
                 RQRotationType::Matrix => RotationType::Matrix as i32,
@@ -213,8 +211,6 @@ mod tests {
     use super::*;
 
     use half::{bf16, f16};
-    use prost::Message;
-    use rstest::rstest;
 
     fn test_bq<T: Float>() {
         let data: Vec<T> = [1.0, -1.0, 1.0, -5.0, -7.0, -1.0, 1.0, -1.0, -0.2, 1.2, 3.2]
@@ -250,23 +246,6 @@ mod tests {
     #[test]
     fn test_rq_build_params_default_num_bits() {
         assert_eq!(RQBuildParams::default().num_bits, 5);
-        assert_eq!(
-            RabitQuantization::from(&RQBuildParams::default()).layered,
-            None
-        );
-    }
-
-    #[rstest]
-    #[case::unspecified(None)]
-    #[case::disabled(Some(false))]
-    #[case::enabled(Some(true))]
-    fn test_rq_layered_presence_round_trip(#[case] layered: Option<bool>) {
-        let details = RabitQuantization {
-            layered,
-            ..RabitQuantization::from(&RQBuildParams::default())
-        };
-        let decoded = RabitQuantization::decode(details.encode_to_vec().as_slice()).unwrap();
-        assert_eq!(decoded.layered, layered);
     }
 
     #[test]
