@@ -232,8 +232,9 @@ pub async fn get_row_id_index(dataset: &Dataset) -> Result<Option<Arc<RowIdIndex
 
 /// Resolve row IDs to live addresses, preserving order, duplicates, and misses.
 ///
-/// Stable IDs use an ordinary BTree on `_rowid` for covered fragments and scan
-/// the column in uncovered fragments. Null, missing, and deleted stable IDs
+/// Stable IDs use compact inline ranges directly, an ordinary BTree on `_rowid`
+/// for other covered fragments, and a column scan for the remainder. Null,
+/// missing, and deleted stable IDs
 /// yield `None`. Without stable IDs, each non-null ID is already an address
 /// and is returned unchanged; the caller applies physical deletion filtering.
 ///
@@ -566,6 +567,21 @@ mod test {
         }
         assert!(dataset.schema().field(ROW_ID).is_none());
         let keys = UInt64Array::from(vec![Some(9), Some(1), None, Some(9), Some(20)]);
+        let failing = Arc::new(FailingProxyStore::new());
+        failing.fail_when("get_opts", "", "compact ranges must not perform IO");
+        let metadata_only = dataset.with_object_store_wrappers([
+            failing as Arc<dyn lance_io::object_store::WrappingObjectStore>
+        ]);
+        assert_eq!(
+            row_ids_to_row_addrs(&metadata_only, &keys).await.unwrap(),
+            vec![
+                Some(RowAddress::new_from_parts(2, 1)),
+                Some(RowAddress::new_from_parts(0, 1)),
+                None,
+                Some(RowAddress::new_from_parts(2, 1)),
+                None
+            ],
+        );
         assert_eq!(
             row_ids_to_row_addrs(&dataset, &keys).await.unwrap(),
             vec![
@@ -594,8 +610,17 @@ mod test {
             .unwrap();
         assert_eq!(taken["i"].as_primitive::<Int32Type>().values(), &[9, 1, 9]);
 
+        let before_delete = dataset.clone();
         dataset.delete("i = 1").await.unwrap();
         assert_row_id_lookup_matches_scan(&dataset).await;
+        assert_eq!(
+            row_ids_to_row_addrs(&before_delete, &keys).await.unwrap()[1],
+            Some(RowAddress::new_from_parts(0, 1))
+        );
+        assert_eq!(
+            row_ids_to_row_addrs(&dataset, &keys).await.unwrap()[1],
+            None
+        );
         assert_eq!(
             dataset.load_indices().await.unwrap().len(),
             usize::from(indexed)
@@ -615,6 +640,52 @@ mod test {
                 .unwrap()
                 .num_rows(),
             4
+        );
+    }
+
+    #[tokio::test]
+    async fn test_inline_range_lookup_offsets_and_snapshot_changes() {
+        let mut dataset = row_id_lookup_dataset().await;
+        let keys = UInt64Array::from(vec![Some(0), Some(100), Some(101), Some(2), None]);
+        let original = row_ids_to_row_addrs(&dataset, &keys).await.unwrap();
+        let old_snapshot = dataset.clone();
+        let mut sequence = RowIdSequence::from(100..102);
+        sequence.extend(RowIdSequence::from(0..2));
+        let manifest = Arc::make_mut(&mut dataset.manifest);
+        Arc::make_mut(&mut manifest.fragments)[0].row_id_meta = Some(RowIdMeta::Inline(
+            lance_table::rowids::write_row_ids(&sequence).into(),
+        ));
+        assert_eq!(
+            row_ids_to_row_addrs(&dataset, &keys).await.unwrap(),
+            vec![
+                Some(RowAddress::new_from_parts(0, 2)),
+                Some(RowAddress::new_from_parts(0, 0)),
+                Some(RowAddress::new_from_parts(0, 1)),
+                None,
+                None
+            ],
+        );
+        assert_eq!(
+            row_ids_to_row_addrs(&old_snapshot, &keys).await.unwrap(),
+            original
+        );
+
+        let manifest = Arc::make_mut(&mut dataset.manifest);
+        Arc::make_mut(&mut manifest.fragments)[1].row_id_meta = Some(RowIdMeta::Inline(
+            lance_table::rowids::write_row_ids(&RowIdSequence::from(0..4)).into(),
+        ));
+        let error = row_ids_to_row_addrs(&dataset, &keys).await.unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("not unique for key at position 0")
+        );
+        assert_eq!(
+            row_ids_to_row_addrs(&dataset, &UInt64Array::from(vec![9]))
+                .await
+                .unwrap(),
+            vec![Some(RowAddress::new_from_parts(2, 1))]
         );
     }
 
@@ -834,6 +905,20 @@ mod test {
                 .await
                 .unwrap();
         }
+        dataset
+            .update_config([(SPILL_ROW_LINEAGE_CONFIG_KEY, "false")])
+            .await
+            .unwrap();
+        dataset
+            .append(
+                lance_datagen::gen_batch()
+                    .col("i", lance_datagen::array::step_custom::<Int32Type>(12, 1))
+                    .into_reader_rows(4.into(), 1.into()),
+                None,
+            )
+            .await
+            .unwrap();
+        let tail_fragment = dataset.fragments().last().unwrap().id as u32;
         drop(dataset);
 
         let failing = Arc::new(FailingProxyStore::new());
@@ -844,6 +929,7 @@ mod test {
         );
         let dataset = DatasetBuilder::from_uri(&directory)
             .with_read_params(ReadParams {
+                index_cache_size_bytes: 0,
                 store_options: Some(ObjectStoreParams {
                     object_store_wrapper: Some(failing),
                     ..Default::default()
@@ -853,7 +939,7 @@ mod test {
             .load()
             .await
             .unwrap();
-        let keys = UInt64Array::from(vec![Some(9), Some(1), None, Some(9), Some(99)]);
+        let keys = UInt64Array::from(vec![Some(9), Some(1), None, Some(9), Some(99), Some(14)]);
         assert_eq!(
             row_ids_to_row_addrs(&dataset, &keys).await.unwrap(),
             vec![
@@ -862,7 +948,19 @@ mod test {
                 None,
                 Some(RowAddress::new_from_parts(3, 9)),
                 None,
+                Some(RowAddress::new_from_parts(tail_fragment, 2)),
             ]
+        );
+        let rebound = Arc::new(FailingProxyStore::new());
+        rebound.fail_when("get_opts", "_indices/", "lookup must use the rebound store");
+        let rebound = dataset.with_object_store_wrappers([
+            rebound as Arc<dyn lance_io::object_store::WrappingObjectStore>
+        ]);
+        let error = row_ids_to_row_addrs(&rebound, &keys).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("lookup must use the rebound store")
         );
         let error = get_row_id_index(&dataset).await.unwrap_err();
         assert!(matches!(error, Error::IO { .. }));

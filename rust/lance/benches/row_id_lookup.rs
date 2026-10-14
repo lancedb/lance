@@ -5,6 +5,8 @@
 //!
 //! Run with `cargo bench -p lance --profile release-with-debug --bench row_id_lookup`.
 //! `ROW_ID_LOOKUP_ROWS` sets the row count (default 100,000, at least 8).
+//! `ROW_ID_LOOKUP_COVERAGE` selects full (default), none, or tail (10% unindexed).
+//! `ROW_ID_LOOKUP_KEY_BATCHES` rotates this many deterministic batches (default 16).
 //! Append-only and globally shuffled tables use the same keys and local store.
 //! Cold means a fresh Lance session (OS caches are not flushed); dataset open is
 //! outside the timed region. Warm means the reverse index / BTree pages have
@@ -38,7 +40,12 @@ use lance_table::transaction::{Operation, RewriteGroup, TransactionBuilder};
 use rand::{Rng, SeedableRng, rngs::SmallRng, seq::SliceRandom};
 use tokio::runtime::Runtime;
 
-async fn build_table(uri: &str, rows: usize, shuffled: bool) -> Dataset {
+async fn build_table(uri: &str, total_rows: usize, shuffled: bool, coverage: &str) -> Dataset {
+    let rows = if coverage == "tail" {
+        total_rows * 9 / 10
+    } else {
+        total_rows
+    };
     let batch = record_batch!(("key", UInt64, (0..rows as u64).collect::<Vec<_>>())).unwrap();
     let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
     let params = WriteParams {
@@ -109,28 +116,55 @@ async fn build_table(uri: &str, rows: usize, shuffled: bool) -> Dataset {
         .await
         .unwrap();
     }
-    let index = dataset
-        .create_index(
-            &[ROW_ID],
-            IndexType::BTree,
-            None,
-            &ScalarIndexParams::default(),
-            false,
-        )
-        .await
+    let bytes = if coverage != "none" {
+        let index = dataset
+            .create_index(
+                &[ROW_ID],
+                IndexType::BTree,
+                None,
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        index
+            .files
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|file| file.size_bytes)
+            .sum::<u64>()
+    } else {
+        0
+    };
+    if rows < total_rows {
+        dataset
+            .update_config([(SPILL_ROW_LINEAGE_CONFIG_KEY, "false")])
+            .await
+            .unwrap();
+        let batch = record_batch!((
+            "key",
+            UInt64,
+            (rows as u64..total_rows as u64).collect::<Vec<_>>()
+        ))
         .unwrap();
-    let bytes: u64 = index
-        .files
-        .as_ref()
-        .unwrap()
-        .iter()
-        .map(|file| file.size_bytes)
-        .sum();
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+        dataset
+            .append(
+                reader,
+                Some(WriteParams {
+                    max_rows_per_file: total_rows - rows,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+    }
     let reverse = get_row_id_index(&dataset).await.unwrap().unwrap();
     println!(
-        "layout={} rows={rows} btree_bytes={bytes} btree_bytes_per_row={:.3} reverse_index_deep_size_bytes={}",
+        "layout={} coverage={coverage} rows={total_rows} btree_bytes={bytes} btree_bytes_per_row={:.3} reverse_index_deep_size_bytes={}",
         if shuffled { "shuffled" } else { "append" },
-        bytes as f64 / rows as f64,
+        bytes as f64 / total_rows as f64,
         reverse.deep_size_of()
     );
     dataset
@@ -142,82 +176,103 @@ fn bench_row_id_lookup(criterion: &mut Criterion) {
             .parse::<usize>()
             .expect("ROW_ID_LOOKUP_ROWS must be an integer")
     });
-    assert!(rows >= 8, "ROW_ID_LOOKUP_ROWS must be at least 8");
+    assert!(rows >= 16, "ROW_ID_LOOKUP_ROWS must be at least 16");
+    let coverage = std::env::var("ROW_ID_LOOKUP_COVERAGE").unwrap_or_else(|_| "full".into());
+    assert!(
+        ["full", "none", "tail"].contains(&coverage.as_str()),
+        "invalid ROW_ID_LOOKUP_COVERAGE"
+    );
+    let batches = std::env::var("ROW_ID_LOOKUP_KEY_BATCHES")
+        .map_or(16, |value| value.parse::<usize>().unwrap());
+    assert!(batches > 0, "ROW_ID_LOOKUP_KEY_BATCHES must be positive");
     let runtime = Runtime::new().unwrap();
     for shuffled in [false, true] {
         let directory = TempStrDir::default();
-        let dataset = runtime.block_on(build_table(&directory, rows, shuffled));
+        let dataset = runtime.block_on(build_table(&directory, rows, shuffled, &coverage));
         let layout = if shuffled { "shuffled" } else { "append" };
-        let mut group = criterion.benchmark_group(format!("row_id_lookup/{layout}"));
+        let mut group = criterion.benchmark_group(format!("row_id_lookup/{layout}/{coverage}"));
         group.sample_size(10);
         group.warm_up_time(Duration::from_secs(1));
         group.measurement_time(Duration::from_secs(2));
         for key_count in [1, 1000] {
             let mut random = SmallRng::seed_from_u64(7);
-            let ids = (0..key_count)
-                .map(|_| random.random_range(0..rows as u64))
+            let ids = (0..batches)
+                .map(|_| {
+                    (0..key_count)
+                        .map(|_| random.random_range(0..rows as u64))
+                        .collect::<Vec<_>>()
+                })
                 .collect::<Vec<_>>();
-            let keys = UInt64Array::from(ids.clone());
+            let keys = ids
+                .iter()
+                .map(|ids| UInt64Array::from(ids.clone()))
+                .collect::<Vec<_>>();
             let reverse = runtime
                 .block_on(get_row_id_index(&dataset))
                 .unwrap()
                 .unwrap();
-            let expected = reverse.get_many(&ids).unwrap();
-            assert_eq!(
-                runtime
-                    .block_on(row_ids_to_row_addrs(&dataset, &keys))
-                    .unwrap(),
-                expected
-            );
-            group.bench_with_input(
-                BenchmarkId::new("reverse_warm", key_count),
-                &ids,
-                |bench, ids| {
-                    bench.iter(|| {
-                        std::hint::black_box(runtime.block_on(async {
-                            get_row_id_index(&dataset)
-                                .await
-                                .unwrap()
-                                .unwrap()
-                                .get_many(ids)
-                                .unwrap()
-                        }))
-                    });
-                },
-            );
-            group.bench_with_input(
-                BenchmarkId::new("btree_warm", key_count),
-                &keys,
-                |bench, keys| {
-                    bench.iter(|| {
-                        std::hint::black_box(
-                            runtime
-                                .block_on(row_ids_to_row_addrs(&dataset, keys))
-                                .unwrap(),
-                        )
-                    });
-                },
-            );
+            for (ids, keys) in ids.iter().zip(&keys) {
+                assert_eq!(
+                    runtime
+                        .block_on(row_ids_to_row_addrs(&dataset, keys))
+                        .unwrap(),
+                    reverse.get_many(ids).unwrap()
+                );
+            }
+            group.bench_function(BenchmarkId::new("reverse_warm", key_count), |bench| {
+                let mut batch = 0;
+                bench.iter(|| {
+                    let ids = &ids[batch % batches];
+                    batch += 1;
+                    std::hint::black_box(runtime.block_on(async {
+                        get_row_id_index(&dataset)
+                            .await
+                            .unwrap()
+                            .unwrap()
+                            .get_many(ids)
+                            .unwrap()
+                    }))
+                });
+            });
+            group.bench_function(BenchmarkId::new("lookup_warm", key_count), |bench| {
+                let mut batch = 0;
+                bench.iter(|| {
+                    let keys = &keys[batch % batches];
+                    batch += 1;
+                    std::hint::black_box(
+                        runtime
+                            .block_on(row_ids_to_row_addrs(&dataset, keys))
+                            .unwrap(),
+                    )
+                });
+            });
             for btree in [false, true] {
                 group.bench_function(
-                    BenchmarkId::new(if btree { "btree_cold" } else { "reverse_cold" }, key_count),
+                    BenchmarkId::new(
+                        if btree { "lookup_cold" } else { "reverse_cold" },
+                        key_count,
+                    ),
                     |bench| {
+                        let mut batch = 0;
                         bench.iter_batched(
                             || {
-                                runtime
+                                let dataset = runtime
                                     .block_on(DatasetBuilder::from_uri(&directory).load())
-                                    .unwrap()
+                                    .unwrap();
+                                let key_batch = batch % batches;
+                                batch += 1;
+                                (dataset, key_batch)
                             },
-                            |cold| {
+                            |(cold, key_batch)| {
                                 runtime.block_on(async {
                                     let actual = if btree {
-                                        row_ids_to_row_addrs(&cold, &keys).await.unwrap()
+                                        row_ids_to_row_addrs(&cold, &keys[key_batch]).await.unwrap()
                                     } else {
                                         get_row_id_index(&cold)
                                             .await
                                             .unwrap()
                                             .unwrap()
-                                            .get_many(&ids)
+                                            .get_many(&ids[key_batch])
                                             .unwrap()
                                     };
                                     std::hint::black_box(actual)

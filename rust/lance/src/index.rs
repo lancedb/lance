@@ -6758,6 +6758,34 @@ mod tests {
         assert_eq!(details.type_url, "/lance.index.pb.BTreeIndexDetails");
         assert_eq!(IndexDetails(details).get_plugin().unwrap().name(), "BTree");
         assert!(index_type_is_known(&indices[0]));
+        // Loading a value-order lookup permutation must preserve the frozen
+        // reader's address-sorted bitmap results for released index files.
+        let metrics = lance_index::metrics::NoOpMetricsCollector;
+        let index = crate::index::scalar::open_scalar_index(&dataset, "x", &indices[0], &metrics)
+            .await
+            .unwrap();
+        let result = index
+            .search(
+                &lance_index::scalar::SargableQuery::IsIn(
+                    [17, 500, 999]
+                        .into_iter()
+                        .map(|value| datafusion::scalar::ScalarValue::Int64(Some(value)))
+                        .collect(),
+                ),
+                &metrics,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result
+                .row_addrs()
+                .true_rows()
+                .row_addrs()
+                .unwrap()
+                .map(u64::from)
+                .collect::<Vec<_>>(),
+            vec![17, 500, 999],
+        );
     }
 
     #[tokio::test]

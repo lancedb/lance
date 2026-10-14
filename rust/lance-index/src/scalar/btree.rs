@@ -40,7 +40,6 @@ use crate::{
 use arrow_arith::numeric::add;
 use arrow_array::{
     Array, ArrayAccessor, ArrayRef, ArrowNativeTypeOp, PrimitiveArray, RecordBatch, UInt32Array,
-    UInt64Array,
     cast::AsArray,
     make_array, new_empty_array,
     types::{
@@ -56,14 +55,12 @@ use datafusion::physical_plan::{
     sorts::sort_preserving_merge::SortPreservingMergeExec, stream::RecordBatchStreamAdapter,
     union::UnionExec,
 };
-use datafusion_common::hash_utils::{RandomState, with_hashes};
 use datafusion_common::{DFSchema, DataFusionError, ScalarValue};
 use datafusion_expr::execution_props::ExecutionProps;
 use datafusion_physical_expr::{
     PhysicalExpr, PhysicalSortExpr, create_physical_expr, expressions::Column,
 };
 use futures::{FutureExt, Stream, StreamExt, TryStreamExt, stream};
-use hashbrown::{HashTable, hash_table::Entry};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{
     Error, ROW_ADDR, Result,
@@ -1644,83 +1641,80 @@ impl CacheKey for BTreeIndexStateKey {
     }
 }
 
-/// Lookup keys grouped by value, so a page value finds the positions of every
-/// key equal to it with one hash probe.
-///
-/// This is the hash set behind DataFusion's generic IN-list filter, except each
-/// entry carries its key positions: an IN-list only says whether a value
-/// matched, and recovering which keys it matched would take a second lookup.
-/// Equality is decided by one comparator, so grouping keys and matching page
-/// values cannot disagree.
-struct KeysByValue {
+/// Input positions sorted by key, shared by every candidate page. Keeping the
+/// ordinals lets repeated keys produce repeated matches without a hash join.
+struct LookupKeys {
     keys: ArrayRef,
-    random_state: RandomState,
-    groups: HashTable<KeyGroup>,
+    order: UInt32Array,
 }
 
-struct KeyGroup {
-    hash: u64,
-    /// Positions in `keys` of every key equal to this value, ascending.
-    positions: Vec<u32>,
-}
-
-impl KeyGroup {
-    fn representative(&self) -> usize {
-        self.positions[0] as usize
-    }
-}
-
-impl KeysByValue {
-    /// Group the non-null entries of `keys` by value; null keys match nothing.
+impl LookupKeys {
     fn try_new(keys: ArrayRef) -> Result<Self> {
-        let random_state = RandomState::default();
-        let mut groups: HashTable<KeyGroup> = HashTable::new();
-        let key_eq = make_comparator(&keys, &keys, SortOptions::default())?;
-        with_hashes([&keys], &random_state, |hashes| {
-            for idx in (0..keys.len()).filter(|idx| keys.is_valid(*idx)) {
-                let hash = hashes[idx];
-                match groups.entry(
-                    hash,
-                    |group| key_eq(group.representative(), idx).is_eq(),
-                    |group| group.hash,
-                ) {
-                    Entry::Occupied(mut entry) => entry.get_mut().positions.push(idx as u32),
-                    Entry::Vacant(entry) => {
-                        entry.insert(KeyGroup {
-                            hash,
-                            positions: vec![idx as u32],
-                        });
-                    }
-                }
-            }
-            Ok(())
-        })?;
-        Ok(Self {
-            keys,
-            random_state,
-            groups,
-        })
+        let order = arrow_ord::sort::sort_to_indices(&keys, None, None)?;
+        let order = order.slice(keys.null_count(), keys.len() - keys.null_count());
+        Ok(Self { keys, order })
     }
 
-    /// Pair every non-null page value with the positions of the keys equal to it.
-    fn match_page(&self, values: &ArrayRef, row_ids: &UInt64Array) -> Result<LookupMatches> {
-        let value_eq = make_comparator(values, &self.keys, SortOptions::default())?;
+    fn match_page(
+        &self,
+        page: &FlatIndex,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<LookupMatches> {
+        let values = page.values();
+        let order = page.value_order();
+        if order.is_empty() || self.order.is_empty() {
+            return Ok(LookupMatches::empty());
+        }
+        let comparator = make_comparator(values, &self.keys, SortOptions::default())?;
+        let comparisons = std::cell::Cell::new(0);
+        let compare = |row: u32, key: u32| {
+            comparisons.set(comparisons.get() + 1);
+            comparator(row as usize, key as usize)
+        };
+        let keys = self.order.values();
+        let start = keys.partition_point(|&key| compare(order[0], key).is_gt());
+        let end = start
+            + keys[start..].partition_point(|&key| !compare(order[order.len() - 1], key).is_lt());
+        let keys = &keys[start..end];
         let mut key_indices = Vec::new();
         let mut matched_row_ids = Vec::new();
-        with_hashes([values], &self.random_state, |hashes| {
-            for idx in (0..values.len()).filter(|idx| values.is_valid(*idx)) {
-                if let Some(group) = self.groups.find(hashes[idx], |group| {
-                    value_eq(idx, group.representative()).is_eq()
-                }) {
-                    key_indices.extend_from_slice(&group.positions);
-                    matched_row_ids.extend(std::iter::repeat_n(
-                        row_ids.value(idx),
-                        group.positions.len(),
-                    ));
+        // Sparse probes skip directly to each key. When probing most of the
+        // page, a merge walk avoids paying a binary search for every key.
+        let dense = keys.len().saturating_mul(order.len().ilog2() as usize + 1) >= order.len();
+        let mut row = 0;
+        let mut key = 0;
+        while key < keys.len() && row < order.len() {
+            if dense {
+                while row < order.len() && compare(order[row], keys[key]).is_lt() {
+                    row += 1;
                 }
+            } else {
+                row += order[row..].partition_point(|&row| compare(row, keys[key]).is_lt());
             }
-            Ok(())
-        })?;
+            if row == order.len() {
+                break;
+            }
+            if !compare(order[row], keys[key]).is_eq() {
+                key += 1;
+                continue;
+            }
+            let mut row_end = row + 1;
+            while row_end < order.len() && compare(order[row_end], keys[key]).is_eq() {
+                row_end += 1;
+            }
+            // Equality is checked with the same Arrow comparator as ordering,
+            // including signed zero and NaN. All duplicate input ordinals and
+            // duplicate page values must survive.
+            while key < keys.len() && compare(order[row], keys[key]).is_eq() {
+                for &position in &order[row..row_end] {
+                    key_indices.push(keys[key]);
+                    matched_row_ids.push(page.ids().value(position as usize));
+                }
+                key += 1;
+            }
+            row = row_end;
+        }
+        metrics.record_comparisons(comparisons.get());
         LookupMatches::new(key_indices.into(), matched_row_ids.into())
     }
 }
@@ -2976,19 +2970,12 @@ impl ScalarIndex for BTreeIndex {
             return Ok(LookupMatches::empty());
         }
 
-        // Pages are row-id ordered (other paths build masks from them), so each
-        // candidate page is scanned in full.
-        // TODO: benchmark whether value-ordered pages, searched by binary
-        // search, would be worth it here.
-        let keys_by_value = KeysByValue::try_new(keys)?;
+        let lookup_keys = LookupKeys::try_new(keys)?;
         let page_matches = self
             .evaluate_pages(
                 pages.into_iter().map(Matches::Some).collect(),
                 metrics,
-                |page, _| {
-                    metrics.record_comparisons(page.values().len());
-                    keys_by_value.match_page(page.values(), page.ids())
-                },
+                |page, _| lookup_keys.match_page(page, metrics),
             )
             .await?;
         Ok(LookupMatches::concat(page_matches))
@@ -4103,8 +4090,8 @@ mod tests {
 
     use super::{
         BTreeIndexPlugin, BTreeIndexState, BTreeLookup, BTreePageKey, DEFAULT_BTREE_BATCH_SIZE,
-        Matches, OrderableScalarValue, PAGE_PREFETCH_CHUNK_SIZE, part_lookup_file_path,
-        part_page_data_file_path, train_btree_index,
+        FlatIndex, LookupKeys, Matches, OrderableScalarValue, PAGE_PREFETCH_CHUNK_SIZE,
+        part_lookup_file_path, part_page_data_file_path, train_btree_index,
     };
     use crate::scalar::registry::ScalarIndexPlugin;
     use arrow_array::RecordBatch;
@@ -4458,11 +4445,17 @@ mod tests {
     }
 
     #[rstest::rstest]
-    #[case::int64_cold(DataType::Int64, false)]
-    #[case::int64_cached(DataType::Int64, true)]
-    #[case::utf8_cold(DataType::Utf8, false)]
+    #[case::int64_cold(DataType::Int64, false, false)]
+    #[case::int64_cached(DataType::Int64, true, false)]
+    #[case::utf8_cold(DataType::Utf8, false, false)]
+    #[case::int64_dense(DataType::Int64, true, true)]
+    #[case::utf8_dense(DataType::Utf8, true, true)]
     #[tokio::test]
-    async fn test_lookup_matches_brute_force(#[case] data_type: DataType, #[case] cached: bool) {
+    async fn test_lookup_matches_brute_force(
+        #[case] data_type: DataType,
+        #[case] cached: bool,
+        #[case] dense: bool,
+    ) {
         // Each value repeats on three rows, so runs straddle the 64-row pages,
         // and a few rows are null.
         let num_rows = 1000_u64;
@@ -4470,7 +4463,7 @@ mod tests {
             (0..num_rows).map(|i| (i % 50 != 7).then_some((i / 3) as i64)),
         ));
         let values = arrow::compute::cast(&values, &data_type).unwrap();
-        let row_ids: Vec<u64> = (0..num_rows).map(|i| i * 7).collect();
+        let row_ids: Vec<u64> = (0..num_rows).map(|i| (i * 701) % num_rows).collect();
 
         let cache = if cached {
             LanceCache::with_capacity(100 * 1024 * 1024)
@@ -4495,6 +4488,13 @@ mod tests {
             Some(100),
             Some(2),
         ]));
+        let keys = if dense {
+            Arc::new(Int64Array::from_iter(
+                (-1..335).rev().flat_map(|key| [Some(key), None, Some(key)]),
+            )) as ArrayRef
+        } else {
+            keys
+        };
         let keys = arrow::compute::cast(&keys, &data_type).unwrap();
 
         let matches = index
@@ -4511,6 +4511,36 @@ mod tests {
             .await
             .unwrap();
         assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn test_sparse_lookup_skips_unrequested_page_values() {
+        let batch = record_batch!(
+            ("values", UInt64, (0..4096).collect::<Vec<_>>()),
+            ("ids", UInt64, (0..4096).rev().collect::<Vec<_>>())
+        )
+        .unwrap();
+        let page = FlatIndex::try_new(batch).unwrap();
+        let keys = LookupKeys::try_new(Arc::new(UInt64Array::from(vec![
+            Some(3000),
+            None,
+            Some(17),
+            Some(3000),
+            Some(5000),
+        ])))
+        .unwrap();
+        let metrics = crate::metrics::LocalMetricsCollector::default();
+        let matches = keys.match_page(&page, &metrics).unwrap();
+        assert_eq!(
+            sorted_pairs(&matches),
+            vec![(0, 1095), (2, 4078), (3, 1095)]
+        );
+        assert!(
+            metrics
+                .comparisons
+                .load(std::sync::atomic::Ordering::Relaxed)
+                < 100
+        );
     }
 
     /// Lookup must agree with `search(Equals)` on float values whose equality

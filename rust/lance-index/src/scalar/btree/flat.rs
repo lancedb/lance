@@ -8,8 +8,10 @@ use std::{ops::Bound, sync::Arc};
 
 use arrow_array::Array;
 use arrow_array::{
-    ArrayRef, BooleanArray, RecordBatch, UInt64Array, cast::AsArray, types::UInt64Type,
+    ArrayRef, BooleanArray, RecordBatch, UInt32Array, UInt64Array, cast::AsArray, types::UInt64Type,
 };
+use arrow_ord::{ord::make_comparator, sort::sort_to_indices};
+use arrow_schema::SortOptions;
 
 use datafusion_common::DFSchema;
 use datafusion_expr::execution_props::ExecutionProps;
@@ -95,10 +97,11 @@ fn empty_ids() -> UInt64Array {
 /// Evaluating a query requires O(N) time where N is the # of rows
 #[derive(Debug)]
 pub struct FlatIndex {
-    /// Sorted by row id. Nothing else is materialized at load time: every
-    /// answer is a filtered view of the id column computed on demand, so a
-    /// cached page costs exactly its Arrow buffers.
+    /// Sorted by row id, so filtered id columns remain sorted for bitmap assembly.
     data: Arc<RecordBatch>,
+    /// Positions of non-null values in ascending value order. This preserves
+    /// sparse lookup without duplicating the page's value and address columns.
+    value_order: UInt32Array,
     df_schema: DFSchema,
 }
 
@@ -106,7 +109,7 @@ impl DeepSizeOf for FlatIndex {
     fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
         // `df_schema` is a two-field schema derived from `data`; its footprint
         // is a few hundred bytes and not worth a separate accounting.
-        self.data.get_array_memory_size()
+        self.data.get_array_memory_size() + self.value_order.get_array_memory_size()
     }
 }
 
@@ -115,11 +118,38 @@ impl FlatIndex {
     pub fn try_new(data: RecordBatch) -> Result<Self> {
         // Sort by row id so every filtered view of the id column is itself
         // sorted, which is what makes bitmap construction cheap downstream.
-        let data = data.sort_by_column(IDS_COL_IDX, None)?;
+        let values = data.column(VALUES_COL_IDX);
+        let compare = make_comparator(values, values, SortOptions::default())?;
+        let mut value_order: Vec<u32> = if values.len() == values.logical_null_count() {
+            Vec::new()
+        } else {
+            (0..values.len())
+                .filter(|&idx| values.is_valid(idx))
+                .map(|idx| idx as u32)
+                .collect()
+        };
+        // Current writers already persist value order. Cache deserialization
+        // and older pages may not, so only sort the permutation when needed.
+        if !value_order
+            .windows(2)
+            .all(|pair| !compare(pair[0] as usize, pair[1] as usize).is_gt())
+        {
+            value_order.sort_unstable_by(|&a, &b| compare(a as usize, b as usize));
+        }
+        let row_order = sort_to_indices(data.column(IDS_COL_IDX), None, None)?;
+        let mut inverse = vec![0; row_order.len()];
+        for (new, old) in row_order.values().iter().enumerate() {
+            inverse[*old as usize] = new as u32;
+        }
+        for position in &mut value_order {
+            *position = inverse[*position as usize];
+        }
+        let data = data.take(&row_order)?;
         let df_schema = DFSchema::try_from(data.schema())?;
 
         Ok(Self {
             data: Arc::new(data),
+            value_order: UInt32Array::from(value_order),
             df_schema,
         })
     }
@@ -130,6 +160,10 @@ impl FlatIndex {
 
     pub(crate) fn values(&self) -> &ArrayRef {
         self.data.column(VALUES_COL_IDX)
+    }
+
+    pub(crate) fn value_order(&self) -> &[u32] {
+        self.value_order.values()
     }
 
     fn has_nulls(&self) -> bool {
@@ -421,11 +455,19 @@ impl CacheCodecImpl for FlatIndex {
         Self: Sized,
     {
         let batch = r.read_ipc()?;
-
+        // Cached data is already address-sorted. Keep its IPC buffers shared
+        // with the cache payload and rebuild only the small lookup permutation.
+        let values = batch.column(VALUES_COL_IDX);
+        let value_order = if values.len() == values.logical_null_count() {
+            UInt32Array::from(Vec::<u32>::new())
+        } else {
+            let order = sort_to_indices(values, None, None)?;
+            order.slice(values.null_count(), values.len() - values.null_count())
+        };
         let df_schema = DFSchema::try_from(batch.schema())?;
-
         Ok(Self {
             data: Arc::new(batch),
+            value_order,
             df_schema,
         })
     }
@@ -439,7 +481,7 @@ mod tests {
     };
 
     use super::*;
-    use arrow_array::{record_batch, types::Int32Type};
+    use arrow_array::{NullArray, record_batch, types::Int32Type};
     use datafusion_common::ScalarValue;
     use lance_core::utils::row_addr_remap::GroupInput;
     use lance_datagen::{RowCount, array, gen_batch};
@@ -479,6 +521,13 @@ mod tests {
 
         assert_eq!(restored.data, index.data);
         assert_eq!(restored.all().unwrap(), index.all().unwrap());
+        let ordered_values = |index: &FlatIndex| {
+            arrow_select::take::take(index.values(), &index.value_order, None).unwrap()
+        };
+        assert_eq!(
+            ordered_values(&restored).to_data(),
+            ordered_values(index).to_data()
+        );
     }
 
     /// The per-page primitives hand back sorted, filtered views of the id
@@ -558,6 +607,21 @@ mod tests {
         )
         .unwrap();
         assert_roundtrips(&FlatIndex::try_new(batch).unwrap());
+
+        let nulls = RecordBatch::try_from_iter_with_nullable([
+            (
+                BTREE_VALUES_COLUMN,
+                Arc::new(NullArray::new(3)) as ArrayRef,
+                true,
+            ),
+            (
+                BTREE_IDS_COLUMN,
+                Arc::new(UInt64Array::from(vec![2, 0, 1])) as ArrayRef,
+                false,
+            ),
+        ])
+        .unwrap();
+        assert_roundtrips(&FlatIndex::try_new(nulls).unwrap());
 
         // Empty index
         let empty = RecordBatch::new_empty(example_index().data.schema());

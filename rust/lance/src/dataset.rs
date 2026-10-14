@@ -254,6 +254,8 @@ pub struct Dataset {
     /// Object stores for additional base paths, normally shared across clones.
     /// Applying new object store wrappers starts a fresh cache scope.
     pub(crate) base_object_stores: BaseObjectStores,
+    /// Immutable lookup preparation, scoped to this handle's snapshot and stores.
+    pub(crate) lookup_cache: Arc<lookup::LookupCache>,
 }
 
 /// The `OnceCell` coalesces concurrent first resolutions into one build.
@@ -949,6 +951,7 @@ impl Dataset {
             store_params: store_params.map(Box::new),
             base_store_params,
             base_object_stores: Default::default(),
+            lookup_cache: Default::default(),
         })
     }
 
