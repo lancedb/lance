@@ -97,6 +97,9 @@ use crate::{Error, Result};
 /// A plan to optimize the indices of a dataset.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OptimizeIndicesPlan {
+    /// Identifies the plan. Every unit and result carries it, and a merge
+    /// takes only the results of its own plan.
+    pub plan_id: Uuid,
     /// The dataset version the plan was made from.
     pub read_version: u64,
     /// The build units. Each writes one new segment.
@@ -108,6 +111,7 @@ pub struct OptimizeIndicesPlan {
 /// Build one new, uncommitted segment over a group of fragments.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OptimizeIndexTask {
+    pub plan_id: Uuid,
     pub read_version: u64,
     /// The merge this task's result feeds.
     pub group: u32,
@@ -133,8 +137,9 @@ pub struct OptimizeIndexTask {
 /// Combine the results of one merge group into the segment to commit.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OptimizeIndexMerge {
+    pub plan_id: Uuid,
     pub read_version: u64,
-    /// The key task results carry to reach this merge.
+    /// The key task results of the same plan carry to reach this merge.
     pub group: u32,
     /// Committed segments merged into the output, which the commit then
     /// removes.
@@ -149,6 +154,7 @@ pub struct OptimizeIndexMerge {
 /// A segment produced by a task or a merge.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IndexSegmentResult {
+    pub plan_id: Uuid,
     pub read_version: u64,
     pub group: u32,
     /// The segment's metadata; its index name is `segment.name`.
@@ -320,6 +326,7 @@ pub async fn plan_optimize_indices(
     Ok(plan_optimize_indices_or_skip(dataset, &indices, options)
         .await?
         .unwrap_or_else(|| OptimizeIndicesPlan {
+            plan_id: Uuid::new_v4(),
             read_version: dataset.manifest.version,
             tasks: Vec::new(),
             merges: Vec::new(),
@@ -367,6 +374,7 @@ pub(crate) async fn plan_optimize_indices_or_skip(
     let named = options.index_names.is_some();
     let bounded = options.max_rows_per_task.is_some() || options.max_rows_per_segment.is_some();
     let mut plan = OptimizeIndicesPlan {
+        plan_id: Uuid::new_v4(),
         read_version: dataset.manifest.version,
         tasks: Vec::new(),
         merges: Vec::new(),
@@ -444,10 +452,11 @@ async fn plan_unsplit_index(
     if !unsplit_index_needs_rewrite(dataset, name, segments, &unindexed, options).await? {
         return Ok(());
     }
-    let read_version = plan.read_version;
+    let (plan_id, read_version) = (plan.plan_id, plan.read_version);
     let group = plan.merges.len() as u32;
     let last = *segments.last().expect("an index has at least one segment");
     plan.tasks.push(OptimizeIndexTask {
+        plan_id,
         read_version,
         group,
         fragments: unindexed
@@ -460,6 +469,7 @@ async fn plan_unsplit_index(
         retrain: options.retrain,
     });
     plan.merges.push(OptimizeIndexMerge {
+        plan_id,
         read_version,
         group,
         old_segments: Vec::new(),
@@ -855,7 +865,7 @@ async fn pack_split_index(
         {
             continue;
         }
-        let read_version = plan.read_version;
+        let (plan_id, read_version) = (plan.plan_id, plan.read_version);
         let group = plan.merges.len() as u32;
         // A single task folds the old segments in itself, in one pass.
         let (absorbed_by_task, absorbed_by_merge) = if builds.len() == 1 {
@@ -865,6 +875,7 @@ async fn pack_split_index(
         };
         for fragments in builds {
             plan.tasks.push(OptimizeIndexTask {
+                plan_id,
                 read_version,
                 group,
                 fragments,
@@ -875,6 +886,7 @@ async fn pack_split_index(
             });
         }
         plan.merges.push(OptimizeIndexMerge {
+            plan_id,
             read_version,
             group,
             old_segments: absorbed_by_merge,
@@ -943,6 +955,7 @@ impl OptimizeIndexTask {
                 .await?
         };
         Ok(results.map(|results| IndexSegmentResult {
+            plan_id: self.plan_id,
             read_version: self.read_version,
             group: self.group,
             replaces: results
@@ -985,16 +998,16 @@ impl OptimizeIndexMerge {
             .map(|segment| segment.uuid)
             .chain(self.replaces.iter().copied())
             .collect();
-        for result in task_results
-            .iter()
-            .filter(|result| result.group == self.group)
-        {
-            if result.read_version != self.read_version {
+        for result in task_results {
+            // `group` is unique within a plan only.
+            if result.plan_id != self.plan_id {
                 return Err(Error::invalid_input(format!(
-                    "task result for group {} was built from dataset version {}, but this merge \
-                     was planned from version {}",
-                    self.group, result.read_version, self.read_version
+                    "task result for group {} belongs to plan {}, not to this merge's plan {}",
+                    result.group, result.plan_id, self.plan_id
                 )));
+            }
+            if result.group != self.group {
+                continue;
             }
             from_tasks += 1;
             inputs.push(result.segment.clone());
@@ -1022,6 +1035,7 @@ impl OptimizeIndexMerge {
             }
         };
         Ok(Some(IndexSegmentResult {
+            plan_id: self.plan_id,
             read_version: self.read_version,
             group: self.group,
             segment,
@@ -1434,9 +1448,16 @@ mod tests {
         for task in &plan.tasks {
             let result = task.execute(&dataset).await.unwrap().unwrap();
             assert_round_trip(&result);
-            assert_eq!(result.read_version, plan.read_version);
+            assert_eq!(
+                (result.plan_id, result.read_version),
+                (plan.plan_id, plan.read_version)
+            );
             built.push(result);
         }
+        // A merge takes only the results of its own plan.
+        let mut foreign = built[0].clone();
+        foreign.plan_id = Uuid::new_v4();
+        assert!(plan.merges[0].execute(&dataset, &[foreign]).await.is_err());
         let mut merged = Vec::new();
         for merge in &plan.merges {
             merged.push(merge.execute(&dataset, &built).await.unwrap().unwrap());
