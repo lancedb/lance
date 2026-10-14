@@ -40,7 +40,7 @@ they should return an "unsupported" error on any read or write operation.
 | `2^14`   | `FLAG_MANAGED_BLOBS`            | Yes             | Yes             | Blob descriptors independently address owned objects. Readers resolve the descriptor's base and path; cleanup preserves objects referenced by protected snapshots, independently of the original data file. Both bits remain set on later versions, including restores. |
 | `2^15`   | `FLAG_NON_REUSABLE_FIELD_IDS`    | No              | Yes             | The manifest sets `max_allocated_field_id`, and a writer must assign new field IDs above it. Before activation, all clients that can write to the dataset must enforce writer feature flags. See [Field IDs](schema.md#field-ids). |
 
-| `2^17`   | `FLAG_CLUSTERING_METADATA`     | No              | Yes             | The snapshot references [clustering configuration or fragment/index segment information](clustering.md). Reserved, unsupported until writers implement its maintenance rules. Readers may ignore clustering metadata. |
+| `2^17`   | `FLAG_CLUSTERING_METADATA`     | No              | Yes             | The snapshot contains [clustering definitions, references, or allocation state](clustering.md), or [generic fragment/segment metadata](index.md#object-metadata). Reserved, unsupported until writers implement the maintenance rules. Readers may ignore this metadata. |
 
 </div>
 

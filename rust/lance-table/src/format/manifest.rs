@@ -1143,7 +1143,9 @@ impl From<&Manifest> for pb::Manifest {
                 .collect(),
             version: m.version,
             branch: m.branch.clone(),
-            clustering: None,
+            clustering: Vec::new(),
+            default_clustering_id: None,
+            max_clustering_id: 0,
             writer_version: m
                 .writer_version
                 .as_ref()
@@ -1263,46 +1265,55 @@ mod tests {
     use roaring::RoaringBitmap;
 
     #[test]
-    fn clustering_proto_retains_provider_versions_and_unknown_metadata() {
-        let fragment_info = pb::ClusteringInfo {
-            provider: "org.example.cluster".into(),
-            version: 7,
-            metadata: HashMap::from([
-                ("bucket".into(), "[0, 100)".into()),
-                ("unknown_option".into(), "  opaque value: 東京  ".into()),
-                ("empty_option".into(), String::new()),
-            ]),
-        };
-        let segment_info = pb::ClusteringInfo {
-            provider: "org.example.other".into(),
-            version: 9,
-            metadata: HashMap::from([("ranges".into(), "[0, 100, 200]".into())]),
-        };
+    fn clustering_proto_retains_definitions_references_and_generic_metadata() {
+        let metadata = HashMap::from([
+            ("org.example.cluster.bucket".into(), "[0, 100)".into()),
+            (
+                "org.example.unknown".into(),
+                "  opaque value: 東京  ".into(),
+            ),
+            ("org.example.empty".into(), String::new()),
+        ]);
         // Test the persisted messages only; runtime maintenance is not enabled yet.
         let manifest = pb::Manifest {
             writer_feature_flags: crate::feature_flags::FLAG_CLUSTERING_METADATA,
-            clustering: Some(pb::Clustering {
-                columns: vec![0, 1],
-                provider: "org.example.cluster".into(),
-                version: 8,
-                provider_metadata: HashMap::from([
-                    ("boundaries".into(), "[0, 100, 200]".into()),
-                    ("unknown_option".into(), "  opaque value: 東京  ".into()),
-                ]),
-            }),
+            clustering: vec![
+                pb::Clustering {
+                    id: 1,
+                    columns: vec![0, 1],
+                    provider: "org.example.cluster".into(),
+                    version: 8,
+                    provider_metadata: HashMap::from([
+                        ("boundaries".into(), "[0, 100, 200]".into()),
+                        ("unknown_option".into(), "  opaque value: 東京  ".into()),
+                    ]),
+                },
+                pb::Clustering {
+                    id: 5,
+                    columns: vec![1],
+                    provider: "org.example.other".into(),
+                    version: 9,
+                    provider_metadata: HashMap::new(),
+                },
+            ],
+            default_clustering_id: Some(5),
+            max_clustering_id: 5,
             fragments: vec![
                 pb::DataFragment {
                     id: 1,
-                    clustering: Some(fragment_info),
+                    clustering_id: Some(1),
+                    metadata: metadata.clone(),
                     ..Default::default()
                 },
                 pb::DataFragment {
                     id: 2,
-                    clustering: Some(pb::ClusteringInfo {
-                        provider: "org.example.cluster".into(),
-                        version: 8,
-                        metadata: HashMap::new(),
-                    }),
+                    clustering_id: Some(5),
+                    ..Default::default()
+                },
+                pb::DataFragment {
+                    id: 3,
+                    clustering_id: None,
+                    metadata: metadata.clone(),
                     ..Default::default()
                 },
             ],
@@ -1317,7 +1328,8 @@ mod tests {
             indices: vec![pb::IndexMetadata {
                 name: "vectors".into(),
                 fields: vec![1],
-                clustering: Some(segment_info),
+                clustering_id: Some(5),
+                metadata,
                 ..Default::default()
             }],
         };
@@ -1327,12 +1339,25 @@ mod tests {
         );
         // Disabling the policy leaves existing fragment and segment information intact.
         let disabled = pb::Manifest {
-            clustering: None,
+            default_clustering_id: None,
             ..manifest
         };
         assert_eq!(
             pb::Manifest::decode(disabled.encode_to_vec().as_slice()).unwrap(),
             disabled
+        );
+        assert_eq!(disabled.clustering.len(), 2);
+        assert_eq!(disabled.fragments[2].clustering_id, None);
+        // Proto presence distinguishes an absent reference from an invalid zero.
+        let zero = pb::DataFragment {
+            clustering_id: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(
+            pb::DataFragment::decode(zero.encode_to_vec().as_slice())
+                .unwrap()
+                .clustering_id,
+            Some(0)
         );
     }
 

@@ -5,7 +5,7 @@ syntax = "proto3";
 
 package lance.table;
 
-// Current table-level clustering configuration. Providers manage layout history.
+// Immutable clustering definition shared by fragments and index segments.
 message Clustering {
   // Ordered, non-empty list of distinct, existing schema field IDs.
   repeated int32 columns = 1;
@@ -17,21 +17,6 @@ message Clustering {
    * value encodings; unrelated writes preserve unknown keys and values.
    */
   map<string, string> provider_metadata = 4;
-}
-
-// Clustering information shared by fragments and index segments.
-message ClusteringInfo {
-  // Non-empty, case-sensitive implementation name that organized this output.
-  string provider = 1;
-  // Non-zero identifier of the provider's layout/configuration for this output.
-  uint64 version = 2;
-  /* Provider-defined information, such as group, bucket, or range identifiers.
-   * Empty is valid. It is not proof of index coverage, statistics, or row order.
-   * Ordinary data-fragment rewrites clear this information. Index remap and
-   * rebuild of the existing group preserve it. Merges and rebuilds with different
-   * groups use provider-written output information; without a provider strategy,
-   * their outputs have no clustering information. Unchanged objects preserve
-   * unknown keys and values.
-   */
-  map<string, string> metadata = 3;
+  // Non-zero table-local ID, not the position in Manifest.clustering. Never reused.
+  uint32 id = 5;
 }

@@ -292,11 +292,21 @@ message Manifest {
    */
   optional int32 max_allocated_field_id = 24;
 
-  /* Optional current clustering policy. Absence disables new clustering work
-   * without clearing fragment or index segment information. Requires the
-   * clustering writer feature flag (1 << 17); no clustering reader flag.
+  /* Immutable definitions referenced by fragment and index segment clustering_id.
+   * IDs are unique and non-zero. Keep every referenced definition in this snapshot.
+   * Requires writer flag 1 << 17; no clustering reader flag.
    */
-  Clustering clustering = 25;
+  repeated Clustering clustering = 25;
+
+  /* Definition used by default for new clustering work. Absent means no default
+   * policy; existing definitions and object references remain valid.
+   */
+  optional uint32 default_clustering_id = 26;
+
+  /* Largest clustering ID allocated, or zero if none. Never decreases, including
+   * on restore. Allocate above this value; deleting definitions does not free IDs.
+   */
+  uint32 max_clustering_id = 27;
 } // Manifest
 
 // external dataset base path
@@ -423,13 +433,20 @@ message IndexMetadata {
    */
   repeated int32 covering_fields = 11;
 
-  /* Optional clustering information for this segment's grouping. Remap and
+  /* Optional non-zero ID in Manifest.clustering for this segment's grouping. Remap and
    * rebuild of the existing group preserve it. Merges and rebuilds with different
    * groups use provider-written output information; without a provider strategy,
    * their outputs have no clustering information. Absence makes no clustering
    * claim. Requires writer flag 1 << 17.
    */
-  ClusteringInfo clustering = 12;
+  optional uint32 clustering_id = 12;
+
+  /* Optional per-segment information. Each feature owns and maintains its keys.
+   * Unchanged segments preserve all entries; new outputs do not inherit entries
+   * unless their owner handles that operation. Clustering keys follow clustering_id
+   * maintenance rules. Requires writer flag 1 << 17 while this map is nonempty.
+   */
+  map<string, string> metadata = 13;
 }
 
 // Metadata about a single file within an index segment.

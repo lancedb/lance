@@ -144,6 +144,41 @@ fragment's row lineage sequences when they are not stored in the manifest; see
 fragment's `files`, next to user columns or in a file holding nothing else, and at
 most one file of a fragment may carry each of these ids.
 
+## Object Metadata
+
+`DataFragment.metadata` and `IndexMetadata.metadata` are generic
+`map<string, string>` fields. Empty maps are valid. Each feature owns its keys,
+their encodings, and their maintenance rules. Use namespaced keys to avoid
+collisions, and keep values small. The maps are not proofs of statistics, index
+coverage, or row order.
+
+- Preserve every entry on unchanged objects, including unknown keys and values.
+- When an operation changes a fragment's data or visible rows, output metadata
+  starts empty. Each key owner must implement whether its entries are preserved,
+  regenerated, or removed. This includes compaction, column replacement, refresh,
+  overlays, and deletion changes, even when the fragment ID stays the same.
+- New index outputs follow the same default for merge, remap, and rebuild. A
+  feature may explicitly preserve its own keys for a supported operation.
+- Do not copy or merge unknown entries into changed outputs, even when input
+  values happen to match. Metadata without a maintenance implementation may be
+  lost during such operations.
+
+[Clustering](clustering.md) defines specific rules for clustering-owned keys,
+including preservation on deletion-vector-only changes and same-group index
+remap/rebuild. Those exceptions do not apply to unrelated keys. Metadata must not
+be the only mechanism protecting data correctness; a feature needing stronger
+guarantees must define its own compatibility contract.
+
+Nonempty maps require writer feature flag `1 << 17`, including maps unrelated to
+clustering. Ordinary readers can ignore them. These are persisted-format rules;
+key-maintainer interfaces are left to implementation work.
+
+In the current fragment-tree leaf format, maps remain part of the `DataFragment`
+protobuf in `fragment_meta`. Shredding keys into dictionary-encoded columns is a
+separate leaf-format change; this proposal does not claim that compression exists.
+Tree writers must use a full-record upsert when an operation changes metadata,
+because file-only mutations preserve the other fragment fields.
+
 ## Data Files
 
 Data files store column data for a fragment using the Lance file format.
