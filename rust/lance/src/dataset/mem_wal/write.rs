@@ -2196,16 +2196,6 @@ struct SharedWriterState {
     max_memtable_rows: usize,
 }
 
-/// `batch` rebuilt to the MemTable's schema, which carries field ids. Blob
-/// preparation builds its output fields from a Lance schema, whose ids never
-/// reach Arrow metadata, and the MemTable compares schemas exactly.
-fn with_memtable_field_ids(batch: &RecordBatch, memtable: &MemTable) -> Result<RecordBatch> {
-    Ok(lance_arrow::RecordBatchExt::project_by_schema(
-        batch,
-        memtable.schema(),
-    )?)
-}
-
 impl SharedWriterState {
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -2284,8 +2274,7 @@ impl SharedWriterState {
             let prepared = async {
                 let mut prepared = Vec::with_capacity(batches.len());
                 for batch in batches {
-                    let batch = preprocessor.preprocess_batch(&batch).await?;
-                    prepared.push(with_memtable_field_ids(&batch, memtable)?);
+                    prepared.push(preprocessor.preprocess_batch(&batch).await?);
                 }
                 preprocessor.finish().await?;
                 Ok(prepared)
@@ -2312,8 +2301,7 @@ impl SharedWriterState {
         let prepared = async {
             let mut prepared = Vec::with_capacity(batches.len());
             for batch in batches {
-                let batch = preprocessor.preprocess_batch(&batch).await?;
-                prepared.push(with_memtable_field_ids(&batch, memtable)?);
+                prepared.push(preprocessor.preprocess_batch(&batch).await?);
             }
             Ok(prepared)
         }
@@ -5670,11 +5658,16 @@ mod tests {
     /// A writer schema whose fields carry their ids, a blob's children
     /// included: a blob write is accepted, and the flushed generation keeps the
     /// ids the schema gives the blob's children, so it reads back as the same
-    /// columns.
+    /// columns. `replayed` drops the writer unclosed, as a crash would, so the
+    /// blob reaches the generation through WAL replay.
     #[rstest]
+    #[case::non_durable(false, false)]
+    #[case::durable(true, false)]
+    #[case::replayed(true, true)]
     #[tokio::test]
     async fn test_blob_v2_keeps_field_ids_through_put_and_flush(
-        #[values(true, false)] durable_write: bool,
+        #[case] durable_write: bool,
+        #[case] replayed: bool,
     ) {
         let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
         let batch = create_blob_v2_batch(
@@ -5690,19 +5683,26 @@ mod tests {
             durable_write,
             ..Default::default()
         };
-        let writer = ShardWriter::open(
-            store.clone(),
-            base_path.clone(),
-            base_uri.clone(),
-            config.clone(),
-            Arc::new(crate::dataset::mem_wal::arrow_schema_with_field_ids(
-                &with_ids,
-            )),
-            vec![],
-        )
-        .await
-        .unwrap();
+        let schema = Arc::new(crate::dataset::mem_wal::arrow_schema_with_field_ids(
+            &with_ids,
+        ));
+        let open = || {
+            ShardWriter::open(
+                store.clone(),
+                base_path.clone(),
+                base_uri.clone(),
+                config.clone(),
+                schema.clone(),
+                vec![],
+            )
+        };
+        let mut writer = open().await.unwrap();
         writer.put(vec![batch]).await.unwrap();
+        if replayed {
+            drop(writer);
+            writer = open().await.unwrap();
+            assert_eq!(writer.memtable_stats().await.unwrap().row_count, 2);
+        }
         writer.close().await.unwrap();
 
         let manifest = ShardManifestStore::new(store.clone(), &base_path, config.shard_id, 2)

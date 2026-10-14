@@ -801,6 +801,7 @@ impl BlobPreprocessor {
         metadata: HashMap<String, String>,
     ) -> BlobDescriptorArrayBuilder {
         BlobDescriptorArrayBuilder::new_with_metadata(field.name(), field.is_nullable(), metadata)
+            .with_field_ids_of(field)
     }
 
     async fn write_dedicated(&mut self, source: BlobWriteSource<'_>) -> Result<BlobDescriptor> {
