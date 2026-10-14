@@ -220,8 +220,11 @@ message VectorIndexDetails {
     }
     uint32 num_bits = 1;
     RotationType rotation_type = 2;
-    // Opt-in fixed prefix planes; absent/false retains the single-plane layout.
-    bool layered = 3;
+    /* Fixed prefix planes. Unset build requests use the product's default;
+     * writers persist the resolved layout. Missing stored values retain the
+     * historical single-plane layout. Widths 1 and 2 always use single-plane.
+     */
+    optional bool layered = 3;
     // Absent/COLUMNS retains one column per field.
     RowLayout row_layout = 4;
   }

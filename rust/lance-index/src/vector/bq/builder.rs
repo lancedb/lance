@@ -1049,7 +1049,8 @@ impl Quantization for RabitQuantizer {
         params: &Self::BuildParams,
     ) -> Result<Self> {
         validate_rq_num_bits(params.num_bits)?;
-        if params.layered {
+        let is_layered = params.is_layered();
+        if is_layered {
             super::layered::RQLayout::try_new(params.num_bits)?;
         }
 
@@ -1060,7 +1061,7 @@ impl Quantization for RabitQuantizer {
             ));
         }
         if let Some(mut q) = Self::from_supplied_rotation(params, dim)? {
-            q.metadata.layered = params.layered;
+            q.metadata.layered = is_layered;
             return Ok(q);
         }
 
@@ -1087,7 +1088,7 @@ impl Quantization for RabitQuantizer {
                 )));
             }
         };
-        q.metadata.layered = params.layered;
+        q.metadata.layered = is_layered;
         Ok(q)
     }
 
@@ -1674,6 +1675,36 @@ mod tests {
             "{}",
             err
         );
+    }
+
+    #[rstest::rstest]
+    fn test_rabit_quantizer_resolves_layered_layout(
+        #[values(None, Some(false), Some(true))] layered: Option<bool>,
+        #[values(1, 2, 5)] num_bits: u8,
+        #[values(false, true)] supplied_rotation: bool,
+    ) {
+        let vectors = Float32Array::from(vec![0.0f32; 4 * 32]);
+        let data = FixedSizeListArray::try_new_from_values(vectors, 32).unwrap();
+        let mut params = RQBuildParams {
+            layered,
+            ..RQBuildParams::new(num_bits)
+        };
+        if supplied_rotation {
+            params.rotation = Some(
+                RabitQuantizer::new_with_rotation::<Float32Type>(
+                    num_bits,
+                    32,
+                    RQRotationType::Fast,
+                )
+                .metadata(None),
+            );
+        }
+        let quantizer = RabitQuantizer::build(&data, DistanceType::L2, &params).unwrap();
+        assert_eq!(
+            quantizer.metadata_ref().layered,
+            num_bits > 2 && layered.unwrap_or(false)
+        );
+        assert_eq!(quantizer.metadata_ref().num_bits, num_bits);
     }
 
     #[test]

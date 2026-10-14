@@ -32,7 +32,7 @@ pub const RABIT_MIN_NUM_BITS: u8 = 1;
 pub const RABIT_MAX_NUM_BITS: u8 = 9;
 pub const RABIT_BINARY_NUM_BITS: u8 = 1;
 /// Default number of bits per dimension for IVF_RQ indexes.
-pub(crate) const RABIT_DEFAULT_NUM_BITS: u8 = 5;
+pub const RABIT_DEFAULT_NUM_BITS: u8 = 5;
 
 #[derive(Clone, Default)]
 pub struct BinaryQuantization {}
@@ -125,8 +125,9 @@ pub struct RQBuildParams {
     /// rotates vectors identically. This is transient build-time state and is never
     /// persisted to the `RabitQuantization` params proto.
     pub rotation: Option<RabitQuantizationMetadata>,
-    /// Store prefix code planes; supported for 3 through 9 bits. Default off.
-    pub layered: bool,
+    /// Store prefix code planes; ignored for 1 or 2 bits.
+    /// `None` leaves the choice to the product: false in OSS, true in Enterprise.
+    pub layered: Option<bool>,
 }
 
 pub fn validate_rq_num_bits(num_bits: u8) -> Result<()> {
@@ -163,10 +164,23 @@ pub fn rabit_ex_code_bytes(rotated_dim: usize, ex_bits: u8) -> Result<usize> {
 }
 
 impl RQBuildParams {
-    /// Opt into the layered format. Requires a reader with layered RQ support.
+    /// Override the product default for the layered format.
+    /// Ignored for 1 or 2 bits. Otherwise requires a reader with layered RQ support.
     pub fn with_layered(mut self, layered: bool) -> Self {
-        self.layered = layered;
+        self.layered = Some(layered);
         self
+    }
+
+    /// Whether the resolved layout uses prefix planes. OSS defaults to false;
+    /// 1-bit and 2-bit codes always use the single-plane layout.
+    ///
+    /// ```
+    /// use lance_index::vector::bq::RQBuildParams;
+    /// assert!(RQBuildParams::new(5).with_layered(true).is_layered());
+    /// assert!(!RQBuildParams::new(2).with_layered(true).is_layered());
+    /// ```
+    pub fn is_layered(&self) -> bool {
+        self.num_bits > 2 && self.layered.unwrap_or(false)
     }
 
     pub fn new(num_bits: u8) -> Self {
@@ -174,7 +188,7 @@ impl RQBuildParams {
             num_bits,
             rotation_type: RQRotationType::default(),
             rotation: None,
-            layered: false,
+            layered: None,
         }
     }
 
@@ -183,7 +197,7 @@ impl RQBuildParams {
             num_bits,
             rotation_type,
             rotation: None,
-            layered: false,
+            layered: None,
         }
     }
 }
@@ -215,7 +229,7 @@ impl Default for RQBuildParams {
             num_bits: RABIT_DEFAULT_NUM_BITS,
             rotation_type: RQRotationType::default(),
             rotation: None,
-            layered: false,
+            layered: None,
         }
     }
 }
@@ -225,6 +239,8 @@ mod tests {
     use super::*;
 
     use half::{bf16, f16};
+    use prost::Message;
+    use rstest::rstest;
 
     fn test_bq<T: Float>() {
         let data: Vec<T> = [1.0, -1.0, 1.0, -5.0, -7.0, -1.0, 1.0, -1.0, -0.2, 1.2, 3.2]
@@ -260,6 +276,26 @@ mod tests {
     #[test]
     fn test_rq_build_params_default_num_bits() {
         assert_eq!(RQBuildParams::default().num_bits, 5);
+        assert_eq!(RQBuildParams::default().layered, None);
+        assert_eq!(RQBuildParams::new(5).layered, None);
+        assert_eq!(
+            RQBuildParams::with_rotation_type(5, RQRotationType::Fast).layered,
+            None
+        );
+    }
+
+    #[rstest]
+    #[case::unset(None)]
+    #[case::single_plane(Some(false))]
+    #[case::layered(Some(true))]
+    fn test_rq_layered_presence_round_trip(#[case] layered: Option<bool>) {
+        let params = RQBuildParams {
+            layered,
+            ..Default::default()
+        };
+        let details = RabitQuantization::from(&params);
+        let decoded = RabitQuantization::decode(details.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(decoded.layered, layered);
     }
 
     #[test]
