@@ -10201,6 +10201,7 @@ mod tests {
                             ..Default::default()
                         }),
                     ],
+                    pre_transform: None,
                     version: crate::index::vector::IndexFileVersion::V3,
                     skip_transpose: false,
                     runtime_hints: Default::default(),
@@ -10336,6 +10337,7 @@ mod tests {
                         }),
                         StageParams::RQ(RQBuildParams::new(1)),
                     ],
+                    pre_transform: None,
                     version: crate::index::vector::IndexFileVersion::V3,
                     skip_transpose: false,
                     runtime_hints: Default::default(),
