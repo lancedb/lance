@@ -19,6 +19,8 @@
 use super::{CompositeOperation, Ref};
 use crate::transaction::UpdateMap;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use uuid::Uuid;
 
 /// One thing an action set writes.
 ///
@@ -54,6 +56,8 @@ pub enum Coordinate {
     /// once, on one set of fields, so two writers declaring it on fields of
     /// their own collide even though they name different fields' metadata.
     UnenforcedKey(UnenforcedKey),
+    /// One index segment, by uuid.
+    IndexSegment(Uuid),
 }
 
 /// One of the string maps a manifest carries.
@@ -88,7 +92,8 @@ impl Coordinate {
             | Self::BaseName(_)
             | Self::BaseLocation(_)
             | Self::ConfigEntry { .. }
-            | Self::UnenforcedKey(_) => None,
+            | Self::UnenforcedKey(_)
+            | Self::IndexSegment(_) => None,
         }
     }
 
@@ -112,7 +117,9 @@ impl Coordinate {
 enum Mode {
     /// Reads the coordinate and needs it to still hold what it read. Data
     /// written for a committed field requires the field's definition, since
-    /// the values are encoded in the type it names. Unlike a write, two sets
+    /// the values are encoded in the type it names; an index segment requires
+    /// the data it describes, since the format gives a reader no way to notice
+    /// that those values were replaced underneath it. Unlike a write, two sets
     /// may require the same coordinate -- two readers of one column do not
     /// collide.
     Requires,
@@ -201,6 +208,65 @@ pub struct Footprint {
     /// append's rows would vanish or survive the reset depending on which
     /// commit landed first -- so it is a flag rather than a region.
     exclusive: bool,
+    /// What this set writes into logical indices. A segment's uuid is a
+    /// coordinate, but the thing two writers can collide over is the index the
+    /// segment joins, which is not a set of ids -- see [`IndexClaim`].
+    index_claims: Vec<IndexClaim>,
+}
+
+/// What an action set writes into one logical index.
+///
+/// An index is the set of segments sharing a name, and the query path unions
+/// them, so two writers may extend one index at the same time -- what they may
+/// not do is describe the same rows twice, or disagree about what the index is.
+#[derive(Debug, Clone, PartialEq)]
+struct IndexClaim {
+    name: String,
+    /// What the set says the index is. `None` for an action that edits a
+    /// segment without restating the index's definition.
+    identity: Option<IndexIdentity>,
+    /// The committed fragments this set brings under the index, or `None` when
+    /// the reach is not stated -- what the system indices carry, and what makes
+    /// a claim collide with every other claim on the same index.
+    ///
+    /// Fragments this operation mints are left out. They have no id in the read
+    /// version, so a concurrent writer cannot be covering one.
+    coverage: Option<HashSet<u64>>,
+}
+
+/// What an index is, for the purpose of deciding whether two writers are
+/// building the same one.
+///
+/// `details` is compared as the opaque blob it is. Two segments of one index
+/// built by the same writer serialize identical config, so equality is the
+/// right test until index config is lifted out of the per-segment details.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct IndexIdentity {
+    pub fields: Vec<Ref>,
+    /// Which of `fields` are merely carried: two writers that disagree about
+    /// this disagree about what the index answers for, not just what it holds.
+    pub covering_fields: Vec<Ref>,
+    pub details: Option<Arc<prost_types::Any>>,
+    pub index_version: i32,
+}
+
+impl IndexClaim {
+    fn conflicts_with(&self, other: &Self) -> bool {
+        if self.name != other.name {
+            return false;
+        }
+        if let (Some(ours), Some(theirs)) = (&self.identity, &other.identity)
+            && ours != theirs
+        {
+            return true;
+        }
+        match (&self.coverage, &other.coverage) {
+            (Some(ours), Some(theirs)) => !ours.is_disjoint(theirs),
+            // An unstated reach could be any fragment, including one the other
+            // side is claiming.
+            _ => true,
+        }
+    }
 }
 
 impl Footprint {
@@ -212,12 +278,14 @@ impl Footprint {
     /// That is where the one asymmetry lives: a requirement of this set is
     /// tested against what `committed` wrote, never the reverse, because
     /// `committed` serialized first and nothing arriving later can break what
-    /// it required. The distinction is not academic. Data written for a field
-    /// requires the field's definition; a cast of that field writes it.
-    /// Checking both directions would also reject the cast that arrives
-    /// *after* the data -- an order [`AlterField`](super::AlterField) already
-    /// handles, by rebinding the field in every fragment the manifest has by
-    /// then.
+    /// it required. The distinction is not academic. An index segment requires
+    /// the data it describes; a rewrite of that data writes it. Checking both
+    /// directions would also reject the rewrite that arrives *after* a segment
+    /// -- an order the system already handles, by pruning the stale fragment
+    /// out of the segment's coverage as the rewrite applies.
+    ///
+    /// Index claims are not coordinates and are compared on their own terms,
+    /// symmetrically.
     pub fn conflicts_with(&self, committed: &Self) -> bool {
         // A wholesale rewrite leaves nothing for a concurrent set to land on --
         // not even an append, whose rows the reset would discard or resurrect
@@ -228,7 +296,17 @@ impl Footprint {
         if self.claims_conflict_with(committed) {
             return true;
         }
-        self.anchors_removed_by(committed) || committed.anchors_removed_by(self)
+        if self.anchors_removed_by(committed) || committed.anchors_removed_by(self) {
+            return true;
+        }
+        // Index claims are not coordinates and are compared on their own terms,
+        // symmetrically.
+        self.index_claims.iter().any(|ours| {
+            committed
+                .index_claims
+                .iter()
+                .any(|theirs| ours.conflicts_with(theirs))
+        })
     }
 
     /// Whether any coordinate touched by both sets, directly or through a
@@ -337,6 +415,21 @@ impl Footprint {
         }
     }
 
+    /// Record that this set reads `fields` in `fragment` and needs them to
+    /// still hold what it read.
+    ///
+    /// A fragment this operation mints records nothing: no concurrent writer
+    /// can have replaced data that did not exist when they planned.
+    pub(super) fn require_field_data(
+        &mut self,
+        fragment: u64,
+        fields: impl IntoIterator<Item = Ref>,
+    ) {
+        for field in fields.into_iter().filter_map(committed_field) {
+            self.require(Coordinate::FieldData { fragment, field });
+        }
+    }
+
     /// A field's entry in the schema.
     pub(super) fn write_field_definition(&mut self, field: Ref) {
         if let Some(field) = committed_field(field) {
@@ -356,6 +449,35 @@ impl Footprint {
     /// without claiming anything inside it.
     pub(super) fn require_fragment(&mut self, fragment: u64) {
         self.required_fragments.insert(fragment);
+    }
+
+    /// Record that this set adds a segment to `name`, defining the index as
+    /// `identity` and describing `coverage`.
+    pub(super) fn build_index(
+        &mut self,
+        name: String,
+        identity: IndexIdentity,
+        coverage: Option<impl IntoIterator<Item = Ref>>,
+    ) {
+        self.index_claims.push(IndexClaim {
+            name,
+            identity: Some(identity),
+            coverage: coverage.map(committed_fragments),
+        });
+    }
+
+    /// Record that this set brings `fragments` under `name` by widening a
+    /// segment that is already there, without restating what the index is.
+    pub(super) fn extend_index_coverage(
+        &mut self,
+        name: String,
+        fragments: impl IntoIterator<Item = Ref>,
+    ) {
+        self.index_claims.push(IndexClaim {
+            name,
+            identity: None,
+            coverage: Some(committed_fragments(fragments)),
+        });
     }
 
     /// Record that this set removes `fragment` outright: its existence, and
@@ -403,6 +525,13 @@ impl Footprint {
 /// this operation mints, which no one else can see yet.
 fn committed_field(reference: Ref) -> Option<i32> {
     i32::try_from(reference.committed()?).ok()
+}
+
+fn committed_fragments(fragments: impl IntoIterator<Item = Ref>) -> HashSet<u64> {
+    fragments
+        .into_iter()
+        .filter_map(|fragment| fragment.committed())
+        .collect()
 }
 
 impl From<&CompositeOperation> for Footprint {
