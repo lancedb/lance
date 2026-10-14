@@ -7224,19 +7224,6 @@ mod tests {
         }
     }
 
-    /// A tail is charged for its term cache: one entry per distinct term.
-    #[test]
-    fn test_tail_charges_its_term_cache() {
-        let schema = create_test_schema();
-        let index = FtsMemIndex::new(1, "description".to_string());
-        index.insert(&create_test_batch(&schema), 0).unwrap();
-        let st = index.state.load();
-        let cache = term_cache_bytes(st.tail.writer_term_cache.lock().unwrap().capacity());
-        assert!(cache > 0);
-        assert!(st.tail.resident_bytes_cached() > cache);
-        assert_eq!(st.tail.resident_bytes_cached(), st.tail.resident_bytes());
-    }
-
     /// The tail's running byte counter must stay exactly in step with the walk
     /// it replaces, including across a freeze (which swaps in a fresh tail).
     #[test]

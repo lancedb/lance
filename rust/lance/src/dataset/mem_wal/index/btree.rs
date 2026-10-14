@@ -727,11 +727,12 @@ impl BytesBackend {
 ///
 /// Only the string and binary variants own their bytes; numeric, boolean,
 /// decimal and temporal values live inline in the node. A dictionary value
-/// boxes its key type and its decoded value, which may itself own a string. Nested values (lists,
-/// structs, maps) hold an Arrow array sliced from the inserted batch, sharing
-/// buffers the batch store already charges; only a small per-row header and
-/// offsets array is theirs, and that is not counted. `ScalarValue::size` is no
-/// substitute: it reports the whole shared buffer for every row.
+/// boxes its key type and its decoded value, which may itself own a string.
+/// Nested values (lists, structs, maps) hold an Arrow array sliced from the
+/// inserted batch, sharing buffers the batch store already charges; only a
+/// small per-row header and offsets array is theirs, and that is not counted.
+/// `ScalarValue::size` is no substitute: it reports the whole shared buffer
+/// for every row.
 fn owned_heap_bytes(value: &ScalarValue) -> usize {
     match value {
         ScalarValue::Utf8(Some(s))
@@ -1534,44 +1535,27 @@ mod tests {
     fn test_scalar_backend_charges_owned_key_bytes() {
         let rows = 100;
         let long = "x".repeat(1024);
-        let charge = |array: ArrayRef| {
+        let key_heap = |array: ArrayRef| {
             let backend = Backend::for_type(array.data_type());
-            assert!(matches!(backend, Backend::Scalar(_)));
+            let Backend::Scalar(scalar) = &backend else {
+                panic!("{} should use the fallback backend", array.data_type());
+            };
             backend.insert_array_and_report_existing(&array, 0).unwrap();
-            backend.resident_bytes()
+            assert_eq!(
+                backend.resident_bytes(),
+                scalar.reader.resident_bytes() + scalar.key_heap_bytes.load(Ordering::Relaxed)
+            );
+            scalar.key_heap_bytes.load(Ordering::Relaxed)
         };
-        let short = charge(Arc::new(arrow_array::StringViewArray::from(vec![
-            "a";
-            rows
-        ])));
-        let wide = charge(Arc::new(arrow_array::StringViewArray::from(vec![
-            long.as_str();
-            rows
-        ])));
-        assert!(
-            wide - short >= rows * (long.len() - 1),
-            "{rows} keys of {} bytes should add their bytes: {short} -> {wide}",
-            long.len()
-        );
 
+        let strings = arrow_array::StringViewArray::from(vec![long.as_str(); rows]);
+        assert!(key_heap(Arc::new(strings)) >= rows * long.len());
         // A dictionary of strings decodes each value into an owned string too.
         let dictionary: arrow_array::DictionaryArray<arrow_array::types::Int32Type> =
             vec![long.as_str(); rows].into_iter().collect();
-        let dictionary = charge(Arc::new(dictionary));
-        assert!(
-            dictionary >= rows * long.len(),
-            "{rows} dictionary keys of {} bytes should add their bytes, got {dictionary}",
-            long.len()
-        );
-
-        let floats = Backend::for_type(&DataType::Float64);
-        let Backend::Scalar(scalar) = &floats else {
-            panic!("Float64 should use the fallback backend");
-        };
-        floats
-            .insert_array_and_report_existing(&arrow_array::Float64Array::from(vec![1.5; rows]), 0)
-            .unwrap();
-        assert_eq!(scalar.key_heap_bytes.load(Ordering::Relaxed), 0);
+        assert!(key_heap(Arc::new(dictionary)) >= rows * long.len());
+        let floats = arrow_array::Float64Array::from(vec![1.5; rows]);
+        assert_eq!(key_heap(Arc::new(floats)), 0);
     }
 
     fn create_test_schema() -> Arc<ArrowSchema> {

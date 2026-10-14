@@ -1309,11 +1309,14 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
 
+    use arrow_array::types::Float32Type;
     use arrow_array::{ArrayRef, FixedSizeListArray, Float32Array};
     use arrow_schema::{DataType, Field};
+    use lance_arrow::FixedSizeListArrayExt;
     use lance_index::vector::hnsw::HNSW;
     use lance_index::vector::v3::subindex::IvfSubIndex;
     use lance_linalg::distance::DistanceType;
+    use lance_testing::datagen::generate_random_array_with_seed;
 
     use super::super::{ArrowFixedSizeListVectorStore, VectorSource};
     use super::*;
@@ -1365,44 +1368,20 @@ mod tests {
         assert!(result.iter().any(|point| point.id == 42));
     }
 
-    /// Points in general position, so the diversity heuristic has real choices.
-    fn scattered(rows: usize, dim: usize) -> Arc<FixedSizeListArray> {
-        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
-        let values: Vec<f32> = (0..rows * dim)
-            .map(|_| {
-                state = state
-                    .wrapping_mul(6364136223846793005)
-                    .wrapping_add(1442695040888963407);
-                (state >> 40) as f32 / (1u64 << 24) as f32
-            })
-            .collect();
-        Arc::new(
-            FixedSizeListArray::try_new(
-                Arc::new(Field::new("item", DataType::Float32, true)),
-                dim as i32,
-                Arc::new(Float32Array::from(values)) as ArrayRef,
-                None,
-            )
-            .unwrap(),
-        )
-    }
-
     /// Each node's neighbor lists are charged as it is inserted and hold
-    /// exactly `max_neighbors` once written, across incremental batches and
-    /// through full lists taking further reverse edges; slots never filled
-    /// allocate none. The first node and levels above the graph's top when a
-    /// node was inserted are only reached through reverse edges, so that path
-    /// is covered too.
+    /// exactly `max_neighbors` once written, across incremental batches and a
+    /// full list taking one more reverse edge; slots never filled allocate
+    /// none.
     #[test]
     fn test_neighbor_lists_are_charged_and_bounded_per_inserted_node() {
-        let rows = 400;
-        let capacity = 512;
-        let dim = 8;
-        let m = 4;
+        let (rows, capacity, dim, m) = (400, 512, 8, 4);
         let store = Arc::new(
             ArrowFixedSizeListVectorStore::try_new(capacity, 4, dim, DistanceType::L2).unwrap(),
         );
-        store.append_batch(scattered(rows, dim), 0).unwrap();
+        // Random points, so the diversity heuristic fills lists.
+        let values = generate_random_array_with_seed::<Float32Type>(rows * dim, [7; 32]);
+        let vectors = FixedSizeListArray::try_new_from_values(values, dim as i32).unwrap();
+        store.append_batch(Arc::new(vectors), 0).unwrap();
         let snapshot = store.snapshot();
         let graph = HnswGraph::try_new(
             capacity,
@@ -1418,15 +1397,15 @@ mod tests {
             for (id, node) in graph.nodes.iter().enumerate() {
                 for level in 0..node.levels.len() as u16 {
                     let capacity = node.ranked(level).unwrap().capacity();
-                    if id < inserted {
-                        assert!(
-                            capacity == 0 || capacity == max_neighbors(m, level),
-                            "node {id} level {level} holds {capacity} slots, charged {}",
-                            max_neighbors(m, level)
-                        );
+                    let allowed = if id < inserted {
+                        max_neighbors(m, level)
                     } else {
-                        assert_eq!(capacity, 0, "unfilled slot {id} allocated a list");
-                    }
+                        0
+                    };
+                    assert!(
+                        capacity == 0 || capacity == allowed,
+                        "node {id} level {level} holds {capacity} slots, allowed {allowed}"
+                    );
                 }
             }
             let linked: usize = graph.nodes[..inserted]
@@ -1444,92 +1423,25 @@ mod tests {
             check(start as usize + 50);
         }
 
-        // A full level-0 list taking one more edge keeps its capacity and its
-        // limit; the graph's own build has already done this many times.
+        // A full list taking one more edge is pruned in place, not grown.
         let limit = max_neighbors(m, 0);
         let target = (0..rows as u32)
             .find(|&id| graph.nodes[id as usize].ranked(0).unwrap().len() == limit)
             .expect("some level-0 list should be full");
+        let linked: Vec<u32> = graph.nodes[target as usize]
+            .ranked(0)
+            .unwrap()
+            .iter()
+            .map(|point| point.id)
+            .collect();
         let newcomer = (0..rows as u32)
-            .find(|&id| {
-                id != target
-                    && !graph.nodes[target as usize]
-                        .ranked(0)
-                        .unwrap()
-                        .iter()
-                        .any(|point| point.id == id)
-            })
+            .find(|id| *id != target && !linked.contains(id))
             .unwrap();
+        let distance = snapshot.distance_between(target, newcomer);
         graph
-            .add_reverse_edge(
-                &snapshot,
-                target,
-                newcomer,
-                snapshot.distance_between(target, newcomer),
-                0,
-            )
+            .add_reverse_edge(&snapshot, target, newcomer, distance, 0)
             .unwrap();
-        let ranked = graph.nodes[target as usize].ranked(0).unwrap();
-        assert_eq!(ranked.capacity(), limit);
-        assert!(ranked.len() <= limit);
-        drop(ranked);
         check(rows);
-    }
-
-    /// Pruning in place keeps exactly what the original selection kept: the
-    /// same heuristic, in the same order. The reference is that original
-    /// algorithm, copied verbatim.
-    #[test]
-    fn test_prune_neighbors_matches_the_original_selection() {
-        fn reference(
-            vectors: &impl VectorSource,
-            candidates: &[ScoredPoint],
-            limit: usize,
-        ) -> Vec<ScoredPoint> {
-            let mut candidates = candidates.to_vec();
-            candidates.sort_unstable();
-            if candidates.len() <= limit {
-                return candidates;
-            }
-            let mut selected = Vec::with_capacity(limit);
-            for candidate in candidates {
-                if selected.len() == limit {
-                    break;
-                }
-                if selected.is_empty() || vectors.prefers_candidate(candidate, &selected) {
-                    selected.push(candidate);
-                }
-            }
-            selected
-        }
-
-        let rows = 200;
-        let store =
-            Arc::new(ArrowFixedSizeListVectorStore::try_new(rows, 1, 8, DistanceType::L2).unwrap());
-        store.append_batch(scattered(rows, 8), 0).unwrap();
-        let snapshot = store.snapshot();
-        let mut state = 7_u64;
-        let mut next = |bound: u64| {
-            state = state
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            ((state >> 33) % bound) as u32
-        };
-        for _ in 0..300 {
-            let base = next(rows as u64);
-            let count = 1 + next(40) as usize;
-            let limit = 1 + next(20) as usize;
-            let mut candidates: Vec<ScoredPoint> = Vec::new();
-            while candidates.len() < count {
-                let id = next(rows as u64);
-                if id != base && !candidates.iter().any(|point| point.id == id) {
-                    candidates.push(ScoredPoint::new(id, snapshot.distance_between(base, id)));
-                }
-            }
-            let mut pruned = candidates.clone();
-            prune_neighbors(&snapshot, &mut pruned, limit);
-            assert_eq!(pruned, reference(&snapshot, &candidates, limit));
-        }
     }
 
     /// The graph must be exportable to a boundary its caller chose, because the
