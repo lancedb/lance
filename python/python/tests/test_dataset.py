@@ -609,6 +609,37 @@ def test_enable_stable_row_ids(tmp_path: Path):
     assert table_after["_rowaddr"][3].as_py() == (2 << 32) + 3
 
 
+def test_row_id_btree_index(tmp_path: Path):
+    data = pa.table({"i": range(12)})
+    ds = lance.write_dataset(
+        data, tmp_path, enable_stable_row_ids=True, max_rows_per_file=4
+    )
+    ds.create_scalar_index("_rowid", "BTREE", name="row_ids")
+    with pytest.deprecated_call():
+        assert ds.list_indices()[0]["fields"] == ["_rowid"]
+    assert ds.describe_indices()[0].fields == [-3]
+    assert ds.schema.names == ["i"]
+    assert ds._take_rows([9, 1, 9])["i"].to_pylist() == [9, 1, 9]
+    assert ds.to_table(filter="i >= 8")["i"].to_pylist() == [8, 9, 10, 11]
+
+    ds = lance.write_dataset(pa.table({"i": [12, 13]}), tmp_path, mode="append")
+    assert ds._take_rows([13, 1, 13])["i"].to_pylist() == [13, 1, 13]
+    ds.delete("i = 1")
+    ds.update({"i": "100"}, where="i = 5")
+    assert ds._take_rows([5, 9, 5])["i"].to_pylist() == [100, 9, 100]
+    ds.optimize.optimize_indices()
+    reopened = lance.dataset(tmp_path)
+    with pytest.deprecated_call():
+        assert reopened.list_indices()[0]["fields"] == ["_rowid"]
+    assert reopened._take_rows([13, 5, 9])["i"].to_pylist() == [13, 100, 9]
+
+
+def test_row_id_btree_requires_stable_ids(tmp_path: Path):
+    ds = lance.write_dataset(pa.table({"i": [1, 2]}), tmp_path)
+    with pytest.raises(KeyError, match="_rowid not found in schema"):
+        ds.create_scalar_index("_rowid", "BTREE")
+
+
 @pytest.mark.parametrize("enable_stable_row_ids", [True, False])
 @pytest.mark.parametrize(
     "rows",

@@ -54,7 +54,7 @@ use object_store::ObjectStoreExt;
 use object_store::path::Path;
 use prost::Message;
 use roaring::RoaringBitmap;
-use rowids::get_row_id_index;
+use rowids::row_ids_to_row_addrs;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -77,6 +77,7 @@ pub mod fragment;
 pub(crate) mod fragment_slice;
 mod hash_joiner;
 pub mod index;
+mod lookup;
 pub mod mem_wal;
 mod metadata;
 pub mod optimize;
@@ -2836,6 +2837,37 @@ impl Dataset {
         &self.manifest.schema
     }
 
+    /// The fields available to indices, including `_rowid` on stable-row-ID tables.
+    ///
+    /// `_rowid` has reserved field ID `-3` regardless of whether its values are
+    /// inline in the manifest or stored in a data file. It remains absent from
+    /// [`Self::schema`] and ordinary wildcard projections.
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # fn example(dataset: &Dataset) -> Result<()> {
+    /// let schema = dataset.index_schema()?;
+    /// if let Some(row_id) = schema.field("_rowid") {
+    ///     assert_eq!(row_id.id, lance_core::ROW_ID_FIELD_ID);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn index_schema(&self) -> Result<Cow<'_, Schema>> {
+        if !self.manifest.uses_stable_row_ids() {
+            return Ok(Cow::Borrowed(self.schema()));
+        }
+        let mut schema = self.schema().clone();
+        let mut field = lance_core::datatypes::Field::new_arrow(
+            lance_core::ROW_ID,
+            arrow_schema::DataType::UInt64,
+            false,
+        )?;
+        field.id = lance_core::ROW_ID_FIELD_ID;
+        schema.fields.push(field);
+        Ok(Cow::Owned(schema))
+    }
+
     /// Similar to [Self::schema], but only returns fields that are not marked as blob columns
     /// Creates a new empty projection into the dataset schema
     pub fn empty_projection(self: &Arc<Self>) -> Projection {
@@ -3123,14 +3155,16 @@ impl Dataset {
     }
 
     pub(crate) async fn filter_deleted_ids(&self, ids: &[u64]) -> Result<Vec<u64>> {
-        let (ids, addresses) = if let Some(row_id_index) = get_row_id_index(self).await? {
+        let (ids, addresses) = if self.manifest.uses_stable_row_ids() {
             // Ids absent from the deletion-aware index are deleted; drop
             // them from both lists to keep the zip aligned. ids.len() is an
             // upper bound on the output size, so allocate once up front.
             let mut live_ids = Vec::with_capacity(ids.len());
             let mut addresses = Vec::with_capacity(ids.len());
-            for id in ids {
-                if let Some(address) = row_id_index.get(*id)? {
+            let resolved =
+                row_ids_to_row_addrs(self, &arrow_array::UInt64Array::from(ids.to_vec())).await?;
+            for (id, address) in ids.iter().zip(resolved) {
+                if let Some(address) = address {
                     live_ids.push(*id);
                     addresses.push(u64::from(address));
                 }

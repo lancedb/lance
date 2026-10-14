@@ -4108,6 +4108,7 @@ mod tests {
     };
     use crate::scalar::registry::ScalarIndexPlugin;
     use arrow_array::RecordBatch;
+    use lance_core::ROW_ADDR;
     use lance_core::cache::{CacheCodecImpl, CacheEntryReader, CacheEntryWriter, CacheKey};
 
     /// Serialize a `BTreeIndexState` body (no envelope) for tests.
@@ -4427,7 +4428,7 @@ mod tests {
         let order = arrow::compute::sort_to_indices(values, Some(sort_options), None).unwrap();
         let schema = Arc::new(Schema::new(vec![
             Field::new("value", values.data_type().clone(), true),
-            Field::new("_rowid", DataType::UInt64, false),
+            Field::new(ROW_ADDR, DataType::UInt64, false),
         ]));
         let sorted = RecordBatch::try_new(
             schema.clone(),
@@ -4450,7 +4451,9 @@ mod tests {
         train_btree_index(stream, test_store.as_ref(), 64, None, None)
             .await
             .unwrap();
-        let index = BTreeIndex::load(test_store, None, cache).await.unwrap();
+        let index = BTreeIndex::load(test_store, None, cache, true)
+            .await
+            .unwrap();
         (tmpdir, index)
     }
 
@@ -4561,12 +4564,12 @@ mod tests {
         ));
         let data = gen_batch()
             .col("value", array::step::<Int32Type>())
-            .col("_rowid", array::step::<UInt64Type>())
+            .col(ROW_ADDR, array::step::<UInt64Type>())
             .into_df_stream(RowCount::from(100), BatchCount::from(1));
         train_btree_index(data, test_store.as_ref(), 64, None, None)
             .await
             .unwrap();
-        let index = BTreeIndex::load(test_store, None, &LanceCache::no_cache())
+        let index = BTreeIndex::load(test_store, None, &LanceCache::no_cache(), true)
             .await
             .unwrap();
 

@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use crate::Result;
+use crate::dataset::rowids::row_ids_to_row_addrs;
+use crate::{Dataset, Error, Result};
 use arrow_array::{ArrayRef, RecordBatch, RecordBatchIterator, RecordBatchReader, UInt64Array};
 use arrow_schema::{
     DataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
@@ -16,8 +17,8 @@ use lance_arrow::json::{
 };
 use lance_core::{ROW_CREATED_AT_VERSION, ROW_ID};
 use lance_table::format::{RowDatasetVersionRun, RowDatasetVersionSequence};
+use lance_table::rowids::RowIdSequence;
 use lance_table::rowids::segment::U64Segment;
-use lance_table::rowids::{RowIdIndex, RowIdSequence};
 use roaring::RoaringTreemap;
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -188,23 +189,23 @@ impl CapturedRowIds {
         }
     }
 
-    pub fn row_addrs(&self, index: Option<&RowIdIndex>) -> Result<Cow<'_, RoaringTreemap>> {
+    pub async fn row_addrs(&self, dataset: &Dataset) -> Result<Cow<'_, RoaringTreemap>> {
         match self {
             Self::AddressStyle(addrs) => Ok(Cow::Borrowed(addrs)),
             Self::SequenceStyle {
                 row_ids: sequence, ..
             } => {
                 let mut treemap = RoaringTreemap::new();
-                let Some(index) = index else {
-                    panic!("RowIdIndex required for sequence style row ids")
-                };
-                for row_id in sequence.iter() {
-                    treemap.insert(
-                        index
-                            .get(row_id)?
-                            .expect("row id missing from index")
-                            .into(),
-                    );
+                let ids = UInt64Array::from(sequence.iter().collect::<Vec<_>>());
+                let addresses = row_ids_to_row_addrs(dataset, &ids).await?;
+                for (row_id, address) in sequence.iter().zip(addresses) {
+                    let address = address.ok_or_else(|| {
+                        Error::internal(format!(
+                            "Captured row ID {row_id} has no live address in dataset version {}",
+                            dataset.version().version
+                        ))
+                    })?;
+                    treemap.insert(address.into());
                 }
                 Ok(Cow::Owned(treemap))
             }

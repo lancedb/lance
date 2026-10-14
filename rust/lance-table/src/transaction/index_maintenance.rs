@@ -541,11 +541,15 @@ impl Transaction {
         indices: &mut Vec<IndexMetadata>,
         schema: &Schema,
         fragments: &[Fragment],
+        uses_stable_row_ids: bool,
     ) {
-        let field_ids = schema
+        let mut field_ids = schema
             .fields_pre_order()
             .map(|f| f.id)
             .collect::<HashSet<_>>();
+        if uses_stable_row_ids {
+            field_ids.insert(lance_core::ROW_ID_FIELD_ID);
+        }
 
         // Remove indices for fields no longer in schema
         indices.retain(|existing_index| {
@@ -1081,7 +1085,7 @@ mod tests {
             create_test_index("idx3", 99, 1, Some(RoaringBitmap::from_iter([1])), false), // Field doesn't exist
         ];
 
-        Transaction::retain_relevant_indices(&mut indices, &schema, &fragments);
+        Transaction::retain_relevant_indices(&mut indices, &schema, &fragments, false);
 
         assert_eq!(indices.len(), 2);
         assert!(indices.iter().all(|idx| idx.fields[0] != 99));
@@ -1100,7 +1104,7 @@ mod tests {
             create_test_index("regular_idx", 99, 1, Some(RoaringBitmap::new()), false), // Should be removed
         ];
 
-        Transaction::retain_relevant_indices(&mut indices, &schema, &fragments);
+        Transaction::retain_relevant_indices(&mut indices, &schema, &fragments, false);
 
         assert_eq!(indices.len(), 2);
         assert!(indices.iter().any(|idx| idx.name == FRAG_REUSE_INDEX_NAME));
@@ -1117,7 +1121,7 @@ mod tests {
             create_test_index("other_idx", 1, 1, Some(RoaringBitmap::new()), false),
         ];
 
-        Transaction::retain_relevant_indices(&mut indices, &schema, &fragments);
+        Transaction::retain_relevant_indices(&mut indices, &schema, &fragments, false);
 
         // Fragment reuse index should always be kept
         assert!(indices.iter().any(|idx| idx.name == FRAG_REUSE_INDEX_NAME));
@@ -1136,7 +1140,7 @@ mod tests {
             false,
         )];
 
-        Transaction::retain_relevant_indices(&mut indices, &schema, &fragments);
+        Transaction::retain_relevant_indices(&mut indices, &schema, &fragments, false);
 
         // Single empty scalar index should be kept
         assert_eq!(indices.len(), 1);
@@ -1155,7 +1159,7 @@ mod tests {
             true,
         )];
 
-        Transaction::retain_relevant_indices(&mut indices, &schema, &fragments);
+        Transaction::retain_relevant_indices(&mut indices, &schema, &fragments, false);
 
         // The empty definition is retained: coverage is empty but the index
         // declaration must survive operations that replace every fragment.
@@ -1183,8 +1187,8 @@ mod tests {
             true,
         )];
 
-        Transaction::retain_relevant_indices(&mut scalar_indices, &schema, &fragments);
-        Transaction::retain_relevant_indices(&mut vector_indices, &schema, &fragments);
+        Transaction::retain_relevant_indices(&mut scalar_indices, &schema, &fragments, false);
+        Transaction::retain_relevant_indices(&mut vector_indices, &schema, &fragments, false);
 
         // Both should be kept
         assert_eq!(scalar_indices.len(), 1);
@@ -1199,8 +1203,8 @@ mod tests {
         let mut scalar_indices = vec![create_test_index("scalar_idx", 1, 1, None, false)];
         let mut vector_indices = vec![create_test_index("vector_idx", 1, 1, None, true)];
 
-        Transaction::retain_relevant_indices(&mut scalar_indices, &schema, &fragments);
-        Transaction::retain_relevant_indices(&mut vector_indices, &schema, &fragments);
+        Transaction::retain_relevant_indices(&mut scalar_indices, &schema, &fragments, false);
+        Transaction::retain_relevant_indices(&mut vector_indices, &schema, &fragments, false);
 
         // Both kept: a None bitmap is unknown coverage, not empty coverage, and
         // an unmeasured segment is retained regardless of index type.
@@ -1218,7 +1222,7 @@ mod tests {
             create_test_index("idx", 1, 2, Some(RoaringBitmap::from_iter([2])), false),
         ];
 
-        Transaction::retain_relevant_indices(&mut indices, &schema, &fragments);
+        Transaction::retain_relevant_indices(&mut indices, &schema, &fragments, false);
 
         // The unmeasured segment must survive its non-empty sibling: its bitmap
         // is missing because migration could not open the index, and deleting
@@ -1238,7 +1242,7 @@ mod tests {
             create_test_index("idx", 1, 2, Some(RoaringBitmap::new()), false),
         ];
 
-        Transaction::retain_relevant_indices(&mut indices, &schema, &fragments);
+        Transaction::retain_relevant_indices(&mut indices, &schema, &fragments, false);
 
         // Should keep only the oldest (dataset_version = 1)
         assert_eq!(indices.len(), 1);
@@ -1256,7 +1260,7 @@ mod tests {
             create_test_index("vec_idx", 1, 3, Some(RoaringBitmap::new()), true),
         ];
 
-        Transaction::retain_relevant_indices(&mut indices, &schema, &fragments);
+        Transaction::retain_relevant_indices(&mut indices, &schema, &fragments, false);
 
         // Same as the scalar case: all deltas are empty, so only the oldest
         // definition survives.
@@ -1316,7 +1320,7 @@ mod tests {
             create_test_index("idx", 1, 4, Some(RoaringBitmap::from_iter([1])), false), // Non-empty
         ];
 
-        Transaction::retain_relevant_indices(&mut indices, &schema, &fragments);
+        Transaction::retain_relevant_indices(&mut indices, &schema, &fragments, false);
 
         // Should keep only non-empty indices
         assert_eq!(indices.len(), 2);
@@ -1338,7 +1342,7 @@ mod tests {
             create_test_index("vec_idx", 1, 3, Some(RoaringBitmap::new()), true),          // Empty
         ];
 
-        Transaction::retain_relevant_indices(&mut indices, &schema, &fragments);
+        Transaction::retain_relevant_indices(&mut indices, &schema, &fragments, false);
 
         // Should keep only non-empty index
         assert_eq!(indices.len(), 1);
@@ -1358,7 +1362,7 @@ mod tests {
             false,
         )];
 
-        Transaction::retain_relevant_indices(&mut indices, &schema, &fragments);
+        Transaction::retain_relevant_indices(&mut indices, &schema, &fragments, false);
 
         // Should still keep the index (effective bitmap will be intersection with existing)
         assert_eq!(indices.len(), 1);
@@ -1391,8 +1395,8 @@ mod tests {
             true,
         )];
 
-        Transaction::retain_relevant_indices(&mut scalar_indices, &schema, &fragments);
-        Transaction::retain_relevant_indices(&mut vector_indices, &schema, &fragments);
+        Transaction::retain_relevant_indices(&mut scalar_indices, &schema, &fragments, false);
+        Transaction::retain_relevant_indices(&mut vector_indices, &schema, &fragments, false);
 
         // Both kept: a single index whose column is still in schema is
         // retained even when its effective coverage is empty.
@@ -1411,7 +1415,7 @@ mod tests {
             create_test_index("idx_c", 1, 1, Some(RoaringBitmap::from_iter([1])), false),
         ];
 
-        Transaction::retain_relevant_indices(&mut indices, &schema, &fragments);
+        Transaction::retain_relevant_indices(&mut indices, &schema, &fragments, false);
 
         // All three kept: empty definitions are retained for scalar and
         // vector indexes alike.
@@ -1428,7 +1432,7 @@ mod tests {
 
         let mut indices: Vec<IndexMetadata> = vec![];
 
-        Transaction::retain_relevant_indices(&mut indices, &schema, &fragments);
+        Transaction::retain_relevant_indices(&mut indices, &schema, &fragments, false);
 
         assert_eq!(indices.len(), 0);
     }
@@ -1444,7 +1448,7 @@ mod tests {
             create_test_index("idx3", 99, 1, Some(RoaringBitmap::from_iter([1])), false), // Bad field
         ];
 
-        Transaction::retain_relevant_indices(&mut indices, &schema, &fragments);
+        Transaction::retain_relevant_indices(&mut indices, &schema, &fragments, false);
 
         // Only the bad-field index is dropped; the empty vector definitions
         // are retained.
@@ -1477,7 +1481,7 @@ mod tests {
             create_test_index("idx_e", 99, 1, Some(RoaringBitmap::from_iter([1])), false),
         ];
 
-        Transaction::retain_relevant_indices(&mut indices, &schema, &fragments);
+        Transaction::retain_relevant_indices(&mut indices, &schema, &fragments, false);
 
         // Expected: frag_reuse, idx_a (oldest), vec_b (oldest), idx_c (2
         // non-empty), idx_d = 6 total
@@ -1587,6 +1591,28 @@ mod tests {
     }
 
     // Helper functions for retain_relevant_indices tests
+    #[rstest::rstest]
+    #[case::stable(true)]
+    #[case::physical(false)]
+    fn test_retain_row_id_index(#[case] uses_stable_row_ids: bool) {
+        let schema = create_test_schema(&[1]);
+        let fragments = vec![Fragment::new(0)];
+        let mut indices = vec![create_test_index(
+            "row_ids",
+            lance_core::ROW_ID_FIELD_ID,
+            1,
+            Some(RoaringBitmap::from_iter([0])),
+            false,
+        )];
+        Transaction::retain_relevant_indices(
+            &mut indices,
+            &schema,
+            &fragments,
+            uses_stable_row_ids,
+        );
+        assert_eq!(indices.len(), usize::from(uses_stable_row_ids));
+    }
+
     fn create_test_index(
         name: &str,
         field_id: i32,
@@ -1657,7 +1683,7 @@ mod tests {
         ];
         assert!(indices.iter().any(is_tagged));
 
-        Transaction::retain_relevant_indices(&mut indices, &schema, &fragments);
+        Transaction::retain_relevant_indices(&mut indices, &schema, &fragments, false);
 
         assert_eq!(indices.len(), 8);
         assert!(!indices.iter().any(|idx| idx.name == "idx_e"));
