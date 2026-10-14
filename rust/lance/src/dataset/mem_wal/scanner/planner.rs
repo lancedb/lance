@@ -6,7 +6,6 @@
 use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::{ExecutionPlan, limit::GlobalLimitExec};
 use datafusion::prelude::{Expr, col};
@@ -17,7 +16,10 @@ use crate::dataset::mem_wal::TOMBSTONE;
 
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
-use super::exec::{MEMTABLE_GEN_COLUMN, MemtableGenTagExec, PkBlockFilterExec, ROW_ADDRESS_COLUMN};
+use super::exec::{
+    MEMTABLE_GEN_COLUMN, MemtableGenTagExec, OrderedConcatExec, PkBlockFilterExec,
+    ROW_ADDRESS_COLUMN,
+};
 use super::generation_read::{GenerationRead, memtable_matches_table};
 use super::projection::{
     build_scanner_projection, canonical_output_schema, null_columns, project_to_canonical,
@@ -133,8 +135,10 @@ impl LsmScanPlanner {
     /// ([`PkBlockFilterExec`]) drops any PK superseded by a newer generation.
     /// Each PK therefore survives in exactly one source, so a plain
     /// `UnionExec` carries at most one row per PK — no cross-source dedup,
-    /// sort, or merge needed. `_memtable_gen` / `_rowaddr` are output-only and
-    /// only produced when the caller opts in.
+    /// sort, or merge needed. Its arms are concatenated in source order, so
+    /// the output order, and with it any limit / offset, is the same on every
+    /// run. `_memtable_gen` / `_rowaddr` are output-only and only produced
+    /// when the caller opts in.
     #[instrument(name = "lsm_plan_scan", level = "debug", skip_all, fields(has_filter = filter.is_some(), limit, offset))]
     pub async fn plan_scan(
         &self,
@@ -174,9 +178,9 @@ impl LsmScanPlanner {
         ))
         .await?;
 
-        // Reverse so the union lists the newest generation first. This is
-        // cosmetic — correctness comes from the per-source dedup and the
-        // cross-gen block-list, not from output ordering.
+        // Reverse so the union lists the newest generation first. Dedup
+        // correctness comes from the per-source dedup and the cross-gen
+        // block-list; this order is only the order rows are emitted in.
         let sources: Vec<_> = sources.into_iter().rev().collect();
 
         // Per-source limit pushdown: an unordered LIMIT needs only
@@ -278,13 +282,15 @@ impl LsmScanPlanner {
             None => Vec::new(),
         };
 
-        // Union, then coalesce into a single partition (UnionExec emits one
-        // per arm; downstream consumers only read partition 0).
+        // Union, then concatenate into a single partition in arm order
+        // (UnionExec emits one per arm; downstream consumers only read
+        // partition 0). Arrival order would differ between runs, so an
+        // offset above would page through a different row order each time.
         let plan: Arc<dyn ExecutionPlan> = if source_plans.len() == 1 {
             source_plans.remove(0)
         } else {
             let union = UnionExec::try_new(source_plans)?;
-            Arc::new(CoalescePartitionsExec::new(union))
+            Arc::new(OrderedConcatExec::new(union))
         };
 
         // Project to the canonical output schema, dropping `_rowaddr` /
@@ -749,7 +755,7 @@ mod integration_tests {
         assert_plan_node_equals(
             plan,
             "ProjectionExec:...
-  CoalescePartitionsExec
+  OrderedConcatExec
     UnionExec
     MemTableDedupScanExec: projection=[id, name, _rowaddr], with_row_id=false, with_row_address=true
     PkBlockFilterExec: pk_cols=[id]...
@@ -785,7 +791,7 @@ mod integration_tests {
         assert_plan_node_equals(
             plan,
             "ProjectionExec:...
-  CoalescePartitionsExec
+  OrderedConcatExec
     UnionExec
     MemtableGenTagExec: gen=gen3
       MemTableDedupScanExec: projection=[id, name, _rowaddr], with_row_id=false, with_row_address=true
@@ -1304,7 +1310,7 @@ mod integration_tests {
         assert_plan_node_equals(
             plan,
             "ProjectionExec:...
-  CoalescePartitionsExec
+  OrderedConcatExec
     UnionExec
     ProjectionExec: expr=[id@0 as id, name@1 as name, NULL as _rowaddr]
       MemTableDedupScanExec: projection=[id, name, _rowaddr], with_row_id=false, with_row_address=true
@@ -1370,7 +1376,7 @@ mod integration_tests {
         assert_plan_node_equals(
             plan,
             "ProjectionExec:...
-  CoalescePartitionsExec
+  OrderedConcatExec
     UnionExec
     MemtableGenTagExec: gen=gen3
       ProjectionExec: expr=[id@0 as id, name@1 as name, NULL as _rowaddr]
