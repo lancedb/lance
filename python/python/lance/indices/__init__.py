@@ -6,6 +6,7 @@ from enum import Enum
 from .. import lance as _lance
 from .builder import IndexConfig, IndicesBuilder
 from .ivf import IvfModel
+from .pca import PcaParams
 from .pq import PqModel
 
 IndexSegmentDescription = _lance.indices.IndexSegmentDescription
@@ -14,6 +15,7 @@ IndexSegment = _lance.indices.IndexSegment
 __all__ = [
     "IndicesBuilder",
     "IndexConfig",
+    "PcaParams",
     "PqModel",
     "IvfModel",
     "IndexFileVersion",

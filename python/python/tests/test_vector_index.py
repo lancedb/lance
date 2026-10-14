@@ -11,6 +11,7 @@ import string
 import tempfile
 import time
 import uuid
+from dataclasses import FrozenInstanceError
 from pathlib import Path
 from typing import Optional
 
@@ -22,7 +23,7 @@ import pytest
 from conftest import ProgressRecorder, progress_event_tags, stage_progress_values
 from lance import LanceDataset, LanceFragment
 from lance.dataset import VectorIndexReader, VectorSearchQuery
-from lance.indices import IndexFileVersion, IndicesBuilder
+from lance.indices import IndexFileVersion, IndicesBuilder, PcaParams
 from lance.query import MatchQuery, PhraseQuery
 from lance.util import (  # noqa: E402
     _target_partition_size_to_num_partitions,
@@ -1575,6 +1576,7 @@ def test_create_ivf_rq_index():
         num_partitions=4,
     )
     assert ds.describe_indices()[0].field_names == ["vector"]
+    assert ds.describe_indices()[0].segments[0].index_version == 2
     stats = ds.stats.index_stats("vector_idx")
     assert stats["indices"][0]["sub_index"]["num_bits"] == 5
     assert stats["indices"][0]["sub_index"]["packed"] is True
@@ -1622,6 +1624,230 @@ def test_build_rq_model_default_num_bits():
 
     model = json.loads(indices.build_rq_model(dimension=8))
     assert model["num_bits"] == 5
+
+
+def test_pca_params_defaults_and_frozen():
+    params = PcaParams(dimension=8)
+
+    assert params.dimension == 8
+    assert params.random_rotation is False
+    assert params.whitening is False
+    assert params.epsilon == 1e-5
+    assert params.sample_size == 65536
+    assert params.max_training_memory_bytes == 1073741824
+    assert params.sampling_seed == 42
+    assert params.rotation_seed == 5
+    with pytest.raises(FrozenInstanceError):
+        params.dimension = 4
+
+
+def test_create_ivf_rq_with_pca():
+    rng = np.random.default_rng(20260827)
+    latent = rng.standard_normal((512, 8)).astype(np.float32)
+    mixing = rng.standard_normal((8, 8)).astype(np.float32)
+    vectors = np.concatenate([latent, latent @ mixing], axis=1)
+    assert np.linalg.matrix_rank(vectors) >= 8
+
+    table = vec_to_table(data=vectors).append_column(
+        "id", pa.array(np.arange(len(vectors)))
+    )
+    ds = lance.write_dataset(table, "memory://", mode="overwrite")
+    nearest = {"column": "vector", "q": vectors[0], "k": 10}
+    expected_ids = set(ds.to_table(nearest=nearest, columns=["id"])["id"].to_pylist())
+
+    params = PcaParams(
+        dimension=8,
+        random_rotation=True,
+        whitening=True,
+        epsilon=1e-4,
+        sample_size=512,
+        max_training_memory_bytes=64 * 1024 * 1024,
+        sampling_seed=17,
+        rotation_seed=29,
+    )
+    ds = ds.create_index(
+        "vector",
+        index_type="IVF_RQ",
+        num_partitions=4,
+        num_bits=4,
+        pca=params,
+    )
+
+    info = ds.describe_indices()[0]
+    assert info.segments[0].index_version == 3
+    pre_transform = info.details["pre_transform"]
+    assert pre_transform["type"] == "pca"
+    assert pre_transform["dimension"] == 8
+    assert pre_transform["random_rotation"] is True
+    assert pre_transform["whitening"] is True
+    assert pre_transform["epsilon"] == pytest.approx(1e-4)
+    assert pre_transform["sample_size"] == 512
+    assert pre_transform["max_training_memory_bytes"] == 64 * 1024 * 1024
+    assert pre_transform["sampling_seed"] == 17
+    assert pre_transform["rotation_seed"] == 29
+    assert pre_transform["model_fingerprint"].startswith("blake3:")
+
+    actual_ids = set(
+        ds.to_table(
+            nearest={
+                **nearest,
+                "nprobes": 4,
+                "refine_factor": 4,
+            },
+            columns=["id"],
+        )["id"].to_pylist()
+    )
+    assert len(expected_ids & actual_ids) / len(expected_ids) >= 0.5
+
+
+def test_create_ivf_rq_with_pca_streaming():
+    rng = np.random.default_rng(20260903)
+    latent = rng.standard_normal((512, 8)).astype(np.float32)
+    mixing = rng.standard_normal((8, 8)).astype(np.float32)
+    vectors = np.concatenate([latent, latent @ mixing], axis=1)
+    assert np.linalg.matrix_rank(vectors) >= 8
+
+    table = vec_to_table(data=vectors).append_column(
+        "id", pa.array(np.arange(len(vectors)))
+    )
+    nearest = {"column": "vector", "q": vectors[0], "k": 10}
+
+    batch_ds = lance.write_dataset(table, "memory://pca-batch", mode="overwrite")
+    expected_ids = set(
+        batch_ds.to_table(nearest=nearest, columns=["id"])["id"].to_pylist()
+    )
+    params = PcaParams(
+        dimension=8,
+        sample_size=512,
+        max_training_memory_bytes=64 * 1024 * 1024,
+    )
+    batch_ds = batch_ds.create_index(
+        "vector",
+        index_type="IVF_RQ",
+        num_partitions=4,
+        num_bits=4,
+        pca=params,
+    )
+
+    streaming_ds = lance.write_dataset(
+        table, "memory://pca-streaming", mode="overwrite"
+    )
+    streaming_ds = streaming_ds.create_index(
+        "vector",
+        index_type="IVF_RQ",
+        num_partitions=4,
+        num_bits=4,
+        pca=params,
+        streaming_sample_rate=8,
+        streaming_refine_passes=1,
+    )
+
+    info = streaming_ds.describe_indices()[0]
+    assert info.segments[0].index_version == 3
+    pre_transform = info.details["pre_transform"]
+    assert pre_transform["type"] == "pca"
+    assert pre_transform["dimension"] == 8
+    assert pre_transform["model_fingerprint"].startswith("blake3:")
+
+    def recall_for(dataset):
+        actual_ids = set(
+            dataset.to_table(
+                nearest={
+                    **nearest,
+                    "nprobes": 4,
+                    "refine_factor": 4,
+                },
+                columns=["id"],
+            )["id"].to_pylist()
+        )
+        return len(expected_ids & actual_ids) / len(expected_ids)
+
+    batch_recall = recall_for(batch_ds)
+    streaming_recall = recall_for(streaming_ds)
+    assert streaming_recall >= 0.5
+    assert abs(streaming_recall - batch_recall) <= 0.10
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"index_type": "IVF_FLAT"}, "only supported for IVF_RQ"),
+        ({"metric": "cosine"}, "requires the L2/euclidean metric"),
+        ({"accelerator": "cuda"}, "does not support accelerator"),
+        ({"filter_nan": False}, "requires filter_nan=True"),
+        ({"train": False}, "requires train=True"),
+        ({"fragment_ids": [0]}, "does not support fragment_ids"),
+        (
+            {"ivf_centroids": np.zeros((4, 16), dtype=np.float32)},
+            "precomputed IVF centroids",
+        ),
+        ({"ivf_centroids_file": "centroids.npy"}, "precomputed IVF centroids"),
+        ({"rabitq_model": "{}"}, "does not support rabitq_model"),
+        (
+            {"precomputed_partition_dataset": "memory://precomputed"},
+            "does not support precomputed_partition_dataset",
+        ),
+        ({"precomputed_partitions_file": "partitions"}, "precomputed buffers"),
+        ({"precomputed_shuffle_buffers": ["buffer"]}, "precomputed buffers"),
+        ({"index_file_version": IndexFileVersion.LEGACY}, "Legacy index file"),
+    ],
+)
+def test_create_ivf_rq_with_pca_rejects_unsupported_options(overrides, message):
+    ds = lance.write_dataset(
+        create_table(nvec=32, ndim=16), "memory://", mode="overwrite"
+    )
+    kwargs = {
+        "index_type": "IVF_RQ",
+        "num_partitions": 4,
+        "pca": PcaParams(dimension=8),
+        **overrides,
+    }
+
+    with pytest.raises(ValueError, match=message):
+        ds.create_index("vector", **kwargs)
+
+
+def test_create_index_rejects_invalid_pca_type():
+    ds = lance.write_dataset(
+        create_table(nvec=32, ndim=16), "memory://", mode="overwrite"
+    )
+
+    with pytest.raises(TypeError, match="pca must be a PcaParams instance"):
+        ds.create_index(
+            "vector",
+            index_type="IVF_RQ",
+            num_partitions=4,
+            pca={"dimension": 8},
+        )
+
+
+def test_pca_options_require_dimension():
+    ds = lance.write_dataset(
+        create_table(nvec=32, ndim=16), "memory://", mode="overwrite"
+    )
+
+    with pytest.raises(ValueError, match="pca_whitening requires pca_dimension"):
+        ds.create_index(
+            "vector",
+            index_type="IVF_RQ",
+            num_partitions=4,
+            pca_whitening=True,
+        )
+
+
+def test_create_index_uncommitted_rejects_pca():
+    ds = lance.write_dataset(
+        create_table(nvec=32, ndim=16), "memory://", mode="overwrite"
+    )
+
+    with pytest.raises(ValueError, match="create_index_uncommitted"):
+        ds.create_index_uncommitted(
+            "vector",
+            index_type="IVF_RQ",
+            num_partitions=4,
+            fragment_ids=[0],
+            pca=PcaParams(dimension=8),
+        )
 
 
 def test_create_ivf_rq_skip_transpose():
