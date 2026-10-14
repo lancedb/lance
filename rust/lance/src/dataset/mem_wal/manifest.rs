@@ -511,8 +511,11 @@ impl ShardManifestStore {
     /// A version's existence is what rejects a writer still building on its
     /// predecessor, so `min_age` must exceed the writers' max position age (one
     /// hour by default) plus the longest a single write can stall.
-    /// Deletion stops at the first version younger than `min_age`, so the
-    /// versions kept stay contiguous.
+    ///
+    /// Versions are deleted oldest first, one at a time, stopping at the first
+    /// failure or the first version younger than `min_age`. The versions left
+    /// stay contiguous even mid-prune, because a lookup starting from a
+    /// surviving version would stop at a gap above it and miss the latest.
     pub async fn prune_versions_before(&self, keep_from: u64, min_age: Duration) -> Result<usize> {
         let latest = self.find_latest_version().await?;
         if keep_from > latest {
@@ -540,17 +543,13 @@ impl ShardManifestStore {
             })
             .collect();
         let count = pruned.len();
-        let mut results = self
-            .object_store
-            .inner
-            .delete_stream(futures::stream::iter(pruned.into_iter().map(Ok)).boxed());
-        while let Some(result) = results.next().await {
-            match result {
-                Ok(_) | Err(object_store::Error::NotFound { .. }) => {}
+        for path in pruned {
+            match self.object_store.inner.delete(&path).await {
+                Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
                 Err(e) => {
                     return Err(Error::io(format!(
-                        "Failed to prune manifest versions for shard {}: {}",
-                        self.shard_id, e
+                        "Failed to prune manifest version {path} for shard {}: {e}",
+                        self.shard_id
                     )));
                 }
             }
@@ -1473,6 +1472,56 @@ mod tests {
             ),
             (6, peer_epoch, 6, 1)
         );
+    }
+
+    /// A prune that fails partway leaves no gap: a lookup that starts from the
+    /// oldest surviving version still reaches the latest.
+    #[tokio::test]
+    async fn a_failed_prune_leaves_the_versions_contiguous() {
+        let (store, base_path, _temp_dir) = create_local_store().await;
+        let shard_id = Uuid::new_v4();
+        let writer = ShardManifestStore::new(store.clone(), &base_path, shard_id, 2);
+        write_versions(&writer, shard_id, 6).await;
+
+        let first = shard_manifest_path(&base_path, &shard_id).join(manifest_filename(1).as_str());
+        let policy = Arc::new(Mutex::new(ProxyObjectStorePolicy::new()));
+        policy.lock().unwrap().set_before_policy(
+            "refuse v1",
+            Arc::new(move |method: &str, path: &Path| {
+                if method == "delete" && *path == first {
+                    return Err(object_store::Error::Generic {
+                        store: "test",
+                        source: "access denied".into(),
+                    }
+                    .into());
+                }
+                Ok(())
+            }),
+        );
+        let mut proxied = (*store).clone();
+        proxied.inner = Arc::new(ProxyObjectStore::new(store.inner.clone(), policy));
+        let pruner = ShardManifestStore::new(Arc::new(proxied), &base_path, shard_id, 2);
+        assert!(
+            pruner
+                .prune_versions_before(6, Duration::ZERO)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            writer.list_versions().await.unwrap(),
+            vec![1, 2, 3, 4, 5, 6]
+        );
+
+        store
+            .inner
+            .put(
+                &hint_path(&base_path, &shard_id),
+                Bytes::from(serde_json::to_vec(&VersionHint { version: 1 }).unwrap()).into(),
+            )
+            .await
+            .unwrap();
+        let reader = ShardManifestStore::new(store, &base_path, shard_id, 2);
+        assert_eq!(reader.refresh_latest().await.unwrap().unwrap().version, 6);
     }
 
     /// Initializing a shard whose version 1 was pruned leaves its history alone.
