@@ -64,6 +64,7 @@ pub struct InPlaceMergeInsertExec {
     source_skipped_duplicates: Arc<AtomicU64>,
     spill_session_context: SessionContext,
     spill_execution_options: LanceExecutionOptions,
+    update_if_deferred: bool,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
     merge_stats: Arc<Mutex<Option<MergeStats>>>,
@@ -78,6 +79,7 @@ impl std::fmt::Debug for InPlaceMergeInsertExec {
             .field("params", &self.params)
             .field("source_skipped_duplicates", &self.source_skipped_duplicates)
             .field("spill_execution_options", &self.spill_execution_options)
+            .field("update_if_deferred", &self.update_if_deferred)
             .field("properties", &self.properties)
             .field("metrics", &self.metrics)
             .field("merge_stats", &self.merge_stats)
@@ -110,11 +112,18 @@ impl InPlaceMergeInsertExec {
             source_skipped_duplicates,
             spill_session_context,
             spill_execution_options,
+            update_if_deferred: false,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
             merge_stats: Arc::new(Mutex::new(None)),
             transaction: Arc::new(Mutex::new(None)),
         })
+    }
+
+    /// Marks the `UpdateIf` condition as evaluated by `MergeConditionExec`.
+    pub fn with_update_if_deferred(mut self) -> Self {
+        self.update_if_deferred = true;
+        self
     }
 
     /// Takes the merge statistics if the execution has completed.
@@ -364,16 +373,8 @@ impl DisplayAs for InPlaceMergeInsertExec {
         match t {
             datafusion::physical_plan::DisplayFormatType::Default
             | datafusion::physical_plan::DisplayFormatType::Verbose => {
-                let when_matched = match &self.params.when_matched {
-                    crate::dataset::WhenMatched::UpdateAll => "UpdateAll".to_string(),
-                    crate::dataset::WhenMatched::UpdateIf(condition) => {
-                        format!("UpdateIf({})", condition)
-                    }
-                    crate::dataset::WhenMatched::UpdateIfExpr(expr) => {
-                        format!("UpdateIf({})", expr.human_display())
-                    }
-                    other => format!("{:?}", other),
-                };
+                let when_matched =
+                    super::when_matched_label(&self.params.when_matched, self.update_if_deferred);
                 write!(
                     f,
                     "InPlaceMergeInsert: on=[{}], when_matched={}, mode=RewriteColumns",
@@ -417,6 +418,7 @@ impl ExecutionPlan for InPlaceMergeInsertExec {
             source_skipped_duplicates: self.source_skipped_duplicates.clone(),
             spill_session_context: self.spill_session_context.clone(),
             spill_execution_options: self.spill_execution_options.clone(),
+            update_if_deferred: self.update_if_deferred,
             properties: self.properties.clone(),
             metrics: self.metrics.clone(),
             merge_stats: self.merge_stats.clone(),

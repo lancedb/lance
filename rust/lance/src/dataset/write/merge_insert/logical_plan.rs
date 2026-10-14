@@ -9,7 +9,7 @@ use datafusion::{
     physical_plan::ExecutionPlan,
     physical_planner::{ExtensionPlanner, PhysicalPlanner},
 };
-use datafusion_expr::{LogicalPlan, UserDefinedLogicalNode, UserDefinedLogicalNodeCore};
+use datafusion_expr::{Expr, LogicalPlan, UserDefinedLogicalNode, UserDefinedLogicalNodeCore};
 use lance_core::{ROW_ADDR, ROW_ID};
 use lance_datafusion::exec::LanceExecutionOptions;
 use std::{
@@ -20,6 +20,7 @@ use std::{
 use crate::Dataset;
 use crate::dataset::write::merge_insert::exec::{
     DeleteOnlyMergeInsertExec, FullSchemaMergeInsertExec, InPlaceMergeInsertExec,
+    MergeConditionExec,
 };
 use crate::dataset::{WhenMatched, WhenNotMatchedBySource};
 
@@ -39,6 +40,16 @@ pub enum WriteSink {
     /// already hold the matched rows and tombstone the old versions of those
     /// columns.
     RewriteColumns,
+}
+
+/// Conditions over target columns, evaluated by [`MergeConditionExec`] on the
+/// rows they gate rather than folded into `__action`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, PartialOrd)]
+pub struct DeferredConditions {
+    /// `UpdateIf`, on the matched rows.
+    pub update_if: Option<Expr>,
+    /// `DeleteIf`, on the target-only rows.
+    pub delete_if: Option<Expr>,
 }
 
 /// Logical plan node for merge insert write.
@@ -61,6 +72,7 @@ pub struct MergeInsertWriteNode {
     pub(crate) spill_execution_options: LanceExecutionOptions,
     /// Blob columns supplied by the source, excluding target-filled columns.
     pub(crate) source_blob_columns: Vec<String>,
+    pub(crate) deferred: DeferredConditions,
     schema: Arc<DFSchema>,
 }
 
@@ -74,6 +86,7 @@ impl std::fmt::Debug for MergeInsertWriteNode {
             .field("write_sink", &self.write_sink)
             .field("spill_execution_options", &self.spill_execution_options)
             .field("source_blob_columns", &self.source_blob_columns)
+            .field("deferred", &self.deferred)
             .field("schema", &self.schema)
             .finish_non_exhaustive()
     }
@@ -84,6 +97,7 @@ impl PartialEq for MergeInsertWriteNode {
         self.params == other.params
             && self.write_sink == other.write_sink
             && self.source_blob_columns == other.source_blob_columns
+            && self.deferred == other.deferred
             && self.input == other.input
             && self.dataset.base == other.dataset.base
     }
@@ -96,6 +110,7 @@ impl std::hash::Hash for MergeInsertWriteNode {
         self.params.hash(state);
         self.write_sink.hash(state);
         self.source_blob_columns.hash(state);
+        self.deferred.hash(state);
         self.input.hash(state);
         self.dataset.base.hash(state);
     }
@@ -106,7 +121,10 @@ impl PartialOrd for MergeInsertWriteNode {
         match self.params.partial_cmp(&other.params) {
             Some(Ordering::Equal) => match self.write_sink.cmp(&other.write_sink) {
                 Ordering::Equal => match self.source_blob_columns.cmp(&other.source_blob_columns) {
-                    Ordering::Equal => self.input.partial_cmp(&other.input),
+                    Ordering::Equal => match self.deferred.partial_cmp(&other.deferred) {
+                        Some(Ordering::Equal) => self.input.partial_cmp(&other.input),
+                        cmp => cmp,
+                    },
                     cmp => Some(cmp),
                 },
                 cmp => Some(cmp),
@@ -130,6 +148,7 @@ impl MergeInsertWriteNode {
         spill_session_context: SessionContext,
         spill_execution_options: LanceExecutionOptions,
         source_blob_columns: Vec<String>,
+        deferred: DeferredConditions,
     ) -> Self {
         let empty_schema = Arc::new(arrow_schema::Schema::empty());
         let schema = Arc::new(DFSchema::try_from(empty_schema).unwrap());
@@ -142,6 +161,7 @@ impl MergeInsertWriteNode {
             spill_session_context,
             spill_execution_options,
             source_blob_columns,
+            deferred,
             schema,
         }
     }
@@ -220,6 +240,7 @@ impl UserDefinedLogicalNodeCore for MergeInsertWriteNode {
             self.spill_session_context.clone(),
             self.spill_execution_options.clone(),
             self.source_blob_columns.clone(),
+            self.deferred.clone(),
         ))
     }
 
@@ -313,37 +334,58 @@ impl ExtensionPlanner for MergeInsertPlanner {
         node: &dyn UserDefinedLogicalNode,
         logical_inputs: &[&LogicalPlan],
         physical_inputs: &[Arc<dyn ExecutionPlan>],
-        _session_state: &SessionState,
+        session_state: &SessionState,
     ) -> DFResult<Option<Arc<dyn ExecutionPlan>>> {
         Ok(
             if let Some(write_node) = node.as_any().downcast_ref::<MergeInsertWriteNode>() {
                 assert_eq!(logical_inputs.len(), 1, "Inconsistent number of inputs");
                 assert_eq!(physical_inputs.len(), 1, "Inconsistent number of inputs");
 
+                let mut input = physical_inputs[0].clone();
+                let update_if_deferred = write_node.deferred.update_if.is_some();
+                if write_node.deferred != DeferredConditions::default() {
+                    input = Arc::new(MergeConditionExec::try_new(
+                        input,
+                        logical_inputs[0].schema(),
+                        write_node.dataset.clone(),
+                        write_node.deferred.update_if.clone(),
+                        write_node.deferred.delete_if.clone(),
+                        session_state,
+                    )?);
+                }
+
                 let exec: Arc<dyn ExecutionPlan> = if Self::is_delete_only(&write_node.params) {
                     Arc::new(DeleteOnlyMergeInsertExec::try_new(
-                        physical_inputs[0].clone(),
+                        input,
                         write_node.dataset.clone(),
                         write_node.params.clone(),
                         write_node.source_skipped_duplicates.clone(),
                     )?)
                 } else if write_node.write_sink == WriteSink::RewriteColumns {
-                    Arc::new(InPlaceMergeInsertExec::try_new(
-                        physical_inputs[0].clone(),
+                    let exec = InPlaceMergeInsertExec::try_new(
+                        input,
                         write_node.dataset.clone(),
                         write_node.params.clone(),
                         write_node.source_skipped_duplicates.clone(),
                         write_node.spill_session_context.clone(),
                         write_node.spill_execution_options.clone(),
-                    )?)
+                    )?;
+                    match update_if_deferred {
+                        true => Arc::new(exec.with_update_if_deferred()),
+                        false => Arc::new(exec),
+                    }
                 } else {
-                    Arc::new(FullSchemaMergeInsertExec::try_new(
-                        physical_inputs[0].clone(),
+                    let exec = FullSchemaMergeInsertExec::try_new(
+                        input,
                         write_node.dataset.clone(),
                         write_node.params.clone(),
                         write_node.source_skipped_duplicates.clone(),
                         write_node.source_blob_columns.clone(),
-                    )?)
+                    )?;
+                    match update_if_deferred {
+                        true => Arc::new(exec.with_update_if_deferred()),
+                        false => Arc::new(exec),
+                    }
                 };
                 Some(exec)
             } else {
