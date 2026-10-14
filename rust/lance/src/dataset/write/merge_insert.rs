@@ -39,7 +39,7 @@ pub(super) const MERGE_SOURCE_SENTINEL: &str = "__merge_source_sentinel";
 pub mod inserted_rows;
 
 use assign_action::{
-    condition_target_columns, merge_insert_action, parse_delete_condition, parse_update_condition,
+    condition_reads_target, merge_insert_action, parse_delete_condition, parse_update_condition,
 };
 use inserted_rows::KeyExistenceFilter;
 
@@ -2569,17 +2569,11 @@ impl MergeInsertJob {
         let join_type = self.create_plan_join_type();
         let dataset_schema: Schema = self.dataset.schema().into();
         // A condition that reads target columns is evaluated after the join
-        // on the rows it gates (`MergeConditionExec`); folded into `__action`
-        // it would pull those columns into the target scan. Columns a whole-row
-        // rewrite fills from the target side are scanned regardless.
-        let filled =
-            |name: &str| write_sink == WriteSink::RewriteRows && !source_field_names.contains(name);
+        // on the rows it gates (`MergeConditionExec`), which takes only the
+        // columns its input lacks; folded into `__action` it would pull them
+        // into the target scan.
         let split = |condition: Option<Expr>| match condition {
-            Some(condition)
-                if condition_target_columns(&condition, self.dataset.schema())
-                    .iter()
-                    .any(|name| !filled(name)) =>
-            {
+            Some(condition) if condition_reads_target(&condition, self.dataset.schema()) => {
                 (None, Some(condition))
             }
             condition => (condition, None),
@@ -16580,6 +16574,10 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
                 plan.contains("MergeCondition: update_if=") && plan.contains("take=[payload]"),
                 "the condition must be evaluated on the matched rows: {plan}"
             );
+            assert!(
+                plan.contains("when_matched=UpdateIf(MergeCondition)"),
+                "the write node must not display a predicate it does not evaluate: {plan}"
+            );
 
             io.incremental_stats();
             let (updated, stats) = run(job, &source).await;
@@ -16649,6 +16647,9 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
                 .when_matched(WhenMatched::update_if(&ds, condition).unwrap())
                 .try_build()
                 .unwrap();
+            // The filled column is bound in place, not taken again.
+            let plan = explain(&job, &source).await;
+            assert!(plan.contains("take=[]"), "{plan}");
             let (updated, stats) = run(job, &source).await;
             assert_eq!(stats.num_updated_rows, 1);
             let rows = updated
@@ -16969,11 +16970,11 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
             ))
         }
 
-        /// Control: the same legacy blob predicate on the folded path (the
-        /// source omits `payload`, so a whole-row rewrite fills it from the
-        /// scan) succeeds with or without the deferred take.
+        /// Control: the same legacy blob predicate where the source omits
+        /// `payload`, so a whole-row rewrite fills it from the scan and the
+        /// condition reads that copy rather than taking it.
         #[tokio::test]
-        async fn legacy_blob_condition_folded_control() {
+        async fn legacy_blob_condition_filled_control() {
             let mut metadata = HashMap::new();
             metadata.insert(lance_arrow::BLOB_META_KEY.to_string(), "true".to_string());
             let schema = Arc::new(Schema::new(vec![
@@ -17014,7 +17015,7 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
                 .explain_plan(Some(input.schema().as_ref()), false)
                 .await
                 .unwrap();
-            assert!(!plan.contains("MergeCondition:"), "{plan}");
+            assert!(plan.contains("take=[]"), "{plan}");
             let (_, stats) = job.execute_reader(reader(input)).await.unwrap();
             assert_eq!(stats.num_updated_rows, 1);
         }
@@ -17112,6 +17113,10 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
                 .unwrap();
             let plan = explain(&job, &source).await;
             assert!(!plan.contains("MergeCondition:"), "{plan}");
+            assert!(
+                plan.contains("when_matched=UpdateIf(source.payload IS NOT NULL)"),
+                "{plan}"
+            );
         }
     }
 }

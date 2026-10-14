@@ -10,7 +10,6 @@ use datafusion::common::{
 use datafusion::scalar::ScalarValue;
 use datafusion_expr::{Case, Expr, col};
 use lance_core::datatypes::Schema;
-use std::collections::HashSet;
 use std::sync::Arc;
 
 // Note: right now, this is a fixed enum. In the future, this will need to be
@@ -106,28 +105,17 @@ pub fn parse_delete_condition(params: &MergeInsertParams) -> Result<Option<Expr>
     }
 }
 
-/// The target columns a merge condition reads, in dataset order. An
-/// unqualified name counts: the join resolves it to the target when the source
-/// lacks it, and rejects it as ambiguous when both carry it, as the take does.
-pub fn condition_target_columns(condition: &Expr, dataset_schema: &Schema) -> Vec<String> {
-    let referenced = condition
-        .column_refs()
-        .into_iter()
-        .filter(|column| {
-            column
-                .relation
-                .as_ref()
-                .is_none_or(|relation| relation.table() == "target")
-        })
-        .map(|column| column.name.as_str())
-        .collect::<HashSet<_>>();
-    dataset_schema
-        .fields
-        .iter()
-        .map(|field| field.name.as_str())
-        .filter(|name| referenced.contains(name))
-        .map(String::from)
-        .collect()
+/// Whether a merge condition reads a target column. An unqualified name
+/// counts: the join resolves it to the target when the source lacks it, and
+/// rejects it as ambiguous when both carry it, as the take does.
+pub fn condition_reads_target(condition: &Expr, dataset_schema: &Schema) -> bool {
+    condition.column_refs().into_iter().any(|column| {
+        column
+            .relation
+            .as_ref()
+            .is_none_or(|relation| relation.table() == "target")
+            && dataset_schema.field(&column.name).is_some()
+    })
 }
 
 /// Transforms merge insert parameters into a logical expression. The output

@@ -21,6 +21,20 @@ pub use write::FullSchemaMergeInsertExec;
 
 use super::MergeStats;
 use crate::Dataset;
+use crate::dataset::WhenMatched;
+
+/// `when_matched` for a write node's plan display; an `UpdateIf` gated by
+/// `MergeConditionExec` names that node rather than a predicate it does not evaluate.
+pub(super) fn when_matched_label(when_matched: &WhenMatched, update_if_deferred: bool) -> String {
+    match when_matched {
+        WhenMatched::UpdateIf(_) | WhenMatched::UpdateIfExpr(_) if update_if_deferred => {
+            "UpdateIf(MergeCondition)".to_string()
+        }
+        WhenMatched::UpdateIf(condition) => format!("UpdateIf({condition})"),
+        WhenMatched::UpdateIfExpr(expr) => format!("UpdateIf({})", expr.human_display()),
+        other => format!("{other:?}"),
+    }
+}
 
 pub(super) struct MergeInsertMetrics {
     pub num_inserted_rows: Count,

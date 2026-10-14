@@ -5,12 +5,12 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use arrow_array::{
-    Array, RecordBatch, UInt8Array, UInt32Array,
+    Array, RecordBatch, RecordBatchOptions, UInt8Array, UInt32Array,
     cast::AsArray,
     types::{UInt8Type, UInt64Type},
 };
 use arrow_schema::{DataType, SchemaRef};
-use arrow_select::take::take_record_batch;
+use arrow_select::take::take;
 use datafusion::common::{
     Column, DFSchema, DataFusionError, Result as DFResult, TableReference,
     tree_node::{Transformed, TransformedResult, TreeNode},
@@ -54,9 +54,9 @@ struct Evaluator {
     update_if: Option<Arc<dyn PhysicalExpr>>,
     /// Gates `Delete` on the target-only rows.
     delete_if: Option<Arc<dyn PhysicalExpr>>,
-    /// The input columns followed by the taken target columns.
+    /// The input columns the conditions read, followed by the taken ones.
     eval_schema: SchemaRef,
-    input_width: usize,
+    eval_inputs: Vec<usize>,
     take: Option<Arc<ProjectionPlan>>,
     action_idx: usize,
     rowaddr_idx: usize,
@@ -131,12 +131,31 @@ impl MergeConditionExec {
                 Some(Arc::new(take))
             }
         };
+        // Only the input columns the conditions read are copied for evaluation.
+        let mut eval_inputs = [&update_if, &delete_if]
+            .into_iter()
+            .flatten()
+            .flat_map(|condition| condition.column_refs())
+            .filter_map(|column| input_schema.index_of_column(column).ok())
+            .collect::<Vec<_>>();
+        eval_inputs.sort_unstable();
+        eval_inputs.dedup();
+        let read = DFSchema::new_with_metadata(
+            eval_inputs
+                .iter()
+                .map(|&i| {
+                    let (qualifier, field) = input_schema.qualified_field(i);
+                    (qualifier.cloned(), field.clone())
+                })
+                .collect(),
+            Default::default(),
+        )?;
         let eval_df_schema = match &take {
-            Some(take) => input_schema.join(&DFSchema::try_from_qualified_schema(
+            Some(take) => read.join(&DFSchema::try_from_qualified_schema(
                 "target",
                 &take.output_schema()?,
             )?)?,
-            None => input_schema.clone(),
+            None => read,
         };
         let eval_schema: SchemaRef = Arc::new(eval_df_schema.as_arrow().clone());
         let physical = |condition: Expr, clause: &str| -> DFResult<Arc<dyn PhysicalExpr>> {
@@ -164,7 +183,7 @@ impl MergeConditionExec {
                 update_if,
                 delete_if,
                 eval_schema,
-                input_width: physical_schema.fields().len(),
+                eval_inputs,
                 take,
                 action_idx,
                 rowaddr_idx,
@@ -225,7 +244,7 @@ fn resolve_target_columns(
 
 impl Evaluator {
     fn taken_columns(&self) -> impl Iterator<Item = &str> {
-        self.eval_schema.fields()[self.input_width..]
+        self.eval_schema.fields()[self.eval_inputs.len()..]
             .iter()
             .map(|field| field.name().as_str())
     }
@@ -283,7 +302,11 @@ impl Evaluator {
             })
             .collect::<DFResult<Vec<_>>>()?;
         let indices = UInt32Array::from(candidates.clone());
-        let mut columns = take_record_batch(&batch, &indices)?.columns().to_vec();
+        let mut columns = self
+            .eval_inputs
+            .iter()
+            .map(|&i| take(batch.column(i), &indices, None))
+            .collect::<Result<Vec<_>, _>>()?;
         if let Some(take) = &self.take {
             let taken =
                 TakeBuilder::try_new_from_addresses(self.dataset.clone(), addrs, take.clone())?
@@ -303,7 +326,11 @@ impl Evaluator {
                 columns.push(column.clone());
             }
         }
-        let eval_batch = RecordBatch::try_new(self.eval_schema.clone(), columns)?;
+        let eval_batch = RecordBatch::try_new_with_options(
+            self.eval_schema.clone(),
+            columns,
+            &RecordBatchOptions::new().with_row_count(Some(candidates.len())),
+        )?;
 
         let mut new_actions = actions.values().to_vec();
         let mut reject_failing =

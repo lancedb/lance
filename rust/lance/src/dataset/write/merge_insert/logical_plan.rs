@@ -314,6 +314,7 @@ impl ExtensionPlanner for MergeInsertPlanner {
                 assert_eq!(physical_inputs.len(), 1, "Inconsistent number of inputs");
 
                 let mut input = physical_inputs[0].clone();
+                let update_if_deferred = write_node.deferred.update_if.is_some();
                 if write_node.deferred != DeferredConditions::default() {
                     input = Arc::new(MergeConditionExec::try_new(
                         input,
@@ -333,20 +334,28 @@ impl ExtensionPlanner for MergeInsertPlanner {
                         write_node.source_skipped_duplicates.clone(),
                     )?)
                 } else if write_node.write_sink == WriteSink::RewriteColumns {
-                    Arc::new(InPlaceMergeInsertExec::try_new(
+                    let exec = InPlaceMergeInsertExec::try_new(
                         input,
                         write_node.dataset.clone(),
                         write_node.params.clone(),
                         write_node.source_skipped_duplicates.clone(),
-                    )?)
+                    )?;
+                    match update_if_deferred {
+                        true => Arc::new(exec.with_update_if_deferred()),
+                        false => Arc::new(exec),
+                    }
                 } else {
-                    Arc::new(FullSchemaMergeInsertExec::try_new(
+                    let exec = FullSchemaMergeInsertExec::try_new(
                         input,
                         write_node.dataset.clone(),
                         write_node.params.clone(),
                         write_node.source_skipped_duplicates.clone(),
                         write_node.source_blob_columns.clone(),
-                    )?)
+                    )?;
+                    match update_if_deferred {
+                        true => Arc::new(exec.with_update_if_deferred()),
+                        false => Arc::new(exec),
+                    }
                 };
                 Some(exec)
             } else {
