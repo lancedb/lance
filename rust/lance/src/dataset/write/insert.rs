@@ -27,6 +27,7 @@ use crate::dataset::transaction::{Operation, Transaction, TransactionBuilder};
 use crate::dataset::write::{
     validate_and_resolve_target_bases_with_primary, write_fragments_internal_impl,
 };
+use crate::io::commit::idempotency;
 use crate::{Error, Result};
 use tracing::info;
 
@@ -327,6 +328,10 @@ impl<'a> InsertBuilder<'a> {
     }
 
     fn validate_write(&self, context: &mut WriteContext, data_schema: &Schema) -> Result<()> {
+        if let Some(properties) = &context.params.transaction_properties {
+            idempotency::validate_properties(properties)?;
+        }
+
         // Write mode
         match (&context.params.mode, &context.dest) {
             (WriteMode::Create, WriteDestination::Dataset(ds)) => {

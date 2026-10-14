@@ -270,8 +270,10 @@ impl<'a> CommitBuilder<'a> {
     /// Detached commits reject keys. Cannot be combined with
     /// [`Self::with_idempotency_property`].
     ///
-    /// Experimental: how the keys are stored and checked may change
-    /// incompatibly until the format feature is stabilized.
+    /// Experimental: release builds fail with [`Error::NotSupported`] unless
+    /// the `LANCE_ENABLE_UNSTABLE_IDEMPOTENCY_KEYS` env var is set, and how
+    /// the keys are stored and checked may change incompatibly until the
+    /// format feature is stabilized.
     ///
     /// # Examples
     ///

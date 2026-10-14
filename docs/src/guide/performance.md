@@ -306,6 +306,8 @@ For more details on which operations conflict with each other, see
 !!! warning "Experimental"
 
     Idempotency keys are an experimental format feature and may change incompatibly.
+    Release builds reject them unless the `LANCE_ENABLE_UNSTABLE_IDEMPOTENCY_KEYS`
+    environment variable is set.
 
 A commit with [idempotency keys](../format/table/transaction.md#idempotency-keys) compares its keys with
 the keys of every transaction committed after its read version. The keys are stored with the transaction,

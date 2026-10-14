@@ -25,6 +25,13 @@
 //! required history. These keys alone do not provide table-wide at-most-once
 //! execution.
 //!
+//! # Experimental
+//!
+//! Idempotency keys are an experimental format feature. Release builds
+//! reject keys unless [`ENABLE_UNSTABLE_IDEMPOTENCY_KEYS_ENV`] is set; debug
+//! builds always accept them so tests exercise the path. A build that rejects
+//! keys commits exactly as it did before keys existed.
+//!
 //! # Caller-named property
 //!
 //! [`CommitBuilder::with_idempotency_property`] names a transaction property
@@ -71,6 +78,30 @@ pub const MAX_IDEMPOTENCY_KEYS_ENV: &str = "LANCE_MAX_IDEMPOTENCY_KEYS";
 /// Env var overriding [`DEFAULT_MAX_IDEMPOTENCY_KEY_BYTES`] process-wide, as
 /// a positive integer.
 pub const MAX_IDEMPOTENCY_KEY_BYTES_ENV: &str = "LANCE_MAX_IDEMPOTENCY_KEY_BYTES";
+
+/// Env var that opts a release build into idempotency keys before the format
+/// feature is stabilized.
+pub const ENABLE_UNSTABLE_IDEMPOTENCY_KEYS_ENV: &str = "LANCE_ENABLE_UNSTABLE_IDEMPOTENCY_KEYS";
+
+/// Whether this build accepts idempotency keys: always in debug builds, and in
+/// release builds only when [`ENABLE_UNSTABLE_IDEMPOTENCY_KEYS_ENV`] is set,
+/// like the unstable features in `lance_table::feature_flags`.
+fn idempotency_keys_enabled() -> bool {
+    cfg!(debug_assertions) || std::env::var_os(ENABLE_UNSTABLE_IDEMPOTENCY_KEYS_ENV).is_some()
+}
+
+/// Split out from [`idempotency_keys_enabled`] so the rejection is testable
+/// without toggling the build profile or environment.
+fn require_enabled(enabled: bool) -> Result<()> {
+    if enabled {
+        Ok(())
+    } else {
+        Err(Error::not_supported(format!(
+            "idempotency keys are an experimental feature; set \
+             {ENABLE_UNSTABLE_IDEMPOTENCY_KEYS_ENV} to use them"
+        )))
+    }
+}
 
 /// The most distinct idempotency keys one transaction may carry:
 /// [`MAX_IDEMPOTENCY_KEYS_ENV`] if valid, otherwise
@@ -131,12 +162,17 @@ pub(crate) struct IdempotencyKeys {
 impl IdempotencyKeys {
     /// The keys of `transaction`, or `None` when it carries none.
     ///
-    /// Fails when the keys are malformed or exceed the limits, so a commit
-    /// whose keys cannot be checked is rejected before it does any IO.
+    /// Fails when the keys are malformed or exceed the limits, or when this
+    /// build does not enable the feature, so a commit whose keys cannot be
+    /// checked is rejected before it does any IO. Every commit path calls
+    /// this, so it is also where the experimental gate is enforced.
     pub(crate) fn from_transaction(transaction: &Transaction) -> Result<Option<Self>> {
         let keys = transaction_keys(transaction)?;
+        if keys.is_empty() {
+            return Ok(None);
+        }
         validate(&keys)?;
-        Ok((!keys.is_empty()).then_some(Self {
+        Ok(Some(Self {
             keys,
             caller_property: None,
         }))
@@ -262,7 +298,21 @@ fn malformed(property: &str, err: serde_json::Error) -> Error {
     ))
 }
 
+/// Check the idempotency keys in a write's transaction `properties` before
+/// any data is written, so a write that cannot commit writes no data files.
+pub(crate) fn validate_properties(properties: &HashMap<String, String>) -> Result<()> {
+    let Some(raw) = properties.get(IDEMPOTENCY_KEYS_PROPERTY) else {
+        return Ok(());
+    };
+    let keys = parse_keys(raw).map_err(|err| malformed(IDEMPOTENCY_KEYS_PROPERTY, err))?;
+    if keys.is_empty() {
+        return Ok(());
+    }
+    validate(&keys)
+}
+
 fn validate(keys: &BTreeSet<String>) -> Result<()> {
+    require_enabled(idempotency_keys_enabled())?;
     validate_with_limits(keys, max_idempotency_keys(), max_idempotency_key_bytes())
 }
 
@@ -481,6 +531,18 @@ mod tests {
         let encoded = encode_keys(keys);
         let transaction = append(1, &[(IDEMPOTENCY_KEYS_PROPERTY, &encoded)]);
         assert_invalid_input(IdempotencyKeys::from_transaction(&transaction), message);
+    }
+
+    #[test]
+    fn test_require_enabled() {
+        require_enabled(true).unwrap();
+        let err = require_enabled(false).unwrap_err();
+        assert!(matches!(err, Error::NotSupported { .. }), "{err:?}");
+        assert!(
+            err.to_string()
+                .contains(ENABLE_UNSTABLE_IDEMPOTENCY_KEYS_ENV),
+            "{err}"
+        );
     }
 
     #[test]
@@ -844,11 +906,14 @@ mod tests {
             .unwrap();
         let reader = || RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone());
 
+        // Rejected before any data file is written.
+        let dir = TempStrDir::default();
         let params = WriteParams::default().with_idempotency_keys([""]);
         assert_invalid_input(
-            Dataset::write(reader(), "memory://", Some(params)).await,
+            Dataset::write(reader(), dir.as_str(), Some(params)).await,
             "non-empty",
         );
+        assert!(!std::path::Path::new(dir.as_str()).join("data").exists());
 
         let params = WriteParams::default().with_idempotency_keys(["a"]);
         let created = Dataset::write(reader(), "memory://", Some(params))

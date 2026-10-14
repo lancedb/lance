@@ -2147,6 +2147,11 @@ def test_commit_batch_append():
     assert merged_txn.operation.fragments == fragments2 + fragments3
 
 
+@pytest.fixture
+def enable_unstable_idempotency_keys(monkeypatch):
+    monkeypatch.setenv("LANCE_ENABLE_UNSTABLE_IDEMPOTENCY_KEYS", "1")
+
+
 def _idempotency_append(dataset, read_version, properties=None):
     data = pa.table({"a": [1], "b": [1]})
     fragments = lance.fragment.write_fragments(data, dataset)
@@ -2185,7 +2190,9 @@ def _commit_with(api, dataset, keys):
     [(["b", "c"], ["b"]), (["c"], None)],
     ids=["shared", "disjoint"],
 )
-def test_commit_idempotency(first_api, second_api, second_keys, overlap):
+def test_commit_idempotency(
+    enable_unstable_idempotency_keys, first_api, second_api, second_keys, overlap
+):
     from lance.commit import DuplicateTransactionError
 
     dataset = lance.write_dataset(pa.table({"a": [0], "b": [0]}), "memory://")
@@ -2235,7 +2242,9 @@ def test_commit_idempotency_api_probe():
     ],
     ids=["missing", "malformed", "both", "empty_key", "str", "detached"],
 )
-def test_commit_idempotency_errors(kwargs, properties, error, match):
+def test_commit_idempotency_errors(
+    enable_unstable_idempotency_keys, kwargs, properties, error, match
+):
     dataset = lance.write_dataset(pa.table({"a": [0], "b": [0]}), "memory://")
     with pytest.raises(error, match=match):
         lance.LanceDataset.commit(
@@ -2245,7 +2254,7 @@ def test_commit_idempotency_errors(kwargs, properties, error, match):
 
 
 @pytest.mark.parametrize("api", ["write_dataset", "insert"])
-def test_write_idempotency_keys(api):
+def test_write_idempotency_keys(enable_unstable_idempotency_keys, api):
     from lance.commit import DuplicateTransactionError
 
     original = lance.write_dataset(pa.table({"a": [0], "b": [0]}), "memory://")
@@ -2264,7 +2273,7 @@ def test_write_idempotency_keys(api):
     assert write(["m2"]).version == 3
 
 
-def test_commit_batch_idempotency_keys():
+def test_commit_batch_idempotency_keys(enable_unstable_idempotency_keys):
     from lance.commit import DuplicateTransactionError
 
     dataset = lance.write_dataset(pa.table({"a": [0], "b": [0]}), "memory://")
