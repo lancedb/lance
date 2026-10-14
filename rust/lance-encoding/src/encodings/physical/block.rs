@@ -1061,10 +1061,15 @@ mod tests {
                 STRUCTURAL_ENCODING_FULLZIP.to_string(),
             );
             let field = field.with_metadata(field_meta);
+            let expected_encoding = if encoding == TestEncoding::StructuralSparse {
+                "lz4"
+            } else {
+                "zstd"
+            };
             let test_cases = TestCases::basic()
                 // Need to use large pages as small pages might be too small to compress
                 .with_page_sizes(vec![1024 * 1024])
-                .with_expected_encoding("lz4")
+                .with_expected_encoding(expected_encoding)
                 .with_encoding(encoding)
                 .with_slicing_modes([use_slicing]);
 

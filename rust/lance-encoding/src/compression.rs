@@ -834,12 +834,22 @@ pub fn try_packed_struct_per_value(
     ))))
 }
 
+/// Which explicitly requested general codecs variable-width per-value compression honors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PerValueGeneralCompression {
+    /// Only `zstd`; released readers fail on LZ4 full-zip pages that contain nulls.
+    ZstdOnly,
+    /// Every requested codec.
+    Any,
+}
+
 /// Encode variable-width values directly, with FSST or per-value compression
 /// when applicable.
 pub fn try_variable_width_per_value(
     field: &Field,
     data: &DataBlock,
     params: &CompressionFieldParams,
+    general_compression: PerValueGeneralCompression,
 ) -> Result<Option<Box<dyn PerValueCompressor>>> {
     let DataBlock::VariableWidth(data) = data else {
         return Ok(None);
@@ -855,8 +865,15 @@ pub fn try_variable_width_per_value(
     if (max_len > 32 * 1024 || per_value_requested) && data_size >= FSST_LEAST_INPUT_SIZE as u64 {
         // FSST uses a dedicated encoder and cannot be a general buffer compressor.
         // Keep the existing default fallback when large values request FSST.
-        if let Some(compression) = compression.filter(|compression| *compression != "fsst") {
-            let config = CompressionConfig::new(compression.parse()?, params.compression_level);
+        let requested_scheme = match (general_compression, compression) {
+            (_, None | Some("fsst")) => None,
+            (PerValueGeneralCompression::ZstdOnly, Some(compression)) => {
+                (compression == "zstd").then_some(CompressionScheme::Zstd)
+            }
+            (PerValueGeneralCompression::Any, Some(compression)) => Some(compression.parse()?),
+        };
+        if let Some(scheme) = requested_scheme {
+            let config = CompressionConfig::new(scheme, params.compression_level);
             return Ok(Some(Box::new(CompressedBufferEncoder::try_new(config)?)));
         }
         return Ok(Some(Box::new(CompressedBufferEncoder::default())));
@@ -2586,26 +2603,41 @@ mod tests {
     }
 
     #[rstest::rstest]
-    #[cfg(feature = "lz4")]
+    #[cfg(all(feature = "lz4", feature = "zstd"))]
     #[case(32, 4096)]
     #[case(64, 4096)]
     #[case(32, 40 * 1024)]
     #[case(64, 40 * 1024)]
-    fn test_per_value_honors_explicit_lz4(#[case] bits_per_offset: u8, #[case] value_size: usize) {
+    fn test_per_value_explicit_lz4(
+        #[case] bits_per_offset: u8,
+        #[case] value_size: usize,
+        #[values(
+            TestEncoding::StructuralU16,
+            TestEncoding::StructuralU32,
+            TestEncoding::StructuralSparse
+        )]
+        test_encoding: TestEncoding,
+    ) {
         let mut field = create_test_field("body", DataType::Binary);
         field
             .metadata
             .insert(COMPRESSION_META_KEY.to_string(), "lz4".to_string());
-        let strategy = baseline_strategy(CompressionParams::default());
+        let strategy = strategy(test_encoding, CompressionParams::default());
         let data = create_variable_width_block(bits_per_offset, 16, value_size);
         let compressor = strategy.create_per_value(&field, &data).unwrap();
         let (compressed, encoding) = compressor.compress(data.clone()).unwrap();
         let Some(Compression::General(general)) = encoding.compression.as_ref() else {
             panic!("Expected general per-value compression");
         };
+        let expected_scheme = if test_encoding == TestEncoding::StructuralSparse {
+            crate::format::pb21::CompressionScheme::CompressionAlgorithmLz4
+        } else {
+            crate::format::pb21::CompressionScheme::CompressionAlgorithmZstd
+        };
         assert_eq!(
             general.compression.as_ref().unwrap().scheme(),
-            crate::format::pb21::CompressionScheme::CompressionAlgorithmLz4
+            expected_scheme,
+            "encoding={test_encoding}"
         );
 
         let PerValueDataBlock::Variable(compressed) = compressed else {
