@@ -49,6 +49,9 @@ pub(super) fn compact_blank_source(
     write_schema: Option<&Schema>,
 ) -> Result<RecordBatch> {
     debug_assert_eq!(source.num_rows(), 1);
+    // Unlike `apply_blank_plan`, this can use arrow's validating `take`: the source row
+    // was read back from storage, and the map decoder builds maps with
+    // `MapArray::try_new`, so the maps `copy_rows_unvalidated` exists for never get here.
     let source = arrow_select::take::take_record_batch(source, &UInt32Array::from(vec![0]))?;
     let plans = blank_plans(&source, storage_version, write_schema)?;
     let columns = source

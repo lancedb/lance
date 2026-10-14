@@ -5878,6 +5878,82 @@ mod tests {
         }
     }
 
+    /// `-0.0` and `+0.0` are one key, so a source holding both has a duplicate
+    /// key: each zero target row is matched twice. The default `Fail` rejects
+    /// that as ambiguous; `FirstSeen` updates each zero row once, with either
+    /// source row's value depending on join order.
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn test_merge_insert_source_with_both_float_zeros(
+        #[values(true, false)] use_index: bool,
+        #[values(SourceDedupeBehavior::Fail, SourceDedupeBehavior::FirstSeen)]
+        behavior: SourceDedupeBehavior,
+    ) {
+        let target = record_batch!(
+            (
+                "key",
+                Float64,
+                [Some(-1.0), Some(-0.0), Some(0.0), Some(1.0)]
+            ),
+            ("value", Int32, [10, 20, 30, 40])
+        )
+        .unwrap();
+        let schema = target.schema();
+        let reader = RecordBatchIterator::new(vec![Ok(target)], schema.clone());
+        let mut ds = Dataset::write(reader, "memory://", None).await.unwrap();
+        ds.create_index(
+            &["key"],
+            IndexType::Scalar,
+            None,
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+
+        let source = record_batch!(
+            ("key", Float64, [Some(-0.0), Some(0.0)]),
+            ("value", Int32, [98, 99])
+        )
+        .unwrap();
+        let result = MergeInsertBuilder::try_new(Arc::new(ds), vec!["key".to_string()])
+            .unwrap()
+            .when_not_matched(WhenNotMatched::DoNothing)
+            .when_matched(WhenMatched::UpdateAll)
+            .use_index(use_index)
+            .source_dedupe_behavior(behavior)
+            .try_build()
+            .unwrap()
+            .execute_reader(Box::new(RecordBatchIterator::new(
+                vec![Ok(source)],
+                schema.clone(),
+            )))
+            .await;
+
+        if behavior == SourceDedupeBehavior::Fail {
+            let err = result.unwrap_err().to_string();
+            assert!(
+                err.contains("Ambiguous merge inserts"),
+                "Fail must reject a source holding both zeros, got: {err}"
+            );
+            return;
+        }
+
+        let (ds, _) = result.unwrap();
+        assert_eq!(ds.count_rows(None).await.unwrap(), 4);
+        for (filter, expected) in [
+            ("value = 98 OR value = 99", 2),
+            ("value = 20", 0),
+            ("value = 30", 0),
+        ] {
+            assert_eq!(
+                ds.count_rows(Some(filter.to_string())).await.unwrap(),
+                expected,
+                "{filter}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_indexed_merge_insert() {
         let test_dir = TempStrDir::default();
