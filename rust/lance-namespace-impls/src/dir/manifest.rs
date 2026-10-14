@@ -31,7 +31,7 @@ use lance::session::Session;
 use lance::{Dataset, dataset::scanner::Scanner};
 use lance_core::Error as LanceError;
 use lance_core::datatypes::LANCE_UNENFORCED_PRIMARY_KEY_POSITION;
-use lance_core::{Error, ROW_ID, Result, box_error};
+use lance_core::{Error, ROW_ADDR, ROW_ID, Result, box_error};
 use lance_index::progress::noop_progress;
 use lance_index::registry::IndexPluginRegistry;
 use lance_index::scalar::lance_format::LanceIndexStore;
@@ -60,6 +60,7 @@ use lance_table::format::{Fragment, IndexMetadata, Manifest};
 use lance_table::io::commit::{
     CommitError, CommitHandler, commit_handler_from_url, write_manifest_file_to_path,
 };
+use lance_table::transaction::validate_non_reusable_field_id_transition;
 use object_store::{Error as ObjectStoreError, path::Path};
 use roaring::RoaringBitmap;
 use std::io::Cursor;
@@ -1096,6 +1097,19 @@ impl ManifestNamespace {
         ]))
     }
 
+    /// Like [`Self::value_row_id_schema`], but for a BTree stream: BTree
+    /// training always reads its id column as `ROW_ADDR`, never `ROW_ID` (see
+    /// `BTREE_ROW_ADDR_DOMAIN_VERSION`). The counter these streams number
+    /// rows with is already an address, not a row id -- see the single
+    /// fragment id 0 invariant in `rewrite_manifest` -- so only the column
+    /// name needs to change, not the values.
+    fn value_row_addr_schema(value_field: Field) -> SchemaRef {
+        Arc::new(ArrowSchema::new(vec![
+            value_field,
+            Field::new(ROW_ADDR, DataType::UInt64, false),
+        ]))
+    }
+
     fn string_row_id_batch(
         schema: SchemaRef,
         values: Vec<String>,
@@ -1128,7 +1142,7 @@ impl ManifestNamespace {
 
     fn object_id_index_stream(object_ids: BTreeMap<Arc<str>, u64>) -> SendableRecordBatchStream {
         let schema =
-            Self::value_row_id_schema(Field::new(VALUE_COLUMN_NAME, DataType::Utf8, false));
+            Self::value_row_addr_schema(Field::new(VALUE_COLUMN_NAME, DataType::Utf8, false));
         let stream_schema = schema.clone();
         let stream = stream::unfold(
             (object_ids.into_iter(), false, schema),
@@ -1895,6 +1909,8 @@ impl ManifestNamespace {
             .map_err(CommitError::from)?;
         let base_path = self.base_path.clone().join(MANIFEST_TABLE_NAME);
         let naming_scheme = dataset.manifest_location().naming_scheme;
+        let inline_transaction =
+            lance_table::format::Transaction::try_from(&transaction).map_err(CommitError::from)?;
         commit_handler
             .commit(
                 manifest,
@@ -1903,7 +1919,7 @@ impl ManifestNamespace {
                 &object_store,
                 write_manifest_file_to_path,
                 naming_scheme,
-                Some((&transaction).into()),
+                Some(inline_transaction),
             )
             .await
             .map(|_location| ())
@@ -2063,6 +2079,16 @@ impl ManifestNamespace {
                 schema.clone(),
                 fragments,
             );
+            if let Err(err) = validate_non_reusable_field_id_transition(
+                dataset.manifest(),
+                &manifest,
+                &transaction.operation,
+            ) {
+                self.cleanup_staged_manifest_files(&object_store, &staged_data_files, &[])
+                    .await;
+                return Err(err);
+            }
+            manifest.update_max_field_id();
             let target_version = manifest.version;
 
             let index_uuids = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use futures::{FutureExt, TryStreamExt};
@@ -13,8 +14,9 @@ use lance_index::{
     optimize::OptimizeOptions,
     progress::{IndexBuildProgress, NoopIndexBuildProgress},
     scalar::{
-        CreatedIndex, OldIndexDataFilter, ScalarIndex, index_files_to_table,
+        BuiltinIndexType, CreatedIndex, OldIndexDataFilter, ScalarIndex, index_files_to_table,
         inverted::InvertedIndex,
+        json::json_wrapped_target_type,
         lance_format::LanceIndexStore,
         seed::{FragmentSeed, SEED_META_KEY_PREFIX},
         table_files_to_index,
@@ -33,7 +35,7 @@ use super::vector::ivf::{
     optimize_vector_indices, select_steady_state_rebalance, vector_segment_compatibility,
 };
 use super::vector::{LogicalVectorIndex, VectorIndexParams, details, fresh_vector_segment_params};
-use super::{CreateIndexBuilder, DatasetIndexInternalExt};
+use super::{CreateIndexBuilder, DatasetIndexExt, DatasetIndexInternalExt};
 use crate::dataset::Dataset;
 use crate::dataset::index::LanceIndexStoreExt;
 use crate::dataset::rowids::load_row_id_sequences;
@@ -125,12 +127,29 @@ async fn live_row_ids(
 /// Build the [`OldIndexDataFilter`] that must be applied to existing index
 /// rows when their owning fragments have been pruned by compaction or
 /// deletions.
+///
+/// `address_domain` must be `true` when the consuming index stores physical
+/// row addresses rather than row ids (see
+/// `ScalarIndex::results_are_row_addresses`). `build_stable_row_id_filter`
+/// below produces row ids, which would be the wrong domain to filter such an
+/// index's stored addresses against, so an address-domain index always falls
+/// back to coarse `Fragments` filtering instead, regardless of the dataset's
+/// row-id scheme.
+///
+/// That coarse filtering cannot tell a still-"effective" fragment's live rows
+/// from ones a same-fragment update superseded (under stable row ids,
+/// updating an indexed column deletes the row's old physical copy and writes
+/// the new value elsewhere, but the old fragment keeps its id and stays
+/// "effective"), so an address-domain index can merge in a stale posting this
+/// way. Exact address-level filtering would avoid that; left as a future
+/// optimization.
 pub async fn build_old_data_filter(
     dataset: &Dataset,
     effective_old_frags: &RoaringBitmap,
     deleted_old_frags: &RoaringBitmap,
+    address_domain: bool,
 ) -> Result<Option<OldIndexDataFilter>> {
-    if dataset.manifest.uses_stable_row_ids() {
+    if !address_domain && dataset.manifest.uses_stable_row_ids() {
         let valid_old_row_ids = build_stable_row_id_filter(dataset, effective_old_frags).await?;
         Ok(Some(OldIndexDataFilter::RowIds(valid_old_row_ids)))
     } else {
@@ -139,6 +158,78 @@ pub async fn build_old_data_filter(
             to_remove: deleted_old_frags.clone(),
         }))
     }
+}
+
+/// On a table with a tagged fragment reuse history, the fragments each segment
+/// ANSWERS FOR right now: its coverage as derived by the tagged reader (live
+/// destinations reached through the ledger plus directly covered live
+/// fragments). `None` on every other table.
+///
+/// A tagged segment's stored bitmap is provenance, not coverage: it names the
+/// fragments the segment was built from, which a rewrite may have retired,
+/// while the segment's addresses are translated to live fragments when it is
+/// opened. Maintenance that reads a segment through the translating loader
+/// therefore sees rows in these derived fragments, and must filter and account
+/// for old data in this domain rather than in `stored ∩ live` (which is empty
+/// for a fully rewritten segment and would drop every translated row).
+///
+/// `staged` supplies the plan of segments the manifest does not list (a staged
+/// build being merged, see `plan_staged_segments`); their coverage comes from
+/// that plan. A segment that is neither staged nor registered in the manifest
+/// is an error: "not registered" is not "covers nothing".
+pub async fn tagged_segment_coverage(
+    dataset: &Dataset,
+    segments: &[&IndexMetadata],
+    staged: Option<&crate::index::frag_reuse::StagedRemappingPlans>,
+) -> Result<Option<HashMap<Uuid, RoaringBitmap>>> {
+    use crate::index::frag_reuse::SegmentRemappingPlan;
+
+    let stored = crate::index::load_all_indices(dataset).await?;
+    if !stored
+        .iter()
+        .any(lance_table::system_index::frag_reuse::metadata::is_tagged)
+    {
+        return Ok(None);
+    }
+    let derived = dataset.load_indices().await?;
+    let mut coverage = HashMap::with_capacity(segments.len());
+    for segment in segments {
+        if let Some(plan) = staged.and_then(|plans| plans.get(&segment.uuid)) {
+            let bitmap = match plan {
+                SegmentRemappingPlan::Identity => segment
+                    .fragment_bitmap
+                    .as_ref()
+                    .map(|bitmap| bitmap & dataset.fragment_bitmap.as_ref())
+                    .unwrap_or_default(),
+                SegmentRemappingPlan::Translate { coverage, .. } => coverage.clone(),
+                SegmentRemappingPlan::MissingCoverage(_) => {
+                    return Err(Error::not_supported(format!(
+                        "FRI query coverage is unavailable for staged segment {}",
+                        segment.uuid
+                    )));
+                }
+            };
+            coverage.insert(segment.uuid, bitmap);
+            continue;
+        }
+        if !stored.iter().any(|entry| entry.uuid == segment.uuid) {
+            return Err(Error::invalid_input(format!(
+                "segment {} is not registered in the manifest; a staged segment must be \
+                 merged with its own translation plan",
+                segment.uuid
+            )));
+        }
+        // A registered segment the tagged reader excludes (no coverage it can
+        // honor) has no old data reachable here; leave it empty rather than
+        // fail, the loader reports the precise reason if it is actually opened.
+        let bitmap = derived
+            .iter()
+            .find(|entry| entry.uuid == segment.uuid)
+            .and_then(|entry| entry.fragment_bitmap.clone())
+            .unwrap_or_default();
+        coverage.insert(segment.uuid, bitmap);
+    }
+    Ok(Some(coverage))
 }
 
 /// Split the stored fragment coverage of `segments` into fragments still live in
@@ -191,18 +282,46 @@ pub fn fragment_reuse_affects_segment(
                 .new_frags
                 .iter()
                 .any(|fragment| coverage.contains(fragment.id as u32));
-            (version.dataset_version >= dataset_version && covers_old)
-                || (version.dataset_version > dataset_version && covers_new)
+            // A segment built at or before `version.dataset_version` predates the
+            // rewrite, even if its coverage already moved onto the new fragments.
+            version.dataset_version >= dataset_version && (covers_old || covers_new)
         })
     })
 }
 
 /// Build one [`OldIndexDataFilter`] per segment and return their effective coverage.
+///
+/// `staged` carries the plans of segments the manifest does not list (see
+/// [`tagged_segment_coverage`]); committed merges pass `None`.
+///
+/// See [`build_old_data_filter`] for the meaning of `address_domain`.
 pub async fn build_per_segment_filters(
     dataset: &Dataset,
     segments: &[&IndexMetadata],
+    staged: Option<&crate::index::frag_reuse::StagedRemappingPlans>,
+    address_domain: bool,
 ) -> Result<(RoaringBitmap, Vec<Option<OldIndexDataFilter>>)> {
-    if dataset.manifest.uses_stable_row_ids() {
+    if let Some(coverage) = tagged_segment_coverage(dataset, segments, staged).await? {
+        // Translated addresses live in the derived coverage; retired source
+        // fragments never appear in them, so there is nothing to remove.
+        let mut effective_union = RoaringBitmap::new();
+        let mut filters = Vec::with_capacity(segments.len());
+        for segment in segments {
+            let effective = coverage.get(&segment.uuid).cloned().ok_or_else(|| {
+                Error::internal(format!(
+                    "tagged coverage missing for segment {}",
+                    segment.uuid
+                ))
+            })?;
+            effective_union |= &effective;
+            filters.push(
+                build_old_data_filter(dataset, &effective, &RoaringBitmap::new(), address_domain)
+                    .await?,
+            );
+        }
+        return Ok((effective_union, filters));
+    }
+    if dataset.manifest.uses_stable_row_ids() && !address_domain {
         let mut effective_union = RoaringBitmap::new();
         let mut filters = Vec::with_capacity(segments.len());
         for segment in segments {
@@ -215,7 +334,10 @@ pub async fn build_per_segment_filters(
                     ))
                 })?;
             effective_union |= &effective;
-            filters.push(build_old_data_filter(dataset, &effective, &RoaringBitmap::new()).await?);
+            filters.push(
+                build_old_data_filter(dataset, &effective, &RoaringBitmap::new(), address_domain)
+                    .await?,
+            );
         }
         return Ok((effective_union, filters));
     }
@@ -236,7 +358,7 @@ pub async fn build_per_segment_filters(
             .deleted_fragment_bitmap(&dataset.fragment_bitmap)
             .unwrap_or_default();
         effective_union |= &effective;
-        filters.push(build_old_data_filter(dataset, &effective, &deleted).await?);
+        filters.push(build_old_data_filter(dataset, &effective, &deleted, address_domain).await?);
     }
     Ok((effective_union, filters))
 }
@@ -373,7 +495,7 @@ async fn rebuild_scalar_segment(
         &params,
         true,
         None,
-        Some(training_data),
+        Some((training_data, update_criteria.data_criteria.clone())),
         Arc::new(NoopIndexBuildProgress),
     )
     .await
@@ -456,11 +578,34 @@ async fn merge_scalar_indices<'a>(
         ));
     }
 
-    let selected_old_indices = select_segments_to_merge(dataset.as_ref(), old_indices, options);
+    let mut selected_old_indices = select_segments_to_merge(dataset.as_ref(), old_indices, options);
 
     // No new data + ≤1 old selected = rewriting one segment to itself.
     if unindexed.is_empty() && selected_old_indices.len() <= 1 {
         return Ok(None);
+    }
+
+    // `select_segments_to_merge` only looks at the trailing `num_indices_to_merge`
+    // segments (plus any deletion-affected one); with `num_indices_to_merge: Some(0)`
+    // (append mode) it selects none at all. A row-id-domain BTree segment left
+    // outside that selection would otherwise survive untouched beside the
+    // freshly built address-domain segment this call is about to create.
+    // `LogicalScalarIndex` takes the whole named index's result domain from its
+    // first segment alone, so that mix makes every match the new segment finds
+    // look like a row id needing resolution, and matching rows silently vanish
+    // when that resolution misses. Fold every such segment into this rebuild,
+    // regardless of which ones the trailing-window heuristic already picked,
+    // so the named index never ends up straddling both domains.
+    if index_type == IndexType::BTree && dataset.manifest.uses_stable_row_ids() {
+        for idx in old_indices {
+            if !idx.results_are_row_addrs()
+                && !selected_old_indices
+                    .iter()
+                    .any(|selected| selected.uuid == idx.uuid)
+            {
+                selected_old_indices.push(idx);
+            }
+        }
     }
 
     // For the delta case (`selected` empty) the reference is purely
@@ -470,26 +615,81 @@ async fn merge_scalar_indices<'a>(
         .copied()
         .unwrap_or(old_indices[old_indices.len() - 1]);
     let reference_index = dataset
-        .open_scalar_index(field_path, &reference_idx.uuid, &NoOpMetricsCollector)
+        .open_scalar_index_for_maintenance(field_path, &reference_idx.uuid, &NoOpMetricsCollector)
         .await?;
+
+    // A JSON-wrapped BTREE segment cannot yet carry the row-address-domain
+    // migration safely on a stable-row-id dataset -- see `build_scalar_index`'s
+    // matching guard, which this mirrors so maintenance is rejected too, not
+    // just creation. Checked here, before deciding between a merge or a
+    // rebuild, rather than relying on that guard to be reached only if the
+    // rebuild branch happens to be picked.
+    if dataset.manifest.uses_stable_row_ids() {
+        let reference_params = reference_index.derive_index_params()?;
+        if reference_params.index_type.eq_ignore_ascii_case("json")
+            && reference_params
+                .params
+                .as_deref()
+                .and_then(json_wrapped_target_type)
+                .is_some_and(|target| target.eq_ignore_ascii_case(BuiltinIndexType::BTree.as_str()))
+        {
+            return Err(Error::not_supported(
+                "a JSON-wrapped BTREE index is not yet supported on a dataset with stable row \
+                 ids enabled -- create a plain BTREE index on this column instead, or disable \
+                 stable row ids for this dataset"
+                    .to_string(),
+            ));
+        }
+    }
+
     let update_criteria = reference_index.update_criteria();
 
     // Effective = bitmap ∩ live fragments; deleted = bitmap \ live fragments.
-    let (effective_old_frags, deleted_old_frags) =
-        split_segment_coverage(dataset.as_ref(), selected_old_indices.iter().copied());
+    // On a tagged table the selected segments' old data is instead the coverage
+    // the tagged reader derives for them (translated, live), and retired source
+    // fragments are not something to remove from translated addresses.
+    let tagged_coverage =
+        tagged_segment_coverage(dataset.as_ref(), &selected_old_indices, None).await?;
+    let (effective_old_frags, deleted_old_frags) = match &tagged_coverage {
+        Some(coverage) => (
+            selected_old_indices
+                .iter()
+                .filter_map(|index| coverage.get(&index.uuid))
+                .fold(RoaringBitmap::new(), |acc, bitmap| acc | bitmap),
+            RoaringBitmap::new(),
+        ),
+        None => split_segment_coverage(dataset.as_ref(), selected_old_indices.iter().copied()),
+    };
 
-    let mut frag_bitmap = base_unindexed_bitmap.clone();
-    frag_bitmap |= &effective_old_frags;
+    // The fragments a from-scratch rebuild must scan: everything the merged
+    // segment will answer for, all of it live.
+    let mut rebuild_frags = base_unindexed_bitmap.clone();
+    rebuild_frags |= &effective_old_frags;
     let new_uuid = Uuid::new_v4();
 
     // Scalar Index that expos an N:1 segment-merge primitive reachable without
     // rescanning the dataset
-    let has_segment_merge_primitive = matches!(index_type, IndexType::BTree | IndexType::NGram);
+    let has_segment_merge_primitive = matches!(
+        index_type,
+        IndexType::BTree | IndexType::Bitmap | IndexType::NGram
+    );
     let frag_reuse_index = dataset.open_frag_reuse_index(&NoOpMetricsCollector).await?;
     let ngram_requires_rebuild = index_type == IndexType::NGram
         && frag_reuse_index.as_ref().is_some_and(|frag_reuse_index| {
             fragment_reuse_affects_segments(frag_reuse_index, selected_old_indices.iter().copied())
         });
+
+    // A BTree segment persisted before address-domain support stores row ids
+    // directly. Merging it with newly scanned address-domain data on a
+    // stable-row-id dataset would silently combine two different domains in
+    // the same `ids` column, so such a segment must be rebuilt from scratch
+    // (a full rescan, never touching its stale page data) rather than merged.
+    // Harmless elsewhere: without stable row ids the two domains coincide.
+    let btree_legacy_domain_mismatch = index_type == IndexType::BTree
+        && dataset.manifest.uses_stable_row_ids()
+        && selected_old_indices
+            .iter()
+            .any(|segment| !segment.results_are_row_addrs());
 
     // Merge new data into the existing segment(s) without rebuilding from
     // scratch, when all hold:
@@ -505,8 +705,22 @@ async fn merge_scalar_indices<'a>(
     let can_merge_segments = !effective_old_frags.is_empty()
         && !update_criteria.requires_old_data
         && !ngram_requires_rebuild
+        && !btree_legacy_domain_mismatch
         && (has_segment_merge_primitive || selected_old_indices.len() == 1);
 
+    // The bitmap the merged segment commits, decided by how its content is
+    // produced:
+    //   - rebuilt from a scan: exactly the live fragments scanned (direct
+    //     coverage of every row it holds);
+    //   - merged from the old segments' pages: on a tagged table the union of
+    //     the selected segments' STORED bitmaps, i.e. provenance, retired
+    //     sources included. The pages were translated to live addresses when
+    //     the segments were opened, and the tagged reader stops translating
+    //     at a live fragment, so provenance keeps deriving coverage for this
+    //     segment and for any unselected sibling that shares a destination,
+    //     and keeps the mapping they need retained until they are rebuilt;
+    //     elsewhere the effective (live) coverage, as before.
+    let mut frag_bitmap = rebuild_frags.clone();
     let (created_index, new_dataset_version) = if !can_merge_segments {
         (
             rebuild_scalar_segment(
@@ -515,12 +729,20 @@ async fn merge_scalar_indices<'a>(
                 field_path,
                 column_name,
                 new_uuid,
-                frag_bitmap.iter().collect(),
+                rebuild_frags.iter().collect(),
             )
             .await?,
             dataset.manifest.version,
         )
     } else {
+        if tagged_coverage.is_some() {
+            frag_bitmap = base_unindexed_bitmap.clone();
+            for index in &selected_old_indices {
+                if let Some(stored) = &index.fragment_bitmap {
+                    frag_bitmap |= stored;
+                }
+            }
+        }
         let new_store = LanceIndexStore::from_dataset_for_new(&dataset, &new_uuid)?;
 
         // Try a seed-based update before falling back to a full column scan.
@@ -559,8 +781,13 @@ async fn merge_scalar_indices<'a>(
 
             match index_type {
                 IndexType::BTree => {
-                    let (_, old_data_filters) =
-                        build_per_segment_filters(dataset.as_ref(), &selected_old_indices).await?;
+                    let (_, old_data_filters) = build_per_segment_filters(
+                        dataset.as_ref(),
+                        &selected_old_indices,
+                        None,
+                        true,
+                    )
+                    .await?;
                     crate::index::scalar::btree::open_and_merge_segments(
                         dataset.as_ref(),
                         field_path,
@@ -568,18 +795,44 @@ async fn merge_scalar_indices<'a>(
                         new_data_stream,
                         &new_store,
                         &old_data_filters,
+                        None,
+                    )
+                    .await?
+                }
+                IndexType::Bitmap => {
+                    let (_, old_data_filters) = build_per_segment_filters(
+                        dataset.as_ref(),
+                        &selected_old_indices,
+                        None,
+                        false,
+                    )
+                    .await?;
+                    crate::index::scalar::bitmap::open_and_merge_segments(
+                        dataset.as_ref(),
+                        field_path,
+                        &selected_old_indices,
+                        new_data_stream,
+                        &new_store,
+                        &old_data_filters,
+                        None,
                     )
                     .await?
                 }
                 IndexType::NGram => {
-                    let (_, old_data_filters) =
-                        build_per_segment_filters(dataset.as_ref(), &selected_old_indices).await?;
+                    let (_, old_data_filters) = build_per_segment_filters(
+                        dataset.as_ref(),
+                        &selected_old_indices,
+                        None,
+                        false,
+                    )
+                    .await?;
                     crate::index::scalar::ngram::open_and_merge_segments(
                         dataset.as_ref(),
                         &selected_old_indices,
                         Some(new_data_stream),
                         &new_store,
                         &old_data_filters,
+                        None,
                     )
                     .await?
                 }
@@ -588,6 +841,7 @@ async fn merge_scalar_indices<'a>(
                         dataset.as_ref(),
                         &effective_old_frags,
                         &deleted_old_frags,
+                        false,
                     )
                     .await?;
                     reference_index
@@ -904,15 +1158,36 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
             // live rows, so merging them would resurrect stale vectors; they
             // may only be replaced. A born-empty segment (deferred build) has
             // no stored rows and stays mergeable.
+            // Under a tagged history an empty bitmap does not mean empty
+            // pages: an in-place rewrite withdraws a segment's whole coverage
+            // and leaves its files. Such a segment is dormant too, rebuilt
+            // from the live fragments; only a definition without files (the
+            // deferred build) stays mergeable there. Elsewhere an index
+            // initialized on an empty table has files and no rows and keeps
+            // merging as before.
+            // On a tagged table a segment's stored bitmap is provenance: its
+            // rows translate to the coverage the tagged reader derives for
+            // it, so THAT is its live coverage. A segment the reader excludes
+            // (derived coverage empty) is the dormant one.
+            let tagged_coverage =
+                tagged_segment_coverage(dataset.as_ref(), old_indices, None).await?;
             let (live_segments, dormant_segments): (Vec<&IndexMetadata>, Vec<&IndexMetadata>) =
                 old_indices.iter().copied().partition(|idx| {
-                    let has_stored_rows = idx
-                        .fragment_bitmap
-                        .as_ref()
-                        .is_some_and(|bitmap| !bitmap.is_empty());
-                    let has_live_coverage = idx
-                        .effective_fragment_bitmap(&dataset.fragment_bitmap)
-                        .is_none_or(|bitmap| !bitmap.is_empty());
+                    let has_stored_rows = match &tagged_coverage {
+                        Some(_) => !is_definition_only_segment(idx),
+                        None => idx
+                            .fragment_bitmap
+                            .as_ref()
+                            .is_some_and(|bitmap| !bitmap.is_empty()),
+                    };
+                    let has_live_coverage = match &tagged_coverage {
+                        Some(coverage) => coverage
+                            .get(&idx.uuid)
+                            .is_some_and(|bitmap| !bitmap.is_empty()),
+                        None => idx
+                            .effective_fragment_bitmap(&dataset.fragment_bitmap)
+                            .is_none_or(|bitmap| !bitmap.is_empty()),
+                    };
                     !has_stored_rows || has_live_coverage
                 });
             if !dormant_segments.is_empty() && !live_segments.is_empty() && !options.retrain {
@@ -952,8 +1227,11 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     .map(Some);
             }
 
+            // The maintenance opener: a segment the tagged reader excludes
+            // from the listing (its coverage was withdrawn) is still here,
+            // opened as contributing nothing, so it can be replaced.
             let full_logical_index = dataset
-                .open_logical_vector_index(&field_path, &old_indices[0].name)
+                .open_logical_vector_index_for_maintenance(&field_path, &old_indices[0].name)
                 .await?;
             let mut opened_indices_by_uuid = full_logical_index
                 .iter()
@@ -1140,10 +1418,19 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     return Ok(None);
                 }
 
-                let new_fragment_bitmap = removed_segment
-                    .effective_fragment_bitmap(&dataset.fragment_bitmap)
-                    .or_else(|| removed_segment.fragment_bitmap.clone())
-                    .unwrap_or_default();
+                // The rebalanced file was read through the translating
+                // loader, so on a tagged table it holds live addresses under
+                // the segment's stored provenance: publish that provenance,
+                // as a merge does, not stored ∩ live, which is empty for
+                // retired sources and would turn indexed rows into scans.
+                let new_fragment_bitmap = if tagged_coverage.is_some() {
+                    removed_segment.fragment_bitmap.clone().unwrap_or_default()
+                } else {
+                    removed_segment
+                        .effective_fragment_bitmap(&dataset.fragment_bitmap)
+                        .or_else(|| removed_segment.fragment_bitmap.clone())
+                        .unwrap_or_default()
+                };
 
                 Ok((
                     new_uuid,
@@ -1266,7 +1553,11 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
             let mut indices = Vec::with_capacity(old_indices.len());
             for idx in old_indices {
                 match dataset
-                    .open_generic_index(&field_path, &idx.uuid, &NoOpMetricsCollector)
+                    .open_generic_index_for_maintenance(
+                        &field_path,
+                        &idx.uuid,
+                        &NoOpMetricsCollector,
+                    )
                     .await
                 {
                     Ok(index) => indices.push(index),
@@ -1305,7 +1596,11 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                         .copied()
                         .unwrap_or(old_indices[old_indices.len() - 1]);
                     let reference_index = dataset
-                        .open_scalar_index(&field_path, &reference_idx.uuid, &NoOpMetricsCollector)
+                        .open_scalar_index_for_maintenance(
+                            &field_path,
+                            &reference_idx.uuid,
+                            &NoOpMetricsCollector,
+                        )
                         .await?;
                     let update_criteria = reference_index.update_criteria();
                     if update_criteria.requires_old_data {
@@ -1332,7 +1627,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                             &params,
                             true,
                             None,
-                            Some(new_data_stream),
+                            Some((new_data_stream, update_criteria.data_criteria.clone())),
                             Arc::new(NoopIndexBuildProgress),
                         )
                         .await?;
@@ -1366,15 +1661,39 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     let mut frag_bitmap = base_unindexed_bitmap;
                     let mut effective_old_frags = RoaringBitmap::new();
                     let mut selected_indices = Vec::with_capacity(selected_old_indices.len());
+                    // On a tagged table a selected segment's old data is the
+                    // coverage the reader derives for it (translated, live)
+                    // and the merged segment keeps the stored provenance,
+                    // exactly as the scalar merge does; stored ∩ live would
+                    // be empty for retired sources and drop indexed rows.
+                    let tagged_coverage =
+                        tagged_segment_coverage(dataset.as_ref(), &selected_old_indices, None)
+                            .await?;
                     for idx in &selected_old_indices {
-                        if let Some(effective) =
-                            idx.effective_fragment_bitmap(&dataset.fragment_bitmap)
-                        {
-                            frag_bitmap |= &effective;
-                            effective_old_frags |= &effective;
+                        match &tagged_coverage {
+                            Some(coverage) => {
+                                if let Some(derived) = coverage.get(&idx.uuid) {
+                                    effective_old_frags |= derived;
+                                }
+                                if let Some(stored) = &idx.fragment_bitmap {
+                                    frag_bitmap |= stored;
+                                }
+                            }
+                            None => {
+                                if let Some(effective) =
+                                    idx.effective_fragment_bitmap(&dataset.fragment_bitmap)
+                                {
+                                    frag_bitmap |= &effective;
+                                    effective_old_frags |= &effective;
+                                }
+                            }
                         }
                         let scalar_index = dataset
-                            .open_scalar_index(&field_path, &idx.uuid, &NoOpMetricsCollector)
+                            .open_scalar_index_for_maintenance(
+                                &field_path,
+                                &idx.uuid,
+                                &NoOpMetricsCollector,
+                            )
                             .await?;
                         let inverted_index = scalar_index
                             .as_any()
@@ -1414,7 +1733,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                                 &reference_index.derive_index_params()?,
                                 true,
                                 None,
-                                Some(new_data_stream),
+                                Some((new_data_stream, update_criteria.data_criteria.clone())),
                                 Arc::new(NoopIndexBuildProgress),
                             )
                             .await?,
@@ -1570,7 +1889,7 @@ mod tests {
         ));
 
         let rebuilt_segment = IndexMetadata {
-            dataset_version: 5,
+            dataset_version: 6,
             fragment_bitmap: Some(RoaringBitmap::from_iter([2u32])),
             ..segment
         };
@@ -1579,14 +1898,16 @@ mod tests {
             [&rebuilt_segment]
         ));
 
-        let stale_remapped_segment = IndexMetadata {
-            dataset_version: 4,
-            ..rebuilt_segment
-        };
-        assert!(fragment_reuse_affects_segments(
-            &frag_reuse_index,
-            [&stale_remapped_segment]
-        ));
+        for stale_version in [4, 5] {
+            let stale_remapped_segment = IndexMetadata {
+                dataset_version: stale_version,
+                ..rebuilt_segment.clone()
+            };
+            assert!(
+                fragment_reuse_affects_segments(&frag_reuse_index, [&stale_remapped_segment]),
+                "{stale_version}"
+            );
+        }
     }
 
     fn clustered_vector_batch(
@@ -3579,6 +3900,386 @@ mod tests {
         }
     }
 
+    /// A stray row-id-domain segment left beside a freshly built address-domain
+    /// one is not just imprecise, it is wrong: `LogicalScalarIndex` takes the
+    /// whole named index's result domain from its first segment alone, so the
+    /// new segment's real addresses get treated as row ids wherever they land
+    /// outside the old segment's row-id numbering, and those rows vanish from
+    /// every query. `select_segments_to_merge` selects nothing in append mode
+    /// (`num_indices_to_merge: Some(0)`), so without folding every remaining
+    /// legacy segment into the rebuild regardless of what it selected, this is
+    /// exactly what append-mode optimize would do under stable row ids.
+    #[tokio::test]
+    async fn test_optimize_btree_append_rebuilds_stray_legacy_segment_with_stable_row_ids() {
+        async fn query_id_count(dataset: &Dataset, id: &str) -> usize {
+            dataset
+                .scan()
+                .filter(&format!("id = '{}'", id))
+                .unwrap()
+                .project(&["id"])
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap()
+                .num_rows()
+        }
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)]));
+        let make_batch = |start: i32, end: i32| {
+            let ids = StringArray::from_iter_values((start..end).map(|i| format!("song-{i}")));
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(ids)]).unwrap()
+        };
+
+        // One fragment, one BTree segment, built under stable row ids so row
+        // ids and row addresses are already two independent numbering schemes.
+        let reader = RecordBatchIterator::new(vec![Ok(make_batch(0, 64))], schema.clone());
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 64,
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::BTree);
+        let original_fragment_id = dataset.get_fragments()[0].id() as u32;
+        let segment = crate::index::create::CreateIndexBuilder::new(
+            &mut dataset,
+            &["id"],
+            IndexType::BTree,
+            &params,
+        )
+        .name("id_idx".into())
+        .fragments(vec![original_fragment_id])
+        .execute_uncommitted()
+        .await
+        .unwrap();
+        assert!(
+            segment.results_are_row_addrs(),
+            "a segment built by the current code is always address-domain"
+        );
+
+        // Relabel it as a pre-migration (row-id-domain) segment: index_version
+        // is exactly how `results_are_row_addrs` tells the two apart, and real
+        // legacy segments on disk differ from a fresh one only in that label
+        // (`BTreeIndexPlugin::load_index` derives domain purely from the
+        // version its caller passes in, never from the file itself).
+        let legacy_segment = IndexMetadata {
+            index_version: 0,
+            ..segment
+        };
+        dataset
+            .commit_existing_index_segments("id_idx", "id", vec![legacy_segment])
+            .await
+            .unwrap();
+
+        // Append a second fragment and leave it unindexed, then optimize in
+        // append mode -- the scenario that selects zero old segments to merge.
+        let appended = RecordBatchIterator::new(vec![Ok(make_batch(64, 128))], schema.clone());
+        let mut dataset = Dataset::write(
+            appended,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 64,
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        dataset
+            .optimize_indices(&OptimizeOptions::append())
+            .await
+            .unwrap();
+
+        let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
+
+        // The stray legacy segment must not survive append-mode optimize: it
+        // has to be folded into one consolidated, address-domain segment
+        // rather than left beside the new delta.
+        let committed = dataset.load_indices_by_name("id_idx").await.unwrap();
+        assert_eq!(
+            committed.len(),
+            1,
+            "the legacy segment must be rebuilt together with the new data, \
+             not left beside it: {committed:?}"
+        );
+        assert!(
+            committed[0].results_are_row_addrs(),
+            "the rebuilt segment must be address-domain"
+        );
+
+        // Rows from both the original and the newly appended fragment must be
+        // findable -- in particular rows only the new segment's data covers,
+        // which a stray legacy segment reporting the wrong domain would drop.
+        for id in ["song-10", "song-100", "song-127"] {
+            assert_eq!(query_id_count(&dataset, id).await, 1, "missing row {id}");
+        }
+    }
+
+    /// The same invariant as the append-mode case above, but for
+    /// `num_indices_to_merge: Some(N)` with `N` small enough that the legacy
+    /// segment sits outside the trailing window `select_segments_to_merge`
+    /// picks. A fix scoped to "nothing was selected" (`num_indices_to_merge:
+    /// Some(0)`) would miss this: the legacy segment is just as stray here,
+    /// left beside whatever the merge of the trailing segments produces.
+    #[tokio::test]
+    async fn test_optimize_btree_merge_rebuilds_legacy_segment_outside_merge_window() {
+        async fn query_id_count(dataset: &Dataset, id: &str) -> usize {
+            dataset
+                .scan()
+                .filter(&format!("id = '{}'", id))
+                .unwrap()
+                .project(&["id"])
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap()
+                .num_rows()
+        }
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)]));
+        let make_batch = |start: i32, end: i32| {
+            let ids = StringArray::from_iter_values((start..end).map(|i| format!("song-{i}")));
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(ids)]).unwrap()
+        };
+
+        // Three fragments, three BTree segments, under stable row ids.
+        let reader = RecordBatchIterator::new(
+            vec![
+                Ok(make_batch(0, 64)),
+                Ok(make_batch(64, 128)),
+                Ok(make_batch(128, 192)),
+            ],
+            schema.clone(),
+        );
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 64,
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::BTree);
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 3);
+
+        let mut staged_segments = Vec::new();
+        for fragment in &fragments {
+            staged_segments.push(
+                crate::index::create::CreateIndexBuilder::new(
+                    &mut dataset,
+                    &["id"],
+                    IndexType::BTree,
+                    &params,
+                )
+                .name("id_idx".into())
+                .fragments(vec![fragment.id() as u32])
+                .execute_uncommitted()
+                .await
+                .unwrap(),
+            );
+        }
+        // Relabel only the oldest (first) segment as pre-migration row-id
+        // domain -- the one `num_indices_to_merge: Some(2)` below will leave
+        // outside its trailing window.
+        staged_segments[0] = IndexMetadata {
+            index_version: 0,
+            ..staged_segments[0].clone()
+        };
+        dataset
+            .commit_existing_index_segments("id_idx", "id", staged_segments)
+            .await
+            .unwrap();
+        assert_eq!(
+            dataset.load_indices_by_name("id_idx").await.unwrap().len(),
+            3
+        );
+
+        let appended = RecordBatchIterator::new(vec![Ok(make_batch(192, 256))], schema.clone());
+        let mut dataset = Dataset::write(
+            appended,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 64,
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Merge only the trailing 2 old segments with the new data; the
+        // legacy segment (index 0 of 3) is outside this window.
+        dataset
+            .optimize_indices(&OptimizeOptions::merge(2))
+            .await
+            .unwrap();
+
+        let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
+        let committed = dataset.load_indices_by_name("id_idx").await.unwrap();
+        assert_eq!(
+            committed.len(),
+            1,
+            "the legacy segment outside the merge window must still be folded \
+             into the rebuild, not left standing alone: {committed:?}"
+        );
+        assert!(
+            committed[0].results_are_row_addrs(),
+            "the rebuilt segment must be address-domain"
+        );
+
+        // In particular, rows the legacy segment alone covers must still be
+        // findable once it is no longer the only segment of its domain.
+        for id in ["song-10", "song-100", "song-200"] {
+            assert_eq!(query_id_count(&dataset, id).await, 1, "missing row {id}");
+        }
+    }
+
+    fn json_btree_schema_and_batch(ids: std::ops::Range<i32>) -> (Arc<Schema>, RecordBatch) {
+        // A plain Utf8 field tagged with the `arrow.json` extension is read as
+        // JSON text (`JsonEncoding::of_field`) -- simpler to construct by hand
+        // than genuine JSONB bytes, and exercised the same way by
+        // `test_json_text_input_extracts_like_jsonb` in lance-index.
+        let doc_field = Field::new("doc", DataType::Utf8, false).with_metadata(
+            std::collections::HashMap::from([(
+                lance_arrow::ARROW_EXT_NAME_KEY.to_string(),
+                lance_arrow::json::ARROW_JSON_EXT_NAME.to_string(),
+            )]),
+        );
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            doc_field,
+        ]));
+        let doc_values: Vec<String> = ids.clone().map(|i| format!(r#"{{"x":{i}}}"#)).collect();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(ids)),
+                Arc::new(StringArray::from(doc_values)),
+            ],
+        )
+        .unwrap();
+        (schema, batch)
+    }
+
+    fn json_btree_params() -> ScalarIndexParams {
+        ScalarIndexParams {
+            index_type: "json".to_string(),
+            params: Some(r#"{"target_index_type":"btree","path":"x"}"#.to_string()),
+        }
+    }
+
+    /// A JSON-wrapped BTREE index cannot yet carry the row-address-domain
+    /// migration through its own metadata (see the guard in
+    /// `super::super::scalar::build_scalar_index`), so creating one on a
+    /// stable-row-id dataset must be rejected rather than silently produce an
+    /// address-domain segment none of the domain-safety checks elsewhere can
+    /// see through the wrapper.
+    #[tokio::test]
+    async fn test_json_wrapped_btree_create_rejected_with_stable_row_ids() {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        let (schema, batch) = json_btree_schema_and_batch(0..10);
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let params = json_btree_params();
+        let err = dataset
+            .create_index_builder(&["doc"], IndexType::Scalar, &params)
+            .name("doc_idx".to_string())
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("JSON-wrapped BTREE"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            dataset
+                .load_indices_by_name("doc_idx")
+                .await
+                .unwrap()
+                .is_empty(),
+            "the rejected index must not be committed"
+        );
+    }
+
+    /// The same combination is unaffected -- and must keep working exactly as
+    /// before this guard was added -- on a dataset that does not use stable
+    /// row ids, where a row id and a row address are the same value.
+    #[tokio::test]
+    async fn test_json_wrapped_btree_create_and_optimize_without_stable_row_ids() {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        let (schema, batch) = json_btree_schema_and_batch(0..10);
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let mut dataset = Dataset::write(reader, test_uri, Some(WriteParams::default()))
+            .await
+            .unwrap();
+
+        let params = json_btree_params();
+        dataset
+            .create_index_builder(&["doc"], IndexType::Scalar, &params)
+            .name("doc_idx".to_string())
+            .await
+            .unwrap();
+        assert_eq!(
+            dataset.load_indices_by_name("doc_idx").await.unwrap().len(),
+            1
+        );
+
+        // Maintenance (insert + optimize) on the same, still-unaffected
+        // combination must keep working too.
+        let (_, more) = json_btree_schema_and_batch(10..20);
+        let appended = RecordBatchIterator::new(vec![Ok(more)], schema);
+        let mut dataset = Dataset::write(
+            appended,
+            test_uri,
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset
+            .optimize_indices(&OptimizeOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            dataset.load_indices_by_name("doc_idx").await.unwrap().len(),
+            1,
+            "optimize should merge into a single segment, not fail or leave extras"
+        );
+    }
+
     #[tokio::test]
     async fn test_optimize_bitmap_index_append() {
         let test_dir = TempStrDir::default();
@@ -3829,6 +4530,15 @@ mod tests {
         assert_eq!(segments, 2, "optimization should add one FTS delta segment");
     }
 
+    /// BTree stores row addresses (`BTREE_ROW_ADDR_DOMAIN_VERSION`), so a plain
+    /// eager compaction on a stable-row-id dataset invalidates it exactly like a
+    /// zone map: with nothing to repair the addresses it stores, the rewritten
+    /// fragment drops out of its coverage (still correct -- the scanner falls
+    /// back to a full scan for it -- just uncovered). `defer_index_remap` is
+    /// what keeps the guarantee this test used to make about eager compaction:
+    /// the FRI it writes lets the btree follow its data to the new fragment, and
+    /// draining that FRI via `optimize_indices` (a segment merge, not a rescan)
+    /// must not change any answer either.
     #[tokio::test]
     async fn test_optimize_btree_keeps_rows_with_stable_row_ids_after_compaction() {
         async fn query_id_count(dataset: &Dataset, id: &str) -> usize {
@@ -3880,12 +4590,22 @@ mod tests {
             &mut dataset,
             crate::dataset::optimize::CompactionOptions {
                 target_rows_per_fragment: 512,
+                defer_index_remap: true,
                 ..Default::default()
             },
             None,
         )
         .await
         .unwrap();
+
+        assert!(
+            dataset
+                .load_index_by_name(lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME)
+                .await
+                .unwrap()
+                .is_some(),
+            "a deferred compaction over an address-domain index must write an FRI"
+        );
 
         let frags = dataset.get_fragments();
         assert!(!frags.is_empty());
@@ -3895,9 +4615,13 @@ mod tests {
                 .unindexed_fragments("id_idx")
                 .await
                 .unwrap()
-                .is_empty()
+                .is_empty(),
+            "the FRI must let the btree follow its data to the rewritten fragment"
         );
+        assert_eq!(query_id_count(&dataset, "song-42").await, 1);
 
+        // Draining the FRI into the index (a segment merge, not a rescan) must
+        // not change any answer.
         dataset
             .optimize_indices(&OptimizeOptions::default())
             .await
@@ -3905,6 +4629,9 @@ mod tests {
 
         let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
         assert_eq!(query_id_count(&dataset, "song-42").await, 1);
+        for i in [0, 42, 128, 255] {
+            assert_eq!(query_id_count(&dataset, &format!("song-{i}")).await, 1);
+        }
     }
 
     /// Updating an indexed vector column in place (`update_columns` +
@@ -4610,6 +5337,7 @@ mod tests {
     async fn test_optimize_errors_when_deletion_vector_unreadable() {
         use crate::dataset::UpdateBuilder;
         use arrow_array::Int32Array;
+        use lance_index::scalar::BuiltinIndexType;
         use lance_table::io::deletion::deletion_file_path;
 
         let test_dir = TempStrDir::default();
@@ -4642,9 +5370,9 @@ mod tests {
         dataset
             .create_index(
                 &["num"],
-                IndexType::BTree,
+                IndexType::Bitmap,
                 None,
-                &ScalarIndexParams::default(),
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap),
                 true,
             )
             .await
@@ -4944,5 +5672,517 @@ mod tests {
             .unwrap()
             .num_rows();
         assert_eq!(total, 150, "no rows may be lost across compaction + merge");
+    }
+
+    /// Build one Bitmap segment per fragment of `dataset` under `index_name`.
+    async fn commit_bitmap_segment_per_fragment(dataset: &mut Dataset, index_name: &str) {
+        let groups = dataset
+            .get_fragments()
+            .iter()
+            .map(|frag| vec![frag.id() as u32])
+            .collect::<Vec<_>>();
+        commit_bitmap_segments(dataset, index_name, &groups).await;
+    }
+
+    /// One committed Bitmap segment per fragment group.
+    async fn commit_bitmap_segments(dataset: &mut Dataset, index_name: &str, groups: &[Vec<u32>]) {
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap);
+        let mut staged = Vec::with_capacity(groups.len());
+        for group in groups {
+            staged.push(
+                CreateIndexBuilder::new(dataset, &["cat"], IndexType::Bitmap, &params)
+                    .name(index_name.into())
+                    .fragments(group.clone())
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+            );
+        }
+        dataset
+            .commit_existing_index_segments(index_name, "cat", staged)
+            .await
+            .unwrap();
+    }
+
+    /// The oldest `dataset_version` across an index's segments, which is what a
+    /// segment merge carries over to the segment it produces. Checked here to
+    /// predate the current manifest, since otherwise it could not tell a merge
+    /// from a rebuild.
+    async fn oldest_segment_version(dataset: &Dataset, index_name: &str) -> u64 {
+        let oldest = dataset
+            .load_indices_by_name(index_name)
+            .await
+            .unwrap()
+            .iter()
+            .map(|segment| segment.dataset_version)
+            .min()
+            .expect("the index must have at least one segment");
+        assert!(
+            oldest < dataset.manifest.version,
+            "the source segments must predate the manifest, or their version \
+             cannot distinguish a merge from a rebuild"
+        );
+        oldest
+    }
+
+    /// Pins that `optimize_indices` took the segment-merge path. A full rebuild
+    /// produces the same rows, so the row counts these tests check cannot tell
+    /// the two apart; the stamped `dataset_version` can, because the merge keeps
+    /// the oldest source segment's version while a rebuild stamps the manifest
+    /// version current at the time of the optimize.
+    async fn assert_merged_not_rebuilt(dataset: &Dataset, index_name: &str, oldest_source: u64) {
+        let segments = dataset.load_indices_by_name(index_name).await.unwrap();
+        assert_eq!(
+            segments.len(),
+            1,
+            "the optimize must consolidate every bitmap segment, got {segments:?}"
+        );
+        assert_eq!(
+            segments[0].dataset_version, oldest_source,
+            "the optimize rebuilt the index instead of merging the segments: a \
+             merged segment carries the oldest source segment's dataset version"
+        );
+    }
+
+    fn id_cat_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("cat", DataType::Utf8, false),
+        ]))
+    }
+
+    /// `id` ascending, `cat` cycling through A/B/C.
+    fn id_cat_batch(schema: &Arc<Schema>, range: std::ops::Range<i32>) -> RecordBatch {
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(range.clone())),
+                Arc::new(StringArray::from_iter_values(
+                    range.map(|i| ["A", "B", "C"][(i % 3) as usize]),
+                )),
+            ],
+        )
+        .unwrap()
+    }
+
+    async fn count_cat(dataset: &Dataset, cat: &str) -> usize {
+        count_rows_where(dataset, &format!("cat = '{cat}'")).await
+    }
+
+    async fn count_rows_where(dataset: &Dataset, predicate: &str) -> usize {
+        dataset
+            .scan()
+            .filter(predicate)
+            .unwrap()
+            .count_rows()
+            .await
+            .unwrap() as usize
+    }
+
+    /// `id` ascending, `cat` cycling through A/B/C/NULL.
+    fn id_cat_nullable_batch(schema: &Arc<Schema>, range: std::ops::Range<i32>) -> RecordBatch {
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(range.clone())),
+                Arc::new(StringArray::from_iter(
+                    range.map(|i| ["A", "B", "C"].get((i % 4) as usize).copied()),
+                )),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// The K-way merge over a nullable column: nulls must survive consolidation of
+    /// several segments plus an unindexed tail, and `IS NULL` is served from
+    /// `null_map`, which is filled separately from the value row sets.
+    #[tokio::test]
+    async fn test_optimize_bitmap_multi_segment_merge_keeps_nulls() {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("cat", DataType::Utf8, true),
+        ]));
+
+        // 36 rows over three 12-row fragments; every fourth row is null.
+        let reader = RecordBatchIterator::new(
+            vec![
+                Ok(id_cat_nullable_batch(&schema, 0..12)),
+                Ok(id_cat_nullable_batch(&schema, 12..24)),
+                Ok(id_cat_nullable_batch(&schema, 24..36)),
+            ],
+            schema.clone(),
+        );
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 12,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 3);
+
+        commit_bitmap_segment_per_fragment(&mut dataset, "cat_idx").await;
+        dataset
+            .append(
+                RecordBatchIterator::new(
+                    vec![Ok(id_cat_nullable_batch(&schema, 36..48))],
+                    schema.clone(),
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let oldest_source = oldest_segment_version(&dataset, "cat_idx").await;
+        dataset
+            .optimize_indices(&OptimizeOptions::merge(200))
+            .await
+            .unwrap();
+
+        let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
+        assert_merged_not_rebuilt(&dataset, "cat_idx", oldest_source).await;
+
+        // 48 rows cycling A/B/C/NULL: 12 of each.
+        for cat in ["A", "B", "C"] {
+            assert_eq!(
+                count_cat(&dataset, cat).await,
+                12,
+                "wrong row count for cat = {cat} after merging a nullable column"
+            );
+        }
+        assert_eq!(
+            count_rows_where(&dataset, "cat IS NULL").await,
+            12,
+            "nulls lost across the bitmap merge"
+        );
+        assert_eq!(
+            count_rows_where(&dataset, "cat IS NOT NULL").await,
+            36,
+            "IS NOT NULL disagrees with the value row sets"
+        );
+        assert_eq!(dataset.scan().count_rows().await.unwrap(), 48);
+    }
+
+    /// A 200-way merge over three Bitmap segments plus an unindexed fragment must
+    /// consolidate into one segment (via the N:1 segment-merge primitive) and keep
+    /// every posting.
+    #[tokio::test]
+    async fn test_optimize_bitmap_multi_segment_merge_consolidates() {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let schema = id_cat_schema();
+
+        let reader = RecordBatchIterator::new(
+            vec![
+                Ok(id_cat_batch(&schema, 0..50)),
+                Ok(id_cat_batch(&schema, 50..100)),
+                Ok(id_cat_batch(&schema, 100..150)),
+            ],
+            schema.clone(),
+        );
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 50,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 3);
+
+        commit_bitmap_segment_per_fragment(&mut dataset, "cat_idx").await;
+        assert_eq!(
+            dataset.load_indices_by_name("cat_idx").await.unwrap().len(),
+            3
+        );
+
+        dataset
+            .append(
+                RecordBatchIterator::new(vec![Ok(id_cat_batch(&schema, 150..200))], schema.clone()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let oldest_source = oldest_segment_version(&dataset, "cat_idx").await;
+        dataset
+            .optimize_indices(&OptimizeOptions::merge(200))
+            .await
+            .unwrap();
+
+        let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
+        assert_merged_not_rebuilt(&dataset, "cat_idx", oldest_source).await;
+        let segments = dataset.load_indices_by_name("cat_idx").await.unwrap();
+        let expected_coverage = dataset
+            .get_fragments()
+            .iter()
+            .map(|frag| frag.id() as u32)
+            .collect::<RoaringBitmap>();
+        assert_eq!(
+            segments[0].fragment_bitmap.as_ref(),
+            Some(&expected_coverage),
+            "merged bitmap segment must cover every dataset fragment"
+        );
+
+        for (cat, expected) in [("A", 67), ("B", 67), ("C", 66)] {
+            assert_eq!(
+                count_cat(&dataset, cat).await,
+                expected,
+                "wrong row count for cat = {cat} after multi-segment bitmap merge"
+            );
+        }
+    }
+
+    /// A wide consolidation: 26 Bitmap delta segments merged into one by a single
+    /// `optimize_indices` call, with no unindexed data on top.
+    #[tokio::test]
+    async fn test_optimize_bitmap_wide_consolidation() {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let schema = id_cat_schema();
+
+        let num_segments = 26;
+        let rows_per_fragment = 12;
+        let total_rows = num_segments * rows_per_fragment;
+        let batches = (0..num_segments)
+            .map(|i| {
+                Ok(id_cat_batch(
+                    &schema,
+                    i * rows_per_fragment..(i + 1) * rows_per_fragment,
+                ))
+            })
+            .collect::<Vec<_>>();
+        let reader = RecordBatchIterator::new(batches, schema.clone());
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: rows_per_fragment as usize,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), num_segments as usize);
+
+        commit_bitmap_segment_per_fragment(&mut dataset, "cat_idx").await;
+        assert_eq!(
+            dataset.load_indices_by_name("cat_idx").await.unwrap().len(),
+            num_segments as usize
+        );
+
+        let oldest_source = oldest_segment_version(&dataset, "cat_idx").await;
+        dataset
+            .optimize_indices(&OptimizeOptions::merge(num_segments as usize))
+            .await
+            .unwrap();
+
+        let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
+        assert_merged_not_rebuilt(&dataset, "cat_idx", oldest_source).await;
+        let segments = dataset.load_indices_by_name("cat_idx").await.unwrap();
+        let expected_coverage = dataset
+            .get_fragments()
+            .iter()
+            .map(|frag| frag.id() as u32)
+            .collect::<RoaringBitmap>();
+        assert_eq!(
+            segments[0].fragment_bitmap.as_ref(),
+            Some(&expected_coverage)
+        );
+
+        let per_cat = (total_rows / 3) as usize;
+        for cat in ["A", "B", "C"] {
+            assert_eq!(
+                count_cat(&dataset, cat).await,
+                per_cat,
+                "wrong row count for cat = {cat} after wide bitmap consolidation"
+            );
+        }
+    }
+
+    /// Deferred-remap compaction leaves the bitmap segments pointing at retired
+    /// fragment ids; a K-way segment merge must remap them through the
+    /// FragReuseIndex instead of dropping or misattributing the rows.
+    ///
+    /// Null rows ride in `null_map`, which the merge fills separately from the
+    /// value row sets, so they need remapping of their own and the nullable
+    /// case is not covered by the other one.
+    #[rstest]
+    #[case::non_null(false)]
+    #[case::nullable(true)]
+    #[tokio::test]
+    async fn test_optimize_bitmap_merge_remaps_deferred_compaction(#[case] nullable: bool) {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("cat", DataType::Utf8, nullable),
+        ]));
+        // A/B/C cycling, with every fourth row null in the nullable case.
+        let batch = |range: std::ops::Range<i32>| {
+            if nullable {
+                id_cat_nullable_batch(&schema, range)
+            } else {
+                id_cat_batch(&schema, range)
+            }
+        };
+
+        let reader = RecordBatchIterator::new(
+            vec![
+                Ok(batch(0..50)),
+                Ok(batch(50..100)),
+                Ok(batch(100..150)),
+                Ok(batch(150..200)),
+            ],
+            schema.clone(),
+        );
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 50,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        // Two fragments per segment: compaction only ever bins fragments that
+        // carry the same set of index segments, so one segment per fragment
+        // would leave every bin a single fragment and plan no work at all.
+        commit_bitmap_segments(&mut dataset, "cat_idx", &[vec![0, 1], vec![2, 3]]).await;
+
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        let mut dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
+        // Every original fragment was retired, so each segment's postings now
+        // need the FragReuseIndex to reach a live row.
+        assert!(
+            dataset.get_fragments().iter().all(|frag| frag.id() >= 4),
+            "compaction must have retired every indexed fragment"
+        );
+        dataset
+            .append(
+                RecordBatchIterator::new(vec![Ok(batch(200..240))], schema.clone()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let oldest_source = oldest_segment_version(&dataset, "cat_idx").await;
+        dataset
+            .optimize_indices(&OptimizeOptions::merge(200))
+            .await
+            .unwrap();
+
+        let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
+        assert_merged_not_rebuilt(&dataset, "cat_idx", oldest_source).await;
+        // 240 rows: A/B/C/NULL evenly when nullable, A/B/C otherwise.
+        let (expected_per_cat, expected_nulls) = if nullable {
+            ([60, 60, 60], 60)
+        } else {
+            ([80, 80, 80], 0)
+        };
+        for (cat, expected) in ["A", "B", "C"].into_iter().zip(expected_per_cat) {
+            assert_eq!(
+                count_cat(&dataset, cat).await,
+                expected,
+                "cat = {cat} lost or gained rows across deferred compaction + bitmap merge"
+            );
+        }
+        assert_eq!(
+            count_rows_where(&dataset, "cat IS NULL").await,
+            expected_nulls,
+            "null rows were not remapped across deferred compaction + bitmap merge"
+        );
+        assert_eq!(
+            count_rows_where(&dataset, "cat IS NOT NULL").await,
+            240 - expected_nulls,
+            "IS NOT NULL disagrees with the value row sets after the remap"
+        );
+        assert_eq!(
+            dataset.scan().count_rows().await.unwrap(),
+            240,
+            "no rows may be lost across compaction + bitmap merge"
+        );
+    }
+
+    /// Stable-row-id update against an older Bitmap segment's fragment: the K-way
+    /// merge must drop that segment's stale postings, not just the tail segment's.
+    #[tokio::test]
+    async fn test_optimize_bitmap_drops_stale_rows_across_segments_after_update() {
+        use crate::dataset::UpdateBuilder;
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let schema = id_cat_schema();
+
+        let reader = RecordBatchIterator::new(
+            vec![
+                Ok(id_cat_batch(&schema, 0..50)),
+                Ok(id_cat_batch(&schema, 50..100)),
+            ],
+            schema.clone(),
+        );
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 50,
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        commit_bitmap_segment_per_fragment(&mut dataset, "cat_idx").await;
+
+        // Rows 0..25 live in the *older* segment's fragment; rewrite their cat.
+        let res = UpdateBuilder::new(Arc::new(dataset.clone()))
+            .update_where("id < 25")
+            .unwrap()
+            .set("cat", "'Z'")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+        let mut dataset = res.new_dataset.as_ref().clone();
+
+        let oldest_source = oldest_segment_version(&dataset, "cat_idx").await;
+        dataset
+            .optimize_indices(&OptimizeOptions::default())
+            .await
+            .unwrap();
+
+        let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
+        // Two segments went in, so this exercised the K-way path rather than the
+        // single-segment `update` this change does not touch.
+        assert_merged_not_rebuilt(&dataset, "cat_idx", oldest_source).await;
+        // ids 0..25 are now 'Z'; the remaining A/B/C counts come from ids 25..100.
+        assert_eq!(count_cat(&dataset, "Z").await, 25, "updated rows missing");
+        for (cat, expected) in [("A", 25), ("B", 25), ("C", 25)] {
+            assert_eq!(
+                count_cat(&dataset, cat).await,
+                expected,
+                "bitmap merge returned stale rows for cat = {cat}"
+            );
+        }
     }
 }
