@@ -25,7 +25,8 @@ use crate::vector::bq::transform::{
     RabitRowFactors, SCALE_FACTORS_FIELD,
 };
 use crate::vector::bq::{
-    RABIT_DEFAULT_NUM_BITS, RQBuildParams, RQRotationType, rabit_binary_code_bytes, rabit_ex_bits,
+    RABIT_DEFAULT_NUM_BITS, RQBuildParams, RQRotationType, RQRowLayout, rabit_binary_code_bytes,
+    rabit_ex_bits,
     rotation::{apply_fast_rotation, fast_rotation_signs_len, random_fast_rotation_signs},
     validate_rq_num_bits,
 };
@@ -578,6 +579,7 @@ impl RabitQuantizer {
                     num_bits,
                     packed: false,
                     layered: false,
+                    row_layout: Default::default(),
                     query_estimator: RabitQueryEstimator::RawQuery,
                 }
             }
@@ -590,6 +592,7 @@ impl RabitQuantizer {
                 num_bits,
                 packed: false,
                 layered: false,
+                row_layout: Default::default(),
                 query_estimator: RabitQueryEstimator::RawQuery,
             },
         };
@@ -1048,6 +1051,12 @@ impl Quantization for RabitQuantizer {
         _: lance_linalg::distance::DistanceType,
         params: &Self::BuildParams,
     ) -> Result<Self> {
+        if params.row_layout != RQRowLayout::Columns {
+            return Err(Error::not_supported(format!(
+                "row_layout={} requires plane-row writer support",
+                params.row_layout
+            )));
+        }
         validate_rq_num_bits(params.num_bits)?;
         let is_layered = params.is_layered();
         if is_layered {
@@ -1062,6 +1071,7 @@ impl Quantization for RabitQuantizer {
         }
         if let Some(mut q) = Self::from_supplied_rotation(params, dim)? {
             q.metadata.layered = is_layered;
+            q.metadata.row_layout = params.row_layout;
             return Ok(q);
         }
 
@@ -1089,6 +1099,7 @@ impl Quantization for RabitQuantizer {
             }
         };
         q.metadata.layered = is_layered;
+        q.metadata.row_layout = params.row_layout;
         Ok(q)
     }
 
@@ -1705,6 +1716,19 @@ mod tests {
             num_bits > 2 && layered.unwrap_or(false)
         );
         assert_eq!(quantizer.metadata_ref().num_bits, num_bits);
+    }
+
+    #[test]
+    fn test_rabit_quantizer_rejects_unimplemented_row_layout() {
+        let values = Float32Array::from(vec![0.0f32; 32]);
+        let data = FixedSizeListArray::try_new_from_values(values, 32).unwrap();
+        let params = RQBuildParams::new(5).with_row_layout(RQRowLayout::PlaneRows);
+        let err = RabitQuantizer::build(&data, DistanceType::L2, &params).unwrap_err();
+        assert!(matches!(err, Error::NotSupported { .. }));
+        assert!(
+            err.to_string()
+                .contains("row_layout=plane_rows requires plane-row writer support")
+        );
     }
 
     #[test]

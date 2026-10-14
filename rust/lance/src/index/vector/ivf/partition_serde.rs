@@ -471,6 +471,7 @@ impl<S: IvfSubIndex> CacheCodecImpl for PartitionEntry<S, RabitQuantizer> {
             // The storage batch already has packed codes; skip re-packing.
             packed: true,
             layered: header.layered,
+            row_layout: Default::default(),
             query_estimator,
         };
         let storage = <RabitQuantizer as Quantization>::Storage::try_from_batch(

@@ -299,7 +299,17 @@ pub fn vector_params_from_details(details: &prost_types::Any) -> Option<VectorIn
                 metric,
                 ivf,
                 RQBuildParams::with_rotation_type(rq.num_bits as u8, rotation_type)
-                    .with_layered(rq.layered.unwrap_or(false)),
+                    .with_layered(rq.layered.unwrap_or(false))
+                    .with_row_layout(
+                        match rabit_quantization::RowLayout::try_from(rq.row_layout).ok()? {
+                            rabit_quantization::RowLayout::Columns => {
+                                lance_index::vector::bq::RQRowLayout::Columns
+                            }
+                            rabit_quantization::RowLayout::PlaneRows => {
+                                lance_index::vector::bq::RQRowLayout::PlaneRows
+                            }
+                        },
+                    ),
             )
         }
         (Some(hnsw), Some(Compression::Pq(pq))) => VectorIndexParams::with_ivf_hnsw_pq_params(
@@ -692,9 +702,17 @@ async fn convert_v3_metadata_to_details(
                             rabit_quantization::RotationType::Matrix
                         }
                     };
+                    let row_layout = match rq.row_layout {
+                        lance_index::vector::bq::RQRowLayout::Columns => {
+                            rabit_quantization::RowLayout::Columns
+                        }
+                        lance_index::vector::bq::RQRowLayout::PlaneRows => {
+                            rabit_quantization::RowLayout::PlaneRows
+                        }
+                    };
                     Some(Compression::Rq(RabitQuantization {
                         layered: Some(rq.layered),
-                        row_layout: rabit_quantization::RowLayout::Columns as i32,
+                        row_layout: row_layout.into(),
                         num_bits: rq.num_bits as u32,
                         rotation_type: rotation_type.into(),
                     }))
