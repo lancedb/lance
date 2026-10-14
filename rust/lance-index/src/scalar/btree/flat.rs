@@ -4,7 +4,10 @@
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_index_core::remapping::RowAddrTranslator;
 use std::collections::BTreeSet;
-use std::{ops::Bound, sync::Arc};
+use std::{
+    ops::Bound,
+    sync::{Arc, Mutex},
+};
 
 use arrow_array::Array;
 use arrow_array::{
@@ -17,10 +20,10 @@ use datafusion_common::DFSchema;
 use datafusion_expr::execution_props::ExecutionProps;
 use datafusion_physical_expr::{PhysicalExpr, create_physical_expr};
 use lance_arrow::RecordBatchExt;
-use lance_core::Result;
 use lance_core::cache::{CacheCodecImpl, CacheEntryReader, CacheEntryWriter};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::address::RowAddress;
+use lance_core::{Error, Result};
 use lance_select::{NullableRowAddrSet, RowAddrTreeMap, RowSetOps};
 use roaring::RoaringBitmap;
 use tracing::instrument;
@@ -99,17 +102,29 @@ fn empty_ids() -> UInt64Array {
 pub struct FlatIndex {
     /// Sorted by row id, so filtered id columns remain sorted for bitmap assembly.
     data: Arc<RecordBatch>,
-    /// Positions of non-null values in ascending value order. This preserves
-    /// sparse lookup without duplicating the page's value and address columns.
-    value_order: UInt32Array,
+    /// Reuse the address-sort permutation until lookup needs value order.
+    /// Ordinary filters never pay for constructing a second ordering.
+    lookup_order: Mutex<LookupOrder>,
     df_schema: DFSchema,
+}
+
+#[derive(Debug)]
+enum LookupOrder {
+    /// Maps address-sorted positions to positions in the original input page.
+    Source(UInt32Array),
+    /// Cached IPC only contains address-sorted data, without its input order.
+    Unsorted,
+    /// Positions of non-null values in ascending value order.
+    Values(UInt32Array),
 }
 
 impl DeepSizeOf for FlatIndex {
     fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
         // `df_schema` is a two-field schema derived from `data`; its footprint
         // is a few hundred bytes and not worth a separate accounting.
-        self.data.get_array_memory_size() + self.value_order.get_array_memory_size()
+        // Charge for the eventual lookup permutation even before it exists,
+        // so lazy initialization cannot grow an already-accounted cache entry.
+        self.data.get_array_memory_size() + self.data.num_rows() * std::mem::size_of::<u32>()
     }
 }
 
@@ -118,38 +133,13 @@ impl FlatIndex {
     pub fn try_new(data: RecordBatch) -> Result<Self> {
         // Sort by row id so every filtered view of the id column is itself
         // sorted, which is what makes bitmap construction cheap downstream.
-        let values = data.column(VALUES_COL_IDX);
-        let compare = make_comparator(values, values, SortOptions::default())?;
-        let mut value_order: Vec<u32> = if values.len() == values.logical_null_count() {
-            Vec::new()
-        } else {
-            (0..values.len())
-                .filter(|&idx| values.is_valid(idx))
-                .map(|idx| idx as u32)
-                .collect()
-        };
-        // Current writers already persist value order. Cache deserialization
-        // and older pages may not, so only sort the permutation when needed.
-        if !value_order
-            .windows(2)
-            .all(|pair| !compare(pair[0] as usize, pair[1] as usize).is_gt())
-        {
-            value_order.sort_unstable_by(|&a, &b| compare(a as usize, b as usize));
-        }
         let row_order = sort_to_indices(data.column(IDS_COL_IDX), None, None)?;
-        let mut inverse = vec![0; row_order.len()];
-        for (new, old) in row_order.values().iter().enumerate() {
-            inverse[*old as usize] = new as u32;
-        }
-        for position in &mut value_order {
-            *position = inverse[*position as usize];
-        }
         let data = data.take(&row_order)?;
         let df_schema = DFSchema::try_from(data.schema())?;
 
         Ok(Self {
             data: Arc::new(data),
-            value_order: UInt32Array::from(value_order),
+            lookup_order: Mutex::new(LookupOrder::Source(row_order)),
             df_schema,
         })
     }
@@ -162,8 +152,39 @@ impl FlatIndex {
         self.data.column(VALUES_COL_IDX)
     }
 
-    pub(crate) fn value_order(&self) -> &[u32] {
-        self.value_order.values()
+    pub(crate) fn value_order(&self) -> Result<UInt32Array> {
+        let mut order = self
+            .lookup_order
+            .lock()
+            .map_err(|_| Error::internal("BTree lookup order lock poisoned"))?;
+        if let LookupOrder::Values(order) = &*order {
+            return Ok(order.clone());
+        }
+        let values = self.values();
+        let value_order = if values.len() == values.logical_null_count() {
+            UInt32Array::from(Vec::<u32>::new())
+        } else if let LookupOrder::Source(row_order) = &*order {
+            let mut positions = vec![0; row_order.len()];
+            for (position, &source) in row_order.values().iter().enumerate() {
+                positions[source as usize] = position as u32;
+            }
+            positions.retain(|&position| values.is_valid(position as usize));
+            let compare = make_comparator(values, values, SortOptions::default())?;
+            // Current writers persist value order. Remapped or older pages
+            // may not, so validate it before using the inverse permutation.
+            if !positions
+                .windows(2)
+                .all(|pair| !compare(pair[0] as usize, pair[1] as usize).is_gt())
+            {
+                positions.sort_unstable_by(|&a, &b| compare(a as usize, b as usize));
+            }
+            UInt32Array::from(positions)
+        } else {
+            let order = sort_to_indices(values, None, None)?;
+            order.slice(values.null_count(), values.len() - values.null_count())
+        };
+        *order = LookupOrder::Values(value_order.clone());
+        Ok(value_order)
     }
 
     fn has_nulls(&self) -> bool {
@@ -456,18 +477,11 @@ impl CacheCodecImpl for FlatIndex {
     {
         let batch = r.read_ipc()?;
         // Cached data is already address-sorted. Keep its IPC buffers shared
-        // with the cache payload and rebuild only the small lookup permutation.
-        let values = batch.column(VALUES_COL_IDX);
-        let value_order = if values.len() == values.logical_null_count() {
-            UInt32Array::from(Vec::<u32>::new())
-        } else {
-            let order = sort_to_indices(values, None, None)?;
-            order.slice(values.null_count(), values.len() - values.null_count())
-        };
+        // and defer rebuilding the lookup permutation until it is requested.
         let df_schema = DFSchema::try_from(batch.schema())?;
         Ok(Self {
             data: Arc::new(batch),
-            value_order,
+            lookup_order: Mutex::new(LookupOrder::Unsorted),
             df_schema,
         })
     }
@@ -522,7 +536,11 @@ mod tests {
         assert_eq!(restored.data, index.data);
         assert_eq!(restored.all().unwrap(), index.all().unwrap());
         let ordered_values = |index: &FlatIndex| {
-            arrow_select::take::take(index.values(), &index.value_order, None).unwrap()
+            let charged_size = index.deep_size_of();
+            let order = index.value_order().unwrap();
+            assert_eq!(index.deep_size_of(), charged_size);
+            assert_eq!(index.value_order().unwrap(), order);
+            arrow_select::take::take(index.values(), &order, None).unwrap()
         };
         assert_eq!(
             ordered_values(&restored).to_data(),

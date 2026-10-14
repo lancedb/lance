@@ -1661,7 +1661,8 @@ impl LookupKeys {
         metrics: &dyn MetricsCollector,
     ) -> Result<LookupMatches> {
         let values = page.values();
-        let order = page.value_order();
+        let order = page.value_order()?;
+        let order = order.values();
         if order.is_empty() || self.order.is_empty() {
             return Ok(LookupMatches::empty());
         }
