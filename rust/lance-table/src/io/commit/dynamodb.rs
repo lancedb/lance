@@ -104,6 +104,10 @@ where
 /// path -- string
 /// committer -- string
 ///
+/// The credentials need `dynamodb:DescribeTable` for that check, `GetItem`,
+/// `PutItem` and `Query` for the commit protocol, and `BatchWriteItem` for
+/// [`ExternalManifestStore::delete`], which removes a dataset's rows in batches.
+///
 /// Consistency: This store is expected to have read-after-write consistency
 /// consistent_read should always be set to true
 ///
