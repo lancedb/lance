@@ -86,9 +86,13 @@ If a provider fails, return an error. Do not silently switch to normal maintenan
 - **Index merge:** the provider decides how to merge and writes the new segments'
   clustering metadata. A normal merge without a provider strategy produces
   segments with no clustering metadata.
-- **Index remap or rebuild:** keep the segment's clustering metadata.
+- **Index remap or rebuild of an existing group:** keep the segment's clustering
+  metadata when updating row addresses or rebuilding index files for that group.
+  Rebuilding with different fragment groups creates a new layout and follows the
+  rule below.
 - **New provider-created layout:** the provider writes its own metadata. Lance
-  does not copy or combine the input maps automatically.
+  does not copy or combine the input maps automatically. A rebuild with different
+  groups and no provider strategy produces segments with no clustering metadata.
 
 Index maintenance does not change the data fragments' clustering metadata.
 

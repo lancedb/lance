@@ -423,9 +423,11 @@ message IndexMetadata {
    */
   repeated int32 covering_fields = 11;
 
-  /* Optional clustering information for this segment's grouping. Ordinary
-   * merge, rebuild, and remap do not inherit it; provider operations set it for
-   * their outputs. Absence makes no clustering claim. Requires writer flag 1 << 17.
+  /* Optional clustering information for this segment's grouping. Remap and
+   * rebuild of the existing group preserve it. Merges and rebuilds with different
+   * groups use provider-written output information; without a provider strategy,
+   * their outputs have no clustering information. Absence makes no clustering
+   * claim. Requires writer flag 1 << 17.
    */
   ClusteringInfo clustering = 12;
 }

@@ -27,8 +27,11 @@ message ClusteringInfo {
   uint64 version = 2;
   /* Provider-defined information, such as group, bucket, or range identifiers.
    * Empty is valid. It is not proof of index coverage, statistics, or row order.
-   * Ordinary rewrites do not inherit this information; provider operations set
-   * it for their outputs. Unchanged objects preserve unknown keys and values.
+   * Ordinary data-fragment rewrites clear this information. Index remap and
+   * rebuild of the existing group preserve it. Merges and rebuilds with different
+   * groups use provider-written output information; without a provider strategy,
+   * their outputs have no clustering information. Unchanged objects preserve
+   * unknown keys and values.
    */
   map<string, string> metadata = 3;
 }
