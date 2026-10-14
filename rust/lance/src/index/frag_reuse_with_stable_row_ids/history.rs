@@ -2683,11 +2683,8 @@ mod tests {
     /// keeps both versions it needs. Saved, dropped and committed again, it
     /// covers what the history translates. Caught up, it needs neither version:
     /// cleanup empties the history but keeps the entry, and the next compaction
-    /// records into it. Once the records the saved segment needed are trimmed,
-    /// it no longer covers the fragments they translated: a raw `CreateIndex` of
-    /// it is refused, and `commit_existing_index_segments` leaves them out.
-    /// Translations hold, with the same stable row ids, while the records are
-    /// kept.
+    /// records into it. Translations hold, with the same stable row ids, while
+    /// the records are kept.
     #[rstest]
     #[tokio::test]
     async fn test_address_index_lives_with_the_history(
@@ -2747,7 +2744,7 @@ mod tests {
         assert_eq!(coverage_of(&saved, "i_idx"), translated);
         dataset.drop_index("i_idx").await.unwrap();
         dataset
-            .commit_existing_index_segments("i_idx", "i", saved.clone())
+            .commit_existing_index_segments("i_idx", "i", saved)
             .await
             .unwrap();
         let republished = dataset.load_indices_by_name("i_idx").await.unwrap();
@@ -2765,31 +2762,6 @@ mod tests {
         assert_eq!(history(&dataset).await.len(), 1);
         assert_translations_hold(&before, uri).await;
         assert_answers_through(&dataset, "i_idx", "i < 80").await;
-
-        dataset.drop_index("i_idx").await.unwrap();
-        let version = dataset.manifest.version;
-        let error = commit(
-            &dataset,
-            version,
-            Operation::CreateIndex {
-                new_indices: saved.clone(),
-                removed_indices: vec![],
-            },
-            false,
-        )
-        .await
-        .expect_err("the trimmed records no longer translate the saved coverage");
-        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
-        dataset
-            .commit_existing_index_segments("i_idx", "i", saved)
-            .await
-            .unwrap();
-        let coverage = coverage_of(
-            &dataset.load_indices_by_name("i_idx").await.unwrap(),
-            "i_idx",
-        );
-        assert!(coverage.is_disjoint(&translated), "{coverage:?}");
-        assert_matches_a_scan(&dataset, "i < 80").await;
     }
 
     #[derive(Clone, Copy, Debug)]
@@ -2956,17 +2928,21 @@ mod tests {
     }
 
     /// A zone map segment built before a recorded compaction is committed from
-    /// a fresh handle after it, with the compaction's record kept or trimmed by
-    /// a cleanup no index holds back. A staged segment covers the fragments the
-    /// compaction retired, so its rows are scanned either way. A saved segment
-    /// covers the compaction's output: while the record is kept it answers
-    /// through the index, and once the record is trimmed the output is left out
-    /// and scanned. Lookups always match a scan.
+    /// a fresh handle after it. A staged segment covers the fragments the
+    /// compaction retired, so its rows are scanned whether a cleanup no index
+    /// holds back trimmed the record or not. A saved segment covers the
+    /// compaction's output and, while the record is kept, answers through the
+    /// index. Lookups always match a scan. A saved segment committed after the
+    /// record is trimmed is left out: validating that publication is deferred
+    /// with #9947.
     #[rstest]
+    #[case::staged(Republished::Staged, false)]
+    #[case::staged_after_a_trim(Republished::Staged, true)]
+    #[case::saved(Republished::Saved, false)]
     #[tokio::test]
     async fn test_republished_zone_map_covers_only_what_the_history_translates(
-        #[values(Republished::Staged, Republished::Saved)] republished: Republished,
-        #[values(false, true)] trimmed: bool,
+        #[case] republished: Republished,
+        #[case] trimmed: bool,
     ) {
         let dir = TempStrDir::default();
         let uri = dir.as_str();
@@ -3013,62 +2989,13 @@ mod tests {
         }
     }
 
-    /// A saved zone map reaches the second of two chained recorded compactions
-    /// through the first, whose record a cleanup trimmed: `keeper`, built
-    /// between them, needs only the second record, so the oldest one goes.
-    /// Committed again, the zone map covers only the fragment no compaction
-    /// touched, and lookups match a scan.
-    #[tokio::test]
-    async fn test_republished_zone_map_does_not_cover_a_fragment_behind_a_trimmed_link() {
-        let dir = TempStrDir::default();
-        let uri = dir.as_str();
-        let mut dataset = zone_mapped_table(uri).await;
-        let segment = stage_zone_map(&mut dataset, "i", "late").await;
-        dataset
-            .commit_existing_index_segments("late", "i", vec![segment])
-            .await
-            .unwrap();
-        let first = compact_recorded(&mut dataset, &[0, 1]).await;
-        let keeper = stage_zone_map(&mut dataset, "j", "keeper").await;
-        dataset
-            .commit_existing_index_segments("keeper", "j", vec![keeper])
-            .await
-            .unwrap();
-        let second = compact_recorded(&mut dataset, &[3, first as u64]).await;
-        let saved = dataset.load_indices_by_name("late").await.unwrap();
-        assert_eq!(
-            saved[0].fragment_bitmap.clone().unwrap(),
-            RoaringBitmap::from_iter([2, second])
-        );
-        dataset.drop_index("late").await.unwrap();
-        cleanup_frag_reuse_index(&mut dataset).await.unwrap();
-        let kept = history(&dataset).await;
-        assert_eq!(kept.len(), 1);
-        assert_eq!(kept[0].new_frag_ids(), vec![second as u64]);
-
-        let mut latest = Dataset::open(uri).await.unwrap();
-        latest
-            .commit_existing_index_segments("late", "i", saved)
-            .await
-            .unwrap();
-        assert_eq!(
-            coverage_of(&load_all_indices(&latest).await.unwrap(), "late"),
-            RoaringBitmap::from_iter([2])
-        );
-        assert_answers_through(&latest, "late", "i >= 100 AND i < 150").await;
-        assert_matches_a_scan(&latest, "i < 100 OR i >= 150").await;
-    }
-
     /// A saved zone map is committed again while a cleanup that read before
     /// it trims the record it needs. Committed first from a handle that read
-    /// the record, the zone map holds the cleanup back. Committed after the
-    /// cleanup from a handle that read the record, it is refused as
-    /// retryable and leaves the output out when committed again.
-    #[rstest]
+    /// the record, the zone map holds the cleanup back. The opposite order, a
+    /// cleanup committed before the saved segment is published, is deferred
+    /// with #9947.
     #[tokio::test]
-    async fn test_republished_zone_map_racing_a_cleanup_keeps_what_it_covers(
-        #[values(false, true)] zone_map_first: bool,
-    ) {
+    async fn test_republished_zone_map_racing_a_cleanup_keeps_what_it_covers() {
         let dir = TempStrDir::default();
         let uri = dir.as_str();
         let mut dataset = zone_mapped_table(uri).await;
@@ -3084,41 +3011,21 @@ mod tests {
         let mut publisher = Dataset::open(uri).await.unwrap();
         let mut cleaner = Dataset::open(uri).await.unwrap();
 
-        if zone_map_first {
-            publisher
-                .commit_existing_index_segments("late", "i", saved)
-                .await
-                .unwrap();
-            let error = cleanup_frag_reuse_index(&mut cleaner)
-                .await
-                .expect_err("the zone map still needs the record");
-            assert_retryable(&error, "may still hold row addresses it moved");
-            let latest = Dataset::open(uri).await.unwrap();
-            assert_same_history(&history(&latest).await, &recorded);
-            assert_eq!(
-                coverage_of(&load_all_indices(&latest).await.unwrap(), "late"),
-                RoaringBitmap::from_iter([compacted])
-            );
-            assert_answers_through(&latest, "late", "i < 150").await;
-            return;
-        }
-        cleanup_frag_reuse_index(&mut cleaner).await.unwrap();
-        let error = publisher
-            .commit_existing_index_segments("late", "i", saved.clone())
-            .await
-            .expect_err("the record the zone map needs is gone");
-        assert!(
-            matches!(error, Error::RetryableCommitConflict { .. }),
-            "{error}"
-        );
-        let mut latest = Dataset::open(uri).await.unwrap();
-        assert_eq!(latest.manifest.version, cleaner.manifest.version);
-        latest
+        publisher
             .commit_existing_index_segments("late", "i", saved)
             .await
             .unwrap();
-        assert!(coverage_of(&load_all_indices(&latest).await.unwrap(), "late").is_empty());
-        assert_matches_a_scan(&latest, "i < 150").await;
+        let error = cleanup_frag_reuse_index(&mut cleaner)
+            .await
+            .expect_err("the zone map still needs the record");
+        assert_retryable(&error, "may still hold row addresses it moved");
+        let latest = Dataset::open(uri).await.unwrap();
+        assert_same_history(&history(&latest).await, &recorded);
+        assert_eq!(
+            coverage_of(&load_all_indices(&latest).await.unwrap(), "late"),
+            RoaringBitmap::from_iter([compacted])
+        );
+        assert_answers_through(&latest, "late", "i < 150").await;
     }
 
     /// Twelve recorded compactions each rewrite both fragments into two, so
@@ -3191,54 +3098,6 @@ mod tests {
             current
         );
         assert_answers_through(&dataset, "i_idx", "i < 50").await;
-    }
-
-    /// A saved zone map reaches fragments recorded compactions produced from
-    /// shared sources: 0 and 1 rewritten into 4 and 5, 2 and 3 into 6 and 7,
-    /// then 5 and 6 into 8 and 9. `keeper`, built after the first compaction,
-    /// lets a cleanup trim that one's record. Committed again, the zone map
-    /// covers 7 alone: 4 no longer traces to the build, and neither do 8 and
-    /// 9, which hold 5's rows, however well their other source, 6, traces back
-    /// with 7. Lookups match a scan.
-    #[tokio::test]
-    async fn test_republished_zone_map_does_not_cover_shared_sources_behind_a_trimmed_link() {
-        let dir = TempStrDir::default();
-        let uri = dir.as_str();
-        let mut dataset = zone_mapped_table(uri).await;
-        let segment = stage_zone_map(&mut dataset, "i", "late").await;
-        dataset
-            .commit_existing_index_segments("late", "i", vec![segment])
-            .await
-            .unwrap();
-        let first = compact_into_two(&mut dataset, &[0, 1]).await;
-        let keeper = stage_zone_map(&mut dataset, "j", "keeper").await;
-        dataset
-            .commit_existing_index_segments("keeper", "j", vec![keeper])
-            .await
-            .unwrap();
-        let second = compact_into_two(&mut dataset, &[2, 3]).await;
-        let third = compact_into_two(&mut dataset, &[first[1], second[0]]).await;
-        assert_eq!([first, second, third].concat(), [4, 5, 6, 7, 8, 9]);
-        let saved = dataset.load_indices_by_name("late").await.unwrap();
-        assert_eq!(
-            saved[0].fragment_bitmap.clone().unwrap(),
-            RoaringBitmap::from_iter([4, 7, 8, 9])
-        );
-        dataset.drop_index("late").await.unwrap();
-        cleanup_frag_reuse_index(&mut dataset).await.unwrap();
-        assert_eq!(history(&dataset).await.len(), 2);
-
-        let mut latest = Dataset::open(uri).await.unwrap();
-        latest
-            .commit_existing_index_segments("late", "i", saved)
-            .await
-            .unwrap();
-        assert_eq!(
-            coverage_of(&load_all_indices(&latest).await.unwrap(), "late"),
-            RoaringBitmap::from_iter([7])
-        );
-        assert_answers_through(&latest, "late", "i >= 150").await;
-        assert_matches_a_scan(&latest, "i < 150").await;
     }
 
     #[derive(Clone, Copy, Debug)]
@@ -3436,199 +3295,6 @@ mod tests {
         assert_eq!(latest.manifest.version, clone.manifest.version);
         assert_same_history(&history(&latest).await, &recorded);
         assert_translations_hold(&before, &clone_uri).await;
-    }
-
-    /// A zone map saved once a recorded compaction moved its coverage onto the
-    /// output, dropped, and reattached by a raw `CreateIndex` after cleanup
-    /// trimmed the record: the commit is refused, as invalid when it reads the
-    /// trimmed version and as retryable when it is detached from the version
-    /// before the trim. The table is left as it was.
-    #[rstest]
-    #[tokio::test]
-    async fn test_saved_segment_reattached_after_its_record_is_trimmed_is_refused(
-        #[values(false, true)] detached: bool,
-    ) {
-        let dir = TempStrDir::default();
-        let mut dataset = zone_mapped_table(dir.as_str()).await;
-        let segment = stage_zone_map(&mut dataset, "i", "late").await;
-        dataset
-            .commit_existing_index_segments("late", "i", vec![segment])
-            .await
-            .unwrap();
-        let compacted = compact_recorded(&mut dataset, &[0, 1, 2, 3]).await;
-        let saved = dataset.load_indices_by_name("late").await.unwrap();
-        assert_eq!(
-            coverage_of(&saved, "late"),
-            RoaringBitmap::from_iter([compacted])
-        );
-        dataset.drop_index("late").await.unwrap();
-        let before_trim = dataset.manifest.version;
-        cleanup_frag_reuse_index(&mut dataset).await.unwrap();
-        assert!(history(&dataset).await.is_empty());
-
-        let read_version = if detached {
-            before_trim
-        } else {
-            dataset.manifest.version
-        };
-        let error = commit(
-            &dataset,
-            read_version,
-            Operation::CreateIndex {
-                new_indices: saved,
-                removed_indices: vec![],
-            },
-            detached,
-        )
-        .await
-        .expect_err("the trimmed record no longer translates the saved coverage");
-        if detached {
-            assert_retryable(&error, "commit the segments again from the latest version");
-        } else {
-            assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
-        }
-        let latest = Dataset::open(dir.as_str()).await.unwrap();
-        assert_eq!(latest.manifest.version, dataset.manifest.version);
-        assert!(
-            latest
-                .load_indices_by_name("late")
-                .await
-                .unwrap()
-                .is_empty()
-        );
-        assert_matches_a_scan(&latest, "i < 150").await;
-    }
-
-    /// A zone map prepared while the history translates its coverage loses the
-    /// record to a cleanup before it is committed, and in one case its build
-    /// manifest too: the commit is refused as retryable either way, and
-    /// committed again from the latest version it covers nothing.
-    #[rstest]
-    #[tokio::test]
-    async fn test_prepared_segment_losing_its_record_before_publication_is_retried(
-        #[values(false, true)] remove_build_manifest: bool,
-    ) {
-        use crate::index::{IntoIndexSegment, build_index_metadata_from_segments};
-
-        let dir = TempStrDir::default();
-        let mut dataset = zone_mapped_table(dir.as_str()).await;
-        let segment = stage_zone_map(&mut dataset, "i", "late").await;
-        dataset
-            .commit_existing_index_segments("late", "i", vec![segment])
-            .await
-            .unwrap();
-        let compacted = compact_recorded(&mut dataset, &[0, 1, 2, 3]).await;
-        let saved = dataset.load_indices_by_name("late").await.unwrap();
-        let build_manifest = dataset
-            .checkout_version(saved[0].dataset_version)
-            .await
-            .unwrap()
-            .manifest_location
-            .path
-            .clone();
-        dataset.drop_index("late").await.unwrap();
-        let publisher = dataset.clone();
-        let prepared = build_index_metadata_from_segments(
-            &publisher,
-            "late",
-            publisher.schema().field("i").unwrap().id,
-            saved
-                .iter()
-                .cloned()
-                .map(IntoIndexSegment::into_index_segment)
-                .collect::<Result<Vec<_>>>()
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            coverage_of(&prepared, "late"),
-            RoaringBitmap::from_iter([compacted])
-        );
-        cleanup_frag_reuse_index(&mut dataset).await.unwrap();
-        if remove_build_manifest {
-            dataset.object_store.delete(&build_manifest).await.unwrap();
-        }
-
-        let error = commit(
-            &publisher,
-            publisher.manifest.version,
-            Operation::CreateIndex {
-                new_indices: prepared,
-                removed_indices: vec![],
-            },
-            false,
-        )
-        .await
-        .expect_err("the record the prepared coverage needs is gone");
-        assert_retryable(&error, "commit the segments again from the latest version");
-
-        let mut latest = Dataset::open(dir.as_str()).await.unwrap();
-        latest
-            .commit_existing_index_segments("late", "i", saved)
-            .await
-            .unwrap();
-        assert!(coverage_of(&load_all_indices(&latest).await.unwrap(), "late").is_empty());
-        assert_matches_a_scan(&latest, "i < 150").await;
-    }
-
-    /// A zone map saved once a recorded compaction of fragments 0 and 1 moved
-    /// its coverage onto the output, dropped, and published again by a raw
-    /// `CreateIndex` in place of a zone map built after cleanup trimmed the
-    /// record. Replacing the current zone map says nothing of the entries the
-    /// saved one holds, so the commit is refused as invalid, detached or not,
-    /// and the current zone map stays.
-    #[rstest]
-    #[tokio::test]
-    async fn test_saved_segment_replacing_the_current_index_is_refused(
-        #[values(false, true)] detached: bool,
-    ) {
-        let dir = TempStrDir::default();
-        let mut dataset = zone_mapped_table(dir.as_str()).await;
-        let segment = stage_zone_map(&mut dataset, "i", "late").await;
-        dataset
-            .commit_existing_index_segments("late", "i", vec![segment])
-            .await
-            .unwrap();
-        let compacted = compact_recorded(&mut dataset, &[0, 1]).await;
-        let saved = dataset.load_indices_by_name("late").await.unwrap();
-        assert_eq!(
-            coverage_of(&saved, "late"),
-            RoaringBitmap::from_iter([2, 3, compacted])
-        );
-        dataset.drop_index("late").await.unwrap();
-        cleanup_frag_reuse_index(&mut dataset).await.unwrap();
-        assert!(history(&dataset).await.is_empty());
-        let fresh = stage_zone_map(&mut dataset, "i", "late").await;
-        dataset
-            .commit_existing_index_segments("late", "i", vec![fresh])
-            .await
-            .unwrap();
-        let current = dataset.load_indices_by_name("late").await.unwrap();
-
-        let result = commit(
-            &dataset,
-            dataset.manifest.version,
-            Operation::CreateIndex {
-                new_indices: saved,
-                removed_indices: current.clone(),
-            },
-            detached,
-        )
-        .await;
-        if let Ok(published) = &result {
-            // What the refusal prevents: entries that no longer translate.
-            assert_matches_a_scan(published, "i < 150").await;
-        }
-        let error = result.expect_err("the trimmed record no longer translates the saved coverage");
-        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
-        let latest = Dataset::open(dir.as_str()).await.unwrap();
-        assert_eq!(latest.manifest.version, dataset.manifest.version);
-        assert_eq!(
-            latest.load_indices_by_name("late").await.unwrap()[0].uuid,
-            current[0].uuid
-        );
-        assert_matches_a_scan(&latest, "i < 150").await;
     }
 
     /// The same saved zone map published by a raw `CreateIndex` that also
