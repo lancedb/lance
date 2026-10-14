@@ -17,6 +17,7 @@
 //! module. This module holds the coordinate space and the comparison.
 
 use super::{CompositeOperation, Ref};
+use crate::format::key_existence::KeyExistenceFilter;
 use crate::transaction::UpdateMap;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -33,6 +34,8 @@ pub enum Coordinate {
     FragmentExistence(u64),
     /// A committed fragment's deletion file.
     FragmentDeletions(u64),
+    /// A committed fragment's per-row version sequences.
+    FragmentRowVersions(u64),
     /// The data backing one field within one committed fragment.
     FieldData { fragment: u64, field: i32 },
     /// A field's definition in the schema.
@@ -85,7 +88,9 @@ impl Coordinate {
     /// The fragment this coordinate lives in, if it is fragment-scoped.
     fn fragment(&self) -> Option<u64> {
         match self {
-            Self::FragmentExistence(id) | Self::FragmentDeletions(id) => Some(*id),
+            Self::FragmentExistence(id)
+            | Self::FragmentDeletions(id)
+            | Self::FragmentRowVersions(id) => Some(*id),
             Self::FieldData { fragment, .. } => Some(*fragment),
             Self::FieldDefinition(_)
             | Self::FieldName(_)
@@ -123,6 +128,11 @@ enum Mode {
     /// may require the same coordinate -- two readers of one column do not
     /// collide.
     Requires,
+    /// Writes some of the coordinate and leaves the rest as it was. An overlay
+    /// is the case: new values for a subset of one field's cells in one
+    /// fragment. Two of these commute -- both land, the newer wins where they
+    /// overlap -- which is what sets it apart from a full write.
+    WritesPart,
     /// Replaces the coordinate. Two of these on one coordinate never commute.
     Writes,
 }
@@ -132,8 +142,8 @@ enum Mode {
 /// containment: a region write is a write of every coordinate the region holds.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum Region {
-    /// A committed fragment: its existence, its deletions, and the data of
-    /// every field in it.
+    /// A committed fragment: its existence, deletions, row versions, and the
+    /// data of every field in it.
     Fragment(u64),
     /// One of the manifest's string maps, every key included.
     Map(ConfigMap),
@@ -152,22 +162,30 @@ impl Region {
 /// `committed` on the same coordinate, where the `committed` set landed after
 /// the `committing` set read.
 ///
-/// | committing \ committed | Writes   | Requires |
-/// |------------------------|----------|----------|
-/// | Writes                 | conflict | ok       |
-/// | Requires               | conflict | ok       |
+/// | committing \ committed | Writes   | WritesPart | Requires |
+/// |------------------------|----------|------------|----------|
+/// | Writes                 | conflict | conflict   | ok       |
+/// | WritesPart             | conflict | ok         | ok       |
+/// | Requires               | conflict | ok         | ok       |
 ///
 /// The `Requires` column is all "ok": what the committed set required held when
 /// it committed, and it serialized first, so nothing arriving later can
 /// retroactively break it. The `Requires` row is the open question, because
-/// the committing set read before the other landed.
+/// the committing set read before the other landed. It collides with a full
+/// write and not a partial one: a segment built over a column an overlay then
+/// landed on is stamped with the version it read, the overlay carries the later
+/// version it committed at, and the read path masks the overlaid cells out of
+/// any segment older than the overlay.
 ///
 /// The table is monotone along [`Mode`]'s order in every row and column, which
 /// is what lets one coordinate touched two ways by one set be summarized by
 /// its strongest mode.
 fn pair_conflicts(committing: Mode, committed: Mode) -> bool {
     match (committing, committed) {
-        (Mode::Writes | Mode::Requires, Mode::Writes) => true,
+        (Mode::Writes, Mode::Writes | Mode::WritesPart) => true,
+        (Mode::WritesPart | Mode::Requires, Mode::Writes) => true,
+        (Mode::WritesPart, Mode::WritesPart) => false,
+        (Mode::Requires, Mode::WritesPart) => false,
         (_, Mode::Requires) => false,
     }
 }
@@ -200,7 +218,7 @@ pub struct Footprint {
     ///
     /// Not a `Requires` claim on the region, because the check is symmetric: a
     /// removal that lands second destroys the cells just as surely as one that
-    /// lands first. And not a write, because it must not collide with a
+    /// lands first. And not a `WritesPart`, because it must not collide with a
     /// concurrent write to some other coordinate in the same fragment.
     required_fragments: HashSet<u64>,
     /// Whether this set rewrites the table wholesale. Such a set collides with
@@ -208,10 +226,32 @@ pub struct Footprint {
     /// append's rows would vanish or survive the reset depending on which
     /// commit landed first -- so it is a flag rather than a region.
     exclusive: bool,
+    /// Whether this set brings rows into the dataset that were not there
+    /// before. Coordinates cannot answer what the key assertions ask: two
+    /// writers inserting the same key write it into fragments of their own, so
+    /// their coordinates stay disjoint however badly the keys collide. Key
+    /// uniqueness is a claim about values, not about structure, so it is
+    /// checked by comparing this flag against the filters below.
+    ///
+    /// Set by any [`AddFragment`](super::AddFragment) that is a data change,
+    /// which over-approximates: the rows a merge insert updates arrive in a new
+    /// fragment too, and those carry no new key. The cost is a conflict between
+    /// two writers who only ever touched keys that were already there.
+    inserts_rows: bool,
+    /// The unique-key preconditions this set carries, one per
+    /// [`AssertUniqueKeys`](super::AssertUniqueKeys).
+    key_assertions: Vec<KeyAssertion>,
     /// What this set writes into logical indices. A segment's uuid is a
     /// coordinate, but the thing two writers can collide over is the index the
     /// segment joins, which is not a set of ids -- see [`IndexClaim`].
     index_claims: Vec<IndexClaim>,
+}
+
+/// A claim about which keys an action set inserts, and over which columns.
+#[derive(Debug, Clone, PartialEq)]
+struct KeyAssertion {
+    key_fields: Vec<Ref>,
+    filter: KeyExistenceFilter,
 }
 
 /// What an action set writes into one logical index.
@@ -284,8 +324,8 @@ impl Footprint {
     /// -- an order the system already handles, by pruning the stale fragment
     /// out of the segment's coverage as the rewrite applies.
     ///
-    /// Index claims are not coordinates and are compared on their own terms,
-    /// symmetrically.
+    /// The value predicates -- key assertions, index claims -- are not
+    /// coordinates and are compared on their own terms, symmetrically.
     pub fn conflicts_with(&self, committed: &Self) -> bool {
         // A wholesale rewrite leaves nothing for a concurrent set to land on --
         // not even an append, whose rows the reset would discard or resurrect
@@ -299,8 +339,15 @@ impl Footprint {
         if self.anchors_removed_by(committed) || committed.anchors_removed_by(self) {
             return true;
         }
-        // Index claims are not coordinates and are compared on their own terms,
-        // symmetrically.
+        // Symmetric, unlike the coordinate requirements above. Dropping the
+        // second direction would let a plain append land a duplicate of a key
+        // a committed merge-insert asserted was absent -- correct if the
+        // assertion is a precondition on that commit, wrong if it is an
+        // invariant on the table. Until that is settled, keep the stricter
+        // reading.
+        if self.key_assertion_violated_by(committed) || committed.key_assertion_violated_by(self) {
+            return true;
+        }
         self.index_claims.iter().any(|ours| {
             committed
                 .index_claims
@@ -352,6 +399,71 @@ impl Footprint {
             .any(|fragment| other.regions.contains_key(&Region::Fragment(*fragment)))
     }
 
+    /// Whether `other` may have introduced a key this set asserts is not there.
+    ///
+    /// A set that asserts nothing has nothing to violate. A key can arrive two
+    /// ways. Writing into a key column of rows that are already there -- a
+    /// column rewrite, an overlay -- can put any value in it and says nothing
+    /// about which, so that is a violation outright. Inserting rows is the
+    /// other, and is only compatible if `other` says which keys it inserted
+    /// over the same columns, and the two filters provably do not intersect.
+    /// Anything less -- an unqualified insert, no assertion over these columns,
+    /// filters built with incomparable parameters -- leaves the assertion
+    /// unverifiable, which counts as a conflict.
+    fn key_assertion_violated_by(&self, other: &Self) -> bool {
+        if self.key_assertions.is_empty() {
+            return false;
+        }
+        if self
+            .key_assertions
+            .iter()
+            .any(|ours| other.writes_into_any_of(&ours.key_fields))
+        {
+            return true;
+        }
+        if !other.inserts_rows {
+            return false;
+        }
+        for ours in &self.key_assertions {
+            // Each assertion speaks for every row its set inserts, over its own
+            // key columns (see `AssertUniqueKeys`). An assertion of theirs
+            // over other columns hashes other values, so it says nothing about
+            // ours either way; one over the same columns says everything.
+            let mut over_same_columns = other
+                .key_assertions
+                .iter()
+                .filter(|theirs| theirs.key_fields == ours.key_fields)
+                .peekable();
+            if over_same_columns.peek().is_none() {
+                return true;
+            }
+            for theirs in over_same_columns {
+                match ours.filter.intersects(&theirs.filter) {
+                    Ok((false, _)) => {}
+                    // Either the keys really do overlap, or the two filters were
+                    // built with parameters that cannot be compared. Neither
+                    // clears the assertion.
+                    Ok((true, _)) | Err(_) => return true,
+                }
+            }
+        }
+        false
+    }
+
+    /// Whether this set writes, wholly or in part, the data of any of `fields`
+    /// in some committed fragment.
+    fn writes_into_any_of(&self, fields: &[Ref]) -> bool {
+        self.claims
+            .iter()
+            .filter(|(_, mode)| **mode >= Mode::WritesPart)
+            .any(|(coordinate, _)| match coordinate {
+                Coordinate::FieldData { field, .. } => {
+                    fields.contains(&Ref::Committed(*field as u64))
+                }
+                _ => false,
+            })
+    }
+
     /// Record a claim on `coordinate`, keeping the strongest mode if the set
     /// already touches it another way. See [`pair_conflicts`] for why the
     /// strongest mode is the right summary.
@@ -365,6 +477,12 @@ impl Footprint {
     /// Record that this set writes `coordinate`. See [`Mode::Writes`].
     pub(super) fn write(&mut self, coordinate: Coordinate) {
         self.claim(coordinate, Mode::Writes);
+    }
+
+    /// Record that this set writes some of `coordinate`, leaving the rest as
+    /// it was. See [`Mode::WritesPart`].
+    pub(super) fn write_part(&mut self, coordinate: Coordinate) {
+        self.claim(coordinate, Mode::WritesPart);
     }
 
     /// Record that this set reads `coordinate` and needs it to still hold what
@@ -478,6 +596,27 @@ impl Footprint {
             identity: None,
             coverage: Some(committed_fragments(fragments)),
         });
+    }
+
+    /// Record that this set rewrites `name` in a way whose reach it cannot
+    /// state, colliding with any concurrent write to the same index.
+    pub(super) fn rewrite_index(&mut self, name: String) {
+        self.index_claims.push(IndexClaim {
+            name,
+            identity: None,
+            coverage: None,
+        });
+    }
+
+    /// Note that this set brings in rows that were not in the dataset before.
+    pub(super) fn insert_rows(&mut self) {
+        self.inserts_rows = true;
+    }
+
+    /// Record a precondition that no concurrent commit inserted a colliding key.
+    pub(super) fn assert_unique_keys(&mut self, key_fields: Vec<Ref>, filter: KeyExistenceFilter) {
+        self.key_assertions
+            .push(KeyAssertion { key_fields, filter });
     }
 
     /// Record that this set removes `fragment` outright: its existence, and
