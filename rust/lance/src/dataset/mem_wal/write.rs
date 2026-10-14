@@ -4453,11 +4453,9 @@ pub struct WalStats {
 /// The set is fixed at seal time, so [`Self::wait`] is bounded no matter how
 /// many memtables freeze while it waits, and each entry reports the outcome of
 /// its own flush. That is why the fence is a captured watcher set and not a
-/// generation number compared against `ShardManifest::current_generation`: the
-/// manifest advances to `generation + 1` on every committed flush without
-/// checking for a gap, so a later generation's success moves it past a
-/// generation that failed and never reached L0 — the watermark would report
-/// durability that does not exist.
+/// generation number compared against `ShardManifest::current_generation`:
+/// the manifest says only which generations have published, not whether one
+/// sealed before the call failed.
 #[derive(Debug)]
 pub struct SealFence {
     sealed_generation: Option<u64>,
@@ -9883,55 +9881,91 @@ mod tests {
         writer_b.close().await.unwrap();
     }
 
-    /// Rows in SSTables once a fresh writer has replayed the WAL and closed,
-    /// which flushes everything it replayed.
-    async fn rows_after_reopen(
-        store: &Arc<ObjectStore>,
-        base_path: &Path,
-        shard_id: Uuid,
-        schema: &Arc<ArrowSchema>,
-    ) -> usize {
-        ShardWriter::open(
-            store.clone(),
-            base_path.clone(),
-            "memory:///",
-            memtable_config_with_pk(shard_id),
-            schema.clone(),
-            vec![],
+    /// A file-backed store whose writes [`FailControls`] can fail, and the
+    /// writer config that routes generation writes through it too.
+    struct FailingFileStore {
+        store: Arc<ObjectStore>,
+        base_path: Path,
+        uri: String,
+        controls: Arc<crate::dataset::mem_wal::test_util::FailControls>,
+        config: ShardWriterConfig,
+        _dir: tempfile::TempDir,
+    }
+
+    async fn failing_file_store() -> FailingFileStore {
+        use crate::dataset::mem_wal::test_util::observable_store_params;
+        use lance_io::object_store::ObjectStoreRegistry;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let uri = format!("file://{}", dir.path().display());
+        let (params, controls) = observable_store_params();
+        let (store, base_path) = ObjectStore::from_uri_and_params(
+            Arc::new(ObjectStoreRegistry::default()),
+            &uri,
+            &params,
         )
         .await
-        .unwrap()
-        .close()
-        .await
         .unwrap();
-        ShardManifestStore::new(store.clone(), base_path, shard_id, 2)
-            .latest()
+        let config = ShardWriterConfig {
+            store_params: Some(params),
+            ..memtable_config_with_pk(Uuid::new_v4())
+        };
+        FailingFileStore {
+            store,
+            base_path,
+            uri,
+            controls,
+            config,
+            _dir: dir,
+        }
+    }
+
+    impl FailingFileStore {
+        async fn writer(&self, schema: &Arc<ArrowSchema>) -> ShardWriter {
+            ShardWriter::open(
+                self.store.clone(),
+                self.base_path.clone(),
+                self.uri.clone(),
+                self.config.clone(),
+                schema.clone(),
+                vec![],
+            )
             .await
             .unwrap()
-            .unwrap()
-            .sstables
-            .iter()
-            .map(|sstable| sstable.physical_rows.unwrap() as usize)
-            .sum()
+        }
+
+        async fn manifest(&self) -> ShardManifest {
+            ShardManifestStore::new(self.store.clone(), &self.base_path, self.config.shard_id, 2)
+                .latest()
+                .await
+                .unwrap()
+                .unwrap()
+        }
+
+        /// The ids a fresh writer reads once it has replayed the WAL, across
+        /// the generations replay flushed and the one it holds in memory.
+        async fn ids_after_reopen(&self, schema: &Arc<ArrowSchema>) -> Vec<i32> {
+            let writer = self.writer(schema).await;
+            let shard_id = self.config.shard_id;
+            let mut ids =
+                read_sstable_ids_via_lsm(&writer, schema.clone(), &self.uri, shard_id, None).await;
+            ids.extend(
+                read_memtable_ids_via_lsm(&writer, schema.clone(), &self.uri, shard_id, None).await,
+            );
+            writer.close().await.unwrap();
+            ids.sort_unstable();
+            ids
+        }
     }
 
     /// A failed flush poisons the writer, so nothing publishes after it and a
     /// crash loses no accepted row: reopening replays the generation.
     #[tokio::test]
     async fn a_failed_flush_poisons_the_writer_and_reopen_recovers_it() {
-        let (store, base_path, controls) = failing_memory_store().await;
-        let schema = schema_with_pk();
-        let shard_id = Uuid::new_v4();
-        let writer = ShardWriter::open(
-            store.clone(),
-            base_path.clone(),
-            "memory:///",
-            memtable_config_with_pk(shard_id),
-            schema.clone(),
-            vec![],
-        )
-        .await
-        .unwrap();
+        let fixture = failing_file_store().await;
+        let controls = &fixture.controls;
+        let schema = Arc::new(schema_with_pk());
+        let writer = fixture.writer(&schema).await;
 
         writer
             .put(vec![create_test_batch(&schema, 0, 5)])
@@ -9950,75 +9984,52 @@ mod tests {
             Some(FenceReason::PersistenceFailure),
             "{refused}"
         );
-        let manifest = ShardManifestStore::new(store.clone(), &base_path, shard_id, 2)
-            .latest()
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(manifest.sstables.is_empty());
+        assert!(fixture.manifest().await.sstables.is_empty());
 
         // Crash: drop without close.
         drop(writer);
         controls.clear_write_failures();
         assert_eq!(
-            rows_after_reopen(&store, &base_path, shard_id, &schema).await,
-            5
+            fixture.ids_after_reopen(&schema).await,
+            (0..5).collect::<Vec<_>>()
         );
     }
 
-    /// Closing after a failed flush publishes no later generation, though that
-    /// one could flush, so the next open replays every accepted row.
+    /// A generation sealed behind one whose flush then fails is not
+    /// published, and the next open replays both.
     #[tokio::test]
-    async fn close_after_a_failed_flush_publishes_nothing_and_replay_recovers_it() {
-        let (store, base_path, controls) = failing_memory_store().await;
-        let schema = schema_with_pk();
-        let shard_id = Uuid::new_v4();
-        let writer = ShardWriter::open(
-            store.clone(),
-            base_path.clone(),
-            "memory:///",
-            memtable_config_with_pk(shard_id),
-            schema.clone(),
-            vec![],
-        )
-        .await
-        .unwrap();
+    async fn a_generation_queued_behind_a_failed_flush_is_not_published() {
+        let fixture = failing_file_store().await;
+        let controls = &fixture.controls;
+        let schema = Arc::new(schema_with_pk());
+        let writer = fixture.writer(&schema).await;
 
         writer
             .put(vec![create_test_batch(&schema, 0, 5)])
             .await
             .unwrap();
         controls.fail_writes_under("_gen_1/");
-        let _first = writer.force_seal_active().await.unwrap();
-        // Lands in generation 2 or is refused, depending on whether the
-        // generation 1 flush has failed yet; neither may publish.
-        let accepted = match writer.put(vec![create_test_batch(&schema, 100, 3)]).await {
-            Ok(_) => 3,
-            Err(refused) => {
-                assert_eq!(
-                    refused.fence_reason(),
-                    Some(FenceReason::PersistenceFailure),
-                    "{refused}"
-                );
-                0
-            }
-        };
-        assert!(writer.close().await.is_err());
+        controls.hold_failing_writes(true);
+        let first = writer.force_seal_active().await.unwrap();
+        writer
+            .put(vec![create_test_batch(&schema, 100, 3)])
+            .await
+            .unwrap();
+        let second = writer.force_seal_active().await.unwrap();
+        controls.hold_failing_writes(false);
+        assert!(first.wait().await.is_err());
+        assert!(second.wait().await.is_err());
+        // Close may still report the unpublished generations, depending on
+        // whether their flush results are still queued; it shuts down either way.
+        let _ = writer.close().await;
 
         controls.clear_write_failures();
-        let manifest = ShardManifestStore::new(store.clone(), &base_path, shard_id, 2)
-            .latest()
-            .await
-            .unwrap()
-            .unwrap();
+        let manifest = fixture.manifest().await;
         assert_eq!(manifest.current_generation, 1);
         assert!(manifest.sstables.is_empty());
-        // A refused write can still have reached the WAL before the writer was
-        // poisoned; nothing accepted is lost either way.
-        let recovered = rows_after_reopen(&store, &base_path, shard_id, &schema).await;
-        assert!(
-            recovered == 5 + accepted || (accepted == 0 && recovered == 8),
-            "recovered {recovered} rows with {accepted} accepted after the failure"
+        assert_eq!(
+            fixture.ids_after_reopen(&schema).await,
+            (0..5).chain(100..103).collect::<Vec<_>>()
         );
     }
 
@@ -10026,35 +10037,12 @@ mod tests {
     /// not attempted again until a reopen replays the generation.
     #[tokio::test]
     async fn a_late_flush_failure_leaves_one_copy_of_the_data() {
-        use crate::dataset::mem_wal::test_util::observable_store_params;
         use futures::TryStreamExt;
-        use lance_io::object_store::ObjectStoreRegistry;
 
-        let temp_dir = tempfile::TempDir::new().unwrap();
-        let uri = format!("file://{}", temp_dir.path().display());
-        let (params, controls) = observable_store_params();
-        let (store, base_path) = ObjectStore::from_uri_and_params(
-            Arc::new(ObjectStoreRegistry::default()),
-            &uri,
-            &params,
-        )
-        .await
-        .unwrap();
-        let schema = schema_with_pk();
-        let config = ShardWriterConfig {
-            store_params: Some(params),
-            ..memtable_config_with_pk(Uuid::new_v4())
-        };
-        let writer = ShardWriter::open(
-            store.clone(),
-            base_path.clone(),
-            uri,
-            config,
-            schema.clone(),
-            vec![],
-        )
-        .await
-        .unwrap();
+        let fixture = failing_file_store().await;
+        let controls = &fixture.controls;
+        let schema = Arc::new(schema_with_pk());
+        let writer = fixture.writer(&schema).await;
         writer
             .put(vec![create_test_batch(&schema, 0, 1)])
             .await
@@ -10062,11 +10050,14 @@ mod tests {
         controls.fail_writes_under("/bloom_filter.bin");
         let first = writer.force_seal_active().await.unwrap();
         assert!(first.wait().await.is_err());
-        tokio::time::sleep(Duration::from_millis(700)).await;
+        // Joins the flush task, so no further attempt can write after the count.
+        // Its result depends on whether the failed flush is still queued.
+        let _ = writer.close().await;
 
-        let copies = store
+        let copies = fixture
+            .store
             .inner
-            .list(Some(&base_path))
+            .list(Some(&fixture.base_path))
             .try_collect::<Vec<_>>()
             .await
             .unwrap()

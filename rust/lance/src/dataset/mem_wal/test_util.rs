@@ -47,6 +47,9 @@ pub struct FailControls {
     get_paths: StdMutex<Vec<String>>,
     /// Fail every write whose path contains this substring.
     fail_writes_under: StdMutex<Option<String>>,
+    /// While set, a write that would fail waits, then fails once released.
+    hold_failing_writes: AtomicBool,
+    failing_writes_released: tokio::sync::Notify,
 }
 
 impl FailControls {
@@ -65,6 +68,23 @@ impl FailControls {
     }
     pub fn clear_write_failures(&self) {
         *self.fail_writes_under.lock().unwrap() = None;
+    }
+    /// Make the writes [`Self::fail_writes_under`] targets wait, until released
+    /// with `false`, before they fail.
+    pub fn hold_failing_writes(&self, hold: bool) {
+        self.hold_failing_writes.store(hold, Ordering::SeqCst);
+        if !hold {
+            self.failing_writes_released.notify_waiters();
+        }
+    }
+    async fn fail_write(&self) -> object_store::Error {
+        loop {
+            let released = self.failing_writes_released.notified();
+            if !self.hold_failing_writes.load(Ordering::SeqCst) {
+                return FailingObjectStore::injected_error();
+            }
+            released.await;
+        }
     }
     fn fails_write(&self, location: &Path) -> bool {
         self.fail_writes_under
@@ -173,7 +193,7 @@ impl OSObjectStore for FailingObjectStore {
             .unwrap()
             .push(location.to_string());
         if self.controls.fails_write(location) {
-            return Err(Self::injected_error());
+            return Err(self.controls.fail_write().await);
         }
         if location.as_ref().ends_with(".blob") {
             self.controls
@@ -219,7 +239,7 @@ impl OSObjectStore for FailingObjectStore {
             .unwrap()
             .push(location.to_string());
         if self.controls.fails_write(location) {
-            return Err(Self::injected_error());
+            return Err(self.controls.fail_write().await);
         }
         self.inner.put_multipart_opts(location, opts).await
     }
