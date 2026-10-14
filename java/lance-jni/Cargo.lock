@@ -4230,6 +4230,7 @@ dependencies = [
  "path_abs",
  "pin-project",
  "prost",
+ "quick-xml",
  "rand 0.9.5",
  "reqsign-core",
  "reqsign-file-read-tokio",

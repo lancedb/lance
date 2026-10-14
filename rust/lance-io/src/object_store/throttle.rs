@@ -772,49 +772,58 @@ fn is_delete_request(request: &HttpRequest) -> bool {
 /// carry, so an object key echoed in `<Key>` or `<Location>` cannot be
 /// mistaken for an error code.
 #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
-fn error_document_code(body: &str) -> Option<&str> {
-    /// The local name of the element whose tag starts `tag` (after `<`).
-    fn local_name(tag: &str) -> &str {
-        let end = tag
-            .find(|c: char| c.is_ascii_whitespace() || c == '>' || c == '/')
-            .unwrap_or(tag.len());
-        let name = &tag[..end];
-        name.rsplit_once(':').map_or(name, |(_, local)| local)
-    }
+fn error_document_code(body: &str) -> Option<String> {
+    use quick_xml::events::Event;
 
-    let mut rest = body.trim_start_matches('\u{feff}').trim_start();
-    if rest.starts_with("<?") {
-        rest = rest[rest.find("?>")? + 2..].trim_start();
-    }
-    let root = rest.strip_prefix('<')?;
-    if !local_name(root).eq_ignore_ascii_case("Error") {
-        return None;
-    }
-    let root_end = root.find('>')?;
-    if root[..root_end].ends_with('/') {
-        return None;
-    }
+    let mut reader = quick_xml::Reader::from_str(body);
+    reader.config_mut().trim_text(true);
 
-    // Walk the root's content, tracking depth so only a direct child counts.
-    let mut rest = &root[root_end + 1..];
-    let mut depth = 0usize;
-    while let Some(start) = rest.find('<') {
-        let tag = &rest[start + 1..];
-        let end = tag.find('>')?;
-        let content = &tag[end + 1..];
-        if tag.starts_with('/') {
-            // At depth 0 this closes the root, which had no `Code` child.
-            depth = depth.checked_sub(1)?;
-        } else if !tag.starts_with(['!', '?']) && !tag[..end].ends_with('/') {
-            if depth == 0 && local_name(tag).eq_ignore_ascii_case("Code") {
-                let code = content[..content.find('<')?].trim();
-                return (!code.is_empty()).then_some(code);
-            }
-            depth += 1;
+    let root = loop {
+        match reader.read_event().ok()? {
+            Event::Decl(_) | Event::PI(_) | Event::Comment(_) | Event::DocType(_) => {}
+            Event::Start(root) => break root,
+            _ => return None,
         }
-        rest = content;
+    };
+    if !root.local_name().as_ref().eq_ignore_ascii_case(b"Error") {
+        return None;
     }
-    None
+
+    // Track depth so only a direct child of the root counts.
+    let mut depth = 0usize;
+    loop {
+        match reader.read_event().ok()? {
+            Event::Start(child)
+                if depth == 0 && child.local_name().as_ref().eq_ignore_ascii_case(b"Code") =>
+            {
+                break;
+            }
+            Event::Start(_) => depth += 1,
+            // At depth 0 this closes the root, which had no `Code` child.
+            Event::End(_) => depth = depth.checked_sub(1)?,
+            Event::Eof => return None,
+            _ => {}
+        }
+    }
+
+    let mut code = String::new();
+    loop {
+        match reader.read_event().ok()? {
+            Event::Text(text) => code.push_str(&text.decode().ok()?),
+            Event::CData(data) => code.push_str(&data.decode().ok()?),
+            Event::GeneralRef(entity) => match entity.resolve_char_ref().ok()? {
+                Some(ch) => code.push(ch),
+                None => code.push_str(quick_xml::escape::resolve_predefined_entity(
+                    &entity.decode().ok()?,
+                )?),
+            },
+            Event::End(_) => break,
+            Event::Eof => return None,
+            _ => {}
+        }
+    }
+    let code = code.trim();
+    (!code.is_empty()).then(|| code.to_string())
 }
 
 /// Whether an error code reports throttling or overload.
@@ -849,7 +858,7 @@ fn classify_multipart_response_body(
     is_complete: bool,
 ) -> BodyVerdict {
     if let Some(code) = error_document_code(body) {
-        let throttle = is_throttle_error_code(code);
+        let throttle = is_throttle_error_code(&code);
         return BodyVerdict {
             retryable: throttle || (is_complete && code.eq_ignore_ascii_case("InternalError")),
             throttle,
@@ -1507,8 +1516,22 @@ mod tests {
     #[case::self_closing_root("<Error/>", None)]
     #[case::not_xml("SlowDown: Please reduce your request rate", None)]
     #[case::empty("", None)]
+    #[case::comment_with_markup(
+        "<Error><!-- <Code>SlowDown</Code> --><Code>NoSuchUpload</Code></Error>",
+        Some("NoSuchUpload")
+    )]
+    #[case::cdata_code("<Error><Code><![CDATA[SlowDown]]></Code></Error>", Some("SlowDown"))]
+    #[case::cdata_with_markup(
+        "<Error><Message><![CDATA[<Code>SlowDown</Code>]]></Message><Code>NoSuchUpload</Code></Error>",
+        Some("NoSuchUpload")
+    )]
+    #[case::attribute_with_gt(
+        "<Error><Code note=\"a>b\">SlowDown</Code></Error>",
+        Some("SlowDown")
+    )]
+    #[case::entity_in_code("<Error><Code>Slow&#68;own</Code></Error>", Some("SlowDown"))]
     fn test_error_document_code(#[case] body: &str, #[case] expected: Option<&str>) {
-        assert_eq!(error_document_code(body), expected);
+        assert_eq!(error_document_code(body).as_deref(), expected);
     }
 
     #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
@@ -2991,7 +3014,8 @@ mod tests {
         failures_remaining: AtomicUsize,
         part_uris: std::sync::Mutex<Vec<String>>,
         complete_failures_remaining: AtomicUsize,
-        complete_calls: AtomicUsize,
+        /// Body of every complete request that reached the mock, in order.
+        complete_bodies: std::sync::Mutex<Vec<Bytes>>,
         complete_error_on_200: bool,
     }
 
@@ -3063,7 +3087,12 @@ mod tests {
                     (::http::StatusCode::OK, "", Some("\"part-etag\""))
                 }
             } else if method == ::http::Method::POST && query.contains("uploadId=") {
-                self.state.complete_calls.fetch_add(1, Ordering::SeqCst);
+                let body = request
+                    .body()
+                    .as_bytes()
+                    .cloned()
+                    .expect("S3 sends the complete request as one contiguous body");
+                self.state.complete_bodies.lock().unwrap().push(body);
                 let mut remaining = self
                     .state
                     .complete_failures_remaining
@@ -3127,7 +3156,7 @@ mod tests {
             failures_remaining: AtomicUsize::new(3),
             part_uris: std::sync::Mutex::new(Vec::new()),
             complete_failures_remaining: AtomicUsize::new(0),
-            complete_calls: AtomicUsize::new(0),
+            complete_bodies: std::sync::Mutex::new(Vec::new()),
             complete_error_on_200: false,
         });
         let throttle_state = AimdThrottleState::new(AimdThrottleConfig::default()).unwrap();
@@ -3162,11 +3191,19 @@ mod tests {
         assert!(part_uris[0].contains("partNumber=1"));
     }
 
-    /// Runs one S3 multipart upload through the AIMD HTTP connector against a
-    /// mock whose first complete request fails, and returns how many complete
-    /// requests reached the mock.
+    /// `MultipartUpload::complete` consumes the recorded part ids before
+    /// sending, so it must be called exactly once. A failed complete is retried
+    /// at the HTTP layer instead, by re-sending the same request with its
+    /// serialized part list. S3 can report a failed complete as a throttling
+    /// status or as HTTP 200 carrying an `InternalError` document.
     #[cfg(feature = "aws")]
-    async fn complete_calls_after_one_failed_complete(complete_error_on_200: bool) -> usize {
+    #[tokio::test(start_paused = true)]
+    #[rstest]
+    #[case::throttled(false)]
+    #[case::internal_error_on_200(true)]
+    async fn test_multipart_http_retry_resends_failed_complete(
+        #[case] complete_error_on_200: bool,
+    ) {
         use object_store::RetryConfig;
         use object_store::aws::AmazonS3Builder;
 
@@ -3174,7 +3211,7 @@ mod tests {
             failures_remaining: AtomicUsize::new(0),
             part_uris: std::sync::Mutex::new(Vec::new()),
             complete_failures_remaining: AtomicUsize::new(1),
-            complete_calls: AtomicUsize::new(0),
+            complete_bodies: std::sync::Mutex::new(Vec::new()),
             complete_error_on_200,
         });
         let throttle_state = AimdThrottleState::new(AimdThrottleConfig::default()).unwrap();
@@ -3203,31 +3240,20 @@ mod tests {
             .unwrap();
         upload.complete().await.unwrap();
 
-        retry_state.complete_calls.load(Ordering::SeqCst)
-    }
-
-    /// `MultipartUpload::complete` consumes the recorded part ids before
-    /// sending, so it must be called exactly once; a throttled complete
-    /// request is retried at the HTTP layer, which re-sends the same request.
-    #[cfg(feature = "aws")]
-    #[tokio::test(start_paused = true)]
-    async fn test_multipart_http_retry_recovers_throttled_complete() {
+        let bodies = retry_state.complete_bodies.lock().unwrap();
         assert_eq!(
-            complete_calls_after_one_failed_complete(false).await,
+            bodies.len(),
             2,
-            "the throttled complete should be retried exactly once at the HTTP layer"
+            "the failed complete should be retried exactly once at the HTTP layer"
         );
-    }
-
-    /// S3 can answer `CompleteMultipartUpload` with HTTP 200 and an
-    /// `InternalError` error document; the HTTP layer must retry that too.
-    #[cfg(feature = "aws")]
-    #[tokio::test(start_paused = true)]
-    async fn test_multipart_http_retry_recovers_200_internal_error_complete() {
+        let first = std::str::from_utf8(&bodies[0]).unwrap();
+        assert!(
+            first.contains("<PartNumber>1</PartNumber>") && first.contains("part-etag"),
+            "the complete request should carry the uploaded part list, got: {first}"
+        );
         assert_eq!(
-            complete_calls_after_one_failed_complete(true).await,
-            2,
-            "a 200 InternalError complete should be retried once at the HTTP layer"
+            bodies[1], bodies[0],
+            "the retried complete should re-send the original part list"
         );
     }
 
