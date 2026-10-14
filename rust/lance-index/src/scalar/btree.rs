@@ -8086,7 +8086,7 @@ mod tests {
             .unwrap();
             let recorder = RescopeRecorder::wrap(backing);
             segments.push(
-                BTreeIndex::load(recorder.clone(), None, &LanceCache::no_cache())
+                BTreeIndex::load(recorder.clone(), None, &LanceCache::no_cache(), true)
                     .await
                     .unwrap(),
             );
