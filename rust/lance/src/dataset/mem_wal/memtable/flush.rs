@@ -288,12 +288,7 @@ impl MemTableFlusher {
         durable: usize,
     ) -> Result<FlushResult> {
         self.manifest_store.check_fenced(epoch).await?;
-        if let Some(published) = self
-            .already_published(memtable, covered_wal_entry_position)
-            .await?
-        {
-            return Ok(published);
-        }
+        self.check_next_generation(memtable).await?;
 
         if memtable.row_count() == 0 {
             return Err(Error::invalid_input("Cannot flush empty MemTable"));
@@ -566,12 +561,7 @@ impl MemTableFlusher {
         durable: usize,
     ) -> Result<FlushResult> {
         self.manifest_store.check_fenced(epoch).await?;
-        if let Some(published) = self
-            .already_published(memtable, covered_wal_entry_position)
-            .await?
-        {
-            return Ok(published);
-        }
+        self.check_next_generation(memtable).await?;
 
         if memtable.row_count() == 0 {
             return Err(Error::invalid_input("Cannot flush empty MemTable"));
@@ -771,20 +761,13 @@ impl MemTableFlusher {
         Ok(())
     }
 
-    /// The result of flushing `memtable` if its generation is already in the
-    /// published manifest, `None` if it is the next one to publish.
+    /// Refuse a generation other than the next one to publish.
     ///
     /// One flush task commits per writer epoch, in generation order, and each
     /// commit sets `current_generation` one past the generation it publishes.
-    /// So a `current_generation` past this generation means its commit landed
-    /// (a retry after the acknowledgement was lost), and one short of it means
-    /// an earlier generation never flushed. Publishing then would move the
-    /// replay position past that generation's WAL entries.
-    async fn already_published(
-        &self,
-        memtable: &MemTable,
-        covered_wal_entry_position: u64,
-    ) -> Result<Option<FlushResult>> {
+    /// A later generation would move the replay position past the WAL entries
+    /// of one that never flushed, and an earlier one is already published.
+    async fn check_next_generation(&self, memtable: &MemTable) -> Result<()> {
         let generation = memtable.generation();
         let manifest = self.manifest_store.latest().await?.ok_or_else(|| {
             Error::io(format!(
@@ -792,30 +775,14 @@ impl MemTableFlusher {
                 self.shard_id
             ))
         })?;
-        match manifest.current_generation.cmp(&generation) {
-            std::cmp::Ordering::Equal => Ok(None),
-            std::cmp::Ordering::Less => Err(Error::internal(format!(
-                "MemTable generation {generation} cannot flush before generation {} of shard {}, \
-                 which has not flushed",
-                manifest.current_generation, self.shard_id
-            ))),
-            std::cmp::Ordering::Greater => {
-                // A compactor may already have drained the SSTable from the
-                // manifest, leaving no path to report.
-                let sstable = manifest
-                    .sstables
-                    .into_iter()
-                    .find(|sstable| sstable.generation == generation)
-                    .unwrap_or_else(|| {
-                        FlushedSize::of(memtable).sstable(generation, String::new())
-                    });
-                Ok(Some(FlushResult {
-                    sstable,
-                    rows_flushed: memtable.row_count(),
-                    covered_wal_entry_position,
-                }))
-            }
+        if manifest.current_generation != generation {
+            return Err(Error::internal(format!(
+                "MemTable generation {generation} is not the next to publish for shard {}, \
+                 which is at generation {}",
+                self.shard_id, manifest.current_generation
+            )));
         }
+        Ok(())
     }
 
     /// Update the shard manifest with the new SSTable.
@@ -1126,9 +1093,8 @@ mod tests {
         assert_eq!(updated_manifest.sstables.len(), 1);
     }
 
-    /// Only the next generation is published: a later one is refused, and a
-    /// published one (a retry after a lost acknowledgement) is reported without
-    /// a second commit.
+    /// Only the next generation is published: a later one, or one already
+    /// published, is refused and leaves the manifest as it was.
     #[tokio::test]
     async fn a_flush_publishes_only_the_next_generation() {
         let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
@@ -1157,7 +1123,7 @@ mod tests {
         assert!(
             refused
                 .to_string()
-                .contains("cannot flush before generation 1"),
+                .contains("generation 2 is not the next to publish"),
             "{refused}"
         );
         let untouched = manifest_store.latest().await.unwrap().unwrap();
@@ -1166,8 +1132,7 @@ mod tests {
 
         flusher.flush(&first, epoch, 1, durable).await.unwrap();
         let published = manifest_store.latest().await.unwrap().unwrap();
-        let again = flusher.flush(&first, epoch, 1, durable).await.unwrap();
-        assert_eq!(again.sstable, published.sstables[0]);
+        assert!(flusher.flush(&first, epoch, 1, durable).await.is_err());
         assert_eq!(manifest_store.latest().await.unwrap().unwrap(), published);
     }
 

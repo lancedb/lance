@@ -5022,8 +5022,8 @@ impl MemTableFlushHandler {
             // Retire the frozen handle on commit success, keyed by generation
             // (non-FIFO completion is fine). Zero grace evicts here; otherwise
             // stamp the grace clock so it lingers for multi-part as-of reads
-            // until the grace sweep. On failure leave it un-stamped: its rows
-            // stay in the read union until a reopen replays them.
+            // until the grace sweep. On failure leave it un-stamped: it stays
+            // resident and charged until a reopen replays it.
             if flush_result.is_ok() {
                 let sstable = memtable.generation();
                 if self.grace.is_zero() {
@@ -11682,8 +11682,7 @@ mod tests {
     }
 
     /// A failed flush keeps its sealed generation charged and stops the writer:
-    /// reads are refused rather than served without that generation, until a
-    /// reopen replays it. Failure is induced deterministically by fencing the
+    /// reads are refused until a reopen replays that generation. Failure is induced deterministically by fencing the
     /// writer with a successor before the seal, so the flush's `check_fenced`
     /// rejects it.
     #[tokio::test]
