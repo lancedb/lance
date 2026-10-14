@@ -30,7 +30,7 @@ use arrow_array::{
     types::{UInt8Type, UInt32Type, UInt64Type},
 };
 use arrow_buffer::NullBufferBuilder;
-use arrow_schema::{DataType, Field, Fields, Schema as ArrowSchema};
+use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use bytes::Bytes;
 use lance_arrow::{
     ARROW_EXT_NAME_KEY, BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY,
@@ -39,7 +39,7 @@ use lance_arrow::{
 use lance_core::{
     datatypes::{
         BLOB_V2_DESC_TYPE, BLOB_V2_LOGICAL_MINIMAL_FIELDS, BLOB_V2_PREPARED_TYPE, BlobKind,
-        BlobV2Layout, Field as LanceField, LANCE_FIELD_ID_KEY, Schema as LanceSchema,
+        BlobV2Layout, Field as LanceField, Schema as LanceSchema,
     },
     utils::blob::blob_path,
 };
@@ -142,52 +142,29 @@ pub(crate) fn prepared_blob_field_with_metadata(
     Field::new(name, BLOB_V2_PREPARED_TYPE.clone(), nullable).with_metadata(metadata)
 }
 
-/// `prepared` under the field id `source` carries, with each child that shares
-/// a name with one of `source`'s children taking that child's id. A stored blob
-/// keeps only `data` and `uri`, under the ids of its prepared children, so this
-/// is what keeps a generation's blob children under the table's ids.
-pub(crate) fn with_field_ids_of(prepared: Field, source: &Field) -> Field {
-    let mut metadata = prepared.metadata().clone();
-    if let Some(id) = source.metadata().get(LANCE_FIELD_ID_KEY) {
-        metadata.insert(LANCE_FIELD_ID_KEY.to_string(), id.clone());
-    }
-    let prepared = prepared.with_metadata(metadata);
-    let (DataType::Struct(prepared_children), DataType::Struct(source_children)) =
-        (prepared.data_type(), source.data_type())
-    else {
-        return prepared;
-    };
-    let children: Fields = prepared_children
-        .iter()
-        .map(|child| {
-            let id = source_children
-                .iter()
-                .find(|source_child| source_child.name() == child.name())
-                .and_then(|source_child| source_child.metadata().get(LANCE_FIELD_ID_KEY));
-            match id {
-                Some(id) => {
-                    let mut metadata = child.metadata().clone();
-                    metadata.insert(LANCE_FIELD_ID_KEY.to_string(), id.clone());
-                    Arc::new(child.as_ref().clone().with_metadata(metadata))
-                }
-                None => child.clone(),
-            }
-        })
-        .collect();
-    prepared.with_data_type(DataType::Struct(children))
+/// `prepared` under the field ids `source` carries: its own, and each
+/// same-named child's. A stored blob keeps only `data` and `uri`, under the ids
+/// of its prepared children, so this is what keeps a generation's blob children
+/// under the table's ids.
+pub(crate) fn with_field_ids_of(prepared: Field, source: &Field) -> Result<Field> {
+    let source = LanceField::try_from(source)?;
+    Ok(crate::dataset::mem_wal::stamp_field_id(
+        &prepared,
+        std::slice::from_ref(&source),
+    ))
 }
 
 fn logical_to_prepared_blob_field(field: &Field) -> Result<Field> {
     if field.is_blob_v2() {
         return match blob_v2_layout(field) {
-            Some(BlobV2Layout::Logical) | Some(BlobV2Layout::Prepared) => Ok(with_field_ids_of(
+            Some(BlobV2Layout::Logical) | Some(BlobV2Layout::Prepared) => with_field_ids_of(
                 prepared_blob_field_with_metadata(
                     field.name(),
                     field.is_nullable(),
                     field.metadata().clone(),
                 ),
                 field,
-            )),
+            ),
             _ => Err(blob_v2_shape_error(
                 field,
                 &[BlobV2Layout::Logical, BlobV2Layout::Prepared],
@@ -760,9 +737,9 @@ impl BlobDescriptorArrayBuilder {
     }
 
     /// Prepare the column under the field ids `source` carries.
-    pub(crate) fn with_field_ids_of(mut self, source: &Field) -> Self {
-        self.field = with_field_ids_of(self.field, source);
-        self
+    pub(crate) fn with_field_ids_of(mut self, source: &Field) -> Result<Self> {
+        self.field = with_field_ids_of(self.field, source)?;
+        Ok(self)
     }
 
     /// Append one packed blob descriptor.
