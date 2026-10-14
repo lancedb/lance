@@ -5589,13 +5589,10 @@ mod tests {
         assert_eq!(actual_payload, expected_payload);
     }
 
-    /// merge_insert matches keys by bit pattern, in the indexed probe and in the
-    /// hash join behind it alike, so a source key of `+0.0` updates only the
-    /// `+0.0` row. Filters answer zero comparisons per IEEE 754 now, and this
-    /// pins that the two are still allowed to disagree: making key matching agree
-    /// needs the unindexed join fixed too, and DataFusion 54 hashes join keys by
-    /// raw bits. Both settings of `use_index` are exercised; which one the planner
-    /// picks for a one-row source is not asserted.
+    /// merge_insert matches float keys per IEEE 754, like filters do, so a source
+    /// key of `+0.0` matches both the `-0.0` and the `+0.0` row. Both settings of
+    /// `use_index` are exercised; which one the planner picks for a one-row source
+    /// is not asserted.
     #[rstest::rstest]
     #[tokio::test]
     async fn test_merge_insert_on_float_zero_key(#[values(true, false)] use_index: bool) {
@@ -5638,10 +5635,10 @@ mod tests {
             .await
             .unwrap();
 
-        // Only the +0.0 row is updated. Checking both sides pins which row was
-        // replaced, not just how many; `value = 20` is the -0.0 row.
+        // Both zero rows are updated; `value = 20` was the -0.0 row and
+        // `value = 30` the +0.0 row.
         assert_eq!(ds.count_rows(None).await.unwrap(), 4);
-        for (filter, expected) in [("value = 99", 1), ("value = 30", 0), ("value = 20", 1)] {
+        for (filter, expected) in [("value = 99", 2), ("value = 30", 0), ("value = 20", 0)] {
             assert_eq!(
                 ds.count_rows(Some(filter.to_string())).await.unwrap(),
                 expected,

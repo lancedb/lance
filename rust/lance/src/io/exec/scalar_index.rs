@@ -36,6 +36,7 @@ use futures::{StreamExt, TryFutureExt, TryStreamExt, stream::BoxStream};
 use lance_core::{Error, ROW_ID_FIELD, Result, deepsize::DeepSizeOf, utils::address::RowAddress};
 use lance_datafusion::{
     chunker::break_stream,
+    signed_zero::zero_encodings,
     utils::{
         ExecutionPlanMetricsSetExt, SCALAR_INDEX_SEARCH_TIME_METRIC, SCALAR_INDEX_SER_TIME_METRIC,
     },
@@ -678,18 +679,28 @@ impl MapIndexExec {
     ///
     /// One NULL survives dedupe on purpose: an index reads a NULL in the list
     /// as "also match null rows", which is a flag rather than a count.
+    ///
+    /// A float zero is looked up under both encodings. The index compares keys
+    /// by encoding, but the hash join downstream matches `-0.0` and `+0.0` per
+    /// IEEE 754, so probing one encoding would miss rows the join would match.
     fn key_values(column: &ArrayRef, dedupe: bool) -> datafusion::error::Result<Vec<ScalarValue>> {
         let mut values = Vec::with_capacity(column.len());
         let mut seen = HashSet::with_capacity(if dedupe { column.len() } else { 0 });
         for row in 0..column.len() {
             let value = ScalarValue::try_from_array(column, row)?;
-            if dedupe {
-                if seen.contains(&value) {
-                    continue;
+            let encodings = match zero_encodings(&value) {
+                Some((negative, positive)) => vec![negative, positive],
+                None => vec![value],
+            };
+            for value in encodings {
+                if dedupe {
+                    if seen.contains(&value) {
+                        continue;
+                    }
+                    seen.insert(value.clone());
                 }
-                seen.insert(value.clone());
+                values.push(value);
             }
-            values.push(value);
         }
         Ok(values)
     }
