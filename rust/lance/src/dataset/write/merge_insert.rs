@@ -5004,6 +5004,7 @@ mod tests {
                 &self.expected_right_keys,
                 &self.expected_stats,
             )
+            .boxed()
             .await;
 
             let row_ids_after = get_row_ids_for_keys(&ds, &self.test_keys).await;
