@@ -2851,6 +2851,11 @@ impl Dataset {
         &self.manifest.fragments
     }
 
+    /// Ids of the fragments in this version.
+    pub fn fragment_bitmap(&self) -> &Arc<RoaringBitmap> {
+        &self.fragment_bitmap
+    }
+
     pub(crate) fn normalize_fragment_ids(fragment_ids: &[u32]) -> Vec<u32> {
         let mut ids = fragment_ids.to_vec();
         ids.sort_unstable();
