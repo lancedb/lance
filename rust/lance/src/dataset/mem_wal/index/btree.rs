@@ -723,10 +723,33 @@ impl BytesBackend {
     }
 }
 
+/// Heap a stored `ScalarValue` key owns outside the arena node it sits in.
+///
+/// Only the string and binary variants own their bytes; numeric, boolean,
+/// decimal and temporal values live inline in the node. Nested values (lists,
+/// structs, maps) hold an Arrow array sliced from the inserted batch, sharing
+/// buffers the batch store already charges; only a small per-row header and
+/// offsets array is theirs, and that is not counted. `ScalarValue::size` is no
+/// substitute: it reports the whole shared buffer for every row.
+fn owned_heap_bytes(value: &ScalarValue) -> usize {
+    match value {
+        ScalarValue::Utf8(Some(s))
+        | ScalarValue::LargeUtf8(Some(s))
+        | ScalarValue::Utf8View(Some(s)) => s.capacity(),
+        ScalarValue::Binary(Some(b))
+        | ScalarValue::LargeBinary(Some(b))
+        | ScalarValue::BinaryView(Some(b))
+        | ScalarValue::FixedSizeBinary(_, Some(b)) => b.capacity(),
+        _ => 0,
+    }
+}
+
 /// Fallback backend for arbitrary scalar types, keyed by `OrderableScalarValue`.
 struct ScalarBackend {
     reader: SkipListReader<IndexKey>,
     writer: Mutex<SkipListWriter<IndexKey>>,
+    /// Heap the stored keys own outside the arena (see [`owned_heap_bytes`]).
+    key_heap_bytes: AtomicUsize,
 }
 
 impl ScalarBackend {
@@ -735,10 +758,15 @@ impl ScalarBackend {
         Self {
             reader,
             writer: Mutex::new(writer),
+            key_heap_bytes: AtomicUsize::new(0),
         }
     }
 
     fn add(&self, value: OrderableScalarValue, row_position: RowPosition) -> bool {
+        // Charged before the key is published, so a concurrent memory read
+        // never sees a key without its heap.
+        self.key_heap_bytes
+            .fetch_add(owned_heap_bytes(&value.0), Ordering::Relaxed);
         let probe = value.clone();
         self.writer.lock().unwrap().insert_and_check_neighbors(
             IndexKey {
@@ -990,7 +1018,7 @@ impl Backend {
                     + b.null_bytes.load(Ordering::Relaxed)
                     + b.key_heap_bytes.load(Ordering::Relaxed)
             }
-            Self::Scalar(b) => b.reader.resident_bytes(),
+            Self::Scalar(b) => b.reader.resident_bytes() + b.key_heap_bytes.load(Ordering::Relaxed),
         }
     }
 
@@ -1491,6 +1519,42 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use rstest::rstest;
     use std::sync::Arc;
+
+    /// Keys the fallback backend copies into owned strings are charged for
+    /// those bytes; values stored inline in the node add nothing.
+    #[test]
+    fn test_scalar_backend_charges_owned_key_bytes() {
+        let rows = 100;
+        let long = "x".repeat(1024);
+        let charge = |array: ArrayRef| {
+            let backend = Backend::for_type(array.data_type());
+            assert!(matches!(backend, Backend::Scalar(_)));
+            backend.insert_array_and_report_existing(&array, 0).unwrap();
+            backend.resident_bytes()
+        };
+        let short = charge(Arc::new(arrow_array::StringViewArray::from(vec![
+            "a";
+            rows
+        ])));
+        let wide = charge(Arc::new(arrow_array::StringViewArray::from(vec![
+            long.as_str();
+            rows
+        ])));
+        assert!(
+            wide - short >= rows * (long.len() - 1),
+            "{rows} keys of {} bytes should add their bytes: {short} -> {wide}",
+            long.len()
+        );
+
+        let floats = Backend::for_type(&DataType::Float64);
+        let Backend::Scalar(scalar) = &floats else {
+            panic!("Float64 should use the fallback backend");
+        };
+        floats
+            .insert_array_and_report_existing(&arrow_array::Float64Array::from(vec![1.5; rows]), 0)
+            .unwrap();
+        assert_eq!(scalar.key_heap_bytes.load(Ordering::Relaxed), 0);
+    }
 
     fn create_test_schema() -> Arc<ArrowSchema> {
         Arc::new(ArrowSchema::new(vec![
