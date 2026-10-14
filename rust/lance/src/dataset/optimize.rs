@@ -269,8 +269,7 @@ pub struct CompactionOptions {
     /// indexed or not. Every index must store row addresses and apply the fragment reuse
     /// index, and keeps its coverage through it. Once a table has a fragment reuse index,
     /// even an empty one, every compaction that rewrites fragments records its moves
-    /// whether or not this is set; there is no supported way to stop recording. Not yet
-    /// supported in release builds.
+    /// whether or not this is set; there is no supported way to stop recording.
     pub defer_index_remap: bool,
     /// How the old-to-new row-address mapping used to remap indices is built.
     /// Defaults to [`IndexRemapMode::Direct`].
