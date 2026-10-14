@@ -398,6 +398,108 @@ async fn managed_compaction_preserves_sidecars_after_source_gc(
     assert!(values[3].as_ref().unwrap().read().await.unwrap().is_empty());
 }
 
+/// merge_insert takes writer-prepared input as append does, so a Managed
+/// reference to an object already under the table is adopted, for an
+/// updated row and an inserted one, without its bytes passing through the
+/// writer.
+#[tokio::test]
+async fn merge_insert_adopts_prepared_managed_references() {
+    use crate::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched};
+    use arrow_array::types::Int32Type;
+    use lance_core::datatypes::BLOB_V2_PREPARED_FIELDS;
+    use object_store::ObjectStoreExt;
+
+    let test_dir = TempStrDir::default();
+    let id = Field::new("id", DataType::Int32, false);
+    let schema = Arc::new(managed_blob_schema(vec![
+        id.clone(),
+        blob_field("blob", true),
+    ]));
+    let mut seed = BlobArrayBuilder::new(1);
+    seed.push_bytes(b"seed").unwrap();
+    let seed = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from(vec![1])), seed.finish().unwrap()],
+    )
+    .unwrap();
+    let dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(seed)], schema.clone()),
+        &test_dir,
+        None,
+    )
+    .await
+    .unwrap();
+    let object = dataset.base.clone().join("_blobs").join("adopted.blob");
+    dataset
+        .object_store
+        .inner
+        .put(&object, Bytes::from(vec![b'v'; 1000]).into())
+        .await
+        .unwrap();
+
+    // Two rows share one object, as rows from one packed file do.
+    let prepared = StructArray::try_new(
+        BLOB_V2_PREPARED_FIELDS.clone(),
+        vec![
+            Arc::new(UInt8Array::from(vec![BlobKind::Managed as u8; 2])) as ArrayRef,
+            Arc::new(LargeBinaryArray::from(vec![None::<&[u8]>, None])),
+            Arc::new(StringArray::from(vec!["_blobs/adopted.blob"; 2])),
+            Arc::new(UInt32Array::from(vec![None::<u32>, None])),
+            Arc::new(UInt64Array::from(vec![400u64, 200])),
+            Arc::new(UInt64Array::from(vec![0u64, 400])),
+        ],
+        None,
+    )
+    .unwrap();
+    let source_schema = Arc::new(managed_blob_schema(vec![
+        id,
+        crate::blob::prepared_blob_field_with_metadata(
+            "blob",
+            true,
+            HashMap::from([(ARROW_EXT_NAME_KEY.to_string(), BLOB_V2_EXT_NAME.to_string())]),
+        ),
+    ]));
+    let source = RecordBatch::try_new(
+        source_schema.clone(),
+        vec![Arc::new(Int32Array::from(vec![1, 2])), Arc::new(prepared)],
+    )
+    .unwrap();
+    let mut builder =
+        MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".to_string()]).unwrap();
+    builder
+        .when_matched(WhenMatched::UpdateAll)
+        .when_not_matched(WhenNotMatched::InsertAll);
+    let (dataset, stats) = builder
+        .try_build()
+        .unwrap()
+        .execute_reader(RecordBatchIterator::new(vec![Ok(source)], source_schema))
+        .await
+        .unwrap();
+    assert_eq!((stats.num_updated_rows, stats.num_inserted_rows), (1, 1));
+
+    let mut scan = dataset.scan();
+    scan.blob_handling(BlobHandling::AllBinary);
+    let rows = scan.try_into_batch().await.unwrap();
+    let ids = rows["id"].as_primitive::<Int32Type>();
+    let blobs = rows["blob"].as_binary::<i64>();
+    let read: HashMap<i32, usize> = (0..rows.num_rows())
+        .map(|row| {
+            assert!(blobs.value(row).iter().all(|byte| *byte == b'v'));
+            (ids.value(row), blobs.value(row).len())
+        })
+        .collect();
+    assert_eq!(read, HashMap::from([(1, 400), (2, 200)]));
+    let adopted = dataset
+        .take_blobs_by_indices(&[0, 1], "blob")
+        .await
+        .unwrap();
+    for blob in adopted {
+        let blob = blob.unwrap();
+        assert_eq!(blob.kind(), BlobKind::Managed);
+        assert_eq!(blob.uri(), Some("_blobs/adopted.blob"));
+    }
+}
+
 #[tokio::test]
 async fn managed_flag_survives_restore_of_unflagged_snapshot() {
     let dir = crate::utils::test::copy_test_data_to_tmp("v11.0.0/blob_sidecars").unwrap();
