@@ -86,7 +86,7 @@ ignore = [
     { id = "RUSTSEC-2026-0194", reason = "`quick-xml` <0.41 pulled transitively via object_store (datafusion) and reqsign-aws-v4 (opendal); upstream must upgrade first" },
     { id = "RUSTSEC-2026-0195", reason = "`quick-xml` <0.41 pulled transitively via object_store (datafusion) and reqsign-aws-v4 (opendal); upstream must upgrade first" },
     { id = "RUSTSEC-2024-0449", reason = "`serde_yaml` pulled transitively via datafusion-substrait; serde features not utilized by us" },
-]
+    { crate = "chacha20@0.10.0", reason = "yanked upstream; pulled transitively via rand -> object_store, no newer version to update to yet, yanking was for UB in SSE2 which we don't really support anyways" },]
 # If this is true, then cargo deny will use the git executable to fetch advisory database.
 # If this is false, then it uses a built-in git library.
 # Setting this to true can be helpful if you have special authentication requirements that cargo-deny does not support.
