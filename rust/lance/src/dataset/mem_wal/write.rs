@@ -5655,6 +5655,79 @@ mod tests {
         assert!(blob_sidecars(store.as_ref(), &data_dir).await.is_empty());
     }
 
+    /// A writer schema whose fields carry their ids, a blob's children
+    /// included: a blob write is accepted, and the flushed generation keeps the
+    /// ids the schema gives the blob's children, so it reads back as the same
+    /// columns. `replayed` drops the writer unclosed, as a crash would, so the
+    /// blob reaches the generation through WAL replay.
+    #[rstest]
+    #[case::non_durable(false, false)]
+    #[case::durable(true, false)]
+    #[case::replayed(true, true)]
+    #[tokio::test]
+    async fn test_blob_v2_keeps_field_ids_through_put_and_flush(
+        #[case] durable_write: bool,
+        #[case] replayed: bool,
+    ) {
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let batch = create_blob_v2_batch(
+            0,
+            &[
+                BlobTestValue::Bytes(vec![7; 1024 * 1024]),
+                BlobTestValue::Bytes(b"abc".to_vec()),
+            ],
+        );
+        let with_ids = Schema::try_from(batch.schema().as_ref()).unwrap();
+        let config = ShardWriterConfig {
+            shard_id: Uuid::new_v4(),
+            durable_write,
+            ..Default::default()
+        };
+        let schema = Arc::new(crate::dataset::mem_wal::arrow_schema_with_field_ids(
+            &with_ids,
+        ));
+        let open = || {
+            ShardWriter::open(
+                store.clone(),
+                base_path.clone(),
+                base_uri.clone(),
+                config.clone(),
+                schema.clone(),
+                vec![],
+            )
+        };
+        let mut writer = open().await.unwrap();
+        writer.put(vec![batch]).await.unwrap();
+        if replayed {
+            drop(writer);
+            writer = open().await.unwrap();
+            assert_eq!(writer.memtable_stats().await.unwrap().row_count, 2);
+        }
+        writer.close().await.unwrap();
+
+        let manifest = ShardManifestStore::new(store.clone(), &base_path, config.shard_id, 2)
+            .latest()
+            .await
+            .unwrap()
+            .unwrap();
+        let generation = Dataset::open(&format!(
+            "{}/_mem_wal/{}/{}",
+            base_uri, config.shard_id, manifest.sstables[0].path
+        ))
+        .await
+        .unwrap();
+        let blob_children = |schema: &Schema| -> Vec<(String, i32)> {
+            schema
+                .field("blob")
+                .unwrap()
+                .children
+                .iter()
+                .map(|c| (c.name.clone(), c.id))
+                .collect()
+        };
+        assert_eq!(blob_children(generation.schema()), blob_children(&with_ids));
+    }
+
     #[tokio::test]
     async fn test_blob_v2_target_is_reused_across_replay_and_flush() {
         let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
