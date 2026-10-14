@@ -3855,7 +3855,7 @@ mod tests {
     use lance_io::object_store::ObjectStore;
     use lance_linalg::distance::{DistanceType, MetricType};
     use lance_table::feature_flags::{
-        FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS, FLAG_UNSTABLE_SPILLED_ROW_LINEAGE,
+        FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS, FLAG_SPILLED_ROW_LINEAGE,
     };
     use lance_table::format::Manifest;
     use lance_table::format::RowIdMeta;
@@ -6492,10 +6492,7 @@ mod tests {
             flag_words(&dataset, FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS),
             (true, true)
         );
-        assert_eq!(
-            flag_words(&dataset, FLAG_UNSTABLE_SPILLED_ROW_LINEAGE),
-            (true, true)
-        );
+        assert_eq!(flag_words(&dataset, FLAG_SPILLED_ROW_LINEAGE), (true, true));
         assert_moves_keep_row_identity(&before, &dataset).await;
 
         let appended = arrow_array::record_batch!(("i", Int32, [100, 101])).unwrap();
@@ -6534,7 +6531,7 @@ mod tests {
             (false, false)
         );
         assert_eq!(
-            flag_words(&restored, FLAG_UNSTABLE_SPILLED_ROW_LINEAGE),
+            flag_words(&restored, FLAG_SPILLED_ROW_LINEAGE),
             (true, true)
         );
     }
