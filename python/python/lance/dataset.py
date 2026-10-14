@@ -3393,6 +3393,7 @@ class LanceDataset(pa.dataset.Dataset):
         error_if_tagged_old_versions: bool = True,
         delete_rate_limit: Optional[int] = None,
         versions: Optional[List[int]] = None,
+        delete_concurrency: Optional[int] = None,
     ) -> CleanupStats:
         """
         Cleans up old versions of the dataset.
@@ -3433,6 +3434,11 @@ class LanceDataset(pa.dataset.Dataset):
             be ignored without any error and only untagged versions will be
             cleaned up.
 
+        delete_concurrency: int, optional
+            Maximum concurrent file deletions across this cleanup and its cascaded
+            branches. Defaults to the object store's I/O parallelism.
+            Must be positive (at most 2**61 - 1 on 64-bit platforms).
+
         delete_rate_limit: int, optional
             Maximum number of delete operations per second. When not set (default),
             deletions run at full speed. Set this to a positive integer to avoid
@@ -3454,6 +3460,7 @@ class LanceDataset(pa.dataset.Dataset):
             error_if_tagged_old_versions,
             delete_rate_limit,
             versions,
+            delete_concurrency,
         )
 
     def explain_cleanup_old_versions(
@@ -3489,8 +3496,7 @@ class LanceDataset(pa.dataset.Dataset):
             match the parameters. Otherwise, tagged versions will be ignored.
 
         delete_rate_limit: int, optional
-            Accepted for parity with :meth:`cleanup_old_versions`; no deletes are
-            issued by explain.
+            Retained for compatibility; ignored because explain does not delete files.
 
         versions: list[int], optional
             Explain cleanup only for the specified dataset versions.
