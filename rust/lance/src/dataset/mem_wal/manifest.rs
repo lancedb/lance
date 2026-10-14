@@ -22,8 +22,9 @@
 //!
 //! ## Read Protocol
 //!
-//! 1. Start from the version `version_hint.json` names, or, when there is no
-//!    hint or that version is gone, from the newest listed version
+//! 1. Start from the version `version_hint.json` names, or, when the hint is
+//!    missing or unreadable or that version is gone, from the newest listed
+//!    version
 //! 2. Use HEAD requests to check existence of subsequent versions
 //! 3. Continue until a version is not found
 //! 4. Return the last found version
@@ -309,12 +310,13 @@ impl ShardManifestStore {
 
     /// Find the latest manifest version.
     ///
-    /// Starts from the hinted version, or from the newest listed one when there
-    /// is no hint or its version was pruned, then scans forward with HEAD
-    /// requests until a version is not found. Scanning from version 1 instead
-    /// would stop at the first pruned version and miss every later one.
+    /// Starts from the hinted version, or from the newest listed one when the
+    /// hint is missing or unreadable or its version was pruned, then scans
+    /// forward with HEAD requests until a version is not found. Scanning from
+    /// version 1 instead would stop at the first pruned version and miss every
+    /// later one.
     async fn find_latest_version(&self) -> Result<u64> {
-        let mut latest_found = match self.read_version_hint().await? {
+        let mut latest_found = match self.read_version_hint().await {
             Some(hint) if hint > 0 && self.version_exists(hint).await? => hint,
             _ => self.list_versions().await?.last().copied().unwrap_or(0),
         };
@@ -359,25 +361,26 @@ impl ShardManifestStore {
         }
     }
 
-    /// Read the version hint file: `None` when it is absent or unparsable,
-    /// an error when it could not be read.
-    async fn read_version_hint(&self) -> Result<Option<u64>> {
+    /// Read the version hint file: `None` when it is absent, unparsable or
+    /// unreadable. The hint is best-effort; without it the lookup lists the
+    /// versions instead.
+    async fn read_version_hint(&self) -> Option<u64> {
         let path = self.manifest_dir.clone().join("version_hint.json");
-        let read_error = |e: object_store::Error| {
-            Error::io(format!(
-                "Failed to read version hint for shard {}: {}",
-                self.shard_id, e
-            ))
+        let read = async { self.object_store.inner.get(&path).await?.bytes().await };
+        let bytes = match read.await {
+            Ok(bytes) => bytes,
+            Err(object_store::Error::NotFound { .. }) => return None,
+            Err(e) => {
+                warn!(
+                    "Failed to read version hint for shard {}: {}",
+                    self.shard_id, e
+                );
+                return None;
+            }
         };
-        let data = match self.object_store.inner.get(&path).await {
-            Ok(data) => data,
-            Err(object_store::Error::NotFound { .. }) => return Ok(None),
-            Err(e) => return Err(read_error(e)),
-        };
-        let bytes = data.bytes().await.map_err(read_error)?;
-        Ok(serde_json::from_slice::<VersionHint>(&bytes)
+        serde_json::from_slice::<VersionHint>(&bytes)
             .ok()
-            .map(|hint| hint.version))
+            .map(|hint| hint.version)
     }
 
     /// Write the version hint file (best-effort, failures logged but ignored).
@@ -1301,14 +1304,15 @@ mod tests {
         assert_eq!(writer.list_versions().await.unwrap(), vec![3, 4, 5]);
     }
 
-    /// A hint that cannot be read is an error, not a missing hint: falling
-    /// back would hide the failure behind a slower, listing-based answer.
+    /// A hint that cannot be read falls back to listing like a missing one,
+    /// so a pruned history still resolves to the latest version.
     #[tokio::test]
-    async fn an_unreadable_hint_is_an_error() {
+    async fn an_unreadable_hint_falls_back_to_listing() {
         let (store, base_path, _temp_dir) = create_local_store().await;
         let shard_id = Uuid::new_v4();
         let writer = ShardManifestStore::new(store.clone(), &base_path, shard_id, 2);
         write_versions(&writer, shard_id, 3).await;
+        writer.prune_versions_before(3).await.unwrap();
 
         let policy = Arc::new(Mutex::new(ProxyObjectStorePolicy::new()));
         policy.lock().unwrap().set_before_policy(
@@ -1328,7 +1332,7 @@ mod tests {
         proxied.inner = Arc::new(ProxyObjectStore::new(store.inner.clone(), policy));
         let reader = ShardManifestStore::new(Arc::new(proxied), &base_path, shard_id, 2);
 
-        assert!(reader.refresh_latest().await.is_err());
+        assert_eq!(reader.refresh_latest().await.unwrap().unwrap().version, 3);
     }
 
     /// A HEAD that fails is not a version that is absent, and the scan must not
