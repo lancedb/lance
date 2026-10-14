@@ -3026,7 +3026,7 @@ impl FileFragment {
         self.metadata.deletion_file = write_deletion_file(
             &self.dataset.base,
             self.metadata.id,
-            self.dataset.version().version,
+            self.dataset.version_id(),
             &deletion_vector,
             self.dataset.object_store.as_ref(),
         )
