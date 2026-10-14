@@ -54,3 +54,25 @@ readable by Lance < 11.1.0**.  Old readers encounter the `Compression::Constant`
 in the FSL descriptor and panic rather than returning an error.
 
 **Minimum reader version for new files**: Lance 11.1.0.
+
+### LZ4 full-zip string and binary values with nulls (Lance 14.0.0)
+
+**Affected format**: 2.1 and later.
+
+**Scenario**: A nullable `Utf8`, `LargeUtf8`, `Binary`, or `LargeBinary` column that requests
+`lance-encoding:compression=lz4` and is written with the full-zip structural encoding, where a
+page contains at least one null value.
+
+**Previous writer (Lance < 14.0.0)**: The per-value encoder ignored the `lz4` request and
+compressed each value with Zstd instead.  These files remain readable by all readers.
+
+**Fixed writer (Lance ≥ 14.0.0)**: The per-value encoder honors the `lz4` request.  Full-zip
+stores no payload for null values, and the fixed reader (Lance ≥ 14.0.0) skips those empty
+payloads instead of passing them to the LZ4 decompressor.
+
+**Forward compatibility**: Files containing this pattern written by Lance ≥ 14.0.0 are **not
+readable by Lance < 14.0.0**.  Old readers pass the empty payload of each null value to the LZ4
+decompressor, which rejects it because it lacks the LZ4 length prefix, so the read fails with an
+error.  Pages without nulls remain readable by old readers.
+
+**Minimum reader version for new files**: Lance 14.0.0.
