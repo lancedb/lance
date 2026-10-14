@@ -4264,22 +4264,8 @@ impl ShardWriter {
         close_result.and(stage_result)
     }
 
-    /// Close the writer gracefully.
-    ///
-    /// Flushes pending data and shuts down background tasks.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if pending WAL data cannot be persisted, an active or
-    /// frozen MemTable cannot be flushed, a flush handler exits before reporting
-    /// completion, or background tasks cannot be shut down.
-    #[instrument(name = "sw_close", level = "info", skip_all, fields(shard_id = %self.config.shard_id, epoch = self.epoch))]
-    pub async fn close(self) -> Result<()> {
-        info!("Closing ShardWriter for shard {}", self.config.shard_id);
-        if let Err(error) = self.wal_flusher.check_poisoned() {
-            let shutdown_result = self.task_executor.shutdown_all().await;
-            return Self::merge_close_stage(Err(error), "task shutdown", shutdown_result);
-        }
+    async fn drain_for_close(&self) -> Result<()> {
+        self.wal_flusher.check_poisoned()?;
         let mut close_result: Result<()> = Ok(());
 
         match &self.mode {
@@ -4398,7 +4384,24 @@ impl ShardWriter {
             }
         }
 
-        // Shutdown background tasks
+        close_result
+    }
+
+    /// Close the writer gracefully.
+    ///
+    /// Flushes pending data and shuts down background tasks, even if draining fails.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if pending WAL data cannot be persisted, an active or
+    /// frozen MemTable cannot be flushed, a flush handler exits before reporting
+    /// completion, or background tasks cannot be shut down.
+    #[instrument(name = "sw_close", level = "info", skip_all, fields(shard_id = %self.config.shard_id, epoch = self.epoch))]
+    pub async fn close(self) -> Result<()> {
+        info!("Closing ShardWriter for shard {}", self.config.shard_id);
+        let close_result = self.drain_for_close().await;
+        // A drain error must not leave dispatchers retaining the old writer's
+        // memtables while the caller reopens and replays the WAL.
         let shutdown_result = self.task_executor.shutdown_all().await;
         let close_result = Self::merge_close_stage(close_result, "task shutdown", shutdown_result);
         // The failed flush may already have removed its watcher, or may have
@@ -11358,6 +11361,69 @@ mod tests {
         );
 
         writer_b.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_close_shuts_down_after_l0_failure_during_index_drain() {
+        let (_store, _base_path, base_uri, _temp) = create_local_store().await;
+        let (params, controls) = observable_store_params();
+        let (store, base_path) = ObjectStore::from_uri_and_params(
+            Arc::new(ObjectStoreRegistry::default()),
+            &base_uri,
+            &params,
+        )
+        .await
+        .unwrap();
+        let schema = schema_with_pk();
+        let config = ShardWriterConfig {
+            store_params: Some(params),
+            ..memtable_config_with_pk(Uuid::new_v4())
+        };
+        let writer = ShardWriter::open(store, base_path, base_uri, config, schema.clone(), vec![])
+            .await
+            .unwrap();
+        writer
+            .put(vec![create_test_batch(&schema, 0, 1)])
+            .await
+            .unwrap();
+        controls.hold_sstable_puts();
+        controls.fail_sstable_puts(1);
+        let _first_fence = writer.force_seal_active().await.unwrap();
+        writer
+            .put_no_wait(vec![create_test_batch(&schema, 1, 1)])
+            .await
+            .unwrap();
+        let executor = writer.task_executor.clone();
+        let cursors = writer.wal_flusher.cursors().clone();
+        let state = Arc::downgrade(writer.memtable_state_lock().unwrap());
+
+        let error = {
+            let closing = writer.close();
+            tokio::pin!(closing);
+            // Enter the index drain before allowing the frozen generation to fail.
+            assert!(futures::poll!(&mut closing).is_pending());
+            controls.release_sstable_puts();
+            tokio::time::timeout(Duration::from_secs(1), cursors.wait_for_failure())
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(1), closing)
+                .await
+                .unwrap()
+                .unwrap_err()
+        };
+        assert_eq!(error.fence_reason(), Some(FenceReason::PersistenceFailure));
+        assert!(error.to_string().contains("injected SSTable write failure"));
+
+        let is_cancelled = executor.cancellation_token.is_cancelled();
+        let has_retained_state = state.upgrade().is_some();
+        // Clean up even when checking the regression against the broken close path.
+        executor.shutdown_all().await.unwrap();
+        assert!(state.upgrade().is_none());
+        assert!(is_cancelled, "close must cancel its background tasks");
+        assert!(
+            !has_retained_state,
+            "close must join tasks and release writer state before returning"
+        );
     }
 
     /// A later generation cannot commit over a failed flush, even after storage
