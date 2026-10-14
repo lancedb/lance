@@ -1144,8 +1144,6 @@ impl From<&Manifest> for pb::Manifest {
             version: m.version,
             branch: m.branch.clone(),
             clustering: Vec::new(),
-            default_clustering_id: None,
-            max_clustering_id: 0,
             writer_version: m
                 .writer_version
                 .as_ref()
@@ -1296,8 +1294,6 @@ mod tests {
                     provider_metadata: HashMap::new(),
                 },
             ],
-            default_clustering_id: Some(5),
-            max_clustering_id: 5,
             fragments: vec![
                 pb::DataFragment {
                     id: 1,
@@ -1337,17 +1333,8 @@ mod tests {
             pb::IndexSection::decode(segments.encode_to_vec().as_slice()).unwrap(),
             segments
         );
-        // Disabling the policy leaves existing fragment and segment information intact.
-        let disabled = pb::Manifest {
-            default_clustering_id: None,
-            ..manifest
-        };
-        assert_eq!(
-            pb::Manifest::decode(disabled.encode_to_vec().as_slice()).unwrap(),
-            disabled
-        );
-        assert_eq!(disabled.clustering.len(), 2);
-        assert_eq!(disabled.fragments[2].clustering_id, None);
+        assert_eq!(manifest.clustering.len(), 2);
+        assert_eq!(manifest.fragments[2].clustering_id, None);
         // Proto presence distinguishes an absent reference from an invalid zero.
         let zero = pb::DataFragment {
             clustering_id: Some(0),

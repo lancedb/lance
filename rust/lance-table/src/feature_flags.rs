@@ -109,7 +109,7 @@ pub const MANAGED_BLOBS_META_KEY: &str = "lance.blob.managed";
 /// Writers must understand this allocation contract. It does not change how
 /// readers interpret the schema or data files.
 pub const FLAG_NON_REUSABLE_FIELD_IDS: u64 = 1 << 15;
-/// Writer-only protection for clustering definitions, references, ID allocation,
+/// Writer-only protection for clustering definitions, references,
 /// and generic fragment/index segment metadata maintenance.
 /// Reserved beyond the supported range until writers implement its maintenance rules.
 /// Ordinary readers can ignore clustering information; providers share this one bit.

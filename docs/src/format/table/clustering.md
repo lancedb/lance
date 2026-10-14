@@ -18,7 +18,7 @@ summaries built from the seeds.
 
 ## What Lance Stores
 
-### Shared Table Definitions
+### Table Configuration
 
 `Manifest.clustering` is a repeated list of immutable definitions. Each contains:
 
@@ -31,42 +31,28 @@ summaries built from the seeds.
 - `version`: a non-zero version assigned by the provider to these layout rules.
 - `provider_metadata`: provider configuration as `map<string, string>`.
 
-Changing any definition field requires a new ID. IDs start at 1 and are never
-reused. `Manifest.max_clustering_id` records the largest allocated ID, initially
-0. Allocate above it and fail on uint32 exhaustion. It must not decrease, even
-when definitions are removed or a historical snapshot is restored. Concurrent
-allocations must be resolved before commit; definition IDs and output references
-must agree in the committed snapshot.
-Every definition ID must be at most `max_clustering_id`. A default ID must be
-non-zero and resolve just like a fragment or segment reference.
+IDs start at 1. Changing a definition creates a new one with a larger ID.
+New clustering work defaults to the largest ID, regardless of list order.
+An empty list has no default. Existing fragments and segments keep their own
+references, so old and new layouts can coexist.
 
-`Manifest.default_clustering_id` optionally selects the policy for new clustering
-work. Absence means there is no default; it does not invalidate existing layouts.
-List order has no meaning and the latest ID is not implicitly the default.
-
-Keep every definition referenced by a fragment, an index segment, or the default
-policy. Unreferenced definitions may be removed from subsequent manifests. Older
-snapshots retain their own definitions; the current manifest need not keep the
-entire configuration history. References must resolve in the same snapshot,
-including references in spilled fragment records and the index section.
-
-A definition may be registered before a rewrite. The rewrite then commits its
-output fragments, their IDs and metadata, and any FRI mapping together. Publishing
-a new definition together with its first outputs requires an operation supporting
-both changes; this format does not add that transaction API.
+Keep the largest-ID definition and every definition still referenced in the
+snapshot. Other definitions may be removed; older snapshots retain their own
+copies. The current manifest does not need the entire configuration history.
 
 ### Fragment and Index Segment Information
 
-`DataFragment.clustering_id` and `IndexMetadata.clustering_id` are optional uint32
-references to a shared definition. Unset means no clustering claim; a present 0
-or an unresolved ID is invalid. Old fragments can reference old definitions while
-new fragments use another definition.
+Each fragment and index segment can record how it was organized:
 
-The ID identifies shared rules, not an individual bucket. Per-output bucket,
-range, or group IDs belong in the object's generic `metadata` map. Providers own
-their keys and define their string encodings. A segment's grouping may differ
-from its input fragments' grouping. See [Object metadata](index.md#object-metadata)
-for ownership and lifecycle rules.
+- `clustering_id`: optional reference to a definition in the same manifest.
+  Unset means no clustering claim; a present 0 or an unresolved ID is invalid.
+- `metadata`: generic `map<string, string>` for per-object information, including
+  provider-defined bucket, range, or group IDs. Empty maps are valid.
+
+The clustering ID identifies shared rules, not a bucket. A segment's metadata
+describes its own grouping; it does not change its input fragments' metadata.
+Other features can also use the generic map. Each feature owns and maintains its
+keys; see [Object Metadata](index.md#object-metadata).
 
 ## What Providers Do
 
@@ -103,13 +89,13 @@ If a provider fails, return an error. Do not silently switch to normal maintenan
 - **Nothing changed:** keep definitions, references, and metadata on unchanged
   fragments and segments, including keys and values the writer does not recognize.
 - **Normal data rewrite:** clear `clustering_id` and provider-owned clustering
-  keys on the rewritten fragments.
-  Column replacement, refresh, and overlays follow this rule even if the fragment
+  keys on the rewritten fragments. Column replacement, refresh, and overlays
+  follow this rule even if the fragment
   ID stays the same or the changed column is not a clustering key. There is no
   need to decide whether the layout was affected.
 - **Only deletion vectors changed:** keep the fragment's `clustering_id` and
-  provider-owned clustering keys.
-  Providers must account for deleted rows when planning later maintenance.
+  provider-owned clustering keys. Providers must account for deleted rows when
+  planning later maintenance.
 - **Index merge:** the provider decides how to merge and writes the new segments'
   clustering metadata. A normal merge without a provider strategy produces
   segments with no clustering metadata.
@@ -147,7 +133,7 @@ metadata must not add hidden requirements for correct reads or normal writes.
 Set `FLAG_CLUSTERING_METADATA` (`1 << 17`) in a snapshot's `writer_feature_flags`
 if it contains any of the following:
 
-- Table clustering definitions or a default clustering ID.
+- Table clustering definitions.
 - Fragment clustering information, including records in a fragment metadata tree.
 - Index segment clustering information, including records in the index section.
 - Nonempty generic fragment or segment metadata maps, even without clustering.
@@ -156,10 +142,9 @@ Readers need no clustering flag because they can ignore this metadata. Writers
 that do not support the feature must refuse writes. Writers that do support it
 follow the rules above; they do not need to understand every provider.
 
-Clear the flag only when all the above are absent. Retaining only the allocation
-high-water mark also requires the flag so writers cannot reset it. Removing the
-default policy alone is not enough. All providers and layout versions use this one flag. FRI
-and write seeds have separate feature requirements. Reserving this flag does
+Clear the flag only when all the above are absent. All providers and layout
+versions use this one flag. FRI and write seeds have separate feature requirements.
+Reserving this flag does
 not implement clustering APIs or metadata-aware writes.
 
 ### Legacy Column-Level Hints
@@ -168,7 +153,7 @@ not implement clustering APIs or metadata-aware writes.
 are **legacy column-level hints**. Keep their existing rules. Do not remove them
 or change them to match the new configuration.
 
-When `Manifest.default_clustering_id` is set, implementations supporting this
-proposal use the referenced definition's columns instead of the legacy hints.
+When `Manifest.clustering` is nonempty, implementations supporting this
+proposal use the largest-ID definition's columns instead of the legacy hints.
 Otherwise, the hints keep their existing meaning. Historical object references
 are interpreted through their own definitions, not the default or legacy hints.

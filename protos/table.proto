@@ -298,15 +298,6 @@ message Manifest {
    */
   repeated Clustering clustering = 25;
 
-  /* Definition used by default for new clustering work. Absent means no default
-   * policy; existing definitions and object references remain valid.
-   */
-  optional uint32 default_clustering_id = 26;
-
-  /* Largest clustering ID allocated, or zero if none. Never decreases, including
-   * on restore. Allocate above this value; deleting definitions does not free IDs.
-   */
-  uint32 max_clustering_id = 27;
 } // Manifest
 
 // external dataset base path
