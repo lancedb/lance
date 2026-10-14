@@ -72,12 +72,11 @@ Providers can reuse Lance's builders. Lance checks the inputs and conflicting
 concurrent changes, then commits the new files and metadata together. The
 provider API is outside this format proposal.
 
-Providers may use clustering IDs and bucket/group metadata to select candidates
-for compaction or indexing. Column updates can move values outside the original
-bucket, and deletions can leave groups underfilled. To guarantee a current range,
-providers must use valid current statistics or inspect and reorganize the data;
-historical labels alone are not enough. Without that guarantee, grouping by old
-labels may still produce a correct index, but with wider ranges and weaker pruning.
+Providers may use clustering IDs and metadata to select candidates for compaction
+or indexing. Column updates and other operations on a fragment may reduce the
+effectiveness of its original clustering. Providers can also use valid current
+index or column statistics to decide how to group fragments and whether to
+reorganize them. Creation-time metadata alone does not guarantee the current layout.
 
 ### When No Provider Strategy Is Available
 
