@@ -17,9 +17,10 @@ use crate::{
         scalar::{build_bitmap_index_segment, build_scalar_index},
         vector::{
             LANCE_VECTOR_INDEX, StageParams, VectorIndexParams, build_distributed_vector_index,
-            build_empty_vector_index, build_filtered_vector_index, build_vector_index,
+            build_empty_vector_index, build_filtered_vector_index, build_pca_ivf_rq_index,
+            build_vector_index,
         },
-        vector_index_details, vector_index_details_default,
+        vector_index_details, vector_index_details_default, vector_index_details_with_pca,
     },
 };
 use futures::{FutureExt, future::BoxFuture};
@@ -527,6 +528,29 @@ impl<'a> CreateIndexBuilder<'a> {
                     self.progress.clone(),
                 )
                 .await?
+            }
+            (_, LANCE_VECTOR_INDEX) if pca_vector_params(self.params).is_some() => {
+                let vec_params = pca_vector_params(self.params).ok_or_else(|| {
+                    Error::internal("PCA vector params checked by the match guard")
+                })?;
+                let summary = Box::pin(build_pca_ivf_rq_index(
+                    self.dataset,
+                    column,
+                    index_id,
+                    vec_params,
+                    fri,
+                    train && self.fragments.is_none(),
+                    self.progress.clone(),
+                ))
+                .await?;
+                CreatedIndex {
+                    index_details: vector_index_details_with_pca(
+                        vec_params,
+                        summary.pca_fingerprint,
+                    )?,
+                    index_version: vec_params.compatibility_version(),
+                    files: table_files_to_index(summary.files),
+                }
             }
             (
                 IndexType::Vector
@@ -1051,6 +1075,14 @@ fn vector_params_have_precomputed_ivf(params: &VectorIndexParams) -> bool {
     )
 }
 
+/// Vector index params that request a PCA pre-transform.
+fn pca_vector_params(params: &dyn IndexParams) -> Option<&VectorIndexParams> {
+    params
+        .as_any()
+        .downcast_ref::<VectorIndexParams>()
+        .filter(|params| params.pca_params().is_some())
+}
+
 fn effective_vector_fragments(dataset: &Dataset, fragments: Option<&[u32]>) -> Option<Vec<u32>> {
     let fragments = Dataset::normalize_fragment_ids(fragments?);
     let fragment_bitmap: roaring::RoaringBitmap = fragments.iter().copied().collect();
@@ -1116,13 +1148,13 @@ mod tests {
 
     use super::*;
     use crate::dataset::{WriteMode, WriteParams};
-    use crate::index::{DatasetIndexExt, IndexSegment};
+    use crate::index::{DatasetIndexExt, IndexSegment, vector::details::pca_params_from_details};
     use crate::utils::test::covering;
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
     use arrow::datatypes::{Float32Type, Int32Type, Int64Type};
     use arrow_array::cast::AsArray;
     use arrow_array::{
-        Array, FixedSizeListArray, ListArray, RecordBatchIterator, RecordBatchReader,
+        Array, FixedSizeListArray, Float32Array, ListArray, RecordBatchIterator, RecordBatchReader,
     };
     use arrow_array::{Int32Array, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
@@ -1139,6 +1171,7 @@ mod tests {
     use lance_index::vector::hnsw::builder::HnswBuildParams;
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_index::vector::kmeans::{KMeansParams, train_kmeans};
+    use lance_index::vector::pca::{PCA_METADATA_KEY, PcaParams};
     use lance_linalg::distance::{DistanceType, MetricType};
     use roaring::RoaringBitmap;
     use rstest::rstest;
@@ -4620,6 +4653,331 @@ mod tests {
         let loaded = dataset.load_indices_by_name(&committed.name).await.unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].index_version, IndexType::IvfRq.version());
+    }
+
+    #[tokio::test]
+    async fn test_create_pca_ivf_rq_e2e() {
+        use crate::dataset::index::LanceIndexStoreExt;
+        use lance_index::scalar::IndexStore;
+        use lance_index::scalar::lance_format::LanceIndexStore;
+
+        const NUM_ROWS: usize = 512;
+        const DIMENSION: usize = 16;
+        const NUM_PARTITIONS: usize = 8;
+        const K: usize = 10;
+
+        let vectors = (0..NUM_ROWS)
+            .map(|row| {
+                let phase = row as f32 * std::f32::consts::TAU / NUM_ROWS as f32;
+                let latent = [
+                    phase.sin(),
+                    phase.cos(),
+                    (phase * 2.0).sin(),
+                    (phase * 2.0).cos(),
+                    (phase * 4.0).sin(),
+                    (phase * 4.0).cos(),
+                    (phase * 8.0).sin(),
+                    (phase * 8.0).cos(),
+                ];
+                (0..DIMENSION)
+                    .map(|dimension| {
+                        if dimension < latent.len() {
+                            latent[dimension]
+                        } else {
+                            let component = dimension - latent.len();
+                            latent[component] * 0.5 + latent[(component + 1) % latent.len()] * 0.25
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let flat_values = vectors.iter().flatten().copied().collect::<Vec<_>>();
+        let vector_array = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(flat_values),
+            DIMENSION as i32,
+        )
+        .unwrap();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("vector", vector_array.data_type().clone(), false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..NUM_ROWS as i32)),
+                Arc::new(vector_array),
+            ],
+        )
+        .unwrap();
+
+        let tmpdir = TempStrDir::default();
+        let dataset_uri = format!("file://{}", tmpdir.as_str());
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let mut dataset = Dataset::write(reader, &dataset_uri, None).await.unwrap();
+        let params = VectorIndexParams::ivf_rq(NUM_PARTITIONS, 3, DistanceType::L2)
+            .with_pca(PcaParams::new(8).with_sample_size(256));
+
+        let committed =
+            CreateIndexBuilder::new(&mut dataset, &["vector"], IndexType::IvfRq, &params)
+                .name("pca_ivf_rq".to_string())
+                .execute()
+                .await
+                .unwrap();
+        assert_eq!(committed.index_version, 3);
+
+        let dataset = Dataset::open(&dataset_uri).await.unwrap();
+        let segments = dataset.load_indices_by_name("pca_ivf_rq").await.unwrap();
+        assert_eq!(segments.len(), 1);
+        let segment = &segments[0];
+        assert_eq!(segment.index_version, 3);
+        let (_, fingerprint) = pca_params_from_details(
+            segment
+                .index_details
+                .as_deref()
+                .expect("PCA index details must be committed"),
+        )
+        .unwrap()
+        .expect("PCA parameters must be present");
+        assert_eq!(fingerprint.len(), 32);
+
+        let store = LanceIndexStore::from_dataset_for_existing(&dataset, segment)
+            .await
+            .unwrap();
+        let index_file = store
+            .open_index_file(lance_index::INDEX_FILE_NAME)
+            .await
+            .unwrap();
+        assert!(
+            index_file.schema().metadata.contains_key(PCA_METADATA_KEY),
+            "index file schema must point to the persisted PCA model"
+        );
+
+        let query = vectors[237]
+            .iter()
+            .enumerate()
+            .map(|(dimension, value)| value + (dimension as f32 - 7.5) * 0.0001)
+            .collect::<Vec<_>>();
+        let mut exact = vectors
+            .iter()
+            .enumerate()
+            .map(|(id, vector)| {
+                let distance = vector
+                    .iter()
+                    .zip(&query)
+                    .map(|(value, query_value)| (value - query_value).powi(2))
+                    .sum::<f32>();
+                (id as i32, distance)
+            })
+            .collect::<Vec<_>>();
+        exact.sort_by(|left, right| {
+            left.1
+                .total_cmp(&right.1)
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        let exact_top_ids = exact
+            .iter()
+            .take(K)
+            .map(|(id, _)| *id)
+            .collect::<BTreeSet<_>>();
+        let query = Float32Array::from(query);
+
+        let mut cold_scan = dataset.scan();
+        cold_scan.project(&["id"]).unwrap();
+        cold_scan.nearest("vector", &query, K).unwrap();
+        cold_scan.nprobes(NUM_PARTITIONS);
+        cold_scan.fast_search();
+        let cold = cold_scan.try_into_batch().await.unwrap();
+        assert_eq!(cold.num_rows(), K);
+        let cold_ids = cold["id"]
+            .as_primitive::<Int32Type>()
+            .values()
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let recall = cold_ids.intersection(&exact_top_ids).count() as f32 / K as f32;
+        assert!(recall >= 0.5, "PCA IVF_RQ Recall@10 was {recall}");
+
+        let mut cached_scan = dataset.scan();
+        cached_scan.project(&["id"]).unwrap();
+        cached_scan.nearest("vector", &query, K).unwrap();
+        cached_scan.nprobes(NUM_PARTITIONS);
+        cached_scan.fast_search();
+        let cached = cached_scan.try_into_batch().await.unwrap();
+        let cached_ids = cached["id"]
+            .as_primitive::<Int32Type>()
+            .values()
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        assert_eq!(cached_ids, cold_ids);
+
+        let mut refined_scan = dataset.scan();
+        refined_scan.project(&["id"]).unwrap();
+        refined_scan.nearest("vector", &query, K).unwrap();
+        refined_scan.nprobes(NUM_PARTITIONS);
+        refined_scan.refine(64);
+        refined_scan.fast_search();
+        let refined = refined_scan.try_into_batch().await.unwrap();
+        let refined_ids = refined["id"]
+            .as_primitive::<Int32Type>()
+            .values()
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        assert_eq!(refined_ids, exact_top_ids);
+        let refined_distances = refined["_distance"].as_primitive::<Float32Type>();
+        for (id, actual_distance) in refined["id"]
+            .as_primitive::<Int32Type>()
+            .values()
+            .iter()
+            .zip(refined_distances.values())
+        {
+            let expected_distance = exact
+                .iter()
+                .find_map(|(candidate_id, distance)| (candidate_id == id).then_some(*distance))
+                .unwrap();
+            assert!(
+                (actual_distance - expected_distance).abs() <= 1e-4,
+                "refined distance for id={id}: actual={actual_distance}, expected={expected_distance}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_create_pca_ivf_rq_streaming_e2e() {
+        const NUM_ROWS: usize = 512;
+        const DIMENSION: usize = 16;
+        const NUM_PARTITIONS: usize = 8;
+        const K: usize = 10;
+
+        let vectors = (0..NUM_ROWS)
+            .map(|row| {
+                let phase = row as f32 * std::f32::consts::TAU / NUM_ROWS as f32;
+                let latent = [
+                    phase.sin(),
+                    phase.cos(),
+                    (phase * 2.0).sin(),
+                    (phase * 2.0).cos(),
+                    (phase * 4.0).sin(),
+                    (phase * 4.0).cos(),
+                    (phase * 8.0).sin(),
+                    (phase * 8.0).cos(),
+                ];
+                (0..DIMENSION)
+                    .map(|dimension| {
+                        if dimension < latent.len() {
+                            latent[dimension]
+                        } else {
+                            let component = dimension - latent.len();
+                            latent[component] * 0.5 + latent[(component + 1) % latent.len()] * 0.25
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let flat_values = vectors.iter().flatten().copied().collect::<Vec<_>>();
+        let vector_array = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(flat_values),
+            DIMENSION as i32,
+        )
+        .unwrap();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("vector", vector_array.data_type().clone(), false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..NUM_ROWS as i32)),
+                Arc::new(vector_array),
+            ],
+        )
+        .unwrap();
+
+        let tmpdir = TempStrDir::default();
+        let dataset_uri = format!("file://{}", tmpdir.as_str());
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let mut dataset = Dataset::write(reader, &dataset_uri, None).await.unwrap();
+        let mut params = VectorIndexParams::ivf_rq(NUM_PARTITIONS, 3, DistanceType::L2)
+            .with_pca(PcaParams::new(8).with_sample_size(256));
+        if let StageParams::Ivf(ivf) = &mut params.stages[0] {
+            ivf.sample_rate = 16;
+            ivf.streaming_sample_rate = Some(4);
+            ivf.streaming_refine_passes = 1;
+            ivf.max_iters = 4;
+        } else {
+            panic!("expected IVF stage");
+        }
+
+        let committed =
+            CreateIndexBuilder::new(&mut dataset, &["vector"], IndexType::IvfRq, &params)
+                .name("pca_ivf_rq_streaming".to_string())
+                .execute()
+                .await
+                .unwrap();
+        assert_eq!(committed.index_version, 3);
+
+        let dataset = Dataset::open(&dataset_uri).await.unwrap();
+        let segments = dataset
+            .load_indices_by_name("pca_ivf_rq_streaming")
+            .await
+            .unwrap();
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].index_version, 3);
+        let (_, fingerprint) = pca_params_from_details(
+            segments[0]
+                .index_details
+                .as_deref()
+                .expect("PCA index details must be committed"),
+        )
+        .unwrap()
+        .expect("PCA parameters must be present");
+        assert_eq!(fingerprint.len(), 32);
+
+        let query = vectors[237]
+            .iter()
+            .enumerate()
+            .map(|(dimension, value)| value + (dimension as f32 - 7.5) * 0.0001)
+            .collect::<Vec<_>>();
+        let mut exact = vectors
+            .iter()
+            .enumerate()
+            .map(|(id, vector)| {
+                let distance = vector
+                    .iter()
+                    .zip(&query)
+                    .map(|(value, query_value)| (value - query_value).powi(2))
+                    .sum::<f32>();
+                (id as i32, distance)
+            })
+            .collect::<Vec<_>>();
+        exact.sort_by(|left, right| {
+            left.1
+                .total_cmp(&right.1)
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        let exact_top_ids = exact
+            .iter()
+            .take(K)
+            .map(|(id, _)| *id)
+            .collect::<BTreeSet<_>>();
+        let query = Float32Array::from(query);
+
+        let mut scan = dataset.scan();
+        scan.project(&["id"]).unwrap();
+        scan.nearest("vector", &query, K).unwrap();
+        scan.nprobes(NUM_PARTITIONS);
+        scan.refine(4);
+        scan.fast_search();
+        let result = scan.try_into_batch().await.unwrap();
+        let result_ids = result["id"]
+            .as_primitive::<Int32Type>()
+            .values()
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let recall = result_ids.intersection(&exact_top_ids).count() as f32 / K as f32;
+        assert!(recall >= 0.5, "PCA streaming IVF_RQ Recall@10 was {recall}");
     }
 
     #[tokio::test]

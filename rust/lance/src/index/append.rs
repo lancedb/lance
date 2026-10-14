@@ -29,6 +29,7 @@ use prost::Message;
 use roaring::RoaringBitmap;
 use uuid::Uuid;
 
+use super::vector::details::pre_transform_blocks_maintenance;
 use super::vector::ivf::{
     SteadyStateRebalance, VectorSegmentCompatibility, index_type_for_segmented_optimize,
     optimize_vector_indices, select_steady_state_rebalance, vector_segment_compatibility,
@@ -1051,6 +1052,16 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
 
     let (new_uuid, removed_indices, new_fragment_bitmap, created_index, new_dataset_version) =
         if first_is_vector_index {
+            for metadata in old_indices {
+                if let Some(details) = metadata.index_details.as_deref()
+                    && pre_transform_blocks_maintenance(details)?
+                {
+                    return Err(Error::not_supported(
+                        "Appending or optimizing a vector index with a pre-transform is not supported",
+                    ));
+                }
+            }
+
             // Segments with stored rows (raw coverage) but no live coverage
             // (e.g. a definition retained through a full rewrite) are dormant.
             // With stable row ids their stored postings still share ids with
@@ -1119,7 +1130,6 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
             if unindexed.is_empty() && (rebuild_dormant || awaits_training) {
                 return Ok(None);
             }
-
             if awaits_training {
                 return train_from_definition(&dataset, old_indices, &field_path, options)
                     .await

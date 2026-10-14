@@ -14,7 +14,12 @@ pub mod dedup;
 pub(crate) mod details;
 pub mod hamming;
 pub mod ivf;
+mod pca;
+pub(crate) mod pca_load;
+pub(crate) use pca::build_pca_ivf_rq_index;
+pub(crate) use pca::{PcaComponentMismatch, pca_component_mismatch};
 pub mod pq;
+mod training_source;
 pub mod utils;
 
 #[cfg(test)]
@@ -44,10 +49,10 @@ use lance_index::vector::ivf::storage::IvfModel;
 use object_store::path::Path;
 
 use lance_arrow::FixedSizeListArrayExt;
+use lance_index::vector::pca::PcaParams;
 use lance_index::vector::pq::ProductQuantizer;
 use lance_index::vector::quantizer::QuantizationType;
 use lance_index::vector::v3::shuffler::{Shuffler, create_ivf_shuffler};
-use lance_index::vector::pca::PcaParams;
 use lance_index::vector::v3::subindex::SubIndexType;
 use lance_index::vector::{
     VectorIndex,
@@ -505,6 +510,21 @@ impl VectorIndexParams {
         }
     }
 
+    pub fn index_type(&self) -> IndexType {
+        let len = self.stages.len();
+        match (len, self.stages.get(1), self.stages.last()) {
+            (0, _, _) => IndexType::Vector,
+            (1, _, Some(StageParams::Ivf(_))) => IndexType::IvfFlat,
+            (2, _, Some(StageParams::PQ(_))) => IndexType::IvfPq,
+            (2, _, Some(StageParams::SQ(_))) => IndexType::IvfSq,
+            (2, _, Some(StageParams::RQ(_))) => IndexType::IvfRq,
+            (2, _, Some(StageParams::Hnsw(_))) => IndexType::IvfHnswFlat,
+            (3, Some(StageParams::Hnsw(_)), Some(StageParams::PQ(_))) => IndexType::IvfHnswPq,
+            (3, Some(StageParams::Hnsw(_)), Some(StageParams::SQ(_))) => IndexType::IvfHnswSq,
+            _ => IndexType::Vector,
+        }
+    }
+
     /// Configures PCA as the vector pre-transform for this index.
     ///
     /// This is an experimental format feature. The parameters and stored model
@@ -514,6 +534,16 @@ impl VectorIndexParams {
     /// PCA changes the vectors' logical index dimension before IVF and
     /// quantization. It is supported for full new local IVF_RQ builds with L2
     /// distance.
+    ///
+    /// ```
+    /// use lance::index::vector::VectorIndexParams;
+    /// use lance_index::vector::pca::PcaParams;
+    /// use lance_linalg::distance::DistanceType;
+    ///
+    /// let params = VectorIndexParams::ivf_rq(16, 1, DistanceType::L2)
+    ///     .with_pca(PcaParams::new(32));
+    /// assert_eq!(params.pca_params().map(|p| p.dimension), Some(32));
+    /// ```
     pub fn with_pca(mut self, params: PcaParams) -> Self {
         self.pre_transform = Some(PreTransformParams::Pca(params));
         self
@@ -532,21 +562,6 @@ impl VectorIndexParams {
         match (self.pre_transform.is_some(), self.index_type()) {
             (true, IndexType::IvfRq) => lance_index::VECTOR_PRE_TRANSFORM_INDEX_VERSION,
             (_, index_type) => index_type.version() as u32,
-        }
-    }
-
-    pub fn index_type(&self) -> IndexType {
-        let len = self.stages.len();
-        match (len, self.stages.get(1), self.stages.last()) {
-            (0, _, _) => IndexType::Vector,
-            (1, _, Some(StageParams::Ivf(_))) => IndexType::IvfFlat,
-            (2, _, Some(StageParams::PQ(_))) => IndexType::IvfPq,
-            (2, _, Some(StageParams::SQ(_))) => IndexType::IvfSq,
-            (2, _, Some(StageParams::RQ(_))) => IndexType::IvfRq,
-            (2, _, Some(StageParams::Hnsw(_))) => IndexType::IvfHnswFlat,
-            (3, Some(StageParams::Hnsw(_)), Some(StageParams::PQ(_))) => IndexType::IvfHnswPq,
-            (3, Some(StageParams::Hnsw(_)), Some(StageParams::SQ(_))) => IndexType::IvfHnswSq,
-            _ => IndexType::Vector,
         }
     }
 }
@@ -836,6 +851,95 @@ async fn prepare_vector_segment_build(
     );
 
     Ok((element_type, index_type, ivf_params, shuffler, temp_dir))
+}
+
+/// The single check of which PCA builds are supported, run before any index
+/// files are written. `full_new_build` is false for empty, fragment-limited
+/// and incremental builds.
+fn validate_pca_build_supported(
+    params: &VectorIndexParams,
+    vector_type: &DataType,
+    input_dimension: usize,
+    full_new_build: bool,
+) -> Result<()> {
+    let Some(pca) = params.pca_params() else {
+        return Ok(());
+    };
+    if params.index_type() != IndexType::IvfRq {
+        return Err(Error::not_supported(
+            "PCA pre-transform is only supported for IVF_RQ".to_string(),
+        ));
+    }
+    if params.metric_type != DistanceType::L2 {
+        return Err(Error::not_supported(format!(
+            "PCA IVF_RQ requires L2 distance, got {}",
+            params.metric_type
+        )));
+    }
+    if !matches!(params.version, IndexFileVersion::V3) {
+        return Err(Error::not_supported(
+            "PCA IVF_RQ requires the V3 index file format".to_string(),
+        ));
+    }
+    let DataType::FixedSizeList(field, _) = vector_type else {
+        return Err(Error::not_supported(format!(
+            "PCA IVF_RQ requires a FixedSizeList vector column, got {vector_type}"
+        )));
+    };
+    if !matches!(
+        field.data_type(),
+        DataType::Float16 | DataType::Float32 | DataType::Float64
+    ) {
+        return Err(Error::not_supported(format!(
+            "PCA IVF_RQ requires Float16, Float32, or Float64 vector values, got {}",
+            field.data_type()
+        )));
+    }
+    pca.validate(input_dimension, pca.sample_size)?;
+    u32::try_from(pca.sample_size).map_err(|_| {
+        Error::invalid_input(format!(
+            "pca.sample_size={} exceeds the manifest limit {}",
+            pca.sample_size,
+            u32::MAX
+        ))
+    })?;
+    if pca.dimension == 0 || pca.dimension >= input_dimension || !pca.dimension.is_multiple_of(8) {
+        return Err(Error::invalid_input(format!(
+            "pca.dimension={} must be greater than 0, smaller than input_dimension={input_dimension}, and divisible by 8",
+            pca.dimension
+        )));
+    }
+    if !full_new_build {
+        return Err(Error::not_supported(
+            "PCA IVF_RQ is only supported for a full new local build with train=true and without fragment_ids".to_string(),
+        ));
+    }
+    let StageParams::Ivf(ivf) = &params.stages[0] else {
+        return Err(Error::invalid_input(
+            "PCA IVF_RQ requires IVF as the first stage",
+        ));
+    };
+    if ivf.centroids.is_some() {
+        return Err(Error::not_supported(
+            "PCA IVF_RQ does not support precomputed IVF centroids".to_string(),
+        ));
+    }
+    if ivf.precomputed_partitions_file.is_some() || ivf.precomputed_shuffle_buffers.is_some() {
+        return Err(Error::not_supported(
+            "PCA IVF_RQ does not support precomputed partitions or shuffle buffers".to_string(),
+        ));
+    }
+    let Some(StageParams::RQ(rq)) = params.stages.get(1) else {
+        return Err(Error::invalid_input(
+            "PCA IVF_RQ requires RQ as the second stage",
+        ));
+    };
+    if rq.rotation.is_some() {
+        return Err(Error::not_supported(
+            "PCA IVF_RQ does not support a prebuilt RQ rotation model".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Build a Distributed Vector Index for specific fragments
@@ -2104,6 +2208,14 @@ pub async fn initialize_vector_index(
 
     // Vector indices currently support only single fields, use the first one
     let column_name = field_names[0];
+
+    if let Some(details) = source_index.index_details.as_deref()
+        && details::pre_transform_blocks_maintenance(details)?
+    {
+        return Err(Error::not_supported(
+            "Initializing a vector index from a source index with a pre-transform is not supported",
+        ));
+    }
 
     let source_vector_index = source_dataset
         .open_vector_index(column_name, &source_index.uuid, &NoOpMetricsCollector)
@@ -4495,5 +4607,92 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(results.num_rows(), 5, "Should return 5 nearest neighbors");
+    }
+
+    #[test]
+    fn pca_uses_dynamic_manifest_compatibility_version() {
+        let rq = VectorIndexParams::ivf_rq(4, 1, DistanceType::L2);
+        assert_eq!(
+            rq.compatibility_version(),
+            IndexType::IvfRq.version() as u32
+        );
+        assert!(rq.pca_params().is_none());
+
+        let pca_rq = rq.with_pca(PcaParams::new(8));
+        assert_eq!(
+            pca_rq.compatibility_version(),
+            lance_index::VECTOR_PRE_TRANSFORM_INDEX_VERSION
+        );
+        assert_eq!(pca_rq.pca_params().map(|params| params.dimension), Some(8));
+
+        let pca_flat = VectorIndexParams::ivf_flat(4, DistanceType::L2).with_pca(PcaParams::new(8));
+        assert_eq!(
+            pca_flat.compatibility_version(),
+            IndexType::IvfFlat.version() as u32
+        );
+    }
+
+    #[test]
+    fn pca_build_support_matrix() {
+        let vector_type =
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 16);
+        let valid = VectorIndexParams::ivf_rq(4, 1, DistanceType::L2).with_pca(PcaParams::new(8));
+        validate_pca_build_supported(&valid, &vector_type, 16, true).unwrap();
+
+        let mut streaming = valid.clone();
+        if let StageParams::Ivf(ivf) = &mut streaming.stages[0] {
+            ivf.streaming_sample_rate = Some(32);
+            ivf.streaming_coreset_rate = Some(16);
+            ivf.streaming_refine_passes = 1;
+        }
+        validate_pca_build_supported(&streaming, &vector_type, 16, true).unwrap();
+
+        let unsupported = [
+            VectorIndexParams::ivf_flat(4, DistanceType::L2).with_pca(PcaParams::new(8)),
+            VectorIndexParams::ivf_rq(4, 1, DistanceType::Cosine).with_pca(PcaParams::new(8)),
+            VectorIndexParams::ivf_rq(4, 1, DistanceType::L2).with_pca(PcaParams::new(7)),
+        ];
+        for params in unsupported {
+            assert!(validate_pca_build_supported(&params, &vector_type, 16, true).is_err());
+        }
+
+        let oversized_sample = VectorIndexParams::ivf_rq(4, 1, DistanceType::L2)
+            .with_pca(PcaParams::new(8).with_sample_size(u32::MAX as usize + 1));
+        let error =
+            validate_pca_build_supported(&oversized_sample, &vector_type, 16, true).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("manifest limit"));
+
+        assert!(validate_pca_build_supported(&valid, &vector_type, 16, false).is_err());
+
+        let multivector = DataType::List(Arc::new(Field::new("item", vector_type, true)));
+        assert!(validate_pca_build_supported(&valid, &multivector, 16, true).is_err());
+    }
+
+    #[tokio::test]
+    async fn pca_ivf_rq_build_returns_model_fingerprint() {
+        let test_dir = TempStrDir::default();
+        let uri = format!("{}/pca-summary", test_dir.as_str());
+        let reader = lance_datagen::gen_batch()
+            .col("vector", array::rand_vec::<Float32Type>(16.into()))
+            .into_reader_rows(RowCount::from(128), BatchCount::from(1));
+        let dataset = Dataset::write(reader, &uri, None).await.unwrap();
+        let params = VectorIndexParams::ivf_rq(2, 1, DistanceType::L2)
+            .with_pca(PcaParams::new(8).with_sample_size(64));
+
+        let summary = pca::build_pca_ivf_rq_index(
+            &dataset,
+            "vector",
+            Uuid::new_v4(),
+            &params,
+            None,
+            true,
+            noop_progress(),
+        )
+        .await
+        .unwrap();
+
+        assert!(summary.pca_fingerprint.is_some());
+        assert!(!summary.files.is_empty());
     }
 }

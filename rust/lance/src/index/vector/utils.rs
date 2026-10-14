@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::collections::HashSet;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -13,6 +14,7 @@ use arrow_buffer::{Buffer, MutableBuffer};
 use futures::{Stream, StreamExt, TryStreamExt, stream};
 use lance_arrow::DataTypeExt;
 use lance_core::datatypes::Schema;
+use lance_index::progress::IndexBuildProgress;
 use lance_linalg::distance::DistanceType;
 use log::{info, warn};
 use rand::rngs::SmallRng;
@@ -384,6 +386,207 @@ pub fn filter_finite_training_data(
         let filtered = arrow::compute::filter(&training_data, &finite_mask)?;
         Ok(filtered.as_fixed_size_list().clone())
     }
+}
+
+/// Logical row offsets selected for dataset-aware PCA training.
+///
+/// The sampled vectors are read only while validating candidates. Keeping just
+/// offsets bounds persistent sampling memory independently of vector width.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PcaTrainingSample {
+    /// Sorted dataset-wide logical offsets of valid sampled vectors.
+    pub row_offsets: Vec<u64>,
+}
+
+enum PcaCandidateSampler {
+    Sparse {
+        candidate_count: u64,
+        visited: HashSet<u64>,
+    },
+    Dense {
+        candidates: Vec<u64>,
+        next: usize,
+    },
+}
+
+impl PcaCandidateSampler {
+    fn new(candidate_count: usize, target: usize) -> Self {
+        if target.saturating_mul(2) < candidate_count {
+            Self::Sparse {
+                candidate_count: candidate_count as u64,
+                visited: HashSet::with_capacity(target),
+            }
+        } else {
+            Self::Dense {
+                candidates: (0..candidate_count as u64).collect(),
+                next: 0,
+            }
+        }
+    }
+
+    fn remaining(&self) -> usize {
+        match self {
+            Self::Sparse {
+                candidate_count,
+                visited,
+            } => (*candidate_count as usize).saturating_sub(visited.len()),
+            Self::Dense { candidates, next } => candidates.len().saturating_sub(*next),
+        }
+    }
+
+    fn draw(&mut self, count: usize, rng: &mut SmallRng) -> Vec<u64> {
+        let count = count.min(self.remaining());
+        match self {
+            Self::Sparse {
+                candidate_count,
+                visited,
+            } => {
+                let mut offsets = Vec::with_capacity(count);
+                while offsets.len() < count {
+                    let offset = rng.random_range(0..*candidate_count);
+                    if visited.insert(offset) {
+                        offsets.push(offset);
+                    }
+                }
+                offsets
+            }
+            Self::Dense { candidates, next } => {
+                let end = next.saturating_add(count);
+                for index in *next..end {
+                    let swap_index = rng.random_range(index..candidates.len());
+                    candidates.swap(index, swap_index);
+                }
+                let offsets = candidates[*next..end].to_vec();
+                *next = end;
+                offsets
+            }
+        }
+    }
+}
+
+fn is_valid_pca_vector(array: &FixedSizeListArray, row: usize) -> Result<bool> {
+    if array.is_null(row) {
+        return Ok(false);
+    }
+    let dimension = usize::try_from(array.value_length()).map_err(|_| {
+        Error::invalid_input(format!(
+            "PCA vector value_length={} is not a valid dimension",
+            array.value_length()
+        ))
+    })?;
+    let value_start = array
+        .offset()
+        .checked_add(row)
+        .and_then(|row| row.checked_mul(dimension))
+        .ok_or_else(|| Error::invalid_input("PCA vector child offset overflows usize"))?;
+    let values = array.values();
+    let value_end = value_start
+        .checked_add(dimension)
+        .ok_or_else(|| Error::invalid_input("PCA vector child range overflows usize"))?;
+    if value_end > values.len() {
+        return Err(Error::invalid_input(format!(
+            "PCA vector child range [{value_start}, {value_end}) exceeds values length {}",
+            values.len()
+        )));
+    }
+    if (value_start..value_end).any(|index| values.is_null(index)) {
+        return Ok(false);
+    }
+    let is_finite = match values.data_type() {
+        DataType::Float16 => values
+            .as_primitive::<arrow_array::types::Float16Type>()
+            .values()[value_start..value_end]
+            .iter()
+            .all(|value| value.is_finite()),
+        DataType::Float32 => values
+            .as_primitive::<arrow_array::types::Float32Type>()
+            .values()[value_start..value_end]
+            .iter()
+            .all(|value| value.is_finite()),
+        DataType::Float64 => values
+            .as_primitive::<arrow_array::types::Float64Type>()
+            .values()[value_start..value_end]
+            .iter()
+            .all(|value| value.is_finite()),
+        data_type => {
+            return Err(Error::invalid_input(format!(
+                "PCA sampling requires Float16, Float32, or Float64 vector values, got {data_type}"
+            )));
+        }
+    };
+    Ok(is_finite)
+}
+
+/// Deterministically samples valid vector row offsets for PCA training.
+///
+/// Candidates are unique, invalid vectors are replaced from the same RNG
+/// stream, and the returned offsets are sorted into the training order.
+pub async fn sample_valid_vector_offsets_seeded(
+    dataset: &Dataset,
+    column: &str,
+    max_valid_rows: usize,
+    sampling_seed: u64,
+    fragment_ids: Option<&[u32]>,
+    progress: Arc<dyn IndexBuildProgress>,
+) -> Result<PcaTrainingSample> {
+    if fragment_ids.is_some() {
+        return Err(Error::not_supported(
+            "PCA dataset sampling with fragment_ids is not supported",
+        ));
+    }
+    let vector_field = dataset.schema().field(column).ok_or_else(|| {
+        Error::invalid_input(format!(
+            "PCA sampling column {column:?} does not exist in the dataset schema"
+        ))
+    })?;
+    if !matches!(vector_field.data_type(), DataType::FixedSizeList(_, _)) {
+        return Err(Error::invalid_input(format!(
+            "PCA sampling column {column:?} must be FixedSizeList, got {}",
+            vector_field.data_type()
+        )));
+    }
+
+    let candidate_count = dataset.count_rows(None).await?;
+    let target = max_valid_rows.min(candidate_count);
+    progress
+        .stage_start("sample_pca", Some(target as u64), "rows")
+        .await?;
+    let projection = Arc::new(dataset.schema().project(&[column])?);
+    let mut rng = SmallRng::seed_from_u64(sampling_seed);
+    let mut sampler = PcaCandidateSampler::new(candidate_count, target);
+    let mut valid_offsets = Vec::with_capacity(target);
+
+    const PCA_SAMPLE_TAKE_BATCH_SIZE: usize = 8192;
+    while valid_offsets.len() < target && sampler.remaining() > 0 {
+        let requested = target.saturating_sub(valid_offsets.len());
+        let mut candidates = sampler.draw(requested, &mut rng);
+        candidates.sort_unstable();
+        for chunk in candidates.chunks(PCA_SAMPLE_TAKE_BATCH_SIZE) {
+            let batch = dataset.take(chunk, projection.clone()).await?;
+            let vectors = get_column_from_batch(&batch, column)?;
+            let vectors = vectors.as_fixed_size_list();
+            if vectors.len() != chunk.len() {
+                return Err(Error::index(format!(
+                    "PCA sampling take returned {} rows for {} requested offsets",
+                    vectors.len(),
+                    chunk.len()
+                )));
+            }
+            for (row, offset) in chunk.iter().enumerate() {
+                if is_valid_pca_vector(vectors, row)? {
+                    valid_offsets.push(*offset);
+                }
+            }
+            progress
+                .stage_progress("sample_pca", valid_offsets.len() as u64)
+                .await?;
+        }
+    }
+    valid_offsets.sort_unstable();
+    progress.stage_complete("sample_pca").await?;
+    Ok(PcaTrainingSample {
+        row_offsets: valid_offsets,
+    })
 }
 
 #[derive(Debug)]
@@ -1194,13 +1397,14 @@ mod tests {
 
     use crate::dataset::{InsertBuilder, WriteParams};
     use arrow_array::{
-        ArrayRef, Float32Array, Int32Array, RecordBatchIterator, types::Float32Type,
+        ArrayRef, Float32Array, Int32Array, RecordBatch, RecordBatchIterator, types::Float32Type,
     };
     use arrow_buffer::{BooleanBufferBuilder, NullBuffer};
-    use arrow_schema::{DataType, Field};
+    use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use lance_arrow::FixedSizeListArrayExt;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::{ArrayGeneratorExt, Dimension, RowCount, array, gen_batch};
+    use lance_index::progress::noop_progress;
 
     #[rstest::rstest]
     #[case::f32_1024(DataType::Float32, 1024, 16_384)]
@@ -1897,5 +2101,115 @@ mod tests {
 
         assert_eq!(num_rows, max_rows);
         assert_eq!(buf.len(), max_rows * byte_width);
+    }
+
+    async fn make_pca_sampling_dataset(rows: Vec<Option<Vec<Option<f32>>>>) -> Dataset {
+        let dimension = rows
+            .iter()
+            .find_map(|row| row.as_ref().map(Vec::len))
+            .unwrap();
+        let values = rows
+            .iter()
+            .flat_map(|row| row.clone().unwrap_or_else(|| vec![Some(0.0); dimension]))
+            .collect::<Vec<_>>();
+        let child = Arc::new(Float32Array::from(values));
+        let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let mut validity = BooleanBufferBuilder::new(rows.len());
+        for row in &rows {
+            validity.append(row.is_some());
+        }
+        let vectors = FixedSizeListArray::try_new(
+            item_field.clone(),
+            dimension as i32,
+            child,
+            Some(NullBuffer::new(validity.finish())),
+        )
+        .unwrap();
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "vector",
+            DataType::FixedSizeList(item_field, dimension as i32),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(vectors)]).unwrap();
+        InsertBuilder::new("memory://")
+            .execute(vec![batch])
+            .await
+            .unwrap()
+    }
+
+    fn finite_sampling_rows(count: usize) -> Vec<Option<Vec<Option<f32>>>> {
+        (0..count)
+            .map(|row| {
+                Some(vec![
+                    Some(row as f32),
+                    Some((row.saturating_mul(3)) as f32 + 0.25),
+                ])
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_pca_sampling_seed_is_deterministic_and_sorted() {
+        let dataset = make_pca_sampling_dataset(finite_sampling_rows(100)).await;
+        let first =
+            sample_valid_vector_offsets_seeded(&dataset, "vector", 16, 42, None, noop_progress())
+                .await
+                .unwrap();
+        let repeated =
+            sample_valid_vector_offsets_seeded(&dataset, "vector", 16, 42, None, noop_progress())
+                .await
+                .unwrap();
+        let other =
+            sample_valid_vector_offsets_seeded(&dataset, "vector", 16, 43, None, noop_progress())
+                .await
+                .unwrap();
+
+        assert_eq!(first, repeated);
+        assert_ne!(first, other);
+        assert!(first.row_offsets.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[tokio::test]
+    async fn test_pca_sampling_replenishes_invalid_candidates_until_exhausted() {
+        let rows = vec![
+            None,
+            Some(vec![Some(1.0), None]),
+            Some(vec![Some(f32::NAN), Some(2.0)]),
+            Some(vec![Some(3.0), Some(f32::INFINITY)]),
+            Some(vec![Some(4.0), Some(4.5)]),
+            Some(vec![Some(5.0), Some(5.5)]),
+            Some(vec![Some(6.0), Some(6.5)]),
+            Some(vec![Some(7.0), Some(7.5)]),
+        ];
+        let dataset = make_pca_sampling_dataset(rows).await;
+
+        let filled =
+            sample_valid_vector_offsets_seeded(&dataset, "vector", 4, 7, None, noop_progress())
+                .await
+                .unwrap();
+        assert_eq!(filled.row_offsets, vec![4, 5, 6, 7]);
+
+        let exhausted =
+            sample_valid_vector_offsets_seeded(&dataset, "vector", 8, 7, None, noop_progress())
+                .await
+                .unwrap();
+        assert_eq!(exhausted.row_offsets, vec![4, 5, 6, 7]);
+    }
+
+    #[tokio::test]
+    async fn test_pca_sampling_rejects_fragment_filter() {
+        let dataset = make_pca_sampling_dataset(finite_sampling_rows(8)).await;
+        let error = sample_valid_vector_offsets_seeded(
+            &dataset,
+            "vector",
+            4,
+            42,
+            Some(&[0]),
+            noop_progress(),
+        )
+        .await
+        .expect_err("fragment-limited PCA sampling must be explicit");
+        assert!(matches!(error, Error::NotSupported { .. }));
+        assert!(error.to_string().contains("fragment_ids"));
     }
 }

@@ -20,6 +20,7 @@ use arrow_array::{
     RecordBatch, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, Field, Fields};
+use async_trait::async_trait;
 use futures::{FutureExt, SinkExt, stream};
 use futures::{
     Stream,
@@ -33,16 +34,17 @@ use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::{Error, ROW_ID_FIELD, Result};
 use lance_file::version::ConcreteFileVersion;
 use lance_file::versions as file_versions;
-use lance_file::writer::FileWriterOptions;
+use lance_file::writer::{FileWriter, FileWriterOptions};
 use lance_index::frag_reuse::{CompactFragReuseIndex, CompactFragReuseIndexHandle};
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::progress::{IndexBuildProgress, NoopIndexBuildProgress};
-use lance_index::scalar::RowIdRemapper;
+use lance_index::scalar::{IndexFile as ScalarIndexFile, IndexWriter, RowIdRemapper};
 use lance_index::vector::bq::storage::{RABIT_CODE_COLUMN, unpack_codes};
 use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::hnsw::remap::{remap_graph_batch, remap_graph_repair};
 use lance_index::vector::kmeans::KMeansParams;
+use lance_index::vector::pca::{PCA_METADATA_KEY, PcaModel, PcaParams, write_pca_model};
 use lance_index::vector::pq::storage::transpose;
 use lance_index::vector::quantizer::{
     QuantizationMetadata, QuantizationType, QuantizerBuildParams,
@@ -50,7 +52,7 @@ use lance_index::vector::quantizer::{
 use lance_index::vector::quantizer::{QuantizerMetadata, QuantizerStorage};
 use lance_index::vector::shared::{SupportedIvfIndexType, write_unified_ivf_and_index_metadata};
 use lance_index::vector::storage::STORAGE_METADATA_KEY;
-use lance_index::vector::transform::Flatten;
+use lance_index::vector::transform::{Flatten, PcaTransformer};
 use lance_index::vector::v3::shuffler::{
     DEFAULT_PARTITION_WINDOW_BYTES, EmptyReader, IvfShufflerReader, create_ivf_shuffler,
 };
@@ -100,6 +102,10 @@ use crate::index::vector::utils::infer_vector_dim;
 use super::v2::IVFIndex;
 use super::{
     ivf::load_precomputed_partitions_if_available,
+    training_source::{
+        DatasetVectorSource, PreTransformVectorSource, TrainingVectorTransform,
+        VectorTrainingDataSource,
+    },
     utils::{self, get_vector_type},
 };
 
@@ -341,6 +347,7 @@ pub struct IvfIndexBuilder<S: IvfSubIndex, Q: Quantization> {
     dataset: Option<Dataset>,
     shuffler: Option<Arc<dyn Shuffler>>,
     ivf_params: Option<IvfBuildParams>,
+    pca_params: Option<PcaParams>,
     quantizer_params: Option<Q::BuildParams>,
     sub_index_params: Option<S::BuildParams>,
     _temp_dir: TempStdDir, // store this for keeping the temp dir alive and clean up after build
@@ -375,6 +382,8 @@ pub struct IvfIndexBuilder<S: IvfSubIndex, Q: Quantization> {
 
     // lance file version for writing index files
     format_version: ConcreteFileVersion,
+
+    pca_model: Option<Arc<PcaModel>>,
 
     progress: Arc<dyn IndexBuildProgress>,
 }
@@ -434,6 +443,81 @@ type UnindexedStream = Box<dyn Stream<Item = Result<RecordBatch>> + Send + Unpin
 pub struct VectorIndexBuildSummary {
     pub indices_merged: usize,
     pub files: Vec<IndexFile>,
+    pub pca_fingerprint: Option<[u8; 32]>,
+}
+
+struct PcaFileWriterAdapter<'a>(&'a mut FileWriter);
+
+#[async_trait]
+impl IndexWriter for PcaFileWriterAdapter<'_> {
+    async fn write_record_batch(&mut self, _batch: RecordBatch) -> Result<u64> {
+        Err(Error::not_supported(
+            "PCA file-writer adapter does not write record batches",
+        ))
+    }
+
+    async fn add_global_buffer(&mut self, data: bytes::Bytes) -> Result<u32> {
+        self.0.add_global_buffer(data).await
+    }
+
+    async fn finish(&mut self) -> Result<ScalarIndexFile> {
+        Err(Error::not_supported(
+            "PCA file-writer adapter does not finish files",
+        ))
+    }
+
+    async fn finish_with_metadata(
+        &mut self,
+        _metadata: HashMap<String, String>,
+    ) -> Result<ScalarIndexFile> {
+        Err(Error::not_supported(
+            "PCA file-writer adapter does not finish files",
+        ))
+    }
+}
+
+fn validate_pca_writer_shape(
+    model: &PcaModel,
+    quantization_type: QuantizationType,
+    expected_input_dimension: usize,
+    ivf: &IvfModel,
+    rq_rotated_dimension: usize,
+) -> Result<()> {
+    if quantization_type != QuantizationType::Rabit {
+        return Err(Error::invalid_input(format!(
+            "PCA pre-transform requires Rabit quantizer, actual={quantization_type}"
+        )));
+    }
+    let centroids = ivf
+        .centroids_array()
+        .ok_or_else(|| Error::invalid_input("PCA pre-transform requires IVF centroids"))?;
+    match super::pca_component_mismatch(
+        model,
+        expected_input_dimension,
+        ivf.dimension(),
+        &centroids.value_type(),
+        rq_rotated_dimension,
+    ) {
+        None => Ok(()),
+        Some(super::PcaComponentMismatch::InputDimension { actual, expected }) => {
+            Err(Error::invalid_input(format!(
+                "PCA input_dimension actual={actual} expected={expected} from dataset column"
+            )))
+        }
+        Some(super::PcaComponentMismatch::CentroidType { actual }) => Err(Error::invalid_input(
+            format!("IVF centroid dtype actual={actual} expected=Float32 for PCA pre-transform"),
+        )),
+        Some(super::PcaComponentMismatch::OutputDimension { actual, expected }) => {
+            Err(Error::invalid_input(format!(
+                "PCA output_dimension actual={actual} expected={expected} from IVF centroids"
+            )))
+        }
+        Some(super::PcaComponentMismatch::RqDimension { actual, expected }) => {
+            Err(Error::invalid_input(format!(
+                "RQ metadata rotated_dim actual={actual} expected={expected} from PCA output_dimension"
+            )))
+        }
+    }
 }
 
 impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> {
@@ -460,6 +544,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             dataset: Some(dataset),
             shuffler: Some(shuffler.into()),
             ivf_params,
+            pca_params: None,
             quantizer_params,
             sub_index_params: Some(sub_index_params),
             _temp_dir: temp_dir,
@@ -477,6 +562,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             target_partition_size: None,
             transpose_codes: true,
             format_version,
+            pca_model: None,
             progress: Arc::new(NoopIndexBuildProgress),
         })
     }
@@ -529,6 +615,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             dataset: Some(dataset),
             shuffler: None,
             ivf_params: None,
+            pca_params: None,
             quantizer_params: None,
             sub_index_params: None,
             _temp_dir: temp_dir,
@@ -545,6 +632,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             target_partition_size: None,
             transpose_codes: true,
             format_version,
+            pca_model: None,
             progress: Arc::new(NoopIndexBuildProgress),
         })
     }
@@ -552,6 +640,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
     // build the index and return the files created by the writer.
     pub async fn build(&mut self) -> Result<VectorIndexBuildSummary> {
         let progress = self.progress.clone();
+
+        self.train_pre_transform().await?;
 
         // step 1. train IVF & quantizer
         let max_iters = self.ivf_params.as_ref().map(|p| p.max_iters as u64);
@@ -590,6 +680,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         Ok(VectorIndexBuildSummary {
             indices_merged: self.merged_num,
             files,
+            pca_fingerprint: self.pca_model.as_deref().map(PcaModel::fingerprint),
         })
     }
 
@@ -676,6 +767,12 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         self
     }
 
+    /// Configure PCA training for a full new dataset build.
+    pub fn with_pca_params(&mut self, params: PcaParams) -> &mut Self {
+        self.pca_params = Some(params);
+        self
+    }
+
     /// Read existing rows from `indices`, keeping every row they hold.
     pub fn with_existing_indices(&mut self, indices: Vec<Arc<dyn VectorIndex>>) -> &mut Self {
         self.existing_indices = indices.into_iter().map(ExistingIndex::unfiltered).collect();
@@ -735,19 +832,25 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                         "dataset not set before loading or building IVF",
                     ));
                 };
-                let dim = utils::get_vector_dim(dataset.schema(), &self.column)?;
+                let dim = self.training_pre_transform().map_or_else(
+                    || utils::get_vector_dim(dataset.schema(), &self.column),
+                    |transform| Ok(transform.output_dimension()),
+                )?;
                 let ivf_params = self
                     .ivf_params
                     .as_ref()
                     .ok_or(Error::invalid_input("IVF build params not set"))?;
-                super::build_ivf_model(
+                super::build_ivf_model_with_context(
                     dataset,
                     &self.column,
                     dim,
                     self.distance_type,
                     ivf_params,
-                    self.fragment_filter.as_deref(),
-                    self.progress.clone(),
+                    super::IvfModelTrainingContext {
+                        fragment_ids: self.fragment_filter.as_deref(),
+                        pre_transform: self.training_pre_transform(),
+                        progress: self.progress.clone(),
+                    },
                 )
                 .await
             }
@@ -775,28 +878,13 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             "loading training data for quantizer. sample size: {}",
             sample_size_hint
         );
-        let training_data = utils::maybe_sample_training_data(
-            dataset,
-            &self.column,
-            sample_size_hint,
-            self.fragment_filter.as_deref(),
-        )
-        .await?;
+        let training_data = self
+            .sample_stage_training(dataset, sample_size_hint)
+            .await?;
         info!(
             "Finished loading training data in {:02} seconds",
             start.elapsed().as_secs_f32()
         );
-
-        // If metric type is cosine, normalize the training data, and after this point,
-        // treat the metric type as L2.
-        let training_data = if self.distance_type == DistanceType::Cosine {
-            lance_linalg::kernels::normalize_fsl_owned(training_data)?
-        } else {
-            training_data
-        };
-
-        // we filtered out nulls when sampling, but we still need to filter out NaNs and INFs here
-        let training_data = utils::filter_finite_training_data(training_data)?;
 
         let training_data = match (self.ivf.as_ref(), Q::use_residual(self.distance_type)) {
             (Some(ivf), true) => {
@@ -987,12 +1075,13 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         let code_column = quantizer.column();
 
         let transformer = Arc::new(
-            lance_index::vector::ivf::new_ivf_transformer_with_quantizer(
+            lance_index::vector::ivf::new_ivf_transformer_with_pre_transform(
                 ivf.centroids.clone().unwrap(),
                 self.distance_type,
                 &self.column,
                 quantizer.into(),
                 None,
+                self.ivf_pre_transformer(&self.column),
             )?,
         );
 
@@ -1706,6 +1795,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 "quantizer not set before merge partitions",
             ));
         };
+        self.validate_pre_transform(ivf, &quantizer)?;
 
         let quantization_type = Q::quantization_type();
         let is_pq = quantization_type == QuantizationType::Product;
@@ -1951,6 +2041,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             S::metadata_key(),
             serde_json::to_string(&partition_index_metadata)?,
         );
+        self.write_pre_transform(&mut index_writer).await?;
 
         let storage_summary = storage_writer.finish().await?;
         let index_summary = index_writer.finish().await?;
@@ -1967,6 +2058,89 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 size_bytes: index_summary.size_bytes,
             },
         ])
+    }
+
+    /// Train the configured pre-transform before IVF training, which then
+    /// runs in its output space.
+    async fn train_pre_transform(&mut self) -> Result<()> {
+        let Some(pca_params) = self.pca_params.as_ref() else {
+            return Ok(());
+        };
+        if self.pca_model.is_some()
+            || self.ivf.is_some()
+            || self.quantizer.is_some()
+            || !self.existing_indices.is_empty()
+            || self.fragment_filter.is_some()
+            || self.shuffle_reader.is_some()
+            || self.shuffle_data_input.lock().unwrap().is_some()
+        {
+            return Err(Error::invalid_input(
+                "PCA pre-transform is only supported for a full new dataset build",
+            ));
+        }
+        let dataset = self
+            .dataset
+            .as_ref()
+            .ok_or_else(|| Error::invalid_input("PCA pre-transform requires the source dataset"))?;
+        let model = super::pca::PcaTrainer::new(
+            dataset.clone(),
+            self.column.clone(),
+            None,
+            self.progress.clone(),
+        )
+        .train_dataset(pca_params)
+        .await?;
+        self.pca_model = Some(Arc::new(model));
+        Ok(())
+    }
+
+    /// The trained pre-transform as seen by IVF training and partition
+    /// assignment.
+    fn training_pre_transform(&self) -> Option<&dyn TrainingVectorTransform> {
+        self.pca_model
+            .as_deref()
+            .map(|model| model as &dyn TrainingVectorTransform)
+    }
+
+    /// The trained pre-transform as a step of the IVF transform chain over
+    /// `column`.
+    fn ivf_pre_transformer(&self, column: &str) -> Option<Arc<dyn Transformer>> {
+        self.pca_model
+            .clone()
+            .map(|model| Arc::new(PcaTransformer::new(model, column)) as Arc<dyn Transformer>)
+    }
+
+    fn apply_pre_transform(&self, vectors: &FixedSizeListArray) -> Result<FixedSizeListArray> {
+        match self.training_pre_transform() {
+            Some(transform) => transform.transform_vectors(vectors),
+            None => Ok(vectors.clone()),
+        }
+    }
+
+    async fn write_pre_transform(&self, index_writer: &mut FileWriter) -> Result<()> {
+        if let Some(pca_model) = self.pca_model.as_deref() {
+            let mut adapter = PcaFileWriterAdapter(&mut *index_writer);
+            let buffer_index = write_pca_model(&mut adapter, pca_model).await?;
+            index_writer.add_schema_metadata(PCA_METADATA_KEY, buffer_index.to_string());
+        }
+        Ok(())
+    }
+
+    fn validate_pre_transform(&self, ivf: &IvfModel, quantizer: &Q) -> Result<()> {
+        let Some(model) = self.pca_model.as_deref() else {
+            return Ok(());
+        };
+        let dataset = self.dataset.as_ref().ok_or_else(|| {
+            Error::invalid_input("PCA pre-transform requires the source dataset for validation")
+        })?;
+        let expected_input_dimension = utils::get_vector_dim(dataset.schema(), &self.column)?;
+        validate_pca_writer_shape(
+            model,
+            Q::quantization_type(),
+            expected_input_dimension,
+            ivf,
+            quantizer.code_dim(),
+        )
     }
 
     // take raw vectors from the dataset
@@ -2029,6 +2203,24 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 }
             })
             .buffered(prefetch.max(1)))
+    }
+
+    async fn sample_stage_training(
+        &self,
+        dataset: &Dataset,
+        sample_size: usize,
+    ) -> Result<FixedSizeListArray> {
+        let source =
+            DatasetVectorSource::new(dataset, &self.column, self.fragment_filter.as_deref());
+        if let Some(transform) = self.training_pre_transform() {
+            PreTransformVectorSource::try_new(source, transform)?
+                .sample(sample_size)
+                .await
+        } else {
+            source
+                .sample_for_distance(sample_size, self.distance_type)
+                .await
+        }
     }
 
     /// A chunk of raw vectors flattened to one row id per vector (a multivector
@@ -2251,9 +2443,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
 
         let (transformer, vector_field) = self.assign_transformer(new_centroids)?;
         let transformer = Arc::new(transformer);
+        // Centroids are in the pre-transform output space. The rows fetched here
+        // are still the original vectors, so the fetch is sized from that field.
         let (rows_per_fetch, prefetch) = raw_vector_fetch_shape(
             is_multivector_column(dataset.schema(), &self.column)?,
-            new_centroids.value_length() as usize,
+            infer_vector_dim(vector_field.data_type())?,
             &vector_field,
             self.store.block_size(),
         );
@@ -2370,7 +2564,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             )))?
             .as_fixed_size_list()
             .clone();
-        Ok(Some(vectors))
+        Ok(Some(self.apply_pre_transform(&vectors)?))
     }
 
     /// Train the centroids that split one partition `split.ways` ways. Only a
@@ -2676,7 +2870,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         };
         let (rows_per_fetch, prefetch) = raw_vector_fetch_shape(
             multivector,
-            ivf.dimension(),
+            infer_vector_dim(vector_field.data_type())?,
             &vector_field,
             self.store.block_size(),
         );
@@ -2702,22 +2896,28 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 let mut chunks = Box::pin(regroup_by_bytes(fetched, RAW_VECTOR_FETCH_BYTES));
                 while let Some(chunk) = chunks.try_next().await? {
                     let (row_ids, vectors) = self.flatten_raw_vectors(&chunk)?;
+                    let assignment_vectors = self.apply_pre_transform(&vectors)?;
                     for start in (0..row_ids.len()).step_by(JOIN_VECTORS_PER_BATCH) {
                         let end = (start + JOIN_VECTORS_PER_BATCH).min(row_ids.len());
                         let mut assign_ops: BTreeMap<u32, Vec<AssignOp>> = BTreeMap::new();
                         for i in start..end {
-                            let vector = vectors.value(i);
+                            let assignment_vector = assignment_vectors.value(i);
                             let vector_window;
                             let (window_ids, window_centroids) = if multivector {
-                                vector_window =
-                                    window_for_vector(self.distance_type, ivf, &vector, removed)?;
+                                vector_window = window_for_vector(
+                                    self.distance_type,
+                                    ivf,
+                                    &assignment_vector,
+                                    removed,
+                                )?;
                                 &vector_window
                             } else {
                                 &partition_window
                             };
-                            let (target, had_room) = choose_join_destination(
+                            let (target, had_room) = choose_assignment_destination::<T>(
+                                self.training_pre_transform().is_some(),
                                 self.distance_type,
-                                vector.as_primitive::<T>(),
+                                &assignment_vector,
                                 window_ids,
                                 window_centroids,
                                 ivf,
@@ -2732,7 +2932,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                             assign_ops
                                 .entry(target)
                                 .or_default()
-                                .push(AssignOp::Add((row_ids.value(i), vector)));
+                                .push(AssignOp::Add((row_ids.value(i), vectors.value(i))));
                         }
                         for (target, ops) in assign_ops {
                             let batch = Self::build_assign_batch::<T>(
@@ -2793,12 +2993,13 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             ));
         };
 
-        let transformer = lance_index::vector::ivf::new_ivf_transformer_with_quantizer(
+        let transformer = lance_index::vector::ivf::new_ivf_transformer_with_pre_transform(
             centroids.clone(),
             self.distance_type,
             vector_field.name().as_str(),
             quantizer.into(),
             None,
+            self.ivf_pre_transformer(vector_field.name()),
         )?;
         Ok((transformer, vector_field))
     }
@@ -2969,6 +3170,43 @@ where
         .filter(|&(i, _)| accept(candidate_ids.value(i)))
         .min_by(|(_, a), (_, b)| a.total_cmp(b))
         .map(|(i, _)| candidate_ids.value(i)))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn choose_assignment_destination<T: ArrowPrimitiveType>(
+    projected_f32: bool,
+    distance_type: DistanceType,
+    assignment_vector: &ArrayRef,
+    window_ids: &UInt32Array,
+    window_centroids: &FixedSizeListArray,
+    ivf: &IvfModel,
+    removed: &HashSet<usize>,
+    room: &[usize],
+) -> Result<(u32, bool)>
+where
+    T::Native: Dot + L2 + Normalize,
+{
+    if projected_f32 {
+        choose_join_destination(
+            distance_type,
+            assignment_vector.as_primitive::<Float32Type>(),
+            window_ids,
+            window_centroids,
+            ivf,
+            removed,
+            room,
+        )
+    } else {
+        choose_join_destination(
+            distance_type,
+            assignment_vector.as_primitive::<T>(),
+            window_ids,
+            window_centroids,
+            ivf,
+            removed,
+            room,
+        )
+    }
 }
 
 /// Where a row of a joined partition goes: the nearest of the `window` (the
@@ -3259,6 +3497,89 @@ mod tests {
     use lance_index::vector::v3::shuffler::{
         ShufflePartition, ShufflePartitionWindow, ShufflePartitionWindowPlan,
     };
+
+    fn writer_test_pca_model() -> PcaModel {
+        let vectors = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(vec![
+                1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, -1.0, -1.0, -1.0,
+            ]),
+            3,
+        )
+        .unwrap();
+        PcaModel::train(&vectors, &lance_index::vector::pca::PcaParams::new(2)).unwrap()
+    }
+
+    #[test]
+    fn validate_pca_writer_shape_rejects_inconsistent_components() {
+        let model = writer_test_pca_model();
+        let valid_centroids = IvfModel::new(
+            FixedSizeListArray::try_new_from_values(
+                Float32Array::from(vec![0.0, 0.0, 1.0, 1.0]),
+                2,
+            )
+            .unwrap(),
+            None,
+        );
+        let cases = [
+            (
+                validate_pca_writer_shape(
+                    &model,
+                    QuantizationType::Product,
+                    3,
+                    &valid_centroids,
+                    2,
+                ),
+                "Rabit quantizer",
+            ),
+            (
+                validate_pca_writer_shape(&model, QuantizationType::Rabit, 4, &valid_centroids, 2),
+                "input_dimension actual=3 expected=4",
+            ),
+            (
+                validate_pca_writer_shape(
+                    &model,
+                    QuantizationType::Rabit,
+                    3,
+                    &IvfModel::new(
+                        FixedSizeListArray::try_new_from_values(
+                            Float32Array::from(vec![0.0, 0.0, 0.0]),
+                            1,
+                        )
+                        .unwrap(),
+                        None,
+                    ),
+                    2,
+                ),
+                "output_dimension actual=2 expected=1",
+            ),
+            (
+                validate_pca_writer_shape(
+                    &model,
+                    QuantizationType::Rabit,
+                    3,
+                    &IvfModel::new(
+                        FixedSizeListArray::try_new_from_values(
+                            arrow_array::Float64Array::from(vec![0.0, 0.0]),
+                            2,
+                        )
+                        .unwrap(),
+                        None,
+                    ),
+                    2,
+                ),
+                "centroid dtype actual=Float64 expected=Float32",
+            ),
+            (
+                validate_pca_writer_shape(&model, QuantizationType::Rabit, 3, &valid_centroids, 1),
+                "rotated_dim actual=1 expected=2",
+            ),
+        ];
+        for (result, message) in cases {
+            let error = result.unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }));
+            assert!(error.to_string().contains(message), "{error}");
+        }
+    }
 
     struct SingleBatchReader {
         batch: RecordBatch,
