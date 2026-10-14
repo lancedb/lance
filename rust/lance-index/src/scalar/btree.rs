@@ -8056,12 +8056,13 @@ mod tests {
         ))
     }
 
-    /// `rows` sorted `(value, _rowid)` pairs from `start`, so segments built from different
+    /// `rows` sorted `(value, _rowaddr)` pairs from `start`, so segments built from different
     /// starts are disjoint.
     fn sorted_values(start: i32, rows: i32) -> SendableRecordBatchStream {
         let values: Vec<i32> = (start..start + rows).collect();
         let row_ids: Vec<u64> = values.iter().map(|v| *v as u64).collect();
-        let batch = record_batch!(("value", Int32, values), ("_rowid", UInt64, row_ids)).unwrap();
+        let batch =
+            record_batch!(("value", Int32, values), ("_rowaddr", UInt64, row_ids)).unwrap();
         Box::pin(RecordBatchStreamAdapter::new(
             batch.schema(),
             stream::once(futures::future::ok(batch)),
