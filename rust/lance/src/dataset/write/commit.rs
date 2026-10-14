@@ -264,6 +264,9 @@ impl<'a> CommitBuilder<'a> {
     /// Detached commits reject keys. Cannot be combined with
     /// [`Self::with_idempotency_property`].
     ///
+    /// Experimental: how the keys are stored and checked may change
+    /// incompatibly until the format feature is stabilized.
+    ///
     /// # Examples
     ///
     /// ```

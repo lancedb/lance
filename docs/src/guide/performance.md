@@ -303,6 +303,10 @@ For more details on which operations conflict with each other, see
 
 ### Idempotency Keys
 
+!!! warning "Experimental"
+
+    Idempotency keys are an experimental format feature and may change incompatibly.
+
 A commit with [idempotency keys](../format/table/transaction.md#idempotency-keys) compares its keys with
 the keys of every transaction committed after its read version. The keys are stored with the transaction,
 so each later keyed commit in the same window reads them again. To bound this cost, Lance limits the keys
