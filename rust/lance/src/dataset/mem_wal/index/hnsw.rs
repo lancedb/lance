@@ -157,8 +157,9 @@ impl HnswMemIndex {
         self.len() == 0
     }
 
-    /// Upper bound on heap bytes held, sized by `capacity`: the first insert
-    /// allocates the whole graph, so it is reported before that insert too.
+    /// Upper bound on heap bytes held. The first insert allocates the graph's
+    /// fixed part, sized by `capacity`, so that part is reported before the
+    /// insert too; each node's neighbor lists are charged as it is inserted.
     pub(crate) fn resident_bytes(&self) -> usize {
         match self.state.get() {
             Some(s) => s.graph.resident_bytes() + s.storage.resident_bytes(),

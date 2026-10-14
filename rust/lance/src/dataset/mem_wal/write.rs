@@ -921,8 +921,8 @@ impl ShardMemory {
     /// figure, not another term to add. `0` in WAL-only mode, which has none.
     ///
     /// Broken out because it does not behave like row data and is usually what
-    /// explains a shard near its ceiling with few rows in it: an HNSW graph is
-    /// pre-allocated in full on the first insert.
+    /// explains a shard near its ceiling with few rows in it: an HNSW graph
+    /// allocates a fixed part sized by `max_memtable_rows` on the first insert.
     pub fn index_bytes(&self) -> usize {
         match &self.source {
             ShardMemorySource::MemTables(t) => t
@@ -2826,7 +2826,7 @@ impl ShardWriter {
         let writer_schema = if config.enable_memtable {
             let writer_schema = WriterSchema::try_new(&schema, index_specs)?;
 
-            // An HNSW graph reserves its whole capacity before the first insert,
+            // An HNSW graph reserves its fixed part before the first insert,
             // but the seal trigger only measures row bytes. A reservation with no
             // room left under the ceiling puts the shard over budget at zero rows
             // — nothing to seal, so nothing to flush, so every put stalls and then

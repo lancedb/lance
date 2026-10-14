@@ -226,26 +226,25 @@ struct LevelLinks {
 }
 
 impl LevelLinks {
-    fn new() -> Self {
+    /// `empty` is one empty list the whole graph shares until a level first
+    /// publishes, so an unfilled slot allocates nothing per level.
+    fn new(empty: &Arc<Vec<u32>>) -> Self {
         Self {
-            published: ArcSwap::from_pointee(Vec::<u32>::new()),
+            published: ArcSwap::new(Arc::clone(empty)),
             ranked: Mutex::new(Vec::new()),
         }
     }
 
-    /// Heap bytes every level holds from construction: the `Arc` behind the
-    /// empty `published` list (strong + weak refcounts and the Vec header),
-    /// rounded to the 16-byte granule allocators hand out for a block this
-    /// small. One per level of every slot, so the rounding is not noise.
-    fn fixed_bytes() -> usize {
-        (2 * std::mem::size_of::<usize>() + std::mem::size_of::<Vec<u32>>()).next_multiple_of(16)
-    }
-
     /// Heap bytes a level adds once its node is in the graph: `ranked` at
-    /// exactly `max_neighbors` (it never holds more between operations), and
-    /// `published` counted at full width though a publish may hold fewer.
+    /// exactly `max_neighbors`, and a published list counted at full width
+    /// (a publish may hold fewer) plus its `Arc` block (refcounts and the Vec
+    /// header), rounded to the 16-byte granule allocators hand out for a
+    /// block that small.
     fn linked_bytes(max_neighbors: usize) -> usize {
-        max_neighbors * (std::mem::size_of::<ScoredPoint>() + std::mem::size_of::<u32>())
+        let published_block = (2 * std::mem::size_of::<usize>() + std::mem::size_of::<Vec<u32>>())
+            .next_multiple_of(16);
+        published_block
+            + max_neighbors * (std::mem::size_of::<ScoredPoint>() + std::mem::size_of::<u32>())
     }
 
     fn publish_from_ranked(&self, ranked: &[ScoredPoint]) {
@@ -262,8 +261,8 @@ struct Node {
 }
 
 impl Node {
-    fn new(target_level: u16) -> Self {
-        let levels = (0..=target_level).map(|_| LevelLinks::new()).collect();
+    fn new(target_level: u16, empty: &Arc<Vec<u32>>) -> Self {
+        let levels = (0..=target_level).map(|_| LevelLinks::new(empty)).collect();
         Self {
             target_level,
             levels,
@@ -274,8 +273,7 @@ impl Node {
     /// Heap bytes a node of `target_level` holds from construction, excluding
     /// the `Node` itself (which lives inline in the graph's node arena).
     fn fixed_bytes(target_level: u16) -> usize {
-        (target_level as usize + 1)
-            * (std::mem::size_of::<LevelLinks>() + LevelLinks::fixed_bytes())
+        (target_level as usize + 1) * std::mem::size_of::<LevelLinks>()
     }
 
     /// Heap bytes a node of `target_level` adds once it is in the graph.
@@ -344,6 +342,7 @@ impl HnswGraph {
         }
 
         let mut rng = SmallRng::seed_from_u64(params.seed);
+        let empty = Arc::new(Vec::new());
         let mut nodes = Vec::with_capacity(capacity);
         let mut node_bytes = 0;
         for id in 0..capacity {
@@ -353,7 +352,7 @@ impl HnswGraph {
                 random_level(&params, &mut rng)
             };
             node_bytes += Node::fixed_bytes(target_level);
-            nodes.push(Node::new(target_level));
+            nodes.push(Node::new(target_level, &empty));
         }
 
         let pool_size = visited_pool_size();
@@ -415,7 +414,7 @@ impl HnswGraph {
         let mut reaching = capacity;
         let mut links = 0;
         for _ in 0..params.max_level {
-            links += reaching * (std::mem::size_of::<LevelLinks>() + LevelLinks::fixed_bytes());
+            links += reaching * std::mem::size_of::<LevelLinks>();
             reaching /= ratio;
             if reaching == 0 {
                 break;
@@ -1070,24 +1069,9 @@ impl HnswGraph {
         candidates: &[ScoredPoint],
         limit: usize,
     ) -> Vec<ScoredPoint> {
-        if candidates.len() <= limit {
-            let mut candidates = candidates.to_vec();
-            candidates.sort_unstable();
-            return candidates;
-        }
-
         let mut candidates = candidates.to_vec();
-        candidates.sort_unstable();
-        let mut selected = Vec::with_capacity(limit);
-        for candidate in candidates {
-            if selected.len() == limit {
-                break;
-            }
-            if selected.is_empty() || vectors.prefers_candidate(candidate, &selected) {
-                selected.push(candidate);
-            }
-        }
-        selected
+        prune_neighbors(vectors, &mut candidates, limit);
+        candidates
     }
 
     fn set_node_neighbors(&self, id: u32, level: u16, neighbors: &[ScoredPoint]) -> Result<()> {
@@ -1120,11 +1104,19 @@ impl HnswGraph {
         // A level the node was never connected at (the first node, or a level
         // above the graph's top when it was inserted) is first reached here.
         size_ranked(&mut ranked, limit);
-        ranked.push(ScoredPoint::new(neighbor, distance));
-        if ranked.len() > limit {
-            *ranked = self.select_neighbors(vectors, &ranked, limit);
-        } else {
+        let point = ScoredPoint::new(neighbor, distance);
+        if ranked.len() < limit {
+            ranked.push(point);
             ranked.sort_unstable();
+        } else {
+            // Full: prune the list plus the newcomer in one scratch buffer and
+            // copy the survivors back, so `ranked` keeps its capacity.
+            let mut candidates = Vec::with_capacity(ranked.len() + 1);
+            candidates.extend_from_slice(&ranked);
+            candidates.push(point);
+            prune_neighbors(vectors, &mut candidates, limit);
+            ranked.clear();
+            ranked.extend_from_slice(&candidates);
         }
         node.mark_dirty(level);
         Ok(())
@@ -1226,10 +1218,33 @@ fn max_neighbors(m: usize, level: u16) -> usize {
     if level == 0 { m * 2 } else { m }
 }
 
-/// Give a node's `ranked` list its full `max_neighbors` the first time it is
-/// written, and never more: from then on it is filled in place, so its
-/// capacity is what [`LevelLinks::linked_bytes`] charges. A push past the
-/// limit grows it only until the same lock replaces it with a pruned list.
+/// Sort `candidates` nearest first and keep at most `limit` of them, each one
+/// kept only if the vectors prefer it over every candidate already kept (the
+/// HNSW diversity heuristic). Compacts in place: the kept prefix is written
+/// behind the read position, so no second buffer is needed.
+fn prune_neighbors(vectors: &impl VectorSource, candidates: &mut Vec<ScoredPoint>, limit: usize) {
+    candidates.sort_unstable();
+    if candidates.len() <= limit {
+        return;
+    }
+    let mut kept = 0;
+    for read in 0..candidates.len() {
+        if kept == limit {
+            break;
+        }
+        let candidate = candidates[read];
+        if kept == 0 || vectors.prefers_candidate(candidate, &candidates[..kept]) {
+            candidates[kept] = candidate;
+            kept += 1;
+        }
+    }
+    candidates.truncate(kept);
+}
+
+/// Give a node's `ranked` list exactly `max_neighbors` of capacity the first
+/// time it is written. Every later write fits in it (a full list is pruned
+/// through a scratch buffer), so its capacity is what
+/// [`LevelLinks::linked_bytes`] charges.
 fn size_ranked(ranked: &mut Vec<ScoredPoint>, max_neighbors: usize) {
     if ranked.capacity() < max_neighbors {
         ranked.reserve_exact(max_neighbors - ranked.len());
@@ -1350,20 +1365,44 @@ mod tests {
         assert!(result.iter().any(|point| point.id == 42));
     }
 
-    /// The charge for a node's neighbor lists is `max_neighbors` per level, so
-    /// no list may hold more once a build settles, and a slot never filled may
-    /// hold none. The first node and any node above the graph's top level are
-    /// only ever reached through reverse edges, so this covers that path too.
+    /// Points in general position, so the diversity heuristic has real choices.
+    fn scattered(rows: usize, dim: usize) -> Arc<FixedSizeListArray> {
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        let values: Vec<f32> = (0..rows * dim)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (state >> 40) as f32 / (1u64 << 24) as f32
+            })
+            .collect();
+        Arc::new(
+            FixedSizeListArray::try_new(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                dim as i32,
+                Arc::new(Float32Array::from(values)) as ArrayRef,
+                None,
+            )
+            .unwrap(),
+        )
+    }
+
+    /// Each node's neighbor lists are charged as it is inserted and hold
+    /// exactly `max_neighbors` once written, across incremental batches and
+    /// through full lists taking further reverse edges; slots never filled
+    /// allocate none. The first node and levels above the graph's top when a
+    /// node was inserted are only reached through reverse edges, so that path
+    /// is covered too.
     #[test]
-    fn test_neighbor_lists_are_sized_once_and_only_for_inserted_nodes() {
-        let rows = 300;
+    fn test_neighbor_lists_are_charged_and_bounded_per_inserted_node() {
+        let rows = 400;
         let capacity = 512;
-        let dim = 16;
-        let m = 8;
+        let dim = 8;
+        let m = 4;
         let store = Arc::new(
             ArrowFixedSizeListVectorStore::try_new(capacity, 4, dim, DistanceType::L2).unwrap(),
         );
-        let ids = store.append_batch(fsl(rows, dim), 0).unwrap();
+        store.append_batch(scattered(rows, dim), 0).unwrap();
         let snapshot = store.snapshot();
         let graph = HnswGraph::try_new(
             capacity,
@@ -1375,31 +1414,122 @@ mod tests {
         .unwrap();
         let fixed = graph.resident_bytes();
 
-        graph.insert_batch(ids, &snapshot).unwrap();
-
-        for (id, node) in graph.nodes.iter().enumerate() {
-            for level in 0..node.levels.len() as u16 {
-                let ranked = node.ranked(level).unwrap();
-                if id < rows {
-                    assert!(
-                        ranked.capacity() <= max_neighbors(m, level),
-                        "node {id} level {level} holds {} slots, over the charged {}",
-                        ranked.capacity(),
-                        max_neighbors(m, level)
-                    );
-                } else {
-                    assert_eq!(ranked.capacity(), 0, "unfilled slot {id} allocated a list");
+        let check = |inserted: usize| {
+            for (id, node) in graph.nodes.iter().enumerate() {
+                for level in 0..node.levels.len() as u16 {
+                    let capacity = node.ranked(level).unwrap().capacity();
+                    if id < inserted {
+                        assert!(
+                            capacity == 0 || capacity == max_neighbors(m, level),
+                            "node {id} level {level} holds {capacity} slots, charged {}",
+                            max_neighbors(m, level)
+                        );
+                    } else {
+                        assert_eq!(capacity, 0, "unfilled slot {id} allocated a list");
+                    }
                 }
             }
+            let linked: usize = graph.nodes[..inserted]
+                .iter()
+                .map(|node| Node::linked_bytes(node.target_level, m))
+                .sum();
+            assert_eq!(
+                graph.resident_bytes(),
+                fixed + linked + graph.packed_bytes.load(Ordering::Relaxed),
+                "charge after {inserted} rows"
+            );
+        };
+        for start in (0..rows as u32).step_by(50) {
+            graph.insert_batch(start..start + 50, &snapshot).unwrap();
+            check(start as usize + 50);
         }
-        let linked: usize = graph.nodes[..rows]
-            .iter()
-            .map(|node| Node::linked_bytes(node.target_level, m))
-            .sum();
-        assert_eq!(
-            graph.resident_bytes(),
-            fixed + linked + graph.packed_bytes.load(Ordering::Relaxed)
-        );
+
+        // A full level-0 list taking one more edge keeps its capacity and its
+        // limit; the graph's own build has already done this many times.
+        let limit = max_neighbors(m, 0);
+        let target = (0..rows as u32)
+            .find(|&id| graph.nodes[id as usize].ranked(0).unwrap().len() == limit)
+            .expect("some level-0 list should be full");
+        let newcomer = (0..rows as u32)
+            .find(|&id| {
+                id != target
+                    && !graph.nodes[target as usize]
+                        .ranked(0)
+                        .unwrap()
+                        .iter()
+                        .any(|point| point.id == id)
+            })
+            .unwrap();
+        graph
+            .add_reverse_edge(
+                &snapshot,
+                target,
+                newcomer,
+                snapshot.distance_between(target, newcomer),
+                0,
+            )
+            .unwrap();
+        let ranked = graph.nodes[target as usize].ranked(0).unwrap();
+        assert_eq!(ranked.capacity(), limit);
+        assert!(ranked.len() <= limit);
+        drop(ranked);
+        check(rows);
+    }
+
+    /// Pruning in place keeps exactly what the original selection kept: the
+    /// same heuristic, in the same order. The reference is that original
+    /// algorithm, copied verbatim.
+    #[test]
+    fn test_prune_neighbors_matches_the_original_selection() {
+        fn reference(
+            vectors: &impl VectorSource,
+            candidates: &[ScoredPoint],
+            limit: usize,
+        ) -> Vec<ScoredPoint> {
+            let mut candidates = candidates.to_vec();
+            candidates.sort_unstable();
+            if candidates.len() <= limit {
+                return candidates;
+            }
+            let mut selected = Vec::with_capacity(limit);
+            for candidate in candidates {
+                if selected.len() == limit {
+                    break;
+                }
+                if selected.is_empty() || vectors.prefers_candidate(candidate, &selected) {
+                    selected.push(candidate);
+                }
+            }
+            selected
+        }
+
+        let rows = 200;
+        let store =
+            Arc::new(ArrowFixedSizeListVectorStore::try_new(rows, 1, 8, DistanceType::L2).unwrap());
+        store.append_batch(scattered(rows, 8), 0).unwrap();
+        let snapshot = store.snapshot();
+        let mut state = 7_u64;
+        let mut next = |bound: u64| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 33) % bound) as u32
+        };
+        for _ in 0..300 {
+            let base = next(rows as u64);
+            let count = 1 + next(40) as usize;
+            let limit = 1 + next(20) as usize;
+            let mut candidates: Vec<ScoredPoint> = Vec::new();
+            while candidates.len() < count {
+                let id = next(rows as u64);
+                if id != base && !candidates.iter().any(|point| point.id == id) {
+                    candidates.push(ScoredPoint::new(id, snapshot.distance_between(base, id)));
+                }
+            }
+            let mut pruned = candidates.clone();
+            prune_neighbors(&snapshot, &mut pruned, limit);
+            assert_eq!(pruned, reference(&snapshot, &candidates, limit));
+        }
     }
 
     /// The graph must be exportable to a boundary its caller chose, because the

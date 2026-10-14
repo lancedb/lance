@@ -726,7 +726,8 @@ impl BytesBackend {
 /// Heap a stored `ScalarValue` key owns outside the arena node it sits in.
 ///
 /// Only the string and binary variants own their bytes; numeric, boolean,
-/// decimal and temporal values live inline in the node. Nested values (lists,
+/// decimal and temporal values live inline in the node. A dictionary value
+/// boxes its key type and its decoded value, which may itself own a string. Nested values (lists,
 /// structs, maps) hold an Arrow array sliced from the inserted batch, sharing
 /// buffers the batch store already charges; only a small per-row header and
 /// offsets array is theirs, and that is not counted. `ScalarValue::size` is no
@@ -740,6 +741,11 @@ fn owned_heap_bytes(value: &ScalarValue) -> usize {
         | ScalarValue::LargeBinary(Some(b))
         | ScalarValue::BinaryView(Some(b))
         | ScalarValue::FixedSizeBinary(_, Some(b)) => b.capacity(),
+        ScalarValue::Dictionary(_, inner) => {
+            std::mem::size_of::<DataType>().next_multiple_of(16)
+                + std::mem::size_of::<ScalarValue>().next_multiple_of(16)
+                + owned_heap_bytes(inner)
+        }
         _ => 0,
     }
 }
@@ -765,8 +771,10 @@ impl ScalarBackend {
     fn add(&self, value: OrderableScalarValue, row_position: RowPosition) -> bool {
         // Charged before the key is published, so a concurrent memory read
         // never sees a key without its heap.
-        self.key_heap_bytes
-            .fetch_add(owned_heap_bytes(&value.0), Ordering::Relaxed);
+        let heap = owned_heap_bytes(&value.0);
+        if heap > 0 {
+            self.key_heap_bytes.fetch_add(heap, Ordering::Relaxed);
+        }
         let probe = value.clone();
         self.writer.lock().unwrap().insert_and_check_neighbors(
             IndexKey {
@@ -1543,6 +1551,16 @@ mod tests {
         assert!(
             wide - short >= rows * (long.len() - 1),
             "{rows} keys of {} bytes should add their bytes: {short} -> {wide}",
+            long.len()
+        );
+
+        // A dictionary of strings decodes each value into an owned string too.
+        let dictionary: arrow_array::DictionaryArray<arrow_array::types::Int32Type> =
+            vec![long.as_str(); rows].into_iter().collect();
+        let dictionary = charge(Arc::new(dictionary));
+        assert!(
+            dictionary >= rows * long.len(),
+            "{rows} dictionary keys of {} bytes should add their bytes, got {dictionary}",
             long.len()
         );
 
