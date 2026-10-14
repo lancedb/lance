@@ -30,7 +30,7 @@ use arrow_array::{
     types::{UInt8Type, UInt32Type, UInt64Type},
 };
 use arrow_buffer::NullBufferBuilder;
-use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+use arrow_schema::{DataType, Field, Fields, Schema as ArrowSchema};
 use bytes::Bytes;
 use lance_arrow::{
     ARROW_EXT_NAME_KEY, BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY,
@@ -39,7 +39,8 @@ use lance_arrow::{
 use lance_core::{
     datatypes::{
         BLOB_V2_DESC_TYPE, BLOB_V2_LOGICAL_MINIMAL_FIELDS, BLOB_V2_PREPARED_FIELDS,
-        BLOB_V2_PREPARED_TYPE, BlobKind, BlobV2Layout, Field as LanceField, Schema as LanceSchema,
+        BLOB_V2_PREPARED_TYPE, BlobKind, BlobV2Layout, Field as LanceField, LANCE_FIELD_ID_KEY,
+        Schema as LanceSchema,
     },
     utils::blob::blob_path,
 };
@@ -142,14 +143,52 @@ pub(crate) fn prepared_blob_field_with_metadata(
     Field::new(name, BLOB_V2_PREPARED_TYPE.clone(), nullable).with_metadata(metadata)
 }
 
+/// `prepared` with each child that shares a name with one of `source`'s
+/// children taking that child's field id. A generation written from the
+/// prepared layout then keeps the ids its table gives `data` and `uri`; the
+/// prepared-only children get fresh ones.
+fn with_child_field_ids_of(prepared: Field, source: &Field) -> Field {
+    let (DataType::Struct(prepared_children), DataType::Struct(source_children)) =
+        (prepared.data_type(), source.data_type())
+    else {
+        return prepared;
+    };
+    let children: Fields = prepared_children
+        .iter()
+        .map(|child| {
+            let id = source_children
+                .iter()
+                .find(|source_child| source_child.name() == child.name())
+                .and_then(|source_child| source_child.metadata().get(LANCE_FIELD_ID_KEY));
+            match id {
+                Some(id) => {
+                    let mut metadata = child.metadata().clone();
+                    metadata.insert(LANCE_FIELD_ID_KEY.to_string(), id.clone());
+                    Arc::new(child.as_ref().clone().with_metadata(metadata))
+                }
+                None => child.clone(),
+            }
+        })
+        .collect();
+    Field::new(
+        prepared.name(),
+        DataType::Struct(children),
+        prepared.is_nullable(),
+    )
+    .with_metadata(prepared.metadata().clone())
+}
+
 fn logical_to_prepared_blob_field(field: &Field) -> Result<Field> {
     if field.is_blob_v2() {
         return match blob_v2_layout(field) {
             Some(BlobV2Layout::Logical) | Some(BlobV2Layout::Prepared) => {
-                Ok(prepared_blob_field_with_metadata(
-                    field.name(),
-                    field.is_nullable(),
-                    field.metadata().clone(),
+                Ok(with_child_field_ids_of(
+                    prepared_blob_field_with_metadata(
+                        field.name(),
+                        field.is_nullable(),
+                        field.metadata().clone(),
+                    ),
+                    field,
                 ))
             }
             _ => Err(blob_v2_shape_error(
