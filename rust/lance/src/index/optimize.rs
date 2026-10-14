@@ -263,23 +263,22 @@ async fn fragment_row_count(dataset: &Dataset, fragment: &Fragment) -> Result<u6
     }
 }
 
-/// First-fit bin packing: each item goes into the first bin with room, or a
-/// new one, so an item over the limit fills a bin alone. Without a limit
-/// everything shares one bin.
-fn pack_first_fit<T>(items: Vec<(T, u64)>, limit: Option<u64>) -> Vec<Vec<T>> {
+/// Next-fit bin packing: each item joins the last bin while it has room, or
+/// opens a new one, so an item over the limit fills a bin alone and an item
+/// never goes back to an earlier bin. Without a limit everything shares one
+/// bin. Over items in fragment order every bin is a contiguous run of
+/// fragments, which compaction needs to bin neighbors together.
+fn pack_next_fit<T>(items: Vec<(T, u64)>, limit: Option<u64>) -> Vec<Vec<T>> {
     let limit = limit.unwrap_or(u64::MAX);
     // (items, rows used)
     let mut bins: Vec<(Vec<T>, u64)> = Vec::new();
     for (item, rows) in items {
-        match bins
-            .iter_mut()
-            .find(|(_, used)| used.saturating_add(rows) <= limit)
-        {
-            Some((bin, used)) => {
+        match bins.last_mut() {
+            Some((bin, used)) if used.saturating_add(rows) <= limit => {
                 bin.push(item);
                 *used = used.saturating_add(rows);
             }
-            None => bins.push((vec![item], rows)),
+            _ => bins.push((vec![item], rows)),
         }
     }
     bins.into_iter().map(|(items, _)| items).collect()
@@ -796,19 +795,20 @@ async fn pack_split_index(
         );
     }
 
-    let build_inputs = fragments
+    let mut build_inputs: Vec<(u32, u64)> = fragments
         .iter()
         .map(|fragment| {
             let id = fragment.id as u32;
             (id, rows_by_fragment.get(&id).copied().unwrap_or(0))
         })
         .collect();
+    build_inputs.sort_by_key(|(id, _)| *id);
     // A task's output is never split, so it holds no more than a segment may.
     let task_limit = [options.max_rows_per_task, options.max_rows_per_segment]
         .into_iter()
         .flatten()
         .min();
-    let fragment_groups = pack_first_fit(build_inputs, task_limit);
+    let fragment_groups = pack_next_fit(build_inputs, task_limit);
 
     enum MergeInput {
         Absorbed(IndexMetadata),
@@ -831,8 +831,15 @@ async fn pack_split_index(
             .sum();
         merge_inputs.push((MergeInput::Build(group), rows));
     }
+    // In fragment order, so an output segment covers a contiguous run too.
+    merge_inputs.sort_by_cached_key(|(input, _)| match input {
+        MergeInput::Absorbed(segment) => segment
+            .effective_fragment_bitmap(&dataset.fragment_bitmap)
+            .and_then(|bitmap| bitmap.min()),
+        MergeInput::Build(fragments) => fragments.first().copied(),
+    });
 
-    for bin in pack_first_fit(merge_inputs, options.max_rows_per_segment) {
+    for bin in pack_next_fit(merge_inputs, options.max_rows_per_segment) {
         let mut absorbed = Vec::new();
         let mut builds = Vec::new();
         for input in bin {
@@ -1379,18 +1386,19 @@ mod tests {
     }
 
     #[test]
-    fn test_pack_first_fit() {
-        // Over the limit: a bin of its own. Otherwise first bin with room.
-        let bins = pack_first_fit(
+    fn test_pack_next_fit() {
+        // Over the limit: a bin of its own. Otherwise the last bin while it
+        // has room; "d" does not go back to "a", keeping bins contiguous.
+        let bins = pack_next_fit(
             vec![("a", 300), ("b", 5000), ("c", 400), ("d", 200), ("e", 900)],
             Some(1000),
         );
-        assert_eq!(bins, vec![vec!["a", "c", "d"], vec!["b"], vec!["e"]]);
+        assert_eq!(bins, vec![vec!["a"], vec!["b"], vec!["c", "d"], vec!["e"]]);
         assert_eq!(
-            pack_first_fit(vec![("a", 1), ("b", 2)], None),
+            pack_next_fit(vec![("a", 1), ("b", 2)], None),
             vec![vec!["a", "b"]]
         );
-        assert!(pack_first_fit::<&str>(vec![], None).is_empty());
+        assert!(pack_next_fit::<&str>(vec![], None).is_empty());
     }
 
     #[tokio::test]
