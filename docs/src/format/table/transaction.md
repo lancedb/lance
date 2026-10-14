@@ -607,6 +607,14 @@ When a concurrent transaction is detected, the rebase process:
 
 ### Idempotency Keys
 
+!!! warning "Experimental"
+
+    Idempotency keys are an experimental format feature. The reserved
+    property, its encoding and the conflict rule may change incompatibly
+    without a separate vote, and the feature is removed if its
+    stabilization vote does not pass. Removing it never rewrites data:
+    writers that do not implement it see an ordinary transaction property.
+
 A transaction may carry idempotency keys: strings chosen by the application that identify units of work which must be applied to the table at most once.
 For example, a queue consumer whose messages can be redelivered to another consumer uses the message ids as keys.
 
