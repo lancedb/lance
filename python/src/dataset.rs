@@ -3238,7 +3238,7 @@ impl Dataset {
                 let dataset = match dataset {
                     Some(dataset)
                         if rust_transaction.read_version != 0
-                            && dataset.version().version != rust_transaction.read_version =>
+                            && dataset.version_id() != rust_transaction.read_version =>
                     {
                         Some(Arc::new(
                             dataset
