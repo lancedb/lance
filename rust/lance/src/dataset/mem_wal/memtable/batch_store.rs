@@ -44,7 +44,7 @@ use std::cell::UnsafeCell;
 use std::collections::HashSet;
 use std::mem::MaybeUninit;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use arrow::array::ArrayData;
 use arrow_array::RecordBatch;
@@ -296,12 +296,6 @@ pub struct BatchStore {
     /// Generation-scoped Blob v2 writer. Durable puts reuse its current pack;
     /// the WAL path seals it before persisting any descriptors that reference it.
     blob_preprocessor: AsyncMutex<BlobPreprocessorState>,
-
-    /// Highest WAL entry position holding any of these batches; 0 when none
-    /// does yet (WAL positions start at 1). A memtable flush records this as
-    /// the WAL position it covers, so it must be raised before the durability
-    /// cursor shows the batches as appended.
-    last_wal_entry_position: AtomicU64,
 }
 
 // SAFETY: Safe to share across threads because:
@@ -372,7 +366,6 @@ impl BatchStore {
             target,
             generation,
             blob_preprocessor: AsyncMutex::new(BlobPreprocessorState::default()),
-            last_wal_entry_position: AtomicU64::new(0),
         }
     }
 
@@ -708,21 +701,6 @@ impl BatchStore {
             }
         }
         Ok(())
-    }
-
-    /// Record that the WAL entry at `position` holds batches of this store.
-    pub(crate) fn record_wal_entry_position(&self, position: u64) {
-        self.last_wal_entry_position
-            .fetch_max(position, Ordering::AcqRel);
-    }
-
-    /// Highest WAL entry position holding batches of this store, or `None`
-    /// if none has been recorded.
-    pub(crate) fn last_wal_entry_position(&self) -> Option<u64> {
-        match self.last_wal_entry_position.load(Ordering::Acquire) {
-            0 => None,
-            position => Some(position),
-        }
     }
 
     /// The local exclusive end of this store covered by a writer-global cursor.

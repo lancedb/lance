@@ -913,11 +913,6 @@ impl WalFlusher {
             .await?;
         let wal_io_duration = start.elapsed();
 
-        // Record the entry on the store before advancing the durability
-        // cursor: a freeze that finds these batches durable takes its covered
-        // position from the store.
-        batch_store.record_wal_entry_position(append_result.entry_position);
-
         // Advance the writer-global durability cursor and wake waiters. The range
         // just appended is `[start, end)` *local to this store*, so it must be
         // lifted into the writer's coordinate space before it is published —
