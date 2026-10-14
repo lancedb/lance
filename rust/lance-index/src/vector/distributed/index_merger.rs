@@ -2791,6 +2791,7 @@ mod tests {
             num_bits: 1,
             packed: false,
             layered: false,
+            row_layout: Default::default(),
             query_estimator: RabitQueryEstimator::RawQuery,
         };
 
@@ -2924,6 +2925,7 @@ mod tests {
             num_bits: 1,
             packed: true,
             layered: false,
+            row_layout: Default::default(),
             query_estimator: RabitQueryEstimator::RawQuery,
         };
 
@@ -2995,6 +2997,7 @@ mod tests {
             num_bits,
             packed: false,
             layered,
+            row_layout: Default::default(),
             query_estimator: RabitQueryEstimator::RawQuery,
         };
 
@@ -3138,6 +3141,7 @@ mod tests {
             num_bits: 5,
             packed: false,
             layered: false,
+            row_layout: Default::default(),
             query_estimator: RabitQueryEstimator::RawQuery,
         };
         write_rq_partial_aux(&store, &a, &metadata, &[2], 0, DistanceType::L2)
