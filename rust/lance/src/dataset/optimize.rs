@@ -135,6 +135,7 @@ use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
 use lance_index::frag_reuse::{FRAG_REUSE_INDEX_NAME, FragReuseGroup};
 use lance_index::is_system_index;
 use lance_index::metrics::NoOpMetricsCollector;
+use lance_table::feature_flags::managed_blobs_enabled;
 use lance_table::format::overlay::TOMBSTONE_FIELD_ID;
 use lance_table::format::{
     Fragment, IndexMetadata, ROW_CREATED_AT_VERSION_FIELD_ID, ROW_ID_FIELD_ID,
@@ -1641,7 +1642,11 @@ impl BlobV2FieldRewritePlan {
         }
     }
 
-    fn try_new(field: &LanceField, input_field: &ArrowField) -> Result<Self> {
+    fn try_new(
+        field: &LanceField,
+        input_field: &ArrowField,
+        preserve_managed: bool,
+    ) -> Result<Self> {
         if !field_contains_blob_v2(field) {
             return Ok(Self::passthrough(input_field));
         }
@@ -1654,6 +1659,13 @@ impl BlobV2FieldRewritePlan {
                 ))
             })?;
             let ArrowDataType::Struct(input_children) = input_field.data_type() else {
+                // Legacy blob bytes: the writer converts them to Blob v2.
+                if matches!(
+                    input_field.data_type(),
+                    ArrowDataType::Binary | ArrowDataType::LargeBinary
+                ) {
+                    return Ok(Self::passthrough(input_field));
+                }
                 return Err(Error::invalid_input(format!(
                     "Blob v2 field '{}' has non-struct input type {:?}",
                     field.name,
@@ -1662,9 +1674,14 @@ impl BlobV2FieldRewritePlan {
             };
             let output_field = match BlobV2Layout::classify(input_children) {
                 Some(BlobV2Layout::Logical) => Arc::new(input_field.clone()),
-                Some(BlobV2Layout::Descriptor) => {
-                    transformed_arrow_field(field, BLOB_V2_LOGICAL_TYPE.clone())
-                }
+                Some(BlobV2Layout::Descriptor) => transformed_arrow_field(
+                    field,
+                    if preserve_managed {
+                        lance_core::datatypes::BLOB_V2_PREPARED_TYPE.clone()
+                    } else {
+                        BLOB_V2_LOGICAL_TYPE.clone()
+                    },
+                ),
                 Some(actual) => {
                     return Err(Error::invalid_input(format!(
                         "Blob v2 field '{}' has {actual} input layout; expected logical or descriptor layout during rewrite",
@@ -1699,7 +1716,7 @@ impl BlobV2FieldRewritePlan {
                     .children
                     .iter()
                     .zip(input_children.iter())
-                    .map(|(child, input_child)| Self::try_new(child, input_child))
+                    .map(|(child, input_child)| Self::try_new(child, input_child, preserve_managed))
                     .collect::<Result<Vec<_>>>()?;
                 let output_children = children
                     .iter()
@@ -1721,7 +1738,7 @@ impl BlobV2FieldRewritePlan {
                         field.name
                     ))
                 })?;
-                let child = Box::new(Self::try_new(child, input_child)?);
+                let child = Box::new(Self::try_new(child, input_child, preserve_managed)?);
                 Ok(Self::List {
                     field_name: field.name.clone(),
                     output_field: arrow_field_with_data_type(
@@ -1738,7 +1755,7 @@ impl BlobV2FieldRewritePlan {
                         field.name
                     ))
                 })?;
-                let child = Box::new(Self::try_new(child, input_child)?);
+                let child = Box::new(Self::try_new(child, input_child, preserve_managed)?);
                 Ok(Self::LargeList {
                     field_name: field.name.clone(),
                     output_field: arrow_field_with_data_type(
@@ -1777,12 +1794,15 @@ impl BlobV2FieldRewritePlan {
                 Self::Blob {
                     field_id,
                     field_name,
-                    ..
+                    output_field,
                 } => {
                     let struct_arr = array.as_struct();
                     match BlobV2Layout::classify(struct_arr.fields()) {
                         Some(BlobV2Layout::Logical) => Ok(array),
                         Some(BlobV2Layout::Descriptor) => {
+                            if matches!(output_field.data_type(), ArrowDataType::Struct(fields) if BlobV2Layout::classify(fields) == Some(BlobV2Layout::Prepared)) {
+                                return super::blob::preserve_managed_descriptors(dataset, *field_id, struct_arr, &row_addrs, output_field).await;
+                            }
                             let descriptor =
                                 BlobV2Descriptor::try_from_struct(struct_arr, field_name)?;
                             let classification =
@@ -1948,6 +1968,7 @@ impl BlobV2BatchRewritePlan {
         schema: &lance_core::datatypes::Schema,
         input_schema: &ArrowSchema,
         keep_row_addr: bool,
+        preserve_managed: bool,
     ) -> Result<Self> {
         let row_addr_idx = input_schema
             .column_with_name(lance_core::ROW_ADDR)
@@ -1969,7 +1990,7 @@ impl BlobV2BatchRewritePlan {
                 continue;
             }
             let field_plan = if let Some(field) = schema.field(input_field.name()) {
-                BlobV2FieldRewritePlan::try_new(field, input_field)?
+                BlobV2FieldRewritePlan::try_new(field, input_field, preserve_managed)?
             } else {
                 BlobV2FieldRewritePlan::passthrough(input_field)
             };
@@ -2029,7 +2050,8 @@ pub(crate) async fn transform_blob_v2_batch(
     batch: RecordBatch,
     keep_row_addr: bool,
 ) -> Result<RecordBatch> {
-    let plan = BlobV2BatchRewritePlan::try_new(schema, batch.schema().as_ref(), keep_row_addr)?;
+    let plan =
+        BlobV2BatchRewritePlan::try_new(schema, batch.schema().as_ref(), keep_row_addr, false)?;
     plan.transform_batch(dataset, batch).await
 }
 
@@ -2575,6 +2597,11 @@ async fn rewrite_files(
                 dataset.schema(),
                 schema.as_ref(),
                 false,
+                managed_blobs_enabled(dataset.schema())?
+                    && matches!(
+                        write_version,
+                        ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3
+                    ),
             )?);
             let transformed_schema = rewrite_plan.output_schema.clone();
             let transformed = reader_with_progress.then(move |batch_result| {
@@ -3724,6 +3751,7 @@ async fn cleanup_compaction_files_after_reservation_failure(
 mod tests {
 
     mod binary_copy;
+    mod concurrent_reindex;
     use self::remapping::RemappedIndex;
     use super::*;
     use crate::dataset::WriteDestination;
@@ -10636,10 +10664,11 @@ mod tests {
     }
 
     /// Merge-only deferred compaction, then a PHYSICAL remap + FRI trim. Asserts
-    /// the index is rebuilt, the fragment-reuse index trims to zero versions,
-    /// and KNN stays consistent with the pre-compaction answer through both the
-    /// FRI window and the physical remap. (HNSW rebuilds its graph on physical
-    /// remap, so the overlap is recall-tolerant.)
+    /// the index is rebuilt with its details kept, the fragment-reuse index
+    /// trims to zero versions, and KNN stays consistent with the
+    /// pre-compaction answer through both the FRI window and the physical
+    /// remap. (HNSW rebuilds its graph on physical remap, so the overlap is
+    /// recall-tolerant.)
     async fn check_vector_remap_and_trim(
         params: VectorIndexParams,
         k: usize,
@@ -10670,12 +10699,12 @@ mod tests {
             )
             .await
             .unwrap();
-        let original_uuid = dataset
+        let original = dataset
             .load_index_by_name("vec_idx")
             .await
             .unwrap()
-            .unwrap()
-            .uuid;
+            .unwrap();
+        let original_uuid = original.uuid;
 
         // Sample queries from stored vectors + capture the pre-compaction answer.
         let mut rows: Vec<Vec<f32>> = Vec::new();
@@ -10742,15 +10771,18 @@ mod tests {
             .unwrap();
         cleanup_frag_reuse_index(&mut dataset).await.unwrap();
 
-        let remapped_uuid = dataset
+        let remapped = dataset
             .load_index_by_name("vec_idx")
             .await
             .unwrap()
-            .unwrap()
-            .uuid;
+            .unwrap();
         assert_ne!(
-            remapped_uuid, original_uuid,
+            remapped.uuid, original_uuid,
             "index should have been physically remapped"
+        );
+        assert_eq!(
+            remapped.index_details, original.index_details,
+            "a remap keeps the index's details"
         );
         if let Some(meta) = dataset
             .load_index_by_name(FRAG_REUSE_INDEX_NAME)
@@ -10803,6 +10835,28 @@ mod tests {
         let params = VectorIndexParams::with_ivf_pq_params(
             DistanceType::L2,
             small_ivf(),
+            PQBuildParams {
+                max_iters: 2,
+                num_sub_vectors: 2,
+                ..Default::default()
+            },
+        );
+        // Boxed for CI clippy `large_futures`: the remap future grew past 16 KiB.
+        Box::pin(check_vector_remap_and_trim(params, 10, 8, Some(8))).await;
+    }
+
+    /// Details a remap must carry over: a metric other than the default and a
+    /// partition size the build was given.
+    #[tokio::test]
+    async fn test_ivf_pq_cosine_with_target_partition_size_remap_and_trim() {
+        use lance_index::vector::pq::PQBuildParams;
+        let params = VectorIndexParams::with_ivf_pq_params(
+            DistanceType::Cosine,
+            lance_index::vector::ivf::IvfBuildParams {
+                num_partitions: None,
+                target_partition_size: Some(128),
+                ..small_ivf()
+            },
             PQBuildParams {
                 max_iters: 2,
                 num_sub_vectors: 2,
@@ -12053,8 +12107,8 @@ mod tests {
         input_schema.fields[0].unload_blobs_recursive();
         let input_field = Field::from(&input_schema.fields[0]);
 
-        let plan =
-            BlobV2FieldRewritePlan::try_new(&logical_schema.fields[0], &input_field).unwrap();
+        let plan = BlobV2FieldRewritePlan::try_new(&logical_schema.fields[0], &input_field, false)
+            .unwrap();
         let BlobV2FieldRewritePlan::Struct { children, .. } = &plan else {
             panic!("nested blob field should produce a struct rewrite plan");
         };
