@@ -29,8 +29,15 @@
 //! 3. Continue until a version is not found
 //! 4. Return the last found version
 //!
-//! The read never depends on versions before its starting point, so they can
-//! be deleted with [`ShardManifestStore::prune_versions_before`].
+//! ## Pruning
+//!
+//! A writer builds each version on its cached position, and the existing next
+//! version is what rejects a writer that lost its shard. A writer re-reads any
+//! position older than one hour, and
+//! [`ShardManifestStore::prune_versions_before`] never deletes a version younger
+//! than one day, so the version a stale writer could target still exists and
+//! its write collides. Pruning deletes oldest first, so the versions left are
+//! always contiguous and a lookup from any of them reaches the latest.
 
 use object_store::ObjectStoreExt;
 use std::collections::HashMap;
@@ -55,12 +62,11 @@ use uuid::Uuid;
 use super::util::{manifest_filename, parse_bit_reversed_filename, shard_manifest_path};
 
 /// How long a writer builds on its position without re-reading storage.
-///
-/// A writer that lost its shard without noticing keeps building on its old
-/// position, and only the existing successor version rejects its write. Pruning
-/// must therefore keep every version younger than this, plus the longest a
-/// single write can stall; see [`ShardManifestStore::prune_versions_before`].
-const DEFAULT_MAX_POSITION_AGE: Duration = Duration::from_secs(60 * 60);
+const MAX_POSITION_AGE: Duration = Duration::from_secs(60 * 60);
+
+/// The youngest version pruning deletes. It exceeds [`MAX_POSITION_AGE`] by a
+/// margin for a stalled write and for skew between this clock and the store's.
+const MIN_PRUNE_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Version hint file structure.
 #[derive(Debug, Serialize, Deserialize)]
@@ -79,6 +85,7 @@ pub struct ShardManifestStore {
     manifest_dir: Path,
     manifest_scan_batch_size: usize,
     max_position_age: Duration,
+    min_prune_age: Duration,
     /// This store's position: the version it may build its next write on, and
     /// what [`Self::latest`] serves.
     ///
@@ -120,15 +127,16 @@ impl ShardManifestStore {
             shard_id,
             manifest_dir,
             manifest_scan_batch_size,
-            max_position_age: DEFAULT_MAX_POSITION_AGE,
+            max_position_age: MAX_POSITION_AGE,
+            min_prune_age: MIN_PRUNE_AGE,
             latest: RwLock::new(None),
         }
     }
 
-    /// Set how long [`Self::commit_update`] builds on this store's position
-    /// before re-reading storage. Defaults to one hour.
-    pub fn with_max_position_age(mut self, max_position_age: Duration) -> Self {
+    #[cfg(test)]
+    fn with_ages(mut self, max_position_age: Duration, min_prune_age: Duration) -> Self {
         self.max_position_age = max_position_age;
+        self.min_prune_age = min_prune_age;
         self
     }
 
@@ -375,9 +383,7 @@ impl ShardManifestStore {
     ///
     /// Starts from the hinted version, or from the newest listed one when the
     /// hint is missing or unreadable or its version was pruned, then scans
-    /// forward with HEAD requests until a version is not found. Scanning from
-    /// version 1 instead would stop at the first pruned version and miss every
-    /// later one.
+    /// forward with HEAD requests until a version is not found.
     async fn find_latest_version(&self) -> Result<u64> {
         let mut latest_found = match self.read_version_hint().await {
             Some(hint) if hint > 0 && self.version_exists(hint).await? => hint,
@@ -504,19 +510,15 @@ impl ShardManifestStore {
         Ok(versions)
     }
 
-    /// Delete the manifest versions below `keep_from` that are at least
-    /// `min_age` old and return how many were deleted. `keep_from` may not be
-    /// past the latest version, so the latest always survives.
-    ///
-    /// A version's existence is what rejects a writer still building on its
-    /// predecessor, so `min_age` must exceed the writers' max position age (one
-    /// hour by default) plus the longest a single write can stall.
+    /// Delete the manifest versions below `keep_from` that are at least one day
+    /// old and return how many were deleted. `keep_from` may not be past the
+    /// latest version, so the latest always survives.
     ///
     /// Versions are deleted oldest first, one at a time, stopping at the first
-    /// failure or the first version younger than `min_age`. The versions left
-    /// stay contiguous even mid-prune, because a lookup starting from a
-    /// surviving version would stop at a gap above it and miss the latest.
-    pub async fn prune_versions_before(&self, keep_from: u64, min_age: Duration) -> Result<usize> {
+    /// failure or the first version younger than a day, so the versions left
+    /// stay contiguous even mid-prune. See the module docs for why the age
+    /// keeps a stale writer fenced.
+    pub async fn prune_versions_before(&self, keep_from: u64) -> Result<usize> {
         let latest = self.find_latest_version().await?;
         if keep_from > latest {
             return Err(Error::invalid_input(format!(
@@ -524,12 +526,8 @@ impl ShardManifestStore {
                 self.shard_id
             )));
         }
-        let min_age = chrono::Duration::from_std(min_age).map_err(|e| {
-            Error::invalid_input(format!(
-                "invalid min_age {min_age:?} for pruning shard {}: {e}",
-                self.shard_id
-            ))
-        })?;
+        let min_age = chrono::Duration::from_std(self.min_prune_age)
+            .expect("the minimum prune age fits in a chrono duration");
         let written_by = Utc::now() - min_age;
         let pruned: Vec<Path> = self
             .list_version_times()
@@ -1355,15 +1353,10 @@ mod tests {
     async fn the_latest_version_survives_pruned_history() {
         let (store, base_path, _temp_dir) = create_local_store().await;
         let shard_id = Uuid::new_v4();
-        let writer = ShardManifestStore::new(store.clone(), &base_path, shard_id, 2);
+        let writer = ShardManifestStore::new(store.clone(), &base_path, shard_id, 2)
+            .with_ages(Duration::ZERO, Duration::ZERO);
         write_versions(&writer, shard_id, 20).await;
-        assert_eq!(
-            writer
-                .prune_versions_before(20, Duration::ZERO)
-                .await
-                .unwrap(),
-            19
-        );
+        assert_eq!(writer.prune_versions_before(20).await.unwrap(), 19);
         assert_eq!(writer.list_versions().await.unwrap(), vec![20]);
 
         let hint = hint_path(&base_path, &shard_id);
@@ -1389,23 +1382,13 @@ mod tests {
     async fn pruning_never_removes_the_latest_version() {
         let (store, base_path, _temp_dir) = create_local_store().await;
         let shard_id = Uuid::new_v4();
-        let writer = ShardManifestStore::new(store.clone(), &base_path, shard_id, 2);
+        let writer = ShardManifestStore::new(store.clone(), &base_path, shard_id, 2)
+            .with_ages(Duration::ZERO, Duration::ZERO);
         write_versions(&writer, shard_id, 5).await;
 
-        assert!(
-            writer
-                .prune_versions_before(6, Duration::ZERO)
-                .await
-                .is_err()
-        );
+        assert!(writer.prune_versions_before(6).await.is_err());
         assert_eq!(writer.list_versions().await.unwrap(), vec![1, 2, 3, 4, 5]);
-        assert_eq!(
-            writer
-                .prune_versions_before(3, Duration::ZERO)
-                .await
-                .unwrap(),
-            2
-        );
+        assert_eq!(writer.prune_versions_before(3).await.unwrap(), 2);
         assert_eq!(writer.list_versions().await.unwrap(), vec![3, 4, 5]);
     }
 
@@ -1413,20 +1396,22 @@ mod tests {
     /// after pruning: either the successor that rejects it is too young to
     /// prune, or the writer's position is too old to build on and it re-reads.
     #[rstest::rstest]
-    #[case::without_pruning(None, DEFAULT_MAX_POSITION_AGE, 5)]
-    #[case::successor_too_young_to_prune(Some(Duration::from_secs(24 * 60 * 60)), DEFAULT_MAX_POSITION_AGE, 5)]
-    #[case::stale_position_is_reread(Some(Duration::ZERO), Duration::ZERO, 0)]
+    #[case::without_pruning(false, MAX_POSITION_AGE, MIN_PRUNE_AGE, 5)]
+    #[case::successor_too_young_to_prune(true, MAX_POSITION_AGE, MIN_PRUNE_AGE, 5)]
+    #[case::stale_position_is_reread(true, Duration::ZERO, Duration::ZERO, 0)]
     #[tokio::test]
     async fn pruning_never_unfences_a_stale_writer(
-        #[case] prune_min_age: Option<Duration>,
+        #[case] prune: bool,
         #[case] max_position_age: Duration,
+        #[case] min_prune_age: Duration,
         #[case] versions_left_below_tip: usize,
     ) {
         let (store, base_path, _temp_dir) = create_local_store().await;
         let shard_id = Uuid::new_v4();
         let stale = ShardManifestStore::new(store.clone(), &base_path, shard_id, 2)
-            .with_max_position_age(max_position_age);
-        let peer = ShardManifestStore::new(store.clone(), &base_path, shard_id, 2);
+            .with_ages(max_position_age, min_prune_age);
+        let peer = ShardManifestStore::new(store.clone(), &base_path, shard_id, 2)
+            .with_ages(max_position_age, min_prune_age);
         let (stale_epoch, _) = stale.claim_epoch(0).await.unwrap();
         let (peer_epoch, _) = peer.claim_epoch(0).await.unwrap();
         for generation in 3..=6 {
@@ -1442,8 +1427,8 @@ mod tests {
             .await
             .unwrap();
         }
-        if let Some(min_age) = prune_min_age {
-            peer.prune_versions_before(6, min_age).await.unwrap();
+        if prune {
+            peer.prune_versions_before(6).await.unwrap();
         }
         assert_eq!(
             peer.list_versions().await.unwrap().len(),
@@ -1474,6 +1459,40 @@ mod tests {
         );
     }
 
+    /// A listing that fails is an error, never an empty shard a claim would
+    /// reset.
+    #[tokio::test]
+    async fn a_failed_listing_is_an_error() {
+        let (store, base_path, _temp_dir) = create_local_store().await;
+        let shard_id = Uuid::new_v4();
+        let writer = ShardManifestStore::new(store.clone(), &base_path, shard_id, 2);
+        write_versions(&writer, shard_id, 3).await;
+        store
+            .inner
+            .delete(&hint_path(&base_path, &shard_id))
+            .await
+            .unwrap();
+
+        let policy = Arc::new(Mutex::new(ProxyObjectStorePolicy::new()));
+        policy.lock().unwrap().set_before_policy(
+            "list fails",
+            Arc::new(|method: &str, _: &Path| {
+                if method == "list" {
+                    return Err(object_store::Error::Generic {
+                        store: "test",
+                        source: "503 slow down".into(),
+                    }
+                    .into());
+                }
+                Ok(())
+            }),
+        );
+        let mut proxied = (*store).clone();
+        proxied.inner = Arc::new(ProxyObjectStore::new(store.inner.clone(), policy));
+        let reader = ShardManifestStore::new(Arc::new(proxied), &base_path, shard_id, 2);
+        assert!(reader.refresh_latest().await.is_err());
+    }
+
     /// A prune that fails partway leaves no gap: a lookup that starts from the
     /// oldest surviving version still reaches the latest.
     #[tokio::test]
@@ -1500,13 +1519,9 @@ mod tests {
         );
         let mut proxied = (*store).clone();
         proxied.inner = Arc::new(ProxyObjectStore::new(store.inner.clone(), policy));
-        let pruner = ShardManifestStore::new(Arc::new(proxied), &base_path, shard_id, 2);
-        assert!(
-            pruner
-                .prune_versions_before(6, Duration::ZERO)
-                .await
-                .is_err()
-        );
+        let pruner = ShardManifestStore::new(Arc::new(proxied), &base_path, shard_id, 2)
+            .with_ages(Duration::ZERO, Duration::ZERO);
+        assert!(pruner.prune_versions_before(6).await.is_err());
         assert_eq!(
             writer.list_versions().await.unwrap(),
             vec![1, 2, 3, 4, 5, 6]
@@ -1529,7 +1544,8 @@ mod tests {
     async fn initializing_a_pruned_shard_keeps_its_tip() {
         let (store, base_path, _temp_dir) = create_local_store().await;
         let shard_id = Uuid::new_v4();
-        let writer = ShardManifestStore::new(store.clone(), &base_path, shard_id, 2);
+        let writer = ShardManifestStore::new(store.clone(), &base_path, shard_id, 2)
+            .with_ages(Duration::ZERO, Duration::ZERO);
         writer.initialize_shard(0, HashMap::new()).await.unwrap();
         let (epoch, _) = writer.claim_epoch(0).await.unwrap();
         for generation in 3..=6 {
@@ -1542,10 +1558,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        writer
-            .prune_versions_before(6, Duration::ZERO)
-            .await
-            .unwrap();
+        writer.prune_versions_before(6).await.unwrap();
 
         let retry = ShardManifestStore::new(store.clone(), &base_path, shard_id, 2);
         let existing = retry.initialize_shard(0, HashMap::new()).await.unwrap();
@@ -1564,12 +1577,10 @@ mod tests {
     async fn an_unreadable_hint_falls_back_to_listing() {
         let (store, base_path, _temp_dir) = create_local_store().await;
         let shard_id = Uuid::new_v4();
-        let writer = ShardManifestStore::new(store.clone(), &base_path, shard_id, 2);
+        let writer = ShardManifestStore::new(store.clone(), &base_path, shard_id, 2)
+            .with_ages(Duration::ZERO, Duration::ZERO);
         write_versions(&writer, shard_id, 3).await;
-        writer
-            .prune_versions_before(3, Duration::ZERO)
-            .await
-            .unwrap();
+        writer.prune_versions_before(3).await.unwrap();
 
         let policy = Arc::new(Mutex::new(ProxyObjectStorePolicy::new()));
         policy.lock().unwrap().set_before_policy(
