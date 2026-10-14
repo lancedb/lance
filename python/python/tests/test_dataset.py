@@ -1647,6 +1647,9 @@ def test_cleanup_old_versions(tmp_path):
 
     dataset = lance.dataset(base_dir)
 
+    with pytest.raises(OSError, match="delete_concurrency"):
+        dataset.cleanup_old_versions(delete_concurrency=0)
+
     # These calls do nothing, but make sure we can call the method ok
 
     # Ok, defaults to two weeks ago
@@ -1683,6 +1686,7 @@ def test_explain_cleanup_old_versions(tmp_path):
         older_than=(datetime.now() - moment),
         include_files=True,
         max_files=1000,
+        delete_rate_limit=0,
     )
 
     assert explanation.read_version == dataset.version
@@ -1993,7 +1997,9 @@ def test_cleanup_with_rate_limit(tmp_path):
     start = time.time_ns()
     # Cleanup with a rate limit should still remove old versions correctly
     stats = dataset.cleanup_old_versions(
-        older_than=(now - latest_version_timestamp), delete_rate_limit=1
+        older_than=(now - latest_version_timestamp),
+        delete_rate_limit=1,
+        delete_concurrency=2,
     )
     finished = time.time_ns()
 
