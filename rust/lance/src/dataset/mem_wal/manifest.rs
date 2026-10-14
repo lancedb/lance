@@ -35,8 +35,10 @@
 use object_store::ObjectStoreExt;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use lance_core::{Error, Result};
@@ -51,6 +53,14 @@ use tracing::instrument;
 use uuid::Uuid;
 
 use super::util::{manifest_filename, parse_bit_reversed_filename, shard_manifest_path};
+
+/// How long a writer builds on its position without re-reading storage.
+///
+/// A writer that lost its shard without noticing keeps building on its old
+/// position, and only the existing successor version rejects its write. Pruning
+/// must therefore keep every version younger than this, plus the longest a
+/// single write can stall; see [`ShardManifestStore::prune_versions_before`].
+const DEFAULT_MAX_POSITION_AGE: Duration = Duration::from_secs(60 * 60);
 
 /// Version hint file structure.
 #[derive(Debug, Serialize, Deserialize)]
@@ -68,6 +78,7 @@ pub struct ShardManifestStore {
     shard_id: Uuid,
     manifest_dir: Path,
     manifest_scan_batch_size: usize,
+    max_position_age: Duration,
     /// This store's position: the version it may build its next write on, and
     /// what [`Self::latest`] serves.
     ///
@@ -76,7 +87,16 @@ pub struct ShardManifestStore {
     /// stays latest until a PUT-IF-NOT-EXISTS collision proves otherwise. A
     /// plain [`Self::latest`] scan never sets it, so a reader that polls keeps
     /// observing the writer instead of pinning the first manifest it saw.
-    latest: RwLock<Option<ShardManifest>>,
+    latest: RwLock<Option<Position>>,
+}
+
+/// A manifest this store knows was the latest at `confirmed_at`.
+#[derive(Debug)]
+struct Position {
+    manifest: ShardManifest,
+    /// Taken before the read or write that confirmed it, so the age is never
+    /// understated.
+    confirmed_at: Instant,
 }
 
 impl ShardManifestStore {
@@ -100,24 +120,54 @@ impl ShardManifestStore {
             shard_id,
             manifest_dir,
             manifest_scan_batch_size,
+            max_position_age: DEFAULT_MAX_POSITION_AGE,
             latest: RwLock::new(None),
         }
     }
 
-    /// The cached manifest, if this store has written one.
-    fn cached(&self) -> Option<ShardManifest> {
-        self.latest.read().expect("manifest cache lock").clone()
+    /// Set how long [`Self::commit_update`] builds on this store's position
+    /// before re-reading storage. Defaults to one hour.
+    pub fn with_max_position_age(mut self, max_position_age: Duration) -> Self {
+        self.max_position_age = max_position_age;
+        self
     }
 
-    /// Publish `manifest` as the latest. Only ever called after a durable write.
+    /// The cached manifest, if this store has written one.
+    fn cached(&self) -> Option<ShardManifest> {
+        self.latest
+            .read()
+            .expect("manifest cache lock")
+            .as_ref()
+            .map(|position| position.manifest.clone())
+    }
+
+    /// The cached manifest, if it was confirmed within the max position age.
+    fn fresh_cached(&self) -> Option<ShardManifest> {
+        self.latest
+            .read()
+            .expect("manifest cache lock")
+            .as_ref()
+            .filter(|position| position.confirmed_at.elapsed() <= self.max_position_age)
+            .map(|position| position.manifest.clone())
+    }
+
+    /// Publish `manifest`, confirmed latest at `confirmed_at`, as the latest.
+    /// Only ever called after a durable write or a read of storage.
     ///
     /// Never regresses: the flush task and the tailer's cursor updates share one
     /// handle, so two writes can win their CAS in one order and return to their
-    /// callers in the other.
-    fn cache(&self, manifest: &ShardManifest) {
+    /// callers in the other. Re-confirming the same version renews it.
+    fn cache(&self, manifest: &ShardManifest, confirmed_at: Instant) {
         let mut latest = self.latest.write().expect("manifest cache lock");
-        if latest.as_ref().is_none_or(|c| manifest.version > c.version) {
-            *latest = Some(manifest.clone());
+        let is_newer = latest.as_ref().is_none_or(|c| {
+            manifest.version > c.manifest.version
+                || (manifest.version == c.manifest.version && confirmed_at > c.confirmed_at)
+        });
+        if is_newer {
+            *latest = Some(Position {
+                manifest: manifest.clone(),
+                confirmed_at,
+            });
         }
     }
 
@@ -154,9 +204,10 @@ impl ShardManifestStore {
     /// Returns `None` if no manifest exists (new shard).
     #[instrument(name = "manifest_refresh_latest", level = "debug", skip_all, fields(shard_id = %self.shard_id))]
     pub async fn refresh_latest(&self) -> Result<Option<ShardManifest>> {
+        let started = Instant::now();
         let latest = self.scan_latest().await?;
         if let Some(manifest) = &latest {
-            self.cache(manifest);
+            self.cache(manifest, started);
         }
         Ok(latest)
     }
@@ -199,6 +250,9 @@ impl ShardManifestStore {
     /// `shard_field_values` maps field_id to raw Arrow scalar bytes.
     /// Initial manifests use writer epoch 0. A writer that claims the shard
     /// will write a new manifest with epoch 1 before appending WAL entries.
+    ///
+    /// A shard that already has a manifest is not written to: once version 1
+    /// is pruned, writing it again would succeed and hide the shard's history.
     pub async fn initialize_shard(
         &self,
         shard_spec_id: u32,
@@ -217,17 +271,25 @@ impl ShardManifestStore {
             status: ShardStatus::Active,
         };
 
-        match self.write(&manifest).await {
-            Ok(_) => Ok(manifest),
-            Err(error) => match self.refresh_latest().await? {
-                Some(existing)
-                    if existing.shard_spec_id == manifest.shard_spec_id
-                        && existing.shard_field_values == manifest.shard_field_values =>
-                {
-                    Ok(existing)
-                }
-                _ => Err(error),
+        let existing = match self.refresh_latest().await? {
+            Some(existing) => existing,
+            None => match self.write(&manifest).await {
+                Ok(_) => return Ok(manifest),
+                Err(error) => match self.refresh_latest().await? {
+                    Some(existing) => existing,
+                    None => return Err(error),
+                },
             },
+        };
+        if existing.shard_spec_id == manifest.shard_spec_id
+            && existing.shard_field_values == manifest.shard_field_values
+        {
+            Ok(existing)
+        } else {
+            Err(Error::invalid_input(format!(
+                "shard {} is already initialized with spec {} and different field values than spec {}",
+                self.shard_id, existing.shard_spec_id, manifest.shard_spec_id
+            )))
         }
     }
 
@@ -267,6 +329,7 @@ impl ShardManifestStore {
         let pb_manifest = pb::ShardManifest::from(manifest);
         let bytes = pb_manifest.encode_to_vec();
 
+        let started = Instant::now();
         self.object_store
             .put_if_absent(&path, Bytes::from(bytes).into())
             .await
@@ -287,7 +350,7 @@ impl ShardManifestStore {
             })?;
 
         // The write landed, so this is now the latest.
-        self.cache(manifest);
+        self.cache(manifest, started);
 
         // Best-effort update version hint (failures are logged as warnings)
         self.write_version_hint(version).await;
@@ -410,6 +473,17 @@ impl ShardManifestStore {
 
     /// List all manifest versions, in ascending order.
     pub async fn list_versions(&self) -> Result<Vec<u64>> {
+        Ok(self
+            .list_version_times()
+            .await?
+            .into_iter()
+            .map(|(version, _)| version)
+            .collect())
+    }
+
+    /// List all manifest versions with when each was written, in ascending
+    /// version order.
+    async fn list_version_times(&self) -> Result<Vec<(u64, DateTime<Utc>)>> {
         let mut versions = Vec::new();
         let mut listing = self.object_store.inner.list(Some(&self.manifest_dir));
         while let Some(item) = listing.next().await {
@@ -423,17 +497,23 @@ impl ShardManifestStore {
                 && filename.ends_with(".binpb")
                 && let Some(version) = parse_bit_reversed_filename(filename)
             {
-                versions.push(version);
+                versions.push((version, meta.last_modified));
             }
         }
         versions.sort_unstable();
         Ok(versions)
     }
 
-    /// Delete every manifest version below `keep_from` and return how many
-    /// were deleted. `keep_from` may not be past the latest version, so the
-    /// latest always survives.
-    pub async fn prune_versions_before(&self, keep_from: u64) -> Result<usize> {
+    /// Delete the manifest versions below `keep_from` that are at least
+    /// `min_age` old and return how many were deleted. `keep_from` may not be
+    /// past the latest version, so the latest always survives.
+    ///
+    /// A version's existence is what rejects a writer still building on its
+    /// predecessor, so `min_age` must exceed the writers' max position age (one
+    /// hour by default) plus the longest a single write can stall.
+    /// Deletion stops at the first version younger than `min_age`, so the
+    /// versions kept stay contiguous.
+    pub async fn prune_versions_before(&self, keep_from: u64, min_age: Duration) -> Result<usize> {
         let latest = self.find_latest_version().await?;
         if keep_from > latest {
             return Err(Error::invalid_input(format!(
@@ -441,12 +521,19 @@ impl ShardManifestStore {
                 self.shard_id
             )));
         }
+        let min_age = chrono::Duration::from_std(min_age).map_err(|e| {
+            Error::invalid_input(format!(
+                "invalid min_age {min_age:?} for pruning shard {}: {e}",
+                self.shard_id
+            ))
+        })?;
+        let written_by = Utc::now() - min_age;
         let pruned: Vec<Path> = self
-            .list_versions()
+            .list_version_times()
             .await?
             .into_iter()
-            .take_while(|version| *version < keep_from)
-            .map(|version| {
+            .take_while(|(version, written)| *version < keep_from && *written <= written_by)
+            .map(|(version, _)| {
                 self.manifest_dir
                     .clone()
                     .join(manifest_filename(version).as_str())
@@ -663,8 +750,10 @@ impl ShardManifestStore {
         for attempt in 0..MAX_RETRIES {
             // Step 1: take a position to build on. A cold cache — a fresh
             // store, or a retry after losing a race — must go to storage and
-            // adopt what it finds, or the write below has no baseline.
-            let current = match self.cached() {
+            // adopt what it finds, or the write below has no baseline. So must
+            // an old one: pruning may have deleted the successor that would
+            // reject a write built on it.
+            let current = match self.fresh_cached() {
                 Some(cached) => cached,
                 None => self
                     .refresh_latest()
@@ -859,7 +948,7 @@ mod tests {
         manifest_store.write(&newer).await.unwrap();
 
         // The straggler resolving after the newer write already cached.
-        manifest_store.cache(&older);
+        manifest_store.cache(&older, Instant::now());
 
         assert_eq!(
             manifest_store.latest().await.unwrap().unwrap().version,
@@ -1269,7 +1358,13 @@ mod tests {
         let shard_id = Uuid::new_v4();
         let writer = ShardManifestStore::new(store.clone(), &base_path, shard_id, 2);
         write_versions(&writer, shard_id, 20).await;
-        assert_eq!(writer.prune_versions_before(20).await.unwrap(), 19);
+        assert_eq!(
+            writer
+                .prune_versions_before(20, Duration::ZERO)
+                .await
+                .unwrap(),
+            19
+        );
         assert_eq!(writer.list_versions().await.unwrap(), vec![20]);
 
         let hint = hint_path(&base_path, &shard_id);
@@ -1298,10 +1393,120 @@ mod tests {
         let writer = ShardManifestStore::new(store.clone(), &base_path, shard_id, 2);
         write_versions(&writer, shard_id, 5).await;
 
-        assert!(writer.prune_versions_before(6).await.is_err());
+        assert!(
+            writer
+                .prune_versions_before(6, Duration::ZERO)
+                .await
+                .is_err()
+        );
         assert_eq!(writer.list_versions().await.unwrap(), vec![1, 2, 3, 4, 5]);
-        assert_eq!(writer.prune_versions_before(3).await.unwrap(), 2);
+        assert_eq!(
+            writer
+                .prune_versions_before(3, Duration::ZERO)
+                .await
+                .unwrap(),
+            2
+        );
         assert_eq!(writer.list_versions().await.unwrap(), vec![3, 4, 5]);
+    }
+
+    /// A writer that lost its shard without noticing must still be rejected
+    /// after pruning: either the successor that rejects it is too young to
+    /// prune, or the writer's position is too old to build on and it re-reads.
+    #[rstest::rstest]
+    #[case::without_pruning(None, DEFAULT_MAX_POSITION_AGE, 5)]
+    #[case::successor_too_young_to_prune(Some(Duration::from_secs(24 * 60 * 60)), DEFAULT_MAX_POSITION_AGE, 5)]
+    #[case::stale_position_is_reread(Some(Duration::ZERO), Duration::ZERO, 0)]
+    #[tokio::test]
+    async fn pruning_never_unfences_a_stale_writer(
+        #[case] prune_min_age: Option<Duration>,
+        #[case] max_position_age: Duration,
+        #[case] versions_left_below_tip: usize,
+    ) {
+        let (store, base_path, _temp_dir) = create_local_store().await;
+        let shard_id = Uuid::new_v4();
+        let stale = ShardManifestStore::new(store.clone(), &base_path, shard_id, 2)
+            .with_max_position_age(max_position_age);
+        let peer = ShardManifestStore::new(store.clone(), &base_path, shard_id, 2);
+        let (stale_epoch, _) = stale.claim_epoch(0).await.unwrap();
+        let (peer_epoch, _) = peer.claim_epoch(0).await.unwrap();
+        for generation in 3..=6 {
+            peer.commit_update(peer_epoch, |c| ShardManifest {
+                version: c.next_version(),
+                current_generation: generation,
+                sstables: vec![lance_index::mem_wal::SsTable::unmeasured(
+                    generation,
+                    format!("gen_{generation}"),
+                )],
+                ..c.clone()
+            })
+            .await
+            .unwrap();
+        }
+        if let Some(min_age) = prune_min_age {
+            peer.prune_versions_before(6, min_age).await.unwrap();
+        }
+        assert_eq!(
+            peer.list_versions().await.unwrap().len(),
+            versions_left_below_tip + 1
+        );
+
+        let result = stale
+            .commit_update(stale_epoch, |c| ShardManifest {
+                version: c.next_version(),
+                current_generation: 99,
+                ..c.clone()
+            })
+            .await;
+        assert!(
+            matches!(result, Err(Error::Fenced { .. })),
+            "the stale writer must be rejected: {result:?}"
+        );
+        let reader = ShardManifestStore::new(store, &base_path, shard_id, 2);
+        let tip = reader.refresh_latest().await.unwrap().unwrap();
+        assert_eq!(
+            (
+                tip.version,
+                tip.writer_epoch,
+                tip.current_generation,
+                tip.sstables.len()
+            ),
+            (6, peer_epoch, 6, 1)
+        );
+    }
+
+    /// Initializing a shard whose version 1 was pruned leaves its history alone.
+    #[tokio::test]
+    async fn initializing_a_pruned_shard_keeps_its_tip() {
+        let (store, base_path, _temp_dir) = create_local_store().await;
+        let shard_id = Uuid::new_v4();
+        let writer = ShardManifestStore::new(store.clone(), &base_path, shard_id, 2);
+        writer.initialize_shard(0, HashMap::new()).await.unwrap();
+        let (epoch, _) = writer.claim_epoch(0).await.unwrap();
+        for generation in 3..=6 {
+            writer
+                .commit_update(epoch, |c| ShardManifest {
+                    version: c.next_version(),
+                    current_generation: generation,
+                    ..c.clone()
+                })
+                .await
+                .unwrap();
+        }
+        writer
+            .prune_versions_before(6, Duration::ZERO)
+            .await
+            .unwrap();
+
+        let retry = ShardManifestStore::new(store.clone(), &base_path, shard_id, 2);
+        let existing = retry.initialize_shard(0, HashMap::new()).await.unwrap();
+        assert_eq!(existing.version, 6);
+        let reader = ShardManifestStore::new(store, &base_path, shard_id, 2);
+        let tip = reader.refresh_latest().await.unwrap().unwrap();
+        assert_eq!(
+            (tip.version, tip.writer_epoch, tip.current_generation),
+            (6, epoch, 6)
+        );
     }
 
     /// A hint that cannot be read falls back to listing like a missing one,
@@ -1312,7 +1517,10 @@ mod tests {
         let shard_id = Uuid::new_v4();
         let writer = ShardManifestStore::new(store.clone(), &base_path, shard_id, 2);
         write_versions(&writer, shard_id, 3).await;
-        writer.prune_versions_before(3).await.unwrap();
+        writer
+            .prune_versions_before(3, Duration::ZERO)
+            .await
+            .unwrap();
 
         let policy = Arc::new(Mutex::new(ProxyObjectStorePolicy::new()));
         policy.lock().unwrap().set_before_policy(
