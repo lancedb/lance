@@ -23,27 +23,27 @@ pub(in crate::dataset::blob) struct BlobEntry {
 /// One resolved logical selection. Its position in the containing vector is
 /// the caller's selection index.
 #[derive(Debug)]
-pub(in crate::dataset::blob) struct ResolvedBlobSelection {
-    pub(in crate::dataset::blob) row_address: u64,
-    pub(in crate::dataset::blob) file: Option<BlobFile>,
-    pub(in crate::dataset::blob) requested_range: Option<BlobReadRange>,
+pub(super) struct ResolvedBlobSelection {
+    pub(super) row_address: u64,
+    pub(super) file: Option<BlobFile>,
+    pub(super) requested_range: Option<BlobReadRange>,
 }
 
 /// Physical read input derived from one [`BlobEntry`].
 #[derive(Debug)]
-pub(in crate::dataset::blob) struct PlannedBlobRead {
-    pub(in crate::dataset::blob) selection_index: usize,
-    pub(in crate::dataset::blob) row_address: u64,
-    pub(in crate::dataset::blob) requested_range: Option<BlobReadRange>,
+pub(super) struct PlannedBlobRead {
+    pub(super) selection_index: usize,
+    pub(super) row_address: u64,
+    pub(super) requested_range: Option<BlobReadRange>,
     physical_range: Range<u64>,
 }
 
 /// A slice of one disjoint physical range submitted to the file scheduler.
 #[derive(Debug)]
-pub(in crate::dataset::blob) struct PlannedBlobReadSlice {
-    pub(in crate::dataset::blob) read_index: usize,
-    pub(in crate::dataset::blob) physical_range_index: usize,
-    pub(in crate::dataset::blob) relative_range: Range<u64>,
+pub(super) struct PlannedBlobReadSlice {
+    pub(super) read_index: usize,
+    pub(super) physical_range_index: usize,
+    pub(super) relative_range: Range<u64>,
 }
 
 /// One physical read paired with the backing source used to batch it.
@@ -56,16 +56,16 @@ struct SourcePlannedBlobRead {
 
 /// One per-source read plan emitted by `read_blobs`.
 #[derive(Debug)]
-pub(in crate::dataset::blob) struct BlobReadPlan {
+pub(super) struct BlobReadPlan {
     source_key: BlobSourceKey,
-    pub(in crate::dataset::blob) source: Arc<BlobSource>,
-    pub(in crate::dataset::blob) reads: Vec<PlannedBlobRead>,
+    pub(super) source: Arc<BlobSource>,
+    pub(super) reads: Vec<PlannedBlobRead>,
 }
 
 /// A payload-bounded group of per-source plans.
 #[derive(Debug)]
-pub(in crate::dataset::blob) struct BlobReadBatch {
-    pub(in crate::dataset::blob) plans: Vec<BlobReadPlan>,
+pub(super) struct BlobReadBatch {
+    pub(super) plans: Vec<BlobReadPlan>,
 }
 
 #[derive(Debug)]
@@ -185,7 +185,7 @@ impl BlobReadBatchFootprint {
 /// Split selected reads into request-order batches before grouping each batch
 /// by physical source. Each batch accounts for the physical spans that the file
 /// scheduler will read after coalescing nearby ranges.
-pub(in crate::dataset::blob) fn plan_blob_read_batches(
+pub(super) fn plan_blob_read_batches(
     mut entries: Vec<BlobEntry>,
     physical_buffer_size: u64,
 ) -> Result<Vec<BlobReadBatch>> {
@@ -289,9 +289,7 @@ fn group_blob_read_plans(planned_reads: Vec<SourcePlannedBlobRead>) -> Vec<BlobR
     plans
 }
 
-pub(in crate::dataset::blob) fn plan_blob_read_plans(
-    entries: Vec<BlobEntry>,
-) -> Result<Vec<BlobReadPlan>> {
+pub(super) fn plan_blob_read_plans(entries: Vec<BlobEntry>) -> Result<Vec<BlobReadPlan>> {
     Ok(group_blob_read_plans(plan_blob_reads(entries)?))
 }
 
@@ -301,7 +299,7 @@ pub(in crate::dataset::blob) fn plan_blob_read_plans(
 /// overlapping ranges need to be mapped onto their union first so a split does
 /// not advance past the start of a later nested range while reconstructing the
 /// caller's buffers.
-pub(in crate::dataset::blob) fn plan_disjoint_blob_reads(
+pub(super) fn plan_disjoint_blob_reads(
     reads: &[PlannedBlobRead],
 ) -> (Vec<Range<u64>>, Vec<PlannedBlobReadSlice>) {
     let mut non_empty_ranges = reads

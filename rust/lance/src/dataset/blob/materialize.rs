@@ -20,7 +20,7 @@ use lance_arrow::ARROW_EXT_NAME_KEY;
 use tokio::sync::Notify;
 
 use super::locate::{BlobV2DescriptorColumns, BlobV2ReadContext, blob_version_from_descriptions};
-use super::read::plan::BlobEntry;
+use super::read::BlobEntry;
 use super::read::{ReadBlobsExecution, execute_blob_entries_with_execution};
 use crate::dataset::Dataset;
 use lance_core::datatypes::{BlobKind, BlobVersion, Field as LanceField, Schema};

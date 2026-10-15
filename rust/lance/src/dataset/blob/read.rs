@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-pub(super) mod plan;
+mod plan;
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -17,8 +17,9 @@ use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt, stream};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 
+pub(super) use self::plan::BlobEntry;
 use self::plan::{
-    BlobEntry, BlobReadBatch, BlobReadPlan, ResolvedBlobSelection, plan_blob_read_batches,
+    BlobReadBatch, BlobReadPlan, ResolvedBlobSelection, plan_blob_read_batches,
     plan_blob_read_plans, plan_disjoint_blob_reads,
 };
 use super::file::{BlobFile, BlobSource};

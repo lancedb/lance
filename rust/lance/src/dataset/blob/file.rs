@@ -747,7 +747,7 @@ impl BlobFileState {
 mod tests {
     use super::*;
 
-    use crate::dataset::blob::read::plan::BlobEntry;
+    use crate::dataset::blob::read::BlobEntry;
     use crate::dataset::blob::read::{BlobReadRange, execute_blob_entries};
     use crate::dataset::blob::test_util::{
         gated_range_store, recording_range_store, reject_empty_range_store,
