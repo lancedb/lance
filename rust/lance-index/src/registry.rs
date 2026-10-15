@@ -13,9 +13,10 @@ use crate::{
     pb, pbold,
     scalar::{
         bitmap::BitmapIndexPlugin, bloomfilter::BloomFilterIndexPlugin, btree::BTreeIndexPlugin,
-        fmindex::FMIndexPlugin, inverted::InvertedIndexPlugin, json::JsonIndexPlugin,
-        label_list::LabelListIndexPlugin, minhash_lsh::MinHashLshIndexPlugin,
-        ngram::NGramIndexPlugin, registry::ScalarIndexPlugin, zonemap::ZoneMapIndexPlugin,
+        fmindex::FMIndexPlugin, fragstats::FragmentColumnStatsIndexPlugin,
+        inverted::InvertedIndexPlugin, json::JsonIndexPlugin, label_list::LabelListIndexPlugin,
+        minhash_lsh::MinHashLshIndexPlugin, ngram::NGramIndexPlugin, registry::ScalarIndexPlugin,
+        zonemap::ZoneMapIndexPlugin,
     },
 };
 
@@ -110,6 +111,8 @@ impl IndexPluginRegistry {
         registry.add_plugin::<pb::JsonIndexDetails, JsonIndexPlugin>();
         registry.add_plugin::<pb::FmIndexDetails, FMIndexPlugin>();
         registry.add_plugin::<pb::MinHashLshIndexDetails, MinHashLshIndexPlugin>();
+        registry
+            .add_plugin::<pb::FragmentColumnStatsIndexDetails, FragmentColumnStatsIndexPlugin>();
         #[cfg(feature = "geo")]
         registry.add_plugin::<pb::RTreeIndexDetails, RTreeIndexPlugin>();
 

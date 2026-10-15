@@ -79,6 +79,8 @@ pub enum IndexType {
 
     MinHashLsh = 12, // MinHash LSH (near-duplicate detection)
 
+    FragmentColumnStats = 13, // Per-fragment column statistics for planning-time pruning
+
     // 100+ and up for vector index.
     /// Flat vector index.
     Vector = 100, // Legacy vector index, alias to IvfPq
@@ -106,6 +108,7 @@ impl std::fmt::Display for IndexType {
             Self::RTree => write!(f, "RTree"),
             Self::Fm => write!(f, "Fm"),
             Self::MinHashLsh => write!(f, "MinHashLsh"),
+            Self::FragmentColumnStats => write!(f, "FragmentColumnStats"),
             Self::Vector | Self::IvfPq => write!(f, "IVF_PQ"),
             Self::IvfFlat => write!(f, "IVF_FLAT"),
             Self::IvfSq => write!(f, "IVF_SQ"),
@@ -135,6 +138,7 @@ impl TryFrom<i32> for IndexType {
             v if v == Self::RTree as i32 => Ok(Self::RTree),
             v if v == Self::Fm as i32 => Ok(Self::Fm),
             v if v == Self::MinHashLsh as i32 => Ok(Self::MinHashLsh),
+            v if v == Self::FragmentColumnStats as i32 => Ok(Self::FragmentColumnStats),
             v if v == Self::Vector as i32 => Ok(Self::Vector),
             v if v == Self::IvfFlat as i32 => Ok(Self::IvfFlat),
             v if v == Self::IvfSq as i32 => Ok(Self::IvfSq),
@@ -165,6 +169,9 @@ impl TryFrom<&str> for IndexType {
             "RTree" | "RTREE" | "R_TREE" => Ok(Self::RTree),
             "Fm" | "FM" => Ok(Self::Fm),
             "MinHashLsh" | "MINHASHLSH" | "MINHASH_LSH" => Ok(Self::MinHashLsh),
+            "FragmentColumnStats" | "FRAGMENTCOLUMNSTATS" | "FRAGMENT_COLUMN_STATS" => {
+                Ok(Self::FragmentColumnStats)
+            }
             "Vector" | "VECTOR" => Ok(Self::Vector),
             "IVF_FLAT" => Ok(Self::IvfFlat),
             "IVF_SQ" => Ok(Self::IvfSq),
@@ -197,7 +204,8 @@ impl IndexType {
                 | Self::BloomFilter
                 | Self::RTree
                 | Self::Fm
-                | Self::MinHashLsh,
+                | Self::MinHashLsh
+                | Self::FragmentColumnStats,
         )
     }
 
@@ -239,6 +247,7 @@ impl IndexType {
             Self::RTree => 0,
             Self::Fm => 0,
             Self::MinHashLsh => 0,
+            Self::FragmentColumnStats => 0,
 
             // IMPORTANT: if any vector index subtype needs a format bump that is
             // not backward compatible, its new version must be set to
@@ -308,6 +317,7 @@ impl IndexType {
             Self::RTree => url.ends_with("RTreeIndexDetails"),
             Self::Fm => url.ends_with("FMIndexDetails"),
             Self::MinHashLsh => url.ends_with("MinHashLshIndexDetails"),
+            Self::FragmentColumnStats => url.ends_with("FragmentColumnStatsIndexDetails"),
             Self::FragmentReuse => url.ends_with("FragmentReuseIndexDetails"),
             Self::MemWal => url.ends_with("MemWalIndexDetails"),
             Self::Vector
