@@ -13,7 +13,7 @@ use std::num::NonZero;
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 
 use lance_core::utils::io_stats::IoStatsRecorder;
@@ -31,6 +31,23 @@ const BACKPRESSURE_MIN: u64 = 5;
 // Don't log backpressure warnings more than once / minute
 const BACKPRESSURE_DEBOUNCE: u64 = 60;
 const SCHEDULER_STATE_EVENT_TARGET: &str = "lance_io::scheduler::state";
+
+// How often the I/O loop's otherwise-indefinite wait is interrupted to check
+// whether the queue has gone quiet. Cheap: just a timestamp comparison under
+// a lock that is already taken on every real wakeup, and this is the only
+// thing that can notice a queue with pending demand and zero progress, since
+// a truly stuck queue means nothing else is left calling into this state to
+// trigger a check on its own.
+const WATCHDOG_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+// A queue with outstanding demand (pending requests, or delivered-but-
+// unconsumed priorities) and no deliveries or consumption for this long is
+// reported as stuck. Comfortably above ordinary I/O latency so a slow but
+// live backend doesn't trip it, short enough to be useful well before a
+// human would otherwise notice a hang.
+const WATCHDOG_STUCK_THRESHOLD: Duration = Duration::from_secs(15);
+// Once stuck, don't re-log more than once a minute (matches
+// `BACKPRESSURE_DEBOUNCE`'s rationale: stay quiet while still true).
+const WATCHDOG_WARN_DEBOUNCE: Duration = Duration::from_secs(60);
 
 // Global counter of how many IOPS we have issued
 static IOPS_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -119,10 +136,18 @@ struct IoQueueState {
     last_warn: AtomicU64,
     // When true, skip all byte-based backpressure checks (set when io_buffer_size == 0)
     no_backpressure: bool,
+    // Last time a task was delivered to the consumer or bytes were reported
+    // consumed - the two events that constitute "the queue is moving".
+    // Compared against `WATCHDOG_STUCK_THRESHOLD` by `is_stuck`.
+    last_progress: Instant,
+    // Last time the watchdog actually logged a stuck warning, for
+    // `WATCHDOG_WARN_DEBOUNCE`. `None` until the first warning.
+    last_watchdog_warn: Option<Instant>,
 }
 
 impl IoQueueState {
     fn new(io_capacity: u32, io_buffer_size: u64) -> Self {
+        let now = Instant::now();
         Self {
             io_capacity,
             iops_avail: io_capacity,
@@ -131,9 +156,11 @@ impl IoQueueState {
             pending_requests: BinaryHeap::new(),
             priorities_in_flight: PrioritiesInFlight::new(io_capacity),
             done_scheduling: false,
-            start: Instant::now(),
+            start: now,
             last_warn: AtomicU64::from(0),
             no_backpressure: io_buffer_size == 0,
+            last_progress: now,
+            last_watchdog_warn: None,
         }
     }
 
@@ -141,7 +168,13 @@ impl IoQueueState {
         if !tracing::enabled!(target: SCHEDULER_STATE_EVENT_TARGET, tracing::Level::TRACE) {
             return None;
         }
+        Some(self.build_scheduler_state_event())
+    }
 
+    /// Same fields as [`Self::scheduler_state_event`], but built
+    /// unconditionally - for the watchdog, which must report a stuck queue
+    /// whether or not anyone has `TRACE` enabled for this target.
+    fn build_scheduler_state_event(&self) -> SchedulerStateEvent {
         let pending_bytes = self
             .pending_requests
             .iter()
@@ -172,7 +205,7 @@ impl IoQueueState {
         let (min_in_flight_priority_high, min_in_flight_priority_low) =
             split_priority(min_in_flight_priority);
 
-        Some(SchedulerStateEvent {
+        SchedulerStateEvent {
             queue_kind: "standard",
             io_capacity: u64::from(self.io_capacity),
             iops_available: u64::from(self.iops_avail),
@@ -193,7 +226,7 @@ impl IoQueueState {
             head_task_priority_bypass,
             head_task_blocked_by_iops,
             head_task_blocked_by_bytes,
-        })
+        }
     }
 
     fn warn_if_needed(&self) {
@@ -261,10 +294,51 @@ impl IoQueueState {
                     );
                 }
             }
+            self.note_progress();
             Some(self.pending_requests.pop().unwrap())
         } else {
             None
         }
+    }
+
+    /// Record that the queue did something meaningful: delivered a task to
+    /// the consumer, or had bytes reported consumed. Resets the watchdog's
+    /// stuck clock.
+    fn note_progress(&mut self) {
+        self.last_progress = Instant::now();
+    }
+
+    /// Whether the queue has outstanding demand (pending requests, or
+    /// delivered-but-not-yet-consumed priorities) and has made no progress
+    /// for `WATCHDOG_STUCK_THRESHOLD`. Both halves matter: a queue with
+    /// nothing outstanding is just idle, not stuck, and a queue that is
+    /// still delivering/consuming - however slowly - is merely busy.
+    fn is_stuck(&self) -> bool {
+        let has_outstanding_demand =
+            !self.pending_requests.is_empty() || !self.priorities_in_flight.is_empty();
+        has_outstanding_demand && self.last_progress.elapsed() >= WATCHDOG_STUCK_THRESHOLD
+    }
+
+    /// If stuck and not still within `WATCHDOG_WARN_DEBOUNCE` of the last
+    /// warning, emit one WARN-level snapshot of the queue state and arm the
+    /// debounce. Called from the I/O loop's own wait, so it fires even when
+    /// every other caller into this queue has gone silent - the one case
+    /// that matters, since a true deadlock means nothing else would ever
+    /// trigger a check on its own.
+    fn check_watchdog(&mut self) {
+        if !self.is_stuck() {
+            return;
+        }
+        let now = Instant::now();
+        let within_debounce = self
+            .last_watchdog_warn
+            .is_some_and(|last_warn| now.duration_since(last_warn) < WATCHDOG_WARN_DEBOUNCE);
+        if within_debounce {
+            return;
+        }
+        self.last_watchdog_warn = Some(now);
+        self.build_scheduler_state_event()
+            .warn_stuck(self.last_progress.elapsed());
     }
 }
 
@@ -322,7 +396,18 @@ impl IoQueue {
                 }
             }
 
-            self.notify.notified().await;
+            // An otherwise-indefinite wait: real activity (push /
+            // on_iop_complete / on_bytes_consumed) wakes this immediately
+            // via `notify_one`. The timeout only matters when nothing does -
+            // it's the sole mechanism that can notice a stuck queue, since a
+            // true deadlock means every other caller into this state has
+            // also gone silent.
+            if tokio::time::timeout(WATCHDOG_CHECK_INTERVAL, self.notify.notified())
+                .await
+                .is_err()
+            {
+                self.state.lock().unwrap().check_watchdog();
+            }
         }
     }
 
@@ -344,6 +429,7 @@ impl IoQueue {
             for _ in 0..num_reqs {
                 state.priorities_in_flight.remove(priority);
             }
+            state.note_progress();
             state.scheduler_state_event()
         };
         emit_scheduler_state_event(event, &self.stats);
@@ -725,6 +811,71 @@ impl SchedulerStateEvent {
             head_task_blocked_by_bytes_present = self.head_task_blocked_by_bytes.is_some(),
             head_task_blocked_by_bytes = self.head_task_blocked_by_bytes.unwrap_or(false),
             "Scheduler state"
+        );
+    }
+
+    /// Emitted by the watchdog ([`IoQueueState::check_watchdog`]) when a
+    /// queue has outstanding demand and has made no progress for
+    /// `WATCHDOG_STUCK_THRESHOLD`. Unlike `trace`, this always fires - no
+    /// target/level needs to be pre-enabled - since the whole point is to
+    /// surface a stuck queue to an operator who was not expecting one and
+    /// so had no reason to turn on scheduler tracing in advance.
+    fn warn_stuck(self, stuck_for: Duration) {
+        let stuck_for_secs = stuck_for.as_secs();
+        tracing::event!(
+            target: SCHEDULER_STATE_EVENT_TARGET,
+            tracing::Level::WARN,
+            queue_kind = self.queue_kind,
+            stuck_for_secs,
+            io_capacity = self.io_capacity,
+            iops_available = self.iops_available,
+            active_iops = self.active_iops,
+            pending_iops = self.pending_iops,
+            pending_bytes = self.pending_bytes,
+            bytes_available = self.bytes_available,
+            bytes_reserved = self.bytes_reserved,
+            io_buffer_size_bytes = self.io_buffer_size_bytes,
+            priorities_in_flight = self.priorities_in_flight,
+            no_backpressure = self.no_backpressure,
+            head_task_bytes_present = self.head_task_bytes.is_some(),
+            head_task_bytes = self.head_task_bytes.unwrap_or_default(),
+            head_task_priority_high_present = self.head_task_priority_high.is_some(),
+            head_task_priority_high = self.head_task_priority_high.unwrap_or_default(),
+            head_task_priority_low_present = self.head_task_priority_low.is_some(),
+            head_task_priority_low = self.head_task_priority_low.unwrap_or_default(),
+            min_in_flight_priority_high_present = self.min_in_flight_priority_high.is_some(),
+            min_in_flight_priority_high = self.min_in_flight_priority_high.unwrap_or_default(),
+            min_in_flight_priority_low_present = self.min_in_flight_priority_low.is_some(),
+            min_in_flight_priority_low = self.min_in_flight_priority_low.unwrap_or_default(),
+            head_task_can_deliver_present = self.head_task_can_deliver.is_some(),
+            head_task_can_deliver = self.head_task_can_deliver.unwrap_or(false),
+            head_task_priority_bypass_present = self.head_task_priority_bypass.is_some(),
+            head_task_priority_bypass = self.head_task_priority_bypass.unwrap_or(false),
+            head_task_blocked_by_iops_present = self.head_task_blocked_by_iops.is_some(),
+            head_task_blocked_by_iops = self.head_task_blocked_by_iops.unwrap_or(false),
+            head_task_blocked_by_bytes_present = self.head_task_blocked_by_bytes.is_some(),
+            head_task_blocked_by_bytes = self.head_task_blocked_by_bytes.unwrap_or(false),
+            "I/O scheduler appears stuck"
+        );
+        log::warn!(
+            "I/O scheduler ({}) has made no progress for {}s: {} pending request(s) \
+             ({} bytes), {} priority class(es) delivered but not yet consumed (min priority \
+             in flight: {:?}/{:?}), bytes_available={}/{}, iops_available={}/{}. If this \
+             persists, this may be the backpressure deadlock described in \
+             https://github.com/lance-format/lance/issues/9575 - set \
+             RUST_LOG={}=trace for a full state trace.",
+            self.queue_kind,
+            stuck_for_secs,
+            self.pending_iops,
+            self.pending_bytes,
+            self.priorities_in_flight,
+            self.min_in_flight_priority_high,
+            self.min_in_flight_priority_low,
+            self.bytes_available,
+            self.io_buffer_size_bytes,
+            self.iops_available,
+            self.io_capacity,
+            SCHEDULER_STATE_EVENT_TARGET,
         );
     }
 }
@@ -1478,6 +1629,92 @@ mod tests {
         });
 
         handle.assert_finished();
+    }
+
+    #[test]
+    fn test_watchdog_warns_when_stuck_with_outstanding_demand() {
+        use tracing_mock::{expect, subscriber};
+
+        // One priority class delivered but never consumed (simulates a
+        // caller that received data and never drained it), plus a second,
+        // distinct request still waiting to be admitted - "outstanding
+        // demand" by either half of `is_stuck`'s definition.
+        let mut state = IoQueueState::new(4, 1);
+        state.priorities_in_flight.push(0);
+        state.pending_requests.push(make_task(1, false));
+        state.last_progress = Instant::now() - WATCHDOG_STUCK_THRESHOLD - Duration::from_secs(1);
+
+        let event = expect::event()
+            .with_target(SCHEDULER_STATE_EVENT_TARGET)
+            .at_level(tracing::Level::WARN)
+            .with_fields(
+                expect::field("queue_kind")
+                    .with_value(&"standard")
+                    .and(expect::field("pending_iops").with_value(&1u64))
+                    .and(expect::field("priorities_in_flight").with_value(&1u64)),
+            );
+        let (subscriber, handle) = subscriber::mock().event(event).run_with_handle();
+
+        tracing::subscriber::with_default(subscriber, || {
+            state.check_watchdog();
+        });
+
+        handle.assert_finished();
+        assert!(
+            state.last_watchdog_warn.is_some(),
+            "check_watchdog should record that it warned"
+        );
+    }
+
+    #[test]
+    fn test_watchdog_silent_before_threshold() {
+        let mut state = IoQueueState::new(4, 1);
+        state.pending_requests.push(make_task(0, false));
+        // Progress was just noted; nowhere near `WATCHDOG_STUCK_THRESHOLD`.
+        state.last_progress = Instant::now();
+
+        state.check_watchdog();
+
+        assert!(
+            state.last_watchdog_warn.is_none(),
+            "a queue that is merely busy, not stuck, should not warn"
+        );
+    }
+
+    #[test]
+    fn test_watchdog_silent_when_idle() {
+        let mut state = IoQueueState::new(4, 1);
+        // Stale `last_progress`, but nothing pending and nothing in flight:
+        // an idle queue, not a stuck one.
+        state.last_progress = Instant::now() - WATCHDOG_STUCK_THRESHOLD - Duration::from_secs(1);
+
+        state.check_watchdog();
+
+        assert!(
+            state.last_watchdog_warn.is_none(),
+            "an idle queue with no outstanding demand should not warn"
+        );
+    }
+
+    #[test]
+    fn test_watchdog_debounces_repeat_warnings() {
+        let mut state = IoQueueState::new(4, 1);
+        state.pending_requests.push(make_task(0, false));
+        state.last_progress = Instant::now() - WATCHDOG_STUCK_THRESHOLD - Duration::from_secs(1);
+
+        state.check_watchdog();
+        let first_warn = state
+            .last_watchdog_warn
+            .expect("first check should have warned");
+
+        // Still stuck, immediately re-checked: within `WATCHDOG_WARN_DEBOUNCE`,
+        // so the timestamp must not move.
+        state.check_watchdog();
+        assert_eq!(
+            state.last_watchdog_warn,
+            Some(first_warn),
+            "a repeat check inside the debounce window should not re-warn"
+        );
     }
 
     #[test]
