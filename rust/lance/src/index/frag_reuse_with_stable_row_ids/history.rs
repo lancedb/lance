@@ -359,11 +359,9 @@ async fn validate_trim(
 }
 
 enum Loss<'a> {
-    /// The entry itself is gone.
     Removed,
     /// A recorded version is missing or no longer the same.
     Version(&'a FragReuseVersion),
-    /// A rewrite moves rows without recording them.
     Unrecorded,
 }
 
@@ -461,7 +459,6 @@ impl ReadSnapshot<'_> {
     }
 }
 
-/// What the writer read: the version, its indices and its v0 history, if any.
 struct ReadState {
     version: u64,
     indices: Vec<IndexMetadata>,
@@ -2107,18 +2104,11 @@ mod tests {
         Some(frag_reuse_index.is_some())
     }
 
-    /// The stable-row-id case of the F6 race: an index built before a
-    /// recorded compaction commits after it, and a cleanup that read before
-    /// that index, once the caught-up zone map no longer needed the version,
-    /// commits on either side of it. The late index never loses the version it
-    /// needs. Committed first, it holds the cleanup back: the cleanup's commit
-    /// finds it still needing the version, and the cleanup run again keeps it.
-    /// Committed second, it finds the version trimmed and is built again from
-    /// the latest version, also in the session that compacted, whose cached
-    /// rewrite still carries the history. The table is in memory: a store that
-    /// lists a manifest under another e_tag than its write returned (CIFS,
-    /// where mtime settles after the write) makes the commit reload it, and the
-    /// reloaded transaction replaces the cached one.
+    /// An index built from the pre-compaction snapshot blocks cleanup if it
+    /// commits first. If cleanup trims first, index creation must retry from
+    /// the latest snapshot.
+    /// Memory storage preserves the cached in-process rewrite: on CIFS, an
+    /// e_tag change can reload the transaction and replace that cache entry.
     #[rstest]
     #[tokio::test]
     async fn test_cleanup_racing_index_creation_keeps_the_mapping_it_needs(
@@ -2236,14 +2226,8 @@ mod tests {
         RawRepublish,
     }
 
-    /// A cleanup and a recorded compaction race from separate handles, in
-    /// either order, on a table no index needs the history of. A trim that
-    /// lands first is no license to drop the compaction's version: the
-    /// compaction, planned before the trim, appends its own version to what
-    /// the trim kept, without bringing back what it removed. A trim or
-    /// republish that lands second would drop the version recorded since it
-    /// read, so it is refused as retryable, and the cleanup run again trims
-    /// both.
+    /// A rewrite rebases onto a trimmed history without resurrecting versions.
+    /// A stale trim or republish must retry rather than erase a new recording.
     #[rstest]
     #[tokio::test]
     async fn test_cleanup_and_a_recorded_rewrite_race_in_either_order(
@@ -2562,11 +2546,8 @@ mod tests {
         CaughtUp,
     }
 
-    /// Once no index needs the recorded versions, cleanup trims all of them but
-    /// keeps the entry. The handle that cleaned up, a warm one in its session
-    /// and a cold one read the empty history, the version it replaced still
-    /// holds the full one, and the next compaction records into the empty
-    /// history, with or without `defer_index_remap`.
+    /// Trimming every version preserves the empty recording marker.
+    /// Current handles see the trim; the previous snapshot retains its history.
     #[rstest]
     #[tokio::test]
     async fn test_cleanup_trims_the_history_no_index_needs(
@@ -2632,12 +2613,8 @@ mod tests {
         (dataset, before)
     }
 
-    /// Cleanup keeps every version an index may still need. The zone map built
-    /// before the first compaction needs its version. Caught up, it needs only
-    /// the second compaction's, so cleanup trims the first and keeps the second,
-    /// through which the second's moves still translate, from the handle that
-    /// cleaned up, a warm one and a cold one, and the zone map still answers as
-    /// a scan does. Caught up again, it needs neither.
+    /// Catching up an index makes only the oldest prefix trimmable.
+    /// Retained moves must still translate correctly and serve indexed queries.
     #[tokio::test]
     async fn test_cleanup_keeps_the_versions_an_index_needs() {
         let dir = TempStrDir::default();
@@ -2676,15 +2653,9 @@ mod tests {
         assert_answers_through(&latest, "i_idx", "i >= 55 AND i < 75").await;
     }
 
-    /// A BTree on a stable-row-ID table stores row addresses (index format
-    /// version 1), so it lives with the history exactly as a zone map does.
-    /// Built before recording starts, the index answers as a scan does through
-    /// a recorded compaction and a second one that keeps recording, and cleanup
-    /// keeps both versions it needs. Saved, dropped and committed again, it
-    /// covers what the history translates. Caught up, it needs neither version:
-    /// cleanup empties the history but keeps the entry, and the next compaction
-    /// records into it. Translations hold, with the same stable row ids, while
-    /// the records are kept.
+    /// BTree v1 stores physical row addresses even with stable row IDs.
+    /// Both address-index types retain needed history through compaction and
+    /// republication; cleanup preserves recording after they catch up.
     #[rstest]
     #[tokio::test]
     async fn test_address_index_lives_with_the_history(

@@ -9167,7 +9167,6 @@ mod tests {
         assert_moves_keep_row_identity(&before, &latest).await;
     }
 
-    /// The id of the newest fragment, the one the last compaction wrote.
     fn newest_fragment(dataset: &Dataset) -> u32 {
         dataset
             .get_fragments()
@@ -12311,13 +12310,8 @@ mod tests {
         ids
     }
 
-    /// Vector partitions a session decoded through a v0 history embed its
-    /// moves. Without stable row ids nothing validates a raw rewrite, which can
-    /// publish a different history under the same UUID. The partitions are
-    /// keyed by the history's content, so the handle the commit returns and a
-    /// later handle in its session find what a cold one finds, and an exact
-    /// index what exact search finds. The legacy file format is opened through
-    /// its own path.
+    /// Decoded vector partitions embed v0 remapping, so changing history under
+    /// the same UUID must invalidate them. Cover both vector index load paths.
     #[rstest]
     #[case::ivf_flat(false)]
     #[case::legacy_ivf_pq(true)]
