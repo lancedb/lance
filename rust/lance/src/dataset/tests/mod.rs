@@ -4,6 +4,7 @@
 mod data_file_part;
 #[cfg(feature = "substrait")]
 mod dataset_aggregate;
+mod dataset_blob;
 mod dataset_common;
 mod dataset_concurrency_store;
 mod dataset_fts_combined_fields;
