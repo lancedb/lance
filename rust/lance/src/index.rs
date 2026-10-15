@@ -72,9 +72,11 @@ use tracing::{info, instrument, warn};
 use uuid::Uuid;
 use vector::details::{
     derive_vector_index_type, infer_missing_vector_details, needs_vector_details_inference,
-    vector_details_as_json,
+    pre_transform_blocks_maintenance, vector_details_as_json,
 };
-pub(crate) use vector::details::{vector_index_details, vector_index_details_default};
+pub(crate) use vector::details::{
+    vector_index_details, vector_index_details_default, vector_index_details_with_pca,
+};
 use vector::ivf::v2::{IVFIndex, IvfStateEntryBox};
 use vector::utils::get_vector_type;
 
@@ -2861,6 +2863,18 @@ impl DatasetIndexExt for Dataset {
             source_dataset_version
         };
 
+        if all_vector {
+            for segment in source_segments.iter() {
+                if let Some(details) = segment.index_details.as_deref()
+                    && pre_transform_blocks_maintenance(details)?
+                {
+                    return Err(Error::not_supported(
+                        "Merging vector index segments with a pre-transform is not supported",
+                    ));
+                }
+            }
+        }
+
         let staged = staged.as_ref();
         let mut merged_segment = if all_vector {
             crate::index::vector::ivf::merge_segments(self, source_segments).await?
@@ -4183,10 +4197,32 @@ impl Dataset {
         let frag_reuse_uuid = frag_reuse::fri_cache_id(&resolved).copied();
         let query_cache = frag_reuse::scoped_index_cache(self, &resolved);
         let remapping = resolved.map(|(_, remapping)| remapping);
+        let pre_transform = vector::pca_load::DeclaredPreTransform::from_manifest(
+            index_meta,
+            frag_reuse_uuid.as_ref(),
+        )?;
 
         // Check sized cache first (v2+ indices with serializable state).
         let state_key = IvfIndexStateCacheKey::new(uuid, frag_reuse_uuid.as_ref());
-        if let Some(entry) = self.index_cache.get_with_key(&state_key).await {
+        if let Some(entry) = pre_transform.cached_state(&self.index_cache).await? {
+            log::debug!("Found PreTransformIndexState in cache uuid: {}", uuid);
+            let (_, field) = resolve_index_column(self.schema(), index_meta, column)?;
+            let partition_cache = query_cache.for_index(uuid, frag_reuse_uuid.as_ref());
+            let index = entry
+                .inner
+                .0
+                .reconstruct(
+                    object_store.clone(),
+                    self.metadata_cache.as_ref(),
+                    partition_cache,
+                    remapping.clone(),
+                )
+                .await?;
+            return pre_transform.attach_cached(index, &entry, &field.data_type());
+        }
+        if !pre_transform.is_declared()
+            && let Some(entry) = self.index_cache.get_with_key(&state_key).await
+        {
             log::debug!("Found IvfIndexState in cache uuid: {}", uuid);
             let partition_cache = query_cache.for_index(uuid, frag_reuse_uuid.as_ref());
             return entry
@@ -4234,6 +4270,7 @@ impl Dataset {
 
         let tailing_bytes = read_last_block(reader.as_ref()).await?;
         let (major_version, minor_version) = read_version(&tailing_bytes)?;
+        pre_transform.check_container_version(major_version, minor_version)?;
 
         // Namespace the index cache by the UUID of the index. v2+ partition
         // entries are store-free and remain reusable across object-store
@@ -4324,10 +4361,13 @@ impl Dataset {
                 let (field_path, field) = resolve_index_column(self.schema(), index_meta, column)?;
 
                 let (_, element_type) = get_vector_type(self.schema(), &field_path)?;
+                let pre_transform_model = pre_transform
+                    .read(&reader, &index_metadata.index_type)
+                    .await?;
 
                 info!(target: TRACE_IO_EVENTS, index_uuid=%uuid, r#type=IO_TYPE_OPEN_VECTOR, version="0.3", index_type=index_metadata.index_type);
 
-                match index_metadata.index_type.as_str() {
+                let loaded = match index_metadata.index_type.as_str() {
                     "IVF_FLAT" => match element_type {
                         DataType::Float16 | DataType::Float32 | DataType::Float64 => {
                             let ivf = IVFIndex::<FlatIndex, FlatQuantizer>::try_new(
@@ -4464,7 +4504,17 @@ impl Dataset {
                         "Unsupported index type: {}",
                         index_metadata.index_type
                     ))),
-                }
+                }?;
+                let (index, ivf_entry) = loaded;
+                pre_transform
+                    .attach_opened(
+                        &self.index_cache,
+                        index,
+                        ivf_entry,
+                        pre_transform_model,
+                        &field.data_type(),
+                    )
+                    .await
             }
 
             _ => Err(Error::index(
@@ -4486,7 +4536,7 @@ impl Dataset {
             self.index_cache
                 .insert_with_key(&state_key, Arc::new(ivf_entry))
                 .await;
-        } else {
+        } else if !pre_transform.is_declared() {
             self.index_cache
                 .insert_with_key(&cache_key, Arc::new(CachedLegacyVectorIndex(index.clone())))
                 .await;
@@ -4615,6 +4665,10 @@ impl DatasetIndexInternalExt for Dataset {
                 .await?;
             segments.push((metadata, index));
         }
+        vector::pca_load::validate_logical_pca_fingerprints(
+            name,
+            segments.iter().map(|(metadata, _)| metadata),
+        )?;
 
         LogicalVectorIndex::try_new(name.to_string(), column.to_string(), segments)
     }
