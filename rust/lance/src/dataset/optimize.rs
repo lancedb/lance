@@ -942,14 +942,6 @@ impl CompactionPlanner for DefaultCompactionPlanner {
             };
 
             let indices = indices_containing_frag(fragment.id as u32);
-            if log::log_enabled!(log::Level::Trace) {
-                log::trace!(
-                    "Compaction fragment_id={}, index_count={}, indices={:?}",
-                    fragment.id,
-                    indices.len(),
-                    indices,
-                );
-            }
 
             match (candidacy, &mut current_bin) {
                 (None, None) => {} // keep searching
@@ -999,13 +991,14 @@ impl CompactionPlanner for DefaultCompactionPlanner {
         }
 
         if log::log_enabled!(log::Level::Debug) {
-            // Bound both dimensions so large compaction plans do not flood the logs.
-            const MAX_PREVIEW_BINS: usize = 10;
+            // Bound both dimensions of the candidate bin previews.
+            const MAX_PREVIEW_BINS: usize = 100;
             const MAX_PREVIEW_ITEMS: usize = 100;
             log::debug!(
-                "Compaction candidate_bins: count={}, omitted_bins={}",
+                "Compaction candidate_bins: count={}, omitted_bins={}, index_fragmaps={:?}",
                 candidate_bins.len(),
                 candidate_bins.len().saturating_sub(MAX_PREVIEW_BINS),
+                index_fragmaps,
             );
             for (bin_index, bin) in candidate_bins.iter().take(MAX_PREVIEW_BINS).enumerate() {
                 let fragment_ids: Vec<_> = bin
