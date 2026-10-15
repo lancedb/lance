@@ -19,13 +19,13 @@ import java.util.Arrays;
 import java.util.Objects;
 
 /**
- * A reusable IVF_RQ rotation model. Send {@link #toBytes()} to other builders and restore it with
- * {@link #fromBytes(byte[])}. Physical merging also requires the same IVF centroids and compatible
- * index parameters across segments.
+ * A reusable IVF_RQ model containing rotation and quantization settings. Send {@link #toBytes()} to
+ * other builders and restore it with {@link #fromBytes(byte[])}. Physical merging also requires the
+ * same IVF centroids and compatible index parameters across segments.
  *
- * <p>Only {@link RQRotationType#FAST} can be serialized because the matrix rotation is omitted by
- * the model format. Dimension must be positive and divisible by 8; numBits must be between 1 and 9
- * inclusive.
+ * <p>Only {@link RQRotationType#FAST} models are supported. Dimension must be positive and
+ * divisible by 8; numBits must be between 1 and 9 inclusive. Restored models using the
+ * residual-query estimator require numBits to be 1.
  *
  * <pre>{@code
  * RQModel model = RQModel.build(128, (byte) 5);
@@ -51,14 +51,19 @@ public final class RQModel {
     this.numBits = numBits;
   }
 
-  /** Generate a model with fast rotation for the given vector dimension and number of bits. */
+  /**
+   * Generate a model with fast rotation and the raw-query estimator for the given vector dimension
+   * and number of bits.
+   */
   public static RQModel build(int dimension, byte numBits) {
     return new RQModel(nativeBuild(dimension, numBits), dimension, numBits);
   }
 
   /**
-   * Restore a serialized model received from another process. The rotation payload is validated
-   * immediately; the index build also checks its dimension against the indexed vectors.
+   * Restore a serialized model received from another process, preserving its rotation and
+   * quantization settings. Models without a query estimator use the residual-query estimator.
+   * Unsupported settings are rejected immediately; the index build also checks the model dimension
+   * against the indexed vectors.
    */
   public static RQModel fromBytes(byte[] bytes) {
     Objects.requireNonNull(bytes, "bytes");

@@ -8,7 +8,7 @@ use jni::JNIEnv;
 use jni::objects::{JByteArray, JClass, JObject};
 use jni::sys::{jbyte, jbyteArray, jint, jintArray};
 use lance_index::vector::bq::builder::RabitQuantizer;
-use lance_index::vector::bq::storage::RabitQuantizationMetadata;
+use lance_index::vector::bq::storage::{RabitQuantizationMetadata, RabitQueryEstimator};
 use lance_index::vector::bq::{RQBuildParams, RQRotationType, validate_rq_num_bits};
 use lance_index::vector::quantizer::Quantization;
 
@@ -56,9 +56,9 @@ fn extract_rq_rotation_type(env: &mut JNIEnv, rq_obj: &JObject) -> Result<RQRota
 }
 
 pub(crate) fn parse_rq_model(bytes: &[u8]) -> Result<RabitQuantizationMetadata> {
-    let model: RabitQuantizationMetadata = serde_json::from_slice(bytes)
+    let mut model: RabitQuantizationMetadata = serde_json::from_slice(bytes)
         .map_err(|e| Error::input_error(format!("Invalid RQ model: {e}")))?;
-    validate_rq_num_bits(model.num_bits).map_err(|e| Error::input_error(e.to_string()))?;
+    validate_rq_num_bits(model.num_bits)?;
     let dimension = model.rotated_dim();
     if dimension == 0 || dimension > i32::MAX as usize || !dimension.is_multiple_of(8) {
         return Err(Error::input_error(format!(
@@ -71,9 +71,15 @@ pub(crate) fn parse_rq_model(bytes: &[u8]) -> Result<RabitQuantizationMetadata> 
             model.rotation_type
         )));
     }
-    model
-        .validate_rotation()
-        .map_err(|e| Error::input_error(e.to_string()))?;
+    if model.query_estimator == RabitQueryEstimator::ResidualQuery && model.num_bits != 1 {
+        return Err(Error::input_error(format!(
+            "RQ model query_estimator=residual_query requires num_bits=1, got {}",
+            model.num_bits
+        )));
+    }
+    model.validate_rotation()?;
+    model.packed = false;
+    model.rotate_mat_position = None;
     Ok(model)
 }
 
@@ -101,7 +107,7 @@ fn inner_build<'local>(
             "IVF_RQ dimension must be positive and divisible by 8, got {dimension}"
         )));
     }
-    validate_rq_num_bits(num_bits as u8).map_err(|e| Error::input_error(e.to_string()))?;
+    validate_rq_num_bits(num_bits as u8)?;
     let quantizer = RabitQuantizer::new_with_rotation::<Float32Type>(
         num_bits as u8,
         dimension,
@@ -144,7 +150,58 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_rq_model_validates_rotation_payload() {
+    fn test_preserves_model_settings() {
+        let mut model =
+            RabitQuantizer::new_with_rotation::<Float32Type>(3, 32, RQRotationType::Fast)
+                .metadata(None);
+        let bytes = serde_json::to_vec(&model).unwrap();
+        let parsed = parse_rq_model(&bytes).unwrap();
+        assert_eq!(
+            serde_json::to_value(&parsed).unwrap(),
+            serde_json::to_value(&model).unwrap()
+        );
+
+        model.num_bits = 1;
+        model.query_estimator = RabitQueryEstimator::ResidualQuery;
+        let expected = serde_json::to_value(&model).unwrap();
+        model.packed = true;
+        model.rotate_mat_position = Some(42);
+
+        let parsed = parse_rq_model(&serde_json::to_vec(&model).unwrap()).unwrap();
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), expected);
+    }
+
+    #[test]
+    fn test_default_query_estimator() {
+        let mut model =
+            RabitQuantizer::new_with_rotation::<Float32Type>(1, 32, RQRotationType::Fast)
+                .metadata(None);
+        let mut payload = serde_json::to_value(&model).unwrap();
+        payload.as_object_mut().unwrap().remove("query_estimator");
+
+        let parsed = parse_rq_model(&serde_json::to_vec(&payload).unwrap()).unwrap();
+        model.query_estimator = RabitQueryEstimator::ResidualQuery;
+        assert_eq!(
+            serde_json::to_value(&parsed).unwrap(),
+            serde_json::to_value(&model).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_rejects_multi_bit_residual_query() {
+        let mut model =
+            RabitQuantizer::new_with_rotation::<Float32Type>(3, 32, RQRotationType::Fast)
+                .metadata(None);
+        model.query_estimator = RabitQueryEstimator::ResidualQuery;
+
+        let err = parse_rq_model(&serde_json::to_vec(&model).unwrap()).unwrap_err();
+        let message = err.to_string();
+        assert!(message.starts_with("java/lang/IllegalArgumentException:"));
+        assert!(message.contains("query_estimator=residual_query requires num_bits=1, got 3"));
+    }
+
+    #[test]
+    fn test_validates_rotation_payload() {
         let mut model =
             RabitQuantizer::new_with_rotation::<Float32Type>(3, 32, RQRotationType::Fast)
                 .metadata(None);
