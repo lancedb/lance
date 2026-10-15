@@ -11524,6 +11524,161 @@ mod tests {
         );
     }
 
+    #[rstest::rstest]
+    #[case::retained_row_ids(false)]
+    #[case::retained_row_addresses(true)]
+    #[tokio::test]
+    async fn test_staged_btree_row_domains_reject_partial_migration(
+        #[case] retain_row_addresses: bool,
+    ) {
+        let dir = copy_test_data_to_tmp("v14.0.0-beta.15/stable_row_id_btree.lance").unwrap();
+        let mut dataset = Dataset::open(&dir.path_str()).await.unwrap();
+        assert!(dataset.manifest.uses_stable_row_ids());
+        let legacy = dataset.load_indices_by_name("value_idx").await.unwrap();
+        assert_eq!(legacy.len(), 2);
+        assert!(
+            legacy
+                .iter()
+                .all(|segment| !segment.results_are_row_addrs())
+        );
+        let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::BTree);
+        let mut current = Vec::with_capacity(2);
+        for fragment_id in [0, 1] {
+            current.push(
+                dataset
+                    .create_index_builder(&["value"], IndexType::BTree, &params)
+                    .name("value_idx".into())
+                    .replace(true)
+                    .fragments(vec![fragment_id])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+            );
+        }
+        assert!(
+            current
+                .iter()
+                .all(|segment| segment.results_are_row_addrs())
+        );
+        if retain_row_addresses {
+            dataset
+                .commit_existing_index_segments("value_idx", "value", current.clone())
+                .await
+                .unwrap();
+        }
+        dataset = Dataset::open(&dir.path_str()).await.unwrap();
+        let before_version = dataset.version_id();
+        let before = dataset.load_indices_by_name("value_idx").await.unwrap();
+        let incoming = if retain_row_addresses {
+            legacy[0].clone()
+        } else {
+            current[0].clone()
+        };
+        let error = dataset
+            .commit_existing_index_segments("value_idx", "value", vec![incoming])
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(error.to_string().contains("mixes row-ID and row-address"));
+        let mut dataset = Dataset::open(&dir.path_str()).await.unwrap();
+        assert_eq!(dataset.version_id(), before_version);
+        assert_eq!(
+            dataset.load_indices_by_name("value_idx").await.unwrap(),
+            before
+        );
+        for (filter, expected) in [("value = 1", 1), ("value = 9", 1), ("value IS NULL", 2)] {
+            for indexed in [false, true] {
+                let mut scan = dataset.scan();
+                scan.filter(filter).unwrap().use_scalar_index(indexed);
+                assert_eq!(scan.try_into_batch().await.unwrap().num_rows(), expected);
+            }
+        }
+        // A complete migration remains valid: no legacy sibling survives it.
+        dataset
+            .commit_existing_index_segments("value_idx", "value", current)
+            .await
+            .unwrap();
+        assert!(
+            dataset
+                .load_indices_by_name("value_idx")
+                .await
+                .unwrap()
+                .iter()
+                .all(|segment| segment.results_are_row_addrs())
+        );
+        assert_eq!(
+            dataset.count_rows(Some("value = 9".into())).await.unwrap(),
+            1
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::legacy_first(false, false)]
+    #[case::address_first(true, false)]
+    #[case::transaction_boundary(false, true)]
+    #[tokio::test]
+    async fn test_staged_btree_row_domains_reject_mixed_incoming(
+        #[case] reverse: bool,
+        #[case] direct_transaction: bool,
+    ) {
+        let dir = copy_test_data_to_tmp("v14.0.0-beta.15/stable_row_id_btree.lance").unwrap();
+        let mut dataset = Dataset::open(&dir.path_str()).await.unwrap();
+        let legacy = dataset.load_indices_by_name("value_idx").await.unwrap();
+        let first = legacy
+            .iter()
+            .find(|segment| segment.fragment_bitmap.as_ref().unwrap().contains(0))
+            .unwrap()
+            .clone();
+        let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::BTree);
+        let current = dataset
+            .create_index_builder(&["value"], IndexType::BTree, &params)
+            .name("value_idx".into())
+            .replace(true)
+            .fragments(vec![1])
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        let mut incoming = vec![first, current];
+        if reverse {
+            incoming.reverse();
+        }
+        let version = dataset.version_id();
+        let error = if direct_transaction {
+            dataset
+                .apply_commit(
+                    Transaction::new(
+                        version,
+                        Operation::CreateIndex {
+                            new_indices: incoming,
+                            removed_indices: legacy.clone(),
+                        },
+                        None,
+                    ),
+                    &Default::default(),
+                    &Default::default(),
+                )
+                .await
+                .unwrap_err()
+        } else {
+            dataset
+                .commit_existing_index_segments("value_idx", "value", incoming)
+                .await
+                .unwrap_err()
+        };
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(error.to_string().contains("mixes row-ID and row-address"));
+        let dataset = Dataset::open(&dir.path_str()).await.unwrap();
+        assert_eq!(dataset.version_id(), version);
+        assert_eq!(
+            dataset.load_indices_by_name("value_idx").await.unwrap(),
+            legacy
+        );
+        assert_eq!(
+            dataset.count_rows(Some("value = 9".into())).await.unwrap(),
+            1
+        );
+    }
+
     #[tokio::test]
     async fn test_commit_existing_index_segments_commits_multiple_segments() {
         use lance_datagen::{BatchCount, RowCount, array};
