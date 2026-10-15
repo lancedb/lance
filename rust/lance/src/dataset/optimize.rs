@@ -942,8 +942,8 @@ impl CompactionPlanner for DefaultCompactionPlanner {
             };
 
             let indices = indices_containing_frag(fragment.id as u32);
-            if log::log_enabled!(log::Level::Debug) {
-                log::debug!(
+            if log::log_enabled!(log::Level::Trace) {
+                log::trace!(
                     "Compaction fragment_id={}, index_count={}, indices={:?}",
                     fragment.id,
                     indices.len(),
