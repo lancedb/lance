@@ -307,6 +307,19 @@ pub(crate) async fn derive_fragment_stats_update(
                 .or_default()
                 .push(record);
         }
+        // A segment whose bitmap is empty contributes nothing (the creation
+        // placeholder, or coverage centrally withdrawn to zero) and may be
+        // dropped by any later commit.
+        for candidate in segments {
+            if candidate
+                .fragment_bitmap
+                .as_ref()
+                .is_some_and(|bitmap| bitmap.is_empty())
+                && !update.replaced_uuids.contains(&candidate.uuid)
+            {
+                update.replaced_uuids.push(candidate.uuid);
+            }
+        }
         for (bucket, records) in by_bucket {
             // Segments never span buckets, so any covered id identifies the
             // bucket; an empty bitmap identifies nothing and is never matched.

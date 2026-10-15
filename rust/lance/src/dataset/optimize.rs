@@ -740,13 +740,36 @@ pub(super) async fn can_use_binary_copy_current(
             // (including global buffers) is re-generated, not copied from inputs.
             //
             // Therefore, we reject input files that contain any additional global buffers beyond
-            // the required schema / file descriptor global buffer (global buffer index 0).
+            // the required schema / file descriptor global buffer (global buffer index 0),
+            // EXCEPT index seed buffers (fragment-local statistics payloads, schema metadata
+            // keys "lance.seed.<column>" = "<buf_index>:..."). Those are derived, per-file
+            // artifacts: dropping them on compaction only downgrades the rewritten fragments
+            // to "no statistics" (a conservative state), never affects correctness. Carrying
+            // them forward via metadata-level zone concatenation is future work.
             if file_meta.file_buffers.len() > 1 {
+                let seed_buffer_indices: std::collections::HashSet<u32> = file_meta
+                    .file_schema
+                    .metadata
+                    .iter()
+                    .filter(|(key, _)| {
+                        key.starts_with(lance_index::scalar::seed::SEED_META_KEY_PREFIX)
+                    })
+                    .filter_map(|(_, value)| value.split(':').next()?.parse::<u32>().ok())
+                    .collect();
+                let all_extras_are_seeds = (1..file_meta.file_buffers.len() as u32)
+                    .all(|buffer_index| seed_buffer_indices.contains(&buffer_index));
+                if !all_extras_are_seeds {
+                    log::debug!(
+                        "Binary copy disabled: data file has extra non-seed global buffers (len={})",
+                        file_meta.file_buffers.len()
+                    );
+                    return Ok(false);
+                }
                 log::debug!(
-                    "Binary copy disabled: data file has extra global buffers (len={})",
-                    file_meta.file_buffers.len()
+                    "Binary copy proceeding past {} seed buffer(s); rewritten fragments will \
+                     have no fragment statistics until re-collected",
+                    file_meta.file_buffers.len() - 1
                 );
-                return Ok(false);
             }
         }
     }
