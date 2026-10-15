@@ -55,7 +55,7 @@ from .dependencies import (
 from .dependencies import numpy as np
 from .dependencies import pandas as pd
 from .fragment import DataFile, FragmentMetadata, LanceFragment
-from .indices import IndexConfig, IndexSegment, SupportedDistributedIndices
+from .indices import IndexConfig, IndexSegment, PcaParams, SupportedDistributedIndices
 from .lance import (
     CleanupExplanation,
     CleanupStats,
@@ -4010,9 +4010,12 @@ class LanceDataset(pa.dataset.Dataset):
         streaming_refine_passes: Optional[int] = None,
         skip_transpose: bool = False,
         rabitq_model: Optional[str] = None,
+        pca: Optional[PcaParams] = None,
         require_commit: bool = True,
         **kwargs,
     ) -> Index:
+        if pca is not None and not isinstance(pca, PcaParams):
+            raise TypeError(f"pca must be a PcaParams instance, got {type(pca)}")
         if not require_commit and fragment_ids is None:
             raise ValueError(
                 "create_index_uncommitted requires fragment_ids "
@@ -4101,6 +4104,63 @@ class LanceDataset(pa.dataset.Dataset):
         if index_type not in valid_index_types:
             raise NotImplementedError(
                 f"Only {valid_index_types} index types supported. Got {index_type}"
+            )
+
+        if pca is not None:
+            if index_type != "IVF_RQ":
+                raise ValueError("pca is only supported for IVF_RQ indices")
+            if metric.lower() not in ("l2", "euclidean"):
+                raise ValueError("pca requires the L2/euclidean metric")
+            if accelerator is not None:
+                raise ValueError("pca does not support accelerator builds")
+            if not filter_nan:
+                raise ValueError("pca requires filter_nan=True")
+            if not train:
+                raise ValueError("pca requires train=True")
+            if not require_commit:
+                raise ValueError("pca does not support create_index_uncommitted")
+            if fragment_ids is not None:
+                raise ValueError("pca does not support fragment_ids")
+            if ivf_centroids is not None or ivf_centroids_file is not None:
+                raise ValueError("pca does not support precomputed IVF centroids")
+            if rabitq_model is not None:
+                raise ValueError("pca does not support rabitq_model")
+            if precomputed_partition_dataset is not None:
+                raise ValueError("pca does not support precomputed_partition_dataset")
+
+            precomputed_keys = {
+                "precomputed_partitions_file",
+                "precomputed_shuffle_buffers",
+                "precomputed_shuffle_buffers_path",
+            }
+            provided_precomputed_keys = precomputed_keys.intersection(kwargs)
+            if provided_precomputed_keys:
+                provided = ", ".join(sorted(provided_precomputed_keys))
+                raise ValueError(
+                    f"pca does not support precomputed buffers: {provided}"
+                )
+
+            index_file_version = kwargs.get("index_file_version")
+            index_file_version = getattr(
+                index_file_version, "value", index_file_version
+            )
+            if (
+                isinstance(index_file_version, str)
+                and index_file_version.lower() == "legacy"
+            ):
+                raise ValueError("pca does not support the Legacy index file format")
+
+            kwargs.update(
+                {
+                    "pca_dimension": pca.dimension,
+                    "pca_random_rotation": pca.random_rotation,
+                    "pca_whitening": pca.whitening,
+                    "pca_epsilon": pca.epsilon,
+                    "pca_sample_size": pca.sample_size,
+                    "pca_max_training_memory_bytes": (pca.max_training_memory_bytes),
+                    "pca_sampling_seed": pca.sampling_seed,
+                    "pca_rotation_seed": pca.rotation_seed,
+                }
             )
 
         # Handle timing for various parts of accelerated builds
@@ -4421,6 +4481,7 @@ class LanceDataset(pa.dataset.Dataset):
         streaming_coreset_rate: Optional[int] = None,
         streaming_refine_passes: Optional[int] = None,
         skip_transpose: bool = False,
+        pca: Optional[PcaParams] = None,
         progress_callback: Optional[Callable[[IndexProgress], None]] = None,
         **kwargs,
     ) -> LanceDataset:
@@ -4534,6 +4595,13 @@ class LanceDataset(pa.dataset.Dataset):
             Number of extra streaming Lloyd refinement passes to run after streaming
             coreset training. Each pass loads at most
             ``num_partitions * streaming_sample_rate`` raw vectors at a time.
+        pca : PcaParams, optional
+            **Experimental.** PCA pre-transform configuration for ``IVF_RQ``.
+            PCA accepts original vectors at query time and is supported only for
+            committed, trained, CPU-built ``IVF_RQ`` indices using the
+            L2/euclidean metric. The configuration and stored model may change
+            incompatibly, in which case the index must be rebuilt. The source
+            data is not rewritten.
         kwargs :
             Parameters passed to the index building process.
 
@@ -4564,6 +4632,8 @@ class LanceDataset(pa.dataset.Dataset):
 
             - num_bits
                 The number of bits for RQ (Rabit Quantization). Default is 5.
+            - pca
+                A :class:`lance.indices.PcaParams` PCA pre-transform configuration.
 
         Optional parameters for `IVF_HNSW_*`:
             max_level
@@ -4597,6 +4667,19 @@ class LanceDataset(pa.dataset.Dataset):
                 "vector",
                 "IVF_HNSW_SQ",
                 num_partitions=256,
+            )
+
+        .. code-block:: python
+
+            import lance
+            from lance.indices import PcaParams
+
+            dataset = lance.dataset("/tmp/sift.lance")
+            dataset.create_index(
+                "vector",
+                "IVF_RQ",
+                num_partitions=256,
+                pca=PcaParams(dimension=64, whitening=True),
             )
 
         Experimental Accelerator (GPU) support:
@@ -4659,6 +4742,7 @@ class LanceDataset(pa.dataset.Dataset):
             streaming_coreset_rate=streaming_coreset_rate,
             streaming_refine_passes=streaming_refine_passes,
             skip_transpose=skip_transpose,
+            pca=pca,
             require_commit=True,
             **kwargs,
         )
@@ -4697,6 +4781,7 @@ class LanceDataset(pa.dataset.Dataset):
         streaming_refine_passes: Optional[int] = None,
         skip_transpose: bool = False,
         rabitq_model: Optional[str] = None,
+        pca: Optional[PcaParams] = None,
         **kwargs,
     ) -> Index:
         """
@@ -4753,6 +4838,10 @@ class LanceDataset(pa.dataset.Dataset):
         is_scalar_segment_request = self._is_segment_native_scalar_index_type(
             index_type
         )
+        if pca is not None and not isinstance(pca, PcaParams):
+            raise TypeError(f"pca must be a PcaParams instance, got {type(pca)}")
+        if pca is not None and is_scalar_segment_request:
+            raise ValueError("pca is only supported for IVF_RQ indices")
         if is_scalar_segment_request:
             if fragment_ids is None:
                 raise ValueError(
@@ -4805,6 +4894,7 @@ class LanceDataset(pa.dataset.Dataset):
             streaming_refine_passes=streaming_refine_passes,
             skip_transpose=skip_transpose,
             rabitq_model=rabitq_model,
+            pca=pca,
             require_commit=False,
             **kwargs,
         )

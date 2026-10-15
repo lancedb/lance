@@ -2407,9 +2407,14 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                             }
                             None => None,
                         };
+                        // Decorators transform once here and return the inner index so early/late search does not transform again.
+                        let (search_index, query) = raw_index
+                            .clone()
+                            .prepare_partition_query(&query)?
+                            .unwrap_or((raw_index, query));
 
                         let early_search = Self::initial_search(
-                            raw_index.clone(),
+                            search_index.clone(),
                             query.clone(),
                             part_ids.clone(),
                             q_c_dists.clone(),
@@ -2420,7 +2425,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                             seg_mask.clone(),
                         );
                         let late_search = Self::late_search(
-                            raw_index.clone(),
+                            search_index,
                             query,
                             part_ids,
                             q_c_dists,

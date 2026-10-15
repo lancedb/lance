@@ -8,6 +8,7 @@ use lance_linalg::distance::MetricType;
 
 use crate::dataset::Dataset;
 
+use crate::index::vector::training_source::TrainingVectorTransform;
 use super::super::{
     FixedIvfTrainingRanges, FixedIvfTrainingSampler, KMeansProgressCallback,
     StreamingFloatKMeansMetricPolicy, StreamingKMeansMetricPolicy, WeightedCoreset,
@@ -20,13 +21,18 @@ use super::StreamingCoresetAlgorithm;
 
 pub(in crate::index::vector::ivf) struct FloatCoresetAlgorithm<'a> {
     metric_policy: &'a dyn StreamingFloatKMeansMetricPolicy,
+    pre_transform: Option<&'a dyn TrainingVectorTransform>,
 }
 
 impl<'a> FloatCoresetAlgorithm<'a> {
     pub(in crate::index::vector::ivf) fn new(
         metric_policy: &'a dyn StreamingFloatKMeansMetricPolicy,
+        pre_transform: Option<&'a dyn TrainingVectorTransform>,
     ) -> Self {
-        Self { metric_policy }
+        Self {
+            metric_policy,
+            pre_transform,
+        }
     }
 }
 
@@ -141,6 +147,7 @@ impl StreamingCoresetAlgorithm for FloatCoresetAlgorithm<'_> {
             initial_centroids,
             passes,
             on_progress,
+            self.pre_transform,
         )
         .await
     }
@@ -168,6 +175,7 @@ impl StreamingCoresetAlgorithm for FloatCoresetAlgorithm<'_> {
             fragment_ids,
             passes,
             on_progress,
+            self.pre_transform,
         )
         .await
     }
