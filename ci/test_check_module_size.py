@@ -7,10 +7,12 @@ import subprocess
 
 import pytest
 from check_module_size import (
+    EXCEPTIONS_FILE,
     FileChange,
     Size,
     changed_rust_files,
     evaluate,
+    main,
     parse_exceptions,
     stale_exceptions,
 )
@@ -80,3 +82,55 @@ def test_changed_rust_files(tmp_path, monkeypatch):
         FileChange("grown.rs", Size(10, 20), Size(15, 30)),
         FileChange("moved.rs", Size(20, 40), Size(21, 42)),
     ]
+
+
+def numbered(start, stop):
+    """Distinct 8-byte lines, so git can merge edits to different regions."""
+    return "".join(f"line {i:02}\n" for i in range(start, stop))
+
+
+@pytest.mark.parametrize(
+    "base_files, main_files, pr_files",
+    [
+        # main grows big.rs past the limit and lists it after the PR branched.
+        pytest.param(
+            {"big.rs": numbered(0, 10), "other.rs": "", EXCEPTIONS_FILE: ""},
+            {"big.rs": numbered(0, 14), EXCEPTIONS_FILE: "big.rs\n"},
+            {"other.rs": numbered(0, 1)},
+            id="main_adds_exception",
+        ),
+        # main splits big.rs and unlists it while the PR appends to it.
+        pytest.param(
+            {"big.rs": numbered(0, 15), EXCEPTIONS_FILE: "big.rs\n"},
+            {"big.rs": numbered(10, 15), EXCEPTIONS_FILE: ""},
+            {"big.rs": numbered(0, 16)},
+            id="main_removes_exception",
+        ),
+    ],
+)
+@pytest.mark.parametrize("head", ["HEAD", "HEAD^2"])
+def test_pr_diverged_from_main(
+    tmp_path, monkeypatch, base_files, main_files, pr_files, head
+):
+    def git(*args):
+        subprocess.run(["git", "-C", tmp_path, *args], check=True, capture_output=True)
+
+    def commit(files):
+        for name, content in files.items():
+            path = tmp_path / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content)
+        git("add", "-A")
+        git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "c")
+
+    git("init", "-q", "-b", "main")
+    commit(base_files)
+    git("switch", "-q", "-c", "pr")
+    commit(pr_files)
+    git("switch", "-q", "main")
+    commit(main_files)
+    # Mirror the workflow's checkout: the test merge commit of the PR into main.
+    git("-c", "user.name=t", "-c", "user.email=t@t", "merge", "-q", "--no-ff", "pr")
+
+    monkeypatch.chdir(tmp_path)
+    assert main(["HEAD^1", head, "--fail-bytes", "100"]) == 0

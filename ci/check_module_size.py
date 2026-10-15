@@ -21,7 +21,6 @@ import argparse
 import subprocess
 import sys
 from dataclasses import dataclass
-from pathlib import Path
 
 WARN_LINES = 3000
 FAIL_BYTES = 400_000
@@ -201,7 +200,9 @@ def main(argv=None):
     parser.add_argument("--summary", help="append a markdown summary to this file")
     args = parser.parse_args(argv)
 
-    exceptions = parse_exceptions(Path(EXCEPTIONS_FILE).read_text())
+    # Read the list from the same tree as the module sizes, not the working
+    # tree, so the two cannot disagree when the checkout differs from `head`.
+    exceptions = parse_exceptions(git("show", f"{args.head}:{EXCEPTIONS_FILE}"))
 
     changes = changed_rust_files(args.base, args.head)
     findings = evaluate(changes, exceptions, args.warn_lines, args.fail_bytes)

@@ -34,7 +34,8 @@ jobs:
           # Full history (without blobs) is needed to find the merge base.
           fetch-depth: 0
           filter: blob:none
-      # The checkout is the PR's test merge commit: HEAD^1 is the base branch
-      # and HEAD^2 is the PR head.
+      # The checkout is the PR's test merge commit. Comparing it with HEAD^1
+      # (the current base branch) measures only the PR's growth, and checks the
+      # exceptions list against what main will look like after merging.
       - name: Check module sizes
-        run: python3 ci/check_module_size.py HEAD^1 HEAD^2 --summary "$GITHUB_STEP_SUMMARY"
+        run: python3 ci/check_module_size.py HEAD^1 HEAD --summary "$GITHUB_STEP_SUMMARY"
