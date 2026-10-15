@@ -1088,21 +1088,22 @@ impl ScanScheduler {
                 let queue = io_queue.clone();
                 let requested_range = task.clone();
                 let run_fn = Box::new(move || {
-                    // The counters behind iops_counter()/bytes_read_counter()
-                    // are published by IoTask::run on the standard path, so
-                    // this one has to publish the same pair, the same way:
-                    // the requested length, counted whether or not the read
-                    // comes back, and nothing at all for an empty range.
-                    let num_bytes = requested_range.end - requested_range.start;
-                    if num_bytes > 0 {
-                        IOPS_COUNTER.fetch_add(1, Ordering::Release);
+                    // An empty range asks for no bytes, which IoTask::run
+                    // answers without a request. Reaching a cloud store with
+                    // one is an InvalidGetRange error there.
+                    if requested_range.start == requested_range.end {
+                        return async { Ok(Bytes::new()) }.boxed();
                     }
+                    // IoTask::run publishes the counters behind
+                    // iops_counter()/bytes_read_counter(), so this path has to
+                    // publish the same pair the same way: the requested
+                    // length, on the error arm as well.
+                    let num_bytes = requested_range.end - requested_range.start;
+                    IOPS_COUNTER.fetch_add(1, Ordering::Release);
                     let bytes_fut = reader
                         .get_range(requested_range.start as usize..requested_range.end as usize)
                         .inspect(move |_| {
-                            if num_bytes > 0 {
-                                BYTES_READ_COUNTER.fetch_add(num_bytes, Ordering::Release);
-                            }
+                            BYTES_READ_COUNTER.fetch_add(num_bytes, Ordering::Release);
                         });
                     async move {
                         let bytes = bytes_fut.await.map_err(Error::from)?;
