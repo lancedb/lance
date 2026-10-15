@@ -33,17 +33,11 @@ const BACKPRESSURE_DEBOUNCE: u64 = 60;
 const SCHEDULER_STATE_EVENT_TARGET: &str = "lance_io::scheduler::state";
 
 // How often the I/O loop's otherwise-indefinite wait is interrupted to check
-// whether the queue has gone quiet. Cheap: just a timestamp comparison under
-// a lock that is already taken on every real wakeup, and this is the only
-// thing that can notice a queue with pending demand and zero progress, since
-// a truly stuck queue means nothing else is left calling into this state to
-// trigger a check on its own.
+// whether the queue has gone quiet
 const WATCHDOG_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 // A queue with outstanding demand (pending requests, or delivered-but-
 // unconsumed priorities) and no deliveries or consumption for this long is
-// reported as stuck. Comfortably above ordinary I/O latency so a slow but
-// live backend doesn't trip it, short enough to be useful well before a
-// human would otherwise notice a hang.
+// reported as stuck.
 const WATCHDOG_STUCK_THRESHOLD: Duration = Duration::from_secs(15);
 // Once stuck, don't re-log more than once a minute (matches
 // `BACKPRESSURE_DEBOUNCE`'s rationale: stay quiet while still true).
@@ -310,9 +304,7 @@ impl IoQueueState {
 
     /// Whether the queue has outstanding demand (pending requests, or
     /// delivered-but-not-yet-consumed priorities) and has made no progress
-    /// for `WATCHDOG_STUCK_THRESHOLD`. Both halves matter: a queue with
-    /// nothing outstanding is just idle, not stuck, and a queue that is
-    /// still delivering/consuming - however slowly - is merely busy.
+    /// for `WATCHDOG_STUCK_THRESHOLD`.
     fn is_stuck(&self) -> bool {
         let has_outstanding_demand =
             !self.pending_requests.is_empty() || !self.priorities_in_flight.is_empty();
@@ -321,10 +313,7 @@ impl IoQueueState {
 
     /// If stuck and not still within `WATCHDOG_WARN_DEBOUNCE` of the last
     /// warning, emit one WARN-level snapshot of the queue state and arm the
-    /// debounce. Called from the I/O loop's own wait, so it fires even when
-    /// every other caller into this queue has gone silent - the one case
-    /// that matters, since a true deadlock means nothing else would ever
-    /// trigger a check on its own.
+    /// debounce.
     fn check_watchdog(&mut self) {
         if !self.is_stuck() {
             return;
@@ -396,12 +385,8 @@ impl IoQueue {
                 }
             }
 
-            // An otherwise-indefinite wait: real activity (push /
-            // on_iop_complete / on_bytes_consumed) wakes this immediately
-            // via `notify_one`. The timeout only matters when nothing does -
-            // it's the sole mechanism that can notice a stuck queue, since a
-            // true deadlock means every other caller into this state has
-            // also gone silent.
+            // Timeout occasionally to check if we need to emit a warning of potential
+            // deadlock
             if tokio::time::timeout(WATCHDOG_CHECK_INTERVAL, self.notify.notified())
                 .await
                 .is_err()
@@ -816,10 +801,7 @@ impl SchedulerStateEvent {
 
     /// Emitted by the watchdog ([`IoQueueState::check_watchdog`]) when a
     /// queue has outstanding demand and has made no progress for
-    /// `WATCHDOG_STUCK_THRESHOLD`. Unlike `trace`, this always fires - no
-    /// target/level needs to be pre-enabled - since the whole point is to
-    /// surface a stuck queue to an operator who was not expecting one and
-    /// so had no reason to turn on scheduler tracing in advance.
+    /// `WATCHDOG_STUCK_THRESHOLD`.
     fn warn_stuck(self, stuck_for: Duration) {
         let stuck_for_secs = stuck_for.as_secs();
         tracing::event!(
@@ -860,10 +842,7 @@ impl SchedulerStateEvent {
         log::warn!(
             "I/O scheduler ({}) has made no progress for {}s: {} pending request(s) \
              ({} bytes), {} priority class(es) delivered but not yet consumed (min priority \
-             in flight: {:?}/{:?}), bytes_available={}/{}, iops_available={}/{}. If this \
-             persists, this may be the backpressure deadlock described in \
-             https://github.com/lance-format/lance/issues/9575 - set \
-             RUST_LOG={}=trace for a full state trace.",
+             in flight: {:?}/{:?}), bytes_available={}/{}, iops_available={}/{}.",
             self.queue_kind,
             stuck_for_secs,
             self.pending_iops,
@@ -875,7 +854,6 @@ impl SchedulerStateEvent {
             self.io_buffer_size_bytes,
             self.iops_available,
             self.io_capacity,
-            SCHEDULER_STATE_EVENT_TARGET,
         );
     }
 }
