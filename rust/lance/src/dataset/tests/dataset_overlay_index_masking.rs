@@ -1235,6 +1235,71 @@ async fn test_remapping_merge_rescans_overlay_stale_fragment(
     assert_optimize_is_noop(&mut dataset, &merge, &merged).await;
 }
 
+/// The same re-read, with the stale rows on fragment 1 rather than fragment 0.
+///
+/// Fragment 0's addresses are `0 << 32 | offset`, which in a freshly written dataset are the
+/// same integers as its row ids, so a stale set built in one domain and used in the other is
+/// indistinguishable there. Fragment 1's are not: address `1 << 32 | 1` against row id 7.
+/// Only this placement tells the two domains apart, and since #9481 they differ per index
+/// type -- a BTree filters its carried-over entries by address even under stable row ids,
+/// while Bitmap still filters by row id. The Bitmap cases are the control: they must stay
+/// green, or the stale set is keyed to the index rather than narrowed to it.
+#[rstest]
+#[case::btree(IndexType::BTree)]
+#[case::bitmap(IndexType::Bitmap)]
+#[tokio::test]
+async fn test_remapping_merge_rescans_overlay_stale_rows_off_fragment_zero(
+    #[case] index_type: IndexType,
+    #[values(false, true)] stable_row_ids: bool,
+) {
+    let mut dataset = create_base_dataset_with(stable_row_ids).await;
+    commit_single_fragment_segments(&mut dataset, "age", index_type, "age_idx").await;
+
+    // Fragment 1: id 7 age 70 -> 777, id 9 age 90 -> NULL, committed after the segments.
+    let mut dataset = overlay_age(dataset, "age_stale", 1, &[(1, Some(777)), (3, None)]).await;
+    append_age_fragment(&mut dataset, 12..18).await;
+
+    let merge = OptimizeOptions::merge(2);
+    let merged = optimize_into_one_segment(&mut dataset, "age_idx", &merge, &[0, 1, 2]).await;
+    assert!(
+        dataset
+            .unindexed_fragments("age_idx")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // The overlaid values replace the stored ones rather than joining them.
+    assert_eq!(age_hits(&dataset, 777).await, 1);
+    assert_eq!(age_hits(&dataset, 70).await, 0);
+    assert_eq!(
+        scalar_index_hits(&dataset, "age", "age_idx", &SargableQuery::IsNull()).await,
+        1
+    );
+    assert_eq!(age_hits(&dataset, 90).await, 0);
+    assert_eq!(
+        age_hits(&dataset, 60).await,
+        1,
+        "fragment 1 must be scanned once, not scanned and carried over"
+    );
+    assert_eq!(
+        age_hits(&dataset, 30).await,
+        1,
+        "fragment 0 is carried over untouched"
+    );
+
+    assert_ids_match_oracle(&dataset, "age = 70", &[]).await;
+    assert_ids_match_oracle(&dataset, "age = 777", &[7]).await;
+    assert_ids_match_oracle(&dataset, "age = 90", &[]).await;
+    assert_ids_match_oracle(&dataset, "age IS NULL", &[9]).await;
+    assert_ids_match_oracle(&dataset, "age = 30", &[3]).await;
+    assert_ids_match_oracle(&dataset, "age = 60", &[6]).await;
+    let not_null = (0..18).filter(|id| *id != 9).collect::<Vec<i32>>();
+    assert_ids_match_oracle(&dataset, "age IS NOT NULL", &not_null).await;
+    assert_answered_by_index(&dataset, "age = 777").await;
+    assert_optimize_is_noop(&mut dataset, &merge, &merged).await;
+}
+
 /// `id` 0..6 with a `List<Utf8>` `tags` column, three rows per fragment (fragments 0 and 1).
 async fn create_tags_dataset() -> Dataset {
     let ids = Arc::new(Int32Array::from_iter_values(0..6)) as ArrayRef;
