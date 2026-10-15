@@ -1201,6 +1201,15 @@ pub struct Scanner {
     /// to handle this better in the future as well)
     use_scalar_index: bool,
 
+    /// If true (default), use fragment column statistics indices to exclude
+    /// whole fragments at planning time. Fragments without statistics are
+    /// never excluded.
+    use_fragment_stats: bool,
+
+    /// Fragments excluded by fragment column statistics, resolved once per
+    /// plan in `create_plan_impl` and read by every consumer.
+    stats_excluded_cache: std::sync::OnceLock<RoaringBitmap>,
+
     /// Whether to use statistics to optimize the scan (default: true)
     ///
     /// This is used for debugging or benchmarking purposes.
@@ -1693,6 +1702,8 @@ impl Scanner {
             index_segments: None,
             fast_search: false,
             use_scalar_index: true,
+            use_fragment_stats: true,
+            stats_excluded_cache: std::sync::OnceLock::new(),
             include_deleted_rows: false,
             scan_stats_callback: None,
             strict_batch_size: false,
@@ -2034,6 +2045,7 @@ impl Scanner {
     ///
     pub fn filter(&mut self, filter: &str) -> Result<&mut Self> {
         self.filter.expr_filter = Some(ExprFilter::Sql(filter.to_string()));
+        self.stats_excluded_cache = std::sync::OnceLock::new();
         Ok(self)
     }
 
@@ -2100,11 +2112,13 @@ impl Scanner {
     /// must be a scalar expression whose return type is boolean.
     pub fn filter_substrait(&mut self, filter: &[u8]) -> Result<&mut Self> {
         self.filter.expr_filter = Some(ExprFilter::Substrait(filter.to_vec()));
+        self.stats_excluded_cache = std::sync::OnceLock::new();
         Ok(self)
     }
 
     pub fn filter_expr(&mut self, filter: Expr) -> &mut Self {
         self.filter.expr_filter = Some(ExprFilter::Datafusion(filter));
+        self.stats_excluded_cache = std::sync::OnceLock::new();
         self
     }
 
@@ -2264,6 +2278,24 @@ impl Scanner {
     pub fn use_scalar_index(&mut self, use_scalar_index: bool) -> &mut Self {
         self.use_scalar_index = use_scalar_index;
         self
+    }
+
+    /// Set whether to use fragment column statistics for planning-time
+    /// fragment pruning (default: true).
+    ///
+    /// Disable to compare plans with and without statistics-based pruning.
+    pub fn use_fragment_stats(&mut self, use_fragment_stats: bool) -> &mut Self {
+        self.use_fragment_stats = use_fragment_stats;
+        self.stats_excluded_cache = std::sync::OnceLock::new();
+        self
+    }
+
+    /// Fragments excluded by fragment column statistics for the current plan,
+    /// resolved once in `create_plan_impl`. `None` when nothing is excludable.
+    fn stats_excluded(&self) -> Option<&RoaringBitmap> {
+        self.stats_excluded_cache
+            .get()
+            .filter(|bitmap| !bitmap.is_empty())
     }
 
     /// Set whether to use strict batch size.
@@ -3756,6 +3788,23 @@ impl Scanner {
             .create_filter_plan(use_scalar_index, query_filter, fts_document_granularity)
             .await?;
 
+        // Resolve the fragment-statistics exclusion scope once per plan.
+        // Subtractive and conservative: fragments without valid statistics
+        // can never appear in the excluded set.
+        if self.use_fragment_stats
+            && let Some(full_expr) = filter_plan.expr_filter_plan.full_expr.as_ref()
+        {
+            let excluded = crate::dataset::fragstats_scope::fragment_stats_excluded(
+                self.dataset.as_ref(),
+                full_expr,
+            )
+            .await?;
+            // Deterministic in (dataset, filter): every setter that changes
+            // either resets the cell, so a kept first value is always the
+            // value this plan would compute.
+            let _ = self.stats_excluded_cache.set(excluded);
+        }
+
         let mut use_limit_node = true;
         // Source: either a (K|A)NN search, full text search, or a (full|indexed) scan
         let mut plan: Arc<dyn ExecutionPlan> = match (
@@ -4192,6 +4241,23 @@ impl Scanner {
 
         if let Some(fragments) = fragments {
             read_options = read_options.with_fragments(fragments);
+        }
+
+        // Fragment column statistics scope: planning-time exclusion of whole
+        // fragments from per-fragment summaries. Subtractive and conservative;
+        // the narrowed fragment list also feeds the scalar-index fragment
+        // scope below, so excluded fragments cost no index I/O either.
+        if let Some(excluded) = self.stats_excluded() {
+            let base = read_options
+                .fragments
+                .clone()
+                .unwrap_or_else(|| self.dataset.fragments().clone());
+            let retained: Vec<Fragment> = base
+                .iter()
+                .filter(|fragment| !excluded.contains(fragment.id as u32))
+                .cloned()
+                .collect();
+            read_options = read_options.with_fragments(Arc::new(retained));
         }
 
         if let Some(scan_range) = scan_range {
