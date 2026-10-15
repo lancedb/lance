@@ -137,7 +137,7 @@ use crate::dataset::sql::SqlQueryBuilder;
 use crate::datatypes::Schema;
 use crate::io::commit::{
     commit_detached_transaction, commit_new_dataset, commit_transaction,
-    default_commit_retry_timeout, detect_overlapping_fragments,
+    default_commit_retry_timeout, detect_overlapping_fragments, fix_schema,
 };
 use crate::session::Session;
 use crate::utils::temporal::{SystemTime, timestamp_to_nanos, utc_now};
@@ -153,7 +153,7 @@ use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_namespace::models::{DeclareTableRequest, DescribeTableRequest};
 use lance_table::feature_flags::{
     apply_feature_flags, ensure_can_read_manifest, ensure_can_write_manifest,
-    validate_paired_feature_flags,
+    validate_non_reusable_field_id_flags, validate_paired_feature_flags,
 };
 use lance_table::io::deletion::{DELETIONS_DIR, relative_deletion_file_path};
 use lance_table::rowids::{RowIdSequence, write_row_ids};
@@ -1329,10 +1329,19 @@ impl Dataset {
     /// Read the transaction (if any) and commit timestamp of a version of the
     /// dataset. `version` is a version number on this dataset's current branch.
     ///
-    /// Reads the version's manifest transiently: no historical `Dataset` is
-    /// constructed, no `IndexSection` is decoded, and no session cache is read
-    /// or written, so scanning many historical versions does not fill the
-    /// shared caches.
+    /// When `version` is the version this handle is checked out at, the
+    /// in-memory manifest is used and the transaction is read directly from
+    /// storage, so no manifest download is needed. Otherwise the version's
+    /// manifest is read transiently: no historical `Dataset` is constructed,
+    /// no `IndexSection` is decoded, and no session cache is written, so
+    /// scanning many historical versions does not fill the shared caches. A
+    /// manifest that the session cache already holds (for example after
+    /// `checkout_version`) is reused instead of being downloaded again.
+    ///
+    /// Neither path consults or populates the session's transaction cache
+    /// (unlike [`Self::read_transaction`]): that cache is keyed only by
+    /// version number, which is not safe to reuse across a dataset dropped
+    /// and recreated at the same URI within the same session (see #8916).
     ///
     /// Returns an error if the version does not exist (for example, if it has
     /// been cleaned up).
@@ -1349,23 +1358,56 @@ impl Dataset {
     /// # }
     /// ```
     pub async fn read_version_transaction(&self, version: u64) -> Result<VersionTransaction> {
+        if version == self.manifest.version {
+            let transaction = self
+                .read_transaction_from_storage(&self.manifest, &self.manifest_location)
+                .await?;
+            return Ok(VersionTransaction {
+                version,
+                timestamp: self.manifest.timestamp(),
+                transaction,
+            });
+        }
+
         // Resolve against this dataset's current branch.
         let manifest_location = self
             .commit_handler
             .resolve_version_location(&self.base, version, &self.object_store.inner)
             .await?;
 
-        // Keep the DatasetNotFound variant callers expect for a missing version.
-        let manifest = read_manifest(
-            &self.object_store,
-            &manifest_location.path,
-            manifest_location.size,
-        )
-        .await
-        .map_err(|e| match &e {
-            Error::NotFound { uri, .. } => Error::dataset_not_found(uri.clone(), box_error(e)),
-            _ => e,
-        })?;
+        // Mirror `get_manifest`: only a location with a known size (and hence
+        // a trustworthy e_tag) identifies a cache entry precisely enough to
+        // reuse without re-reading the manifest body.
+        let cached_manifest = if manifest_location.size.is_some() {
+            let manifest_key = ManifestKey {
+                version: manifest_location.version,
+                e_tag: manifest_location.e_tag.as_deref(),
+            };
+            self.metadata_cache.get_with_key(&manifest_key).await
+        } else {
+            None
+        };
+
+        let manifest = match cached_manifest {
+            Some(manifest) => manifest,
+            None => {
+                // Keep the DatasetNotFound variant callers expect for a missing
+                // version.
+                let manifest = read_manifest(
+                    &self.object_store,
+                    &manifest_location.path,
+                    manifest_location.size,
+                )
+                .await
+                .map_err(|e| match &e {
+                    Error::NotFound { uri, .. } => {
+                        Error::dataset_not_found(uri.clone(), box_error(e))
+                    }
+                    _ => e,
+                })?;
+                Arc::new(manifest)
+            }
+        };
 
         // The resolved manifest must belong to this dataset's branch. A
         // mismatch means the commit handler resolved against a different chain
@@ -2809,6 +2851,11 @@ impl Dataset {
         &self.manifest.fragments
     }
 
+    /// Ids of the fragments in this version.
+    pub fn fragment_bitmap(&self) -> &Arc<RoaringBitmap> {
+        &self.fragment_bitmap
+    }
+
     pub(crate) fn normalize_fragment_ids(fragment_ids: &[u32]) -> Vec<u32> {
         let mut ids = fragment_ids.to_vec();
         ids.sort_unstable();
@@ -3293,6 +3340,51 @@ impl Dataset {
             .execute(transaction)
             .await?;
 
+        *self = new_ds;
+        Ok(())
+    }
+
+    /// Activate monotonic, non-reusable field IDs for a legacy dataset.
+    ///
+    /// The activation commit records the current maximum referenced field ID as
+    /// a persistent high-water mark. Later schema changes allocate above it even
+    /// after fields and their files are dropped. Activation is one-way and
+    /// idempotent.
+    ///
+    /// Before calling this method, ensure that all clients that can write to the
+    /// dataset enforce writer feature flags, rejecting writes when they do not
+    /// support a required flag. Clients that ignore these flags must no longer
+    /// write to the dataset: they may discard the high-water mark and allow
+    /// field IDs to be reused. This method cannot enforce that client policy.
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # async fn activate(dataset: &mut Dataset) -> Result<()> {
+    /// dataset.migrate_to_non_reusable_field_ids().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn migrate_to_non_reusable_field_ids(&mut self) -> Result<()> {
+        if self.manifest.uses_non_reusable_field_ids() {
+            return Ok(());
+        }
+
+        let mut repaired_manifest = self.manifest.as_ref().clone();
+        fix_schema(&mut repaired_manifest)?;
+        let transaction = Transaction::new(
+            self.manifest.version,
+            Operation::Merge {
+                fragments: repaired_manifest.fragments.as_ref().clone(),
+                schema: repaired_manifest.schema,
+                preserves_nullability: true,
+            },
+            None,
+        );
+        let new_ds = CommitBuilder::new(Arc::new(self.clone()))
+            .with_max_retries(0)
+            .with_non_reusable_field_id_migration_activation()
+            .execute(transaction)
+            .await?;
         *self = new_ds;
         Ok(())
     }
@@ -3866,7 +3958,7 @@ impl Dataset {
         // Final schema is union of current schema, plus the RHS schema without
         // the right_on key.
         let mut new_schema: Schema = self.schema().merge(joiner.out_schema().as_ref())?;
-        new_schema.set_field_id(Some(self.manifest.max_field_id()));
+        new_schema.try_set_field_id(Some(self.manifest.max_field_id()))?;
 
         // Write new data file to each fragment. Parallelism is done over columns,
         // so no parallelism done at this level.
@@ -4202,6 +4294,8 @@ pub(crate) struct ManifestWriteConfig {
     /// It bypasses the "cannot enable stable row ids on existing dataset" guard and
     /// sets `manifest.next_row_id` to the provided value before activating the flag.
     migration_next_row_id: Option<u64>, // default None
+    /// Whether this commit activates non-reusable field IDs.
+    activate_non_reusable_field_ids: bool,
     /// This commit is a tagged fragment-reuse-index trim derived by
     /// `cleanup_frag_reuse_index` against the current manifest entry; see
     /// `ManifestBuildConfig::tagged_frag_reuse_trim`.
@@ -4218,6 +4312,7 @@ impl Default for ManifestWriteConfig {
             use_legacy_format: None,
             storage_format: None,
             migration_next_row_id: None,
+            activate_non_reusable_field_ids: false,
             tagged_frag_reuse_trim: false,
         }
     }
@@ -4260,6 +4355,7 @@ impl ManifestWriteConfig {
             storage_format: self.storage_format.clone(),
             disable_transaction_file: self.disable_transaction_file,
             migration_next_row_id: self.migration_next_row_id,
+            activate_non_reusable_field_ids: self.activate_non_reusable_field_ids,
             spilled_row_lineage: Default::default(),
         }
     }
@@ -4303,6 +4399,7 @@ pub(crate) async fn write_manifest_file(
     transaction: Option<lance_table::format::Transaction>,
     may_change_schema: bool,
 ) -> std::result::Result<ManifestLocation, CommitError> {
+    manifest.update_max_field_id();
     validate_paired_feature_flags(manifest)?;
     if let Some(indices) = &indices {
         lance_table::system_index::frag_reuse::metadata::validate_flags(manifest, indices)?;
@@ -4333,7 +4430,6 @@ pub(crate) async fn write_manifest_file(
         blob::validate_blob_threshold_metadata(&manifest.schema)
             .map_err(CommitError::OtherError)?;
     }
-
     if config.auto_set_feature_flags {
         // build_manifest may have already set FLAG_STABLE_ROW_IDS on the manifest.
         // Preserve it here so this second apply_feature_flags call does not clear it
@@ -4349,13 +4445,14 @@ pub(crate) async fn write_manifest_file(
             indices.as_deref().unwrap_or_default(),
         );
     }
-    // After the flag reset, which restores the stable-row-id flag a shallow clone
-    // masks. Here rather than in `build_manifest`, which restore and clone bypass.
+    // After the flag reset, so it judges the flags being published. Here rather
+    // than in `build_manifest`, which restore and clone bypass.
     crate::index::frag_reuse_with_stable_row_ids::validate_frag_reuse_with_stable_row_ids(
         manifest,
         indices.as_deref().unwrap_or_default(),
     )?;
 
+    validate_non_reusable_field_id_flags(manifest).map_err(CommitError::OtherError)?;
     versions::finalize_manifest_storage_version(manifest)?;
 
     manifest.set_timestamp(timestamp_to_nanos(config.timestamp));

@@ -2547,6 +2547,7 @@ pub(crate) async fn merge_segments(
                 dataset,
                 owned_fragments,
                 &no_deleted_fragments,
+                false,
             )
             .await?
             .ok_or_else(|| {
@@ -5972,6 +5973,7 @@ mod tests {
                     upper_bound: None,
                     minimum_nprobes: 1,
                     maximum_nprobes: None,
+                    search_effort: 0.5,
                     ef: None,
                     refine_factor: None,
                     metric_type: Some(MetricType::L2),
@@ -7300,7 +7302,12 @@ mod tests {
             assert_eq!(centroids.value_type(), DataType::UInt8);
             let values = centroids.values().as_primitive::<UInt8Type>().values();
             assert_eq!(
-                values.chunks_exact(DIMENSION).collect::<HashSet<_>>().len(),
+                values
+                    .as_chunks::<DIMENSION>()
+                    .0
+                    .iter()
+                    .collect::<HashSet<_>>()
+                    .len(),
                 NUM_PARTITIONS
             );
         }

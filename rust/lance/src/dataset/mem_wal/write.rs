@@ -37,10 +37,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::instrument;
 use uuid::Uuid;
 
-pub use super::index::{
-    BTreeIndexConfig, BTreeMemIndex, FtsIndexConfig, HnswIndexConfig, IndexStore, MemIndexConfig,
-    MemIndexKind, validate_index_configs,
-};
+pub use super::index::{BTreeMemIndex, IndexStore, MemIndexSpec, validate_index_specs};
 pub use super::memtable::CacheConfig;
 pub use super::memtable::MemTable;
 pub use super::memtable::batch_store::{BatchStore, StoreFull, StoredBatch};
@@ -49,6 +46,7 @@ pub use super::memtable::scanner::MemTableScanner;
 pub use super::util::{WatchableOnceCell, WatchableOnceCellReader};
 pub use super::wal::{WalEntry, WalEntryData, WalFlushFailure, WalFlushResult, WalFlusher};
 
+use super::index::{MemIndexPlugin, MemIndexRegistry};
 use super::memtable::flush::TriggerMemTableFlush;
 use super::observer::WalObserver;
 use super::scanner::InMemoryMemTableRef;
@@ -195,7 +193,7 @@ pub struct ShardWriterConfig {
     ///
     /// When `false`, the writer skips the MemTable layer entirely:
     /// - No MemTable / BatchStore / IndexStore is allocated.
-    /// - `index_configs` must be empty (validated at open time).
+    /// - `index_specs` must be empty (validated at open time).
     /// - No MemTable freezing or Lance file flushing happens.
     /// - `max_unflushed_memtable_bytes` is reused as the backpressure
     ///   budget for the WAL-only pending-batch queue: `put` blocks while
@@ -219,12 +217,27 @@ pub struct ShardWriterConfig {
     /// MemTable (and, on flush, the on-disk graph serialized from it). They are
     /// a property of the writer that builds the MemTable, not of the index
     /// definition: each SSTable is independent, so different writers
-    /// may use different parameters. An index without an entry uses the default
-    /// build parameters. `num_edges` is the HNSW graph degree (level 0 retains
+    /// may use different parameters. An index with no entry here or in
+    /// [`index_overrides`](Self::index_overrides) uses the default build
+    /// parameters. `num_edges` is the HNSW graph degree (level 0 retains
     /// `2 * num_edges`), equivalent to FAISS's `M`.
     ///
     /// Default: empty.
     pub hnsw_params: HashMap<String, HnswBuildParams>,
+
+    /// Settings for the plugin maintaining an index, by index name, as the
+    /// type the plugin reads through
+    /// [`ResolveContext::overrides`](super::index::ResolveContext::overrides).
+    /// Naming an index here and in [`hnsw_params`](Self::hnsw_params) is an
+    /// error. Each writer passes its own: these are not recorded as writer
+    /// defaults.
+    ///
+    /// Default: empty.
+    pub index_overrides: HashMap<String, Arc<dyn std::any::Any + Send + Sync>>,
+
+    /// The memtable index plugins this writer can maintain. Defaults to the
+    /// kinds Lance builds in.
+    pub mem_index_registry: MemIndexRegistry,
 
     /// Optional warmer fired pre-commit for each new generation (zero cold reads
     /// on first query). Wired to the flusher; supplied by the consumer (e.g. the
@@ -281,6 +294,8 @@ impl Default for ShardWriterConfig {
             frozen_memtable_grace: Duration::ZERO,
             enable_memtable: true,
             hnsw_params: HashMap::new(),
+            index_overrides: HashMap::new(),
+            mem_index_registry: MemIndexRegistry::default(),
             warmer: None,
             observer: None,
             store_params: None,
@@ -397,6 +412,31 @@ impl ShardWriterConfig {
     /// full WAL-only-mode contract. Defaults to `true`.
     pub fn with_enable_memtable(mut self, enable: bool) -> Self {
         self.enable_memtable = enable;
+        self
+    }
+
+    /// Register a memtable index plugin. Fails if another plugin already
+    /// maintains the same base-table index.
+    pub fn with_mem_index_plugin(mut self, plugin: Arc<dyn MemIndexPlugin>) -> Result<Self> {
+        self.mem_index_registry.add_plugin(plugin)?;
+        Ok(self)
+    }
+
+    /// The plugins this writer maintains indexes with.
+    pub fn with_mem_index_registry(mut self, registry: MemIndexRegistry) -> Self {
+        self.mem_index_registry = registry;
+        self
+    }
+
+    /// Give the plugin maintaining `index_name` these settings, replacing any
+    /// given before.
+    pub fn with_index_override(
+        mut self,
+        index_name: impl Into<String>,
+        settings: impl std::any::Any + Send + Sync,
+    ) -> Self {
+        self.index_overrides
+            .insert(index_name.into(), Arc::new(settings));
         self
     }
 
@@ -1350,9 +1390,10 @@ struct WriterState {
     frozen_memtables: VecDeque<FrozenMemTable>,
     /// Flag to prevent duplicate memtable flush requests.
     flush_requested: bool,
-    /// Counter for WAL flush threshold crossings.
+    /// Current memtable's claimed WAL-size threshold crossings.
     wal_flush_trigger_count: usize,
-    /// Last time a WAL flush was triggered (for time-based flush).
+    /// Last write-path interval trigger. Its boundary is resolved when handled,
+    /// so this recovers sequential-write latency without defeating group commit.
     last_wal_flush_trigger_time: u64,
 }
 
@@ -1439,7 +1480,7 @@ async fn replay_memtable_from_wal(
     pk_columns: &[String],
     flusher: &MemTableFlusher,
     wal_flusher: &WalFlusher,
-    index_configs: &[MemIndexConfig],
+    index_specs: &[MemIndexSpec],
     max_memtable_size: usize,
     max_memtable_rows: usize,
     max_resident_bytes: usize,
@@ -1458,6 +1499,7 @@ async fn replay_memtable_from_wal(
     let mut position = start_position;
 
     let mut active = make_memtable(base_generation, 0, None)?;
+    let mut last_replayed_generation: Option<u64> = None;
 
     loop {
         match tailer.read_entry(position).await? {
@@ -1479,9 +1521,25 @@ async fn replay_memtable_from_wal(
                         position, entry.writer_epoch, target.creator_epoch
                     )));
                 }
+                // An entry of a generation below the one replay starts from is
+                // already in that generation's SSTable. A flush's covered
+                // position can trail its generation's last entry, so replay
+                // reaches such entries.
+                let already_flushed = entry
+                    .generation
+                    .is_some_and(|generation| generation < base_generation);
+                if let (Some(generation), Some(last)) = (entry.generation, last_replayed_generation)
+                    && generation < last
+                {
+                    return Err(Error::io(format!(
+                        "WAL entry at position {} has generation {} below the generation {} \
+                         replayed before it",
+                        position, generation, last
+                    )));
+                }
                 // Fence sentinels deserialize to zero batches and are skipped
                 // here — they carry only a position, no rows.
-                if !entry.batches.is_empty() {
+                if !entry.batches.is_empty() && !already_flushed {
                     // Start a new memtable where the entry's recorded generation
                     // changes. Entries with no generation use the size rule below.
                     if let Some(generation) = entry.generation
@@ -1496,7 +1554,7 @@ async fn replay_memtable_from_wal(
                             our_epoch,
                             position.saturating_sub(1),
                             global_end,
-                            index_configs,
+                            index_specs,
                         )
                         .await?;
                         active = make_memtable(generation, global_end, None)?;
@@ -1529,7 +1587,7 @@ async fn replay_memtable_from_wal(
                                 our_epoch,
                                 position.saturating_sub(1),
                                 global_end,
-                                index_configs,
+                                index_specs,
                             )
                             .await?;
                         }
@@ -1614,7 +1672,7 @@ async fn replay_memtable_from_wal(
                             our_epoch,
                             covered,
                             global_end,
-                            index_configs,
+                            index_specs,
                         )
                         .await?;
 
@@ -1622,6 +1680,9 @@ async fn replay_memtable_from_wal(
                     }
 
                     active.insert_batches_only(batches).await?;
+                    if entry.generation.is_some() {
+                        last_replayed_generation = entry.generation;
+                    }
                 }
                 position = position.checked_add(1).ok_or_else(|| {
                     Error::io(format!(
@@ -1785,30 +1846,33 @@ async fn flush_replayed_memtable(
     epoch: u64,
     covered: u64,
     durable: usize,
-    index_configs: &[MemIndexConfig],
+    index_specs: &[MemIndexSpec],
 ) -> Result<()> {
     index_replayed_batches(memtable).await?;
-    if index_configs.is_empty() {
+    if index_specs.is_empty() {
         flusher.flush(memtable, epoch, covered, durable).await?;
     } else {
-        Box::pin(flusher.flush_with_indexes(memtable, epoch, index_configs, covered, durable))
+        Box::pin(flusher.flush_with_indexes(memtable, epoch, index_specs, covered, durable))
             .await?;
     }
     Ok(())
 }
 
 /// Whether two maintained sets describe the same indexes.
-fn same_index_set(current: &[MemIndexConfig], next: &[MemIndexConfig]) -> bool {
+fn same_index_set(current: &[MemIndexSpec], next: &[MemIndexSpec]) -> bool {
     if current.len() != next.len() {
         return false;
     }
     // Names are unique within a set, so ordering by name is canonical.
-    fn by_name(configs: &[MemIndexConfig]) -> Vec<&MemIndexConfig> {
-        let mut configs: Vec<&MemIndexConfig> = configs.iter().collect();
-        configs.sort_unstable_by_key(|config| config.name());
-        configs
+    fn by_name(specs: &[MemIndexSpec]) -> Vec<&MemIndexSpec> {
+        let mut specs: Vec<&MemIndexSpec> = specs.iter().collect();
+        specs.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+        specs
     }
-    by_name(current) == by_name(next)
+    by_name(current)
+        .into_iter()
+        .zip(by_name(next))
+        .all(|(a, b)| a.same_index(b))
 }
 
 /// Pair each primary-key column name with its field id (both derived from the
@@ -1961,19 +2025,19 @@ struct WriterSchema {
     /// `storage` with Blob v2 payload columns replaced by their prepared
     /// descriptors. Memtables are created under this one.
     prepared: Arc<ArrowSchema>,
-    /// `storage` as a Lance schema, for validating index configs and resolving
+    /// `storage` as a Lance schema, for validating index specs and resolving
     /// FTS field ids.
     lance_schema: Schema,
     pk_field_ids: Vec<i32>,
     /// Primary-key column names, for each memtable's PK-position index.
     pk_columns: Vec<String>,
-    index_configs: Arc<[MemIndexConfig]>,
+    index_specs: Arc<[MemIndexSpec]>,
 }
 
 impl WriterSchema {
     /// Derive the writer's schemas from the caller's, which should carry field
     /// ids under `lance:field_id`.
-    fn try_new(schema: &ArrowSchema, index_configs: Vec<MemIndexConfig>) -> Result<Self> {
+    fn try_new(schema: &ArrowSchema, index_specs: Vec<MemIndexSpec>) -> Result<Self> {
         // lance owns `_tombstone` and appends it here — idempotent across reopens.
         let tombstoned = schema_with_tombstone(schema);
         let pk_fields = Schema::try_from(tombstoned.as_ref())?;
@@ -1993,24 +2057,24 @@ impl WriterSchema {
             prepared,
             pk_field_ids,
             pk_columns,
-            index_configs: Arc::from([]),
+            index_specs: Arc::from([]),
         }
-        .with_index_configs(index_configs)
+        .with_index_specs(index_specs)
     }
 
-    /// The same schema with `index_configs` instead.
+    /// The same schema with `index_specs` instead.
     ///
     /// A bad config is rejected before any row is accepted, since it would
     /// fail every insert, including WAL replay.
-    fn with_index_configs(&self, index_configs: Vec<MemIndexConfig>) -> Result<Self> {
-        validate_index_configs(
-            &index_configs,
+    fn with_index_specs(&self, index_specs: Vec<MemIndexSpec>) -> Result<Self> {
+        validate_index_specs(
+            &index_specs,
             self.storage.as_ref(),
             &self.lance_schema,
             &self.pk_columns,
         )?;
         Ok(Self {
-            index_configs: index_configs.into(),
+            index_specs: index_specs.into(),
             ..self.clone()
         })
     }
@@ -2025,7 +2089,7 @@ impl WriterSchema {
     fn is_equivalent(&self, other: &Self) -> bool {
         self.storage == other.storage
             && self.logical == other.logical
-            && same_index_set(&self.index_configs, &other.index_configs)
+            && same_index_set(&self.index_specs, &other.index_specs)
     }
 
     /// A new memtable under this schema at the given generation and offset.
@@ -2062,8 +2126,12 @@ impl WriterSchema {
             global_offset,
             target,
         )?;
-        let mut indexes =
-            IndexStore::from_configs(&self.index_configs, max_memtable_rows, batch_capacity)?;
+        let mut indexes = IndexStore::from_specs(
+            &self.index_specs,
+            &self.lance_schema,
+            max_memtable_rows,
+            batch_capacity,
+        )?;
         if !self.pk_columns.is_empty() {
             indexes.enable_pk_index(&pk_index_columns(&self.pk_columns, &self.pk_field_ids));
         }
@@ -2183,9 +2251,9 @@ impl SharedWriterState {
         memtable: &MemTable,
         schema: &WriterSchema,
         batches: Vec<RecordBatch>,
-    ) -> Result<(Vec<RecordBatch>, Option<BlobPreprocessor>)> {
+    ) -> Result<(Vec<RecordBatch>, Option<BlobPreprocessor>, bool)> {
         let Some(target) = memtable.target() else {
-            return Ok((batches, None));
+            return Ok((batches, None, false));
         };
         let logical_schema = Schema::try_from(schema.storage.as_ref())?;
         let data_dir = target
@@ -2198,36 +2266,81 @@ impl SharedWriterState {
             .map(|session| session.store_registry())
             .unwrap_or_default();
         let source_store_params = self.config.store_params.clone().unwrap_or_default();
-        let mut preprocessor = BlobPreprocessor::new(
-            self.object_store.as_ref().clone(),
-            data_dir,
-            target.data_file_key().to_string(),
-            &logical_schema,
-            None,
-            true,
-            ExternalBlobMode::Reference,
-            source_store_registry,
-            source_store_params,
-            None,
-        )?
-        .for_mem_wal(memtable.blob_id_allocator());
+        let new_preprocessor = || {
+            BlobPreprocessor::new(
+                self.object_store.as_ref().clone(),
+                data_dir.clone(),
+                target.data_file_key().to_string(),
+                &logical_schema,
+                None,
+                true,
+                ExternalBlobMode::Reference,
+                source_store_registry,
+                source_store_params,
+                None,
+            )
+            .map(|preprocessor| preprocessor.for_mem_wal(memtable.blob_id_allocator()))
+        };
 
-        for batch in &batches {
-            preprocessor.validate_batch(batch).await?;
+        // A non-durable put becomes visible when its in-memory index apply
+        // finishes, so its sidecar must already be readable at that point.
+        // Preserve the original per-put finalization for that mode.
+        if !self.config.durable_write {
+            let mut preprocessor = new_preprocessor()?;
+
+            for batch in &batches {
+                preprocessor.validate_batch(batch).await?;
+            }
+            let prepared = async {
+                let mut prepared = Vec::with_capacity(batches.len());
+                for batch in batches {
+                    prepared.push(preprocessor.preprocess_batch(&batch).await?);
+                }
+                preprocessor.finish().await?;
+                Ok(prepared)
+            }
+            .await;
+            if prepared.is_err() {
+                preprocessor.abort();
+            }
+            return prepared.map(|batches| (batches, Some(preprocessor), false));
         }
+
+        // Durable puts share one preprocessor per MemTable generation. Keeping
+        // its partial pack open lets sequential put_no_wait calls use one object;
+        // WalFlusher seals it before appending the corresponding descriptors.
+        let batch_store = memtable.batch_store();
+        let mut guard = batch_store.blob_preprocessor().lock().await;
+        {
+            let preprocessor = guard.get_or_insert_with(new_preprocessor)?;
+            for batch in &batches {
+                preprocessor.validate_batch(batch).await?;
+            }
+        }
+        let preprocessor = guard.begin_operation()?;
         let prepared = async {
             let mut prepared = Vec::with_capacity(batches.len());
             for batch in batches {
                 prepared.push(preprocessor.preprocess_batch(&batch).await?);
             }
-            preprocessor.finish().await?;
             Ok(prepared)
         }
         .await;
-        if prepared.is_err() {
-            preprocessor.abort();
+        match prepared {
+            Ok(batches) => {
+                guard.complete_operation();
+                Ok((batches, None, true))
+            }
+            Err(error) => {
+                // The open pack may contain payloads from earlier
+                // unacknowledged puts. Latch a terminal pack failure so even a
+                // flush that was already queued cannot append their descriptors
+                // after the upload is abandoned.
+                guard.fail(&error);
+                self.wal_flusher.poison(&error);
+                Err(error)
+            }
         }
-        prepared.map(|batches| (batches, Some(preprocessor)))
     }
 
     /// Ask the index-apply task to cover `[indexed, end_batch_position)` of this
@@ -2290,6 +2403,7 @@ impl SharedWriterState {
         )?;
 
         let mut old_memtable = std::mem::replace(&mut state.memtable, new_memtable);
+        state.wal_flush_trigger_count = 0;
         // The outgoing memtable flushes with the indexes it was built with.
         let old_schema = std::mem::replace(&mut state.schema, next_schema);
         old_memtable.freeze(last_wal_entry_position);
@@ -2374,7 +2488,7 @@ impl SharedWriterState {
 
         let _ = self.memtable_flush_tx.send(TriggerMemTableFlush::Flush {
             memtable: frozen_memtable,
-            index_configs: Arc::clone(&old_schema.index_configs),
+            index_specs: Arc::clone(&old_schema.index_specs),
             done: None,
         });
 
@@ -2479,77 +2593,105 @@ impl SharedWriterState {
         )
     }
 
-    /// Check if WAL flush is needed and trigger if so.
+    /// Check whether the current memtable crossed a WAL size or time threshold.
+    ///
+    /// Both signals are best-effort and resolve the latest pending suffix when
+    /// the handler drains the message. This preserves group commit while the
+    /// write-path clock prevents a sequential durable client from waiting for a
+    /// fresh ticker period after every completed append. Freeze and close use
+    /// their own exact, completion-bearing triggers.
     ///
     /// Takes `&mut WriterState` directly since caller already holds the lock.
     fn maybe_trigger_wal_flush(&self, state: &mut WriterState) {
-        let threshold = self.config.max_wal_buffer_size;
-
-        let batch_count = state.memtable.batch_count();
+        let now = now_millis();
+        let time_trigger = claim_wal_time_trigger(
+            &mut state.last_wal_flush_trigger_time,
+            now,
+            self.config.max_wal_flush_interval,
+        );
         let total_bytes = state.memtable.batch_store().row_bytes();
-        let batch_store = state.memtable.batch_store();
-
-        // Check if there are any unflushed batches
-        let has_pending = batch_store.pending_wal_flush_count(self.wal_flusher.durable()) > 0;
-
-        // Check time-based trigger first
-        let time_trigger = if let Some(interval) = self.config.max_wal_flush_interval {
-            let interval_millis = interval.as_millis() as u64;
-            let last_trigger = state.last_wal_flush_trigger_time;
-            let now = now_millis();
-
-            // If last_trigger is 0, this is the first write - start the timer but don't flush
-            if last_trigger == 0 {
-                state.last_wal_flush_trigger_time = now;
-                None
-            } else {
-                let elapsed = now.saturating_sub(last_trigger);
-
-                if elapsed >= interval_millis && has_pending {
-                    state.last_wal_flush_trigger_time = now;
-                    Some(now)
-                } else {
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
-        // If time trigger fired, send a flush message
-        if time_trigger.is_some() {
-            let _ = self.wal_flush_tx.send(TriggerWalFlush {
-                source: WalFlushSource::BatchStore { batch_store },
-                end_batch_position: batch_count,
-                done: None,
-            });
+        let size_trigger = claim_wal_size_trigger(
+            &mut state.wal_flush_trigger_count,
+            total_bytes,
+            self.config.max_wal_buffer_size,
+        );
+        if !time_trigger && !size_trigger {
             return;
         }
-
-        // Check size-based trigger
-        if threshold == 0 {
-            return;
+        if size_trigger {
+            state.last_wal_flush_trigger_time = now;
         }
 
-        // Calculate how many thresholds have been crossed (1 at 10MB, 2 at 20MB, etc.)
-        let thresholds_crossed = total_bytes / threshold;
-
-        // Trigger flush for each unclaimed threshold crossing
-        while state.wal_flush_trigger_count < thresholds_crossed {
-            state.wal_flush_trigger_count += 1;
-            // Update last trigger time so time-based trigger doesn't fire immediately after
-            state.last_wal_flush_trigger_time = now_millis();
-
-            // Trigger WAL flush with captured batch range
-            let _ = self.wal_flush_tx.send(TriggerWalFlush {
-                source: WalFlushSource::BatchStore {
-                    batch_store: batch_store.clone(),
-                },
-                end_batch_position: batch_count,
-                done: None,
-            });
-        }
+        let _ = self.wal_flush_tx.send(TriggerWalFlush {
+            source: WalFlushSource::NextPending,
+            end_batch_position: 0,
+            done: None,
+        });
     }
+}
+
+/// Claim one write-path interval trigger without fixing its flush boundary.
+fn claim_wal_time_trigger(
+    last_trigger_ms: &mut u64,
+    now_ms: u64,
+    interval: Option<Duration>,
+) -> bool {
+    let Some(interval_ms) = interval
+        .filter(|interval| !interval.is_zero())
+        .and_then(|interval| u64::try_from(interval.as_millis()).ok())
+    else {
+        return false;
+    };
+    if *last_trigger_ms == 0 {
+        *last_trigger_ms = now_ms;
+        return false;
+    }
+    if now_ms.saturating_sub(*last_trigger_ms) < interval_ms {
+        return false;
+    }
+    *last_trigger_ms = now_ms;
+    true
+}
+
+/// Claim all WAL-size thresholds crossed by the current put as one trigger.
+///
+/// A single append covers the whole pending suffix, so queueing one message per
+/// crossed threshold only creates stale boundaries under load. The counter is
+/// generation-local and is reset when the active memtable rotates.
+fn claim_wal_size_trigger(
+    claimed_thresholds: &mut usize,
+    total_bytes: usize,
+    threshold: usize,
+) -> bool {
+    if threshold == 0 {
+        return false;
+    }
+    let crossed = total_bytes / threshold;
+    if crossed <= *claimed_thresholds {
+        return false;
+    }
+    *claimed_thresholds = crossed;
+    true
+}
+
+/// Claim WAL-size thresholds for a queue whose byte count shrinks on drain.
+fn claim_pending_wal_size_trigger(
+    claimed_bytes: &mut usize,
+    pending_bytes: usize,
+    threshold: usize,
+) -> bool {
+    if threshold == 0 {
+        return false;
+    }
+    if pending_bytes < *claimed_bytes {
+        *claimed_bytes = 0;
+    }
+    let crossed = (pending_bytes - *claimed_bytes) / threshold;
+    if crossed == 0 {
+        return false;
+    }
+    *claimed_bytes += crossed * threshold;
+    true
 }
 
 /// Trigger-tracking state for WAL-only mode (no MemTable).
@@ -2570,7 +2712,7 @@ struct WalOnlyTriggerState {
     /// fired. Resets to 0 when `pending_bytes` drops below it (drain
     /// happened since the last trigger).
     last_trigger_pending_bytes: usize,
-    /// Last time a WAL flush was triggered (for time-based trigger).
+    /// Last write-path interval trigger. See [`claim_wal_time_trigger`].
     last_wal_flush_trigger_time: u64,
 }
 
@@ -2617,14 +2759,14 @@ impl ShardWriter {
     /// `schema` should carry each field's id under `lance:field_id` in its
     /// field metadata; without them a replayed entry is matched by name, which
     /// a rename loses.
-    #[instrument(name = "sw_open", level = "info", skip_all, fields(shard_id = %config.shard_id, index_count = index_configs.len()))]
+    #[instrument(name = "sw_open", level = "info", skip_all, fields(shard_id = %config.shard_id, index_count = index_specs.len()))]
     pub async fn open(
         object_store: Arc<ObjectStore>,
         base_path: Path,
         base_uri: impl Into<String>,
         config: ShardWriterConfig,
         schema: Arc<ArrowSchema>,
-        index_configs: Vec<MemIndexConfig>,
+        index_specs: Vec<MemIndexSpec>,
     ) -> Result<Self> {
         Box::pin(Self::open_inner(
             object_store,
@@ -2632,7 +2774,7 @@ impl ShardWriter {
             base_uri.into(),
             config,
             schema,
-            index_configs,
+            index_specs,
         ))
         .await
     }
@@ -2643,9 +2785,9 @@ impl ShardWriter {
         base_uri: String,
         config: ShardWriterConfig,
         schema: Arc<ArrowSchema>,
-        index_configs: Vec<MemIndexConfig>,
+        index_specs: Vec<MemIndexSpec>,
     ) -> Result<Self> {
-        if !config.enable_memtable && !index_configs.is_empty() {
+        if !config.enable_memtable && !index_specs.is_empty() {
             return Err(Error::invalid_input(
                 "indexes require enable_memtable = true; \
                  WAL-only mode does not maintain in-memory indexes",
@@ -2678,11 +2820,11 @@ impl ShardWriter {
         // Derive PK metadata and run every side-effect-free validation *before*
         // claiming the epoch. `claim_epoch` durably bumps the stored epoch and,
         // for a successor, `write_fence_sentinel` fences the predecessor — so an
-        // open doomed by purely local input (an index config that disagrees with
+        // open doomed by purely local input (an index spec that disagrees with
         // the schema) must fail here, before it can knock the healthy incumbent off
         // the shard. Memtable-only: WAL-only mode has no indexes to validate.
         let writer_schema = if config.enable_memtable {
-            let writer_schema = WriterSchema::try_new(&schema, index_configs)?;
+            let writer_schema = WriterSchema::try_new(&schema, index_specs)?;
 
             // An HNSW graph reserves its whole capacity before the first insert,
             // but the seal trigger only measures row bytes. A reservation with no
@@ -2709,8 +2851,9 @@ impl ShardWriter {
 
                 // Built the way `make_bound_memtable` builds it below, so this is
                 // the figure the controller will actually read.
-                let mut indexes = IndexStore::from_configs(
-                    &writer_schema.index_configs,
+                let mut indexes = IndexStore::from_specs(
+                    &writer_schema.index_specs,
+                    &writer_schema.lance_schema,
                     config.max_memtable_rows,
                     config.max_memtable_batches,
                 )?;
@@ -2915,7 +3058,7 @@ impl ShardWriter {
             &schema.pk_columns,
             &flusher,
             &wal_flusher,
-            &schema.index_configs,
+            &schema.index_specs,
             config.max_memtable_size,
             config.max_memtable_rows,
             config.max_unflushed_memtable_bytes,
@@ -3422,7 +3565,8 @@ impl ShardWriter {
             //    payloads into the active target, then keep only prepared
             //    descriptors in the memtable and WAL.
             let batches = incoming.shape(&state.schema)?;
-            let (batches, mut blob_preprocessor) = writer_state
+            let batch_store = state.memtable.batch_store();
+            let (batches, mut blob_preprocessor, shared_blob_preprocessor) = writer_state
                 .prepare_batches(&state.memtable, &state.schema, batches)
                 .await?;
 
@@ -3432,6 +3576,12 @@ impl ShardWriter {
                 Err(error) => {
                     if let Some(preprocessor) = blob_preprocessor.as_mut() {
                         preprocessor.abort();
+                    } else if shared_blob_preprocessor {
+                        // Shared preparation may include payloads from earlier
+                        // unacknowledged puts, so abandoning it is a terminal
+                        // group-commit failure rather than a per-put rollback.
+                        batch_store.fail_blob_pack(&error).await;
+                        writer_state.wal_flusher.poison(&error);
                     }
                     return Err(error);
                 }
@@ -3442,7 +3592,6 @@ impl ShardWriter {
             //    afterwards hands the flush trigger the **new** store paired with
             //    the **old** store's end position, so the new store's watermark
             //    jumps past batches that were never appended.
-            let batch_store = state.memtable.batch_store();
             let indexes = state.memtable.indexes_arc();
 
             let start_pos = results.first().map(|(pos, _, _)| *pos).unwrap_or(0);
@@ -3491,18 +3640,11 @@ impl ShardWriter {
             writer_state.trigger_index_apply(batch_store, indexes, batch_positions.end)?;
         }
 
-        // The WAL append is *not* triggered here. It happens on the background
-        // ticker (and on the size trigger, and at freeze/close), which is the only
-        // way the flush interval can mean anything: while every durable put
-        // triggered its own append, the interval could add a redundant trigger but
-        // never delay or batch one.
-        //
-        // The cost is real and accepted: a single client's sequential *durable*
-        // throughput drops from ~10 writes/sec (one PUT round-trip) to roughly one
-        // per tick. That is a policy choice — the interval should mean what it
-        // says, and S3 API cost should be bounded. Latency-sensitive callers want
-        // `durable_write: false`, which now costs them durability only, not
-        // visibility.
+        // The write-path size and interval signals above name no fixed boundary:
+        // the handler resolves the pending suffix when it receives them. That
+        // lets concurrent puts group while a sequential durable client can
+        // submit promptly once an interval has elapsed. The background ticker
+        // remains the backstop when no later put arrives to emit a signal.
 
         // The watcher is returned in both modes now. A non-durable put still
         // waits — for its index apply (~ms), not for an S3 PUT (~100ms).
@@ -3555,18 +3697,10 @@ impl ShardWriter {
             .durable_write
             .then(|| self.wal_flusher.track_batch(None, 0, batch_positions.end));
 
-        // Time- and size-based triggers on the write path, for durable and
-        // non-durable puts alike — mirroring MemTable mode's
-        // `maybe_trigger_wal_flush`. The background ticker drives the append
-        // too; whichever fires first wins, and a redundant trigger is a cheap
-        // no-op because the flush snapshot/commit is idempotent.
-        self.maybe_trigger_wal_flush_wal_only(
-            state,
-            wal_flush_tx,
-            trigger,
-            batch_positions.end,
-            state.queue_bytes(),
-        );
+        // Best-effort size and interval triggers run on the write path for
+        // durable and non-durable puts alike. The background ticker remains the
+        // idle-write backstop.
+        self.maybe_trigger_wal_flush_wal_only(wal_flush_tx, trigger, state.queue_bytes());
 
         self.stats.record_put(start.elapsed());
 
@@ -3584,63 +3718,37 @@ impl ShardWriter {
         Ok(WriteResult { batch_positions })
     }
 
-    /// WAL-only-mode size+time trigger. Mirrors `SharedWriterState::maybe_trigger_wal_flush`
-    /// but reads its inputs from `WalOnlyState` (pending queue) instead of
-    /// the active MemTable.
+    /// WAL-only-mode best-effort size and interval triggers.
     fn maybe_trigger_wal_flush_wal_only(
         &self,
-        state: &Arc<WalOnlyState>,
         wal_flush_tx: &mpsc::UnboundedSender<TriggerWalFlush>,
         trigger: &StdRwLock<WalOnlyTriggerState>,
-        end_batch_position: usize,
         pending_bytes: usize,
     ) {
-        let threshold = self.config.max_wal_buffer_size;
-        let has_pending = state.batch_count() > 0;
-
         let mut t = trigger.write().unwrap();
+        let now = now_millis();
+        let time_trigger = claim_wal_time_trigger(
+            &mut t.last_wal_flush_trigger_time,
+            now,
+            self.config.max_wal_flush_interval,
+        );
 
-        // Time-based trigger.
-        if let Some(interval) = self.config.max_wal_flush_interval {
-            let interval_millis = interval.as_millis() as u64;
-            let now = now_millis();
-            if t.last_wal_flush_trigger_time == 0 {
+        // Claim every newly crossed `max_wal_buffer_size` boundary with one
+        // dynamically resolved trigger. If the pending queue shrank below the
+        // recorded baseline (a drain happened), reset the baseline first so the
+        // next crossing fires correctly.
+        let size_trigger = claim_pending_wal_size_trigger(
+            &mut t.last_trigger_pending_bytes,
+            pending_bytes,
+            self.config.max_wal_buffer_size,
+        );
+        if time_trigger || size_trigger {
+            if size_trigger {
                 t.last_wal_flush_trigger_time = now;
-            } else {
-                let elapsed = now.saturating_sub(t.last_wal_flush_trigger_time);
-                if elapsed >= interval_millis && has_pending {
-                    t.last_wal_flush_trigger_time = now;
-                    let _ = wal_flush_tx.send(TriggerWalFlush {
-                        source: WalFlushSource::WalOnly {
-                            state: state.clone(),
-                        },
-                        end_batch_position,
-                        done: None,
-                    });
-                    return;
-                }
             }
-        }
-
-        if threshold == 0 {
-            return;
-        }
-
-        // Size-based trigger: fire one trigger per `max_wal_buffer_size`
-        // crossed since the last time we triggered. If the pending queue
-        // shrank below the recorded baseline (a drain happened), reset the
-        // baseline first so the next crossing fires correctly.
-        if pending_bytes < t.last_trigger_pending_bytes {
-            t.last_trigger_pending_bytes = 0;
-        }
-        while pending_bytes >= t.last_trigger_pending_bytes + threshold {
-            t.last_trigger_pending_bytes += threshold;
-            t.last_wal_flush_trigger_time = now_millis();
             let _ = wal_flush_tx.send(TriggerWalFlush {
-                source: WalFlushSource::WalOnly {
-                    state: state.clone(),
-                },
-                end_batch_position,
+                source: WalFlushSource::NextPending,
+                end_batch_position: 0,
                 done: None,
             });
         }
@@ -3715,9 +3823,9 @@ impl ShardWriter {
                     .read()
                     .await
                     .schema
-                    .index_configs
+                    .index_specs
                     .iter()
-                    .map(|config| config.name().to_string())
+                    .map(|spec| spec.name.clone())
                     .collect();
                 names.sort_unstable();
                 names
@@ -3915,7 +4023,7 @@ impl ShardWriter {
         }))
     }
 
-    /// Switch this writer to `schema` and `index_configs` without reopening it.
+    /// Switch this writer to `schema` and `index_specs` without reopening it.
     ///
     /// The active memtable is sealed and flushed under its old schema. Reads
     /// match columns by field id, so older rows show up under the new names.
@@ -3941,10 +4049,10 @@ impl ShardWriter {
     pub async fn evolve_schema(
         &self,
         schema: Arc<ArrowSchema>,
-        index_configs: Vec<MemIndexConfig>,
+        index_specs: Vec<MemIndexSpec>,
     ) -> Result<Option<SealFence>> {
         self.replace_writer_schema("evolve_schema", |_current| {
-            WriterSchema::try_new(&schema, index_configs)
+            WriterSchema::try_new(&schema, index_specs)
         })
         .await
     }
@@ -4016,20 +4124,20 @@ impl ShardWriter {
     /// rows answer neither search until compaction.
     ///
     /// `Ok(None)` when the set is already current; nothing is sealed.
-    #[instrument(name = "sw_replace_index_configs", level = "info", skip_all, fields(shard_id = %self.config.shard_id, epoch = self.epoch, index_count = configs.len()))]
+    #[instrument(name = "sw_replace_index_configs", level = "info", skip_all, fields(shard_id = %self.config.shard_id, epoch = self.epoch, index_count = specs.len()))]
     pub async fn replace_index_configs(
         &self,
-        configs: Vec<MemIndexConfig>,
+        specs: Vec<MemIndexSpec>,
     ) -> Result<Option<SealFence>> {
         // Usually already current: check under the read lock and skip the
         // fence check, which reads the manifest.
         if let WriterMode::MemTable { state, .. } = &self.mode
-            && same_index_set(&state.read().await.schema.index_configs, &configs)
+            && same_index_set(&state.read().await.schema.index_specs, &specs)
         {
             return Ok(None);
         }
         self.replace_writer_schema("replace_index_configs", |current| {
-            current.with_index_configs(configs)
+            current.with_index_specs(specs)
         })
         .await
     }
@@ -4756,10 +4864,10 @@ impl MessageHandler<TriggerMemTableFlush> for MemTableFlushHandler {
         match message {
             TriggerMemTableFlush::Flush {
                 memtable,
-                index_configs,
+                index_specs,
                 done,
             } => {
-                let result = self.flush_memtable(memtable, &index_configs).await;
+                let result = self.flush_memtable(memtable, &index_specs).await;
                 if let Some(tx) = done {
                     // Send result through the channel - caller is waiting for it
                     let _ = tx.send(result);
@@ -4785,13 +4893,13 @@ impl MemTableFlushHandler {
     /// for this memtable. Otherwise `wait_for_flush_drain` would observe a
     /// dropped watch channel and return `Err` instead of the actual outcome.
     ///
-    /// `index_configs` are the indexes the memtable was built with. They are
+    /// `index_specs` are the indexes the memtable was built with. They are
     /// rebuilt on the generation, without which `fast_search` misses its rows.
     #[instrument(name = "mt_flush", level = "info", skip_all, fields(generation = memtable.generation(), row_count = memtable.row_count()))]
     async fn flush_memtable(
         &mut self,
         memtable: Arc<MemTable>,
-        index_configs: &[MemIndexConfig],
+        index_specs: &[MemIndexSpec],
     ) -> Result<super::memtable::flush::FlushResult> {
         let start = Instant::now();
 
@@ -4830,7 +4938,7 @@ impl MemTableFlushHandler {
             // `batch_count` is fixed at freeze, so this waits for a target that
             // cannot move, and the watcher surfaces a poisoned writer rather
             // than blocking on a cursor that will never arrive.
-            if !index_configs.is_empty()
+            if !index_specs.is_empty()
                 && let Some(indexes) = memtable.indexes_arc()
             {
                 let target_indexed = memtable.batch_count();
@@ -4847,7 +4955,8 @@ impl MemTableFlushHandler {
             // or, when no flush was triggered at freeze time, the memtable's
             // frozen-at marker captured at freeze. Stamping this into the
             // manifest is what lets replay-on-reopen skip entries this
-            // generation covers.
+            // generation covers. The marker can trail the last entry holding
+            // this memtable's batches; replay skips those entries by generation.
             let covered_wal_entry_position = wal_flushed_position
                 .or_else(|| memtable.frozen_at_wal_entry_position())
                 .unwrap_or(0);
@@ -4862,7 +4971,7 @@ impl MemTableFlushHandler {
             // short of it and trip the flush precondition.
             let durable = self.wal_flusher.durable();
 
-            if index_configs.is_empty() {
+            if index_specs.is_empty() {
                 self.flusher
                     .flush(&memtable, self.epoch, covered_wal_entry_position, durable)
                     .await
@@ -4870,7 +4979,7 @@ impl MemTableFlushHandler {
                 Box::pin(self.flusher.flush_with_indexes(
                     &memtable,
                     self.epoch,
-                    index_configs,
+                    index_specs,
                     covered_wal_entry_position,
                     durable,
                 ))
@@ -5324,6 +5433,323 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_durable_blob_puts_share_pack_until_wal_flush() {
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let shard_id = Uuid::new_v4();
+        let first = create_blob_v2_batch(0, &[BlobTestValue::Bytes(b"first".to_vec())]);
+        let second = create_blob_v2_batch(1, &[BlobTestValue::Bytes(b"later".to_vec())]);
+        let writer = ShardWriter::open(
+            store.clone(),
+            base_path.clone(),
+            base_uri,
+            ShardWriterConfig {
+                shard_id,
+                durable_write: true,
+                max_wal_buffer_size: usize::MAX,
+                max_wal_flush_interval: Some(Duration::from_secs(60)),
+                ..Default::default()
+            },
+            first.schema(),
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        let (_, first_watcher) = writer.put_no_wait(vec![first]).await.unwrap();
+        let (_, second_watcher) = writer.put_no_wait(vec![second]).await.unwrap();
+        let fence = writer.force_seal_active().await.unwrap();
+
+        let mut first_watcher = first_watcher.unwrap();
+        let mut second_watcher = second_watcher.unwrap();
+        first_watcher.wait().await.unwrap();
+        second_watcher.wait().await.unwrap();
+        fence.wait().await.unwrap();
+
+        let tailer = WalTailer::new(store.clone(), base_path.clone(), shard_id);
+        let entry = tailer.read_entry(1).await.unwrap().unwrap();
+        assert_eq!(entry.batches.len(), 2);
+        assert!(tailer.read_entry(2).await.unwrap().is_none());
+
+        let target = entry.target.unwrap();
+        let data_dir = target.generation_path(&base_path, &shard_id).join(DATA_DIR);
+        let sidecars = blob_sidecars(store.as_ref(), &data_dir).await;
+        assert_eq!(sidecars.len(), 1, "both puts must share one packed object");
+        let payload = store
+            .inner
+            .get(&sidecars[0])
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(payload.as_ref(), b"firstlater");
+
+        writer.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_failed_shared_blob_pack_cannot_enter_wal() {
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let shard_id = Uuid::new_v4();
+        let batch = create_blob_v2_batch(0, &[BlobTestValue::Bytes(b"first".to_vec())]);
+        let writer = ShardWriter::open(
+            store.clone(),
+            base_path.clone(),
+            base_uri,
+            ShardWriterConfig {
+                shard_id,
+                durable_write: true,
+                max_wal_buffer_size: usize::MAX,
+                max_wal_flush_interval: Some(Duration::from_secs(60)),
+                ..Default::default()
+            },
+            batch.schema(),
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        let (_, watcher) = writer.put_no_wait(vec![batch]).await.unwrap();
+        let batch_store = match &writer.mode {
+            WriterMode::MemTable { state, .. } => state.read().await.memtable.batch_store(),
+            WriterMode::WalOnly { .. } => unreachable!(),
+        };
+        batch_store
+            .fail_blob_pack(&Error::io("injected shared-pack failure"))
+            .await;
+
+        let error = writer
+            .wal_flusher
+            .flush(&WalFlushSource::BatchStore { batch_store }, 1)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("terminally failed Blob v2 pack"));
+
+        let mut watcher = watcher.unwrap();
+        assert!(watcher.wait().await.is_err());
+        let tailer = WalTailer::new(store, base_path, shard_id);
+        assert!(tailer.read_entry(1).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_failed_shared_blob_pack_retry_cannot_enter_wal() {
+        let (store, base_path, controls) = failing_memory_store().await;
+        let shard_id = Uuid::new_v4();
+        let batch = create_blob_v2_batch(0, &[BlobTestValue::Bytes(b"first".to_vec())]);
+        let writer = ShardWriter::open(
+            store.clone(),
+            base_path.clone(),
+            "memory://".to_string(),
+            ShardWriterConfig {
+                shard_id,
+                durable_write: true,
+                max_wal_buffer_size: usize::MAX,
+                max_wal_flush_interval: Some(Duration::from_secs(60)),
+                ..Default::default()
+            },
+            batch.schema(),
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        let (_, watcher) = writer.put_no_wait(vec![batch]).await.unwrap();
+        let batch_store = match &writer.mode {
+            WriterMode::MemTable { state, .. } => state.read().await.memtable.batch_store(),
+            WriterMode::WalOnly { .. } => unreachable!(),
+        };
+        let source = WalFlushSource::BatchStore {
+            batch_store: batch_store.clone(),
+        };
+        controls.fail_blob_puts(1);
+        let first_error = writer.wal_flusher.flush(&source, 1).await.unwrap_err();
+        assert!(
+            first_error
+                .to_string()
+                .contains("failed to finalize Blob v2 pack")
+        );
+        assert!(writer.wal_flusher.check_poisoned().is_err());
+        assert!(watcher.unwrap().wait().await.is_err());
+
+        assert!(writer.wal_flusher.flush(&source, 1).await.is_err());
+        assert!(
+            WalTailer::new(store.clone(), base_path.clone(), shard_id)
+                .read_entry(1)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let data_dir = batch_store
+            .target()
+            .unwrap()
+            .generation_path(&base_path, &shard_id)
+            .join(DATA_DIR);
+        assert!(blob_sidecars(store.as_ref(), &data_dir).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_cancelled_shared_blob_pack_rollover_cannot_ack_missing_payload() {
+        let (store, base_path, controls) = failing_memory_store().await;
+        let shard_id = Uuid::new_v4();
+        let with_small_pack = |batch: RecordBatch| {
+            let schema = batch.schema();
+            let fields = schema
+                .fields()
+                .iter()
+                .map(|field| {
+                    let mut field = field.as_ref().clone();
+                    if field.name() == "blob" {
+                        let mut metadata = field.metadata().clone();
+                        metadata.insert(
+                            lance_arrow::BLOB_PACK_FILE_SIZE_THRESHOLD_META_KEY.to_string(),
+                            "8".to_string(),
+                        );
+                        field = field.with_metadata(metadata);
+                    }
+                    field
+                })
+                .collect::<Vec<_>>();
+            RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), batch.columns().to_vec())
+                .unwrap()
+        };
+        let first = with_small_pack(create_blob_v2_batch(
+            0,
+            &[BlobTestValue::Bytes(b"first".to_vec())],
+        ));
+        let second = with_small_pack(create_blob_v2_batch(
+            1,
+            &[BlobTestValue::Bytes(b"later".to_vec())],
+        ));
+        let writer = ShardWriter::open(
+            store.clone(),
+            base_path.clone(),
+            "memory://".to_string(),
+            ShardWriterConfig {
+                shard_id,
+                durable_write: true,
+                max_wal_buffer_size: usize::MAX,
+                max_wal_flush_interval: Some(Duration::from_secs(60)),
+                ..Default::default()
+            },
+            first.schema(),
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        let (_, first_watcher) = writer.put_no_wait(vec![first]).await.unwrap();
+        controls.set_block_blob_puts(true);
+        let cancelled =
+            tokio::time::timeout(Duration::from_millis(50), writer.put_no_wait(vec![second])).await;
+        assert!(cancelled.is_err());
+        assert_eq!(controls.blob_attempts(), 1);
+        controls.set_block_blob_puts(false);
+
+        let batch_store = match &writer.mode {
+            WriterMode::MemTable { state, .. } => state.read().await.memtable.batch_store(),
+            WriterMode::WalOnly { .. } => unreachable!(),
+        };
+        let error = writer
+            .wal_flusher
+            .flush(
+                &WalFlushSource::BatchStore {
+                    batch_store: batch_store.clone(),
+                },
+                1,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("terminally failed Blob v2 pack"));
+        assert!(first_watcher.unwrap().wait().await.is_err());
+        assert!(
+            WalTailer::new(store.clone(), base_path.clone(), shard_id)
+                .read_entry(1)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let data_dir = batch_store
+            .target()
+            .unwrap()
+            .generation_path(&base_path, &shard_id)
+            .join(DATA_DIR);
+        assert!(blob_sidecars(store.as_ref(), &data_dir).await.is_empty());
+    }
+
+    /// A writer schema whose fields carry their ids, a blob's children
+    /// included: a blob write is accepted, and the flushed generation keeps the
+    /// ids the schema gives the blob's children, so it reads back as the same
+    /// columns. `replayed` drops the writer unclosed, as a crash would, so the
+    /// blob reaches the generation through WAL replay.
+    #[rstest]
+    #[case::non_durable(false, false)]
+    #[case::durable(true, false)]
+    #[case::replayed(true, true)]
+    #[tokio::test]
+    async fn test_blob_v2_keeps_field_ids_through_put_and_flush(
+        #[case] durable_write: bool,
+        #[case] replayed: bool,
+    ) {
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let batch = create_blob_v2_batch(
+            0,
+            &[
+                BlobTestValue::Bytes(vec![7; 1024 * 1024]),
+                BlobTestValue::Bytes(b"abc".to_vec()),
+            ],
+        );
+        let with_ids = Schema::try_from(batch.schema().as_ref()).unwrap();
+        let config = ShardWriterConfig {
+            shard_id: Uuid::new_v4(),
+            durable_write,
+            ..Default::default()
+        };
+        let schema = Arc::new(crate::dataset::mem_wal::arrow_schema_with_field_ids(
+            &with_ids,
+        ));
+        let open = || {
+            ShardWriter::open(
+                store.clone(),
+                base_path.clone(),
+                base_uri.clone(),
+                config.clone(),
+                schema.clone(),
+                vec![],
+            )
+        };
+        let mut writer = open().await.unwrap();
+        writer.put(vec![batch]).await.unwrap();
+        if replayed {
+            drop(writer);
+            writer = open().await.unwrap();
+            assert_eq!(writer.memtable_stats().await.unwrap().row_count, 2);
+        }
+        writer.close().await.unwrap();
+
+        let manifest = ShardManifestStore::new(store.clone(), &base_path, config.shard_id, 2)
+            .latest()
+            .await
+            .unwrap()
+            .unwrap();
+        let generation = Dataset::open(&format!(
+            "{}/_mem_wal/{}/{}",
+            base_uri, config.shard_id, manifest.sstables[0].path
+        ))
+        .await
+        .unwrap();
+        let blob_children = |schema: &Schema| -> Vec<(String, i32)> {
+            schema
+                .field("blob")
+                .unwrap()
+                .children
+                .iter()
+                .map(|c| (c.name.clone(), c.id))
+                .collect()
+        };
+        assert_eq!(blob_children(generation.schema()), blob_children(&with_ids));
+    }
+
+    #[tokio::test]
     async fn test_blob_v2_target_is_reused_across_replay_and_flush() {
         let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
         let external_dir = tempfile::tempdir().unwrap();
@@ -5346,12 +5772,12 @@ mod tests {
         );
         let schema = first.schema();
         let second = create_blob_v2_batch(8, &[BlobTestValue::Bytes(b"later".to_vec())]);
-        let index_configs = vec![MemIndexConfig::Hnsw(Box::new(HnswIndexConfig::new(
-            "vector_idx".to_string(),
+        let index_specs = vec![MemIndexSpec::hnsw(
+            "vector_idx",
             4,
-            "vector".to_string(),
+            "vector",
             lance_linalg::distance::DistanceType::L2,
-        )))];
+        )];
         let config = ShardWriterConfig {
             shard_id,
             durable_write: true,
@@ -5367,7 +5793,7 @@ mod tests {
                 base_uri.clone(),
                 config.clone(),
                 schema.clone(),
-                index_configs.clone(),
+                index_specs.clone(),
             )
             .await
             .unwrap();
@@ -5474,7 +5900,7 @@ mod tests {
             base_uri.clone(),
             replay_config,
             schema,
-            index_configs,
+            index_specs,
         )
         .await
         .unwrap();
@@ -5919,38 +6345,12 @@ mod tests {
         let err = conform_to_storage_schema(narrow, &storage, &["id".to_string()])
             .expect_err("a column's type cannot change");
         assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "expected InvalidInput, got {err:?}"
+        );
+        assert!(
             err.to_string().contains("count"),
             "the refusal should name the column, got: {err}"
-        );
-    }
-
-    /// A cast that would lose the value is an error, not a column of nulls.
-    #[test]
-    fn test_conform_refuses_a_lossy_retype() {
-        let numeric = schema_with_tombstone(&ArrowSchema::new(vec![
-            Field::new("id", DataType::Int32, false),
-            Field::new("name", DataType::Int32, true),
-        ]));
-        let textual = RecordBatch::try_new(
-            Arc::new(ArrowSchema::new(vec![
-                Field::new("id", DataType::Int32, false),
-                Field::new("name", DataType::Utf8, true),
-            ])),
-            vec![
-                Arc::new(Int32Array::from(vec![1])),
-                Arc::new(StringArray::from(vec!["not a number"])),
-            ],
-        )
-        .unwrap();
-
-        let error = conform_to_storage_schema(textual, &numeric, &["id".to_string()]).unwrap_err();
-        assert!(
-            matches!(error, Error::InvalidInput { .. }),
-            "expected InvalidInput, got {error:?}"
-        );
-        assert!(
-            error.to_string().contains("name"),
-            "the error should name the column: {error}"
         );
     }
 
@@ -6498,7 +6898,6 @@ mod tests {
         filter: Option<&str>,
     ) -> Vec<i32> {
         use crate::dataset::mem_wal::scanner::{LsmScanner, ShardSnapshot};
-        use futures::TryStreamExt;
 
         let manifest = writer.manifest().await.unwrap().unwrap();
         let mut snapshot =
@@ -6506,12 +6905,42 @@ mod tests {
         for sstable in &manifest.sstables {
             snapshot = snapshot.with_sstable(sstable.generation, sstable.path.clone());
         }
-        let mut scanner = LsmScanner::without_base_table(
+        let scanner = LsmScanner::without_base_table(
             schema,
             base_uri.to_string(),
             vec![snapshot],
             vec!["id".to_string()],
         );
+        scan_ids(scanner, filter).await
+    }
+
+    /// The ids a read of the writer's in-memory memtables returns.
+    async fn read_memtable_ids_via_lsm(
+        writer: &ShardWriter,
+        schema: Arc<ArrowSchema>,
+        base_uri: &str,
+        shard_id: Uuid,
+        filter: Option<&str>,
+    ) -> Vec<i32> {
+        use crate::dataset::mem_wal::scanner::LsmScanner;
+
+        let refs = writer.in_memory_memtable_refs().await.unwrap();
+        let scanner = LsmScanner::without_base_table(
+            schema,
+            base_uri.to_string(),
+            vec![],
+            vec!["id".to_string()],
+        )
+        .with_in_memory_memtables(shard_id, refs);
+        scan_ids(scanner, filter).await
+    }
+
+    async fn scan_ids(
+        mut scanner: crate::dataset::mem_wal::scanner::LsmScanner,
+        filter: Option<&str>,
+    ) -> Vec<i32> {
+        use futures::TryStreamExt;
+
         if let Some(predicate) = filter {
             scanner = scanner.filter(predicate).unwrap();
         }
@@ -6591,6 +7020,79 @@ mod tests {
         writer.close().await.unwrap();
     }
 
+    /// A user index may carry any name, including one shaped like an internal
+    /// key index. It keeps its own column through writes, overwrites, deletes,
+    /// a flush and a reopen, and the key index keeps deduplicating beside it.
+    #[tokio::test]
+    async fn test_user_index_named_like_a_key_index_keeps_its_column() {
+        let (store, base_path, base_uri, _temp) = create_local_store().await;
+        let schema = create_pk_test_schema();
+        let shard_id = Uuid::new_v4();
+        let index_specs = vec![MemIndexSpec::btree("__pk__id", 1, "name")];
+        let open = || {
+            ShardWriter::open(
+                store.clone(),
+                base_path.clone(),
+                base_uri.clone(),
+                flush_test_config(shard_id),
+                schema.clone(),
+                index_specs.clone(),
+            )
+        };
+        let renamed = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(StringArray::from(vec!["renamed"])),
+            ],
+        )
+        .unwrap();
+        let cases = [
+            ("name = 'renamed'", vec![1]),
+            ("name = 'name_1'", vec![]),
+            ("name = 'name_2'", vec![]),
+            ("name = 'name_3'", vec![3]),
+            ("id = 1", vec![1]),
+            ("id = 2", vec![]),
+        ];
+
+        let writer = open().await.unwrap();
+        writer
+            .put(vec![create_test_batch(&schema, 0, 5)])
+            .await
+            .unwrap();
+        writer.put(vec![renamed]).await.unwrap();
+        writer.delete(vec![id_only_keys(&[2])]).await.unwrap();
+        for (filter, expected) in &cases {
+            let ids = read_memtable_ids_via_lsm(
+                &writer,
+                schema.clone(),
+                &base_uri,
+                shard_id,
+                Some(filter),
+            )
+            .await;
+            assert_eq!(&ids, expected, "fresh read of {filter}");
+        }
+
+        writer.force_seal_active().await.unwrap();
+        writer.wait_for_flush_drain().await.unwrap();
+        writer.close().await.unwrap();
+        let writer = open().await.unwrap();
+        for (filter, expected) in &cases {
+            let ids = read_sstable_ids_via_lsm(
+                &writer,
+                schema.clone(),
+                &base_uri,
+                shard_id,
+                Some(filter),
+            )
+            .await;
+            assert_eq!(&ids, expected, "flushed read of {filter}");
+        }
+        writer.close().await.unwrap();
+    }
+
     /// Insert+flush, then delete+flush: the tombstone lands in a *newer*
     /// generation than the live row, so the cross-generation block-list must
     /// mask the older row by PK. This is the wallop scenario (seed flushed,
@@ -6649,18 +7151,14 @@ mod tests {
         let (store, base_path, base_uri, _temp) = create_local_store().await;
         let schema = create_pk_test_schema();
         let shard_id = Uuid::new_v4();
-        let index_configs = vec![MemIndexConfig::BTree(BTreeIndexConfig {
-            name: "id_idx".to_string(),
-            field_id: 0,
-            column: "id".to_string(),
-        })];
+        let index_specs = vec![MemIndexSpec::btree("id_idx", 0, "id")];
         let writer = ShardWriter::open(
             store,
             base_path,
             base_uri.clone(),
             flush_test_config(shard_id),
             schema.clone(),
-            index_configs,
+            index_specs,
         )
         .await
         .unwrap();
@@ -7028,11 +7526,7 @@ mod tests {
             ..Default::default()
         };
 
-        let index_configs = vec![MemIndexConfig::BTree(BTreeIndexConfig {
-            name: "id_idx".to_string(),
-            field_id: 0,
-            column: "id".to_string(),
-        })];
+        let index_specs = vec![MemIndexSpec::btree("id_idx", 0, "id")];
 
         let writer = ShardWriter::open(
             store,
@@ -7040,7 +7534,7 @@ mod tests {
             base_uri,
             config,
             schema.clone(),
-            index_configs,
+            index_specs,
         )
         .await
         .unwrap();
@@ -7062,13 +7556,8 @@ mod tests {
     #[test]
     fn test_a_changed_metric_is_a_changed_index_set() {
         use lance_linalg::distance::DistanceType;
-        let old = MemIndexConfig::hnsw("vector_idx".into(), 1, "vector".into(), DistanceType::L2);
-        let new = MemIndexConfig::hnsw(
-            "vector_idx".into(),
-            1,
-            "vector".into(),
-            DistanceType::Cosine,
-        );
+        let old = MemIndexSpec::hnsw("vector_idx", 1, "vector", DistanceType::L2);
+        let new = MemIndexSpec::hnsw("vector_idx", 1, "vector", DistanceType::Cosine);
         assert!(!same_index_set(&[old], &[new]));
     }
 
@@ -7093,11 +7582,7 @@ mod tests {
             manifest_scan_batch_size: 2,
             ..Default::default()
         };
-        let id_idx = MemIndexConfig::BTree(BTreeIndexConfig {
-            name: "id_idx".to_string(),
-            field_id: 0,
-            column: "id".to_string(),
-        });
+        let id_idx = MemIndexSpec::btree("id_idx", 0, "id");
         let writer = Arc::new(
             ShardWriter::open(
                 store,
@@ -7193,11 +7678,7 @@ mod tests {
             manifest_scan_batch_size: 2,
             ..Default::default()
         };
-        let id_idx = MemIndexConfig::BTree(BTreeIndexConfig {
-            name: "id_idx".to_string(),
-            field_id: 0,
-            column: "id".to_string(),
-        });
+        let id_idx = MemIndexSpec::btree("id_idx", 0, "id");
         let writer = ShardWriter::open(
             store,
             base_path,
@@ -7297,11 +7778,7 @@ mod tests {
             ..Default::default()
         };
 
-        let index_configs = vec![MemIndexConfig::BTree(BTreeIndexConfig {
-            name: "id_idx".to_string(),
-            field_id: 0,
-            column: "id".to_string(),
-        })];
+        let index_specs = vec![MemIndexSpec::btree("id_idx", 0, "id")];
 
         let writer = ShardWriter::open(
             store,
@@ -7309,7 +7786,7 @@ mod tests {
             base_uri.clone(),
             config,
             schema.clone(),
-            index_configs,
+            index_specs,
         )
         .await
         .unwrap();
@@ -8701,14 +9178,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_wal_only_rejects_index_configs() {
+    async fn test_wal_only_rejects_index_specs() {
         let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
         let schema = create_test_schema();
-        let index_configs = vec![MemIndexConfig::BTree(BTreeIndexConfig {
-            name: "id_idx".to_string(),
-            field_id: 0,
-            column: "id".to_string(),
-        })];
+        let index_specs = vec![MemIndexSpec::btree("id_idx", 0, "id")];
 
         let err = ShardWriter::open(
             store,
@@ -8716,7 +9189,7 @@ mod tests {
             base_uri,
             wal_only_config(Uuid::new_v4()),
             schema,
-            index_configs,
+            index_specs,
         )
         .await
         .err()
@@ -9064,14 +9537,10 @@ mod tests {
             .await
             .unwrap();
 
-        // An index config that disagrees with the schema (FTS on the Int32 `id`
+        // An index spec that disagrees with the schema (FTS on the Int32 `id`
         // column) is rejected on local validation. On the old path this rejection
         // landed only after the epoch had already been claimed.
-        let bad_fts = MemIndexConfig::Fts(FtsIndexConfig::new(
-            "bad_fts".to_string(),
-            0,
-            "id".to_string(),
-        ));
+        let bad_fts = MemIndexSpec::fts("bad_fts", 0, "id");
         let err = ShardWriter::open(
             store.clone(),
             base_path.clone(),
@@ -9303,7 +9772,7 @@ mod tests {
                 base_uri.clone(),
                 writer_a_config,
                 schema.clone(),
-                // WAL-only mode builds no index; writer B carries the HNSW configs.
+                // WAL-only mode builds no index; writer B carries the HNSW specs.
                 vec![],
             )
             .await
@@ -9317,10 +9786,9 @@ mod tests {
         }
 
         // Replay has 32 rows to place into memtables capped at 8.
-        let writer_b =
-            ShardWriter::open(store, base_path, base_uri, config, schema, hnsw_configs())
-                .await
-                .expect("a WAL holding more rows than the cap must still reopen");
+        let writer_b = ShardWriter::open(store, base_path, base_uri, config, schema, hnsw_specs())
+            .await
+            .expect("a WAL holding more rows than the cap must still reopen");
 
         let manifest = writer_b.manifest().await.unwrap().unwrap();
         assert!(
@@ -9672,9 +10140,87 @@ mod tests {
         assert!(next_pending_store(frozen_list(), Arc::clone(&active), 3).is_none());
     }
 
-    /// A durable writer with no flush ticker cannot make progress in either
-    /// mode — the ticker is the only thing that drives the WAL append the put
-    /// waits on — so `open()` rejects it rather than letting a put block forever.
+    #[test]
+    fn test_wal_size_trigger_coalesces_crossings() {
+        let threshold = 64;
+        let mut claimed = 0;
+
+        assert!(!claim_wal_size_trigger(&mut claimed, 63, threshold));
+        assert!(claim_wal_size_trigger(
+            &mut claimed,
+            3 * threshold + 1,
+            threshold
+        ));
+        assert_eq!(claimed, 3);
+
+        assert!(!claim_wal_size_trigger(
+            &mut claimed,
+            3 * threshold + 63,
+            threshold
+        ));
+        assert!(claim_wal_size_trigger(
+            &mut claimed,
+            4 * threshold,
+            threshold
+        ));
+        assert_eq!(claimed, 4);
+        assert!(!claim_wal_size_trigger(&mut claimed, usize::MAX, 0));
+    }
+
+    #[test]
+    fn test_wal_time_trigger_preserves_interval_without_fixed_boundary() {
+        let interval = Some(Duration::from_millis(100));
+        let mut last = 0;
+
+        assert!(!claim_wal_time_trigger(&mut last, 1_000, interval));
+        assert_eq!(last, 1_000);
+        assert!(!claim_wal_time_trigger(&mut last, 1_099, interval));
+        assert!(claim_wal_time_trigger(&mut last, 1_100, interval));
+        assert_eq!(last, 1_100);
+        assert!(!claim_wal_time_trigger(&mut last, 1_199, interval));
+        assert!(claim_wal_time_trigger(&mut last, 1_200, interval));
+        assert!(!claim_wal_time_trigger(&mut last, 1_300, None));
+        assert!(!claim_wal_time_trigger(
+            &mut last,
+            1_300,
+            Some(Duration::ZERO)
+        ));
+    }
+
+    #[test]
+    fn test_pending_wal_size_trigger_coalesces_and_resets_after_drain() {
+        let threshold = 64;
+        let mut claimed_bytes = 0;
+
+        assert!(claim_pending_wal_size_trigger(
+            &mut claimed_bytes,
+            3 * threshold + 1,
+            threshold
+        ));
+        assert_eq!(claimed_bytes, 3 * threshold);
+        assert!(!claim_pending_wal_size_trigger(
+            &mut claimed_bytes,
+            3 * threshold + 63,
+            threshold
+        ));
+
+        assert!(!claim_pending_wal_size_trigger(
+            &mut claimed_bytes,
+            threshold - 1,
+            threshold
+        ));
+        assert_eq!(claimed_bytes, 0);
+        assert!(claim_pending_wal_size_trigger(
+            &mut claimed_bytes,
+            threshold,
+            threshold
+        ));
+        assert_eq!(claimed_bytes, threshold);
+    }
+
+    /// A durable writer with no flush interval cannot guarantee progress in
+    /// either mode: a small put may not cross the size threshold, and without an
+    /// interval neither the write path nor ticker drives its WAL append.
     #[rstest]
     #[case::memtable(true)]
     #[case::wal_only(false)]
@@ -9785,7 +10331,7 @@ mod tests {
         );
     }
 
-    /// An index config that disagrees with the schema fails `open()` outright.
+    /// An index spec that disagrees with the schema fails `open()` outright.
     /// It must not be allowed to accept writes: the insert would fail
     /// deterministically on every batch, including batches replayed from the
     /// WAL, so once a row was durable the shard could never reopen. Before this
@@ -9798,11 +10344,7 @@ mod tests {
         let shard_id = Uuid::new_v4();
 
         // `id` is Int32, not a string column.
-        let bad_fts = MemIndexConfig::Fts(FtsIndexConfig::new(
-            "bad_fts".to_string(),
-            0,
-            "id".to_string(),
-        ));
+        let bad_fts = MemIndexSpec::fts("bad_fts", 0, "id");
 
         let Err(err) = ShardWriter::open(
             store,
@@ -9958,6 +10500,166 @@ mod tests {
         );
         assert_eq!(stats.batch_count, 0);
         writer_b.close().await.unwrap();
+    }
+
+    const COVERED_TEST_ROW_CAP: usize = 16;
+
+    /// Append the active memtable's un-appended batches to the WAL without
+    /// going through the flush handler, so the writer state does not learn the
+    /// new entry position: the window between an append and its bookkeeping.
+    async fn append_active_without_state_update(writer: &ShardWriter) {
+        let batch_store = writer
+            .memtable_state_lock()
+            .unwrap()
+            .read()
+            .await
+            .memtable
+            .batch_store();
+        let end = batch_store.len();
+        let result = writer
+            .wal_flusher
+            .flush(&WalFlushSource::BatchStore { batch_store }, end)
+            .await
+            .unwrap();
+        assert!(result.entry.is_some(), "the append must write an entry");
+    }
+
+    /// A memtable frozen after its batches were appended, but before the
+    /// writer state recorded that append, flushes with a covered position
+    /// short of the append. Reopen replays that entry and skips it by its
+    /// generation, restoring only the generation after it.
+    #[tokio::test]
+    async fn test_reopen_after_flush_with_stale_covered_position() {
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let schema = schema_with_pk();
+        let shard_id = Uuid::new_v4();
+        // Appends happen only when the test drives them.
+        let config = ShardWriterConfig {
+            durable_write: false,
+            max_wal_flush_interval: None,
+            max_memtable_rows: COVERED_TEST_ROW_CAP,
+            ..memtable_config_with_pk(shard_id)
+        };
+
+        let writer_a = ShardWriter::open(
+            store.clone(),
+            base_path.clone(),
+            base_uri.clone(),
+            config.clone(),
+            schema.clone(),
+            vec![],
+        )
+        .await
+        .unwrap();
+        writer_a
+            .put(vec![create_test_batch(&schema, 0, 4)])
+            .await
+            .unwrap();
+        append_active_without_state_update(&writer_a).await;
+        // The freeze finds nothing left to append, so it triggers no append
+        // whose position it could take.
+        writer_a.force_seal_active().await.unwrap();
+        writer_a.wait_for_flush_drain().await.unwrap();
+
+        let manifest = writer_a.manifest().await.unwrap().unwrap();
+        assert_eq!(
+            manifest.replay_after_wal_entry_position, 0,
+            "the covered position must miss WAL entry 1 for reopen to replay it"
+        );
+
+        // Fill the next generation to just under the cap, then crash.
+        writer_a
+            .put(vec![create_test_batch(&schema, 100, 14)])
+            .await
+            .unwrap();
+        append_active_without_state_update(&writer_a).await;
+        writer_a.abort().await.unwrap();
+        drop(writer_a);
+
+        let writer_b = ShardWriter::open(
+            store,
+            base_path,
+            base_uri.clone(),
+            config,
+            schema.clone(),
+            vec![],
+        )
+        .await
+        .expect("a shard reopened with the config it was written under must open");
+
+        assert_eq!(
+            writer_b.memtable_stats().await.unwrap().row_count,
+            14,
+            "replay must restore only the unflushed generation"
+        );
+        assert_eq!(
+            read_sstable_ids_via_lsm(&writer_b, schema, &base_uri, shard_id, None).await,
+            (0..4).collect::<Vec<_>>()
+        );
+        writer_b.close().await.unwrap();
+    }
+
+    /// Past the generation replay starts from, WAL generations only move
+    /// forward; an entry whose generation goes backwards fails the open.
+    #[tokio::test]
+    async fn test_replay_rejects_backwards_generation() {
+        use crate::dataset::mem_wal::ShardManifestStore;
+
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let schema = schema_with_pk();
+        let shard_id = Uuid::new_v4();
+        let config = memtable_config_with_pk(shard_id);
+
+        let writer_a = ShardWriter::open(
+            store.clone(),
+            base_path.clone(),
+            base_uri.clone(),
+            config.clone(),
+            schema.clone(),
+            vec![],
+        )
+        .await
+        .unwrap();
+        let manifest = writer_a.manifest().await.unwrap().unwrap();
+        let base_generation = manifest.current_generation;
+        let epoch = writer_a.epoch;
+        writer_a.abort().await.unwrap();
+        drop(writer_a);
+
+        let manifest_store = Arc::new(ShardManifestStore::new(
+            store.clone(),
+            &base_path,
+            shard_id,
+            2,
+        ));
+        let appender = WalAppender::with_claimed_epoch(
+            store.clone(),
+            base_path.clone(),
+            shard_id,
+            manifest_store,
+            epoch,
+            0,
+            WalRetryConfig::default(),
+        );
+        for (start_id, generation) in [(0, base_generation + 1), (10, base_generation)] {
+            appender
+                .append_for_target(
+                    vec![create_test_batch(&schema, start_id, 2)],
+                    None,
+                    Some(generation),
+                )
+                .await
+                .unwrap();
+        }
+
+        let err = ShardWriter::open(store, base_path, base_uri, config, schema, vec![])
+            .await
+            .map(|_| ())
+            .expect_err("a WAL generation going backwards must fail the open");
+        assert!(
+            err.to_string().contains("below the generation"),
+            "unexpected error: {err}"
+        );
     }
 
     /// Replay aborts the open with a clear fence error if it encounters a
@@ -10292,11 +10994,7 @@ mod tests {
         // silently reading zero after index apply moved off the WAL-flush path.
         let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
         let schema = create_pk_test_schema();
-        let index_configs = vec![MemIndexConfig::BTree(BTreeIndexConfig {
-            name: "id_idx".to_string(),
-            field_id: 0,
-            column: "id".to_string(),
-        })];
+        let index_specs = vec![MemIndexSpec::btree("id_idx", 0, "id")];
 
         let writer = ShardWriter::open(
             store,
@@ -10304,7 +11002,7 @@ mod tests {
             base_uri,
             flush_test_config(Uuid::new_v4()),
             schema.clone(),
-            index_configs,
+            index_specs,
         )
         .await
         .unwrap();
@@ -11127,7 +11825,7 @@ mod tests {
             base_uri,
             config,
             schema.clone(),
-            hnsw_configs(),
+            hnsw_specs(),
         )
         .await
         .unwrap();
@@ -11174,11 +11872,7 @@ mod tests {
         ]));
         // Keys long enough to spill out of the skiplist nodes, so the index heap
         // grows with the column instead of staying a fixed reservation.
-        let btree = vec![MemIndexConfig::BTree(BTreeIndexConfig {
-            name: "text_idx".to_string(),
-            field_id: 1,
-            column: "text".to_string(),
-        })];
+        let btree = vec![MemIndexSpec::btree("text_idx", 1, "text")];
 
         let rows = 2_000usize;
         let width = 512usize;
@@ -11244,7 +11938,7 @@ mod tests {
             max_memtable_rows: 2_000,
             ..Default::default()
         };
-        let reserved = reserved_index_bytes(&sizing, &hnsw_configs());
+        let reserved = reserved_index_bytes(&sizing, &hnsw_specs());
         let (store, base_path, base_uri, _t) = create_local_store().await;
         let config = ShardWriterConfig {
             shard_id: Uuid::new_v4(),
@@ -11261,7 +11955,7 @@ mod tests {
             base_uri,
             config,
             hnsw_schema(8),
-            hnsw_configs(),
+            hnsw_specs(),
         )
         .await
         .err()
@@ -11286,20 +11980,26 @@ mod tests {
         ]))
     }
 
-    fn hnsw_configs() -> Vec<MemIndexConfig> {
-        vec![MemIndexConfig::Hnsw(Box::new(HnswIndexConfig::new(
-            "vec_idx".to_string(),
+    /// The shard schema the reservation tests build memtables against.
+    fn test_lance_schema() -> Schema {
+        Schema::try_from(hnsw_schema(8).as_ref()).unwrap()
+    }
+
+    fn hnsw_specs() -> Vec<MemIndexSpec> {
+        vec![MemIndexSpec::hnsw(
+            "vec_idx",
             1,
-            "vector".to_string(),
+            "vector",
             lance_linalg::distance::DistanceType::L2,
-        )))]
+        )]
     }
 
     /// What the configured indexes owe before a single row arrives — the figure
     /// `open` validates against, computed the way the memtable will build them.
-    fn reserved_index_bytes(config: &ShardWriterConfig, configs: &[MemIndexConfig]) -> usize {
-        IndexStore::from_configs(
-            configs,
+    fn reserved_index_bytes(config: &ShardWriterConfig, specs: &[MemIndexSpec]) -> usize {
+        IndexStore::from_specs(
+            specs,
+            &test_lance_schema(),
             config.max_memtable_rows,
             config.max_memtable_batches,
         )
@@ -11324,7 +12024,7 @@ mod tests {
             max_unflushed_memtable_bytes: 1024 * 1024,
             ..Default::default()
         };
-        let reserved = reserved_index_bytes(&config, &hnsw_configs());
+        let reserved = reserved_index_bytes(&config, &hnsw_specs());
         assert!(
             reserved > config.max_unflushed_memtable_bytes,
             "the fixture must actually over-subscribe the ceiling, got {reserved}"
@@ -11336,7 +12036,7 @@ mod tests {
             base_uri,
             config,
             hnsw_schema(32),
-            hnsw_configs(),
+            hnsw_specs(),
         )
         .await
         .err()
@@ -11455,7 +12155,7 @@ mod tests {
             max_memtable_rows: 2_000,
             ..Default::default()
         };
-        let reserved = reserved_index_bytes(&sizing, &hnsw_configs());
+        let reserved = reserved_index_bytes(&sizing, &hnsw_specs());
         let max_memtable_size = 4 * 1024;
 
         let config = ShardWriterConfig {
@@ -11475,7 +12175,7 @@ mod tests {
             base_uri,
             config,
             schema.clone(),
-            hnsw_configs(),
+            hnsw_specs(),
         )
         .await
         .expect("a reservation that leaves room under the ceiling must open");
