@@ -86,6 +86,10 @@ ignore = [
     { id = "RUSTSEC-2026-0194", reason = "`quick-xml` <0.41 pulled transitively via object_store (datafusion) and reqsign-aws-v4 (opendal); upstream must upgrade first" },
     { id = "RUSTSEC-2026-0195", reason = "`quick-xml` <0.41 pulled transitively via object_store (datafusion) and reqsign-aws-v4 (opendal); upstream must upgrade first" },
     { id = "RUSTSEC-2024-0449", reason = "`serde_yaml` pulled transitively via datafusion-substrait; serde features not utilized by us" },
+    { id = "RUSTSEC-2026-0349", reason = "minor CVE, cannot upgrade due to our release age policy (must be 48 hours old)" },
+    { id = "RUSTSEC-2026-0348", reason = "minor CVE, cannot upgrade due to our release age policy (must be 48 hours old)" },
+    { id = "RUSTSEC-2026-0347", reason = "minor CVE, cannot upgrade due to our release age policy (must be 48 hours old)" },
+    { id = "RUSTSEC-2026-0346", reason = "minor CVE, cannot upgrade due to our release age policy (must be 48 hours old)" },
 ]
 # If this is true, then cargo deny will use the git executable to fetch advisory database.
 # If this is false, then it uses a built-in git library.

@@ -799,8 +799,9 @@ impl BlobPreprocessor {
         &self,
         field: &ArrowField,
         metadata: HashMap<String, String>,
-    ) -> BlobDescriptorArrayBuilder {
+    ) -> Result<BlobDescriptorArrayBuilder> {
         BlobDescriptorArrayBuilder::new_with_metadata(field.name(), field.is_nullable(), metadata)
+            .with_field_ids_of(field)
     }
 
     async fn write_dedicated(&mut self, source: BlobWriteSource<'_>) -> Result<BlobDescriptor> {
@@ -891,7 +892,7 @@ impl BlobPreprocessor {
             .column_by_name("position")
             .expect("validated prepared Blob has position")
             .as_primitive::<UInt64Type>();
-        let mut output = self.blob_writer_with_metadata(field, writer_metadata.clone());
+        let mut output = self.blob_writer_with_metadata(field, writer_metadata.clone())?;
 
         for row in 0..values.len() {
             if values.is_null(row) {
@@ -1381,7 +1382,7 @@ impl BlobPreprocessor {
             .column_by_name("size")
             .map(|col| col.as_primitive::<UInt64Type>());
 
-        let mut blob_writer = self.blob_writer_with_metadata(field, writer_metadata.clone());
+        let mut blob_writer = self.blob_writer_with_metadata(field, writer_metadata.clone())?;
 
         for i in 0..struct_arr.len() {
             if struct_arr.is_null(i) {

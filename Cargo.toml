@@ -201,6 +201,7 @@ prost = "0.14.1"
 prost-build = "0.14.1"
 prost-types = "0.14.1"
 protobuf-src = "2.1"
+quick-xml = "0.41"
 quote = "1.0.33"
 rand = { version = "0.9.1", features = ["small_rng"] }
 rand_distr = { version = "0.5.1" }
