@@ -541,4 +541,151 @@ mod tests {
             .unwrap();
         assert_eq!(candidates, vec![1]);
     }
+
+    #[tokio::test]
+    async fn test_vector_search_consumes_stats_scope() {
+        use crate::index::vector::VectorIndexParams;
+        use arrow_array::{FixedSizeListArray, Float32Array};
+        use lance_arrow::FixedSizeListArrayExt;
+        use lance_linalg::distance::MetricType;
+
+        const DIM: usize = 8;
+        let test_uri = TempStrDir::default();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("i", ArrowDataType::Int64, false),
+            Field::new(
+                "vec",
+                ArrowDataType::FixedSizeList(
+                    Arc::new(Field::new("item", ArrowDataType::Float32, true)),
+                    DIM as i32,
+                ),
+                true,
+            ),
+        ]));
+        let make_batch = |start: i64, end: i64| {
+            let values = Float32Array::from_iter_values(
+                (start..end).flat_map(|v| std::iter::repeat_n(v as f32, DIM)),
+            );
+            let vecs = FixedSizeListArray::try_new_from_values(values, DIM as i32).unwrap();
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from_iter_values(start..end)),
+                    Arc::new(vecs),
+                ],
+            )
+            .unwrap()
+        };
+
+        // Fragments 0,1 (0..200): written first, covered by the vector index.
+        let params = WriteParams {
+            max_rows_per_file: 100,
+            ..Default::default()
+        };
+        let mut dataset = crate::Dataset::write(
+            RecordBatchIterator::new([Ok(make_batch(0, 200))], schema.clone()),
+            &test_uri,
+            Some(params),
+        )
+        .await
+        .unwrap();
+        dataset
+            .create_index(
+                &["vec"],
+                IndexType::Vector,
+                None,
+                &VectorIndexParams::ivf_flat(1, MetricType::L2),
+                true,
+            )
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["i"],
+                IndexType::FragmentColumnStats,
+                None,
+                &ScalarIndexParams::new("FragmentColumnStats".to_string()),
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Fragments 2,3 (200..400): appended after both indices; covered by
+        // statistics via same-commit registration, NOT by the vector index.
+        let append = WriteParams {
+            mode: WriteMode::Append,
+            max_rows_per_file: 100,
+            ..Default::default()
+        };
+        let dataset = crate::Dataset::write(
+            RecordBatchIterator::new([Ok(make_batch(200, 400))], schema.clone()),
+            Arc::new(dataset),
+            Some(append),
+        )
+        .await
+        .unwrap();
+
+        async fn knn_ids(dataset: &crate::Dataset, filter: &str, use_stats: bool) -> Vec<i64> {
+            const DIM: usize = 8;
+            let query = Float32Array::from_iter_values(std::iter::repeat_n(205.0f32, DIM));
+            let mut scanner = dataset.scan();
+            scanner.nearest("vec", &query, 5).unwrap();
+            scanner.prefilter(true);
+            scanner.filter(filter).unwrap();
+            scanner.use_fragment_stats(use_stats);
+            let batches: Vec<RecordBatch> = scanner
+                .try_into_stream()
+                .await
+                .unwrap()
+                .try_collect()
+                .await
+                .unwrap();
+            let mut ids: Vec<i64> = batches
+                .iter()
+                .flat_map(|b| {
+                    b.column_by_name("i")
+                        .unwrap()
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap()
+                        .values()
+                        .to_vec()
+                })
+                .collect();
+            ids.sort_unstable();
+            ids
+        }
+
+        for filter in ["i >= 350", "i >= 150 AND i < 260", "i >= 200"] {
+            assert_eq!(
+                knn_ids(&dataset, filter, true).await,
+                knn_ids(&dataset, filter, false).await,
+                "top-k must match for filter {filter}"
+            );
+        }
+
+        // Candidates entirely in the statistics-covered, vector-unindexed
+        // tail: the ANN branch disappears (its only segment covers 0,1).
+        let query = Float32Array::from_iter_values(std::iter::repeat_n(205.0f32, 8));
+        let mut scanner = dataset.scan();
+        scanner.nearest("vec", &query, 5).unwrap();
+        scanner.prefilter(true);
+        scanner.filter("i >= 350").unwrap();
+        let analyzed = scanner.analyze_plan().await.unwrap();
+        assert!(
+            !analyzed.contains("ANNIvfPartition"),
+            "ANN segment should be skipped when its fragments are excluded:\n{analyzed}"
+        );
+
+        let mut scanner = dataset.scan();
+        scanner.nearest("vec", &query, 5).unwrap();
+        scanner.prefilter(true);
+        scanner.filter("i >= 350").unwrap();
+        scanner.use_fragment_stats(false);
+        let analyzed = scanner.analyze_plan().await.unwrap();
+        assert!(
+            analyzed.contains("ANNIvfPartition"),
+            "baseline keeps the ANN branch:\n{analyzed}"
+        );
+    }
 }

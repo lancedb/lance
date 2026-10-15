@@ -7115,17 +7115,19 @@ impl Scanner {
     ) -> Result<Vec<Fragment>> {
         if let Some(target_fragments) = &self.fragments {
             let indexed_fragments = self.get_indexed_frags(index_segments);
-            Ok(target_fragments
-                .iter()
-                .filter(|fragment| !indexed_fragments.contains(fragment.id as u32))
-                .cloned()
-                .collect())
+            Ok(self.retain_target_fragments(
+                target_fragments
+                    .iter()
+                    .filter(|fragment| !indexed_fragments.contains(fragment.id as u32))
+                    .cloned()
+                    .collect(),
+            ))
         } else if self.index_segments.is_some() {
             // An explicit segment selection with no fragment restriction searches
             // exactly those segments; there is nothing to fall back for.
             Ok(Vec::new())
         } else {
-            self.dataset.unindexed_fragments(index_name).await
+            Ok(self.retain_target_fragments(self.dataset.unindexed_fragments(index_name).await?))
         }
     }
 
@@ -8202,38 +8204,45 @@ impl Scanner {
     }
 
     fn get_fragments_as_bitmap(&self) -> RoaringBitmap {
-        if let Some(fragments) = &self.fragments {
+        let mut bitmap = if let Some(fragments) = &self.fragments {
             RoaringBitmap::from_iter(fragments.iter().map(|f| f.id as u32))
         } else {
             self.dataset.fragment_bitmap.as_ref().clone()
+        };
+        if let Some(excluded) = self.stats_excluded() {
+            bitmap -= excluded;
         }
+        bitmap
     }
 
     fn retain_relevant_index_segments(
         &self,
         index_segments: Vec<IndexMetadata>,
     ) -> Vec<IndexMetadata> {
-        if let Some(fragments) = &self.fragments {
-            let target_fragments = RoaringBitmap::from_iter(fragments.iter().map(|f| f.id as u32));
-            index_segments
-                .into_iter()
-                .filter(|idx| {
-                    idx.fragment_bitmap
-                        .as_ref()
-                        .is_some_and(|fragmap| !(fragmap & &target_fragments).is_empty())
-                })
-                .collect()
-        } else {
-            index_segments
+        if self.fragments.is_none() && self.stats_excluded().is_none() {
+            return index_segments;
         }
+        let target_fragments = self.get_fragments_as_bitmap();
+        index_segments
+            .into_iter()
+            .filter(|idx| {
+                idx.fragment_bitmap
+                    .as_ref()
+                    .is_some_and(|fragmap| !(fragmap & &target_fragments).is_empty())
+            })
+            .collect()
     }
 
-    /// Retain only fragments that are in the user-specified fragment list.
-    /// If no fragment list is specified, returns the fragments unchanged.
+    /// Retain only fragments that are in the user-specified fragment list and
+    /// not excluded by fragment column statistics.
+    /// With no restrictions, returns the fragments unchanged.
     fn retain_target_fragments(&self, mut fragments: Vec<Fragment>) -> Vec<Fragment> {
         if let Some(target) = &self.fragments {
             let bitmap = RoaringBitmap::from_iter(target.iter().map(|f| f.id as u32));
             fragments.retain(|f| bitmap.contains(f.id as u32));
+        }
+        if let Some(excluded) = self.stats_excluded() {
+            fragments.retain(|f| !excluded.contains(f.id as u32));
         }
         fragments
     }
