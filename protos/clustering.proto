@@ -15,8 +15,4 @@ message Clustering {
   string provider = 3;
   // Non-zero layout/configuration identifier, not a dataset or software version.
   uint64 version = 4;
-  /* Provider-defined configuration. Empty is valid. Providers define keys and
-   * value encodings; unrelated writes preserve unknown keys and values.
-   */
-  map<string, string> provider_metadata = 5;
 }

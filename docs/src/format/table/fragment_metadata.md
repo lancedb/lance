@@ -207,6 +207,11 @@ in [Data Overlay Files](data_overlay_file.md).
 nonempty `files` or `overlays`, then restore these fields from the row.
 All other fragment fields keep their protobuf representation and semantics.
 
+This includes [fragment metadata](index.md#fragment-metadata): the map remains in
+`fragment_meta`. Dictionary encoding its keys requires a separate leaf-format
+change. Metadata changes use a full-record upsert; file-only mutations preserve
+the other fragment fields.
+
 Each file struct represents a `DataFile`: `field_ids` maps to `fields`, and
 `major_version` and `minor_version` map to `file_major_version` and
 `file_minor_version`. Other fields use their protobuf names.

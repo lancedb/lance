@@ -433,11 +433,10 @@ message IndexMetadata {
    */
   optional uint32 clustering_id = 12;
 
-  /* Optional per-segment information. Each feature owns and maintains its keys.
-   * Fragment updates do not refresh these entries or prove their applicability.
-   * Unchanged segments preserve all entries; new outputs do not inherit entries
-   * unless their owner handles that operation. Clustering keys follow clustering_id
-   * maintenance rules. Requires writer flag 1 << 17 while this map is nonempty.
+  /* Arbitrary metadata associated with this index segment, like Manifest.table_metadata.
+   * Entries must remain valid after changes to the segment. Changes to the same
+   * segment preserve all entries, including unknown keys. New segments do not
+   * inherit entries automatically. Requires writer flag 1 << 17 while nonempty.
    */
   map<string, string> metadata = 13;
 }

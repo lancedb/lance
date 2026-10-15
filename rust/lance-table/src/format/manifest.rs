@@ -1274,26 +1274,31 @@ mod tests {
         ]);
         // Test the persisted messages only; runtime maintenance is not enabled yet.
         let manifest = pb::Manifest {
-            writer_feature_flags: crate::feature_flags::FLAG_CLUSTERING_METADATA,
+            writer_feature_flags: crate::feature_flags::FLAG_OBJECT_METADATA,
             clustering: vec![
                 pb::Clustering {
                     id: 1,
                     columns: vec![0, 1],
                     provider: "org.example.cluster".into(),
                     version: 8,
-                    provider_metadata: HashMap::from([
-                        ("boundaries".into(), "[0, 100, 200]".into()),
-                        ("unknown_option".into(), "  opaque value: 東京  ".into()),
-                    ]),
                 },
                 pb::Clustering {
                     id: 5,
                     columns: vec![1],
                     provider: "org.example.other".into(),
                     version: 9,
-                    provider_metadata: HashMap::new(),
                 },
             ],
+            table_metadata: HashMap::from([
+                (
+                    "org.example.cluster.1.boundaries".into(),
+                    "[0, 100, 200]".into(),
+                ),
+                (
+                    "org.example.cluster.1.unknown_option".into(),
+                    "  opaque value: 東京  ".into(),
+                ),
+            ]),
             fragments: vec![
                 pb::DataFragment {
                     id: 1,

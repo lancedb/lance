@@ -144,42 +144,18 @@ fragment's row lineage sequences when they are not stored in the manifest; see
 fragment's `files`, next to user columns or in a file holding nothing else, and at
 most one file of a fragment may carry each of these ids.
 
-## Object Metadata
+### Fragment Metadata
 
-`DataFragment.metadata` and `IndexMetadata.metadata` are generic
-`map<string, string>` fields. Empty maps are valid. Each feature owns its keys
-and their encodings. Use namespaced keys to avoid
-collisions, and keep values small. The maps are not proofs of statistics, index
-coverage, or row order.
+Like `Manifest.table_metadata`, `DataFragment.metadata` is a `map<string, string>`
+for arbitrary metadata associated with the fragment. It may be empty. Use namespaced
+keys and small values. Any metadata stored here must remain valid regardless of
+operations on the same fragment, including column replacement, overlays, and deletions.
 
-Fragment metadata describes facts about the fragment when it was created. Key
-owners must choose meanings that remain true after later changes, rather than
-asserting current column values or layout guarantees.
+- Changes to the same fragment preserve all entries, including unknown ones.
+- New fragments do not automatically inherit metadata from their inputs.
 
-- Preserve all entries on the same fragment, including unknown keys and values,
-  through column replacement, refresh, overlays, and deletions.
-- Compaction and rewrites creating new fragments do not automatically propagate
-  input metadata. The creator supplies information about each new fragment.
-- A creation-time bucket or min/max record is not a bound on current values.
-  Consumers must verify applicability before relying on it for current data.
-
-Unchanged index segments also preserve all entries. New index outputs do not
-automatically inherit metadata; key owners define output information for merge,
-remap, and rebuild. [Clustering](clustering.md) preserves its own keys for
-same-group index remap/rebuild. These rules do not make segment metadata proof
-of the current values in its input fragments. Metadata must not
-be the only mechanism protecting data correctness; a feature needing stronger
-guarantees must define its own compatibility contract.
-
-Nonempty maps require writer feature flag `1 << 17`, including maps unrelated to
-clustering. Ordinary readers can ignore them. These are persisted-format rules;
-provider interfaces are left to implementation work.
-
-In the current fragment-tree leaf format, maps remain part of the `DataFragment`
-protobuf in `fragment_meta`. Shredding keys into dictionary-encoded columns is a
-separate leaf-format change; this proposal does not claim that compression exists.
-Tree writers must use a full-record upsert when an operation changes metadata,
-because file-only mutations preserve the other fragment fields.
+A nonempty map requires `FLAG_OBJECT_METADATA` (`1 << 17`) in
+`writer_feature_flags`. Readers may ignore it.
 
 ## Data Files
 

@@ -94,11 +94,10 @@ message DataFragment {
    */
   optional uint32 clustering_id = 15;
 
-  /* Facts about this fragment when it was created. Each key owner defines its
-   * meaning so it remains true after column replacement, overlays, and deletions.
-   * Those operations preserve all entries, including unknown keys. Compaction
-   * and rewrites creating new fragments do not propagate input entries; the
-   * creator supplies metadata describing each new fragment.
+  /* Arbitrary metadata associated with this fragment, like Manifest.table_metadata.
+   * Entries must remain valid after operations on the same fragment, including
+   * column replacement, overlays, and deletions. Those operations preserve all
+   * entries, including unknown keys. New fragments do not inherit entries automatically.
    * Requires writer flag 1 << 17 while this map is nonempty.
    */
   map<string, string> metadata = 16;

@@ -112,8 +112,8 @@ pub const FLAG_NON_REUSABLE_FIELD_IDS: u64 = 1 << 15;
 /// Writer-only protection for clustering definitions, references,
 /// and generic fragment/index segment metadata maintenance.
 /// Reserved beyond the supported range until writers implement its maintenance rules.
-/// Ordinary readers can ignore clustering information; providers share this one bit.
-pub const FLAG_CLUSTERING_METADATA: u64 = 1 << 17;
+/// Ordinary readers can ignore this metadata; all covered features share this one bit.
+pub const FLAG_OBJECT_METADATA: u64 = 1 << 17;
 /// The first bit that is unknown as a feature flag
 pub const FLAG_UNKNOWN: u64 = 1 << 16;
 
@@ -346,7 +346,7 @@ fn supported_flags_when(
     // Reserved, not implemented: see the flag's doc comment.
     mark_supported(&mut supported, FLAG_FRAGMENT_TREE, false);
     mark_supported(&mut supported, FLAG_INDEPENDENT_COVERING_FIELDS, false);
-    mark_supported(&mut supported, FLAG_CLUSTERING_METADATA, false);
+    mark_supported(&mut supported, FLAG_OBJECT_METADATA, false);
     supported
 }
 
@@ -538,16 +538,16 @@ mod tests {
     use crate::format::BasePath;
 
     #[test]
-    fn test_clustering_flag_fences_writes_without_blocking_reads() {
+    fn test_object_metadata_flag_fences_writes_without_blocking_reads() {
         let mut manifest = empty_manifest();
-        manifest.writer_feature_flags = FLAG_CLUSTERING_METADATA;
+        manifest.writer_feature_flags = FLAG_OBJECT_METADATA;
         ensure_can_read_manifest(&manifest).unwrap();
         let error = ensure_can_write_manifest(&manifest).unwrap_err();
         assert!(matches!(error, Error::NotSupported { .. }));
         assert!(error.to_string().contains("cannot be written"));
-        assert!(!can_read_dataset(FLAG_CLUSTERING_METADATA));
-        assert!(!can_write_dataset(FLAG_CLUSTERING_METADATA));
-        assert_eq!(FLAG_CLUSTERING_METADATA, 1 << 17);
+        assert!(!can_read_dataset(FLAG_OBJECT_METADATA));
+        assert!(!can_write_dataset(FLAG_OBJECT_METADATA));
+        assert_eq!(FLAG_OBJECT_METADATA, 1 << 17);
         // Reserving bit 17 must not accidentally enable the unassigned bit 16.
         assert_eq!(FLAG_UNKNOWN, 1 << 16);
         assert!(!can_read_dataset(FLAG_UNKNOWN));
