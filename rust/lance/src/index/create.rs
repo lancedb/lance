@@ -483,6 +483,25 @@ impl<'a> CreateIndexBuilder<'a> {
                     .await?
                 }
             }
+            (IndexType::FragmentColumnStats, LANCE_SCALAR_INDEX) => {
+                if self.preprocessed_data.is_some() {
+                    return Err(Error::invalid_input(
+                        "fragment column stats index does not accept preprocessed data"
+                            .to_string(),
+                    ));
+                }
+                // Register-only creation: no historical scan, no footer reads.
+                // The index starts with no coverage; statistics arrive with
+                // future writes of the indexed column.
+                let created_index = crate::index::fragstats::register_empty_fragment_stats_index(
+                    self.dataset,
+                    column,
+                    index_id,
+                )
+                .await?;
+                self.fragments = Some(Vec::new());
+                created_index
+            }
             (IndexType::Scalar, LANCE_SCALAR_INDEX) => {
                 // Guess the index type
                 let params = self

@@ -85,6 +85,7 @@ pub mod frag_reuse;
 pub mod frag_reuse_reader;
 mod frag_reuse_remapping;
 pub(crate) mod frag_reuse_with_stable_row_ids;
+pub(crate) mod fragstats;
 pub mod mem_wal;
 pub mod prefilter;
 pub mod scalar;
