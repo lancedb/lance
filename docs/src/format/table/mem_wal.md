@@ -146,8 +146,6 @@ _mem_wal/{shard_id}/{random8}_gen_{i}/
 `{random8}` is an 8-character random hex value generated for each flush attempt.
 If a flush attempt fails, a retry writes a different directory instead of reusing a partially written one.
 The shard manifest records the successful directory name in the SSTable's `path`.
-Generations publish in order: a writer commits generation `i` only while the manifest's `current_generation` is `i`.
-So an SSTable directory the manifest does not reference, whose generation is below `current_generation`, is a failed attempt that will never be published.
 
 ### SSTable Accounting
 
