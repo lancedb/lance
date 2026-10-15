@@ -7,6 +7,7 @@ use std::sync::Arc;
 use futures::{FutureExt, TryStreamExt};
 use lance_core::{Error, Result};
 use lance_file::reader::FileReaderOptions;
+use lance_file::versions::data_file_columns;
 use lance_index::{
     INDEX_FILE_NAME, IndexType,
     frag_reuse::CompactFragReuseIndex,
@@ -386,7 +387,6 @@ async fn try_harvest_seeds(
     let Some(field) = dataset.schema().fields.iter().find(|f| f.id == field_id) else {
         return Ok(None);
     };
-    let meta_key = format!("{}{}", SEED_META_KEY_PREFIX, field.name);
     let mut seeds = Vec::with_capacity(fragments.len());
     let mut schedulers = HashMap::new();
 
@@ -430,13 +430,36 @@ async fn try_harvest_seeds(
             return Ok(None);
         };
 
-        let Some(meta_value) = reader
-            .metadata()
-            .file_schema
-            .metadata
-            .get(&meta_key)
-            .cloned()
+        // Renames preserve the manifest's field IDs, but seed keys retain
+        // the names used when writing the file. Resolve the stored field
+        // through its physical column, since field IDs can also be remapped.
+        let Some((_, column_index)) = data_file
+            .fields
+            .iter()
+            .zip(data_file.column_indices.iter())
+            .find(|(id, column_index)| **id == field.id && **column_index >= 0)
         else {
+            return Ok(None);
+        };
+        let metadata = reader.metadata();
+        let file_schema = &metadata.file_schema;
+        let (stored_ids, stored_columns) = data_file_columns(metadata.version, file_schema);
+        let Some((stored_id, _)) = stored_ids
+            .iter()
+            .zip(&stored_columns)
+            .find(|(_, stored_column)| *stored_column == column_index)
+        else {
+            return Ok(None);
+        };
+        let Some(stored_field) = file_schema
+            .fields
+            .iter()
+            .find(|stored| stored.id == *stored_id && stored.data_type() == field.data_type())
+        else {
+            return Ok(None);
+        };
+        let meta_key = format!("{}{}", SEED_META_KEY_PREFIX, stored_field.name);
+        let Some(meta_value) = file_schema.metadata.get(&meta_key).cloned() else {
             return Ok(None);
         };
 
