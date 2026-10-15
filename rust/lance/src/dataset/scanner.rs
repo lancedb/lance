@@ -20007,6 +20007,100 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         .await;
     }
 
+    #[rstest]
+    #[case::address_offset_only(false, false)]
+    #[case::address_with_id(false, true)]
+    #[case::stable_offset_only(true, false)]
+    #[case::stable_with_id(true, true)]
+    #[tokio::test]
+    async fn test_ann_row_offset_projection(
+        #[case] has_stable_row_ids: bool,
+        #[case] has_id_projection: bool,
+    ) {
+        let mut dataset = gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .col(
+                "vec",
+                array::cycle_vec(array::step::<Float32Type>(), Dimension::from(2)),
+            )
+            .into_ram_dataset_with_params(
+                FragmentCount::from(3),
+                FragmentRowCount::from(4),
+                Some(WriteParams {
+                    max_rows_per_file: 4,
+                    enable_stable_row_ids: has_stable_row_ids,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        let centroids = Arc::new(
+            FixedSizeListArray::try_new_from_values(Float32Array::from(vec![0.0, 1.0]), 2).unwrap(),
+        );
+        let params = VectorIndexParams::with_ivf_flat_params(
+            MetricType::L2,
+            IvfBuildParams::try_with_centroids(1, centroids).unwrap(),
+        );
+        dataset
+            .create_index(&["vec"], IndexType::Vector, None, &params, true)
+            .await
+            .unwrap();
+        dataset.delete("id IN (1, 5)").await.unwrap();
+        assert_eq!(dataset.get_fragments().len(), 3);
+
+        let mut scanner = dataset.scan();
+        scanner
+            .nearest("vec", &Float32Array::from(vec![14.5, 15.5]), 4)
+            .unwrap()
+            .minimum_nprobes(1)
+            .maximum_nprobes(1);
+        let projection = if has_id_projection {
+            vec!["id", ROW_OFFSET]
+        } else {
+            vec![ROW_OFFSET]
+        };
+        scanner.project(&projection).unwrap();
+        // Keep the default distance projection and ordering: they cause the
+        // physical optimizer to request statistics above AddRowOffsetExec.
+        let plan = scanner.explain_plan(false).await.unwrap();
+        assert!(plan.contains("ANNSubIndex"), "{plan}");
+        assert!(plan.contains("AddRowOffsetExec"), "{plan}");
+        let batch = scanner.try_into_batch().await.unwrap();
+        let mut expected_columns = projection;
+        expected_columns.push(DIST_COL);
+        assert_eq!(
+            batch
+                .schema()
+                .fields()
+                .iter()
+                .map(|field| field.name().as_str())
+                .collect::<Vec<_>>(),
+            expected_columns
+        );
+
+        // Vectors are [2 * id, 2 * id + 1]. The exact neighbors are 7, 8, 6, 9;
+        // deleting 1 and 5 shifts their logical offsets by two.
+        let expected_offsets = [5, 6, 4, 7];
+        let offsets = batch[ROW_OFFSET].as_primitive::<UInt64Type>().values();
+        let recall = offsets
+            .iter()
+            .filter(|offset| expected_offsets.contains(offset))
+            .count() as f64
+            / expected_offsets.len() as f64;
+        assert_eq!(recall, 1.0);
+        assert_eq!(offsets.as_ref(), expected_offsets);
+        assert_eq!(
+            batch[DIST_COL].as_primitive::<Float32Type>().values(),
+            &[0.5, 4.5, 12.5, 24.5]
+        );
+        if has_id_projection {
+            assert_eq!(
+                batch["id"].as_primitive::<Int32Type>().values(),
+                &[7, 8, 6, 9]
+            );
+        }
+    }
+
     // Unit-level companion to the NOT IN case in
     // test_filter_to_take_with_stable_row_ids: exercises the lowering directly,
     // independent of the expression simplifier's InList expansion threshold
