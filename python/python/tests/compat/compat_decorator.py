@@ -18,7 +18,7 @@ from contextlib import contextmanager
 from typing import Any, Dict, List, Optional
 
 import pytest
-from packaging.version import Version
+from packaging.version import InvalidVersion, Version
 
 
 def _fetch_stable_versions() -> List[Version]:
@@ -65,12 +65,27 @@ def recent_major_versions(n: int) -> List[str]:
     return major_versions
 
 
-def _fetch_last_beta_release():
-    """Returns the latest beta version available on fury.io.
+def _build_version() -> str:
+    """The version of the build under test."""
+    import lance
+
+    return lance.__version__
+
+
+def _fetch_last_beta_release(current_version: Optional[str] = None):
+    """Returns the newest pre-release on fury.io older than the build under test.
+
+    Not simply the newest pre-release: the release automation bumps main's
+    version in the same commit that cuts a beta, so from the moment that beta
+    is published it carries the version every branch is also building. Pinning
+    it would hand a compat test a venv holding the build under test and call it
+    the older build, and a test asserting something only a genuinely older
+    build satisfies then fails for every pull request until the next release.
 
     Uses pip to query the fury.io index for pre-release versions of pylance.
     """
     try:
+        build = Version(current_version or _build_version())
         # Use pip index to get versions from fury.io
         result = subprocess.run(
             [
@@ -98,14 +113,18 @@ def _fetch_last_beta_release():
             for line in result.stdout.splitlines():
                 if "Available versions:" in line:
                     versions_str = line.split("Available versions:")[1].strip()
-                    versions = [v.strip() for v in versions_str.split(",")]
-                    # Return the first beta/pre-release version
-                    for v in versions:
-                        if "beta" in v or "rc" in v or "a" in v or "b" in v:
-                            return v
-                    # If no pre-release found, return the first version
-                    if versions:
-                        return versions[0]
+                    older_prereleases = []
+                    for raw in versions_str.split(","):
+                        raw = raw.strip()
+                        try:
+                            parsed = Version(raw)
+                        except InvalidVersion:
+                            continue
+                        if parsed.is_prerelease and parsed < build:
+                            older_prereleases.append((parsed, raw))
+                    if older_prereleases:
+                        return max(older_prereleases)[1]
+                    return None
 
         print(
             "Warning: Could not fetch latest beta release from fury.io",
