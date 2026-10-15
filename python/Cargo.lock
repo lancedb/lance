@@ -1228,9 +1228,9 @@ checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 
 [[package]]
 name = "chacha20"
-version = "0.10.0"
+version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6f8d983286843e49675a4b7a2d174efe136dc93a18d69130dd18198a6c167601"
+checksum = "65c35e4b699c7e15ccbe7ee35c005e4fc0a278d22238a2857e6ce2dadeda1b06"
 dependencies = [
  "cfg-if 1.0.4",
  "cpufeatures 0.3.0",
@@ -2800,7 +2800,7 @@ checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
 name = "fsst"
-version = "14.0.0-beta.15"
+version = "14.0.0-beta.18"
 dependencies = [
  "arrow-array",
  "rand 0.9.5",
@@ -3994,7 +3994,7 @@ checksum = "e037a2e1d8d5fdbd49b16a4ea09d5d6401c1f29eca5ff29d03d3824dba16256a"
 
 [[package]]
 name = "lance"
-version = "14.0.0-beta.15"
+version = "14.0.0-beta.18"
 dependencies = [
  "arc-swap",
  "arrow",
@@ -4067,7 +4067,7 @@ dependencies = [
 
 [[package]]
 name = "lance-arrow"
-version = "14.0.0-beta.15"
+version = "14.0.0-beta.18"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4110,7 +4110,7 @@ dependencies = [
 
 [[package]]
 name = "lance-bitpacking"
-version = "14.0.0-beta.15"
+version = "14.0.0-beta.18"
 dependencies = [
  "arrayref",
  "crunchy",
@@ -4120,7 +4120,7 @@ dependencies = [
 
 [[package]]
 name = "lance-core"
-version = "14.0.0-beta.15"
+version = "14.0.0-beta.18"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4157,7 +4157,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datafusion"
-version = "14.0.0-beta.15"
+version = "14.0.0-beta.18"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4189,7 +4189,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datagen"
-version = "14.0.0-beta.15"
+version = "14.0.0-beta.18"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4206,7 +4206,7 @@ dependencies = [
 
 [[package]]
 name = "lance-derive"
-version = "14.0.0-beta.15"
+version = "14.0.0-beta.18"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4215,7 +4215,7 @@ dependencies = [
 
 [[package]]
 name = "lance-encoding"
-version = "14.0.0-beta.15"
+version = "14.0.0-beta.18"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -4248,7 +4248,7 @@ dependencies = [
 
 [[package]]
 name = "lance-file"
-version = "14.0.0-beta.15"
+version = "14.0.0-beta.18"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -4280,7 +4280,7 @@ dependencies = [
 
 [[package]]
 name = "lance-geo"
-version = "14.0.0-beta.15"
+version = "14.0.0-beta.18"
 dependencies = [
  "datafusion",
  "geo-traits",
@@ -4294,7 +4294,7 @@ dependencies = [
 
 [[package]]
 name = "lance-index"
-version = "14.0.0-beta.15"
+version = "14.0.0-beta.18"
 dependencies = [
  "arc-swap",
  "arrow",
@@ -4365,7 +4365,7 @@ dependencies = [
 
 [[package]]
 name = "lance-index-core"
-version = "14.0.0-beta.15"
+version = "14.0.0-beta.18"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -4388,7 +4388,7 @@ dependencies = [
 
 [[package]]
 name = "lance-io"
-version = "14.0.0-beta.15"
+version = "14.0.0-beta.18"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4415,6 +4415,7 @@ dependencies = [
  "path_abs",
  "pin-project",
  "prost",
+ "quick-xml",
  "rand 0.9.5",
  "reqsign-core",
  "reqsign-file-read-tokio",
@@ -4430,7 +4431,7 @@ dependencies = [
 
 [[package]]
 name = "lance-jsonb"
-version = "14.0.0-beta.15"
+version = "14.0.0-beta.18"
 dependencies = [
  "byteorder",
  "ethnum",
@@ -4447,7 +4448,7 @@ dependencies = [
 
 [[package]]
 name = "lance-linalg"
-version = "14.0.0-beta.15"
+version = "14.0.0-beta.18"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -4461,7 +4462,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace"
-version = "14.0.0-beta.15"
+version = "14.0.0-beta.18"
 dependencies = [
  "arrow",
  "async-trait",
@@ -4475,7 +4476,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace-impls"
-version = "14.0.0-beta.15"
+version = "14.0.0-beta.18"
 dependencies = [
  "arc-swap",
  "arrow",
@@ -4524,7 +4525,7 @@ dependencies = [
 
 [[package]]
 name = "lance-select"
-version = "14.0.0-beta.15"
+version = "14.0.0-beta.18"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4538,7 +4539,7 @@ dependencies = [
 
 [[package]]
 name = "lance-table"
-version = "14.0.0-beta.15"
+version = "14.0.0-beta.18"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4578,7 +4579,7 @@ dependencies = [
 
 [[package]]
 name = "lance-tokenizer"
-version = "14.0.0-beta.15"
+version = "14.0.0-beta.18"
 dependencies = [
  "frostem",
  "icu_segmenter",
@@ -6143,7 +6144,7 @@ dependencies = [
 
 [[package]]
 name = "pylance"
-version = "14.0.0-beta.15"
+version = "14.0.0-beta.18"
 dependencies = [
  "alloc-stdlib",
  "arrow",
