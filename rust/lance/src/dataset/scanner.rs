@@ -2932,20 +2932,18 @@ impl Scanner {
     pub(crate) fn calculate_final_projection(
         &self,
         current_schema: &ArrowSchema,
+        highlight: Option<Arc<dyn PhysicalExpr>>,
     ) -> Result<Vec<(Arc<dyn PhysicalExpr>, String)>> {
         // Select the columns from the output schema based on the user's projection (or the list
         // of all available columns if the user did not specify a projection)
         let mut output_expr = self.projection_plan.to_physical_exprs(current_schema)?;
-        if self.highlight {
+        if let Some(highlight) = highlight {
             if output_expr.iter().any(|(_, name)| name == HIGHLIGHTS_COL) {
                 return Err(Error::invalid_input(
                     "projection conflicts with reserved _highlights column",
                 ));
             }
-            output_expr.push((
-                expressions::col(HIGHLIGHTS_COL, current_schema)?,
-                HIGHLIGHTS_COL.to_owned(),
-            ));
+            output_expr.push((highlight, HIGHLIGHTS_COL.to_owned()));
         }
 
         if self.full_text_query.is_some()
@@ -3797,7 +3795,8 @@ impl Scanner {
                     //
                     // SELECT 1 FROM t (not supported error)
                     // SELECT non_existent_column FROM t (column not found error)
-                    let output_expr = self.calculate_final_projection(&ArrowSchema::empty())?;
+                    let output_expr =
+                        self.calculate_final_projection(&ArrowSchema::empty(), None)?;
                     return Err(Error::not_supported_source(format!("Scans must request at least one column.  Received only dynamic expressions: {:?}", output_expr).into()));
                 }
 
@@ -3933,11 +3932,16 @@ impl Scanner {
 
         // Take remaining columns required for projection
         plan = self.take(plan, self.projection_plan.physical_projection.clone())?;
-        if self.highlight
-            && let Some(query) = &full_text_query
-        {
-            plan = self.highlight_plan(plan, query).await?;
-        }
+        let highlight = if self.highlight {
+            let query = full_text_query
+                .as_ref()
+                .ok_or_else(|| Error::internal("highlight requires a resolved full-text query"))?;
+            let (input, expression) = self.prepare_highlight(plan, query).await?;
+            plan = input;
+            Some(expression)
+        } else {
+            None
+        };
 
         // Add system columns, if requested
         if self.projection_plan.must_add_row_offset {
@@ -3945,7 +3949,8 @@ impl Scanner {
         }
 
         // Final projection
-        let final_projection = self.calculate_final_projection(plan.schema().as_ref())?;
+        let final_projection =
+            self.calculate_final_projection(plan.schema().as_ref(), highlight)?;
 
         plan = Arc::new(DFProjectionExec::try_new(final_projection, plan)?);
 

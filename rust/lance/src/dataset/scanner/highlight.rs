@@ -1,12 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+mod expression;
+
 use super::Scanner;
 use crate::index::scalar::inverted::{ResolvedFtsField, resolve_fts_analyzer, resolve_fts_field};
 use crate::io::exec::fts::default_text_tokenizer;
-use crate::io::exec::highlight::HighlightExec;
 use crate::{Error, Result};
 use datafusion::physical_plan::ExecutionPlan;
+use datafusion_physical_expr::PhysicalExpr;
+use expression::HighlightExpr;
 use lance_core::datatypes::{LogicalType, OnMissing};
 use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::inverted::highlight::{HighlightLeaf, PreparedHighlightQuery};
@@ -25,11 +28,11 @@ struct PreparedField {
     analyzer: Option<Arc<dyn LanceTokenizer>>,
 }
 impl Scanner {
-    pub(super) async fn highlight_plan(
+    pub(super) async fn prepare_highlight(
         &self,
         input: Arc<dyn ExecutionPlan>,
         query: &FullTextSearchQuery,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
+    ) -> Result<(Arc<dyn ExecutionPlan>, Arc<dyn PhysicalExpr>)> {
         let granularity = self.fts_document_granularity(&query.query)?;
         let canonical = |column: &str| {
             Ok(resolve_fts_field(self.dataset.schema(), column, granularity)?.canonical_path)
@@ -135,11 +138,12 @@ impl Scanner {
             .empty_projection()
             .union_columns(roots, OnMissing::Error)?;
         let input = self.take(input, projection)?;
-        Ok(Arc::new(HighlightExec::new(
-            input,
-            Arc::new(PreparedHighlightQuery::new(query, leaves)),
-            Arc::new(sources),
-        )))
+        let expression = HighlightExpr::try_new(
+            PreparedHighlightQuery::new(query, leaves),
+            sources,
+            input.schema().as_ref(),
+        )?;
+        Ok((input, Arc::new(expression)))
     }
 }
 
@@ -213,6 +217,9 @@ mod tests {
     use crate::dataset::{WriteMode, WriteParams};
     use crate::index::DatasetIndexExt;
     use arrow_array::{Array, RecordBatch, RecordBatchIterator, cast::AsArray, record_batch};
+    use datafusion::datasource::memory::MemorySourceConfig;
+    use datafusion::physical_plan::projection::ProjectionExec;
+    use datafusion_physical_expr::expressions::col;
     use lance_index::IndexType;
     use lance_index::scalar::inverted::DocumentGranularity;
     use lance_index::scalar::inverted::InvertedIndexParams;
@@ -649,6 +656,14 @@ mod tests {
             .unwrap();
         let baseline = scan.try_into_batch().await.unwrap();
         let highlighted = scan.with_highlight().try_into_batch().await.unwrap();
+        let plan = scan.create_plan().await.unwrap();
+        let projection = plan.downcast_ref::<ProjectionExec>().unwrap();
+        assert!(
+            projection
+                .expr()
+                .iter()
+                .any(|expr| { expr.alias == HIGHLIGHTS_COL && expr.expr.is::<HighlightExpr>() })
+        );
         assert_eq!(highlighted.num_rows(), 1);
         assert_eq!(
             baseline.column_by_name("id"),
@@ -663,6 +678,53 @@ mod tests {
             .unwrap();
         let result = scan.try_into_batch().await.unwrap();
         assert_eq!(hits(&result, 0), vec!["needle", "needle"]);
+    }
+
+    #[tokio::test]
+    async fn highlight_projection_tracks_reordered_inputs() {
+        let batch = record_batch!(
+            ("id", Int32, [0]),
+            ("title", Utf8, ["alpha"]),
+            ("body", Utf8, ["beta beta"])
+        )
+        .unwrap();
+        let dataset = write(batch.clone(), None).await;
+        let query = FullTextSearchQuery::new_query(
+            BooleanQuery::new([
+                (Occur::Should, text_match("alpha", "title")),
+                (Occur::Should, text_match("beta", "body")),
+            ])
+            .into(),
+        );
+        let input =
+            MemorySourceConfig::try_new_exec(&[vec![batch.clone()]], batch.schema(), None).unwrap();
+        let scan = dataset.scan();
+        let query = scan.resolve_full_text_search_query(&query).await.unwrap();
+        let (_, expression) = scan.prepare_highlight(input, &query).await.unwrap();
+        let expected = expression.evaluate(&batch).unwrap().into_array(1).unwrap();
+        // Simulate a projection rewrite that drops id and reorders the text columns.
+        let reordered = batch.project(&[2, 1]).unwrap();
+        let rewritten = expression
+            .clone()
+            .with_new_children(vec![
+                col("body", reordered.schema().as_ref()).unwrap(),
+                col("title", reordered.schema().as_ref()).unwrap(),
+            ])
+            .unwrap();
+        let actual = rewritten
+            .evaluate(&reordered)
+            .unwrap()
+            .into_array(1)
+            .unwrap();
+        assert_eq!(expected.as_ref(), actual.as_ref());
+        assert!(
+            rewritten
+                .evaluate(&reordered.slice(0, 0))
+                .unwrap()
+                .into_array(0)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[rstest]
