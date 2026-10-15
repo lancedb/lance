@@ -22,7 +22,7 @@ use super::{CompositeOperation, Ref};
 use crate::format::overlay::staleness::field_affects_index;
 use crate::format::{BasePath, Fragment, IndexMetadata, Manifest, ManifestBuildConfig, RowIdMeta};
 use crate::rowids::read_row_ids;
-use crate::rowids::version::build_version_meta;
+use crate::rowids::version::{SpilledRowLineage, build_version_meta};
 use crate::system_index::mem_wal::{
     CompactedSsTable, MEM_WAL_INDEX_NAME, update_mem_wal_index_compacted_sstables,
 };
@@ -373,6 +373,12 @@ impl<'a> ApplyState<'a> {
     /// version sequences.
     pub(super) fn uses_stable_row_ids(&self) -> bool {
         self.current_manifest.uses_stable_row_ids()
+    }
+
+    /// Row lineage the caller read ahead of time for fragments whose lineage
+    /// lives in a data file, which applying cannot read itself.
+    pub(super) fn spilled_row_lineage(&self) -> &'a SpilledRowLineage {
+        &self.build_config.spilled_row_lineage
     }
 
     pub(super) fn schema(&self) -> &Schema {
