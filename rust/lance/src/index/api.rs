@@ -378,6 +378,19 @@ pub trait DatasetIndexExt {
     ) -> Result<IndexMetadata>;
 
     /// Commit one or more existing physical index segments as a logical index.
+    ///
+    /// Each segment's coverage is checked against this dataset version first.
+    /// A covered fragment whose indexed data changed since the segment was
+    /// built is left out. So is a fragment compaction produced since, unless
+    /// the fragment reuse index still records every rewrite from the
+    /// segment's build to it and the indexed data is unchanged along them: the
+    /// segment holds those rows' addresses from its build. Without a fragment
+    /// reuse index, a segment of stable row ids on a table that has them keeps
+    /// such a fragment, as compaction leaves the ids valid. A segment whose
+    /// build version has been cleaned up keeps none of its coverage, since
+    /// nothing then shows which fragments it was built over. Rows left out are
+    /// scanned, and a commit that would replace a segment still covering them
+    /// is refused.
     async fn commit_existing_index_segments(
         &mut self,
         index_name: &str,
