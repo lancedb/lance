@@ -6,7 +6,7 @@ use lance_index_core::remapping::RowAddrTranslator;
 use std::collections::BTreeSet;
 use std::{
     ops::Bound,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
 };
 
 use arrow_array::Array;
@@ -30,6 +30,7 @@ use tracing::instrument;
 
 use datafusion_common::ScalarValue;
 
+use super::lookup::U64Lookup;
 use crate::metrics::MetricsCollector;
 use crate::scalar::btree::{BTREE_VALUES_COLUMN, OrderableScalarValue};
 use crate::scalar::{AnyQuery, SargableQuery};
@@ -105,6 +106,7 @@ pub struct FlatIndex {
     /// Reuse the address-sort permutation until lookup needs value order.
     /// Ordinary filters never pay for constructing a second ordering.
     lookup_order: Mutex<LookupOrder>,
+    lookup_u64: OnceLock<Option<U64Lookup>>,
     df_schema: DFSchema,
 }
 
@@ -124,7 +126,14 @@ impl DeepSizeOf for FlatIndex {
         // is a few hundred bytes and not worth a separate accounting.
         // Charge for the eventual lookup permutation even before it exists,
         // so lazy initialization cannot grow an already-accounted cache entry.
-        self.data.get_array_memory_size() + self.data.num_rows() * std::mem::size_of::<u32>()
+        let lookup_extra = if self.values().as_primitive_opt::<UInt64Type>().is_some() {
+            U64Lookup::extra_size(self.data.num_rows())
+        } else {
+            0
+        };
+        self.data.get_array_memory_size()
+            + self.data.num_rows() * std::mem::size_of::<u32>()
+            + lookup_extra
     }
 }
 
@@ -140,6 +149,7 @@ impl FlatIndex {
         Ok(Self {
             data: Arc::new(data),
             lookup_order: Mutex::new(LookupOrder::Source(row_order)),
+            lookup_u64: OnceLock::new(),
             df_schema,
         })
     }
@@ -185,6 +195,20 @@ impl FlatIndex {
         };
         *order = LookupOrder::Values(value_order.clone());
         Ok(value_order)
+    }
+
+    pub(super) fn lookup_u64(&self) -> Result<Option<&U64Lookup>> {
+        let Some(values) = self.values().as_primitive_opt::<UInt64Type>() else {
+            return Ok(None);
+        };
+        if let Some(lookup) = self.lookup_u64.get() {
+            return Ok(lookup.as_ref());
+        }
+        let order = self.value_order()?;
+        Ok(self
+            .lookup_u64
+            .get_or_init(|| U64Lookup::try_new(values, self.ids(), order))
+            .as_ref())
     }
 
     fn has_nulls(&self) -> bool {
@@ -482,6 +506,7 @@ impl CacheCodecImpl for FlatIndex {
         Ok(Self {
             data: Arc::new(batch),
             lookup_order: Mutex::new(LookupOrder::Unsorted),
+            lookup_u64: OnceLock::new(),
             df_schema,
         })
     }
@@ -644,6 +669,85 @@ mod tests {
         // Empty index
         let empty = RecordBatch::new_empty(example_index().data.schema());
         assert_roundtrips(&FlatIndex::try_new(empty).unwrap());
+    }
+
+    #[rstest]
+    #[case::range(vec![Some(103), Some(100), Some(102), Some(101)], Some(vec![73, 70, 72, 71]), true)]
+    #[case::dense(vec![Some(103), Some(100), Some(102), Some(101)], Some(vec![15, 0, 8, 20]), true)]
+    #[case::sparse_word_boundaries((0..130).filter(|key| key % 3 != 1).map(Some).collect(), None, true)]
+    #[case::nullable(vec![Some(102), None, Some(100), Some(101)], None, true)]
+    #[case::high_keys((u64::MAX-7..=u64::MAX).rev().map(Some).collect(), None, true)]
+    #[case::duplicate_and_hole(vec![Some(10), Some(11), Some(11), Some(13)], None, false)]
+    #[case::huge_span(vec![Some(0), Some(u64::MAX)], None, false)]
+    #[case::all_null(vec![None, None], None, false)]
+    #[case::empty(vec![], None, false)]
+    fn test_u64_mapping_preserves_pairs_and_cache(
+        #[case] values: Vec<Option<u64>>,
+        #[case] addresses: Option<Vec<u64>>,
+        #[case] specialized: bool,
+    ) {
+        let addresses =
+            addresses.unwrap_or_else(|| (0..values.len()).rev().map(|i| (i * 2) as u64).collect());
+        let batch = record_batch!(
+            (BTREE_VALUES_COLUMN, UInt64, values.clone()),
+            (BTREE_IDS_COLUMN, UInt64, addresses.clone())
+        )
+        .unwrap();
+        let index = FlatIndex::try_new(batch).unwrap();
+        let mut bytes = Vec::new();
+        index
+            .serialize(&mut CacheEntryWriter::new(&mut bytes))
+            .unwrap();
+        let bytes = bytes::Bytes::from(bytes);
+        let restored = FlatIndex::deserialize(&mut CacheEntryReader::new(
+            &bytes,
+            0,
+            FlatIndex::CURRENT_VERSION,
+        ))
+        .unwrap();
+        let mut queries = values.clone();
+        queries.extend([
+            Some(0),
+            Some(12),
+            Some(63),
+            Some(64),
+            Some(65),
+            Some(127),
+            Some(128),
+            Some(u64::MAX),
+            None,
+        ]);
+        let mut expected = Vec::new();
+        for (key_index, key) in queries.iter().enumerate() {
+            if let Some(key) = key {
+                for (value, address) in values.iter().zip(&addresses) {
+                    if value == &Some(*key) {
+                        expected.push((key_index as u32, *address));
+                    }
+                }
+            }
+        }
+        expected.sort_unstable();
+        for page in [&index, &restored] {
+            let charged = page.deep_size_of();
+            assert_eq!(page.lookup_u64().unwrap().is_some(), specialized);
+            let keys = crate::scalar::btree::LookupKeys::try_new(
+                Arc::new(UInt64Array::from(queries.clone())),
+                true,
+            )
+            .unwrap();
+            let matches = keys.match_page(page, &NoOpMetricsCollector).unwrap();
+            let mut actual = matches
+                .key_indices
+                .values()
+                .iter()
+                .copied()
+                .zip(matches.row_ids.values().iter().copied())
+                .collect::<Vec<_>>();
+            actual.sort_unstable();
+            assert_eq!(actual, expected);
+            assert_eq!(page.deep_size_of(), charged);
+        }
     }
 
     /// The data batch must decode zero-copy through the full envelope-bearing

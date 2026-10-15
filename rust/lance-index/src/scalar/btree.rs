@@ -60,7 +60,7 @@ use datafusion_expr::execution_props::ExecutionProps;
 use datafusion_physical_expr::{
     PhysicalExpr, PhysicalSortExpr, create_physical_expr, expressions::Column,
 };
-use futures::{FutureExt, Stream, StreamExt, TryStreamExt, stream};
+use futures::{Stream, StreamExt, TryStreamExt, stream};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{
     Error, ROW_ADDR, Result,
@@ -89,6 +89,7 @@ use serde::{Deserialize, Serialize, Serializer};
 use tracing::{info, instrument};
 
 mod flat;
+mod lookup;
 
 pub const BTREE_LOOKUP_NAME: &str = "page_lookup.lance";
 const BTREE_PAGES_NAME: &str = "page_data.lance";
@@ -1646,13 +1647,18 @@ impl CacheKey for BTreeIndexStateKey {
 struct LookupKeys {
     keys: ArrayRef,
     order: UInt32Array,
+    use_u64_mapping: bool,
 }
 
 impl LookupKeys {
-    fn try_new(keys: ArrayRef) -> Result<Self> {
+    fn try_new(keys: ArrayRef, use_u64_mapping: bool) -> Result<Self> {
         let order = arrow_ord::sort::sort_to_indices(&keys, None, None)?;
         let order = order.slice(keys.null_count(), keys.len() - keys.null_count());
-        Ok(Self { keys, order })
+        Ok(Self {
+            keys,
+            order,
+            use_u64_mapping,
+        })
     }
 
     fn match_page(
@@ -1660,6 +1666,32 @@ impl LookupKeys {
         page: &FlatIndex,
         metrics: &dyn MetricsCollector,
     ) -> Result<LookupMatches> {
+        if self.use_u64_mapping
+            && let Some(keys) = self.keys.as_primitive_opt::<UInt64Type>()
+            && let Some(lookup) = page.lookup_u64()?
+        {
+            let order = self.order.values();
+            let comparisons = std::cell::Cell::new(0);
+            let start = order.partition_point(|&position| {
+                comparisons.set(comparisons.get() + 1);
+                keys.value(position as usize) < lookup.first()
+            });
+            let end = start
+                + order[start..].partition_point(|&position| {
+                    comparisons.set(comparisons.get() + 1);
+                    keys.value(position as usize) <= lookup.last()
+                });
+            let mut key_indices = Vec::with_capacity(end - start);
+            let mut matched_row_ids = Vec::with_capacity(end - start);
+            for &position in &order[start..end] {
+                if let Some(address) = lookup.get(keys.value(position as usize), page.ids()) {
+                    key_indices.push(position);
+                    matched_row_ids.push(address);
+                }
+            }
+            metrics.record_comparisons(comparisons.get() + 2 * (end - start));
+            return LookupMatches::new(key_indices.into(), matched_row_ids.into());
+        }
         let values = page.values();
         let order = page.value_order()?;
         let order = order.values();
@@ -1725,6 +1757,7 @@ impl LookupKeys {
 #[derive(Clone, Debug)]
 pub struct BTreeIndex {
     page_lookup: Arc<BTreeLookup>,
+    regular_u64_pages: Option<lookup::RegularU64Pages>,
     index_cache: WeakLanceCache,
     store: Arc<dyn IndexStore>,
     data_type: DataType,
@@ -1801,8 +1834,14 @@ impl BTreeIndex {
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         results_are_row_addresses: bool,
     ) -> Self {
+        let regular_u64_pages = if results_are_row_addresses {
+            lookup::RegularU64Pages::try_new(&page_lookup.batch, page_lookup.search_start)
+        } else {
+            None
+        };
         Self {
             page_lookup,
+            regular_u64_pages,
             store,
             data_type,
             index_cache,
@@ -1895,43 +1934,11 @@ impl BTreeIndex {
         result.map(|(page, _)| page)
     }
 
-    /// Split `pages` into those already cached (looked up individually by the
-    /// caller) and those missing, the missing ones sorted by page id.
-    ///
-    /// Probing the cache for the whole page set before loading any of it is
-    /// what lets the misses be read together: within
-    /// [`Self::evaluate_missing_pages`], sorting means each chunk's ranges are
-    /// ascending and disjoint, which is what lets the reader merge neighbours
-    /// into shared requests. The answer is a snapshot and may be stale by the
-    /// time a page is actually read (evicted by then, or already loaded by a
-    /// concurrent query); both call paths handle that through the cache's own
-    /// loader rather than assuming the snapshot still holds.
-    async fn partition_cached_pages(&self, pages: Vec<Matches>) -> (Vec<Matches>, Vec<Matches>) {
-        let mut cached = Vec::new();
-        let mut missing = Vec::new();
-        for matches in pages {
-            let is_cached = self
-                .index_cache
-                .get_with_key(&BTreePageKey {
-                    page_number: matches.page_id(),
-                })
-                .await
-                .is_some();
-            if is_cached {
-                cached.push(matches);
-            } else {
-                missing.push(matches);
-            }
-        }
-        missing.sort_unstable_by_key(Matches::page_id);
-        (cached, missing)
-    }
-
     /// Read, cache, and search every page in `missing`,
     /// [`PAGE_PREFETCH_CHUNK_SIZE`] pages at a time.
     ///
-    /// `missing` must be sorted by page id (as returned by
-    /// [`Self::partition_cached_pages`]) so each chunk's ranges are ascending
+    /// `missing` must be sorted by page id (by [`Self::evaluate_pages`]) so each
+    /// chunk's ranges are ascending
     /// and disjoint, which is what lets [`IndexReader::read_record_batches`]
     /// merge neighbours into shared requests.
     ///
@@ -2130,37 +2137,35 @@ impl BTreeIndex {
     ) -> Result<Vec<T>> {
         let lazy_index_reader =
             LazyIndexReader::new(self.store.clone(), self.ranges_to_files.clone());
-        let (cached_pages, missing_pages) = self.partition_cached_pages(pages).await;
-        let missing_results = self
-            .evaluate_missing_pages(&missing_pages, &lazy_index_reader, metrics, &evaluate)
-            .await?;
-        let evaluate = &evaluate;
-        let page_tasks = cached_pages
-            .into_iter()
-            .map(|matches| {
-                let index_reader = lazy_index_reader.clone();
-                async move {
-                    let subindex = self
-                        .lookup_page(matches.page_id(), index_reader, metrics)
-                        .await?;
-                    evaluate(&subindex, matches)
-                }
-                .boxed()
-            })
-            .collect::<Vec<_>>();
+        let mut results = Vec::with_capacity(pages.len());
+        let mut missing_pages = Vec::new();
+        for matches in pages {
+            if let Some(page) = self
+                .index_cache
+                .get_with_key(&BTreePageKey {
+                    page_number: matches.page_id(),
+                })
+                .await
+            {
+                metrics.record_index_cache_hit();
+                // Consume and release each handle before the next cache access.
+                // This avoids both a second lookup and pinning a whole query's
+                // pages across disk-cache reads or the missing-page pipeline.
+                results.push(evaluate(&page, matches)?);
+            } else {
+                missing_pages.push(matches);
+            }
+        }
+        missing_pages.sort_unstable_by_key(Matches::page_id);
         debug!(
             "Evaluating {} btree pages ({} prefetched)",
-            page_tasks.len() + missing_results.len(),
-            missing_results.len()
+            results.len() + missing_pages.len(),
+            missing_pages.len()
         );
-
-        let mut results: Vec<T> = stream::iter(page_tasks)
-            // I/O and compute mixed here but important case is index in cache so
-            // use compute intensive thread count
-            .buffered(get_num_compute_intensive_cpus())
-            .try_collect()
-            .await?;
-        results.extend(missing_results);
+        results.extend(
+            self.evaluate_missing_pages(&missing_pages, &lazy_index_reader, metrics, &evaluate)
+                .await?,
+        );
         Ok(results)
     }
 
@@ -2964,14 +2969,19 @@ impl ScalarIndex for BTreeIndex {
         } else {
             keys.clone()
         };
-        let pages = self
-            .page_lookup
-            .candidate_pages_for_values(non_null_keys.as_ref())?;
+        let pages = if let Some(directory) = &self.regular_u64_pages
+            && let Some(keys) = non_null_keys.as_primitive_opt::<UInt64Type>()
+        {
+            directory.candidate_pages(keys, self.page_lookup.page_numbers()?.values())
+        } else {
+            self.page_lookup
+                .candidate_pages_for_values(non_null_keys.as_ref())?
+        };
         if pages.is_empty() {
             return Ok(LookupMatches::empty());
         }
 
-        let lookup_keys = LookupKeys::try_new(keys)?;
+        let lookup_keys = LookupKeys::try_new(keys, self.results_are_row_addresses)?;
         let page_matches = self
             .evaluate_pages(
                 pages.into_iter().map(Matches::Some).collect(),
@@ -4522,13 +4532,16 @@ mod tests {
         )
         .unwrap();
         let page = FlatIndex::try_new(batch).unwrap();
-        let keys = LookupKeys::try_new(Arc::new(UInt64Array::from(vec![
-            Some(3000),
-            None,
-            Some(17),
-            Some(3000),
-            Some(5000),
-        ])))
+        let keys = LookupKeys::try_new(
+            Arc::new(UInt64Array::from(vec![
+                Some(3000),
+                None,
+                Some(17),
+                Some(3000),
+                Some(5000),
+            ])),
+            true,
+        )
         .unwrap();
         let metrics = crate::metrics::LocalMetricsCollector::default();
         let matches = keys.match_page(&page, &metrics).unwrap();
@@ -4542,6 +4555,35 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Relaxed)
                 < 100
         );
+    }
+
+    #[rstest::rstest]
+    #[case::dense(false)]
+    #[case::gaps_and_nulls(true)]
+    #[tokio::test]
+    async fn test_u64_lookup_matches_live_pairs(
+        #[case] gaps: bool,
+        #[values(false, true)] cached: bool,
+    ) {
+        let values = Arc::new(UInt64Array::from_iter(
+            (0..256).map(|i| (!gaps || i % 3 != 1).then_some(100 + i)),
+        )) as ArrayRef;
+        let addresses = (0..256)
+            .map(|i| (7_u64 << 32) | ((i * 37) % 256))
+            .collect::<Vec<_>>();
+        let cache = if cached {
+            LanceCache::with_capacity(1024 * 1024)
+        } else {
+            LanceCache::no_cache()
+        };
+        let (_tmpdir, index) = train_lookup_index(&values, &addresses, &cache).await;
+        let keys =
+            UInt64Array::from_iter((90..360).rev().flat_map(|key| [Some(key), None, Some(key)]));
+        let expected = brute_force_lookup(values.as_ref(), &addresses, &keys);
+        for _ in 0..2 {
+            let actual = index.lookup(&keys, &NoOpMetricsCollector).await.unwrap();
+            assert_eq!(sorted_pairs(&actual), expected);
+        }
     }
 
     /// Lookup must agree with `search(Equals)` on float values whose equality
@@ -7084,6 +7126,77 @@ mod tests {
             ("page_idx", UInt32, [0, 1, 2])
         )
         .unwrap()
+    }
+
+    #[rstest::rstest]
+    #[case::regular_origin(vec![Some(100), Some(104), Some(108)], vec![Some(103), Some(107), Some(109)], true)]
+    #[case::overlap(vec![Some(100), Some(104)], vec![Some(104), Some(108)], false)]
+    #[case::holes(vec![Some(100), Some(104)], vec![Some(102), Some(106)], false)]
+    #[case::repeated_boundary(vec![Some(100), Some(100)], vec![Some(100), Some(103)], false)]
+    #[case::null_prefix(vec![None, Some(100), Some(104)], vec![None, Some(103), Some(105)], true)]
+    #[case::full_u64_span(vec![Some(0)], vec![Some(u64::MAX)], false)]
+    #[case::upper_boundary(vec![Some(u64::MAX-7), Some(u64::MAX-3)], vec![Some(u64::MAX-4), Some(u64::MAX)], true)]
+    #[case::empty(vec![], vec![], false)]
+    fn test_u64_directory_matches_interval_membership(
+        #[case] mins: Vec<Option<u64>>,
+        #[case] maxs: Vec<Option<u64>>,
+        #[case] regular: bool,
+    ) {
+        let page_ids = (0..mins.len())
+            .rev()
+            .map(|i| (i * 3 + 1) as u32)
+            .collect::<Vec<_>>();
+        let batch = record_batch!(
+            ("min", UInt64, mins.clone()),
+            ("max", UInt64, maxs.clone()),
+            (
+                "null_count",
+                UInt32,
+                mins.iter()
+                    .map(|min| u32::from(min.is_none()))
+                    .collect::<Vec<_>>()
+            ),
+            ("page_idx", UInt32, page_ids.clone())
+        )
+        .unwrap();
+        let lookup = BTreeLookup::try_new(batch).unwrap();
+        let directory = super::lookup::RegularU64Pages::try_new(&lookup.batch, lookup.search_start);
+        assert_eq!(directory.is_some(), regular);
+        let keys = [
+            None,
+            Some(0),
+            Some(99),
+            Some(100),
+            Some(102),
+            Some(103),
+            Some(104),
+            Some(105),
+            Some(107),
+            Some(108),
+            Some(109),
+            Some(110),
+            Some(u64::MAX - 7),
+            Some(u64::MAX - 4),
+            Some(u64::MAX - 3),
+            Some(u64::MAX),
+        ];
+        for key in keys {
+            let query = UInt64Array::from(vec![key, None, key]);
+            let mut expected = mins
+                .iter()
+                .zip(&maxs)
+                .zip(&page_ids)
+                .filter_map(|((min, max), page)| match (key, min, max) {
+                    (Some(key), Some(min), Some(max)) if key >= *min && key <= *max => Some(*page),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            expected.sort_unstable();
+            assert_eq!(lookup.candidate_pages_for_values(&query).unwrap(), expected);
+            if let Some(directory) = &directory {
+                assert_eq!(directory.candidate_pages(&query, &page_ids), expected);
+            }
+        }
     }
 
     fn osv(v: i32) -> OrderableScalarValue {
