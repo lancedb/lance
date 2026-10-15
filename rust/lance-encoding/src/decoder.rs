@@ -237,7 +237,7 @@ use prost::Message;
 use tokio::sync::mpsc::error::SendError;
 use tokio::sync::mpsc::{self, unbounded_channel};
 
-use lance_core::error::{CloneableError, LanceOptionExt};
+use lance_core::error::{LanceOptionExt, SharedError};
 use lance_core::{ArrowResult, Error, Result};
 use tracing::instrument;
 
@@ -2869,7 +2869,7 @@ impl PriorityRange for ListPriorityRange {
 /// I/O request per accumulated block.
 pub(crate) const IO_REQUEST_BATCH_BYTES: u64 = 8 * 1024 * 1024;
 
-type SharedRead = Shared<BoxFuture<'static, std::result::Result<Arc<Vec<Bytes>>, CloneableError>>>;
+type SharedRead = Shared<BoxFuture<'static, std::result::Result<Arc<Vec<Bytes>>, SharedError>>>;
 
 /// What a pending read receives once its batch is submitted.
 enum SubmittedRead {
@@ -2951,7 +2951,13 @@ impl RequestBatch {
         if pending.is_empty() {
             return;
         }
-        if pending.len() == 1 {
+        // The I/O layer rejects unsorted ranges, so a lone unsorted read takes
+        // the sort and scatter below like any batch.
+        if pending.len() == 1
+            && pending[0]
+                .ranges
+                .is_sorted_by_key(|range| (range.start, range.end))
+        {
             let read = pending.into_iter().next().unwrap();
             let _ = read.tx.send(SubmittedRead::Alone(
                 inner.submit_request(read.ranges, read.priority),
@@ -2985,7 +2991,7 @@ impl RequestBatch {
         }
         let batched: SharedRead = inner
             .submit_request(ranges, priority)
-            .map(|result| result.map(Arc::new).map_err(CloneableError))
+            .map(|result| result.map(Arc::new).map_err(SharedError::from))
             .boxed()
             .shared();
         for (read, read_positions) in pending.into_iter().zip(positions) {
@@ -3040,7 +3046,7 @@ impl EncodingsIo for RequestBatch {
             match submitted {
                 SubmittedRead::Alone(request) => request.await,
                 SubmittedRead::Shared(batched, positions) => {
-                    let bytes = batched.await.map_err(|err| err.0)?;
+                    let bytes = batched.await.map_err(|err| err.to_error())?;
                     Ok(positions
                         .into_iter()
                         .map(|position| bytes[position].clone())

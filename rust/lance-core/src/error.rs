@@ -2,9 +2,10 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::fmt;
+use std::sync::Arc;
 
 use arrow_schema::ArrowError;
-use snafu::{IntoError as _, Location, Snafu};
+use snafu::{GenerateImplicitData as _, IntoError as _, Location, Snafu};
 
 type BoxedError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
@@ -603,7 +604,9 @@ impl Error {
         match self {
             Self::NotFound { .. } => true,
             Self::Wrapped { error, .. }
-                if error.downcast_ref::<CommitStatusUnknownError>().is_some() =>
+                if unshared(error)
+                    .downcast_ref::<CommitStatusUnknownError>()
+                    .is_some() =>
             {
                 false
             }
@@ -756,7 +759,9 @@ impl Error {
         matches!(
             self,
             Self::Wrapped { error, .. }
-                if error.downcast_ref::<CommitStatusUnknownError>().is_some()
+                if unshared(error)
+                    .downcast_ref::<CommitStatusUnknownError>()
+                    .is_some()
         )
     }
 
@@ -789,12 +794,30 @@ impl Error {
         }
     }
 
+    /// The variant's boxed source, for the variants that carry one.
+    fn boxed_source(&self) -> Option<&BoxedError> {
+        match self {
+            Self::InvalidInput { source, .. }
+            | Self::DatasetNotFound { source, .. }
+            | Self::CorruptFile { source, .. }
+            | Self::NotSupported { source, .. }
+            | Self::CommitConflict { source, .. }
+            | Self::IncompatibleTransaction { source, .. }
+            | Self::RetryableCommitConflict { source, .. }
+            | Self::IO { source, .. }
+            | Self::Wrapped { error: source, .. }
+            | Self::Namespace { source, .. }
+            | Self::External { source } => Some(source),
+            _ => None,
+        }
+    }
+
     /// Returns a reference to the external error source if this is an `External` variant.
     ///
     /// This allows downcasting to recover the original error type.
     pub fn external_source(&self) -> Option<&BoxedError> {
         match self {
-            Self::External { source } => Some(source),
+            Self::External { source } => Some(unshared(source)),
             _ => None,
         }
     }
@@ -1143,6 +1166,290 @@ pub struct CloneableResult<T: Clone>(pub std::result::Result<T, CloneableError>)
 impl<T: Clone> From<Result<T>> for CloneableResult<T> {
     fn from(result: Result<T>) -> Self {
         Self(result.map_err(CloneableError))
+    }
+}
+
+/// An [`Error`] that every consumer of one failed operation receives, such as
+/// the readers that share one batched I/O request.
+///
+/// Unlike [`CloneableError`], nothing is rebuilt from a message: each consumer
+/// gets the original variant with its fields and location. A boxed source is
+/// shared rather than copied; it displays as the original and its source chain
+/// leads to the original typed error, so `downcast_ref` along the chain,
+/// [`Error::is_not_found`], [`Error::is_commit_status_unknown`] and
+/// [`Error::external_source`] behave as on the original. [`Error::into_external`]
+/// cannot hand out the shared source and returns the wrapper instead.
+#[derive(Debug, Clone)]
+pub struct SharedError(Arc<Error>);
+
+impl From<Error> for SharedError {
+    fn from(error: Error) -> Self {
+        Self(Arc::new(error))
+    }
+}
+
+impl SharedError {
+    /// An owned error with the original variant, fields and location.
+    pub fn to_error(&self) -> Error {
+        let source = || -> BoxedError { Box::new(SharedSource(self.0.clone())) };
+        let backtrace = MaybeBacktrace::generate;
+        match self.0.as_ref() {
+            Error::InvalidInput { location, .. } => Error::InvalidInput {
+                source: source(),
+                location,
+                backtrace: backtrace(),
+            },
+            Error::DatasetAlreadyExists { uri, location, .. } => Error::DatasetAlreadyExists {
+                uri: uri.clone(),
+                location,
+                backtrace: backtrace(),
+            },
+            Error::SchemaMismatch {
+                difference,
+                location,
+                ..
+            } => Error::SchemaMismatch {
+                difference: difference.clone(),
+                location,
+                backtrace: backtrace(),
+            },
+            Error::DatasetNotFound { path, location, .. } => Error::DatasetNotFound {
+                path: path.clone(),
+                source: source(),
+                location,
+                backtrace: backtrace(),
+            },
+            Error::CorruptFile { path, location, .. } => Error::CorruptFile {
+                path: path.clone(),
+                source: source(),
+                location,
+                backtrace: backtrace(),
+            },
+            Error::NotSupported { location, .. } => Error::NotSupported {
+                source: source(),
+                location,
+                backtrace: backtrace(),
+            },
+            Error::CommitConflict {
+                version, location, ..
+            } => Error::CommitConflict {
+                version: *version,
+                source: source(),
+                location,
+                backtrace: backtrace(),
+            },
+            Error::IncompatibleTransaction { location, .. } => Error::IncompatibleTransaction {
+                source: source(),
+                location,
+                backtrace: backtrace(),
+            },
+            Error::RetryableCommitConflict {
+                version, location, ..
+            } => Error::RetryableCommitConflict {
+                version: *version,
+                source: source(),
+                location,
+                backtrace: backtrace(),
+            },
+            Error::TooMuchWriteContention {
+                message, location, ..
+            } => Error::TooMuchWriteContention {
+                message: message.clone(),
+                location,
+                backtrace: backtrace(),
+            },
+            Error::Timeout { message, location } => Error::Timeout {
+                message: message.clone(),
+                location,
+            },
+            Error::Internal {
+                message, location, ..
+            } => Error::Internal {
+                message: message.clone(),
+                location,
+                backtrace: backtrace(),
+            },
+            Error::PrerequisiteFailed {
+                message, location, ..
+            } => Error::PrerequisiteFailed {
+                message: message.clone(),
+                location,
+                backtrace: backtrace(),
+            },
+            Error::Unprocessable {
+                message, location, ..
+            } => Error::Unprocessable {
+                message: message.clone(),
+                location,
+                backtrace: backtrace(),
+            },
+            Error::Arrow {
+                message, location, ..
+            } => Error::Arrow {
+                message: message.clone(),
+                location,
+                backtrace: backtrace(),
+            },
+            Error::Schema {
+                message, location, ..
+            } => Error::Schema {
+                message: message.clone(),
+                location,
+                backtrace: backtrace(),
+            },
+            Error::NotFound { uri, location, .. } => Error::NotFound {
+                uri: uri.clone(),
+                location,
+                backtrace: backtrace(),
+            },
+            Error::IO { location, .. } => Error::IO {
+                source: source(),
+                location,
+                backtrace: backtrace(),
+            },
+            Error::Index {
+                message, location, ..
+            } => Error::Index {
+                message: message.clone(),
+                location,
+                backtrace: backtrace(),
+            },
+            Error::IndexNotFound {
+                identity, location, ..
+            } => Error::IndexNotFound {
+                identity: identity.clone(),
+                location,
+                backtrace: backtrace(),
+            },
+            Error::InvalidTableLocation { message } => Error::InvalidTableLocation {
+                message: message.clone(),
+            },
+            Error::Stop => Error::Stop,
+            Error::Wrapped { location, .. } => Error::Wrapped {
+                error: source(),
+                location,
+                backtrace: backtrace(),
+            },
+            Error::Cloned {
+                message, location, ..
+            } => Error::Cloned {
+                message: message.clone(),
+                location,
+                backtrace: backtrace(),
+            },
+            Error::Execution {
+                message, location, ..
+            } => Error::Execution {
+                message: message.clone(),
+                location,
+                backtrace: backtrace(),
+            },
+            Error::InvalidRef { message } => Error::InvalidRef {
+                message: message.clone(),
+            },
+            Error::RefConflict { message } => Error::RefConflict {
+                message: message.clone(),
+            },
+            Error::RefNotFound { message } => Error::RefNotFound {
+                message: message.clone(),
+            },
+            Error::Cleanup { message } => Error::Cleanup {
+                message: message.clone(),
+            },
+            Error::VersionNotFound { message } => Error::VersionNotFound {
+                message: message.clone(),
+            },
+            Error::VersionConflict {
+                message,
+                major_version,
+                minor_version,
+                location,
+                ..
+            } => Error::VersionConflict {
+                message: message.clone(),
+                major_version: *major_version,
+                minor_version: *minor_version,
+                location,
+                backtrace: backtrace(),
+            },
+            Error::Namespace { location, .. } => Error::Namespace {
+                source: source(),
+                location,
+                backtrace: backtrace(),
+            },
+            Error::External { .. } => Error::External { source: source() },
+            Error::FieldNotFound { source } => Error::FieldNotFound {
+                source: FieldNotFoundError {
+                    field_name: source.field_name.clone(),
+                    candidates: source.candidates.clone(),
+                },
+            },
+            Error::DiskCapExceeded {
+                cap_bytes,
+                used_bytes,
+                location,
+            } => Error::DiskCapExceeded {
+                cap_bytes: *cap_bytes,
+                used_bytes: *used_bytes,
+                location,
+            },
+            Error::Fenced {
+                reason,
+                message,
+                location,
+            } => Error::Fenced {
+                reason: *reason,
+                message: message.clone(),
+                location,
+            },
+            Error::Backpressure { message, location } => Error::Backpressure {
+                message: message.clone(),
+                location,
+            },
+        }
+    }
+}
+
+/// The boxed source of a [`SharedError`], standing in for the original's.
+struct SharedSource(Arc<Error>);
+
+impl SharedSource {
+    fn original(&self) -> &(dyn std::error::Error + 'static) {
+        match self.0.boxed_source() {
+            Some(source) => source.as_ref(),
+            // `SharedError::to_error` builds a `SharedSource` only for
+            // variants that carry a boxed source.
+            None => self.0.as_ref(),
+        }
+    }
+}
+
+impl fmt::Debug for SharedSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(self.original(), f)
+    }
+}
+
+impl fmt::Display for SharedSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self.original(), f)
+    }
+}
+
+impl std::error::Error for SharedSource {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.original())
+    }
+}
+
+/// The original boxed error behind any [`SharedSource`] wrappers.
+fn unshared(source: &BoxedError) -> &BoxedError {
+    match source
+        .downcast_ref::<SharedSource>()
+        .and_then(|shared| shared.0.boxed_source())
+    {
+        Some(original) => unshared(original),
+        None => source,
     }
 }
 
