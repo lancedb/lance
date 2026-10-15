@@ -366,8 +366,9 @@ pub async fn build_per_segment_filters(
 
 /// Attempt to read seed buffers for `index` from `fragments`' data files.
 ///
-/// Returns `Some(vec)` only if every fragment has a seed entry; returns `None`
-/// if any fragment is missing a seed or its data file cannot be opened.
+/// Returns `Some(vec)` only if every fragment has a seed entry whose field
+/// identity can be verified; returns `None` if a seed is missing, its file
+/// cannot be opened, or its physical column mapping cannot be verified.
 /// Index-type-specific validation (e.g. `rows_per_zone` checks) is left to the
 /// caller via [`FragmentSeed::metadata_value`].
 async fn try_harvest_seeds(
@@ -444,6 +445,11 @@ async fn try_harvest_seeds(
         let metadata = reader.metadata();
         let file_schema = &metadata.file_schema;
         let (stored_ids, stored_columns) = data_file_columns(metadata.version, file_schema);
+        // Blob footers can retain descriptor fields without physical columns.
+        // Their inferred positions must not select another column's seed.
+        if stored_columns.len() != metadata.column_metadatas.len() {
+            return Ok(None);
+        }
         let Some((stored_id, _)) = stored_ids
             .iter()
             .zip(&stored_columns)

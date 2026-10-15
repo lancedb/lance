@@ -24,6 +24,7 @@ use lance_core::utils::tempfile::TempStrDir;
 use lance_datafusion::utils::reader_to_stream;
 use lance_encoding::decoder::FilterExpression;
 use lance_file::reader::{FileReader, FileReaderOptions};
+use lance_file::version::LanceFileVersion;
 use lance_index::IndexType;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::seed::{IndexSeedWriter, SEED_META_KEY_PREFIX};
@@ -35,6 +36,7 @@ use lance_io::utils::CachedFileSize;
 use lance_table::format::{DataFile, Fragment};
 
 use crate::Dataset;
+use crate::blob::{BlobArrayBuilder, blob_field};
 use crate::dataset::schema_evolution::{ColumnAlteration, NewColumnTransform};
 use crate::dataset::transaction::{DataReplacementGroup, Operation};
 use crate::dataset::write::merge_insert::{WhenMatched, WhenNotMatched};
@@ -311,6 +313,93 @@ async fn test_zone_map_seed_harvest_after_column_name_swap() {
     assert_eq!(expected, 10);
     let mut indexed = dataset.scan();
     indexed.filter("id = 100").unwrap();
+    assert_eq!(indexed.try_into_batch().await.unwrap().num_rows(), expected);
+}
+
+#[rstest::rstest]
+#[case::blob_first(true, false)]
+#[case::blob_last(false, false)]
+#[case::blob_first_renamed(true, true)]
+#[tokio::test]
+async fn test_zone_map_seed_harvest_with_blob_columns(
+    #[case] blob_first: bool,
+    #[case] rename: bool,
+) {
+    let dir = TempStrDir::default();
+    let mut fields = ["a", "b", "c", "d", "e", "f"]
+        .map(|name| ArrowField::new(name, DataType::Int32, false))
+        .to_vec();
+    let blob_position = if blob_first { 0 } else { fields.len() };
+    fields.insert(blob_position, blob_field("blob", false));
+    let schema = Arc::new(ArrowSchema::new(fields));
+    let make_batch = || {
+        let mut blobs = BlobArrayBuilder::new(10);
+        for _ in 0..10 {
+            blobs.push_bytes(b"blob").unwrap();
+        }
+        let mut arrays = [1, 2, 3, 4, 5, 100]
+            .map(|v| Arc::new(Int32Array::from(vec![v; 10])) as ArrayRef)
+            .to_vec();
+        arrays.insert(blob_position, blobs.finish().unwrap());
+        RecordBatch::try_new(schema.clone(), arrays).unwrap()
+    };
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(make_batch())], schema.clone()),
+        dir.as_str(),
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    for name in ["a", "f"] {
+        dataset
+            .create_index(
+                &[name],
+                IndexType::ZoneMap,
+                None,
+                &zone_map_params(true),
+                false,
+            )
+            .await
+            .unwrap();
+    }
+    dataset
+        .append(RecordBatchIterator::new([Ok(make_batch())], schema), None)
+        .await
+        .unwrap();
+    let file = &dataset.fragments()[1].files[0];
+    assert!(seed_in_file(&dataset, &file.path, "a").await.is_some());
+    assert!(seed_in_file(&dataset, &file.path, "f").await.is_some());
+    let column = if rename {
+        dataset
+            .alter_columns(&[
+                ColumnAlteration::new("a".into()).rename("f".into()),
+                ColumnAlteration::new("f".into()).rename("a".into()),
+            ])
+            .await
+            .unwrap();
+        "a"
+    } else {
+        "f"
+    };
+    let filter = format!("{column} = 100");
+    dataset
+        .optimize_indices(&OptimizeOptions::default())
+        .await
+        .unwrap();
+    let dataset = Dataset::open(dir.as_str()).await.unwrap();
+    let mut flat = dataset.scan();
+    flat.use_scalar_index(false)
+        .project(&[column])
+        .unwrap()
+        .filter(&filter)
+        .unwrap();
+    let expected = flat.try_into_batch().await.unwrap().num_rows();
+    assert_eq!(expected, 20);
+    let mut indexed = dataset.scan();
+    indexed.project(&[column]).unwrap().filter(&filter).unwrap();
     assert_eq!(indexed.try_into_batch().await.unwrap().num_rows(), expected);
 }
 
