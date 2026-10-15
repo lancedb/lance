@@ -105,6 +105,16 @@ impl MokaCacheBackend {
 
 #[async_trait]
 impl CacheBackend for MokaCacheBackend {
+    async fn get_resident(&self, key: &InternalCacheKey) -> Option<CacheEntry> {
+        self.cache.get(key).await.map(|r| r.entry)
+    }
+
+    /// Moka does not count `contains_key` as a read: the entry's popularity
+    /// estimate and recency order stay unchanged.
+    async fn peek_resident(&self, key: &InternalCacheKey) -> bool {
+        self.cache.contains_key(key)
+    }
+
     async fn get(&self, key: &InternalCacheKey, _codec: Option<CacheCodec>) -> Option<CacheEntry> {
         self.cache.get(key).await.map(|r| r.entry)
     }
@@ -167,6 +177,10 @@ impl CacheBackend for MokaCacheBackend {
     async fn size_bytes(&self) -> usize {
         self.cache.run_pending_tasks().await;
         self.weighted_size_bytes()
+    }
+
+    fn capacity_bytes(&self) -> Option<usize> {
+        Some(self.capacity)
     }
 
     fn approx_num_entries(&self) -> usize {
@@ -269,6 +283,15 @@ mod tests {
         let key = InternalCacheKey::from_bytes([0; 16]);
         assert_eq!(weight_unit(4096), 1);
         assert_eq!(entry_weight(&key, 7, 1), 23);
+    }
+
+    #[test]
+    fn capacity_bytes_reports_configured_capacity() {
+        assert_eq!(
+            MokaCacheBackend::with_capacity(4096).capacity_bytes(),
+            Some(4096)
+        );
+        assert_eq!(MokaCacheBackend::no_cache().capacity_bytes(), Some(0));
     }
 
     #[tokio::test]
