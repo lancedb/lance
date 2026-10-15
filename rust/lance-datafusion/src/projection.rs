@@ -5,7 +5,7 @@ use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use datafusion::{logical_expr::Expr, physical_plan::projection::ProjectionExec};
 use datafusion_common::{Column, DFSchema};
-use datafusion_physical_expr::PhysicalExpr;
+use datafusion_physical_expr::{PhysicalExpr, expressions::CastExpr};
 use futures::TryStreamExt;
 use std::{
     collections::{HashMap, HashSet},
@@ -414,6 +414,7 @@ impl ProjectionPlan {
         current_schema: &ArrowSchema,
     ) -> Result<Vec<(Arc<dyn PhysicalExpr>, String)>> {
         let physical_df_schema = Arc::new(DFSchema::try_from(current_schema.clone())?);
+        let projection_schema = self.physical_projection.to_arrow_schema();
         self.requested_output_expr
             .iter()
             .map(|output_column| {
@@ -424,14 +425,26 @@ impl ProjectionPlan {
                 } else {
                     output_column.expr.clone()
                 };
-                Ok((
-                    datafusion::physical_expr::create_physical_expr(
-                        &expr,
-                        physical_df_schema.as_ref(),
-                        &Default::default(),
-                    )?,
-                    output_column.name.clone(),
-                ))
+                let mut physical_expr = datafusion::physical_expr::create_physical_expr(
+                    &expr,
+                    physical_df_schema.as_ref(),
+                    &Default::default(),
+                )?;
+                // A filter can load additional children of a projected struct or list.
+                // A bare column expression would retain those filter-only children.
+                if let Expr::Column(column) = &expr
+                    && let Ok(field) = projection_schema.field_with_name(&column.name)
+                    && field.data_type().is_nested()
+                    && physical_expr.data_type(current_schema)?.is_nested()
+                    && field.data_type() != &physical_expr.data_type(current_schema)?
+                {
+                    physical_expr = Arc::new(CastExpr::new(
+                        physical_expr,
+                        field.data_type().clone(),
+                        None,
+                    ));
+                }
+                Ok((physical_expr, output_column.name.clone()))
             })
             .collect::<Result<Vec<_>>>()
     }
