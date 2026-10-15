@@ -2281,9 +2281,13 @@ def test_write_idempotency_keys(enable_unstable_idempotency_keys, api):
     data = pa.table({"a": [1], "b": [1]})
 
     def write(keys):
+        # Every write reads version 1 so later writes must check committed keys.
+        dataset = original.checkout_version(1)
         if api == "insert":
-            return original.insert(data, idempotency_keys=keys)
-        return lance.write_dataset(data, original, mode="append", idempotency_keys=keys)
+            # insert() updates the handle in place and returns None.
+            dataset.insert(data, idempotency_keys=keys)
+            return dataset
+        return lance.write_dataset(data, dataset, mode="append", idempotency_keys=keys)
 
     assert write(["m1"]).version == 2
     with pytest.raises(DuplicateTransactionError) as excinfo:
