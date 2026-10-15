@@ -390,14 +390,21 @@ pub async fn build_per_segment_filters(
 /// What a remapping merge re-reads. Returns the stale rows, those an overlay replaced after
 /// the source segment covering them was built, which are dropped from each source's
 /// carried-over entries, and the scan selection: those rows and every row of the unindexed
-/// fragments, as one selection so the scan sorts them together. Both are keyed like the
-/// old-data filters ([`OldIndexDataFilter`]): row ids under stable row ids, addresses
-/// otherwise.
+/// fragments, as one selection so the scan sorts them together.
+///
+/// The two are keyed differently. The stale rows are keyed like the old-data filter they are
+/// subtracted from, so they follow `address_domain` exactly as [`build_old_data_filter`] does:
+/// addresses for an address-domain index, row ids only when the dataset uses stable row ids
+/// and the index does not. The selection is keyed by what the scanner takes, which is always
+/// the `_rowid` domain (see [`Scanner::with_row_id_prefilter`]), whatever the index stores.
+///
+/// [`Scanner::with_row_id_prefilter`]: crate::dataset::scanner::Scanner::with_row_id_prefilter
 async fn overlay_rescan(
     dataset: &Dataset,
     selected_old_indices: &[&IndexMetadata],
     effective_old_frags: &RoaringBitmap,
     unindexed: &[Fragment],
+    address_domain: bool,
 ) -> Result<(RowAddrTreeMap, TrainingRows)> {
     // The same per-row, field-aware, version-gated check the scanner masks by.
     let overlaid = overlaid_fragments(&dataset.manifest.fragments);
@@ -424,15 +431,17 @@ async fn overlay_rescan(
         selection.insert_fragment(fragment.id as u32);
     }
     if dataset.manifest.uses_stable_row_ids() {
-        stale_rows = translate_addr_treemap_to_row_ids(dataset, &stale_rows).await?;
         selection = translate_addr_treemap_to_row_ids(dataset, &selection).await?;
+        if !address_domain {
+            stale_rows = translate_addr_treemap_to_row_ids(dataset, &stale_rows).await?;
+        }
     }
     Ok((stale_rows, TrainingRows::Rows(selection)))
 }
 
 /// Remove `stale_rows` from a segment's old-data filter ([`OldIndexDataFilter`]): the rows
-/// an overlay replaced after the segment was built, keyed like the filter (row ids under
-/// stable row ids, addresses otherwise). The merge re-reads them.
+/// an overlay replaced after the segment was built, keyed like the filter (see
+/// [`overlay_rescan`]). The merge re-reads them.
 fn block_stale_rows(
     dataset: &Dataset,
     filter: Option<OldIndexDataFilter>,
@@ -827,6 +836,8 @@ async fn merge_scalar_indices<'a>(
             &selected_old_indices,
             &effective_old_frags,
             unindexed,
+            // The domain each `build_per_segment_filters` call below asks for.
+            index_type == IndexType::BTree,
         )
         .await?
     } else {
