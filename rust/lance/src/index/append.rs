@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::HashMap;
+use std::collections::{HashMap, hash_map::Entry};
 use std::sync::Arc;
 
 use futures::{FutureExt, TryStreamExt};
@@ -363,7 +363,7 @@ pub async fn build_per_segment_filters(
     Ok((effective_union, filters))
 }
 
-/// Attempt to read seed buffers for `column_name` from `fragments`' data files.
+/// Attempt to read seed buffers for `index` from `fragments`' data files.
 ///
 /// Returns `Some(vec)` only if every fragment has a seed entry; returns `None`
 /// if any fragment is missing a seed or its data file cannot be opened.
@@ -372,30 +372,47 @@ pub async fn build_per_segment_filters(
 async fn try_harvest_seeds(
     dataset: &Dataset,
     fragments: &[Fragment],
-    column_name: &str,
+    index: &IndexMetadata,
 ) -> Result<Option<Vec<FragmentSeed>>> {
     if fragments.is_empty() {
         return Ok(Some(Vec::new()));
     }
 
-    let meta_key = format!("{}{}", SEED_META_KEY_PREFIX, column_name);
+    // SeedCollector writes seeds only for top-level keyed fields. A nested
+    // leaf can share its name with a different, seeded top-level column.
+    let Some(field_id) = index.keyed_field() else {
+        return Ok(None);
+    };
+    let Some(field) = dataset.schema().fields.iter().find(|f| f.id == field_id) else {
+        return Ok(None);
+    };
+    let meta_key = format!("{}{}", SEED_META_KEY_PREFIX, field.name);
     let mut seeds = Vec::with_capacity(fragments.len());
-
-    let scheduler = ScanScheduler::new(
-        dataset.object_store.clone(),
-        SchedulerConfig::max_bandwidth(&dataset.object_store),
-    );
+    let mut schedulers = HashMap::new();
 
     for fragment in fragments {
-        let Some(data_file) = fragment.files.first() else {
+        // A column replacement can retain an older file for other columns.
+        // Its seed still describes the old values, even after the manifest
+        // stops mapping this column to that file.
+        let Some(data_file) = fragment.files.iter().rev().find(|file| {
+            file.schema(dataset.schema())
+                .field_by_id(field.id)
+                .is_some()
+        }) else {
             return Ok(None);
         };
 
         let path = dataset
-            .base
-            .clone()
-            .join(crate::dataset::DATA_DIR)
+            .data_file_dir(data_file)?
             .join(data_file.path.as_str());
+        let scheduler = match schedulers.entry(data_file.base_id) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => {
+                let store = dataset.object_store(data_file.base_id).await?;
+                let config = SchedulerConfig::max_bandwidth(&store);
+                entry.insert(ScanScheduler::new(store, config))
+            }
+        };
         let Ok(file_scheduler) = scheduler.open_file(&path, &CachedFileSize::unknown()).await
         else {
             return Ok(None);
@@ -756,7 +773,8 @@ async fn merge_scalar_indices<'a>(
         // Only open data files looking for seeds when the plugin confirms this
         // index type and configuration can actually produce them.
         let maybe_created = if plugin.might_use_seeds(&index_details) {
-            if let Some(seeds) = try_harvest_seeds(dataset.as_ref(), unindexed, column_name).await?
+            if let Some(seeds) =
+                try_harvest_seeds(dataset.as_ref(), unindexed, reference_idx).await?
             {
                 plugin
                     .update_from_seeds(seeds, reference_index.clone(), &index_details, &new_store)
