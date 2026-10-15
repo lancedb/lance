@@ -1,7 +1,6 @@
 nav:
   - index.md
   - Schema: schema.md
-  - Column Comparisons: ordering.md
   - Versioning: versioning.md
   - Transactions: transaction.md
   - Layout: layout.md
