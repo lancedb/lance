@@ -470,12 +470,12 @@ mod test {
     use crate::utils::test::{DatagenExt, FailingProxyStore, FragmentCount, FragmentRowCount};
     use arrow_array::cast::AsArray;
     use arrow_array::types::{Float32Type, Int32Type, UInt64Type};
-    use arrow_array::{Array, Int32Array, RecordBatch, RecordBatchIterator, UInt64Array};
+    use arrow_array::{Array, ArrayRef, Int32Array, RecordBatch, RecordBatchIterator, UInt64Array};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use futures::Future;
     use lance_core::datatypes::Schema;
     use lance_core::{ROW_ADDR, ROW_ID, utils::address::RowAddress};
-    use lance_datagen::Dimension;
+    use lance_datagen::{ArrayGeneratorExt, Dimension};
     use lance_index::{IndexType, scalar::ScalarIndexParams};
     use lance_io::object_store::ObjectStoreParams;
     use lance_table::rowids::segment::U64Segment;
@@ -760,6 +760,8 @@ mod test {
         dataset = Arc::try_unwrap(update.new_dataset).unwrap();
         assert_row_id_lookup_matches_scan(&dataset).await;
         dataset.delete("i = 1").await.unwrap();
+        let before_compaction = dataset.clone();
+        assert_row_id_lookup_matches_scan(&before_compaction).await;
         compact_files(
             &mut dataset,
             CompactionOptions {
@@ -780,8 +782,33 @@ mod test {
             );
         }
         assert_row_id_lookup_matches_scan(&dataset).await;
+        assert_row_id_lookup_matches_scan(&before_compaction).await;
+        let indices = dataset.load_indices().await.unwrap();
+        let row_ids = indices
+            .iter()
+            .find(|index| index.name == "row_ids")
+            .unwrap();
+        let coverage =
+            row_ids.fragment_bitmap.as_ref().unwrap() & dataset.fragment_bitmap().as_ref();
+        assert_eq!(
+            coverage.is_empty(),
+            !defer,
+            "only recorded address translation can preserve the compacted index coverage"
+        );
         dataset.optimize_indices(&Default::default()).await.unwrap();
         assert_row_id_lookup_matches_scan(&dataset).await;
+        let coverage: roaring::RoaringBitmap = dataset
+            .load_indices()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|index| index.name == "row_ids")
+            .flat_map(|index| index.fragment_bitmap.as_ref().unwrap().iter())
+            .collect();
+        assert_eq!(
+            &(coverage & dataset.fragment_bitmap().as_ref()),
+            dataset.fragment_bitmap().as_ref()
+        );
         let taken = dataset
             .take_rows(&[5, 9, 5], dataset.schema().clone())
             .await
@@ -792,31 +819,71 @@ mod test {
         );
     }
 
+    #[rstest::rstest]
+    #[case::signed("i")]
+    #[case::unsigned("u")]
     #[tokio::test]
-    async fn test_row_id_btree_unique_key_lookup() {
+    async fn test_row_id_btree_unique_key_lookup(#[case] column: &str) {
         let mut dataset = lance_datagen::gen_batch()
             .col(
                 "i",
-                lance_datagen::array::cycle::<Int32Type>(vec![7, 8, 7, 9]),
+                lance_datagen::array::cycle::<Int32Type>(vec![7, 8, 7, 9])
+                    .with_nulls(&[false, true, false, false]),
+            )
+            .col(
+                "u",
+                lance_datagen::array::cycle::<UInt64Type>(vec![7, 8, 7, 9])
+                    .with_nulls(&[false, true, false, false]),
             )
             .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(2))
             .await
             .unwrap();
-        let keys = Int32Array::from(vec![Some(7), None, Some(9)]);
-        for indexed in [false, true] {
-            if indexed {
+        let keys: ArrayRef = match column {
+            "i" => Arc::new(Int32Array::from(vec![
+                Some(7),
+                None,
+                Some(9),
+                Some(7),
+                Some(99),
+            ])),
+            "u" => Arc::new(UInt64Array::from(vec![
+                Some(7),
+                None,
+                Some(9),
+                Some(7),
+                Some(99),
+            ])),
+            _ => unreachable!(),
+        };
+        let null_value: ArrayRef = match column {
+            "i" => Arc::new(Int32Array::from(vec![8])),
+            "u" => Arc::new(UInt64Array::from(vec![8])),
+            _ => unreachable!(),
+        };
+        for indexed_fragments in 0..=2 {
+            if indexed_fragments == 1 {
+                let params = ScalarIndexParams::default();
+                let fragment_id = dataset.fragments()[0].id as u32;
                 dataset
-                    .create_index(
-                        &["i"],
-                        IndexType::BTree,
-                        None,
-                        &ScalarIndexParams::default(),
-                        false,
-                    )
+                    .create_index_builder(&[column], IndexType::BTree, &params)
+                    .fragments(vec![fragment_id])
                     .await
                     .unwrap();
+            } else if indexed_fragments == 2 {
+                dataset.optimize_indices(&Default::default()).await.unwrap();
             }
-            let error = dataset.lookup_row_addresses("i", &keys).await.unwrap_err();
+            assert_eq!(
+                dataset
+                    .lookup_row_addresses(column, null_value.as_ref())
+                    .await
+                    .unwrap(),
+                vec![None],
+                "a null value must not match its underlying buffer value"
+            );
+            let error = dataset
+                .lookup_row_addresses(column, keys.as_ref())
+                .await
+                .unwrap_err();
             assert!(matches!(error, Error::InvalidInput { .. }));
             assert!(
                 error
@@ -825,13 +892,18 @@ mod test {
             );
         }
         dataset.delete("_rowaddr = 0").await.unwrap();
-        let resolved = dataset.lookup_row_addresses("i", &keys).await.unwrap();
+        let resolved = dataset
+            .lookup_row_addresses(column, keys.as_ref())
+            .await
+            .unwrap();
         assert_eq!(
             resolved,
             vec![
                 Some(RowAddress::new_from_parts(1, 0)),
                 None,
-                Some(RowAddress::new_from_parts(1, 1))
+                Some(RowAddress::new_from_parts(1, 1)),
+                Some(RowAddress::new_from_parts(1, 0)),
+                None,
             ]
         );
         let error = dataset
@@ -842,11 +914,21 @@ mod test {
         assert!(error.to_string().contains("expected Int32"));
     }
 
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum LookupMaintenance {
+        Build,
+        Defer,
+        Optimize,
+    }
+
     #[rstest::rstest]
-    #[case::built_after_compaction(false)]
-    #[case::remapped_by_fri(true)]
+    #[case::built_after_compaction(LookupMaintenance::Build)]
+    #[case::remapped_by_fri(LookupMaintenance::Defer)]
+    #[case::optimized_after_compaction(LookupMaintenance::Optimize)]
     #[tokio::test]
-    async fn test_row_id_btree_covered_lookup_does_not_read_lineage(#[case] remapped: bool) {
+    async fn test_row_id_btree_covered_lookup_does_not_read_lineage(
+        #[case] maintenance: LookupMaintenance,
+    ) {
         let directory = lance_core::utils::tempfile::TempStrDir::default();
         let mut dataset = lance_datagen::gen_batch()
             .col("i", lance_datagen::array::step::<Int32Type>())
@@ -869,7 +951,7 @@ mod test {
             ])
             .await
             .unwrap();
-        if remapped {
+        if maintenance != LookupMaintenance::Build {
             dataset
                 .create_index(
                     &[ROW_ID],
@@ -885,7 +967,7 @@ mod test {
             &mut dataset,
             CompactionOptions {
                 target_rows_per_fragment: 20,
-                defer_index_remap: remapped,
+                defer_index_remap: maintenance == LookupMaintenance::Defer,
                 ..Default::default()
             },
             None,
@@ -893,7 +975,7 @@ mod test {
         .await
         .unwrap();
         assert_eq!(dataset.fragments()[0].row_id_meta, Some(RowIdMeta::Column));
-        if !remapped {
+        if maintenance == LookupMaintenance::Build {
             dataset
                 .create_index(
                     &[ROW_ID],
@@ -904,6 +986,8 @@ mod test {
                 )
                 .await
                 .unwrap();
+        } else if maintenance == LookupMaintenance::Optimize {
+            dataset.optimize_indices(&Default::default()).await.unwrap();
         }
         dataset
             .update_config([(SPILL_ROW_LINEAGE_CONFIG_KEY, "false")])

@@ -627,6 +627,13 @@ def test_row_id_btree_index(tmp_path: Path):
     ds.delete("i = 1")
     ds.update({"i": "100"}, where="i = 5")
     assert ds._take_rows([5, 9, 5])["i"].to_pylist() == [100, 9, 100]
+    before_compaction = lance.dataset(tmp_path, version=ds.version)
+    ds.update_config(
+        {"lance.row_lineage.spill": "true", "lance.row_lineage.inline_max_bytes": "0"}
+    )
+    ds.optimize.compact_files(target_rows_per_fragment=32)
+    assert ds._take_rows([13, 5, 9])["i"].to_pylist() == [13, 100, 9]
+    assert before_compaction._take_rows([13, 5, 9])["i"].to_pylist() == [13, 100, 9]
     ds.optimize.optimize_indices()
     reopened = lance.dataset(tmp_path)
     with pytest.deprecated_call():
