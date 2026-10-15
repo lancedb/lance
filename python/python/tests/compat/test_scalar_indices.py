@@ -12,6 +12,7 @@ and written by other versions.
 import os
 import shutil
 from pathlib import Path
+from typing import Optional
 
 import lance
 import pyarrow as pa
@@ -150,8 +151,7 @@ class BTreeRowAddressDomainIndex(UpgradeDowngradeTest):
         Being an older build is not the same as predating the migration: the
         pinned release moves forward with every beta, so from
         ROW_ADDRESS_DOMAIN_SINCE on it reads the format the current build
-        writes and is expected to use the index like any other build that
-        understands it.
+        writes, and the fallback this test pins is not its behaviour to keep.
         """
         return Version(self.compat_version) >= ROW_ADDRESS_DOMAIN_SINCE
 
@@ -173,7 +173,7 @@ class BTreeRowAddressDomainIndex(UpgradeDowngradeTest):
         )
         dataset.create_scalar_index("btree", "BTREE")
 
-    def _assert_queryable(self, expect_index_used: bool):
+    def _assert_queryable(self, expect_index_used: Optional[bool]):
         ds = lance.dataset(self.path)
         table = ds.to_table(filter="btree == 7")
         assert table.num_rows == 1
@@ -181,9 +181,9 @@ class BTreeRowAddressDomainIndex(UpgradeDowngradeTest):
 
         explain = ds.scanner(filter="btree == 7").explain_plan()
         used_index = "ScalarIndexQuery" in explain or "MaterializeIndex" in explain
-        if expect_index_used:
+        if expect_index_used is True:
             assert used_index, "expected the BTREE index to be used"
-        else:
+        elif expect_index_used is False:
             assert not used_index, (
                 "an older build must not use a BTREE index in a format it "
                 "does not understand -- it should fall back to a full scan"
@@ -192,11 +192,18 @@ class BTreeRowAddressDomainIndex(UpgradeDowngradeTest):
     def check_read(self):
         """An old-format index must be used by the current build; a
         too-new one must be safely ignored (but answers must stay correct)
-        by an older build."""
-        self._assert_queryable(
-            expect_index_used=not self._is_old_build()
-            or self._reads_row_address_domain()
-        )
+        by an older build.
+
+        A pinned build that reads the row-address domain only has to answer
+        correctly. Whether it uses the index depends on what the index still
+        covers, and on a stable-row-id dataset compaction leaves it covering
+        nothing until the next optimize."""
+        if not self._is_old_build():
+            self._assert_queryable(expect_index_used=True)
+        elif self._reads_row_address_domain():
+            self._assert_queryable(expect_index_used=None)
+        else:
+            self._assert_queryable(expect_index_used=False)
 
     def check_write(self):
         """Insert a row and update the index, then verify old and new rows
