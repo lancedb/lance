@@ -1,13 +1,16 @@
-# Zone-level Column Statistics
+# Column Statistics Write Seeds
 
-A **write seed** is a saved summary of one column, collected while writing a
-data file. It divides the column into **zones**, normally 8,192 rows each, and
-stores one statistics record per zone in the same data file.
+A **write seed** is table-layer metadata containing a saved summary of one
+column, collected while writing a data file. The table writer divides the
+column into **zones**, normally 8,192 rows each, and stores one statistics
+record per zone in that file's generic metadata and global-buffer storage.
 
-A reader can use these summaries to skip zones that cannot match a filter.
-Combining zone summaries gives fragment or index-segment summaries for pruning
-at a larger scale. An index builder can also reuse seeds instead of reading the
-column again.
+A table-level planner can interpret these summaries to select zones, fragments,
+or index segments that may match a filter. An index builder can also reuse
+compatible seeds instead of reading the column again. The data-file reader and
+writer only expose generic metadata and buffer APIs: they do not interpret seed
+versions, comparison rules, or filter expressions. The table layer owns seed
+collection, validation, aggregation, and pruning decisions.
 
 This proposal defines **version 1 of the write-seed format** and reserves its
 dataset feature bit. Writing and reading version 1 seeds requires a follow-up
@@ -15,30 +18,14 @@ implementation. The existing ZoneMap index format and query behavior are unchang
 
 ## Arrow Rust ordering
 
-Bounds follow **Arrow Rust's ascending value ordering** for the declared column
-type. Writers and consumers must agree on these rules:
+Bounds use the declared column type's ascending comparison rules defined in
+[Column Comparison Rules](../../table/ordering.md). Version 1 excludes nulls and
+all NaNs from min/max and counts them separately. Descending sort options and
+null placement do not change these bounds. Types without supported bounds keep
+them unknown.
 
-- Signed and unsigned integers compare by numeric value within their type.
-- Booleans use `false < true`.
-- Decimals compare their signed, unscaled integers within the declared scale.
-- Dates, times, timestamps, and durations compare their underlying integer
-  values within the declared type and unit. Timestamp timezone metadata does
-  not change this comparison.
-- Strings compare lexicographically by UTF-8 bytes; binary values compare
-  lexicographically by bytes. A shorter prefix precedes a longer value. There
-  is no locale collation, case folding, or whitespace normalization.
-- Floats use IEEE 754 `totalOrder`: negative NaNs precede negative infinity,
-  positive NaNs follow positive infinity, and `-0.0 < +0.0`. NaN representations
-  are ordered within each sign group, including signaling/quiet distinctions
-  and payloads. Version 1 bounds exclude all NaNs; counts describe them instead.
-
-Nulls are counted separately. Descending sort options and null placement do not
-change the ascending bounds. An ordering rule does not require bounds support
-for every Arrow type; an unavailable bound must remain unknown.
-
-Writers and readers must keep these rules when upgrading Arrow. If a query uses
-different comparison rules, its reader may use these statistics to skip data
-only when it can prove that no matching rows will be lost.
+If a query uses different comparison rules, a table-level consumer may use the
+statistics to skip data only when it can prove that no matching rows will be lost.
 
 ## Version 1 statistics fields
 
@@ -76,17 +63,17 @@ statistics for individual child fields.
 A null bound does not, by itself, mean that all rows are null. Use the counts:
 
 - If `zone_length = null_count + nan_count`, no non-null, non-NaN values remain.
-- Otherwise, a null bound means that bound is unknown. A reader cannot use it
+- Otherwise, a null bound means that bound is unknown. A consumer cannot use it
   to exclude values.
 
 Each record must satisfy `null_count + nan_count <= zone_length` and
-`negative_nan_count <= nan_count`. Readers must check these constraints without
+`negative_nan_count <= nan_count`. Consumers must check these constraints without
 overflowing the arithmetic.
 
 ## Storage layout
 
-The data file's schema metadata tells the reader where to find each column's
-seed. The key is `lance.seed.<column_name>` and the value is
+The table layer locates each column's seed through the data file's generic
+schema metadata. The key is `lance.seed.<column_name>` and the value is
 `<buffer_index>:<rows_per_zone>`. For example, `lance.seed.price = "7:8192"`
 means: read the `price` statistics from global buffer 7 in this file, with a
 configured zone size of 8,192 rows. This locator is unchanged from version 0.
@@ -149,10 +136,10 @@ bitmap optional; min/max and counts do not depend on it.
 
 ## Consuming and aggregating statistics
 
-Before using a seed, readers must check its version, column type, zone size,
-and which physical rows it describes. If the version is unsupported, they can
-read the column instead. A malformed seed of a known version is an error;
-readers must not try to interpret it as version 0.
+Before using a seed, table-level consumers must check its version, column type,
+zone size, and which physical rows it describes. If the version is unsupported,
+they can read the column instead. A malformed seed of a known version is an
+error; consumers must not try to interpret it as version 0.
 
 For pruning, use min/max for non-NaN values and the NaN counts separately.
 Negative NaNs sort below non-NaN values; positive NaNs sort above them. The
@@ -181,7 +168,7 @@ not fix existing ZoneMap index reader behavior.
 
 ## Version 0: existing seeds
 
-Existing seeds have no `version` metadata entry. Readers must interpret those
+Existing seeds have no `version` metadata entry. Consumers must interpret those
 buffers as version 0, using this schema:
 
 ```python
@@ -198,7 +185,7 @@ Version 1 changes three things: it adds `version = "1"` to the seed's metadata,
 adds `negative_nan_count`, and keeps all NaNs out of min/max.
 
 Version 0 records only the total NaN count. Its `max` may contain a `+NaN`
-marker even when all NaNs are negative. Readers must not treat that marker as
+marker even when all NaNs are negative. Consumers must not treat that marker as
 proof of a positive NaN, or as a bound on non-NaN values. When `nan_count > 0`,
 either sign remains possible.
 
