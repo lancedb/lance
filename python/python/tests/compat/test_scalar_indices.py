@@ -15,12 +15,18 @@ from pathlib import Path
 
 import lance
 import pyarrow as pa
+from packaging.version import Version
 
 from .compat_decorator import (
     UpgradeDowngradeTest,
     compat_test,
 )
 from .util import safe_data_storage_version
+
+#: The first release that reads and writes BTREE in the row-address domain
+#: (#9481). A pinned build from here on understands the format the current
+#: build writes.
+ROW_ADDRESS_DOMAIN_SINCE = Version("14.0.0b16")
 
 
 @compat_test(min_version="0.30.0")
@@ -138,6 +144,17 @@ class BTreeRowAddressDomainIndex(UpgradeDowngradeTest):
         """
         return self._running_in_old_venv
 
+    def _reads_row_address_domain(self) -> bool:
+        """Whether the pinned build understands the format under test.
+
+        Being an older build is not the same as predating the migration: the
+        pinned release moves forward with every beta, so from
+        ROW_ADDRESS_DOMAIN_SINCE on it reads the format the current build
+        writes and is expected to use the index like any other build that
+        understands it.
+        """
+        return Version(self.compat_version) >= ROW_ADDRESS_DOMAIN_SINCE
+
     def create(self):
         """Create a stable-row-id dataset with a BTREE index."""
         shutil.rmtree(self.path, ignore_errors=True)
@@ -176,7 +193,10 @@ class BTreeRowAddressDomainIndex(UpgradeDowngradeTest):
         """An old-format index must be used by the current build; a
         too-new one must be safely ignored (but answers must stay correct)
         by an older build."""
-        self._assert_queryable(expect_index_used=not self._is_old_build())
+        self._assert_queryable(
+            expect_index_used=not self._is_old_build()
+            or self._reads_row_address_domain()
+        )
 
     def check_write(self):
         """Insert a row and update the index, then verify old and new rows
