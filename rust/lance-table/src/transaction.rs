@@ -47,7 +47,7 @@ pub use operation::{
     DataOverlayGroup, DataReplacementGroup, Operation, RewriteGroup, RewrittenIndex,
     TaggedRewriteAssembly, UpdateMode, UpdatedFragmentOffsets, reordered_sources,
 };
-pub use prepare::{FragReuseUpdate, PreparedIndices};
+pub use prepare::{DerivedStatsUpdate, FragReuseUpdate, PreparedIndices};
 pub use row_version::has_writer_placed_lineage;
 pub use update_map::{
     UpdateMap, UpdateMapEntry, translate_config_updates, translate_schema_metadata_updates,

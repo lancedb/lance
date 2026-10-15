@@ -270,6 +270,34 @@ pub(crate) async fn write_records(
     Ok(vec![file])
 }
 
+/// Write one statistics segment file from fully-formed records.
+///
+/// Records are sorted by fragment id with last-writer-wins dedup. Returns the
+/// created index description; the caller owns registering it (with a coverage
+/// bitmap that is a subset of the written records).
+pub async fn write_fragment_stats_segment(
+    records: Vec<FragmentStatsRecord>,
+    data_type: &DataType,
+    index_store: &dyn IndexStore,
+) -> Result<CreatedIndex> {
+    let files = write_records(records, data_type, index_store).await?;
+    Ok(CreatedIndex {
+        index_details: make_fragment_column_stats_details(),
+        index_version: FRAGMENT_COLUMN_STATS_INDEX_VERSION,
+        files,
+    })
+}
+
+/// Fold one seed payload into a record (see the module rules); `None` means
+/// the fragment stays uncovered.
+pub fn fold_seed_payload(
+    seed: &FragmentSeed,
+    expected_row_count: u64,
+    data_type: &DataType,
+) -> Option<FragmentStatsRecord> {
+    fold_seed_to_record(seed, expected_row_count, data_type)
+}
+
 /// Build index files from pre-harvested fragment seeds.
 ///
 /// Returns the created index and the fragment ids that actually received
@@ -423,6 +451,11 @@ impl FragmentColumnStatsIndex {
 
     pub fn num_fragments(&self) -> usize {
         self.records.len()
+    }
+
+    /// The records of this segment, ordered by fragment id.
+    pub fn records(&self) -> &[FragmentStatsRecord] {
+        &self.records
     }
 
     pub fn value_data_type(&self) -> &DataType {

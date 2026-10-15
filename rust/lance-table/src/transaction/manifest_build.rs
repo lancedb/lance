@@ -621,7 +621,7 @@ impl Transaction {
             prepared.frag_reuse_update(),
             config.migration_next_row_id,
         )?;
-        let (original_indices, prepared_indices, frag_reuse) = prepared.into_parts();
+        let (original_indices, prepared_indices, frag_reuse, derived_stats) = prepared.into_parts();
         if config.use_stable_row_ids
             && config.migration_next_row_id.is_none()
             && current_manifest
@@ -709,6 +709,7 @@ impl Transaction {
             .and_then(|m| m.max_fragment_id())
             .map(|id| id + 1)
             .unwrap_or(0);
+        let first_assignable_fragment_id = fragment_id;
         let mut final_fragments = Vec::new();
         let mut final_indices = prepared_indices;
 
@@ -1685,6 +1686,47 @@ impl Transaction {
             (None, Some(false)) => Some(ConcreteFileVersion::V2_0),
             (None, None) => None,
         };
+
+        // Derived fragment statistics assembled by the commit path for this
+        // attempt: replace the superseded bucket segments and publish the
+        // rewritten ones. Validation is defensive, and on any mismatch the
+        // whole update is dropped: a data commit never fails, and coverage is
+        // never corrupted, over derived statistics. Every new segment's
+        // bitmap must stay within the fragments this build assigned ids to
+        // plus the fragments the replaced segments already covered.
+        if !derived_stats.is_empty() {
+            let replaced: std::collections::HashSet<uuid::Uuid> =
+                derived_stats.replaced_uuids.iter().copied().collect();
+            let mut allowed = roaring::RoaringBitmap::new();
+            for index in final_indices.iter() {
+                if replaced.contains(&index.uuid)
+                    && let Some(bitmap) = &index.fragment_bitmap
+                {
+                    allowed |= bitmap;
+                }
+            }
+            if first_assignable_fragment_id < fragment_id {
+                allowed.insert_range(first_assignable_fragment_id as u32..fragment_id as u32);
+            }
+            let existing_uuids: std::collections::HashSet<uuid::Uuid> =
+                final_indices.iter().map(|index| index.uuid).collect();
+            let valid = derived_stats.new_segments.iter().all(|segment| {
+                !existing_uuids.contains(&segment.uuid)
+                    && segment
+                        .fragment_bitmap
+                        .as_ref()
+                        .is_some_and(|bitmap| bitmap.is_subset(&allowed))
+            });
+            if valid {
+                final_indices.retain(|index| !replaced.contains(&index.uuid));
+                final_indices.extend(derived_stats.new_segments.clone());
+            } else {
+                log::warn!(
+                    "dropping derived fragment statistics update: segments do not \
+                     match this attempt's fragments; coverage stays as it was"
+                );
+            }
+        }
 
         // Applied once the final index list is known, so it sees exactly the
         // indices this commit publishes rather than what any one operation arm

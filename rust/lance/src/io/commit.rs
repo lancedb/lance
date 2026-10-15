@@ -1618,13 +1618,24 @@ async fn prepare_attempt(
     } else {
         None
     };
-    transaction.prepare_indices(
+    let prepared = transaction.prepare_indices(
         Some(dataset.manifest.as_ref()),
         indices.as_ref().clone(),
         build_config,
         ledger,
         frag_reuse,
-    )
+    )?;
+    // Derived statistics registration is best effort: a failure here must
+    // never fail or block the data commit.
+    let derived_stats =
+        match crate::index::fragstats::derive_fragment_stats_update(dataset, transaction).await {
+            Ok(update) => update,
+            Err(e) => {
+                log::warn!("skipping fragment statistics registration for this commit: {e}");
+                Default::default()
+            }
+        };
+    Ok(prepared.with_derived_stats(derived_stats))
 }
 
 pub(crate) async fn load_and_sort_new_transactions(

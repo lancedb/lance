@@ -41,6 +41,25 @@ pub enum FragReuseUpdate {
     Trim,
 }
 
+/// Derived index segments assembled by the commit path for one attempt:
+/// statistics bucket segments rewritten to absorb this transaction's new
+/// fragments. In-memory only and re-derived per attempt, like the fragment
+/// reuse assembly. Validation happens in the manifest build; on any mismatch
+/// the whole update is dropped so a data commit never fails over statistics.
+#[derive(Debug, Clone, Default)]
+pub struct DerivedStatsUpdate {
+    /// Segment uuids this update supersedes (the previous bucket files).
+    pub replaced_uuids: Vec<uuid::Uuid>,
+    /// The rewritten bucket segments to publish.
+    pub new_segments: Vec<IndexMetadata>,
+}
+
+impl DerivedStatsUpdate {
+    pub fn is_empty(&self) -> bool {
+        self.replaced_uuids.is_empty() && self.new_segments.is_empty()
+    }
+}
+
 /// The index lists of one commit attempt: the list as read from the
 /// manifest current at the attempt, the prepared list the builder starts
 /// from, and what was settled about the fragment reuse entry.
@@ -55,6 +74,7 @@ pub struct PreparedIndices {
     original: Vec<IndexMetadata>,
     prepared: Vec<IndexMetadata>,
     frag_reuse: FragReuseUpdate,
+    derived_stats: DerivedStatsUpdate,
 }
 
 impl PreparedIndices {
@@ -69,7 +89,15 @@ impl PreparedIndices {
             original,
             prepared,
             frag_reuse,
+            derived_stats: DerivedStatsUpdate::default(),
         }
+    }
+
+    /// Attach derived statistics segments assembled by the commit path for
+    /// this attempt. Consumed by the manifest build after the operation arm.
+    pub fn with_derived_stats(mut self, derived_stats: DerivedStatsUpdate) -> Self {
+        self.derived_stats = derived_stats;
+        self
     }
 
     /// The version of the manifest the lists were prepared against; `None`
@@ -94,7 +122,19 @@ impl PreparedIndices {
         &self.frag_reuse
     }
 
-    pub(crate) fn into_parts(self) -> (Vec<IndexMetadata>, Vec<IndexMetadata>, FragReuseUpdate) {
-        (self.original, self.prepared, self.frag_reuse)
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        Vec<IndexMetadata>,
+        Vec<IndexMetadata>,
+        FragReuseUpdate,
+        DerivedStatsUpdate,
+    ) {
+        (
+            self.original,
+            self.prepared,
+            self.frag_reuse,
+            self.derived_stats,
+        )
     }
 }
