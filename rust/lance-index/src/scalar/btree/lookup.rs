@@ -6,6 +6,43 @@
 use arrow_array::{Array, RecordBatch, UInt32Array, UInt64Array, cast::AsArray, types::UInt64Type};
 use lance_core::utils::address::RowAddress;
 
+use crate::scalar::LookupMatches;
+
+/// One page's positions in the shared, value-sorted input permutation.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct LookupPage {
+    pub(super) page_id: u32,
+    /// `None` keeps the general path for overlapping or irregular ranges.
+    pub(super) key_range: Option<(usize, usize)>,
+}
+
+/// Accumulate a query's candidates before constructing its two Arrow arrays.
+pub(super) struct LookupBuffers {
+    key_indices: Vec<u32>,
+    row_ids: Vec<u64>,
+}
+
+impl LookupBuffers {
+    pub(super) fn new(capacity: usize) -> Self {
+        Self {
+            key_indices: Vec::with_capacity(capacity),
+            row_ids: Vec::with_capacity(capacity),
+        }
+    }
+
+    pub(super) fn push(&mut self, key: u32, address: u64) {
+        self.key_indices.push(key);
+        self.row_ids.push(address);
+    }
+
+    pub(super) fn finish(self) -> LookupMatches {
+        LookupMatches {
+            key_indices: self.key_indices.into(),
+            row_ids: self.row_ids.into(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(super) struct RegularU64Pages {
     first: u64,
@@ -16,8 +53,12 @@ pub(super) struct RegularU64Pages {
 
 impl RegularU64Pages {
     pub(super) fn try_new(batch: &RecordBatch, start: usize) -> Option<Self> {
-        let mins = batch.column(0).as_primitive_opt::<UInt64Type>()?;
-        let maxs = batch.column(1).as_primitive_opt::<UInt64Type>()?;
+        let mins = batch
+            .column_by_name("min")?
+            .as_primitive_opt::<UInt64Type>()?;
+        let maxs = batch
+            .column_by_name("max")?
+            .as_primitive_opt::<UInt64Type>()?;
         if start >= batch.num_rows() || mins.is_null(start) || maxs.is_null(start) {
             return None;
         }
@@ -46,16 +87,45 @@ impl RegularU64Pages {
         })
     }
 
-    pub(super) fn candidate_pages(&self, keys: &UInt64Array, page_ids: &[u32]) -> Vec<u32> {
-        let mut pages = Vec::with_capacity(keys.len());
-        for key in keys.iter().flatten() {
-            if key >= self.first && key <= self.last {
-                let position = self.start + ((key - self.first) / self.width) as usize;
-                pages.push(page_ids[position]);
+    pub(super) fn group_keys(
+        &self,
+        keys: &UInt64Array,
+        order: &[u32],
+        page_ids: &[u32],
+    ) -> Vec<LookupPage> {
+        let mut pages: Vec<LookupPage> = Vec::with_capacity(order.len().min(page_ids.len()));
+        for (position, &ordinal) in order.iter().enumerate() {
+            let key = keys.value(ordinal as usize);
+            if key < self.first {
+                continue;
+            }
+            if key > self.last {
+                break;
+            }
+            let page_id = page_ids[self.start + ((key - self.first) / self.width) as usize];
+            if let Some(last) = pages.last_mut()
+                && last.page_id == page_id
+                && let Some((_, end)) = &mut last.key_range
+            {
+                *end = position + 1;
+            } else {
+                pages.push(LookupPage {
+                    page_id,
+                    key_range: Some((position, position + 1)),
+                });
             }
         }
-        pages.sort_unstable();
-        pages.dedup();
+        pages.sort_unstable_by_key(|page| page.page_id);
+        // Repeated physical page IDs must still be evaluated once. Their
+        // disjoint input slices use the general lookup rather than losing keys.
+        pages.dedup_by(|later, earlier| {
+            if later.page_id == earlier.page_id {
+                earlier.key_range = None;
+                true
+            } else {
+                false
+            }
+        });
         pages
     }
 }

@@ -736,7 +736,10 @@ mod tests {
                 true,
             )
             .unwrap();
-            let matches = keys.match_page(page, &NoOpMetricsCollector).unwrap();
+            let mut matches = crate::scalar::btree::LookupBuffers::new(queries.len());
+            keys.match_page(page, None, &mut matches, &NoOpMetricsCollector)
+                .unwrap();
+            let matches = matches.finish();
             let mut actual = matches
                 .key_indices
                 .values()
