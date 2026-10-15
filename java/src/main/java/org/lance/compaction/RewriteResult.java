@@ -36,7 +36,7 @@ public class RewriteResult implements Serializable {
   private final long readVersion;
 
   // Serialized RoaringTreemap of row addresses read from the original fragments.
-  // null for stable row IDs.
+  // null when nothing consumes them; with stable row IDs only defer_index_remap does.
   @Nullable private final byte[] rowAddrs;
 
   // Set only for a column repack: the fragment it repacked and the data files it wrote.

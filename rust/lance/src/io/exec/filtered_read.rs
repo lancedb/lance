@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::Poll;
@@ -12,11 +12,11 @@ use std::{
 use arrow_array::cast::AsArray;
 use arrow_array::types::UInt64Type;
 use arrow_array::{Array, BooleanArray, RecordBatch, RecordBatchOptions, UInt32Array};
-use arrow_schema::{Schema as ArrowSchema, SchemaRef};
+use arrow_schema::{DataType, Schema as ArrowSchema, SchemaRef};
 use datafusion::catalog::Session;
 use datafusion::common::runtime::SpawnedTask;
 use datafusion::common::stats::Precision;
-use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
@@ -34,8 +34,8 @@ use datafusion_physical_plan::filter::FilterExec;
 use datafusion_physical_plan::metrics::{BaselineMetrics, Count, MetricsSet, Time};
 use futures::stream::BoxStream;
 use futures::{FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt, future};
-use lance_arrow::RecordBatchExt;
-use lance_core::datatypes::{OnMissing, Schema as LanceSchema};
+use lance_arrow::{DataTypeExt, RecordBatchExt};
+use lance_core::datatypes::{Field, OnMissing, Schema as LanceSchema, format_field_path_minimal};
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::utils::futures::FinallyStreamExt;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
@@ -1507,7 +1507,7 @@ impl FilteredReadStream {
         };
 
         if let Some(filter) = &fragment_read_task.filter {
-            let filter_cols = Planner::column_names_in_expr(filter);
+            let filter_cols = filter_read_columns(filter, fragment_read_task.projection.as_ref());
             if !filter_cols.is_empty() {
                 fragment_read_task.projection = Arc::new(
                     fragment_read_task
@@ -1738,6 +1738,128 @@ impl FilteredReadStream {
                 future::ready(Ok(Some(result)))
             })
     }
+}
+
+/// Columns a filter needs read, with a column that appears only as the operand
+/// of `IS NULL` / `IS NOT NULL` replaced by its narrowest fixed-width leaf.
+///
+/// A nested column's validity is carried by every leaf under it, so the check
+/// is answered from one narrow leaf instead of the whole column. A column with
+/// no such leaf (a bare `large_binary`, a blob) is read whole.
+pub(crate) fn filter_read_columns(filter: &Expr, projection: &Projection) -> Vec<String> {
+    let null_checked = null_check_only_columns(filter);
+    let schema = projection.base_schema();
+    Planner::column_names_in_expr(filter)
+        .into_iter()
+        .map(|column| {
+            if !null_checked.contains(&column) {
+                return column;
+            }
+            schema
+                .resolve(&column)
+                .and_then(|fields| validity_leaf(fields.last()?))
+                .map(|leaf| format!("{column}.{leaf}"))
+                .unwrap_or(column)
+        })
+        .collect()
+}
+
+/// Columns referenced only as the direct operand of a null check.
+fn null_check_only_columns(filter: &Expr) -> HashSet<String> {
+    let mut null_checked = HashSet::new();
+    let mut other = HashSet::new();
+    filter
+        .apply(|expr| {
+            match expr {
+                Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
+                    if let Expr::Column(column) = inner.as_ref() {
+                        null_checked.insert(column.name.clone());
+                        return Ok(TreeNodeRecursion::Jump);
+                    }
+                }
+                Expr::Column(column) => {
+                    other.insert(column.name.clone());
+                }
+                _ => {}
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })
+        .expect("infallible visitor");
+    null_checked.difference(&other).cloned().collect()
+}
+
+/// Path, relative to `field`, of its narrowest fixed-width leaf, preferring
+/// leaves under fewer list levels. `None` when `field` is a leaf, is stored as
+/// one physical column (blob, packed struct, map), or has no such leaf.
+fn validity_leaf(field: &Field) -> Option<String> {
+    fn fixed_width(data_type: &DataType) -> Option<usize> {
+        match data_type {
+            DataType::Boolean => Some(1),
+            other => other.byte_width_opt(),
+        }
+    }
+    fn is_atomic(field: &Field) -> bool {
+        field.is_blob()
+            || field.is_packed_struct()
+            || matches!(field.data_type(), DataType::Map(..))
+    }
+    fn walk(field: &Field, list_depth: usize) -> Option<((usize, usize), Vec<&str>)> {
+        if is_atomic(field) {
+            return None;
+        }
+        if let Some(width) = fixed_width(&field.data_type()) {
+            return Some(((list_depth, width), vec![]));
+        }
+        let child_depth = list_depth + usize::from(!field.data_type().is_struct());
+        field
+            .children
+            .iter()
+            .filter_map(|child| {
+                let (score, mut path) = walk(child, child_depth)?;
+                path.insert(0, child.name.as_str());
+                Some((score, path))
+            })
+            .min_by_key(|(score, _)| *score)
+    }
+    let (_, path) = walk(field, 0)?;
+    (!path.is_empty()).then(|| format_field_path_minimal(&path))
+}
+
+/// Top-level names of the projected fields, listing a partially projected
+/// nested field by the paths of its projected leaves.
+fn projected_column_names(projection: &Projection) -> Vec<String> {
+    fn leaf_count(field: &Field) -> usize {
+        if field.children.is_empty() {
+            1
+        } else {
+            field.children.iter().map(leaf_count).sum()
+        }
+    }
+    fn leaf_paths<'a>(field: &'a Field, prefix: &mut Vec<&'a str>, names: &mut Vec<String>) {
+        prefix.push(&field.name);
+        if field.children.is_empty() {
+            names.push(format_field_path_minimal(prefix));
+        } else {
+            for child in &field.children {
+                leaf_paths(child, prefix, names);
+            }
+        }
+        prefix.pop();
+    }
+    let base = projection.base_schema();
+    let mut names = Vec::new();
+    for field in &projection.to_bare_schema().fields {
+        let whole = field.is_blob()
+            || base
+                .field_by_id(field.id)
+                .is_none_or(|base_field| leaf_count(base_field) == leaf_count(field));
+        if whole {
+            names.push(field.name.clone());
+        } else {
+            leaf_paths(field, &mut Vec::new(), &mut names);
+        }
+    }
+    names
 }
 
 /// Options for a filtered read.
@@ -2021,7 +2143,7 @@ impl FilteredReadOptions {
                 continue;
             }
 
-            let filter_columns = Planner::column_names_in_expr(filter);
+            let filter_columns = filter_read_columns(filter, &self.projection);
             let projection = self
                 .projection
                 .clone()
@@ -2062,10 +2184,10 @@ impl FilteredReadOptions {
     ) -> Result<Self> {
         self.projection = projection;
         for (filter, physical_filter) in &mut self.physical_filters {
-            let projection = self
-                .projection
-                .clone()
-                .union_columns(Planner::column_names_in_expr(filter), OnMissing::Error)?;
+            let projection = self.projection.clone().union_columns(
+                filter_read_columns(filter, &self.projection),
+                OnMissing::Error,
+            )?;
             let schema = public_blob_v2_binary_projection_schema(&projection);
             *physical_filter = physical_filter
                 .clone()
@@ -3409,15 +3531,7 @@ impl DisplayAs for FilteredReadExec {
                 }
             };
         }
-        let columns = self
-            .options
-            .projection
-            .to_bare_schema()
-            .fields
-            .iter()
-            .map(|f| f.name.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
+        let columns = projected_column_names(&self.options.projection).join(", ");
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
                 write!(
@@ -3515,15 +3629,13 @@ impl ExecutionPlan for FilteredReadExec {
         partition: Option<usize>,
     ) -> datafusion::error::Result<Arc<Statistics>> {
         if let RowSelector::RowStream(source) = &self.input {
-            // At most one output row per input row
-            let num_rows = source.plan.partition_statistics(partition)?.num_rows;
-            let num_rows = if self.options.physical_row_addr_prefilter.is_some() {
-                // Row-stream inputs may repeat keys, so bitmap cardinality is not
-                // an output bound. Filtering can only reduce the input estimate.
-                num_rows.to_inexact()
-            } else {
-                num_rows
-            };
+            // At most one output row per input row, since keys of deleted or
+            // missing rows are dropped
+            let num_rows = source
+                .plan
+                .partition_statistics(partition)?
+                .num_rows
+                .to_inexact();
             return Ok(Arc::new(Statistics {
                 num_rows,
                 total_byte_size: estimated_total_byte_size(num_rows, self.bytes_per_row),
@@ -3619,7 +3731,7 @@ impl ExecutionPlan for FilteredReadExec {
         // stats and basic filter shape)
 
         // Need to add in filter columns even though they aren't part of the projection
-        let filter_columns = Planner::column_names_in_expr(filter);
+        let filter_columns = filter_read_columns(filter, &self.options.projection);
         let read_projection = self
             .options
             .projection
@@ -6449,6 +6561,7 @@ mod tests {
         use super::*;
         use arrow_array::{Float32Array, LargeBinaryArray, StringArray, UInt64Array};
         use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
+        use datafusion::datasource::memory::MemorySourceConfig;
         use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr, expressions::col};
         use datafusion::physical_plan::ExecutionPlanProperties;
         use datafusion::physical_plan::sorts::sort::SortExec;
@@ -7437,10 +7550,20 @@ mod tests {
                 DataType::UInt64,
                 true,
             )]));
-            let batch = RecordBatch::try_new(input_schema, vec![Arc::new(UInt64Array::from(keys))])
-                .unwrap();
+            let batch = RecordBatch::try_new(
+                input_schema.clone(),
+                vec![Arc::new(UInt64Array::from(keys))],
+            )
+            .unwrap();
 
-            let plan = take_plan(&dataset, rows_input(vec![batch]), &["i"]).unwrap();
+            // The input knows its exact row count; the take can only bound its own
+            let input =
+                MemorySourceConfig::try_new_exec(&[vec![batch]], input_schema, None).unwrap();
+            let plan = take_plan(&dataset, input, &["i"]).unwrap();
+            assert_eq!(
+                plan.partition_statistics(None).unwrap().num_rows,
+                Precision::Inexact(2)
+            );
             let result = concat_batches(&plan.schema(), &run(&plan).await).unwrap();
             assert_eq!(result.num_rows(), 1);
             let i_col = result
@@ -7641,5 +7764,188 @@ mod tests {
             let plan = take_plan(&dataset, input, &["text"]).unwrap();
             plan.execute(0, Arc::new(TaskContext::default())).unwrap();
         }
+    }
+
+    fn null_check_schema() -> ArrowSchema {
+        use arrow_schema::{Field as ArrowField, Fields};
+        let narrow_wide = |narrow: ArrowField| {
+            DataType::Struct(Fields::from(vec![
+                narrow,
+                ArrowField::new("data", DataType::LargeBinary, true),
+            ]))
+        };
+        let list = |item: DataType| DataType::List(Arc::new(ArrowField::new("item", item, true)));
+        let idx = || ArrowField::new("idx", DataType::Int32, true);
+        ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, true),
+            ArrowField::new("cells", list(narrow_wide(idx())), true),
+            ArrowField::new(
+                "st",
+                DataType::Struct(Fields::from(vec![
+                    ArrowField::new("name", DataType::Utf8, true),
+                    ArrowField::new("flag", DataType::Boolean, true),
+                    ArrowField::new("data", DataType::LargeBinary, true),
+                ])),
+                true,
+            ),
+            ArrowField::new("deep", list(list(narrow_wide(idx()))), true),
+            // The leaf under no list wins over the narrower one under a list
+            ArrowField::new(
+                "mix",
+                DataType::Struct(Fields::from(vec![
+                    ArrowField::new("tags", list(DataType::Int8), true),
+                    ArrowField::new(
+                        "inner",
+                        narrow_wide(ArrowField::new("n", DataType::Int64, true)),
+                        true,
+                    ),
+                    ArrowField::new("blob", DataType::LargeBinary, true),
+                ])),
+                true,
+            ),
+            ArrowField::new("raw", DataType::LargeBinary, true),
+            ArrowField::new("rawlist", list(DataType::LargeBinary), true),
+            ArrowField::new(
+                "wide",
+                DataType::Struct(Fields::from(vec![
+                    ArrowField::new("a", DataType::Utf8, true),
+                    ArrowField::new("b", DataType::LargeBinary, true),
+                ])),
+                true,
+            ),
+            ArrowField::new(
+                "dict",
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                true,
+            ),
+            ArrowField::new(
+                "dstruct",
+                DataType::Struct(Fields::from(vec![
+                    ArrowField::new(
+                        "d",
+                        DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                        true,
+                    ),
+                    ArrowField::new("n", DataType::Int16, true),
+                ])),
+                true,
+            ),
+            ArrowField::new(
+                "vec",
+                DataType::FixedSizeList(
+                    Arc::new(ArrowField::new("item", DataType::Float32, true)),
+                    4,
+                ),
+                true,
+            ),
+            ArrowField::new(
+                "fsl",
+                DataType::FixedSizeList(
+                    Arc::new(ArrowField::new("item", narrow_wide(idx()), true)),
+                    2,
+                ),
+                true,
+            ),
+            ArrowField::new(
+                "dotted",
+                narrow_wide(ArrowField::new("a.b", DataType::Int32, true)),
+                true,
+            ),
+            ArrowField::new(
+                "tick",
+                narrow_wide(ArrowField::new("a`b", DataType::Int32, true)),
+                true,
+            ),
+            ArrowField::new("packed", narrow_wide(idx()), true).with_metadata(HashMap::from([(
+                "lance-encoding:packed".to_string(),
+                "true".to_string(),
+            )])),
+            ArrowField::new("lb", DataType::LargeBinary, true).with_metadata(HashMap::from([(
+                "lance-encoding:blob".to_string(),
+                "true".to_string(),
+            )])),
+            crate::blob::blob_field("b2", true),
+            ArrowField::new(
+                "m",
+                DataType::Map(
+                    Arc::new(ArrowField::new(
+                        "entries",
+                        DataType::Struct(Fields::from(vec![
+                            ArrowField::new("keys", DataType::Utf8, false),
+                            ArrowField::new("values", DataType::Int32, true),
+                        ])),
+                        false,
+                    )),
+                    false,
+                ),
+                true,
+            ),
+        ])
+    }
+
+    #[rstest]
+    #[case::list_of_struct("cells IS NULL", &["cells.item.idx"])]
+    #[case::is_not_null("cells IS NOT NULL", &["cells.item.idx"])]
+    #[case::negated("NOT (cells IS NULL)", &["cells.item.idx"])]
+    #[case::with_other_column("cells IS NULL OR id > 5", &["cells.item.idx", "id"])]
+    #[case::both_checks("cells IS NULL AND NOT (cells IS NOT NULL)", &["cells.item.idx"])]
+    #[case::referenced_elsewhere("st IS NULL AND st.name = 'x'", &["st", "st.name"])]
+    #[case::struct_only_boolean_leaf("st IS NULL", &["st.flag"])]
+    #[case::nested_lists("deep IS NULL", &["deep.item.item.idx"])]
+    #[case::fewer_lists_beats_narrower("mix IS NULL", &["mix.inner.n"])]
+    #[case::bare_binary("raw IS NULL", &["raw"])]
+    #[case::list_of_binary("rawlist IS NULL", &["rawlist"])]
+    #[case::struct_of_wide("wide IS NULL", &["wide"])]
+    #[case::dictionary("dict IS NULL", &["dict"])]
+    #[case::dictionary_sibling("dstruct IS NULL", &["dstruct.n"])]
+    #[case::fixed_size_list("vec IS NULL", &["vec"])]
+    #[case::fixed_size_list_of_struct("fsl IS NULL", &["fsl.item.idx"])]
+    #[case::dotted_leaf("dotted IS NULL", &["dotted.`a.b`"])]
+    #[case::backtick_leaf("tick IS NULL", &["tick.`a``b`"])]
+    #[case::packed_struct("packed IS NULL", &["packed"])]
+    #[case::legacy_blob("lb IS NULL", &["lb"])]
+    #[case::blob_v2("b2 IS NULL", &["b2"])]
+    #[case::map("m IS NULL", &["m"])]
+    fn test_filter_read_columns(#[case] filter: &str, #[case] expected: &[&str]) {
+        let arrow_schema = null_check_schema();
+        let schema = Arc::new(LanceSchema::try_from(&arrow_schema).unwrap());
+        let expr = Planner::new(Arc::new(arrow_schema))
+            .parse_filter(filter)
+            .unwrap();
+        let columns = filter_read_columns(&expr, &Projection::empty(schema.clone()));
+        assert_eq!(columns, expected);
+        for column in &columns {
+            assert!(
+                schema.resolve(column).is_some(),
+                "{column} does not resolve"
+            );
+        }
+    }
+
+    #[test]
+    fn test_filter_read_columns_projected_column_stays_whole() {
+        let arrow_schema = null_check_schema();
+        let schema = Arc::new(LanceSchema::try_from(&arrow_schema).unwrap());
+        let expr = Planner::new(Arc::new(arrow_schema))
+            .parse_filter("cells IS NULL")
+            .unwrap();
+        let projection = Projection::empty(schema.clone())
+            .union_column("cells", OnMissing::Error)
+            .unwrap();
+        let columns = filter_read_columns(&expr, &projection);
+        let read = projection
+            .clone()
+            .union_columns(columns, OnMissing::Error)
+            .unwrap();
+        assert_eq!(read.field_ids, projection.field_ids);
+        assert_eq!(projected_column_names(&read), vec!["cells"]);
+
+        let narrow = Projection::empty(schema)
+            .union_columns(["id", "cells.item.idx"], OnMissing::Error)
+            .unwrap();
+        assert_eq!(
+            projected_column_names(&narrow),
+            vec!["id", "cells.item.idx"]
+        );
     }
 }

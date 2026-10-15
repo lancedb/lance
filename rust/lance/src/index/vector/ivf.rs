@@ -2547,6 +2547,7 @@ pub(crate) async fn merge_segments(
                 dataset,
                 owned_fragments,
                 &no_deleted_fragments,
+                false,
             )
             .await?
             .ok_or_else(|| {
@@ -5972,6 +5973,7 @@ mod tests {
                     upper_bound: None,
                     minimum_nprobes: 1,
                     maximum_nprobes: None,
+                    search_effort: 0.5,
                     ef: None,
                     refine_factor: None,
                     metric_type: Some(MetricType::L2),

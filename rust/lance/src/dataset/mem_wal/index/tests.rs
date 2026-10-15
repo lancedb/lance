@@ -154,7 +154,7 @@ impl MemIndexPlugin for StubPlugin {
     fn query_parser(
         &self,
         index_name: String,
-        _index_details: Option<&prost_types::Any>,
+        _params: &dyn MemIndexParams,
     ) -> Option<Box<dyn ScalarQueryParser>> {
         Some(Box::new(SargableQueryParser::new(
             index_name,
@@ -1256,9 +1256,9 @@ fn a_stand_in_full_text_index_reports_its_granularity() {
     );
 }
 
-/// Settings that differ only in a cached schema lookup are the same index; a
-/// plugin of another type with the same name, or another column or field, is
-/// not.
+/// Settings that differ only in a cached schema lookup are the same index;
+/// other settings, a plugin of another type with the same name, or another
+/// column or field are not.
 #[test]
 fn same_index_compares_what_an_index_is_built_from() {
     let arrow = ArrowSchema::new(vec![Field::new("text", DataType::Utf8, true)]);
@@ -1287,12 +1287,6 @@ fn same_index_compares_what_an_index_is_built_from() {
         "text",
         InvertedIndexParams::default().with_position(true),
     )));
-    let mut rebuilt = unresolved.clone();
-    rebuilt.index_details = Some(Arc::new(prost_types::Any {
-        type_url: "/lance.table.InvertedIndexDetails".to_string(),
-        value: vec![1],
-    }));
-    assert!(!unresolved.same_index(&rebuilt));
 }
 
 /// One index listed twice is one index; two different ones under one name are
