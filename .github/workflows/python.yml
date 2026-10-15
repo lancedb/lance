@@ -182,14 +182,14 @@ jobs:
           assert "__lance_frag_reuse" in names, "recording is off"
           EOF
           pytest -v --junitxml=recording.xml \
-            python/tests/test_optimize.py::test_public_compaction_keeps_recording_with_stable_row_ids \
-            python/tests/test_optimize.py::test_raw_rewrite_without_its_moves_is_refused_with_stable_row_ids \
+            python/tests/test_optimize.py::test_public_compaction_records_only_when_deferred_with_stable_row_ids \
+            python/tests/test_optimize.py::test_raw_rewrite_without_recording_falls_back_to_scans_with_stable_row_ids \
             python/tests/test_optimize.py::test_frag_reuse_index_cannot_be_dropped_with_stable_row_ids
           python - <<'EOF'
           import xml.etree.ElementTree as ET
           suite = ET.parse("recording.xml").getroot().find("testsuite")
           counts = {key: int(suite.get(key)) for key in ("tests", "failures", "errors", "skipped")}
-          assert counts == {"tests": 4, "failures": 0, "errors": 0, "skipped": 0}, counts
+          assert counts == {"tests": 5, "failures": 0, "errors": 0, "skipped": 0}, counts
           print("ran with recording:", ", ".join(case.get("name") for case in suite.iter("testcase")))
           EOF
 

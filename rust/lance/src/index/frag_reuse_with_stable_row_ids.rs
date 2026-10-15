@@ -42,18 +42,6 @@ pub fn has_frag_reuse_with_stable_row_ids(manifest: &Manifest, indices: &[IndexM
     manifest.uses_stable_row_ids() && indices.iter().any(is_frag_reuse_index_entry)
 }
 
-/// Whether a compaction of this stable-row-id table records its row-address
-/// moves. `defer_index_remap` starts recording; once the entry exists, even an
-/// empty one, every compaction records whatever the option says.
-pub fn records_compaction_moves(
-    manifest: &Manifest,
-    indices: &[IndexMetadata],
-    defer_index_remap: bool,
-) -> bool {
-    manifest.uses_stable_row_ids()
-        && (defer_index_remap || has_frag_reuse_with_stable_row_ids(manifest, indices))
-}
-
 /// `supports_batch_row_id_remapping` is only a proxy for applying the legacy
 /// fragment reuse index on load, so every admitted type needs a query test on
 /// that path.

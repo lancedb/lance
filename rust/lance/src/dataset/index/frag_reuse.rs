@@ -101,13 +101,13 @@ impl Dataset {
 /// Typically run after [`compact_files`] with deferred remap and per-index
 /// [`remap_column_index`] have caught the indexes up.
 ///
-/// On a table with stable row ids, readers other than indices also translate
-/// old row addresses through the history, so cleanup removes only its oldest
-/// versions, up to the first one an index still needs, and keeps every later
-/// version as it is. It keeps the entry when it removes every version, so later
-/// compactions keep recording. Nothing keeps a version for readers other than
-/// indices: once no index needs it, it is removed even if an application still
-/// translates addresses through it.
+/// On a table with stable row ids, cleanup removes only the oldest versions, up
+/// to the first one an index of the manifest still needs, and keeps every later
+/// version as it is, so an address a kept version maps still translates through
+/// every later recorded move. It keeps the entry when it removes every version.
+/// Nothing keeps a version for readers other than indices: once no index needs
+/// it, it is removed even if an application still translates addresses through
+/// it.
 ///
 /// # Errors
 ///

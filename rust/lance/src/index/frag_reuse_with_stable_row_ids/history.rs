@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! On a stable-row-id table the fragment reuse index is the row-address
-//! history readers translate old addresses through. A publication must keep
-//! every recorded version exactly, and a rewrite must append the one version
-//! that records its own moves. Only a cleanup, a commit that replaces nothing
-//! but the fragment reuse index, may remove versions: the oldest ones, and only
-//! those no index of the published manifest still needs. Nothing keeps a
-//! version for readers other than indices.
+//! On a stable-row-id table, indices that store row addresses translate them
+//! through the fragment reuse history after a deferred compaction. A
+//! publication must keep every recorded version exactly. A rewrite that carries
+//! the history appends the one version recording its own moves; a rewrite that
+//! does not leaves it unchanged, and its address indices stop covering the
+//! fragments it rewrites. Only a cleanup, a commit that replaces nothing but
+//! the fragment reuse index, may remove versions: the oldest ones, and only
+//! those no index of the published manifest still needs.
 
 use std::io::Cursor;
 use std::sync::Arc;
@@ -53,9 +54,10 @@ fn sole_v0_entry(indices: &[IndexMetadata]) -> std::result::Result<Option<&Index
 
 /// Refuse a commit that would lose or alter recorded history on a stable-row-id
 /// table, or append a version that does not record its rewrite or whose stamp
-/// misplaces it. A cleanup may trim the oldest versions no index needs
-/// ([`validate_trim`]). `base` is the manifest the commit replaces (for a
-/// detached commit, the one it builds on).
+/// misplaces it. A rewrite that does not carry the history records nothing. A
+/// cleanup may trim the oldest versions no index needs ([`validate_trim`]).
+/// `base` is the manifest the commit replaces (for a detached commit, the one it
+/// builds on).
 ///
 /// A refusal is retryable when the history or index it misses was published
 /// after the writer's `read` snapshot, and `InvalidInput` when the writer saw
@@ -83,8 +85,13 @@ pub async fn validate_frag_reuse_history(
     ) else {
         return Ok(());
     };
-    let groups = match operation {
-        Operation::Rewrite { groups, .. } if !groups.is_empty() => Some(groups.as_slice()),
+    // The groups of a rewrite, and whether it carries the history to record them in.
+    let rewrite = match operation {
+        Operation::Rewrite {
+            groups,
+            frag_reuse_index,
+            ..
+        } if !groups.is_empty() => Some((groups.as_slice(), frag_reuse_index.is_some())),
         _ => None,
     };
 
@@ -132,7 +139,7 @@ pub async fn validate_frag_reuse_history(
         }
     };
 
-    match (groups, appended.as_slice()) {
+    match (rewrite, appended.as_slice()) {
         (None, []) => Ok(()),
         (None, versions) => Err(Error::invalid_input(format!(
             "Cannot commit a {} that adds {} fragment reuse version(s): a version may only be \
@@ -140,18 +147,18 @@ pub async fn validate_frag_reuse_history(
             operation.name(),
             versions.len()
         ))),
-        (Some(_), []) => match replaced {
-            Some(_) => Err(read.refuse(Loss::Unrecorded, base).await),
-            None => Err(Error::invalid_input(
-                "Cannot commit a rewrite that creates a fragment reuse index without recording \
-                 its own row-address moves in it",
-            )),
-        },
-        (Some(groups), [version]) => {
+        // Unrecorded: the manifest build drops the rewritten fragments from the
+        // coverage of indices that store row addresses.
+        (Some((_, false)), []) => Ok(()),
+        (Some((_, true)), []) => Err(Error::invalid_input(
+            "Cannot commit a rewrite that carries a fragment reuse index without appending the \
+             version that records its own row-address moves",
+        )),
+        (Some((groups, _)), [version]) => {
             validate_appended_version(base, proposed_manifest, groups, version).await?;
             validate_appended_stamp(&base_indices, last_stamp, groups, version)
         }
-        (Some(groups), versions) => Err(Error::invalid_input(format!(
+        (Some((groups, _)), versions) => Err(Error::invalid_input(format!(
             "Cannot commit a rewrite of {} group(s) that appends {} fragment reuse versions: a \
              rewrite records its moves in exactly one version",
             groups.len(),
@@ -362,7 +369,6 @@ enum Loss<'a> {
     Removed,
     /// A recorded version is missing or no longer the same.
     Version(&'a FragReuseVersion),
-    Unrecorded,
 }
 
 impl ReadSnapshot<'_> {
@@ -381,7 +387,7 @@ impl ReadSnapshot<'_> {
         };
         let was_seen = match (&loss, &read_history) {
             (_, None) => false,
-            (Loss::Removed | Loss::Unrecorded, Some(_)) => true,
+            (Loss::Removed, Some(_)) => true,
             (Loss::Version(lost), Some(details)) => details
                 .versions
                 .iter()
@@ -390,10 +396,10 @@ impl ReadSnapshot<'_> {
         if was_seen {
             return Error::invalid_input(match loss {
                 Loss::Removed => format!(
-                    "Cannot remove the fragment reuse index of a table with stable row ids: it \
-                     holds the row-address history readers translate old addresses through, \
-                     which this table recorded at version {read_version}, the version this \
-                     commit read, and there is no supported way to stop recording"
+                    "Cannot remove the fragment reuse index of a table with stable row ids: \
+                     indices translate their row addresses through its history, which this table \
+                     held at version {read_version}, the version this commit read. A cleanup \
+                     removes the versions no index needs and keeps the entry"
                 ),
                 Loss::Version(lost) => format!(
                     "Cannot drop or alter the fragment reuse version stamped {} on a table with \
@@ -403,28 +409,17 @@ impl ReadSnapshot<'_> {
                      must be kept exactly",
                     lost.dataset_version
                 ),
-                Loss::Unrecorded => format!(
-                    "Cannot commit a rewrite that moves rows without recording their \
-                     row-address moves: this table with stable row ids already recorded them in \
-                     its fragment reuse index at version {read_version}, the version this commit \
-                     read, and every rewrite records from then on"
-                ),
             });
         }
         let message = match loss {
             Loss::Removed => format!(
-                "This commit would remove the fragment reuse index, which the table started \
-                 recording after version {read_version}, the version this commit read"
+                "This commit would remove the fragment reuse index, which the table gained \
+                 after version {read_version}, the version this commit read"
             ),
             Loss::Version(lost) => format!(
                 "This commit would drop or alter the fragment reuse version stamped {}, which \
                  was recorded after version {read_version}, the version this commit read",
                 lost.dataset_version
-            ),
-            Loss::Unrecorded => format!(
-                "This rewrite moves rows without recording their row-address moves, but the \
-                 table started recording them after version {read_version}, the version this \
-                 commit read"
             ),
         };
         Error::retryable_commit_conflict_source(
@@ -1218,28 +1213,72 @@ mod tests {
         }
     }
 
-    /// A rewrite that skips recording on a table that already records was
-    /// built wrong, whichever way it reaches publication.
+    /// Every row of `before` keeps its stable row id and value in `dataset`,
+    /// wherever it now lives.
+    async fn assert_rows_keep_their_ids(before: &HashMap<u64, (u64, i32)>, dataset: &Dataset) {
+        let by_id = |rows: &HashMap<u64, (u64, i32)>| {
+            rows.values()
+                .map(|(row_id, value)| (*row_id, *value))
+                .collect::<HashMap<_, _>>()
+        };
+        assert_eq!(by_id(&rows_by_addr(dataset).await), by_id(before));
+    }
+
+    /// A rewrite that does not carry the history publishes without recording:
+    /// the history stays as it was, and the zone map stops covering the
+    /// rewritten fragments, whose rows are scanned. A rewrite that carries the
+    /// history without appending its own moves is refused.
     #[rstest]
     #[tokio::test]
-    async fn test_rewrite_without_its_moves_is_refused(#[values(false, true)] detached: bool) {
+    async fn test_unrecorded_rewrite_keeps_the_history(
+        #[values(false, true)] carries_the_history: bool,
+        #[values(false, true)] detached: bool,
+    ) {
         let dir = TempStrDir::default();
-        let (mut dataset, before) = recording_table(dir.as_str(), Storage::Inline).await;
+        let (mut dataset, _) = recording_table(dir.as_str(), Storage::Inline).await;
+        create_zone_map(&mut dataset).await;
         let (group, _) = rewrite_of(&mut dataset, &[6, 7]).await;
+        let rewritten = group
+            .new_fragments
+            .iter()
+            .map(|fragment| fragment.id as u32)
+            .chain([6, 7])
+            .collect::<RoaringBitmap>();
         let recorded = history(&dataset).await;
+        let before = rows_by_addr(&dataset).await;
+        let frag_reuse_index = if carries_the_history {
+            Some(frag_reuse_entry(&dataset).await)
+        } else {
+            None
+        };
         let operation = Operation::Rewrite {
             groups: vec![group],
             rewritten_indices: vec![],
-            frag_reuse_index: None,
+            frag_reuse_index,
         };
-        assert_refused(
-            commit(&dataset, dataset.manifest.version, operation, detached).await,
-            "already recorded them in its fragment reuse index",
-        );
-        let latest = Dataset::open(dir.as_str()).await.unwrap();
-        assert_eq!(latest.manifest.version, dataset.manifest.version);
-        assert_same_history(&history(&latest).await, &recorded);
-        assert_translations_hold(&before, dir.as_str()).await;
+        let result = commit(&dataset, dataset.manifest.version, operation, detached).await;
+
+        if carries_the_history {
+            // On the main chain the rebase's shape check refuses it first.
+            let refusal = if detached {
+                "without appending the version that records"
+            } else {
+                "plus one version of its own"
+            };
+            assert_refused(result, refusal);
+            let latest = Dataset::open(dir.as_str()).await.unwrap();
+            assert_eq!(latest.manifest.version, dataset.manifest.version);
+            assert_same_history(&history(&latest).await, &recorded);
+            return;
+        }
+        let published = result.unwrap();
+        assert_same_history(&history(&published).await, &recorded);
+        let coverage = coverage_of(&load_all_indices(&published).await.unwrap(), "i_idx");
+        assert!(coverage.is_disjoint(&rewritten), "{coverage:?}");
+        assert_eq!(coverage, RoaringBitmap::from_iter([2, 5, 8, 9]));
+        assert_rows_keep_their_ids(&before, &published).await;
+        assert_answers_through(&published, "i_idx", "i >= 20 AND i < 50").await;
+        assert_answers_through(&published, "i_idx", "i >= 55").await;
     }
 
     /// A detached commit is checked against the manifest it builds on. History
@@ -1539,9 +1578,9 @@ mod tests {
         assert_translations_hold_at(&before, dir.as_str(), Some(version)).await;
     }
 
-    /// An ordinary compaction of the two newest fragments, adjacent in id
-    /// order, records its moves, and every row still translates.
-    async fn assert_ordinary_compaction_records(uri: &str, before: &HashMap<u64, (u64, i32)>) {
+    /// A deferred compaction of the two newest fragments, adjacent in id order,
+    /// records its moves, and every row still translates.
+    async fn assert_deferred_compaction_records(uri: &str, before: &HashMap<u64, (u64, i32)>) {
         let mut compactor = Dataset::open(uri).await.unwrap();
         let recorded = history(&compactor).await.len();
         let newest = compactor
@@ -1554,7 +1593,6 @@ mod tests {
             .collect::<Vec<_>>();
         let options = CompactionOptions {
             target_rows_per_fragment: 1_000,
-            defer_index_remap: false,
             ..compaction_of(&compactor, &newest)
         };
         let metrics = compact_files(&mut compactor, options, None).await.unwrap();
@@ -1565,7 +1603,7 @@ mod tests {
     }
 
     /// The promotion `restored` was refused: the main chain kept its version
-    /// and history, and ordinary compaction keeps recording on it.
+    /// and history, and a deferred compaction still records on it.
     async fn assert_promotion_refused(
         restored: Result<()>,
         message: &str,
@@ -1580,7 +1618,7 @@ mod tests {
         let latest = Dataset::open(uri).await.unwrap();
         assert_eq!(latest.manifest.version, version);
         assert_same_history(&history(&latest).await, recorded);
-        assert_ordinary_compaction_records(uri, before).await;
+        assert_deferred_compaction_records(uri, before).await;
     }
 
     /// Restoring a detached version promotes its history onto the main chain
@@ -1691,9 +1729,9 @@ mod tests {
 
     /// A detached version whose stamps and index versions are main-chain
     /// versions, as a compaction planned on the main chain records them,
-    /// promotes, and recording continues after it.
+    /// promotes, and a later deferred compaction records after it.
     #[tokio::test]
-    async fn test_promoting_a_detached_version_within_the_main_chain_keeps_recording() {
+    async fn test_promoting_a_detached_version_within_the_main_chain_is_allowed() {
         let dir = TempStrDir::default();
         let (mut dataset, before) = recording_table(dir.as_str(), Storage::Inline).await;
         create_zone_map(&mut dataset).await;
@@ -1720,7 +1758,7 @@ mod tests {
         assert_eq!(latest.manifest.version, dataset.manifest.version + 1);
         assert_eq!(history(&latest).await.len(), recorded.len() + 1);
         assert_translations_hold(&before, dir.as_str()).await;
-        assert_ordinary_compaction_records(dir.as_str(), &before).await;
+        assert_deferred_compaction_records(dir.as_str(), &before).await;
         let latest = Dataset::open(dir.as_str()).await.unwrap();
         assert_answers_through(&latest, "i_idx", "i >= 50").await;
     }
@@ -2373,11 +2411,12 @@ mod tests {
 
     /// A clone of a recording table whose rows were all deleted keeps stable
     /// row ids, the history and the row id high-water mark, so its next
-    /// compaction records. With no index, cleanup then trims every version,
-    /// and the emptied history records the compaction after that.
+    /// deferred compaction records. With no index, cleanup then trims every
+    /// version, and the emptied history records the deferred compaction after
+    /// that.
     #[rstest]
     #[tokio::test]
-    async fn test_clone_of_an_emptied_recording_table_keeps_recording(
+    async fn test_clone_of_an_emptied_recording_table_records_again(
         #[values(false, true)] is_shallow: bool,
     ) {
         let dir = TempStrDir::default();
@@ -2414,6 +2453,7 @@ mod tests {
             &mut clone,
             CompactionOptions {
                 target_rows_per_fragment: 20,
+                defer_index_remap: true,
                 ..Default::default()
             },
             None,
@@ -2446,6 +2486,7 @@ mod tests {
             &mut clone,
             CompactionOptions {
                 target_rows_per_fragment: 1_000,
+                defer_index_remap: true,
                 ..Default::default()
             },
             None,
@@ -2546,8 +2587,11 @@ mod tests {
         CaughtUp,
     }
 
-    /// Trimming every version preserves the empty recording marker.
-    /// Current handles see the trim; the previous snapshot retains its history.
+    /// Trimming every version keeps the empty entry. Current handles see the
+    /// trim; the previous snapshot retains its history. Only a deferred
+    /// compaction records into the empty history: without `defer_index_remap`
+    /// it stays empty, and a caught-up zone map stops covering the rewritten
+    /// fragments instead of following their rows.
     #[rstest]
     #[tokio::test]
     async fn test_cleanup_trims_the_history_no_index_needs(
@@ -2583,9 +2627,26 @@ mod tests {
             ..compaction_of(&dataset, &[6, 7])
         };
         compact_files(&mut dataset, options, None).await.unwrap();
-        assert_eq!(history(&dataset).await.len(), 1);
-        assert_translations_hold_through(&before, &dataset).await;
-        assert_translations_hold(&before, uri).await;
+        let output = dataset.manifest.max_fragment_id.unwrap();
+        let latest = Dataset::open(uri).await.unwrap();
+        assert!(has_frag_reuse_flag(&latest));
+        assert_rows_keep_their_ids(&before, &latest).await;
+        if defer_index_remap {
+            assert_eq!(history(&dataset).await.len(), 1);
+            assert_translations_hold_through(&before, &dataset).await;
+            assert_translations_hold(&before, uri).await;
+        } else {
+            assert!(history(&latest).await.is_empty());
+        }
+        if matches!(indexing, Indexing::CaughtUp) {
+            let coverage = coverage_of(&load_all_indices(&latest).await.unwrap(), "i_idx");
+            assert!(
+                !coverage.contains(6) && !coverage.contains(7),
+                "{coverage:?}"
+            );
+            assert_eq!(coverage.contains(output), defer_index_remap, "{coverage:?}");
+            assert_answers_through(&latest, "i_idx", "i >= 55").await;
+        }
     }
 
     /// A recording table as [`recording_table`] makes it, with a zone map built
@@ -2653,13 +2714,23 @@ mod tests {
         assert_answers_through(&latest, "i_idx", "i >= 55 AND i < 75").await;
     }
 
-    /// BTree v1 stores physical row addresses even with stable row IDs.
-    /// Both address-index types retain needed history through compaction and
-    /// republication; cleanup preserves recording after they catch up.
+    /// Every index type that stores row addresses lives with the history the
+    /// same way: zone maps, bloom filters and BTrees from format version 1. A
+    /// deferred compaction records its moves, which the index answers through.
+    /// A compaction without `defer_index_remap` records nothing, also across the
+    /// output of a recorded one: the index stops covering what it rewrote, which
+    /// is scanned, and the rows keep their stable row ids. Cleanup keeps the
+    /// version the index still needs, and the index republishes through it. A
+    /// later deferred compaction of the unrecorded output records its own moves
+    /// without giving the index coverage it never had, and neither does merging
+    /// the index's segments. Caught up, the index needs no version: cleanup
+    /// empties the history, keeps the entry, and the next deferred compaction
+    /// records into it.
     #[rstest]
     #[tokio::test]
     async fn test_address_index_lives_with_the_history(
-        #[values(IndexType::ZoneMap, IndexType::BTree)] index_type: IndexType,
+        #[values(IndexType::ZoneMap, IndexType::BloomFilter, IndexType::BTree)]
+        index_type: IndexType,
     ) {
         let dir = TempStrDir::default();
         let uri = dir.as_str();
@@ -2680,6 +2751,7 @@ mod tests {
         dataset.delete("i IN (1, 2, 5, 61)").await.unwrap();
         let params = match index_type {
             IndexType::ZoneMap => ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap),
+            IndexType::BloomFilter => ScalarIndexParams::for_builtin(BuiltinIndexType::BloomFilter),
             _ => ScalarIndexParams::default(),
         };
         dataset
@@ -2692,47 +2764,104 @@ mod tests {
         if index_type == IndexType::BTree {
             assert_eq!(index.index_version, 1);
         }
+        // Rows of fragments 0, 1 and 7 end up behind the unrecorded compaction;
+        // the others stay where they are or move only through recorded ones.
+        // A bloom filter answers only equality.
+        let (behind, elsewhere) = if index_type == IndexType::BloomFilter {
+            (["i = 15", "i = 73"], ["i = 25", "i = 45"])
+        } else {
+            (
+                ["i < 20", "i >= 70"],
+                ["i >= 20 AND i < 50", "i >= 50 AND i < 70"],
+            )
+        };
+        let assert_answers = async |dataset: &Dataset| {
+            for filter in behind.iter().chain(&elsewhere) {
+                assert_answers_through(dataset, "i_idx", filter).await;
+            }
+        };
+        let index_coverage = async |dataset: &Dataset| {
+            coverage_of(&load_all_indices(dataset).await.unwrap(), "i_idx")
+        };
         let before = rows_by_addr(&dataset).await;
 
-        let options = compaction_of(&dataset, &[0, 1, 3, 4]);
-        compact_files(&mut dataset, options, None).await.unwrap();
+        // Recorded, one compaction each so the outputs' ids are known:
+        // fragments 0 and 1 become 8, and 3 and 4 become 9.
+        assert_eq!(compact_recorded(&mut dataset, &[0, 1]).await, 8);
+        assert_eq!(compact_recorded(&mut dataset, &[3, 4]).await, 9);
         assert!(has_frag_reuse_flag(&dataset));
-        assert_answers_through(&dataset, "i_idx", "i < 80").await;
-        let options = CompactionOptions {
-            defer_index_remap: false,
-            ..compaction_of(&dataset, &[6, 7])
-        };
-        compact_files(&mut dataset, options, None).await.unwrap();
         let recorded = history(&dataset).await;
         assert_eq!(recorded.len(), 2);
-        assert_translations_hold(&before, uri).await;
-        assert_answers_through(&dataset, "i_idx", "i >= 55 AND i < 75").await;
+        assert_eq!(
+            index_coverage(&dataset).await,
+            RoaringBitmap::from_iter([2, 5, 6, 7, 8, 9])
+        );
+        assert_answers(&dataset).await;
+
+        // Unrecorded: 7 and the recorded output 8 become 10.
+        let options = CompactionOptions {
+            target_rows_per_fragment: 1_000,
+            defer_index_remap: false,
+            ..compaction_of(&dataset, &[7, 8])
+        };
+        compact_files(&mut dataset, options, None).await.unwrap();
+        let latest = Dataset::open(uri).await.unwrap();
+        assert_same_history(&history(&latest).await, &recorded);
+        let coverage = RoaringBitmap::from_iter([2, 5, 6, 9]);
+        assert_eq!(index_coverage(&latest).await, coverage);
+        assert_rows_keep_their_ids(&before, &latest).await;
+        let off_the_unrecorded_move = before
+            .iter()
+            .filter(|(addr, _)| ![0, 1, 7].contains(&(**addr >> 32)))
+            .map(|(addr, row)| (*addr, *row))
+            .collect::<HashMap<_, _>>();
+        assert_translations_hold(&off_the_unrecorded_move, uri).await;
+        assert_answers(&latest).await;
+
+        // The index still needs the recorded versions for 9.
         cleanup_frag_reuse_index(&mut dataset).await.unwrap();
         assert_same_history(&history(&dataset).await, &recorded);
-
         let saved = dataset.load_indices_by_name("i_idx").await.unwrap();
-        let translated = RoaringBitmap::from_iter([2, 5, 8, 9, 10]);
-        assert_eq!(coverage_of(&saved, "i_idx"), translated);
         dataset.drop_index("i_idx").await.unwrap();
         dataset
             .commit_existing_index_segments("i_idx", "i", saved)
             .await
             .unwrap();
-        let republished = dataset.load_indices_by_name("i_idx").await.unwrap();
-        assert_eq!(coverage_of(&republished, "i_idx"), translated);
-        assert_answers_through(&dataset, "i_idx", "i < 80").await;
+        assert_eq!(index_coverage(&dataset).await, coverage);
+        assert_answers(&dataset).await;
 
+        // Recorded again: the unrecorded output 10 and appended rows in 11.
+        let batch =
+            arrow_array::record_batch!(("i", Int32, (1000..1010).collect::<Vec<i32>>())).unwrap();
+        dataset
+            .append(
+                arrow_array::RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+                None,
+            )
+            .await
+            .unwrap();
+        let before = rows_by_addr(&dataset).await;
+        let output = compact_recorded(&mut dataset, &[10, 11]).await;
+        assert_eq!(history(&dataset).await.len(), 3);
+        assert_translations_hold(&before, uri).await;
+        let latest = Dataset::open(uri).await.unwrap();
+        assert_eq!(index_coverage(&latest).await, coverage);
+        assert_answers(&latest).await;
         catch_up_i_idx(&mut dataset).await;
+        let caught_up = index_coverage(&dataset).await;
+        assert!(!caught_up.contains(output), "{caught_up:?}");
+        assert_answers(&dataset).await;
+
         cleanup_frag_reuse_index(&mut dataset).await.unwrap();
         let latest = Dataset::open(uri).await.unwrap();
         assert!(history(&latest).await.is_empty());
         assert!(has_frag_reuse_flag(&latest));
-        assert_answers_through(&latest, "i_idx", "i < 80").await;
+        assert_answers(&latest).await;
         let before = rows_by_addr(&dataset).await;
         compact_recorded(&mut dataset, &[2, 5]).await;
         assert_eq!(history(&dataset).await.len(), 1);
         assert_translations_hold(&before, uri).await;
-        assert_answers_through(&dataset, "i_idx", "i < 80").await;
+        assert_answers(&dataset).await;
     }
 
     #[derive(Clone, Copy, Debug)]
