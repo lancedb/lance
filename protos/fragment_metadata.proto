@@ -86,11 +86,9 @@ message DataFragment {
    */
   uint64 physical_rows = 4;
 
-  /* Optional non-zero ID in Manifest.clustering describing how this fragment
-   * was organized when created, not a guarantee about its current values.
-   * Column replacement, overlays, and deletions preserve it. New fragments do
-   * not inherit it automatically; their creator sets it for their own layout.
-   * Absence makes no clustering claim. Requires writer flag 1 << 17.
+  /* Optional reference to a clustering definition in the same manifest.
+   * When present, the ID must be non-zero. Requires FLAG_OBJECT_METADATA (1 << 17)
+   * in writer_feature_flags; no clustering reader flag is required.
    */
   optional uint32 clustering_id = 15;
 

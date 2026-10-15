@@ -25,11 +25,9 @@ such as `<provider>.<clustering_id>.<key>`. Each provider defines its keys and v
 ### Fragment and Index Segment Information
 
 Each fragment and index segment may set `clustering_id` to a definition in the
-same manifest. The reference records how the object was organized when created;
-it does not guarantee its current values still follow that layout.
+same manifest.
 
-Providers can store extra per-object information, such as creation-time bucket,
-range, or group IDs, in the generic metadata maps. See
+Providers can store extra per-object information in the generic metadata maps. See
 [Fragment Metadata](index.md#fragment-metadata) and
 [Index Segment Metadata](../index/index.md#index-segment-metadata) for their
 definitions and maintenance rules.

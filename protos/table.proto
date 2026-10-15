@@ -424,12 +424,9 @@ message IndexMetadata {
    */
   repeated int32 covering_fields = 11;
 
-  /* Optional non-zero ID in Manifest.clustering recording this segment's grouping,
-   * not a guarantee about the current values in its fragments. Remap and
-   * rebuild of the existing group preserve it. Merges and rebuilds with different
-   * groups use provider-written output information; without a provider strategy,
-   * their outputs have no clustering information. Absence makes no clustering
-   * claim. Requires writer flag 1 << 17.
+  /* Optional reference to a clustering definition in the same manifest.
+   * When present, the ID must be non-zero. Requires FLAG_OBJECT_METADATA (1 << 17)
+   * in writer_feature_flags; no clustering reader flag is required.
    */
   optional uint32 clustering_id = 12;
 
