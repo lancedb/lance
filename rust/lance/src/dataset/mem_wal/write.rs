@@ -2224,6 +2224,7 @@ struct SharedWriterState {
 }
 
 impl SharedWriterState {
+    /// Bundle the handles the writer's put, freeze, and close paths share.
     #[allow(clippy::too_many_arguments)]
     fn new(
         memory: Arc<ArcSwap<ResidentMemTables>>,
@@ -2993,6 +2994,8 @@ impl ShardWriter {
         })
     }
 
+    /// Replay the WAL into memtables, then start the WAL-flush, index-apply,
+    /// and memtable-flush tasks.
     #[allow(clippy::too_many_arguments)]
     async fn open_memtable_mode(
         config: &ShardWriterConfig,
@@ -4364,8 +4367,7 @@ impl ShardWriter {
                     }
                     st.frozen_flush_watchers.iter().cloned().collect()
                 };
-                // A failing flush would otherwise retry forever and hold close
-                // here. Its generation stays in the WAL for the next open.
+                // Else a failing flush retries forever; replay recovers its generation.
                 writer_state.stop_flush_retries.cancel();
                 for mut watcher in watchers {
                     let stage_result = match watcher.await_value().await {
@@ -4800,7 +4802,7 @@ impl WalFlushHandler {
 /// First delay before a failed memtable flush is retried; it doubles per attempt.
 const FLUSH_RETRY_BASE_DELAY: Duration = Duration::from_millis(500);
 /// Longest delay between attempts at a failing memtable flush.
-const FLUSH_RETRY_MAX_DELAY: Duration = Duration::from_secs(30);
+const FLUSH_RETRY_MAX_DELAY: Duration = Duration::from_secs(10 * 60);
 
 /// Background handler for MemTable flush operations.
 ///
@@ -4829,6 +4831,7 @@ struct MemTableFlushHandler {
 }
 
 impl MemTableFlushHandler {
+    /// `stop_retrying` ends the retries of a failing flush when cancelled.
     #[allow(clippy::too_many_arguments)]
     fn new(
         state: Arc<RwLock<WriterState>>,
@@ -4912,10 +4915,8 @@ impl MemTableFlushHandler {
     /// then flushes to Lance storage. The WAL flush is already queued by
     /// freeze_memtable to ensure strict ordering of WAL entries.
     ///
-    /// A failed write of the generation is retried with backoff until it
-    /// lands, fails in a way a retry cannot fix (a fence or a refused
-    /// precondition), or `close` cancels the retries. Nothing later flushes
-    /// meanwhile, so the replay position never passes it.
+    /// A failed write is retried with backoff until it lands, fails for good
+    /// (fence, refused precondition), or `close` cancels; nothing later flushes meanwhile.
     ///
     /// Whether the flush succeeds or fails, the memtable's flush-completion
     /// watcher is always signaled and the backpressure queue is always drained
@@ -5021,8 +5022,7 @@ impl MemTableFlushHandler {
                     Ok(result) => return Ok(result),
                     Err(error) => error,
                 };
-                // A fence or a refused precondition fails the same way on
-                // every attempt.
+                // A fence or a refused precondition fails the same way every attempt.
                 if matches!(
                     error,
                     Error::Fenced { .. } | Error::Internal { .. } | Error::InvalidInput { .. }
@@ -9920,8 +9920,7 @@ mod tests {
         writer_b.close().await.unwrap();
     }
 
-    /// Rows in SSTables once a fresh writer has replayed the WAL and closed,
-    /// which flushes everything it replayed.
+    /// Rows in SSTables after a fresh writer replays the WAL and closes.
     async fn rows_after_reopen(
         store: &Arc<ObjectStore>,
         base_path: &Path,
@@ -9952,8 +9951,8 @@ mod tests {
             .sum()
     }
 
-    /// A failing flush is retried, and no later generation publishes ahead of
-    /// it, so every accepted row survives a crash once it lands.
+    /// A failing flush is retried before any later generation publishes, so no
+    /// accepted row is lost to a crash once it lands.
     #[tokio::test]
     async fn a_failing_flush_is_retried_before_any_later_generation() {
         let (store, base_path, controls) = failing_memory_store().await;
@@ -10011,9 +10010,8 @@ mod tests {
         );
     }
 
-    /// Closing gives up on a flush that keeps failing and publishes no later
-    /// generation, though that one could flush, so the next open replays every
-    /// written row.
+    /// Close stops retrying a failing flush without publishing a later
+    /// generation, so the next open replays every row.
     #[tokio::test]
     async fn close_gives_up_on_a_failing_flush_and_replay_recovers_it() {
         let (store, base_path, controls) = failing_memory_store().await;

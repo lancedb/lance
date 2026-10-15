@@ -63,9 +63,11 @@ impl FailControls {
     pub fn fail_writes_under(&self, needle: &str) {
         *self.fail_writes_under.lock().unwrap() = Some(needle.to_string());
     }
+    /// Stop failing the writes [`Self::fail_writes_under`] targets.
     pub fn clear_write_failures(&self) {
         *self.fail_writes_under.lock().unwrap() = None;
     }
+    /// Whether a write to `location` should fail.
     fn fails_write(&self, location: &Path) -> bool {
         self.fail_writes_under
             .lock()

@@ -771,15 +771,12 @@ impl MemTableFlusher {
         Ok(())
     }
 
-    /// The result of flushing `memtable` if its generation is already in the
-    /// published manifest, `None` if it is the next one to publish.
+    /// The flush result if `memtable`'s generation is already published, `None`
+    /// if it is next to publish.
     ///
-    /// One flush task commits per writer epoch, in generation order, and each
-    /// commit sets `current_generation` one past the generation it publishes.
-    /// So a `current_generation` past this generation means its commit landed
-    /// (a retry after the acknowledgement was lost), and one short of it means
-    /// an earlier generation never flushed. Publishing then would move the
-    /// replay position past that generation's WAL entries.
+    /// Errors when an earlier generation is unpublished: publishing would move
+    /// the replay position past its WAL entries. Reads the cached manifest, so
+    /// call after `check_fenced` refreshes it.
     async fn already_published(
         &self,
         memtable: &MemTable,
@@ -1126,9 +1123,8 @@ mod tests {
         assert_eq!(updated_manifest.sstables.len(), 1);
     }
 
-    /// Only the next generation is published: a later one is refused, and a
-    /// published one (a retry after a lost acknowledgement) is reported without
-    /// a second commit.
+    /// A later generation is refused; a published one is reported without a
+    /// second commit.
     #[tokio::test]
     async fn a_flush_publishes_only_the_next_generation() {
         let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
