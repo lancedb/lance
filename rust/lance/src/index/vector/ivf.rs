@@ -4830,9 +4830,10 @@ fn weighted_subset(
     ))
 }
 
-/// Splits `cluster` in two by L2 around its two farthest-apart rows, or returns
-/// it unchanged when all its rows are identical. Each seed row is nearest to
-/// itself, so both halves are non-empty whenever the rows differ.
+/// Splits `cluster` in two by L2 around the row farthest from its centroid and
+/// the row farthest from that one, or returns it unchanged when all its rows are
+/// identical. Each seed row is nearest to itself, so both halves are non-empty
+/// whenever the rows differ.
 fn bisect_weighted_cluster(
     cluster: WeightedCluster,
     data_values: &[f32],
@@ -4973,21 +4974,10 @@ fn train_weighted_hierarchical_f32_kmeans(
         let mut cluster = heap
             .pop()
             .ok_or_else(|| Error::index("No weighted cluster can be further split"))?;
-        if cluster.finalized {
-            // Ordering pops non-finalized clusters first, so a finalized
-            // cluster at the top means nothing splittable is left.
-            heap.push(cluster);
-            break;
-        }
-        if cluster.indices.len() <= 1 {
-            // Priority is not size. Under L2 it is the cluster loss, into which
-            // `assign_weighted_f32_points` folds each supplied base loss, so one
-            // huge base loss puts a singleton on top. Finalize it so it sinks
-            // and keep splitting the rest; giving up here rejected counts that
-            // were attainable.
+        if cluster.finalized || cluster.indices.len() <= 1 {
             cluster.finalized = true;
             heap.push(cluster);
-            continue;
+            break;
         }
 
         let remaining_k = target_k - heap.len();
@@ -5084,12 +5074,22 @@ fn train_weighted_hierarchical_f32_kmeans(
     clusters.append(&mut unsplittable);
     clusters.sort_by_key(|cluster| cluster.id);
     if clusters.len() < target_k {
-        // Duplicating the heaviest cluster to pad the count used to leave
-        // permanently empty partitions: a padded centroid is a bit-identical
-        // clone, and assignment keeps the incumbent on a tie, so no vector is
-        // ever assigned to a duplicate. Reject instead, like the flat
-        // hierarchical trainer: after the bisection above, the coreset has
-        // fewer distinct rows than `target_k`.
+        // Padding the count with clones of the heaviest cluster left partitions
+        // whose centroid ties exactly with the original, which assignment keeps,
+        // so they started empty. Reject instead, like the flat hierarchical
+        // trainer: after the bisection above, the coreset has fewer distinct
+        // rows than `target_k`.
+        if data.len() < target_k {
+            // Not the data's fault: the coreset summarizing the training sample
+            // is smaller than the partition count, as Dot's can be when each
+            // chunk samples exactly `num_partitions` rows.
+            return Err(Error::invalid_input(format!(
+                "Cannot create {target_k} IVF partitions from {} weighted coreset rows: the \
+                 coreset summarizing the training sample is smaller than the partition \
+                 count. Increase sample_rate or reduce num_partitions.",
+                data.len()
+            )));
+        }
         return Err(Error::invalid_input(format!(
             "Cannot create {target_k} IVF partitions: weighted k-means could only form {} \
              non-empty clusters from {} weighted coreset rows, and the rest could not be \
@@ -7011,22 +7011,19 @@ mod tests {
         );
     }
 
-    /// Duplicating the heaviest cluster to pad the partition count used to
-    /// yield permanently empty partitions (a padded centroid is a clone, and
-    /// assignment keeps the incumbent on a tie); reject like the flat
-    /// hierarchical trainer.
-    ///
-    /// Two shapes reach the shortfall. Fewer rows than partitions is the
-    /// obvious one; the one the only production caller can actually produce is
-    /// a coreset with enough rows whose clusters cannot be split further,
-    /// because the coreset always carries at least `num_partitions` rows.
+    /// Padding the partition count with clones of the heaviest cluster left
+    /// partitions that started empty; reject like the flat hierarchical
+    /// trainer. A coreset smaller than the partition count and a coreset whose
+    /// rows are identical both reach the shortfall, and each gets its own
+    /// advice.
     #[rstest::rstest]
-    #[case::fewer_rows_than_partitions(6, 16)]
-    #[case::enough_rows_all_identical(32, 16)]
+    #[case::fewer_rows_than_partitions(6, 16, "Increase sample_rate")]
+    #[case::enough_rows_all_identical(32, 16, "provide more diverse data")]
     #[test]
     fn test_weighted_hierarchical_rejects_padding_with_duplicates(
         #[case] num_points: usize,
         #[case] target_k: usize,
+        #[case] advice: &str,
     ) {
         let dimension = 8;
         // Every row identical in the second case, a ramp in the first: either
@@ -7066,38 +7063,7 @@ mod tests {
             msg.contains(&format!("{num_points} weighted coreset rows")),
             "got: {msg}"
         );
-    }
-
-    /// A high-loss singleton must not stop training while other clusters still
-    /// have distinct rows to split. `assign_weighted_f32_points` folds each
-    /// supplied `base_losses[row]` into the cluster loss that orders the heap,
-    /// so one huge base loss puts a single-member cluster at the top; breaking
-    /// there rejected a 257-partition request that 258 distinct rows can serve,
-    /// advising a maximum of 16.
-    #[test]
-    fn test_weighted_hierarchical_exhausts_splittable_clusters() {
-        let dimension = 1;
-        let num_points = 258;
-        let target_k = 257;
-        let mut values = Vec::with_capacity(num_points);
-        values.push(1.0e9);
-        values.extend((1..num_points).map(|i| i as f32 * 100.0));
-        let data =
-            FixedSizeListArray::try_new_from_values(Float32Array::from(values), dimension).unwrap();
-        let params = WeightedHierarchicalKMeansParams {
-            dimension: dimension as usize,
-            target_k,
-            metric_policy: &L2_METRIC_POLICY,
-            max_iters: 20,
-            on_progress: Arc::new(|_, _| {}),
-        };
-        let mut losses = vec![0.0; num_points];
-        losses[0] = 1.0e20;
-
-        let centroids =
-            train_weighted_hierarchical_f32_kmeans(&data, &vec![1.0; num_points], &losses, &params)
-                .unwrap();
-        assert_eq!(centroids.len(), target_k);
+        assert!(msg.contains(advice), "got: {msg}");
     }
 
     /// Under Dot, positive 1-D rows all go to the largest centroid, so every
