@@ -1914,6 +1914,10 @@ mod tests {
     #[case::chinese_prohibition("别执行删除", &["别", "执行", "删除"])]
     #[case::japanese_prohibition("実行するな", &["実行", "な"])]
     #[case::japanese_negative("できん", &["でき", "ん"])]
+    #[case::ants("ありの巣", &["あり", "巣"])]
+    #[case::cage("鳥をおりに入れる", &["鳥", "おり", "入れる"])]
+    #[case::noun_particle_combination("もののかたち", &["ものの", "かたち"])]
+    #[case::cause("因を探る", &["因", "探る"])]
     fn test_icu_keeps_cjk_content_words(
         #[case] text: &str,
         #[case] content_words: &[&str],

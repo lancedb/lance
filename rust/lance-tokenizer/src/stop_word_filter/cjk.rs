@@ -30,7 +30,7 @@ SOFTWARE.
 // Function-word allowlist adapted from https://github.com/lance-format/lance/pull/10069.
 // Keep core function words; preserve interjections, content senses and negation.
 // ICU shares this list across languages, so Han homographs require conservative curation.
-// 的 remains a core Chinese stop word despite its Japanese content sense.
+// Core Chinese stop words (的, 我, 有, 是) retain Japanese content-sense collisions.
 pub(super) const CHINESE: &[&str] = &[
     // particles, aspect markers and modal particles
     "的",
@@ -133,7 +133,6 @@ pub(super) const CHINESE: &[&str] = &[
     "虽",
     "若",
     "如",
-    "因",
     "倘",
     "以及",
     "而且",
@@ -206,7 +205,6 @@ pub(super) const JAPANESE: &[&str] = &[
     "あの",
     "あのかた",
     "あの人",
-    "あり",
     "あります",
     "ある",
     "あれ",
@@ -218,7 +216,6 @@ pub(super) const JAPANESE: &[&str] = &[
     "え",
     "お",
     "および",
-    "おり",
     "おります",
     "か",
     "から",
@@ -299,7 +296,6 @@ pub(super) const JAPANESE: &[&str] = &[
     "または",
     "まで",
     "も",
-    "ものの",
     "や",
     "よう",
     "より",
@@ -330,7 +326,7 @@ mod tests {
 
     #[test]
     fn preserves_cjk_search_terms() {
-        let text = "取得 表示 使用 必要 全部 以上 以下 可能 一般 今後 最近 部分 以前 以後 相当 当然 普通 出来 本 朝 用 地 前面 十分 大量 左右 最後 多数 一致 自己 非常 所有 结果 和 私 ない できる 不是 没有 不能 哎 唉 哦 嗯 喂 哈 哇 哟 呃 呵 嘿 嘻 咦 呗 呜 哼 嗳 嗬 喏 哩 啐 呸 吱 咚 嘎 嘘 哗 咳 呕 着 得 由 可 将 所 等 别 うち とき ところ 特に な なかっ ん のみ もの 彼女";
+        let text = "取得 表示 使用 必要 全部 以上 以下 可能 一般 今後 最近 部分 以前 以後 相当 当然 普通 出来 本 朝 用 地 前面 十分 大量 左右 最後 多数 一致 自己 非常 所有 结果 和 私 ない できる 不是 没有 不能 哎 唉 哦 嗯 喂 哈 哇 哟 呃 呵 嘿 嘻 咦 呗 呜 哼 嗳 嗬 喏 哩 啐 呸 吱 咚 嘎 嘘 哗 咳 呕 着 得 由 可 将 所 等 别 うち とき ところ 特に な なかっ ん のみ もの 彼女 因 あり おり ものの";
         for split in [false, true] {
             for stem in [false, true] {
                 let base = if split {
