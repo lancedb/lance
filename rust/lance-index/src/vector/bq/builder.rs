@@ -624,6 +624,13 @@ impl RabitQuantizer {
             )));
         }
 
+        if metadata.rotation_type != params.rotation_type {
+            return Err(Error::invalid_input(format!(
+                "rabitq_model rotation_type={:?} does not match requested rotation_type={:?}",
+                metadata.rotation_type, params.rotation_type
+            )));
+        }
+
         let rotated_dim = metadata.rotated_dim();
         if rotated_dim != dim {
             return Err(Error::invalid_input(format!(
@@ -632,7 +639,7 @@ impl RabitQuantizer {
             )));
         }
 
-        metadata.validate_rotation()?;
+        metadata.validate_for_build()?;
 
         Ok(Some(Self {
             metadata: metadata.clone(),
@@ -1634,22 +1641,29 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_rabit_quantizer_reuses_supplied_rotation() {
+    #[rstest]
+    #[case::raw_query(3, RabitQueryEstimator::RawQuery)]
+    #[case::residual_query(1, RabitQueryEstimator::ResidualQuery)]
+    fn test_rabit_quantizer_reuses_supplied_rotation(
+        #[case] num_bits: u8,
+        #[case] query_estimator: RabitQueryEstimator,
+    ) {
         let vectors = Float32Array::from(vec![0.0f32; 4 * 32]);
         let fsl = FixedSizeListArray::try_new_from_values(vectors, 32).unwrap();
-        let supplied =
-            RabitQuantizer::new_with_rotation::<Float32Type>(3, 32, RQRotationType::Fast)
+        let mut supplied =
+            RabitQuantizer::new_with_rotation::<Float32Type>(num_bits, 32, RQRotationType::Fast)
                 .metadata(None);
+        supplied.query_estimator = query_estimator;
         let supplied_signs = supplied.fast_rotation_signs.clone();
 
-        let mut params = RQBuildParams::with_rotation_type(3, RQRotationType::Fast);
+        let mut params = RQBuildParams::with_rotation_type(num_bits, RQRotationType::Fast);
         params.rotation = Some(supplied);
 
         let quantizer = RabitQuantizer::build(&fsl, DistanceType::L2, &params).unwrap();
         let metadata = quantizer.metadata_ref();
-        assert_eq!(metadata.num_bits, 3);
+        assert_eq!(metadata.num_bits, num_bits);
         assert_eq!(metadata.rotation_type, RQRotationType::Fast);
+        assert_eq!(metadata.query_estimator, query_estimator);
         assert_eq!(metadata.fast_rotation_signs, supplied_signs);
     }
 
@@ -1677,6 +1691,26 @@ mod tests {
         params.rotation = Some(wrong_dim);
         let err = RabitQuantizer::build(&fsl, DistanceType::L2, &params).unwrap_err();
         assert!(err.to_string().contains("does not match vector dimension"));
+
+        let mut params = RQBuildParams::with_rotation_type(3, RQRotationType::Matrix);
+        params.rotation = Some(supplied.clone());
+        let err = RabitQuantizer::build(&fsl, DistanceType::L2, &params).unwrap_err();
+        assert!(matches!(&err, Error::InvalidInput { .. }));
+        assert!(
+            err.to_string()
+                .contains("rotation_type=Fast does not match requested rotation_type=Matrix")
+        );
+
+        let mut residual_query = supplied.clone();
+        residual_query.query_estimator = RabitQueryEstimator::ResidualQuery;
+        let mut params = RQBuildParams::with_rotation_type(3, RQRotationType::Fast);
+        params.rotation = Some(residual_query);
+        let err = RabitQuantizer::build(&fsl, DistanceType::L2, &params).unwrap_err();
+        assert!(matches!(&err, Error::InvalidInput { .. }));
+        assert!(
+            err.to_string()
+                .contains("query_estimator=residual_query requires num_bits=1, got 3")
+        );
 
         let mut wrong_sign_len = supplied;
         wrong_sign_len.fast_rotation_signs.as_mut().unwrap().pop();

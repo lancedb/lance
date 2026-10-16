@@ -8,7 +8,7 @@ use jni::JNIEnv;
 use jni::objects::{JByteArray, JClass, JObject};
 use jni::sys::{jbyte, jbyteArray, jint, jintArray};
 use lance_index::vector::bq::builder::RabitQuantizer;
-use lance_index::vector::bq::storage::{RabitQuantizationMetadata, RabitQueryEstimator};
+use lance_index::vector::bq::storage::RabitQuantizationMetadata;
 use lance_index::vector::bq::{RQBuildParams, RQRotationType, validate_rq_num_bits};
 use lance_index::vector::quantizer::Quantization;
 
@@ -20,20 +20,7 @@ pub(crate) fn extract_rq_build_params(env: &mut JNIEnv, rq_obj: JObject) -> Resu
     let rotation_type = extract_rq_rotation_type(env, &rq_obj)?;
     let rotation = env.get_optional_from_method(&rq_obj, "getModel", |env, model| {
         let bytes = env.get_vec_u8_from_method(&model, "toBytes")?;
-        let metadata = parse_rq_model(&bytes)?;
-        if metadata.num_bits != num_bits {
-            return Err(Error::input_error(format!(
-                "RQ model num_bits={} does not match requested num_bits={}",
-                metadata.num_bits, num_bits
-            )));
-        }
-        if metadata.rotation_type != rotation_type {
-            return Err(Error::input_error(format!(
-                "RQ model rotation_type={:?} does not match requested rotation_type={:?}",
-                metadata.rotation_type, rotation_type
-            )));
-        }
-        Ok(metadata)
+        parse_rq_model(&bytes)
     })?;
     Ok(RQBuildParams {
         num_bits,
@@ -58,7 +45,6 @@ fn extract_rq_rotation_type(env: &mut JNIEnv, rq_obj: &JObject) -> Result<RQRota
 pub(crate) fn parse_rq_model(bytes: &[u8]) -> Result<RabitQuantizationMetadata> {
     let mut model: RabitQuantizationMetadata = serde_json::from_slice(bytes)
         .map_err(|e| Error::input_error(format!("Invalid RQ model: {e}")))?;
-    validate_rq_num_bits(model.num_bits)?;
     let dimension = model.rotated_dim();
     if dimension == 0 || dimension > i32::MAX as usize || !dimension.is_multiple_of(8) {
         return Err(Error::input_error(format!(
@@ -71,13 +57,7 @@ pub(crate) fn parse_rq_model(bytes: &[u8]) -> Result<RabitQuantizationMetadata> 
             model.rotation_type
         )));
     }
-    if model.query_estimator == RabitQueryEstimator::ResidualQuery && model.num_bits != 1 {
-        return Err(Error::input_error(format!(
-            "RQ model query_estimator=residual_query requires num_bits=1, got {}",
-            model.num_bits
-        )));
-    }
-    model.validate_rotation()?;
+    model.validate_for_build()?;
     model.packed = false;
     model.rotate_mat_position = None;
     Ok(model)
@@ -148,6 +128,7 @@ fn inner_inspect<'local>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lance_index::vector::bq::storage::RabitQueryEstimator;
 
     #[test]
     fn test_preserves_model_settings() {

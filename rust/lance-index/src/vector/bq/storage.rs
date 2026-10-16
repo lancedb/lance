@@ -285,8 +285,15 @@ impl RabitQuantizationMetadata {
         rabit_binary_code_bytes(self.rotated_dim())
     }
 
-    /// Validate that the rotation payload matches the dimension stored in this metadata.
-    pub fn validate_rotation(&self) -> Result<()> {
+    /// Validate the quantization settings and rotation payload for a new index build.
+    pub fn validate_for_build(&self) -> Result<()> {
+        validate_rq_num_bits(self.num_bits)?;
+        if self.query_estimator == RabitQueryEstimator::ResidualQuery && self.num_bits != 1 {
+            return Err(Error::invalid_input(format!(
+                "RQ model query_estimator=residual_query requires num_bits=1, got {}",
+                self.num_bits
+            )));
+        }
         let dim = self.rotated_dim();
         match self.rotation_type {
             RQRotationType::Fast => {
