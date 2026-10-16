@@ -6,6 +6,7 @@
 
 use lance_core::utils::address::RowAddress;
 use lance_index::scalar::RowAddrTranslator;
+use lance_index::vector::storage::ResidentColumns;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
@@ -75,7 +76,7 @@ use vector::details::{
     vector_details_as_json,
 };
 pub(crate) use vector::details::{vector_index_details, vector_index_details_default};
-use vector::ivf::v2::{IVFIndex, IvfStateEntryBox};
+use vector::ivf::v2::{IVFIndex, IvfOpenContext, IvfStateEntryBox, aux_file_key};
 use vector::utils::get_vector_type;
 
 mod api;
@@ -4214,6 +4215,24 @@ impl Dataset {
     ) -> Result<Arc<dyn VectorIndex>> {
         let uuid = &index_meta.uuid;
         let object_store = self.object_store_for_index(index_meta).await?;
+        let index_dir = self.indice_files_dir(index_meta)?;
+        // Hold the shared allocation before cache accesses can evict it.
+        // The handle is dropped if this index does not use resident columns.
+        let file_cache = self.index_cache.for_index(uuid, None);
+        let resident_columns_handle = Some(ResidentColumns::shared(&aux_file_key(
+            &object_store,
+            &index_dir,
+            uuid,
+        )));
+        // What the session declares about the index, for whichever IVF open
+        // or reconstruction below runs, and where a reconstruction adds the
+        // I/O of a resident store load.
+        let open_context = IvfOpenContext {
+            origin_latency_hint: self.session.index_origin_latency(),
+            resident_columns: self.session.index_resident_columns(),
+            file_cache: Some(file_cache),
+            resident_columns_handle,
+        };
         let resolved =
             frag_reuse::open_row_id_remapping_with_plan(self, index_meta, staged, purpose, metrics)
                 .await?;
@@ -4238,6 +4257,7 @@ impl Dataset {
                     self.metadata_cache.as_ref(),
                     partition_cache,
                     remapping,
+                    open_context,
                 )
                 .await;
         }
@@ -4259,7 +4279,6 @@ impl Dataset {
         } else {
             self.open_frag_reuse_index(metrics).await?
         };
-        let index_dir = self.indice_files_dir(index_meta)?;
         let index_file = index_dir
             .clone()
             .join(uuid.to_string())
@@ -4380,6 +4399,7 @@ impl Dataset {
                                 self.metadata_cache.as_ref(),
                                 index_cache,
                                 file_sizes,
+                                open_context,
                             )
                             .await?;
                             Ok(wrap_ivf(ivf))
@@ -4393,6 +4413,7 @@ impl Dataset {
                                 self.metadata_cache.as_ref(),
                                 index_cache,
                                 file_sizes,
+                                open_context,
                             )
                             .await?;
                             Ok(wrap_ivf(ivf))
@@ -4412,6 +4433,7 @@ impl Dataset {
                             self.metadata_cache.as_ref(),
                             index_cache,
                             file_sizes,
+                            open_context,
                         )
                         .await?;
                         Ok(wrap_ivf(ivf))
@@ -4426,6 +4448,7 @@ impl Dataset {
                             self.metadata_cache.as_ref(),
                             index_cache,
                             file_sizes,
+                            open_context,
                         )
                         .await?;
                         Ok(wrap_ivf(ivf))
@@ -4440,6 +4463,7 @@ impl Dataset {
                             self.metadata_cache.as_ref(),
                             index_cache,
                             file_sizes,
+                            open_context,
                         )
                         .await?;
                         Ok(wrap_ivf(ivf))
@@ -4455,6 +4479,7 @@ impl Dataset {
                                 self.metadata_cache.as_ref(),
                                 index_cache,
                                 file_sizes,
+                                open_context,
                             )
                             .await?;
                             Ok(wrap_ivf(ivf))
@@ -4468,6 +4493,7 @@ impl Dataset {
                                 self.metadata_cache.as_ref(),
                                 index_cache,
                                 file_sizes,
+                                open_context,
                             )
                             .await?;
                             Ok(wrap_ivf(ivf))
@@ -4483,6 +4509,7 @@ impl Dataset {
                             self.metadata_cache.as_ref(),
                             index_cache,
                             file_sizes,
+                            open_context,
                         )
                         .await?;
                         Ok(wrap_ivf(ivf))
@@ -4497,6 +4524,7 @@ impl Dataset {
                             self.metadata_cache.as_ref(),
                             index_cache,
                             file_sizes,
+                            open_context,
                         )
                         .await?;
                         Ok(wrap_ivf(ivf))
