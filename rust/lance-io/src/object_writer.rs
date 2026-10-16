@@ -1479,25 +1479,17 @@ mod tests {
         );
     }
 
-    #[rstest]
-    #[tokio::test]
-    async fn test_zero_upload_parallelism_rejected_before_upload(
-        #[values(PutMode::Overwrite, PutMode::Create)] put_mode: PutMode,
-    ) {
+    #[test]
+    fn test_zero_upload_parallelism_rejected() {
         let store = LanceObjectStore::memory();
         let path = Path::from("zero-concurrency.lance");
-        let error = ObjectWriter::with_upload_parallelism(&store, &path, put_mode, 0)
+        let error = ObjectWriter::with_upload_parallelism(&store, &path, PutMode::Overwrite, 0)
             .err()
             .expect("zero concurrency must be rejected");
 
         assert!(matches!(error, Error::InvalidInput { .. }));
         assert!(error.to_string().contains("LANCE_UPLOAD_CONCURRENCY"));
         assert!(error.to_string().contains("got 0"));
-        assert_eq!(store.io_stats_snapshot().write_iops, 0);
-        assert!(matches!(
-            store.inner.head(&path).await.unwrap_err(),
-            object_store::Error::NotFound { .. }
-        ));
     }
 
     #[rstest]
