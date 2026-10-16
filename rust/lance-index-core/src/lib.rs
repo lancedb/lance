@@ -225,8 +225,7 @@ impl IndexType {
     /// This would happen when creating index in a newer version of Lance,
     /// but then opening the index in older version of Lance
     ///
-    /// For [`Self::IvfRq`] this identifies the latest declared row layout.
-    /// Use [`Self::max_vector_version`] for the reader capability of this build:
+    /// For [`Self::IvfRq`] this is only the highest version this build reads:
     /// an IVF_RQ writer commits the version of the row layout it writes
     /// (`lance_index::ivf_rq_index_version`), so a column-layout index keeps
     /// the version older readers accept.
@@ -297,11 +296,7 @@ impl IndexType {
             Self::IvfRq,
         ]
         .into_iter()
-        // Plane-row version 3 is reserved by the API; its reader lands separately.
-        .map(|index_type| match index_type {
-            Self::IvfRq => 2,
-            _ => index_type.version() as u32,
-        })
+        .map(|index_type| index_type.version() as u32)
         .max()
         .unwrap_or(1)
     }

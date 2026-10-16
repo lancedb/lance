@@ -566,14 +566,6 @@ impl<'a> CreateIndexBuilder<'a> {
                     .ok_or_else(|| {
                         Error::index("Vector index type must take a VectorIndexParams".to_string())
                     })?;
-                if let Some(StageParams::RQ(rq)) = vec_params.stages.last()
-                    && rq.row_layout != RQRowLayout::Columns
-                {
-                    return Err(Error::not_supported(format!(
-                        "row_layout={} requires plane-row writer support",
-                        rq.row_layout
-                    )));
-                }
                 let index_version = vector_index_version(vec_params);
 
                 let effective_fragments =
@@ -4622,44 +4614,15 @@ mod tests {
         );
     }
 
-    #[rstest]
-    #[tokio::test]
-    async fn test_create_index_rejects_unimplemented_rq_row_layout(
-        #[values(false, true)] train: bool,
-    ) {
-        let reader = gen_batch()
-            .col(
-                "vector",
-                lance_datagen::array::rand_vec::<Float32Type>(lance_datagen::Dimension::from(16)),
-            )
-            .into_reader_rows(
-                lance_datagen::RowCount::from(64),
-                lance_datagen::BatchCount::from(2),
-            );
-        let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
-        let version_before = dataset.version().version;
-        let params = VectorIndexParams::with_ivf_rq_params(
-            DistanceType::L2,
-            IvfBuildParams::default(),
-            lance_index::vector::bq::RQBuildParams::new(5).with_row_layout(RQRowLayout::PlaneRows),
-        );
-        let err = dataset
-            .create_index_builder(&["vector"], IndexType::IvfRq, &params)
-            .train(train)
-            .execute()
-            .await
-            .unwrap_err();
-        assert!(matches!(err, Error::NotSupported { .. }), "{err:?}");
-        assert!(err.to_string().contains("row_layout=plane_rows"));
-        assert_eq!(dataset.version().version, version_before);
-    }
-
     /// An IVF_RQ index is committed with the version of the row layout it
     /// is written in: the column layout keeps version 2, which readers
-    /// without plane-row support accept. This build leaves the reserved
-    /// plane-row version 3 out of its usable indexes until that reader lands.
+    /// without plane-row support accept, and plane rows take version 3, the
+    /// highest this build reads. A version above that is left out of the
+    /// usable indexes.
     #[rstest]
     #[case::columns(RQRowLayout::Columns, false)]
+    #[case::plane_rows_native(RQRowLayout::PlaneRows, false)]
+    #[case::plane_rows_layered(RQRowLayout::PlaneRows, true)]
     #[tokio::test]
     async fn test_create_index_ivf_rq_version_follows_row_layout(
         #[case] row_layout: RQRowLayout,
@@ -4739,7 +4702,7 @@ mod tests {
 
         // A version above what this build reads is left out.
         let mut unreadable = loaded.clone();
-        unreadable[0].index_version = IndexType::max_vector_version() as i32 + 1;
+        unreadable[0].index_version = IndexType::IvfRq.version() + 1;
         let transaction = Transaction::new(
             dataset.manifest.version,
             Operation::CreateIndex {

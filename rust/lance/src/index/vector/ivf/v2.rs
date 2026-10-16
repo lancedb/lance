@@ -54,7 +54,7 @@ use lance_index::vector::bq::layered::{EntryColumns, SignBounds};
 use lance_index::vector::bq::partition_codes::PartitionCodesKey;
 use lance_index::vector::bq::rabit_ex_bits;
 use lance_index::vector::bq::scan_stats;
-use lance_index::vector::bq::storage::{RabitQueryEstimator, SEGMENT_NUM_CODES};
+use lance_index::vector::bq::storage::{RQRowLayout, RabitQueryEstimator, SEGMENT_NUM_CODES};
 use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantizer};
 use lance_index::vector::graph::OrderedNode;
 use lance_index::vector::hnsw::HNSW;
@@ -103,6 +103,7 @@ use super::{IvfIndexPartitionStatistics, IvfIndexStatistics, maybe_centroids_for
 pub mod rabit_scan;
 
 use rabit_scan::{RabitCacheLayout, RabitScan, RabitScanContext, RabitScanFactory};
+pub mod row_layout;
 
 pub(crate) type RabitSearchCacheCell = Arc<Mutex<Option<Option<Arc<RabitSearchCache>>>>>;
 
@@ -1982,6 +1983,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
 
     /// Bytes the index's resident columns take, whether or not it keeps
     /// them; see [`lance_index::vector::storage::resident_columns_bytes`].
+    /// Zero for a plane-row file, which never keeps a resident store.
     pub fn resident_columns_bytes(&self) -> u64 {
         self.storage.resident_columns_bytes()
     }
@@ -1989,9 +1991,16 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
     /// The size of the index's resident store, whether or not it keeps
     /// one, and what an index cache charges for it once loaded, which the
     /// open compared with the cache's entry limit; see
-    /// [`ResidentColumnsSetting::admits`].
+    /// [`ResidentColumnsSetting::admits`]. Zero for a plane-row file.
     pub fn resident_store_size(&self) -> Result<ResidentStoreSize> {
         self.storage.resident_store_size()
+    }
+
+    /// How the index's auxiliary file stores each row's fields. Only an
+    /// IVF_RQ index can store plane rows; reads unpack them, so results do
+    /// not depend on the layout.
+    pub fn row_layout(&self) -> RQRowLayout {
+        self.storage.row_layout()
     }
 
     /// Replace whether reads keep the small columns resident, so tests can

@@ -327,7 +327,7 @@ pub enum RQRowLayout {
     #[default]
     Columns,
     /// One fixed-width row column per plane, which packs the plane's fields
-    /// (requires a reader and writer with plane-row support).
+    /// ([`super::plane_rows`]).
     PlaneRows,
 }
 
@@ -556,6 +556,10 @@ impl QuantizerMetadata for RabitQuantizationMetadata {
         self.rotate_mat_position = Some(index);
     }
 
+    fn row_layout(&self) -> RQRowLayout {
+        self.row_layout
+    }
+
     fn parse_buffer(&mut self, bytes: Bytes) -> Result<()> {
         if self.rotation_type != RQRotationType::Matrix {
             return Ok(());
@@ -665,12 +669,6 @@ impl RabitQuantizationStorage {
         prepack_ex: bool,
         scope: PlaneScope,
     ) -> Result<Self> {
-        if metadata.row_layout != RQRowLayout::Columns {
-            return Err(Error::not_supported(format!(
-                "row_layout={} requires plane-row reader support",
-                metadata.row_layout
-            )));
-        }
         let distance_type = match (metadata.query_estimator, distance_type) {
             (RabitQueryEstimator::RawQuery, DistanceType::Cosine) => DistanceType::L2,
             _ => distance_type,
@@ -3943,26 +3941,6 @@ mod tests {
     }
 
     #[test]
-    fn test_try_from_batch_rejects_unimplemented_row_layout() {
-        let mut metadata = make_test_metadata(8);
-        metadata.row_layout = RQRowLayout::PlaneRows;
-        let codes =
-            FixedSizeListArray::try_new_from_values(UInt8Array::from(vec![0u8; 2]), 1).unwrap();
-        let err = RabitQuantizationStorage::try_from_batch(
-            make_test_batch(codes),
-            &metadata,
-            DistanceType::L2,
-            None,
-        )
-        .unwrap_err();
-        assert!(matches!(err, Error::NotSupported { .. }));
-        assert!(
-            err.to_string()
-                .contains("row_layout=plane_rows requires plane-row reader support")
-        );
-    }
-
-    #[test]
     fn test_rabit_metadata_defaults_old_indexes_to_residual_query() {
         let metadata: RabitQuantizationMetadata = serde_json::from_str(
             r#"{"rotate_mat_position":0,"rotation_type":"matrix","code_dim":64,"num_bits":1,"packed":true}"#,
@@ -3975,6 +3953,39 @@ mod tests {
                 .unwrap()
                 .get("row_layout")
                 .is_none()
+        );
+    }
+
+    /// Metadata without `row_layout` is the column layout, which is never
+    /// written, so column-layout metadata keeps the bytes older writers
+    /// produced; the plane-row layout is written and read back by name.
+    #[test]
+    fn test_rabit_metadata_row_layout_serde() {
+        let legacy = r#"{"rotate_mat_position":0,"rotation_type":"matrix","code_dim":64,"num_bits":1,"packed":true,"layered":false,"query_estimator":"raw_query"}"#;
+        let metadata: RabitQuantizationMetadata = serde_json::from_str(legacy).unwrap();
+        assert_eq!(metadata.row_layout, RQRowLayout::Columns);
+        assert_eq!(metadata.row_layout(), RQRowLayout::Columns);
+        let json = serde_json::to_string(&metadata).unwrap();
+        assert!(!json.contains("row_layout"), "{json}");
+
+        let mut plane_rows = metadata;
+        plane_rows.row_layout = RQRowLayout::PlaneRows;
+        let json = serde_json::to_string(&plane_rows).unwrap();
+        assert!(json.contains(r#""row_layout":"plane_rows""#), "{json}");
+        let read: RabitQuantizationMetadata = serde_json::from_str(&json).unwrap();
+        assert_eq!(read.row_layout, RQRowLayout::PlaneRows);
+
+        for layout in [RQRowLayout::Columns, RQRowLayout::PlaneRows] {
+            assert_eq!(layout.as_str().parse::<RQRowLayout>().unwrap(), layout);
+            assert_eq!(layout.to_string(), layout.as_str());
+        }
+        assert!("rows".parse::<RQRowLayout>().is_err());
+        assert!(
+            serde_json::from_str::<RabitQuantizationMetadata>(&legacy.replace(
+                r#""layered":false"#,
+                r#""layered":false,"row_layout":"rows""#
+            ))
+            .is_err()
         );
     }
 
@@ -4148,7 +4159,7 @@ mod tests {
             num_bits: 2,
             packed: false,
             layered: false,
-            row_layout: Default::default(),
+            row_layout: RQRowLayout::Columns,
             query_estimator: RabitQueryEstimator::RawQuery,
         };
         let codes =
@@ -4276,7 +4287,7 @@ mod tests {
                         num_bits,
                         packed: false,
                         layered: false,
-                        row_layout: Default::default(),
+                        row_layout: RQRowLayout::Columns,
                         query_estimator: RabitQueryEstimator::RawQuery,
                     };
                     let codes = FixedSizeListArray::try_new_from_values(
@@ -4442,7 +4453,7 @@ mod tests {
             num_bits: 2,
             packed: false,
             layered: false,
-            row_layout: Default::default(),
+            row_layout: RQRowLayout::Columns,
             query_estimator: RabitQueryEstimator::RawQuery,
         };
         let codes =
@@ -4617,7 +4628,7 @@ mod tests {
             num_bits,
             packed: false,
             layered: false,
-            row_layout: Default::default(),
+            row_layout: RQRowLayout::Columns,
             query_estimator: RabitQueryEstimator::RawQuery,
         };
         let code_len = rabit_binary_code_bytes(code_dim);
@@ -4823,7 +4834,7 @@ mod tests {
             num_bits,
             packed: false,
             layered: false,
-            row_layout: Default::default(),
+            row_layout: RQRowLayout::Columns,
             query_estimator: RabitQueryEstimator::RawQuery,
         };
         let codes = FixedSizeListArray::try_new_from_values(
@@ -4909,7 +4920,7 @@ mod tests {
             num_bits,
             packed: false,
             layered: false,
-            row_layout: Default::default(),
+            row_layout: RQRowLayout::Columns,
             query_estimator: RabitQueryEstimator::RawQuery,
         };
         let codes = FixedSizeListArray::try_new_from_values(
@@ -5230,7 +5241,7 @@ mod tests {
             num_bits: 1,
             packed: false,
             layered: false,
-            row_layout: Default::default(),
+            row_layout: RQRowLayout::Columns,
             query_estimator: RabitQueryEstimator::RawQuery,
         };
         let codes =
@@ -5266,7 +5277,7 @@ mod tests {
             num_bits: 2,
             packed: false,
             layered: false,
-            row_layout: Default::default(),
+            row_layout: RQRowLayout::Columns,
             query_estimator: RabitQueryEstimator::RawQuery,
         };
         let codes =
