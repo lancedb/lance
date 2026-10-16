@@ -6492,7 +6492,7 @@ class LanceOperation:
         )
         update_mode: str = ""
         updated_fragment_offsets: Optional[Dict[int, bytes]] = None
-        compacted_sstables: List["lance.mem_wal.CompactedSsTable"] = dataclasses.field(
+        compacted_sstables: List["mem_wal.CompactedSsTable"] = dataclasses.field(
             default_factory=list
         )
 
@@ -6871,7 +6871,7 @@ class LanceOperation:
             SSTables to mark compacted, one entry per shard.
         """
 
-        compacted_sstables: List["lance.mem_wal.CompactedSsTable"] = dataclasses.field(
+        compacted_sstables: List["mem_wal.CompactedSsTable"] = dataclasses.field(
             default_factory=list
         )
 
