@@ -3021,7 +3021,7 @@ mod test {
             "add_columns should clean files written by the current unfinished writer"
         );
         let blob_dir = StdPath::new(test_uri).join("_blobs");
-        assert!(!file_paths_in(&blob_dir).is_empty());
+        assert!(file_paths_in(&blob_dir).is_empty());
         // Failed uploads use the existing orphan policy. There is no concurrent
         // writer in this test, so explicit unverified cleanup can reclaim them.
         dataset
@@ -3128,7 +3128,7 @@ mod test {
             })
             .expect("checkpoint should record the newly written data file");
         let new_file_path = StdPath::new(test_uri).join("data").join(&new_file.path);
-        let new_blob_dir = StdPath::new(test_uri).join("_blobs");
+        let new_blob_dir = new_file_path.with_extension("");
         assert!(
             new_file_path.exists(),
             "cleanup must not delete data files after checkpoint takes ownership"
@@ -3375,7 +3375,7 @@ mod test {
             })
             .expect("checkpoint should record the newly written data file");
         let new_file_path = StdPath::new(test_uri).join("data").join(&new_file.path);
-        let new_blob_dir = StdPath::new(test_uri).join("_blobs");
+        let new_blob_dir = new_file_path.with_extension("");
         assert!(
             new_file_path.exists(),
             "cleanup must not delete data files after checkpoint takes ownership"

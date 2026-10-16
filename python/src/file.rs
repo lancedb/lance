@@ -226,7 +226,7 @@ impl LanceFileMetadata {
 #[pymethods]
 impl LanceFileMetadata {
     pub fn __repr__(&self) -> PyResult<String> {
-        serde_yaml::to_string(self).map_err(|err| PyRuntimeError::new_err(err.to_string()))
+        yaml_serde::to_string(self).map_err(|err| PyRuntimeError::new_err(err.to_string()))
     }
 }
 
