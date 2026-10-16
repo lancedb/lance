@@ -1876,7 +1876,24 @@ mod tests {
     #[case::retrieved_data("取得したデータを全部表示", &["取得", "全部", "表示"])]
     #[case::start_processing("以上の場合は処理を開始する", &["以上", "場合", "処理", "開始"])]
     #[case::change_settings("以下の方法で設定を変更", &["以下", "方法", "設定", "変更"])]
-    fn test_icu_keeps_japanese_content_words(
+    #[case::read_book("本を読む", &["本"])]
+    #[case::morning_run("朝に走る", &["朝"])]
+    #[case::have_business("用がある", &["用"])]
+    #[case::end_of_earth("地の果て", &["地"])]
+    #[case::bring_forward("前面に出す", &["前面"])]
+    #[case::enough_time("十分な時間がある", &["十分"])]
+    #[case::large_amount("大量のデータ", &["大量"])]
+    #[case::move_sideways("左右に動く", &["左右"])]
+    #[case::last_day("最後の日", &["最後"])]
+    #[case::many_opinions("多数の意見", &["多数"])]
+    #[case::agree("意見が一致した", &["一致"])]
+    #[case::introduce_self("自己紹介をする", &["自己"])]
+    #[case::very_many("非常に多い", &["非常"])]
+    #[case::own_land("土地を所有する", &["所有"])]
+    #[case::all_users("从数据库获取所有用户信息并返回结果", &["所有", "结果"])]
+    #[case::no_permission("没有权限", &["没有", "权限"])]
+    #[case::not_an_error("不是错误", &["不是", "错误"])]
+    fn test_icu_keeps_cjk_content_words(
         #[case] text: &str,
         #[case] content_words: &[&str],
         #[values("icu", "icu/split")] base_tokenizer: &str,
