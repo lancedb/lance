@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use crate::scalar::RowAddrTranslatorRef;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
+use lance_index_core::remapping::RowAddrTranslator;
 use lance_index_core::remapping::{BatchRowIdRemapper, remap_row_addrs_tree_map_async};
 use std::{
     any::Any,
@@ -46,8 +48,8 @@ use super::{BuiltinIndexType, SargableQuery, ScalarIndexParams};
 use super::{MetricsCollector, SearchResult};
 use crate::pbold;
 use crate::scalar::bitmap::{
-    BitmapIndexState, build_index_map, merge_index_maps, merge_source_entry_count,
-    new_bitmap_batch_writer, remap_index_map, remap_row_addrs,
+    BitmapIndexState, OldSegment, build_index_map, merge_index_maps, merge_source_entry_count,
+    new_bitmap_batch_writer, remap_index_map, remap_row_addrs_with,
 };
 use crate::scalar::expression::{LabelListQueryParser, ScalarQueryParser};
 use crate::scalar::registry::{
@@ -201,6 +203,40 @@ impl LabelListIndex {
     }
 }
 
+impl LabelListIndex {
+    /// The one remap implementation: the legacy `remap` (an in-memory
+    /// mapping, borrowed as a synchronous translator) and `remap_streaming`
+    /// both come here, so neither copies a map nor delegates to the other.
+    async fn remap_with(
+        &self,
+        mapping: RowAddrTranslatorRef<'_>,
+        dest_store: &dyn IndexStore,
+    ) -> Result<CreatedIndex> {
+        let remapped_nulls = remap_row_addrs_with(&self.list_nulls, mapping).await?;
+        let mut writer = new_bitmap_batch_writer(
+            dest_store,
+            BITMAP_LOOKUP_NAME,
+            self.values_index.value_type(),
+        )
+        .await?;
+        writer
+            .add_global_buffer(
+                LABEL_LIST_NULLS_METADATA_KEY.to_string(),
+                serialize_list_nulls(&remapped_nulls)?,
+            )
+            .await?;
+        remap_index_map(&self.values_index, mapping, &mut writer).await?;
+        let file = writer.finish().await?;
+
+        Ok(CreatedIndex {
+            index_details: prost_types::Any::from_msg(&pbold::LabelListIndexDetails::default())
+                .unwrap(),
+            index_version: LABEL_LIST_INDEX_VERSION,
+            files: vec![file],
+        })
+    }
+}
+
 #[async_trait]
 impl ScalarIndex for LabelListIndex {
     #[instrument(skip_all, level = "debug")]
@@ -242,28 +278,15 @@ impl ScalarIndex for LabelListIndex {
         mapping: &RowAddrRemap,
         dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
-        let remapped_nulls = remap_row_addrs(&self.list_nulls, mapping)?;
-        let mut writer = new_bitmap_batch_writer(
-            dest_store,
-            BITMAP_LOOKUP_NAME,
-            self.values_index.value_type(),
-        )
-        .await?;
-        writer
-            .add_global_buffer(
-                LABEL_LIST_NULLS_METADATA_KEY.to_string(),
-                serialize_list_nulls(&remapped_nulls)?,
-            )
-            .await?;
-        remap_index_map(&self.values_index, mapping, &mut writer).await?;
-        let file = writer.finish().await?;
+        self.remap_with(mapping.into(), dest_store).await
+    }
 
-        Ok(CreatedIndex {
-            index_details: prost_types::Any::from_msg(&pbold::LabelListIndexDetails::default())
-                .unwrap(),
-            index_version: LABEL_LIST_INDEX_VERSION,
-            files: vec![file],
-        })
+    async fn remap_streaming(
+        &self,
+        translator: &RowAddrTranslator,
+        dest_store: &dyn IndexStore,
+    ) -> Result<CreatedIndex> {
+        self.remap_with(translator.as_ref(), dest_store).await
     }
 
     /// Add the new data into the index, creating an updated version of the index in `dest_store`
@@ -273,15 +296,8 @@ impl ScalarIndex for LabelListIndex {
         dest_store: &dyn IndexStore,
         old_data_filter: Option<super::OldIndexDataFilter>,
     ) -> Result<CreatedIndex> {
-        // Not applied, matching every other derived-key scalar index (ngram,
-        // fmindex, bloomfilter, zonemap, rtree). Only btree and bitmap -- one
-        // key per row -- prune retired rows here. The cost is real: postings for
-        // retired rows survive, so an update that rewrites rows in place can
-        // leave this index returning them. Preserved as-is rather than fixed,
-        // since changing it is a correctness change this memory work should not
-        // carry.
-        let _ = old_data_filter;
-        let file = update_label_list_index(self, new_data, dest_store).await?;
+        let file =
+            update_label_list_index(self, new_data, dest_store, old_data_filter.as_ref()).await?;
 
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pbold::LabelListIndexDetails::default())
@@ -524,12 +540,10 @@ fn serialize_list_nulls(null_map: &RowAddrTreeMap) -> Result<Bytes> {
 /// buffers the data volume at all.
 ///
 /// Nulls sort first because `OrderableScalarValue` orders them below every
-/// value, so [`build_index_map`]'s ascending-input `debug_assert!` rejects a
-/// stream that puts them last. Its runtime path would in fact tolerate a null
-/// run anywhere -- `finish_run` never advances the old-keys cursor for a null
-/// key -- but the assert is the contract, and null-first is also what
-/// [`remap_index_map`] emits and what the plain bitmap index's training scan
-/// produces.
+/// value. [`build_index_map`] would accept a single null run anywhere -- nulls
+/// are collected separately rather than merge-joined by value -- but null-first
+/// is also what [`remap_index_map`] emits and what the plain bitmap index's
+/// training scan produces.
 ///
 /// `mem_pool_size`, when set, overrides the session's memory pool for this
 /// sort instead of leaving it to `LANCE_MEM_POOL_SIZE`. Production callers
@@ -618,11 +632,18 @@ async fn write_label_list_index(
     value_type: &DataType,
     sorted_labels: SendableRecordBatchStream,
     old_index: Option<&BitmapIndex>,
+    old_data_filter: Option<&OldIndexDataFilter>,
     list_nulls: impl FnOnce() -> Result<RowAddrTreeMap>,
 ) -> Result<IndexFile> {
     let mut writer = new_bitmap_batch_writer(store, BITMAP_LOOKUP_NAME, value_type).await?;
-    // `None`: LabelList does not apply the old-data filter. See `update`.
-    build_index_map(sorted_labels, old_index, None, &mut writer).await?;
+    let old_segments = old_index
+        .map(|index| OldSegment {
+            index,
+            filter: old_data_filter,
+        })
+        .into_iter()
+        .collect();
+    build_index_map(sorted_labels, old_segments, &mut writer).await?;
     writer
         .add_global_buffer(
             LABEL_LIST_NULLS_METADATA_KEY.to_string(),
@@ -657,7 +678,7 @@ async fn train_label_list_index_with_plan(
     let value_type = data.schema().field(0).data_type().clone();
     let (sorted, sort_plan) = sort_labels_by_value(data, mem_pool_size)?;
 
-    let file = write_label_list_index(index_store, &value_type, sorted, None, || {
+    let file = write_label_list_index(index_store, &value_type, sorted, None, None, || {
         Ok(list_nulls.lock().unwrap().clone())
     })
     .await?;
@@ -686,6 +707,7 @@ async fn update_label_list_index(
     existing: &LabelListIndex,
     new_data: SendableRecordBatchStream,
     dest_store: &dyn IndexStore,
+    old_data_filter: Option<&OldIndexDataFilter>,
 ) -> Result<IndexFile> {
     let list_nulls = Arc::new(Mutex::new(RowAddrTreeMap::new()));
     let new_data = track_list_nulls(new_data, list_nulls.clone());
@@ -712,8 +734,13 @@ async fn update_label_list_index(
         &value_type,
         sorted,
         Some(&existing.values_index),
+        old_data_filter,
         || {
             let mut merged = (*existing_nulls).clone();
+            // Prune old state before adding replacements, which may reuse row IDs.
+            if let Some(filter) = old_data_filter {
+                filter.retain_old_rows(&mut merged);
+            }
             merged |= &*list_nulls.lock().unwrap();
             Ok(merged)
         },
@@ -727,8 +754,8 @@ async fn update_label_list_index(
 /// separate `list_nulls` row set. Because distributed segments cover disjoint rows
 /// (distinct fragments), merging streams and unions the bitmap payloads by key
 /// and separately unions the `list_nulls` sets; no source-data re-scan is
-/// required. This mirrors [`crate::scalar::bitmap::merge_bitmap_indices`] but
-/// also carries the per-segment `list_nulls`. When `old_data_filter` is provided,
+/// required. This mirrors [`crate::scalar::bitmap::BitmapIndex::merge_segments`]
+/// but also carries the per-segment `list_nulls`. When `old_data_filter` is provided,
 /// rows from retired fragments are removed from both the value bitmaps and
 /// `list_nulls`.
 pub async fn merge_label_list_indices(
@@ -830,11 +857,11 @@ impl DeepSizeOf for LabelListIndexState {
 }
 
 impl LabelListIndexState {
-    fn from_index(index: &LabelListIndex) -> Result<Self> {
-        Ok(Self {
-            bitmap_state: BitmapIndexState::from_index(&index.values_index)?,
+    fn from_index(index: &LabelListIndex) -> Self {
+        Self {
+            bitmap_state: BitmapIndexState::from_index(&index.values_index),
             list_nulls: index.list_nulls.clone(),
-        })
+        }
     }
 
     fn from_scalar_index(index: &dyn ScalarIndex) -> Result<Self> {
@@ -846,7 +873,7 @@ impl LabelListIndexState {
                     "LabelListIndexState::from_scalar_index called with a non-label-list index",
                 )
             })?;
-        Self::from_index(label_list)
+        Ok(Self::from_index(label_list))
     }
 
     fn into_label_list_index(
@@ -864,7 +891,9 @@ impl LabelListIndexState {
 
 impl CacheCodecImpl for LabelListIndexState {
     const TYPE_ID: &'static str = "lance.scalar.LabelListIndexState";
-    const CURRENT_VERSION: u32 = 1;
+    /// Bumped with the nested [`BitmapIndexState`] body, which version 2 writes
+    /// as several lookup batches that version-1 readers reject.
+    const CURRENT_VERSION: u32 = 2;
 
     /// Wire format:
     /// ```text
@@ -1038,6 +1067,7 @@ impl ScalarIndexPlugin for LabelListIndexPlugin {
         &self,
         index_store: Arc<dyn IndexStore>,
         _index_details: &prost_types::Any,
+        _index_version: u32,
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
@@ -1055,6 +1085,7 @@ impl ScalarIndexPlugin for LabelListIndexPlugin {
         &self,
         index_store: Arc<dyn IndexStore>,
         _index_details: &prost_types::Any,
+        _index_version: u32,
         remapping: Option<Arc<dyn BatchRowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
@@ -1113,6 +1144,7 @@ impl ScalarIndexPlugin for LabelListIndexPlugin {
 
 #[cfg(test)]
 mod tests {
+    use lance_core::utils::row_addr_remap::RowAddrRemap;
     use std::collections::BTreeMap;
 
     use datafusion_common::ScalarValue;
@@ -1166,8 +1198,7 @@ mod tests {
         }
         let mut bitmap_nulls = RowAddrTreeMap::new();
         bitmap_nulls.insert(RowAddress::new_from_parts(0, 3).into());
-        let bitmap_state =
-            BitmapIndexState::new_for_test(index_map, bitmap_nulls, DataType::Int32).unwrap();
+        let bitmap_state = BitmapIndexState::new_for_test(index_map, bitmap_nulls, DataType::Int32);
 
         let mut list_nulls = RowAddrTreeMap::new();
         list_nulls.insert(RowAddress::new_from_parts(0, 9).into());
@@ -1190,8 +1221,8 @@ mod tests {
 
         assert_eq!(&*restored.list_nulls, &*state.list_nulls);
         assert_eq!(
-            restored.bitmap_state.lookup_batch(),
-            state.bitmap_state.lookup_batch()
+            restored.bitmap_state.index_map(),
+            state.bitmap_state.index_map()
         );
         assert_eq!(
             restored.bitmap_state.null_map(),
@@ -1199,14 +1230,15 @@ mod tests {
         );
     }
 
-    /// The nested bitmap lookup batch must decode zero-copy through the full
-    /// envelope, proving the leading `list_nulls` RAW_BLOB does not knock the
-    /// nested IPC section off its 64-byte boundary.
+    /// The nested bitmap state must decode through the full envelope after the
+    /// leading `list_nulls` RAW_BLOB, from a buffer whose sections do not start
+    /// at the offsets the writer saw.
     #[test]
-    fn test_label_list_nested_lookup_is_zero_copy() {
+    fn test_label_list_state_codec_envelope_roundtrip() {
         const ALIGN: usize = 64;
+        let state = sample_state();
         let codec = CacheCodec::from_impl::<LabelListIndexState>();
-        let any: Arc<dyn std::any::Any + Send + Sync> = Arc::new(sample_state());
+        let any: Arc<dyn std::any::Any + Send + Sync> = Arc::new(state.clone());
         let mut buf = Vec::new();
         codec.serialize(&any, &mut buf).unwrap();
 
@@ -1217,18 +1249,11 @@ mod tests {
 
         let restored = codec.deserialize(&data).hit().unwrap();
         let restored = restored.downcast::<LabelListIndexState>().unwrap();
-
-        let base = data.as_ptr() as usize;
-        let end = base + data.len();
-        for col in restored.bitmap_state.lookup_batch().columns() {
-            for buffer in col.to_data().buffers() {
-                let ptr = buffer.as_ptr() as usize;
-                assert!(
-                    ptr >= base && ptr < end,
-                    "nested bitmap lookup buffer was realigned — misaligned IPC section",
-                );
-            }
-        }
+        assert_eq!(&*restored.list_nulls, &*state.list_nulls);
+        assert_eq!(
+            restored.bitmap_state.index_map(),
+            state.bitmap_state.index_map()
+        );
     }
 
     // One scan batch unnests to more bytes than the small pool can admit at once.
@@ -1863,6 +1888,60 @@ mod tests {
         );
     }
 
+    #[rstest]
+    #[case::stable_row_ids(true)]
+    #[case::row_addresses(false)]
+    #[tokio::test]
+    #[serial_test::serial(LANCE_DF_SPILL_POOL)]
+    async fn test_update_applies_old_data_filter(#[case] stable_row_ids: bool) {
+        const KEPT: u64 = 1 << 32;
+        let initial = vec![
+            (
+                0,
+                Some(vec![Some("old".into()), Some("shared".into()), None]),
+            ),
+            (1, None),
+            (2, Some(vec![Some("old".into())])),
+            (3, None),
+            (KEPT, Some(vec![Some("kept".into())])),
+            (KEPT + 1, None),
+        ];
+        let updated_start = if stable_row_ids { 0 } else { 2 << 32 };
+        let replacements = vec![
+            (
+                updated_start,
+                Some(vec![Some("new".into()), Some("shared".into())]),
+            ),
+            (updated_start + 1, Some(vec![Some("new".into())])),
+            (updated_start + 2, None),
+            (updated_start + 3, Some(vec![])),
+        ];
+        let filter = if stable_row_ids {
+            OldIndexDataFilter::RowIds([KEPT, KEPT + 1].into_iter().collect())
+        } else {
+            OldIndexDataFilter::Fragments {
+                to_keep: RoaringBitmap::from_iter([1]),
+                to_remove: RoaringBitmap::from_iter([0]),
+            }
+        };
+        let (_src_dir, index) = build_label_list_segment(&initial).await;
+        let (_dest_dir, dest_store) = test_util::index_store();
+        index
+            .update(
+                sample_rows_to_stream(&replacements),
+                dest_store.as_ref(),
+                Some(filter),
+            )
+            .await
+            .unwrap();
+
+        let mut actual = read_index_contents(dest_store.as_ref()).await;
+        // Bitmap updates retain empty keys; compare the surviving memberships.
+        actual.labels.retain(|(_, rows)| !rows.is_empty());
+        let expected_rows = [initial[4..].to_vec(), replacements].concat();
+        assert_eq!(build_label_list_index(&expected_rows).await, actual);
+    }
+
     /// The spill and destination file schemas are declared from the existing
     /// index while the keys come from the new stream, so a disagreement must be
     /// rejected rather than written as a file whose schema lies about its keys.
@@ -1895,7 +1974,7 @@ mod tests {
             futures::stream::iter(vec![Ok(batch)]),
         ));
 
-        let error = update_label_list_index(index.as_ref(), new_data, dest_store.as_ref())
+        let error = update_label_list_index(index.as_ref(), new_data, dest_store.as_ref(), None)
             .await
             .expect_err("a value-type mismatch must be rejected");
         let message = error.to_string();
@@ -1975,6 +2054,7 @@ mod tests {
             legacy.as_ref(),
             sample_rows_to_stream(&additional),
             updated_store.as_ref(),
+            None,
         )
         .await
         .unwrap();
@@ -2053,6 +2133,7 @@ mod tests {
                     index.as_ref(),
                     sample_rows_to_stream(second),
                     dest_store.as_ref(),
+                    None,
                 )
                 .await
                 .unwrap();
