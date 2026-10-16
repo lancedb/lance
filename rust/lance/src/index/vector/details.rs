@@ -65,8 +65,6 @@ struct PcaDetailsJson {
     transform_type: &'static str,
     dimension: u32,
     random_rotation: bool,
-    whitening: bool,
-    epsilon: f32,
     sample_size: u32,
     max_training_memory_bytes: u64,
     sampling_seed: u64,
@@ -121,8 +119,6 @@ fn pca_parameters(
                     ))
                 })?,
                 random_rotation: params.random_rotation,
-                whitening: params.whitening,
-                epsilon: params.epsilon,
                 sample_size: u32::try_from(params.sample_size).map_err(|_| {
                     Error::invalid_input(format!(
                         "pca.sample_size={} does not fit in u32",
@@ -311,8 +307,6 @@ pub fn pca_params_from_details(
         PcaParams {
             dimension,
             random_rotation: pca.random_rotation,
-            whitening: pca.whitening,
-            epsilon: pca.epsilon,
             sample_size,
             max_training_memory_bytes,
             sampling_seed: pca.sampling_seed,
@@ -623,8 +617,6 @@ pub fn vector_details_as_json(details: &prost_types::Any) -> Result<String> {
                     ))
                 })?,
                 random_rotation: params.random_rotation,
-                whitening: params.whitening,
-                epsilon: params.epsilon,
                 sample_size: u32::try_from(params.sample_size).map_err(|_| {
                     Error::index(format!(
                         "pca.sample_size={} does not fit in u32",
@@ -1124,8 +1116,6 @@ mod tests {
     fn pca_params() -> PcaParams {
         PcaParams::new(16)
             .with_random_rotation(true)
-            .with_whitening(true)
-            .with_epsilon(0.0001)
             .with_sample_size(2048)
             .with_max_training_memory_bytes(16 * 1024 * 1024)
             .with_sampling_seed(7)
@@ -1142,8 +1132,6 @@ mod tests {
             pre_transform: Some(PreTransform::Pca(PcaParameters {
                 dimension,
                 random_rotation: true,
-                whitening: true,
-                epsilon: 0.0001,
                 sample_size: 2048,
                 max_training_memory_bytes: 16 * 1024 * 1024,
                 sampling_seed: 7,
@@ -1220,8 +1208,6 @@ mod tests {
                 "type": "pca",
                 "dimension": 16,
                 "random_rotation": true,
-                "whitening": true,
-                "epsilon": 0.0001,
                 "sample_size": 2048,
                 "max_training_memory_bytes": 16 * 1024 * 1024,
                 "sampling_seed": 7,
@@ -1236,7 +1222,7 @@ mod tests {
         );
         assert_eq!(
             json,
-            r#"{"metric_type":"L2","pre_transform":{"type":"pca","dimension":16,"random_rotation":true,"whitening":true,"epsilon":0.0001,"sample_size":2048,"max_training_memory_bytes":16777216,"sampling_seed":7,"rotation_seed":11,"model_fingerprint":"blake3:000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"}}"#
+            r#"{"metric_type":"L2","pre_transform":{"type":"pca","dimension":16,"random_rotation":true,"sample_size":2048,"max_training_memory_bytes":16777216,"sampling_seed":7,"rotation_seed":11,"model_fingerprint":"blake3:000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"}}"#
         );
     }
 

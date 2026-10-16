@@ -5374,8 +5374,6 @@ fn prepare_vector_index_params(
 
         let pca_option_keys = [
             "pca_random_rotation",
-            "pca_whitening",
-            "pca_epsilon",
             "pca_sample_size",
             "pca_max_training_memory_bytes",
             "pca_sampling_seed",
@@ -5385,12 +5383,6 @@ fn prepare_vector_index_params(
             let mut parsed = PcaParams::new(dimension.extract()?);
             if let Some(value) = kwargs.get_item("pca_random_rotation")? {
                 parsed = parsed.with_random_rotation(value.extract()?);
-            }
-            if let Some(value) = kwargs.get_item("pca_whitening")? {
-                parsed = parsed.with_whitening(value.extract()?);
-            }
-            if let Some(value) = kwargs.get_item("pca_epsilon")? {
-                parsed = parsed.with_epsilon(value.extract()?);
             }
             if let Some(value) = kwargs.get_item("pca_sample_size")? {
                 parsed = parsed.with_sample_size(value.extract()?);

@@ -4129,8 +4129,6 @@ class LanceDataset(pa.dataset.Dataset):
                 {
                     "pca_dimension": pca.dimension,
                     "pca_random_rotation": pca.random_rotation,
-                    "pca_whitening": pca.whitening,
-                    "pca_epsilon": pca.epsilon,
                     "pca_sample_size": pca.sample_size,
                     "pca_max_training_memory_bytes": (pca.max_training_memory_bytes),
                     "pca_sampling_seed": pca.sampling_seed,
@@ -4644,6 +4642,12 @@ class LanceDataset(pa.dataset.Dataset):
                 num_partitions=256,
             )
 
+        ``create_index`` trains the PCA model. Callers pass original-dimension
+        query vectors and do not call a transform themselves. Reopen the dataset
+        before searching. Distances from an unrefined search are L2 in the
+        projected space. ``refine_factor`` reranks the candidates with L2 in the
+        original space.
+
         .. code-block:: python
 
             import lance
@@ -4654,7 +4658,17 @@ class LanceDataset(pa.dataset.Dataset):
                 "vector",
                 "IVF_RQ",
                 num_partitions=256,
-                pca=PcaParams(dimension=64, whitening=True),
+                pca=PcaParams(dimension=64),
+            )
+            dataset = lance.dataset("/tmp/sift.lance")
+            query = dataset.take([0], columns=["vector"])["vector"][0].as_py()
+            dataset.to_table(
+                nearest={
+                    "column": "vector",
+                    "q": query,
+                    "k": 10,
+                    "refine_factor": 10,
+                }
             )
 
         Experimental Accelerator (GPU) support:

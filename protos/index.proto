@@ -255,22 +255,18 @@ message PcaParameters {
   uint32 dimension = 1;
   // Whether a deterministic orthogonal rotation follows PCA.
   bool random_rotation = 2;
-  // Whether retained components are scaled by regularized variance.
-  bool whitening = 3;
-  // Whitening regularizer.
-  float epsilon = 4;
   // Target number of valid rows used for training.
-  uint32 sample_size = 5;
+  uint32 sample_size = 3;
   // Maximum estimated peak bytes permitted for training.
-  uint64 max_training_memory_bytes = 6;
+  uint64 max_training_memory_bytes = 4;
   // Seed used by dataset-aware sampling.
-  uint64 sampling_seed = 7;
+  uint64 sampling_seed = 5;
   // Seed used to construct the deterministic random rotation.
-  uint64 rotation_seed = 8;
+  uint64 rotation_seed = 6;
   // BLAKE3 fingerprint of the exact trained model applied by the index.
   // This must contain exactly 32 raw bytes and is required whenever this
   // message is present.
-  bytes model_fingerprint = 9;
+  bytes model_fingerprint = 7;
 }
 
 // Hierarchical Navigable Small World (HNSW) parameters, used as an optional configuration for IVF indexes.

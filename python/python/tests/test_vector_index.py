@@ -1631,8 +1631,6 @@ def test_pca_params_defaults_and_frozen():
 
     assert params.dimension == 8
     assert params.random_rotation is False
-    assert params.whitening is False
-    assert params.epsilon == 1e-5
     assert params.sample_size == 65536
     assert params.max_training_memory_bytes == 1073741824
     assert params.sampling_seed == 42
@@ -1658,8 +1656,6 @@ def test_create_ivf_rq_with_pca():
     params = PcaParams(
         dimension=8,
         random_rotation=True,
-        whitening=True,
-        epsilon=1e-4,
         sample_size=512,
         max_training_memory_bytes=64 * 1024 * 1024,
         sampling_seed=17,
@@ -1679,8 +1675,6 @@ def test_create_ivf_rq_with_pca():
     assert pre_transform["type"] == "pca"
     assert pre_transform["dimension"] == 8
     assert pre_transform["random_rotation"] is True
-    assert pre_transform["whitening"] is True
-    assert pre_transform["epsilon"] == pytest.approx(1e-4)
     assert pre_transform["sample_size"] == 512
     assert pre_transform["max_training_memory_bytes"] == 64 * 1024 * 1024
     assert pre_transform["sampling_seed"] == 17
@@ -1826,12 +1820,12 @@ def test_pca_options_require_dimension():
         create_table(nvec=32, ndim=16), "memory://", mode="overwrite"
     )
 
-    with pytest.raises(ValueError, match="pca_whitening requires pca_dimension"):
+    with pytest.raises(ValueError, match="pca_sample_size requires pca_dimension"):
         ds.create_index(
             "vector",
             index_type="IVF_RQ",
             num_partitions=4,
-            pca_whitening=True,
+            pca_sample_size=128,
         )
 
 
