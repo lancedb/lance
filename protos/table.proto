@@ -298,6 +298,13 @@ message Manifest {
    */
   repeated Clustering clustering = 25;
 
+  /* Highest clustering ID ever allocated in this lineage; zero before the first.
+   * Allocate max_clustering_id + 1 and update this value in the same commit.
+   * Never decreases, including after definition removal or restore.
+   * u32::MAX exhausts the ID space. A nonzero value requires FLAG_OBJECT_METADATA.
+   */
+  uint32 max_clustering_id = 26;
+
 } // Manifest
 
 // external dataset base path

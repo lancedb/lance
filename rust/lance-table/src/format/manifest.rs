@@ -1144,6 +1144,7 @@ impl From<&Manifest> for pb::Manifest {
             version: m.version,
             branch: m.branch.clone(),
             clustering: Vec::new(),
+            max_clustering_id: 0,
             writer_version: m
                 .writer_version
                 .as_ref()
@@ -1275,6 +1276,7 @@ mod tests {
         // Test the persisted messages only; runtime maintenance is not enabled yet.
         let manifest = pb::Manifest {
             writer_feature_flags: crate::feature_flags::FLAG_OBJECT_METADATA,
+            max_clustering_id: 7,
             clustering: vec![
                 pb::Clustering {
                     id: 1,
@@ -1339,7 +1341,17 @@ mod tests {
             segments
         );
         assert_eq!(manifest.clustering.len(), 2);
+        assert_eq!(manifest.max_clustering_id, 7);
         assert_eq!(manifest.fragments[2].clustering_id, None);
+        let allocation_only = pb::Manifest {
+            writer_feature_flags: crate::feature_flags::FLAG_OBJECT_METADATA,
+            max_clustering_id: manifest.max_clustering_id,
+            ..Default::default()
+        };
+        assert_eq!(
+            pb::Manifest::decode(allocation_only.encode_to_vec().as_slice()).unwrap(),
+            allocation_only
+        );
         // Proto presence distinguishes an absent reference from an invalid zero.
         let zero = pb::DataFragment {
             clustering_id: Some(0),

@@ -7,7 +7,7 @@ package lance.table;
 
 // Immutable clustering definition shared by fragments and index segments.
 message Clustering {
-  // Non-zero table-local ID, not the position in Manifest.clustering.
+  // Non-zero table-local ID allocated through Manifest.max_clustering_id, not a list position.
   uint32 id = 1;
   // Ordered, non-empty list of distinct, existing schema field IDs.
   repeated int32 columns = 2;

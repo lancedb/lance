@@ -19,6 +19,13 @@ index segments can reference different definitions.
 
 The ID identifies the whole definition, including its provider and version.
 
+`Manifest.max_clustering_id` records the highest ID ever allocated in this
+lineage, or 0 before the first allocation. A new definition gets
+`max_clustering_id + 1`, starting at 1, and updates the value in the same commit.
+Allocate against the latest manifest on each commit attempt. Removing definitions
+or restoring an older snapshot must not lower the value or make IDs reusable.
+Every definition's ID must be at most this value; `2^32 - 1` exhausts the ID space.
+
 Providers may store extra information in `Manifest.table_metadata`, using keys
 such as `<provider>.<clustering_id>.<key>`. Each provider defines its keys and values.
 
@@ -37,7 +44,7 @@ definitions and maintenance rules.
 Set `FLAG_OBJECT_METADATA` (`1 << 17`) in a snapshot's `writer_feature_flags`
 if it contains any of the following:
 
-- Table clustering definitions.
+- Table clustering definitions or a nonzero `max_clustering_id`.
 - Fragment clustering IDs, including records in a fragment metadata tree.
 - Index segment clustering IDs, including records in the index section.
 
