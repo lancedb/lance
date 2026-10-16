@@ -4,6 +4,10 @@
 use std::fmt;
 use std::sync::LazyLock;
 
+mod dispatch;
+
+pub use dispatch::{Candidate, Dispatch, Kernel};
+
 /// A level of SIMD support for some feature.
 ///
 /// `#[non_exhaustive]` so future tiers (e.g. AVX-512 BF16, AMX) can be added
@@ -347,6 +351,60 @@ mod tests {
                 *SIMD_SUPPORT
             );
         }
+    }
+
+    #[test]
+    fn host_features_include_build_baseline() {
+        assert!(CpuFeatures::host().contains(CpuFeatures::baseline()));
+    }
+
+    /// The mask a kernel declares must cover every feature rustc enables for
+    /// it, including implied ones, or a host lacking an implied feature could
+    /// select a kernel that uses it.
+    #[rstest]
+    #[case::sse_chain("avx", CpuFeatures::SSE2.union(CpuFeatures::SSE4_2))]
+    #[case::fma_implies_avx("fma", CpuFeatures::AVX)]
+    #[case::avx512f(
+        "avx512f",
+        CpuFeatures::AVX2.union(CpuFeatures::FMA).union(CpuFeatures::F16C)
+    )]
+    #[case::avx512fp16("avx512fp16", CpuFeatures::AVX512BW.union(CpuFeatures::AVX512F))]
+    #[case::fp16("fp16", CpuFeatures::NEON)]
+    #[case::lasx("lasx", CpuFeatures::LSX)]
+    fn target_feature_mask_includes_implied_features(
+        #[case] name: &str,
+        #[case] implied: CpuFeatures,
+    ) {
+        let features = CpuFeatures::from_target_feature(name).unwrap();
+        assert!(
+            features.contains(implied),
+            "{name} -> {features:?} is missing {implied:?}"
+        );
+    }
+
+    #[test]
+    fn unknown_target_feature_is_rejected() {
+        assert_eq!(CpuFeatures::from_target_feature("avx9000"), None);
+    }
+
+    #[rstest]
+    #[case::none(&[], SimdSupport::None)]
+    #[case::avx(&["avx"], SimdSupport::Avx)]
+    #[case::avx2_without_fma(&["avx2"], SimdSupport::Avx)]
+    #[case::avx_fma(&["fma"], SimdSupport::AvxFma)]
+    #[case::avx2(&["avx2", "fma"], SimdSupport::Avx2)]
+    #[case::avx512(&["avx512f"], SimdSupport::Avx512)]
+    #[case::avx512_fp16(&["avx512fp16"], SimdSupport::Avx512FP16)]
+    #[case::neon_without_fp16(&["neon"], SimdSupport::None)]
+    #[case::neon(&["fp16"], SimdSupport::Neon)]
+    #[case::lsx(&["lsx"], SimdSupport::Lsx)]
+    #[case::lasx(&["lasx"], SimdSupport::Lasx)]
+    fn simd_support_is_derived_from_features(
+        #[case] names: &[&str],
+        #[case] expected: SimdSupport,
+    ) {
+        let features = CpuFeatures::from_target_features(names);
+        assert_eq!(SimdSupport::from_features(features), expected);
     }
 
     #[rstest]
