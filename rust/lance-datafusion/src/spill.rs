@@ -38,8 +38,10 @@ use lance_core::utils::tempfile::TempDir;
 /// batches from the spill. This can be opened before, during, or after batches
 /// have been written to the spill.
 ///
-/// Once [`SpillSender`] is dropped, the temporary file is deleted. This will
-/// cause the [`SpillReceiver`] to return an error if it is still open.
+/// Once [`SpillSender`] is dropped, its status channel closes, which causes
+/// the [`SpillReceiver`] to return an error if it is still open. The temporary
+/// file itself is not deleted by dropping the sender; the caller remains
+/// responsible for deleting it (see above).
 pub fn create_replay_spill(
     path: std::path::PathBuf,
     schema: Arc<Schema>,

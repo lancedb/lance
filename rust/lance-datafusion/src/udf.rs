@@ -38,21 +38,27 @@ pub fn register_functions(ctx: &SessionContext) {
 /// DataFusion's generic "Unknown function" error.
 #[cfg(not(feature = "geo"))]
 fn register_geo_stub_functions(ctx: &SessionContext) {
+    use DataType::*;
+
+    // Argument and return types mirror the signatures the `geo` feature
+    // registers (geodatafusion), so queries that would plan against the real
+    // functions surface the feature-flag error instead of a generic
+    // arity or type-mismatch error.
     let geo_funcs = [
-        "st_intersects",
-        "st_contains",
-        "st_within",
-        "st_touches",
-        "st_crosses",
-        "st_overlaps",
-        "st_covers",
-        "st_coveredby",
-        "st_distance",
-        "st_area",
-        "st_length",
+        ("st_intersects", vec![Binary, Binary], Boolean),
+        ("st_contains", vec![Binary, Binary], Boolean),
+        ("st_within", vec![Binary, Binary], Boolean),
+        ("st_touches", vec![Binary, Binary], Boolean),
+        ("st_crosses", vec![Binary, Binary], Boolean),
+        ("st_overlaps", vec![Binary, Binary], Boolean),
+        ("st_covers", vec![Binary, Binary], Boolean),
+        ("st_coveredby", vec![Binary, Binary], Boolean),
+        ("st_distance", vec![Binary, Binary], Float64),
+        ("st_area", vec![Binary], Float64),
+        ("st_length", vec![Binary], Float64),
     ];
 
-    for name in geo_funcs {
+    for (name, args, return_type) in geo_funcs {
         let func_name = name.to_string();
         let stub = Arc::new(make_scalar_function(
             move |_args: &[ArrayRef]| {
@@ -67,8 +73,8 @@ fn register_geo_stub_functions(ctx: &SessionContext) {
 
         ctx.register_udf(create_udf(
             name,
-            vec![DataType::Binary, DataType::Binary],
-            DataType::Boolean,
+            args,
+            return_type,
             Volatility::Immutable,
             stub,
         ));
@@ -109,12 +115,19 @@ fn contains_tokens() -> ScalarUDF {
                 ),
             )?;
 
+            // A NULL query yields NULL results, not a match-everything row
+            // set: `value(0)` on a null slot returns "", whose empty token
+            // list would otherwise compare 0 == 0 and match every row.
+            let null_query = !scalar_str.is_empty() && scalar_str.is_null(0);
             let tokens: Option<Vec<&str>> = match scalar_str.len() {
                 0 => None,
                 _ => Some(collect_tokens(scalar_str.value(0))),
             };
 
             let result = column.iter().map(|text| {
+                if null_query {
+                    return None;
+                }
                 text.map(|text| {
                     let text_tokens = collect_tokens(text);
                     if let Some(tokens) = &tokens {
@@ -206,5 +219,85 @@ mod tests {
         } else {
             panic!("Expected an Array but got {:?}", values);
         }
+    }
+
+    #[tokio::test]
+    async fn test_contains_tokens_null_query_is_null() {
+        let contains_tokens = CONTAINS_TOKENS_UDF.clone();
+        let text_col = Arc::new(StringArray::from(vec![
+            "a cat catch a fish",
+            "a fish catch a cat",
+        ]));
+        // A NULL query must yield NULL results, not match-everything: the
+        // SQL null-semantics contract for the function's second argument.
+        let null_query = Arc::new(StringArray::from(vec![None::<&str>]));
+
+        let args = vec![
+            ColumnarValue::Array(text_col),
+            ColumnarValue::Array(null_query),
+        ];
+        let arg_fields = vec![
+            Arc::new(Field::new("text_col".to_string(), DataType::Utf8, false)),
+            Arc::new(Field::new("query".to_string(), DataType::Utf8, true)),
+        ];
+
+        let args = ScalarFunctionArgs {
+            args,
+            arg_fields,
+            number_rows: 2,
+            return_field: Arc::new(Field::new("res".to_string(), DataType::Boolean, true)),
+            config_options: Arc::new(Default::default()),
+        };
+
+        let values = contains_tokens.invoke_with_args(args).unwrap();
+        let ColumnarValue::Array(array) = values else {
+            panic!("Expected an Array");
+        };
+        let array = array.as_any().downcast_ref::<BooleanArray>().unwrap();
+        assert_eq!(array.clone(), BooleanArray::from(vec![None, None]));
+    }
+
+    #[cfg(not(feature = "geo"))]
+    #[tokio::test]
+    async fn test_geo_stubs_mirror_real_signatures() {
+        use arrow_array::BinaryArray;
+        use arrow_schema::Schema;
+        use datafusion::prelude::SessionContext;
+
+        let ctx = SessionContext::new();
+        super::register_functions(&ctx);
+
+        let schema = Arc::new(Schema::new(vec![Field::new("g", DataType::Binary, true)]));
+        let batch = arrow_array::RecordBatch::try_new(
+            schema,
+            vec![Arc::new(BinaryArray::from_opt_vec(vec![
+                Some(&[0_u8][..]),
+                None,
+            ]))],
+        )
+        .unwrap();
+        ctx.register_batch("t", batch).unwrap();
+
+        // st_area takes exactly one argument; with the stub's old two-arg
+        // signature the user saw a generic coercion error instead of the
+        // feature-flag message.
+        let df = ctx.sql("SELECT st_area(g) FROM t").await.unwrap();
+        let err = df.collect().await.unwrap_err();
+        assert!(
+            err.to_string().contains("requires the `geo` feature"),
+            "{err}"
+        );
+
+        // st_distance returns Float64, so a range comparison plans correctly
+        // and surfaces the feature-flag error rather than a type error.
+        let df = ctx
+            .sql("SELECT st_distance(g, g) < 10 FROM t")
+            .await
+            .unwrap();
+        let err = df.collect().await.unwrap_err();
+        assert!(
+            err.to_string().contains("requires the `geo` feature"),
+            "{err}"
+        );
     }
 }
