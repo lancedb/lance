@@ -1,6 +1,216 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+//! Selecting one kernel per operation from candidates ranked by preference.
+//!
+//! ```
+//! use lance_core::utils::cpu::Dispatch;
+//!
+//! type DotFn = unsafe fn(&[f32], &[f32]) -> f32;
+//!
+//! lance_core::target_kernel! {
+//!     #[target_features()]
+//!     #[candidate(DOT_PORTABLE: DotFn)]
+//!     fn dot_portable(x: &[f32], y: &[f32]) -> f32 {
+//!         x.iter().zip(y).map(|(a, b)| a * b).sum()
+//!     }
+//! }
+//!
+//! lance_core::dispatch! {
+//!     /// Candidates best first; the last must need no features.
+//!     static DOT: Dispatch<DotFn> = &[DOT_PORTABLE];
+//! }
+//!
+//! assert_eq!(DOT.get().call(&[1.0, 2.0], &[3.0, 4.0]), 11.0);
+//! ```
+
+use std::sync::OnceLock;
+
+use super::CpuFeatures;
+
+/// A kernel together with the CPU features it needs.
+///
+/// Construct one with [`target_kernel!`](crate::target_kernel), which derives
+/// the features from the kernel's own `#[target_feature]` list.
+#[derive(Clone, Copy)]
+pub struct Candidate<F> {
+    name: &'static str,
+    features: CpuFeatures,
+    kernel: F,
+}
+
+impl<F: Copy> Candidate<F> {
+    /// # Safety
+    ///
+    /// Calling `kernel` must be sound on every host that supports `features`.
+    pub const unsafe fn new(name: &'static str, features: CpuFeatures, kernel: F) -> Self {
+        Self {
+            name,
+            features,
+            kernel,
+        }
+    }
+
+    /// The kernel's function name.
+    pub const fn name(&self) -> &'static str {
+        self.name
+    }
+
+    /// Features the host needs to run this kernel.
+    pub const fn features(&self) -> CpuFeatures {
+        self.features
+    }
+
+    /// The kernel, if the host supports it. Lets tests run every candidate.
+    pub fn kernel(&self) -> Option<Kernel<F>> {
+        CpuFeatures::host()
+            .contains(self.features)
+            .then_some(Kernel(self.kernel))
+    }
+}
+
+/// A kernel the host is known to support, so calling it is safe.
+#[derive(Clone, Copy)]
+pub struct Kernel<F>(F);
+
+impl<A: ?Sized, B: ?Sized, R> Kernel<unsafe fn(&A, &B) -> R> {
+    #[inline(always)]
+    pub fn call(self, a: &A, b: &B) -> R {
+        // SAFETY: a `Kernel` only exists for a candidate whose features the
+        // host supports, which is the kernel's only precondition.
+        unsafe { (self.0)(a, b) }
+    }
+}
+
+impl<A: ?Sized, B: ?Sized, C, D: ?Sized, R> Kernel<unsafe fn(&A, &B, C, &mut D) -> R> {
+    #[inline(always)]
+    pub fn call(self, a: &A, b: &B, c: C, d: &mut D) -> R {
+        // SAFETY: see the two-argument `call`.
+        unsafe { (self.0)(a, b, c, d) }
+    }
+}
+
+/// One operation's kernels, best first, with the host's choice made once.
+///
+/// Declare with [`dispatch!`](crate::dispatch). When the build baseline already
+/// supports the best candidate, [`Self::get`] returns it without touching the
+/// host feature set, so the compiler sees a direct call it can inline.
+pub struct Dispatch<F: 'static> {
+    candidates: &'static [Candidate<F>],
+    // Kept outside `Dispatch` so a `static Dispatch` has no interior
+    // mutability; the compiler can then constant-fold `is_static` and the
+    // first kernel in `get`.
+    selected: &'static OnceLock<F>,
+    is_static: bool,
+}
+
+impl<F: Copy> Dispatch<F> {
+    /// Prefer [`dispatch!`](crate::dispatch), which provides `selected`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `candidates` is empty or its last candidate needs any
+    /// feature, so that every host has a kernel. Evaluated in a `static`, this
+    /// is a compile error.
+    pub const fn new(candidates: &'static [Candidate<F>], selected: &'static OnceLock<F>) -> Self {
+        let Some(fallback) = candidates.last() else {
+            panic!("a Dispatch needs at least one candidate");
+        };
+        assert!(
+            fallback.features.is_empty(),
+            "the last Dispatch candidate must not need any CPU feature"
+        );
+        Self {
+            candidates,
+            selected,
+            is_static: CpuFeatures::baseline().contains(candidates[0].features),
+        }
+    }
+
+    /// The best kernel the host supports.
+    #[inline(always)]
+    pub fn get(&self) -> Kernel<F> {
+        if self.is_static {
+            return Kernel(self.candidates[0].kernel);
+        }
+        Kernel(*self.selected.get_or_init(|| self.selected().kernel))
+    }
+
+    /// The candidate [`Self::get`] returns.
+    pub fn selected(&self) -> &'static Candidate<F> {
+        &self.candidates[select(self.candidates, CpuFeatures::host())]
+    }
+
+    /// Whether the build baseline supports the best candidate, so selection
+    /// happens at compile time.
+    pub const fn is_static(&self) -> bool {
+        self.is_static
+    }
+
+    /// All candidates, best first.
+    pub const fn candidates(&self) -> &'static [Candidate<F>] {
+        self.candidates
+    }
+}
+
+/// Index of the first candidate `host` supports.
+fn select<F>(candidates: &[Candidate<F>], host: CpuFeatures) -> usize {
+    candidates
+        .iter()
+        .position(|candidate| host.contains(candidate.features))
+        .expect("Dispatch::new requires a candidate without features")
+}
+
+/// Declares a kernel and a [`Candidate`] for it from one feature list.
+///
+/// The kernel gets one `#[target_feature(enable = ...)]` per listed feature,
+/// and the candidate requires exactly those features plus the ones rustc
+/// implies, so the two cannot drift apart. The kernel is a safe function: its
+/// only precondition is the target features, and a [`Dispatch`] or
+/// [`Candidate::kernel`] checks those before handing out a callable
+/// [`Kernel`]. Unknown feature names fail to compile.
+///
+/// The candidate type must be the `unsafe fn` pointer type of the kernel.
+#[macro_export]
+macro_rules! target_kernel {
+    (
+        #[target_features($($feature:literal),* $(,)?)]
+        #[candidate($candidate_vis:vis $candidate:ident: $kernel_type:ty)]
+        $(#[$attr:meta])*
+        $vis:vis fn $name:ident($($params:tt)*) $(-> $ret:ty)? $body:block
+    ) => {
+        $(#[$attr])*
+        $(#[target_feature(enable = $feature)])*
+        $vis fn $name($($params)*) $(-> $ret)? $body
+
+        $candidate_vis const $candidate: $crate::utils::cpu::Candidate<$kernel_type> = {
+            const FEATURES: $crate::utils::cpu::CpuFeatures =
+                $crate::utils::cpu::CpuFeatures::from_target_features(&[$($feature),*]);
+            // SAFETY: the kernel is a safe function whose `#[target_feature]`
+            // attributes come from the same list as `FEATURES`.
+            unsafe { $crate::utils::cpu::Candidate::new(stringify!($name), FEATURES, $name) }
+        };
+    };
+}
+
+/// Declares a `static` [`Dispatch`] over a slice of [`Candidate`]s, best first.
+///
+/// The slice may be a block whose tail expressions are `#[cfg]`-gated per
+/// architecture.
+#[macro_export]
+macro_rules! dispatch {
+    (
+        $(#[$attr:meta])*
+        $vis:vis static $name:ident: Dispatch<$kernel_type:ty> = $candidates:expr;
+    ) => {
+        $(#[$attr])*
+        $vis static $name: $crate::utils::cpu::Dispatch<$kernel_type> = {
+            static SELECTED: ::std::sync::OnceLock<$kernel_type> = ::std::sync::OnceLock::new();
+            $crate::utils::cpu::Dispatch::new($candidates, &SELECTED)
+        };
+    };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

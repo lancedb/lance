@@ -4,11 +4,6 @@
 //! L2 (Euclidean) distance.
 //!
 
-#[cfg(all(
-    target_arch = "x86_64",
-    not(all(target_feature = "avx2", target_feature = "fma"))
-))]
-use std::arch::x86_64::{_mm256_loadu_ps, _mm256_mul_ps, _mm256_sub_ps};
 use std::iter::Sum;
 use std::ops::AddAssign;
 use std::sync::Arc;
@@ -31,20 +26,10 @@ use num_traits::{AsPrimitive, Num};
 #[cfg(feature = "fp16kernels")]
 use crate::distance::HalfBackend;
 use crate::distance::{
-    HALF_KERNELS_COMPILED, HalfType, U8_U32_ACCUMULATOR_MAX_LEN, assert_batch_layout,
-    assert_equal_lengths, half_backend, int8_query_to_f32, x86_half_features,
+    BatchDistances, BatchKernel, HALF_KERNELS_COMPILED, HalfType, PairKernel,
+    U8_U32_ACCUMULATOR_MAX_LEN, assert_batch_layout, assert_equal_lengths, half_backend,
+    int8_query_to_f32, x86_half_features,
 };
-
-#[cfg(all(
-    target_arch = "x86_64",
-    not(all(target_feature = "avx2", target_feature = "fma"))
-))]
-use crate::distance::{BatchIter, BatchKernel, BatchKind, BatchOperation};
-#[cfg(all(
-    target_arch = "x86_64",
-    not(all(target_feature = "avx2", target_feature = "fma"))
-))]
-use crate::simd::x86::hsum256_ps;
 
 /// Calculate the L2 distance between two vectors.
 ///
@@ -295,11 +280,7 @@ impl L2 for f32 {
     #[inline]
     fn l2(x: &[Self], y: &[Self]) -> f32 {
         assert_equal_lengths(x.len(), y.len());
-        // Trait methods cannot carry `#[target_feature]` attributes, so the body
-        // lives in a free function that runtime-dispatches via `*SIMD_SUPPORT`
-        // to an AVX2 or AVX-512 inner kernel on capable hosts, or a portable
-        // scalar fallback.
-        l2_f32_dispatched(x, y)
+        L2_F32.get().call(x, y)
     }
 
     fn l2_batch<'a>(
@@ -308,202 +289,70 @@ impl L2 for f32 {
         dimension: usize,
     ) -> impl Iterator<Item = Self> + 'a {
         assert_batch_layout(x.len(), y.len(), dimension);
-        // Exactly one arm compiles; see `Dot::dot_batch` for f32.
-        #[cfg(all(
-            target_arch = "x86_64",
-            target_feature = "avx2",
-            target_feature = "fma"
-        ))]
+        BatchDistances::new(x, y, dimension, L2_F32_BATCH.get())
+    }
+}
+
+lance_core::dispatch! {
+    static L2_F32: Dispatch<PairKernel> = {
+        #[cfg(target_arch = "x86_64")]
         {
-            // `l2_scalar::<_, _, 16>` chunks the vector by 16 lanes. At or below
-            // that width the chunking degenerates to its scalar remainder loop
-            // and vectorizes nothing, so the explicit AVX kernel is worth ~40%.
-            // Above it the autovectorizer already does well and the 8-wide
-            // kernel can lose, so keep the exact kernel the pre-dispatch code
-            // used and stay non-regressing by construction.
-            //
-            // SAFETY: the build baseline enables avx2+fma, which imply avx+fma,
-            // so the kernel's `#[target_feature]` contract is met statically.
-            let narrow = dimension <= 16;
-            y.chunks_exact(dimension).map(move |v| {
-                if narrow {
-                    unsafe { x86::l2_f32_avx_fma(x, v) }
-                } else {
-                    l2_f32_scalar(x, v)
-                }
-            })
-        }
-        #[cfg(all(
-            target_arch = "x86_64",
-            not(all(target_feature = "avx2", target_feature = "fma"))
-        ))]
-        {
-            l2_batch_f32_runtime_dispatch(x, y, dimension)
+            &[
+                x86::L2_F32_AVX512,
+                x86::L2_F32_AVX_FMA,
+                x86::L2_F32_AVX,
+                L2_F32_SCALAR,
+            ]
         }
         #[cfg(not(target_arch = "x86_64"))]
         {
-            // `assert_batch_layout` proves every chunk has the same length as
-            // `x`, so call the private kernel directly instead of repeating
-            // the public `L2::l2` validation for every vector.
-            y.chunks_exact(dimension)
-                .map(move |v| l2_f32_dispatched(x, v))
+            &[L2_F32_SCALAR]
         }
-    }
-}
-
-/// Sub-AVX2 builds: pick a `#[target_feature]` kernel once for the batch.
-#[cfg(all(
-    target_arch = "x86_64",
-    not(all(target_feature = "avx2", target_feature = "fma"))
-))]
-#[inline]
-fn l2_batch_f32_runtime_dispatch<'a>(
-    x: &'a [f32],
-    y: &'a [f32],
-    dimension: usize,
-) -> impl Iterator<Item = f32> + 'a {
-    let (kernel, kind): (BatchKernel, BatchKind) = match *SIMD_SUPPORT {
-        // AVX-512 has no useful work for an eight-element vector. Retain the
-        // AVX/FMA kernel used by the former Haswell baseline for PQ dimensions.
-        SimdSupport::Avx512 | SimdSupport::Avx512FP16 if dimension > 16 => {
-            (x86::l2_batch_f32_avx512, BatchKind::Avx512)
-        }
-        SimdSupport::Avx512 | SimdSupport::Avx512FP16 if std::is_x86_feature_detected!("fma") => {
-            (x86::l2_batch_f32_avx_fma, BatchKind::AvxFma)
-        }
-        SimdSupport::Avx2 | SimdSupport::AvxFma => (x86::l2_batch_f32_avx_fma, BatchKind::AvxFma),
-        SimdSupport::Avx512 | SimdSupport::Avx512FP16 | SimdSupport::Avx => {
-            (x86::l2_batch_f32_avx, BatchKind::Avx)
-        }
-        _ => (l2_batch_f32_scalar, BatchKind::Scalar),
     };
-
-    // SAFETY: the runtime tier and the explicit FMA check above establish the
-    // selected kernel's target-feature contract.
-    unsafe { BatchIter::<L2Batch>::new(x, y, dimension, kernel, kind) }
 }
 
-#[cfg(all(
-    target_arch = "x86_64",
-    not(all(target_feature = "avx2", target_feature = "fma"))
-))]
-struct L2Batch;
+lance_core::dispatch! {
+    /// There is no AVX-512 candidate: the AVX+FMA kernel is the best one so
+    /// that Haswell-baseline builds select it statically and inline it, which
+    /// matters at the 8-wide PQ dimension. Its dimension-dependent choice
+    /// mirrors what those builds have always computed.
+    static L2_F32_BATCH: Dispatch<BatchKernel> = {
+        #[cfg(target_arch = "x86_64")]
+        {
+            &[
+                x86::L2_F32_BATCH_AVX_FMA,
+                x86::L2_F32_BATCH_AVX,
+                L2_F32_BATCH_SCALAR,
+            ]
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            &[L2_F32_BATCH_SCALAR]
+        }
+    };
+}
 
-#[cfg(all(
-    target_arch = "x86_64",
-    not(all(target_feature = "avx2", target_feature = "fma"))
-))]
-impl BatchOperation for L2Batch {
+lance_core::target_kernel! {
+    #[target_features()]
+    #[candidate(L2_F32_SCALAR: PairKernel)]
+    /// Portable L2 distance for f32, relying on LLVM to auto-vectorize it.
     #[inline]
-    fn fold_scalar<B, F>(key: &[f32], batch: &[f32], dimension: usize, init: B, mut f: F) -> B
-    where
-        F: FnMut(B, f32) -> B,
-    {
-        batch
-            .chunks_exact(dimension)
-            .fold(init, |acc, vector| f(acc, l2_f32_scalar(key, vector)))
-    }
-
-    #[target_feature(enable = "avx")]
-    unsafe fn fold_avx<B, F>(key: &[f32], batch: &[f32], dimension: usize, init: B, mut f: F) -> B
-    where
-        F: FnMut(B, f32) -> B,
-    {
-        if dimension == 8 {
-            let key_values = unsafe { _mm256_loadu_ps(key.as_ptr()) };
-            return batch.as_chunks::<8>().0.iter().fold(init, |acc, vector| {
-                let vector_values = unsafe { _mm256_loadu_ps(vector.as_ptr()) };
-                let difference = _mm256_sub_ps(key_values, vector_values);
-                let squared = _mm256_mul_ps(difference, difference);
-                f(acc, unsafe { hsum256_ps(squared) })
-            });
-        }
-        batch.chunks_exact(dimension).fold(init, |acc, vector| {
-            f(acc, unsafe { x86::l2_f32_avx(key, vector) })
-        })
-    }
-
-    #[target_feature(enable = "avx,fma")]
-    unsafe fn fold_avx_fma<B, F>(
-        key: &[f32],
-        batch: &[f32],
-        dimension: usize,
-        init: B,
-        mut f: F,
-    ) -> B
-    where
-        F: FnMut(B, f32) -> B,
-    {
-        if dimension == 8 {
-            let key_values = unsafe { _mm256_loadu_ps(key.as_ptr()) };
-            return batch.as_chunks::<8>().0.iter().fold(init, |acc, vector| {
-                let vector_values = unsafe { _mm256_loadu_ps(vector.as_ptr()) };
-                let difference = _mm256_sub_ps(key_values, vector_values);
-                let squared = _mm256_mul_ps(difference, difference);
-                f(acc, unsafe { hsum256_ps(squared) })
-            });
-        }
-        batch.chunks_exact(dimension).fold(init, |acc, vector| {
-            f(acc, unsafe { x86::l2_f32_avx_fma(key, vector) })
-        })
-    }
-
-    #[target_feature(enable = "avx512f")]
-    unsafe fn fold_avx512<B, F>(
-        key: &[f32],
-        batch: &[f32],
-        dimension: usize,
-        init: B,
-        mut f: F,
-    ) -> B
-    where
-        F: FnMut(B, f32) -> B,
-    {
-        batch.chunks_exact(dimension).fold(init, |acc, vector| {
-            f(acc, unsafe { x86::l2_f32_avx512(key, vector) })
-        })
+    fn l2_f32_scalar(x: &[f32], y: &[f32]) -> f32 {
+        // 16 = 512 (avx512) / 8 bits / 4 (sizeof(f32))
+        // See https://github.com/lance-format/lance/pull/2450.
+        l2_scalar::<f32, f32, 16>(x, y)
     }
 }
 
-#[cfg(all(
-    target_arch = "x86_64",
-    not(all(target_feature = "avx2", target_feature = "fma"))
-))]
-unsafe fn l2_batch_f32_scalar(x: &[f32], batch: &[f32], dimension: usize, output: &mut [f32]) {
-    debug_assert_eq!(output.len(), batch.len() / dimension);
-    for (distance, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
-        *distance = l2_f32_scalar(x, y);
-    }
-}
-
-/// L2 distance for f32, runtime-dispatched via `SIMD_SUPPORT` on x86_64
-/// (AVX-512 / AVX2+FMA / AVX+FMA / AVX / scalar). Non-x86 uses the
-/// auto-vectorised scalar loop.
-#[inline]
-fn l2_f32_dispatched(x: &[f32], y: &[f32]) -> f32 {
-    #[cfg(target_arch = "x86_64")]
-    {
-        match *SIMD_SUPPORT {
-            SimdSupport::Avx512 | SimdSupport::Avx512FP16 => unsafe { x86::l2_f32_avx512(x, y) },
-            SimdSupport::Avx2 | SimdSupport::AvxFma => unsafe { x86::l2_f32_avx_fma(x, y) },
-            SimdSupport::Avx => unsafe { x86::l2_f32_avx(x, y) },
-            _ => l2_f32_scalar(x, y),
+lance_core::target_kernel! {
+    #[target_features()]
+    #[candidate(L2_F32_BATCH_SCALAR: BatchKernel)]
+    #[inline]
+    fn l2_batch_f32_scalar(x: &[f32], batch: &[f32], dimension: usize, output: &mut [f32]) {
+        for (distance, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
+            *distance = l2_f32_scalar(x, y);
         }
     }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        l2_f32_scalar(x, y)
-    }
-}
-
-/// Portable scalar L2 distance for f32. Used as the x86_64 fallback when no
-/// AVX2 is detected, and as the only path on non-x86 architectures. The
-/// `LANES = 16` chunking matches the explicit-SIMD inner kernels above.
-#[inline]
-fn l2_f32_scalar(x: &[f32], y: &[f32]) -> f32 {
-    // 16 = 512 (avx512) / 8 bits / 4 (sizeof(f32))
-    // See https://github.com/lance-format/lance/pull/2450.
-    l2_scalar::<f32, f32, 16>(x, y)
 }
 
 impl L2 for f64 {
@@ -552,67 +401,65 @@ fn l2_f64_scalar(x: &[f64], y: &[f64]) -> f32 {
 mod x86 {
     use std::arch::x86_64::*;
 
+    use crate::distance::{BatchKernel, PairKernel};
     use crate::simd::f64::{f64x4, f64x8};
     use crate::simd::x86::hsum256_ps;
     use crate::simd::{FloatSimd, SIMD};
 
-    /// L2 distance from `x` to every `dimension`-sized vector in `batch`, with
-    /// the AVX-512 tier entered once for the whole batch rather than once per
-    /// vector.
-    ///
-    /// # Safety
-    /// The host must support AVX-512F.
-    ///
-    /// Only compiled for builds whose baseline is below avx2+fma; at or above
-    /// that baseline `l2_batch` inlines the kernel directly and never runtime-
-    /// dispatches, so this wrapper would be dead code (see `l2_batch`).
-    #[cfg(not(all(target_feature = "avx2", target_feature = "fma")))]
-    #[target_feature(enable = "avx512f")]
-    pub(super) unsafe fn l2_batch_f32_avx512(
-        x: &[f32],
-        batch: &[f32],
-        dimension: usize,
-        output: &mut [f32],
-    ) {
-        debug_assert_eq!(output.len(), batch.len() / dimension);
-        for (distance, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
-            *distance = unsafe { l2_f32_avx512(x, y) };
+    lance_core::target_kernel! {
+        #[target_features("avx", "fma")]
+        #[candidate(pub(super) L2_F32_BATCH_AVX_FMA: BatchKernel)]
+        /// Up to 16 dimensions the scalar kernel's 16-lane chunking degenerates
+        /// to its remainder loop, so the explicit AVX kernel wins; above that
+        /// the auto-vectorized scalar kernel is as good or better.
+        pub(super) fn l2_batch_f32_avx_fma(
+            x: &[f32],
+            batch: &[f32],
+            dimension: usize,
+            output: &mut [f32],
+        ) {
+            if dimension == 8
+                && let Ok(key) = <&[f32; 8]>::try_from(x)
+            {
+                let key = unsafe { _mm256_loadu_ps(key.as_ptr()) };
+                for (distance, y) in output.iter_mut().zip(batch.as_chunks::<8>().0) {
+                    let diff = _mm256_sub_ps(key, unsafe { _mm256_loadu_ps(y.as_ptr()) });
+                    *distance = unsafe { hsum256_ps(_mm256_mul_ps(diff, diff)) };
+                }
+            } else if dimension <= 16 {
+                for (distance, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
+                    *distance = l2_f32_avx_fma(x, y);
+                }
+            } else {
+                for (distance, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
+                    *distance = super::l2_f32_scalar(x, y);
+                }
+            }
         }
     }
 
-    /// As [`l2_batch_f32_avx512`], for the AVX+FMA and AVX2 tiers.
-    ///
-    /// # Safety
-    /// The host must support AVX and FMA.
-    #[cfg(not(all(target_feature = "avx2", target_feature = "fma")))]
-    #[target_feature(enable = "avx,fma")]
-    pub(super) unsafe fn l2_batch_f32_avx_fma(
-        x: &[f32],
-        batch: &[f32],
-        dimension: usize,
-        output: &mut [f32],
-    ) {
-        debug_assert_eq!(output.len(), batch.len() / dimension);
-        for (distance, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
-            *distance = unsafe { l2_f32_avx_fma(x, y) };
-        }
-    }
-
-    /// As [`l2_batch_f32_avx512`], for the AVX-without-FMA tier.
-    ///
-    /// # Safety
-    /// The host must support AVX.
-    #[cfg(not(all(target_feature = "avx2", target_feature = "fma")))]
-    #[target_feature(enable = "avx")]
-    pub(super) unsafe fn l2_batch_f32_avx(
-        x: &[f32],
-        batch: &[f32],
-        dimension: usize,
-        output: &mut [f32],
-    ) {
-        debug_assert_eq!(output.len(), batch.len() / dimension);
-        for (distance, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
-            *distance = unsafe { l2_f32_avx(x, y) };
+    lance_core::target_kernel! {
+        #[target_features("avx")]
+        #[candidate(pub(super) L2_F32_BATCH_AVX: BatchKernel)]
+        pub(super) fn l2_batch_f32_avx(
+            x: &[f32],
+            batch: &[f32],
+            dimension: usize,
+            output: &mut [f32],
+        ) {
+            if dimension == 8
+                && let Ok(key) = <&[f32; 8]>::try_from(x)
+            {
+                let key = unsafe { _mm256_loadu_ps(key.as_ptr()) };
+                for (distance, y) in output.iter_mut().zip(batch.as_chunks::<8>().0) {
+                    let diff = _mm256_sub_ps(key, unsafe { _mm256_loadu_ps(y.as_ptr()) });
+                    *distance = unsafe { hsum256_ps(_mm256_mul_ps(diff, diff)) };
+                }
+            } else {
+                for (distance, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
+                    *distance = l2_f32_avx(x, y);
+                }
+            }
         }
     }
 
@@ -710,85 +557,112 @@ mod x86 {
         (acc_sum + tail) as f32
     }
 
-    /// AVX-512 path for f32: 16-wide `__m512` with `vsubps` + `vfmadd231ps` per iteration.
-    #[inline]
-    #[target_feature(enable = "avx512f")]
-    pub unsafe fn l2_f32_avx512(x: &[f32], y: &[f32]) -> f32 {
-        let dim = x.len();
-        let unrolled_len = dim / 16 * 16;
+    lance_core::target_kernel! {
+        #[target_features("avx512f")]
+        #[candidate(pub(super) L2_F32_AVX512: PairKernel)]
+        /// AVX-512 path for f32: 16-wide `__m512` with `vsubps` + `vfmadd231ps` per iteration.
+        #[inline]
+        pub(super) fn l2_f32_avx512(x: &[f32], y: &[f32]) -> f32 {
+            // Callers pass equal lengths; `min` keeps the unchecked loads in
+            // bounds for any input, as a safe function must.
+            let dim = x.len().min(y.len());
+            let unrolled_len = dim / 16 * 16;
 
-        let mut acc = _mm512_setzero_ps();
-        for i in (0..unrolled_len).step_by(16) {
-            let a = _mm512_loadu_ps(x.as_ptr().add(i));
-            let b = _mm512_loadu_ps(y.as_ptr().add(i));
-            let diff = _mm512_sub_ps(a, b);
-            acc = _mm512_fmadd_ps(diff, diff, acc);
+            let mut acc = _mm512_setzero_ps();
+            for i in (0..unrolled_len).step_by(16) {
+                let (a, b) = unsafe {
+                    (
+                        _mm512_loadu_ps(x.as_ptr().add(i)),
+                        _mm512_loadu_ps(y.as_ptr().add(i)),
+                    )
+                };
+                let diff = _mm512_sub_ps(a, b);
+                acc = _mm512_fmadd_ps(diff, diff, acc);
+            }
+
+            let tail: f32 = x[unrolled_len..]
+                .iter()
+                .zip(y[unrolled_len..].iter())
+                .map(|(&a, &b)| {
+                    let diff = a - b;
+                    diff * diff
+                })
+                .sum();
+
+            _mm512_reduce_add_ps(acc) + tail
         }
-
-        let tail: f32 = x[unrolled_len..]
-            .iter()
-            .zip(y[unrolled_len..].iter())
-            .map(|(&a, &b)| {
-                let diff = a - b;
-                diff * diff
-            })
-            .sum();
-
-        _mm512_reduce_add_ps(acc) + tail
     }
 
-    /// AVX + FMA path for f32. Covers both AvxFma and AVX2 dispatch (body uses no AVX2-specific intrinsics).
-    #[inline]
-    #[target_feature(enable = "avx,fma")]
-    pub unsafe fn l2_f32_avx_fma(x: &[f32], y: &[f32]) -> f32 {
-        let dim = x.len();
-        let unrolled_len = dim / 8 * 8;
+    lance_core::target_kernel! {
+        #[target_features("avx", "fma")]
+        #[candidate(pub(super) L2_F32_AVX_FMA: PairKernel)]
+        /// AVX + FMA path for f32. Covers both AvxFma and AVX2 hosts (body uses no AVX2-specific intrinsics).
+        #[inline]
+        pub(super) fn l2_f32_avx_fma(x: &[f32], y: &[f32]) -> f32 {
+            // See `l2_f32_avx512` for `min`.
+            let dim = x.len().min(y.len());
+            let unrolled_len = dim / 8 * 8;
 
-        let mut acc = _mm256_setzero_ps();
-        for i in (0..unrolled_len).step_by(8) {
-            let a = _mm256_loadu_ps(x.as_ptr().add(i));
-            let b = _mm256_loadu_ps(y.as_ptr().add(i));
-            let diff = _mm256_sub_ps(a, b);
-            acc = _mm256_fmadd_ps(diff, diff, acc);
+            let mut acc = _mm256_setzero_ps();
+            for i in (0..unrolled_len).step_by(8) {
+                let (a, b) = unsafe {
+                    (
+                        _mm256_loadu_ps(x.as_ptr().add(i)),
+                        _mm256_loadu_ps(y.as_ptr().add(i)),
+                    )
+                };
+                let diff = _mm256_sub_ps(a, b);
+                acc = _mm256_fmadd_ps(diff, diff, acc);
+            }
+
+            let tail: f32 = x[unrolled_len..]
+                .iter()
+                .zip(y[unrolled_len..].iter())
+                .map(|(&a, &b)| {
+                    let diff = a - b;
+                    diff * diff
+                })
+                .sum();
+
+            let sum = unsafe { hsum256_ps(acc) };
+            sum + tail
         }
-
-        let tail: f32 = x[unrolled_len..]
-            .iter()
-            .zip(y[unrolled_len..].iter())
-            .map(|(&a, &b)| {
-                let diff = a - b;
-                diff * diff
-            })
-            .sum();
-
-        hsum256_ps(acc) + tail
     }
 
-    /// AVX-only path for f32 (no FMA): squared diff via `_mm256_mul_ps` + `_mm256_add_ps` for Sandy/Ivy Bridge.
-    #[inline]
-    #[target_feature(enable = "avx")]
-    pub unsafe fn l2_f32_avx(x: &[f32], y: &[f32]) -> f32 {
-        let dim = x.len();
-        let unrolled_len = dim / 8 * 8;
+    lance_core::target_kernel! {
+        #[target_features("avx")]
+        #[candidate(pub(super) L2_F32_AVX: PairKernel)]
+        /// AVX-only path for f32 (no FMA): squared diff via `_mm256_mul_ps` + `_mm256_add_ps` for Sandy/Ivy Bridge.
+        #[inline]
+        pub(super) fn l2_f32_avx(x: &[f32], y: &[f32]) -> f32 {
+            // See `l2_f32_avx512` for `min`.
+            let dim = x.len().min(y.len());
+            let unrolled_len = dim / 8 * 8;
 
-        let mut acc = _mm256_setzero_ps();
-        for i in (0..unrolled_len).step_by(8) {
-            let a = _mm256_loadu_ps(x.as_ptr().add(i));
-            let b = _mm256_loadu_ps(y.as_ptr().add(i));
-            let diff = _mm256_sub_ps(a, b);
-            acc = _mm256_add_ps(acc, _mm256_mul_ps(diff, diff));
+            let mut acc = _mm256_setzero_ps();
+            for i in (0..unrolled_len).step_by(8) {
+                let (a, b) = unsafe {
+                    (
+                        _mm256_loadu_ps(x.as_ptr().add(i)),
+                        _mm256_loadu_ps(y.as_ptr().add(i)),
+                    )
+                };
+                let diff = _mm256_sub_ps(a, b);
+                acc = _mm256_add_ps(acc, _mm256_mul_ps(diff, diff));
+            }
+
+            let tail: f32 = x[unrolled_len..]
+                .iter()
+                .zip(y[unrolled_len..].iter())
+                .map(|(&a, &b)| {
+                    let diff = a - b;
+                    diff * diff
+                })
+                .sum();
+
+            let sum = unsafe { hsum256_ps(acc) };
+            sum + tail
         }
-
-        let tail: f32 = x[unrolled_len..]
-            .iter()
-            .zip(y[unrolled_len..].iter())
-            .map(|(&a, &b)| {
-                let diff = a - b;
-                diff * diff
-            })
-            .sum();
-
-        hsum256_ps(acc) + tail
     }
 }
 
