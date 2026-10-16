@@ -3372,8 +3372,20 @@ pub async fn commit_compaction(
     // the rewrite on their own and never reach this remap.
     let needs_remapping = !options.defer_index_remap && has_address_style;
 
+    // Whether this commit is actually about to remap an address-domain index
+    // immediately with these addresses, as opposed to merely being permitted
+    // to try. `needs_remapping` alone is not enough: on a stable-row-id table
+    // with no address-domain index, the tasks' recorded addresses can only
+    // have come from `defer_index_remap` at plan/execution time (distributed
+    // mode may commit with different options than it planned with), and the
+    // commit must still honor that recording intent -- folding them into a
+    // fragment reuse index -- rather than silently discarding them because
+    // nothing here will consume them eagerly.
+    let remapping_eagerly =
+        uses_stable_row_ids && needs_remapping && has_address_domain_index(dataset).await?;
+
     let records_row_addrs = if uses_stable_row_ids {
-        records_stable_row_id_moves(dataset, &completed_tasks, options, needs_remapping).await?
+        records_stable_row_id_moves(dataset, &completed_tasks, options, remapping_eagerly).await?
     } else {
         options.defer_index_remap
     };
