@@ -3,7 +3,6 @@
 
 //! Principal component analysis for vector pre-transforms.
 
-use std::f64::consts::TAU;
 use std::mem::size_of;
 use std::sync::{Arc, LazyLock, OnceLock};
 
@@ -14,13 +13,13 @@ use arrow_array::{
 };
 use arrow_schema::DataType;
 use bytes::Bytes;
-use faer::{Mat, Side, linalg::solvers::SelfAdjointEigen};
 use lance_arrow::FixedSizeListArrayExt;
 use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_core::{Error, Result};
+use ndarray::Array2;
 use prost::Message;
+use rand::SeedableRng;
 use rand::rngs::SmallRng;
-use rand::{RngCore, SeedableRng};
 
 use crate::pb;
 use crate::scalar::{IndexReader, IndexWriter};
@@ -70,7 +69,6 @@ const DEFAULT_SAMPLE_SIZE: usize = 65_536;
 const DEFAULT_MAX_TRAINING_MEMORY_BYTES: usize = 1_073_741_824;
 const DEFAULT_SAMPLING_SEED: u64 = 42;
 const DEFAULT_ROTATION_SEED: u64 = 5;
-const DEFAULT_EPSILON: f32 = 1.0e-5;
 const TRANSFORM_BATCH_SIZE: usize = 4096;
 
 /// Configuration for training a PCA vector transform.
@@ -82,9 +80,7 @@ const TRANSFORM_BATCH_SIZE: usize = 4096;
 /// ```
 /// use lance_index::vector::pca::PcaParams;
 ///
-/// let params = PcaParams::new(64)
-///     .with_whitening(true)
-///     .with_random_rotation(false);
+/// let params = PcaParams::new(64).with_random_rotation(false);
 /// assert_eq!(params.dimension, 64);
 /// ```
 #[derive(Debug, Clone, PartialEq)]
@@ -93,13 +89,6 @@ pub struct PcaParams {
     pub dimension: usize,
     /// Whether to apply a deterministic orthogonal rotation after PCA.
     pub random_rotation: bool,
-    /// Whether to scale retained components by their regularized variance.
-    pub whitening: bool,
-    /// Regularizer used by whitening.
-    ///
-    /// This must be finite and positive when whitening is enabled. Otherwise,
-    /// it may be zero but must remain finite and non-negative.
-    pub epsilon: f32,
     /// Target number of valid rows used by dataset-aware training.
     pub sample_size: usize,
     /// Maximum estimated peak bytes permitted for training.
@@ -116,8 +105,6 @@ impl PcaParams {
         Self {
             dimension,
             random_rotation: false,
-            whitening: false,
-            epsilon: DEFAULT_EPSILON,
             sample_size: DEFAULT_SAMPLE_SIZE,
             max_training_memory_bytes: DEFAULT_MAX_TRAINING_MEMORY_BYTES,
             sampling_seed: DEFAULT_SAMPLING_SEED,
@@ -127,16 +114,6 @@ impl PcaParams {
 
     pub fn with_random_rotation(mut self, enabled: bool) -> Self {
         self.random_rotation = enabled;
-        self
-    }
-
-    pub fn with_whitening(mut self, enabled: bool) -> Self {
-        self.whitening = enabled;
-        self
-    }
-
-    pub fn with_epsilon(mut self, epsilon: f32) -> Self {
-        self.epsilon = epsilon;
         self
     }
 
@@ -196,20 +173,6 @@ impl PcaParams {
                 "pca.max_training_memory_bytes must be greater than 0".to_string(),
             ));
         }
-        if !self.epsilon.is_finite()
-            || (self.whitening && self.epsilon <= 0.0)
-            || (!self.whitening && self.epsilon < 0.0)
-        {
-            let requirement = if self.whitening {
-                "finite and greater than 0"
-            } else {
-                "finite and non-negative"
-            };
-            return Err(Error::invalid_input(format!(
-                "pca.epsilon must be {requirement} when whitening={}, got {}",
-                self.whitening, self.epsilon
-            )));
-        }
         Ok(())
     }
 
@@ -221,12 +184,7 @@ impl PcaParams {
         batch_rows: usize,
     ) -> Result<()> {
         self.validate(input_dimension, row_count)?;
-        let path = if row_count >= input_dimension {
-            TrainingPath::Covariance
-        } else {
-            TrainingPath::Gram
-        };
-        validate_memory_budget(row_count, input_dimension, batch_rows, path, true, self)
+        validate_memory_budget(row_count, input_dimension, batch_rows, true, self)
     }
 }
 
@@ -668,12 +626,7 @@ impl PcaModel {
         let row_count = data.len();
         params.validate(input_dimension, row_count)?;
         validate_training_array(data)?;
-        let path = if row_count >= input_dimension {
-            TrainingPath::Covariance
-        } else {
-            TrainingPath::Gram
-        };
-        validate_memory_budget(row_count, input_dimension, row_count, path, false, params)?;
+        validate_memory_budget(row_count, input_dimension, row_count, false, params)?;
 
         let logical_values = logical_values(data)?;
         let values = values_as_f64(logical_values.as_ref())?;
@@ -690,138 +643,30 @@ impl PcaModel {
         }
 
         let mean = compensated_mean(&values, row_count, input_dimension)?;
-        let (eigenvalues, basis) = if row_count >= input_dimension {
-            let covariance = covariance_matrix(&values, &mean, row_count, input_dimension)?;
-            eigenpairs_descending(covariance)?
-        } else {
-            let centered = center_values(&values, &mean, row_count, input_dimension)?;
-            gram_eigenvectors(&centered, row_count, input_dimension, params.dimension)?
-        };
-        let model =
-            Self::from_eigenpairs(mean, row_count, input_dimension, eigenvalues, basis, params)?;
-        model.validate_trained(data)?;
-        Ok(model)
-    }
-
-    /// Trains a model from a mean and row-major population covariance matrix.
-    ///
-    /// The covariance must be a finite, symmetric `input_dimension *
-    /// input_dimension` matrix, where `input_dimension == mean.len()`.
-    /// `sample_count` records how many valid vectors contributed to the
-    /// statistics. This entry point reuses the same eigendecomposition,
-    /// whitening, and random-rotation kernel as [`Self::train`].
-    pub fn train_from_covariance(
-        mean: &[f64],
-        sample_count: usize,
-        covariance: &[f64],
-        params: &PcaParams,
-    ) -> Result<Self> {
-        Self::train_from_second_moment(
-            mean,
-            sample_count,
-            covariance,
-            SecondMomentScale::Covariance,
-            params,
-        )
+        let covariance = covariance_matrix(&values, &mean, row_count, input_dimension)?;
+        let (eigenvalues, basis) = eigenpairs_descending(&covariance, input_dimension)?;
+        Self::from_eigenpairs(mean, row_count, input_dimension, eigenvalues, basis, params)
     }
 
     /// Trains a model from a mean and row-major centered scatter matrix.
     ///
     /// `scatter` must equal the sum of centered outer products and must be a
     /// finite, symmetric `mean.len() * mean.len()` matrix. Population
-    /// covariance is computed as `scatter / sample_count`.
+    /// covariance is computed as `scatter / sample_count`. This is the
+    /// statistics entry point used by streaming dataset training.
     pub fn train_from_scatter(
         mean: &[f64],
         sample_count: usize,
         scatter: &[f64],
         params: &PcaParams,
     ) -> Result<Self> {
-        Self::train_from_second_moment(
-            mean,
-            sample_count,
-            scatter,
-            SecondMomentScale::Scatter,
-            params,
-        )
-    }
-
-    /// Trains a model from a mean and complete row-major centered observations.
-    ///
-    /// This Gram-matrix entry point is restricted to `sample_count <
-    /// mean.len()`. `centered` must contain exactly `sample_count * mean.len()`
-    /// finite values and each row is expected to have already had `mean`
-    /// subtracted from it.
-    pub fn train_from_centered(
-        mean: &[f64],
-        sample_count: usize,
-        centered: &[f64],
-        params: &PcaParams,
-    ) -> Result<Self> {
-        let input_dimension = mean.len();
-        params.validate(input_dimension, sample_count)?;
-        if sample_count >= input_dimension {
-            return Err(Error::invalid_input(format!(
-                "PCA Gram training requires sample_count < input_dimension, got sample_count={sample_count}, input_dimension={input_dimension}"
-            )));
-        }
-        validate_finite_slice(mean, "mean")?;
-        let expected_len = sample_count.checked_mul(input_dimension).ok_or_else(|| {
-            Error::invalid_input(format!(
-                "PCA centered shape [{sample_count}, {input_dimension}] overflows usize"
-            ))
-        })?;
-        if centered.len() != expected_len {
-            return Err(Error::invalid_input(format!(
-                "PCA centered values length={} does not match shape [{sample_count}, {input_dimension}] requiring {expected_len} values",
-                centered.len()
-            )));
-        }
-        validate_finite_slice(centered, "centered values")?;
-        validate_memory_budget(
-            sample_count,
-            input_dimension,
-            0,
-            TrainingPath::Gram,
-            false,
-            params,
-        )?;
-        let (eigenvalues, basis) =
-            gram_eigenvectors(centered, sample_count, input_dimension, params.dimension)?;
-        Self::from_eigenpairs(
-            mean.to_vec(),
-            sample_count,
-            input_dimension,
-            eigenvalues,
-            basis,
-            params,
-        )
-    }
-
-    fn train_from_second_moment(
-        mean: &[f64],
-        sample_count: usize,
-        second_moment: &[f64],
-        scale: SecondMomentScale,
-        params: &PcaParams,
-    ) -> Result<Self> {
         let input_dimension = mean.len();
         params.validate(input_dimension, sample_count)?;
         validate_finite_slice(mean, "mean")?;
-        validate_symmetric_matrix(second_moment, input_dimension, scale.label())?;
-        validate_memory_budget(
-            sample_count,
-            input_dimension,
-            0,
-            TrainingPath::Covariance,
-            false,
-            params,
-        )?;
-        let denominator = match scale {
-            SecondMomentScale::Covariance => 1.0,
-            SecondMomentScale::Scatter => sample_count as f64,
-        };
+        validate_symmetric_matrix(scatter, input_dimension, "scatter")?;
+        validate_memory_budget(sample_count, input_dimension, 0, false, params)?;
         let (eigenvalues, basis) =
-            covariance_eigenvectors(second_moment, input_dimension, denominator)?;
+            covariance_eigenvectors(scatter, input_dimension, sample_count as f64)?;
         Self::from_eigenpairs(
             mean.to_vec(),
             sample_count,
@@ -875,10 +720,9 @@ impl PcaModel {
         };
         let matrix_f64 = assemble_transform(
             &basis,
-            &sanitized[..params.dimension],
             rotation.as_deref(),
             input_dimension,
-            params,
+            params.dimension,
         )?;
         let transform_matrix = Arc::new(Float32Array::from(
             matrix_f64
@@ -921,10 +765,9 @@ impl PcaModel {
             .checked_mul(self.output_dimension)
             .ok_or_else(|| Error::invalid_input("PCA output shape overflows usize"))?;
         let mut output = Vec::with_capacity(output_len);
-        let matrix = Mat::<f32>::from_fn(
-            self.output_dimension,
-            self.input_dimension,
-            |row, column| {
+        let matrix = Array2::from_shape_fn(
+            (self.output_dimension, self.input_dimension),
+            |(row, column)| {
                 self.transform_matrix
                     .value(row * self.input_dimension + column)
             },
@@ -934,13 +777,15 @@ impl PcaModel {
                 .saturating_add(TRANSFORM_BATCH_SIZE)
                 .min(row_count);
             let chunk_rows = chunk_end - chunk_start;
-            let centered = Mat::<f32>::from_fn(chunk_rows, self.input_dimension, |row, column| {
-                input[(chunk_start + row) * self.input_dimension + column] - self.mean.value(column)
-            });
-            let transformed = &centered * matrix.transpose();
+            let centered =
+                Array2::from_shape_fn((chunk_rows, self.input_dimension), |(row, column)| {
+                    input[(chunk_start + row) * self.input_dimension + column]
+                        - self.mean.value(column)
+                });
+            let transformed = centered.dot(&matrix.t());
             for row in 0..chunk_rows {
                 for column in 0..self.output_dimension {
-                    let value = transformed[(row, column)];
+                    let value = transformed[[row, column]];
                     if !value.is_finite() {
                         return Err(Error::invalid_input_source(Box::new(PcaNonFiniteOutput {
                             row: chunk_start + row,
@@ -1038,39 +883,6 @@ impl PcaModel {
         *hasher.finalize().as_bytes()
     }
 
-    fn validate_trained(&self, training_data: &FixedSizeListArray) -> Result<()> {
-        self.validate_model()?;
-
-        let transformed = self.transform(training_data)?;
-        if transformed
-            .values()
-            .as_primitive::<Float32Type>()
-            .values()
-            .iter()
-            .any(|value| !value.is_finite())
-        {
-            return Err(Error::index(
-                "PCA training sample transform produced non-finite values".to_string(),
-            ));
-        }
-        if !training_data.is_empty() {
-            let first = training_data.value(0);
-            let query = self.transform_query(first.as_ref())?;
-            let query = query.as_primitive::<Float32Type>();
-            let batch = transformed.value(0);
-            let batch = batch.as_primitive::<Float32Type>();
-            for (query_value, batch_value) in query.values().iter().zip(batch.values()) {
-                let tolerance = 1.0e-5 + 1.0e-5 * batch_value.abs();
-                if (query_value - batch_value).abs() > tolerance {
-                    return Err(Error::index(
-                        "PCA query and batch transforms differ beyond tolerance".to_string(),
-                    ));
-                }
-            }
-        }
-        Ok(())
-    }
-
     fn validate_model(&self) -> Result<()> {
         let expected_matrix_len = self
             .output_dimension
@@ -1099,59 +911,7 @@ impl PcaModel {
             ));
         }
 
-        let mut centered_mean = Vec::with_capacity(self.output_dimension);
-        transform_row(
-            self.mean.values(),
-            self.mean.values(),
-            self.transform_matrix.values(),
-            self.input_dimension,
-            self.output_dimension,
-            &mut centered_mean,
-        )?;
-        let max_matrix = self
-            .transform_matrix
-            .values()
-            .iter()
-            .fold(0.0_f64, |value, item| value.max(f64::from(item.abs())));
-        let max_mean = self
-            .mean
-            .values()
-            .iter()
-            .fold(0.0_f64, |value, item| value.max(f64::from(item.abs())));
-        let tolerance = 32.0
-            * f64::from(f32::EPSILON)
-            * (self.input_dimension as f64 * max_matrix * max_mean + 1.0);
-        if centered_mean
-            .iter()
-            .any(|value| f64::from(value.abs()) > tolerance)
-        {
-            return Err(Error::index(format!(
-                "PCA trained model failed centered-mean validation with tolerance={tolerance}"
-            )));
-        }
-
         Ok(())
-    }
-}
-
-#[derive(Clone, Copy)]
-enum TrainingPath {
-    Covariance,
-    Gram,
-}
-
-#[derive(Clone, Copy)]
-enum SecondMomentScale {
-    Covariance,
-    Scatter,
-}
-
-impl SecondMomentScale {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Covariance => "covariance",
-            Self::Scatter => "scatter",
-        }
     }
 }
 
@@ -1269,25 +1029,13 @@ fn validate_memory_budget(
     row_count: usize,
     input_dimension: usize,
     batch_rows: usize,
-    path: TrainingPath,
     uses_matrix_accumulation: bool,
     params: &PcaParams,
 ) -> Result<()> {
-    let matrix_dimension = match path {
-        TrainingPath::Covariance => input_dimension,
-        TrainingPath::Gram => row_count,
-    };
-    let matrix_elements = matrix_dimension
-        .checked_mul(matrix_dimension)
+    let matrix_elements = input_dimension
+        .checked_mul(input_dimension)
         .ok_or_else(|| Error::invalid_input("PCA statistics matrix shape overflows usize"))?;
-    let stat_elements = match path {
-        TrainingPath::Covariance => matrix_elements,
-        TrainingPath::Gram => row_count
-            .checked_mul(input_dimension)
-            .and_then(|centered| centered.checked_add(matrix_elements))
-            .ok_or_else(|| Error::invalid_input("PCA Gram statistics shape overflows usize"))?,
-    };
-    let stat = checked_bytes(stat_elements, size_of::<f64>(), "statistics")?;
+    let stat = checked_bytes(matrix_elements, size_of::<f64>(), "statistics")?;
     let eig = checked_bytes(
         matrix_elements.checked_mul(3).ok_or_else(|| {
             Error::invalid_input("PCA eigensolver workspace estimate overflows usize")
@@ -1305,11 +1053,11 @@ fn validate_memory_budget(
         .dimension
         .checked_mul(input_dimension)
         .ok_or_else(|| Error::invalid_input("PCA transform workspace shape overflows usize"))?;
-    // Training can concurrently hold the retained basis, its whitened copy,
-    // and the final rotated transform before conversion to f32.
+    // Training can concurrently hold the retained basis and the rotated
+    // transform before conversion to f32.
     let transform_workspace = checked_bytes(
         transform_elements
-            .checked_mul(3)
+            .checked_mul(2)
             .ok_or_else(|| Error::invalid_input("PCA transform workspace overflows usize"))?,
         size_of::<f64>(),
         "transform workspace",
@@ -1343,14 +1091,13 @@ fn validate_memory_budget(
     // Streaming covariance uses a centered batch matrix and a batch-local
     // scatter matrix in addition to the converted input batch and accumulated
     // statistics.
-    let matrix_accumulation_workspace =
-        if uses_matrix_accumulation && matches!(path, TrainingPath::Covariance) {
-            batch.checked_add(stat).ok_or_else(|| {
-                Error::invalid_input("PCA matrix accumulation workspace estimate overflows usize")
-            })?
-        } else {
-            0
-        };
+    let matrix_accumulation_workspace = if uses_matrix_accumulation {
+        batch.checked_add(stat).ok_or_else(|| {
+            Error::invalid_input("PCA matrix accumulation workspace estimate overflows usize")
+        })?
+    } else {
+        0
+    };
     let total = stat
         .checked_add(eig)
         .and_then(|value| value.checked_add(model))
@@ -1459,22 +1206,6 @@ fn compensated_mean(values: &[f64], rows: usize, dimension: usize) -> Result<Vec
     Ok(sums)
 }
 
-fn center_values(values: &[f64], mean: &[f64], rows: usize, dimension: usize) -> Result<Vec<f64>> {
-    let length = rows
-        .checked_mul(dimension)
-        .ok_or_else(|| Error::invalid_input("PCA centered matrix shape overflows usize"))?;
-    let mut centered = Vec::with_capacity(length);
-    for row in values.chunks_exact(dimension) {
-        centered.extend(row.iter().zip(mean).map(|(value, mean)| value - mean));
-    }
-    if centered.iter().any(|value| !value.is_finite()) {
-        return Err(Error::invalid_input(
-            "PCA centering produced a non-finite value".to_string(),
-        ));
-    }
-    Ok(centered)
-}
-
 /// Accumulates a centered scatter matrix from one row-major batch.
 ///
 /// `values` contains complete observations with `mean.len()` values per row.
@@ -1502,13 +1233,13 @@ pub fn accumulate_centered_scatter(
     validate_symmetric_matrix(scatter, dimension, "accumulated scatter")?;
 
     let rows = values.len() / dimension;
-    let centered = Mat::<f64>::from_fn(rows, dimension, |row, column| {
+    let centered = Array2::from_shape_fn((rows, dimension), |(row, column)| {
         values[row * dimension + column] - mean[column]
     });
-    let batch_scatter = centered.transpose() * &centered;
+    let batch_scatter = centered.t().dot(&centered);
     for row in 0..dimension {
         for column in row..dimension {
-            let value = scatter[row * dimension + column] + batch_scatter[(row, column)];
+            let value = scatter[row * dimension + column] + batch_scatter[[row, column]];
             if !value.is_finite() {
                 return Err(Error::invalid_input(format!(
                     "PCA scatter accumulation produced non-finite value={value} at row={row}, column={column}, shape=[{dimension}, {dimension}]"
@@ -1526,8 +1257,8 @@ fn covariance_matrix(
     mean: &[f64],
     rows: usize,
     dimension: usize,
-) -> Result<Mat<f64>> {
-    let mut covariance = Mat::<f64>::zeros(dimension, dimension);
+) -> Result<Vec<f64>> {
+    let mut covariance = vec![0.0; dimension * dimension];
     let denominator = rows as f64;
     for column in 0..dimension {
         for other in column..dimension {
@@ -1542,7 +1273,8 @@ fn covariance_matrix(
                     "PCA population covariance contains non-finite value={value} at row={column}, column={other}, shape=[{dimension}, {dimension}]"
                 )));
             }
-            covariance[(column, other)] = value;
+            covariance[column * dimension + other] = value;
+            covariance[other * dimension + column] = value;
         }
     }
     Ok(covariance)
@@ -1553,78 +1285,52 @@ fn covariance_eigenvectors(
     dimension: usize,
     denominator: f64,
 ) -> Result<(Vec<f64>, Vec<f64>)> {
-    let covariance = Mat::<f64>::from_fn(dimension, dimension, |row, column| {
-        covariance[row * dimension + column] / denominator
-    });
-    eigenpairs_descending(covariance)
+    if denominator == 0.0 || !denominator.is_finite() {
+        return Err(Error::invalid_input(format!(
+            "PCA covariance denominator={denominator} must be finite and non-zero"
+        )));
+    }
+    let scaled = covariance
+        .iter()
+        .map(|value| value / denominator)
+        .collect::<Vec<_>>();
+    eigenpairs_descending(&scaled, dimension)
 }
 
-fn gram_eigenvectors(
-    centered: &[f64],
-    rows: usize,
-    input_dimension: usize,
-    output_dimension: usize,
-) -> Result<(Vec<f64>, Vec<f64>)> {
-    let mut gram = Mat::<f64>::zeros(rows, rows);
-    let denominator = rows as f64;
-    for row in 0..rows {
-        for other in row..rows {
-            let mut sum = 0.0;
-            for column in 0..input_dimension {
-                sum += centered[row * input_dimension + column]
-                    * centered[other * input_dimension + column];
-            }
-            gram[(row, other)] = sum / denominator;
-        }
-    }
-    let (eigenvalues, gram_vectors) = eigenpairs_descending(gram)?;
-    let (_, effective_rank, tau) = sanitize_eigenvalues(eigenvalues.clone(), output_dimension)?;
-    if effective_rank < output_dimension {
-        return Ok((eigenvalues, Vec::new()));
-    }
-
-    let basis_len = output_dimension
-        .checked_mul(input_dimension)
-        .ok_or_else(|| Error::invalid_input("PCA Gram basis shape overflows usize"))?;
-    let mut basis = vec![0.0; basis_len];
-    for component in 0..output_dimension {
-        let denominator = (rows as f64 * eigenvalues[component]).sqrt();
-        if !denominator.is_finite() || denominator <= tau.sqrt() {
-            return Err(Error::index(format!(
-                "PCA Gram eigenvector lift has invalid denominator={denominator} for component={component}"
-            )));
-        }
-        for column in 0..input_dimension {
-            let mut value = 0.0;
-            for row in 0..rows {
-                value +=
-                    centered[row * input_dimension + column] * gram_vectors[component * rows + row];
-            }
-            basis[component * input_dimension + column] = value / denominator;
-        }
-        normalize_vector(
-            &mut basis[component * input_dimension..(component + 1) * input_dimension],
-            "Gram-lifted eigenvector",
-        )?;
-    }
-    Ok((eigenvalues, basis))
-}
-
-fn eigenpairs_descending(matrix: Mat<f64>) -> Result<(Vec<f64>, Vec<f64>)> {
-    let dimension = matrix.nrows();
-    let decomposition = SelfAdjointEigen::new(matrix.as_ref(), Side::Upper)
-        .map_err(|error| Error::index(format!("PCA eigendecomposition failed: {error:?}")))?;
-    let eigenvalues = decomposition.S().column_vector();
-    let eigenvectors = decomposition.U();
-    let mut descending_values = Vec::with_capacity(dimension);
-    let element_count = dimension
+fn eigenpairs_descending(matrix: &[f64], dimension: usize) -> Result<(Vec<f64>, Vec<f64>)> {
+    let expected_len = dimension
         .checked_mul(dimension)
-        .ok_or_else(|| Error::invalid_input("PCA eigenvector shape overflows usize"))?;
-    let mut descending_vectors = Vec::with_capacity(element_count);
-    for component in (0..dimension).rev() {
-        descending_values.push(eigenvalues[component]);
+        .ok_or_else(|| Error::invalid_input("PCA eigenvector shape overflows usize".to_string()))?;
+    if matrix.len() != expected_len {
+        return Err(Error::invalid_input(format!(
+            "PCA eigendecomposition matrix length={} does not match shape [{dimension}, {dimension}]",
+            matrix.len()
+        )));
+    }
+    let dense = nalgebra::DMatrix::from_row_slice(dimension, dimension, matrix);
+    // Each Jacobi sweep is O(dimension^2) rotations. Cap the solver at about
+    // 30 sweeps so a non-converging matrix fails instead of looping forever.
+    let max_iterations = dimension
+        .saturating_mul(dimension)
+        .saturating_mul(15)
+        .max(32);
+    let tolerance = f64::EPSILON * (dimension as f64);
+    let decomposition = nalgebra::SymmetricEigen::try_new(dense, tolerance, max_iterations)
+        .ok_or_else(|| {
+            Error::index(format!(
+                "PCA eigendecomposition failed to converge within {max_iterations} iterations"
+            ))
+        })?;
+    let mut order: Vec<usize> = (0..dimension).collect();
+    order.sort_by(|&left, &right| {
+        decomposition.eigenvalues[right].total_cmp(&decomposition.eigenvalues[left])
+    });
+    let mut descending_values = Vec::with_capacity(dimension);
+    let mut descending_vectors = Vec::with_capacity(expected_len);
+    for component in order {
+        descending_values.push(decomposition.eigenvalues[component]);
         for row in 0..dimension {
-            descending_vectors.push(eigenvectors[(row, component)]);
+            descending_vectors.push(decomposition.eigenvectors[(row, component)]);
         }
     }
     Ok((descending_values, descending_vectors))
@@ -1721,43 +1427,19 @@ fn canonicalize_sign(vector: &mut [f64]) -> Result<()> {
     Ok(())
 }
 
-fn deterministic_gaussian_matrix(dimension: usize, seed: u64) -> Result<Vec<f64>> {
-    let length = dimension
-        .checked_mul(dimension)
-        .ok_or_else(|| Error::invalid_input("PCA random rotation shape overflows usize"))?;
-    let mut rng = SmallRng::seed_from_u64(seed);
-    let mut values = Vec::with_capacity(length);
-    while values.len() < length {
-        let a = rng.next_u64() >> 11;
-        let b = rng.next_u64() >> 11;
-        let u1 = (a + 1) as f64 * 2.0_f64.powi(-53);
-        let u2 = b as f64 * 2.0_f64.powi(-53);
-        let radius = (-2.0 * u1.ln()).sqrt();
-        let angle = TAU * u2;
-        values.push(radius * angle.cos());
-        if values.len() < length {
-            values.push(radius * angle.sin());
-        }
-    }
-    Ok(values)
-}
-
 fn deterministic_rotation(dimension: usize, seed: u64) -> Result<Vec<f64>> {
-    let gaussian = deterministic_gaussian_matrix(dimension, seed)?;
-    let matrix = Mat::from_fn(dimension, dimension, |row, column| {
-        gaussian[row * dimension + column]
-    });
-    let mut rotation = matrix.qr().compute_Q();
+    let mut rng = SmallRng::seed_from_u64(seed);
+    let mut rotation = crate::vector::bq::builder::random_orthogonal_with_rng(dimension, &mut rng)?;
     for column in 0..dimension {
         let mut pivot = 0;
         for row in 1..dimension {
-            if rotation[(row, column)].abs() > rotation[(pivot, column)].abs() {
+            if rotation[[row, column]].abs() > rotation[[pivot, column]].abs() {
                 pivot = row;
             }
         }
-        if rotation[(pivot, column)] < 0.0 {
+        if rotation[[pivot, column]] < 0.0 {
             for row in 0..dimension {
-                rotation[(row, column)] = -rotation[(row, column)];
+                rotation[[row, column]] = -rotation[[row, column]];
             }
         }
     }
@@ -1767,7 +1449,7 @@ fn deterministic_rotation(dimension: usize, seed: u64) -> Result<Vec<f64>> {
         for column in 0..dimension {
             let mut dot = 0.0;
             for inner in 0..dimension {
-                dot += rotation[(inner, row)] * rotation[(inner, column)];
+                dot += rotation[[inner, row]] * rotation[[inner, column]];
             }
             let expected = if row == column { 1.0 } else { 0.0 };
             if (dot - expected).abs() > tolerance {
@@ -1775,7 +1457,7 @@ fn deterministic_rotation(dimension: usize, seed: u64) -> Result<Vec<f64>> {
                     "PCA random rotation failed orthogonality validation: row={row}, column={column}, value={dot}, tolerance={tolerance}"
                 )));
             }
-            row_major.push(rotation[(row, column)]);
+            row_major.push(rotation[[row, column]]);
         }
     }
     Ok(row_major)
@@ -1783,36 +1465,21 @@ fn deterministic_rotation(dimension: usize, seed: u64) -> Result<Vec<f64>> {
 
 fn assemble_transform(
     basis: &[f64],
-    eigenvalues: &[f64],
     rotation: Option<&[f64]>,
     input_dimension: usize,
-    params: &PcaParams,
+    output_dimension: usize,
 ) -> Result<Vec<f64>> {
-    let output_dimension = params.dimension;
     let length = output_dimension
         .checked_mul(input_dimension)
         .ok_or_else(|| Error::invalid_input("PCA transform matrix shape overflows usize"))?;
-    let mut scaled_basis = vec![0.0; length];
-    for component in 0..output_dimension {
-        let scale = if params.whitening {
-            (eigenvalues[component] + f64::from(params.epsilon))
-                .sqrt()
-                .recip()
-        } else {
-            1.0
-        };
-        if !scale.is_finite() {
-            return Err(Error::index(format!(
-                "PCA whitening scale for component={component} is non-finite"
-            )));
-        }
-        for column in 0..input_dimension {
-            scaled_basis[component * input_dimension + column] =
-                basis[component * input_dimension + column] * scale;
-        }
+    if basis.len() != length {
+        return Err(Error::index(format!(
+            "PCA retained basis length={} does not match shape [{output_dimension}, {input_dimension}]",
+            basis.len()
+        )));
     }
     let Some(rotation) = rotation else {
-        return Ok(scaled_basis);
+        return Ok(basis.to_vec());
     };
     let mut transform = vec![0.0; length];
     for row in 0..output_dimension {
@@ -1820,7 +1487,7 @@ fn assemble_transform(
             let mut value = 0.0;
             for inner in 0..output_dimension {
                 value += rotation[row * output_dimension + inner]
-                    * scaled_basis[inner * input_dimension + column];
+                    * basis[inner * input_dimension + column];
             }
             transform[row * input_dimension + column] = value;
         }
@@ -1919,9 +1586,7 @@ pub fn transform_row_with(
     output_dimension: usize,
     output: &mut Vec<f32>,
 ) -> Result<()> {
-    debug_assert_eq!(input.len(), input_dimension);
-    debug_assert_eq!(mean.len(), input_dimension);
-    debug_assert_eq!(matrix.len(), input_dimension * output_dimension);
+    validate_transform_layout(input, mean, matrix, input_dimension, output_dimension)?;
     if kernel == TransformKernel::Scalar {
         for row in 0..output_dimension {
             let mut value = 0.0_f32;
@@ -1971,6 +1636,34 @@ pub fn transform_row_with(
                 ));
             }
         }
+    }
+    Ok(())
+}
+
+fn validate_transform_layout(
+    input: &[f32],
+    mean: &[f32],
+    matrix: &[f32],
+    input_dimension: usize,
+    output_dimension: usize,
+) -> Result<()> {
+    if input.len() != input_dimension || mean.len() != input_dimension {
+        return Err(Error::invalid_input(format!(
+            "PCA transform input length={} and mean length={} must both equal input_dimension={input_dimension}",
+            input.len(),
+            mean.len()
+        )));
+    }
+    let expected_matrix_len = input_dimension
+        .checked_mul(output_dimension)
+        .ok_or_else(|| {
+            Error::invalid_input("PCA transform matrix shape overflows usize".to_string())
+        })?;
+    if matrix.len() != expected_matrix_len {
+        return Err(Error::invalid_input(format!(
+            "PCA transform matrix length={} does not match input_dimension={input_dimension} * output_dimension={output_dimension}",
+            matrix.len()
+        )));
     }
     Ok(())
 }
@@ -2242,8 +1935,6 @@ mod tests {
     fn params_have_documented_defaults() {
         let params = PcaParams::new(8);
         assert!(!params.random_rotation);
-        assert!(!params.whitening);
-        assert_eq!(params.epsilon, 1.0e-5);
         assert_eq!(params.sample_size, 65_536);
         assert_eq!(params.max_training_memory_bytes, 1_073_741_824);
         assert_eq!(params.sampling_seed, 42);
@@ -2274,7 +1965,7 @@ mod tests {
     }
 
     #[test]
-    fn gram_path_trains_and_query_matches_batch() {
+    fn covariance_query_matches_batch_when_samples_are_fewer_than_dimensions() {
         let vectors = f32_vectors(full_rank_values(4, 6), 6);
         let model = PcaModel::train(&vectors, &PcaParams::new(2)).expect("training should work");
         let batch = model.transform(&vectors).expect("transform should work");
@@ -2290,7 +1981,7 @@ mod tests {
     }
 
     #[test]
-    fn covariance_and_scatter_statistics_match_in_memory_training() {
+    fn scatter_statistics_match_in_memory_training() {
         let rows = 8;
         let dimension = 3;
         let values = full_rank_values(rows, dimension);
@@ -2298,66 +1989,22 @@ mod tests {
         let values = values.into_iter().map(f64::from).collect::<Vec<_>>();
         let mean =
             compensated_mean(&values, rows, dimension).expect("mean calculation should work");
-        let covariance_matrix =
-            covariance_matrix(&values, &mean, rows, dimension).expect("covariance should work");
-        let mut covariance = Vec::with_capacity(dimension * dimension);
-        for row in 0..dimension {
-            for column in 0..dimension {
-                covariance.push(covariance_matrix[(row.min(column), row.max(column))]);
-            }
-        }
-        let scatter = covariance
-            .iter()
-            .map(|value| value * rows as f64)
-            .collect::<Vec<_>>();
+        let mut scatter = vec![0.0; dimension * dimension];
+        accumulate_centered_scatter(&values, &mean, &mut scatter)
+            .expect("scatter accumulation should work");
         let params = PcaParams::new(2)
-            .with_whitening(true)
             .with_random_rotation(true)
             .with_rotation_seed(31);
 
         let in_memory = PcaModel::train(&vectors, &params).expect("array training should work");
-        let from_covariance = PcaModel::train_from_covariance(&mean, rows, &covariance, &params)
-            .expect("covariance training should work");
         let from_scatter = PcaModel::train_from_scatter(&mean, rows, &scatter, &params)
             .expect("scatter training should work");
 
-        assert_eq!(from_covariance.fingerprint(), in_memory.fingerprint());
         assert_eq!(from_scatter.fingerprint(), in_memory.fingerprint());
         assert_eq!(
-            from_covariance
+            from_scatter
                 .transform(&vectors)
-                .expect("covariance model transform should work"),
-            in_memory
-                .transform(&vectors)
-                .expect("in-memory model transform should work")
-        );
-    }
-
-    #[test]
-    fn centered_gram_statistics_match_in_memory_training() {
-        let rows = 4;
-        let dimension = 6;
-        let values = full_rank_values(rows, dimension);
-        let vectors = f32_vectors(values.clone(), dimension as i32);
-        let values = values.into_iter().map(f64::from).collect::<Vec<_>>();
-        let mean =
-            compensated_mean(&values, rows, dimension).expect("mean calculation should work");
-        let centered =
-            center_values(&values, &mean, rows, dimension).expect("centering should work");
-        let params = PcaParams::new(2)
-            .with_whitening(true)
-            .with_random_rotation(true)
-            .with_rotation_seed(37);
-
-        let in_memory = PcaModel::train(&vectors, &params).expect("array training should work");
-        let from_centered = PcaModel::train_from_centered(&mean, rows, &centered, &params)
-            .expect("Gram training should work");
-
-        assert_eq!(from_centered.fingerprint(), in_memory.fingerprint());
-        assert_eq!(
-            from_centered
-                .transform(&vectors)
-                .expect("Gram model transform should work"),
+                .expect("scatter model transform should work"),
             in_memory
                 .transform(&vectors)
                 .expect("in-memory model transform should work")
@@ -2367,8 +2014,8 @@ mod tests {
     #[test]
     fn statistics_apis_validate_shapes_values_and_streaming_memory() {
         let params = PcaParams::new(1);
-        let error = PcaModel::train_from_covariance(&[0.0, 0.0], 3, &[1.0, 0.0, 0.0], &params)
-            .expect_err("incorrect covariance length must fail");
+        let error = PcaModel::train_from_scatter(&[0.0, 0.0], 3, &[1.0, 0.0, 0.0], &params)
+            .expect_err("incorrect scatter length must fail");
         assert!(matches!(error, Error::InvalidInput { .. }));
         assert!(error.to_string().contains("requiring 4 values"));
 
@@ -2377,8 +2024,9 @@ mod tests {
         assert!(matches!(error, Error::InvalidInput { .. }));
         assert!(error.to_string().contains("must be symmetric"));
 
-        let error = PcaModel::train_from_centered(&[0.0, f64::NAN, 0.0], 2, &[0.0; 6], &params)
-            .expect_err("non-finite mean must fail");
+        let error =
+            PcaModel::train_from_scatter(&[0.0, f64::NAN], 3, &[1.0, 0.0, 0.0, 1.0], &params)
+                .expect_err("non-finite mean must fail");
         assert!(matches!(error, Error::InvalidInput { .. }));
         assert!(error.to_string().contains("mean"));
         assert!(error.to_string().contains("element=1"));
@@ -2411,12 +2059,12 @@ mod tests {
 
     #[test]
     fn streaming_matrix_memory_budget_has_exact_boundary() {
-        let accepted = PcaParams::new(1).with_max_training_memory_bytes(552);
+        let accepted = PcaParams::new(1).with_max_training_memory_bytes(528);
         accepted
             .validate_streaming_memory_budget(3, 8, 2)
             .expect("exact streaming matrix memory estimate should pass");
 
-        let rejected = PcaParams::new(1).with_max_training_memory_bytes(551);
+        let rejected = PcaParams::new(1).with_max_training_memory_bytes(527);
         let error = rejected
             .validate_streaming_memory_budget(3, 8, 2)
             .expect_err("one byte below the matrix memory estimate must fail");
@@ -2424,7 +2072,7 @@ mod tests {
         assert!(error.to_string().contains("M_stat=72"));
         assert!(error.to_string().contains("M_batch=48"));
         assert!(error.to_string().contains("M_matrix_accumulation=120"));
-        assert!(error.to_string().contains("total=552"));
+        assert!(error.to_string().contains("total=528"));
     }
 
     #[test]
@@ -2447,7 +2095,7 @@ mod tests {
     }
 
     #[test]
-    fn gram_path_lifts_largest_axes_in_descending_order() {
+    fn covariance_path_selects_axes_when_samples_are_fewer_than_dimensions() {
         let vectors = f32_vectors(
             vec![
                 3.0, 0.0, 0.0, 0.0, 0.0, -3.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0,
@@ -2469,44 +2117,6 @@ mod tests {
             5.0,
             epsilon = 1.0e-12
         );
-    }
-
-    #[test]
-    fn whitening_uses_population_eigenvalues() {
-        let vectors = f32_vectors(full_rank_values(10, 3), 3);
-        let epsilon = 1.0e-3;
-        let plain =
-            PcaModel::train(&vectors, &PcaParams::new(2)).expect("plain training should work");
-        let whitened = PcaModel::train(
-            &vectors,
-            &PcaParams::new(2).with_whitening(true).with_epsilon(epsilon),
-        )
-        .expect("whitening training should work");
-        let plain_output = plain
-            .transform(&vectors)
-            .expect("plain transform should work");
-        let whitened_output = whitened
-            .transform(&vectors)
-            .expect("whitened transform should work");
-        let plain_values = plain_output.values().as_primitive::<Float32Type>();
-        let whitened_values = whitened_output.values().as_primitive::<Float32Type>();
-        for column in 0..2 {
-            let plain_variance: f64 = (0..10)
-                .map(|row| f64::from(plain_values.value(row * 2 + column)).powi(2))
-                .sum::<f64>()
-                / 10.0;
-            let whitened_variance: f64 = (0..10)
-                .map(|row| f64::from(whitened_values.value(row * 2 + column)).powi(2))
-                .sum::<f64>()
-                / 10.0;
-            let expected = plain_variance / (plain_variance + f64::from(epsilon));
-            assert_relative_eq!(
-                whitened_variance,
-                expected,
-                epsilon = 5.0e-3,
-                max_relative = 5.0e-2
-            );
-        }
     }
 
     #[test]
@@ -2546,48 +2156,6 @@ mod tests {
             })
             .sum();
         assert_relative_eq!(plain_distance, rotated_distance, max_relative = 1.0e-4);
-    }
-
-    #[test]
-    fn whitening_and_rotation_can_be_combined() {
-        let vectors = f32_vectors(full_rank_values(9, 4), 4);
-        let params = PcaParams::new(3)
-            .with_whitening(true)
-            .with_epsilon(1.0e-4)
-            .with_random_rotation(true)
-            .with_rotation_seed(23);
-        let model = PcaModel::train(&vectors, &params).expect("PCAWR training should work");
-        let transformed = model
-            .transform(&vectors)
-            .expect("PCAWR transform should work");
-        assert_eq!(transformed.value_length(), 3);
-        assert!(
-            transformed
-                .values()
-                .as_primitive::<Float32Type>()
-                .values()
-                .iter()
-                .all(|value| value.is_finite())
-        );
-    }
-
-    #[test]
-    fn box_muller_has_stable_prefix() {
-        let values = deterministic_gaussian_matrix(2, 5).expect("generation should work");
-        let mut rng = SmallRng::seed_from_u64(5);
-        let mut expected = Vec::with_capacity(4);
-        for _ in 0..2 {
-            let a = rng.next_u64() >> 11;
-            let b = rng.next_u64() >> 11;
-            let u1 = (a + 1) as f64 * 2.0_f64.powi(-53);
-            let u2 = b as f64 * 2.0_f64.powi(-53);
-            let radius = (-2.0 * u1.ln()).sqrt();
-            expected.push(radius * (TAU * u2).cos());
-            expected.push(radius * (TAU * u2).sin());
-        }
-        for (actual, expected) in values.iter().zip(expected) {
-            assert_relative_eq!(*actual, expected, epsilon = 1.0e-12);
-        }
     }
 
     #[test]
@@ -2771,25 +2339,6 @@ mod tests {
                 .expect("decoded transform must succeed"),
             expected
         );
-    }
-
-    #[test]
-    fn whitening_rotation_model_round_trips() {
-        let vectors = f32_vectors(full_rank_values(9, 4), 4);
-        let params = PcaParams::new(3)
-            .with_whitening(true)
-            .with_random_rotation(true)
-            .with_rotation_seed(29);
-        let trained = PcaModel::train(&vectors, &params).expect("training must succeed");
-        let decoded = decode_pca_model(&encode_pca_model(&trained).expect("encode must succeed"))
-            .expect("decode must succeed");
-        assert_eq!(decoded.transform_matrix(), trained.transform_matrix());
-        assert_eq!(decoded.mean(), trained.mean());
-        assert_eq!(
-            decoded.transform(&vectors).expect("transform must succeed"),
-            trained.transform(&vectors).expect("transform must succeed")
-        );
-        assert!(decoded.training_stats().is_none());
     }
 
     #[test]
@@ -3050,6 +2599,38 @@ mod tests {
     }
 
     #[test]
+    fn transform_row_with_rejects_inconsistent_lengths() {
+        let input = [1.0_f32; 8];
+        let mean = [0.0_f32; 8];
+        let matrix = [0.0_f32; 8];
+        let mut output = Vec::new();
+        let error = transform_row_with(
+            TransformKernel::Portable,
+            &input,
+            &mean,
+            &matrix,
+            8,
+            4,
+            &mut output,
+        )
+        .expect_err("a 4 by 8 matrix cannot be stored in 8 floats");
+        assert!(error.to_string().contains("matrix length=8"));
+        assert!(output.is_empty());
+
+        let error = transform_row_with(
+            TransformKernel::Scalar,
+            &input[..4],
+            &mean,
+            &[0.0_f32; 32],
+            8,
+            4,
+            &mut output,
+        )
+        .expect_err("short input must fail before any kernel reads it");
+        assert!(error.to_string().contains("input length=4"));
+    }
+
+    #[test]
     fn transform_kernels_match_scalar_loop() {
         for (input_dimension, output_dimension) in [
             (1usize, 1usize),
@@ -3092,10 +2673,12 @@ mod tests {
                     &mut actual,
                 )
                 .unwrap_or_else(|error| panic!("{kernel:?} kernel must succeed: {error}"));
-                for (row, (actual_value, expected_value)) in actual.iter().zip(&expected).enumerate()
+                for (row, (actual_value, expected_value)) in
+                    actual.iter().zip(&expected).enumerate()
                 {
                     assert!(
-                        (actual_value - expected_value).abs() <= 1.0e-4 * (1.0 + expected_value.abs()),
+                        (actual_value - expected_value).abs()
+                            <= 1.0e-4 * (1.0 + expected_value.abs()),
                         "{kernel:?} {input_dimension}x{output_dimension} row {row}: {actual_value} vs {expected_value}"
                     );
                 }

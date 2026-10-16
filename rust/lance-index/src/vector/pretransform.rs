@@ -27,42 +27,6 @@ use crate::metrics::MetricsCollector;
 use crate::prefilter::PreFilter;
 use crate::{Index, IndexType};
 
-trait QueryPreTransform: Debug + Send + Sync {
-    /// Short name used in error messages, e.g. "PCA".
-    fn kind(&self) -> &'static str;
-
-    fn transform(&self, key: &ArrayRef) -> Result<ArrayRef>;
-
-    fn deep_size_of_children(&self, context: &mut Context) -> usize;
-
-    /// Whether distances in the transformed space still bound the original
-    /// distances, so `lower_bound` / `upper_bound` remain meaningful.
-    fn preserves_distance_bounds(&self) -> bool;
-}
-
-#[derive(Debug)]
-struct PcaQueryPreTransform {
-    model: Arc<PcaModel>,
-}
-
-impl QueryPreTransform for PcaQueryPreTransform {
-    fn kind(&self) -> &'static str {
-        "PCA"
-    }
-
-    fn transform(&self, key: &ArrayRef) -> Result<ArrayRef> {
-        self.model.transform_query(key.as_ref())
-    }
-
-    fn deep_size_of_children(&self, context: &mut Context) -> usize {
-        self.model.deep_size_of_children(context)
-    }
-
-    fn preserves_distance_bounds(&self) -> bool {
-        false
-    }
-}
-
 /// A vector index decorator that transforms query vectors before delegation.
 ///
 /// The transform is applied exactly once at each outer query entry point.
@@ -71,30 +35,23 @@ impl QueryPreTransform for PcaQueryPreTransform {
 #[derive(Debug)]
 pub struct PreTransformIndex {
     inner: Arc<dyn VectorIndex>,
-    transform: Arc<dyn QueryPreTransform>,
+    model: Arc<PcaModel>,
 }
 
 impl PreTransformIndex {
     /// Creates a query decorator backed by a trained PCA model.
     pub fn new_pca(inner: Arc<dyn VectorIndex>, model: Arc<PcaModel>) -> Self {
-        Self::with_transform(inner, Arc::new(PcaQueryPreTransform { model }))
-    }
-
-    fn with_transform(inner: Arc<dyn VectorIndex>, transform: Arc<dyn QueryPreTransform>) -> Self {
-        Self { inner, transform }
+        Self { inner, model }
     }
 
     fn transformed_query(&self, query: &Query) -> Result<Query> {
-        if !self.transform.preserves_distance_bounds()
-            && (query.lower_bound.is_some() || query.upper_bound.is_some())
-        {
-            return Err(Error::not_supported(format!(
-                "{} vector indices do not support lower_bound or upper_bound queries",
-                self.transform.kind()
-            )));
+        if query.lower_bound.is_some() || query.upper_bound.is_some() {
+            return Err(Error::not_supported(
+                "PCA vector indices do not support lower_bound or upper_bound queries".to_string(),
+            ));
         }
         let mut transformed = query.clone();
-        transformed.key = self.transform.transform(&query.key)?;
+        transformed.key = self.model.transform_query(query.key.as_ref())?;
         Ok(transformed)
     }
 
@@ -107,13 +64,12 @@ impl PreTransformIndex {
 impl DeepSizeOf for PreTransformIndex {
     fn deep_size_of_children(&self, context: &mut Context) -> usize {
         let inner_size = self.inner.deep_size_of_children(context);
-        let transform_size =
-            if context.mark_seen(Arc::as_ptr(&self.transform) as *const () as usize) {
-                size_of_val(self.transform.as_ref()) + self.transform.deep_size_of_children(context)
-            } else {
-                0
-            };
-        inner_size + transform_size
+        let model_size = if context.mark_seen(Arc::as_ptr(&self.model) as *const () as usize) {
+            size_of_val(self.model.as_ref()) + self.model.deep_size_of_children(context)
+        } else {
+            0
+        };
+        inner_size + model_size
     }
 }
 
@@ -251,9 +207,9 @@ impl VectorIndex for PreTransformIndex {
         length: usize,
     ) -> Result<Box<dyn VectorIndex>> {
         let inner = self.inner.load(reader, offset, length).await?;
-        Ok(Box::new(Self::with_transform(
+        Ok(Box::new(Self::new_pca(
             Arc::from(inner),
-            self.transform.clone(),
+            self.model.clone(),
         )))
     }
 
@@ -268,9 +224,9 @@ impl VectorIndex for PreTransformIndex {
             .inner
             .load_partition(reader, offset, length, partition_id)
             .await?;
-        Ok(Box::new(Self::with_transform(
+        Ok(Box::new(Self::new_pca(
             Arc::from(inner),
-            self.transform.clone(),
+            self.model.clone(),
         )))
     }
 
@@ -326,6 +282,28 @@ impl VectorIndex for PreTransformIndex {
         self.inner.sub_index_type()
     }
 
+    fn supports_pairwise_vectors(&self) -> bool {
+        // Pairwise scoring compares stored codes. Those codes were written
+        // after the PCA projection, so the inner index can score them directly.
+        self.inner.supports_pairwise_vectors()
+    }
+
+    async fn prepare_pairwise_partition(
+        &self,
+        partition_id: usize,
+        batch_size: usize,
+        memory_limit: usize,
+        spill_store: &dyn lance_io::spill::SpillStore,
+    ) -> Result<super::pairwise::PairwisePartition> {
+        self.inner
+            .prepare_pairwise_partition(partition_id, batch_size, memory_limit, spill_store)
+            .await
+    }
+
+    fn stored_fragments(&self) -> Option<RoaringBitmap> {
+        self.inner.stored_fragments()
+    }
+
     fn open_io_stats(&self) -> Option<lance_io::scheduler::ScanStats> {
         self.inner.open_io_stats()
     }
@@ -334,8 +312,9 @@ impl VectorIndex for PreTransformIndex {
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use arrow_array::cast::AsArray;
+    use arrow_array::types::Float32Type;
     use arrow_array::{Array, FixedSizeListArray, Float32Array};
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use futures::{StreamExt, stream};
@@ -343,52 +322,18 @@ mod tests {
 
     use super::super::VECTOR_RESULT_SCHEMA;
     use super::super::flat::index::FlatQuantizer;
-    use super::super::pca::PcaParams;
+    use super::super::pca::{PcaModel, PcaParams};
     use super::*;
     use crate::metrics::NoOpMetricsCollector;
     use crate::prefilter::NoFilter;
 
-    #[derive(Debug)]
-    struct CountingTransform {
-        calls: AtomicUsize,
-        offset: f32,
-    }
-
-    impl CountingTransform {
-        fn new(offset: f32) -> Self {
-            Self {
-                calls: AtomicUsize::new(0),
-                offset,
-            }
-        }
-    }
-
-    impl QueryPreTransform for CountingTransform {
-        fn kind(&self) -> &'static str {
-            "counting"
-        }
-
-        fn preserves_distance_bounds(&self) -> bool {
-            true
-        }
-
-        fn transform(&self, key: &ArrayRef) -> Result<ArrayRef> {
-            self.calls.fetch_add(1, Ordering::Relaxed);
-            let key = key
-                .as_any()
-                .downcast_ref::<Float32Array>()
-                .ok_or_else(|| Error::invalid_input("test query key must be Float32Array"))?;
-            Ok(Arc::new(Float32Array::from(
-                key.values()
-                    .iter()
-                    .map(|value| value + self.offset)
-                    .collect::<Vec<_>>(),
-            )))
-        }
-
-        fn deep_size_of_children(&self, _context: &mut Context) -> usize {
-            0
-        }
+    fn test_model() -> Arc<PcaModel> {
+        let vectors = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(vec![2.0, 0.0, -2.0, 0.0, 0.0, 1.0, 0.0, -1.0]),
+            2,
+        )
+        .expect("test vectors must be valid");
+        Arc::new(PcaModel::train(&vectors, &PcaParams::new(1)).expect("test PCA model must train"))
     }
 
     #[derive(Debug, Default)]
@@ -615,8 +560,8 @@ mod tests {
             column: "vector".to_string(),
             key: Arc::new(Float32Array::from(vec![1.0, 2.0])),
             k: 17,
-            lower_bound: Some(0.1),
-            upper_bound: Some(9.0),
+            lower_bound: None,
+            upper_bound: None,
             minimum_nprobes: 2,
             maximum_nprobes: Some(8),
             search_effort: 0.5,
@@ -630,29 +575,20 @@ mod tests {
         }
     }
 
-    fn decorated() -> (
-        Arc<PreTransformIndex>,
-        Arc<MockVectorIndex>,
-        Arc<CountingTransform>,
-    ) {
+    fn decorated() -> (Arc<PreTransformIndex>, Arc<MockVectorIndex>, Arc<PcaModel>) {
         let inner = Arc::new(MockVectorIndex::new());
-        let transform = Arc::new(CountingTransform::new(10.0));
-        let index = Arc::new(PreTransformIndex::with_transform(
-            inner.clone(),
-            transform.clone(),
-        ));
-        (index, inner, transform)
+        let model = test_model();
+        let index = Arc::new(PreTransformIndex::new_pca(inner.clone(), model.clone()));
+        (index, inner, model)
     }
 
-    fn assert_transformed_query(actual: &Query, original: &Query) {
+    fn assert_transformed_query(actual: &Query, original: &Query, model: &PcaModel) {
+        let expected = model
+            .transform_query(original.key.as_ref())
+            .expect("test query must project");
         assert_eq!(
-            actual
-                .key
-                .as_any()
-                .downcast_ref::<Float32Array>()
-                .unwrap()
-                .values(),
-            &[11.0, 12.0]
+            actual.key.as_primitive::<Float32Type>().values(),
+            expected.as_primitive::<Float32Type>().values()
         );
         assert_eq!(actual.column, original.column);
         assert_eq!(actual.k, original.k);
@@ -672,24 +608,22 @@ mod tests {
 
     #[tokio::test]
     async fn transforms_find_and_search_once() {
-        let (index, inner, transform) = decorated();
+        let (index, inner, model) = decorated();
         let query = query();
 
         index.find_partitions(&query).unwrap();
-        assert_eq!(transform.calls.load(Ordering::Relaxed), 1);
-        assert_transformed_query(&inner.queries.lock().unwrap()[0], &query);
+        assert_transformed_query(&inner.queries.lock().unwrap()[0], &query, &model);
 
         index
             .search(&query, Arc::new(NoFilter), &NoOpMetricsCollector)
             .await
             .unwrap();
-        assert_eq!(transform.calls.load(Ordering::Relaxed), 2);
-        assert_transformed_query(&inner.queries.lock().unwrap()[1], &query);
+        assert_transformed_query(&inner.queries.lock().unwrap()[1], &query, &model);
     }
 
     #[tokio::test]
     async fn search_partitions_delegates_override_after_one_transform() {
-        let (index, inner, transform) = decorated();
+        let (index, inner, model) = decorated();
         let query = query();
         let stream = index
             .search_partitions(
@@ -707,16 +641,15 @@ mod tests {
         let batches = stream.collect::<Vec<_>>().await;
 
         assert!(batches.is_empty());
-        assert_eq!(transform.calls.load(Ordering::Relaxed), 1);
         let calls = inner.calls.lock().unwrap();
         assert_eq!(calls.search_partitions, 1);
         assert_eq!(calls.search_in_partition, 0);
-        assert_transformed_query(&inner.queries.lock().unwrap()[0], &query);
+        assert_transformed_query(&inner.queries.lock().unwrap()[0], &query, &model);
     }
 
     #[tokio::test]
     async fn direct_partition_search_transforms_once() {
-        let (index, inner, transform) = decorated();
+        let (index, inner, model) = decorated();
         let query = query();
 
         index
@@ -724,32 +657,29 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(transform.calls.load(Ordering::Relaxed), 1);
         assert_eq!(inner.calls.lock().unwrap().search_in_partition, 1);
-        assert_transformed_query(&inner.queries.lock().unwrap()[0], &query);
+        assert_transformed_query(&inner.queries.lock().unwrap()[0], &query, &model);
     }
 
     #[tokio::test]
     async fn prepared_search_only_transforms_during_prepare() {
-        let (index, inner, transform) = decorated();
+        let (index, inner, model) = decorated();
         let query = query();
 
         let prepared = index
             .prepare_partition_search(3, &query, Arc::new(NoFilter), &NoOpMetricsCollector)
             .await
             .unwrap();
-        assert_eq!(transform.calls.load(Ordering::Relaxed), 1);
         index
             .search_prepared_partition(prepared, &NoOpMetricsCollector)
             .unwrap();
 
-        assert_eq!(transform.calls.load(Ordering::Relaxed), 1);
         let calls = inner.calls.lock().unwrap();
         assert_eq!(calls.prepare, 1);
         assert_eq!(calls.execute_prepared, 1);
         let queries = inner.queries.lock().unwrap();
-        assert_transformed_query(&queries[0], &query);
-        assert_transformed_query(&queries[1], &query);
+        assert_transformed_query(&queries[0], &query, &model);
+        assert_transformed_query(&queries[1], &query, &model);
     }
 
     #[tokio::test]
@@ -796,8 +726,7 @@ mod tests {
     #[tokio::test]
     async fn remap_rejects_shared_inner_without_panicking() {
         let inner = Arc::new(MockVectorIndex::new());
-        let transform = Arc::new(CountingTransform::new(10.0));
-        let mut index = PreTransformIndex::with_transform(inner.clone(), transform);
+        let mut index = PreTransformIndex::new_pca(inner.clone(), test_model());
 
         let error = index.remap(&RowAddrRemap::empty()).await.unwrap_err();
 
@@ -810,7 +739,7 @@ mod tests {
 
     #[tokio::test]
     async fn prepared_partition_query_is_reused_by_parallel_searches() {
-        let (index, inner, transform) = decorated();
+        let (index, inner, model) = decorated();
         let original = query();
         let (search_index, prepared_query) = index
             .prepare_partition_query(&original)
@@ -829,10 +758,9 @@ mod tests {
                 .expect("partition search should succeed");
         }
 
-        assert_eq!(transform.calls.load(Ordering::Relaxed), 1);
         assert_eq!(inner.calls.lock().unwrap().search_in_partition, 3);
         for actual in inner.queries.lock().unwrap().iter() {
-            assert_transformed_query(actual, &original);
+            assert_transformed_query(actual, &original, &model);
         }
     }
 
@@ -873,7 +801,9 @@ mod tests {
         .unwrap();
         let model = Arc::new(PcaModel::train(&training_data, &PcaParams::new(1)).unwrap());
         let index = PreTransformIndex::new_pca(Arc::new(MockVectorIndex::new()), model);
-        let error = index.transformed_query(&query()).unwrap_err();
+        let mut original = query();
+        original.lower_bound = Some(0.1);
+        let error = index.transformed_query(&original).unwrap_err();
 
         assert!(matches!(error, Error::NotSupported { .. }));
         assert!(error.to_string().contains("PCA vector indices"));
@@ -882,7 +812,7 @@ mod tests {
 
     #[test]
     fn transforming_a_query_preserves_the_original_for_refine() {
-        let (index, _, _) = decorated();
+        let (index, _, model) = decorated();
         let original = query();
 
         let transformed = index
@@ -898,7 +828,20 @@ mod tests {
                 .values(),
             &[1.0, 2.0]
         );
-        assert_transformed_query(&transformed, &original);
+        assert_transformed_query(&transformed, &original, &model);
+    }
+
+    #[test]
+    fn distance_bounds_are_rejected() {
+        let (index, _, _) = decorated();
+        let mut original = query();
+        original.lower_bound = Some(0.1);
+
+        let error = index
+            .transformed_query(&original)
+            .expect_err("PCA must reject distance bounds");
+
+        assert!(error.to_string().contains("lower_bound"));
     }
 
     /// Names of the methods declared at the top level of the block that
@@ -922,8 +865,13 @@ mod tests {
     fn overrides_every_vector_index_method_or_lists_its_default() {
         // Batch search keeps the trait default: it reports unsupported, so
         // callers fall back to per-query search, which transforms each query.
-        const INHERITED_DEFAULTS: &[&str] =
-            &["supports_batch_partition_search", "search_partitions_batch"];
+        // Streaming remap keeps the trait default because that default calls
+        // the overridden remap and stored_fragments methods.
+        const INHERITED_DEFAULTS: &[&str] = &[
+            "supports_batch_partition_search",
+            "search_partitions_batch",
+            "remap_streaming",
+        ];
 
         let declared = method_names(
             include_str!("../vector.rs"),
