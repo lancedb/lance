@@ -38,11 +38,14 @@ pub(super) const MERGE_SOURCE_SENTINEL: &str = "__merge_source_sentinel";
 
 pub mod inserted_rows;
 
-use assign_action::merge_insert_action;
+use assign_action::{
+    condition_reads_target, merge_insert_action, parse_delete_condition, parse_update_condition,
+};
 use inserted_rows::KeyExistenceFilter;
 
 use super::cleanup_data_fragments;
 use super::retry::{RetryConfig, RetryExecutor, execute_with_retry};
+use super::seeds::SeedCollector;
 use super::{
     CommitBuilder, TargetBaseInfo, WriteMode, WriteParams,
     validate_and_resolve_target_bases_with_primary, write_fragments_internal,
@@ -50,6 +53,7 @@ use super::{
 use crate::dataset::rowids::{get_row_id_index, load_spilled_row_lineage};
 use crate::dataset::transaction::UpdateMode::{RewriteColumns, RewriteRows};
 use crate::dataset::utils::CapturedRowIds;
+use crate::dataset::utils::SchemaAdapter;
 use crate::index::DatasetIndexExt;
 use crate::{
     Dataset,
@@ -148,6 +152,20 @@ use tracing::error;
 mod assign_action;
 mod exec;
 mod logical_plan;
+
+/// Check a merge source against the target schema. As on append, a legacy
+/// blob input matches a Blob v2 target column; the writer converts it.
+fn check_source_schema(
+    source: &lance_core::datatypes::Schema,
+    target: &lance_core::datatypes::Schema,
+    options: &SchemaCompareOptions,
+) -> Result<()> {
+    source.check_compatible(target, options).or_else(|err| {
+        let source = super::promote_legacy_blob_schema(source)?;
+        let target = super::promote_legacy_blob_schema(target)?;
+        source.check_compatible(&target, options).map_err(|_| err)
+    })
+}
 
 /// Build a source schema in target field order while preserving the source's
 /// logical leaf types. The latter matters for extension columns such as Arrow
@@ -629,7 +647,7 @@ impl MergeInsertParams {
 /// [`MergeInsertJob::update_fragments`] deposit their results.
 #[derive(Debug, Default)]
 struct PatchSink {
-    /// Fragments that gained a data file, one entry per task.
+    /// Patched fragments, including key-only matches that only update metadata.
     fragments: Mutex<Vec<Fragment>>,
     /// Physical offsets each fragment had patched. Only populated under stable
     /// row ids, which is the only thing that reads the row-version metadata
@@ -640,7 +658,7 @@ struct PatchSink {
 /// What [`MergeInsertJob::update_fragments`] wrote.
 #[derive(Debug)]
 pub(super) struct PatchedFragments {
-    /// Existing fragments that gained a data file for the patched columns.
+    /// Existing fragments with column patches or updated row-version metadata.
     pub updated_fragments: Vec<Fragment>,
     /// Fragments written for rows that carried no target address.
     pub new_fragments: Vec<Fragment>,
@@ -1241,6 +1259,20 @@ fn fill_missing_target_columns(
     Ok(df.select(projection)?)
 }
 
+/// How the merge plan reads the target's blob columns: legacy blobs as binary,
+/// Blob v2 as descriptors. The target scan and the deferred take of
+/// `MergeConditionExec` must agree, or a condition sees different types.
+fn target_blob_handling(dataset: &Dataset) -> lance_core::datatypes::BlobHandling {
+    lance_core::datatypes::BlobHandling::SomeBlobsBinary(
+        dataset
+            .schema()
+            .fields_pre_order()
+            .filter(|field| field.is_blob() && !field.is_blob_v2())
+            .map(|field| field.id as u32)
+            .collect(),
+    )
+}
+
 impl MergeInsertJob {
     pub async fn execute_reader(
         self,
@@ -1262,18 +1294,14 @@ impl MergeInsertJob {
         options.ignore_field_order = true;
 
         // Try full schema match first.
-        if lance_schema
-            .check_compatible(target_schema, &options)
-            .is_ok()
-        {
+        if check_source_schema(&lance_schema, target_schema, &options).is_ok() {
             return Ok(SchemaComparison::FullCompatible);
         }
 
         // If full match fails, try subschema match.
         options.allow_subschema = true;
 
-        lance_schema
-            .check_compatible(target_schema, &options)
+        check_source_schema(&lance_schema, target_schema, &options)
             .map(|_| SchemaComparison::Subschema)
     }
 
@@ -1630,14 +1658,29 @@ impl MergeInsertJob {
     /// fragments.
     ///
     /// `source` must carry `_rowaddr` plus the columns to write. A null
-    /// `_rowaddr` routes the row to a new fragment.
+    /// `_rowaddr` routes the row to a new fragment. Join columns in `on` are
+    /// written for new rows but preserved in existing fragments.
     pub(super) async fn update_fragments(
         dataset: Arc<Dataset>,
         source: SendableRecordBatchStream,
         current_version: u64,
         target_bases_info: Option<Vec<TargetBaseInfo>>,
         write_version: ConcreteFileVersion,
+        on: &[String],
     ) -> Result<PatchedFragments> {
+        let source_schema = source.schema();
+        let update_projection: Vec<usize> = source_schema
+            .fields()
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, field)| (!on.contains(field.name())).then_some(idx))
+            .collect();
+        // Every group has the same projected schema. Deletions and fragment
+        // coverage change its rows, not whether it carries columns to write.
+        let has_updated_columns = update_projection.iter().any(|&idx| {
+            let name = source_schema.field(idx).name();
+            name != ROW_ADDR && name != ROW_ID
+        });
         // Shared across the per-group tasks spawned below; only new fragments
         // are routed to target bases, column patches stay in primary storage.
         let target_bases_info = Arc::new(target_bases_info);
@@ -1789,32 +1832,63 @@ impl MergeInsertJob {
                         .extend(offsets);
                 }
 
+                // A key-only match still updates row-version metadata, but
+                // has no column data to write or invalidate.
+                if write_schema.fields.is_empty() {
+                    if dataset.manifest.uses_stable_row_ids() {
+                        let updated_offsets: Vec<usize> = get_row_addr_iter(&batches)
+                            .map(|(row_addr, _)| RowAddress::from(row_addr).row_offset() as usize)
+                            .collect();
+                        let spilled_lineage =
+                            load_spilled_row_lineage(&dataset, [&metadata]).await?;
+                        lance_table::rowids::version::refresh_row_latest_update_meta_for_partial_frag_rewrite_cols(
+                            &mut metadata,
+                            &updated_offsets,
+                            current_version,
+                            dataset.manifest.version,
+                            &spilled_lineage,
+                        )?;
+                    }
+                    // Keep the matched fragments in the conflict read set even
+                    // without stable row ids: a concurrent rewrite of their
+                    // physical addresses must cause the merge to retry.
+                    patched
+                        .fragments
+                        .lock()
+                        .map_err(|err| {
+                            Error::internal(format!("Failed to lock patched fragments: {err}"))
+                        })?
+                        .push(metadata);
+                    return Ok(reservation_size);
+                }
+
                 if has_full_fragment_coverage {
                     // Exact, deletion-free coverage can be written directly because the
                     // batches are sorted by row address.
 
-                    let mut writer = versions::open_writer(
+                    let mut seeds = SeedCollector::for_write(
                         write_version,
-                        &dataset.object_store,
+                        Some(&dataset),
                         &write_schema,
-                        &dataset.base,
-                        super::WriterOptions {
-                            add_data_dir: true,
-                            ..Default::default()
-                        },
+                        true,
                     )
                     .await?;
+                    let mut writer =
+                        versions::open_update_writer(write_version, &dataset, &write_schema, false)
+                            .await?;
 
-                    // We need to remove rowaddr before writing.
-                    batches
-                        .iter_mut()
-                        .try_for_each(|batch| match batch.drop_column(ROW_ADDR) {
-                            Ok(b) => {
-                                *batch = b;
-                                Ok(())
-                            }
-                            Err(e) => Err(e),
-                        })?;
+                    // We need to remove rowaddr before writing. The data file
+                    // writer and the seed collector must then see the same
+                    // representation: a Utf8View or BinaryView source is stored
+                    // as its classic offset type, and the writer's own
+                    // conversion never reaches these batches, so normalize once
+                    // here for both.
+                    batches.iter_mut().try_for_each(|batch| {
+                        let without_addr = batch.drop_column(ROW_ADDR)?;
+                        *batch = SchemaAdapter::new(without_addr.schema())
+                            .to_physical_batch(without_addr)?;
+                        Ok::<_, Error>(())
+                    })?;
 
                     let source_version = metadata
                         .referenced_lance_files()
@@ -1836,12 +1910,20 @@ impl MergeInsertJob {
                         ));
                         let mut stream = chunk_stream(stream, batch_size as usize);
                         while let Some(chunk) = stream.next().await {
-                            writer.write(&chunk?).await?;
+                            let chunk = chunk?;
+                            writer.write(&chunk).await?;
+                            for batch in &chunk {
+                                seeds.observe(batch)?;
+                            }
                         }
                     } else {
                         writer.write(batches.as_slice()).await?;
+                        for batch in &batches {
+                            seeds.observe(batch)?;
+                        }
                     }
 
+                    seeds.flush(writer.as_mut()).await?;
                     let (_num_rows, data_file) = writer.finish().await?;
 
                     metadata.files.push(data_file);
@@ -2060,6 +2142,13 @@ impl MergeInsertJob {
                     };
                     let metadata = fragment.metadata.clone();
 
+                    // Matched join columns are equal by definition. Retain
+                    // them in the source only for the new-fragment branch.
+                    let batches = batches
+                        .into_iter()
+                        .map(|batch| batch.project(&update_projection))
+                        .collect::<std::result::Result<Vec<_>, _>>()?;
+
                     let fut = handle_fragment(
                         dataset.clone(),
                         fragment,
@@ -2119,6 +2208,9 @@ impl MergeInsertJob {
         // Collect the updated fragments, and map the field ids. Tombstone old ones
         // as needed.
         for fragment in &mut updated_fragments {
+            if !has_updated_columns {
+                continue;
+            }
             let updated_fields = fragment.files.last().unwrap().fields.clone();
             all_fields_updated.extend(updated_fields.iter().map(|&f| f as u32));
             for data_file in &mut fragment.files.iter_mut().rev().skip(1) {
@@ -2327,6 +2419,16 @@ impl MergeInsertJob {
         }
     }
 
+    /// Whether the source provides a dataset column with a blob anywhere in it.
+    fn source_carries_blob(&self, source_schema: &Schema) -> bool {
+        self.dataset
+            .schema()
+            .fields
+            .iter()
+            .filter(|field| source_schema.column_with_name(&field.name).is_some())
+            .any(subtree_has_blob)
+    }
+
     /// Resolves the caller's [`MergeInsertWriteMode`] against this operation.
     ///
     /// [`WriteSink::RewriteColumns`] only ever replaces column data within a
@@ -2358,11 +2460,8 @@ impl MergeInsertJob {
         {
             blockers.push("the source covers every dataset column, so there is nothing to skip");
         }
-        // A source of nothing but the join key has no new values to write: the
-        // patch would reproduce the key column byte for byte, and still cost a
-        // full-fragment column file plus the invalidation of every index over
-        // the key. Row-rewrite writes more bytes for it, but it does not
-        // invalidate those indices.
+        // A source of nothing but the join key has no new column values to
+        // write, so there is no column patch for this sink to perform.
         if !source_schema
             .fields()
             .iter()
@@ -2394,14 +2493,7 @@ impl MergeInsertJob {
         // the top-level fields it carries and then descends: a blob nested
         // anywhere under one of them (struct member, list item, map value) is
         // still patched by writing that whole top-level column.
-        if self
-            .dataset
-            .schema()
-            .fields
-            .iter()
-            .filter(|field| source_schema.column_with_name(&field.name).is_some())
-            .any(subtree_has_blob)
-        {
+        if self.source_carries_blob(source_schema) {
             blockers.push("the source carries a blob column, whose stored form differs from the one it provides");
         }
 
@@ -2424,13 +2516,6 @@ impl MergeInsertJob {
         //       indexed vs non-indexed cases. That should be handled by optimizer rules.
         let write_sink = self.select_write_sink(provider.schema().as_ref())?;
         let session_ctx = SessionContext::new();
-        let binary_blob_field_ids = self
-            .dataset
-            .schema()
-            .fields_pre_order()
-            .filter(|field| field.is_blob() && !field.is_blob_v2())
-            .map(|field| field.id as u32)
-            .collect();
         let target_provider = Arc::new(
             crate::datafusion::dataframe::LanceTableProvider::new_with_ordering(
                 self.dataset.clone(),
@@ -2438,9 +2523,7 @@ impl MergeInsertJob {
                 true,
                 false,
             )
-            .with_blob_handling(lance_core::datatypes::BlobHandling::SomeBlobsBinary(
-                binary_blob_field_ids,
-            )),
+            .with_blob_handling(target_blob_handling(&self.dataset)),
         );
         let scan = session_ctx.read_table(target_provider)?;
         // Wrap column names in double quotes to preserve case (DataFusion lowercases unquoted identifiers)
@@ -2504,6 +2587,19 @@ impl MergeInsertJob {
         let scan_aliased = scan.alias("target")?;
         let join_type = self.create_plan_join_type();
         let dataset_schema: Schema = self.dataset.schema().into();
+        // A condition that reads target columns is evaluated after the join
+        // on the rows it gates (`MergeConditionExec`), which takes only the
+        // columns its input lacks; folded into `__action` it would pull them
+        // into the target scan.
+        let split = |condition: Option<Expr>| match condition {
+            Some(condition) if condition_reads_target(&condition, self.dataset.schema()) => {
+                (None, Some(condition))
+            }
+            condition => (condition, None),
+        };
+        let (update_condition, deferred_update_if) =
+            split(parse_update_condition(&self.params, &dataset_schema)?);
+        let (delete_condition, deferred_delete_if) = split(parse_delete_condition(&self.params)?);
         let mut df = scan_aliased
             .join(
                 source_df_aliased,
@@ -2514,7 +2610,7 @@ impl MergeInsertJob {
             )?
             .with_column(
                 MERGE_ACTION_COLUMN,
-                merge_insert_action(&self.params, Some(&dataset_schema))?,
+                merge_insert_action(&self.params, update_condition, delete_condition)?,
             )?;
 
         // Partial-schema upsert: fill the dataset columns the source does not
@@ -2537,6 +2633,10 @@ impl MergeInsertJob {
             source_skipped_duplicates,
             write_sink,
             source_blob_columns,
+            logical_plan::DeferredConditions {
+                update_if: deferred_update_if,
+                delete_if: deferred_delete_if,
+            },
         );
         let logical_plan = LogicalPlan::Extension(Extension {
             node: Arc::new(write_node),
@@ -2567,11 +2667,7 @@ impl MergeInsertJob {
 
         // Execute the plan
         // Assert that we have exactly one partition since we're designed for single-partition execution
-        let partition_count = match plan.properties().output_partitioning() {
-            datafusion_physical_expr::Partitioning::RoundRobinBatch(n) => *n,
-            datafusion_physical_expr::Partitioning::Hash(_, n) => *n,
-            datafusion_physical_expr::Partitioning::UnknownPartitioning(n) => *n,
-        };
+        let partition_count = plan.properties().output_partitioning().partition_count();
 
         if partition_count != 1 {
             return Err(Error::invalid_input(format!(
@@ -2655,8 +2751,9 @@ impl MergeInsertJob {
         // Convert to lance schema for comparison
         let lance_schema = lance_core::datatypes::Schema::try_from(source_schema)?;
         let full_schema = self.dataset.schema();
-        let is_full_schema = full_schema.compare_with_options(
+        let is_full_schema = check_source_schema(
             &lance_schema,
+            full_schema,
             &SchemaCompareOptions {
                 compare_metadata: false,
                 // Allow nullable source fields for non-nullable targets.
@@ -2665,16 +2762,21 @@ impl MergeInsertJob {
                 ignore_field_order: true,
                 ..Default::default()
             },
-        );
+        )
+        .is_ok();
 
         // Partial-schema upsert: every source field must exist in the target
-        // and have a compatible data type. Missing target columns will be
+        // and have a compatible data type (legacy blob input matches Blob v2,
+        // as in `check_source_schema`). Missing target columns will be
         // filled from the target side of the join in `create_plan`.
         let is_subset_schema = !is_full_schema
             && lance_schema.fields.iter().all(|sf| {
                 full_schema
                     .field(&sf.name)
-                    .map(|tf| tf.data_type() == sf.data_type())
+                    .map(|tf| {
+                        tf.data_type() == sf.data_type()
+                            || (tf.is_blob_v2() && sf.is_blob() && !sf.is_blob_v2())
+                    })
                     .unwrap_or(false)
             });
 
@@ -2715,8 +2817,10 @@ impl MergeInsertJob {
         // probe: the sink decides how many bytes are written, the probe only how
         // the matched rows are found. Merges that write nothing (no matched
         // update) or write whole rows on both paths (a full-schema source) are
-        // unaffected, so they keep the index.
-        let write_mode_needs_v2 = self.params.write_mode == MergeInsertWriteMode::RewriteRows
+        // unaffected, so they keep the index. A source carrying a blob column
+        // needs whole rows too: patching cannot write blobs (`select_write_sink`).
+        let write_mode_needs_v2 = (self.params.write_mode == MergeInsertWriteMode::RewriteRows
+            || self.source_carries_blob(source_schema))
             && is_subset_schema
             && matches!(
                 self.params.when_matched,
@@ -2805,8 +2909,9 @@ impl MergeInsertJob {
         let source_schema = source.schema();
         let lance_schema = lance_core::datatypes::Schema::try_from(source_schema.as_ref())?;
         let full_schema = self.dataset.schema();
-        let is_full_schema = full_schema.compare_with_options(
+        let is_full_schema = check_source_schema(
             &lance_schema,
+            full_schema,
             &SchemaCompareOptions {
                 compare_metadata: false,
                 // Allow nullable source fields for non-nullable targets.
@@ -2816,7 +2921,8 @@ impl MergeInsertJob {
                 ignore_field_order: true,
                 ..Default::default()
             },
-        );
+        )
+        .is_ok();
         let source = if is_full_schema {
             let target_schema = Schema::from(full_schema);
             let canonical_schema = Arc::new(canonical_source_schema(
@@ -2935,6 +3041,7 @@ impl MergeInsertJob {
                 self.dataset.manifest.version + 1,
                 target_bases_info,
                 self.params.write_version(&self.dataset),
+                &self.params.on,
             )
             .await?;
 
@@ -4007,6 +4114,7 @@ mod tests {
             dataset.manifest().version + 1,
             None,
             dataset.manifest.data_storage_format.lance_file_format(),
+            &[],
         )
         .await
         .unwrap_err();
@@ -6868,6 +6976,12 @@ mod tests {
 
     mod subcols {
         use super::*;
+        use crate::dataset::optimize::{CompactionOptions, compact_files};
+        use crate::dataset::rowids::{
+            INLINE_ROW_LINEAGE_MAX_BYTES_CONFIG_KEY, SPILL_ROW_LINEAGE_CONFIG_KEY,
+        };
+        use lance_core::{ROW_CREATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION};
+        use lance_table::format::RowDatasetVersionMeta;
         use rstest::rstest;
 
         struct Fixtures {
@@ -7083,8 +7197,8 @@ mod tests {
                     let data_files = &frag.files;
                     // Updated columns should be only columns in new data files
                     // -2 field ids are tombstoned.
-                    assert_eq!(data_files[0].fields.as_ref(), &[0, -2, -2]);
-                    assert_eq!(data_files[1].fields.as_ref(), &[2, 1]);
+                    assert_eq!(data_files[0].fields.as_ref(), &[0, -2, 2]);
+                    assert_eq!(data_files[1].fields.as_ref(), &[1]);
                 };
                 has_added_files(&fragments_after[1]);
                 has_added_files(&fragments_after[2]);
@@ -7306,7 +7420,7 @@ mod tests {
             );
             // `UpdateAll` references no target column, so `other` is absent
             // from the plan entirely. An `UpdateIf` whose condition reads an
-            // omitted column pulls it back into the target scan — see
+            // omitted column takes it for the matched rows — see
             // `test_merge_insert_subcols_in_place_update_if_reads_omitted_column`.
             assert!(
                 !plan.contains("other"),
@@ -7315,11 +7429,10 @@ mod tests {
             );
         }
 
-        /// The read-side win is conditional: an `UpdateIf` condition that reads
-        /// a column the source omits pulls that column back into the target
-        /// scan, because the `__action` expression still references it. The
-        /// write-side win is unaffected — the column is read but never
-        /// rewritten.
+        /// An `UpdateIf` condition that reads a column the source omits must
+        /// not pull that column into the target scan; it is taken for the
+        /// matched rows only. The write-side win is unaffected — the column
+        /// is read but never rewritten.
         #[tokio::test]
         async fn test_merge_insert_subcols_in_place_update_if_reads_omitted_column() {
             let Fixtures { ds, new_data } = Box::pin(setup(false)).await;
@@ -7342,9 +7455,17 @@ mod tests {
                 plan.contains("InPlaceMergeInsert: on=[key]"),
                 "the condition must not change the write sink: {plan}"
             );
+            let scan = plan
+                .lines()
+                .find(|line| line.contains("LanceRead"))
+                .unwrap_or_else(|| panic!("no LanceRead in plan: {plan}"));
             assert!(
-                plan.contains("other"),
-                "a condition over an omitted column must keep it in the plan: {plan}"
+                !scan.contains("other"),
+                "the condition's column must not be in the target scan: {plan}"
+            );
+            assert!(
+                plan.contains("MergeCondition:") && plan.contains("take=[other]"),
+                "the condition must be evaluated on the matched rows: {plan}"
             );
 
             // And the condition is genuinely evaluated against the stored
@@ -8336,8 +8457,7 @@ mod tests {
         async fn test_merge_insert_subcols_in_place_reports_fields_modified() {
             let Fixtures { ds, new_data } = Box::pin(setup(false)).await;
 
-            // `value` is field id 1 in the dataset schema; `key` (the join key)
-            // is written too because the source carries it.
+            // Join keys remain unchanged even though the source carries them.
             let value_field_id = ds.schema().field("value").unwrap().id as u32;
             let key_field_id = ds.schema().field("key").unwrap().id as u32;
             let other_field_id = ds.schema().field("other").unwrap().id as u32;
@@ -8366,9 +8486,12 @@ mod tests {
                 } => {
                     assert!(matches!(update_mode, Some(RewriteColumns)));
                     assert!(
-                        fields_modified.contains(&value_field_id)
-                            && fields_modified.contains(&key_field_id),
+                        fields_modified.contains(&value_field_id),
                         "patched fields must be reported, got {fields_modified:?}"
+                    );
+                    assert!(
+                        !fields_modified.contains(&key_field_id),
+                        "join keys must not be reported as modified, got {fields_modified:?}"
                     );
                     assert!(
                         !fields_modified.contains(&other_field_id),
@@ -8378,6 +8501,659 @@ mod tests {
                 }
                 other => panic!("expected Operation::Update, got: {other:?}"),
             }
+        }
+
+        #[rstest]
+        #[case::indexed_update(true, false, false)]
+        #[case::indexed_upsert(true, true, false)]
+        #[case::planned_update(false, false, false)]
+        #[case::indexed_key_only(true, true, true)]
+        #[tokio::test]
+        async fn test_merge_insert_subcols_preserves_join_columns(
+            #[case] scalar_index: bool,
+            #[case] insert: bool,
+            #[case] key_only: bool,
+            #[values(false, true)] composite_key: bool,
+            #[values(false, true)] stable_row_ids: bool,
+        ) {
+            let initial = record_batch!(
+                ("id", UInt32, [0, 1, 2, 3, 4, 5]),
+                ("id2", UInt32, [0, 1, 0, 1, 0, 1]),
+                ("value", UInt32, [10, 11, 12, 13, 14, 15]),
+                ("other", UInt32, [20, 21, 22, 23, 24, 25])
+            )
+            .unwrap();
+            let mut ds = InsertBuilder::new("memory://")
+                .with_params(&WriteParams {
+                    max_rows_per_file: 3,
+                    enable_stable_row_ids: stable_row_ids,
+                    ..Default::default()
+                })
+                .execute(vec![initial])
+                .await
+                .unwrap();
+            let on = if composite_key {
+                vec!["id", "id2"]
+            } else {
+                vec!["id"]
+            };
+            if scalar_index {
+                for key in &on {
+                    ds.create_index(
+                        &[*key],
+                        IndexType::BTree,
+                        None,
+                        &ScalarIndexParams::default(),
+                        false,
+                    )
+                    .await
+                    .unwrap();
+                }
+            }
+            ds.create_index(
+                &["value"],
+                IndexType::BTree,
+                None,
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+            let mut ds = Arc::new(ds);
+
+            // Cover fragment 0 entirely and fragment 1 partially, plus an
+            // unmatched key. Reorder source columns to exercise name matching.
+            for (iteration, value) in [100, 200].into_iter().enumerate() {
+                let source = record_batch!(
+                    (
+                        "value",
+                        UInt32,
+                        [Some(value), None, Some(value), Some(value), Some(value)]
+                    ),
+                    ("id2", UInt32, [0, 1, 0, 0, 0]),
+                    ("id", UInt32, [0, 1, 2, 4, 6])
+                )
+                .unwrap();
+                let projection = match (composite_key, key_only) {
+                    (false, false) => vec![0, 2],
+                    (true, false) => vec![0, 1, 2],
+                    (false, true) => vec![2],
+                    (true, true) => vec![1, 2],
+                };
+                let source = source.project(&projection).unwrap();
+                let (updated_ds, stats) = MergeInsertBuilder::try_new(
+                    ds.clone(),
+                    on.iter().map(|key| key.to_string()).collect(),
+                )
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(if insert {
+                    WhenNotMatched::InsertAll
+                } else {
+                    WhenNotMatched::DoNothing
+                })
+                .write_mode(if scalar_index {
+                    MergeInsertWriteMode::Auto
+                } else {
+                    MergeInsertWriteMode::RewriteColumns
+                })
+                .try_build()
+                .unwrap()
+                .execute_reader(RecordBatchIterator::new(
+                    [Ok(source.clone())],
+                    source.schema(),
+                ))
+                .await
+                .unwrap();
+                ds = updated_ds;
+                assert_eq!(
+                    stats.num_updated_rows,
+                    if insert && iteration == 1 { 5 } else { 4 }
+                );
+                assert_eq!(stats.num_inserted_rows, u64::from(insert && iteration == 0));
+                assert_eq!(stats.num_deleted_rows, 0);
+
+                for fragment in ds.get_fragments().iter().take(2) {
+                    let files = &fragment.metadata().files;
+                    assert_eq!(
+                        files[0].fields.as_ref(),
+                        &[0, 1, if key_only { 2 } else { -2 }, 3]
+                    );
+                    assert_eq!(files.len(), if key_only { 1 } else { 2 });
+                    if !key_only {
+                        assert_eq!(files.last().unwrap().fields.as_ref(), &[2]);
+                    }
+                }
+                if scalar_index {
+                    for key in &on {
+                        let index = ds
+                            .load_scalar_index(
+                                IndexCriteria::default().with_name(&format!("{key}_idx")),
+                            )
+                            .await
+                            .unwrap()
+                            .expect("join key index must remain usable after each merge");
+                        assert_eq!(
+                            index.fragment_bitmap,
+                            Some(RoaringBitmap::from_iter([0, 1]))
+                        );
+                    }
+                }
+                let indices = ds.load_indices().await.unwrap();
+                let value_index = indices
+                    .iter()
+                    .find(|index| index.name == "value_idx")
+                    .unwrap();
+                assert_eq!(
+                    value_index.fragment_bitmap,
+                    Some(if key_only {
+                        RoaringBitmap::from_iter([0, 1])
+                    } else {
+                        RoaringBitmap::new()
+                    })
+                );
+
+                let mut scanner = ds.scan();
+                scanner.scan_in_order(true);
+                if stable_row_ids {
+                    scanner
+                        .project(&[
+                            "id",
+                            "id2",
+                            "value",
+                            "other",
+                            lance_core::ROW_LAST_UPDATED_AT_VERSION,
+                        ])
+                        .unwrap();
+                }
+                let result = scanner.try_into_batch().await.unwrap();
+                assert_eq!(result.num_rows(), if insert { 7 } else { 6 });
+                for row in 0..6 {
+                    assert_eq!(
+                        result["id"].as_primitive::<UInt32Type>().value(row),
+                        row as u32
+                    );
+                    assert_eq!(
+                        result["id2"].as_primitive::<UInt32Type>().value(row),
+                        (row % 2) as u32
+                    );
+                    assert_eq!(
+                        result["other"].as_primitive::<UInt32Type>().value(row),
+                        row as u32 + 20
+                    );
+                    let values = result["value"].as_primitive::<UInt32Type>();
+                    if !key_only && [0, 1, 2, 4].contains(&row) {
+                        assert_eq!(values.is_null(row), row == 1);
+                        if row != 1 {
+                            assert_eq!(values.value(row), value);
+                        }
+                    } else {
+                        assert_eq!(values.value(row), row as u32 + 10);
+                    }
+                    if stable_row_ids {
+                        let versions = result[lance_core::ROW_LAST_UPDATED_AT_VERSION]
+                            .as_primitive::<UInt64Type>();
+                        assert_eq!(
+                            versions.value(row),
+                            if [0, 1, 2, 4].contains(&row) {
+                                ds.version().version
+                            } else {
+                                1
+                            }
+                        );
+                    }
+                }
+                if insert {
+                    assert_eq!(result["id"].as_primitive::<UInt32Type>().value(6), 6);
+                    assert_eq!(result["id2"].is_null(6), !composite_key);
+                    if composite_key {
+                        assert_eq!(result["id2"].as_primitive::<UInt32Type>().value(6), 0);
+                    }
+                    assert!(result["other"].is_null(6));
+                    assert_eq!(result["value"].is_null(6), key_only);
+                    if !key_only {
+                        assert_eq!(result["value"].as_primitive::<UInt32Type>().value(6), value);
+                    }
+                    if stable_row_ids {
+                        assert_eq!(
+                            result[lance_core::ROW_LAST_UPDATED_AT_VERSION]
+                                .as_primitive::<UInt64Type>()
+                                .value(6),
+                            ds.version().version
+                        );
+                    }
+                }
+            }
+        }
+
+        #[derive(Debug, Clone, Copy)]
+        enum ConcurrentWrite {
+            Compaction,
+            ColumnRewrite,
+            IndexBuild,
+        }
+
+        #[rstest]
+        #[case::compaction(ConcurrentWrite::Compaction)]
+        #[case::column_rewrite(ConcurrentWrite::ColumnRewrite)]
+        #[case::index_build(ConcurrentWrite::IndexBuild)]
+        #[tokio::test]
+        async fn test_merge_insert_key_only_concurrent_write(
+            #[case] concurrent_write: ConcurrentWrite,
+            #[values(false, true)] stable_row_ids: bool,
+        ) {
+            let initial = record_batch!(
+                ("id", UInt32, [0, 1, 2, 3, 4, 5]),
+                ("value", UInt32, [10, 11, 12, 13, 14, 15]),
+                ("other", UInt32, [20, 21, 22, 23, 24, 25])
+            )
+            .unwrap();
+            let mut ds = InsertBuilder::new("memory://")
+                .with_params(&WriteParams {
+                    max_rows_per_file: 3,
+                    enable_stable_row_ids: stable_row_ids,
+                    ..Default::default()
+                })
+                .execute(vec![initial])
+                .await
+                .unwrap();
+            ds.create_index(
+                &["id"],
+                IndexType::BTree,
+                None,
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+            let ds = Arc::new(ds);
+            let source = record_batch!(("id", UInt32, [0, 4])).unwrap();
+            let job = MergeInsertBuilder::try_new(ds.clone(), vec!["id".into()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::DoNothing)
+                .commit_retries(0)
+                .try_build()
+                .unwrap();
+            let prepared = job
+                .clone()
+                .execute_uncommitted_batches(vec![source.clone()])
+                .await
+                .unwrap();
+            assert_eq!(prepared.stats.num_updated_rows, 2);
+            assert_eq!(prepared.stats.num_files_written, 0);
+            let Operation::Update {
+                updated_fragments,
+                fields_modified,
+                ..
+            } = &prepared.transaction.operation
+            else {
+                panic!("expected an in-place update");
+            };
+            assert!(fields_modified.is_empty());
+            assert_eq!(updated_fragments.len(), 2);
+            if !stable_row_ids {
+                assert_eq!(updated_fragments.as_slice(), ds.fragments().as_slice());
+            }
+
+            let mut other = ds.as_ref().clone();
+            match concurrent_write {
+                ConcurrentWrite::Compaction => {
+                    compact_files(
+                        &mut other,
+                        CompactionOptions {
+                            target_rows_per_fragment: 6,
+                            ..Default::default()
+                        },
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(other.fragments().len(), 1);
+                }
+                ConcurrentWrite::ColumnRewrite => {
+                    let patch =
+                        record_batch!(("id", UInt32, [0]), ("value", UInt32, [99])).unwrap();
+                    let (patched, _) =
+                        MergeInsertBuilder::try_new(Arc::new(other), vec!["id".into()])
+                            .unwrap()
+                            .when_matched(WhenMatched::UpdateAll)
+                            .when_not_matched(WhenNotMatched::DoNothing)
+                            .write_mode(MergeInsertWriteMode::RewriteColumns)
+                            .try_build()
+                            .unwrap()
+                            .execute_batches(vec![patch])
+                            .await
+                            .unwrap();
+                    other = patched.as_ref().clone();
+                }
+                ConcurrentWrite::IndexBuild => {
+                    other
+                        .create_index(
+                            &["value"],
+                            IndexType::BTree,
+                            None,
+                            &ScalarIndexParams::default(),
+                            false,
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+
+            let mut columns = vec!["id", "value", "other"];
+            if stable_row_ids {
+                columns.push(ROW_LAST_UPDATED_AT_VERSION);
+            }
+            let before = other
+                .scan()
+                .project(&columns)
+                .unwrap()
+                .scan_in_order(true)
+                .try_into_batch()
+                .await
+                .unwrap();
+            // Compaction physically rewrites fragments, and on a
+            // stable-row-id dataset the "id" BTree index now stores row
+            // addresses, which the rewrite invalidates for the affected
+            // fragment (`test_addr_domain_index_does_not_cover_rewritten_update_fragment`).
+            // The in-place patch that would otherwise write zero files falls
+            // back to a real rewrite there to keep the index's coverage
+            // consistent, matching ZoneMap/BloomFilter/FM's existing
+            // address-domain behavior.
+            let expect_rewrite =
+                stable_row_ids && matches!(concurrent_write, ConcurrentWrite::Compaction);
+
+            let commit = CommitBuilder::new(Arc::new(other.clone()))
+                .with_max_retries(0)
+                .execute(prepared.transaction)
+                .await;
+            let merged = if matches!(concurrent_write, ConcurrentWrite::IndexBuild) {
+                commit.unwrap()
+            } else {
+                let error = commit.unwrap_err();
+                assert!(
+                    matches!(error, Error::RetryableCommitConflict { .. }),
+                    "{error}"
+                );
+                assert!(error.to_string().contains("preempted"), "{error}");
+                // Start from the stale handle again: the merge must replay on
+                // the latest fragments instead of resurrecting the old files.
+                let (merged, stats) = job.execute_batches(vec![source]).await.unwrap();
+                assert_eq!(stats.num_attempts, 2);
+                assert_eq!(stats.num_updated_rows, 2);
+                assert_eq!(stats.num_files_written, if expect_rewrite { 1 } else { 0 });
+                merged.as_ref().clone()
+            };
+            if expect_rewrite {
+                // The address-domain "id" index can no longer cover the
+                // fragment the rewrite touched, so the patched rows land in
+                // a brand new fragment alongside `other`'s single compacted
+                // one instead of overwriting it in place.
+                assert_eq!(merged.fragments().len(), other.fragments().len() + 1);
+            } else {
+                assert_eq!(merged.fragments().len(), other.fragments().len());
+                for (merged_fragment, current) in
+                    merged.fragments().iter().zip(other.fragments().iter())
+                {
+                    assert_eq!(merged_fragment.id, current.id);
+                    assert_eq!(merged_fragment.files, current.files);
+                    if !stable_row_ids {
+                        assert_eq!(merged_fragment, current);
+                    }
+                }
+            }
+            let after = merged
+                .scan()
+                .project(&columns)
+                .unwrap()
+                .scan_in_order(true)
+                .try_into_batch()
+                .await
+                .unwrap();
+            // `before`'s row order is always original-id order (it was
+            // captured before any rewrite). `after`'s is too, except when
+            // `expect_rewrite` relocates the patched rows (ids 0 and 4) to a
+            // new trailing fragment -- so look rows up by id rather than
+            // assuming position, which degrades to position for every other
+            // case since id and position coincide here.
+            let after_row_for_id = |id: u32| -> usize {
+                let ids = after["id"].as_primitive::<UInt32Type>();
+                (0..ids.len()).find(|&i| ids.value(i) == id).unwrap()
+            };
+            if expect_rewrite {
+                for id in 0u32..6 {
+                    assert_eq!(
+                        before.project(&[0, 1, 2]).unwrap().slice(id as usize, 1),
+                        after
+                            .project(&[0, 1, 2])
+                            .unwrap()
+                            .slice(after_row_for_id(id), 1),
+                        "row id {id} mismatched"
+                    );
+                }
+            } else {
+                assert_eq!(
+                    before.project(&[0, 1, 2]).unwrap(),
+                    after.project(&[0, 1, 2]).unwrap()
+                );
+            }
+            if stable_row_ids {
+                for id in 0u32..6 {
+                    assert_eq!(
+                        after[ROW_LAST_UPDATED_AT_VERSION]
+                            .as_primitive::<UInt64Type>()
+                            .value(after_row_for_id(id)),
+                        if [0, 4].contains(&id) {
+                            merged.version().version
+                        } else {
+                            before[ROW_LAST_UPDATED_AT_VERSION]
+                                .as_primitive::<UInt64Type>()
+                                .value(id as usize)
+                        }
+                    );
+                }
+            }
+            let live_fragments = merged
+                .fragments()
+                .iter()
+                .map(|fragment| fragment.id as u32)
+                .collect::<RoaringBitmap>();
+            let indices = merged.load_indices().await.unwrap();
+            let expected_indices = if matches!(concurrent_write, ConcurrentWrite::IndexBuild) {
+                vec!["id_idx", "value_idx"]
+            } else {
+                vec!["id_idx"]
+            };
+            // The address-domain "id" index cannot cover the new fragment a
+            // rewrite creates -- its stored addresses describe the fragment
+            // it was built against, not whatever replaced part of it (see
+            // `test_addr_domain_index_does_not_cover_rewritten_update_fragment`).
+            // Nor does it keep partial credit for the untouched remainder of
+            // the rewritten fragment: the whole fragment drops out of its
+            // coverage, leaving it empty here (only one fragment existed).
+            let empty_bitmap = RoaringBitmap::new();
+            for name in expected_indices {
+                let index = indices.iter().find(|index| index.name == name).unwrap();
+                let expected_bitmap = if expect_rewrite && name == "id_idx" {
+                    &empty_bitmap
+                } else {
+                    &live_fragments
+                };
+                assert_eq!(index.fragment_bitmap.as_ref(), Some(expected_bitmap));
+            }
+            merged.validate().await.unwrap();
+        }
+
+        #[rstest]
+        #[tokio::test]
+        async fn test_merge_insert_subcols_deleted_and_spilled_lineage(
+            #[values(false, true)] stable_row_ids: bool,
+            #[values(false, true)] key_only: bool,
+        ) {
+            let initial = record_batch!(
+                ("id", UInt32, [0, 1, 2, 3, 4, 5]),
+                ("value", UInt32, [10, 11, 12, 13, 14, 15]),
+                ("other", UInt32, [20, 21, 22, 23, 24, 25])
+            )
+            .unwrap();
+            let mut ds = InsertBuilder::new("memory://")
+                .with_params(&WriteParams {
+                    max_rows_per_file: if stable_row_ids { 1 } else { 3 },
+                    enable_stable_row_ids: stable_row_ids,
+                    ..Default::default()
+                })
+                .execute(vec![initial])
+                .await
+                .unwrap();
+            if stable_row_ids {
+                ds.update_config([
+                    (SPILL_ROW_LINEAGE_CONFIG_KEY, "true"),
+                    (INLINE_ROW_LINEAGE_MAX_BYTES_CONFIG_KEY, "0"),
+                ])
+                .await
+                .unwrap();
+                compact_files(
+                    &mut ds,
+                    CompactionOptions {
+                        target_rows_per_fragment: 3,
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .await
+                .unwrap();
+                assert_eq!(ds.fragments().len(), 2);
+                for fragment in ds.fragments().iter() {
+                    assert!(matches!(
+                        fragment.last_updated_at_version_meta,
+                        Some(RowDatasetVersionMeta::Column)
+                    ));
+                }
+            }
+            ds.create_index(
+                &["id"],
+                IndexType::BTree,
+                None,
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+            ds.delete("id = 1").await.unwrap();
+            assert!(
+                ds.fragments()
+                    .iter()
+                    .any(|fragment| fragment.deletion_file.is_some())
+            );
+            let mut columns = vec!["id", "value", "other"];
+            if stable_row_ids {
+                columns.extend([ROW_CREATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION]);
+            }
+            let before = ds
+                .scan()
+                .project(&columns)
+                .unwrap()
+                .with_row_id()
+                .order_by(Some(vec![ColumnOrdering::asc_nulls_first("id".into())]))
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+            let source = record_batch!(
+                ("id", UInt32, [0, 1, 2, 4]),
+                ("value", UInt32, [Some(100), Some(100), None, Some(100)])
+            )
+            .unwrap();
+            let source = if key_only {
+                source.project(&[0]).unwrap()
+            } else {
+                source
+            };
+            let (merged, stats) =
+                MergeInsertBuilder::try_new(Arc::new(ds.clone()), vec!["id".into()])
+                    .unwrap()
+                    .when_matched(WhenMatched::UpdateAll)
+                    .when_not_matched(WhenNotMatched::DoNothing)
+                    .try_build()
+                    .unwrap()
+                    .execute_batches(vec![source])
+                    .await
+                    .unwrap();
+            assert_eq!(stats.num_updated_rows, 3);
+            assert_eq!(stats.num_inserted_rows, 0);
+            assert_eq!(stats.num_deleted_rows, 0);
+            for (merged_fragment, original) in merged.fragments().iter().zip(ds.fragments().iter())
+            {
+                assert_eq!(merged_fragment.id, original.id);
+                assert_eq!(merged_fragment.deletion_file, original.deletion_file);
+                if key_only {
+                    assert_eq!(merged_fragment.files, original.files);
+                } else {
+                    assert_eq!(merged_fragment.files.len(), original.files.len() + 1);
+                    assert_eq!(merged_fragment.files.last().unwrap().fields.as_ref(), &[1]);
+                    assert_eq!(merged_fragment.files[0].fields[0], 0);
+                    assert_eq!(merged_fragment.files[0].fields[1], -2);
+                }
+            }
+            let after = merged
+                .scan()
+                .project(&columns)
+                .unwrap()
+                .with_row_id()
+                .order_by(Some(vec![ColumnOrdering::asc_nulls_first("id".into())]))
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+            assert_eq!(
+                after["id"].as_primitive::<UInt32Type>().values().as_ref(),
+                &[0, 2, 3, 4, 5]
+            );
+            assert_eq!(&after[ROW_ID], &before[ROW_ID]);
+            assert_eq!(&after["other"], &before["other"]);
+            if stable_row_ids {
+                assert_eq!(
+                    &after[ROW_CREATED_AT_VERSION],
+                    &before[ROW_CREATED_AT_VERSION]
+                );
+            }
+            for (row, key) in [0, 2, 3, 4, 5].into_iter().enumerate() {
+                let matched = [0, 2, 4].contains(&key);
+                let values = after["value"].as_primitive::<UInt32Type>();
+                assert_eq!(values.is_null(row), !key_only && key == 2);
+                if !values.is_null(row) {
+                    assert_eq!(
+                        values.value(row),
+                        if !key_only && matched { 100 } else { key + 10 }
+                    );
+                }
+                if stable_row_ids {
+                    assert_eq!(
+                        after[ROW_LAST_UPDATED_AT_VERSION]
+                            .as_primitive::<UInt64Type>()
+                            .value(row),
+                        if matched {
+                            merged.version().version
+                        } else {
+                            before[ROW_LAST_UPDATED_AT_VERSION]
+                                .as_primitive::<UInt64Type>()
+                                .value(row)
+                        }
+                    );
+                }
+            }
+            assert!(
+                merged
+                    .scan()
+                    .filter("id = 4")
+                    .unwrap()
+                    .explain_plan(false)
+                    .await
+                    .unwrap()
+                    .contains("ScalarIndexQuery")
+            );
+            merged.validate().await.unwrap();
         }
 
         /// Fragments can carry the same column in different data-file layouts:
@@ -8721,10 +9497,9 @@ mod tests {
         }
 
         /// A source carrying nothing but the join key has no values to write, so
-        /// `RewriteColumns` cannot help it: the patch would reproduce the key
-        /// column byte for byte at the cost of a full-fragment column file and
-        /// the invalidation of every index over that key. Asking for it must
-        /// error rather than quietly writing whole rows instead.
+        /// `RewriteColumns` requires at least one non-key column to patch.
+        /// Asking for it with only the key must error rather than quietly
+        /// writing whole rows instead.
         #[tokio::test]
         async fn test_merge_insert_rewrite_columns_rejects_key_only_source() {
             let Fixtures { ds, new_data } = Box::pin(setup(false)).await;
@@ -9364,16 +10139,12 @@ mod tests {
             .await
             .unwrap();
 
-        // Fragment 3 is fully removed.  We could keep it technically but today it is removed
-        // which is also fine.  Fragment 2 is partially and must be removed.
-        //
-        // TODO: We should not be modifying the id_index here.  A merge_insert should not need
-        // to rewrite the id field.  However, it seems we are doing that today.  This should be
-        // fixed in
-        check_indices(&dataset, &[0, 1], &[0, 1]).await;
+        // Join keys stay in their original files, so their index keeps every
+        // fragment. Only the rewritten value column loses index coverage.
+        check_indices(&dataset, &[0, 1, 2, 3], &[0, 1]).await;
 
-        // One more test but this time we touch all fragments which causes the index to be removed
-        // entirely.
+        // Touching all fragments invalidates the value index entirely while
+        // preserving the join key index.
         let dataset = test_dataset().await;
 
         // Vertical merge insert (full schema), one fragment is deleted and should be removed from
@@ -9396,7 +10167,7 @@ mod tests {
             .await
             .unwrap();
 
-        check_indices(&dataset, &[], &[]).await;
+        check_indices(&dataset, &[0, 1, 2, 3], &[]).await;
     }
 
     #[tokio::test]
@@ -9535,10 +10306,11 @@ mod tests {
             "MergeInsert: on=[key], when_matched=UpdateAll, when_not_matched=InsertAll, when_not_matched_by_source=Keep
   CoalescePartitionsExec
     ProjectionExec: expr=[_rowid@0 as _rowid, _rowaddr@1 as _rowaddr, value@2 as value, key@3 as key, __merge_source_sentinel@4 as __merge_source_sentinel, CASE WHEN _rowaddr@1 IS NULL THEN 2 WHEN _rowaddr@1 IS NOT NULL THEN 1 ELSE 0 END as __action]
-      HashJoinExec: mode=CollectLeft, join_type=Right, on=[(key@0, key@1)], projection=[_rowid@1, _rowaddr@2, value@3, key@4, __merge_source_sentinel@5]
-        LanceRead: uri=..., projection=[key], num_fragments=1, range_before=None, range_after=None, \
-        row_id=true, row_addr=true, full_filter=--, refine_filter=--
-        RepartitionExec: partitioning=RoundRobinBatch(...), input_partitions=1
+      HashJoinExec: mode=Partitioned, join_type=Right, on=[(key@0, key@1)], projection=[_rowid@1, _rowaddr@2, value@3, key@4, __merge_source_sentinel@5]
+        RepartitionExec: partitioning=Hash([key@0], ...), input_partitions=1
+          LanceRead: uri=..., projection=[key], num_fragments=1, range_before=None, range_after=None, \
+          row_id=true, row_addr=true, full_filter=--, refine_filter=--
+        RepartitionExec: partitioning=Hash([key@1], ...), input_partitions=1
           ProjectionExec: expr=[value@0 as value, key@1 as key, true as __merge_source_sentinel]
             StreamingTableExec: partition_sizes=1, projection=[value, key]"
         ).await.unwrap();
@@ -9550,9 +10322,9 @@ mod tests {
     /// without a swap the target is always the build side.
     ///
     /// The target here is one row past DataFusion's
-    /// `hash_join_single_partition_threshold_rows`, and `FilteredReadExec`
-    /// reports no `total_byte_size`, so the target cannot pass the collect
-    /// threshold. That leaves the source: a materialized one reports exact
+    /// `hash_join_single_partition_threshold_rows`, and its estimated width puts it
+    /// past the 1 MiB byte threshold too, so the target cannot be collected on
+    /// either count. That leaves the source: a materialized one reports exact
     /// statistics and fits under the threshold, so `JoinSelection` swaps it onto
     /// the build side and rewrites `Right` into `Left`. A one-shot stream reports
     /// `Absent` for everything, neither side qualifies for `CollectLeft`, and the
@@ -9692,11 +10464,8 @@ mod tests {
         let ds = Arc::new(Dataset::write(data, "memory://", None).await.unwrap());
 
         // The source covers the dataset's schema, so nothing is filled from the
-        // target side. Two rows
-        // against the target's 64 keeps the source the smaller side, which is what
-        // makes the join collect it here; both sides are under DataFusion's collect
-        // threshold, so the choice comes from comparing row counts. Raise the source
-        // above 64 and the join collects the target instead.
+        // target side. Two rows against the target's 64 keep the source smaller
+        // in estimated bytes as well as row count, so the join collects it.
         let source =
             record_batch!(("key", UInt32, [1, 100]), ("value", UInt32, [999, 999])).unwrap();
 
@@ -9791,8 +10560,9 @@ mod tests {
             "MergeInsert: on=[key], when_matched=UpdateAll, when_not_matched=DoNothing, when_not_matched_by_source=Keep
   CoalescePartitionsExec
     ProjectionExec: expr=[_rowid@0 as _rowid, _rowaddr@1 as _rowaddr, value@2 as value, key@3 as key, __merge_source_sentinel@4 as __merge_source_sentinel, CASE WHEN _rowaddr@1 IS NOT NULL THEN 1 ELSE 0 END as __action]
-      HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(key@0, key@1)], projection=[_rowid@1, _rowaddr@2, value@3, key@4, __merge_source_sentinel@5]
-        LanceRead: uri=..., projection=[key], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=true, full_filter=--, refine_filter=--
+      HashJoinExec: mode=Partitioned, join_type=Inner, on=[(key@0, key@1)], projection=[_rowid@1, _rowaddr@2, value@3, key@4, __merge_source_sentinel@5]
+        RepartitionExec: partitioning=Hash([key@0], ...), input_partitions=1
+          LanceRead: uri=..., projection=[key], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=true, full_filter=--, refine_filter=--
         RepartitionExec...
           ProjectionExec: expr=[value@0 as value, key@1 as key, true as __merge_source_sentinel]
             StreamingTableExec: partition_sizes=1, projection=[value, key]"
@@ -9841,8 +10611,9 @@ mod tests {
             "MergeInsert: on=[key], when_matched=UpdateIf(source.value > 20), when_not_matched=DoNothing, when_not_matched_by_source=Keep
   CoalescePartitionsExec
     ProjectionExec: expr=[_rowid@0 as _rowid, _rowaddr@1 as _rowaddr, value@2 as value, key@3 as key, __merge_source_sentinel@4 as __merge_source_sentinel, CASE WHEN _rowaddr@1 IS NOT NULL AND value@2 > 20 THEN 1 ELSE 0 END as __action]
-      HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(key@0, key@1)], projection=[_rowid@1, _rowaddr@2, value@3, key@4, __merge_source_sentinel@5]
-        LanceRead: uri=..., projection=[key], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=true, full_filter=--, refine_filter=--
+      HashJoinExec: mode=Partitioned, join_type=Inner, on=[(key@0, key@1)], projection=[_rowid@1, _rowaddr@2, value@3, key@4, __merge_source_sentinel@5]
+        RepartitionExec: partitioning=Hash([key@0], ...), input_partitions=1
+          LanceRead: uri=..., projection=[key], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=true, full_filter=--, refine_filter=--
         RepartitionExec...
           ProjectionExec: expr=[value@0 as value, key@1 as key, true as __merge_source_sentinel]
             StreamingTableExec: partition_sizes=1, projection=[value, key]"
@@ -9898,8 +10669,9 @@ mod tests {
             "MergeInsert: on=[key], when_matched=DoNothing, when_not_matched=InsertAll, when_not_matched_by_source=Keep
   CoalescePartitionsExec
     ProjectionExec: expr=[_rowid@0 as _rowid, _rowaddr@1 as _rowaddr, value@2 as value, key@3 as key, __merge_source_sentinel@4 as __merge_source_sentinel, CASE WHEN _rowaddr@1 IS NULL THEN 2 ELSE 0 END as __action]
-      HashJoinExec: mode=CollectLeft, join_type=Right, on=[(key@0, key@1)], projection=[_rowid@1, _rowaddr@2, value@3, key@4, __merge_source_sentinel@5]
-        LanceRead: uri=..., projection=[key], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=true, full_filter=--, refine_filter=--
+      HashJoinExec: mode=Partitioned, join_type=Right, on=[(key@0, key@1)], projection=[_rowid@1, _rowaddr@2, value@3, key@4, __merge_source_sentinel@5]
+        RepartitionExec: partitioning=Hash([key@0], ...), input_partitions=1
+          LanceRead: uri=..., projection=[key], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=true, full_filter=--, refine_filter=--
         RepartitionExec...
           ProjectionExec: expr=[value@0 as value, key@1 as key, true as __merge_source_sentinel]
             StreamingTableExec: partition_sizes=1, projection=[value, key]"
@@ -14420,16 +15192,27 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
         .await
         .unwrap();
 
+        ds.create_index(
+            &["value_a"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
         let ds = Arc::new(ds);
 
-        // Invalidate fragment 2 (the middle one)
+        // Invalidate fragment 2 (the middle one) in the rewritten value's index.
         let frag2_start = 2 * rows_per_frag;
         let ds = partial_merge_insert(ds, frag2_start..frag2_start + rows_per_frag, 999.0).await;
 
         // Verify pre-compaction state
         let indices = ds.load_indices().await.unwrap();
-        let idx = indices.iter().find(|i| i.name == "id_idx").unwrap();
+        let idx = indices.iter().find(|i| i.name == "value_a_idx").unwrap();
         assert!(!idx.fragment_bitmap.as_ref().unwrap().contains(2));
+        let key_idx = indices.iter().find(|i| i.name == "id_idx").unwrap();
+        assert!(key_idx.fragment_bitmap.as_ref().unwrap().contains(2));
 
         // Run compaction with a target that forces merging of the small fragments.
         let mut ds = (*ds).clone();
@@ -14443,7 +15226,7 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
         // Fragment 2 (unindexed) may or may not be compacted on its own.
         // Either way, the old fragment IDs in the bitmap should be replaced.
         let indices = ds.load_indices().await.unwrap();
-        let idx = indices.iter().find(|i| i.name == "id_idx").unwrap();
+        let idx = indices.iter().find(|i| i.name == "value_a_idx").unwrap();
         let bitmap = idx.fragment_bitmap.as_ref().unwrap();
         for &old_id in &[0u32, 1, 3, 4] {
             assert!(
@@ -15196,8 +15979,20 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
         );
     }
 
+    /// A legacy blob source merges into a 2.1 table, and into a 2.2 table whose
+    /// column is Blob v2. Partial + indexed patches the blob column in place,
+    /// which fails for Blob v2 sources too, so it is not covered here.
+    #[rstest::rstest]
+    #[case::full(false, false)]
+    #[case::full_indexed(true, false)]
+    #[case::partial(false, true)]
     #[tokio::test]
-    async fn test_merge_insert_with_blob_v1_source_provides_blob() {
+    async fn test_merge_insert_with_blob_v1_source_provides_blob(
+        #[case] indexed: bool,
+        #[case] partial: bool,
+        #[values(LanceFileVersion::V2_1, LanceFileVersion::V2_2)] version: LanceFileVersion,
+        #[values(false, true)] delete_unmatched: bool,
+    ) {
         use arrow_array::LargeBinaryArray;
         use arrow_schema::Schema as ArrowSchema;
         use lance_arrow::BLOB_META_KEY;
@@ -15222,57 +16017,84 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
             )
             .unwrap()
         };
-        let dataset = Arc::new(
-            Dataset::write(
-                RecordBatchIterator::new(
-                    vec![Ok(make_batch(
-                        vec![Some(b"foo"), Some(b"bar")],
-                        vec![0, 1],
-                        vec![10, 20],
-                    ))],
-                    schema.clone(),
-                ),
-                &test_dir,
-                Some(WriteParams {
-                    data_storage_version: Some(LanceFileVersion::V2_1),
-                    ..Default::default()
-                }),
-            )
-            .await
-            .unwrap(),
-        );
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(
+                vec![Ok(make_batch(
+                    vec![Some(b"foo"), Some(b"bar")],
+                    vec![0, 1],
+                    vec![10, 20],
+                ))],
+                schema.clone(),
+            ),
+            &test_dir,
+            Some(WriteParams {
+                data_storage_version: Some(version),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        if indexed {
+            dataset
+                .create_index(
+                    &["id"],
+                    IndexType::Scalar,
+                    None,
+                    &ScalarIndexParams::default(),
+                    false,
+                )
+                .await
+                .unwrap();
+        }
+        let mut batch = make_batch(vec![Some(b"baz"), Some(b"qux")], vec![1, 2], vec![200, 300]);
+        if partial {
+            batch = batch.project(&[0, 1]).unwrap();
+        }
         let source = Box::new(RecordBatchIterator::new(
-            vec![Ok(make_batch(
-                vec![Some(b"baz"), Some(b"qux")],
-                vec![1, 2],
-                vec![200, 300],
-            ))],
-            schema,
+            vec![Ok(batch.clone())],
+            batch.schema(),
         ));
 
-        let job = MergeInsertBuilder::try_new(dataset, vec!["id".to_string()])
-            .unwrap()
+        let mut builder =
+            MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".to_string()]).unwrap();
+        builder
             .when_matched(WhenMatched::UpdateAll)
-            .when_not_matched(WhenNotMatched::InsertAll)
+            .when_not_matched(WhenNotMatched::InsertAll);
+        if delete_unmatched {
+            builder.when_not_matched_by_source(WhenNotMatchedBySource::Delete);
+        }
+        let (new_dataset, _) = builder
             .try_build()
-            .unwrap();
-        let (new_dataset, _) = job.execute_reader(source).await.unwrap();
-        let blobs = new_dataset
-            .take_blobs_by_indices(&[0, 1, 2], "blobs")
+            .unwrap()
+            .execute_reader(source)
             .await
             .unwrap();
-        assert_eq!(
-            blobs[0].as_ref().unwrap().read().await.unwrap().as_ref(),
-            b"foo"
-        );
-        assert_eq!(
-            blobs[1].as_ref().unwrap().read().await.unwrap().as_ref(),
-            b"baz"
-        );
-        assert_eq!(
-            blobs[2].as_ref().unwrap().read().await.unwrap().as_ref(),
-            b"qux"
-        );
+
+        let ids = new_dataset
+            .scan()
+            .project(&["id"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let ids = ids["id"]
+            .as_primitive::<arrow_array::types::Int64Type>()
+            .values();
+        let indices: Vec<u64> = (0..ids.len() as u64).collect();
+        let blobs = new_dataset
+            .take_blobs_by_indices(&indices, "blobs")
+            .await
+            .unwrap();
+        let mut actual = Vec::new();
+        for (id, blob) in ids.iter().zip(blobs) {
+            actual.push((*id, blob.unwrap().read().await.unwrap().to_vec()));
+        }
+        actual.sort();
+        let mut expected = vec![(1, b"baz".to_vec()), (2, b"qux".to_vec())];
+        if !delete_unmatched {
+            expected.insert(0, (0, b"foo".to_vec()));
+        }
+        assert_eq!(actual, expected);
     }
 
     #[tokio::test]
@@ -15347,6 +16169,112 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
         assert_eq!(
             blobs[2].as_ref().unwrap().read().await.unwrap().as_ref(),
             b"qux"
+        );
+    }
+
+    /// A partial-schema source carrying a Blob v2 column updates and inserts
+    /// whether or not the join key has a scalar index.
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn test_merge_insert_partial_blob_v2_source(#[values(false, true)] indexed: bool) {
+        use crate::{BlobArrayBuilder, blob_field};
+        use arrow_schema::Schema as ArrowSchema;
+
+        let test_dir = TempStrDir::default();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            blob_field("blobs", true),
+            Field::new("id", DataType::Int64, true),
+            Field::new("other", DataType::Int64, true),
+        ]));
+        let make_batch = |blob_values: &[&[u8]], ids: Vec<i64>| {
+            let mut blobs = BlobArrayBuilder::new(blob_values.len());
+            for value in blob_values {
+                blobs.push_bytes(value).unwrap();
+            }
+            let others = ids.iter().map(|id| id * 10).collect::<Vec<_>>();
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    blobs.finish().unwrap(),
+                    Arc::new(Int64Array::from(ids)),
+                    Arc::new(Int64Array::from(others)),
+                ],
+            )
+            .unwrap()
+        };
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(
+                vec![Ok(make_batch(&[b"foo", b"bar"], vec![0, 1]))],
+                schema.clone(),
+            ),
+            &test_dir,
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        if indexed {
+            dataset
+                .create_index(
+                    &["id"],
+                    IndexType::Scalar,
+                    None,
+                    &ScalarIndexParams::default(),
+                    false,
+                )
+                .await
+                .unwrap();
+        }
+        let source = make_batch(&[b"baz", b"qux"], vec![1, 2])
+            .project(&[0, 1])
+            .unwrap();
+        let source = Box::new(RecordBatchIterator::new(
+            vec![Ok(source.clone())],
+            source.schema(),
+        ));
+
+        let (new_dataset, _) =
+            MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::InsertAll)
+                .try_build()
+                .unwrap()
+                .execute_reader(source)
+                .await
+                .unwrap();
+
+        let batch = new_dataset
+            .scan()
+            .project(&["id", "other"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let blobs = new_dataset
+            .take_blobs_by_indices(&[0, 1, 2], "blobs")
+            .await
+            .unwrap();
+        let ids = batch["id"].as_primitive::<arrow_array::types::Int64Type>();
+        let others = batch["other"].as_primitive::<arrow_array::types::Int64Type>();
+        let mut actual = Vec::new();
+        for (row, blob) in blobs.into_iter().enumerate() {
+            actual.push((
+                ids.value(row),
+                others.is_valid(row).then(|| others.value(row)),
+                blob.unwrap().read().await.unwrap().to_vec(),
+            ));
+        }
+        actual.sort();
+        assert_eq!(
+            actual,
+            vec![
+                (0, Some(0), b"foo".to_vec()),
+                (1, Some(10), b"baz".to_vec()),
+                (2, None, b"qux".to_vec()),
+            ]
         );
     }
 
@@ -15558,5 +16486,711 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
             blobs[2].as_ref().unwrap().read().await.unwrap().as_ref(),
             b"qux"
         );
+    }
+
+    /// `UpdateIf` / `DeleteIf` conditions over target columns are evaluated by
+    /// `MergeConditionExec` on the rows they gate, never through the target scan.
+    mod deferred_conditions {
+        use super::*;
+        use arrow_array::{ArrayRef, LargeBinaryArray};
+        use lance_datagen::{ArrayGeneratorExt, ByteCount};
+        use lance_io::{object_store::WrappingObjectStore, utils::tracking_store::IOTracker};
+        use rstest::rstest;
+
+        const PAYLOAD_BYTES: u64 = 16 * 1024;
+        const ROWS_PER_FRAGMENT: usize = 50;
+        const NUM_FRAGMENTS: usize = 8;
+        const NUM_ROWS: usize = ROWS_PER_FRAGMENT * NUM_FRAGMENTS;
+        const COLUMN_BYTES: u64 = PAYLOAD_BYTES * NUM_ROWS as u64;
+
+        struct Fixture {
+            ds: Arc<Dataset>,
+            batch: RecordBatch,
+            io: IOTracker,
+        }
+
+        /// `key` and `other` step 0..400 over eight 50-row fragments; `payload`
+        /// is 16 KiB per row and null at local row 25 of every fragment.
+        async fn fixture() -> Fixture {
+            let mut nulls = vec![false; ROWS_PER_FRAGMENT];
+            nulls[25] = true;
+            let batch = lance_datagen::gen_batch()
+                .with_seed(Seed::from(7))
+                .col("key", array::step::<Int32Type>())
+                .col("other", array::step::<UInt32Type>())
+                .col(
+                    "payload",
+                    array::rand_fixedbin(ByteCount::from(PAYLOAD_BYTES), true).with_nulls(&nulls),
+                )
+                .into_batch_rows(RowCount::from(NUM_ROWS as u64))
+                .unwrap();
+            let ds = Dataset::write(
+                Box::new(RecordBatchIterator::new(
+                    [Ok(batch.clone())],
+                    batch.schema(),
+                )),
+                "memory://",
+                Some(WriteParams {
+                    max_rows_per_file: ROWS_PER_FRAGMENT,
+                    data_storage_version: Some(LanceFileVersion::V2_2),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+            let io = IOTracker::default();
+            let ds = Arc::new(ds.with_object_store_wrappers([
+                Arc::new(io.clone()) as Arc<dyn WrappingObjectStore>
+            ]));
+            io.incremental_stats();
+            Fixture { ds, batch, io }
+        }
+
+        /// A partial-schema source of `key` + `payload`.
+        fn source(keys: &[i32]) -> RecordBatch {
+            record_batch!(
+                ("key", Int32, keys.to_vec()),
+                (
+                    "payload",
+                    LargeBinary,
+                    keys.iter().map(|_| b"new".as_slice()).collect::<Vec<_>>()
+                )
+            )
+            .unwrap()
+        }
+
+        fn builder(ds: &Arc<Dataset>) -> MergeInsertBuilder {
+            let mut builder =
+                MergeInsertBuilder::try_new(ds.clone(), vec!["key".to_string()]).unwrap();
+            builder.when_not_matched(WhenNotMatched::DoNothing);
+            builder
+        }
+
+        async fn explain(job: &MergeInsertJob, source: &RecordBatch) -> String {
+            job.explain_plan(Some(source.schema().as_ref()), false)
+                .await
+                .unwrap()
+        }
+
+        fn scan_line(plan: &str) -> &str {
+            plan.lines()
+                .find(|line| line.contains("LanceRead"))
+                .unwrap_or_else(|| panic!("no LanceRead in plan: {plan}"))
+        }
+
+        async fn run(job: MergeInsertJob, source: &RecordBatch) -> (Arc<Dataset>, MergeStats) {
+            let reader = Box::new(RecordBatchIterator::new(
+                [Ok(source.clone())],
+                source.schema(),
+            ));
+            job.execute_reader(reader).await.unwrap()
+        }
+
+        /// `(key, payload)` for every row matching `filter`, in key order.
+        async fn payloads(ds: &Dataset, filter: &str) -> Vec<(i32, Option<Vec<u8>>)> {
+            let batch = ds
+                .scan()
+                .project(&["key", "payload"])
+                .unwrap()
+                .filter(filter)
+                .unwrap()
+                .scan_in_order(true)
+                .try_into_batch()
+                .await
+                .unwrap();
+            let keys = batch["key"].as_primitive::<Int32Type>();
+            let payloads = batch["payload"].as_binary::<i64>();
+            let mut rows = (0..batch.num_rows())
+                .map(|i| {
+                    (
+                        keys.value(i),
+                        payloads.is_valid(i).then(|| payloads.value(i).to_vec()),
+                    )
+                })
+                .collect::<Vec<_>>();
+            rows.sort_by_key(|(key, _)| *key);
+            rows
+        }
+
+        fn stored(batch: &RecordBatch, key: i32) -> Option<Vec<u8>> {
+            let payloads = batch["payload"].as_binary::<i64>();
+            payloads
+                .is_valid(key as usize)
+                .then(|| payloads.value(key as usize).to_vec())
+        }
+
+        /// The condition's column must not enter the target scan, which reads
+        /// every row however small the source is; it is taken for the matched
+        /// rows alone. The source is out of key order and spans fragments, so
+        /// the take has to restore the join's row order.
+        #[rstest]
+        #[case::rewrite_columns(MergeInsertWriteMode::RewriteColumns)]
+        #[case::rewrite_rows(MergeInsertWriteMode::RewriteRows)]
+        #[tokio::test]
+        async fn update_if_reads_target_column_for_matched_rows_only(
+            #[case] write_mode: MergeInsertWriteMode,
+        ) {
+            let Fixture { ds, batch, io } = fixture().await;
+            // Fragments 6, 0, 2, 1; keys 325 and 75 sit at local row 25.
+            let source = source(&[325, 30, 130, 75]);
+            let job = builder(&ds)
+                .when_matched(WhenMatched::update_if(&ds, "target.payload IS NULL").unwrap())
+                .write_mode(write_mode)
+                .try_build()
+                .unwrap();
+
+            let plan = explain(&job, &source).await;
+            assert!(
+                !scan_line(&plan).contains("payload"),
+                "the condition's column must not be in the target scan: {plan}"
+            );
+            assert!(
+                plan.contains("MergeCondition: update_if=") && plan.contains("take=[payload]"),
+                "the condition must be evaluated on the matched rows: {plan}"
+            );
+            assert!(
+                plan.contains("when_matched=UpdateIf(MergeCondition)"),
+                "the write node must not display a predicate it does not evaluate: {plan}"
+            );
+
+            io.incremental_stats();
+            let (updated, stats) = run(job, &source).await;
+            assert_eq!(stats.num_updated_rows, 2);
+            let read_bytes = io.incremental_stats().read_bytes;
+            assert!(
+                read_bytes < COLUMN_BYTES / 2,
+                "read {read_bytes} bytes against a {COLUMN_BYTES}-byte column"
+            );
+            assert_eq!(
+                payloads(&updated, "key IN (325, 30, 130, 75)").await,
+                vec![
+                    (30, stored(&batch, 30)),
+                    (75, Some(b"new".to_vec())),
+                    (130, stored(&batch, 130)),
+                    (325, Some(b"new".to_vec())),
+                ]
+            );
+            assert_eq!(updated.count_rows(None).await.unwrap(), NUM_ROWS);
+        }
+
+        /// A full-schema source: the write path rewrites whole rows and the
+        /// target scan carries only the join key.
+        #[tokio::test]
+        async fn update_if_full_schema_source() {
+            let Fixture { ds, batch, io } = fixture().await;
+            let source = record_batch!(
+                ("key", Int32, [25, 30]),
+                ("other", UInt32, [1000u32, 1001]),
+                ("payload", LargeBinary, [b"new".as_slice(), b"new"])
+            )
+            .unwrap();
+            let job = builder(&ds)
+                .when_matched(WhenMatched::update_if(&ds, "target.payload IS NULL").unwrap())
+                .try_build()
+                .unwrap();
+
+            let plan = explain(&job, &source).await;
+            assert!(
+                !scan_line(&plan).contains("payload") && plan.contains("take=[payload]"),
+                "{plan}"
+            );
+            io.incremental_stats();
+            let (updated, stats) = run(job, &source).await;
+            assert_eq!(stats.num_updated_rows, 1);
+            assert!(io.incremental_stats().read_bytes < COLUMN_BYTES / 2);
+            assert_eq!(
+                payloads(&updated, "key IN (25, 30)").await,
+                vec![(25, Some(b"new".to_vec())), (30, stored(&batch, 30))]
+            );
+        }
+
+        /// With whole-row rewrites the source's omitted columns are filled
+        /// from the target side of the join, so the condition's column is in
+        /// the plan twice: unqualified for the write and `target.`-qualified
+        /// for the condition. Both spellings of the condition must resolve.
+        #[rstest]
+        #[case::qualified("target.payload IS NULL")]
+        #[case::unqualified("payload IS NULL")]
+        #[tokio::test]
+        async fn update_if_rewrite_rows_omitted_column(#[case] condition: &str) {
+            let Fixture { ds, batch, .. } = fixture().await;
+            let source =
+                record_batch!(("key", Int32, [25, 30]), ("other", UInt32, [1000u32, 1001]))
+                    .unwrap();
+            let job = builder(&ds)
+                .when_matched(WhenMatched::update_if(&ds, condition).unwrap())
+                .try_build()
+                .unwrap();
+            // The filled column is bound in place, not taken again.
+            let plan = explain(&job, &source).await;
+            assert!(plan.contains("take=[]"), "{plan}");
+            let (updated, stats) = run(job, &source).await;
+            assert_eq!(stats.num_updated_rows, 1);
+            let rows = updated
+                .scan()
+                .filter("key IN (25, 30)")
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+            let keys = rows["key"].as_primitive::<Int32Type>();
+            let others = rows["other"].as_primitive::<UInt32Type>();
+            let mut rows = keys
+                .values()
+                .iter()
+                .zip(others.values())
+                .collect::<Vec<_>>();
+            rows.sort();
+            assert_eq!(rows, vec![(&25, &1000), (&30, &30)]);
+            assert_eq!(
+                payloads(&updated, "key IN (25, 30)").await,
+                vec![(25, None), (30, stored(&batch, 30))]
+            );
+        }
+
+        /// The join key is a target column like any other: the condition's
+        /// copy is taken, since the scanned copy does not survive projection
+        /// pruning.
+        #[tokio::test]
+        async fn update_if_over_join_key() {
+            let Fixture { ds, .. } = fixture().await;
+            let source = source(&[25, 30, 35]);
+            let job = builder(&ds)
+                .when_matched(WhenMatched::update_if(&ds, "target.key >= 30").unwrap())
+                .write_mode(MergeInsertWriteMode::RewriteColumns)
+                .try_build()
+                .unwrap();
+            let plan = explain(&job, &source).await;
+            assert!(plan.contains("take=[key]"), "{plan}");
+            let (updated, stats) = run(job, &source).await;
+            assert_eq!(stats.num_updated_rows, 2);
+            assert_eq!(
+                payloads(&updated, "key IN (30, 35)").await,
+                vec![(30, Some(b"new".to_vec())), (35, Some(b"new".to_vec()))]
+            );
+        }
+
+        /// A condition over both sides reads the source column from the join
+        /// output and takes only the target column.
+        #[tokio::test]
+        async fn update_if_mixed_source_and_target_columns() {
+            let Fixture { ds, .. } = fixture().await;
+            let source = record_batch!(
+                ("key", Int32, [25, 30, 35]),
+                ("other", UInt32, [0u32, 31, 40])
+            )
+            .unwrap();
+            let job = builder(&ds)
+                .when_matched(WhenMatched::update_if(&ds, "source.other > target.other").unwrap())
+                .write_mode(MergeInsertWriteMode::RewriteColumns)
+                .try_build()
+                .unwrap();
+            let plan = explain(&job, &source).await;
+            assert!(plan.contains("take=[other]"), "{plan}");
+            let (updated, stats) = run(job, &source).await;
+            assert_eq!(stats.num_updated_rows, 2);
+            let rows = updated
+                .scan()
+                .filter("key IN (25, 30, 35)")
+                .unwrap()
+                .scan_in_order(true)
+                .try_into_batch()
+                .await
+                .unwrap();
+            assert_eq!(
+                rows["other"].as_primitive::<UInt32Type>().values(),
+                &[25, 31, 40]
+            );
+        }
+
+        /// `_rowid` is not a dataset column, so it is read from the join output
+        /// while the dataset column next to it is taken.
+        #[tokio::test]
+        async fn update_if_row_id_with_target_column() {
+            let Fixture { ds, batch, .. } = fixture().await;
+            let source = source(&[25, 30, 75]);
+            let condition = logical_expr::col("target._rowid")
+                .lt(logical_expr::lit(ROWS_PER_FRAGMENT as u64))
+                .and(logical_expr::col("target.payload").is_null());
+            let job = builder(&ds)
+                .when_matched(WhenMatched::UpdateIfExpr(condition))
+                .write_mode(MergeInsertWriteMode::RewriteColumns)
+                .try_build()
+                .unwrap();
+            let plan = explain(&job, &source).await;
+            assert!(plan.contains("take=[payload]"), "{plan}");
+            let (updated, stats) = run(job, &source).await;
+            assert_eq!(stats.num_updated_rows, 1);
+            assert_eq!(
+                payloads(&updated, "key IN (25, 30, 75)").await,
+                vec![
+                    (25, Some(b"new".to_vec())),
+                    (30, stored(&batch, 30)),
+                    (75, None),
+                ]
+            );
+        }
+
+        /// A null verdict rejects the row, as a `WHERE` clause would: the
+        /// null-payload row's verdict is `false OR NULL`.
+        #[tokio::test]
+        async fn update_if_null_verdict_rejects() {
+            let Fixture { ds, .. } = fixture().await;
+            let source = source(&[25, 30]);
+            let job = builder(&ds)
+                .when_matched(
+                    WhenMatched::update_if(&ds, "target.payload IS NOT NULL OR NULL").unwrap(),
+                )
+                .write_mode(MergeInsertWriteMode::RewriteColumns)
+                .try_build()
+                .unwrap();
+            let (updated, stats) = run(job, &source).await;
+            assert_eq!(stats.num_updated_rows, 1);
+            assert_eq!(
+                payloads(&updated, "key IN (25, 30)").await,
+                vec![(25, None), (30, Some(b"new".to_vec()))]
+            );
+        }
+
+        /// Duplicate source keys reach the condition before the write node
+        /// rejects them; the take must tolerate the repeated address so the
+        /// write node's error is the one the caller sees.
+        #[tokio::test]
+        async fn update_if_duplicate_source_keys_still_rejected() {
+            let Fixture { ds, .. } = fixture().await;
+            let source = source(&[25, 30, 25]);
+            let job = builder(&ds)
+                .when_matched(WhenMatched::update_if(&ds, "target.payload IS NULL").unwrap())
+                .try_build()
+                .unwrap();
+            let reader = Box::new(RecordBatchIterator::new(
+                [Ok(source.clone())],
+                source.schema(),
+            ));
+            let err = job.execute_reader(reader).await.unwrap_err().to_string();
+            assert!(err.contains("Ambiguous merge inserts"), "{err}");
+        }
+
+        /// The node sits between the write sink and the join.
+        #[tokio::test]
+        async fn condition_node_sits_above_the_join() {
+            let Fixture { ds, .. } = fixture().await;
+            let source = source(&[25]);
+            let job = builder(&ds)
+                .when_matched(WhenMatched::update_if(&ds, "target.payload IS NULL").unwrap())
+                .try_build()
+                .unwrap();
+            let plan = explain(&job, &source).await;
+            let position = |needle: &str| {
+                plan.lines()
+                    .position(|line| line.contains(needle))
+                    .unwrap_or_else(|| panic!("no {needle} in plan: {plan}"))
+            };
+            assert!(
+                position("MergeInsert: on=") < position("MergeCondition:")
+                    && position("MergeCondition:") < position("HashJoinExec"),
+                "{plan}"
+            );
+        }
+
+        /// A `DeleteIf` over a target column is gated the same way, on the
+        /// target-only rows. That set is the table minus the matches, so the
+        /// take reads about as many bytes as the scan did; what it saves is
+        /// holding the column on the join's build side.
+        #[tokio::test]
+        async fn delete_if_reads_target_column_for_unmatched_rows_only() {
+            let Fixture { ds, io, .. } = fixture().await;
+            let source = source(&[25, 30, 35]);
+            let job = builder(&ds)
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched_by_source(
+                    WhenNotMatchedBySource::delete_if(&ds, "payload IS NULL").unwrap(),
+                )
+                .try_build()
+                .unwrap();
+
+            let plan = explain(&job, &source).await;
+            assert!(
+                !scan_line(&plan).contains("payload"),
+                "the condition's column must not be in the target scan: {plan}"
+            );
+            assert!(
+                plan.contains("delete_if=") && plan.contains("take=[payload]"),
+                "the condition must be evaluated on the unmatched rows: {plan}"
+            );
+
+            io.incremental_stats();
+            let (updated, stats) = run(job, &source).await;
+            assert_eq!(stats.num_updated_rows, 3);
+            // One null payload per fragment; fragment 0's (key 25) is matched.
+            assert_eq!(stats.num_deleted_rows, (NUM_FRAGMENTS - 1) as u64);
+            let read_bytes = io.incremental_stats().read_bytes;
+            assert!(
+                read_bytes < COLUMN_BYTES + COLUMN_BYTES / 10,
+                "read {read_bytes} bytes against a {COLUMN_BYTES}-byte column"
+            );
+            assert_eq!(payloads(&updated, "payload IS NULL").await, vec![]);
+            assert_eq!(
+                updated.count_rows(None).await.unwrap(),
+                NUM_ROWS - (NUM_FRAGMENTS - 1)
+            );
+            assert_eq!(
+                payloads(&updated, "key IN (25, 75)").await,
+                vec![(25, Some(b"new".to_vec()))]
+            );
+        }
+
+        /// Both conditions deferred at once, over different columns. The
+        /// source carries every column so that neither is filled from the
+        /// target side.
+        #[tokio::test]
+        async fn update_if_and_delete_if_together() {
+            let Fixture { ds, batch, .. } = fixture().await;
+            let source = record_batch!(
+                ("key", Int32, [25, 30, 35]),
+                ("other", UInt32, [25u32, 30, 35]),
+                ("payload", LargeBinary, [b"new".as_slice(), b"new", b"new"])
+            )
+            .unwrap();
+            let job = builder(&ds)
+                .when_matched(WhenMatched::update_if(&ds, "target.payload IS NULL").unwrap())
+                .when_not_matched_by_source(
+                    WhenNotMatchedBySource::delete_if(&ds, "other < 3").unwrap(),
+                )
+                .try_build()
+                .unwrap();
+            let plan = explain(&job, &source).await;
+            assert!(
+                !scan_line(&plan).contains("payload")
+                    && !scan_line(&plan).contains("other")
+                    && plan.contains("take=[other, payload]"),
+                "{plan}"
+            );
+            let (updated, stats) = run(job, &source).await;
+            assert_eq!((stats.num_updated_rows, stats.num_deleted_rows), (1, 3));
+            assert_eq!(
+                payloads(&updated, "key < 4 OR key IN (25, 30)").await,
+                vec![
+                    (3, stored(&batch, 3)),
+                    (25, Some(b"new".to_vec())),
+                    (30, stored(&batch, 30)),
+                ]
+            );
+        }
+
+        /// Gate reproducer: a legacy blob column must reach the condition as
+        /// `LargeBinary`, as the target scan presents it, not as a descriptor.
+        #[tokio::test]
+        async fn gate_legacy_blob_condition() {
+            let mut metadata = HashMap::new();
+            metadata.insert(lance_arrow::BLOB_META_KEY.to_string(), "true".to_string());
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("key", DataType::Int32, false),
+                Field::new("payload", DataType::LargeBinary, true).with_metadata(metadata),
+            ]));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
+                    Arc::new(LargeBinaryArray::from(vec![Some(b"old".as_slice()), None])),
+                ],
+            )
+            .unwrap();
+            let ds = Arc::new(
+                Dataset::write(
+                    reader(batch),
+                    "memory://",
+                    Some(WriteParams {
+                        data_storage_version: Some(LanceFileVersion::V2_1),
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .unwrap(),
+            );
+            let input = RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(Int32Array::from(vec![1])) as ArrayRef,
+                    Arc::new(LargeBinaryArray::from(vec![Some(b"new".as_slice())])),
+                ],
+            )
+            .unwrap();
+            let condition =
+                WhenMatched::update_if(&ds, "target.payload != source.payload").unwrap();
+            let mut builder = MergeInsertBuilder::try_new(ds, vec!["key".to_string()]).unwrap();
+            builder
+                .when_matched(condition)
+                .when_not_matched(WhenNotMatched::DoNothing)
+                .use_index(false);
+            let (_, stats) = builder
+                .try_build()
+                .unwrap()
+                .execute_reader(reader(input))
+                .await
+                .unwrap();
+            assert_eq!(stats.num_updated_rows, 1);
+        }
+
+        fn reader(
+            batch: RecordBatch,
+        ) -> Box<
+            RecordBatchIterator<std::vec::IntoIter<std::result::Result<RecordBatch, ArrowError>>>,
+        > {
+            let schema = batch.schema();
+            Box::new(RecordBatchIterator::new(
+                vec![Ok(batch)].into_iter(),
+                schema,
+            ))
+        }
+
+        /// Control: the same legacy blob predicate where the source omits
+        /// `payload`, so a whole-row rewrite fills it from the scan and the
+        /// condition reads that copy rather than taking it.
+        #[tokio::test]
+        async fn legacy_blob_condition_filled_control() {
+            let mut metadata = HashMap::new();
+            metadata.insert(lance_arrow::BLOB_META_KEY.to_string(), "true".to_string());
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("key", DataType::Int32, false),
+                Field::new("other", DataType::Int32, false),
+                Field::new("payload", DataType::LargeBinary, true).with_metadata(metadata),
+            ]));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
+                    Arc::new(Int32Array::from(vec![0, 0])) as ArrayRef,
+                    Arc::new(LargeBinaryArray::from(vec![Some(b"old".as_slice()), None])),
+                ],
+            )
+            .unwrap();
+            let ds = Arc::new(
+                Dataset::write(
+                    reader(batch),
+                    "memory://",
+                    Some(WriteParams {
+                        data_storage_version: Some(LanceFileVersion::V2_1),
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .unwrap(),
+            );
+            let input = record_batch!(("key", Int32, [1, 2]), ("other", Int32, [7, 7])).unwrap();
+            let job = MergeInsertBuilder::try_new(ds.clone(), vec!["key".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::update_if(&ds, "target.payload = X'6F6C64'").unwrap())
+                .when_not_matched(WhenNotMatched::DoNothing)
+                .use_index(false)
+                .try_build()
+                .unwrap();
+            let plan = job
+                .explain_plan(Some(input.schema().as_ref()), false)
+                .await
+                .unwrap();
+            assert!(plan.contains("take=[]"), "{plan}");
+            let (_, stats) = job.execute_reader(reader(input)).await.unwrap();
+            assert_eq!(stats.num_updated_rows, 1);
+        }
+
+        /// A Blob v2 column reaches the condition as the descriptor the target
+        /// scan presents (`position`, `size`), so a predicate over the
+        /// descriptor works through the deferred take.
+        #[tokio::test]
+        async fn blob_v2_descriptor_condition() {
+            use crate::{BlobArrayBuilder, blob_field};
+            use datafusion::functions::core::expr_fn::get_field;
+
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("key", DataType::Int32, false),
+                blob_field("blobs", true),
+            ]));
+            let make_batch = |keys: Vec<i32>, values: &[&[u8]]| {
+                let mut blobs = BlobArrayBuilder::new(values.len());
+                for value in values {
+                    blobs.push_bytes(value).unwrap();
+                }
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(Int32Array::from(keys)) as ArrayRef,
+                        blobs.finish().unwrap(),
+                    ],
+                )
+                .unwrap()
+            };
+            let ds = Arc::new(
+                Dataset::write(
+                    reader(make_batch(vec![1, 2, 3], &[b"foo", b"quux", b"ab"])),
+                    "memory://",
+                    Some(WriteParams {
+                        data_storage_version: Some(LanceFileVersion::V2_2),
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .unwrap(),
+            );
+            let input = make_batch(vec![1, 2, 3], &[b"new", b"new", b"new"]);
+            let condition =
+                get_field(logical_expr::col("target.blobs"), "size").gt(logical_expr::lit(3u64));
+            let job = MergeInsertBuilder::try_new(ds.clone(), vec!["key".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateIfExpr(condition))
+                .when_not_matched(WhenNotMatched::DoNothing)
+                .use_index(false)
+                .try_build()
+                .unwrap();
+            let plan = job
+                .explain_plan(Some(input.schema().as_ref()), false)
+                .await
+                .unwrap();
+            assert!(
+                !scan_line(&plan).contains("blobs") && plan.contains("take=[blobs]"),
+                "{plan}"
+            );
+            let (updated, stats) = job.execute_reader(reader(input)).await.unwrap();
+            assert_eq!(stats.num_updated_rows, 1);
+            let blobs = updated
+                .take_blobs_by_indices(&[0, 1, 2], "blobs")
+                .await
+                .unwrap();
+            let mut values = Vec::new();
+            for blob in blobs.iter() {
+                values.push(
+                    blob.as_ref()
+                        .unwrap()
+                        .read()
+                        .await
+                        .unwrap()
+                        .as_ref()
+                        .to_vec(),
+                );
+            }
+            values.sort();
+            assert_eq!(
+                values,
+                vec![b"ab".to_vec(), b"foo".to_vec(), b"new".to_vec()]
+            );
+        }
+
+        /// A condition over source columns alone stays in the join's action
+        /// expression; nothing is taken.
+        #[tokio::test]
+        async fn source_only_condition_is_not_deferred() {
+            let Fixture { ds, .. } = fixture().await;
+            let source = source(&[25, 30]);
+            let job = builder(&ds)
+                .when_matched(WhenMatched::update_if(&ds, "source.payload IS NOT NULL").unwrap())
+                .try_build()
+                .unwrap();
+            let plan = explain(&job, &source).await;
+            assert!(!plan.contains("MergeCondition:"), "{plan}");
+            assert!(
+                plan.contains("when_matched=UpdateIf(source.payload IS NOT NULL)"),
+                "{plan}"
+            );
+        }
     }
 }

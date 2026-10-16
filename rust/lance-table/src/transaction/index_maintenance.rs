@@ -193,7 +193,7 @@ impl Transaction {
     }
 
     /// `fields` plus every field nested under them, deduplicated.
-    fn with_descendants(schema: &Schema, fields: Vec<u32>) -> Vec<u32> {
+    pub fn with_descendants(schema: &Schema, fields: Vec<u32>) -> Vec<u32> {
         let mut expanded = Vec::with_capacity(fields.len());
         for id in fields {
             expanded.push(id);
@@ -403,6 +403,19 @@ impl Transaction {
             return;
         }
 
+        let fragment_ids = updated_fragments.iter().map(|f| f.id as u32).collect();
+        Self::prune_updated_fragment_ids_from_indices(indices, &fragment_ids, fields_modified);
+    }
+
+    /// [`Self::prune_updated_fields_from_indices`] by fragment id.
+    pub fn prune_updated_fragment_ids_from_indices(
+        indices: &mut [IndexMetadata],
+        fragment_ids: &RoaringBitmap,
+        fields_modified: &[u32],
+    ) {
+        if fields_modified.is_empty() || fragment_ids.is_empty() {
+            return;
+        }
         // If we modified any fields in the fragments then we need to remove those fragments
         // from the index if the index covers one of those modified fields.
         let fields_modified_set = fields_modified.iter().collect::<HashSet<_>>();
@@ -413,9 +426,7 @@ impl Transaction {
                 .any(|field_id| fields_modified_set.contains(&u32::try_from(*field_id).unwrap()))
                 && let Some(fragment_bitmap) = &mut index.fragment_bitmap
             {
-                for fragment_id in updated_fragments.iter().map(|f| f.id as u32) {
-                    fragment_bitmap.remove(fragment_id);
-                }
+                *fragment_bitmap -= fragment_ids;
             }
         }
     }
@@ -443,10 +454,17 @@ impl Transaction {
     ) -> Vec<(u64, Vec<u32>)> {
         let prev_by_id: HashMap<u64, &Fragment> =
             prev_fragments.iter().map(|f| (f.id, f)).collect();
+        // Only the first occurrence of a previous id is that fragment's merged
+        // version; later ones are staged fragments still carrying placeholder
+        // id 0, which must not be mistaken for a rewrite of fragment 0.
+        let mut seen_prev_ids = HashSet::new();
         new_fragments
             .iter()
             .filter_map(|new_frag| {
                 let prev = prev_by_id.get(&new_frag.id)?;
+                if !seen_prev_ids.insert(new_frag.id) {
+                    return None;
+                }
                 let prev_paths = Self::fragment_field_paths(prev);
                 let new_paths = Self::fragment_field_paths(new_frag);
                 let mut changed: Vec<u32> = prev_paths
@@ -729,6 +747,17 @@ impl Transaction {
         Ok(())
     }
 
+    fn duplicate_rewrite_error(version: u64, fragment_id: u64) -> Error {
+        Error::commit_conflict_source(
+            version,
+            format!(
+                "a rewrite operation attempts to replace fragment id={} more than once",
+                fragment_id
+            )
+            .into(),
+        )
+    }
+
     pub(super) fn handle_rewrite_fragments(
         final_fragments: &mut Vec<Fragment>,
         groups: &[RewriteGroup],
@@ -736,37 +765,41 @@ impl Transaction {
         version: u64,
         _next_row_id: Option<&u64>,
     ) -> Result<()> {
+        // Index fragment positions up front so each rewrite group is located in
+        // O(1). Scanning and splicing/retaining the fragment list per group is
+        // O(groups * fragments) and dominates commit time on manifests with
+        // millions of fragments.
+        let positions: HashMap<u64, usize> = final_fragments
+            .iter()
+            .enumerate()
+            .map(|(position, fragment)| (fragment.id, position))
+            .collect();
+
+        // Contiguous groups have their new fragments spliced in at the position
+        // of their first old fragment; non-contiguous groups have their new
+        // fragments appended at the end.
+        let mut removed = vec![false; final_fragments.len()];
+        let mut replacements: HashMap<usize, Vec<Fragment>> = HashMap::new();
+        let mut appended: Vec<Fragment> = Vec::new();
+
         for group in groups {
-            // If the old fragments are contiguous, find the range
-            let replace_range = {
-                let start = final_fragments
+            let start = *positions.get(&group.old_fragments[0].id).ok_or_else(|| {
+                Error::commit_conflict_source(
+                    version,
+                    format!(
+                        "dataset does not contain a fragment a rewrite operation wants to replace: id={}",
+                        group.old_fragments[0].id
+                    )
+                    .into(),
+                )
+            })?;
+
+            let contiguous = start + group.old_fragments.len() <= final_fragments.len()
+                && group
+                    .old_fragments
                     .iter()
                     .enumerate()
-                    .find(|(_, f)| f.id == group.old_fragments[0].id)
-                    .ok_or_else(|| {
-                        Error::commit_conflict_source(
-                            version,
-                            format!(
-                                "dataset does not contain a fragment a rewrite operation wants to replace: id={}",
-                                group.old_fragments[0].id
-                            )
-                            .into(),
-                        )
-                    })?
-                    .0;
-
-                // Verify old_fragments matches contiguous range
-                let mut i = 1;
-                loop {
-                    if i == group.old_fragments.len() {
-                        break Some(start..start + i);
-                    }
-                    if final_fragments[start + i].id != group.old_fragments[i].id {
-                        break None;
-                    }
-                    i += 1;
-                }
-            };
+                    .all(|(i, old)| final_fragments[start + i].id == old.id);
 
             let new_fragments = Self::fragments_with_ids(group.new_fragments.clone(), fragment_id)
                 .collect::<Vec<_>>();
@@ -775,17 +808,47 @@ impl Transaction {
             // (recalc_versions_for_rewritten_fragments) which preserves version information
             // from the original fragments. We don't modify it here.
 
-            if let Some(replace_range) = replace_range {
-                // Efficiently path using slice
-                final_fragments.splice(replace_range, new_fragments);
-            } else {
-                // Slower path for non-contiguous ranges
-                for fragment in group.old_fragments.iter() {
-                    final_fragments.retain(|f| f.id != fragment.id);
+            if contiguous {
+                for (i, old_fragment) in group.old_fragments.iter().enumerate() {
+                    let position = start + i;
+                    if removed[position] {
+                        return Err(Self::duplicate_rewrite_error(version, old_fragment.id));
+                    }
+                    removed[position] = true;
                 }
-                final_fragments.extend(new_fragments);
+                replacements.insert(start, new_fragments);
+            } else {
+                for old_fragment in group.old_fragments.iter() {
+                    let position = positions.get(&old_fragment.id).ok_or_else(|| {
+                        Error::commit_conflict_source(
+                            version,
+                            format!(
+                                "dataset does not contain a fragment a rewrite operation wants to replace: id={}",
+                                old_fragment.id
+                            )
+                            .into(),
+                        )
+                    })?;
+                    if removed[*position] {
+                        return Err(Self::duplicate_rewrite_error(version, old_fragment.id));
+                    }
+                    removed[*position] = true;
+                }
+                appended.extend(new_fragments);
             }
         }
+
+        let mut rewritten = Vec::with_capacity(final_fragments.len() + appended.len());
+        for (position, fragment) in std::mem::take(final_fragments).into_iter().enumerate() {
+            if let Some(new_fragments) = replacements.remove(&position) {
+                rewritten.extend(new_fragments);
+            }
+            if !removed[position] {
+                rewritten.push(fragment);
+            }
+        }
+        rewritten.extend(appended);
+        *final_fragments = rewritten;
         Ok(())
     }
 }
@@ -884,6 +947,109 @@ mod tests {
         ];
 
         assert_eq!(final_fragments, expected_fragments);
+    }
+
+    #[test]
+    fn test_rewrite_fragments_missing_fragment() {
+        let mut final_fragments: Vec<Fragment> = (0..4).map(Fragment::new).collect();
+        let rewrite_groups = vec![RewriteGroup {
+            old_fragments: vec![Fragment::new(7)],
+            new_fragments: vec![Fragment::new(0)],
+        }];
+
+        let mut fragment_id = 10;
+        let result = Transaction::handle_rewrite_fragments(
+            &mut final_fragments,
+            &rewrite_groups,
+            &mut fragment_id,
+            42,
+            None,
+        );
+
+        let error = result.unwrap_err();
+        assert!(matches!(error, Error::CommitConflict { .. }));
+        assert!(error.to_string().contains("id=7"));
+    }
+
+    #[test]
+    fn test_rewrite_fragments_non_contiguous_missing_fragment() {
+        // The group's first old fragment (1) exists, but it is not adjacent to
+        // the second old fragment (7), which does not exist. The group takes
+        // the non-contiguous path, which must still error instead of silently
+        // dropping fragment 7 from the rewrite.
+        let mut final_fragments: Vec<Fragment> = (0..4).map(Fragment::new).collect();
+        let rewrite_groups = vec![RewriteGroup {
+            old_fragments: vec![Fragment::new(1), Fragment::new(7)],
+            new_fragments: vec![Fragment::new(0)],
+        }];
+
+        let mut fragment_id = 10;
+        let result = Transaction::handle_rewrite_fragments(
+            &mut final_fragments,
+            &rewrite_groups,
+            &mut fragment_id,
+            42,
+            None,
+        );
+
+        let error = result.unwrap_err();
+        assert!(matches!(error, Error::CommitConflict { .. }));
+        assert!(error.to_string().contains("id=7"));
+    }
+
+    #[test]
+    fn test_rewrite_fragments_past_the_end() {
+        // The group's old fragments start near the end of the list and would
+        // index past it if the contiguity check were not bounds-checked.
+        let mut final_fragments: Vec<Fragment> = (0..4).map(Fragment::new).collect();
+        let rewrite_groups = vec![RewriteGroup {
+            old_fragments: vec![Fragment::new(3), Fragment::new(0)],
+            new_fragments: vec![Fragment::new(10)],
+        }];
+
+        let mut fragment_id = 11;
+        Transaction::handle_rewrite_fragments(
+            &mut final_fragments,
+            &rewrite_groups,
+            &mut fragment_id,
+            42,
+            None,
+        )
+        .unwrap();
+
+        // Non-contiguous: fragments 3 and 0 are removed, new fragment 10 is
+        // appended at the end.
+        let expected_fragments: Vec<Fragment> =
+            vec![Fragment::new(1), Fragment::new(2), Fragment::new(10)];
+        assert_eq!(final_fragments, expected_fragments);
+    }
+
+    #[test]
+    fn test_rewrite_fragments_duplicate_fragment() {
+        let mut final_fragments: Vec<Fragment> = (0..4).map(Fragment::new).collect();
+        let rewrite_groups = vec![
+            RewriteGroup {
+                old_fragments: vec![Fragment::new(1), Fragment::new(2)],
+                new_fragments: vec![Fragment::new(0)],
+            },
+            RewriteGroup {
+                old_fragments: vec![Fragment::new(2), Fragment::new(3)],
+                new_fragments: vec![Fragment::new(0)],
+            },
+        ];
+
+        let mut fragment_id = 10;
+        let result = Transaction::handle_rewrite_fragments(
+            &mut final_fragments,
+            &rewrite_groups,
+            &mut fragment_id,
+            42,
+            None,
+        );
+
+        let error = result.unwrap_err();
+        assert!(matches!(error, Error::CommitConflict { .. }));
+        assert!(error.to_string().contains("id=2"));
     }
 
     #[test]
