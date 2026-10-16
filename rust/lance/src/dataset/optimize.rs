@@ -3289,16 +3289,18 @@ pub async fn commit_compaction(
     remap_options: Arc<dyn IndexRemapperOptions>,
     options: &CompactionOptions,
 ) -> Result<CompactionMetrics> {
-    Ok(
-        commit_compaction_impl(dataset, completed_tasks, remap_options, options, false)
-            .await
-            .inspect_err(|error| {
-                log::warn!(
-                    "Compaction commit failed; leaving rewritten files in place for GC: {error}"
-                )
-            })?
-            .metrics,
-    )
+    Ok(Box::pin(commit_compaction_impl(
+        dataset,
+        completed_tasks,
+        remap_options,
+        options,
+        false,
+    ))
+    .await
+    .inspect_err(|error| {
+        log::warn!("Compaction commit failed; leaving rewritten files in place for GC: {error}")
+    })?
+    .metrics)
 }
 
 async fn commit_compaction_impl(

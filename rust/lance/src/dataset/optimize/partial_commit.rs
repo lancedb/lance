@@ -55,13 +55,19 @@ pub async fn commit_compaction_with_partial_progress(
             "partial compaction requires defer_index_remap",
         ));
     }
-    commit_compaction_impl(dataset, completed_tasks, remap_options, options, true)
-        .await
-        .inspect_err(|error| {
-            log::warn!(
-                "Partial compaction commit failed; leaving rewritten files in place for GC: {error}"
-            )
-        })
+    Box::pin(commit_compaction_impl(
+        dataset,
+        completed_tasks,
+        remap_options,
+        options,
+        true,
+    ))
+    .await
+    .inspect_err(|error| {
+        log::warn!(
+            "Partial compaction commit failed; leaving rewritten files in place for GC: {error}"
+        )
+    })
 }
 
 pub(super) async fn surviving_groups(
@@ -115,7 +121,11 @@ pub(super) fn retain_groups<T>(groups: &mut Vec<T>, keep: &[bool]) {
 mod tests {
     use super::*;
     use crate::dataset::index::DatasetIndexRemapperOptions;
-    use crate::dataset::{WriteParams, optimize::plan_compaction, transaction::RewriteGroup};
+    use crate::dataset::{
+        WriteParams,
+        optimize::{CompactionTask, TaskData, plan_compaction},
+        transaction::RewriteGroup,
+    };
     use crate::index::{DatasetIndexExt, load_all_indices};
     use arrow_array::{Int64Array, RecordBatch, RecordBatchIterator};
     use arrow_schema::{DataType, Field, Schema};
@@ -269,9 +279,18 @@ mod tests {
     async fn committed_rows_exclude_deletions_present_in_the_plan() {
         let (_dir, mut dataset, _, options) = fixture(false).await;
         dataset.delete("a = 0").await.unwrap();
-        let plan = plan_compaction(&dataset, &options).await.unwrap();
         let mut results = Vec::new();
-        for task in plan.compaction_tasks() {
+        for fragments in dataset.get_fragments().chunks(2) {
+            let task = CompactionTask {
+                task: TaskData {
+                    fragments: fragments
+                        .iter()
+                        .map(|fragment| fragment.metadata().clone())
+                        .collect(),
+                },
+                read_version: dataset.version().version,
+                options: options.clone(),
+            };
             results.push(task.execute(&dataset).await.unwrap());
         }
         dataset.delete("a = 20").await.unwrap();
