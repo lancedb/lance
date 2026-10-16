@@ -1031,33 +1031,22 @@ impl SchedulerConfig {
     }
 }
 
-/// Panics with a clear, actionable message if the current runtime has no
-/// time driver enabled. The standard (non-lite) I/O queue's stuck-queue
-/// watchdog relies on `tokio::time::timeout`, which otherwise panics deep
-/// inside the queue's own detached background task on first use - pointing
-/// at `scheduler.rs` instead of at the actual misconfiguration site. Check
-/// once, synchronously, in the caller's own stack instead.
+/// Fails fast, synchronously, in the caller's own stack, if the current
+/// runtime has no time driver enabled. The standard (non-lite) I/O queue's
+/// stuck-queue watchdog relies on `tokio::time::timeout`, which otherwise
+/// panics deep inside the queue's own detached background task on first
+/// use - pointing a confused caller at `scheduler.rs` instead of at their
+/// runtime builder.
 ///
-/// `catch_unwind` alone doesn't stop the default panic hook from printing
-/// to stderr; the hook is swapped out for the probe so a correctly
-/// misconfigured caller gets exactly one clear panic, not two.
+/// Deliberately just constructs and drops a `Sleep` rather than probing via
+/// `catch_unwind`/a swapped panic hook: `Sleep::new_timeout` already panics
+/// immediately (not at first poll) with its own clear message naming
+/// `enable_time`/`enable_all`, and letting that panic propagate normally
+/// avoids touching the process-global panic hook - a previous version of
+/// this check swapped it out, which races any other thread that panics
+/// during the (admittedly brief) window.
 fn require_time_driver() {
-    let previous_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
-    let probe = std::panic::catch_unwind(|| {
-        // Deliberately never awaited: the panic this probes for happens at
-        // construction (inside `Sleep::new_timeout`), not at first poll.
-        #[allow(clippy::let_underscore_future)]
-        let _ = tokio::time::sleep(Duration::from_secs(0));
-    });
-    std::panic::set_hook(previous_hook);
-    if probe.is_err() {
-        panic!(
-            "ScanScheduler's standard I/O scheduler requires a Tokio runtime with a time \
-             driver enabled. Build the runtime with `enable_time()` or `enable_all()`, e.g. \
-             `tokio::runtime::Builder::new_multi_thread().enable_all().build()`."
-        );
-    }
+    drop(tokio::time::sleep(Duration::ZERO));
 }
 
 impl ScanScheduler {
@@ -1840,10 +1829,11 @@ mod tests {
     #[test]
     fn test_scan_scheduler_panics_clearly_without_time_driver() {
         // The standard scheduler's watchdog needs `tokio::time::timeout`;
-        // `require_time_driver` should catch a runtime missing
-        // `enable_time()`/`enable_all()` synchronously, at construction, with
-        // a message pointing at the fix - not let the first real `timeout`
-        // call panic later, deep inside the queue's own background task.
+        // `require_time_driver` should fail a runtime missing
+        // `enable_time()`/`enable_all()` synchronously, at construction (via
+        // tokio's own panic, which names the fix) - not let the first real
+        // `timeout` call panic later, deep inside the queue's own
+        // background task.
         let rt = tokio::runtime::Builder::new_multi_thread().build().unwrap();
         let result = rt.block_on(async {
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
