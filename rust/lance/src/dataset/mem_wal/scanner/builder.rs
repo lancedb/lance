@@ -48,9 +48,8 @@ struct LsmVectorQuery {
     k: usize,
     /// IVF partition probe bounds for indexed arms.
     probe_bounds: ProbeBounds,
-    /// Re-rank base candidates with exact distances when set (refine factor is
-    /// treated as a boolean; the LSM merge needs exact base distances).
-    refine: bool,
+    /// Refine factor for the base and SSTable arms; `None` leaves them unrefined.
+    refine_factor: Option<u32>,
     /// Distance metric; `None` defaults to L2 (matching the unindexed memtable arm).
     metric_type: Option<DistanceType>,
 }
@@ -503,7 +502,7 @@ impl LsmScanner {
             key: key.slice(0, key.len()),
             k,
             probe_bounds: ProbeBounds::default(),
-            refine: false,
+            refine_factor: None,
             metric_type: None,
         });
         Ok(self)
@@ -541,12 +540,11 @@ impl LsmScanner {
         self
     }
 
-    /// Re-rank base-table candidates with exact distances so they are directly
-    /// comparable to the exact memtable distances in the cross-source merge.
-    /// The factor is treated as a boolean today. No-op unless `nearest` was set.
+    /// Re-rank base and SSTable candidates by exact distance over `refine_factor`
+    /// times as many. `0` clears it; no-op unless `nearest` was set.
     pub fn refine(mut self, refine_factor: u32) -> Self {
         if let Some(q) = self.nearest.as_mut() {
-            q.refine = refine_factor > 0;
+            q.refine_factor = (refine_factor > 0).then_some(refine_factor);
         }
         self
     }
@@ -646,7 +644,8 @@ impl LsmScanner {
             distance_type,
         )
         .with_identity_schema(Arc::clone(&self.identity_schema))
-        .with_filter(self.filter.clone());
+        .with_filter(self.filter.clone())
+        .with_refine_factor(nearest.refine_factor);
         if let BaseSource::Table(dataset) = &self.base {
             planner = planner.with_dataset(dataset.clone());
         }
@@ -673,7 +672,7 @@ impl LsmScanner {
                 per_source_k,
                 nearest.probe_bounds,
                 self.projection.as_deref(),
-                nearest.refine,
+                false,
                 overfetch_factor,
             )
             .await?;
