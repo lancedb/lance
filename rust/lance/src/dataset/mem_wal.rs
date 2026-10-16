@@ -50,7 +50,7 @@ pub mod write;
 use std::sync::Arc;
 
 use lance_core::Result;
-use lance_core::datatypes::{Field, LANCE_FIELD_ID_KEY, Schema};
+use lance_core::datatypes::{BlobV2Layout, Field, LANCE_FIELD_ID_KEY, Schema};
 
 use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
@@ -58,7 +58,7 @@ use object_store::path::Path;
 use uuid::Uuid;
 
 use self::util::{generate_random_hash, shard_base_path};
-use crate::blob::blob_v2_layout;
+use crate::blob::{blob_v2_layout, logical_to_prepared_blob_schema};
 use crate::dataset::fragment::write::generate_random_filename;
 
 /// Column name for the mem_wal tombstone (delete sentinel) marker.
@@ -283,8 +283,7 @@ pub fn schema_with_tombstone(base: &ArrowSchema) -> Arc<ArrowSchema> {
 /// with `false`; a column the target does not declare is dropped; a missing
 /// primary key is an error.
 ///
-/// A blob v2 column keeps the layout the batches hold it in: its children are a
-/// fixed layout, not columns a rename can move.
+/// Blob v2 columns the batches hold writer-prepared stay prepared.
 ///
 /// `batches` must be in `source_schema` order. The result is in `target_schema`
 /// order, without field ids.
@@ -311,40 +310,22 @@ pub fn reconcile_batches(
             .collect::<Vec<_>>(),
         source_schema.metadata().clone(),
     );
-    let target = with_source_blob_layouts(&source, target_schema);
+    // Resolving prepared blobs against the declared logical layout would drop
+    // the reference they carry.
+    let target = if source
+        .fields()
+        .iter()
+        .any(|field| blob_v2_layout(field) == Some(BlobV2Layout::Prepared))
+    {
+        Arc::new(logical_to_prepared_blob_schema(target_schema)?)
+    } else {
+        Arc::clone(target_schema)
+    };
     let plan = reconcile::Plan::resolve(&source, &target, pk_columns)?.emitting_plain_schema();
     if plan.is_identity() {
         return Ok(batches);
     }
     batches.iter().map(|batch| plan.apply(batch)).collect()
-}
-
-/// `target` with each blob v2 column typed as the source holds it.
-fn with_source_blob_layouts(source: &ArrowSchema, target: &Arc<ArrowSchema>) -> Arc<ArrowSchema> {
-    let fields: Vec<ArrowField> = target
-        .fields()
-        .iter()
-        .map(|field| {
-            let held = blob_v2_layout(field).and_then(|_| {
-                let id = reconcile::field_id_of(field)?;
-                source
-                    .fields()
-                    .iter()
-                    .find(|f| reconcile::field_id_of(f) == Some(id) && blob_v2_layout(f).is_some())
-            });
-            match held {
-                Some(held) => field
-                    .as_ref()
-                    .clone()
-                    .with_data_type(held.data_type().clone()),
-                None => field.as_ref().clone(),
-            }
-        })
-        .collect();
-    Arc::new(ArrowSchema::new_with_metadata(
-        fields,
-        target.metadata().clone(),
-    ))
 }
 
 pub use api::{
@@ -495,11 +476,10 @@ mod tests {
         assert_eq!(a.value(0), 20, "id 2's value follows its id to `a`");
     }
 
-    /// A generation holds blob v2 columns writer-prepared while the table
-    /// declares them logical. Resolving the children by name would rebuild the
-    /// logical layout and drop the reference the prepared one carries.
+    /// A blob column held writer-prepared, as the MemTable stores it, keeps its
+    /// kind and reference though the table declares it logical.
     #[test]
-    fn a_blob_column_keeps_the_layout_the_generation_holds() {
+    fn a_prepared_blob_column_stays_prepared() {
         use lance_arrow::{ARROW_EXT_NAME_KEY, BLOB_V2_EXT_NAME};
         use lance_core::datatypes::{
             BLOB_V2_LOGICAL_MINIMAL_FIELDS, BLOB_V2_PREPARED_FIELDS, BLOB_V2_PREPARED_TYPE,
