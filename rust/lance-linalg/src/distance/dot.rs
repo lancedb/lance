@@ -979,21 +979,48 @@ mod tests {
         });
     }
 
+    /// Every host-supported f32 kernel, single-pair and batch, must agree with
+    /// an f64 reference. Prefixes of length 8 and 16 pin the batch kernels'
+    /// PQ-width fast paths regardless of the generated dimension.
     #[rstest::rstest]
-    fn test_dot_f32_scalar_simd_parity(
+    fn test_dot_f32_kernels_match_reference(
         #[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)] shard: usize,
     ) {
         run_vector_pair_proptest(arbitrary_f32, dimension_shard(shard), |x, y| {
-            let x_f64: Vec<f64> = x.iter().map(|&v| v as f64).collect();
-            let y_f64: Vec<f64> = y.iter().map(|&v| v as f64).collect();
-            let scalar = x_f64
-                .iter()
-                .zip(y_f64.iter())
-                .map(|(&a, &b)| a * b)
-                .sum::<f64>() as f32;
-            let simd = <f32 as Dot>::dot(&x, &y);
-            let max_error = max_error::<f32>(&x_f64, &y_f64);
-            prop_assert!(approx::relative_eq!(scalar, simd, epsilon = max_error));
+            for dimension in [8, 16, x.len()].into_iter().filter(|&d| d <= x.len()) {
+                let (x, y) = (&x[..dimension], &y[..dimension]);
+                let x_f64: Vec<f64> = x.iter().map(|&v| v as f64).collect();
+                let y_f64: Vec<f64> = y.iter().map(|&v| v as f64).collect();
+                let want = dot_scalar_ref(&x_f64, &y_f64);
+                let max_error = max_error::<f32>(&x_f64, &y_f64);
+
+                for candidate in DOT_F32.candidates() {
+                    let Some(kernel) = candidate.kernel() else {
+                        continue;
+                    };
+                    let got = kernel.call(x, y);
+                    prop_assert!(
+                        approx::relative_eq!(got, want, epsilon = max_error),
+                        "{} at dim {dimension}: {got} != {want}",
+                        candidate.name()
+                    );
+                }
+
+                // The zero vector pins the second output to exactly 0.
+                let batch = [y, &vec![0.0; dimension]].concat();
+                for candidate in DOT_F32_BATCH.candidates() {
+                    let Some(kernel) = candidate.kernel() else {
+                        continue;
+                    };
+                    let mut got = [f32::NAN; 2];
+                    kernel.call(x, &batch, dimension, &mut got);
+                    prop_assert!(
+                        approx::relative_eq!(got[0], want, epsilon = max_error) && got[1] == 0.0,
+                        "{} at dim {dimension}: {got:?} != [{want}, 0]",
+                        candidate.name()
+                    );
+                }
+            }
             Ok(())
         });
     }
@@ -1022,63 +1049,6 @@ mod tests {
             let simd = dot_f64_simd(&x, &y);
             let max_error = max_error::<f64>(&x, &y);
             prop_assert!(approx::relative_eq!(scalar, simd, epsilon = max_error));
-        }
-
-        /// AVX-512-direct parity for f32: explicitly compares the scalar
-        /// fallback against the native f32 AVX-512 inner kernel on
-        /// AVX-512F-capable hosts. Early-returns on hosts without AVX-512F.
-        #[cfg(target_arch = "x86_64")]
-        #[test]
-        fn test_dot_f32_scalar_vs_avx512_parity(
-            (x, y) in arbitrary_vector_pair(arbitrary_f32, 4..4048)
-        ) {
-            if !std::is_x86_feature_detected!("avx512f") {
-                return Ok(());
-            }
-            let scalar = dot_f32_scalar(&x, &y);
-            let avx512 = unsafe { x86::dot_f32_avx512(&x, &y) };
-            let x_f64: Vec<f64> = x.iter().map(|&v| v as f64).collect();
-            let y_f64: Vec<f64> = y.iter().map(|&v| v as f64).collect();
-            let max_error = max_error::<f32>(&x_f64, &y_f64);
-            prop_assert!(approx::relative_eq!(scalar, avx512, epsilon = max_error));
-        }
-
-        /// AVX + FMA-direct parity for the f32 dot kernel. Covers the AMD
-        /// Piledriver / Steamroller / FX-7500 tier. Early-returns on hosts
-        /// without both AVX and FMA.
-        #[cfg(target_arch = "x86_64")]
-        #[test]
-        fn test_dot_f32_scalar_vs_avx_fma_parity(
-            (x, y) in arbitrary_vector_pair(arbitrary_f32, 4..4048)
-        ) {
-            if !(std::is_x86_feature_detected!("avx") && std::is_x86_feature_detected!("fma")) {
-                return Ok(());
-            }
-            let scalar = dot_f32_scalar(&x, &y);
-            let avx_fma = unsafe { x86::dot_f32_avx_fma(&x, &y) };
-            let x_f64: Vec<f64> = x.iter().map(|&v| v as f64).collect();
-            let y_f64: Vec<f64> = y.iter().map(|&v| v as f64).collect();
-            let max_error = max_error::<f32>(&x_f64, &y_f64);
-            prop_assert!(approx::relative_eq!(scalar, avx_fma, epsilon = max_error));
-        }
-
-        /// AVX-only-direct parity for the f32 dot kernel. Covers the Intel
-        /// Sandy Bridge / Ivy Bridge tier. Early-returns on hosts without
-        /// AVX.
-        #[cfg(target_arch = "x86_64")]
-        #[test]
-        fn test_dot_f32_scalar_vs_avx_parity(
-            (x, y) in arbitrary_vector_pair(arbitrary_f32, 4..4048)
-        ) {
-            if !std::is_x86_feature_detected!("avx") {
-                return Ok(());
-            }
-            let scalar = dot_f32_scalar(&x, &y);
-            let avx = unsafe { x86::dot_f32_avx(&x, &y) };
-            let x_f64: Vec<f64> = x.iter().map(|&v| v as f64).collect();
-            let y_f64: Vec<f64> = y.iter().map(|&v| v as f64).collect();
-            let max_error = max_error::<f32>(&x_f64, &y_f64);
-            prop_assert!(approx::relative_eq!(scalar, avx, epsilon = max_error));
         }
 
         /// AVX-512-direct parity: explicitly compares the scalar fallback
@@ -1181,70 +1151,5 @@ mod tests {
                 epsilon = 1e-5
             ));
         }
-    }
-
-    /// The per-batch `#[target_feature]` kernels are only reached on sub-AVX2
-    /// builds or AVX-512 hosts, so call them directly to cover them.
-    #[cfg(all(
-        target_arch = "x86_64",
-        not(all(target_feature = "avx2", target_feature = "fma"))
-    ))]
-    fn check_dot_batch_kernel(kernel: BatchKernel) {
-        for dimension in [8_usize, 16, 40] {
-            let num_vectors = 3;
-            let x: Vec<f32> = (0..dimension).map(|i| (i as f32) * 0.5 + 1.0).collect();
-            let batch: Vec<f32> = (0..dimension * num_vectors)
-                .map(|i| ((i % 7) as f32) + 1.0)
-                .collect();
-
-            let mut got = vec![0.0; num_vectors];
-            unsafe { kernel(&x, &batch, dimension, &mut got) };
-            assert_eq!(got.len(), num_vectors);
-            for (chunk, &g) in batch.chunks_exact(dimension).zip(got.iter()) {
-                let want = dot_scalar::<f32, f32, 16>(&x, chunk);
-                assert!(
-                    approx::relative_eq!(g, want, epsilon = 1e-4),
-                    "dim {dimension}: kernel {g} != scalar {want}"
-                );
-            }
-        }
-    }
-
-    // The runtime-dispatch batch kernels only exist in sub-avx2+fma builds
-    // (see `x86::dot_batch_f32_avx512`), so gate their tests the same way.
-    #[cfg(all(
-        target_arch = "x86_64",
-        not(all(target_feature = "avx2", target_feature = "fma"))
-    ))]
-    #[test]
-    fn test_dot_batch_avx_fma_matches_scalar() {
-        if !std::is_x86_feature_detected!("avx") || !std::is_x86_feature_detected!("fma") {
-            return;
-        }
-        check_dot_batch_kernel(x86::dot_batch_f32_avx_fma);
-    }
-
-    #[cfg(all(
-        target_arch = "x86_64",
-        not(all(target_feature = "avx2", target_feature = "fma"))
-    ))]
-    #[test]
-    fn test_dot_batch_avx_matches_scalar() {
-        if !std::is_x86_feature_detected!("avx") {
-            return;
-        }
-        check_dot_batch_kernel(x86::dot_batch_f32_avx);
-    }
-
-    #[cfg(all(
-        target_arch = "x86_64",
-        not(all(target_feature = "avx2", target_feature = "fma"))
-    ))]
-    #[test]
-    fn test_dot_batch_avx512_matches_scalar() {
-        if !std::is_x86_feature_detected!("avx512f") {
-            return;
-        }
-        check_dot_batch_kernel(x86::dot_batch_f32_avx512);
     }
 }
