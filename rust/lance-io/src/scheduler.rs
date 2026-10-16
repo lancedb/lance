@@ -1031,6 +1031,35 @@ impl SchedulerConfig {
     }
 }
 
+/// Panics with a clear, actionable message if the current runtime has no
+/// time driver enabled. The standard (non-lite) I/O queue's stuck-queue
+/// watchdog relies on `tokio::time::timeout`, which otherwise panics deep
+/// inside the queue's own detached background task on first use - pointing
+/// at `scheduler.rs` instead of at the actual misconfiguration site. Check
+/// once, synchronously, in the caller's own stack instead.
+///
+/// `catch_unwind` alone doesn't stop the default panic hook from printing
+/// to stderr; the hook is swapped out for the probe so a correctly
+/// misconfigured caller gets exactly one clear panic, not two.
+fn require_time_driver() {
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let probe = std::panic::catch_unwind(|| {
+        // Deliberately never awaited: the panic this probes for happens at
+        // construction (inside `Sleep::new_timeout`), not at first poll.
+        #[allow(clippy::let_underscore_future)]
+        let _ = tokio::time::sleep(Duration::from_secs(0));
+    });
+    std::panic::set_hook(previous_hook);
+    if probe.is_err() {
+        panic!(
+            "ScanScheduler's standard I/O scheduler requires a Tokio runtime with a time \
+             driver enabled. Build the runtime with `enable_time()` or `enable_all()`, e.g. \
+             `tokio::runtime::Builder::new_multi_thread().enable_all().build()`."
+        );
+    }
+}
+
 impl ScanScheduler {
     /// Create a new scheduler with the given I/O capacity
     ///
@@ -1052,6 +1081,7 @@ impl ScanScheduler {
             ));
             IoQueueType::Lite(io_queue)
         } else {
+            require_time_driver();
             let io_queue = Arc::new(IoQueue::new(
                 io_capacity as u32,
                 config.io_buffer_size_bytes,
@@ -1805,6 +1835,54 @@ mod tests {
             assert_eq!(expected, actual);
             offset += READ_SIZE;
         }
+    }
+
+    #[test]
+    fn test_scan_scheduler_panics_clearly_without_time_driver() {
+        // The standard scheduler's watchdog needs `tokio::time::timeout`;
+        // `require_time_driver` should catch a runtime missing
+        // `enable_time()`/`enable_all()` synchronously, at construction, with
+        // a message pointing at the fix - not let the first real `timeout`
+        // call panic later, deep inside the queue's own background task.
+        let rt = tokio::runtime::Builder::new_multi_thread().build().unwrap();
+        let result = rt.block_on(async {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                ScanScheduler::new(
+                    Arc::new(ObjectStore::memory()),
+                    SchedulerConfig {
+                        io_buffer_size_bytes: 1024,
+                        use_lite_scheduler: Some(false),
+                    },
+                )
+            }))
+        });
+
+        let panic = result.expect_err("ScanScheduler::new should panic without a time driver");
+        let message = panic
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()))
+            .unwrap_or_default();
+        assert!(
+            message.contains("enable_time") || message.contains("enable_all"),
+            "panic message should point at the fix (enable_time/enable_all), got: {message}"
+        );
+    }
+
+    #[test]
+    fn test_scan_scheduler_lite_does_not_require_time_driver() {
+        // The lite scheduler never uses tokio::time, so it should work fine
+        // on a runtime without a time driver - this must not panic.
+        let rt = tokio::runtime::Builder::new_multi_thread().build().unwrap();
+        rt.block_on(async {
+            let _scheduler = ScanScheduler::new(
+                Arc::new(ObjectStore::memory()),
+                SchedulerConfig {
+                    io_buffer_size_bytes: 1024,
+                    use_lite_scheduler: Some(true),
+                },
+            );
+        });
     }
 
     #[tokio::test]
