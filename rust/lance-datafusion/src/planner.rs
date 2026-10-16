@@ -1706,6 +1706,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_parse_filter_not_recurses() {
+        let schema = Arc::new(Schema::new(vec![Field::new("f", DataType::Float32, false)]));
+        let planner = Planner::new(schema);
+
+        // NOT must recurse so its inner comparison narrows the literal to the
+        // column type like the unnarrowed comparison does. Otherwise, after
+        // DataFusion's coerce pass casts the column, NOT (f = 0.1) and
+        // f = 0.1 can both hold for the same Float32 row.
+        let positive = planner.parse_filter("f = 0.1").unwrap();
+        let negated = planner.parse_filter("NOT (f = 0.1)").unwrap();
+        let Expr::Not(inner) = &negated else {
+            panic!("expected NOT expression, got {negated}");
+        };
+        assert_eq!(inner.as_ref(), &positive);
+    }
+
     #[rstest]
     #[case::right("value >> 32", Operator::BitwiseShiftRight, vec![0, 1, 3])]
     #[case::left(

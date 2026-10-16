@@ -119,6 +119,12 @@ impl ProjectionBuilder {
         }
 
         for col in Planner::column_names_in_expr(&expr) {
+            // A system column referenced inside a larger expression (e.g.
+            // `_rowoffset + 1`) must request its supporting exec node too;
+            // the bare-column check above only catches whole-column outputs.
+            if col == ROW_OFFSET {
+                self.must_add_row_offset = true;
+            }
             // Discovery can bind an exact provisional scoring field beside a mixed-case stored
             // field. Load the stored field too so final-schema replanning can select the stored
             // or search-generated field from the physical input.

@@ -13867,6 +13867,10 @@ mod test {
         // Make sure we can reference * fields in exprs and add new columns
         check_exprs(&["_rowid", "*", "x * 2"], &["_rowid", "x", "y", "x * 2"]).await;
 
+        // A system column referenced inside a larger expression must request
+        // its supporting exec node just like a bare reference does.
+        check_exprs(&["_rowoffset + 1"], &["_rowoffset + 1"]).await;
+
         let check_fails = |projection: &[&str]| {
             let mut scan = data.scan();
             assert!(scan.project(projection).is_err());
