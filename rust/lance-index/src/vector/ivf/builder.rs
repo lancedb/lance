@@ -324,10 +324,18 @@ mod tests {
         );
     }
 
+    /// Nulls are read through the values buffer, so a null partition would
+    /// silently land the row in whatever partition the buffer holds, and a
+    /// null row id would assign some other row.
+    #[rstest::rstest]
+    #[case::null_partition(vec![Some(1), Some(2)], vec![Some(0), None], "'partition' has 1")]
+    #[case::null_row_id(vec![None, Some(2)], vec![Some(0), Some(1)], "'row_id' has 1")]
     #[tokio::test]
-    async fn test_load_precomputed_partitions_rejects_nulls() {
-        // Nulls are read through the values buffer, so a null partition would
-        // silently land the row in whatever partition the buffer holds.
+    async fn test_load_precomputed_partitions_rejects_nulls(
+        #[case] row_ids: Vec<Option<u64>>,
+        #[case] partitions: Vec<Option<u32>>,
+        #[case] expected: &str,
+    ) {
         let schema = Arc::new(ArrowSchema::new(vec![
             Field::new("row_id", DataType::UInt64, true),
             Field::new("partition", DataType::UInt32, true),
@@ -335,8 +343,8 @@ mod tests {
         let batch = RecordBatch::try_new(
             schema,
             vec![
-                Arc::new(UInt64Array::from(vec![Some(1u64), Some(2)])),
-                Arc::new(UInt32Array::from(vec![Some(0u32), None])),
+                Arc::new(UInt64Array::from(row_ids)),
+                Arc::new(UInt32Array::from(partitions)),
             ],
         )
         .unwrap();
@@ -344,6 +352,6 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, Error::InvalidInput { .. }), "got: {err:?}");
-        assert!(err.to_string().contains("null"), "got: {err}");
+        assert!(err.to_string().contains(expected), "got: {err}");
     }
 }
