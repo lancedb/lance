@@ -28,7 +28,7 @@ datafusion-expr.workspace = true
 datafusion-physical-expr.workspace = true
 datafusion.workspace = true
 dirs.workspace = true
-faer.workspace = true
+nalgebra.workspace = true
 fst.workspace = true
 futures.workspace = true
 geoarrow-array = { workspace = true, optional = true }

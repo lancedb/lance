@@ -64,14 +64,93 @@ The specific version of the vector index is recorded in the `index_version` fiel
     stabilization vote does not pass. Indexes that do not use a pre-transform
     are unaffected.
 
-An `IVF_RQ` index may store one PCA pre-transform in `VectorIndexDetails.pre_transform`.
-When the field is absent, vectors are indexed in their original dimension.
-When it is present, vectors are projected by the stored `PcaModel` before IVF and
-quantization, and query vectors are projected the same way before search.
-An index that uses the pre-transform records index metadata version 3 so older
-readers skip it. The IVF_RQ quantization format itself is unchanged.
-The source dataset is not rewritten; dropping the feature only requires
-rebuilding the index.
+An `IVF_RQ` index may store one PCA pre-transform. The index metric must be
+L2. Cosine and dot are not defined for this pre-transform. When
+`VectorIndexDetails.pre_transform` is absent, vectors are indexed in their
+original dimension. When it is present, both indexed vectors and query vectors
+are projected by the stored model before IVF and quantization. An index that
+uses the pre-transform records index metadata version 3 so older readers skip
+it. The IVF_RQ quantization format itself is unchanged. The source dataset is
+not rewritten; dropping the feature only requires rebuilding the index.
+
+### Parameters
+
+`VectorIndexDetails.pre_transform.pca` is a `PcaParameters` message:
+
+```protobuf
+%%% proto.message.PcaParameters %%%
+```
+
+`dimension` is the projected dimension and must be non-zero. `model_fingerprint`
+is required and contains exactly 32 raw bytes. This message does not store a
+whitening flag, a whitening scale, or an epsilon. A reader must not infer
+either field from a missing protobuf number.
+
+### Model file
+
+The trained model is not stored in `PcaParameters`. It is one global buffer in
+the index file `index.idx`, not in `auxiliary.idx`. The Arrow schema metadata
+key is `lance:pca`. Its value is the decimal text of the one-based global
+buffer index returned when that buffer was written, the same numbering as
+`lance:ivf`. The index is not fixed. The file container must be legacy
+container `(0, 3)` or file version 2.x, because those containers can store
+schema metadata and global buffers.
+
+The buffer is a protobuf `PcaModel`:
+
+```protobuf
+%%% proto.message.PcaModel %%%
+```
+
+`model_version` must be 1. Both tensors are required, `data_type` must be
+`FLOAT32`, and `data` is little-endian IEEE-754. `transform_matrix` has rank 2
+and shape `[output_dimension, input_dimension]`, stored row-major.
+`mean` has rank 1 and shape `[input_dimension]`. No dimension may be zero.
+`data` length must equal the product of the shape times 4. Every value must
+be finite. `mean` length must equal the matrix column count.
+`output_dimension` must equal `PcaParameters.dimension`, and must be strictly
+less than `input_dimension`.
+
+### Projection
+
+For an input vector `x` and the stored mean, both of length `input_dimension`,
+the projected vector `y` has length `output_dimension`:
+
+```text
+y = A (x - mean)
+```
+
+`A` is `transform_matrix`. Element `r` of `y` is the dot product of matrix row
+`r` with `(x - mean)`. The same formula is used for vectors written into the
+index and for query vectors. If `random_rotation` is true, the orthogonal
+rotation chosen at training is already multiplied into `A`. The file does not
+store a second PCA rotation matrix. Rows of `A` are not rescaled, so this
+version does not whiten the projection.
+
+### Fingerprint
+
+`model_fingerprint` is the BLAKE3-256 digest of the stored transform, not of
+the training parameters. The hashed bytes, in order, are:
+
+1. The ASCII domain separator `lance-vector-pre-transform:pca:v1`, with no
+   trailing NUL.
+2. `model_version` as a 4-byte little-endian unsigned integer. For version 1
+   these bytes are `01 00 00 00`.
+3. Each `float32` of `transform_matrix`, in stored row-major order, then each
+   `float32` of `mean`. Each value is 4 little-endian IEEE-754 bytes. Negative
+   zero is canonicalized to positive zero before it is hashed. Every other
+   finite value is hashed unchanged.
+
+The digest is 32 bytes. Index details that render the fingerprint as text use
+the prefix `blake3:` followed by 64 lowercase hexadecimal digits. That text is
+not what is hashed and is not what the protobuf stores.
+
+Index metadata version 3 requires `PcaParameters`, the 32-byte fingerprint, the
+`lance:pca` metadata key, and the model buffer, and the physical index type
+must be `IVF_RQ`. On load, the fingerprint recomputed from the buffer must
+equal the manifest bytes, and the matrix row count must equal `dimension`.
+Any other index metadata version must not declare PCA parameters and must not
+contain `lance:pca` or the model buffer. A mismatch is a corrupt index.
 
 ## Storage Layout (V3)
 

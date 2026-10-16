@@ -648,8 +648,6 @@ mod tests {
                 pre_transform: Some(PreTransform::Pca(PcaParameters {
                     dimension: 2,
                     random_rotation: false,
-                    whitening: false,
-                    epsilon: 1.0e-5,
                     sample_size: 4,
                     max_training_memory_bytes: 1024,
                     sampling_seed: 42,

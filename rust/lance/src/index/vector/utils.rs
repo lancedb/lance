@@ -375,7 +375,12 @@ pub async fn maybe_sample_training_data(
 
 /// Filter out non-finite vectors from sampled training data.
 ///
-/// This is a no-op when all rows are finite, avoiding an unnecessary copy.
+/// IVF applies this after the sample has already been drawn, so rejected rows
+/// shrink that sample. PCA uses the same
+/// [`lance_index::vector::utils::is_finite`] predicate while drawing, and
+/// replaces rejected rows until the requested number of valid offsets is
+/// reached. This is a no-op when all rows are finite, avoiding an unnecessary
+/// copy.
 pub fn filter_finite_training_data(
     training_data: FixedSizeListArray,
 ) -> Result<FixedSizeListArray> {
@@ -464,57 +469,41 @@ impl PcaCandidateSampler {
     }
 }
 
-fn is_valid_pca_vector(array: &FixedSizeListArray, row: usize) -> Result<bool> {
-    if array.is_null(row) {
-        return Ok(false);
+fn require_pca_float_values(array: &FixedSizeListArray) -> Result<()> {
+    match array.values().data_type() {
+        DataType::Float16 | DataType::Float32 | DataType::Float64 => Ok(()),
+        data_type => Err(Error::invalid_input(format!(
+            "PCA sampling requires Float16, Float32, or Float64 vector values, got {data_type}"
+        ))),
     }
-    let dimension = usize::try_from(array.value_length()).map_err(|_| {
-        Error::invalid_input(format!(
-            "PCA vector value_length={} is not a valid dimension",
-            array.value_length()
-        ))
-    })?;
-    let value_start = array
-        .offset()
-        .checked_add(row)
-        .and_then(|row| row.checked_mul(dimension))
-        .ok_or_else(|| Error::invalid_input("PCA vector child offset overflows usize"))?;
-    let values = array.values();
-    let value_end = value_start
-        .checked_add(dimension)
-        .ok_or_else(|| Error::invalid_input("PCA vector child range overflows usize"))?;
-    if value_end > values.len() {
-        return Err(Error::invalid_input(format!(
-            "PCA vector child range [{value_start}, {value_end}) exceeds values length {}",
-            values.len()
+}
+
+/// Read one fixed-size-list vector column at the given dataset row offsets.
+///
+/// IVF uniform sampling and PCA candidate validation both read rows through
+/// this take.
+pub(super) async fn take_vector_column(
+    dataset: &Dataset,
+    column: &str,
+    offsets: &[u64],
+    projection: Arc<Schema>,
+) -> Result<FixedSizeListArray> {
+    let batch = dataset.take(offsets, projection).await?;
+    let array = get_column_from_batch(&batch, column)?;
+    if !matches!(array.data_type(), DataType::FixedSizeList(_, _)) {
+        return Err(Error::index(format!(
+            "Sample training data: column {column} is not a vector column"
         )));
     }
-    if (value_start..value_end).any(|index| values.is_null(index)) {
-        return Ok(false);
+    let vectors = array.as_fixed_size_list().clone();
+    if vectors.len() != offsets.len() {
+        return Err(Error::index(format!(
+            "Training take returned {} rows for {} requested offsets",
+            vectors.len(),
+            offsets.len()
+        )));
     }
-    let is_finite = match values.data_type() {
-        DataType::Float16 => values
-            .as_primitive::<arrow_array::types::Float16Type>()
-            .values()[value_start..value_end]
-            .iter()
-            .all(|value| value.is_finite()),
-        DataType::Float32 => values
-            .as_primitive::<arrow_array::types::Float32Type>()
-            .values()[value_start..value_end]
-            .iter()
-            .all(|value| value.is_finite()),
-        DataType::Float64 => values
-            .as_primitive::<arrow_array::types::Float64Type>()
-            .values()[value_start..value_end]
-            .iter()
-            .all(|value| value.is_finite()),
-        data_type => {
-            return Err(Error::invalid_input(format!(
-                "PCA sampling requires Float16, Float32, or Float64 vector values, got {data_type}"
-            )));
-        }
-    };
-    Ok(is_finite)
+    Ok(vectors)
 }
 
 /// Deterministically samples valid vector row offsets for PCA training.
@@ -562,18 +551,14 @@ pub async fn sample_valid_vector_offsets_seeded(
         let mut candidates = sampler.draw(requested, &mut rng);
         candidates.sort_unstable();
         for chunk in candidates.chunks(PCA_SAMPLE_TAKE_BATCH_SIZE) {
-            let batch = dataset.take(chunk, projection.clone()).await?;
-            let vectors = get_column_from_batch(&batch, column)?;
-            let vectors = vectors.as_fixed_size_list();
-            if vectors.len() != chunk.len() {
-                return Err(Error::index(format!(
-                    "PCA sampling take returned {} rows for {} requested offsets",
-                    vectors.len(),
-                    chunk.len()
-                )));
-            }
+            let vectors = take_vector_column(dataset, column, chunk, projection.clone()).await?;
+            require_pca_float_values(&vectors)?;
+            // Same null / NaN / infinity predicate as
+            // [`filter_finite_training_data`]. A rejected row does not count
+            // toward `max_valid_rows`; the next draw replenishes it.
+            let finite = lance_index::vector::utils::is_finite(&vectors);
             for (row, offset) in chunk.iter().enumerate() {
-                if is_valid_pca_vector(vectors, row)? {
+                if finite.value(row) {
                     valid_offsets.push(*offset);
                 }
             }
@@ -1101,17 +1086,23 @@ async fn sample_fsl_uniform(
 
     let total_chunks = indices.len().div_ceil(batch_rows);
     let dataset = Arc::new(dataset.clone());
-    let mut batches = stream::iter(indices.chunks(batch_rows).map(<[u64]>::to_vec))
-        .map(move |chunk| {
-            let dataset = dataset.clone();
-            let projection = projection.clone();
-            async move { dataset.take(&chunk, projection).await }
-        })
-        .buffered(batch_readahead)
-        .enumerate();
-    while let Some((chunk_idx, batch)) = batches.next().await {
-        let batch = batch?;
-        let array = get_column_from_batch(&batch, column)?;
+    let column_name = column.to_string();
+    let mut batches =
+        stream::iter(indices.chunks(batch_rows).map(<[u64]>::to_vec))
+            .map(move |chunk| {
+                let dataset = dataset.clone();
+                let projection = projection.clone();
+                let column_name = column_name.clone();
+                async move {
+                    take_vector_column(dataset.as_ref(), &column_name, &chunk, projection).await
+                }
+            })
+            .buffered(batch_readahead)
+            .enumerate();
+    while let Some((chunk_idx, vectors)) = batches.next().await {
+        let vectors = vectors?;
+        let row_count = vectors.len();
+        let array: ArrayRef = Arc::new(vectors);
         accumulate_fsl_values(
             &mut values_buf,
             &mut total_rows,
@@ -1124,7 +1115,7 @@ async fn sample_fsl_uniform(
             "Sample training data: batch {}/{} read {} rows ({}/{} sampled by uniform random sampling)",
             chunk_idx + 1,
             total_chunks,
-            batch.num_rows(),
+            row_count,
             total_rows.min(sample_size_hint),
             sample_size_hint
         );

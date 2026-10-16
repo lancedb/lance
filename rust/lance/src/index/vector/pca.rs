@@ -14,7 +14,7 @@ use arrow_schema::DataType;
 use lance_index::progress::IndexBuildProgress;
 use lance_index::vector::pca::{PcaModel, PcaParams, accumulate_centered_scatter};
 
-use super::utils::{get_column_from_batch, get_vector_dim, sample_valid_vector_offsets_seeded};
+use super::utils::{get_vector_dim, sample_valid_vector_offsets_seeded};
 use crate::dataset::Dataset;
 use crate::{Error, Result};
 
@@ -150,58 +150,28 @@ impl PcaTrainer {
         }
         let mean = sums;
 
-        let statistics = if sample_count >= input_dimension {
-            let matrix_len = input_dimension
-                .checked_mul(input_dimension)
-                .ok_or_else(|| Error::invalid_input("PCA scatter matrix shape overflows usize"))?;
-            let mut scatter = vec![0.0_f64; matrix_len];
-            for offsets in sample.row_offsets.chunks(PCA_TRAINING_BATCH_SIZE) {
-                let values = self
-                    .read_values(offsets, projection.clone(), input_dimension)
-                    .await?;
-                accumulate_centered_scatter(&values, &mean, &mut scatter)?;
-                completed = completed.checked_add(offsets.len()).ok_or_else(|| {
-                    Error::invalid_input("PCA center progress completed rows overflows usize")
-                })?;
-                self.progress
-                    .stage_progress("center_pca", completed as u64)
-                    .await?;
-            }
-            PcaStatistics::Scatter(scatter)
-        } else {
-            let centered_len = sample_count
-                .checked_mul(input_dimension)
-                .ok_or_else(|| Error::invalid_input("PCA centered matrix shape overflows usize"))?;
-            let mut centered = Vec::with_capacity(centered_len);
-            for offsets in sample.row_offsets.chunks(PCA_TRAINING_BATCH_SIZE) {
-                let values = self
-                    .read_values(offsets, projection.clone(), input_dimension)
-                    .await?;
-                for row in values.chunks_exact(input_dimension) {
-                    centered.extend(row.iter().zip(&mean).map(|(value, mean)| value - mean));
-                }
-                completed = completed.checked_add(offsets.len()).ok_or_else(|| {
-                    Error::invalid_input("PCA center progress completed rows overflows usize")
-                })?;
-                self.progress
-                    .stage_progress("center_pca", completed as u64)
-                    .await?;
-            }
-            PcaStatistics::Centered(centered)
-        };
+        let matrix_len = input_dimension
+            .checked_mul(input_dimension)
+            .ok_or_else(|| Error::invalid_input("PCA scatter matrix shape overflows usize"))?;
+        let mut scatter = vec![0.0_f64; matrix_len];
+        for offsets in sample.row_offsets.chunks(PCA_TRAINING_BATCH_SIZE) {
+            let values = self
+                .read_values(offsets, projection.clone(), input_dimension)
+                .await?;
+            accumulate_centered_scatter(&values, &mean, &mut scatter)?;
+            completed = completed.checked_add(offsets.len()).ok_or_else(|| {
+                Error::invalid_input("PCA center progress completed rows overflows usize")
+            })?;
+            self.progress
+                .stage_progress("center_pca", completed as u64)
+                .await?;
+        }
         self.progress.stage_complete("center_pca").await?;
 
         self.progress
             .stage_start("eigendecompose_pca", Some(1), "work_units")
             .await?;
-        let model = match statistics {
-            PcaStatistics::Scatter(scatter) => {
-                PcaModel::train_from_scatter(&mean, sample_count, &scatter, params)?
-            }
-            PcaStatistics::Centered(centered) => {
-                PcaModel::train_from_centered(&mean, sample_count, &centered, params)?
-            }
-        };
+        let model = PcaModel::train_from_scatter(&mean, sample_count, &scatter, params)?;
         self.progress
             .stage_progress("eigendecompose_pca", 1)
             .await?;
@@ -215,16 +185,11 @@ impl PcaTrainer {
         projection: Arc<lance_core::datatypes::Schema>,
         expected_dimension: usize,
     ) -> Result<Vec<f64>> {
-        let batch = self.dataset.take(offsets, projection).await?;
-        let array = get_column_from_batch(&batch, &self.column)?;
-        let vectors = array.as_fixed_size_list();
-        vectors_as_f64(vectors, expected_dimension)
+        let vectors =
+            super::utils::take_vector_column(&self.dataset, &self.column, offsets, projection)
+                .await?;
+        vectors_as_f64(&vectors, expected_dimension)
     }
-}
-
-enum PcaStatistics {
-    Scatter(Vec<f64>),
-    Centered(Vec<f64>),
 }
 
 fn vectors_as_f64(vectors: &FixedSizeListArray, expected_dimension: usize) -> Result<Vec<f64>> {
