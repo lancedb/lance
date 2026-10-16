@@ -2805,17 +2805,14 @@ impl MergeInsertJob {
         .is_ok();
 
         // Partial-schema upsert: every source field must exist in the target
-        // and have a compatible data type (legacy blob input matches Blob v2,
-        // as in `check_source_schema`). Missing target columns will be
-        // filled from the target side of the join in `create_plan`.
+        // and have a compatible data type (legacy or Blob v2 input in any
+        // layout matches Blob v2, as in `check_source_schema`). Missing target
+        // columns will be filled from the target side of the join in `create_plan`.
         let is_subset_schema = !is_full_schema
             && lance_schema.fields.iter().all(|sf| {
                 full_schema
                     .field(&sf.name)
-                    .map(|tf| {
-                        tf.data_type() == sf.data_type()
-                            || (tf.is_blob_v2() && sf.is_blob() && !sf.is_blob_v2())
-                    })
+                    .map(|tf| tf.data_type() == sf.data_type() || (tf.is_blob_v2() && sf.is_blob()))
                     .unwrap_or(false)
             });
 

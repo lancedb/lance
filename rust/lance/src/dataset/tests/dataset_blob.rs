@@ -402,23 +402,35 @@ async fn managed_compaction_preserves_sidecars_after_source_gc(
 /// reference to an object already under the table is adopted, for an
 /// updated row and an inserted one, without its bytes passing through the
 /// writer. A source may also leave out table columns, which then keep their
-/// values.
+/// values, and the table may declare the blob in either logical layout.
 #[rstest]
 #[tokio::test]
-async fn merge_insert_adopts_prepared_managed_references(#[values(false, true)] partial: bool) {
+async fn merge_insert_adopts_prepared_managed_references(
+    #[values(false, true)] partial: bool,
+    #[values(false, true)] complete: bool,
+) {
     use crate::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched};
     use arrow_array::types::Int32Type;
 
     let test_dir = TempStrDir::default();
     let id = Field::new("id", DataType::Int32, false);
-    let mut fields = vec![id.clone(), blob_field("blob", true)];
-    let mut seed = BlobArrayBuilder::new(2);
-    seed.push_bytes(b"seed").unwrap();
-    seed.push_bytes(b"seed").unwrap();
-    let mut columns = vec![
-        Arc::new(Int32Array::from(vec![0, 1])) as ArrayRef,
-        seed.finish().unwrap(),
-    ];
+    let (blob, seed) = if complete {
+        let seed = complete_blob_v2_array(
+            vec![Some(b"seed".to_vec()); 2],
+            vec![None; 2],
+            vec![None; 2],
+            vec![None; 2],
+            None,
+        );
+        (complete_blob_v2_field("blob", true), seed)
+    } else {
+        let mut seed = BlobArrayBuilder::new(2);
+        seed.push_bytes(b"seed").unwrap();
+        seed.push_bytes(b"seed").unwrap();
+        (blob_field("blob", true), seed.finish().unwrap())
+    };
+    let mut fields = vec![id.clone(), blob];
+    let mut columns = vec![Arc::new(Int32Array::from(vec![0, 1])) as ArrayRef, seed];
     if partial {
         fields.push(Field::new("other", DataType::Int32, true));
         columns.push(Arc::new(Int32Array::from(vec![6, 7])));
