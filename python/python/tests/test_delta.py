@@ -174,7 +174,9 @@ def test_delta_get_upserted_rows():
             "val": pa.array(["a", "b", "c"], type=pa.string()),
         }
     )
-    ds = write_dataset(table, "memory://delta_api_test_upsert", enable_stable_row_ids=True)
+    ds = write_dataset(
+        table, "memory://delta_api_test_upsert", enable_stable_row_ids=True
+    )
     ds.update({"val": "'b_updated'"}, where="id = 2")
     ds.insert(
         pa.table(
@@ -193,7 +195,9 @@ def test_delta_with_dates():
     from datetime import datetime, timedelta, timezone
 
     table = pa.table({"id": pa.array([1, 2], type=pa.int32())})
-    ds = write_dataset(table, "memory://delta_api_test_dates", enable_stable_row_ids=True)
+    ds = write_dataset(
+        table, "memory://delta_api_test_dates", enable_stable_row_ids=True
+    )
     # versions() returns a naive local datetime. Attach the local zone before
     # converting to UTC; labeling that wall time as UTC shifts the window.
     created = ds.versions()[0]["timestamp"]
@@ -210,6 +214,8 @@ def test_delta_with_dates():
     naive_begin = begin.replace(tzinfo=None)
     naive_end = end.replace(tzinfo=None)
     inserted = (
-        ds.delta(begin_date=naive_begin, end_date=naive_end).get_inserted_rows().read_all()
+        ds.delta(begin_date=naive_begin, end_date=naive_end)
+        .get_inserted_rows()
+        .read_all()
     )
     assert inserted.column("id").to_pylist() == [3]
