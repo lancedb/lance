@@ -137,8 +137,12 @@ impl IndexMetadata {
     /// True when the index reports matches as physical row addresses rather than row ids
     /// (`ScalarIndex::results_are_row_addresses`).
     ///
-    /// Such an index cannot follow its data through a rewrite: the addresses it stores
-    /// name fragments and offsets, and neither kind supports remap.
+    /// Such an index cannot follow its data through a rewrite the way a row-id-domain
+    /// index can: the addresses it stores name fragments and offsets, which a rewrite
+    /// invalidates. A type whose index supports remap (BTree) can still be rewritten in
+    /// place; a type that cannot (ZoneMap, BloomFilter, FM) instead loses coverage of the
+    /// rewritten fragments until it is rebuilt, or is kept in step through the fragment
+    /// reuse index's read-time translation.
     ///
     /// Currently this is a rather short list.  We will soon be migrating the remaining
     /// row-id-domain indexes to use row addresses.  At that point this list will grow and
