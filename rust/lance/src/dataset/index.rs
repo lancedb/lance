@@ -90,10 +90,7 @@ impl IndexRemapper for DatasetIndexRemapper {
         let mapping = RowAddrTranslator::sync(mapping);
         // On a stable-row-id table a row-id-domain index's ids survive the
         // rewrite untouched; translating them through an address map would
-        // corrupt them, since a stable row id is numerically indistinguishable
-        // from an address into fragment 0. Its fragment bitmap still has to
-        // follow the data, which the caller's fallback path (not this remap)
-        // handles for every index this loop skips.
+        // corrupt them.
         let uses_stable_row_ids = self.dataset.manifest.uses_stable_row_ids();
         let mut remapped = Vec::with_capacity(self.indices.len());
         for index in self.indices.iter() {

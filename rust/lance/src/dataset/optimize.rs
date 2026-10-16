@@ -266,14 +266,11 @@ pub struct CompactionOptions {
     /// indexed or not. Every index must store row addresses and apply the fragment reuse
     /// index, and keeps its coverage through it. Not yet supported in release builds.
     ///
-    /// When false (eager, the default), a stable-row-id table's row-id-domain
-    /// indices (e.g. vector, bitmap) follow their data to the new fragments for
-    /// free; their ids survive the rewrite. An address-domain index whose type
-    /// supports remap (e.g. BTree) is remapped immediately instead, the same
-    /// way a non-stable-row-id table's indices are. An address-domain index
-    /// whose type does not support remap (ZoneMap, BloomFilter, FM) loses
-    /// coverage of the rewritten fragments until it is rebuilt or compaction
-    /// runs with `defer_index_remap` set.
+    /// When this is false (eager, the default) and the dataset uses stable row ids then
+    /// the behavior depends on the index.  Some legacy indexes store row ids.  These
+    /// indexes remain valid and their fragment bitmaps are updated.  Modern indexes
+    /// store row addresses and these indexes need to be remapped as if we were not using
+    /// stable row ids.
     pub defer_index_remap: bool,
     /// How the old-to-new row-address mapping used to remap indices is built.
     /// Defaults to [`IndexRemapMode::Direct`].
@@ -2596,10 +2593,7 @@ async fn rewrite_files(
         .sum::<u64>();
     let uses_stable_row_ids = dataset.manifest.uses_stable_row_ids();
     // A scan captures stable row ids, not row addresses; derive old addresses
-    // from fragment metadata instead, whenever something will consume them:
-    // a deferred remap through the FRI, or an address-domain index an eager
-    // commit can remap immediately (row-id-domain indices need neither, since
-    // their ids survive the rewrite on their own).
+    // from fragment metadata instead, whenever something will consume them.
     let records_from_fragment_metadata = uses_stable_row_ids
         && (options.defer_index_remap || has_address_domain_index(dataset.as_ref()).await?);
     // Capturing row addresses is only useful if something will consume them:
