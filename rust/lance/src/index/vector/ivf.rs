@@ -5493,6 +5493,7 @@ mod tests {
     use lance_index::metrics::NoOpMetricsCollector;
     use lance_index::progress::noop_progress;
     use lance_index::scalar::OldIndexDataFilter;
+    use lance_index::vector::bq::RQBuildParams;
     use lance_index::vector::sq::builder::SQBuildParams;
     use lance_linalg::distance::l2_distance_batch;
     use lance_testing::datagen::{
@@ -6090,11 +6091,17 @@ mod tests {
         assert_eq!(5, results[0].num_rows());
     }
 
-    /// A precomputed partitions file is user data. For IVF_PQ the residual step
-    /// reaches it first and used to panic out of a spawned transform; the
-    /// shuffler's own range check (`v3/shuffler.rs`) never got a chance to run.
+    /// A precomputed partitions file is user data. Its ids index the centroids
+    /// in the transform, so IVF_PQ's residual step and IVF_RQ's distance to the
+    /// chosen centroid reach a bad id before the shuffler's own range check
+    /// (`v3/shuffler.rs`) can run.
+    #[rstest]
+    #[case::ivf_pq(IndexType::IvfPq)]
+    #[case::ivf_rq(IndexType::IvfRq)]
     #[tokio::test]
-    async fn test_create_ivf_pq_rejects_out_of_range_precomputed_partition() {
+    async fn test_create_index_rejects_out_of_range_precomputed_partition(
+        #[case] index_type: IndexType,
+    ) {
         let test_dir = TempStrDir::default();
         let test_uri = format!("{}/ds", test_dir.as_str());
         let partitions_uri = format!("{}/parts", test_dir.as_str());
@@ -6128,9 +6135,19 @@ mod tests {
         let mut ivf_params =
             IvfBuildParams::try_with_centroids(2, Arc::new(ivf_centroids)).unwrap();
         ivf_params.precomputed_partitions_file = Some(partitions_uri);
-        let pq_params =
-            PQBuildParams::with_codebook(4, 8, Arc::new(generate_random_array(256 * DIM)));
-        let params = VectorIndexParams::with_ivf_pq_params(MetricType::L2, ivf_params, pq_params);
+        let params = match index_type {
+            IndexType::IvfPq => {
+                let pq_params =
+                    PQBuildParams::with_codebook(4, 8, Arc::new(generate_random_array(256 * DIM)));
+                VectorIndexParams::with_ivf_pq_params(MetricType::L2, ivf_params, pq_params)
+            }
+            IndexType::IvfRq => VectorIndexParams::with_ivf_rq_params(
+                MetricType::L2,
+                ivf_params,
+                RQBuildParams::default(),
+            ),
+            _ => unreachable!("not a case of this test"),
+        };
 
         let error = dataset
             .create_index(&["vector"], IndexType::Vector, None, &params, false)
@@ -6142,8 +6159,8 @@ mod tests {
         );
         let message = error.to_string();
         assert!(
-            message.contains("partition id 7") && message.contains("2 centroids"),
-            "the error must name the id and the centroid count: {message}"
+            message.contains("partition id 7") && message.contains("out of range for 2"),
+            "the error must name the id and the partition count: {message}"
         );
     }
 
