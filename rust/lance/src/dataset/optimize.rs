@@ -839,6 +839,12 @@ impl CompactionPlanner for DefaultCompactionPlanner {
                 &load_all_indices(dataset).await?,
             )?;
         }
+        if !self.options.defer_index_remap
+            && dataset.manifest.uses_stable_row_ids()
+            && has_address_domain_index(dataset).await?
+        {
+            reject_eager_remap_over_undrained_fri(dataset).await?;
+        }
 
         // get_fragments should be returning fragments in sorted order (by id)
         // and fragment ids should be unique
@@ -2496,6 +2502,33 @@ async fn has_address_domain_index(dataset: &Dataset) -> Result<bool> {
         .any(|index| !is_system_index(index) && index.results_are_row_addrs()))
 }
 
+/// Refuse an eager remap of an address-domain index while this stable-row-id
+/// table's fragment reuse index is not fully drained.
+///
+/// A remappable index (e.g. BTree) is remapped by reading its persisted
+/// pages' stored addresses directly and translating them with this
+/// compaction's own old-to-new move map; it never composes that read with a
+/// fragment reuse index's pending moves. If the table still carries one -- a
+/// prior deferred compaction left addresses that only the FRI translates --
+/// remapping now would write those untranslated addresses into the rebuilt
+/// index and the manifest would then claim full coverage, silently dropping
+/// every row the FRI still had to translate. Draining it first, with
+/// `optimize_indices`, or compacting with `defer_index_remap` set instead,
+/// keeps the index's pages in step with its coverage.
+async fn reject_eager_remap_over_undrained_fri(dataset: &Dataset) -> Result<()> {
+    if let Some(fri) = dataset.frag_reuse_index().await?
+        && !fri.is_empty()
+    {
+        return Err(Error::not_supported(
+            "Cannot eagerly compact: this stable-row-id table carries a fragment reuse \
+             index that is not fully drained, and an address-domain index exists that an \
+             eager remap would have to re-read through it. Drain the fragment reuse index \
+             first (run optimize_indices), or compact with defer_index_remap set",
+        ));
+    }
+    Ok(())
+}
+
 /// The old row addresses of `fragments`' live (non-deleted) rows, reconstructed
 /// from fragment metadata and deletion files alone -- no data scan. Callers
 /// (the deferred/FRI path and the eager address-domain remap path) pair these
@@ -3380,6 +3413,9 @@ pub async fn commit_compaction(
     // nothing here will consume them eagerly.
     let remapping_eagerly =
         uses_stable_row_ids && needs_remapping && has_address_domain_index(dataset).await?;
+    if remapping_eagerly {
+        reject_eager_remap_over_undrained_fri(dataset).await?;
+    }
 
     let records_row_addrs = if uses_stable_row_ids {
         records_stable_row_id_moves(dataset, &completed_tasks, options, remapping_eagerly).await?
@@ -6820,6 +6856,76 @@ mod tests {
         assert!(error.to_string().contains(expected), "{error}");
         dataset.checkout_latest().await.unwrap();
         assert_eq!(dataset.version().version, version);
+    }
+
+    /// An address-domain index is remapped by reading its persisted pages'
+    /// stored addresses directly, never composed with a fragment reuse
+    /// index's pending moves. Eagerly remapping one while a prior deferred
+    /// compaction's FRI is still undrained would write those untranslated,
+    /// pre-FRI addresses into the rebuilt index, and the manifest would then
+    /// claim it fully covers fragments the FRI alone can still resolve --
+    /// silently losing the rows the FRI has to translate. Eager compaction
+    /// must refuse instead, until the FRI is drained.
+    #[tokio::test]
+    async fn test_eager_remap_refuses_undrained_fri_over_address_domain_index() {
+        let mut dataset = stable_row_id_dataset("memory://", 5).await;
+        dataset
+            .create_index(
+                &["i"],
+                IndexType::BTree,
+                Some("i_idx".into()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        // A deferred compaction merges every fragment, leaving the btree's
+        // pages stale and a non-empty FRI as the only thing resolving them.
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 1_000,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !dataset
+                .frag_reuse_index()
+                .await
+                .unwrap()
+                .unwrap()
+                .is_empty()
+        );
+
+        let error = compact_files(&mut dataset, CompactionOptions::default(), None)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+        assert!(error.to_string().contains("fragment reuse"), "{error}");
+        assert!(error.to_string().contains("not fully drained"), "{error}");
+
+        // Catch the btree up to the FRI's moves (a segment merge, not a
+        // rescan), then trim the now-caught-up version: this lets eager
+        // compaction proceed again.
+        remapping::remap_column_index(&mut dataset, &["i"], Some("i_idx".into()))
+            .await
+            .unwrap();
+        cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+        assert!(
+            dataset
+                .frag_reuse_index()
+                .await
+                .unwrap()
+                .is_none_or(|fri| fri.is_empty())
+        );
+        compact_files(&mut dataset, CompactionOptions::default(), None)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
