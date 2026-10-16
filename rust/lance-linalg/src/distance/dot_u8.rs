@@ -172,6 +172,10 @@ pub fn dot_u8(a: &[u8], b: &[u8]) -> u32 {
 /// This retains the runtime-selected SIMD kernel and widens its result between
 /// chunks that are guaranteed to fit in a u32.
 ///
+/// # Panics
+///
+/// Panics if `a` and `b` have different lengths.
+///
 /// # Example
 ///
 /// ```

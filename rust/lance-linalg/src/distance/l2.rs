@@ -148,7 +148,7 @@ pub fn l2_distance_uint_scalar(key: &[u8], target: &[u8]) -> f32 {
 /// # Panics
 ///
 /// Panics if `from` and `to` have different lengths, and separately if `LANES`
-/// is zero, which `chunks_exact` rejects.
+/// is zero, which `as_chunks` rejects.
 #[inline]
 pub fn l2_scalar<
     T: AsPrimitive<Output>,
