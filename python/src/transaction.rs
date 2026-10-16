@@ -494,17 +494,15 @@ fn extract_inserted_rows_filter(ob: &Bound<'_, PyAny>) -> PyResult<KeyExistenceF
     let payload: Vec<u8> = ob.getattr("payload")?.extract()?;
     let filter = match kind.as_str() {
         "exact" => {
-            if payload.len() % 8 != 0 {
+            if !payload.len().is_multiple_of(8) {
                 return Err(PyValueError::new_err(format!(
                     "exact inserted_rows_filter payload length must be a multiple of 8, got {}",
                     payload.len()
                 )));
             }
             let mut hashes = HashSet::with_capacity(payload.len() / 8);
-            for chunk in payload.chunks_exact(8) {
-                let mut bytes = [0u8; 8];
-                bytes.copy_from_slice(chunk);
-                hashes.insert(u64::from_le_bytes(bytes));
+            for chunk in payload.as_chunks::<8>().0 {
+                hashes.insert(u64::from_le_bytes(*chunk));
             }
             FilterType::ExactSet(hashes)
         }
