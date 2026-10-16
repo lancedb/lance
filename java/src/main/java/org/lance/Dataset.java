@@ -1633,8 +1633,10 @@ public class Dataset implements Closeable {
 
   /**
    * Get per-fragment column-layout statistics for this dataset version: how many data files hold a
-   * column of the schema, and how many overlay files each fragment carries. Only manifest metadata
-   * is read.
+   * column of the schema, each file's size and schema field count, the share of dead field slots,
+   * and how many overlay files each fragment carries. Only manifest metadata is read.
+   *
+   * <p>This is an experimental API. It may change at any time.
    *
    * @return column-layout statistics as parallel arrays, in manifest order
    */

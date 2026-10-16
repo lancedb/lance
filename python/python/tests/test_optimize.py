@@ -183,7 +183,7 @@ def test_compact_files_repacks_columns(tmp_path: Path):
         assert s["live_file_count"] == 3
         assert s["fields_per_file"] == [2, 1, 1]
         assert all(size is not None for size in s["file_sizes"])
-        assert s["tombstoned_field_ratio"] == 0.0
+        assert s["dead_slot_ratio"] == 0.0
         assert s["overlay_count"] == 0
 
     metrics = dataset.optimize.compact_files(

@@ -1976,7 +1976,7 @@ fn inner_get_column_layout_statistics<'local>(
         .iter()
         .map(|s| to_int(s.live_file_count))
         .collect::<Result<Vec<_>>>()?;
-    let ratios: Vec<f64> = stats.iter().map(|s| s.tombstoned_field_ratio).collect();
+    let ratios: Vec<f64> = stats.iter().map(|s| s.dead_slot_ratio).collect();
     let overlay_counts = stats
         .iter()
         .map(|s| to_int(s.overlay_count))

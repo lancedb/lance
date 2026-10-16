@@ -2124,7 +2124,7 @@ impl Dataset {
                 dict.set_item("live_file_count", stats.live_file_count)?;
                 dict.set_item("file_sizes", stats.file_sizes)?;
                 dict.set_item("fields_per_file", stats.fields_per_file)?;
-                dict.set_item("tombstoned_field_ratio", stats.tombstoned_field_ratio)?;
+                dict.set_item("dead_slot_ratio", stats.dead_slot_ratio)?;
                 dict.set_item("overlay_count", stats.overlay_count)?;
                 Ok(dict.unbind())
             })

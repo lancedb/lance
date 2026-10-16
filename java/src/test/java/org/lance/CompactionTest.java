@@ -295,7 +295,7 @@ public class CompactionTest {
         assertArrayEquals(new int[] {2, 1}, layout.getFieldsPerFile()[0]);
         assertEquals(2, layout.getFileSizes()[0].length);
         assertTrue(layout.getFileSizes()[0][0] > 0);
-        assertArrayEquals(new double[] {0.0, 0.0}, layout.getTombstonedFieldRatios());
+        assertArrayEquals(new double[] {0.0, 0.0}, layout.getDeadSlotRatios());
         assertArrayEquals(new int[] {0, 0}, layout.getOverlayCounts());
 
         CompactionOptions options =

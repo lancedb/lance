@@ -77,6 +77,7 @@ async fn test_zone_map_seed_harvest_after_repeated_column_replacement(
         WriteDestination::Dataset(Arc::new(dataset)),
         Operation::DataReplacement {
             replacements: vec![replacement],
+            data_change: true,
         },
         Some(read_version),
         None,
@@ -270,6 +271,7 @@ async fn test_zone_map_seed_harvest_after_column_name_swap() {
         WriteDestination::Dataset(Arc::new(dataset)),
         Operation::DataReplacement {
             replacements: vec![replacement],
+            data_change: true,
         },
         Some(read_version),
         None,

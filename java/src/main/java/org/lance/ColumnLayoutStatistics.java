@@ -16,15 +16,16 @@ package org.lance;
 /**
  * Per-fragment column-layout statistics of a dataset version as parallel arrays: index {@code i} of
  * every getter describes the same fragment. Returned by {@link
- * Dataset#getColumnLayoutStatistics()}. Compaction repacks a fragment's columns into fewer files
- * when its live file count is above {@code maxDataFilesPerFragment}.
+ * Dataset#getColumnLayoutStatistics()}.
+ *
+ * <p>This is an experimental API. It may change at any time.
  */
 public final class ColumnLayoutStatistics {
   private final long[] fragmentIds;
   private final int[] liveFileCounts;
   private final long[][] fileSizes;
   private final int[][] fieldsPerFile;
-  private final double[] tombstonedFieldRatios;
+  private final double[] deadSlotRatios;
   private final int[] overlayCounts;
 
   ColumnLayoutStatistics(
@@ -32,13 +33,13 @@ public final class ColumnLayoutStatistics {
       int[] liveFileCounts,
       long[][] fileSizes,
       int[][] fieldsPerFile,
-      double[] tombstonedFieldRatios,
+      double[] deadSlotRatios,
       int[] overlayCounts) {
     this.fragmentIds = fragmentIds;
     this.liveFileCounts = liveFileCounts;
     this.fileSizes = fileSizes;
     this.fieldsPerFile = fieldsPerFile;
-    this.tombstonedFieldRatios = tombstonedFieldRatios;
+    this.deadSlotRatios = deadSlotRatios;
     this.overlayCounts = overlayCounts;
   }
 
@@ -49,8 +50,8 @@ public final class ColumnLayoutStatistics {
 
   /**
    * Number of data files holding at least one column of the schema, per fragment, aligned with
-   * {@link #getFragmentIds()}. A file left holding only tombstones or dropped columns, or kept only
-   * for the fragment's spilled row lineage, is not counted.
+   * {@link #getFragmentIds()}. A file holding only tombstones, dropped columns, or the fragment's
+   * spilled row lineage is not counted.
    */
   public int[] getLiveFileCounts() {
     return liveFileCounts;
@@ -74,8 +75,8 @@ public final class ColumnLayoutStatistics {
    * or repack, or left by a dropped column. Spilled row lineage is not counted. A fragment rewrite
    * reclaims these slots.
    */
-  public double[] getTombstonedFieldRatios() {
-    return tombstonedFieldRatios;
+  public double[] getDeadSlotRatios() {
+    return deadSlotRatios;
   }
 
   /** Number of data overlay files per fragment, aligned with {@link #getFragmentIds()}. */
