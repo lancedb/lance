@@ -312,22 +312,29 @@ impl IoQueueState {
     }
 
     /// If stuck and not still within `WATCHDOG_WARN_DEBOUNCE` of the last
-    /// warning, emit one WARN-level snapshot of the queue state and arm the
-    /// debounce.
-    fn check_watchdog(&mut self) {
+    /// warning, arms the debounce and returns the snapshot + stuck duration
+    /// to warn about. Building the snapshot is cheap, but actually emitting
+    /// it (a `tracing`/`log` call, which may reach an arbitrarily slow
+    /// subscriber) is left to the caller to do *after* releasing the queue
+    /// lock - same reasoning as every other state-mutating method here
+    /// (`push`, `on_bytes_consumed`, ...), which all build their event
+    /// under the lock and emit it once the guard is dropped.
+    fn check_watchdog(&mut self) -> Option<(SchedulerStateEvent, Duration)> {
         if !self.is_stuck() {
-            return;
+            return None;
         }
         let now = Instant::now();
         let within_debounce = self
             .last_watchdog_warn
             .is_some_and(|last_warn| now.duration_since(last_warn) < WATCHDOG_WARN_DEBOUNCE);
         if within_debounce {
-            return;
+            return None;
         }
         self.last_watchdog_warn = Some(now);
-        self.build_scheduler_state_event()
-            .warn_stuck(self.last_progress.elapsed());
+        Some((
+            self.build_scheduler_state_event(),
+            self.last_progress.elapsed(),
+        ))
     }
 }
 
@@ -428,7 +435,10 @@ impl IoQueue {
                     .await
                     .is_err()
                 {
-                    self.state.lock().unwrap().check_watchdog();
+                    let stuck = self.state.lock().unwrap().check_watchdog();
+                    if let Some((event, stuck_for)) = stuck {
+                        event.warn_stuck(stuck_for);
+                    }
                 }
             } else {
                 self.notify.notified().await;
@@ -1662,7 +1672,7 @@ mod tests {
         state.pending_requests.push(make_task(1, false));
         state.last_progress = Instant::now() - WATCHDOG_STUCK_THRESHOLD - Duration::from_secs(1);
 
-        let event = expect::event()
+        let expected_event = expect::event()
             .with_target(SCHEDULER_STATE_EVENT_TARGET)
             .at_level(tracing::Level::WARN)
             .with_fields(
@@ -1671,10 +1681,16 @@ mod tests {
                     .and(expect::field("pending_iops").with_value(&1u64))
                     .and(expect::field("priorities_in_flight").with_value(&1u64)),
             );
-        let (subscriber, handle) = subscriber::mock().event(event).run_with_handle();
+        // `check_watchdog` only builds the snapshot and arms the debounce;
+        // emission (what the mock subscriber observes) happens via
+        // `warn_stuck`, called separately - mirroring how the real caller
+        // in `IoQueue::pop` emits only after releasing the queue lock.
+        let stuck = state.check_watchdog();
+        let (event, stuck_for) = stuck.expect("should be stuck");
 
+        let (subscriber, handle) = subscriber::mock().event(expected_event).run_with_handle();
         tracing::subscriber::with_default(subscriber, || {
-            state.check_watchdog();
+            event.warn_stuck(stuck_for);
         });
 
         handle.assert_finished();
@@ -1691,12 +1707,13 @@ mod tests {
         // Progress was just noted; nowhere near `WATCHDOG_STUCK_THRESHOLD`.
         state.last_progress = Instant::now();
 
-        state.check_watchdog();
+        let stuck = state.check_watchdog();
 
         assert!(
-            state.last_watchdog_warn.is_none(),
+            stuck.is_none(),
             "a queue that is merely busy, not stuck, should not warn"
         );
+        assert!(state.last_watchdog_warn.is_none());
     }
 
     #[test]
@@ -1706,12 +1723,13 @@ mod tests {
         // an idle queue, not a stuck one.
         state.last_progress = Instant::now() - WATCHDOG_STUCK_THRESHOLD - Duration::from_secs(1);
 
-        state.check_watchdog();
+        let stuck = state.check_watchdog();
 
         assert!(
-            state.last_watchdog_warn.is_none(),
+            stuck.is_none(),
             "an idle queue with no outstanding demand should not warn"
         );
+        assert!(state.last_watchdog_warn.is_none());
     }
 
     #[test]
@@ -1720,14 +1738,19 @@ mod tests {
         state.pending_requests.push(make_task(0, false));
         state.last_progress = Instant::now() - WATCHDOG_STUCK_THRESHOLD - Duration::from_secs(1);
 
-        state.check_watchdog();
+        let first_stuck = state.check_watchdog();
+        assert!(first_stuck.is_some(), "first check should have warned");
         let first_warn = state
             .last_watchdog_warn
             .expect("first check should have warned");
 
         // Still stuck, immediately re-checked: within `WATCHDOG_WARN_DEBOUNCE`,
-        // so the timestamp must not move.
-        state.check_watchdog();
+        // so the timestamp must not move and no new event should be handed back.
+        let second_stuck = state.check_watchdog();
+        assert!(
+            second_stuck.is_none(),
+            "a repeat check inside the debounce window should not return a new warning"
+        );
         assert_eq!(
             state.last_watchdog_warn,
             Some(first_warn),
