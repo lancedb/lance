@@ -42,6 +42,7 @@ use lance::dataset::scanner::{
     AggregateExpr, ColumnOrdering, DatasetRecordBatchStream, ExecutionStatsCallback, ExprFilter,
     MaterializationStyle, QueryFilter, RowAddrMask, RowAddrTreeMap,
 };
+use datafusion_common::ScalarValue;
 use lance::dataset::statistics::{DataStatistics, DatasetStatisticsExt};
 use lance::dataset::{
     BatchInfo, BatchUDF, CommitBuilder, MergeStats, NewColumnTransform, UDFCheckpointStore,
@@ -822,6 +823,18 @@ impl From<DatasetBasePath> for BasePath {
             py_base_path.is_dataset_root,
         )
     }
+}
+
+/// Convert a DataFusion scalar to a Python value via a one-element PyArrow array.
+fn scalar_value_to_py(py: Python<'_>, value: ScalarValue) -> PyResult<Py<PyAny>> {
+    if value.is_null() {
+        return Ok(py.None());
+    }
+    let array = value
+        .to_array()
+        .map_err(|err| PyValueError::new_err(err.to_string()))?;
+    let py_array = array.to_data().to_pyarrow(py)?;
+    Ok(py_array.get_item(0)?.call_method0("as_py")?.unbind())
 }
 
 /// Lance Dataset that will be wrapped by another class in Python
@@ -3016,6 +3029,25 @@ impl Dataset {
         rt().block_on(None, self.ds.calculate_data_stats())?
             .infer_error()
             .map(PyLance)
+    }
+
+    /// Global `[min, max]` for `column` from its ZoneMap index, without a scan.
+    ///
+    /// `None` when the column has no ZoneMap, the index does not cover every
+    /// live fragment, a newer data overlay can move values outside the
+    /// summaries, or the column contains NaN.
+    #[pyo3(signature = (column))]
+    fn column_value_range(
+        &self,
+        py: Python<'_>,
+        column: String,
+    ) -> PyResult<Option<(Py<PyAny>, Py<PyAny>)>> {
+        let range = rt()
+            .block_on(None, self.ds.statistics().column_value_range(&column))?
+            .infer_error()?;
+        range
+            .map(|(lo, hi)| Ok((scalar_value_to_py(py, lo)?, scalar_value_to_py(py, hi)?)))
+            .transpose()
     }
 
     fn get_fragments(self_: PyRef<'_, Self>) -> PyResult<Vec<FileFragment>> {
