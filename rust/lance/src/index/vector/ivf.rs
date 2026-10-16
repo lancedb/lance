@@ -5044,10 +5044,11 @@ fn train_weighted_hierarchical_f32_kmeans(
         }
     }
 
-    // A k-means split can leave every row on one side even when the rows
-    // differ, which happens under Dot, and the cluster is then finalized whole.
-    // Bisect such clusters by L2 until `target_k` is reached, so the count
-    // falls short only when the coreset holds fewer distinct rows.
+    // The split loop can stop with multi-row clusters left: a k-means split can
+    // leave every row on one side even when the rows differ, which happens
+    // under Dot, and a singleton at the top of the heap ends the loop. Bisect
+    // the remaining multi-row clusters by L2 until `target_k` is reached, so
+    // the count falls short only when the coreset holds fewer distinct rows.
     let mut clusters = heap.into_vec();
     let mut unsplittable = Vec::new();
     while clusters.len() + unsplittable.len() < target_k {
@@ -5081,7 +5082,7 @@ fn train_weighted_hierarchical_f32_kmeans(
         // rows than `target_k`.
         if data.len() < target_k {
             // Not the data's fault: the coreset summarizing the training sample
-            // is smaller than the partition count, as Dot's can be when each
+            // is smaller than the partition count, as Dot's can be when its only
             // chunk samples exactly `num_partitions` rows.
             return Err(Error::invalid_input(format!(
                 "Cannot create {target_k} IVF partitions from {} weighted coreset rows: the \
