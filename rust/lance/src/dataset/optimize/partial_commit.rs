@@ -30,6 +30,8 @@ pub struct CompactionCommitResult {
 /// each retry. The original task read versions remain authoritative. Exhausting all
 /// groups returns a conflict error. Uncommitted files are left for garbage collection.
 /// Inline index remapping requires atomic completion and is rejected.
+/// Retries continue while valid groups remain and the dataset advances; there is
+/// no overall retry budget. Callers own cancellation and any enclosing job deadline.
 ///
 /// ```no_run
 /// # use std::sync::Arc;
