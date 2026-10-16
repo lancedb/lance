@@ -28,15 +28,14 @@ SOFTWARE.
 */
 
 // Function-word allowlist adapted from https://github.com/lance-format/lance/pull/10069.
-// A positive list avoids deleting shared Han content words from Japanese text.
-// Preserve negation (不是 and 没有) so that searches retain their polarity.
+// Keep core function words; preserve interjections, content senses and negation.
+// ICU shares this list across languages, so Han homographs require conservative curation.
+// 的 remains a core Chinese stop word despite its Japanese content sense.
 pub(super) const CHINESE: &[&str] = &[
     // particles, aspect markers and modal particles
     "的",
     "了",
-    "着",
     "过",
-    "得",
     "之",
     "乎",
     "也",
@@ -170,7 +169,6 @@ pub(super) const CHINESE: &[&str] = &[
     "向",
     "到",
     "至",
-    "由",
     "为",
     "以",
     "按",
@@ -185,58 +183,23 @@ pub(super) const CHINESE: &[&str] = &[
     // auxiliaries and common verbs used as function words
     "是",
     "有",
-    "可",
-    "将",
     "就",
     "乃",
-    "所",
     "该",
-    "等",
     "另",
-    "别",
     "就是",
     "是否",
     "是的",
     "已经",
     "可以",
     "还有",
-    // interjections
-    "哎",
-    "唉",
-    "哦",
-    "嗯",
-    "喂",
-    "哈",
-    "哇",
-    "哟",
-    "呃",
-    "呵",
-    "嘿",
-    "嘻",
-    "咦",
-    "呗",
-    "呜",
-    "哼",
-    "嗳",
-    "嗬",
-    "喏",
-    "哩",
-    "啐",
-    "呸",
-    "吱",
-    "咚",
-    "嘎",
-    "嘘",
-    "哗",
-    "咳",
-    "呕",
     // Traditional Chinese forms retained from the existing curation.
     "嗎",
     "我們",
     "你們",
 ];
 
-// Preserve grammatical filtering while retaining content, numbers and polarity.
+// Preserve reviewed content words, modifiers and negative markers.
 pub(super) const JAPANESE: &[&str] = &[
     "あそこ",
     "あっ",
@@ -252,7 +215,6 @@ pub(super) const JAPANESE: &[&str] = &[
     "います",
     "いる",
     "う",
-    "うち",
     "え",
     "お",
     "および",
@@ -299,17 +261,13 @@ pub(super) const JAPANESE: &[&str] = &[
     "と",
     "という",
     "といった",
-    "とき",
-    "ところ",
     "として",
     "とともに",
     "とも",
     "と共に",
     "どこ",
     "どの",
-    "な",
     "なお",
-    "なかっ",
     "ながら",
     "なっ",
     "など",
@@ -331,7 +289,6 @@ pub(super) const JAPANESE: &[&str] = &[
     "に関する",
     "の",
     "ので",
-    "のみ",
     "は",
     "ば",
     "へ",
@@ -342,7 +299,6 @@ pub(super) const JAPANESE: &[&str] = &[
     "または",
     "まで",
     "も",
-    "もの",
     "ものの",
     "や",
     "よう",
@@ -353,13 +309,10 @@ pub(super) const JAPANESE: &[&str] = &[
     "れ",
     "れる",
     "を",
-    "ん",
     "何",
     "及び",
     "彼",
-    "彼女",
     "我々",
-    "特に",
     "私",
     "私達",
     "貴方",
@@ -367,7 +320,6 @@ pub(super) const JAPANESE: &[&str] = &[
 ];
 
 // These valid monolingual stop words have content meanings in other languages.
-// Language-specific additions remain opt-in instead of widening the ICU union.
 pub(super) const UNION_EXCLUSIONS: &[&str] = &["和", "私"];
 
 #[cfg(test)]
@@ -378,7 +330,7 @@ mod tests {
 
     #[test]
     fn preserves_cjk_search_terms() {
-        let text = "取得 表示 使用 必要 全部 以上 以下 可能 一般 今後 最近 部分 以前 以後 相当 当然 普通 出来 本 朝 用 地 前面 十分 大量 左右 最後 多数 一致 自己 非常 所有 结果 和 私 ない できる 不是 没有 不能";
+        let text = "取得 表示 使用 必要 全部 以上 以下 可能 一般 今後 最近 部分 以前 以後 相当 当然 普通 出来 本 朝 用 地 前面 十分 大量 左右 最後 多数 一致 自己 非常 所有 结果 和 私 ない できる 不是 没有 不能 哎 唉 哦 嗯 喂 哈 哇 哟 呃 呵 嘿 嘻 咦 呗 呜 哼 嗳 嗬 喏 哩 啐 呸 吱 咚 嘎 嘘 哗 咳 呕 着 得 由 可 将 所 等 别 うち とき ところ 特に な なかっ ん のみ もの 彼女";
         for split in [false, true] {
             for stem in [false, true] {
                 let base = if split {
@@ -416,7 +368,10 @@ mod tests {
 
     #[test]
     fn retains_cjk_function_word_filtering() {
-        for word in ["的", "了", "是", "の", "を", "は", "嗎", "我們", "你們"] {
+        for word in [
+            "的", "了", "是", "我", "你", "他", "啊", "呀", "嘛", "啦", "吗", "吧", "呢", "の",
+            "を", "は", "嗎", "我們", "你們",
+        ] {
             let mut analyzer = TextAnalyzer::builder(RawTokenizer::default())
                 .filter(StopWordFilter::all())
                 .build();
