@@ -393,9 +393,7 @@ impl IoQueue {
             }
 
             // Timeout occasionally to check if we need to emit a warning of potential
-            // deadlock. Requires a runtime with a time driver enabled
-            // (`enable_time()`/`enable_all()`) - see `vector_throughput`'s
-            // runtime builder for the in-tree example this bit us on.
+            // deadlock.
             if tokio::time::timeout(WATCHDOG_CHECK_INTERVAL, self.notify.notified())
                 .await
                 .is_err()
