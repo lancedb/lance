@@ -232,6 +232,19 @@ impl<'a> BatchDistances<'a> {
         self.buffer_len = num_vectors;
         true
     }
+
+    /// Kept out of line so that `next`, which reaches this once per buffer,
+    /// stays a leaf. Inlined, the kernel call makes every `next` save and
+    /// restore registers, which doubles the cost of a dimension-8 distance
+    /// behind `cosine_batch`'s boxed iterator.
+    #[cold]
+    fn refill_and_next(&mut self) -> Option<f32> {
+        if !self.refill() {
+            return None;
+        }
+        self.buffer_index = 1;
+        Some(self.buffer[0])
+    }
 }
 
 impl Iterator for BatchDistances<'_> {
@@ -239,8 +252,8 @@ impl Iterator for BatchDistances<'_> {
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        if self.buffer_index == self.buffer_len && !self.refill() {
-            return None;
+        if self.buffer_index == self.buffer_len {
+            return self.refill_and_next();
         }
         let value = self.buffer[self.buffer_index];
         self.buffer_index += 1;

@@ -1127,21 +1127,51 @@ where
     debug_assert_eq!(from.len(), dimension);
 
     // TODO: if we detect there is a run of nulls, should we skip those?
-    let to_values =
-        to.values()
-            .as_any()
-            .downcast_ref::<T::ArrayType>()
-            .ok_or(Error::InvalidArgumentError(format!(
-                "`to` values have data type {}, expected {} to match `from`",
-                to.values().data_type(),
-                from.data_type()
-            )))?;
+    let to_values = downcast_to_values::<T>(from, to)?;
     let dists = cosine_distance_batch(from.as_slice(), to_values.as_slice(), dimension);
 
     Ok(Arc::new(Float32Array::new(
         dists.collect(),
         to.nulls().cloned(),
     )))
+}
+
+/// The f32 case of [`do_cosine_distance_arrow_batch`], which writes every
+/// distance with one batch kernel call instead of going through the boxed
+/// iterator of [`Cosine::cosine_batch`] one distance at a time.
+fn do_cosine_distance_arrow_batch_f32(
+    from: &Float32Array,
+    to: &FixedSizeListArray,
+) -> Result<Arc<Float32Array>> {
+    let dimension = to.value_length() as usize;
+    let (from, batch) = (
+        from.as_slice(),
+        downcast_to_values::<Float32Type>(from, to)?.as_slice(),
+    );
+    assert_batch_layout(from.len(), batch.len(), dimension);
+
+    let mut distances = vec![0.0; batch.len() / dimension];
+    COSINE_F32_BATCH
+        .get()
+        .call(from, batch, dimension, &mut distances);
+    Ok(Arc::new(Float32Array::new(
+        distances.into(),
+        to.nulls().cloned(),
+    )))
+}
+
+fn downcast_to_values<'a, T: ArrowFloatType>(
+    from: &T::ArrayType,
+    to: &'a FixedSizeListArray,
+) -> Result<&'a T::ArrayType> {
+    to.values()
+        .as_any()
+        .downcast_ref::<T::ArrayType>()
+        .ok_or(Error::InvalidArgumentError(format!(
+            "`to` values have data type {}, expected {} to match `from`",
+            to.values().data_type(),
+            from.data_type()
+        )))
 }
 
 /// Compute Cosine distance between a vector and a batch of vectors.
@@ -1169,9 +1199,9 @@ pub fn cosine_distance_arrow_batch(
 ) -> Result<Arc<Float32Array>> {
     match *from.data_type() {
         DataType::Float16 => do_cosine_distance_arrow_batch::<Float16Type>(from.as_primitive(), to),
-        DataType::Float32 => do_cosine_distance_arrow_batch::<Float32Type>(from.as_primitive(), to),
+        DataType::Float32 => do_cosine_distance_arrow_batch_f32(from.as_primitive(), to),
         DataType::Float64 => do_cosine_distance_arrow_batch::<Float64Type>(from.as_primitive(), to),
-        DataType::Int8 => do_cosine_distance_arrow_batch::<Float32Type>(
+        DataType::Int8 => do_cosine_distance_arrow_batch_f32(
             &int8_query_to_f32(from.as_primitive::<Int8Type>())?,
             &to.convert_to_floating_point()?,
         ),
@@ -1434,6 +1464,36 @@ mod tests {
             prop_assume!(norm_l2(&x) > 1e-6);
             prop_assume!(norm_l2(&y) > 1e-6);
             do_cosine_test(&x, &y)?;
+        }
+    }
+
+    /// The f32 arrow path fills every distance with one batch kernel call; it
+    /// must match the per-vector `cosine` and keep the targets' nulls.
+    #[rstest::rstest]
+    #[case::dim_8(8)]
+    #[case::dim_40(40)]
+    fn test_cosine_arrow_batch_f32_matches_per_vector(#[case] dimension: usize) {
+        let num_vectors = 70;
+        let x: Vec<f32> = (0..dimension)
+            .map(|index| (index % 13) as f32 * 0.25 + 1.0)
+            .collect();
+        let batch: Vec<f32> = (0..dimension * num_vectors)
+            .map(|index| (index % 11) as f32 * 0.5 - 2.0)
+            .collect();
+        let nulls = arrow_buffer::NullBuffer::from_iter((0..num_vectors).map(|i| i % 3 != 0));
+        let to = FixedSizeListArray::try_new(
+            Arc::new(arrow_schema::Field::new("item", DataType::Float32, true)),
+            dimension as i32,
+            Arc::new(Float32Array::from(batch.clone())),
+            Some(nulls.clone()),
+        )
+        .unwrap();
+
+        let got = cosine_distance_arrow_batch(&Float32Array::from(x.clone()), &to).unwrap();
+
+        assert_eq!(got.nulls(), Some(&nulls));
+        for (got, vector) in got.values().iter().zip(batch.chunks_exact(dimension)) {
+            assert_relative_eq!(*got, f32::cosine(&x, vector), max_relative = 1e-5);
         }
     }
 
