@@ -27,7 +27,7 @@ use lance_file::versions::v1::reader::FileReader as V1FileReader;
 use lance_index::INDEX_METADATA_SCHEMA_KEY;
 pub use lance_index::IndexParams;
 use lance_index::frag_reuse::{
-    CompactFragReuseIndex, CompactFragReuseIndexHandle, FRAG_REUSE_INDEX_NAME,
+    CompactFragReuseIndex, CompactFragReuseIndexHandle, FRAG_REUSE_INDEX_NAME, FragReuseVersion,
 };
 use lance_index::mem_wal::{MEM_WAL_INDEX_NAME, MemWalIndex, MemWalIndexHandle};
 use lance_index::optimize::OptimizeOptions;
@@ -587,10 +587,54 @@ async fn indexed_data_differs(
     revives_rows(before, after, then, now).await
 }
 
+/// The fragments of a segment's build snapshot that the recorded rewrites
+/// chained into `fragment`, which compaction produced after the build at
+/// `version`: each source the snapshot does not hold is followed back to the
+/// group, recorded at or after `version`, that produced it. `None` when a link
+/// is missing, a source neither the snapshot holds nor a recorded group
+/// produced, so the segment's rows there cannot be traced to the build.
+///
+/// A group that produced several fragments gives them the same sources, so
+/// repeated compactions reach a fragment along many paths: each fragment is
+/// followed once, which keeps the work within the fragments the history names.
+fn sources_at_build(
+    versions: &[FragReuseVersion],
+    version: u64,
+    fragment: u32,
+    is_built: impl Fn(u32) -> bool,
+) -> Option<Vec<u32>> {
+    let mut sources = Vec::new();
+    let mut visited = RoaringBitmap::new();
+    let mut pending = vec![fragment];
+    while let Some(fragment) = pending.pop() {
+        if !visited.insert(fragment) {
+            continue;
+        }
+        if is_built(fragment) {
+            sources.push(fragment);
+            continue;
+        }
+        let group = versions
+            .iter()
+            .filter(|reuse| reuse.dataset_version >= version)
+            .flat_map(|reuse| reuse.groups.iter())
+            .find(|group| {
+                group
+                    .new_frags
+                    .iter()
+                    .any(|produced| produced.id as u32 == fragment)
+            })?;
+        pending.extend(group.old_frags.iter().map(|source| source.id as u32));
+    }
+    Some(sources)
+}
+
 /// The version each covered fragment's index entries describe: its segment's
-/// version, or for a fragment a later compaction produced, that compaction's
-/// inputs at the segment's version. `None` for a fragment whose segment's
-/// version has been cleaned up, or that fits neither.
+/// version, or for a fragment compactions produced after the build, the
+/// fragments of the segment's version that they rewrote into it, through every
+/// recorded rewrite in between ([`sources_at_build`]). `None` for a fragment
+/// whose segment's version has been cleaned up, or whose chain of rewrites is
+/// not fully recorded.
 async fn build_provenance(
     history: &mut History<'_>,
     frag_reuse_index: &CompactFragReuseIndex,
@@ -610,26 +654,16 @@ async fn build_provenance(
                 provenance.entry(fragment).or_insert(None);
                 continue;
             };
-            if built_at.fragment(fragment).is_some() {
-                provenance.entry(fragment).or_insert(Some(version));
-                continue;
-            }
-            let group = frag_reuse_index
-                .details
-                .versions
-                .iter()
-                .filter(|reuse| reuse.dataset_version >= version)
-                .flat_map(|reuse| reuse.groups.iter())
-                .find(|group| {
-                    group
-                        .new_frags
-                        .iter()
-                        .any(|produced| produced.id as u32 == fragment)
-                });
-            match group {
-                Some(group) => {
-                    for source in &group.old_frags {
-                        provenance.entry(source.id as u32).or_insert(Some(version));
+            let sources = sources_at_build(
+                &frag_reuse_index.details.versions,
+                version,
+                fragment,
+                |id| built_at.fragment(id).is_some(),
+            );
+            match sources {
+                Some(sources) => {
+                    for source in sources {
+                        provenance.entry(source).or_insert(Some(version));
                     }
                 }
                 None => {
@@ -710,7 +744,14 @@ async fn fresh_fragments(
                 };
             }
             for new in &group.new_frags {
-                following.insert(new.id as u32, committed.filter(|_| !stale));
+                let new = new.id as u32;
+                // A covered fragment whose entries could not be dated stays
+                // out, though another covered fragment's sources lead to the
+                // group that produced it: those vouch for none of the group's
+                // other inputs.
+                if following.get(&new) != Some(&None) {
+                    following.insert(new, committed.filter(|_| !stale));
+                }
             }
         }
     }
@@ -5091,7 +5132,9 @@ mod tests {
     use crate::dataset::{WriteMode, WriteParams};
     use crate::index::vector::VectorIndexParams;
     use crate::session::Session;
-    use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount, copy_test_data_to_tmp};
+    use crate::utils::test::{
+        DatagenExt, FragmentCount, FragmentRowCount, compact_into_two, copy_test_data_to_tmp,
+    };
     use arrow::array::AsArray;
     use arrow::datatypes::{Float32Type, Int32Type, Int64Type};
     use arrow_array::Int32Array;
@@ -11524,6 +11567,161 @@ mod tests {
         );
     }
 
+    #[rstest::rstest]
+    #[case::retained_row_ids(false)]
+    #[case::retained_row_addresses(true)]
+    #[tokio::test]
+    async fn test_staged_btree_row_domains_reject_partial_migration(
+        #[case] retain_row_addresses: bool,
+    ) {
+        let dir = copy_test_data_to_tmp("v14.0.0-beta.15/stable_row_id_btree.lance").unwrap();
+        let mut dataset = Dataset::open(&dir.path_str()).await.unwrap();
+        assert!(dataset.manifest.uses_stable_row_ids());
+        let legacy = dataset.load_indices_by_name("value_idx").await.unwrap();
+        assert_eq!(legacy.len(), 2);
+        assert!(
+            legacy
+                .iter()
+                .all(|segment| !segment.results_are_row_addrs())
+        );
+        let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::BTree);
+        let mut current = Vec::with_capacity(2);
+        for fragment_id in [0, 1] {
+            current.push(
+                dataset
+                    .create_index_builder(&["value"], IndexType::BTree, &params)
+                    .name("value_idx".into())
+                    .replace(true)
+                    .fragments(vec![fragment_id])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+            );
+        }
+        assert!(
+            current
+                .iter()
+                .all(|segment| segment.results_are_row_addrs())
+        );
+        if retain_row_addresses {
+            dataset
+                .commit_existing_index_segments("value_idx", "value", current.clone())
+                .await
+                .unwrap();
+        }
+        dataset = Dataset::open(&dir.path_str()).await.unwrap();
+        let before_version = dataset.version_id();
+        let before = dataset.load_indices_by_name("value_idx").await.unwrap();
+        let incoming = if retain_row_addresses {
+            legacy[0].clone()
+        } else {
+            current[0].clone()
+        };
+        let error = dataset
+            .commit_existing_index_segments("value_idx", "value", vec![incoming])
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(error.to_string().contains("mixes row-ID and row-address"));
+        let mut dataset = Dataset::open(&dir.path_str()).await.unwrap();
+        assert_eq!(dataset.version_id(), before_version);
+        assert_eq!(
+            dataset.load_indices_by_name("value_idx").await.unwrap(),
+            before
+        );
+        for (filter, expected) in [("value = 1", 1), ("value = 9", 1), ("value IS NULL", 2)] {
+            for indexed in [false, true] {
+                let mut scan = dataset.scan();
+                scan.filter(filter).unwrap().use_scalar_index(indexed);
+                assert_eq!(scan.try_into_batch().await.unwrap().num_rows(), expected);
+            }
+        }
+        // A complete migration remains valid: no legacy sibling survives it.
+        dataset
+            .commit_existing_index_segments("value_idx", "value", current)
+            .await
+            .unwrap();
+        assert!(
+            dataset
+                .load_indices_by_name("value_idx")
+                .await
+                .unwrap()
+                .iter()
+                .all(|segment| segment.results_are_row_addrs())
+        );
+        assert_eq!(
+            dataset.count_rows(Some("value = 9".into())).await.unwrap(),
+            1
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::legacy_first(false, false)]
+    #[case::address_first(true, false)]
+    #[case::transaction_boundary(false, true)]
+    #[tokio::test]
+    async fn test_staged_btree_row_domains_reject_mixed_incoming(
+        #[case] reverse: bool,
+        #[case] direct_transaction: bool,
+    ) {
+        let dir = copy_test_data_to_tmp("v14.0.0-beta.15/stable_row_id_btree.lance").unwrap();
+        let mut dataset = Dataset::open(&dir.path_str()).await.unwrap();
+        let legacy = dataset.load_indices_by_name("value_idx").await.unwrap();
+        let first = legacy
+            .iter()
+            .find(|segment| segment.fragment_bitmap.as_ref().unwrap().contains(0))
+            .unwrap()
+            .clone();
+        let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::BTree);
+        let current = dataset
+            .create_index_builder(&["value"], IndexType::BTree, &params)
+            .name("value_idx".into())
+            .replace(true)
+            .fragments(vec![1])
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        let mut incoming = vec![first, current];
+        if reverse {
+            incoming.reverse();
+        }
+        let version = dataset.version_id();
+        let error = if direct_transaction {
+            dataset
+                .apply_commit(
+                    Transaction::new(
+                        version,
+                        Operation::CreateIndex {
+                            new_indices: incoming,
+                            removed_indices: legacy.clone(),
+                        },
+                        None,
+                    ),
+                    &Default::default(),
+                    &Default::default(),
+                )
+                .await
+                .unwrap_err()
+        } else {
+            dataset
+                .commit_existing_index_segments("value_idx", "value", incoming)
+                .await
+                .unwrap_err()
+        };
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(error.to_string().contains("mixes row-ID and row-address"));
+        let dataset = Dataset::open(&dir.path_str()).await.unwrap();
+        assert_eq!(dataset.version_id(), version);
+        assert_eq!(
+            dataset.load_indices_by_name("value_idx").await.unwrap(),
+            legacy
+        );
+        assert_eq!(
+            dataset.count_rows(Some("value = 9".into())).await.unwrap(),
+            1
+        );
+    }
+
     #[tokio::test]
     async fn test_commit_existing_index_segments_commits_multiple_segments() {
         use lance_datagen::{BatchCount, RowCount, array};
@@ -15164,5 +15362,137 @@ mod tests {
             distance > 1_000.0,
             "nearest distance {distance} should reflect the rewritten vectors, not stale postings"
         );
+    }
+
+    /// `fragments` fragments of 10 rows of `i`, with a BTree index on it so
+    /// that deferred compactions record their groups. Returns the table and
+    /// the fragments the index was built over.
+    async fn recording_btree_table(uri: &str, fragments: u32) -> (Dataset, RoaringBitmap) {
+        let mut dataset = gen_batch()
+            .col("i", array::step::<Int32Type>())
+            .into_dataset_with_params(
+                uri,
+                FragmentCount::from(fragments),
+                FragmentRowCount::from(10),
+                Some(WriteParams {
+                    max_rows_per_file: 10,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["i"],
+                IndexType::BTree,
+                Some("i_idx".into()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        let built = dataset
+            .manifest
+            .fragments
+            .iter()
+            .map(|fragment| fragment.id as u32)
+            .collect();
+        (dataset, built)
+    }
+
+    /// Twelve compactions each rewrite both fragments into two, so both
+    /// outputs come from both inputs and a current fragment reaches every
+    /// earlier one along many paths. Traced back to the index's build, each
+    /// fragment is followed once: the work stays within the fragments the
+    /// history names, and the build's two fragments come back once each.
+    #[tokio::test]
+    async fn test_sources_at_build_follows_each_shared_ancestor_once() {
+        let dir = TempStrDir::default();
+        let (mut dataset, built) = recording_btree_table(dir.as_str(), 2).await;
+        let version = dataset.manifest.version;
+        for _ in 0..12 {
+            let current = dataset
+                .manifest
+                .fragments
+                .iter()
+                .map(|fragment| fragment.id)
+                .collect::<Vec<_>>();
+            compact_into_two(&mut dataset, &current).await;
+        }
+        let history = dataset.frag_reuse_index().await.unwrap().unwrap();
+        let versions = &history.details.versions;
+        let named = versions
+            .iter()
+            .flat_map(|reuse| reuse.old_frag_ids().into_iter().chain(reuse.new_frag_ids()))
+            .map(|id| id as u32)
+            .collect::<RoaringBitmap>();
+        assert_eq!((versions.len(), named.len()), (12, 26));
+
+        for fragment in dataset.manifest.fragments.iter() {
+            let visits = std::cell::Cell::new(0);
+            let mut sources = sources_at_build(versions, version, fragment.id as u32, |id| {
+                visits.set(visits.get() + 1);
+                built.contains(id)
+            })
+            .unwrap();
+            assert!(
+                visits.get() <= named.len(),
+                "tracing fragment {} took {} visits and returned {} sources",
+                fragment.id,
+                visits.get(),
+                sources.len()
+            );
+            sources.sort_unstable();
+            assert_eq!(sources, [0, 1]);
+        }
+    }
+
+    /// Compactions rewrite fragments 0 and 1 into 4 and 5, 2 and 3 into 6 and
+    /// 7, then 5 and 6 into 8 and 9. The index is caught up past the first
+    /// one, so a cleanup trims its record: 4 and 5 no longer trace to the
+    /// build, and neither do 8 and 9, though their other source, 6, does, as 7
+    /// still does.
+    #[tokio::test]
+    async fn test_sources_at_build_fails_on_a_missing_link_beside_a_traced_one() {
+        let dir = TempStrDir::default();
+        let (mut dataset, built) = recording_btree_table(dir.as_str(), 4).await;
+        let version = dataset.manifest.version;
+        let first = compact_into_two(&mut dataset, &[0, 1]).await;
+        crate::dataset::optimize::remapping::remap_column_index(
+            &mut dataset,
+            &["i"],
+            Some("i_idx".into()),
+        )
+        .await
+        .unwrap();
+        let second = compact_into_two(&mut dataset, &[2, 3]).await;
+        let third = compact_into_two(&mut dataset, &[first[1], second[0]]).await;
+        let trace = |versions: &[FragReuseVersion], fragment: u64| {
+            sources_at_build(versions, version, fragment as u32, |id| built.contains(id)).map(
+                |mut sources| {
+                    sources.sort_unstable();
+                    sources
+                },
+            )
+        };
+        let recorded = dataset.frag_reuse_index().await.unwrap().unwrap();
+        assert_eq!(
+            trace(&recorded.details.versions, third[0]),
+            Some(vec![0, 1, 2, 3])
+        );
+
+        crate::dataset::index::frag_reuse::cleanup_frag_reuse_index(&mut dataset)
+            .await
+            .unwrap();
+        let kept = dataset.frag_reuse_index().await.unwrap().unwrap();
+        assert_eq!(kept.details.versions.len(), 2);
+        for fragment in [first[0], third[0], third[1]] {
+            assert_eq!(
+                trace(&kept.details.versions, fragment),
+                None,
+                "fragment {fragment}"
+            );
+        }
+        assert_eq!(trace(&kept.details.versions, second[1]), Some(vec![2, 3]));
     }
 }

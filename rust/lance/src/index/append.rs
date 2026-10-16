@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::HashMap;
+use std::collections::{HashMap, hash_map::Entry};
 use std::sync::Arc;
 
 use futures::{FutureExt, TryStreamExt};
 use lance_core::{Error, Result};
 use lance_file::reader::FileReaderOptions;
+use lance_file::versions::data_file_columns;
 use lance_index::{
     INDEX_FILE_NAME, IndexType,
     frag_reuse::CompactFragReuseIndex,
@@ -363,39 +364,56 @@ pub async fn build_per_segment_filters(
     Ok((effective_union, filters))
 }
 
-/// Attempt to read seed buffers for `column_name` from `fragments`' data files.
+/// Attempt to read seed buffers for `index` from `fragments`' data files.
 ///
-/// Returns `Some(vec)` only if every fragment has a seed entry; returns `None`
-/// if any fragment is missing a seed or its data file cannot be opened.
+/// Returns `Some(vec)` only if every fragment has a seed entry whose field
+/// identity can be verified; returns `None` if a seed is missing, its file
+/// cannot be opened, or its physical column mapping cannot be verified.
 /// Index-type-specific validation (e.g. `rows_per_zone` checks) is left to the
 /// caller via [`FragmentSeed::metadata_value`].
 async fn try_harvest_seeds(
     dataset: &Dataset,
     fragments: &[Fragment],
-    column_name: &str,
+    index: &IndexMetadata,
 ) -> Result<Option<Vec<FragmentSeed>>> {
     if fragments.is_empty() {
         return Ok(Some(Vec::new()));
     }
 
-    let meta_key = format!("{}{}", SEED_META_KEY_PREFIX, column_name);
+    // SeedCollector writes seeds only for top-level keyed fields. A nested
+    // leaf can share its name with a different, seeded top-level column.
+    let Some(field_id) = index.keyed_field() else {
+        return Ok(None);
+    };
+    let Some(field) = dataset.schema().fields.iter().find(|f| f.id == field_id) else {
+        return Ok(None);
+    };
     let mut seeds = Vec::with_capacity(fragments.len());
-
-    let scheduler = ScanScheduler::new(
-        dataset.object_store.clone(),
-        SchedulerConfig::max_bandwidth(&dataset.object_store),
-    );
+    let mut schedulers = HashMap::new();
 
     for fragment in fragments {
-        let Some(data_file) = fragment.files.first() else {
+        // A column replacement can retain an older file for other columns.
+        // Its seed still describes the old values, even after the manifest
+        // stops mapping this column to that file.
+        let Some(data_file) = fragment.files.iter().rev().find(|file| {
+            file.schema(dataset.schema())
+                .field_by_id(field.id)
+                .is_some()
+        }) else {
             return Ok(None);
         };
 
         let path = dataset
-            .base
-            .clone()
-            .join(crate::dataset::DATA_DIR)
+            .data_file_dir(data_file)?
             .join(data_file.path.as_str());
+        let scheduler = match schedulers.entry(data_file.base_id) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => {
+                let store = dataset.object_store(data_file.base_id).await?;
+                let config = SchedulerConfig::max_bandwidth(&store);
+                entry.insert(ScanScheduler::new(store, config))
+            }
+        };
         let Ok(file_scheduler) = scheduler.open_file(&path, &CachedFileSize::unknown()).await
         else {
             return Ok(None);
@@ -413,13 +431,41 @@ async fn try_harvest_seeds(
             return Ok(None);
         };
 
-        let Some(meta_value) = reader
-            .metadata()
-            .file_schema
-            .metadata
-            .get(&meta_key)
-            .cloned()
+        // Renames preserve the manifest's field IDs, but seed keys retain
+        // the names used when writing the file. Resolve the stored field
+        // through its physical column, since field IDs can also be remapped.
+        let Some((_, column_index)) = data_file
+            .fields
+            .iter()
+            .zip(data_file.column_indices.iter())
+            .find(|(id, column_index)| **id == field.id && **column_index >= 0)
         else {
+            return Ok(None);
+        };
+        let metadata = reader.metadata();
+        let file_schema = &metadata.file_schema;
+        let (stored_ids, stored_columns) = data_file_columns(metadata.version, file_schema);
+        // Blob footers can retain descriptor fields without physical columns.
+        // Their inferred positions must not select another column's seed.
+        if stored_columns.len() != metadata.column_metadatas.len() {
+            return Ok(None);
+        }
+        let Some((stored_id, _)) = stored_ids
+            .iter()
+            .zip(&stored_columns)
+            .find(|(_, stored_column)| *stored_column == column_index)
+        else {
+            return Ok(None);
+        };
+        let Some(stored_field) = file_schema
+            .fields
+            .iter()
+            .find(|stored| stored.id == *stored_id && stored.data_type() == field.data_type())
+        else {
+            return Ok(None);
+        };
+        let meta_key = format!("{}{}", SEED_META_KEY_PREFIX, stored_field.name);
+        let Some(meta_value) = file_schema.metadata.get(&meta_key).cloned() else {
             return Ok(None);
         };
 
@@ -756,7 +802,8 @@ async fn merge_scalar_indices<'a>(
         // Only open data files looking for seeds when the plugin confirms this
         // index type and configuration can actually produce them.
         let maybe_created = if plugin.might_use_seeds(&index_details) {
-            if let Some(seeds) = try_harvest_seeds(dataset.as_ref(), unindexed, column_name).await?
+            if let Some(seeds) =
+                try_harvest_seeds(dataset.as_ref(), unindexed, reference_idx).await?
             {
                 plugin
                     .update_from_seeds(seeds, reference_index.clone(), &index_details, &new_store)
@@ -1839,7 +1886,7 @@ mod tests {
     use crate::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched, WriteMode, WriteParams};
     use crate::index::CreateIndexBuilder;
     use crate::index::vector::VectorIndexParams;
-    use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+    use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount, copy_test_data_to_tmp};
 
     #[test]
     fn test_fragment_reuse_at_source_version_affects_segment() {
@@ -4025,130 +4072,60 @@ mod tests {
         }
     }
 
-    /// The same invariant as the append-mode case above, but for
-    /// `num_indices_to_merge: Some(N)` with `N` small enough that the legacy
-    /// segment sits outside the trailing window `select_segments_to_merge`
-    /// picks. A fix scoped to "nothing was selected" (`num_indices_to_merge:
-    /// Some(0)`) would miss this: the legacy segment is just as stray here,
-    /// left beside whatever the merge of the trailing segments produces.
+    /// A trailing merge window must also rebuild legacy segments outside it.
+    /// Use a real pre-migration index: committing a mixture of row domains is
+    /// rejected before optimization can run.
     #[tokio::test]
     async fn test_optimize_btree_merge_rebuilds_legacy_segment_outside_merge_window() {
-        async fn query_id_count(dataset: &Dataset, id: &str) -> usize {
-            dataset
-                .scan()
-                .filter(&format!("id = '{}'", id))
-                .unwrap()
-                .project(&["id"])
-                .unwrap()
-                .try_into_batch()
-                .await
-                .unwrap()
-                .num_rows()
-        }
+        let dir = copy_test_data_to_tmp("v14.0.0-beta.15/stable_row_id_btree.lance").unwrap();
+        let uri = dir.path_str();
+        let mut dataset = Dataset::open(&uri).await.unwrap();
+        assert!(dataset.manifest.uses_stable_row_ids());
+        let legacy = dataset.load_indices_by_name("value_idx").await.unwrap();
+        assert_eq!(legacy.len(), 2);
+        assert!(legacy.iter().all(|index| !index.results_are_row_addrs()));
 
-        let test_dir = TempStrDir::default();
-        let test_uri = test_dir.as_str();
-
-        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)]));
-        let make_batch = |start: i32, end: i32| {
-            let ids = StringArray::from_iter_values((start..end).map(|i| format!("song-{i}")));
-            RecordBatch::try_new(schema.clone(), vec![Arc::new(ids)]).unwrap()
-        };
-
-        // Three fragments, three BTree segments, under stable row ids.
-        let reader = RecordBatchIterator::new(
-            vec![
-                Ok(make_batch(0, 64)),
-                Ok(make_batch(64, 128)),
-                Ok(make_batch(128, 192)),
-            ],
-            schema.clone(),
-        );
-        let mut dataset = Dataset::write(
-            reader,
-            test_uri,
-            Some(WriteParams {
-                max_rows_per_file: 64,
-                enable_stable_row_ids: true,
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
-
-        let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::BTree);
-        let fragments = dataset.get_fragments();
-        assert_eq!(fragments.len(), 3);
-
-        let mut staged_segments = Vec::new();
-        for fragment in &fragments {
-            staged_segments.push(
-                crate::index::create::CreateIndexBuilder::new(
-                    &mut dataset,
-                    &["id"],
-                    IndexType::BTree,
-                    &params,
-                )
-                .name("id_idx".into())
-                .fragments(vec![fragment.id() as u32])
-                .execute_uncommitted()
-                .await
-                .unwrap(),
-            );
-        }
-        // Relabel only the oldest (first) segment as pre-migration row-id
-        // domain -- the one `num_indices_to_merge: Some(2)` below will leave
-        // outside its trailing window.
-        staged_segments[0] = IndexMetadata {
-            index_version: 0,
-            ..staged_segments[0].clone()
-        };
+        let batch = arrow_array::record_batch!(("value", Int32, [Some(20), None])).unwrap();
+        let schema = batch.schema();
         dataset
-            .commit_existing_index_segments("id_idx", "id", staged_segments)
+            .append(RecordBatchIterator::new([Ok(batch)], schema), None)
             .await
             .unwrap();
-        assert_eq!(
-            dataset.load_indices_by_name("id_idx").await.unwrap().len(),
-            3
-        );
+        assert_eq!(dataset.get_fragments().len(), 3);
 
-        let appended = RecordBatchIterator::new(vec![Ok(make_batch(192, 256))], schema.clone());
-        let mut dataset = Dataset::write(
-            appended,
-            test_uri,
-            Some(WriteParams {
-                max_rows_per_file: 64,
-                mode: WriteMode::Append,
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
-
-        // Merge only the trailing 2 old segments with the new data; the
-        // legacy segment (index 0 of 3) is outside this window.
+        // One of the two legacy segments is outside this trailing window.
+        // Both must join the rebuild before its address-domain result commits.
         dataset
-            .optimize_indices(&OptimizeOptions::merge(2))
+            .optimize_indices(&OptimizeOptions::merge(1))
             .await
             .unwrap();
 
-        let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
-        let committed = dataset.load_indices_by_name("id_idx").await.unwrap();
+        let dataset = Dataset::open(&uri).await.unwrap();
+        let committed = dataset.load_indices_by_name("value_idx").await.unwrap();
         assert_eq!(
             committed.len(),
             1,
-            "the legacy segment outside the merge window must still be folded \
-             into the rebuild, not left standing alone: {committed:?}"
+            "the legacy segment outside the merge window must join the rebuild: {committed:?}"
         );
-        assert!(
-            committed[0].results_are_row_addrs(),
-            "the rebuilt segment must be address-domain"
-        );
+        assert!(committed[0].results_are_row_addrs());
+        assert_eq!(committed[0].fragment_bitmap.as_ref().unwrap().len(), 3);
 
-        // In particular, rows the legacy segment alone covers must still be
-        // findable once it is no longer the only segment of its domain.
-        for id in ["song-10", "song-100", "song-200"] {
-            assert_eq!(query_id_count(&dataset, id).await, 1, "missing row {id}");
+        // Check both original fragments and the appended rows, including NULLs.
+        for (filter, expected) in [
+            ("value = 1", 1),
+            ("value = 9", 1),
+            ("value = 20", 1),
+            ("value IS NULL", 3),
+        ] {
+            for indexed in [false, true] {
+                let mut scan = dataset.scan();
+                scan.use_scalar_index(indexed).filter(filter).unwrap();
+                assert_eq!(
+                    scan.try_into_batch().await.unwrap().num_rows(),
+                    expected,
+                    "{filter}, indexed={indexed}"
+                );
+            }
         }
     }
 

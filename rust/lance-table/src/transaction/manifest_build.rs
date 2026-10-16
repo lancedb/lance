@@ -1201,6 +1201,35 @@ impl Transaction {
                     new_index.validate_covering_fields()?;
                 }
                 final_indices.extend(new_indices.clone());
+
+                // Check the final set, including retained siblings, on every
+                // commit attempt. A format migration may change the result
+                // domain without changing the index type.
+                let changed_names = new_indices
+                    .iter()
+                    .map(|index| index.name.as_str())
+                    .collect::<HashSet<_>>();
+                let mut first_segments: HashMap<&str, &IndexMetadata> = HashMap::new();
+                for index in &final_indices {
+                    if !changed_names.contains(index.name.as_str()) {
+                        continue;
+                    }
+                    if let Some(first) = first_segments.get(index.name.as_str()) {
+                        if first.results_are_row_addrs() != index.results_are_row_addrs() {
+                            return Err(Error::invalid_input(format!(
+                                "Index '{}' mixes row-ID and row-address segments {} (version {}) \
+                                 and {} (version {}); rebuild every segment in one commit",
+                                index.name,
+                                first.uuid,
+                                first.index_version,
+                                index.uuid,
+                                index.index_version,
+                            )));
+                        }
+                    } else {
+                        first_segments.insert(index.name.as_str(), index);
+                    }
+                }
             }
             Operation::ReserveFragments { .. } | Operation::UpdateConfig { .. } => {
                 final_fragments.extend(maybe_existing_fragments?.clone());

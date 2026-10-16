@@ -43,8 +43,9 @@ impl InMemoryMemTableRef {
     /// indexes plus the fixed PK bloom filter.
     ///
     /// Usually the term that explains an indexed table's footprint — an HNSW
-    /// index pre-allocates its whole graph on the first insert — so it can dwarf
-    /// row bytes while [`Self::row_bytes`] reads near zero.
+    /// index allocates a fixed part sized by `max_memtable_rows` on the first
+    /// insert — so it can dwarf row bytes while [`Self::row_bytes`] reads near
+    /// zero.
     pub fn index_bytes(&self) -> usize {
         self.index_store.resident_bytes()
             + crate::dataset::mem_wal::memtable::pk_bloom_filter_bytes()
