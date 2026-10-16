@@ -156,6 +156,14 @@ message Manifest {
    *   legacy-form entry in the same manifest -- or set the bit only when no
    *   entry declares covering fields -- and manifests derived from it must keep
    *   the bit set until a reverse conversion is likewise atomic.
+   * * 1 << 16: a referenced data file contains version 1 zone-level statistics
+   *   seeds. Their min/max exclude NaNs, which are counted separately by sign.
+   *   This does not change the ZoneMap index format. Both feature words
+   *   must carry the bit, atomically with the first reference. Unsupported
+   *   readers and writers must refuse the dataset. The bits remain set in
+   *   derived snapshots, including clone and restore, because data files may
+   *   retain version 1 seeds. Legacy seeds may coexist and must be decoded
+   *   with their original semantics.
    */
   uint64 reader_feature_flags = 9;
 
@@ -170,6 +178,9 @@ message Manifest {
    * * 1 << 15: the manifest also sets max_allocated_field_id. A writer must
    *   assign new field IDs above that value and advance it in the same commit.
    *   The field and flag must either both be set or both be absent.
+   * * 1 << 16: paired with the reader bit for version 1 zone-level statistics
+   *   seeds. Writers must preserve the seed contract and the required bits
+   *   during data writes, index maintenance, cleanup, clone, and restore.
    */
   uint64 writer_feature_flags = 10;
 

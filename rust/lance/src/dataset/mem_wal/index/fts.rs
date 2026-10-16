@@ -938,12 +938,12 @@ impl BatchMeta {
 /// the tail's term map. An estimate — the node layout is crossbeam-internal.
 const SKIPMAP_ENTRY_OVERHEAD: usize = 32;
 
-/// Size of a sealed batch block. Small enough that copying the partial tail
-/// block on append stays cheap; large enough that sealing (which clones the
+/// Size of a frozen batch block. Small enough that copying the partial tail
+/// block on append stays cheap; large enough that freezing (which clones the
 /// block-pointer vec) is rare.
 const BATCH_BLOCK: usize = 64;
 
-/// Append-only, structurally-shared log of visible batch metadata. Sealed full
+/// Append-only, structurally-shared log of visible batch metadata. Frozen full
 /// blocks are immutable and shared across snapshots; only the current partial
 /// block is copied on append, so publishing a batch is amortized O(1) (instead
 /// of copying every batch pointer per publish — O(batches²) per generation)
@@ -951,7 +951,7 @@ const BATCH_BLOCK: usize = 64;
 #[derive(Debug, Clone)]
 struct BatchLog {
     /// Immutable full blocks (each `BATCH_BLOCK` long), shared across snapshots.
-    sealed: Arc<Vec<Arc<[Arc<BatchMeta>]>>>,
+    frozen: Arc<Vec<Arc<[Arc<BatchMeta>]>>>,
     /// The current partial block (`< BATCH_BLOCK` entries).
     tail: Arc<[Arc<BatchMeta>]>,
     len: usize,
@@ -960,28 +960,28 @@ struct BatchLog {
 impl BatchLog {
     fn empty() -> Self {
         Self {
-            sealed: Arc::new(Vec::new()),
+            frozen: Arc::new(Vec::new()),
             tail: Arc::from(Vec::<Arc<BatchMeta>>::new().into_boxed_slice()),
             len: 0,
         }
     }
 
-    /// A new log with `meta` appended; shares every sealed block with `self`,
+    /// A new log with `meta` appended; shares every frozen block with `self`,
     /// copying only the partial tail block.
     fn pushed(&self, meta: Arc<BatchMeta>) -> Self {
         let mut tail: Vec<Arc<BatchMeta>> = self.tail.to_vec();
         tail.push(meta);
         if tail.len() == BATCH_BLOCK {
-            let mut sealed = (*self.sealed).clone();
-            sealed.push(Arc::from(tail.into_boxed_slice()));
+            let mut frozen = (*self.frozen).clone();
+            frozen.push(Arc::from(tail.into_boxed_slice()));
             Self {
-                sealed: Arc::new(sealed),
+                frozen: Arc::new(frozen),
                 tail: Arc::from(Vec::<Arc<BatchMeta>>::new().into_boxed_slice()),
                 len: self.len + 1,
             }
         } else {
             Self {
-                sealed: Arc::clone(&self.sealed),
+                frozen: Arc::clone(&self.frozen),
                 tail: Arc::from(tail.into_boxed_slice()),
                 len: self.len + 1,
             }
@@ -991,15 +991,15 @@ impl BatchLog {
     fn get(&self, i: usize) -> Option<&Arc<BatchMeta>> {
         let block = i / BATCH_BLOCK;
         let off = i % BATCH_BLOCK;
-        match self.sealed.get(block) {
+        match self.frozen.get(block) {
             Some(b) => b.get(off),
-            None if block == self.sealed.len() => self.tail.get(off),
+            None if block == self.frozen.len() => self.tail.get(off),
             None => None,
         }
     }
 
     fn iter(&self) -> impl Iterator<Item = &Arc<BatchMeta>> {
-        self.sealed
+        self.frozen
             .iter()
             .flat_map(|b| b.iter())
             .chain(self.tail.iter())
@@ -1129,6 +1129,25 @@ impl<'a> Drop for PooledTokenizer<'a> {
 // FtsMemIndex
 // ============================================================================
 
+/// Heap bytes of the writer's term cache at `capacity`: its hash table only,
+/// since its keys and values are clones of `Arc`s the `SkipMap` already owns.
+///
+/// Mirrors the table `std::collections::HashMap` allocates: a power-of-two
+/// bucket count kept at most 7/8 full (fully usable below 8 buckets), one
+/// entry and one control byte per bucket, plus a trailing control group.
+fn term_cache_bytes(capacity: usize) -> usize {
+    const CONTROL_GROUP_BYTES: usize = 16;
+    if capacity == 0 {
+        return 0;
+    }
+    let buckets = if capacity < 8 {
+        capacity + 1
+    } else {
+        capacity / 7 * 8
+    };
+    buckets * (std::mem::size_of::<(Arc<str>, Arc<ArcSwap<TermSlice>>)>() + 1) + CONTROL_GROUP_BYTES
+}
+
 /// In-memory full-text search index. See module docs for the concurrency
 /// model and visibility contract.
 /// The bounded mutable accumulator: recent inserts since the last freeze, in
@@ -1206,6 +1225,7 @@ impl TailIndex {
             .lock()
             .expect("writer term cache poisoned — single-writer invariant violated");
         // Mirrors `memory_size`'s per-term arithmetic; keep the two in step.
+        let cache_before = term_cache_bytes(cache.capacity());
         let mut added = 0;
         for (term, builder) in term_builders {
             let chunk = builder.build(batch_position, with_position);
@@ -1230,6 +1250,9 @@ impl TailIndex {
             let cur = slot.load_full();
             slot.store(TermSlice::push(cur, chunk));
         }
+        // The cache only grows within a tail generation, so this never goes
+        // negative; a freeze drops it along with the tail.
+        added += term_cache_bytes(cache.capacity()) - cache_before;
         drop(cache);
         let document_count = documents.len() as u64;
         let new_meta = Arc::new(BatchMeta {
@@ -1251,6 +1274,12 @@ impl TailIndex {
 
     fn resident_bytes(&self) -> usize {
         let mut total = std::mem::size_of::<Self>();
+        total += term_cache_bytes(
+            self.writer_term_cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .capacity(),
+        );
         for entry in self.terms.iter() {
             let term: &Arc<str> = entry.key();
             total += std::mem::size_of::<Arc<str>>() + term.len() + SKIPMAP_ENTRY_OVERHEAD;
@@ -7165,6 +7194,34 @@ mod tests {
             after_two > after_one,
             "memory should grow after second insert"
         );
+    }
+
+    /// The term cache is charged for the table `HashMap` allocates: a
+    /// power-of-two bucket count whose usable share is what `capacity()`
+    /// reports. Checked against real maps across every growth step.
+    #[test]
+    fn test_term_cache_bytes_follows_the_table() {
+        let entry = std::mem::size_of::<(Arc<str>, Arc<ArcSwap<TermSlice>>)>() + 1;
+        assert_eq!(term_cache_bytes(0), 0);
+        let mut cache: FxHashMap<Arc<str>, Arc<ArcSwap<TermSlice>>> = FxHashMap::default();
+        for i in 0..5_000 {
+            cache.insert(Arc::from(i.to_string()), TermSlice::empty_arc_swap());
+            let capacity = cache.capacity();
+            let buckets = (term_cache_bytes(capacity) - 16) / entry;
+            assert!(
+                buckets.is_power_of_two(),
+                "{buckets} buckets at capacity {capacity}"
+            );
+            let usable = if buckets <= 8 {
+                buckets - 1
+            } else {
+                buckets / 8 * 7
+            };
+            assert_eq!(
+                usable, capacity,
+                "{buckets} buckets do not hold capacity {capacity}"
+            );
+        }
     }
 
     /// The tail's running byte counter must stay exactly in step with the walk
