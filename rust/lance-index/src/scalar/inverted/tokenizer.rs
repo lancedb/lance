@@ -1832,7 +1832,7 @@ mod tests {
         );
     }
 
-    // Common Chinese function words/particles (了 是 在 的 和 有 我) are the
+    // Common Chinese function words/particles (了 是 在 的 有 我) are the
     // highest-frequency Chinese tokens; like the English pronouns they must be
     // removed by the ICU `all()` stop-word path so they don't build huge
     // posting lists. Real content words (英语 = "English", 数据 = "data") must
@@ -1851,7 +1851,7 @@ mod tests {
         let mut stream = tokenizer.token_stream_for_search("我 在 有 了 是 的 和 英语 数据");
         let tokens: Vec<String> =
             std::iter::from_fn(|| stream.next().map(|t| t.text.clone())).collect();
-        let stop = ["我", "在", "有", "了", "是", "的", "和"];
+        let stop = ["我", "在", "有", "了", "是", "的"];
         let leaked: Vec<&String> = tokens
             .iter()
             .filter(|t| stop.contains(&t.as_str()))
@@ -1860,10 +1860,47 @@ mod tests {
             leaked.is_empty(),
             "common Chinese stop words leaked through the icu pipeline: {leaked:?} (all tokens: {tokens:?})"
         );
+        // 和 also denotes a Japanese sum, so the language-blind union retains it.
+        assert!(
+            tokens.iter().any(|token| token == "和"),
+            "Han content word 和 was dropped: {tokens:?}"
+        );
         // The real content words must still be indexed.
         assert!(
             tokens.iter().any(|t| t == "英语"),
             "content word 英语 was dropped: {tokens:?}"
         );
+    }
+
+    #[rstest]
+    #[case::retrieved_data("取得したデータを全部表示", &["取得", "全部", "表示"])]
+    #[case::start_processing("以上の場合は処理を開始する", &["以上", "場合", "処理", "開始"])]
+    #[case::change_settings("以下の方法で設定を変更", &["以下", "方法", "設定", "変更"])]
+    fn test_icu_keeps_japanese_content_words(
+        #[case] text: &str,
+        #[case] content_words: &[&str],
+        #[values("icu", "icu/split")] base_tokenizer: &str,
+        #[values(false, true)] stem: bool,
+    ) {
+        let mut tokenizer = InvertedIndexParams::default()
+            .base_tokenizer(base_tokenizer.to_string())
+            .stem(stem)
+            .build()
+            .unwrap();
+        let mut stream = tokenizer.token_stream_for_search(text);
+        let tokens: Vec<String> =
+            std::iter::from_fn(|| stream.next().map(|token| token.text.clone())).collect();
+        for word in content_words {
+            assert!(
+                tokens.iter().any(|token| token == word),
+                "content word {word} was filtered from {text}: {tokens:?}"
+            );
+        }
+        for particle in ["の", "を", "は"] {
+            assert!(
+                !tokens.iter().any(|token| token == particle),
+                "function particle {particle} was retained: {tokens:?}"
+            );
+        }
     }
 }
