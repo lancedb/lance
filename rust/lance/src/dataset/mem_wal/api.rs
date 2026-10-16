@@ -44,7 +44,7 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow_schema::DataType;
+use arrow_schema::{DataType, Schema as ArrowSchema};
 use async_trait::async_trait;
 use lance_core::datatypes::Schema as LanceSchema;
 use lance_core::{Error, Result};
@@ -63,6 +63,7 @@ use crate::index::mem_wal::{load_mem_wal_index_details, new_mem_wal_index_meta};
 use super::index::{
     MemIndexRegistry, MemIndexSpec, ResolveContext, unsupported_index_type, validate_index_specs,
 };
+use super::scanner::exec::validate_pk_types;
 use super::scanner::sstable_cache::open_sstable;
 use super::scanner::{DatasetCache, ShardSnapshot};
 use super::schema_with_tombstone;
@@ -282,6 +283,15 @@ impl<'a> InitializeMemWalBuilder<'a> {
         let (sharding_specs, num_shards) = resolve_sharding(dataset, sharding)?;
 
         dataset.schema().verify_primary_key()?;
+        // The primary key is immutable, and every LSM read and flush hashes it,
+        // so an unhashable key would accept writes that then cannot be read.
+        let pk_columns: Vec<String> = dataset
+            .schema()
+            .unenforced_primary_key()
+            .iter()
+            .map(|f| f.name.clone())
+            .collect();
+        validate_pk_types(&ArrowSchema::from(dataset.schema()), &pk_columns)?;
 
         let indices = dataset.load_indices().await?;
         if indices.iter().any(|idx| idx.name == MEM_WAL_INDEX_NAME) {
@@ -1572,6 +1582,50 @@ mod tests {
         assert!(
             dataset.mem_wal_index_details().await.unwrap().is_none(),
             "a rejected maintained set must not be committed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_initialize_mem_wal_rejects_unhashable_primary_key() {
+        // A Float64 key can be installed through field metadata, but LSM
+        // reads cannot hash it; initialization must refuse it up front.
+        let tmp = tempfile::tempdir().unwrap();
+        let uri = format!("{}/base", tmp.path().to_str().unwrap());
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "id",
+            DataType::Float64,
+            false,
+        )]));
+        let reader = RecordBatchIterator::new(Vec::new(), schema);
+        let mut dataset = Dataset::write(reader, &uri, Some(WriteParams::default()))
+            .await
+            .unwrap();
+        dataset
+            .update_field_metadata()
+            .update(
+                "id",
+                [(
+                    lance_core::datatypes::LANCE_UNENFORCED_PRIMARY_KEY_POSITION,
+                    "1",
+                )],
+            )
+            .unwrap()
+            .await
+            .unwrap();
+
+        let error = dataset
+            .initialize_mem_wal()
+            .unsharded()
+            .execute()
+            .await
+            .expect_err("a Float64 primary key cannot be hashed");
+        assert!(
+            error.to_string().contains("unsupported type Float64"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            dataset.mem_wal_index_details().await.unwrap().is_none(),
+            "a rejected MemWAL must not be committed"
         );
     }
 
