@@ -2913,7 +2913,7 @@ impl DirectoryNamespace {
             return err;
         }
         let detail = err.to_string();
-        if let Error::IO { source, .. } = &err
+        if let Error::IO { source, .. } = err.find_root()
             && let Some(os_err) = source.downcast_ref::<ObjectStoreError>()
         {
             if is_throttle_error(os_err) {
@@ -2970,7 +2970,7 @@ impl DirectoryNamespace {
     /// typed via [`classify_storage_error`], while a genuine not-found (missing
     /// dataset, version, or ref) keeps the caller's `not_found` variant.
     fn map_open_error(err: Error, not_found: NamespaceError) -> Error {
-        if matches!(&err, Error::IO { .. })
+        if matches!(err.find_root(), Error::IO { .. })
             && !manifest::ManifestNamespace::is_not_found_load_error(&err)
         {
             return Self::classify_storage_error(err);
@@ -7154,6 +7154,41 @@ mod tests {
             mutation_error_code(DirectoryNamespace::classify_storage_error(preexisting)),
             ErrorCode::TableAlreadyExists
         );
+    }
+
+    /// A storage error coalesced through a shared cache load arrives wrapped in
+    /// `Error::Shared` while other waiters still hold it, and must be classified
+    /// as the IO error it wraps.
+    #[test]
+    fn test_storage_error_classification_sees_through_shared() {
+        let shared = |os_err: ObjectStoreError| Error::Shared {
+            source: Arc::new(os_err.into()),
+        };
+        let throttle = || ObjectStoreError::Generic {
+            store: "test",
+            source: "after 3 retries, max_retries: 3 - 503 ServerBusy".into(),
+        };
+        assert_eq!(
+            mutation_error_code(DirectoryNamespace::classify_storage_error(shared(
+                throttle()
+            ))),
+            ErrorCode::Throttling
+        );
+        assert_eq!(
+            mutation_error_code(DirectoryNamespace::map_open_error(
+                shared(throttle()),
+                NamespaceError::TableNotFound {
+                    message: "t".to_string(),
+                }
+            )),
+            ErrorCode::Throttling
+        );
+        assert!(manifest::ManifestNamespace::is_not_found_load_error(
+            &shared(ObjectStoreError::NotFound {
+                path: "x".to_string(),
+                source: "missing".into(),
+            })
+        ));
     }
 
     #[test]
