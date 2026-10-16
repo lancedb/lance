@@ -15,6 +15,8 @@ from pathlib import Path
 
 import lance
 import pyarrow as pa
+import pytest
+from packaging.version import Version
 
 from .compat_decorator import (
     UpgradeDowngradeTest,
@@ -116,27 +118,21 @@ class BTreeRowAddressDomainIndex(UpgradeDowngradeTest):
       by the current build.
     - Updating it (inserting rows, then optimizing) with the current build
       keeps both old and new rows queryable.
-    - Once the current build has touched the index this way, an older build
-      must no longer use it -- its format version has moved past what that
-      build supports -- but it must still answer every query correctly via a
-      full scan, and must not error out when writing to the dataset
-      afterwards.
+    - Readers released before 14.0.0b16 must ignore the updated index and
+      answer correctly via a full scan. Readers from 14.0.0b16 onward must
+      use it. Both must still be able to write to the dataset afterwards.
     """
 
     def __init__(self, path: Path):
         self.path = path
 
-    def _is_old_build(self) -> bool:
-        """True while this method body is executing inside the pinned old
-        venv under test.
-
-        Reads _running_in_old_venv (set by VenvExecutor.execute_method), not
-        a lance.__version__ / compat_version comparison: the current build's
-        own version is not a fixed marker distinct from every pinned release
-        under test -- see that flag's docstring on UpgradeDowngradeTest for
-        the version-collision this caused (lance-format/lance#9481).
-        """
-        return self._running_in_old_venv
+    def _supports_row_address_index(self) -> bool:
+        # beta.16 is the first released reader for the row-address format.
+        # The current checkout's version string may still predate that release,
+        # so distinguish it by the harness role, not by lance.__version__.
+        return not self._running_in_old_venv or Version(self.compat_version) >= Version(
+            "14.0.0b16"
+        )
 
     def create(self):
         """Create a stable-row-id dataset with a BTREE index."""
@@ -173,10 +169,8 @@ class BTreeRowAddressDomainIndex(UpgradeDowngradeTest):
             )
 
     def check_read(self):
-        """An old-format index must be used by the current build; a
-        too-new one must be safely ignored (but answers must stay correct)
-        by an older build."""
-        self._assert_queryable(expect_index_used=not self._is_old_build())
+        """Use supported index formats and safely ignore too-new ones."""
+        self._assert_queryable(expect_index_used=self._supports_row_address_index())
 
     def check_write(self):
         """Insert a row and update the index, then verify old and new rows
@@ -207,6 +201,78 @@ class BTreeRowAddressDomainIndex(UpgradeDowngradeTest):
         # once, in `create`) can.
         table = ds.to_table(filter="btree == 1000")
         assert table.num_rows >= 1
+
+        # Preserve the post-compaction result checks above, then restore
+        # physical-address coverage before testing the next reader's format
+        # support. Older readers cannot rebuild this index format.
+        if self._supports_row_address_index():
+            ds.optimize.optimize_indices()
+
+
+@pytest.fixture
+def btree_row_address_compat_case(tmp_path):
+    path = tmp_path / "data.lance"
+    dataset = lance.write_dataset(
+        pa.table({"idx": range(16), "btree": range(16)}),
+        path,
+        max_rows_per_file=8,
+        data_storage_version="2.1",
+        enable_stable_row_ids=True,
+    )
+    dataset.create_scalar_index("btree", "BTREE")
+    return BTreeRowAddressDomainIndex(path)
+
+
+@pytest.mark.parametrize(
+    "version,running_in_old_venv,expect_index_used",
+    [
+        pytest.param("14.0.0b15", False, True, id="current-before-release"),
+        pytest.param("14.0.0b16", False, True, id="current-same-version"),
+        pytest.param("13.0.0", True, False, id="older-stable"),
+        pytest.param("14.0.0b15", True, False, id="last-unsupported-beta"),
+        pytest.param("14.0.0b16", True, True, id="first-supported-beta"),
+        pytest.param("14.0.0-beta.16", True, True, id="cargo-beta-spelling"),
+        pytest.param("14.0.0", True, True, id="stable-release"),
+    ],
+)
+def test_btree_row_address_reader_capability(
+    btree_row_address_compat_case,
+    monkeypatch,
+    version,
+    running_in_old_venv,
+    expect_index_used,
+):
+    case = btree_row_address_compat_case
+    monkeypatch.setattr(lance, "__version__", version)
+    case.compat_version = version
+    case._running_in_old_venv = running_in_old_venv
+    dataset = lance.dataset(case.path)
+    if not expect_index_used:
+        dataset.drop_index("btree_idx")
+    case.check_read()
+
+    # The opposite plan must still fail: neither reader capability may be
+    # treated as permission to silently stop checking index usage.
+    if expect_index_used:
+        dataset.drop_index("btree_idx")
+        message = "expected the BTREE index to be used"
+    else:
+        dataset.create_scalar_index("btree", "BTREE")
+        message = "an older build must not use a BTREE index"
+    with pytest.raises(AssertionError, match=message):
+        case.check_read()
+
+
+@pytest.mark.parametrize("running_in_old_venv", [False, True])
+def test_btree_row_address_maintenance_restores_coverage(
+    btree_row_address_compat_case, running_in_old_venv
+):
+    case = btree_row_address_compat_case
+    case.compat_version = "14.0.0b16"
+    case._running_in_old_venv = running_in_old_venv
+    case.check_write()
+    case.check_read()
+    assert lance.dataset(case.path).count_rows("btree == 1000") == 1
 
 
 @compat_test(min_version="0.30.0")
