@@ -139,8 +139,24 @@ impl LogicalScalarIndex {
     ///
     /// Supply one bitmap per segment, in constructor order. Address-domain results
     /// already discard deleted addresses during translation and do not need this mask.
+    /// The dataset must be the snapshot being queried. Without this option,
+    /// row-ID-domain segments are combined without checking fragment ownership.
+    /// For datasets without stable row IDs or for address-domain segments, this
+    /// method validates the bitmap count but does not install a restriction.
     ///
-    fn with_fragment_coverage(
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use lance::{Dataset, index::scalar::LogicalScalarIndex};
+    /// # use lance_index::scalar::ScalarIndex;
+    /// # use roaring::RoaringBitmap;
+    /// # fn scoped(dataset: &Dataset, segments: Vec<Arc<dyn ScalarIndex>>,
+    /// #           fragments: Vec<RoaringBitmap>) -> lance_core::Result<()> {
+    /// let index = LogicalScalarIndex::try_new("value_idx".into(), "value".into(), segments)?
+    ///     .with_fragment_coverage(dataset, fragments)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_fragment_coverage(
         mut self,
         dataset: &Dataset,
         fragments: Vec<RoaringBitmap>,
@@ -592,6 +608,7 @@ mod tests {
     async fn test_segment_ownership_after_update(
         #[case] stable_row_ids: bool,
         #[case] nullable: bool,
+        #[values(IndexType::BTree, IndexType::Bitmap)] index_type: IndexType,
     ) {
         let batch = arrow_array::record_batch!(
             (
@@ -628,9 +645,12 @@ mod tests {
         )
         .await
         .unwrap();
-        let params = ScalarIndexParams::default();
+        let params = ScalarIndexParams::for_builtin(match index_type {
+            IndexType::Bitmap => BuiltinIndexType::Bitmap,
+            _ => BuiltinIndexType::BTree,
+        });
         let old = dataset
-            .create_index_builder(&["value"], IndexType::BTree, &params)
+            .create_index_builder(&["value"], index_type, &params)
             .name("value_idx".to_owned())
             .fragments(vec![0, 1])
             .execute_uncommitted()
@@ -659,7 +679,7 @@ mod tests {
             .clone();
         let moved_fragment = dataset.fragments().last().unwrap().id as u32;
         let new = dataset
-            .create_index_builder(&["value"], IndexType::BTree, &params)
+            .create_index_builder(&["value"], index_type, &params)
             .name("value_idx".to_owned())
             .replace(true)
             .fragments(vec![moved_fragment])
