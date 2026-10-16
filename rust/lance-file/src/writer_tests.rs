@@ -10,7 +10,9 @@ mod tests {
     use crate::testing::FsFixture;
     use crate::version::ConcreteFileVersion;
     use crate::versions;
-    use crate::writer::{ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES, FileWriter, FileWriterOptions};
+    use crate::writer::{
+        ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES, FieldTypeMismatch, FileWriter, FileWriterOptions,
+    };
     use arrow_array::builder::{Float32Builder, Int32Builder};
     use arrow_array::types::Float64Type;
     use arrow_array::{
@@ -21,6 +23,8 @@ mod tests {
     use arrow_schema::{
         DataType, Field, Field as ArrowField, Fields as ArrowFields, Schema, Schema as ArrowSchema,
     };
+    use lance_arrow::ARROW_EXT_NAME_KEY;
+    use lance_arrow::json::{ARROW_JSON_EXT_NAME, JSON_EXT_NAME, JsonArray, json_field};
     use lance_core::cache::LanceCache;
     use lance_core::datatypes::Schema as LanceSchema;
     use lance_core::utils::tempfile::TempObjFile;
@@ -93,6 +97,30 @@ mod tests {
         file_writer.add_schema_metadata("foo", "bar");
         file_writer.finish().await.unwrap();
         // Tests asserting the contents of the written file are in reader.rs
+    }
+
+    #[rstest]
+    #[case::v2_1(ConcreteFileVersion::V2_1)]
+    #[case::v2_2(ConcreteFileVersion::V2_2)]
+    #[case::v2_3(ConcreteFileVersion::V2_3)]
+    #[tokio::test]
+    async fn test_negative_dictionary_values_with_runt_tail(#[case] version: ConcreteFileVersion) {
+        let values: Vec<i64> = (0..9216_u64)
+            .map(|i| ((i.wrapping_mul(2_654_435_761) >> 7) % 1600) as i64 - 800)
+            .collect();
+        let batch = arrow_array::record_batch!(("f0", Int64, values)).unwrap();
+        let reader = arrow_array::RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+        let fs = FsFixture::default();
+
+        crate::testing::write_lance_file(reader, &fs, version, FileWriterOptions::default()).await;
+        let read = crate::testing::read_lance_file(
+            &fs,
+            Arc::new(DecoderPlugins::default()),
+            lance_encoding::decoder::FilterExpression::no_filter(),
+        )
+        .await;
+        let read = arrow_select::concat::concat_batches(&read[0].schema(), &read).unwrap();
+        assert_eq!(read, batch);
     }
 
     #[tokio::test]
@@ -581,6 +609,114 @@ mod tests {
         );
     }
 
+    fn field_type_mismatch(error: lance_core::Error) -> FieldTypeMismatch {
+        match error {
+            lance_core::Error::InvalidInput { source, .. } => source
+                .downcast_ref::<FieldTypeMismatch>()
+                .unwrap_or_else(|| panic!("expected a field type mismatch, got: {source}"))
+                .clone(),
+            other => panic!("expected an invalid input error, got: {other}"),
+        }
+    }
+
+    /// Arrow JSON text that skipped conversion to Lance JSONB is rejected
+    /// before anything is encoded, naming the offending field.
+    #[rstest]
+    #[case::top_level(false)]
+    #[case::nested_in_struct(true)]
+    #[tokio::test]
+    async fn test_writer_rejects_unconverted_arrow_json(
+        #[case] nested: bool,
+        #[values(
+            ConcreteFileVersion::V2_0,
+            ConcreteFileVersion::V2_1,
+            ConcreteFileVersion::V2_2,
+            ConcreteFileVersion::V2_3
+        )]
+        version: ConcreteFileVersion,
+    ) {
+        let arrow_json =
+            ArrowField::new("j", DataType::Utf8, true).with_metadata(HashMap::from([(
+                ARROW_EXT_NAME_KEY.to_string(),
+                ARROW_JSON_EXT_NAME.to_string(),
+            )]));
+        let text: ArrayRef = Arc::new(StringArray::from(vec![r#"{"a":1}"#]));
+        let in_struct = |field: ArrowField| {
+            if nested {
+                ArrowField::new("s", DataType::Struct(vec![field].into()), true)
+            } else {
+                field
+            }
+        };
+        let jsonb: ArrayRef = Arc::new(JsonArray::try_from(text.clone()).unwrap().into_inner());
+        let batch_of = |field: ArrowField, values: ArrayRef| {
+            let field = in_struct(field);
+            let values: ArrayRef = match field.data_type() {
+                DataType::Struct(fields) => {
+                    Arc::new(StructArray::new(fields.clone(), vec![values], None))
+                }
+                _ => values,
+            };
+            RecordBatch::try_new(Arc::new(ArrowSchema::new(vec![field])), vec![values]).unwrap()
+        };
+        let converted = batch_of(json_field("j", true), jsonb);
+        let batch = batch_of(arrow_json, text);
+        let file_schema = LanceSchema::try_from(converted.schema().as_ref()).unwrap();
+
+        let fs = FsFixture::default();
+        let mut writer = create_writer(
+            fs.object_store.create(&fs.tmp_path).await.unwrap(),
+            file_schema,
+            version,
+            FileWriterOptions::default(),
+        )
+        .unwrap();
+        // A batch with an accepted schema must not let a later, different
+        // schema through.
+        writer.write_batch(&converted).await.unwrap();
+        let mismatch = field_type_mismatch(writer.write_batch(&batch).await.unwrap_err());
+        assert_eq!(mismatch.field_path, if nested { "s.j" } else { "j" });
+        assert_eq!(mismatch.expected.data_type(), &DataType::LargeBinary);
+        assert_eq!(mismatch.expected.extension_type_name(), Some(JSON_EXT_NAME));
+        assert_eq!(mismatch.actual.data_type(), &DataType::Utf8);
+        assert_eq!(
+            mismatch.actual.extension_type_name(),
+            Some(ARROW_JSON_EXT_NAME)
+        );
+        // The rejected batch reached no encoder.
+        assert_eq!(writer.finish().await.unwrap().num_rows, 1);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_write_column_rejects_mismatched_type(
+        #[values(
+            ConcreteFileVersion::V2_0,
+            ConcreteFileVersion::V2_1,
+            ConcreteFileVersion::V2_2,
+            ConcreteFileVersion::V2_3
+        )]
+        version: ConcreteFileVersion,
+    ) {
+        let file_schema =
+            LanceSchema::try_from(&ArrowSchema::new(vec![json_field("j", true)])).unwrap();
+        let fs = FsFixture::default();
+        let mut writer = create_writer(
+            fs.object_store.create(&fs.tmp_path).await.unwrap(),
+            file_schema,
+            version,
+            FileWriterOptions::default(),
+        )
+        .unwrap();
+        let text: ArrayRef = Arc::new(StringArray::from(vec![r#"{"a":1}"#]));
+        let mismatch = field_type_mismatch(writer.write_column(0, text).await.unwrap_err());
+        assert_eq!(mismatch.field_path, "j");
+        assert_eq!(mismatch.expected.data_type(), &DataType::LargeBinary);
+        // A bare array carries no extension of its own.
+        assert_eq!(mismatch.actual.data_type(), &DataType::Utf8);
+        assert_eq!(mismatch.actual.extension_type_name(), None);
+    }
+
     fn struct_array(fields: ArrowFields, nulls: Option<NullBuffer>) -> StructArray {
         StructArray::new(
             fields,
@@ -675,6 +811,191 @@ mod tests {
             )
             .await,
             vec![Some(4), Some(5), Some(6)]
+        );
+    }
+
+    /// The 2.1+ preflight must pair each field with the array encoding will select for
+    /// it. Pairing `batch.columns()` positionally against the schema misreads a batch
+    /// whose column order differs: it rejects a legal null in the nullable field while
+    /// naming the non-nullable one, and lets a null through in the non-nullable field.
+    #[rstest]
+    #[case::null_in_nullable_field(true, true)]
+    #[case::null_in_non_nullable_field(false, false)]
+    #[tokio::test]
+    async fn test_structural_writer_verifies_name_selected_nullability(
+        #[values(
+            ConcreteFileVersion::V2_1,
+            ConcreteFileVersion::V2_2,
+            ConcreteFileVersion::V2_3
+        )]
+        version: ConcreteFileVersion,
+        #[case] null_in_nullable: bool,
+        #[case] should_succeed: bool,
+    ) {
+        // The schema declares "a" non-nullable; the batch puts "b" first, so a
+        // positional pairing would check "a" against "b"'s array. The batch's
+        // columns are both nullable (what `record_batch!` builds); the writer's
+        // schema is the contract being checked.
+        let writer_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, false),
+            ArrowField::new("b", DataType::Int32, true),
+        ]));
+        let with_null: Vec<Option<i32>> = vec![Some(1), None, Some(3)];
+        let without_null: Vec<Option<i32>> = vec![Some(4), Some(5), Some(6)];
+        let (b, a) = if null_in_nullable {
+            (with_null, without_null)
+        } else {
+            (without_null, with_null)
+        };
+        let batch = arrow_array::record_batch!(("b", Int32, b), ("a", Int32, a)).unwrap();
+
+        let fs = FsFixture::default();
+        let mut writer = create_writer(
+            fs.object_store.create(&fs.tmp_path).await.unwrap(),
+            LanceSchema::try_from(writer_schema.as_ref()).unwrap(),
+            version,
+            FileWriterOptions::default(),
+        )
+        .unwrap();
+
+        let result = writer.write_batch(&batch).await;
+        if should_succeed {
+            result.expect("a null in the nullable field must be accepted");
+            writer.finish().await.unwrap();
+        } else {
+            let error = result.unwrap_err();
+            assert!(
+                matches!(error, lance_core::Error::InvalidInput { .. }),
+                "expected InvalidInput, got: {error}"
+            );
+            assert!(
+                error
+                    .to_string()
+                    .contains("field `a` contained null values"),
+                "expected the error to name field `a`, got: {error}"
+            );
+        }
+    }
+
+    /// With two batch columns named `a`, encoding selects the first via
+    /// `column_by_name`, so the nullability preflight must check that same first
+    /// column. Non-nullable `a` sits at schema index 1, where a positional pairing
+    /// would line it up with the second `a` (which carries a null) and wrongly
+    /// reject; name selection validates the first `a` that is actually written.
+    /// Guards against a future positional fast path reintroducing the mismatch.
+    #[rstest]
+    #[tokio::test]
+    async fn test_structural_writer_checks_first_duplicate_column_nullability(
+        #[values(
+            ConcreteFileVersion::V2_1,
+            ConcreteFileVersion::V2_2,
+            ConcreteFileVersion::V2_3
+        )]
+        version: ConcreteFileVersion,
+    ) {
+        let writer_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("z", DataType::Int32, true),
+            ArrowField::new("a", DataType::Int32, false),
+        ]));
+        let lance_schema = LanceSchema::try_from(writer_schema.as_ref()).unwrap();
+        // Two columns named "a": the first is what `column_by_name` (and the
+        // encoder) selects and is null-free; the second carries a null and must
+        // be ignored by the name-selected check.
+        let first_a: Vec<Option<i32>> = vec![Some(1), Some(2), Some(3)];
+        let second_a: Vec<Option<i32>> = vec![Some(4), None, Some(6)];
+        let z: Vec<Option<i32>> = vec![Some(7), Some(8), Some(9)];
+        let batch = arrow_array::record_batch!(
+            ("a", Int32, first_a),
+            ("a", Int32, second_a),
+            ("z", Int32, z)
+        )
+        .unwrap();
+
+        let fs = FsFixture::default();
+        let mut writer = create_writer(
+            fs.object_store.create(&fs.tmp_path).await.unwrap(),
+            lance_schema.clone(),
+            version,
+            FileWriterOptions::default(),
+        )
+        .unwrap();
+
+        writer
+            .write_batch(&batch)
+            .await
+            .expect("the first \"a\" is null-free, so the name-selected check accepts it");
+        writer.finish().await.unwrap();
+
+        // Read `a` back: the encoder must have written the first `a` (null-free),
+        // not the second. A positional fast path on the encoding side would write
+        // the second `a` and its null, passing the preflight but only failing here.
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let reader = FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &LanceCache::no_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            read_int32_column(
+                &reader,
+                &lance_schema,
+                version,
+                "a",
+                lance_io::ReadBatchParams::RangeFull,
+            )
+            .await,
+            vec![Some(1), Some(2), Some(3)]
+        );
+    }
+
+    /// A batch missing a column the schema names is rejected when arrays are
+    /// selected by name, not written short. The type preflight leaves a missing
+    /// column for this step (`check_batch` skips absent columns), so the error
+    /// has to come from the name selection itself.
+    #[rstest]
+    #[tokio::test]
+    async fn test_structural_writer_rejects_batch_missing_column(
+        #[values(
+            ConcreteFileVersion::V2_1,
+            ConcreteFileVersion::V2_2,
+            ConcreteFileVersion::V2_3
+        )]
+        version: ConcreteFileVersion,
+    ) {
+        // The schema names "a" and "b", both nullable so only the absence of a
+        // column can fail the write; the batch carries only "a".
+        let writer_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, true),
+            ArrowField::new("b", DataType::Int32, true),
+        ]));
+        let a: Vec<Option<i32>> = vec![Some(1), Some(2), Some(3)];
+        let batch = arrow_array::record_batch!(("a", Int32, a)).unwrap();
+
+        let fs = FsFixture::default();
+        let mut writer = create_writer(
+            fs.object_store.create(&fs.tmp_path).await.unwrap(),
+            LanceSchema::try_from(writer_schema.as_ref()).unwrap(),
+            version,
+            FileWriterOptions::default(),
+        )
+        .unwrap();
+
+        let error = writer.write_batch(&batch).await.unwrap_err();
+        assert!(
+            matches!(error, lance_core::Error::InvalidInput { .. }),
+            "expected InvalidInput, got: {error}"
+        );
+        assert!(
+            error.to_string().contains("missing the column `b`"),
+            "expected the error to name the missing column `b`, got: {error}"
         );
     }
 
@@ -1157,6 +1478,90 @@ mod tests {
         }
 
         assert_eq!(total_page_num, 8)
+    }
+
+    fn assert_zero_max_page_bytes_error(error: lance_core::Error) {
+        assert!(
+            matches!(error, lance_core::Error::InvalidInput { .. }),
+            "unexpected error: {error:?}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("max_page_bytes must be greater than 0, got 0")
+        );
+    }
+
+    #[rstest]
+    #[case::schema_writer(false)]
+    #[case::lazy_writer(true)]
+    #[tokio::test]
+    async fn test_zero_max_page_bytes_rejected(#[case] lazy: bool) {
+        let path = TempObjFile::default();
+        let object_store = ObjectStore::local();
+        let object_writer = object_store.create(&path).await.unwrap();
+        let options = FileWriterOptions {
+            max_page_bytes: Some(0),
+            ..Default::default()
+        };
+
+        let error = if lazy {
+            let mut writer =
+                versions::create_lazy_writer(ConcreteFileVersion::V2_0, object_writer, options)
+                    .unwrap();
+            let batch = arrow_array::record_batch!(("data", UInt64, [1])).unwrap();
+            writer.write_batch(&batch).await.unwrap_err()
+        } else {
+            let schema = LanceSchema::try_from(&Schema::new(vec![Field::new(
+                "data",
+                DataType::UInt64,
+                false,
+            )]))
+            .unwrap();
+            versions::create_writer(ConcreteFileVersion::V2_0, object_writer, schema, options)
+                .err()
+                .expect("zero max_page_bytes should fail")
+        };
+
+        assert_zero_max_page_bytes_error(error);
+    }
+
+    #[tokio::test]
+    async fn test_v2_0_writer_rejects_zero_max_page_bytes() {
+        let path = TempObjFile::default();
+        let object_store = ObjectStore::local();
+        let object_writer = object_store.create(&path).await.unwrap();
+        let schema = LanceSchema::try_from(&Schema::new(vec![Field::new(
+            "data",
+            DataType::UInt64,
+            false,
+        )]))
+        .unwrap();
+        let options = FileWriterOptions {
+            max_page_bytes: Some(0),
+            ..Default::default()
+        };
+
+        let error = versions::v2_0::create_writer(object_writer, schema, options)
+            .err()
+            .expect("zero max_page_bytes should fail");
+        assert_zero_max_page_bytes_error(error);
+    }
+
+    #[tokio::test]
+    async fn test_v2_1_lazy_writer_rejects_zero_max_page_bytes() {
+        let path = TempObjFile::default();
+        let object_store = ObjectStore::local();
+        let object_writer = object_store.create(&path).await.unwrap();
+        let options = FileWriterOptions {
+            max_page_bytes: Some(0),
+            ..Default::default()
+        };
+        let batch = arrow_array::record_batch!(("data", UInt64, [1])).unwrap();
+
+        let mut writer = versions::v2_1::create_lazy_writer(object_writer, options);
+        let error = writer.write_batch(&batch).await.unwrap_err();
+        assert_zero_max_page_bytes_error(error);
     }
 
     #[tokio::test(flavor = "current_thread")]

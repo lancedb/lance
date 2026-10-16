@@ -32,7 +32,10 @@ use tracing::instrument;
 use crate::{
     datatypes::FieldsWithMeta,
     format::{pb, pbfile},
-    writer::{ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES, FileWriterOptions, PAGE_BUFFER_ALIGNMENT},
+    writer::{
+        ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES, ExpectedTypes, FileWriterOptions,
+        PAGE_BUFFER_ALIGNMENT,
+    },
 };
 
 const PAD_BUFFER: [u8; PAGE_BUFFER_ALIGNMENT] = [72; PAGE_BUFFER_ALIGNMENT];
@@ -381,6 +384,7 @@ impl StructuralFileSink {
 /// a schema is initialized. This component only executes that decision.
 pub struct EncodingPipeline {
     schema: Option<Schema>,
+    expected_types: Option<ExpectedTypes>,
     field_encoders: Vec<Box<dyn FieldEncoder>>,
     field_id_to_column_indices: Vec<(u32, u32)>,
     rows_written: u64,
@@ -393,6 +397,7 @@ impl EncodingPipeline {
     pub fn new(options: FileWriterOptions) -> Self {
         Self {
             schema: None,
+            expected_types: None,
             field_encoders: Vec::new(),
             field_id_to_column_indices: Vec::new(),
             rows_written: 0,
@@ -400,6 +405,10 @@ impl EncodingPipeline {
             schema_metadata: HashMap::new(),
             options,
         }
+    }
+
+    pub(crate) fn validate_options(&self) -> Result<()> {
+        self.options.validate()
     }
 
     pub fn encoding_options(&self, schema: &Schema) -> EncodingOptions {
@@ -523,13 +532,43 @@ impl EncodingPipeline {
         Ok(())
     }
 
-    fn verify_nullability_constraints(&self, batch: &RecordBatch) -> Result<()> {
-        for (column, field) in batch
-            .columns()
+    /// Select, by name, the array that will be encoded for each schema field.
+    ///
+    /// A batch may order its columns differently from the schema or carry extra
+    /// ones, so each field's array is pulled by name rather than by position. A
+    /// column the schema names but the batch lacks is an error. Selecting once
+    /// here lets the nullability check and the encoder share the result, so each
+    /// field is resolved by name a single time per batch rather than once for the
+    /// check and again for the encoder, as the v2.0 writer already does.
+    fn field_arrays(&self, batch: &RecordBatch) -> Result<Vec<(usize, ArrayRef)>> {
+        self.schema
+            .as_ref()
+            .unwrap()
+            .fields
             .iter()
-            .zip(self.schema.as_ref().unwrap().fields.iter())
-        {
-            Self::verify_field_nullability(column.as_ref(), field)?;
+            .enumerate()
+            .map(|(field_index, field)| {
+                let array = batch.column_by_name(&field.name).ok_or_else(|| {
+                    Error::invalid_input_source(
+                        format!(
+                            "Cannot write batch.  The batch was missing the column `{}`",
+                            field.name
+                        )
+                        .into(),
+                    )
+                })?;
+                Ok((field_index, array.clone()))
+            })
+            .collect()
+    }
+
+    /// Verify each selected array against its field's nullability, on the same
+    /// `(field_index, array)` pairs the encoder writes, so the check and the
+    /// encoder never disagree about which array belongs to a field.
+    fn verify_nullability(&self, field_arrays: &[(usize, ArrayRef)]) -> Result<()> {
+        let fields = &self.schema.as_ref().unwrap().fields;
+        for (field_index, array) in field_arrays {
+            Self::verify_field_nullability(array.as_ref(), &fields[*field_index])?;
         }
         Ok(())
     }
@@ -558,34 +597,6 @@ impl EncodingPipeline {
             .collect()
     }
 
-    fn encode_batch(
-        &mut self,
-        batch: &RecordBatch,
-        external_buffers: &mut OutOfLineBuffers,
-    ) -> Result<Vec<Vec<EncodeTask>>> {
-        let field_arrays = self
-            .schema
-            .as_ref()
-            .unwrap()
-            .fields
-            .iter()
-            .enumerate()
-            .map(|(field_index, field)| {
-                let array = batch.column_by_name(&field.name).ok_or_else(|| {
-                    Error::invalid_input_source(
-                        format!(
-                            "Cannot write batch.  The batch was missing the column `{}`",
-                            field.name
-                        )
-                        .into(),
-                    )
-                })?;
-                Ok((field_index, array.clone()))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        self.encode_columns(&field_arrays, external_buffers)
-    }
-
     #[instrument(skip_all, level = "debug")]
     pub async fn write_batch(
         &mut self,
@@ -598,7 +609,13 @@ impl EncodingPipeline {
             batch.num_columns(),
             batch.get_array_memory_size()
         );
-        self.verify_nullability_constraints(batch)?;
+        let schema = self
+            .schema
+            .as_ref()
+            .expect("the pipeline is initialized before writing");
+        self.expected_types
+            .get_or_insert_with(|| ExpectedTypes::new(schema))
+            .check_batch(batch)?;
         let num_rows = batch.num_rows() as u64;
         if num_rows == 0 {
             return Ok(());
@@ -609,9 +626,15 @@ impl EncodingPipeline {
             ));
         }
 
+        // Resolve each field's array by name once, then both check nullability
+        // and encode from the same arrays: a batch may reorder or duplicate
+        // columns, so the check must see exactly what the encoder writes.
+        let field_arrays = self.field_arrays(batch)?;
+        self.verify_nullability(&field_arrays)?;
+
         let mut external_buffers =
             OutOfLineBuffers::new(sink.tell().await?, PAGE_BUFFER_ALIGNMENT as u64);
-        let encoding_tasks = self.encode_batch(batch, &mut external_buffers)?;
+        let encoding_tasks = self.encode_columns(&field_arrays, &mut external_buffers)?;
         for external_buffer in external_buffers.take_buffers() {
             sink.write_aligned_buffer(&external_buffer).await?;
         }
@@ -659,6 +682,9 @@ impl EncodingPipeline {
                 "cannot write Lance files with more than 2^32 rows".into(),
             ));
         }
+        self.expected_types
+            .get_or_insert_with(|| ExpectedTypes::new(schema))
+            .check_column(column_index, &array)?;
         Self::verify_field_nullability(array.as_ref(), field)?;
         if array.is_empty() {
             return Ok(());
