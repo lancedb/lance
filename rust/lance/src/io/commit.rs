@@ -83,6 +83,7 @@ pub mod conflict_resolver;
 mod dynamodb;
 #[cfg(test)]
 mod external_manifest;
+pub mod idempotency;
 pub mod namespace_manifest;
 #[cfg(all(feature = "dynamodb_tests", test))]
 mod s3_test;
@@ -790,6 +791,9 @@ pub(crate) async fn commit_new_dataset(
     session: Arc<Session>,
     keep_field_ids: bool,
 ) -> Result<(Manifest, ManifestLocation)> {
+    // Nothing was committed before the first version, so there is nothing to
+    // check the keys against; they are recorded for later commits.
+    idempotency::IdempotencyKeys::from_transaction(transaction)?;
     do_commit_new_dataset(
         object_store,
         source_store,
@@ -1303,6 +1307,12 @@ pub(crate) async fn do_commit_detached_transaction(
     retry_timeout: Duration,
 ) -> Result<(Manifest, ManifestLocation)> {
     ensure_can_write_manifest(&dataset.manifest)?;
+    if idempotency::IdempotencyKeys::from_transaction(transaction)?.is_some() {
+        return Err(Error::not_supported(
+            "idempotency keys cannot be used with detached commits: a detached version is not \
+             part of the version history, so no later commit can be checked against it",
+        ));
+    }
     let mut transaction = transaction.clone();
     canonicalize_non_reusable_field_ids(Some(&dataset.manifest), &mut transaction.operation, None)?;
     let transaction = &transaction;
@@ -1703,10 +1713,15 @@ pub(crate) async fn commit_transaction(
     retry_timeout: Duration,
     manifest_naming_scheme: ManifestNamingScheme,
     affected_rows: Option<&RowAddrTreeMap>,
+    idempotency_property: Option<&str>,
 ) -> Result<(Manifest, ManifestLocation)> {
     // Note: object_store has been configured with WriteParams, but dataset.object_store.as_ref()
     // has not necessarily. So for anything involving writing, use `object_store`.
     let read_version = transaction.read_version;
+    // Reject unusable keys before any IO. A strict overwrite never rebases,
+    // and needs no check: its manifest put only succeeds when nothing was
+    // committed after its read version.
+    idempotency::IdempotencyKeys::from_transaction(transaction)?;
     let mut target_version = read_version + 1;
     let original_dataset = dataset.clone();
 
@@ -1781,7 +1796,9 @@ pub(crate) async fn commit_transaction(
             // started at exact same time better.
 
             let mut rebase =
-                TransactionRebase::try_new(&original_dataset, transaction, affected_rows).await?;
+                TransactionRebase::try_new(&original_dataset, transaction, affected_rows)
+                    .await?
+                    .with_idempotency_property(idempotency_property);
             rebase.load_current_lineage(&dataset).await?;
             let seen = other_transactions
                 .iter()
@@ -1790,6 +1807,16 @@ pub(crate) async fn commit_transaction(
             let missing = (checked_since + 1..=dataset.manifest.version)
                 .filter(|version| !seen.contains(version))
                 .collect::<Vec<_>>();
+            if !missing.is_empty() && rebase.has_idempotency_keys() {
+                return Err(Error::commit_conflict_source(
+                    dataset.manifest.version,
+                    format!(
+                        "versions {missing:?} were cleaned up after this commit's read version \
+                         {read_version}, so they cannot be checked for its idempotency keys"
+                    )
+                    .into(),
+                ));
+            }
             if rebase.needs_versions(&missing) {
                 return Err(Error::retryable_commit_conflict_source(
                     dataset.manifest.version,
@@ -1801,9 +1828,7 @@ pub(crate) async fn commit_transaction(
                 ));
             }
 
-            for (other_version, other_transaction) in other_transactions.iter() {
-                rebase.check_txn(other_transaction, *other_version)?;
-            }
+            rebase.check_txns(&other_transactions)?;
 
             let (rebased, assembly) = rebase.finish_with_tagged_rewrite(&dataset).await?;
             transaction = rebased;
@@ -3528,6 +3553,7 @@ mod tests {
             &CommitConfig::default(),
             DEFAULT_COMMIT_RETRY_TIMEOUT,
             dataset.manifest_location.naming_scheme,
+            None,
             None,
         )
         .await

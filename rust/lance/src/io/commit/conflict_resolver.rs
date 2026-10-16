@@ -11,6 +11,7 @@ use crate::index::frag_reuse::{
     load_frag_reuse_index_details, load_frag_reuse_records, records_added_since,
 };
 use crate::index::mem_wal::{load_mem_wal_index_details, new_mem_wal_index_meta};
+use crate::io::commit::idempotency::IdempotencyKeys;
 use crate::io::deletion::read_dataset_deletion_file;
 use crate::{
     Dataset,
@@ -82,6 +83,10 @@ pub struct TransactionRebase<'a> {
     /// settle it at commit time. A same-name CreateIndex that changed what
     /// the index is (its fields or type) still conflicts.
     staged_replay: bool,
+    /// The transaction's idempotency keys, `None` when it carries none.
+    /// Every transaction it is checked against must not share any of them.
+    /// Boxed: the commit loop holds the rebase across awaits.
+    idempotency_keys: Option<Box<IdempotencyKeys>>,
 }
 
 /// Whether a fragment-reuse index would corrupt `index` rather than repair it.
@@ -247,6 +252,7 @@ impl<'a> TransactionRebase<'a> {
         transaction: Transaction,
         affected_rows: Option<&'a RowAddrTreeMap>,
     ) -> Result<Self> {
+        let idempotency_keys = IdempotencyKeys::from_transaction(&transaction)?.map(Box::new);
         match &transaction.operation {
             // These operations add new fragments or don't modify any.
             Operation::Append { .. }
@@ -288,6 +294,7 @@ impl<'a> TransactionRebase<'a> {
                     read_schema,
                     reuse: Default::default(),
                     staged_replay: false,
+                    idempotency_keys,
                 })
             }
             Operation::Delete {
@@ -325,6 +332,7 @@ impl<'a> TransactionRebase<'a> {
                         read_schema: None,
                         reuse: Default::default(),
                         staged_replay: false,
+                        idempotency_keys,
                     });
                 }
 
@@ -346,6 +354,7 @@ impl<'a> TransactionRebase<'a> {
                     read_schema: None,
                     reuse: Default::default(),
                     staged_replay: false,
+                    idempotency_keys,
                 })
             }
             Operation::Rewrite {
@@ -385,6 +394,7 @@ impl<'a> TransactionRebase<'a> {
                     read_schema: None,
                     reuse,
                     staged_replay: false,
+                    idempotency_keys,
                 })
             }
             Operation::DataReplacement { replacements } => {
@@ -408,6 +418,7 @@ impl<'a> TransactionRebase<'a> {
                     read_schema: None,
                     reuse: Default::default(),
                     staged_replay: false,
+                    idempotency_keys,
                 })
             }
             Operation::DataOverlay { groups } => {
@@ -431,6 +442,7 @@ impl<'a> TransactionRebase<'a> {
                     read_schema: None,
                     reuse: Default::default(),
                     staged_replay: false,
+                    idempotency_keys,
                 })
             }
             Operation::Merge { fragments, .. } => {
@@ -453,6 +465,7 @@ impl<'a> TransactionRebase<'a> {
                     read_schema: None,
                     reuse: Default::default(),
                     staged_replay: false,
+                    idempotency_keys,
                 })
             }
             // An unrecognized operation cannot be rebased: we don't know what it touches.
@@ -634,7 +647,56 @@ impl<'a> TransactionRebase<'a> {
             })
     }
 
+    /// Also read other transactions' idempotency keys from `property`, the
+    /// caller-named property of
+    /// [`CommitBuilder::with_idempotency_property`](crate::dataset::CommitBuilder::with_idempotency_property).
+    pub(crate) fn with_idempotency_property(mut self, property: Option<&str>) -> Self {
+        self.idempotency_keys = self
+            .idempotency_keys
+            .map(|keys| Box::new(keys.with_caller_property(property)));
+        self
+    }
+
+    pub(crate) fn has_idempotency_keys(&self) -> bool {
+        self.idempotency_keys.is_some()
+    }
+
+    /// [`Self::check_txn`] for every transaction committed in `window`, in
+    /// version order.
+    ///
+    /// Idempotency keys are checked across the whole window before any other
+    /// rule: a retryable conflict with an earlier version must not mask a
+    /// duplicate in a later one, because a caller that retries re-reads the
+    /// table past the duplicate and would apply the work twice.
+    pub(crate) fn check_txns(&mut self, window: &[(u64, Arc<Transaction>)]) -> Result<()> {
+        if let Some(keys) = &self.idempotency_keys {
+            for (other_version, other_transaction) in window {
+                keys.check(other_transaction, *other_version)?;
+            }
+        }
+        for (other_version, other_transaction) in window {
+            self.check_operation(other_transaction, *other_version)?;
+        }
+        Ok(())
+    }
+
+    /// Check `other_transaction`, committed at `other_version` after our read
+    /// version, and record what rebasing over it requires.
+    ///
+    /// A transaction that shares any of our idempotency keys fails with
+    /// [`Error::DuplicateTransaction`], whatever the operations.
     pub fn check_txn(&mut self, other_transaction: &Transaction, other_version: u64) -> Result<()> {
+        if let Some(keys) = &self.idempotency_keys {
+            keys.check(other_transaction, other_version)?;
+        }
+        self.check_operation(other_transaction, other_version)
+    }
+
+    fn check_operation(
+        &mut self,
+        other_transaction: &Transaction,
+        other_version: u64,
+    ) -> Result<()> {
         // Either order: the claim was checked without the write's data.
         let ours = &self.transaction.operation;
         let theirs = &other_transaction.operation;
@@ -4612,6 +4674,7 @@ mod tests {
                 read_schema: None,
                 reuse: Default::default(),
                 staged_replay: false,
+                idempotency_keys: None,
             };
 
             let result = rebase.check_txn(&unknown, 1);
@@ -4832,6 +4895,7 @@ mod tests {
                 read_schema: None,
                 reuse: Default::default(),
                 staged_replay: false,
+                idempotency_keys: None,
             };
             let other_txn = Transaction::new(0, other.clone(), None);
             let result = rebase.check_txn(&other_txn, 1);
@@ -4899,6 +4963,7 @@ mod tests {
                 read_schema: None,
                 reuse: Default::default(),
                 staged_replay: false,
+                idempotency_keys: None,
             };
             let other_txn = Transaction::new(0, other.clone(), None);
             let result = rebase.check_txn(&other_txn, 1);
@@ -5048,6 +5113,7 @@ mod tests {
                 read_schema: None,
                 reuse: Default::default(),
                 staged_replay: false,
+                idempotency_keys: None,
             };
             let other_txn = Transaction::new(0, other.clone(), None);
             let result = rebase.check_txn(&other_txn, 1);
@@ -5098,6 +5164,7 @@ mod tests {
                 read_schema: None,
                 reuse: Default::default(),
                 staged_replay: false,
+                idempotency_keys: None,
             };
             let result = append_rebase.check_txn(&Transaction::new(0, merge.clone(), None), 1);
             assert_eq!(
@@ -5121,6 +5188,7 @@ mod tests {
                 read_schema: None,
                 reuse: Default::default(),
                 staged_replay: false,
+                idempotency_keys: None,
             };
             let result = merge_rebase.check_txn(&Transaction::new(0, append, None), 1);
             assert!(
@@ -5209,6 +5277,7 @@ mod tests {
                         read_schema: None,
                         reuse: Default::default(),
                         staged_replay: false,
+                        idempotency_keys: None,
                     };
                     let result = rebase.check_txn(&Transaction::new(0, theirs, None), 1);
                     assert_eq!(
@@ -5267,6 +5336,7 @@ mod tests {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
+            idempotency_keys: None,
         };
         let result = rebase.check_txn(&Transaction::new(0, project, None), 1);
         assert_eq!(
@@ -5406,6 +5476,7 @@ mod tests {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
+            idempotency_keys: None,
         };
         let update = Transaction::new(
             1,
@@ -5474,6 +5545,7 @@ mod tests {
                 read_schema: None,
                 reuse: Default::default(),
                 staged_replay: false,
+                idempotency_keys: None,
             };
             let result = rebase.check_txn(&Transaction::new(0, theirs, None), 1);
             assert_eq!(result.is_err(), conflicts, "{result:?}");
@@ -5536,6 +5608,7 @@ mod tests {
                 read_schema: None,
                 reuse: Default::default(),
                 staged_replay: false,
+                idempotency_keys: None,
             };
             let result = rebase.check_txn(&merge, 1);
             assert_eq!(result.is_err(), conflicts, "{result:?}");
@@ -5565,6 +5638,7 @@ mod tests {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
+            idempotency_keys: None,
         };
         let result = rebase.check_txn(&install, 1);
         assert!(
@@ -5617,6 +5691,7 @@ mod tests {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
+            idempotency_keys: None,
         };
 
         let same_name = Transaction::new(
@@ -5680,6 +5755,7 @@ mod tests {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
+            idempotency_keys: None,
         };
         let different_name_result = rebase.check_txn(&different_name, 1);
         assert!(
@@ -5746,6 +5822,7 @@ mod tests {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
+            idempotency_keys: None,
         };
         let result = rebase.check_txn(&Transaction::new(0, committed_operation, None), 1);
 
@@ -5795,6 +5872,7 @@ mod tests {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
+            idempotency_keys: None,
         };
 
         let result = rebase.check_txn(&Transaction::new(0, drop_operation, None), 1);
@@ -5845,6 +5923,7 @@ mod tests {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
+            idempotency_keys: None,
         };
 
         let result = rebase.check_txn(&Transaction::new(0, removal_operation, None), 1);
@@ -5922,6 +6001,7 @@ mod tests {
                 read_schema: None,
                 reuse: Default::default(),
                 staged_replay: false,
+                idempotency_keys: None,
             };
             let result = rebase.check_txn(&rewrite, 2);
             if expect_conflict {
@@ -6006,6 +6086,7 @@ mod tests {
                 reuse: Default::default(),
 
                 staged_replay: false,
+                idempotency_keys: None,
             };
             // Disjoint from the rewritten fragment, so this only exercises the
             // stable-row-ids check and not the group-straddling check below it.
@@ -6708,6 +6789,7 @@ mod tests {
                 read_schema: None,
                 reuse: Default::default(),
                 staged_replay: false,
+                idempotency_keys: None,
             };
 
             let result = rebase.check_txn(&txn2, 1);
@@ -6779,6 +6861,7 @@ mod tests {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
+            idempotency_keys: None,
         };
 
         let result = rebase.check_txn(&committed_txn, 1);
@@ -6825,6 +6908,7 @@ mod tests {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
+            idempotency_keys: None,
         };
 
         let result = rebase.check_txn(&committed_txn, 1);
@@ -6872,6 +6956,7 @@ mod tests {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
+            idempotency_keys: None,
         };
 
         let result = rebase.check_txn(&committed_txn, 1);
@@ -6919,6 +7004,7 @@ mod tests {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
+            idempotency_keys: None,
         };
 
         let result = rebase.check_txn(&committed_txn, 1);
@@ -6977,6 +7063,7 @@ mod tests {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
+            idempotency_keys: None,
         };
 
         let result = rebase.check_txn(&committed_txn, 1);
@@ -7010,6 +7097,7 @@ mod tests {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
+            idempotency_keys: None,
         };
 
         let result_higher = rebase_higher.check_txn(&committed_txn, 1);
@@ -7064,6 +7152,7 @@ mod tests {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
+            idempotency_keys: None,
         };
 
         // CreateIndex of MemWalIndex should be compatible with UpdateMemWalState

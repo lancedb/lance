@@ -539,8 +539,11 @@ mod test {
     }
 
     #[cfg(not(windows))]
+    #[rstest::rstest]
+    #[case::no_keys(false)]
+    #[case::disjoint_keys(true)]
     #[tokio::test]
-    async fn test_concurrent_commits_are_okay() {
+    async fn test_concurrent_commits_are_okay(#[case] has_keys: bool) {
         const NUM_WRITERS: usize = 5;
         const CONTENDED_VERSION: u64 = 2;
         let external_store =
@@ -565,10 +568,13 @@ mod test {
         // All writers first attempt version 2. One succeeds and the rest must
         // observe the conflict, refresh, and commit distinct later versions.
         let write_futs = (0..NUM_WRITERS)
-            .map(|_| data_gen.batch(10))
-            .map(|data| {
+            .map(|writer| (writer, data_gen.batch(10)))
+            .map(|(writer, data)| {
                 let mut params = write_params(handler.clone());
                 params.mode = WriteMode::Append;
+                if has_keys {
+                    params = params.with_idempotency_keys([format!("message-{writer}")]);
+                }
                 Dataset::write(data, ds_uri, Some(params))
             })
             .collect::<Vec<_>>();
@@ -625,6 +631,68 @@ mod test {
             })
             .collect::<Vec<_>>();
         assert!(unexpected_entries.is_empty(), "{:?}", unexpected_entries);
+    }
+
+    /// Writers racing for the same version with the same idempotency key:
+    /// exactly one applies, and every other writer, after losing the race and
+    /// re-reading, fails naming the winner's version.
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn test_concurrent_commits_with_shared_keys() {
+        const NUM_WRITERS: usize = 5;
+        const CONTENDED_VERSION: u64 = 2;
+        let external_store =
+            TestExternalManifestStore::with_contention(CONTENDED_VERSION, NUM_WRITERS);
+        let handler = Arc::new(ExternalManifestCommitHandler {
+            external_manifest_store: Arc::new(external_store),
+        });
+        let mut data_gen =
+            BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("x".to_owned())));
+        let dir = TempStrDir::default();
+        let ds_uri = &dir;
+        Dataset::write(
+            data_gen.batch(10),
+            ds_uri,
+            Some(write_params(handler.clone())),
+        )
+        .await
+        .unwrap();
+
+        let write_futs = (0..NUM_WRITERS)
+            .map(|writer| (writer, data_gen.batch(10)))
+            .map(|(writer, data)| {
+                let mut params = write_params(handler.clone());
+                params.mode = WriteMode::Append;
+                params = params.with_idempotency_keys(["message", &format!("writer-{writer}")]);
+                Dataset::write(data, ds_uri, Some(params))
+            })
+            .collect::<Vec<_>>();
+        let (applied, rejected): (Vec<_>, Vec<_>) = join_all(write_futs)
+            .await
+            .into_iter()
+            .partition(|result| result.is_ok());
+
+        assert_eq!(applied.len(), 1, "{applied:?}");
+        assert_eq!(
+            applied[0].as_ref().unwrap().version().version,
+            CONTENDED_VERSION
+        );
+        for result in rejected {
+            match result {
+                Err(Error::DuplicateTransaction { version, keys, .. }) => {
+                    assert_eq!(version, CONTENDED_VERSION);
+                    assert_eq!(keys, vec!["message".to_string()]);
+                }
+                other => panic!("expected DuplicateTransaction, got {other:?}"),
+            }
+        }
+        let ds = DatasetBuilder::from_uri(ds_uri)
+            .with_read_params(read_params(handler))
+            .load()
+            .await
+            .unwrap();
+        assert_eq!(ds.version().version, CONTENDED_VERSION);
+        assert_eq!(ds.count_rows(None).await.unwrap(), 20);
     }
 
     #[tokio::test]

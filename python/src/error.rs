@@ -52,6 +52,23 @@ fn commit_conflict_error(py: Python<'_>, err: &LanceError, retryable: bool) -> P
     }
 }
 
+/// Build `lance.commit.DuplicateTransactionError` (an `OSError`) carrying the
+/// version that already applied the keys and the shared keys, so callers can
+/// tell their own landed commit from another writer's.
+fn duplicate_transaction_error(
+    py: Python<'_>,
+    err: &LanceError,
+    version: u64,
+    keys: &[String],
+) -> PyErr {
+    let message = err.to_string();
+    PyModule::import(py, "lance.commit")
+        .and_then(|module| module.getattr("DuplicateTransactionError"))
+        .and_then(|class| class.call1((message.clone(), version, keys.to_vec())))
+        .map(|exc| PyErr::from_value(exc.into_bound()))
+        .unwrap_or_else(|_| PyIOError::new_err(message))
+}
+
 /// Try to convert a NamespaceError to the corresponding Python exception.
 /// Returns the appropriate Python exception from lance_namespace.errors module.
 fn namespace_error_to_pyerr(py: Python<'_>, ns_err: &NamespaceError) -> PyErr {
@@ -118,7 +135,7 @@ impl<T> PythonErrorExt<T> for std::result::Result<T, LanceError> {
             Err(err) => match err {
                 LanceError::InvalidInput { .. } => self.value_error(),
                 LanceError::NotSupported { .. } => self.not_implemented(),
-                LanceError::IO { .. } => self.io_error(),
+                LanceError::IO { .. } | LanceError::DuplicateTransaction { .. } => self.io_error(),
                 LanceError::Timeout { .. } => self.timeout_error(),
                 LanceError::NotFound { .. } => self.value_error(),
                 LanceError::RefNotFound { .. } => self.value_error(),
@@ -160,7 +177,12 @@ impl<T> PythonErrorExt<T> for std::result::Result<T, LanceError> {
     }
 
     fn io_error(self) -> PyResult<T> {
-        self.map_err(|err| PyIOError::new_err(err.to_string()))
+        self.map_err(|err| match &err {
+            LanceError::DuplicateTransaction { version, keys, .. } => {
+                Python::attach(|py| duplicate_transaction_error(py, &err, *version, keys))
+            }
+            _ => PyIOError::new_err(err.to_string()),
+        })
     }
 
     fn timeout_error(self) -> PyResult<T> {

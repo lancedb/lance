@@ -53,6 +53,7 @@ use crate::dataset::blob::{
     blob_dedicated_threshold_from_metadata, blob_inline_threshold_from_metadata,
     blob_pack_file_threshold_from_metadata,
 };
+use crate::io::commit::idempotency;
 use crate::session::Session;
 
 use super::fragment::write::generate_random_filename;
@@ -779,6 +780,45 @@ impl WriteParams {
     pub fn with_transaction_properties(self, properties: HashMap<String, String>) -> Self {
         Self {
             transaction_properties: Some(Arc::new(properties)),
+            ..self
+        }
+    }
+
+    /// Apply this write at most once per idempotency key, as
+    /// [`CommitBuilder::with_idempotency_keys`] does for a commit.
+    ///
+    /// The keys are stored in [`Self::transaction_properties`], replacing any
+    /// keys set there before. Call this after
+    /// [`Self::with_transaction_properties`], which replaces the whole map.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use arrow_array::RecordBatch;
+    /// # use lance::Result;
+    /// # use lance::dataset::{InsertBuilder, WriteMode, WriteParams};
+    /// # async fn test(uri: &str, data: RecordBatch) -> Result<()> {
+    /// let params = WriteParams {
+    ///     mode: WriteMode::Append,
+    ///     ..Default::default()
+    /// }
+    /// .with_idempotency_keys(["message-17"]);
+    /// InsertBuilder::new(uri)
+    ///     .with_params(&params)
+    ///     .execute(vec![data])
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_idempotency_keys(self, keys: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        let mut properties = self
+            .transaction_properties
+            .as_deref()
+            .cloned()
+            .unwrap_or_default();
+        idempotency::set_keys(&mut properties, keys.into_iter().map(Into::into).collect());
+        Self {
+            transaction_properties: (!properties.is_empty()).then(|| Arc::new(properties)),
             ..self
         }
     }

@@ -4,6 +4,8 @@
 import base64
 import contextlib
 import importlib
+import inspect
+import json
 import os
 import pickle
 import platform
@@ -2163,6 +2165,163 @@ def test_commit_batch_append():
     assert isinstance(merged_txn, lance.Transaction)
     assert isinstance(merged_txn.operation, lance.LanceOperation.Append)
     assert merged_txn.operation.fragments == fragments2 + fragments3
+
+
+@pytest.fixture
+def enable_unstable_idempotency_keys(monkeypatch):
+    monkeypatch.setenv("LANCE_ENABLE_UNSTABLE_IDEMPOTENCY_KEYS", "1")
+
+
+def _idempotency_append(dataset, read_version, properties=None):
+    data = pa.table({"a": [1], "b": [1]})
+    fragments = lance.fragment.write_fragments(data, dataset)
+    return lance.Transaction(
+        read_version,
+        lance.LanceOperation.Append(fragments),
+        transaction_properties=properties or {},
+    )
+
+
+def _commit_with(api, dataset, keys):
+    """Commit an append at version 1 with ``keys`` through ``api``."""
+    if api == "keys":
+        return lance.LanceDataset.commit(
+            dataset, _idempotency_append(dataset, 1), idempotency_keys=keys
+        )
+    properties = {"app_keys": json.dumps(keys)}
+    return lance.LanceDataset.commit(
+        dataset,
+        _idempotency_append(dataset, 1, properties),
+        idempotency_property="app_keys",
+    )
+
+
+@pytest.mark.parametrize(
+    "first_api, second_api",
+    [
+        ("keys", "keys"),
+        ("property", "keys"),
+        ("keys", "property"),
+        ("property", "property"),
+    ],
+)
+@pytest.mark.parametrize(
+    "second_keys, overlap",
+    [(["b", "c"], ["b"]), (["c"], None)],
+    ids=["shared", "disjoint"],
+)
+def test_commit_idempotency(
+    enable_unstable_idempotency_keys, first_api, second_api, second_keys, overlap
+):
+    from lance.commit import DuplicateTransactionError
+
+    dataset = lance.write_dataset(pa.table({"a": [0], "b": [0]}), "memory://")
+    first = _commit_with(first_api, dataset, ["a", "b"])
+    assert first.version == 2
+    properties = first.read_transaction(2).transaction_properties
+    assert properties["__lance_idempotency_keys"] == '["a","b"]'
+    if first_api == "property":
+        assert json.loads(properties["app_keys"]) == ["a", "b"]
+
+    if overlap is None:
+        assert _commit_with(second_api, dataset, second_keys).version == 3
+        return
+    with pytest.raises(DuplicateTransactionError) as excinfo:
+        _commit_with(second_api, dataset, second_keys)
+    assert isinstance(excinfo.value, OSError)
+    assert excinfo.value.version == 2
+    assert excinfo.value.keys == overlap
+    assert first.checkout_version(2).count_rows() == 2
+
+
+def test_commit_idempotency_api_probe():
+    # Callers detect support by inspecting the signature and the error class.
+    parameters = inspect.signature(lance.LanceDataset.commit).parameters
+    assert "idempotency_property" in parameters
+    assert "idempotency_keys" in parameters
+    error = getattr(
+        importlib.import_module("lance.commit"), "DuplicateTransactionError"
+    )
+    assert issubclass(error, OSError)
+
+
+@pytest.mark.parametrize(
+    "kwargs, properties, error, match",
+    [
+        ({"idempotency_property": "app_keys"}, {}, OSError, "is not set"),
+        ({"idempotency_property": "app_keys"}, {"app_keys": "a"}, OSError, "JSON"),
+        (
+            {"idempotency_property": "app_keys", "idempotency_keys": ["a"]},
+            {"app_keys": '["a"]'},
+            OSError,
+            "mutually exclusive",
+        ),
+        ({"idempotency_keys": [""]}, {}, OSError, "non-empty"),
+        ({"idempotency_keys": "abc"}, {}, TypeError, "not a str"),
+        ({"idempotency_keys": ["a"], "detached": True}, {}, OSError, "detached"),
+    ],
+    ids=["missing", "malformed", "both", "empty_key", "str", "detached"],
+)
+def test_commit_idempotency_errors(
+    enable_unstable_idempotency_keys, kwargs, properties, error, match
+):
+    dataset = lance.write_dataset(pa.table({"a": [0], "b": [0]}), "memory://")
+    with pytest.raises(error, match=match):
+        lance.LanceDataset.commit(
+            dataset, _idempotency_append(dataset, 1, properties), **kwargs
+        )
+    assert dataset.latest_version == 1
+
+
+@pytest.mark.parametrize("api", ["write_dataset", "insert"])
+def test_write_idempotency_keys(enable_unstable_idempotency_keys, api):
+    from lance.commit import DuplicateTransactionError
+
+    original = lance.write_dataset(pa.table({"a": [0], "b": [0]}), "memory://")
+    data = pa.table({"a": [1], "b": [1]})
+
+    def write(keys):
+        # Every write reads version 1 so later writes must check committed keys.
+        dataset = original.checkout_version(1)
+        if api == "insert":
+            # insert() updates the handle in place and returns None.
+            dataset.insert(data, idempotency_keys=keys)
+            return dataset
+        return lance.write_dataset(data, dataset, mode="append", idempotency_keys=keys)
+
+    assert write(["m1"]).version == 2
+    with pytest.raises(DuplicateTransactionError) as excinfo:
+        write(["m1", "m2"])
+    assert excinfo.value.version == 2
+    assert excinfo.value.keys == ["m1"]
+    assert write(["m2"]).version == 3
+
+
+def test_commit_batch_idempotency_keys(enable_unstable_idempotency_keys):
+    from lance.commit import DuplicateTransactionError
+
+    dataset = lance.write_dataset(pa.table({"a": [0], "b": [0]}), "memory://")
+    keyed = {"__lance_idempotency_keys": '["a"]'}
+    transactions = [
+        _idempotency_append(dataset, 1, keyed),
+        _idempotency_append(dataset, 1),
+    ]
+    result = lance.LanceDataset.commit_batch(
+        dataset, transactions, idempotency_keys=["b"]
+    )
+    properties = result["dataset"].read_transaction(2).transaction_properties
+    assert properties["__lance_idempotency_keys"] == '["a","b"]'
+
+    with pytest.raises(DuplicateTransactionError) as excinfo:
+        lance.LanceDataset.commit(
+            dataset, _idempotency_append(dataset, 1), idempotency_keys=["b"]
+        )
+    assert (excinfo.value.version, excinfo.value.keys) == (2, ["b"])
+
+    with pytest.raises(OSError, match="shares the idempotency key 'a'"):
+        lance.LanceDataset.commit_batch(
+            dataset, [_idempotency_append(dataset, 1, keyed)] * 2
+        )
 
 
 def test_delete_with_commit(tmp_path: Path):

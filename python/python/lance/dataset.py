@@ -4968,6 +4968,8 @@ class LanceDataset(pa.dataset.Dataset):
         namespace_client_managed_versioning: bool = False,
         base_store_params: Optional[Dict[str, Dict[str, str]]] = None,
         commit_timeout: Optional[timedelta] = _DEFAULT_COMMIT_TIMEOUT,
+        idempotency_keys: Optional[Iterable[str]] = None,
+        idempotency_property: Optional[str] = None,
     ) -> LanceDataset:
         """Create a new version of dataset
 
@@ -5044,6 +5046,30 @@ class LanceDataset(pa.dataset.Dataset):
             Maximum time to wait for the commit operation (including retries on
             conflict) to complete. Defaults to 30 minutes. Pass ``None`` to
             disable the timeout entirely. Must be a positive duration.
+        idempotency_keys : iterable of str, optional
+            Ids of the work this commit applies, such as queue message ids, so
+            it is applied at most once. If a transaction committed after the
+            read version already carries any of these keys, the commit raises
+            :class:`lance.commit.DuplicateTransactionError` naming that version
+            and the shared keys instead of rebasing over it. That version may
+            be this writer's own earlier commit, when a commit that already
+            landed is retried. Versions at or before the read version are not
+            checked. Keys must be non-empty. By default a transaction may carry
+            at most 4096 keys totalling 256 KiB; the ``LANCE_MAX_IDEMPOTENCY_KEYS``
+            and ``LANCE_MAX_IDEMPOTENCY_KEY_BYTES`` environment variables change
+            the limits. Detached commits reject keys. Experimental: release
+            builds reject keys unless the
+            ``LANCE_ENABLE_UNSTABLE_IDEMPOTENCY_KEYS`` environment variable is
+            set, and how the keys are stored and checked may change
+            incompatibly.
+        idempotency_property : str, optional
+            Name of a transaction property that already holds this commit's
+            idempotency keys as a JSON array of strings; it must be set on this
+            commit's transaction. Behaves like ``idempotency_keys``, and other
+            transactions' keys are also read from this property, so writers
+            that only know the property and writers using ``idempotency_keys``
+            see each other's keys. Prefer ``idempotency_keys``; cannot be
+            combined with it.
 
         Returns
         -------
@@ -5124,6 +5150,8 @@ class LanceDataset(pa.dataset.Dataset):
                 table_id=table_id,
                 namespace_client_managed_versioning=namespace_client_managed_versioning,
                 commit_timeout=commit_timeout,
+                idempotency_keys=_idempotency_keys(idempotency_keys),
+                idempotency_property=idempotency_property,
             )
         elif isinstance(operation, LanceOperation.BaseOperation):
             new_ds = _Dataset.commit(
@@ -5141,6 +5169,8 @@ class LanceDataset(pa.dataset.Dataset):
                 table_id=table_id,
                 namespace_client_managed_versioning=namespace_client_managed_versioning,
                 commit_timeout=commit_timeout,
+                idempotency_keys=_idempotency_keys(idempotency_keys),
+                idempotency_property=idempotency_property,
             )
         else:
             raise TypeError(
@@ -5171,6 +5201,7 @@ class LanceDataset(pa.dataset.Dataset):
         max_retries: int = 20,
         base_store_params: Optional[Dict[str, Dict[str, str]]] = None,
         commit_timeout: Optional[timedelta] = _DEFAULT_COMMIT_TIMEOUT,
+        idempotency_keys: Optional[Iterable[str]] = None,
     ) -> BulkCommitResult:
         """Create a new version of dataset with multiple transactions.
 
@@ -5219,6 +5250,11 @@ class LanceDataset(pa.dataset.Dataset):
             Maximum time to wait for the commit operation (including retries on
             conflict) to complete. Defaults to 30 minutes. Pass ``None`` to
             disable the timeout entirely. Must be a positive duration.
+        idempotency_keys : iterable of str, optional
+            Keys added to the idempotency keys the transactions already carry
+            (see ``idempotency_keys`` on :meth:`commit`). The batch is committed
+            with the union of all keys; transactions of the batch must not
+            share keys.
 
         Returns
         -------
@@ -5256,6 +5292,7 @@ class LanceDataset(pa.dataset.Dataset):
             detached=detached,
             max_retries=max_retries,
             commit_timeout=commit_timeout,
+            idempotency_keys=_idempotency_keys(idempotency_keys),
         )
         ds = LanceDataset.__new__(LanceDataset)
         ds._ds = new_ds
@@ -8148,6 +8185,7 @@ def write_dataset(
     namespace_client: Optional[LanceNamespace] = None,
     table_id: Optional[List[str]] = None,
     session: Optional[Session] = None,
+    idempotency_keys: Optional[Iterable[str]] = None,
 ) -> LanceDataset:
     """Write a given data_obj to the given uri
 
@@ -8243,6 +8281,9 @@ def write_dataset(
         and can be retrieved using read_transaction().
         If both `commit_message` and `properties` are provided, `commit_message` will
         override any "lance.commit.message" key in `properties`.
+    idempotency_keys: iterable of str, optional
+        Ids of the work this write applies, so it is applied at most once. See
+        ``idempotency_keys`` on :meth:`LanceDataset.commit`.
     initial_bases: list of DatasetBasePath, optional
         New base paths to register in the manifest. Only used in **CREATE mode**.
         Cannot be specified in APPEND or OVERWRITE modes.
@@ -8419,6 +8460,7 @@ def write_dataset(
         "allow_external_blob_outside_bases": allow_external_blob_outside_bases,
         "blob_pack_file_size_threshold": blob_pack_file_size_threshold,
         "session": session,
+        "idempotency_keys": _idempotency_keys(idempotency_keys),
     }
 
     # Add namespace_client and table_id for storage options provider and managed
@@ -8701,6 +8743,13 @@ def _validate_metadata(metadata: dict):
                 )
         elif isinstance(v, dict):
             _validate_metadata(v)
+
+
+def _idempotency_keys(keys: Optional[Iterable[str]]) -> Optional[List[str]]:
+    # A bare string is an iterable of characters, almost certainly a mistake.
+    if isinstance(keys, str):
+        raise TypeError("idempotency_keys must be an iterable of str, not a str")
+    return None if keys is None else list(keys)
 
 
 def _merge_message_to_properties(
