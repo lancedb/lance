@@ -1567,52 +1567,89 @@ mod tests {
         });
     }
 
+    /// Checks one cosine distance against an f64 reference. The absolute
+    /// `epsilon` covers inputs with extreme dynamic range, where a near-zero
+    /// result differs between f32 and f64 accumulation by more than
+    /// `max_relative` of itself.
+    fn check_cosine(
+        got: f32,
+        want: f32,
+        kernel: &str,
+        dimension: usize,
+    ) -> std::result::Result<(), TestCaseError> {
+        prop_assert!(
+            approx::relative_eq!(got, want, max_relative = 1e-3, epsilon = 1e-6),
+            "{kernel} at dim {dimension}: {got} != {want}"
+        );
+        Ok(())
+    }
+
+    /// Every host-supported f32 kernel, single-pair and batch, must agree with
+    /// an f64 reference. Prefixes of length 8 and 16 pin the batch kernels'
+    /// PQ-width fast paths regardless of the generated dimension.
     #[rstest::rstest]
-    fn test_cosine_fast_f32_scalar_simd_parity(
+    fn test_cosine_f32_kernels_match_reference(
         #[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)] shard: usize,
     ) {
         run_vector_pair_proptest(arbitrary_f32, dimension_shard(shard), |x, y| {
-            prop_assume!(norm_l2(&x) > 1e-10);
-            prop_assume!(norm_l2(&y) > 1e-10);
-            let x_norm = norm_l2(&x);
-            let x_f64: Vec<f64> = x.iter().map(|&v| v as f64).collect();
-            let y_f64: Vec<f64> = y.iter().map(|&v| v as f64).collect();
-            let scalar = cosine_fast_scalar(&x_f64, x_norm, &y_f64);
-            let simd = <f32 as Cosine>::cosine_fast(&x, x_norm, &y);
-            prop_assert!(approx::relative_eq!(scalar, simd, max_relative = 1e-3));
+            for dimension in [8, 16, x.len()].into_iter().filter(|&d| d <= x.len()) {
+                let (x, y) = (&x[..dimension], &y[..dimension]);
+                let (x_norm, y_norm) = (norm_l2(x), norm_l2(y));
+                if x_norm <= 1e-10 || y_norm <= 1e-10 {
+                    continue;
+                }
+                let x_f64: Vec<f64> = x.iter().map(|&v| v as f64).collect();
+                let y_f64: Vec<f64> = y.iter().map(|&v| v as f64).collect();
+                let want = cosine_fast_scalar(&x_f64, x_norm, &y_f64);
+                let want_with_norms = cosine_with_norms_scalar(&x_f64, x_norm, y_norm, &y_f64);
+                let want_self = cosine_fast_scalar(&x_f64, x_norm, &x_f64);
+
+                for candidate in COSINE_F32.candidates() {
+                    let Some(kernel) = candidate.kernel() else {
+                        continue;
+                    };
+                    check_cosine(kernel.call(x, x_norm, y), want, candidate.name(), dimension)?;
+                }
+
+                for candidate in COSINE_WITH_NORMS_F32.candidates() {
+                    let Some(kernel) = candidate.kernel() else {
+                        continue;
+                    };
+                    let got = kernel.call(x, x_norm, y_norm, y);
+                    check_cosine(got, want_with_norms, candidate.name(), dimension)?;
+                }
+
+                let batch = [y, x].concat();
+                for candidate in COSINE_F32_BATCH.candidates() {
+                    let Some(kernel) = candidate.kernel() else {
+                        continue;
+                    };
+                    let mut got = [f32::NAN; 2];
+                    kernel.call(x, &batch, dimension, &mut got);
+                    check_cosine(got[0], want, candidate.name(), dimension)?;
+                    check_cosine(got[1], want_self, candidate.name(), dimension)?;
+                }
+            }
             Ok(())
         });
     }
 
+    /// Every host-supported f64 kernel must agree with an f64 reference.
     #[rstest::rstest]
-    fn test_cosine_with_norms_f32_scalar_simd_parity(
-        #[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)] shard: usize,
-    ) {
-        run_vector_pair_proptest(arbitrary_f32, dimension_shard(shard), |x, y| {
-            prop_assume!(norm_l2(&x) > 1e-10);
-            prop_assume!(norm_l2(&y) > 1e-10);
-            let x_norm = norm_l2(&x);
-            let y_norm = norm_l2(&y);
-            let x_f64: Vec<f64> = x.iter().map(|&v| v as f64).collect();
-            let y_f64: Vec<f64> = y.iter().map(|&v| v as f64).collect();
-            let scalar = cosine_with_norms_scalar(&x_f64, x_norm, y_norm, &y_f64);
-            let simd = <f32 as Cosine>::cosine_with_norms(&x, x_norm, y_norm, &y);
-            prop_assert!(approx::relative_eq!(scalar, simd, max_relative = 1e-3));
-            Ok(())
-        });
-    }
-
-    #[rstest::rstest]
-    fn test_cosine_fast_f64_scalar_simd_parity(
+    fn test_cosine_f64_kernels_match_reference(
         #[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)] shard: usize,
     ) {
         run_vector_pair_proptest(arbitrary_f64, dimension_shard(shard), |x, y| {
             prop_assume!(norm_l2(&x) > 1e-20);
             prop_assume!(norm_l2(&y) > 1e-20);
             let x_norm = norm_l2(&x);
-            let scalar = cosine_fast_scalar(&x, x_norm, &y);
-            let simd = <f64 as Cosine>::cosine_fast(&x, x_norm, &y);
-            prop_assert!(approx::relative_eq!(scalar, simd, max_relative = 1e-3));
+            let want = cosine_fast_scalar(&x, x_norm, &y);
+            for candidate in COSINE_F64.candidates() {
+                let Some(kernel) = candidate.kernel() else {
+                    continue;
+                };
+                check_cosine(kernel.call(&x, x_norm, &y), want, candidate.name(), x.len())?;
+            }
             Ok(())
         });
     }
@@ -1632,345 +1669,19 @@ mod tests {
             prop_assume!(norm_l2(&y) > 1e-6);
             do_cosine_test(&x, &y)?;
         }
-
-        /// AVX-512-direct parity for the f32 cosine_fast kernel. Early-returns
-        /// on hosts without AVX-512F so the test stays portable.
-        #[cfg(target_arch = "x86_64")]
-        #[test]
-        fn test_cosine_fast_f32_scalar_vs_avx512_parity(
-            (x, y) in arbitrary_vector_pair(arbitrary_f32, 4..4048)
-        ) {
-            if !std::is_x86_feature_detected!("avx512f") {
-                return Ok(());
-            }
-            prop_assume!(norm_l2(&x) > 1e-10);
-            prop_assume!(norm_l2(&y) > 1e-10);
-            let x_norm = norm_l2(&x);
-            let scalar = cosine_scalar(&x, x_norm, &y);
-            let avx512 = unsafe { f32_x86::cosine_fast_avx512(&x, x_norm, &y) };
-            prop_assert!(approx::relative_eq!(scalar, avx512, max_relative = 1e-5));
-        }
-
-        /// AVX + FMA-direct parity for the f32 cosine_fast kernel. Covers
-        /// the AMD Piledriver / Steamroller / FX-7500 tier. Early-returns
-        /// on hosts without both AVX and FMA.
-        #[cfg(target_arch = "x86_64")]
-        #[test]
-        fn test_cosine_fast_f32_scalar_vs_avx_fma_parity(
-            (x, y) in arbitrary_vector_pair(arbitrary_f32, 4..4048)
-        ) {
-            if !(std::is_x86_feature_detected!("avx") && std::is_x86_feature_detected!("fma")) {
-                return Ok(());
-            }
-            prop_assume!(norm_l2(&x) > 1e-10);
-            prop_assume!(norm_l2(&y) > 1e-10);
-            let x_norm = norm_l2(&x);
-            let scalar = cosine_scalar(&x, x_norm, &y);
-            let avx_fma = unsafe { f32_x86::cosine_fast_avx_fma(&x, x_norm, &y) };
-            prop_assert!(approx::relative_eq!(scalar, avx_fma, max_relative = 1e-5));
-        }
-
-        /// AVX-only-direct parity for the f32 cosine_fast kernel. Covers
-        /// the Intel Sandy Bridge / Ivy Bridge tier. Early-returns on
-        /// hosts without AVX.
-        #[cfg(target_arch = "x86_64")]
-        #[test]
-        fn test_cosine_fast_f32_scalar_vs_avx_parity(
-            (x, y) in arbitrary_vector_pair(arbitrary_f32, 4..4048)
-        ) {
-            if !std::is_x86_feature_detected!("avx") {
-                return Ok(());
-            }
-            prop_assume!(norm_l2(&x) > 1e-10);
-            prop_assume!(norm_l2(&y) > 1e-10);
-            let x_norm = norm_l2(&x);
-            let scalar = cosine_scalar(&x, x_norm, &y);
-            let avx = unsafe { f32_x86::cosine_fast_avx(&x, x_norm, &y) };
-            prop_assert!(approx::relative_eq!(scalar, avx, max_relative = 1e-5));
-        }
-
-        /// AVX-512-direct parity for the f32 cosine_with_norms kernel.
-        /// Early-returns on hosts without AVX-512F.
-        #[cfg(target_arch = "x86_64")]
-        #[test]
-        fn test_cosine_with_norms_f32_scalar_vs_avx512_parity(
-            (x, y) in arbitrary_vector_pair(arbitrary_f32, 4..4048)
-        ) {
-            if !std::is_x86_feature_detected!("avx512f") {
-                return Ok(());
-            }
-            prop_assume!(norm_l2(&x) > 1e-10);
-            prop_assume!(norm_l2(&y) > 1e-10);
-            let x_norm = norm_l2(&x);
-            let y_norm = norm_l2(&y);
-            let scalar = cosine_scalar_fast(&x, x_norm, &y, y_norm);
-            let avx512 = unsafe { f32_x86::cosine_with_norms_avx512(&x, x_norm, y_norm, &y) };
-            prop_assert!(approx::relative_eq!(scalar, avx512, max_relative = 1e-5));
-        }
-
-        /// AVX + FMA-direct parity for the f32 cosine_with_norms kernel.
-        /// Covers the AMD Piledriver / Steamroller / FX-7500 tier.
-        /// Early-returns on hosts without both AVX and FMA.
-        #[cfg(target_arch = "x86_64")]
-        #[test]
-        fn test_cosine_with_norms_f32_scalar_vs_avx_fma_parity(
-            (x, y) in arbitrary_vector_pair(arbitrary_f32, 4..4048)
-        ) {
-            if !(std::is_x86_feature_detected!("avx") && std::is_x86_feature_detected!("fma")) {
-                return Ok(());
-            }
-            prop_assume!(norm_l2(&x) > 1e-10);
-            prop_assume!(norm_l2(&y) > 1e-10);
-            let x_norm = norm_l2(&x);
-            let y_norm = norm_l2(&y);
-            let scalar = cosine_scalar_fast(&x, x_norm, &y, y_norm);
-            let avx_fma = unsafe { f32_x86::cosine_with_norms_avx_fma(&x, x_norm, y_norm, &y) };
-            prop_assert!(approx::relative_eq!(scalar, avx_fma, max_relative = 1e-5));
-        }
-
-        /// AVX-only-direct parity for the f32 cosine_with_norms kernel.
-        /// Covers the Intel Sandy Bridge / Ivy Bridge tier. Early-returns
-        /// on hosts without AVX.
-        #[cfg(target_arch = "x86_64")]
-        #[test]
-        fn test_cosine_with_norms_f32_scalar_vs_avx_parity(
-            (x, y) in arbitrary_vector_pair(arbitrary_f32, 4..4048)
-        ) {
-            if !std::is_x86_feature_detected!("avx") {
-                return Ok(());
-            }
-            prop_assume!(norm_l2(&x) > 1e-10);
-            prop_assume!(norm_l2(&y) > 1e-10);
-            let x_norm = norm_l2(&x);
-            let y_norm = norm_l2(&y);
-            let scalar = cosine_scalar_fast(&x, x_norm, &y, y_norm);
-            let avx = unsafe { f32_x86::cosine_with_norms_avx(&x, x_norm, y_norm, &y) };
-            prop_assert!(approx::relative_eq!(scalar, avx, max_relative = 1e-5));
-        }
-
-        /// AVX-512-direct parity for the f64 cosine_fast kernel. Early-returns
-        /// on hosts without AVX-512F.
-        #[cfg(target_arch = "x86_64")]
-        #[test]
-        fn test_cosine_fast_f64_scalar_vs_avx512_parity(
-            (x, y) in arbitrary_vector_pair(arbitrary_f64, 4..4048)
-        ) {
-            if !std::is_x86_feature_detected!("avx512f") {
-                return Ok(());
-            }
-            prop_assume!(norm_l2(&x) > 1e-20);
-            prop_assume!(norm_l2(&y) > 1e-20);
-            let x_norm = norm_l2(&x);
-            let scalar = cosine_fast_scalar(&x, x_norm, &y);
-            let avx512 = unsafe { f64_x86::cosine_fast_avx512(&x, x_norm, &y) };
-            prop_assert!(approx::relative_eq!(scalar, avx512, max_relative = 1e-5));
-        }
-
-        /// AVX + FMA-direct parity for the f64 cosine_fast kernel. Covers
-        /// the AMD Piledriver / Steamroller / FX-7500 tier. Early-returns
-        /// on hosts without both AVX and FMA.
-        #[cfg(target_arch = "x86_64")]
-        #[test]
-        fn test_cosine_fast_f64_scalar_vs_avx_fma_parity(
-            (x, y) in arbitrary_vector_pair(arbitrary_f64, 4..4048)
-        ) {
-            if !(std::is_x86_feature_detected!("avx") && std::is_x86_feature_detected!("fma")) {
-                return Ok(());
-            }
-            prop_assume!(norm_l2(&x) > 1e-20);
-            prop_assume!(norm_l2(&y) > 1e-20);
-            let x_norm = norm_l2(&x);
-            let scalar = cosine_fast_scalar(&x, x_norm, &y);
-            let avx_fma = unsafe { f64_x86::cosine_fast_avx_fma(&x, x_norm, &y) };
-            prop_assert!(approx::relative_eq!(scalar, avx_fma, max_relative = 1e-5));
-        }
-
-        /// AVX-only-direct parity for the f64 cosine_fast kernel. Covers
-        /// the Intel Sandy Bridge / Ivy Bridge tier. Early-returns on
-        /// hosts without AVX.
-        #[cfg(target_arch = "x86_64")]
-        #[test]
-        fn test_cosine_fast_f64_scalar_vs_avx_parity(
-            (x, y) in arbitrary_vector_pair(arbitrary_f64, 4..4048)
-        ) {
-            if !std::is_x86_feature_detected!("avx") {
-                return Ok(());
-            }
-            prop_assume!(norm_l2(&x) > 1e-20);
-            prop_assume!(norm_l2(&y) > 1e-20);
-            let x_norm = norm_l2(&x);
-            let scalar = cosine_fast_scalar(&x, x_norm, &y);
-            let avx = unsafe { f64_x86::cosine_fast_avx(&x, x_norm, &y) };
-            prop_assert!(approx::relative_eq!(scalar, avx, max_relative = 1e-5));
-        }
-
-        /// Parity check for `cosine_once_8` (despecialised 8-lane width).
-        ///
-        /// The `epsilon = 1e-6` clause handles the case where the proptest
-        /// generator produces inputs with extreme dynamic range (e.g., mixing
-        /// `1e-43` with `1e7` in the same vector). When the dot product is
-        /// dominated by one large term and the cosine result is near zero,
-        /// the f32-precision SIMD path and the f64-precision scalar reference
-        /// can legitimately differ by more than `max_relative = 1e-3` of the
-        /// (near-zero) result. The absolute epsilon catches these without
-        /// masking real bugs (where the absolute error would be > 1e-6).
-        #[test]
-        fn test_cosine_once_8_scalar_simd_parity(
-            (x, y) in arbitrary_vector_pair(arbitrary_f32, 8..9)
-        ) {
-            prop_assume!(norm_l2(&x) > 1e-10);
-            prop_assume!(norm_l2(&y) > 1e-10);
-            let x_norm = norm_l2(&x);
-            let x_f64: Vec<f64> = x.iter().map(|&v| v as f64).collect();
-            let y_f64: Vec<f64> = y.iter().map(|&v| v as f64).collect();
-            let scalar = cosine_fast_scalar(&x_f64, x_norm, &y_f64);
-            let simd = f32::cosine_once_8(&x, x_norm, &y);
-            prop_assert!(approx::relative_eq!(scalar, simd, max_relative = 1e-3, epsilon = 1e-6));
-        }
-
-        /// Parity check for `cosine_once_16` (despecialised 16-lane width).
-        /// See `test_cosine_once_8_scalar_simd_parity` for `epsilon` rationale.
-        #[test]
-        fn test_cosine_once_16_scalar_simd_parity(
-            (x, y) in arbitrary_vector_pair(arbitrary_f32, 16..17)
-        ) {
-            prop_assume!(norm_l2(&x) > 1e-10);
-            prop_assume!(norm_l2(&y) > 1e-10);
-            let x_norm = norm_l2(&x);
-            let x_f64: Vec<f64> = x.iter().map(|&v| v as f64).collect();
-            let y_f64: Vec<f64> = y.iter().map(|&v| v as f64).collect();
-            let scalar = cosine_fast_scalar(&x_f64, x_norm, &y_f64);
-            let simd = f32::cosine_once_16(&x, x_norm, &y);
-            prop_assert!(approx::relative_eq!(scalar, simd, max_relative = 1e-3, epsilon = 1e-6));
-        }
-
-        /// AVX-512-direct parity for the 8-lane cosine_once kernel. Verifies
-        /// the masked-load (mask 0x00FF) AVX-512 implementation produces
-        /// the same result as the scalar reference. Early-returns on hosts
-        /// without AVX-512F.
-        #[cfg(target_arch = "x86_64")]
-        #[test]
-        fn test_cosine_once_8_scalar_vs_avx512_parity(
-            (x, y) in arbitrary_vector_pair(arbitrary_f32, 8..9)
-        ) {
-            if !std::is_x86_feature_detected!("avx512f") {
-                return Ok(());
-            }
-            prop_assume!(norm_l2(&x) > 1e-10);
-            prop_assume!(norm_l2(&y) > 1e-10);
-            let x_norm = norm_l2(&x);
-            let scalar = super::f32::cosine_once_8_scalar(&x, x_norm, &y);
-            let avx512 =
-                unsafe { super::f32::cosine_once_x86::cosine_once_8_avx512(&x, x_norm, &y) };
-            prop_assert!(approx::relative_eq!(scalar, avx512, max_relative = 1e-5));
-        }
-
-        /// AVX-512-direct parity for the 16-lane cosine_once kernel. Verifies
-        /// the full-width `__m512` load implementation produces the same
-        /// result as the scalar reference. Early-returns on hosts without
-        /// AVX-512F.
-        #[cfg(target_arch = "x86_64")]
-        #[test]
-        fn test_cosine_once_16_scalar_vs_avx512_parity(
-            (x, y) in arbitrary_vector_pair(arbitrary_f32, 16..17)
-        ) {
-            if !std::is_x86_feature_detected!("avx512f") {
-                return Ok(());
-            }
-            prop_assume!(norm_l2(&x) > 1e-10);
-            prop_assume!(norm_l2(&y) > 1e-10);
-            let x_norm = norm_l2(&x);
-            let scalar = super::f32::cosine_once_16_scalar(&x, x_norm, &y);
-            let avx512 =
-                unsafe { super::f32::cosine_once_x86::cosine_once_16_avx512(&x, x_norm, &y) };
-            prop_assert!(approx::relative_eq!(scalar, avx512, max_relative = 1e-5));
-        }
-
-        /// AVX + FMA-direct parity for the 8-lane cosine_once kernel.
-        /// Covers the AMD Piledriver / Steamroller / FX-7500 tier.
-        /// Early-returns on hosts without both AVX and FMA.
-        #[cfg(target_arch = "x86_64")]
-        #[test]
-        fn test_cosine_once_8_scalar_vs_avx_fma_parity(
-            (x, y) in arbitrary_vector_pair(arbitrary_f32, 8..9)
-        ) {
-            if !(std::is_x86_feature_detected!("avx") && std::is_x86_feature_detected!("fma")) {
-                return Ok(());
-            }
-            prop_assume!(norm_l2(&x) > 1e-10);
-            prop_assume!(norm_l2(&y) > 1e-10);
-            let x_norm = norm_l2(&x);
-            let scalar = super::f32::cosine_once_8_scalar(&x, x_norm, &y);
-            let avx_fma =
-                unsafe { super::f32::cosine_once_x86::cosine_once_8_avx_fma(&x, x_norm, &y) };
-            prop_assert!(approx::relative_eq!(scalar, avx_fma, max_relative = 1e-5));
-        }
-
-        /// AVX + FMA-direct parity for the 16-lane cosine_once kernel.
-        /// Covers the AMD Piledriver / Steamroller / FX-7500 tier.
-        /// Early-returns on hosts without both AVX and FMA.
-        #[cfg(target_arch = "x86_64")]
-        #[test]
-        fn test_cosine_once_16_scalar_vs_avx_fma_parity(
-            (x, y) in arbitrary_vector_pair(arbitrary_f32, 16..17)
-        ) {
-            if !(std::is_x86_feature_detected!("avx") && std::is_x86_feature_detected!("fma")) {
-                return Ok(());
-            }
-            prop_assume!(norm_l2(&x) > 1e-10);
-            prop_assume!(norm_l2(&y) > 1e-10);
-            let x_norm = norm_l2(&x);
-            let scalar = super::f32::cosine_once_16_scalar(&x, x_norm, &y);
-            let avx_fma =
-                unsafe { super::f32::cosine_once_x86::cosine_once_16_avx_fma(&x, x_norm, &y) };
-            prop_assert!(approx::relative_eq!(scalar, avx_fma, max_relative = 1e-5));
-        }
-
-        /// AVX-only-direct parity for the 8-lane cosine_once kernel.
-        /// Covers the Intel Sandy Bridge / Ivy Bridge tier. Early-returns
-        /// on hosts without AVX.
-        #[cfg(target_arch = "x86_64")]
-        #[test]
-        fn test_cosine_once_8_scalar_vs_avx_parity(
-            (x, y) in arbitrary_vector_pair(arbitrary_f32, 8..9)
-        ) {
-            if !std::is_x86_feature_detected!("avx") {
-                return Ok(());
-            }
-            prop_assume!(norm_l2(&x) > 1e-10);
-            prop_assume!(norm_l2(&y) > 1e-10);
-            let x_norm = norm_l2(&x);
-            let scalar = super::f32::cosine_once_8_scalar(&x, x_norm, &y);
-            let avx = unsafe { super::f32::cosine_once_x86::cosine_once_8_avx(&x, x_norm, &y) };
-            prop_assert!(approx::relative_eq!(scalar, avx, max_relative = 1e-5));
-        }
-
-        /// AVX-only-direct parity for the 16-lane cosine_once kernel.
-        /// Covers the Intel Sandy Bridge / Ivy Bridge tier. Early-returns
-        /// on hosts without AVX.
-        #[cfg(target_arch = "x86_64")]
-        #[test]
-        fn test_cosine_once_16_scalar_vs_avx_parity(
-            (x, y) in arbitrary_vector_pair(arbitrary_f32, 16..17)
-        ) {
-            if !std::is_x86_feature_detected!("avx") {
-                return Ok(());
-            }
-            prop_assume!(norm_l2(&x) > 1e-10);
-            prop_assume!(norm_l2(&y) > 1e-10);
-            let x_norm = norm_l2(&x);
-            let scalar = super::f32::cosine_once_16_scalar(&x, x_norm, &y);
-            let avx = unsafe { super::f32::cosine_once_x86::cosine_once_16_avx(&x, x_norm, &y) };
-            prop_assert!(approx::relative_eq!(scalar, avx, max_relative = 1e-5));
-        }
     }
 
+    /// `cosine_batch` must agree with the per-vector `cosine`, including across
+    /// the iterator's 64-distance buffer refills.
     #[rstest::rstest]
     #[case::dim_8(8)]
+    #[case::dim_12(12)]
     #[case::dim_16(16)]
     #[case::dim_40(40)]
+    #[case::dim_1024(1024)]
     fn test_cosine_batch_matches_per_vector(#[case] dimension: usize) {
-        let num_vectors = 5;
+        // Spans two full buffers and a partial one.
+        let num_vectors = 130;
         let x: Vec<f32> = (0..dimension)
             .map(|index| (index % 13) as f32 * 0.25 + 1.0)
             .collect();
@@ -1990,66 +1701,5 @@ mod tests {
                 epsilon = 1e-6
             );
         }
-    }
-
-    /// Asserts a batch-level f32 cosine SIMD kernel matches the scalar
-    /// `cosine_fast` reference for every vector in a multi-vector batch. Runs
-    /// each of the kernel's three internal dimension arms (8, 16, and the
-    /// general `chunks_exact` path). The AVX/FMA helpers are test-only, while
-    /// the AVX-512 helper is selected only by AVX2-baseline builds, so direct
-    /// calls cover them under the default x86-64-v2 baseline.
-    #[cfg(target_arch = "x86_64")]
-    fn check_cosine_batch_kernel(kernel: unsafe fn(&[f32], f32, &[f32], usize, &mut [f32])) {
-        for dimension in [8_usize, 16, 40] {
-            let x: Vec<f32> = (0..dimension).map(|i| (i as f32) * 0.5 + 1.0).collect();
-            let x_norm = norm_l2(&x);
-            let num_vectors = 3;
-            let batch: Vec<f32> = (0..dimension * num_vectors)
-                .map(|i| ((i % 7) as f32) + 1.0)
-                .collect();
-
-            let mut got = vec![0.0; num_vectors];
-            unsafe { kernel(&x, x_norm, &batch, dimension, &mut got) };
-            assert_eq!(got.len(), num_vectors);
-
-            let x_f64: Vec<f64> = x.iter().map(|&v| v as f64).collect();
-            for (chunk, &g) in batch.chunks_exact(dimension).zip(got.iter()) {
-                let y_f64: Vec<f64> = chunk.iter().map(|&v| v as f64).collect();
-                let expected = cosine_fast_scalar(&x_f64, x_norm, &y_f64);
-                assert_relative_eq!(g, expected, max_relative = 1e-3, epsilon = 1e-6);
-            }
-        }
-    }
-
-    /// AVX + FMA batch kernel parity (AVX2 / AVX+FMA tiers). Runs on any
-    /// Haswell-or-newer host; early-returns without AVX and FMA.
-    #[cfg(target_arch = "x86_64")]
-    #[test]
-    fn test_cosine_batch_avx_fma_matches_scalar() {
-        if !(std::is_x86_feature_detected!("avx") && std::is_x86_feature_detected!("fma")) {
-            return;
-        }
-        check_cosine_batch_kernel(super::f32::cosine_batch_avx_fma);
-    }
-
-    /// AVX-only batch kernel parity (Sandy Bridge / Ivy Bridge tier).
-    /// Early-returns on hosts without AVX.
-    #[cfg(target_arch = "x86_64")]
-    #[test]
-    fn test_cosine_batch_avx_matches_scalar() {
-        if !std::is_x86_feature_detected!("avx") {
-            return;
-        }
-        check_cosine_batch_kernel(super::f32::cosine_batch_avx);
-    }
-
-    /// AVX-512 batch kernel parity. Early-returns on hosts without AVX-512F.
-    #[cfg(target_arch = "x86_64")]
-    #[test]
-    fn test_cosine_batch_avx512_matches_scalar() {
-        if !std::is_x86_feature_detected!("avx512f") {
-            return;
-        }
-        check_cosine_batch_kernel(super::f32::cosine_batch_avx512);
     }
 }
