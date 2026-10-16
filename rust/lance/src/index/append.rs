@@ -693,27 +693,33 @@ async fn merge_scalar_indices<'a>(
         .open_scalar_index_for_maintenance(field_path, &reference_idx.uuid, &NoOpMetricsCollector)
         .await?;
 
-    // A JSON-wrapped BTREE segment cannot yet carry the row-address-domain
-    // migration safely on a stable-row-id dataset -- see `build_scalar_index`'s
-    // matching guard, which this mirrors so maintenance is rejected too, not
-    // just creation. Checked here, before deciding between a merge or a
-    // rebuild, rather than relying on that guard to be reached only if the
-    // rebuild branch happens to be picked.
+    // A JSON-wrapped BTREE/Bitmap/LabelList segment cannot yet carry the
+    // row-address-domain migration safely on a stable-row-id dataset -- see
+    // `build_scalar_index`'s matching guard, which this mirrors so maintenance
+    // is rejected too, not just creation. Checked here, before deciding
+    // between a merge or a rebuild, rather than relying on that guard to be
+    // reached only if the rebuild branch happens to be picked.
     if dataset.manifest.uses_stable_row_ids() {
         let reference_params = reference_index.derive_index_params()?;
         if reference_params.index_type.eq_ignore_ascii_case("json")
-            && reference_params
+            && let Some(target) = reference_params
                 .params
                 .as_deref()
                 .and_then(json_wrapped_target_type)
-                .is_some_and(|target| target.eq_ignore_ascii_case(BuiltinIndexType::BTree.as_str()))
+            && let Some(builtin) = [
+                BuiltinIndexType::BTree,
+                BuiltinIndexType::Bitmap,
+                BuiltinIndexType::LabelList,
+            ]
+            .into_iter()
+            .find(|builtin| target.eq_ignore_ascii_case(builtin.as_str()))
         {
-            return Err(Error::not_supported(
-                "a JSON-wrapped BTREE index is not yet supported on a dataset with stable row \
-                 ids enabled -- create a plain BTREE index on this column instead, or disable \
-                 stable row ids for this dataset"
-                    .to_string(),
-            ));
+            let name = builtin.as_str().to_uppercase();
+            return Err(Error::not_supported(format!(
+                "a JSON-wrapped {name} index is not yet supported on a dataset with stable \
+                 row ids enabled -- create a plain {name} index on this column instead, or \
+                 disable stable row ids for this dataset"
+            )));
         }
     }
 
@@ -4392,9 +4398,15 @@ mod tests {
     }
 
     fn json_btree_params() -> ScalarIndexParams {
+        json_wrapped_params("btree")
+    }
+
+    fn json_wrapped_params(target_index_type: &str) -> ScalarIndexParams {
         ScalarIndexParams {
             index_type: "json".to_string(),
-            params: Some(r#"{"target_index_type":"btree","path":"x"}"#.to_string()),
+            params: Some(format!(
+                r#"{{"target_index_type":"{target_index_type}","path":"x"}}"#
+            )),
         }
     }
 
@@ -4430,6 +4442,51 @@ mod tests {
             .unwrap_err();
         assert!(
             err.to_string().contains("JSON-wrapped BTREE"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            dataset
+                .load_indices_by_name("doc_idx")
+                .await
+                .unwrap()
+                .is_empty(),
+            "the rejected index must not be committed"
+        );
+    }
+
+    /// The same guard must also cover a JSON-wrapped BITMAP target: Bitmap
+    /// moved to the row-address-domain format in this same PR, so it is
+    /// exposed to the identical wrapper-metadata gap as BTREE (see
+    /// lance-format/lance#9814's review discussion). Without this, a fresh
+    /// JSON index over a Bitmap target on a stable-row-id dataset would
+    /// silently write address-domain postings that query translation reads
+    /// back as row ids, dropping matches outside fragment 0.
+    #[tokio::test]
+    async fn test_json_wrapped_bitmap_create_rejected_with_stable_row_ids() {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        let (schema, batch) = json_btree_schema_and_batch(0..10);
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let params = json_wrapped_params("bitmap");
+        let err = dataset
+            .create_index_builder(&["doc"], IndexType::Scalar, &params)
+            .name("doc_idx".to_string())
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("JSON-wrapped BITMAP"),
             "unexpected error: {err}"
         );
         assert!(
