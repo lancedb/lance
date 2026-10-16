@@ -34,7 +34,10 @@ use std::sync::Arc;
 fn is_substrait_compatible(data_type: &DataType) -> bool {
     match data_type {
         DataType::FixedSizeList(_, _) => false,
-        DataType::List(inner) => is_substrait_compatible(inner.data_type()),
+        DataType::List(inner) | DataType::LargeList(inner) => {
+            is_substrait_compatible(inner.data_type())
+        }
+        DataType::Map(entries, _) => is_substrait_compatible(entries.data_type()),
         DataType::Struct(fields) => fields
             .iter()
             .all(|f| is_substrait_compatible(f.data_type())),
@@ -641,6 +644,15 @@ async fn parse_groupings(
 ) -> Result<Vec<Expr>> {
     let mut group_exprs = Vec::new();
 
+    // GROUPING SETS / CUBE / ROLLUP emit one Grouping per set. Flattening
+    // them into a single joint group-by would silently change the aggregates,
+    // and the downstream PhysicalGroupBy::new_single cannot execute sets.
+    if agg_rel.groupings.len() > 1 {
+        return Err(Error::invalid_input(
+            "GROUPING SETS / ROLLUP / CUBE are not supported (multiple grouping sets)",
+        ));
+    }
+
     // First, handle the new-style grouping_expressions + expression_references
     if !agg_rel.grouping_expressions.is_empty() {
         for grouping in &agg_rel.groupings {
@@ -733,7 +745,7 @@ async fn parse_measures(
 mod tests {
     use std::sync::Arc;
 
-    use arrow_schema::{DataType, Field, Schema, TimeUnit};
+    use arrow_schema::{DataType, Field, Fields, Schema, TimeUnit};
     use datafusion::{
         execution::SessionState,
         logical_expr::{BinaryExpr, Case, Operator},
@@ -1336,6 +1348,49 @@ mod tests {
         assert_substrait_roundtrip(pruned, id_filter("test-id")).await;
     }
 
+    #[tokio::test]
+    async fn test_prune_schema_for_substrait_nested_list_types() {
+        // The producer recurses into LargeList and Map children, so an FSL
+        // nested under them must still be pruned.
+        use crate::substrait::prune_schema_for_substrait;
+
+        let fsl = |width: i32| {
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), width)
+        };
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new(
+                "ll_ok",
+                DataType::LargeList(Arc::new(Field::new("item", DataType::Int32, true))),
+                true,
+            ),
+            Field::new(
+                "ll_fsl",
+                DataType::LargeList(Arc::new(Field::new("item", fsl(16), true))),
+                true,
+            ),
+            Field::new(
+                "map_fsl",
+                DataType::Map(
+                    Arc::new(Field::new(
+                        "entries",
+                        DataType::Struct(Fields::from(vec![
+                            Field::new("key", DataType::Utf8, false),
+                            Field::new("value", fsl(8), true),
+                        ])),
+                        false,
+                    )),
+                    false,
+                ),
+                true,
+            ),
+        ]);
+
+        let pruned = prune_schema_for_substrait(&schema);
+        let names: Vec<&str> = pruned.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(names, vec!["id", "ll_ok"]);
+    }
+
     // ==================== Aggregate parsing tests ====================
 
     use datafusion_substrait::substrait::proto::{
@@ -1566,6 +1621,42 @@ mod tests {
             agg_expr.schema_name().to_string().contains("sum"),
             "Expected SUM aggregate, got: {}",
             agg_expr.schema_name()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_parse_substrait_aggregate_grouping_sets_rejected() {
+        // GROUPING SETS / CUBE / ROLLUP emit one Grouping per set. Flattening
+        // them into a single joint group-by would silently change the
+        // aggregates, and PhysicalGroupBy::new_single cannot execute sets.
+        let bytes = create_aggregate_plan(
+            vec![simple_agg_measure(0, 1)],
+            vec![agg_field_ref(0), agg_field_ref(1)],
+            vec![
+                Grouping {
+                    #[allow(deprecated)]
+                    grouping_expressions: vec![],
+                    expression_references: vec![0],
+                },
+                Grouping {
+                    #[allow(deprecated)]
+                    grouping_expressions: vec![],
+                    expression_references: vec![1],
+                },
+            ],
+            vec![agg_extension(0, "sum")],
+        );
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("x", DataType::Int32, true),
+            Field::new("y", DataType::Int64, true),
+        ]));
+
+        let result =
+            crate::substrait::parse_substrait_aggregate(&bytes, schema, &session_state()).await;
+        assert!(
+            result.is_err(),
+            "multiple grouping sets must be rejected, got {result:?}"
         );
     }
 
