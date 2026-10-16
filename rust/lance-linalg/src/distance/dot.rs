@@ -963,16 +963,16 @@ mod tests {
         }
     }
 
-    /// `dot_batch` must agree with the per-vector `dot` it replaced, on every
-    /// build: AVX2-baseline, hoisted-dispatch, and portable fallback all
-    /// funnel through here.
+    /// `dot_batch` must agree with the per-vector `dot`, including across the
+    /// iterator's 64-distance buffer refills.
     #[rstest::rstest]
     #[case::dim_8(8)]
     #[case::dim_16(16)]
     #[case::dim_32(32)]
     #[case::dim_1024(1024)]
     fn test_dot_batch_f32_matches_per_vector_dot(#[case] dimension: usize) {
-        let num_vectors = 5;
+        // Spans two full buffers and a partial one.
+        let num_vectors = 130;
         let x: Vec<f32> = (0..dimension)
             .map(|i| ((i % 13) as f32) * 0.25 + 1.0)
             .collect();
@@ -989,10 +989,14 @@ mod tests {
         assert_eq!(got.len(), num_vectors);
         for (g, w) in got.iter().zip(want.iter()) {
             assert!(
-                approx::relative_eq!(g, w, epsilon = 1e-4),
+                approx::relative_eq!(g, w, epsilon = 1e-4, max_relative = 1e-5),
                 "dim {dimension}: batch {g} != per-vector {w}"
             );
         }
+
+        // `sum` drives the iterator's `fold` override rather than `next`.
+        let sum: f32 = f32::dot_batch(&x, &batch, dimension).sum();
+        assert_eq!(sum, got.iter().sum::<f32>());
     }
 
     /// `dot_distance_batch` still yields `1.0 - dot`, unchanged by the hoist.

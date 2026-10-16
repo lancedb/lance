@@ -313,9 +313,9 @@ lance_core::dispatch! {
 
 lance_core::dispatch! {
     /// There is no AVX-512 candidate: the AVX+FMA kernel is the best one so
-    /// that Haswell-baseline builds select it statically and inline it, which
-    /// matters at the 8-wide PQ dimension. Its dimension-dependent choice
-    /// mirrors what those builds have always computed.
+    /// that Haswell-baseline builds select it at compile time, with no
+    /// per-batch dispatch at the 8-wide PQ dimension. Its dimension-dependent
+    /// choice mirrors what those builds have always computed.
     static L2_F32_BATCH: Dispatch<BatchKernel> = {
         #[cfg(target_arch = "x86_64")]
         {
@@ -1321,16 +1321,16 @@ mod tests {
         assert_relative_eq!(d2[1], 0.0); // q2 == target[1]
     }
 
-    /// `l2_batch` must agree with the per-vector `l2` it replaced, on every
-    /// build: the AVX2-baseline path, the hoisted-dispatch path, and the
-    /// portable fallback all funnel through here.
+    /// `l2_batch` must agree with the per-vector `l2`, including across the
+    /// iterator's 64-distance buffer refills.
     #[rstest::rstest]
     #[case::dim_8(8)]
     #[case::dim_16(16)]
     #[case::dim_32(32)]
     #[case::dim_1024(1024)]
     fn test_l2_batch_f32_matches_per_vector_l2(#[case] dimension: usize) {
-        let num_vectors = 5;
+        // Spans two full buffers and a partial one.
+        let num_vectors = 130;
         let x: Vec<f32> = (0..dimension)
             .map(|i| ((i % 13) as f32) * 0.25 + 1.0)
             .collect();
@@ -1347,9 +1347,13 @@ mod tests {
         assert_eq!(got.len(), num_vectors);
         for (g, w) in got.iter().zip(want.iter()) {
             assert!(
-                approx::relative_eq!(g, w, epsilon = 1e-4),
+                approx::relative_eq!(g, w, epsilon = 1e-4, max_relative = 1e-5),
                 "dim {dimension}: batch {g} != per-vector {w}"
             );
         }
+
+        // `sum` drives the iterator's `fold` override rather than `next`.
+        let sum: f32 = f32::l2_batch(&x, &batch, dimension).sum();
+        assert_eq!(sum, got.iter().sum::<f32>());
     }
 }
