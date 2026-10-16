@@ -248,10 +248,12 @@ impl ScopedFragmentRead {
     }
 }
 
-/// A fragment with all of its metadata loaded
+/// A fragment with the metadata needed to plan physical read ranges
 #[derive(Debug, Clone)]
 struct LoadedFragment {
-    row_id_sequence: Arc<RowIdSequence>,
+    /// Only needed to map row-ID masks to physical offsets. Ordinary
+    /// scans and physical row-address streams leave this unloaded.
+    row_id_sequence: Option<Arc<RowIdSequence>>,
     /// Stable row-ID upper ranges computed while routing index candidates.
     /// Reusing them avoids mapping the same mask again during final planning.
     index_upper_ranges: Option<Vec<Range<u64>>>,
@@ -715,6 +717,7 @@ impl FilteredReadStream {
     async fn load_all_fragments(
         dataset: &Arc<Dataset>,
         options: &FilteredReadOptions,
+        needs_row_ids: bool,
     ) -> Result<Vec<LoadedFragment>> {
         let io_parallelism = dataset.object_store.io_parallelism();
         let fragments = options.selected_fragments(dataset.as_ref());
@@ -727,6 +730,7 @@ impl FilteredReadStream {
                     dataset.clone(),
                     frag.clone(),
                     options.with_deleted_rows,
+                    needs_row_ids,
                     None,
                 ))
             })
@@ -769,6 +773,7 @@ impl FilteredReadStream {
         dataset: Arc<Dataset>,
         frag: Fragment,
         include_deleted_rows: bool,
+        needs_row_ids: bool,
         stable_index_routing: Option<StableIndexRouting>,
     ) -> Result<LoadedFragment> {
         let file_fragment = FileFragment::new(dataset.clone(), frag.clone());
@@ -797,20 +802,23 @@ impl FilteredReadStream {
                         ),
                     )
                 })?;
-        let (row_id_sequence, index_upper_ranges) = if dataset.manifest.uses_stable_row_ids() {
+        let (row_id_sequence, index_upper_ranges) = if !needs_row_ids {
+            debug_assert!(stable_index_routing.is_none());
+            (None, None)
+        } else if dataset.manifest.uses_stable_row_ids() {
             let (row_id_sequence, index_upper_ranges) = if let Some(routing) = stable_index_routing
             {
                 (routing.row_id_sequence, routing.upper_ranges)
             } else {
                 (load_row_id_sequence(dataset.as_ref(), &frag).await?, None)
             };
-            (row_id_sequence, index_upper_ranges)
+            (Some(row_id_sequence), index_upper_ranges)
         } else {
             debug_assert!(stable_index_routing.is_none());
             let row_ids_start = frag.id << 32;
             let row_ids_end = row_ids_start + num_physical_rows;
             let addrs_as_ids = Arc::new(RowIdSequence::from(row_ids_start..row_ids_end));
-            (addrs_as_ids, None)
+            (Some(addrs_as_ids), None)
         };
         Ok(LoadedFragment {
             row_id_sequence,
@@ -838,7 +846,7 @@ impl FilteredReadStream {
         mut fragments: Vec<LoadedFragment>,
         evaluated_index: &Option<Arc<EvaluatedIndex>>,
         options: &FilteredReadOptions,
-    ) -> FilteredReadInternalPlan {
+    ) -> Result<FilteredReadInternalPlan> {
         // For pushing down scan_range_after_filter.
         //
         // This is only valid when there is no refine filter left to evaluate.  An exact scalar
@@ -934,7 +942,7 @@ impl FilteredReadStream {
                 &mut fragments_to_read,
                 &mut scan_push_down_fragments_to_read,
                 options.only_indexed_fragments,
-            );
+            )?;
 
             if can_push_down_scan_range_after_filter && to_take == 0 {
                 scan_planned_with_limit_pushed_down = true;
@@ -998,11 +1006,11 @@ impl FilteredReadStream {
             options.scan_range_after_filter.clone()
         };
 
-        FilteredReadInternalPlan {
+        Ok(FilteredReadInternalPlan {
             rows: fragments_to_read,
             filters,
             scan_range_after_filter,
-        }
+        })
     }
 
     /// Handles are constructed here, I/O-free, only for the fragments the
@@ -1066,7 +1074,7 @@ impl FilteredReadStream {
     fn apply_index_to_fragment(
         evaluated_index: &Option<Arc<EvaluatedIndex>>,
         fragment: &FileFragment,
-        row_id_sequence: &Arc<RowIdSequence>,
+        row_id_sequence: &Option<Arc<RowIdSequence>>,
         index_upper_ranges: Option<Vec<Range<u64>>>,
         to_read: Vec<Range<u64>>,
         to_skip: &mut u64,
@@ -1074,11 +1082,16 @@ impl FilteredReadStream {
         fragments_to_read: &mut BTreeMap<u32, Vec<Range<u64>>>,
         scan_push_down_fragments_to_read: &mut BTreeMap<u32, Vec<Range<u64>>>,
         only_indexed_fragments: bool,
-    ) {
+    ) -> Result<()> {
         let fragment_id = fragment.id() as u32;
 
         if let Some(evaluated_index) = evaluated_index {
             if evaluated_index.applicable_fragments.contains(fragment_id) {
+                let row_id_sequence = row_id_sequence.as_ref().ok_or_else(|| {
+                    Error::internal(format!(
+                        "Row IDs were not loaded for indexed fragment {fragment_id}"
+                    ))
+                })?;
                 let _span = tracing::span!(tracing::Level::DEBUG, "apply_index_result").entered();
 
                 let index_result = &evaluated_index.index_result;
@@ -1141,6 +1154,7 @@ impl FilteredReadStream {
             // No index at all - add full fragment to unindexed_ranges
             fragments_to_read.insert(fragment_id, to_read);
         }
+        Ok(())
     }
 
     /// Trim physical ranges to skip `to_skip` rows and take at most `to_take` rows
@@ -2761,6 +2775,9 @@ impl FilteredReadExec {
                         let retained_range_bytes = retained_range_bytes.clone();
                         let fragment = fragment.clone();
                         async move {
+                            let needs_row_ids = evaluated_index.as_ref().is_some_and(|index| {
+                                index.applicable_fragments.contains(fragment.id as u32)
+                            });
                             let metadata_load = if needs_fragment_offsets {
                                 FragmentMetadataLoad::Load
                             } else if let Some(index) = evaluated_index {
@@ -2784,6 +2801,7 @@ impl FilteredReadExec {
                                         dataset,
                                         fragment,
                                         with_deleted_rows,
+                                        needs_row_ids,
                                         None,
                                     )
                                     .await?,
@@ -2793,6 +2811,7 @@ impl FilteredReadExec {
                                         dataset,
                                         fragment,
                                         with_deleted_rows,
+                                        needs_row_ids,
                                         Some(routing),
                                     )
                                     .await?,
@@ -2812,11 +2831,7 @@ impl FilteredReadExec {
                 // Plan the scan; the metadata loaded here drops when planning
                 // finishes — stream construction rebuilds I/O-free handles
                 // from the manifest descriptors
-                Ok(FilteredReadStream::plan_scan(
-                    loaded_fragments,
-                    &evaluated_index,
-                    options,
-                ))
+                FilteredReadStream::plan_scan(loaded_fragments, &evaluated_index, options)
             })
             .await
     }
@@ -3104,6 +3119,7 @@ impl RowStreamRead {
                 let fragments = FilteredReadStream::load_all_fragments(
                     &self.dataset,
                     &self.source.read_options,
+                    self.source.key_column == ROW_ID && self.dataset.manifest.uses_stable_row_ids(),
                 )
                 .await?;
                 let positions = fragments
@@ -3113,7 +3129,12 @@ impl RowStreamRead {
                     .collect();
                 let id_spans = fragments
                     .iter()
-                    .map(|fragment| fragment.row_id_sequence.row_id_range())
+                    .map(|fragment| {
+                        fragment
+                            .row_id_sequence
+                            .as_ref()
+                            .and_then(|sequence| sequence.row_id_range())
+                    })
                     .collect();
                 Ok(StreamFragments {
                     fragments,
@@ -3173,26 +3194,32 @@ impl RowStreamRead {
         keys: &arrow_array::PrimitiveArray<UInt64Type>,
         fragments: &StreamFragments,
         physical_row_addr_prefilter: Option<&RowAddrTreeMap>,
-    ) -> FilteredReadInternalPlan {
+    ) -> Result<FilteredReadInternalPlan> {
         let mut rows: BTreeMap<u32, Vec<Range<u64>>> = BTreeMap::new();
         let (Some(min_key), Some(max_key)) = (arrow::compute::min(keys), arrow::compute::max(keys))
         else {
             // Every key is null
-            return FilteredReadInternalPlan {
+            return Ok(FilteredReadInternalPlan {
                 rows,
                 filters: HashMap::new(),
                 scan_range_after_filter: None,
-            };
+            });
         };
         let requested = RowAddrMask::from_allowed(ids);
         for (fragment, id_span) in fragments.fragments.iter().zip(&fragments.id_spans) {
             // Only fragments whose id span overlaps the batch's key range
             // can hold requested rows
+            let sequence = fragment.row_id_sequence.as_ref().ok_or_else(|| {
+                Error::internal(format!(
+                    "Row IDs were not loaded for row-stream fragment {}",
+                    fragment.fragment.id()
+                ))
+            })?;
             let Some(id_span) = id_span else { continue };
             if *id_span.end() < min_key || *id_span.start() > max_key {
                 continue;
             }
-            let offsets = fragment.row_id_sequence.mask_to_offset_ranges(&requested);
+            let offsets = sequence.mask_to_offset_ranges(&requested);
             if offsets.is_empty() {
                 continue;
             }
@@ -3216,11 +3243,11 @@ impl RowStreamRead {
                 rows.insert(fragment_id, matched);
             }
         }
-        FilteredReadInternalPlan {
+        Ok(FilteredReadInternalPlan {
             rows,
             filters: HashMap::new(),
             scan_range_after_filter: None,
-        }
+        })
     }
 
     fn key_array<'a>(
@@ -3278,7 +3305,7 @@ impl RowStreamRead {
                 keys,
                 fragments,
                 physical_row_addr_prefilter,
-            ))
+            )?)
         }
     }
 
