@@ -143,6 +143,10 @@ mod common {
 }
 
 /// Convert JSONB value to string using jsonb's built-in serde (strict mode)
+///
+/// Values that cannot be represented as a string (arrays, objects) are null,
+/// per the documented "null if conversion fails" contract for the
+/// `json_get_string` UDF family.
 fn json_value_to_string(value: lance_jsonb::OwnedJsonb) -> Result<Option<String>> {
     let raw_jsonb = value.as_raw();
 
@@ -155,13 +159,21 @@ fn json_value_to_string(value: lance_jsonb::OwnedJsonb) -> Result<Option<String>
     }
 
     // Use jsonb's built-in to_str() method - strict conversion
-    raw_jsonb
-        .to_str()
-        .map(Some)
-        .map_err(|e| common::execution_error(format!("Failed to convert to string: {}", e)))
+    match raw_jsonb.to_str() {
+        Ok(s) => Ok(Some(s)),
+        Err(lance_jsonb::Error::InvalidCast) => Ok(None),
+        Err(e) => Err(common::execution_error(format!(
+            "Failed to convert to string: {}",
+            e
+        ))),
+    }
 }
 
 /// Convert JSONB value to integer using jsonb's built-in serde (strict mode)
+///
+/// Values that cannot be represented as an integer (non-numeric strings,
+/// arrays, objects) are null, per the documented "null if conversion fails"
+/// contract for the `json_get_int` UDF family.
 fn json_value_to_int(value: lance_jsonb::OwnedJsonb) -> Result<Option<i64>> {
     let raw_jsonb = value.as_raw();
 
@@ -174,13 +186,21 @@ fn json_value_to_int(value: lance_jsonb::OwnedJsonb) -> Result<Option<i64>> {
     }
 
     // Use jsonb's built-in to_i64() method - strict conversion
-    raw_jsonb
-        .to_i64()
-        .map(Some)
-        .map_err(|e| common::execution_error(format!("Failed to convert to integer: {}", e)))
+    match raw_jsonb.to_i64() {
+        Ok(v) => Ok(Some(v)),
+        Err(lance_jsonb::Error::InvalidCast) => Ok(None),
+        Err(e) => Err(common::execution_error(format!(
+            "Failed to convert to integer: {}",
+            e
+        ))),
+    }
 }
 
 /// Convert JSONB value to float using jsonb's built-in serde (strict mode)
+///
+/// Values that cannot be represented as a float (non-numeric strings, arrays,
+/// objects) are null, per the documented "null if conversion fails" contract
+/// for the `json_get_float` UDF family.
 fn json_value_to_float(value: lance_jsonb::OwnedJsonb) -> Result<Option<f64>> {
     let raw_jsonb = value.as_raw();
 
@@ -193,13 +213,22 @@ fn json_value_to_float(value: lance_jsonb::OwnedJsonb) -> Result<Option<f64>> {
     }
 
     // Use jsonb's built-in to_f64() method - strict conversion
-    raw_jsonb
-        .to_f64()
-        .map(Some)
-        .map_err(|e| common::execution_error(format!("Failed to convert to float: {}", e)))
+    match raw_jsonb.to_f64() {
+        Ok(v) => Ok(Some(v)),
+        Err(lance_jsonb::Error::InvalidCast) => Ok(None),
+        Err(e) => Err(common::execution_error(format!(
+            "Failed to convert to float: {}",
+            e
+        ))),
+    }
 }
 
 /// Convert JSONB value to boolean using jsonb's built-in serde (strict mode)
+///
+/// Numbers coerce per the documented contract (0 -> false, non-zero -> true).
+/// Other values that cannot be represented as a boolean (arrays, objects,
+/// unrecognized strings) are null, per the documented "null if conversion
+/// fails" contract for the `json_get_bool` UDF family.
 fn json_value_to_bool(value: lance_jsonb::OwnedJsonb) -> Result<Option<bool>> {
     let raw_jsonb = value.as_raw();
 
@@ -211,11 +240,22 @@ fn json_value_to_bool(value: lance_jsonb::OwnedJsonb) -> Result<Option<bool>> {
         return Ok(None);
     }
 
+    if let Some(number) = raw_jsonb
+        .as_number()
+        .map_err(|e| common::execution_error(format!("Failed to convert to boolean: {}", e)))?
+    {
+        return Ok(Some(number != lance_jsonb::Number::Int64(0)));
+    }
+
     // Use jsonb's built-in to_bool() method - strict conversion
-    raw_jsonb
-        .to_bool()
-        .map(Some)
-        .map_err(|e| common::execution_error(format!("Failed to convert to boolean: {}", e)))
+    match raw_jsonb.to_bool() {
+        Ok(v) => Ok(Some(v)),
+        Err(lance_jsonb::Error::InvalidCast) => Ok(None),
+        Err(e) => Err(common::execution_error(format!(
+            "Failed to convert to boolean: {}",
+            e
+        ))),
+    }
 }
 
 /// Create the json_extract UDF for extracting JSONPath from JSON data
@@ -708,7 +748,7 @@ fn json_get_float_impl(args: &[ArrayRef]) -> Result<ArrayRef> {
 /// * Second parameter: Field name or array index as string (Utf8)
 ///
 /// # Returns
-/// Boolean value with flexible type coercion (strings like 'true'/'yes'/'1' become true)
+/// Boolean value with flexible type coercion (strings like 'true'/'yes' become true, numbers follow 0 -> false / non-zero -> true, other values null)
 pub fn json_get_bool_udf() -> ScalarUDF {
     create_udf(
         "json_get_bool",
@@ -823,20 +863,32 @@ fn check_array_contains(jsonb_bytes: &[u8], path: &str, value: &str) -> Result<b
             for v in values {
                 // Convert to raw JSONB for direct access
                 let raw = v.as_raw();
-                // Check if it's an array by trying to iterate
-                let mut index = 0;
-                loop {
-                    match raw.get_by_index(index) {
-                        Ok(Some(elem)) => {
-                            let elem_str = elem.to_string();
-                            // Compare as JSON strings (with quotes for strings)
-                            if elem_str == value || elem_str == format!("\"{}\"", value) {
-                                return Ok(true);
-                            }
-                            index += 1;
-                        }
-                        Ok(None) => break, // End of array
-                        Err(_) => break,   // Not an array or error
+                let elements = raw.array_elements().map_err(|e| {
+                    common::execution_error(format!(
+                        "Failed to check array contains at path '{}': {}",
+                        path, e
+                    ))
+                })?;
+                let Some(elements) = elements else {
+                    continue; // Not an array
+                };
+                for elem in elements {
+                    let elem = elem.map_err(|e| {
+                        common::execution_error(format!(
+                            "Failed to check array contains at path '{}': {}",
+                            path, e
+                        ))
+                    })?;
+                    // Compare by content: to_str() returns strings unquoted,
+                    // so needles containing quotes or backslashes match, and
+                    // scalars compare by their JSON text. Containers (which
+                    // to_str() rejects) fall back to their serialized text.
+                    let matched = match elem.as_raw().to_str() {
+                        Ok(s) => s == value,
+                        Err(_) => elem.to_string() == value,
+                    };
+                    if matched {
+                        return Ok(true);
                     }
                 }
             }
@@ -912,25 +964,16 @@ fn get_array_length(jsonb_bytes: &[u8], path: &str) -> Result<Option<i64>> {
             let first = &values[0];
             let raw = first.as_raw();
 
-            // Count array elements by iterating
-            let mut count = 0;
-            loop {
-                match raw.get_by_index(count) {
-                    Ok(Some(_)) => count += 1,
-                    Ok(None) => break, // End of array
-                    Err(_) => {
-                        // Not an array
-                        if count == 0 {
-                            return Err(common::execution_error(format!(
-                                "Path '{}' does not point to an array",
-                                path
-                            )));
-                        }
-                        break;
-                    }
-                }
-            }
-            Ok(Some(count as i64))
+            // Read the length from the array container header in O(1). A path
+            // that resolves to a non-array is null, indistinguishable from a
+            // missing path.
+            let len = raw.array_len().map_err(|e| {
+                common::execution_error(format!(
+                    "Failed to get array length at path '{}': {}",
+                    path, e
+                ))
+            })?;
+            Ok(len.map(|len| len as i64))
         }
         Err(e) => Err(common::execution_error(format!(
             "Failed to get array length at path '{}': {}",
@@ -1069,11 +1112,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_json_get_int_udf() -> Result<()> {
-        let json = r#"{"int": 42, "str_num": "99", "bool": true, "0": 7}"#;
+        let json =
+            r#"{"int": 42, "str_num": "99", "bool": true, "0": 7, "str_bad": "abc", "arr": [1]}"#;
         let jsonb_bytes = create_test_jsonb(json);
 
         let mut binary_builder = LargeBinaryBuilder::new();
-        for _ in 0..4 {
+        for _ in 0..6 {
             binary_builder.append_value(&jsonb_bytes);
         }
 
@@ -1083,16 +1127,22 @@ mod tests {
             Some("str_num"),
             Some("bool"),
             Some("0"),
+            Some("str_bad"),
+            Some("arr"),
         ]));
 
         let result = json_get_int_impl(&[jsonb_array, key_array])?;
         let int_array = result.as_any().downcast_ref::<Int64Array>().unwrap();
 
-        assert_eq!(int_array.len(), 4);
+        assert_eq!(int_array.len(), 6);
         assert_eq!(int_array.value(0), 42);
         assert_eq!(int_array.value(1), 99);
         assert_eq!(int_array.value(2), 1); // jsonb converts true to 1
         assert_eq!(int_array.value(3), 7);
+        // Non-castable values are null per the documented "null if conversion
+        // fails" contract, instead of failing the whole query.
+        assert!(int_array.is_null(4));
+        assert!(int_array.is_null(5));
 
         Ok(())
     }
@@ -1108,13 +1158,14 @@ mod tests {
             "int_neg": -7,
             "big_int": 9223372036854775808,
             "str_num": "3.5",
+            "str_bad": "not_a_number",
             "bool_true": true,
             "null_val": null
         }"#;
         let jsonb_bytes = create_test_jsonb(json);
 
         let mut binary_builder = LargeBinaryBuilder::new();
-        for _ in 0..11 {
+        for _ in 0..12 {
             binary_builder.append_value(&jsonb_bytes);
         }
         let jsonb_array = Arc::new(binary_builder.finish());
@@ -1127,6 +1178,7 @@ mod tests {
             Some("int_neg"),
             Some("big_int"),
             Some("str_num"),
+            Some("str_bad"),
             Some("bool_true"),
             Some("null_val"),
             Some("missing"),
@@ -1135,7 +1187,7 @@ mod tests {
         let result = json_get_float_impl(&[jsonb_array, key_array])?;
         let float_array = result.as_any().downcast_ref::<Float64Array>().unwrap();
 
-        assert_eq!(float_array.len(), 11);
+        assert_eq!(float_array.len(), 12);
         assert_eq!(float_array.value(0), 1.5);
         assert_eq!(float_array.value(1), -2.5);
         assert_eq!(float_array.value(2), 1.0);
@@ -1145,24 +1197,24 @@ mod tests {
         // 2^63 is exactly representable in f64.
         assert_eq!(float_array.value(6), 9223372036854775808.0);
         assert_eq!(float_array.value(7), 3.5);
-        assert_eq!(float_array.value(8), 1.0); // jsonb converts true to 1.0
-        assert!(float_array.is_null(9));
+        // Non-castable strings are null, not a query-fatal error.
+        assert!(float_array.is_null(8));
+        assert_eq!(float_array.value(9), 1.0); // jsonb converts true to 1.0
         assert!(float_array.is_null(10));
+        assert!(float_array.is_null(11));
 
         Ok(())
     }
 
     #[tokio::test]
     async fn test_json_get_bool_udf() -> Result<()> {
-        let json =
-            r#"{"bool_true": true, "bool_false": false, "str_true": "true", "str_false": "false"}"#;
+        let json = r#"{"bool_true": true, "bool_false": false, "str_true": "true", "str_false": "false", "num_one": 1, "num_zero": 0, "num_float": 2.5, "str_one": "1", "str_maybe": "maybe"}"#;
         let jsonb_bytes = create_test_jsonb(json);
 
         let mut binary_builder = LargeBinaryBuilder::new();
-        binary_builder.append_value(&jsonb_bytes);
-        binary_builder.append_value(&jsonb_bytes);
-        binary_builder.append_value(&jsonb_bytes);
-        binary_builder.append_value(&jsonb_bytes);
+        for _ in 0..9 {
+            binary_builder.append_value(&jsonb_bytes);
+        }
 
         let jsonb_array = Arc::new(binary_builder.finish());
         let key_array = Arc::new(StringArray::from(vec![
@@ -1170,26 +1222,40 @@ mod tests {
             Some("bool_false"),
             Some("str_true"),
             Some("str_false"),
+            Some("num_one"),
+            Some("num_zero"),
+            Some("num_float"),
+            Some("str_one"),
+            Some("str_maybe"),
         ]));
 
         let result = json_get_bool_impl(&[jsonb_array, key_array])?;
         let bool_array = result.as_any().downcast_ref::<BooleanArray>().unwrap();
 
-        assert_eq!(bool_array.len(), 4);
+        assert_eq!(bool_array.len(), 9);
         assert!(bool_array.value(0));
         assert!(!bool_array.value(1));
         assert!(bool_array.value(2)); // "true" string converts to true
         assert!(!bool_array.value(3)); // "false" string converts to false
+        // Numbers coerce per the documented contract: 0 -> false, non-zero -> true.
+        assert!(bool_array.value(4));
+        assert!(!bool_array.value(5));
+        assert!(bool_array.value(6));
+        // Non-boolean strings are null, not a query-fatal error.
+        assert!(bool_array.is_null(7));
+        assert!(bool_array.is_null(8));
 
         Ok(())
     }
 
     #[tokio::test]
     async fn test_json_array_contains_udf() -> Result<()> {
-        let json = r#"{"tags": ["rust", "json", "database"], "nums": [1, 2, 3]}"#;
+        let json = r#"{"tags": ["rust", "json", "database"], "nums": [1, 2, 3], "esc": ["say \"hi\"", "a\\b"]}"#;
         let jsonb_bytes = create_test_jsonb(json);
 
         let mut binary_builder = LargeBinaryBuilder::new();
+        binary_builder.append_value(&jsonb_bytes);
+        binary_builder.append_value(&jsonb_bytes);
         binary_builder.append_value(&jsonb_bytes);
         binary_builder.append_value(&jsonb_bytes);
         binary_builder.append_value(&jsonb_bytes);
@@ -1200,23 +1266,70 @@ mod tests {
             Some("$.tags"),
             Some("$.tags"),
             Some("$.nums"),
+            Some("$.esc"),
+            Some("$.esc"),
             Some("$.tags"),
         ]));
         let value_array = Arc::new(StringArray::from(vec![
             Some("rust"),
             Some("python"),
             Some("2"),
+            Some("say \"hi\""),
+            Some("a\\b"),
             Some("any"),
         ]));
 
         let result = json_array_contains_impl(&[jsonb_array, path_array, value_array])?;
         let bool_array = result.as_any().downcast_ref::<BooleanArray>().unwrap();
 
-        assert_eq!(bool_array.len(), 4);
+        assert_eq!(bool_array.len(), 6);
         assert!(bool_array.value(0));
         assert!(!bool_array.value(1));
         assert!(bool_array.value(2));
-        assert!(bool_array.is_null(3));
+        // Needles containing quotes or backslashes must match by content,
+        // not by re-quoted serialization.
+        assert!(bool_array.value(3));
+        assert!(bool_array.value(4));
+        assert!(bool_array.is_null(5));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_json_array_contains_large_array() -> Result<()> {
+        // Guards the single-pass element iteration: the needle sits at the end
+        // of a long array, which the old index-by-index walk made quadratic.
+        let mut elements = Vec::with_capacity(2001);
+        for i in 0..2000 {
+            elements.push(format!("tag_{i}"));
+        }
+        elements.push("needle".to_string());
+        let json = format!(
+            r#"{{"tags": [{}]}}"#,
+            elements
+                .iter()
+                .map(|e| format!("\"{e}\""))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let jsonb_bytes = create_test_jsonb(&json);
+
+        let mut binary_builder = LargeBinaryBuilder::new();
+        binary_builder.append_value(&jsonb_bytes);
+        let jsonb_array = Arc::new(binary_builder.finish());
+        let path_array = Arc::new(StringArray::from(vec![Some("$.tags")]));
+        let value_array = Arc::new(StringArray::from(vec![Some("needle")]));
+
+        let result = json_array_contains_impl(&[jsonb_array.clone(), path_array, value_array])?;
+        let bool_array = result.as_any().downcast_ref::<BooleanArray>().unwrap();
+        assert!(bool_array.value(0));
+
+        let length_result = json_array_length_impl(&[
+            jsonb_array,
+            Arc::new(StringArray::from(vec![Some("$.tags")])),
+        ])?;
+        let int_array = length_result.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(int_array.value(0), 2001);
 
         Ok(())
     }
@@ -1230,6 +1343,7 @@ mod tests {
         binary_builder.append_value(&jsonb_bytes);
         binary_builder.append_value(&jsonb_bytes);
         binary_builder.append_value(&jsonb_bytes);
+        binary_builder.append_value(&jsonb_bytes);
         binary_builder.append_null();
 
         let jsonb_array = Arc::new(binary_builder.finish());
@@ -1237,17 +1351,21 @@ mod tests {
             Some("$.empty"),
             Some("$.tags"),
             Some("$.nested.arr"),
+            Some("$.nested"),
             Some("$.any"),
         ]));
 
         let result = json_array_length_impl(&[jsonb_array, path_array])?;
         let int_array = result.as_any().downcast_ref::<Int64Array>().unwrap();
 
-        assert_eq!(int_array.len(), 4);
+        assert_eq!(int_array.len(), 5);
         assert_eq!(int_array.value(0), 0);
         assert_eq!(int_array.value(1), 3);
         assert_eq!(int_array.value(2), 2);
+        // A path that resolves to a non-array is null (indistinguishable from
+        // a missing path), not 0 and not a query-fatal error.
         assert!(int_array.is_null(3));
+        assert!(int_array.is_null(4));
 
         Ok(())
     }

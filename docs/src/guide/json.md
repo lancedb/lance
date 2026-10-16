@@ -219,8 +219,7 @@ Returns the length of a JSON array.
 
 **Returns:** 
 - Integer: length of the array
-- null: if path doesn't exist
-- Error: if path points to a non-array value
+- null: if path doesn't exist or points to a non-array value
 
 **Example:**
 ```python
