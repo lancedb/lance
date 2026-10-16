@@ -25,7 +25,7 @@ use crate::dataset::ReadParams;
 use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::transaction::{Operation, Transaction, TransactionBuilder};
 use crate::dataset::write::{
-    validate_and_resolve_target_bases_with_primary, write_fragments_internal,
+    validate_and_resolve_target_bases_with_primary, write_fragments_internal_impl,
 };
 use crate::{Error, Result};
 use tracing::info;
@@ -53,6 +53,8 @@ pub struct InsertBuilder<'a> {
     // TODO: make these parameters a part of the builder, and add specific methods.
     params: Option<&'a WriteParams>,
     write_progress: Option<WriteProgressFn>,
+    preassigned_data_file_name: Option<Arc<String>>,
+    keep_field_ids: bool,
 }
 
 impl<'a> InsertBuilder<'a> {
@@ -61,11 +63,30 @@ impl<'a> InsertBuilder<'a> {
             dest: dest.into(),
             params: None,
             write_progress: None,
+            preassigned_data_file_name: None,
+            keep_field_ids: false,
         }
     }
 
     pub fn with_params(mut self, params: &'a WriteParams) -> Self {
         self.params = Some(params);
+        self
+    }
+
+    pub(crate) fn with_preassigned_data_file_name(
+        mut self,
+        preassigned_data_file_name: impl Into<String>,
+    ) -> Self {
+        self.preassigned_data_file_name = Some(Arc::new(preassigned_data_file_name.into()));
+        self
+    }
+
+    /// Keep the field ids the input schema carries when creating a dataset,
+    /// instead of numbering its fields afresh.
+    ///
+    /// For a MemWAL generation, whose columns must keep the base table's ids.
+    pub(crate) fn with_table_field_ids(mut self) -> Self {
+        self.keep_field_ids = true;
         self
     }
 
@@ -86,7 +107,7 @@ impl<'a> InsertBuilder<'a> {
     /// This writes the data fragments and commits them into the dataset.
     pub async fn execute(&self, data: Vec<RecordBatch>) -> Result<Dataset> {
         let (transaction, context) = self.write_uncommitted_impl(data).await?;
-        Self::do_commit(&context, transaction).await
+        self.do_commit(&context, transaction).await
     }
 
     /// Execute the insert operation with the given stream.
@@ -103,7 +124,7 @@ impl<'a> InsertBuilder<'a> {
         schema: Schema,
     ) -> Result<Dataset> {
         let (transaction, context) = self.write_uncommitted_stream_impl(stream, schema).await?;
-        Self::do_commit(&context, transaction).await
+        self.do_commit(&context, transaction).await
     }
 
     /// Write data files, but don't commit the transaction yet.
@@ -134,7 +155,11 @@ impl<'a> InsertBuilder<'a> {
         self.write_uncommitted_impl(data).await.map(|(t, _)| t)
     }
 
-    async fn do_commit(context: &WriteContext<'_>, transaction: Transaction) -> Result<Dataset> {
+    async fn do_commit(
+        &self,
+        context: &WriteContext<'_>,
+        transaction: Transaction,
+    ) -> Result<Dataset> {
         let mut commit_builder = CommitBuilder::new(context.dest.clone())
             .use_stable_row_ids(context.params.enable_stable_row_ids)
             .with_exact_storage_format(context.storage_version)
@@ -149,6 +174,9 @@ impl<'a> InsertBuilder<'a> {
 
         if let Some(session) = context.params.session.as_ref() {
             commit_builder = commit_builder.with_session(session.clone());
+        }
+        if self.keep_field_ids {
+            commit_builder = commit_builder.with_table_field_ids();
         }
 
         commit_builder.execute(transaction).await
@@ -214,7 +242,12 @@ impl<'a> InsertBuilder<'a> {
         )
         .await?;
 
-        let (written_fragments, written_schema) = write_fragments_internal(
+        if self.preassigned_data_file_name.is_some() && target_base_info.is_some() {
+            return Err(Error::invalid_input(
+                "a fixed data file name cannot be combined with target bases",
+            ));
+        }
+        let (written_fragments, written_schema) = Box::pin(write_fragments_internal_impl(
             context.storage_version,
             context.dest.dataset(),
             context.object_store.clone(),
@@ -223,7 +256,10 @@ impl<'a> InsertBuilder<'a> {
             stream,
             context.params.clone(),
             target_base_info,
-        )
+            None,
+            self.preassigned_data_file_name.clone(),
+            self.keep_field_ids,
+        ))
         .await?;
 
         let transaction = Self::build_transaction(written_schema, written_fragments, &context)?;
@@ -333,7 +369,15 @@ impl<'a> InsertBuilder<'a> {
             schema_cmp_opts.ignore_field_order = true;
 
             let normalized_data_schema = prepared_to_logical_blob_schema(data_schema)?;
-            normalized_data_schema.check_compatible(dataset.schema(), &schema_cmp_opts)?;
+            if normalized_data_schema
+                .check_compatible(dataset.schema(), &schema_cmp_opts)
+                .is_err()
+            {
+                let normalized_data_schema =
+                    super::promote_legacy_blob_schema(&normalized_data_schema)?;
+                let dataset_schema = super::promote_legacy_blob_schema(dataset.schema())?;
+                normalized_data_schema.check_compatible(&dataset_schema, &schema_cmp_opts)?;
+            }
         }
 
         for field in data_schema.fields.iter() {
@@ -896,7 +940,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn create_v2_2_dataset_rejects_legacy_blob_schema() {
+    async fn create_v2_2_dataset_accepts_legacy_blob_input() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("blob", DataType::Binary, false).with_metadata(HashMap::from([(
                 BLOB_META_KEY.to_string(),
@@ -918,50 +962,93 @@ mod test {
             .execute_stream(RecordBatchIterator::new(vec![Ok(batch)], schema.clone()))
             .await;
 
-        let err = dataset.unwrap_err();
-        match err {
-            Error::InvalidInput { source, .. } => {
-                let message = source.to_string();
-                assert!(message.contains("Legacy blob columns"));
-                assert!(message.contains("lance.blob.v2"));
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
+        let dataset = Arc::new(dataset.unwrap());
+        let blobs = dataset.take_blobs_by_indices(&[0], "blob").await.unwrap();
+        assert_eq!(
+            blobs[0].as_ref().unwrap().read().await.unwrap().as_ref(),
+            b"abc"
+        );
+        assert!(dataset.schema().field("blob").unwrap().is_blob_v2());
     }
 
+    #[rstest]
+    #[case::create(None)]
+    #[case::append_v20(Some(LanceFileVersion::V2_0))]
+    #[case::append_v21(Some(LanceFileVersion::V2_1))]
     #[tokio::test]
-    async fn create_v2_2_dataset_rejects_nested_legacy_blob_schema() {
-        let image_field = Field::new("image_bytes", DataType::Binary, true).with_metadata(
-            HashMap::from([(BLOB_META_KEY.to_string(), "true".to_string())]),
-        );
+    async fn create_v2_2_dataset_accepts_nested_legacy_blob_input(
+        #[case] initial_version: Option<LanceFileVersion>,
+    ) {
+        let image_field =
+            Field::new("image_bytes", DataType::LargeBinary, true).with_metadata(HashMap::from([
+                (BLOB_META_KEY.to_string(), "true".to_string()),
+            ]));
         let schema = Arc::new(Schema::new(vec![Field::new(
             "summary_image_nested",
             DataType::Struct(vec![image_field.clone()].into()),
             true,
         )]));
-        let image_values: ArrayRef = Arc::new(BinaryArray::from(vec![Some(b"abc".as_slice())]));
+        let image_values: ArrayRef = Arc::new(arrow_array::LargeBinaryArray::from(vec![Some(
+            b"abc".as_slice(),
+        )]));
         let nested_values = StructArray::from(vec![(Arc::new(image_field), image_values)]);
         let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(nested_values)]).unwrap();
 
-        let dataset = InsertBuilder::new("memory://forced-nested-blob-v2")
+        let dir = TempStrDir::default();
+        let uri = dir.as_str();
+        if let Some(version) = initial_version {
+            InsertBuilder::new(uri)
+                .with_params(&WriteParams {
+                    data_storage_version: Some(version),
+                    ..Default::default()
+                })
+                .execute_stream(RecordBatchIterator::new(
+                    [Ok(batch.clone())],
+                    schema.clone(),
+                ))
+                .await
+                .unwrap();
+        }
+        let dataset = InsertBuilder::new(uri)
             .with_params(&WriteParams {
-                mode: WriteMode::Create,
+                mode: if initial_version.is_some() {
+                    WriteMode::Append
+                } else {
+                    WriteMode::Create
+                },
                 data_storage_version: Some(LanceFileVersion::V2_2),
                 ..Default::default()
             })
             .execute_stream(RecordBatchIterator::new(vec![Ok(batch)], schema.clone()))
             .await;
 
-        let err = dataset.unwrap_err();
-        match err {
-            Error::InvalidInput { source, .. } => {
-                let message = source.to_string();
-                assert!(message.contains("Legacy blob columns"));
-                assert!(message.contains("summary_image_nested.image_bytes"));
-                assert!(message.contains("lance.blob.v2"));
-            }
-            other => panic!("unexpected error: {other:?}"),
+        let dataset = Arc::new(dataset.unwrap());
+        let blobs = dataset
+            .take_blobs_by_indices(&[0], "summary_image_nested.image_bytes")
+            .await
+            .unwrap();
+        assert_eq!(
+            blobs[0].as_ref().unwrap().read().await.unwrap().as_ref(),
+            b"abc"
+        );
+        let descriptors = dataset.scan().try_into_batch().await.unwrap();
+        assert_eq!(
+            descriptors.num_rows(),
+            if initial_version.is_some() { 2 } else { 1 }
+        );
+        for fragment in dataset.get_fragments() {
+            assert_eq!(
+                fragment.scan().try_into_batch().await.unwrap().schema(),
+                descriptors.schema()
+            );
         }
+        assert!(
+            dataset
+                .schema()
+                .field("summary_image_nested.image_bytes")
+                .unwrap()
+                .is_blob_v2()
+        );
     }
 
     mod external_error {
