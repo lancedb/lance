@@ -58,14 +58,11 @@ pub trait Cosine: Dot + Normalize {
         x: &'a [Self],
         batch: &'a [Self],
         dimension: usize,
-    ) -> Box<dyn Iterator<Item = f32> + 'a> {
+    ) -> impl Iterator<Item = f32> + 'a {
         let x_norm = norm_l2(x);
-
-        Box::new(
-            batch
-                .chunks_exact(dimension)
-                .map(move |y| Self::cosine_fast(x, x_norm, y)),
-        )
+        batch
+            .chunks_exact(dimension)
+            .map(move |y| Self::cosine_fast(x, x_norm, y))
     }
 }
 
@@ -233,14 +230,9 @@ impl Cosine for f32 {
         x: &'a [Self],
         batch: &'a [Self],
         dimension: usize,
-    ) -> Box<dyn Iterator<Item = f32> + 'a> {
+    ) -> impl Iterator<Item = Self> + 'a {
         assert_batch_layout(x.len(), batch.len(), dimension);
-        Box::new(BatchDistances::new(
-            x,
-            batch,
-            dimension,
-            COSINE_F32_BATCH.get(),
-        ))
+        BatchDistances::new(x, batch, dimension, COSINE_F32_BATCH.get())
     }
 }
 
@@ -291,9 +283,8 @@ lance_core::dispatch! {
 lance_core::dispatch! {
     /// Unlike `L2_F32_BATCH`, this has an AVX-512 candidate: Haswell builds
     /// have always used the AVX-512 kernel on AVX-512 hosts outside the 8- and
-    /// 16-dimension paths, and `cosine_batch` already pays a virtual call per
-    /// distance through its boxed iterator, so selecting at runtime adds
-    /// little.
+    /// 16-dimension paths. Keeping those results means Haswell builds select
+    /// at runtime, at one indirect call per 64 distances.
     static COSINE_F32_BATCH: Dispatch<BatchKernel> = {
         #[cfg(target_arch = "x86_64")]
         {
@@ -1112,7 +1103,7 @@ pub fn cosine_distance_batch<'a, T: Cosine>(
     from: &'a [T],
     batch: &'a [T],
     dimension: usize,
-) -> Box<dyn Iterator<Item = f32> + 'a> {
+) -> impl Iterator<Item = f32> + 'a {
     T::cosine_batch(from, batch, dimension)
 }
 
@@ -1137,8 +1128,9 @@ where
 }
 
 /// The f32 case of [`do_cosine_distance_arrow_batch`], which writes every
-/// distance with one batch kernel call instead of going through the boxed
-/// iterator of [`Cosine::cosine_batch`] one distance at a time.
+/// distance with one batch kernel call. Collecting [`Cosine::cosine_batch`]
+/// instead drives its buffered iterator one `next` at a time, which costs
+/// half again as much at dimension 8.
 fn do_cosine_distance_arrow_batch_f32(
     from: &Float32Array,
     to: &FixedSizeListArray,
@@ -1515,17 +1507,12 @@ mod tests {
             .map(|index| (index % 11) as f32 * 0.5 - 2.0)
             .collect();
 
-        let boxed: Vec<f32> = f32::cosine_batch(&x, &batch, dimension).collect();
+        let got: Vec<f32> = f32::cosine_batch(&x, &batch, dimension).collect();
 
-        assert_eq!(boxed.len(), num_vectors);
-        for (boxed_distance, vector) in boxed.iter().zip(batch.chunks_exact(dimension)) {
+        assert_eq!(got.len(), num_vectors);
+        for (distance, vector) in got.iter().zip(batch.chunks_exact(dimension)) {
             let expected = f32::cosine(&x, vector);
-            assert_relative_eq!(
-                *boxed_distance,
-                expected,
-                max_relative = 1e-5,
-                epsilon = 1e-6
-            );
+            assert_relative_eq!(*distance, expected, max_relative = 1e-5, epsilon = 1e-6);
         }
     }
 }

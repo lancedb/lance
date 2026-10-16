@@ -234,9 +234,9 @@ impl<'a> BatchDistances<'a> {
     }
 
     /// Kept out of line so that `next`, which reaches this once per buffer,
-    /// stays a leaf. Inlined, the kernel call makes every `next` save and
-    /// restore registers, which doubles the cost of a dimension-8 distance
-    /// behind `cosine_batch`'s boxed iterator.
+    /// stays a leaf when it is not inlined. Inlined, the kernel call made
+    /// every `next` save and restore registers, nearly doubling the cost of a
+    /// dimension-8 distance.
     #[cold]
     fn refill_and_next(&mut self) -> Option<f32> {
         if !self.refill() {
