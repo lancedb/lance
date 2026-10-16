@@ -4,6 +4,7 @@
 //! Vector Index
 //!
 
+use crate::scalar::{RowAddrTranslator, materialize_remap};
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use std::any::Any;
 use std::fmt::Debug;
@@ -21,6 +22,7 @@ use lance_core::{Error, ROW_ID_FIELD, Result};
 use lance_io::traits::Reader;
 use lance_linalg::distance::DistanceType;
 use quantizer::{QuantizationType, Quantizer};
+use roaring::RoaringBitmap;
 use std::sync::LazyLock;
 use v3::subindex::SubIndexType;
 
@@ -31,6 +33,7 @@ pub mod graph;
 pub mod hnsw;
 pub mod ivf;
 pub mod kmeans;
+pub mod pairwise;
 pub mod pq;
 pub mod quantizer;
 pub mod residual;
@@ -101,7 +104,46 @@ pub enum ApproxMode {
     Accurate,
 }
 
-/// Query parameters for the vector indices
+/// Caller-supplied IVF probe parameters before defaults and precedence are resolved.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ProbeParams {
+    /// Fixed probe count, used only when `search_effort` is absent.
+    pub nprobes: Option<usize>,
+    /// Explicit lower bound, overriding the fixed count's lower bound. Defaults to 1.
+    pub minimum_nprobes: Option<usize>,
+    /// Explicit upper bound, overriding the fixed count's upper bound.
+    /// Without either bound or a fixed count, all partitions are available.
+    pub maximum_nprobes: Option<usize>,
+    /// Optional effort in [0, 1]. Absence resolves to 0.5; any supplied value
+    /// ignores `nprobes`, including an explicit 0.5.
+    pub search_effort: Option<f64>,
+}
+
+impl ProbeParams {
+    /// Resolve the minimum, maximum and effort used by [`Query`].
+    ///
+    /// Explicit minimum and maximum bounds remain effective when effort is set.
+    ///
+    /// ```
+    /// use lance_index::vector::ProbeParams;
+    /// let params = ProbeParams {
+    ///     nprobes: Some(20),
+    ///     search_effort: Some(0.5),
+    ///     ..Default::default()
+    /// };
+    /// assert_eq!(params.resolve(), (1, None, 0.5));
+    /// ```
+    pub fn resolve(&self) -> (usize, Option<usize>, f64) {
+        let fixed = self.nprobes.filter(|_| self.search_effort.is_none());
+        (
+            self.minimum_nprobes.or(fixed).unwrap_or(1),
+            self.maximum_nprobes.or(fixed),
+            self.search_effort.unwrap_or(0.5),
+        )
+    }
+}
+
+/// Resolved query parameters for the vector indices.
 
 #[derive(Debug, Clone)]
 pub struct Query {
@@ -130,6 +172,17 @@ pub struct Query {
     /// The maximum number of probes to load and search.  If not set then
     /// ALL partitions will be searched, if needed, to satisfy k results.
     pub maximum_nprobes: Option<usize>,
+
+    /// Continuous initial IVF search budget in [0, 1], default 0.5.
+    ///
+    /// At 0.5, preserve Auto probing. At 0, start at the caller minimum (at
+    /// least one available partition); at 1, start at all available partitions,
+    /// subject to the caller maximum. Intermediate values interpolate
+    /// geometrically around Auto. Later candidate-count expansion is unchanged.
+    /// Caller options are resolved by [`ProbeParams`] before execution: an explicit
+    /// effort ignores fixed `nprobes`, while explicit minimum/maximum bounds remain.
+    /// This does not control quantization accuracy, HNSW ef, or refinement.
+    pub search_effort: f64,
 
     /// The number of candidates to reserve while searching.
     /// this is an optional parameter for HNSW related index types.
@@ -166,6 +219,19 @@ pub struct Query {
     /// This currently only affects RQ-quantized vector indexes, such as IVF_RQ.
     /// Other index types ignore this setting.
     pub approx_mode: ApproxMode,
+}
+
+impl Query {
+    /// Validate the resolved effort range.
+    pub fn validate_search_effort(&self) -> Result<()> {
+        if !self.search_effort.is_finite() || !(0.0..=1.0).contains(&self.search_effort) {
+            return Err(Error::invalid_input(format!(
+                "search_effort must be finite and in [0, 1], got {}",
+                self.search_effort
+            )));
+        }
+        Ok(())
+    }
 }
 
 impl From<pb::VectorMetricType> for DistanceType {
@@ -442,6 +508,27 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
         unimplemented!("only for IVF")
     }
 
+    /// Whether bounded native code-to-code scoring is available (current format).
+    fn supports_pairwise_vectors(&self) -> bool {
+        false
+    }
+
+    /// Stage a partition's codes once, in storage order, for native
+    /// code-to-code tile scoring (see [`pairwise`] for the distance
+    /// definitions). `batch_size` is the maximum rows per staged batch.
+    /// Partitions staged beyond `memory_limit` bytes use the caller's spill store.
+    async fn prepare_pairwise_partition(
+        &self,
+        _partition_id: usize,
+        _batch_size: usize,
+        _memory_limit: usize,
+        _spill_store: &dyn lance_io::spill::SpillStore,
+    ) -> Result<pairwise::PairwisePartition> {
+        Err(lance_core::Error::not_supported(
+            "pair enumeration requires a current-format vector index; rebuild this index",
+        ))
+    }
+
     // for SubIndex only
     async fn to_batch_stream(&self, with_vector: bool) -> Result<SendableRecordBatchStream>;
 
@@ -458,7 +545,45 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
     ///
     /// If an old row id is not in the mapping then it should be
     /// left alone.
+    ///
+    /// Legacy remapping API using an in-memory mapping. Retained for existing
+    /// callers and plugins; new tagged fragment reuse maintenance goes through
+    /// [`Self::remap_streaming`].
     async fn remap(&mut self, mapping: &RowAddrRemap) -> Result<()>;
+
+    /// The fragments whose row addresses this index holds, or `None` when the
+    /// index cannot tell. Read only by the in-memory fallback of
+    /// [`Self::remap_streaming`], which maps every address of every listed
+    /// fragment explicitly and declines when the list is unknown; see
+    /// `ScalarIndex::stored_fragments` for the contract.
+    fn stored_fragments(&self) -> Option<RoaringBitmap> {
+        None
+    }
+
+    /// Remap the row ids through a translator whose payload may need reads.
+    ///
+    /// The default implementation hands a synchronous translator to
+    /// [`Self::remap`] as it is, and materializes a batch translator into a
+    /// complete in-memory mapping first (`materialize_remap`, bounded by the
+    /// translator's budget and requiring [`Self::stored_fragments`]), then
+    /// calls [`Self::remap`] once. It declines with a
+    /// [`RemapUnavailable`](crate::scalar::RemapUnavailable) when it cannot
+    /// prove a complete mapping within budget. Built-in indices translate one
+    /// unit of work at a time instead.
+    async fn remap_streaming(&mut self, translator: &RowAddrTranslator) -> Result<()> {
+        match translator {
+            RowAddrTranslator::Sync(mapping) => self.remap(mapping.as_ref()).await,
+            RowAddrTranslator::Batch(remapper) => {
+                let mapping =
+                    materialize_remap(remapper.as_ref(), self.stored_fragments().as_ref()).await?;
+                self.remap(&mapping).await
+            }
+            #[allow(unreachable_patterns)]
+            _ => Err(Error::not_supported(
+                "this build does not know how to translate through this row address translator",
+            )),
+        }
+    }
 
     /// The metric type of this vector index.
     fn metric_type(&self) -> DistanceType;
