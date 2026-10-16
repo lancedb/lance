@@ -10,7 +10,7 @@ use datafusion::{
     physical_planner::{ExtensionPlanner, PhysicalPlanner},
 };
 use datafusion_expr::{Expr, LogicalPlan, UserDefinedLogicalNode, UserDefinedLogicalNodeCore};
-use lance_core::{ROW_ADDR, ROW_ID};
+use lance_core::{ROW_ADDR, ROW_CREATED_AT_VERSION, ROW_ID};
 use lance_datafusion::exec::LanceExecutionOptions;
 use std::{
     cmp::Ordering,
@@ -281,6 +281,13 @@ impl UserDefinedLogicalNodeCore for MergeInsertWriteNode {
 
                 // Include target._rowid specifically - needed to locate existing rows for updates
                 Some(qualifier) if qualifier.table() == "target" && field.name() == ROW_ID => true,
+
+                // Present only when the row rewrite can spill carried lineage.
+                Some(qualifier)
+                    if qualifier.table() == "target" && field.name() == ROW_CREATED_AT_VERSION =>
+                {
+                    true
+                }
 
                 // Include unqualified columns like "__action" - tells us what operation to perform
                 None if field.name() == MERGE_ACTION_COLUMN => true,
