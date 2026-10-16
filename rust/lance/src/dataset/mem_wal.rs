@@ -50,7 +50,7 @@ pub mod write;
 use std::sync::Arc;
 
 use lance_core::Result;
-use lance_core::datatypes::{Field, LANCE_FIELD_ID_KEY, Schema};
+use lance_core::datatypes::{BlobV2Layout, Field, LANCE_FIELD_ID_KEY, Schema};
 
 use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
@@ -282,6 +282,9 @@ pub fn schema_with_tombstone(base: &ArrowSchema) -> Arc<ArrowSchema> {
 /// with `false`; a column the target does not declare is dropped; a missing
 /// primary key is an error.
 ///
+/// A blob v2 column keeps the layout the batches hold it in: its children are a
+/// fixed layout, not columns a rename can move.
+///
 /// `batches` must be in `source_schema` order. The result is in `target_schema`
 /// order, without field ids.
 pub fn reconcile_batches(
@@ -307,12 +310,44 @@ pub fn reconcile_batches(
             .collect::<Vec<_>>(),
         source_schema.metadata().clone(),
     );
-    let plan =
-        reconcile::Plan::resolve(&source, target_schema, pk_columns)?.emitting_plain_schema();
+    let target = with_source_blob_layouts(&source, target_schema);
+    let plan = reconcile::Plan::resolve(&source, &target, pk_columns)?.emitting_plain_schema();
     if plan.is_identity() {
         return Ok(batches);
     }
     batches.iter().map(|batch| plan.apply(batch)).collect()
+}
+
+/// `target` with each blob v2 column typed as the source holds it.
+fn with_source_blob_layouts(source: &ArrowSchema, target: &Arc<ArrowSchema>) -> Arc<ArrowSchema> {
+    let blob_layout = |field: &ArrowField| match field.data_type() {
+        DataType::Struct(children) => BlobV2Layout::classify(children),
+        _ => None,
+    };
+    let fields: Vec<ArrowField> = target
+        .fields()
+        .iter()
+        .map(|field| {
+            let held = blob_layout(field).and_then(|_| {
+                let id = reconcile::field_id_of(field)?;
+                source
+                    .fields()
+                    .iter()
+                    .find(|f| reconcile::field_id_of(f) == Some(id) && blob_layout(f).is_some())
+            });
+            match held {
+                Some(held) => field
+                    .as_ref()
+                    .clone()
+                    .with_data_type(held.data_type().clone()),
+                None => field.as_ref().clone(),
+            }
+        })
+        .collect();
+    Arc::new(ArrowSchema::new_with_metadata(
+        fields,
+        target.metadata().clone(),
+    ))
 }
 
 pub use api::{
@@ -461,6 +496,71 @@ mod tests {
             .downcast_ref::<arrow_array::Int64Array>()
             .expect("int64");
         assert_eq!(a.value(0), 20, "id 2's value follows its id to `a`");
+    }
+
+    /// A generation holds blob v2 columns writer-prepared while the table
+    /// declares them logical. Resolving the children by name would rebuild the
+    /// logical layout and drop the reference the prepared one carries.
+    #[test]
+    fn a_blob_column_keeps_the_layout_the_generation_holds() {
+        use lance_core::datatypes::{
+            BLOB_V2_LOGICAL_MINIMAL_FIELDS, BLOB_V2_PREPARED_FIELDS, BLOB_V2_PREPARED_TYPE,
+            BlobKind,
+        };
+
+        let source = ArrowSchema::new(vec![
+            stamped("id", DataType::Int64, 0),
+            stamped("blob", BLOB_V2_PREPARED_TYPE.clone(), 1),
+        ]);
+        let target = Arc::new(ArrowSchema::new(vec![
+            stamped("id", DataType::Int64, 0),
+            stamped(
+                "blob",
+                DataType::Struct(BLOB_V2_LOGICAL_MINIMAL_FIELDS.clone()),
+                1,
+            ),
+        ]));
+        let blob = arrow_array::StructArray::new(
+            BLOB_V2_PREPARED_FIELDS.clone(),
+            vec![
+                Arc::new(arrow_array::UInt8Array::from(vec![BlobKind::Managed as u8]))
+                    as arrow_array::ArrayRef,
+                Arc::new(arrow_array::LargeBinaryArray::from(vec![None::<&[u8]>])),
+                Arc::new(arrow_array::StringArray::from(vec!["_blobs/a"])),
+                Arc::new(arrow_array::UInt32Array::from(vec![None])),
+                Arc::new(arrow_array::UInt64Array::from(vec![5])),
+                Arc::new(arrow_array::UInt64Array::from(vec![0])),
+            ],
+            None,
+        );
+        let batch = RecordBatch::try_new(
+            Arc::new(source.clone()),
+            vec![
+                Arc::new(arrow_array::Int64Array::from(vec![1])),
+                Arc::new(blob),
+            ],
+        )
+        .expect("a batch under the source schema");
+
+        let out = reconcile_batches(&source, &target, &["id".to_string()], vec![batch])
+            .expect("reconcile");
+        assert_eq!(out[0].column(1).data_type(), &*BLOB_V2_PREPARED_TYPE);
+        assert_eq!(
+            out[0].schema().field(1).data_type(),
+            &*BLOB_V2_PREPARED_TYPE
+        );
+        let blob = out[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow_array::StructArray>()
+            .expect("blob is a struct");
+        let kind = blob
+            .column_by_name("kind")
+            .expect("kind")
+            .as_any()
+            .downcast_ref::<arrow_array::UInt8Array>()
+            .expect("uint8");
+        assert_eq!(kind.value(0), BlobKind::Managed as u8);
     }
 
     #[test]
