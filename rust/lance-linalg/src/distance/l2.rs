@@ -24,9 +24,7 @@ use half::{bf16, f16};
 use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::cpu::SIMD_SUPPORT;
-// Named tiers are only matched on x86_64, or by the fp16 kernels on the other
-// architectures; without either, nothing below names a `SimdSupport` variant.
-#[cfg(any(feature = "fp16kernels", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 use lance_core::utils::cpu::SimdSupport;
 use num_traits::{AsPrimitive, Num};
 
@@ -132,14 +130,13 @@ pub fn l2_scalar<
     to: &[T],
 ) -> Output {
     assert_equal_lengths(from.len(), to.len());
-    let x_chunks = from.chunks_exact(LANES);
-    let y_chunks = to.chunks_exact(LANES);
+    let (x_chunks, x_remainder) = from.as_chunks::<LANES>();
+    let (y_chunks, y_remainder) = to.as_chunks::<LANES>();
 
-    let s = if !x_chunks.remainder().is_empty() {
-        x_chunks
-            .remainder()
+    let s = if !x_remainder.is_empty() {
+        x_remainder
             .iter()
-            .zip(y_chunks.remainder())
+            .zip(y_remainder)
             .map(|(&x, &y)| {
                 let diff = x.as_() - y.as_();
                 diff * diff
@@ -150,7 +147,7 @@ pub fn l2_scalar<
     };
 
     let mut sums = [Output::zero(); LANES];
-    for (x, y) in x_chunks.zip(y_chunks) {
+    for (x, y) in x_chunks.iter().zip(y_chunks) {
         for i in 0..LANES {
             let diff = x[i].as_() - y[i].as_();
             sums[i] += diff * diff;
@@ -414,7 +411,7 @@ impl BatchOperation for L2Batch {
     {
         if dimension == 8 {
             let key_values = unsafe { _mm256_loadu_ps(key.as_ptr()) };
-            return batch.chunks_exact(8).fold(init, |acc, vector| {
+            return batch.as_chunks::<8>().0.iter().fold(init, |acc, vector| {
                 let vector_values = unsafe { _mm256_loadu_ps(vector.as_ptr()) };
                 let difference = _mm256_sub_ps(key_values, vector_values);
                 let squared = _mm256_mul_ps(difference, difference);
@@ -439,7 +436,7 @@ impl BatchOperation for L2Batch {
     {
         if dimension == 8 {
             let key_values = unsafe { _mm256_loadu_ps(key.as_ptr()) };
-            return batch.chunks_exact(8).fold(init, |acc, vector| {
+            return batch.as_chunks::<8>().0.iter().fold(init, |acc, vector| {
                 let vector_values = unsafe { _mm256_loadu_ps(vector.as_ptr()) };
                 let difference = _mm256_sub_ps(key_values, vector_values);
                 let squared = _mm256_mul_ps(difference, difference);
