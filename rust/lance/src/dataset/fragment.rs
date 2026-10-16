@@ -7429,7 +7429,7 @@ mod tests {
         use super::*;
         use arrow_array::types::Int32Type;
         use lance_datagen::ArrayGeneratorExt;
-        use lance_io::object_store::{ObjectStoreRegistry, WrappingObjectStore};
+        use lance_io::object_store::{ObjectStoreRegistry, WrappingObjectStore, uri_to_url};
         use lance_io::utils::tracking_store::{IOTracker, IoStats};
         use lance_table::format::{ROW_ID_FIELD_ID, RowIdMeta};
         use pretty_assertions::assert_eq;
@@ -7452,7 +7452,13 @@ mod tests {
         // so its reads cannot be confused with user-column or footer reads.
         async fn fixture(spill: bool) -> (TempStrDir, Dataset) {
             let dir = TempStrDir::default();
-            let uri = format!("file-object-store://{}", dir.as_str());
+            // Normalize the file URL first so Windows drive letters remain in
+            // the path, rather than being parsed as the custom scheme's host.
+            let uri = uri_to_url(dir.as_str()).unwrap().as_str().replacen(
+                "file:",
+                "file-object-store:",
+                1,
+            );
             let data = gen_batch()
                 .col("i", array::step::<Int32Type>())
                 .col("n", array::fill::<Int32Type>(0).with_random_nulls(1.0))
