@@ -624,15 +624,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         self.remap_with(mapping.clone(), None).await
     }
 
-    pub async fn remap_streaming_with_ownership(
-        &mut self,
-        mapping: &RowAddrTranslator,
-        owned_fragments: Option<&RoaringBitmap>,
-    ) -> Result<Vec<IndexFile>> {
-        self.remap_with(mapping.clone(), owned_fragments).await
-    }
-
-    async fn remap_with(
+    pub(crate) async fn remap_with(
         &mut self,
         mapping: RowAddrTranslator,
         owned_fragments: Option<&RoaringBitmap>,

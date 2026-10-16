@@ -1551,8 +1551,12 @@ mod tests {
         assert!(indices.is_empty());
     }
 
-    #[test]
-    fn test_handle_rewrite_indices_merges_source_segments() {
+    #[rstest::rstest]
+    #[case::complete(None)]
+    #[case::inconsistent(Some("inconsistent metadata"))]
+    #[case::missing(Some("source segments"))]
+    #[case::incomplete_coverage(Some("split of indexed and non-indexed"))]
+    fn test_handle_rewrite_indices_merges_source_segments(#[case] expected_error: Option<&str>) {
         let mut first = create_test_index(
             "vector_idx",
             1,
@@ -1576,7 +1580,7 @@ mod tests {
             type_url: "type.googleapis.com/lance.index.VectorIndexDetails".to_string(),
             value: vec![1, 2, 3],
         };
-        let rewritten_indices = vec![
+        let mut rewritten_indices = vec![
             RewrittenIndex {
                 old_id: first_id,
                 new_id: merged_id,
@@ -1598,6 +1602,25 @@ mod tests {
         }];
         let mut indices = vec![first, second];
 
+        match expected_error {
+            Some("inconsistent metadata") => rewritten_indices[1].new_index_version += 1,
+            Some("source segments") => {
+                indices.pop();
+            }
+            Some("split of indexed and non-indexed") => {
+                rewritten_indices.pop();
+            }
+            _ => {}
+        }
+        if let Some(expected) = expected_error {
+            let error =
+                Transaction::handle_rewrite_indices(&mut indices, &rewritten_indices, &groups)
+                    .unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }));
+            assert!(error.to_string().contains(expected), "{error}");
+            return;
+        }
+
         Transaction::handle_rewrite_indices(&mut indices, &rewritten_indices, &groups).unwrap();
 
         assert_eq!(indices.len(), 1);
@@ -1610,6 +1633,28 @@ mod tests {
             indices[0].fragment_bitmap.as_ref().unwrap(),
             &RoaringBitmap::from_iter([5])
         );
+    }
+
+    #[test]
+    fn test_handle_rewrite_indices_keeps_identity_routing() {
+        let mut index = create_test_index(
+            "vector_idx",
+            1,
+            3,
+            Some(RoaringBitmap::from_iter([1])),
+            true,
+        );
+        index.base_id = Some(7);
+        let replacement = RewrittenIndex {
+            old_id: index.uuid,
+            new_id: index.uuid,
+            new_index_details: index.index_details.as_ref().unwrap().as_ref().clone(),
+            new_index_version: index.index_version as u32,
+            new_index_files: index.files.clone(),
+        };
+        let mut indices = vec![index];
+        Transaction::handle_rewrite_indices(&mut indices, &[replacement], &[]).unwrap();
+        assert_eq!(indices[0].base_id, Some(7));
     }
 
     #[test]

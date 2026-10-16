@@ -620,7 +620,8 @@ fn partition_vector_segment_merge_groups(
             continue;
         }
         if let Some(group) = groups.iter_mut().find(|group| {
-            vector_segments_share_merge_model(segments[group[0]], segments[segment_idx])
+            can_merge_after_remap(segments[group[0]].1.as_ref())
+                && vector_segments_share_merge_model(segments[group[0]], segments[segment_idx])
         }) {
             group.push(segment_idx);
         } else {
@@ -645,12 +646,17 @@ pub(crate) fn compaction_vector_segment_merge_groups(
     logical_index: &LogicalIvfView<'_>,
 ) -> Vec<Vec<Uuid>> {
     partition_vector_segment_merge_groups(logical_index, |index| {
-        // Remapping writes PQ codes transposed and RQ codes packed for query
-        // execution, while the distributed merger accepts row-major shards.
-        !matches!(
-            index.sub_index_type().1,
-            QuantizationType::Product | QuantizationType::Rabit
-        )
+        // Legacy readers have no v2 model inspection. HNSW remapping preserves
+        // graphs, whereas merging would rebuild them. PQ/RQ remaps write query
+        // layouts that the row-major distributed merger cannot consume.
+        !index.as_any().is::<IVFIndex>()
+            && matches!(
+                index.sub_index_type(),
+                (
+                    SubIndexType::Flat,
+                    QuantizationType::Flat | QuantizationType::Scalar
+                )
+            )
     })
 }
 
@@ -2175,7 +2181,7 @@ fn generate_remap_tasks(offsets: &[usize], lengths: &[u32]) -> Result<Vec<RemapP
 /// thread, and in CI (dev-profile wheel, opt-level 0) it overflowed the
 /// Windows main-thread stack. `remap_index_file_v3` dispatches over an 11-arm
 /// match whose arms each await a different monomorphization of
-/// `IvfIndexBuilder::remap_streaming`; without the box the outer future embeds
+/// `IvfIndexBuilder::remap_with`; without the box the outer future embeds
 /// every specialized builder future, and at opt-level 0 each arm's future is
 /// also materialized as a separate stack temporary while it is polled. Boxing
 /// per arm, in the concrete `Pin<Box<impl Future>>` form (a `dyn Future`
@@ -2188,11 +2194,7 @@ fn remap_boxed<'a, S: IvfSubIndex + 'static, Q: Quantization + 'static>(
     mapping: &'a RowAddrTranslator,
     owned_fragments: Option<&'a RoaringBitmap>,
 ) -> Pin<Box<impl Future<Output = Result<Vec<IndexFile>>> + Send + 'a>> {
-    Box::pin(async move {
-        builder
-            .remap_streaming_with_ownership(mapping, owned_fragments)
-            .await
-    })
+    Box::pin(async move { builder.remap_with(mapping.clone(), owned_fragments).await })
 }
 
 #[allow(clippy::too_many_arguments)]

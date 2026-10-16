@@ -1,8 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+mod compaction;
 pub mod frag_reuse;
-
+use compaction::rewrite_connected_segments;
+pub(crate) use compaction::{
+    constrain_candidate_windows, is_merge_candidate, vector_segment_merge_groups_for_compaction,
+};
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_index::scalar::RowAddrTranslator;
 use std::collections::{HashMap, HashSet};
@@ -11,10 +15,9 @@ use std::sync::Arc;
 use crate::Dataset;
 use crate::dataset::optimize::RemappedIndex;
 use crate::dataset::optimize::remapping::RemapResult;
+use crate::index::DatasetIndexExt;
 use crate::index::remap_index;
 use crate::index::scalar::infer_scalar_index_details;
-use crate::index::vector::ivf::compaction_vector_segment_merge_groups;
-use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
 use arrow_schema::DataType;
 use async_trait::async_trait;
 use lance_core::{Error, Result};
@@ -23,6 +26,7 @@ use lance_index::is_system_index;
 use lance_index::pb::VectorIndexDetails;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_table::format::IndexMetadata;
+use lance_table::transaction::RewriteGroup;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -51,6 +55,10 @@ pub(crate) async fn load_indices_for_remapping(
 
 #[async_trait]
 impl IndexRemapperOptions for DatasetIndexRemapperOptions {
+    fn supports_vector_segment_replacement(&self) -> bool {
+        true
+    }
+
     async fn create_remapper(&self, dataset: &Dataset) -> Result<Option<Box<dyn IndexRemapper>>> {
         let Some(indices) = load_indices_for_remapping(dataset).await? else {
             return Ok(None);
@@ -66,61 +74,6 @@ impl IndexRemapperOptions for DatasetIndexRemapperOptions {
 struct DatasetIndexRemapper {
     dataset: Arc<Dataset>,
     indices: Arc<Vec<IndexMetadata>>,
-}
-
-pub(crate) async fn vector_segment_merge_groups_for_compaction<'a>(
-    dataset: &Dataset,
-    segments: &[&'a IndexMetadata],
-) -> Vec<Vec<&'a IndexMetadata>> {
-    let singleton_groups = || segments.iter().map(|segment| vec![*segment]).collect();
-    if segments.len() < 2
-        || segments.iter().any(|segment| {
-            !segment
-                .index_details
-                .as_ref()
-                .is_some_and(|details| details.type_url.ends_with("VectorIndexDetails"))
-        })
-        || segments
-            .iter()
-            .any(|segment| segment.fields != segments[0].fields)
-        || segments[0].fields.len() != 1
-    {
-        return singleton_groups();
-    }
-
-    let Ok(column) = dataset.schema().field_path(segments[0].fields[0]) else {
-        return singleton_groups();
-    };
-    let Ok(logical_index) = dataset
-        .open_logical_vector_index(&column, &segments[0].name)
-        .await
-    else {
-        return singleton_groups();
-    };
-    let Ok(ivf) = logical_index.as_ivf() else {
-        return singleton_groups();
-    };
-
-    let mut segments_by_id = segments
-        .iter()
-        .map(|segment| (segment.uuid, *segment))
-        .collect::<HashMap<_, _>>();
-    let groups = compaction_vector_segment_merge_groups(&ivf)
-        .into_iter()
-        .filter_map(|group| {
-            let group = group
-                .into_iter()
-                .filter_map(|segment_id| segments_by_id.remove(&segment_id))
-                .collect::<Vec<_>>();
-            (!group.is_empty()).then_some(group)
-        })
-        .collect::<Vec<_>>();
-
-    if segments_by_id.is_empty() {
-        groups
-    } else {
-        singleton_groups()
-    }
 }
 
 impl DatasetIndexRemapper {
@@ -292,6 +245,16 @@ impl IndexRemapper for DatasetIndexRemapper {
         mapping: RowAddrRemap,
         affected_fragment_ids: &[u64],
     ) -> Result<Vec<RemappedIndex>> {
+        self.remap_indices_with_context(mapping, affected_fragment_ids, &[])
+            .await
+    }
+
+    async fn remap_indices_with_context(
+        &self,
+        mapping: RowAddrRemap,
+        affected_fragment_ids: &[u64],
+        rewrite_groups: &[RewriteGroup],
+    ) -> Result<Vec<RemappedIndex>> {
         let affected_frag_ids = HashSet::<u64>::from_iter(affected_fragment_ids.iter().copied());
         // The compaction remap is fully materialized: one shared synchronous
         // translator serves every index.
@@ -323,9 +286,17 @@ impl IndexRemapper for DatasetIndexRemapper {
                 continue;
             }
 
-            for merge_group in
-                vector_segment_merge_groups_for_compaction(&self.dataset, segments).await
-            {
+            let mut merge_groups = Vec::new();
+            for component in rewrite_connected_segments(segments, rewrite_groups) {
+                for compatible in
+                    vector_segment_merge_groups_for_compaction(&self.dataset, &component).await
+                {
+                    // Recompute connectivity within the exact model: an incompatible
+                    // segment must not connect two otherwise independent sources.
+                    merge_groups.extend(rewrite_connected_segments(&compatible, rewrite_groups));
+                }
+            }
+            for merge_group in merge_groups {
                 if let Some(merged) = self
                     .remap_and_merge_vector_segments(&merge_group, &mapping)
                     .await?
