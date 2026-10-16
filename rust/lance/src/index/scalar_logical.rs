@@ -4,7 +4,9 @@
 //! Query-time logical views over scalar index segments.
 
 use lance_core::utils::row_addr_remap::RowAddrRemap;
+use lance_index::scalar::RowAddrTranslator;
 use std::any::Any;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -32,7 +34,8 @@ use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
 /// the segments into a `LogicalScalarIndex` so the scanner can treat them as one index: queries
 /// are fanned out to every segment in parallel and the row-address results are unioned together.
 ///
-/// All segments must share the same [`IndexType`]; mixing types is rejected at construction.
+/// All segments must share the same [`IndexType`] and result row domain; mixing either is
+/// rejected at construction.
 /// Per-segment [`SearchResult`] precision is preserved when combining: a union of `Exact`
 /// results stays `Exact`, a union containing `AtMost` results yields `AtMost`, and a union
 /// containing `AtLeast` results yields `AtLeast`. Combining `AtMost` and `AtLeast` segments in
@@ -73,6 +76,16 @@ impl LogicalScalarIndex {
         {
             return Err(Error::invalid_input(format!(
                 "LogicalScalarIndex '{}' on column '{}' mixes scalar index types",
+                name, column
+            )));
+        }
+        if segments
+            .iter()
+            .any(|segment| segment.results_are_row_addresses() != first.results_are_row_addresses())
+        {
+            return Err(Error::invalid_input(format!(
+                "LogicalScalarIndex '{}' on column '{}' mixes row-ID and row-address segments; \
+                 rebuild every segment in one commit",
                 name, column
             )));
         }
@@ -164,8 +177,7 @@ impl ScalarIndex for LogicalScalarIndex {
     }
 
     fn results_are_row_addresses(&self) -> bool {
-        // All segments of a logical index share the same underlying index type,
-        // so they agree on the result domain.
+        // Construction validates that every segment uses this result domain.
         self.segments[0].results_are_row_addresses()
     }
 
@@ -176,6 +188,17 @@ impl ScalarIndex for LogicalScalarIndex {
     async fn remap(
         &self,
         _mapping: &RowAddrRemap,
+        _dest_store: &dyn lance_index::scalar::IndexStore,
+    ) -> Result<CreatedIndex> {
+        Err(Error::invalid_input(format!(
+            "LogicalScalarIndex '{}' is a query-time wrapper and does not support remap; rebuild the index to consolidate segments before remapping",
+            self.name
+        )))
+    }
+
+    async fn remap_streaming(
+        &self,
+        _translator: &RowAddrTranslator,
         _dest_store: &dyn lance_index::scalar::IndexStore,
     ) -> Result<CreatedIndex> {
         Err(Error::invalid_input(format!(
@@ -341,20 +364,25 @@ pub async fn open_named_scalar_index(
     index_name: &str,
     metrics: &dyn MetricsCollector,
 ) -> Result<Arc<dyn ScalarIndex>> {
-    open_scalar_index_segments(dataset, column, index_name, None, metrics).await
+    open_scalar_index_segments(dataset, column, index_name, None, None, metrics).await
 }
 
-/// Open scalar index segments whose coverage intersects `fragments`.
+/// Open selected scalar index segments whose coverage intersects `fragments`.
 ///
-/// `None` preserves the unscoped behavior and opens every usable segment.
+/// A `None` scope preserves the unscoped behavior for that dimension. UUID selection happens
+/// before any segment is opened.
 pub async fn open_scalar_index_segments(
     dataset: &Dataset,
     column: &str,
     index_name: &str,
     fragments: Option<&RoaringBitmap>,
+    segment_uuids: Option<&HashSet<uuid::Uuid>>,
     metrics: &dyn MetricsCollector,
 ) -> Result<Arc<dyn ScalarIndex>> {
     let mut indices = load_named_scalar_segments(dataset, column, index_name).await?;
+    if let Some(segment_uuids) = segment_uuids {
+        indices.retain(|index| segment_uuids.contains(&index.uuid));
+    }
     if let Some(fragments) = fragments {
         indices.retain(|index| {
             index
@@ -413,9 +441,61 @@ mod tests {
     use crate::dataset::optimize::{CompactionOptions, compact_files};
     use crate::dataset::write::WriteMode;
     use crate::index::create::CreateIndexBuilder;
-    use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+    use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount, copy_test_data_to_tmp};
 
     use super::*;
+
+    #[rstest::rstest]
+    #[case::legacy_first(false)]
+    #[case::address_first(true)]
+    #[tokio::test]
+    async fn test_staged_btree_row_domains_reject_mixed_logical_view(#[case] reverse: bool) {
+        let dir = copy_test_data_to_tmp("v14.0.0-beta.15/stable_row_id_btree.lance").unwrap();
+        let mut dataset = Dataset::open(&dir.path_str()).await.unwrap();
+        let legacy = dataset.load_indices_by_name("value_idx").await.unwrap();
+        let legacy = legacy
+            .iter()
+            .find(|segment| segment.fragment_bitmap.as_ref().unwrap().contains(0))
+            .unwrap();
+        let legacy_index = dataset
+            .open_scalar_index("value", &legacy.uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert!(!legacy_index.results_are_row_addresses());
+
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
+        let mut current = Vec::with_capacity(2);
+        for fragment_id in [0, 1] {
+            current.push(
+                dataset
+                    .create_index_builder(&["value"], IndexType::BTree, &params)
+                    .name("value_idx".into())
+                    .replace(true)
+                    .fragments(vec![fragment_id])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+            );
+        }
+        dataset
+            .commit_existing_index_segments("value_idx", "value", current.clone())
+            .await
+            .unwrap();
+        let current_index = dataset
+            .open_scalar_index("value", &current[1].uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert!(current_index.results_are_row_addresses());
+
+        let mut segments = vec![legacy_index, current_index];
+        if reverse {
+            segments.reverse();
+        }
+        let error =
+            LogicalScalarIndex::try_new("value_idx".into(), "value".into(), segments).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(error.to_string().contains("mixes row-ID and row-address"));
+    }
 
     #[tokio::test]
     async fn test_open_named_scalar_index_uses_all_zonemap_segments() {
@@ -510,6 +590,7 @@ mod tests {
             "value",
             "value_btree",
             Some(&scope),
+            None,
             &NoOpMetricsCollector,
         )
         .await
@@ -587,6 +668,7 @@ mod tests {
             "value",
             "value_btree_pairs",
             Some(&RoaringBitmap::from_iter([target_fragment])),
+            None,
             &NoOpMetricsCollector,
         )
         .await
@@ -2012,5 +2094,82 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![1]
         );
+    }
+
+    /// Legacy storage counts through MaterializeIndexExec. Deleting the unselected
+    /// segment directory must still leave the selected segment countable.
+    #[tokio::test]
+    async fn legacy_storage_count_opens_only_selected_segment() {
+        let test_dir = TempStrDir::default();
+        let mut dataset = lance_datagen::gen_batch()
+            .col("i", array::step::<Int32Type>())
+            .into_dataset_with_params(
+                test_dir.as_str(),
+                FragmentCount::from(2),
+                FragmentRowCount::from(4),
+                Some(WriteParams {
+                    max_rows_per_file: 4,
+                    data_storage_version: Some(lance_file::version::LanceFileVersion::Legacy),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            dataset.manifest.data_storage_format.lance_file_format(),
+            lance_file::version::ConcreteFileVersion::V1
+        );
+
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
+        let fragment_ids: Vec<u32> = dataset
+            .get_fragments()
+            .iter()
+            .map(|fragment| fragment.id() as u32)
+            .collect();
+        let mut segments = Vec::new();
+        for fragment_id in &fragment_ids {
+            segments.push(
+                CreateIndexBuilder::new(&mut dataset, &["i"], IndexType::BTree, &params)
+                    .name("i_idx".to_string())
+                    .fragments(vec![*fragment_id])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+            );
+        }
+        dataset
+            .commit_existing_index_segments("i_idx", "i", segments)
+            .await
+            .unwrap();
+        let committed = dataset.load_indices_by_name("i_idx").await.unwrap();
+        let selected = committed[0].uuid;
+        let omitted = committed[1].uuid;
+        assert_eq!(
+            dataset
+                .count_indexed_rows("i_idx", "i >= 0", Some(&[selected]), None)
+                .await
+                .unwrap(),
+            4
+        );
+
+        let omitted_dir = std::path::Path::new(test_dir.as_str())
+            .join("_indices")
+            .join(omitted.to_string());
+        assert!(omitted_dir.is_dir(), "{}", omitted_dir.display());
+        std::fs::remove_dir_all(&omitted_dir).unwrap();
+        drop(dataset);
+
+        let dataset = Dataset::open(test_dir.as_str()).await.unwrap();
+        assert_eq!(
+            dataset
+                .count_indexed_rows("i_idx", "i >= 0", Some(&[selected]), None)
+                .await
+                .unwrap(),
+            4
+        );
+        dataset
+            .count_indexed_rows("i_idx", "i >= 0", Some(&[omitted]), None)
+            .await
+            .unwrap_err();
     }
 }
