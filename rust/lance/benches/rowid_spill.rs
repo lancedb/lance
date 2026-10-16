@@ -81,15 +81,6 @@
 //!   so a quick run sets this to 0.
 //! - `BENCH_SCENARIOS`: comma-separated subset of `deleted,shuffled` to run
 //!   (default both).
-//! - `BENCH_UPDATE_ONLY=1`: instead measure a filtered update of the shuffled
-//!   table, with spill enabled, over five fresh tables. Reports each sample's
-//!   elapsed time, read/write operations and bytes (including selection planning), and
-//!   new data-file count/bytes. Run this unchanged on the baseline and candidate
-//!   revisions to compare update placement independently of the inline arm.
-//!   A large `BENCH_INLINE_MAX_BYTES` measures the opted-in under-budget path;
-//!   the reported spilled-fragment count distinguishes that control.
-//!   Each update starts with a fresh default-sized session; dataset open is
-//!   outside the timer, and metadata read within the update can be reused.
 //!
 //! A value that does not parse or is out of range stops the benchmark before
 //! any data is written. A spilled arm that spills nothing stops it after that
@@ -112,7 +103,7 @@ use lance::dataset::rowids::{
     SPILL_ROW_LINEAGE_CONFIG_KEY, get_row_id_index, load_row_id_sequence,
 };
 use lance::dataset::{
-    CommitBuilder, Dataset, InsertBuilder, ProjectionRequest, UpdateBuilder, WriteMode, WriteParams,
+    CommitBuilder, Dataset, InsertBuilder, ProjectionRequest, WriteMode, WriteParams,
 };
 use lance::session::Session;
 use lance_core::{ROW_CREATED_AT_VERSION, ROW_ID, ROW_LAST_UPDATED_AT_VERSION};
@@ -1012,11 +1003,6 @@ fn scenarios_from_env() -> Vec<Scenario> {
 
 fn bench_rowid_spill(_c: &mut Criterion) {
     let config = Config::from_env();
-    if std::env::var("BENCH_UPDATE_ONLY").as_deref() == Ok("1") {
-        config.validate(&[Scenario::Shuffled]);
-        Runtime::new().unwrap().block_on(bench_update(config));
-        return;
-    }
     let scenarios = scenarios_from_env();
     config.validate(&scenarios);
     let runtime = Runtime::new().unwrap();
@@ -1037,155 +1023,6 @@ fn bench_rowid_spill(_c: &mut Criterion) {
 
         report(scenario, config, &inline, &spilled);
     }
-}
-
-async fn bench_update(config: Config) {
-    let budget = config
-        .inline_max_bytes
-        .unwrap_or(DEFAULT_INLINE_ROW_LINEAGE_MAX_BYTES)
-        .to_string();
-    println!(
-        "update: {} fragments x {} rows, budget {budget} bytes",
-        config.fragments, config.rows_per_fragment
-    );
-    println!(
-        "sample,elapsed_ms,read_iops,read_bytes,write_iops,written_bytes,output_files,output_bytes,updated_rows,spilled_fragments,row_id_fragments,created_at_fragments,last_updated_at_fragments"
-    );
-    let mut times = Vec::with_capacity(5);
-    for sample in 0..5 {
-        let dir = tempfile::tempdir().unwrap();
-        let uri = dir.path().to_string_lossy().into_owned();
-        let mut dataset = build_base(&uri, config, Scenario::Shuffled).await;
-        dataset
-            .update_config([
-                (SPILL_ROW_LINEAGE_CONFIG_KEY, "true"),
-                (INLINE_ROW_LINEAGE_MAX_BYTES_CONFIG_KEY, budget.as_str()),
-            ])
-            .await
-            .unwrap();
-        let data_dir = dir.path().join("data");
-        let before_files = std::fs::read_dir(&data_dir).unwrap().count();
-        let before_bytes = dir_bytes(data_dir.to_str().unwrap());
-        let dataset = Arc::new(
-            lance::dataset::builder::DatasetBuilder::from_uri(&uri)
-                .with_session(Arc::new(Session::default()))
-                .load()
-                .await
-                .unwrap(),
-        );
-        let store = dataset.object_store(None).await.unwrap();
-        store.io_stats_incremental();
-        let started = Instant::now();
-        let result = UpdateBuilder::new(dataset)
-            .update_where("id % 2 = 0")
-            .unwrap()
-            .set("value", "value + 1")
-            .unwrap()
-            .build()
-            .unwrap()
-            .execute()
-            .await
-            .unwrap();
-        let elapsed = started.elapsed();
-        let stats = store.io_stats_incremental();
-        let output_files = std::fs::read_dir(&data_dir).unwrap().count() - before_files;
-        let output_bytes = dir_bytes(data_dir.to_str().unwrap()) - before_bytes;
-        let spilled_fragments = result
-            .new_dataset
-            .manifest
-            .fragments
-            .iter()
-            .filter(|fragment| fragment.has_spilled_row_lineage())
-            .count();
-        let row_id_fragments = result
-            .new_dataset
-            .manifest
-            .fragments
-            .iter()
-            .filter(|fragment| matches!(fragment.row_id_meta, Some(RowIdMeta::Column)))
-            .count();
-        let created_at_fragments = result
-            .new_dataset
-            .manifest
-            .fragments
-            .iter()
-            .filter(|fragment| {
-                matches!(
-                    fragment.created_at_version_meta,
-                    Some(RowDatasetVersionMeta::Column)
-                )
-            })
-            .count();
-        let last_updated_at_fragments = result
-            .new_dataset
-            .manifest
-            .fragments
-            .iter()
-            .filter(|fragment| {
-                matches!(
-                    fragment.last_updated_at_version_meta,
-                    Some(RowDatasetVersionMeta::Column)
-                )
-            })
-            .count();
-        println!(
-            "{sample},{:.3},{},{},{},{},{output_files},{output_bytes},{},{spilled_fragments},{row_id_fragments},{created_at_fragments},{last_updated_at_fragments}",
-            elapsed.as_secs_f64() * 1000.0,
-            stats.read_iops,
-            stats.read_bytes,
-            stats.write_iops,
-            stats.written_bytes,
-            result.rows_updated
-        );
-        times.push(elapsed);
-
-        let mut scanner = result.new_dataset.scan();
-        scanner
-            .project(&[
-                "id",
-                "value",
-                ROW_ID,
-                ROW_CREATED_AT_VERSION,
-                ROW_LAST_UPDATED_AT_VERSION,
-            ])
-            .unwrap();
-        let mut batches = scanner.try_into_stream().await.unwrap();
-        while let Some(batch) = batches.try_next().await.unwrap() {
-            for row in 0..batch.num_rows() {
-                let id = batch["id"].as_primitive::<Int64Type>().value(row);
-                let created = created_at_version(id as u64, config);
-                let updated = id % 2 == 0;
-                assert_eq!(
-                    batch[ROW_ID].as_primitive::<UInt64Type>().value(row),
-                    id as u64
-                );
-                assert_eq!(
-                    batch[ROW_CREATED_AT_VERSION]
-                        .as_primitive::<UInt64Type>()
-                        .value(row),
-                    created
-                );
-                assert_eq!(
-                    batch[ROW_LAST_UPDATED_AT_VERSION]
-                        .as_primitive::<UInt64Type>()
-                        .value(row),
-                    if updated {
-                        result.new_dataset.version().version
-                    } else {
-                        created
-                    }
-                );
-                assert_eq!(
-                    batch["value"].as_primitive::<Int64Type>().value(row),
-                    value_of(id) + i64::from(updated)
-                );
-            }
-        }
-    }
-    println!(
-        "update median: {:.3} ms",
-        median(&times).as_secs_f64() * 1000.0
-    );
 }
 
 criterion_group!(benches, bench_rowid_spill);
