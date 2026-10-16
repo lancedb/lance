@@ -4218,9 +4218,6 @@ class LanceDataset(pa.dataset.Dataset):
                 fs, path = FileSystem.from_uri(ivf_centroids_file)
                 with fs.open_input_file(path) as f:
                     ivf_centroids = np.load(f)
-                file_clusters = ivf_centroids.shape[0]
-            else:
-                file_clusters = None
 
             if isinstance(num_partitions, float):
                 warnings.warn("num_partitions is float, converting to int")
@@ -4229,14 +4226,6 @@ class LanceDataset(pa.dataset.Dataset):
                 raise TypeError(
                     f"num_partitions must be int, got {type(num_partitions)}"
                 )
-
-            if file_clusters is not None:
-                if num_partitions is not None and file_clusters != num_partitions:
-                    raise ValueError(
-                        f"Ivf centroids file has {file_clusters} clusters, "
-                        f"but num_partitions={num_partitions}"
-                    )
-                num_partitions = file_clusters
             if num_partitions is not None:
                 kwargs["num_partitions"] = num_partitions
             if target_partition_size is not None:
@@ -4294,8 +4283,7 @@ class LanceDataset(pa.dataset.Dataset):
                             f"got {ivf_centroids.shape}"
                         )
                     if ivf_centroids.shape[0] == 0:
-                        # num_partitions was derived from shape[0] above, and
-                        # zero partitions panics in the Rust residual step.
+                        # Zero partitions panics in the Rust residual step.
                         raise ValueError(
                             "Ivf centroids must have at least one cluster, "
                             f"got {ivf_centroids.shape}"
