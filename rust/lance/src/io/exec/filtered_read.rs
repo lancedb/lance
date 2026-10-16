@@ -1806,6 +1806,11 @@ fn null_check_only_columns(filter: &Expr) -> HashSet<String> {
 /// leaves under fewer list levels. `None` when `field` is a leaf, is stored as
 /// one physical column (blob, packed struct, map), or has no such leaf.
 fn validity_leaf(field: &Field) -> Option<String> {
+    validity_leaf_path(field).map(|path| format_field_path_minimal(&path))
+}
+
+/// [`validity_leaf`] as path components.
+pub(crate) fn validity_leaf_path(field: &Field) -> Option<Vec<&str>> {
     fn fixed_width(data_type: &DataType) -> Option<usize> {
         match data_type {
             DataType::Boolean => Some(1),
@@ -1836,7 +1841,7 @@ fn validity_leaf(field: &Field) -> Option<String> {
             .min_by_key(|(score, _)| *score)
     }
     let (_, path) = walk(field, 0)?;
-    (!path.is_empty()).then(|| format_field_path_minimal(&path))
+    (!path.is_empty()).then_some(path)
 }
 
 /// Top-level names of the projected fields, listing a partially projected
