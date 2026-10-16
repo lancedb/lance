@@ -594,6 +594,18 @@ dataset.cleanup_old_versions(
     is **extremely dangerous** — if any other operation is in-progress at all,
     its data files may be deleted, leading to dataset corruption.
 
+Control file deletion throughput with two independent options:
+
+- `delete_concurrency`: maximum concurrent file deletes. If omitted, uses the object
+  store's I/O parallelism, configurable via the `LANCE_IO_THREADS` environment variable.
+- `delete_rate_limit`: maximum delete requests per second. Unlimited when omitted.
+
+Both values must be positive integers.
+
+```python
+dataset.cleanup_old_versions(delete_concurrency=32, delete_rate_limit=100)
+```
+
 ### Automatic cleanup
 
 Instead of calling `cleanup_old_versions` manually, you can configure Lance to
@@ -643,6 +655,8 @@ Auto cleanup parameters can also be set directly via dataset config keys:
 ds.update_config({
     "lance.auto_cleanup.interval": "20",
     "lance.auto_cleanup.older_than": "3600s",
+    "lance.auto_cleanup.delete_concurrency": "32",
+    "lance.auto_cleanup.delete_rate_limit": "100",
 })
 ```
 

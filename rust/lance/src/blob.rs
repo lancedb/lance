@@ -8,6 +8,12 @@
 //! complete shape, `position` and `size` select a non-empty range within an external `uri` and
 //! must be set together. Every non-null row must set exactly one of `data` and `uri`. File-level
 //! blob preparation produces a kind-aware writer intermediate with `blob_id` and range fields.
+//!
+//! Managed blob writes and compaction reuse are opt-in. Set Arrow schema metadata
+//! `lance.blob.managed` to `true` to enable them. Committing this opt-in
+//! permanently requires Managed-aware readers and maintenance clients. Without
+//! this metadata, logical writes use Inline, Packed, and Dedicated descriptors;
+//! prepared Managed descriptors are rejected.
 
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
@@ -32,8 +38,8 @@ use lance_arrow::{
 };
 use lance_core::{
     datatypes::{
-        BLOB_V2_DESC_TYPE, BLOB_V2_LOGICAL_MINIMAL_FIELDS, BLOB_V2_PREPARED_FIELDS,
-        BLOB_V2_PREPARED_TYPE, BlobKind, BlobV2Layout, Field as LanceField, Schema as LanceSchema,
+        BLOB_V2_DESC_TYPE, BLOB_V2_LOGICAL_MINIMAL_FIELDS, BLOB_V2_PREPARED_TYPE, BlobKind,
+        BlobV2Layout, Field as LanceField, Schema as LanceSchema,
     },
     utils::blob::blob_path,
 };
@@ -136,16 +142,29 @@ pub(crate) fn prepared_blob_field_with_metadata(
     Field::new(name, BLOB_V2_PREPARED_TYPE.clone(), nullable).with_metadata(metadata)
 }
 
+/// `prepared` under the field ids `source` carries: its own, and each
+/// same-named child's. A stored blob keeps only `data` and `uri`, under the ids
+/// of its prepared children, so this is what keeps a generation's blob children
+/// under the table's ids.
+pub(crate) fn with_field_ids_of(prepared: Field, source: &Field) -> Result<Field> {
+    let source = LanceField::try_from(source)?;
+    Ok(crate::dataset::mem_wal::stamp_field_id(
+        &prepared,
+        std::slice::from_ref(&source),
+    ))
+}
+
 fn logical_to_prepared_blob_field(field: &Field) -> Result<Field> {
     if field.is_blob_v2() {
         return match blob_v2_layout(field) {
-            Some(BlobV2Layout::Logical) | Some(BlobV2Layout::Prepared) => {
-                Ok(prepared_blob_field_with_metadata(
+            Some(BlobV2Layout::Logical) | Some(BlobV2Layout::Prepared) => with_field_ids_of(
+                prepared_blob_field_with_metadata(
                     field.name(),
                     field.is_nullable(),
                     field.metadata().clone(),
-                ))
-            }
+                ),
+                field,
+            ),
             _ => Err(blob_v2_shape_error(
                 field,
                 &[BlobV2Layout::Logical, BlobV2Layout::Prepared],
@@ -557,6 +576,23 @@ fn validate_prepared_blob_value_array(field: &Field, array: &ArrayRef) -> Result
                 }
                 validate_blob_id(blob_id_col.value(row))?;
             }
+            BlobKind::Managed | BlobKind::ManagedWithBase => {
+                if uri_col.is_null(row)
+                    || ((kind_col.value(row) == BlobKind::ManagedWithBase as u8)
+                        != blob_id_col.is_valid(row))
+                    || blob_size_col.is_null(row)
+                    || position_col.is_null(row)
+                {
+                    return Err(Error::invalid_input(format!(
+                        "Prepared Managed blob row {row} requires `uri`, `blob_size`, and `position`, plus `blob_id` for an explicit base"
+                    )));
+                }
+                lance_core::utils::blob::validate_managed_reference(
+                    uri_col.value(row),
+                    position_col.value(row),
+                    blob_size_col.value(row),
+                )?;
+            }
             BlobKind::External => {
                 if uri_col.is_null(row) || uri_col.value(row).is_empty() {
                     return Err(Error::invalid_input(format!(
@@ -629,6 +665,14 @@ pub enum BlobDescriptor {
     },
     /// Payload bytes stored as the full contents of a dedicated sidecar blob.
     Dedicated { blob_id: u32, size: u64 },
+    /// A known range in an immutable Lance-owned object. `None` uses the
+    /// writer's table base; `Some(id)` requires an already registered base.
+    Managed {
+        base_id: Option<u32>,
+        uri: String,
+        offset: u64,
+        size: u64,
+    },
     /// Payload bytes referenced from an external object or registered base.
     External {
         base_id: u32,
@@ -690,6 +734,12 @@ impl BlobDescriptorArrayBuilder {
             field: prepared_blob_field_with_metadata(&column.into(), nullable, metadata),
             values: Vec::new(),
         }
+    }
+
+    /// Prepare the column under the field ids `source` carries.
+    pub(crate) fn with_field_ids_of(mut self, source: &Field) -> Result<Self> {
+        self.field = with_field_ids_of(self.field, source)?;
+        Ok(self)
     }
 
     /// Append one packed blob descriptor.
@@ -816,6 +866,24 @@ impl BlobDescriptorArrayBuilder {
                     blob_size_builder.append_value(size);
                     position_builder.append_null();
                 }
+                BlobDescriptor::Managed {
+                    base_id,
+                    uri,
+                    offset,
+                    size,
+                } => {
+                    validity.append_non_null();
+                    kind_builder.append_value(if base_id.is_some() {
+                        BlobKind::ManagedWithBase as u8
+                    } else {
+                        BlobKind::Managed as u8
+                    });
+                    data_builder.append_null();
+                    uri_builder.append_value(uri);
+                    blob_id_builder.append_option(base_id);
+                    blob_size_builder.append_value(size);
+                    position_builder.append_value(offset);
+                }
                 BlobDescriptor::External {
                     base_id,
                     uri,
@@ -833,8 +901,14 @@ impl BlobDescriptorArrayBuilder {
             }
         }
 
+        let DataType::Struct(children) = self.field.data_type() else {
+            return Err(Error::internal(format!(
+                "prepared blob field '{}' is not a struct",
+                self.field.name()
+            )));
+        };
         let array = Arc::new(StructArray::try_new(
-            BLOB_V2_PREPARED_FIELDS.clone(),
+            children.clone(),
             vec![
                 Arc::new(kind_builder.finish()),
                 Arc::new(data_builder.finish()),
@@ -872,6 +946,12 @@ fn validate_blob_descriptor(value: &BlobDescriptor) -> Result<()> {
             Ok(())
         }
         BlobDescriptor::Dedicated { blob_id, .. } => validate_blob_id(*blob_id),
+        BlobDescriptor::Managed {
+            uri, offset, size, ..
+        } => {
+            lance_core::utils::blob::validate_managed_reference(uri, *offset, *size)?;
+            Ok(())
+        }
         BlobDescriptor::External {
             uri, offset, size, ..
         } => {
@@ -922,6 +1002,14 @@ impl PackedBlobWriter {
         blob_id: u32,
     ) -> Result<Self> {
         let path = sidecar_path_for_data_file(&data_file_path, blob_id)?;
+        Self::try_new_at(object_store, path, blob_id).await
+    }
+
+    pub(crate) async fn try_new_at(
+        object_store: ObjectStore,
+        path: Path,
+        blob_id: u32,
+    ) -> Result<Self> {
         let writer = object_store.create(&path).await?;
         Ok(Self {
             object_store,
@@ -1063,6 +1151,14 @@ impl DedicatedBlobWriter {
         blob_id: u32,
     ) -> Result<Self> {
         let path = sidecar_path_for_data_file(&data_file_path, blob_id)?;
+        Self::try_new_at(object_store, path, blob_id).await
+    }
+
+    pub(crate) async fn try_new_at(
+        object_store: ObjectStore,
+        path: Path,
+        blob_id: u32,
+    ) -> Result<Self> {
         let writer = object_store.create(&path).await?;
         Ok(Self {
             object_store,
@@ -1241,6 +1337,7 @@ mod tests {
     use arrow_schema::{Fields, Schema as ArrowSchema};
     use async_trait::async_trait;
     use futures::task::noop_waker;
+    use lance_core::datatypes::BLOB_V2_PREPARED_FIELDS;
     use lance_core::datatypes::{BLOB_V2_DESC_FIELDS, BLOB_V2_LOGICAL_FIELDS};
     use lance_core::utils::tempfile::TempDir;
     use lance_io::object_writer::WriteResult;
@@ -1667,6 +1764,37 @@ mod tests {
         assert_eq!(normalized.fields[1].children[1].name, "uri");
         assert!(normalized.fields[1].children[0].id >= 0);
         assert!(normalized.fields[1].children[1].id >= 0);
+    }
+
+    #[test]
+    fn blob_runtime_and_descriptor_fields_do_not_enter_logical_field_id_space() {
+        let mut metadata = HashMap::new();
+        metadata.insert(ARROW_EXT_NAME_KEY.to_string(), BLOB_V2_EXT_NAME.to_string());
+        let prepared_field = prepared_blob_field_with_metadata("blob", true, metadata);
+        let prepared = LanceSchema::try_from(&ArrowSchema::new(vec![prepared_field])).unwrap();
+
+        // Prepared-only children such as `blob_id` and `blob_size` are writer
+        // representation details. Normalization retains IDs only for the
+        // persistent logical identities (`blob`, `data`, and `uri`).
+        let logical = prepared_to_logical_blob_schema(&prepared).unwrap();
+        assert_eq!(logical.fields[0].id, 0);
+        assert_eq!(logical.fields[0].children[0].id, 2);
+        assert_eq!(logical.fields[0].children[1].id, 3);
+        assert_eq!(logical.max_field_id(), Some(3));
+
+        // Descriptor projection creates a file/read-local representation. Its
+        // children deliberately remain synthetic and cannot advance a manifest
+        // field-ID high-water mark.
+        let mut descriptor = logical;
+        descriptor.fields[0].unloaded_mut();
+        assert_eq!(descriptor.fields[0].id, 0);
+        assert!(
+            descriptor.fields[0]
+                .children
+                .iter()
+                .all(|child| child.id == -1)
+        );
+        assert_eq!(descriptor.max_field_id(), Some(0));
     }
 
     #[test]
