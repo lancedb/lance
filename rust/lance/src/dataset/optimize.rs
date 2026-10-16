@@ -2496,8 +2496,11 @@ async fn has_address_domain_index(dataset: &Dataset) -> Result<bool> {
         .any(|index| !is_system_index(index) && index.results_are_row_addrs()))
 }
 
-/// The fragment reuse index pairs these addresses, sorted, with the rewritten rows,
-/// which keep task order, so the task's fragments must be in ascending id order.
+/// The old row addresses of `fragments`' live (non-deleted) rows, reconstructed
+/// from fragment metadata and deletion files alone -- no data scan. Callers
+/// (the deferred/FRI path and the eager address-domain remap path) pair these
+/// addresses, sorted, with the rewritten rows, which keep task order, so the
+/// task's fragments must be in ascending id order.
 async fn live_row_addrs(
     dataset: &Dataset,
     fragments: &[Fragment],
