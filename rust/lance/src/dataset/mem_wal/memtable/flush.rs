@@ -1365,7 +1365,13 @@ mod tests {
         let details =
             prost_types::Any::from_msg(&lance_index::pbold::BTreeIndexDetails::default()).unwrap();
         let index = plugin
-            .load_index(index_store, &details, 0, None, &LanceCache::no_cache())
+            .load_index(
+                index_store,
+                &details,
+                lance_index::scalar::btree::BTREE_INDEX_VERSION,
+                None,
+                &LanceCache::no_cache(),
+            )
             .await
             .unwrap();
 
@@ -1462,7 +1468,13 @@ mod tests {
         let details =
             prost_types::Any::from_msg(&lance_index::pbold::BTreeIndexDetails::default()).unwrap();
         let index = plugin
-            .load_index(index_store, &details, 0, None, &LanceCache::no_cache())
+            .load_index(
+                index_store,
+                &details,
+                lance_index::scalar::btree::BTREE_INDEX_VERSION,
+                None,
+                &LanceCache::no_cache(),
+            )
             .await
             .unwrap();
 

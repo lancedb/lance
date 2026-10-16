@@ -211,7 +211,7 @@ pub fn arrow_schema_with_field_ids(schema: &Schema) -> ArrowSchema {
 /// A struct's children are fields in their own right: they have ids, a rename
 /// moves one child's name and not the parent's, and a reader that cannot see a
 /// child's id has only its name to go on.
-fn stamp_field_id(field: &ArrowField, among: &[Field]) -> ArrowField {
+pub(crate) fn stamp_field_id(field: &ArrowField, among: &[Field]) -> ArrowField {
     let Some(source) = among.iter().find(|f| f.name == *field.name()) else {
         return field.clone();
     };
