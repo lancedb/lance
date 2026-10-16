@@ -64,13 +64,8 @@ struct PcaDetailsJson {
     #[serde(rename = "type")]
     transform_type: &'static str,
     dimension: u32,
-    random_rotation: bool,
-    whitening: bool,
-    epsilon: f32,
     sample_size: u32,
-    max_training_memory_bytes: u64,
     sampling_seed: u64,
-    rotation_seed: u64,
     model_fingerprint: String,
 }
 
@@ -120,24 +115,13 @@ fn pca_parameters(
                         params.dimension
                     ))
                 })?,
-                random_rotation: params.random_rotation,
-                whitening: params.whitening,
-                epsilon: params.epsilon,
                 sample_size: u32::try_from(params.sample_size).map_err(|_| {
                     Error::invalid_input(format!(
                         "pca.sample_size={} does not fit in u32",
                         params.sample_size
                     ))
                 })?,
-                max_training_memory_bytes: u64::try_from(params.max_training_memory_bytes)
-                    .map_err(|_| {
-                        Error::invalid_input(format!(
-                            "pca.max_training_memory_bytes={} does not fit in u64",
-                            params.max_training_memory_bytes
-                        ))
-                    })?,
                 sampling_seed: params.sampling_seed,
-                rotation_seed: params.rotation_seed,
                 model_fingerprint: model_fingerprint.to_vec(),
             }))
         }
@@ -297,26 +281,11 @@ pub fn pca_params_from_details(
             format!("pca.sample_size={} does not fit in usize", pca.sample_size),
         )
     })?;
-    let max_training_memory_bytes =
-        usize::try_from(pca.max_training_memory_bytes).map_err(|_| {
-            Error::corrupt_file_named(
-                "VectorIndexDetails",
-                format!(
-                    "pca.max_training_memory_bytes={} does not fit in usize",
-                    pca.max_training_memory_bytes
-                ),
-            )
-        })?;
     Ok(Some((
         PcaParams {
             dimension,
-            random_rotation: pca.random_rotation,
-            whitening: pca.whitening,
-            epsilon: pca.epsilon,
             sample_size,
-            max_training_memory_bytes,
             sampling_seed: pca.sampling_seed,
-            rotation_seed: pca.rotation_seed,
         },
         model_fingerprint,
     )))
@@ -622,24 +591,13 @@ pub fn vector_details_as_json(details: &prost_types::Any) -> Result<String> {
                         params.dimension
                     ))
                 })?,
-                random_rotation: params.random_rotation,
-                whitening: params.whitening,
-                epsilon: params.epsilon,
                 sample_size: u32::try_from(params.sample_size).map_err(|_| {
                     Error::index(format!(
                         "pca.sample_size={} does not fit in u32",
                         params.sample_size
                     ))
                 })?,
-                max_training_memory_bytes: u64::try_from(params.max_training_memory_bytes)
-                    .map_err(|_| {
-                        Error::index(format!(
-                            "pca.max_training_memory_bytes={} does not fit in u64",
-                            params.max_training_memory_bytes
-                        ))
-                    })?,
                 sampling_seed: params.sampling_seed,
-                rotation_seed: params.rotation_seed,
                 model_fingerprint: fingerprint,
             })
         })
@@ -1123,13 +1081,8 @@ mod tests {
 
     fn pca_params() -> PcaParams {
         PcaParams::new(16)
-            .with_random_rotation(true)
-            .with_whitening(true)
-            .with_epsilon(0.0001)
             .with_sample_size(2048)
-            .with_max_training_memory_bytes(16 * 1024 * 1024)
             .with_sampling_seed(7)
-            .with_rotation_seed(11)
     }
 
     fn pca_details(dimension: u32, fingerprint: Vec<u8>) -> prost_types::Any {
@@ -1141,13 +1094,8 @@ mod tests {
             runtime_hints: Default::default(),
             pre_transform: Some(PreTransform::Pca(PcaParameters {
                 dimension,
-                random_rotation: true,
-                whitening: true,
-                epsilon: 0.0001,
                 sample_size: 2048,
-                max_training_memory_bytes: 16 * 1024 * 1024,
                 sampling_seed: 7,
-                rotation_seed: 11,
                 model_fingerprint: fingerprint,
             })),
         };
@@ -1219,13 +1167,8 @@ mod tests {
             "pre_transform": {
                 "type": "pca",
                 "dimension": 16,
-                "random_rotation": true,
-                "whitening": true,
-                "epsilon": 0.0001,
                 "sample_size": 2048,
-                "max_training_memory_bytes": 16 * 1024 * 1024,
                 "sampling_seed": 7,
-                "rotation_seed": 11,
                 "model_fingerprint":
                     "blake3:000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
             }
@@ -1236,7 +1179,7 @@ mod tests {
         );
         assert_eq!(
             json,
-            r#"{"metric_type":"L2","pre_transform":{"type":"pca","dimension":16,"random_rotation":true,"whitening":true,"epsilon":0.0001,"sample_size":2048,"max_training_memory_bytes":16777216,"sampling_seed":7,"rotation_seed":11,"model_fingerprint":"blake3:000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"}}"#
+            r#"{"metric_type":"L2","pre_transform":{"type":"pca","dimension":16,"sample_size":2048,"sampling_seed":7,"model_fingerprint":"blake3:000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"}}"#
         );
     }
 
