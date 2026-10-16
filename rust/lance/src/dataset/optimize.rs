@@ -148,7 +148,9 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 pub(super) mod binary_copy;
+mod partial_commit;
 pub mod remapping;
+pub use partial_commit::{CompactionCommitResult, commit_compaction_with_partial_progress};
 
 use crate::index::frag_reuse::build_new_frag_reuse_index;
 use crate::io::deletion::read_dataset_deletion_file;
@@ -3284,8 +3286,22 @@ pub async fn commit_compaction(
     remap_options: Arc<dyn IndexRemapperOptions>,
     options: &CompactionOptions,
 ) -> Result<CompactionMetrics> {
+    Ok(
+        commit_compaction_impl(dataset, completed_tasks, remap_options, options, false)
+            .await?
+            .metrics,
+    )
+}
+
+async fn commit_compaction_impl(
+    dataset: &mut Dataset,
+    completed_tasks: Vec<RewriteResult>,
+    remap_options: Arc<dyn IndexRemapperOptions>,
+    options: &CompactionOptions,
+    allow_partial: bool,
+) -> Result<CompactionCommitResult> {
     if completed_tasks.is_empty() {
-        return Ok(CompactionMetrics::default());
+        return Ok(CompactionCommitResult::default());
     }
 
     // A tagged FRI history stores row translation in the manifest entry and
@@ -3379,51 +3395,26 @@ pub async fn commit_compaction(
     }
 
     let mut rewrite_groups = Vec::with_capacity(completed_tasks.len());
-    let mut metrics = CompactionMetrics::default();
+    let mut group_metrics = Vec::with_capacity(completed_tasks.len());
 
     let mut remap_group_inputs: Vec<GroupInput> = Vec::new();
     let mut direct_row_id_map: HashMap<u64, Option<u64>> = HashMap::default();
     let mut frag_reuse_groups: Vec<FragReuseGroup> = Vec::new();
     let mut new_fragment_bitmap: RoaringBitmap = RoaringBitmap::new();
 
-    // Write an FRI only when the compaction touches data an index must later
-    // remap: a rewrite group covered by a data index, or by the existing FRI's new
-    // fragments (the composed remap chain). Compacting only not-yet-indexed data
-    // needs no FRI (one written for it is un-drainable). Decide all-or-nothing per
-    // compaction, never per group -- a partial FRI is unsound: a concurrent reindex
-    // can make a skipped fragment indexed and the conflict resolver's FRI-present
-    // path won't re-check it.
-    //
-    // The same rule applies on tagged tables: a transition for fragments no
-    // index covers and no lineage reaches would grow the history for rows no
-    // reader ever has to translate, with no trim to reclaim it; when nothing
-    // is covered the commit is a plain rewrite, which the tagged-table gate
-    // admits exactly for this uncovered shape.
-    //
-    // Stable row ids record every group: the moves also serve address translation.
-    let indexed_frags: RoaringBitmap = if options.defer_index_remap && !uses_stable_row_ids {
-        let mut covered = RoaringBitmap::new();
-        for bm in load_index_fragmaps(dataset).await? {
-            covered |= bm;
-        }
-        // The stored listing works for v0 and tagged entries alike (the
-        // filtered listing post-processes coverage on tagged tables).
-        if let Some(bm) = load_all_indices(dataset)
-            .await?
-            .iter()
-            .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
-            .and_then(|fri| fri.fragment_bitmap.clone())
-        {
-            covered |= bm;
-        }
-        covered
-    } else {
-        RoaringBitmap::new()
-    };
-    let mut any_group_indexed = false;
-
     for task in completed_tasks {
-        metrics += task.metrics;
+        let rows = if allow_partial {
+            task.new_fragments.iter().try_fold(0u64, |rows, fragment| {
+                let live = fragment.num_rows().ok_or_else(|| {
+                    Error::invalid_input("compacted fragment is missing row counts")
+                })? as u64;
+                rows.checked_add(live)
+                    .ok_or_else(|| Error::invalid_input("compaction row count overflow"))
+            })?
+        } else {
+            0
+        };
+        group_metrics.push((task.metrics, rows));
         // One source of truth: the deferred branch normalizes the source
         // metadata (materialized physical and deleted row counts) and BOTH
         // the rewrite group and the reuse digests are built from it, so the
@@ -3501,12 +3492,6 @@ pub async fn commit_compaction(
             // Record every group; track whether any touches indexed/chain
             // data. Ids beyond the row-address range cannot appear in any
             // index bitmap, so they are uncovered by definition.
-            if old_fragments
-                .iter()
-                .any(|f| u32::try_from(f.id).is_ok_and(|id| indexed_frags.contains(id)))
-            {
-                any_group_indexed = true;
-            }
             let changed_row_addrs = task.row_addrs.ok_or_else(|| {
                 Error::internal(
                     "defer_index_remap requires row_addrs but none were provided".to_string(),
@@ -3600,162 +3585,246 @@ pub async fn commit_compaction(
         Vec::new()
     };
 
-    // A stable-row-id table always keeps a v0 record: recording is refused
-    // before any rewrite where the table requires a tagged history.
-    //
-    // No indexed/chain data touched -> no record at all (all-or-nothing, see
-    // above); the commit is a plain rewrite the tagged gate admits for this
-    // uncovered shape. Otherwise the record's FORM -- a v0 entry, or tagged
-    // transitions riding the in-memory rewrite intent that
-    // `build_frag_reuse_rewrite_entry` assembles onto the entry at every
-    // commit attempt -- is decided HERE, at commit time, from the freshest
-    // state this handle has (the id reservations above do not advance it), not
-    // from a sample taken when the compaction started: another writer may
-    // have tagged the table in between. The record's BASE, however, is the
-    // snapshot at `tasks_read_version`: the commit path works out what the
-    // entry adds by diffing it against the entry at the transaction's read
-    // version, so an entry built from this later handle would fold every
-    // transition other writers appended in between into this rewrite's own
-    // additions and fail the commit for good instead of merging the
-    // histories (`rewrite_reuse_state` refuses such an entry outright). The
-    // read version itself stays at V: raising it to the latest version would
-    // skip the concurrency checks against the writes that landed in between.
-    // The remaining race onto the manifest CAS itself is handled by the
-    // rebase, which converts a v0-shaped intent into tagged transitions when
-    // the current entry turns out tagged (see `finish_rewrite`); the commit
-    // gate still rejects a v0 entry spliced by a writer without that
-    // conversion.
-    let frag_reuse_index = if records_row_addrs && (uses_stable_row_ids || any_group_indexed) {
-        // Once a table is v1, it stays v1: the sticky
-        // FLAG_FRAGMENT_REUSE_INDEX is the final authority
-        // (`uses_tagged_fri`), never the entry's own index_version. With NO
-        // entry -- for example a fully drained history whose entry a trim
-        // deleted -- the flag alone decides, so a tagged table never
-        // restarts its history in the v0 format; with a v0 entry UNDER the
-        // flag (a legacy entry a concurrent upgrade left pending) the
-        // tagged assembly lifts that entry byte-verbatim instead of
-        // extending it in place. A table that never was tagged has neither
-        // flag nor tagged entry, and keeps creating the v0 entry byte
-        // identically.
-        let stored = load_all_indices(dataset).await?;
-        let tagged_at_commit = lance_table::system_index::frag_reuse::metadata::uses_tagged_fri(
-            &dataset.manifest,
-            stored.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME),
-        );
-        if tagged_at_commit {
-            // Materializing a data overlay breaks the reuse premise that a
-            // rewrite moves addresses, never values; on a tagged table the
-            // stale-index handling that v0 applies (dropping destination
-            // ids from swapped bitmaps) is a no-op because provenance never
-            // contains the destinations. Refuse rather than record a
-            // transition; see `build_frag_reuse_rewrite_entry` for the same
-            // rule on the stable-partition path.
-            if let Some(overlaid) = rewrite_groups
+    loop {
+        // Write an FRI only when the compaction touches data an index must later
+        // remap: a rewrite group covered by a data index, or by the existing FRI's new
+        // fragments (the composed remap chain). Compacting only not-yet-indexed data
+        // needs no FRI (one written for it is un-drainable). Decide all-or-nothing per
+        // compaction, never per group -- a partial FRI is unsound: a concurrent reindex
+        // can make a skipped fragment indexed and the conflict resolver's FRI-present
+        // path won't re-check it.
+        //
+        // The same rule applies on tagged tables: a transition for fragments no
+        // index covers and no lineage reaches would grow the history for rows no
+        // reader ever has to translate, with no trim to reclaim it; when nothing
+        // is covered the commit is a plain rewrite, which the tagged-table gate
+        // admits exactly for this uncovered shape.
+        //
+        // Stable row ids record every group: the moves also serve address translation.
+        let indexed_frags: RoaringBitmap = if options.defer_index_remap && !uses_stable_row_ids {
+            let mut covered = RoaringBitmap::new();
+            for bm in load_index_fragmaps(dataset).await? {
+                covered |= bm;
+            }
+            // The stored listing works for v0 and tagged entries alike (the
+            // filtered listing post-processes coverage on tagged tables).
+            if let Some(bm) = load_all_indices(dataset)
+                .await?
                 .iter()
-                .flat_map(|group| group.old_fragments.iter())
-                .find(|frag| !frag.overlays.is_empty())
+                .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
+                .and_then(|fri| fri.fragment_bitmap.clone())
             {
-                return Err(Error::not_supported(format!(
-                    "source fragment {} carries data overlay files; deferred compaction on a \
+                covered |= bm;
+            }
+            covered
+        } else {
+            RoaringBitmap::new()
+        };
+        let any_group_indexed = rewrite_groups
+            .iter()
+            .flat_map(|group| &group.old_fragments)
+            .any(|f| u32::try_from(f.id).is_ok_and(|id| indexed_frags.contains(id)));
+        // A stable-row-id table always keeps a v0 record: recording is refused
+        // before any rewrite where the table requires a tagged history.
+        //
+        // No indexed/chain data touched -> no record at all (all-or-nothing, see
+        // above); the commit is a plain rewrite the tagged gate admits for this
+        // uncovered shape. Otherwise the record's FORM -- a v0 entry, or tagged
+        // transitions riding the in-memory rewrite intent that
+        // `build_frag_reuse_rewrite_entry` assembles onto the entry at every
+        // commit attempt -- is decided HERE, at commit time, from the freshest
+        // state this handle has (the id reservations above do not advance it), not
+        // from a sample taken when the compaction started: another writer may
+        // have tagged the table in between. The record's BASE, however, is the
+        // snapshot at `tasks_read_version`: the commit path works out what the
+        // entry adds by diffing it against the entry at the transaction's read
+        // version, so an entry built from this later handle would fold every
+        // transition other writers appended in between into this rewrite's own
+        // additions and fail the commit for good instead of merging the
+        // histories (`rewrite_reuse_state` refuses such an entry outright). The
+        // read version itself stays at V: raising it to the latest version would
+        // skip the concurrency checks against the writes that landed in between.
+        // The remaining race onto the manifest CAS itself is handled by the
+        // rebase, which converts a v0-shaped intent into tagged transitions when
+        // the current entry turns out tagged (see `finish_rewrite`); the commit
+        // gate still rejects a v0 entry spliced by a writer without that
+        // conversion.
+        let frag_reuse_index = if records_row_addrs && (uses_stable_row_ids || any_group_indexed) {
+            // Once a table is v1, it stays v1: the sticky
+            // FLAG_FRAGMENT_REUSE_INDEX is the final authority
+            // (`uses_tagged_fri`), never the entry's own index_version. With NO
+            // entry -- for example a fully drained history whose entry a trim
+            // deleted -- the flag alone decides, so a tagged table never
+            // restarts its history in the v0 format; with a v0 entry UNDER the
+            // flag (a legacy entry a concurrent upgrade left pending) the
+            // tagged assembly lifts that entry byte-verbatim instead of
+            // extending it in place. A table that never was tagged has neither
+            // flag nor tagged entry, and keeps creating the v0 entry byte
+            // identically.
+            let stored = load_all_indices(dataset).await?;
+            let tagged_at_commit = lance_table::system_index::frag_reuse::metadata::uses_tagged_fri(
+                &dataset.manifest,
+                stored.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME),
+            );
+            if tagged_at_commit {
+                // Materializing a data overlay breaks the reuse premise that a
+                // rewrite moves addresses, never values; on a tagged table the
+                // stale-index handling that v0 applies (dropping destination
+                // ids from swapped bitmaps) is a no-op because provenance never
+                // contains the destinations. Refuse rather than record a
+                // transition; see `build_frag_reuse_rewrite_entry` for the same
+                // rule on the stable-partition path.
+                if let Some(overlaid) = rewrite_groups
+                    .iter()
+                    .flat_map(|group| group.old_fragments.iter())
+                    .find(|frag| !frag.overlays.is_empty())
+                {
+                    return Err(Error::not_supported(format!(
+                        "source fragment {} carries data overlay files; deferred compaction on a \
                      tagged fragment reuse table would materialize the overlaid values while \
                      indices keep translated coverage over the old addresses. Compact the \
                      overlays away or rebuild the covering indices eagerly first",
-                    overlaid.id
-                )));
-            }
-            use lance_table::format::pb::fragment_reuse_index_details as pb_fri;
-            let transitions = frag_reuse_groups
-                .into_iter()
-                .map(|group| pb_fri::Transition {
-                    sources: group
-                        .old_frags
-                        .iter()
-                        .map(pb_fri::FragmentDigest::from)
-                        .collect(),
-                    destinations: group
-                        .new_frags
-                        .iter()
-                        .map(pb_fri::FragmentDigest::from)
-                        .collect(),
-                    mapping: Some(pb_fri::transition::Mapping::OrderedCompaction(
-                        pb_fri::OrderedCompaction {
-                            changed_row_addrs: group.changed_row_addrs,
-                        },
-                    )),
-                })
-                .collect();
-            // The complete entry: the history at the read version plus this
-            // compaction's own transitions, built from the same snapshot the
-            // commit path diffs it against (see above). The commit path
-            // merges the additions onto the entry current at commit.
-            let read_snapshot = if dataset.manifest.version == tasks_read_version {
-                Cow::Borrowed(&*dataset)
-            } else {
-                // A cleaned-up read version fails here, explicitly, rather
-                // than guessing the base from a later snapshot.
-                Cow::Owned(dataset.checkout_version(tasks_read_version).await?)
-            };
-            Some(
-                crate::index::frag_reuse::frag_reuse_entry_appending(&read_snapshot, transitions)
+                        overlaid.id
+                    )));
+                }
+                use lance_table::format::pb::fragment_reuse_index_details as pb_fri;
+                let transitions = frag_reuse_groups
+                    .iter()
+                    .map(|group| pb_fri::Transition {
+                        sources: group
+                            .old_frags
+                            .iter()
+                            .map(pb_fri::FragmentDigest::from)
+                            .collect(),
+                        destinations: group
+                            .new_frags
+                            .iter()
+                            .map(pb_fri::FragmentDigest::from)
+                            .collect(),
+                        mapping: Some(pb_fri::transition::Mapping::OrderedCompaction(
+                            pb_fri::OrderedCompaction {
+                                changed_row_addrs: group.changed_row_addrs.clone(),
+                            },
+                        )),
+                    })
+                    .collect();
+                // The complete entry: the history at the read version plus this
+                // compaction's own transitions, built from the same snapshot the
+                // commit path diffs it against (see above). The commit path
+                // merges the additions onto the entry current at commit.
+                let read_snapshot = if dataset.manifest.version == tasks_read_version {
+                    Cow::Borrowed(&*dataset)
+                } else {
+                    // A cleaned-up read version fails here, explicitly, rather
+                    // than guessing the base from a later snapshot.
+                    Cow::Owned(dataset.checkout_version(tasks_read_version).await?)
+                };
+                Some(
+                    crate::index::frag_reuse::frag_reuse_entry_appending(
+                        &read_snapshot,
+                        transitions,
+                    )
                     .await?,
-            )
-        } else {
-            // The rewrite publishes right after the reservation unless another commit
-            // lands in between, in which case `finish_rewrite` restamps it.
-            let dataset_version = reserved_version.unwrap_or(dataset.manifest.version);
-            Some(
-                build_new_frag_reuse_index(
-                    dataset,
-                    frag_reuse_groups,
-                    new_fragment_bitmap,
-                    dataset_version,
                 )
-                .await?,
+            } else {
+                // The rewrite publishes right after the reservation unless another commit
+                // lands in between, in which case `finish_rewrite` restamps it.
+                let dataset_version = reserved_version.unwrap_or(dataset.manifest.version);
+                Some(
+                    build_new_frag_reuse_index(
+                        dataset,
+                        frag_reuse_groups.clone(),
+                        new_fragment_bitmap.clone(),
+                        dataset_version,
+                    )
+                    .await?,
+                )
+            }
+        } else {
+            if records_row_addrs {
+                log::debug!(
+                    "skipping fragment reuse record: no rewritten fragments are covered by an index or the reuse lineage"
+                );
+            }
+            None
+        };
+
+        let transaction = TransactionBuilder::new(
+            // Use the version at which the compaction tasks were *planned*, not the
+            // version of the dataset handle passed to this function.  In distributed
+            // mode the caller may open a fresh dataset at a later version (V+N), but
+            // the tasks were executed against an older snapshot (V).  Anchoring the
+            // transaction to V ensures the OCC conflict checker scans all writes that
+            // landed between V and the commit point, detecting concurrent DELETE
+            // transactions that would otherwise cause deleted rows to reappear.
+            tasks_read_version,
+            Operation::Rewrite {
+                groups: rewrite_groups.clone(),
+                rewritten_indices: rewritten_indices.clone(),
+                frag_reuse_index,
+            },
+        )
+        .transaction_properties(options.transaction_properties.clone())
+        .build();
+
+        let mut result = CompactionCommitResult {
+            committed_groups: rewrite_groups.len(),
+            ..Default::default()
+        };
+        for (metrics, rows) in &group_metrics {
+            result.metrics += metrics.clone();
+            result.committed_rows = result
+                .committed_rows
+                .checked_add(*rows)
+                .ok_or_else(|| Error::invalid_input("compaction row count overflow"))?;
+        }
+        match dataset
+            .apply_commit(
+                transaction.clone(),
+                &Default::default(),
+                &Default::default(),
             )
+            .await
+        {
+            Ok(()) => return Ok(result),
+            Err(error) => {
+                if !allow_partial
+                    || !matches!(
+                        error,
+                        Error::RetryableCommitConflict { .. }
+                            | Error::IncompatibleTransaction { .. }
+                    )
+                {
+                    return Err(error);
+                }
+                let keep = partial_commit::surviving_groups(dataset, &transaction).await?;
+                if !keep.iter().any(|keep| *keep) {
+                    return Err(error);
+                }
+                if keep.iter().all(|keep| *keep) {
+                    return Err(error);
+                }
+                partial_commit::retain_groups(&mut rewrite_groups, &keep);
+                partial_commit::retain_groups(&mut frag_reuse_groups, &keep);
+                partial_commit::retain_groups(&mut group_metrics, &keep);
+                new_fragment_bitmap = rewrite_groups
+                    .iter()
+                    .flat_map(|g| &g.new_fragments)
+                    .map(|f| {
+                        u32::try_from(f.id).map_err(|_| {
+                            Error::invalid_input(
+                                "compacted fragment id is outside row-address range",
+                            )
+                        })
+                    })
+                    .collect::<Result<RoaringBitmap>>()?;
+                log::info!(
+                    "Retrying compaction with {} surviving groups",
+                    rewrite_groups.len()
+                );
+            }
         }
-    } else {
-        if records_row_addrs {
-            log::debug!(
-                "skipping fragment reuse record: no rewritten fragments are covered by an index or the reuse lineage"
-            );
-        }
-        None
-    };
-
-    let transaction = TransactionBuilder::new(
-        // Use the version at which the compaction tasks were *planned*, not the
-        // version of the dataset handle passed to this function.  In distributed
-        // mode the caller may open a fresh dataset at a later version (V+N), but
-        // the tasks were executed against an older snapshot (V).  Anchoring the
-        // transaction to V ensures the OCC conflict checker scans all writes that
-        // landed between V and the commit point, detecting concurrent DELETE
-        // transactions that would otherwise cause deleted rows to reappear.
-        tasks_read_version,
-        Operation::Rewrite {
-            groups: rewrite_groups,
-            rewritten_indices,
-            frag_reuse_index,
-        },
-    )
-    .transaction_properties(options.transaction_properties.clone())
-    .build();
-
-    if let Err(e) = dataset
-        .apply_commit(transaction, &Default::default(), &Default::default())
-        .await
-    {
-        // RewriteResult is serializable and may be retried after an earlier
-        // ambiguous success. A conflict on this call therefore does not prove
-        // that the rewritten files are unreferenced. Leave them for dataset GC.
-        log::warn!(
-            "Compaction commit failed; leaving {} rewritten fragment(s) in place for GC: {}",
-            all_new_fragments.len(),
-            e
-        );
-        return Err(e);
     }
-
-    Ok(metrics)
 }
 
 /// Materialize the counts the fragment reuse digests and conservation
@@ -8022,10 +8091,84 @@ mod tests {
         assert_eq!(rows_found_through_index(&dataset).await, 11);
     }
 
+    #[tokio::test]
+    async fn partial_compaction_retries_writes_between_commit_attempts() {
+        let dir = TempStrDir::default();
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from_iter_values(0..60))],
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], schema),
+            &dir,
+            Some(WriteParams {
+                max_rows_per_file: 10,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset
+            .create_index(
+                &["a"],
+                IndexType::BTree,
+                None,
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+        let options = CompactionOptions {
+            target_rows_per_fragment: 20,
+            defer_index_remap: true,
+            ..Default::default()
+        };
+        let plan = plan_compaction(&dataset, &options).await.unwrap();
+        let mut results = Vec::new();
+        for task in plan.compaction_tasks() {
+            results.push(task.execute(&dataset).await.unwrap());
+        }
+        assert_eq!(results.len(), 3);
+        let handler = Arc::new(RaceBeforeRewrite::default());
+        handler.arm(
+            &dataset,
+            vec![Race::DeleteRows("a = 0"), Race::DeleteRows("a = 20")],
+        );
+        dataset.commit_handler = handler;
+        let result = commit_compaction_with_partial_progress(
+            &mut dataset,
+            results,
+            Arc::new(DatasetIndexRemapperOptions::default()),
+            &options,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.committed_groups, 1);
+        assert_eq!(result.committed_rows, 20);
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 58);
+        assert_eq!(
+            dataset
+                .count_rows(Some("a = 0 OR a = 20".to_string()))
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            dataset
+                .count_rows(Some("a >= 40".to_string()))
+                .await
+                .unwrap(),
+            20
+        );
+    }
+
     #[derive(Clone, Copy, Debug)]
     enum Race {
         Append,
         BuildIndex,
+        DeleteRows(&'static str),
         /// From another session, so the rebase reads its rewrite from the transaction file.
         CompactElsewhere {
             excluded: &'static [u32],
@@ -8071,6 +8214,7 @@ mod tests {
                 let mut handle = self.handle.lock().unwrap().clone().unwrap();
                 handle.checkout_latest().await.unwrap();
                 match race {
+                    Race::DeleteRows(predicate) => handle.delete(predicate).await.unwrap(),
                     Race::Append => {
                         let batch = arrow_array::record_batch!(("i", Int32, [9000, 9001])).unwrap();
                         handle

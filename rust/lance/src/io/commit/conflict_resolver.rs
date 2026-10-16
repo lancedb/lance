@@ -1548,12 +1548,46 @@ impl<'a> TransactionRebase<'a> {
         other_transaction: &Transaction,
         other_version: u64,
     ) -> Result<()> {
+        self.check_rewrite_groups_txn(other_transaction, other_version, None)
+    }
+
+    pub(crate) fn rewrite_group_conflicts(
+        &self,
+        other_transaction: &Transaction,
+        other_version: u64,
+        group_index: usize,
+    ) -> Result<()> {
+        self.check_rewrite_groups_txn(other_transaction, other_version, Some(group_index))
+    }
+
+    fn check_rewrite_groups_txn(
+        &self,
+        other_transaction: &Transaction,
+        other_version: u64,
+        group_index: Option<usize>,
+    ) -> Result<()> {
         if let Operation::Rewrite {
             groups,
             frag_reuse_index,
             ..
         } = &self.transaction.operation
         {
+            let groups = match group_index {
+                Some(index) => groups.get(index..index + 1).ok_or_else(|| {
+                    Error::invalid_input(format!("rewrite group {index} is out of range"))
+                })?,
+                None => groups.as_slice(),
+            };
+            let group_ids;
+            let modified_fragment_ids = if group_index.is_some() {
+                group_ids = groups
+                    .iter()
+                    .flat_map(|g| g.old_fragments.iter().map(|f| f.id))
+                    .collect::<HashSet<_>>();
+                &group_ids
+            } else {
+                &self.modified_fragment_ids
+            };
             match &other_transaction.operation {
                 // Rewrite is only compatible with operations that don't touch
                 // existing fragments or update fragments we don't touch.
@@ -1578,7 +1612,7 @@ impl<'a> TransactionRebase<'a> {
                         .iter()
                         .map(|f| f.id)
                         .chain(deleted_fragment_ids.iter().copied())
-                        .any(|id| self.modified_fragment_ids.contains(&id))
+                        .any(|id| modified_fragment_ids.contains(&id))
                     {
                         Err(self.retryable_conflict_err(other_transaction, other_version))
                     } else {
@@ -1592,7 +1626,7 @@ impl<'a> TransactionRebase<'a> {
                     if groups
                         .iter()
                         .map(|g| g.fragment_id)
-                        .any(|id| self.modified_fragment_ids.contains(&id))
+                        .any(|id| modified_fragment_ids.contains(&id))
                     {
                         Err(self.retryable_conflict_err(other_transaction, other_version))
                     } else {
@@ -1614,8 +1648,25 @@ impl<'a> TransactionRebase<'a> {
                     // manifest-diff check turns a concurrent stable-partition
                     // append into a retryable conflict.
                     if let Some(transitions) = self.reuse.added_transitions.as_ref() {
+                        let group_fragments: HashSet<u64> = groups
+                            .iter()
+                            .flat_map(|g| {
+                                g.old_fragments
+                                    .iter()
+                                    .chain(g.new_fragments.iter())
+                                    .map(|f| f.id)
+                            })
+                            .collect();
                         let touched: HashSet<u64> = transitions
                             .iter()
+                            .filter(|transition| {
+                                group_index.is_none()
+                                    || transition
+                                        .sources
+                                        .iter()
+                                        .chain(transition.destinations.iter())
+                                        .any(|d| group_fragments.contains(&d.id))
+                            })
                             .flat_map(|transition| {
                                 transition
                                     .sources
@@ -1649,7 +1700,7 @@ impl<'a> TransactionRebase<'a> {
                     if groups
                         .iter()
                         .flat_map(|f| f.old_fragments.iter().map(|f| f.id))
-                        .any(|id| self.modified_fragment_ids.contains(&id))
+                        .any(|id| modified_fragment_ids.contains(&id))
                     {
                         Err(self.retryable_conflict_err(other_transaction, other_version))
                     } else {
