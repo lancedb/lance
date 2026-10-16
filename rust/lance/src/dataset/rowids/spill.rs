@@ -1954,13 +1954,14 @@ mod tests {
                 ),
                 "the created-at versions must spill with the row ids"
             );
-            // The lineage file is one of the fragment's files, after its data,
-            // and holds only what the update carried over.
-            assert_eq!(rewritten.files.len(), 2);
-            assert_eq!(
-                rewritten.files[1].fields.as_ref(),
-                [ROW_ID_FIELD_ID, ROW_CREATED_AT_VERSION_FIELD_ID]
-            );
+            // The user-data file also carries the immutable lineage.
+            assert_eq!(rewritten.files.len(), 1);
+            for field_id in [ROW_ID_FIELD_ID, ROW_CREATED_AT_VERSION_FIELD_ID] {
+                assert_eq!(
+                    rewritten.row_lineage_file(field_id).unwrap(),
+                    Some(&rewritten.files[0])
+                );
+            }
             assert!(
                 matches!(
                     rewritten.last_updated_at_version_meta,
@@ -2013,7 +2014,7 @@ mod tests {
     }
 
     /// The write that spills the fixture's lineage ahead of a schema change.
-    /// Both leave it in a lineage-only file next to the fragment's data.
+    /// Update writes it alongside user data; binary copy uses a lineage-only file.
     #[derive(Debug, Clone, Copy)]
     enum SpillingWrite {
         /// An update rewriting the rows with `i >= 500`.
@@ -2075,8 +2076,7 @@ mod tests {
                 compact_files(&mut dataset, options, None).await.unwrap();
             }
         }
-        // Each spilled fragment keeps its lineage in a file of its own, which
-        // nothing but the lineage keeps alive through the schema change.
+        // Cover both a carrier shared with user data and a lineage-only file.
         let spilled = dataset
             .manifest
             .fragments
@@ -2088,11 +2088,16 @@ mod tests {
             "the fixture must spill before the schema change"
         );
         for fragment in spilled {
-            assert_eq!(fragment.files.len(), 2, "{fragment:?}");
-            assert!(
-                fragment.files[1].fields.iter().all(|field| *field < 0),
-                "expected a lineage-only file: {fragment:?}"
-            );
+            match spilling_write {
+                SpillingWrite::Update => {
+                    assert_eq!(fragment.files.len(), 1, "{fragment:?}");
+                    assert!(fragment.files[0].fields.iter().any(|field| *field >= 0));
+                }
+                SpillingWrite::Compaction => {
+                    assert_eq!(fragment.files.len(), 2, "{fragment:?}");
+                    assert!(fragment.files[1].fields.iter().all(|field| *field < 0));
+                }
+            }
         }
         let before = by_key(&collect_rows(&dataset).await);
 

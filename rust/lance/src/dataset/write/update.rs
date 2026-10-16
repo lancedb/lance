@@ -9,13 +9,15 @@ use super::cleanup_data_fragments;
 use super::retry::{RetryConfig, RetryExecutor, execute_with_retry};
 use super::{CommitBuilder, WriteParams, write_fragments_internal};
 use crate::dataset::rowids::{
-    get_row_id_index, inline_row_lineage_max_bytes, place_carried_row_lineage,
+    RowLineageSpill, get_row_id_index, inline_row_lineage_max_bytes, place_carried_row_lineage,
 };
 use crate::dataset::transaction::UpdateMode::RewriteRows;
 use crate::dataset::transaction::{Operation, Transaction};
-use crate::dataset::utils::make_rowid_capture_stream;
+use crate::dataset::utils::make_rowid_capture_stream_with_lineage;
 use crate::{Dataset, io::exec::Planner};
 use crate::{Error, Result};
+use arrow_array::cast::AsArray;
+use arrow_array::types::UInt64Type;
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::{DataType, Schema as ArrowSchema};
 use datafusion::common::DFSchema;
@@ -24,20 +26,25 @@ use datafusion::logical_expr::ExprSchemable;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{PhysicalExpr, SendableRecordBatchStream};
 use datafusion::prelude::Expr;
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 use lance_arrow::RecordBatchExt;
 use lance_arrow::json::{JsonArray, is_json_field};
 use lance_core::datatypes::BlobHandling;
 use lance_core::error::{InvalidInputSnafu, box_error};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
-use lance_core::{ROW_ADDR_FIELD, ROW_CREATED_AT_VERSION, ROW_ID_FIELD, ROW_OFFSET_FIELD};
+use lance_core::{
+    ROW_ADDR, ROW_ADDR_FIELD, ROW_CREATED_AT_VERSION, ROW_ID, ROW_ID_FIELD, ROW_OFFSET_FIELD,
+};
 use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
 use lance_select::RowAddrTreeMap;
-use lance_table::format::{Fragment, RowDatasetVersionSequence, RowIdMeta};
-use lance_table::rowids::version::rechunk_version_sequences;
+use lance_table::format::{Fragment, RowDatasetVersionMeta, RowDatasetVersionSequence, RowIdMeta};
+use lance_table::rowids::version::{rechunk_version_sequences, write_dataset_versions};
 use lance_table::rowids::{RowIdSequence, rechunk_sequences, write_row_ids};
 use roaring::RoaringTreemap;
 use snafu::ResultExt;
+
+mod lineage;
+use lineage::plan_carried_lineage_spill;
 
 /// Collect a field id and all of its descendant field ids (pre-order). A struct
 /// column update rewrites the whole subtree, so an index on any descendant must be
@@ -342,6 +349,10 @@ impl UpdateJob {
     }
 
     async fn execute_impl(self) -> Result<UpdateData> {
+        self.execute_with_write_params(WriteParams::default()).await
+    }
+
+    async fn execute_with_write_params(self, mut write_params: WriteParams) -> Result<UpdateData> {
         // Resolved before any IO, so a malformed budget fails the update
         // before it rewrites the rows rather than after. Only a table with
         // stable row ids carries lineage over, so no other table depends on
@@ -352,6 +363,7 @@ impl UpdateJob {
             None
         };
         let mut scanner = self.dataset.scan();
+        scanner.scan_in_order(true);
         let legacy_blob_ids = self
             .dataset
             .schema()
@@ -362,6 +374,13 @@ impl UpdateJob {
         if !legacy_blob_ids.is_empty() {
             scanner.blob_handling(BlobHandling::SomeBlobsBinary(legacy_blob_ids));
         }
+        let (selected_rows, spill) = match spill_budget {
+            Some(limit) => {
+                let (rows, spill) = self.plan_carried_lineage(limit, scanner.clone()).await?;
+                (Some(rows), spill)
+            }
+            None => (None, RowLineageSpill::default()),
+        };
         let has_blob_v2_columns = self
             .dataset
             .schema()
@@ -388,7 +407,12 @@ impl UpdateJob {
             scanner.project(&columns)?;
         }
 
-        if let Some(expr) = &self.condition {
+        if let Some(rows) = selected_rows {
+            // Evaluate the predicate only in the planning scan. Both scans
+            // use this immutable snapshot, and the second scan supplies its
+            // own lineage values, so parallel reads cannot misalign them.
+            scanner.with_physical_row_addr_prefilter(rows);
+        } else if let Some(expr) = &self.condition {
             scanner.filter_expr(expr.clone());
         }
 
@@ -398,12 +422,25 @@ impl UpdateJob {
 
         // We keep track of seen row ids so we can delete them from the existing
         // fragments and then set the row id segments in the new fragments.
-        let (stream, row_id_rx) =
-            make_rowid_capture_stream(stream, self.dataset.manifest.uses_stable_row_ids())?;
+        let lineage_fields = spill.schema_fields()?;
+        let retained_lineage = lineage_fields
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect::<Vec<_>>();
+        let (stream, row_id_rx) = make_rowid_capture_stream_with_lineage(
+            stream,
+            self.dataset.manifest.uses_stable_row_ids(),
+            &retained_lineage,
+            spill_budget.is_some(),
+        )?;
 
         let scan_schema = stream.schema();
+        let user_columns = (0..scan_schema.fields().len())
+            .filter(|index| !retained_lineage.contains(&scan_schema.field(*index).name().as_str()))
+            .collect::<Vec<_>>();
+        let user_schema = scan_schema.project(&user_columns)?;
         let expected_schema: ArrowSchema = self.dataset.schema().into();
-        if !has_blob_v2_columns && scan_schema.as_ref() != &expected_schema {
+        if !has_blob_v2_columns && user_schema != expected_schema {
             return Err(Error::internal(format!(
                 "Expected schema {:?} but got {:?}",
                 expected_schema, scan_schema
@@ -458,10 +495,7 @@ impl UpdateJob {
                     .then_some(column_idx)
             })
             .collect::<Vec<_>>();
-        let write_params = WriteParams {
-            allow_external_blob_outside_bases: has_blob_v2_columns,
-            ..Default::default()
-        };
+        write_params.allow_external_blob_outside_bases = has_blob_v2_columns;
         let external_base_resolver = if updated_blob_column_indices.is_empty() {
             None
         } else {
@@ -505,13 +539,15 @@ impl UpdateJob {
                 }
             });
         let stream = RecordBatchStreamAdapter::new(schema, stream);
+        let mut write_schema = self.dataset.schema().clone();
+        write_schema.fields.extend(lineage_fields);
 
         let (mut new_fragments, _) = write_fragments_internal(
             self.write_version,
             Some(&self.dataset),
             self.dataset.object_store.clone(),
             &self.dataset.base,
-            self.dataset.schema().clone(),
+            write_schema,
             Box::pin(stream),
             write_params,
             None, // TODO: support multiple bases for update
@@ -576,9 +612,54 @@ impl UpdateJob {
         })
     }
 
+    /// Resolve the update's row selection once without retaining user data.
+    /// If carried lineage may spill, retain candidate columns in the writing
+    /// scan; the actual file boundaries decide which sequences use them.
+    async fn plan_carried_lineage(
+        &self,
+        limit: usize,
+        mut scanner: crate::dataset::scanner::Scanner,
+    ) -> Result<(RowAddrTreeMap, RowLineageSpill)> {
+        scanner
+            .project(&[ROW_ID, ROW_CREATED_AT_VERSION])?
+            .with_row_address()
+            .scan_in_order(true);
+        if let Some(condition) = &self.condition {
+            scanner.filter_expr(condition.clone());
+        }
+        let stream = scanner
+            .try_into_dfstream(scanner.execution_options())
+            .await?;
+        let (mut stream, captured) =
+            make_rowid_capture_stream_with_lineage(stream, true, &[], true)?;
+        let mut selected_rows = RowAddrTreeMap::new();
+        while let Some(batch) = stream.try_next().await? {
+            let addresses = batch
+                .column_by_name(ROW_ADDR)
+                .ok_or_else(|| Error::internal("Update planning scan omitted row addresses"))?
+                .as_primitive::<UInt64Type>();
+            for address in addresses.values() {
+                selected_rows.insert(*address);
+            }
+        }
+        let captured = captured.try_recv().map_err(|error| {
+            Error::internal(format!("Failed to receive planned row lineage: {error}"))
+        })?;
+        let row_ids = captured
+            .row_id_sequence()
+            .ok_or_else(|| Error::internal("Update planning scan omitted stable row ids"))?;
+        let created_at = captured
+            .created_at_sequence()
+            .ok_or_else(|| Error::internal("Update planning scan omitted created-at versions"))?;
+        Ok((
+            selected_rows,
+            plan_carried_lineage_spill(limit, row_ids, created_at),
+        ))
+    }
+
     /// Give each new fragment the row ids its rows carried before the rewrite
     /// and, where the lineage spills under `spill_budget`, their created-at
-    /// versions too; see [`place_carried_row_lineage`]. The last-updated-at
+    /// versions too. The last-updated-at
     /// version is the commit's to stamp.
     ///
     /// `created_at` is `None` when the scan did not read the created-at
@@ -619,9 +700,43 @@ impl UpdateJob {
         for ((fragment, row_ids), created_at) in
             new_fragments.iter_mut().zip(row_ids).zip(created_at)
         {
-            place_carried_row_lineage(&self.dataset, limit, &row_ids, &created_at)
-                .await?
-                .apply(fragment);
+            let inline_row_ids = write_row_ids(&row_ids);
+            let inline_created_at = write_dataset_versions(&created_at);
+            let spill = RowLineageSpill {
+                row_ids: inline_row_ids.len() > limit,
+                created_at: inline_created_at.len() > limit,
+                last_updated_at: false,
+            };
+            if !spill.any() {
+                place_carried_row_lineage(&self.dataset, limit, &row_ids, &created_at)
+                    .await?
+                    .apply(fragment);
+                continue;
+            }
+            {
+                for field_id in spill.field_ids() {
+                    if fragment.row_lineage_file(field_id)?.is_none() {
+                        return Err(Error::internal(format!(
+                            "Update wrote fragment {} without planned row lineage field {field_id}",
+                            fragment.id
+                        )));
+                    }
+                }
+            }
+            fragment.row_id_meta = Some(if spill.row_ids {
+                RowIdMeta::Column
+            } else {
+                RowIdMeta::Inline(inline_row_ids.into())
+            });
+            fragment.created_at_version_meta = if spill.created_at {
+                Some(RowDatasetVersionMeta::Column)
+            } else if spill.row_ids {
+                Some(RowDatasetVersionMeta::Inline(inline_created_at.into()))
+            } else {
+                None
+            };
+            // The commit assigns this value, including after a conflict.
+            fragment.last_updated_at_version_meta = None;
         }
         Ok(())
     }
@@ -792,7 +907,6 @@ mod tests {
 
     use crate::dataset::rowids::{
         INLINE_ROW_LINEAGE_MAX_BYTES_CONFIG_KEY, SPILL_ROW_LINEAGE_CONFIG_KEY,
-        read_spilled_row_ids, read_spilled_versions,
     };
     use crate::dataset::{WriteDestination, WriteMode};
     use crate::index::DatasetIndexExt;
@@ -805,7 +919,7 @@ mod tests {
     use arrow_array::record_batch;
     use arrow_array::types::{Float32Type, Int32Type};
     use arrow_array::{
-        Int64Array, RecordBatchIterator, StringArray, StructArray, UInt32Array, UInt64Array,
+        Array, Int64Array, RecordBatchIterator, StringArray, StructArray, UInt32Array, UInt64Array,
     };
     use arrow_schema::{Field, Schema as ArrowSchema};
     use arrow_select::concat::concat_batches;
@@ -2376,15 +2490,16 @@ mod tests {
     /// exceeds the inline budget, the new fragments carry only inline row ids:
     /// the commit resolves their created-at versions, as it always has.
     #[rstest]
-    #[case::not_opted_in(false)]
-    #[case::under_budget(true)]
+    #[case::not_opted_in(None)]
+    #[case::disabled(Some("false"))]
+    #[case::under_budget(Some("true"))]
     #[tokio::test]
-    async fn update_leaves_inline_created_at_to_the_commit(#[case] opted_in: bool) {
+    async fn update_leaves_inline_created_at_to_the_commit(#[case] config: Option<&str>) {
         let (dataset, _test_dir) = make_test_dataset(LanceFileVersion::V2_0, true).await;
         let mut dataset = dataset.as_ref().clone();
-        if opted_in {
+        if let Some(value) = config {
             dataset
-                .update_config([(SPILL_ROW_LINEAGE_CONFIG_KEY, "true")])
+                .update_config([(SPILL_ROW_LINEAGE_CONFIG_KEY, value)])
                 .await
                 .unwrap();
         }
@@ -2408,6 +2523,621 @@ mod tests {
             assert_eq!(fragment.created_at_version_meta, None);
             assert_eq!(fragment.last_updated_at_version_meta, None);
             assert_eq!(fragment.files.len(), 1, "no lineage file: {fragment:?}");
+            assert!(fragment.files[0].fields.iter().all(|field| *field >= 0));
+        }
+    }
+
+    #[tokio::test]
+    async fn update_spills_carried_lineage_into_user_data_file() {
+        let (dataset, _test_dir) = make_test_dataset(LanceFileVersion::V2_2, true).await;
+        let mut dataset = dataset.as_ref().clone();
+        dataset
+            .update_config([
+                (SPILL_ROW_LINEAGE_CONFIG_KEY, "true"),
+                (INLINE_ROW_LINEAGE_MAX_BYTES_CONFIG_KEY, "0"),
+            ])
+            .await
+            .unwrap();
+        let update_data = UpdateBuilder::new(Arc::new(dataset))
+            .update_where("id % 2 = 0")
+            .unwrap()
+            .set("name", "'bar'")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute_impl()
+            .await
+            .unwrap();
+
+        assert_eq!(update_data.num_updated_rows, 15);
+        for fragment in &update_data.new_fragments {
+            assert_eq!(fragment.row_id_meta, Some(RowIdMeta::Column));
+            assert_eq!(fragment.last_updated_at_version_meta, None);
+            assert_eq!(fragment.files.len(), 1, "{fragment:?}");
+            assert!(
+                fragment.files[0]
+                    .fields
+                    .contains(&ROW_CREATED_AT_VERSION_FIELD_ID)
+            );
+        }
+    }
+
+    #[rstest]
+    #[case::row_count_split(0, 700, false)]
+    #[case::byte_split(0, 10_000, true)]
+    #[case::all_written_sequences_inline(256, 10_000, true)]
+    #[case::mixed_inline_and_spilled(100, 10_000, true)]
+    #[tokio::test]
+    async fn update_lineage_follows_actual_file_boundaries(
+        #[case] budget: usize,
+        #[case] max_rows: usize,
+        #[case] byte_split: bool,
+    ) {
+        let dir = TempStrDir::default();
+        let batch = record_batch!(
+            ("id", Int64, (0..3000).collect::<Vec<_>>()),
+            (
+                "value",
+                Int64,
+                (0..3000)
+                    .map(|id| (id % 3 != 0).then_some(id))
+                    .collect::<Vec<_>>()
+            )
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+            dir.as_str(),
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                max_rows_per_file: 1000,
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset
+            .add_columns(
+                crate::dataset::NewColumnTransform::SqlExpressions(vec![(
+                    "extra".into(),
+                    "id * 10".into(),
+                )]),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            dataset
+                .manifest
+                .fragments
+                .iter()
+                .all(|fragment| fragment.files.len() == 2)
+        );
+        let columns_version = dataset.version().version;
+        dataset
+            .update_config([
+                (SPILL_ROW_LINEAGE_CONFIG_KEY, "true"),
+                (
+                    INLINE_ROW_LINEAGE_MAX_BYTES_CONFIG_KEY,
+                    budget.to_string().as_str(),
+                ),
+            ])
+            .await
+            .unwrap();
+        let job = UpdateBuilder::new(Arc::new(dataset))
+            .update_where("id < 1000 OR id % 2 = 0")
+            .unwrap()
+            .set("value", "coalesce(value, 0) + 1")
+            .unwrap()
+            .build()
+            .unwrap();
+        let (_, planned) = job
+            .plan_carried_lineage(budget, job.dataset.scan())
+            .await
+            .unwrap();
+        assert!(
+            planned.any(),
+            "the fixture must plan candidate hidden columns"
+        );
+        let written = job
+            .clone()
+            .execute_with_write_params(WriteParams {
+                max_rows_per_file: max_rows,
+                max_bytes_per_file: if byte_split { 1 } else { usize::MAX },
+                file_writer_options: Some(lance_file::writer::FileWriterOptions {
+                    data_cache_bytes: Some(1),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(written.num_updated_rows, 2000);
+        assert!(written.new_fragments.len() >= 3);
+        let spilled = written
+            .new_fragments
+            .iter()
+            .filter(|fragment| fragment.has_spilled_row_lineage())
+            .count();
+        if budget == 256 {
+            assert_eq!(spilled, 0, "every actual byte-split sequence fits inline");
+        } else if budget == 100 {
+            assert!(spilled > 0 && spilled < written.new_fragments.len());
+        } else {
+            assert_eq!(spilled, written.new_fragments.len());
+        }
+        for fragment in &written.new_fragments {
+            assert_eq!(fragment.files.len(), 1, "{fragment:?}");
+            assert!(fragment.physical_rows.unwrap() <= max_rows);
+            assert_eq!(fragment.last_updated_at_version_meta, None);
+            for field_id in planned.field_ids() {
+                let file = fragment.row_lineage_file(field_id).unwrap().unwrap();
+                assert!(file.fields.iter().any(|field| *field >= 0));
+                assert_eq!(file.fields.len(), file.column_indices.len());
+            }
+        }
+        let committed = job
+            .commit_impl(job.dataset.clone(), written)
+            .await
+            .unwrap()
+            .new_dataset;
+        let update_version = committed.version().version;
+        let expected_flag = if spilled == 0 {
+            0
+        } else {
+            lance_table::feature_flags::FLAG_SPILLED_ROW_LINEAGE
+        };
+        assert_eq!(
+            committed.manifest.reader_feature_flags
+                & lance_table::feature_flags::FLAG_SPILLED_ROW_LINEAGE,
+            expected_flag
+        );
+        assert_eq!(
+            committed.manifest.writer_feature_flags
+                & lance_table::feature_flags::FLAG_SPILLED_ROW_LINEAGE,
+            expected_flag
+        );
+        let policy = crate::dataset::cleanup::CleanupPolicyBuilder::default()
+            .retain_n_versions(&committed, 1)
+            .await
+            .unwrap()
+            .delete_unverified(true)
+            .build();
+        crate::dataset::cleanup::cleanup_old_versions(&committed, policy)
+            .await
+            .unwrap();
+        let reopened = Dataset::open(dir.as_str()).await.unwrap();
+        reopened.validate().await.unwrap();
+        let check = |rows: &RecordBatch| {
+            for row in 0..rows.num_rows() {
+                let id = rows["id"].as_primitive::<Int64Type>().value(row);
+                let selected = id < 1000 || id % 2 == 0;
+                assert_eq!(
+                    rows[ROW_ID].as_primitive::<UInt64Type>().value(row),
+                    id as u64
+                );
+                assert_eq!(
+                    rows[ROW_CREATED_AT_VERSION]
+                        .as_primitive::<UInt64Type>()
+                        .value(row),
+                    1
+                );
+                assert_eq!(
+                    rows[lance_core::ROW_LAST_UPDATED_AT_VERSION]
+                        .as_primitive::<UInt64Type>()
+                        .value(row),
+                    if selected {
+                        update_version
+                    } else {
+                        columns_version
+                    }
+                );
+                let values = rows["value"].as_primitive::<Int64Type>();
+                if selected {
+                    assert_eq!(values.value(row), if id % 3 == 0 { 1 } else { id + 1 });
+                } else {
+                    assert_eq!(values.is_null(row), id % 3 == 0);
+                    if id % 3 != 0 {
+                        assert_eq!(values.value(row), id);
+                    }
+                }
+                assert_eq!(
+                    rows["extra"].as_primitive::<Int64Type>().value(row),
+                    id * 10
+                );
+            }
+        };
+        let columns = [
+            "id",
+            "value",
+            "extra",
+            ROW_ID,
+            ROW_CREATED_AT_VERSION,
+            lance_core::ROW_LAST_UPDATED_AT_VERSION,
+        ];
+        let scanned = reopened
+            .scan()
+            .project(&columns)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(scanned.num_rows(), 3000);
+        check(&scanned);
+        let taken = reopened
+            .take_rows(
+                &[2998, 3, 1001, 1000],
+                crate::dataset::ProjectionRequest::from_columns(
+                    columns.into_iter().chain([ROW_ADDR]),
+                    reopened.schema(),
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            taken["id"].as_primitive::<Int64Type>().values(),
+            &[2998, 3, 1001, 1000]
+        );
+        check(&taken);
+    }
+
+    #[tokio::test]
+    async fn update_main_file_lineage_survives_conflict_retry_and_compaction() {
+        let (dataset, dir) = make_test_dataset(LanceFileVersion::V2_2, true).await;
+        let mut dataset = dataset.as_ref().clone();
+        dataset.delete("id IN (3, 12, 27)").await.unwrap();
+        dataset
+            .update_config([
+                (SPILL_ROW_LINEAGE_CONFIG_KEY, "true"),
+                (INLINE_ROW_LINEAGE_MAX_BYTES_CONFIG_KEY, "0"),
+            ])
+            .await
+            .unwrap();
+        let dataset = Arc::new(dataset);
+        let stale = UpdateBuilder::new(dataset.clone())
+            .update_where("id % 2 = 0")
+            .unwrap()
+            .set("name", "concat(name, '_final')")
+            .unwrap()
+            .build()
+            .unwrap();
+        let staged = stale.clone().execute_impl().await.unwrap();
+        UpdateBuilder::new(dataset.clone())
+            .update_where("id % 2 = 0")
+            .unwrap()
+            .set("name", "'other'")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+        let error = stale.commit_impl(dataset, staged).await.unwrap_err();
+        assert!(
+            matches!(error, Error::RetryableCommitConflict { .. }),
+            "{error:?}"
+        );
+        // This job still holds the old snapshot, so execute must encounter
+        // that same conflict, reopen, and reevaluate the update expression.
+        let result = stale.execute().await.unwrap();
+        assert_eq!(result.rows_updated, 14);
+        let update_version = result.new_dataset.version().version;
+        for fragment in result
+            .new_dataset
+            .manifest
+            .fragments
+            .iter()
+            .filter(|fragment| fragment.has_spilled_row_lineage())
+        {
+            assert_eq!(fragment.files.len(), 1);
+            assert!(matches!(
+                fragment.last_updated_at_version_meta,
+                Some(RowDatasetVersionMeta::Inline(_))
+            ));
+        }
+        let mut reopened = Dataset::open(dir.as_str()).await.unwrap();
+        crate::dataset::optimize::compact_files(
+            &mut reopened,
+            crate::dataset::optimize::CompactionOptions {
+                target_rows_per_fragment: 100,
+                materialize_deletions: true,
+                materialize_deletions_threshold: 0.0,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        reopened.validate().await.unwrap();
+        let rows = reopened
+            .scan()
+            .project(&[
+                "id",
+                "name",
+                ROW_ID,
+                ROW_CREATED_AT_VERSION,
+                lance_core::ROW_LAST_UPDATED_AT_VERSION,
+            ])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(rows.num_rows(), 27);
+        for row in 0..rows.num_rows() {
+            let id = rows["id"].as_primitive::<Int64Type>().value(row);
+            assert!(![3, 12, 27].contains(&id));
+            assert_eq!(
+                rows[ROW_ID].as_primitive::<UInt64Type>().value(row),
+                id as u64
+            );
+            assert_eq!(
+                rows[ROW_CREATED_AT_VERSION]
+                    .as_primitive::<UInt64Type>()
+                    .value(row),
+                1
+            );
+            assert_eq!(
+                rows["name"].as_string::<i32>().value(row),
+                if id % 2 == 0 { "other_final" } else { "foo" }
+            );
+            assert_eq!(
+                rows[lance_core::ROW_LAST_UPDATED_AT_VERSION]
+                    .as_primitive::<UInt64Type>()
+                    .value(row),
+                if id % 2 == 0 { update_version } else { 1 }
+            );
+        }
+    }
+
+    #[rstest]
+    #[case::v2_0(LanceFileVersion::V2_0)]
+    #[case::v2_2(LanceFileVersion::V2_2)]
+    #[tokio::test]
+    async fn update_main_file_lineage_follows_nested_physical_columns(
+        #[case] version: LanceFileVersion,
+    ) {
+        let list = Arc::new(
+            arrow_array::ListArray::from_iter_primitive::<Int64Type, _, _>([
+                Some(vec![Some(1), None]),
+                None,
+                Some(vec![]),
+            ]),
+        );
+        let nested = Arc::new(StructArray::from(vec![(
+            Arc::new(Field::new("child", DataType::Int64, true)),
+            Arc::new(Int64Array::from(vec![Some(1), None, Some(3)])) as ArrayRef,
+        )]));
+        let input = record_batch!(("id", Int64, [0, 1, 2]))
+            .unwrap()
+            .try_with_column(
+                Field::new("list", list.data_type().clone(), true),
+                list.clone(),
+            )
+            .unwrap()
+            .try_with_column(
+                Field::new("nested", nested.data_type().clone(), true),
+                nested.clone(),
+            )
+            .unwrap();
+        let dir = TempStrDir::default();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(input.clone())], input.schema()),
+            dir.as_str(),
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                max_rows_per_file: 2,
+                data_storage_version: Some(version),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset
+            .update_config([
+                (SPILL_ROW_LINEAGE_CONFIG_KEY, "true"),
+                (INLINE_ROW_LINEAGE_MAX_BYTES_CONFIG_KEY, "0"),
+            ])
+            .await
+            .unwrap();
+        let result = UpdateBuilder::new(Arc::new(dataset))
+            .set("id", "id + 10")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(result.new_dataset.manifest.fragments.len(), 1);
+        assert_eq!(result.new_dataset.manifest.fragments[0].files.len(), 1);
+        let reopened = Dataset::open(dir.as_str()).await.unwrap();
+        reopened.validate().await.unwrap();
+        let batch = reopened
+            .scan()
+            .project(&["id", "list", "nested", ROW_ID, ROW_CREATED_AT_VERSION])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(
+            batch["id"].as_primitive::<Int64Type>().values(),
+            &[10, 11, 12]
+        );
+        assert_eq!(
+            batch[ROW_ID].as_primitive::<UInt64Type>().values(),
+            &[0, 1, 2]
+        );
+        assert_eq!(
+            batch[ROW_CREATED_AT_VERSION]
+                .as_primitive::<UInt64Type>()
+                .values(),
+            &[1, 1, 1]
+        );
+        assert_eq!(batch["list"].as_ref(), list.as_ref());
+        assert_eq!(batch["nested"].as_ref(), nested.as_ref());
+    }
+
+    #[rstest]
+    #[case::at_budget(0)]
+    #[case::one_byte_over(1)]
+    #[tokio::test]
+    async fn update_lineage_uses_the_exact_written_sequence_budget(#[case] below_size: usize) {
+        let batch = record_batch!(("id", Int64, [0, 1, 2, 3])).unwrap();
+        let dir = TempStrDir::default();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+            dir.as_str(),
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let limit = write_row_ids(&RowIdSequence::from(2..4)).len() - below_size;
+        dataset
+            .update_config([
+                (SPILL_ROW_LINEAGE_CONFIG_KEY, "true"),
+                (
+                    INLINE_ROW_LINEAGE_MAX_BYTES_CONFIG_KEY,
+                    limit.to_string().as_str(),
+                ),
+            ])
+            .await
+            .unwrap();
+        let job = UpdateBuilder::new(Arc::new(dataset))
+            .set("id", "id + 10")
+            .unwrap()
+            .build()
+            .unwrap();
+        let written = job
+            .clone()
+            .execute_with_write_params(WriteParams {
+                max_rows_per_file: 2,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(written.new_fragments.len(), 2);
+        assert!(matches!(
+            written.new_fragments[0].row_id_meta,
+            Some(RowIdMeta::Inline(_))
+        ));
+        assert_eq!(
+            matches!(
+                written.new_fragments[1].row_id_meta,
+                Some(RowIdMeta::Column)
+            ),
+            below_size == 1
+        );
+        if let Some(RowIdMeta::Inline(bytes)) = &written.new_fragments[1].row_id_meta {
+            assert_eq!(bytes.len(), limit);
+        }
+        for fragment in &written.new_fragments {
+            assert_eq!(fragment.files.len(), 1);
+            assert_eq!(
+                fragment.created_at_version_meta,
+                Some(RowDatasetVersionMeta::Column)
+            );
+            assert_eq!(fragment.last_updated_at_version_meta, None);
+            let versions = crate::dataset::rowids::read_spilled_versions(
+                &job.dataset,
+                fragment,
+                ROW_CREATED_AT_VERSION_FIELD_ID,
+            )
+            .await
+            .unwrap();
+            assert_eq!(versions.versions().collect::<Vec<_>>(), vec![1, 1]);
+        }
+    }
+
+    #[tokio::test]
+    async fn update_main_file_lineage_preserves_indexed_selection_order() {
+        let (dataset, dir) = make_test_dataset(LanceFileVersion::V2_2, true).await;
+        let mut dataset = dataset.as_ref().clone();
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::BTree,
+                None,
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::BTree),
+                true,
+            )
+            .await
+            .unwrap();
+        dataset.delete("id = 12").await.unwrap();
+        dataset
+            .update_config([
+                (SPILL_ROW_LINEAGE_CONFIG_KEY, "true"),
+                (INLINE_ROW_LINEAGE_MAX_BYTES_CONFIG_KEY, "0"),
+            ])
+            .await
+            .unwrap();
+        let predicate = "id IN (28, 12, 2, 21, 18, 11)";
+        let mut selection = dataset.scan();
+        selection
+            .project(&[ROW_ID, ROW_CREATED_AT_VERSION])
+            .unwrap()
+            .with_row_address();
+        selection.filter(predicate).unwrap();
+        let plan = selection.explain_plan(false).await.unwrap();
+        assert!(plan.contains("ScalarIndexQuery"), "{plan}");
+        let result = UpdateBuilder::new(Arc::new(dataset))
+            .update_where(predicate)
+            .unwrap()
+            .set("name", "concat('row-', cast(id as string))")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(result.rows_updated, 5);
+        let version = result.new_dataset.version().version;
+        let rewritten = result.new_dataset.manifest.fragments.last().unwrap();
+        assert_eq!(rewritten.files.len(), 1);
+        let reopened = Dataset::open(dir.as_str()).await.unwrap();
+        reopened.validate().await.unwrap();
+        let selected = [2, 11, 18, 21, 28];
+        let taken = reopened
+            .take_rows(
+                &selected,
+                crate::dataset::ProjectionRequest::from_columns(
+                    [
+                        "id",
+                        "name",
+                        ROW_ID,
+                        ROW_CREATED_AT_VERSION,
+                        lance_core::ROW_LAST_UPDATED_AT_VERSION,
+                    ],
+                    reopened.schema(),
+                ),
+            )
+            .await
+            .unwrap();
+        for (row, id) in selected.into_iter().enumerate() {
+            assert_eq!(
+                taken["id"].as_primitive::<Int64Type>().value(row),
+                id as i64
+            );
+            assert_eq!(taken[ROW_ID].as_primitive::<UInt64Type>().value(row), id);
+            assert_eq!(
+                taken[ROW_CREATED_AT_VERSION]
+                    .as_primitive::<UInt64Type>()
+                    .value(row),
+                1
+            );
+            assert_eq!(
+                taken[lance_core::ROW_LAST_UPDATED_AT_VERSION]
+                    .as_primitive::<UInt64Type>()
+                    .value(row),
+                version
+            );
+            assert_eq!(
+                taken["name"].as_string::<i32>().value(row),
+                format!("row-{id}")
+            );
         }
     }
 
@@ -2474,55 +3204,27 @@ mod tests {
         );
     }
 
-    /// The captured lineage is split across the new fragments by their row
-    /// counts, and a created-at capture that does not cover every written row
-    /// is an error rather than a silent fallback to the commit.
     #[tokio::test]
-    async fn place_rewritten_lineage_splits_lineage_by_output_fragment() {
-        let (dataset, _test_dir) = make_test_dataset(LanceFileVersion::V2_0, true).await;
+    async fn place_rewritten_lineage_rejects_mismatched_capture_lengths() {
+        let (dataset, _dir) = make_test_dataset(LanceFileVersion::V2_2, true).await;
         let job = UpdateBuilder::new(dataset)
             .set("name", "'bar'")
             .unwrap()
             .build()
             .unwrap();
-        let output_fragments = || {
-            [(1, 3), (2, 2)].map(|(id, rows)| {
-                let mut fragment = Fragment::new(id);
-                fragment.physical_rows = Some(rows);
-                fragment
-            })
-        };
-        let row_ids = RowIdSequence::from([10u64, 11, 12, 20, 21].as_slice());
-
-        // A zero budget spills everything, so each fragment's share is read
-        // back from its own lineage file.
-        let mut fragments = output_fragments();
-        let created_at = RowDatasetVersionSequence::from_versions(&[1, 1, 2, 3, 3]);
-        job.place_rewritten_lineage(&mut fragments, &row_ids, Some(&created_at), Some(0))
-            .await
-            .unwrap();
-        let mut placed = Vec::new();
-        for fragment in &fragments {
-            let ids = read_spilled_row_ids(&job.dataset, fragment).await.unwrap();
-            let versions =
-                read_spilled_versions(&job.dataset, fragment, ROW_CREATED_AT_VERSION_FIELD_ID)
-                    .await
-                    .unwrap();
-            placed.push((
-                ids.iter().collect::<Vec<_>>(),
-                versions.versions().collect::<Vec<_>>(),
-            ));
-        }
-        assert_eq!(placed[0], (vec![10, 11, 12], vec![1, 1, 2]));
-        assert_eq!(placed[1], (vec![20, 21], vec![3, 3]));
-
-        let mut fragments = output_fragments();
-        let too_few = RowDatasetVersionSequence::from_versions(&[1, 1, 2, 3]);
+        let mut fragments = [Fragment::new(0).with_physical_rows(5)];
+        let row_ids = RowIdSequence::from(0..5);
+        let created_at = RowDatasetVersionSequence::from_versions(&[1, 1, 2, 3]);
         let error = job
-            .place_rewritten_lineage(&mut fragments, &row_ids, Some(&too_few), Some(0))
+            .place_rewritten_lineage(&mut fragments, &row_ids, Some(&created_at), Some(0))
             .await
             .unwrap_err();
-        assert!(matches!(error, Error::Internal { .. }), "{error:?}");
+        assert!(matches!(error, Error::Internal { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("Captured created-at versions not equal")
+        );
     }
 
     #[tokio::test]
@@ -2600,7 +3302,10 @@ mod tests {
     #[case::empty(1)]
     #[case::null(2)]
     #[tokio::test]
-    async fn test_update_preserves_blob_v2(#[case] selected_id: i64) {
+    async fn test_update_preserves_blob_v2(
+        #[case] selected_id: i64,
+        #[values(false, true)] spill: bool,
+    ) {
         use crate::{BlobArrayBuilder, blob_field};
 
         let make_blobs = || {
@@ -2631,18 +3336,30 @@ mod tests {
         )
         .unwrap();
         let test_dir = TempStrDir::default();
-        let dataset = Arc::new(
+        let mut dataset = Arc::new(
             Dataset::write(
                 RecordBatchIterator::new(vec![Ok(batch)], schema),
                 &test_dir,
                 Some(WriteParams {
                     data_storage_version: Some(LanceFileVersion::V2_2),
+                    enable_stable_row_ids: spill,
                     ..Default::default()
                 }),
             )
             .await
             .unwrap(),
         );
+
+        if spill {
+            Arc::get_mut(&mut dataset)
+                .unwrap()
+                .update_config([
+                    (SPILL_ROW_LINEAGE_CONFIG_KEY, "true"),
+                    (INLINE_ROW_LINEAGE_MAX_BYTES_CONFIG_KEY, "0"),
+                ])
+                .await
+                .unwrap();
+        }
 
         for column in ["payload", "info"] {
             let error = UpdateBuilder::new(dataset.clone())
@@ -2668,6 +3385,16 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.rows_updated, 1);
+        if spill {
+            let rewritten = result.new_dataset.manifest.fragments.last().unwrap();
+            assert_eq!(rewritten.files.len(), 1);
+            assert_eq!(rewritten.row_id_meta, Some(RowIdMeta::Column));
+            assert_eq!(
+                rewritten.created_at_version_meta,
+                Some(RowDatasetVersionMeta::Column)
+            );
+            result.new_dataset.validate().await.unwrap();
+        }
 
         let mut scanner = result.new_dataset.scan();
         scanner.blob_handling(BlobHandling::AllBinary);

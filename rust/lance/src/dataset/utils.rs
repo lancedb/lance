@@ -38,8 +38,22 @@ fn extract_row_ids(
     row_id_idx: usize,
     created_at_idx: Option<usize>,
     data_projection: &[usize],
+    row_id_buffer: Option<&mut Vec<u64>>,
 ) -> DFResult<RecordBatch> {
-    row_ids.capture(u64_values(&batch, row_id_idx, "Row ids"))?;
+    let mut values = u64_values(&batch, row_id_idx, "Row ids");
+    if let Some(buffer) = row_id_buffer {
+        while !values.is_empty() {
+            let count = values.len().min(ROW_ID_CAPTURE_CHUNK_ROWS - buffer.len());
+            buffer.extend_from_slice(&values[..count]);
+            values = &values[count..];
+            if buffer.len() == ROW_ID_CAPTURE_CHUNK_ROWS {
+                row_ids.capture(buffer)?;
+                buffer.clear();
+            }
+        }
+    } else {
+        row_ids.capture(values)?;
+    }
     if let Some(created_at_idx) = created_at_idx {
         row_ids.capture_created_at(u64_values(&batch, created_at_idx, "Created-at versions"));
     }
@@ -53,10 +67,30 @@ fn extract_row_ids(
 /// A `_row_created_at_version` column, if the stream carries one, is captured
 /// alongside the row ids and removed from the output the same way.
 pub fn make_rowid_capture_stream(
-    mut target: SendableRecordBatchStream,
+    target: SendableRecordBatchStream,
     stable_row_ids: bool,
 ) -> Result<(SendableRecordBatchStream, Receiver<CapturedRowIds>)> {
+    make_rowid_capture_stream_with_lineage(target, stable_row_ids, &[], false)
+}
+
+/// Metadata capture chunks are independent of user-data batch boundaries.
+/// This bounds the temporary buffer while making spill planning reproducible
+/// for scans with different projected row widths.
+const ROW_ID_CAPTURE_CHUNK_ROWS: usize = 64 * 1024;
+
+/// Capture row lineage while retaining the named columns in the output for a
+/// rewrite that stores them alongside user data. Values therefore follow the
+/// actual data batches, independently of any earlier spill-planning scan.
+/// With `normalize_row_ids`, capture uses fixed-size metadata chunks so the
+/// resulting sequence does not depend on the stream's batch boundaries.
+pub(super) fn make_rowid_capture_stream_with_lineage(
+    mut target: SendableRecordBatchStream,
+    stable_row_ids: bool,
+    retained_lineage: &[&str],
+    normalize_row_ids: bool,
+) -> Result<(SendableRecordBatchStream, Receiver<CapturedRowIds>)> {
     let mut row_ids = CapturedRowIds::new(stable_row_ids);
+    let mut row_id_buffer = normalize_row_ids.then(Vec::new);
 
     let (tx, rx) = std::sync::mpsc::channel();
 
@@ -75,17 +109,35 @@ pub fn make_rowid_capture_stream(
         *created_at = Some(RowDatasetVersionSequence::new());
     }
     let data_cols = (0..schema.fields.len())
-        .filter(|col| *col != row_id_idx && Some(*col) != created_at_idx)
+        .filter(|col| {
+            (*col != row_id_idx && Some(*col) != created_at_idx)
+                || retained_lineage.contains(&schema.field(*col).name().as_str())
+        })
         .collect::<Vec<_>>();
     let output_schema = Arc::new(schema.project(&data_cols)?);
 
     let stream = futures::stream::poll_fn(move |cx| match target.poll_next_unpin(cx) {
         std::task::Poll::Ready(Some(Ok(batch))) => {
-            let res = extract_row_ids(&mut row_ids, batch, row_id_idx, created_at_idx, &data_cols);
+            let res = extract_row_ids(
+                &mut row_ids,
+                batch,
+                row_id_idx,
+                created_at_idx,
+                &data_cols,
+                row_id_buffer.as_mut(),
+            );
             std::task::Poll::Ready(Some(res))
         }
         std::task::Poll::Ready(Some(Err(err))) => std::task::Poll::Ready(Some(Err(err))),
         std::task::Poll::Ready(None) => {
+            if let Some(buffer) = &mut row_id_buffer
+                && !buffer.is_empty()
+            {
+                if let Err(error) = row_ids.capture(buffer) {
+                    return std::task::Poll::Ready(Some(Err(error)));
+                }
+                buffer.clear();
+            }
             let row_ids_out = std::mem::take(&mut row_ids);
             tx.send(row_ids_out).unwrap();
             std::task::Poll::Ready(None)
@@ -396,6 +448,58 @@ impl SchemaAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_array::record_batch;
+    use futures::TryStreamExt;
+    use rstest::rstest;
+
+    #[rstest]
+    #[case::small_batches(127)]
+    #[case::page_batches(8192)]
+    #[case::single_batch(ROW_ID_CAPTURE_CHUNK_ROWS + 3)]
+    #[tokio::test]
+    async fn retained_lineage_capture_is_independent_of_batch_boundaries(
+        #[case] batch_rows: usize,
+    ) {
+        let rows = ROW_ID_CAPTURE_CHUNK_ROWS + 3;
+        let ids = (0..rows as u64).map(|id| id ^ 1).collect::<Vec<_>>();
+        let versions = (0..rows as u64)
+            .map(|row| row / 100 + 1)
+            .collect::<Vec<_>>();
+        let batch = record_batch!(
+            ("value", UInt64, (0..rows as u64).collect::<Vec<_>>()),
+            (ROW_ID, UInt64, ids.clone()),
+            (ROW_CREATED_AT_VERSION, UInt64, versions.clone())
+        )
+        .unwrap();
+        let batches = (0..rows)
+            .step_by(batch_rows)
+            .map(|offset| Ok(batch.slice(offset, batch_rows.min(rows - offset))))
+            .collect::<Vec<_>>();
+        let input = Box::pin(RecordBatchStreamAdapter::new(
+            batch.schema(),
+            futures::stream::iter(batches),
+        ));
+        let (mut output, captured) =
+            make_rowid_capture_stream_with_lineage(input, true, &[ROW_ID], true).unwrap();
+        let mut offset = 0;
+        while let Some(batch) = output.try_next().await.unwrap() {
+            assert!(batch.column_by_name(ROW_CREATED_AT_VERSION).is_none());
+            assert_eq!(
+                u64_values(&batch, 1, ROW_ID),
+                &ids[offset..offset + batch.num_rows()]
+            );
+            offset += batch.num_rows();
+        }
+        assert_eq!(offset, rows);
+        let captured = captured.try_recv().unwrap();
+        let mut expected = RowIdSequence::from(&ids[..ROW_ID_CAPTURE_CHUNK_ROWS]);
+        expected.extend(RowIdSequence::from(&ids[ROW_ID_CAPTURE_CHUNK_ROWS..]));
+        assert_eq!(captured.row_id_sequence(), Some(&expected));
+        assert_eq!(
+            captured.created_at_sequence(),
+            Some(&RowDatasetVersionSequence::from_versions(&versions))
+        );
+    }
 
     #[test]
     fn capture_created_at_extends_a_run_across_batches() {
