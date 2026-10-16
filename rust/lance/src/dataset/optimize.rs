@@ -6577,9 +6577,18 @@ mod tests {
         }
     }
 
+    /// `cat` is a Utf8 column alongside the numeric `i` one so a test can build
+    /// a row-id-domain index (e.g. NGram) over it -- every remaining
+    /// row-id-domain scalar index type requires a text column, unlike BTree,
+    /// Bitmap, and LabelList, which moved to row-address domain and no longer
+    /// serve as that fixture.
     async fn stable_row_id_dataset(uri: &str, num_fragments: u32) -> Dataset {
         lance_datagen::gen_batch()
             .col("i", lance_datagen::array::step::<Int32Type>())
+            .col(
+                "cat",
+                lance_datagen::array::cycle_utf8_literals(&["needle", "haystack"]),
+            )
             .into_dataset_with_params(
                 uri,
                 FragmentCount::from(num_fragments),
@@ -6956,12 +6965,16 @@ mod tests {
             );
         }
         if matches!(mismatch, RecordingMismatch::IncompatibleIndexCreated) {
+            // NGram, not Bitmap: Bitmap now always creates an address-domain
+            // segment on a stable-row-id dataset (safe alongside the recorded
+            // moves by construction), so it can no longer illustrate this
+            // mismatch. NGram still stores row ids directly here.
             dataset
                 .create_index(
-                    &["i"],
-                    IndexType::Bitmap,
+                    &["cat"],
+                    IndexType::NGram,
                     Some("i_idx".into()),
-                    &ScalarIndexParams::default(),
+                    &ScalarIndexParams::for_builtin(BuiltinIndexType::NGram),
                     false,
                 )
                 .await
@@ -9888,16 +9901,16 @@ mod tests {
         // `create_index` sees no FRI at its own version, so its guard passes and
         // the transaction reaches the rebase.
         //
-        // Bitmap, not BTree: BTree now always creates an address-domain
+        // NGram, not BTree/Bitmap: both now always create an address-domain
         // segment on a stable-row-id dataset (safe alongside an FRI by
-        // construction), so it can no longer illustrate this race. Bitmap
-        // still stores row ids directly here.
+        // construction), so neither can illustrate this race any longer.
+        // NGram still stores row ids directly here.
         let err = concurrent
             .create_index(
-                &["id"],
-                IndexType::Bitmap,
+                &["cat"],
+                IndexType::NGram,
                 Some("id_idx".into()),
-                &ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap),
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::NGram),
                 false,
             )
             .await
@@ -10227,7 +10240,11 @@ mod tests {
     #[rstest]
     #[tokio::test]
     async fn test_index_creation_racing_deferred_compaction_with_stable_row_ids(
-        #[values(IndexType::Bitmap, IndexType::ZoneMap)] index_type: IndexType,
+        // NGram, not Bitmap: Bitmap now always creates an address-domain
+        // segment on a stable-row-id dataset (safe alongside an FRI by
+        // construction), so it can no longer illustrate this race. NGram
+        // still stores row ids directly here.
+        #[values(IndexType::NGram, IndexType::ZoneMap)] index_type: IndexType,
         #[values(false, true)] index_commits_first: bool,
         #[values(false, true)] is_disjoint: bool,
         #[values(
@@ -10241,9 +10258,15 @@ mod tests {
         let is_separate_session = first_commit_seen_as == FirstCommitSeenAs::SeparateSession;
         // How the rebase sees the compaction does not matter: an index rebasing
         // past it finds the moves recorded in the latest manifest's reuse index.
-        let expected = match (index_type, index_commits_first) {
-            (IndexType::Bitmap, true) => RaceOutcome::ConflictThenRejected,
-            (IndexType::Bitmap, false) => RaceOutcome::Rejected,
+        // Overlapping coverage (`is_disjoint = false`) makes the rebase in the
+        // `index_commits_first = false` order surface the same raw retryable
+        // conflict the `true` order always does, rather than resolving
+        // straight to the domain rejection: one more manual retry (below)
+        // settles it the same way.
+        let expected = match (index_type, index_commits_first, is_disjoint) {
+            (IndexType::NGram, true, _) => RaceOutcome::ConflictThenRejected,
+            (IndexType::NGram, false, false) => RaceOutcome::ConflictThenRejected,
+            (IndexType::NGram, false, true) => RaceOutcome::Rejected,
             _ => RaceOutcome::Committed,
         };
         let dir = TempStrDir::default();
@@ -10264,14 +10287,22 @@ mod tests {
             excluded_fragment_ids: if is_disjoint { vec![2] } else { vec![] },
             ..Default::default()
         };
-        let params = ScalarIndexParams::for_builtin(if index_type == IndexType::Bitmap {
-            BuiltinIndexType::Bitmap
+        let params = ScalarIndexParams::for_builtin(if index_type == IndexType::NGram {
+            BuiltinIndexType::NGram
         } else {
             BuiltinIndexType::ZoneMap
         });
+        // NGram only applies to the text `cat` column; ZoneMap stays on the
+        // numeric `i` column the filters below query.
+        let index_column = if index_type == IndexType::NGram {
+            "cat"
+        } else {
+            "i"
+        };
         let create_index = async |dataset: &mut Dataset| {
+            let columns = [index_column];
             let builder = dataset
-                .create_index_builder(&["i"], index_type, &params)
+                .create_index_builder(&columns, index_type, &params)
                 .name("i_idx".into());
             if is_disjoint {
                 builder.fragments(vec![2]).await.map(|_| ())
@@ -10398,7 +10429,16 @@ mod tests {
                 ),
                 is_in_memory
             );
-            result
+            if matches!(expected, RaceOutcome::ConflictThenRejected) {
+                assert!(
+                    matches!(result, Err(Error::RetryableCommitConflict { .. })),
+                    "{result:?}"
+                );
+                other.checkout_latest().await.unwrap();
+                create_index(&mut other).await
+            } else {
+                result
+            }
         };
 
         let latest = Dataset::open(dir.as_str()).await.unwrap();
