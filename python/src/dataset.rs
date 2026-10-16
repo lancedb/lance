@@ -35,6 +35,7 @@ use pyo3::{
 };
 use uuid::Uuid;
 
+use datafusion_common::ScalarValue;
 use lance::dataset::AutoCleanupParams;
 use lance::dataset::cleanup::{CleanupFileKind, CleanupPolicyBuilder};
 use lance::dataset::refs::{Ref, TagContents};
@@ -42,7 +43,6 @@ use lance::dataset::scanner::{
     AggregateExpr, ColumnOrdering, DatasetRecordBatchStream, ExecutionStatsCallback, ExprFilter,
     MaterializationStyle, QueryFilter, RowAddrMask, RowAddrTreeMap,
 };
-use datafusion_common::ScalarValue;
 use lance::dataset::statistics::{DataStatistics, DatasetStatisticsExt};
 use lance::dataset::{
     BatchInfo, BatchUDF, CommitBuilder, MergeStats, NewColumnTransform, UDFCheckpointStore,
