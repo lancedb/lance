@@ -408,8 +408,6 @@ async fn managed_compaction_preserves_sidecars_after_source_gc(
 async fn merge_insert_adopts_prepared_managed_references(#[values(false, true)] partial: bool) {
     use crate::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched};
     use arrow_array::types::Int32Type;
-    use lance_core::datatypes::BLOB_V2_PREPARED_FIELDS;
-    use object_store::ObjectStoreExt;
 
     let test_dir = TempStrDir::default();
     let id = Field::new("id", DataType::Int32, false);
@@ -428,45 +426,33 @@ async fn merge_insert_adopts_prepared_managed_references(#[values(false, true)] 
     let schema = Arc::new(managed_blob_schema(fields));
     let seed = RecordBatch::try_new(schema.clone(), columns).unwrap();
     let dataset = Dataset::write(
-        RecordBatchIterator::new(vec![Ok(seed)], schema.clone()),
+        RecordBatchIterator::new(vec![Ok(seed)], schema),
         &test_dir,
         None,
     )
     .await
     .unwrap();
-    let object = dataset.base.clone().join("_blobs").join("adopted.blob");
-    dataset
-        .object_store
-        .inner
-        .put(&object, Bytes::from(vec![b'v'; 1000]).into())
-        .await
-        .unwrap();
+    let blobs_dir = std::path::Path::new(test_dir.as_ref()).join("_blobs");
+    std::fs::create_dir_all(&blobs_dir).unwrap();
+    std::fs::write(blobs_dir.join("adopted.blob"), vec![b'v'; 1000]).unwrap();
 
     // Two rows share one object, as rows from one packed file do.
-    let prepared = StructArray::try_new(
-        BLOB_V2_PREPARED_FIELDS.clone(),
-        vec![
-            Arc::new(UInt8Array::from(vec![BlobKind::Managed as u8; 2])) as ArrayRef,
-            Arc::new(LargeBinaryArray::from(vec![None::<&[u8]>, None])),
-            Arc::new(StringArray::from(vec!["_blobs/adopted.blob"; 2])),
-            Arc::new(UInt32Array::from(vec![None::<u32>, None])),
-            Arc::new(UInt64Array::from(vec![400u64, 200])),
-            Arc::new(UInt64Array::from(vec![0u64, 400])),
-        ],
-        None,
-    )
-    .unwrap();
-    let source_schema = Arc::new(managed_blob_schema(vec![
-        id,
-        crate::blob::prepared_blob_field_with_metadata(
-            "blob",
-            true,
-            HashMap::from([(ARROW_EXT_NAME_KEY.to_string(), BLOB_V2_EXT_NAME.to_string())]),
-        ),
-    ]));
+    let mut prepared = BlobDescriptorArrayBuilder::new("blob");
+    for (offset, size) in [(0, 400), (400, 200)] {
+        prepared
+            .push(BlobDescriptor::Managed {
+                base_id: None,
+                uri: "_blobs/adopted.blob".to_string(),
+                offset,
+                size,
+            })
+            .unwrap();
+    }
+    let (blob, prepared) = prepared.finish().unwrap().into_parts();
+    let source_schema = Arc::new(managed_blob_schema(vec![id, blob]));
     let source = RecordBatch::try_new(
         source_schema.clone(),
-        vec![Arc::new(Int32Array::from(vec![1, 2])), Arc::new(prepared)],
+        vec![Arc::new(Int32Array::from(vec![1, 2])), prepared],
     )
     .unwrap();
     let mut builder =
@@ -490,9 +476,11 @@ async fn merge_insert_adopts_prepared_managed_references(#[values(false, true)] 
     let read: HashMap<i32, &[u8]> = (0..rows.num_rows())
         .map(|row| (ids.value(row), blobs.value(row)))
         .collect();
-    assert_eq!(read[&0], b"seed");
-    assert_eq!(read[&1], vec![b'v'; 400].as_slice());
-    assert_eq!(read[&2], vec![b'v'; 200].as_slice());
+    let v = |n| vec![b'v'; n];
+    assert_eq!(
+        read,
+        HashMap::from([(0, &b"seed"[..]), (1, &v(400)[..]), (2, &v(200)[..])])
+    );
     if partial {
         let other = rows["other"].as_primitive::<Int32Type>();
         let other: HashMap<i32, Option<i32>> = (0..rows.num_rows())
@@ -508,11 +496,11 @@ async fn merge_insert_adopts_prepared_managed_references(#[values(false, true)] 
             HashMap::from([(0, Some(6)), (1, Some(7)), (2, None)])
         );
     }
-    let adopted = dataset
+    for blob in dataset
         .take_blobs_by_indices(&[1, 2], "blob")
         .await
-        .unwrap();
-    for blob in adopted {
+        .unwrap()
+    {
         let blob = blob.unwrap();
         assert_eq!(blob.kind(), BlobKind::Managed);
         assert_eq!(blob.uri(), Some("_blobs/adopted.blob"));
