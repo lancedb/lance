@@ -401,9 +401,11 @@ async fn managed_compaction_preserves_sidecars_after_source_gc(
 /// merge_insert takes writer-prepared input as append does, so a Managed
 /// reference to an object already under the table is adopted, for an
 /// updated row and an inserted one, without its bytes passing through the
-/// writer.
+/// writer. A source may also leave out table columns, which then keep their
+/// values.
+#[rstest]
 #[tokio::test]
-async fn merge_insert_adopts_prepared_managed_references() {
+async fn merge_insert_adopts_prepared_managed_references(#[values(false, true)] partial: bool) {
     use crate::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched};
     use arrow_array::types::Int32Type;
     use lance_core::datatypes::BLOB_V2_PREPARED_FIELDS;
@@ -411,17 +413,20 @@ async fn merge_insert_adopts_prepared_managed_references() {
 
     let test_dir = TempStrDir::default();
     let id = Field::new("id", DataType::Int32, false);
-    let schema = Arc::new(managed_blob_schema(vec![
-        id.clone(),
-        blob_field("blob", true),
-    ]));
-    let mut seed = BlobArrayBuilder::new(1);
+    let mut fields = vec![id.clone(), blob_field("blob", true)];
+    let mut seed = BlobArrayBuilder::new(2);
     seed.push_bytes(b"seed").unwrap();
-    let seed = RecordBatch::try_new(
-        schema.clone(),
-        vec![Arc::new(Int32Array::from(vec![1])), seed.finish().unwrap()],
-    )
-    .unwrap();
+    seed.push_bytes(b"seed").unwrap();
+    let mut columns = vec![
+        Arc::new(Int32Array::from(vec![0, 1])) as ArrayRef,
+        seed.finish().unwrap(),
+    ];
+    if partial {
+        fields.push(Field::new("other", DataType::Int32, true));
+        columns.push(Arc::new(Int32Array::from(vec![6, 7])));
+    }
+    let schema = Arc::new(managed_blob_schema(fields));
+    let seed = RecordBatch::try_new(schema.clone(), columns).unwrap();
     let dataset = Dataset::write(
         RecordBatchIterator::new(vec![Ok(seed)], schema.clone()),
         &test_dir,
@@ -482,15 +487,29 @@ async fn merge_insert_adopts_prepared_managed_references() {
     let rows = scan.try_into_batch().await.unwrap();
     let ids = rows["id"].as_primitive::<Int32Type>();
     let blobs = rows["blob"].as_binary::<i64>();
-    let read: HashMap<i32, usize> = (0..rows.num_rows())
-        .map(|row| {
-            assert!(blobs.value(row).iter().all(|byte| *byte == b'v'));
-            (ids.value(row), blobs.value(row).len())
-        })
+    let read: HashMap<i32, &[u8]> = (0..rows.num_rows())
+        .map(|row| (ids.value(row), blobs.value(row)))
         .collect();
-    assert_eq!(read, HashMap::from([(1, 400), (2, 200)]));
+    assert_eq!(read[&0], b"seed");
+    assert_eq!(read[&1], vec![b'v'; 400].as_slice());
+    assert_eq!(read[&2], vec![b'v'; 200].as_slice());
+    if partial {
+        let other = rows["other"].as_primitive::<Int32Type>();
+        let other: HashMap<i32, Option<i32>> = (0..rows.num_rows())
+            .map(|row| {
+                (
+                    ids.value(row),
+                    other.is_valid(row).then(|| other.value(row)),
+                )
+            })
+            .collect();
+        assert_eq!(
+            other,
+            HashMap::from([(0, Some(6)), (1, Some(7)), (2, None)])
+        );
+    }
     let adopted = dataset
-        .take_blobs_by_indices(&[0, 1], "blob")
+        .take_blobs_by_indices(&[1, 2], "blob")
         .await
         .unwrap();
     for blob in adopted {

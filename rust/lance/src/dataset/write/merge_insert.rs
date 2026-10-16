@@ -2785,8 +2785,10 @@ impl MergeInsertJob {
     /// `InvalidInput` error, because inserted rows would otherwise attempt to
     /// write a non-nullable NULL downstream.
     async fn can_use_create_plan(&self, source_schema: &Schema) -> Result<bool> {
-        // Convert to lance schema for comparison
-        let lance_schema = lance_core::datatypes::Schema::try_from(source_schema)?;
+        // Convert to lance schema for comparison; prepared blobs compare as logical.
+        let lance_schema = prepared_to_logical_blob_schema(
+            &lance_core::datatypes::Schema::try_from(source_schema)?,
+        )?;
         let full_schema = self.dataset.schema();
         let is_full_schema = check_source_schema(
             &lance_schema,
