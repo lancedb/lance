@@ -5037,6 +5037,10 @@ impl MemTableFlushHandler {
                     Ok(result) => return Ok(result),
                     Err(error) => error,
                 };
+                self.stats.record_memtable_flush_failure();
+                if let Some(observer) = &self.observer {
+                    observer.on_memtable_flush_failure(generation, &error);
+                }
                 // A fence or a refused precondition fails the same way every attempt.
                 if matches!(
                     error,
@@ -5149,6 +5153,7 @@ pub struct WriteStats {
     memtable_flush_count: AtomicU64,
     memtable_flush_time_nanos: AtomicU64,
     memtable_flush_rows: AtomicU64,
+    memtable_flush_failures: AtomicU64,
 }
 
 /// Snapshot of write statistics at a point in time.
@@ -5171,6 +5176,8 @@ pub struct WriteStatsSnapshot {
     pub memtable_flush_count: u64,
     pub memtable_flush_time: Duration,
     pub memtable_flush_rows: u64,
+    /// Failed MemTable flush attempts, each retry counted separately.
+    pub memtable_flush_failures: u64,
 }
 
 impl WriteStats {
@@ -5220,6 +5227,11 @@ impl WriteStats {
             .fetch_add(rows as u64, Ordering::Relaxed);
     }
 
+    /// Record a failed MemTable flush attempt.
+    pub fn record_memtable_flush_failure(&self) {
+        self.memtable_flush_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Get a snapshot of current statistics.
     pub fn snapshot(&self) -> WriteStatsSnapshot {
         WriteStatsSnapshot {
@@ -5243,6 +5255,7 @@ impl WriteStats {
                 self.memtable_flush_time_nanos.load(Ordering::Relaxed),
             ),
             memtable_flush_rows: self.memtable_flush_rows.load(Ordering::Relaxed),
+            memtable_flush_failures: self.memtable_flush_failures.load(Ordering::Relaxed),
         }
     }
 
@@ -5264,6 +5277,7 @@ impl WriteStats {
         self.memtable_flush_count.store(0, Ordering::Relaxed);
         self.memtable_flush_time_nanos.store(0, Ordering::Relaxed);
         self.memtable_flush_rows.store(0, Ordering::Relaxed);
+        self.memtable_flush_failures.store(0, Ordering::Relaxed);
     }
 }
 
@@ -10023,6 +10037,62 @@ mod tests {
             rows_after_reopen(&store, &base_path, shard_id, &schema).await,
             5 + 3
         );
+    }
+
+    /// Each failed flush attempt is counted in the stats and reported to the
+    /// observer, so a stuck generation is visible before backpressure builds.
+    #[tokio::test]
+    async fn failed_flush_attempts_are_counted_and_observed() {
+        #[derive(Debug, Default)]
+        struct FailureObserver {
+            failed_generations: std::sync::Mutex<Vec<u64>>,
+        }
+
+        impl WalObserver for FailureObserver {
+            fn on_memtable_flush_failure(&self, generation: u64, _error: &Error) {
+                self.failed_generations.lock().unwrap().push(generation);
+            }
+        }
+
+        let (store, base_path, controls) = failing_memory_store().await;
+        let schema = schema_with_pk();
+        let observer = Arc::new(FailureObserver::default());
+        let sink: Arc<dyn WalObserver> = observer.clone();
+        let config = ShardWriterConfig {
+            observer: Some(sink),
+            ..memtable_config_with_pk(Uuid::new_v4())
+        };
+        let writer = ShardWriter::open(
+            store,
+            base_path,
+            "memory:///",
+            config,
+            schema.clone(),
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        writer
+            .put(vec![create_test_batch(&schema, 0, 5)])
+            .await
+            .unwrap();
+        controls.fail_writes_under("_gen_1/");
+        let _first = writer.force_seal_active().await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while writer.stats().memtable_flush_failures == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the failed flush attempt should be counted");
+        assert_eq!(writer.stats().memtable_flush_count, 0);
+        let failed_generations = observer.failed_generations.lock().unwrap().clone();
+        assert!(!failed_generations.is_empty());
+        assert!(failed_generations.iter().all(|&generation| generation == 1));
+
+        assert!(writer.close().await.is_err());
     }
 
     /// Close stops retrying a failing flush without publishing a later
