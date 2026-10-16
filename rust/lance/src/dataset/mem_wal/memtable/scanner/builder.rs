@@ -581,7 +581,18 @@ impl MemTableScanner {
         visibility: MemTableVisibility,
     ) -> Self {
         let readable_count = indexes.prefix_count(visibility);
+        Self::new_at_readable_count(batch_store, indexes, schema, readable_count)
+    }
 
+    /// As [`Self::new`], bounded by the first `readable_count` published batches
+    /// the caller already snapshotted, so one query reads the memtable through a
+    /// single cursor.
+    pub(crate) fn new_at_readable_count(
+        batch_store: Arc<BatchStore>,
+        indexes: Arc<IndexStore>,
+        schema: SchemaRef,
+        readable_count: usize,
+    ) -> Self {
         Self {
             batch_store,
             indexes,

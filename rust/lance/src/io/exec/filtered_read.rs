@@ -3629,15 +3629,13 @@ impl ExecutionPlan for FilteredReadExec {
         partition: Option<usize>,
     ) -> datafusion::error::Result<Arc<Statistics>> {
         if let RowSelector::RowStream(source) = &self.input {
-            // At most one output row per input row
-            let num_rows = source.plan.partition_statistics(partition)?.num_rows;
-            let num_rows = if self.options.physical_row_addr_prefilter.is_some() {
-                // Row-stream inputs may repeat keys, so bitmap cardinality is not
-                // an output bound. Filtering can only reduce the input estimate.
-                num_rows.to_inexact()
-            } else {
-                num_rows
-            };
+            // At most one output row per input row, since keys of deleted or
+            // missing rows are dropped
+            let num_rows = source
+                .plan
+                .partition_statistics(partition)?
+                .num_rows
+                .to_inexact();
             return Ok(Arc::new(Statistics {
                 num_rows,
                 total_byte_size: estimated_total_byte_size(num_rows, self.bytes_per_row),
@@ -6563,6 +6561,7 @@ mod tests {
         use super::*;
         use arrow_array::{Float32Array, LargeBinaryArray, StringArray, UInt64Array};
         use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
+        use datafusion::datasource::memory::MemorySourceConfig;
         use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr, expressions::col};
         use datafusion::physical_plan::ExecutionPlanProperties;
         use datafusion::physical_plan::sorts::sort::SortExec;
@@ -7551,10 +7550,20 @@ mod tests {
                 DataType::UInt64,
                 true,
             )]));
-            let batch = RecordBatch::try_new(input_schema, vec![Arc::new(UInt64Array::from(keys))])
-                .unwrap();
+            let batch = RecordBatch::try_new(
+                input_schema.clone(),
+                vec![Arc::new(UInt64Array::from(keys))],
+            )
+            .unwrap();
 
-            let plan = take_plan(&dataset, rows_input(vec![batch]), &["i"]).unwrap();
+            // The input knows its exact row count; the take can only bound its own
+            let input =
+                MemorySourceConfig::try_new_exec(&[vec![batch]], input_schema, None).unwrap();
+            let plan = take_plan(&dataset, input, &["i"]).unwrap();
+            assert_eq!(
+                plan.partition_statistics(None).unwrap().num_rows,
+                Precision::Inexact(2)
+            );
             let result = concat_batches(&plan.schema(), &run(&plan).await).unwrap();
             assert_eq!(result.num_rows(), 1);
             let i_col = result
