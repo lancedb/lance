@@ -294,7 +294,7 @@ impl LsmScanner {
     /// SSTables) without including a base Lance table.
     ///
     /// This is useful when the caller owns the base read path separately and
-    /// only needs the WAL's contribution: active memtable ∪ L0 SSTables.
+    /// only needs the WAL's contribution: active memtable ∪ SSTables.
     /// Deduplication semantics are unchanged — newer generations
     /// still win on PK conflicts.
     ///
@@ -353,7 +353,7 @@ impl LsmScanner {
         self
     }
 
-    /// Supply [`Self::schema`] with each field's id, so a sealed generation's
+    /// Supply [`Self::schema`] with each field's id, so a flushed generation's
     /// columns resolve to the table's by id rather than by name. A rename keeps
     /// the id and moves the name, so without this a renamed column reads as
     /// absent. Built with
