@@ -480,67 +480,47 @@ mod tests {
     /// kind and reference though the table declares it logical.
     #[test]
     fn a_prepared_blob_column_stays_prepared() {
-        use lance_arrow::{ARROW_EXT_NAME_KEY, BLOB_V2_EXT_NAME};
-        use lance_core::datatypes::{
-            BLOB_V2_LOGICAL_MINIMAL_FIELDS, BLOB_V2_PREPARED_FIELDS, BLOB_V2_PREPARED_TYPE,
-            BlobKind,
-        };
+        use crate::blob::{BlobDescriptor, BlobDescriptorArrayBuilder, blob_field};
+        use arrow_array::cast::AsArray;
+        use arrow_array::types::UInt8Type;
+        use lance_core::datatypes::BlobKind;
 
-        let blob = |data_type: DataType| {
-            let field = stamped("blob", data_type, 1);
-            let mut metadata = field.metadata().clone();
-            metadata.insert(ARROW_EXT_NAME_KEY.to_string(), BLOB_V2_EXT_NAME.to_string());
-            field.with_metadata(metadata)
-        };
-        let source = ArrowSchema::new(vec![
-            stamped("id", DataType::Int64, 0),
-            blob(BLOB_V2_PREPARED_TYPE.clone()),
-        ]);
-        let target = Arc::new(ArrowSchema::new(vec![
-            stamped("id", DataType::Int64, 0),
-            blob(DataType::Struct(BLOB_V2_LOGICAL_MINIMAL_FIELDS.clone())),
-        ]));
-        let blob = arrow_array::StructArray::new(
-            BLOB_V2_PREPARED_FIELDS.clone(),
-            vec![
-                Arc::new(arrow_array::UInt8Array::from(vec![BlobKind::Managed as u8]))
-                    as arrow_array::ArrayRef,
-                Arc::new(arrow_array::LargeBinaryArray::from(vec![None::<&[u8]>])),
-                Arc::new(arrow_array::StringArray::from(vec!["_blobs/a"])),
-                Arc::new(arrow_array::UInt32Array::from(vec![None])),
-                Arc::new(arrow_array::UInt64Array::from(vec![5])),
-                Arc::new(arrow_array::UInt64Array::from(vec![0])),
-            ],
-            None,
-        );
+        let table = Schema::try_from(&ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int64, false),
+            blob_field("blob", true),
+        ]))
+        .expect("table schema");
+        let target = Arc::new(arrow_schema_with_field_ids(&table));
+        let mut blob = BlobDescriptorArrayBuilder::new("blob")
+            .with_field_ids_of(target.field(1))
+            .expect("prepared under the table's ids");
+        blob.push(BlobDescriptor::Managed {
+            base_id: None,
+            uri: "_blobs/a".to_string(),
+            offset: 0,
+            size: 5,
+        })
+        .expect("a managed reference");
+        let (blob_field, blob) = blob.finish().expect("prepared column").into_parts();
+        let source = ArrowSchema::new(vec![target.field(0).clone(), blob_field]);
         let batch = RecordBatch::try_new(
             Arc::new(source.clone()),
-            vec![
-                Arc::new(arrow_array::Int64Array::from(vec![1])),
-                Arc::new(blob),
-            ],
+            vec![Arc::new(arrow_array::Int64Array::from(vec![1])), blob],
         )
         .expect("a batch under the source schema");
 
         let out = reconcile_batches(&source, &target, &["id".to_string()], vec![batch])
             .expect("reconcile");
-        assert_eq!(out[0].column(1).data_type(), &*BLOB_V2_PREPARED_TYPE);
+        let blob = out[0].column(1).as_struct();
         assert_eq!(
-            out[0].schema().field(1).data_type(),
-            &*BLOB_V2_PREPARED_TYPE
+            BlobV2Layout::classify(blob.fields()),
+            Some(BlobV2Layout::Prepared)
         );
-        let blob = out[0]
-            .column(1)
-            .as_any()
-            .downcast_ref::<arrow_array::StructArray>()
-            .expect("blob is a struct");
-        let kind = blob
-            .column_by_name("kind")
-            .expect("kind")
-            .as_any()
-            .downcast_ref::<arrow_array::UInt8Array>()
-            .expect("uint8");
-        assert_eq!(kind.value(0), BlobKind::Managed as u8);
+        let kind = blob.column_by_name("kind").expect("kind");
+        assert_eq!(
+            kind.as_primitive::<UInt8Type>().value(0),
+            BlobKind::Managed as u8
+        );
     }
 
     /// A plain struct shaped like a blob is not one: its children still resolve
