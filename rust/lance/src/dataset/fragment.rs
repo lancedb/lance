@@ -61,6 +61,7 @@ use lance_table::utils::stream::{
 };
 use object_store::path::Path;
 use roaring::RoaringBitmap;
+use tokio::sync::OnceCell;
 
 use self::write::FragmentCreateBuilder;
 
@@ -1165,7 +1166,16 @@ impl FileFragment {
         let open_files = self.open_readers(projection, &read_config);
         let deletion_vec_load = self.get_deletion_vector();
 
-        let row_id_load = if self.dataset.manifest.uses_stable_row_ids() {
+        // Preserve the legacy reader's eager initialization. Current readers
+        // can defer the sequence until a read actually requests stable row IDs.
+        let needs_row_ids = read_config.with_row_id
+            || self
+                .dataset
+                .manifest
+                .data_storage_format
+                .lance_file_format()
+                == ConcreteFileVersion::V1;
+        let row_id_load = if self.dataset.manifest.uses_stable_row_ids() && needs_row_ids {
             futures::future::Either::Left(
                 load_row_id_sequence(&self.dataset, &self.metadata).map_ok(Some),
             )
@@ -1230,7 +1240,7 @@ impl FileFragment {
             ArrowSchema::from(projection),
             self.count_rows(None).await?,
             num_physical_rows,
-            Arc::new(self.metadata.clone()),
+            Arc::new(self.clone()),
         )?;
 
         // Plan overlay resolution from coverage metadata (no files opened here); the
@@ -3350,10 +3360,9 @@ pub struct FragmentReader {
     /// The deleted row IDs
     deletion_vec: Option<Arc<DeletionVector>>,
 
-    /// The row id sequence
-    ///
-    /// Only populated if the stable row id feature is enabled.
-    row_id_sequence: Option<Arc<RowIdSequence>>,
+    /// Stable row IDs, shared by clones and loaded on demand by current readers.
+    /// An empty cell means not loaded; it does not mean row IDs are addresses.
+    row_id_sequence: Arc<OnceCell<Arc<RowIdSequence>>>,
 
     /// ID of the fragment
     fragment_id: usize,
@@ -3374,8 +3383,8 @@ pub struct FragmentReader {
     /// If false, deleted rows will be removed from the batch, requiring a copy
     make_deletions_null: bool,
 
-    /// The fragment metadata (needed for version columns)
-    fragment: Arc<Fragment>,
+    /// Snapshot and request-specific store binding for deferred sequence reads.
+    fragment: Arc<FileFragment>,
 
     /// The last_updated_at version sequence (loaded from fragment metadata)
     last_updated_at_sequence: Option<Arc<lance_table::rowids::version::RowDatasetVersionSequence>>,
@@ -3468,13 +3477,13 @@ impl FragmentReader {
         output_schema: ArrowSchema,
         num_rows: usize,
         num_physical_rows: usize,
-        fragment: Arc<Fragment>,
+        fragment: Arc<FileFragment>,
     ) -> Result<Self> {
         Ok(Self {
             readers,
             output_schema,
             deletion_vec,
-            row_id_sequence,
+            row_id_sequence: Arc::new(OnceCell::new_with(row_id_sequence)),
             fragment_id,
             with_row_id: false,
             with_row_addr: false,
@@ -3488,6 +3497,22 @@ impl FragmentReader {
             num_physical_rows,
             overlay: None,
         })
+    }
+
+    async fn row_id_sequence(&self) -> Result<Option<Arc<RowIdSequence>>> {
+        if !self.with_row_id || !self.fragment.dataset.manifest.uses_stable_row_ids() {
+            return Ok(None);
+        }
+        // Readers may enable row IDs after open, including on a clone. Keep
+        // successful loads even when the session cache is disabled, but allow
+        // retries after a failed or cancelled load.
+        let sequence = self
+            .row_id_sequence
+            .get_or_try_init(|| {
+                load_row_id_sequence(&self.fragment.dataset, &self.fragment.metadata)
+            })
+            .await?;
+        Ok(Some(sequence.clone()))
     }
 
     pub(crate) fn with_row_id(&mut self) -> &mut Self {
@@ -3711,7 +3736,7 @@ impl FragmentReader {
         // vector is present).
         let config = RowIdAndDeletesConfig {
             deletion_vector: self.deletion_vec.clone(),
-            row_id_sequence: self.row_id_sequence.clone(),
+            row_id_sequence: self.row_id_sequence().await?,
             make_deletions_null: self.make_deletions_null,
             with_row_id: self.with_row_id,
             with_row_addr: self.with_row_addr,
@@ -3906,7 +3931,7 @@ impl FragmentReader {
         // vector is present).
         let config = RowIdAndDeletesConfig {
             deletion_vector: self.deletion_vec.clone(),
-            row_id_sequence: self.row_id_sequence.clone(),
+            row_id_sequence: self.row_id_sequence().await?,
             make_deletions_null: self.make_deletions_null,
             with_row_id: self.with_row_id,
             with_row_addr: self.with_row_addr,
@@ -7398,6 +7423,448 @@ mod tests {
         assert_eq!(expected_data, actual_data);
 
         Ok(())
+    }
+
+    mod demand_row_ids {
+        use super::*;
+        use arrow_array::types::Int32Type;
+        use lance_datagen::ArrayGeneratorExt;
+        use lance_io::object_store::{ObjectStoreRegistry, WrappingObjectStore, uri_to_url};
+        use lance_io::utils::tracking_store::{IOTracker, IoStats};
+        use lance_table::format::{ROW_ID_FIELD_ID, RowIdMeta};
+        use pretty_assertions::assert_eq;
+
+        use crate::dataset::builder::DatasetBuilder;
+        use crate::dataset::optimize::{CompactionMode, CompactionOptions, compact_files};
+        use crate::dataset::rowids::{
+            INLINE_ROW_LINEAGE_MAX_BYTES_CONFIG_KEY, SPILL_ROW_LINEAGE_CONFIG_KEY,
+        };
+        use crate::index::DatasetIndexExt;
+        use crate::io::exec::filtered_read::{FilteredReadExec, FilteredReadOptions};
+        use crate::utils::test::FailingProxyStore;
+        use datafusion::execution::TaskContext;
+        use datafusion_physical_plan::ExecutionPlan;
+        use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
+        use lance_datafusion::exec::OneShotExec;
+        use lance_index::{IndexType, scalar::ScalarIndexParams};
+
+        // Binary-copy compaction gives each output a separate lineage-only file,
+        // so its reads cannot be confused with user-column or footer reads.
+        async fn fixture(spill: bool) -> (TempStrDir, Dataset) {
+            let dir = TempStrDir::default();
+            // Normalize the file URL first so Windows drive letters remain in
+            // the path, rather than being parsed as the custom scheme's host.
+            let uri = uri_to_url(dir.as_str()).unwrap().as_str().replacen(
+                "file:",
+                "file-object-store:",
+                1,
+            );
+            let data = gen_batch()
+                .col("i", array::step::<Int32Type>())
+                .col("n", array::fill::<Int32Type>(0).with_random_nulls(1.0))
+                .into_reader_rows(RowCount::from(6), lance_datagen::BatchCount::from(4));
+            let mut dataset = Dataset::write(
+                data,
+                &uri,
+                Some(WriteParams {
+                    enable_stable_row_ids: true,
+                    max_rows_per_file: 6,
+                    data_storage_version: Some(LanceFileVersion::Stable),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+            if spill {
+                dataset
+                    .update_config([
+                        (SPILL_ROW_LINEAGE_CONFIG_KEY, "true"),
+                        (INLINE_ROW_LINEAGE_MAX_BYTES_CONFIG_KEY, "0"),
+                    ])
+                    .await
+                    .unwrap();
+            }
+            compact_files(
+                &mut dataset,
+                CompactionOptions {
+                    target_rows_per_fragment: 12,
+                    // The assertions use the original row order; concurrent
+                    // compaction commits its outputs in completion order.
+                    num_threads: Some(1),
+                    compaction_mode: Some(CompactionMode::ForceBinaryCopy),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(dataset.get_fragments().len(), 2);
+            for fragment in dataset.get_fragments() {
+                assert_eq!(
+                    matches!(fragment.metadata().row_id_meta, Some(RowIdMeta::Column)),
+                    spill
+                );
+            }
+            dataset.delete("i % 6 = 1").await.unwrap();
+            // Disable both caches so sharing across cloned readers, including
+            // concurrent reads, cannot accidentally be supplied by the session.
+            let dataset = DatasetBuilder::from_uri(&uri)
+                .with_session(Arc::new(Session::new(
+                    0,
+                    0,
+                    Arc::new(ObjectStoreRegistry::default()),
+                )))
+                .load()
+                .await
+                .unwrap();
+            (dir, dataset)
+        }
+
+        fn lineage_reads(stats: &IoStats, fragment: &FileFragment) -> usize {
+            let file = fragment
+                .metadata()
+                .row_lineage_file(ROW_ID_FIELD_ID)
+                .unwrap()
+                .unwrap();
+            stats
+                .requests
+                .iter()
+                .filter(|request| request.path.as_ref().ends_with(&file.path))
+                .count()
+        }
+
+        #[rstest]
+        #[case::payload(false)]
+        #[case::row_address_only(true)]
+        #[tokio::test]
+        async fn skips_unused_sequence(#[case] addresses_only: bool) {
+            let (_dir, dataset) = fixture(true).await;
+            let fragment = dataset.get_fragments().remove(0);
+            let projection = if addresses_only {
+                dataset.schema().project::<&str>(&[]).unwrap()
+            } else {
+                dataset.schema().clone()
+            };
+            dataset.object_store.io_stats_incremental();
+            let reader = fragment
+                .open(
+                    &projection,
+                    FragReadConfig::default().with_row_address(addresses_only),
+                )
+                .await
+                .unwrap();
+            let batch = reader.read_range_as_batch(0..12).await.unwrap();
+            assert_eq!(batch.num_rows(), 10);
+            let stats = dataset.object_store.io_stats_incremental();
+            assert_eq!(lineage_reads(&stats, &fragment), 0, "{stats:?}");
+            if addresses_only {
+                let expected: Vec<u64> = (0..12)
+                    .filter(|i| i % 6 != 1)
+                    .map(|i| RowAddress::new_from_parts(fragment.id() as u32, i).into())
+                    .collect();
+                assert_eq!(
+                    batch[ROW_ADDR]
+                        .as_primitive::<UInt64Type>()
+                        .values()
+                        .as_ref(),
+                    expected
+                );
+            } else {
+                assert_eq!(batch["n"].null_count(), 10);
+                assert!(
+                    stats.read_bytes > 0,
+                    "user data and metadata must still be read"
+                );
+            }
+        }
+
+        #[rstest]
+        #[case::payload(false)]
+        #[case::row_address_only(true)]
+        #[tokio::test]
+        async fn skips_unused_scan_sequence(#[case] addresses_only: bool) {
+            let (_dir, dataset) = fixture(true).await;
+            let mut scanner = dataset.scan();
+            if addresses_only {
+                scanner.project::<&str>(&[]).unwrap().with_row_address();
+            }
+            dataset.object_store.io_stats_incremental();
+            let batch = scanner.try_into_batch().await.unwrap();
+            assert_eq!(batch.num_rows(), 20);
+            let stats = dataset.object_store.io_stats_incremental();
+            for fragment in dataset.get_fragments() {
+                assert_eq!(lineage_reads(&stats, &fragment), 0, "{stats:?}");
+            }
+        }
+
+        #[rstest]
+        #[case::inline(false)]
+        #[case::spilled(true)]
+        #[tokio::test]
+        async fn late_ids_on_cloned_reader(#[case] spill: bool) {
+            let (_dir, dataset) = fixture(spill).await;
+            for (index, fragment) in dataset.get_fragments().into_iter().enumerate() {
+                let reader = fragment
+                    .open(dataset.schema(), FragReadConfig::default())
+                    .await
+                    .unwrap();
+                let mut ids_reader = reader.clone();
+                ids_reader.with_row_id().with_row_address();
+                let batch = ids_reader
+                    .take_as_batch(&[0, 2, 2, 5, 11], None)
+                    .await
+                    .unwrap();
+                let expected = [0, 2, 2, 5, 11].map(|i| (index * 12 + i) as u64);
+                assert_eq!(
+                    batch[ROW_ID].as_primitive::<UInt64Type>().values().as_ref(),
+                    expected
+                );
+                assert_eq!(batch["n"].null_count(), expected.len());
+                assert!(
+                    reader
+                        .read_range_as_batch(0..2)
+                        .await
+                        .unwrap()
+                        .column_by_name(ROW_ID)
+                        .is_none()
+                );
+                let batches = ids_reader
+                    .read_ranges(Arc::from([0..3, 5..8]), 2)
+                    .await
+                    .unwrap()
+                    .buffered(2)
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .unwrap();
+                let actual = batches
+                    .iter()
+                    .flat_map(|batch| {
+                        batch[ROW_ID]
+                            .as_primitive::<UInt64Type>()
+                            .values()
+                            .iter()
+                            .copied()
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(actual, [0, 2, 5, 6].map(|i| (index * 12 + i) as u64));
+                let logical = ids_reader
+                    .read_range(1..3, 2)
+                    .await
+                    .unwrap()
+                    .buffered(1)
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    logical[0][ROW_ID]
+                        .as_primitive::<UInt64Type>()
+                        .values()
+                        .as_ref(),
+                    [(index * 12 + 2) as u64, (index * 12 + 3) as u64]
+                );
+                let mut null_reader = ids_reader.clone();
+                null_reader.with_make_deletions_null();
+                let null_batch = null_reader.read_range_as_batch(0..3).await.unwrap();
+                assert_eq!(
+                    null_batch[ROW_ID]
+                        .as_primitive::<UInt64Type>()
+                        .iter()
+                        .collect::<Vec<_>>(),
+                    [
+                        Some((index * 12) as u64),
+                        None,
+                        Some((index * 12 + 2) as u64)
+                    ]
+                );
+                assert_eq!(
+                    ids_reader
+                        .take_as_batch(&[], None)
+                        .await
+                        .unwrap()
+                        .num_rows(),
+                    0
+                );
+            }
+            let batch = dataset
+                .scan()
+                .filter("i >= 10 AND n IS NULL")
+                .unwrap()
+                .with_row_id()
+                .try_into_batch()
+                .await
+                .unwrap();
+            let expected: Vec<u64> = (10..24).filter(|i| i % 6 != 1).collect();
+            assert_eq!(
+                batch[ROW_ID].as_primitive::<UInt64Type>().values().as_ref(),
+                expected
+            );
+        }
+
+        #[rstest]
+        #[case::row_ids(true)]
+        #[case::row_addresses(false)]
+        #[tokio::test]
+        async fn row_stream_loads_only_for_id_mapping(#[case] stable_ids: bool) {
+            let (_dir, dataset) = fixture(true).await;
+            let dataset = Arc::new(dataset);
+            let fragments = dataset.get_fragments();
+            let keys = [Some(14_u64), None, Some(2), Some(13), Some(2)].map(|id| {
+                id.map(|id| {
+                    if stable_ids {
+                        id
+                    } else {
+                        RowAddress::new_from_parts(
+                            fragments[id as usize / 12].id() as u32,
+                            id as u32 % 12,
+                        )
+                        .into()
+                    }
+                })
+            });
+            let key_column = if stable_ids { ROW_ID } else { ROW_ADDR };
+            let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                key_column,
+                DataType::UInt64,
+                true,
+            )]));
+            let input = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(UInt64Array::from(keys.to_vec()))],
+            )
+            .unwrap();
+            let input = OneShotExec::new(Box::pin(RecordBatchStreamAdapter::new(
+                schema,
+                stream::iter([Ok(input)]),
+            )));
+            let options = FilteredReadOptions::basic_full_read(&dataset);
+            let plan =
+                FilteredReadExec::try_new(dataset.clone(), options, Some(Arc::new(input))).unwrap();
+            dataset.object_store.io_stats_incremental();
+            let batches = plan
+                .execute(0, Arc::new(TaskContext::default()))
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            let batch = concat_batches(&plan.schema(), &batches).unwrap();
+            assert_eq!(
+                batch["i"].as_primitive::<Int32Type>().values().as_ref(),
+                [14, 2, 2]
+            );
+            let stats = dataset.object_store.io_stats_incremental();
+            for fragment in fragments {
+                assert_eq!(
+                    lineage_reads(&stats, &fragment) > 0,
+                    stable_ids,
+                    "{stats:?}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn indexed_scan_still_maps_stable_ids() {
+            let (_dir, mut dataset) = fixture(true).await;
+            dataset
+                .create_index(
+                    &["i"],
+                    IndexType::Scalar,
+                    None,
+                    &ScalarIndexParams::default(),
+                    false,
+                )
+                .await
+                .unwrap();
+            let mut scanner = dataset.scan();
+            scanner
+                .project(&["i"])
+                .unwrap()
+                .filter("i >= 10 AND i < 17")
+                .unwrap();
+            let plan = scanner.explain_plan(false).await.unwrap();
+            assert!(plan.contains("ScalarIndex"), "{plan}");
+            dataset.object_store.io_stats_incremental();
+            let batch = scanner.try_into_batch().await.unwrap();
+            assert_eq!(
+                batch["i"].as_primitive::<Int32Type>().values().as_ref(),
+                [10, 11, 12, 14, 15, 16]
+            );
+            let stats = dataset.object_store.io_stats_incremental();
+            for fragment in dataset.get_fragments() {
+                assert!(
+                    lineage_reads(&stats, &fragment) > 0,
+                    "index results need stable-to-physical mapping: {stats:?}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn shared_load_retries_and_preserves_request_store() {
+            let (_dir, dataset) = fixture(true).await;
+            let failures = Arc::new(FailingProxyStore::new());
+            let tracker = Arc::new(IOTracker::default());
+            let request_dataset = dataset.with_object_store_wrappers([
+                failures.clone() as Arc<dyn WrappingObjectStore>,
+                tracker.clone() as Arc<dyn WrappingObjectStore>,
+            ]);
+            let fragment = request_dataset.get_fragments().remove(0);
+            let mut reader = fragment
+                .open(
+                    &dataset.schema().project::<&str>(&[]).unwrap(),
+                    FragReadConfig::default().with_row_address(true),
+                )
+                .await
+                .unwrap();
+            reader.with_row_id();
+            tracker.incremental_stats();
+            failures.fail_when("get_opts", ".lance", "retry deferred lineage read");
+            let error = reader.read_range_as_batch(0..3).await.unwrap_err();
+            assert!(matches!(error, Error::IO { .. }), "{error:?}");
+            assert!(
+                error.to_string().contains("retry deferred lineage read"),
+                "{error}"
+            );
+            failures.clear_fail_when("get_opts", ".lance");
+            tracker.incremental_stats();
+            let cloned = reader.clone();
+            let (first, second) = tokio::join!(
+                reader.read_range_as_batch(0..3),
+                cloned.read_range_as_batch(5..8)
+            );
+            assert_eq!(
+                first.unwrap()[ROW_ID]
+                    .as_primitive::<UInt64Type>()
+                    .values()
+                    .as_ref(),
+                [0, 2]
+            );
+            assert_eq!(
+                second.unwrap()[ROW_ID]
+                    .as_primitive::<UInt64Type>()
+                    .values()
+                    .as_ref(),
+                [5, 6]
+            );
+            let first_load = tracker.incremental_stats();
+            assert!(
+                lineage_reads(&first_load, &fragment) > 0,
+                "late load must use this request's store"
+            );
+            reader.read_range_as_batch(2..3).await.unwrap();
+            assert_eq!(
+                tracker.incremental_stats().read_iops,
+                0,
+                "clones must retain the loaded sequence even with the session cache disabled"
+            );
+            load_row_id_sequence(&request_dataset, fragment.metadata())
+                .await
+                .unwrap();
+            let single_load = tracker.incremental_stats();
+            assert_eq!(
+                first_load.read_iops, single_load.read_iops,
+                "concurrent clones must perform only one sequence load"
+            );
+            assert_eq!(first_load.read_bytes, single_load.read_bytes);
+        }
     }
 
     #[tokio::test]

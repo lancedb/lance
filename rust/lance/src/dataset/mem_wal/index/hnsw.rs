@@ -157,8 +157,9 @@ impl HnswMemIndex {
         self.len() == 0
     }
 
-    /// Upper bound on heap bytes held, sized by `capacity`: the first insert
-    /// allocates the whole graph, so it is reported before that insert too.
+    /// Upper bound on heap bytes held. The first insert allocates the graph's
+    /// fixed part, sized by `capacity`, so that part is reported before the
+    /// insert too; each node's neighbor lists are charged as it is inserted.
     pub(crate) fn resident_bytes(&self) -> usize {
         match self.state.get() {
             Some(s) => s.graph.resident_bytes() + s.storage.resident_bytes(),
@@ -884,12 +885,12 @@ mod tests {
         RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(ids)), Arc::new(fsl)]).unwrap()
     }
 
-    /// The graph is pre-allocated from `capacity`, so its footprint is settled
-    /// before any row arrives and barely moves as rows do. A memory budget that
-    /// samples only row bytes would miss all of it, and one that waited for the
-    /// first insert would miss the allocation that insert triggers.
+    /// The graph's fixed part is sized from `capacity` and committed by the
+    /// first row, so it is charged before that row arrives. Neighbor lists are
+    /// allocated per inserted node, so a slot never filled costs only its share
+    /// of the fixed part, and the charge grows with the rows.
     #[test]
-    fn test_resident_bytes_is_preallocated_not_proportional_to_rows() {
+    fn test_resident_bytes_charges_capacity_up_front_and_neighbors_per_row() {
         let dim = 8;
         let capacity = 4_000;
         let index = || {
@@ -902,35 +903,34 @@ mod tests {
                 64,
             )
         };
+        let filled = |rows: usize| {
+            let index = index();
+            index.insert(&make_batch(0, rows, dim), 0).unwrap();
+            index.resident_bytes()
+        };
 
         let untouched = index().resident_bytes();
+        let one_row = filled(1);
+        let half = filled(capacity / 2);
+        let all_rows = filled(capacity);
 
-        let sparse = index();
-        sparse.insert(&make_batch(0, 1, dim), 0).unwrap();
-        let one_row = sparse.resident_bytes();
-
-        let full = index();
-        full.insert(&make_batch(0, capacity, dim), 0).unwrap();
-        let all_rows = full.resident_bytes();
-
-        // One row already pays for the whole graph: well over a KB per slot of
-        // capacity, and within a small factor of the fully-populated index.
-        assert!(
-            one_row > capacity * 128,
-            "one row should commit the pre-allocated graph, got {one_row} for capacity {capacity}"
-        );
-        assert!(
-            all_rows < one_row * 2,
-            "a full index ({all_rows}) should not dwarf a one-row index ({one_row})"
-        );
-
-        // The charge is visible before the row that commits it, and close
+        // The fixed part is visible before the row that commits it, and close
         // enough to the real thing to admit against. The reservation walks the
         // level ladder in expectation where the graph samples it, so allow a
         // 25% band either way rather than demanding equality.
         assert!(
             untouched.abs_diff(one_row) * 4 < one_row,
-            "reserved {untouched} should track the built graph {one_row} before the first insert"
+            "reserved {untouched} should track the one-row graph {one_row}"
+        );
+        // Slots that were never filled do not carry neighbor lists, so the
+        // charge follows the rows.
+        assert!(
+            one_row < half && half < all_rows,
+            "the charge should grow with rows: {one_row} < {half} < {all_rows}"
+        );
+        assert!(
+            all_rows > one_row * 3,
+            "a full index ({all_rows}) should owe several times a one-row index ({one_row})"
         );
     }
 
