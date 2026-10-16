@@ -366,6 +366,9 @@ impl Planner {
             BinaryOperator::NotEq => Operator::NotEq,
             BinaryOperator::And => Operator::And,
             BinaryOperator::Or => Operator::Or,
+            BinaryOperator::BitwiseAnd => Operator::BitwiseAnd,
+            BinaryOperator::BitwiseOr => Operator::BitwiseOr,
+            BinaryOperator::BitwiseXor | BinaryOperator::PGBitwiseXor => Operator::BitwiseXor,
             BinaryOperator::PGBitwiseShiftLeft => Operator::BitwiseShiftLeft,
             BinaryOperator::PGBitwiseShiftRight => Operator::BitwiseShiftRight,
             _ => {
@@ -462,27 +465,17 @@ impl Planner {
                 Expr::Not(Box::new(self.parse_sql_expr(expr)?))
             }
 
-            UnaryOperator::Minus => {
-                use datafusion::logical_expr::lit;
-                match expr {
-                    SQLExpr::Value(ValueWithSpan { value: Value::Number(n, _), ..}) => match n.parse::<i64>() {
-                        Ok(n) => lit(-n),
-                        Err(_) => lit(-n
-                            .parse::<f64>()
-                            .map_err(|_e| {
-                                Error::invalid_input(format!("negative operator can be only applied to integer and float operands, got: {n}"))
-                            })?),
-                    },
-                    _ => {
-                        Expr::Negative(Box::new(self.parse_sql_expr(expr)?))
-                    }
-                }
-            }
+            UnaryOperator::Minus => match expr {
+                SQLExpr::Value(ValueWithSpan {
+                    value: Value::Number(n, _),
+                    ..
+                }) => self.number(n.as_str(), true)?,
+                _ => Expr::Negative(Box::new(self.parse_sql_expr(expr)?)),
+            },
 
             _ => {
                 return Err(Error::invalid_input(format!(
-                    "Unary operator '{:?}' is not supported",
-                    op
+                    "Unary operator '{op:?}' is not supported"
                 )));
             }
         })
@@ -517,7 +510,11 @@ impl Planner {
             Value::DoubleQuotedString(s) => Expr::Literal(ScalarValue::Utf8(Some(s.clone())), None),
             Value::Boolean(v) => Expr::Literal(ScalarValue::Boolean(Some(*v)), None),
             Value::Null => Expr::Literal(ScalarValue::Null, None),
-            _ => todo!(),
+            _ => {
+                return Err(Error::invalid_input(format!(
+                    "Unsupported SQL value: {value:?}"
+                )));
+            }
         })
     }
 
@@ -544,6 +541,12 @@ impl Planner {
                     return Err(Error::invalid_input(format!(
                         "Function name must have 1 part, got: {:?}",
                         func.name.0
+                    )));
+                }
+                if args.args.len() != 1 {
+                    return Err(Error::invalid_input(format!(
+                        "is_valid() takes exactly one argument, got {}",
+                        args.args.len()
                     )));
                 }
                 Ok(Expr::IsNotNull(Box::new(
@@ -1214,6 +1217,70 @@ mod tests {
     use rstest::rstest;
 
     #[test]
+    fn test_parse_filter_rejects_bad_input_instead_of_panicking() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("s", DataType::Utf8, true),
+            Field::new("i", DataType::Int32, false),
+        ]));
+        let planner = Planner::new(schema);
+
+        // Unsupported literal spellings must surface as invalid-input errors
+        // from library code, not todo!() panics.
+        assert!(planner.parse_filter("s = N'abc'").is_err());
+
+        // is_valid arity is validated like every other function instead of
+        // panicking on zero args and silently dropping extra args.
+        assert!(planner.parse_filter("is_valid()").is_err());
+        assert!(planner.parse_filter("is_valid(s, s)").is_err());
+
+        // A single is_valid argument still parses to IS NOT NULL.
+        assert_eq!(
+            planner.parse_filter("is_valid(s)").unwrap(),
+            col("s").is_not_null()
+        );
+    }
+
+    #[test]
+    fn test_parse_expr_rejects_multiple_expressions() {
+        let schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, true)]));
+        let planner = Planner::new(schema);
+
+        // A comma-separated list must not be silently truncated to its first
+        // item (e.g. an update SET list or projection pasted by mistake).
+        assert!(planner.parse_expr("s, s").is_err());
+        assert!(planner.parse_expr("s").is_ok());
+    }
+
+    #[test]
+    fn test_parse_filter_i64_min_literal() {
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
+        let planner = Planner::new(schema);
+
+        // i64::MIN is a valid Int64 literal and must not degrade to Float64,
+        // where resolve_expr's lossless-coercion guard would reject it.
+        let expr = planner.parse_filter("x = -9223372036854775808").unwrap();
+        assert_eq!(expr, col("x").eq(lit(i64::MIN)));
+    }
+
+    #[rstest]
+    #[case::bitwise_and("a & b", Operator::BitwiseAnd)]
+    #[case::bitwise_or("a | b", Operator::BitwiseOr)]
+    #[case::bitwise_xor("a ^ b", Operator::BitwiseXor)]
+    fn test_parse_bitwise_ops(#[case] sql: &str, #[case] expected_op: Operator) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("b", DataType::Int64, false),
+        ]));
+        let planner = Planner::new(schema);
+
+        let expr = planner.parse_filter(sql).unwrap();
+        let Expr::BinaryExpr(binary_expr) = &expr else {
+            panic!("expected binary expression for {sql}, got {expr}");
+        };
+        assert_eq!(binary_expr.op, expected_op);
+    }
+
+    #[rstest]
     fn test_parse_filter_simple() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("i", DataType::Int32, false),
