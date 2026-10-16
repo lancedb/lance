@@ -856,16 +856,17 @@ impl CompactionPlanner for DefaultCompactionPlanner {
         );
         // Without stable row ids a rewrite moves every row address, so the
         // indices over the rewritten fragments have to be remapped in the same
-        // commit. With stable row ids only address-domain indices do (a
-        // row-id-domain index's ids survive the rewrite for free). An index
-        // this build cannot open cannot be remapped, so its fragments join the
-        // caller's own exclusions and are left uncompacted - taking the same
-        // path, which terminates the current bin rather than letting the
-        // candidates on either side of the gap be planned together.
+        // commit, and an index this build cannot open cannot be remapped. With
+        // stable row ids this never applies: every index's coverage is fixed
+        // up from manifest metadata alone (follow the data, or drop the
+        // rewritten fragments), which needs no reader for the index at all.
+        // An unremappable index's fragments join the caller's own exclusions
+        // and are left uncompacted - taking the same path, which terminates
+        // the current bin rather than letting the candidates on either side
+        // of the gap be planned together.
         let mut excluded_fragment_ids = self.excluded_fragment_ids.clone();
-        if !self.options.defer_index_remap {
-            let only_address_domain = dataset.manifest.uses_stable_row_ids();
-            let unremappable = unremappable_index_coverage(dataset, only_address_domain)
+        if !dataset.manifest.uses_stable_row_ids() && !self.options.defer_index_remap {
+            let unremappable = unremappable_index_coverage(dataset)
                 .await?
                 .into_iter()
                 .fold(RoaringBitmap::new(), |mut covered, (_, fragments)| {
@@ -2360,21 +2361,17 @@ async fn index_fragment_coverage(
 /// They are held out of the plan instead, and the rest of the table still
 /// compacts.
 ///
-/// Only the eager remap path needs this. `defer_index_remap` hands the repair
-/// to a build that can read the index, through the fragment-reuse index it
-/// writes. On a stable-row-id table a row-id-domain index needs no remap at
-/// all (its ids survive the rewrite), so `only_address_domain` restricts the
-/// check to indices an eager remap would actually have to open.
-async fn unremappable_index_coverage(
-    dataset: &Dataset,
-    only_address_domain: bool,
-) -> Result<Vec<(String, RoaringBitmap)>> {
+/// Only the non-stable-row-id eager remap path needs this: there, a rewrite
+/// group fixes up an index's coverage by remapping it or not at all, so an
+/// index this build cannot open is left stranded on deleted fragment ids. On
+/// a stable-row-id table every index's coverage is instead fixed up from
+/// manifest metadata alone (follow the data, or drop the rewritten
+/// fragments), which needs no reader for the index at all, so this check
+/// does not apply there; callers only run it for non-stable-row-id tables.
+async fn unremappable_index_coverage(dataset: &Dataset) -> Result<Vec<(String, RoaringBitmap)>> {
     let mut coverage = Vec::new();
     for index in load_all_indices(dataset).await?.iter() {
         if index_is_usable(index) {
-            continue;
-        }
-        if only_address_domain && !index.results_are_row_addrs() {
             continue;
         }
         coverage.push((
@@ -2392,7 +2389,8 @@ async fn unremappable_index_coverage(
 /// planner, [`CompactionPlan`] is public and serializable, and a distributed
 /// driver hands [`commit_compaction`] results planned elsewhere. Committing such
 /// a plan strands the index on fragment ids the rewrite deleted, so the commit
-/// boundary refuses it rather than the planner alone.
+/// boundary refuses it rather than the planner alone. Only relevant without
+/// stable row ids; see [`unremappable_index_coverage`].
 async fn reject_unremappable_rewrite(
     dataset: &Dataset,
     completed_tasks: &[RewriteResult],
@@ -2403,8 +2401,7 @@ async fn reject_unremappable_rewrite(
         .filter_map(|fragment| u32::try_from(fragment.id).ok())
         .collect::<RoaringBitmap>();
 
-    let only_address_domain = dataset.manifest.uses_stable_row_ids();
-    for (name, covered) in unremappable_index_coverage(dataset, only_address_domain).await? {
+    for (name, covered) in unremappable_index_coverage(dataset).await? {
         let blocked = covered & &rewritten;
         if !blocked.is_empty() {
             return Err(Error::invalid_input(format!(
@@ -3388,12 +3385,11 @@ pub async fn commit_compaction(
         ));
     }
 
-    // Before anything is written or committed. The condition is the planner's,
-    // not `has_address_style`: a dataset whose only remappable index is one
-    // this build cannot read captures no row addresses at all, which is
-    // exactly the plan that has to be refused here.
+    // Before anything is written or committed. The condition mirrors the
+    // planner's: see `unremappable_index_coverage` for why this only applies
+    // without stable row ids.
     let uses_stable_row_ids = dataset.manifest.uses_stable_row_ids();
-    if !options.defer_index_remap {
+    if !uses_stable_row_ids && !options.defer_index_remap {
         reject_unremappable_rewrite(dataset, &completed_tasks).await?;
     }
 
