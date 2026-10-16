@@ -1265,6 +1265,7 @@ fn merge(left_struct_array: &StructArray, right_struct_array: &StructArray) -> S
                         columns.push(Arc::new(merged_sub_array) as ArrayRef);
                     }
                     (DataType::List(left_list), DataType::List(right_list))
+                    | (DataType::LargeList(left_list), DataType::LargeList(right_list))
                         if left_list.data_type().is_struct()
                             && right_list.data_type().is_struct() =>
                     {
