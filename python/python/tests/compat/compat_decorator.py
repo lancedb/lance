@@ -91,9 +91,8 @@ def _fetch_last_beta_release(current_version: Optional[str] = None):
     Not simply the newest pre-release: the release automation bumps main's
     version in the same commit that cuts a beta, so from the moment that beta
     is published it carries the version every branch is also building. Pinning
-    it would hand a compat test a venv holding the build under test and call it
-    the older build, and a test asserting something only a genuinely older
-    build satisfies then fails for every pull request until the next release.
+    it would hand a compat test a venv labelled with the build's own version
+    and call it the older build.
 
     `current_version` is the build to measure against, defaulting to the
     installed one. Without it there is no way to tell a release older than the
