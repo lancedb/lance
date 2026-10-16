@@ -1909,6 +1909,7 @@ mod tests {
     #[case::choose_place("ところを選ぶ", &["ところ", "選ぶ"])]
     #[case::emphasis("特に安い商品", &["特に", "安い", "商品"])]
     #[case::objects("欲しいもの", &["欲しい", "もの"])]
+    #[case::boyfriend("彼ができる", &["彼", "できる"])]
     #[case::girlfriend("彼女ができる", &["彼女", "できる"])]
     #[case::restriction("読み取りのみ", &["読み取り", "のみ"])]
     #[case::chinese_prohibition("别执行删除", &["别", "执行", "删除"])]
@@ -1918,6 +1919,9 @@ mod tests {
     #[case::cage("鳥をおりに入れる", &["鳥", "おり", "入れる"])]
     #[case::noun_particle_combination("もののかたち", &["ものの", "かたち"])]
     #[case::cause("因を探る", &["因", "探る"])]
+    #[case::picture_kanji("絵をかく", &["絵", "かく"])]
+    #[case::tree_kanji("木に登る", &["木", "登る"])]
+    #[case::poem_kanji("詩を読む", &["詩", "読む"])]
     fn test_icu_keeps_cjk_content_words(
         #[case] text: &str,
         #[case] content_words: &[&str],
