@@ -45,6 +45,7 @@ use inserted_rows::KeyExistenceFilter;
 
 use super::cleanup_data_fragments;
 use super::retry::{RetryConfig, RetryExecutor, execute_with_retry};
+use super::seeds::SeedCollector;
 use super::{
     CommitBuilder, TargetBaseInfo, WriteMode, WriteParams,
     validate_and_resolve_target_bases_with_primary, write_fragments_internal,
@@ -52,6 +53,7 @@ use super::{
 use crate::dataset::rowids::{get_row_id_index, load_spilled_row_lineage};
 use crate::dataset::transaction::UpdateMode::{RewriteColumns, RewriteRows};
 use crate::dataset::utils::CapturedRowIds;
+use crate::dataset::utils::SchemaAdapter;
 use crate::index::DatasetIndexExt;
 use crate::{
     Dataset,
@@ -1864,20 +1866,29 @@ impl MergeInsertJob {
                     // Exact, deletion-free coverage can be written directly because the
                     // batches are sorted by row address.
 
+                    let mut seeds = SeedCollector::for_write(
+                        write_version,
+                        Some(&dataset),
+                        &write_schema,
+                        true,
+                    )
+                    .await?;
                     let mut writer =
                         versions::open_update_writer(write_version, &dataset, &write_schema, false)
                             .await?;
 
-                    // We need to remove rowaddr before writing.
-                    batches
-                        .iter_mut()
-                        .try_for_each(|batch| match batch.drop_column(ROW_ADDR) {
-                            Ok(b) => {
-                                *batch = b;
-                                Ok(())
-                            }
-                            Err(e) => Err(e),
-                        })?;
+                    // We need to remove rowaddr before writing. The data file
+                    // writer and the seed collector must then see the same
+                    // representation: a Utf8View or BinaryView source is stored
+                    // as its classic offset type, and the writer's own
+                    // conversion never reaches these batches, so normalize once
+                    // here for both.
+                    batches.iter_mut().try_for_each(|batch| {
+                        let without_addr = batch.drop_column(ROW_ADDR)?;
+                        *batch = SchemaAdapter::new(without_addr.schema())
+                            .to_physical_batch(without_addr)?;
+                        Ok::<_, Error>(())
+                    })?;
 
                     let source_version = metadata
                         .referenced_lance_files()
@@ -1899,12 +1910,20 @@ impl MergeInsertJob {
                         ));
                         let mut stream = chunk_stream(stream, batch_size as usize);
                         while let Some(chunk) = stream.next().await {
-                            writer.write(&chunk?).await?;
+                            let chunk = chunk?;
+                            writer.write(&chunk).await?;
+                            for batch in &chunk {
+                                seeds.observe(batch)?;
+                            }
                         }
                     } else {
                         writer.write(batches.as_slice()).await?;
+                        for batch in &batches {
+                            seeds.observe(batch)?;
+                        }
                     }
 
+                    seeds.flush(writer.as_mut()).await?;
                     let (_num_rows, data_file) = writer.finish().await?;
 
                     metadata.files.push(data_file);
@@ -8834,6 +8853,17 @@ mod tests {
                 .try_into_batch()
                 .await
                 .unwrap();
+            // Compaction physically rewrites fragments, and on a
+            // stable-row-id dataset the "id" BTree index now stores row
+            // addresses, which the rewrite invalidates for the affected
+            // fragment (`test_addr_domain_index_does_not_cover_rewritten_update_fragment`).
+            // The in-place patch that would otherwise write zero files falls
+            // back to a real rewrite there to keep the index's coverage
+            // consistent, matching ZoneMap/BloomFilter/FM's existing
+            // address-domain behavior.
+            let expect_rewrite =
+                stable_row_ids && matches!(concurrent_write, ConcurrentWrite::Compaction);
+
             let commit = CommitBuilder::new(Arc::new(other.clone()))
                 .with_max_retries(0)
                 .execute(prepared.transaction)
@@ -8852,17 +8882,25 @@ mod tests {
                 let (merged, stats) = job.execute_batches(vec![source]).await.unwrap();
                 assert_eq!(stats.num_attempts, 2);
                 assert_eq!(stats.num_updated_rows, 2);
-                assert_eq!(stats.num_files_written, 0);
+                assert_eq!(stats.num_files_written, if expect_rewrite { 1 } else { 0 });
                 merged.as_ref().clone()
             };
-            assert_eq!(merged.fragments().len(), other.fragments().len());
-            for (merged_fragment, current) in
-                merged.fragments().iter().zip(other.fragments().iter())
-            {
-                assert_eq!(merged_fragment.id, current.id);
-                assert_eq!(merged_fragment.files, current.files);
-                if !stable_row_ids {
-                    assert_eq!(merged_fragment, current);
+            if expect_rewrite {
+                // The address-domain "id" index can no longer cover the
+                // fragment the rewrite touched, so the patched rows land in
+                // a brand new fragment alongside `other`'s single compacted
+                // one instead of overwriting it in place.
+                assert_eq!(merged.fragments().len(), other.fragments().len() + 1);
+            } else {
+                assert_eq!(merged.fragments().len(), other.fragments().len());
+                for (merged_fragment, current) in
+                    merged.fragments().iter().zip(other.fragments().iter())
+                {
+                    assert_eq!(merged_fragment.id, current.id);
+                    assert_eq!(merged_fragment.files, current.files);
+                    if !stable_row_ids {
+                        assert_eq!(merged_fragment, current);
+                    }
                 }
             }
             let after = merged
@@ -8873,22 +8911,45 @@ mod tests {
                 .try_into_batch()
                 .await
                 .unwrap();
-            assert_eq!(
-                before.project(&[0, 1, 2]).unwrap(),
-                after.project(&[0, 1, 2]).unwrap()
-            );
+            // `before`'s row order is always original-id order (it was
+            // captured before any rewrite). `after`'s is too, except when
+            // `expect_rewrite` relocates the patched rows (ids 0 and 4) to a
+            // new trailing fragment -- so look rows up by id rather than
+            // assuming position, which degrades to position for every other
+            // case since id and position coincide here.
+            let after_row_for_id = |id: u32| -> usize {
+                let ids = after["id"].as_primitive::<UInt32Type>();
+                (0..ids.len()).find(|&i| ids.value(i) == id).unwrap()
+            };
+            if expect_rewrite {
+                for id in 0u32..6 {
+                    assert_eq!(
+                        before.project(&[0, 1, 2]).unwrap().slice(id as usize, 1),
+                        after
+                            .project(&[0, 1, 2])
+                            .unwrap()
+                            .slice(after_row_for_id(id), 1),
+                        "row id {id} mismatched"
+                    );
+                }
+            } else {
+                assert_eq!(
+                    before.project(&[0, 1, 2]).unwrap(),
+                    after.project(&[0, 1, 2]).unwrap()
+                );
+            }
             if stable_row_ids {
-                for row in 0..6 {
+                for id in 0u32..6 {
                     assert_eq!(
                         after[ROW_LAST_UPDATED_AT_VERSION]
                             .as_primitive::<UInt64Type>()
-                            .value(row),
-                        if [0, 4].contains(&row) {
+                            .value(after_row_for_id(id)),
+                        if [0, 4].contains(&id) {
                             merged.version().version
                         } else {
                             before[ROW_LAST_UPDATED_AT_VERSION]
                                 .as_primitive::<UInt64Type>()
-                                .value(row)
+                                .value(id as usize)
                         }
                     );
                 }
@@ -8904,9 +8965,22 @@ mod tests {
             } else {
                 vec!["id_idx"]
             };
+            // The address-domain "id" index cannot cover the new fragment a
+            // rewrite creates -- its stored addresses describe the fragment
+            // it was built against, not whatever replaced part of it (see
+            // `test_addr_domain_index_does_not_cover_rewritten_update_fragment`).
+            // Nor does it keep partial credit for the untouched remainder of
+            // the rewritten fragment: the whole fragment drops out of its
+            // coverage, leaving it empty here (only one fragment existed).
+            let empty_bitmap = RoaringBitmap::new();
             for name in expected_indices {
                 let index = indices.iter().find(|index| index.name == name).unwrap();
-                assert_eq!(index.fragment_bitmap.as_ref(), Some(&live_fragments));
+                let expected_bitmap = if expect_rewrite && name == "id_idx" {
+                    &empty_bitmap
+                } else {
+                    &live_fragments
+                };
+                assert_eq!(index.fragment_bitmap.as_ref(), Some(expected_bitmap));
             }
             merged.validate().await.unwrap();
         }
