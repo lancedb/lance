@@ -1035,14 +1035,6 @@ impl SchedulerConfig {
 /// panics deep inside the queue's own detached background task on first
 /// use - pointing a confused caller at `scheduler.rs` instead of at their
 /// runtime builder.
-///
-/// Deliberately just constructs and drops a `Sleep` rather than probing via
-/// `catch_unwind`/a swapped panic hook: `Sleep::new_timeout` already panics
-/// immediately (not at first poll) with its own clear message naming
-/// `enable_time`/`enable_all`, and letting that panic propagate normally
-/// avoids touching the process-global panic hook - a previous version of
-/// this check swapped it out, which races any other thread that panics
-/// during the (admittedly brief) window.
 fn require_time_driver() {
     drop(tokio::time::sleep(Duration::ZERO));
 }
