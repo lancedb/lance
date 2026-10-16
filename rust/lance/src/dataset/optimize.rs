@@ -841,7 +841,7 @@ impl CompactionPlanner for DefaultCompactionPlanner {
         }
         if !self.options.defer_index_remap
             && dataset.manifest.uses_stable_row_ids()
-            && has_address_domain_index(dataset).await?
+            && has_eager_remappable_index(dataset).await?
         {
             reject_eager_remap_over_undrained_fri(dataset).await?;
         }
@@ -2488,18 +2488,21 @@ async fn reserve_fragment_ids(
     Ok(manifest.version)
 }
 
-/// Whether any non-system index on `dataset` stores row addresses rather than
-/// stable row ids (`IndexMetadata::results_are_row_addrs`). Metadata-only: it
-/// does not check `can_remap()`, so a zone map or bloom filter index also
-/// counts even though compaction cannot remap it; a false positive here only
-/// costs an address capture that ends up unused, never a correctness issue.
-async fn has_address_domain_index(dataset: &Dataset) -> Result<bool> {
+/// Whether any non-system index on `dataset` both stores row addresses and
+/// its type supports being eagerly remapped onto them
+/// (`IndexMetadata::supports_eager_remap`). Metadata-only, no index opened:
+/// an index whose type can never remap (ZoneMap, BloomFilter, FM) does not
+/// count, since an eager remap would do nothing for it but materialize and
+/// then discard an old-to-new move for every rewritten row -- on a large
+/// compaction, table-scale memory the rewrite files have already been
+/// written to produce.
+async fn has_eager_remappable_index(dataset: &Dataset) -> Result<bool> {
     let Some(indices) = load_indices_for_remapping(dataset).await? else {
         return Ok(false);
     };
     Ok(indices
         .iter()
-        .any(|index| !is_system_index(index) && index.results_are_row_addrs()))
+        .any(|index| !is_system_index(index) && index.supports_eager_remap()))
 }
 
 /// Refuse an eager remap of an address-domain index while this stable-row-id
@@ -2631,7 +2634,7 @@ async fn rewrite_files(
     // A scan captures stable row ids, not row addresses; derive old addresses
     // from fragment metadata instead, whenever something will consume them.
     let records_from_fragment_metadata = uses_stable_row_ids
-        && (options.defer_index_remap || has_address_domain_index(dataset.as_ref()).await?);
+        && (options.defer_index_remap || has_eager_remappable_index(dataset.as_ref()).await?);
     // Capturing row addresses is only useful if something will consume them:
     // an index to remap now, or a deferred remap through the FRI.
     let capture_row_addrs = !uses_stable_row_ids
@@ -3396,23 +3399,27 @@ pub async fn commit_compaction(
 
     let has_address_style = completed_tasks.iter().any(|t| t.row_addrs.is_some());
     // Address-style results require immediate index remapping unless it is
-    // deferred. On a stable-row-id table only address-domain indices ever
-    // produce address-style results (see `rewrite_files`'s
-    // `records_from_fragment_metadata`); a row-id-domain index's ids survive
-    // the rewrite on their own and never reach this remap.
-    let needs_remapping = !options.defer_index_remap && has_address_style;
+    // deferred. On a stable-row-id table, only an index whose type actually
+    // supports an eager remap (today, BTree) makes this worth attempting:
+    // ZoneMap/BloomFilter/FM always report `RemapResult::Drop`, so creating a
+    // remapper for them would materialize an old-to-new move for every
+    // rewritten row only to discard it -- on a large compaction, table-scale
+    // memory the rewrite files have already been written to produce.
+    // `rewrite_files`'s capture decision already applies this same test
+    // (`has_eager_remappable_index`), so this mostly re-confirms it; it
+    // matters on its own in distributed mode, where a task can record moves
+    // under `defer_index_remap` at plan time and then commit under
+    // different, eager options with no remappable index at all -- there
+    // `needs_remapping` must stay false so the recorded moves fall through
+    // to the fragment-reuse index below instead of being silently discarded.
+    let needs_remapping = !options.defer_index_remap
+        && has_address_style
+        && (!uses_stable_row_ids || has_eager_remappable_index(dataset).await?);
 
-    // Whether this commit is actually about to remap an address-domain index
-    // immediately with these addresses, as opposed to merely being permitted
-    // to try. `needs_remapping` alone is not enough: on a stable-row-id table
-    // with no address-domain index, the tasks' recorded addresses can only
-    // have come from `defer_index_remap` at plan/execution time (distributed
-    // mode may commit with different options than it planned with), and the
-    // commit must still honor that recording intent -- folding them into a
-    // fragment reuse index -- rather than silently discarding them because
-    // nothing here will consume them eagerly.
-    let remapping_eagerly =
-        uses_stable_row_ids && needs_remapping && has_address_domain_index(dataset).await?;
+    // On a non-stable-row-id table `needs_remapping` is never the kind of
+    // eager remap the FRI-drain gate and `records_stable_row_id_moves` care
+    // about; `uses_stable_row_ids` narrows it to that case.
+    let remapping_eagerly = uses_stable_row_ids && needs_remapping;
     if remapping_eagerly {
         reject_eager_remap_over_undrained_fri(dataset).await?;
     }
@@ -5830,18 +5837,32 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone, Copy)]
+    enum IndexPresence {
+        None,
+        /// BTree: address-domain and its type supports an eager remap.
+        RemapCapable,
+        /// ZoneMap: address-domain, but its type always reports
+        /// `RemapResult::Drop`, so it can never be an eager-remap consumer.
+        AddressDomainOnly,
+    }
+
     /// Eager (non-deferred) compaction on a stable-row-id dataset captures row
-    /// addresses only when something will consume them: an address-domain
-    /// index this build can remap in place (see `commit_compaction`'s
-    /// `needs_remapping`). A dataset with no index -- or only row-id-domain
-    /// ones, whose ids survive the rewrite on their own -- must not pay for a
-    /// capture nothing will use.
+    /// addresses only when something will consume them: an index this build
+    /// can remap in place (see `commit_compaction`'s `needs_remapping`).
+    /// A dataset with no index, only row-id-domain ones (whose ids survive
+    /// the rewrite on their own), or only an address-domain index whose type
+    /// can never remap (ZoneMap, BloomFilter, FM) must not pay for a capture
+    /// nothing will use -- on a large compaction, that capture is an
+    /// old-to-new move for every rewritten row.
     #[rstest::rstest]
-    #[case::no_index(false)]
-    #[case::address_domain_index(true)]
+    #[case::no_index(IndexPresence::None, false)]
+    #[case::remap_capable_index(IndexPresence::RemapCapable, true)]
+    #[case::address_domain_only_index(IndexPresence::AddressDomainOnly, false)]
     #[tokio::test]
     async fn test_stable_row_ids_eager_compaction_captures_row_addrs_only_when_needed(
-        #[case] with_address_domain_index: bool,
+        #[case] index_presence: IndexPresence,
+        #[case] expect_capture: bool,
     ) {
         let data = sample_data();
         let reader = RecordBatchIterator::new(vec![Ok(data.slice(0, 9_000))], data.schema());
@@ -5858,9 +5879,22 @@ mod tests {
         .await
         .unwrap();
 
-        if with_address_domain_index {
+        match index_presence {
+            IndexPresence::None => {}
             // Defaults to BTree, which is address-domain under stable row ids.
-            create_scalar_index(&mut dataset, "a", false).await;
+            IndexPresence::RemapCapable => create_scalar_index(&mut dataset, "a", false).await,
+            IndexPresence::AddressDomainOnly => {
+                dataset
+                    .create_index(
+                        &["a"],
+                        IndexType::ZoneMap,
+                        Some("a_idx".into()),
+                        &ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap),
+                        false,
+                    )
+                    .await
+                    .unwrap();
+            }
         }
 
         let options = CompactionOptions {
@@ -5876,9 +5910,9 @@ mod tests {
             .unwrap();
         assert_eq!(
             result.row_addrs.is_some(),
-            with_address_domain_index,
+            expect_capture,
             "eager stable-row-id compaction must capture row addresses exactly when an \
-             address-domain index needs them to remap"
+             eager-remap-capable index needs them to remap"
         );
     }
 
@@ -6926,6 +6960,67 @@ mod tests {
         compact_files(&mut dataset, CompactionOptions::default(), None)
             .await
             .unwrap();
+    }
+
+    /// A table whose only index can never consume an eager remap (ZoneMap
+    /// always reports `RemapResult::Drop`) still has to honor row-address
+    /// moves its tasks recorded under `defer_index_remap` at plan/execution
+    /// time, even when the commit uses different, eager options --
+    /// distributed mode may commit with options other than it planned with
+    /// (see `records_stable_row_id_moves`). Discarding them instead of
+    /// folding them into a fragment reuse index would silently lose track of
+    /// rows no bitmap-follow path ever sees again.
+    #[tokio::test]
+    async fn test_recorded_moves_over_unremappable_index_still_commit_as_fri() {
+        let mut dataset = stable_row_id_dataset("memory://", 3).await;
+        dataset
+            .create_index(
+                &["i"],
+                IndexType::ZoneMap,
+                Some("i_idx".into()),
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let plan = plan_compaction(
+            &dataset,
+            &CompactionOptions {
+                target_rows_per_fragment: 1_000,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let mut results = Vec::new();
+        for task in plan.compaction_tasks() {
+            let result = task.execute(&dataset).await.unwrap();
+            assert!(result.row_addrs.is_some());
+            results.push(result);
+        }
+        assert!(!results.is_empty());
+
+        // Committed with the default (eager) options, unlike the deferred
+        // ones the tasks were planned and executed with.
+        commit_compaction(
+            &mut dataset,
+            results,
+            Arc::new(DatasetIndexRemapperOptions::default()),
+            &CompactionOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            dataset
+                .load_index_by_name(lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME)
+                .await
+                .unwrap()
+                .is_some(),
+            "recorded addresses have no eager consumer and must be committed as an FRI"
+        );
     }
 
     #[tokio::test]
