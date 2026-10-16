@@ -12857,4 +12857,139 @@ mod tests {
             );
         }
     }
+
+    /// Builds low-cardinality rows over keys that stress the dictionary maps:
+    /// empty, a prefix chain, long shared prefixes and multi-byte UTF-8, with a
+    /// null every 17th row.
+    fn tricky_dictionary_rows(num_rows: usize) -> Vec<Option<String>> {
+        let shared = "p".repeat(300);
+        let mut keys: Vec<String> = vec![String::new(), "a".into(), "aa".into(), "aaa".into()];
+        keys.extend(["héllo", "日本語", "🦀"].map(String::from));
+        keys.extend((0..8).map(|i| format!("{shared}{i}")));
+        (0..num_rows)
+            .map(|i| (i % 17 != 0).then(|| keys[(i * 7 + i / 5) % keys.len()].clone()))
+            .collect()
+    }
+
+    fn dictionary_miniblock_metadata() -> HashMap<String, String> {
+        use crate::constants::{DICT_SIZE_RATIO_META_KEY, STRUCTURAL_ENCODING_META_KEY};
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            STRUCTURAL_ENCODING_META_KEY.to_string(),
+            STRUCTURAL_ENCODING_MINIBLOCK.to_string(),
+        );
+        metadata.insert(DICT_SIZE_RATIO_META_KEY.to_string(), "0.99".to_string());
+        metadata
+    }
+
+    /// Strings (32- and 64-bit offsets) and binary values with nulls round-trip
+    /// through the dictionary encoder, and the pages really are dictionary pages.
+    #[tokio::test]
+    async fn test_dictionary_round_trip_variable_width_with_nulls_and_tricky_keys() {
+        use arrow_array::{BinaryArray, LargeStringArray};
+
+        let rows = tricky_dictionary_rows(10_000);
+        let arrays: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(rows.clone())),
+            Arc::new(LargeStringArray::from(rows.clone())),
+            Arc::new(BinaryArray::from_iter(
+                rows.iter().map(|r| r.as_ref().map(|s| s.as_bytes())),
+            )),
+        ];
+        for array in arrays {
+            let test_cases = TestCases::default()
+                .with_encodings([TestEncoding::StructuralU16, TestEncoding::StructuralU32])
+                .with_batch_size(1000)
+                .with_range(0..1000)
+                .with_indices(vec![0, 1, 16, 17, 34, 5_000, 9_999])
+                .with_expected_encoding("dictionary");
+            check_round_trip_encoding_of_data(
+                vec![array],
+                &test_cases,
+                dictionary_miniblock_metadata(),
+            )
+            .await;
+        }
+    }
+
+    /// 64-bit values with nulls, including the extremes, round-trip through the
+    /// fixed-width dictionary encoder.
+    #[tokio::test]
+    async fn test_dictionary_round_trip_u64_with_nulls() {
+        use arrow_array::UInt64Array;
+
+        let keys = [0u64, 1, u64::MAX, 1 << 63, 0xdead_beef];
+        let values: Vec<Option<u64>> = (0..10_000)
+            .map(|i| (i % 13 != 0).then(|| keys[(i * 3 + i / 7) % keys.len()]))
+            .collect();
+        let test_cases = TestCases::default()
+            .with_encoding(TestEncoding::StructuralU32)
+            .with_batch_size(1000)
+            .with_range(0..1000)
+            .with_indices(vec![0, 1, 13, 26, 5_000, 9_999])
+            .with_expected_encoding("dictionary");
+        check_round_trip_encoding_of_data(
+            vec![Arc::new(UInt64Array::from(values)) as ArrayRef],
+            &test_cases,
+            dictionary_miniblock_metadata(),
+        )
+        .await;
+    }
+
+    /// Enough distinct values that a page may exceed the dictionary budget part way
+    /// through building its map; whichever encoding wins, values round-trip.
+    #[tokio::test]
+    async fn test_dictionary_round_trip_high_cardinality_strings() {
+        let values: Vec<Option<String>> = (0..20_000)
+            .map(|i| (i % 29 != 0).then(|| format!("value-{:06}", (i * 7919) % 6_000)))
+            .collect();
+        let test_cases = TestCases::default()
+            .with_encodings([TestEncoding::StructuralU16, TestEncoding::StructuralU32])
+            .with_batch_size(1000)
+            .with_range(0..2000)
+            .with_indices(vec![0, 29, 10_000, 19_999]);
+        check_round_trip_encoding_of_data(
+            vec![Arc::new(StringArray::from(values)) as ArrayRef],
+            &test_cases,
+            dictionary_miniblock_metadata(),
+        )
+        .await;
+    }
+
+    /// Values above the 32 KiB per-value threshold take the per-value zstd path.
+    /// Mixed with nulls, empty and small values, at several levels (and the
+    /// default when no level is set), every page is zstd and every value survives.
+    #[tokio::test]
+    async fn test_per_value_zstd_round_trip_large_values_with_nulls() {
+        use crate::constants::{COMPRESSION_LEVEL_META_KEY, COMPRESSION_META_KEY};
+
+        let values: Vec<Option<String>> = (0..120)
+            .map(|i| match i % 6 {
+                0 => None,
+                1 => Some(String::new()),
+                2 => Some(format!("small-{i}")),
+                _ => Some(format!("{i:05}-").repeat(8_000 + i * 97)),
+            })
+            .collect();
+        for level in [None, Some("1"), Some("3"), Some("19")] {
+            let mut metadata = HashMap::new();
+            metadata.insert(COMPRESSION_META_KEY.to_string(), "zstd".to_string());
+            if let Some(level) = level {
+                metadata.insert(COMPRESSION_LEVEL_META_KEY.to_string(), level.to_string());
+            }
+            let test_cases = TestCases::default()
+                .with_encodings([TestEncoding::StructuralU16, TestEncoding::StructuralU32])
+                .with_page_sizes(vec![64 * 1024 * 1024])
+                .with_batch_size(10)
+                .with_range(0..30)
+                .with_indices(vec![0, 1, 2, 3, 59, 119])
+                .with_expected_encoding("zstd");
+            check_round_trip_encoding_of_data(
+                vec![Arc::new(StringArray::from(values.clone())) as ArrayRef],
+                &test_cases,
+                metadata,
+            )
+            .await;
+        }
+    }
 }

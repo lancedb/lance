@@ -6,6 +6,8 @@
 use std::fmt::Debug;
 use std::time::Duration;
 
+use lance_core::Error;
+
 /// Sink for individual write-path events, supplied by the consumer via
 /// [`ShardWriterConfig::observer`](super::write::ShardWriterConfig::observer).
 ///
@@ -27,4 +29,8 @@ pub trait WalObserver: Send + Sync + Debug {
     /// A frozen memtable became an L0 SSTable. Orders of magnitude longer
     /// than a WAL flush.
     fn on_memtable_flush(&self, _duration: Duration, _rows: usize) {}
+
+    /// A MemTable flush attempt failed. Called once per attempt, so a
+    /// generation that keeps failing is reported on every retry.
+    fn on_memtable_flush_failure(&self, _generation: u64, _error: &Error) {}
 }

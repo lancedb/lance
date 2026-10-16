@@ -1357,7 +1357,7 @@ fn write_stats_to_java<'a>(
 ) -> Result<JObject<'a>> {
     Ok(env.new_object(
         "org/lance/memwal/WriteStats",
-        "(JJJJJJJJ)V",
+        "(JJJJJJJJJ)V",
         &[
             JValueGen::Long(stats.put_count as i64),
             JValueGen::Long(stats.put_time.as_millis() as i64),
@@ -1367,6 +1367,7 @@ fn write_stats_to_java<'a>(
             JValueGen::Long(stats.memtable_flush_count as i64),
             JValueGen::Long(stats.memtable_flush_rows as i64),
             JValueGen::Long(stats.memtable_flush_time.as_millis() as i64),
+            JValueGen::Long(stats.memtable_flush_failures as i64),
         ],
     )?)
 }
