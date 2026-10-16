@@ -688,8 +688,8 @@ fn only_b(dt: &DataType) -> Option<DataType> {
     }
 }
 
-/// `n` deterministic values of `dt`, lists of one or two items, with every
-/// field named `b` all-null when `null_b`.
+/// `n` deterministic values of `dt`, with every field named `b` all-null when
+/// `null_b`. Nested values mix null structs, null lists and empty lists.
 fn fill(dt: &DataType, n: usize, seed: usize, null_b: bool) -> ArrayRef {
     match dt {
         DataType::Int32 => Arc::new(Int32Array::from_iter_values(
@@ -710,16 +710,19 @@ fn fill(dt: &DataType, n: usize, seed: usize, null_b: bool) -> ArrayRef {
                     }
                 })
                 .collect(),
-            None,
+            Some((0..n).map(|i| (seed + i) % 4 != 2).collect()),
         )),
         DataType::List(item) => {
-            let offsets = arrow_buffer::OffsetBuffer::from_lengths((0..n).map(|i| i % 2 + 1));
+            let valid = (0..n).map(|i| (seed + i) % 5 != 4).collect::<Vec<_>>();
+            let offsets = arrow_buffer::OffsetBuffer::from_lengths(
+                (0..n).map(|i| if valid[i] { (seed + i) % 3 } else { 0 }),
+            );
             let len = *offsets.last().unwrap() as usize;
             Arc::new(ListArray::new(
                 item.clone(),
                 offsets,
                 fill(item.data_type(), len, seed * 7, null_b),
-                None,
+                Some(valid.into()),
             ))
         }
         dt => unimplemented!("{dt}"),
@@ -824,6 +827,11 @@ async fn assert_reads(dataset: &Dataset, expected: &RecordBatch, new_leaf: &str,
     li(st(vec![("t", DataType::Int32), ("in", st(vec![("in2", st(vec![("a", DataType::Int32), ("b", DataType::Utf8)]))]))])),
     "c.item.in.in2.b",
     "c.item.in.in2.a"
+)]
+#[case::list_struct_string_leaves(
+    li(st(vec![("a", DataType::Utf8), ("in", st(vec![("s", DataType::Utf8), ("b", DataType::Utf8)]))])),
+    "c.item.in.b",
+    "c.item.in.s"
 )]
 #[case::list_list_struct(
     li(li(st(vec![("a", DataType::Int32), ("b", DataType::Utf8)]))),
