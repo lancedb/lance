@@ -335,12 +335,44 @@ impl IoQueueState {
 //
 // However, it only needs to be SPSC since there is only one "scheduler thread"
 // and one I/O loop.
+/// Whether `tokio::time::timeout`/`sleep` can be used on whatever runtime is
+/// driving the current task. `Sleep::new_timeout` panics immediately on
+/// construction ("Panic if the time driver is not enabled (backwards
+/// compat)", per tokio's own implementation) on a runtime built without
+/// `enable_time()`/`enable_all()` - e.g. the in-tree `vector_throughput`
+/// benchmark. Detect that once, up front, with a throwaway probe rather
+/// than let a real `timeout` call panic the I/O loop's background task and
+/// silently stop it from draining the queue.
+///
+/// `catch_unwind` alone doesn't stop the default panic hook from printing
+/// to stderr, so the hook is swapped out for the duration of the probe -
+/// otherwise a timerless runtime would get one spurious-looking backtrace
+/// per `ScanScheduler` it creates.
+fn runtime_has_time_driver() -> bool {
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let probe = std::panic::catch_unwind(|| {
+        // Deliberately never awaited: the panic this probes for happens at
+        // construction (inside `Sleep::new_timeout`), not at first poll.
+        #[allow(clippy::let_underscore_future)]
+        let _ = tokio::time::sleep(Duration::from_secs(0));
+    });
+    std::panic::set_hook(previous_hook);
+    probe.is_ok()
+}
+
 struct IoQueue {
     // Queue state
     state: Mutex<IoQueueState>,
     // Used to signal new I/O requests have arrived that might potentially be runnable
     notify: Notify,
     stats: IoStats,
+    // Whether the runtime driving this queue has a time driver enabled -
+    // see `runtime_has_time_driver`. When false, `pop` falls back to an
+    // untimed wait: the stuck-queue watchdog simply never fires, but the
+    // queue itself keeps draining exactly as it did before the watchdog
+    // existed.
+    has_time_driver: bool,
 }
 
 impl IoQueue {
@@ -349,6 +381,7 @@ impl IoQueue {
             state: Mutex::new(IoQueueState::new(io_capacity, io_buffer_size)),
             notify: Notify::new(),
             stats,
+            has_time_driver: runtime_has_time_driver(),
         }
     }
 
@@ -386,12 +419,19 @@ impl IoQueue {
             }
 
             // Timeout occasionally to check if we need to emit a warning of potential
-            // deadlock
-            if tokio::time::timeout(WATCHDOG_CHECK_INTERVAL, self.notify.notified())
-                .await
-                .is_err()
-            {
-                self.state.lock().unwrap().check_watchdog();
+            // deadlock. Only possible on a runtime with a time driver enabled -
+            // see `runtime_has_time_driver` - otherwise fall back to the
+            // untimed wait this loop used before the watchdog existed, with
+            // the watchdog simply never firing.
+            if self.has_time_driver {
+                if tokio::time::timeout(WATCHDOG_CHECK_INTERVAL, self.notify.notified())
+                    .await
+                    .is_err()
+                {
+                    self.state.lock().unwrap().check_watchdog();
+                }
+            } else {
+                self.notify.notified().await;
             }
         }
     }
@@ -1779,6 +1819,74 @@ mod tests {
             let expected = &some_data[offset as usize..(offset + READ_SIZE) as usize];
             assert_eq!(expected, actual);
             offset += READ_SIZE;
+        }
+    }
+
+    #[test]
+    fn test_scheduler_works_without_time_driver() {
+        // Regression test for a runtime built without `enable_time()` (e.g.
+        // the in-tree `vector_throughput` benchmark's
+        // `Builder::new_multi_thread().build()`, with no `enable_time`/
+        // `enable_all`) - see `runtime_has_time_driver`. Runs on a
+        // background thread with a hard join timeout: a regression here
+        // (the watchdog's `tokio::time::timeout` panicking the I/O loop's
+        // background task) would otherwise hang this test forever instead
+        // of failing it.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let rt = tokio::runtime::Builder::new_multi_thread().build().unwrap();
+                rt.block_on(async {
+                    let tmp_file = TempObjFile::default();
+                    let obj_store = Arc::new(ObjectStore::local());
+
+                    const DATA_SIZE: u64 = 64 * 1024;
+                    let mut some_data = vec![0; DATA_SIZE as usize];
+                    rand::rng().fill_bytes(&mut some_data);
+                    obj_store.put(&tmp_file, &some_data).await.unwrap();
+
+                    let config = SchedulerConfig::default_for_testing();
+                    let scheduler = ScanScheduler::new(obj_store, config);
+                    let file_scheduler = scheduler
+                        .open_file(&tmp_file, &CachedFileSize::unknown())
+                        .await
+                        .unwrap();
+
+                    const READ_SIZE: u64 = 4 * 1024;
+                    let mut reqs = VecDeque::new();
+                    let mut offset = 0;
+                    while offset < DATA_SIZE {
+                        reqs.push_back(
+                            #[allow(clippy::single_range_in_vec_init)]
+                            file_scheduler
+                                .submit_request(vec![offset..offset + READ_SIZE], 0)
+                                .await
+                                .unwrap(),
+                        );
+                        offset += READ_SIZE;
+                    }
+
+                    offset = 0;
+                    while offset < DATA_SIZE {
+                        let data = reqs.pop_front().unwrap();
+                        let actual = &data[0];
+                        let expected = &some_data[offset as usize..(offset + READ_SIZE) as usize];
+                        assert_eq!(expected, actual);
+                        offset += READ_SIZE;
+                    }
+                });
+            }));
+            let _ = tx.send(result);
+        });
+
+        match rx.recv_timeout(Duration::from_secs(30)) {
+            Ok(Ok(())) => {}
+            Ok(Err(panic)) => std::panic::resume_unwind(panic),
+            Err(_) => panic!(
+                "scheduler read on a runtime without a time driver did not complete within \
+                 30s - this looks like the stuck-queue watchdog's timeout panicking the I/O \
+                 loop's background task on a runtime without enable_time()"
+            ),
         }
     }
 
