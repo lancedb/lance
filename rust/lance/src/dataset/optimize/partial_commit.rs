@@ -55,7 +55,13 @@ pub async fn commit_compaction_with_partial_progress(
             "partial compaction requires defer_index_remap",
         ));
     }
-    commit_compaction_impl(dataset, completed_tasks, remap_options, options, true).await
+    commit_compaction_impl(dataset, completed_tasks, remap_options, options, true)
+        .await
+        .inspect_err(|error| {
+            log::warn!(
+                "Partial compaction commit failed; leaving rewritten files in place for GC: {error}"
+            )
+        })
 }
 
 pub(super) async fn surviving_groups(
@@ -110,14 +116,14 @@ mod tests {
     use super::*;
     use crate::dataset::index::DatasetIndexRemapperOptions;
     use crate::dataset::{WriteParams, optimize::plan_compaction, transaction::RewriteGroup};
-    use crate::index::DatasetIndexExt;
+    use crate::index::{DatasetIndexExt, load_all_indices};
     use arrow_array::{Int64Array, RecordBatch, RecordBatchIterator};
     use arrow_schema::{DataType, Field, Schema};
     use lance_core::utils::tempfile::TempStrDir;
     use lance_index::IndexType;
     use lance_index::scalar::ScalarIndexParams;
 
-    async fn fixture() -> (TempStrDir, Dataset, Vec<RewriteResult>, CompactionOptions) {
+    async fn fixture(tagged: bool) -> (TempStrDir, Dataset, Vec<RewriteResult>, CompactionOptions) {
         let dir = TempStrDir::default();
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
         let batch = RecordBatch::try_new(
@@ -145,6 +151,13 @@ mod tests {
             )
             .await
             .unwrap();
+        if tagged {
+            let indices = load_all_indices(&dataset).await.unwrap().as_ref().clone();
+            let manifest = Arc::make_mut(&mut dataset.manifest);
+            manifest.reader_feature_flags |= lance_table::feature_flags::FLAG_FRAGMENT_REUSE_INDEX;
+            manifest.writer_feature_flags |= lance_table::feature_flags::FLAG_FRAGMENT_REUSE_INDEX;
+            crate::index::frag_reuse_reader::tests::persist_fixture(&mut dataset, indices).await;
+        }
         let options = CompactionOptions {
             target_rows_per_fragment: 20,
             defer_index_remap: true,
@@ -159,9 +172,12 @@ mod tests {
         (dir, dataset, results, options)
     }
 
+    #[rstest::rstest]
+    #[case(false)]
+    #[case(true)]
     #[tokio::test]
-    async fn partial_commit_preserves_concurrent_deletions_and_index_queries() {
-        let (_dir, mut dataset, results, options) = fixture().await;
+    async fn partial_commit_preserves_concurrent_deletions_and_index_queries(#[case] tagged: bool) {
+        let (_dir, mut dataset, results, options) = fixture(tagged).await;
         dataset.delete("a = 0").await.unwrap();
         let result = commit_compaction_with_partial_progress(
             &mut dataset,
@@ -201,7 +217,7 @@ mod tests {
 
     #[tokio::test]
     async fn exhausting_all_groups_fails_without_resurrecting_rows() {
-        let (_dir, mut dataset, results, options) = fixture().await;
+        let (_dir, mut dataset, results, options) = fixture(false).await;
         dataset.delete("a = 0 OR a = 20").await.unwrap();
         let error = commit_compaction_with_partial_progress(
             &mut dataset,
@@ -221,7 +237,7 @@ mod tests {
 
     #[tokio::test]
     async fn successive_updates_remove_only_newly_conflicting_groups() {
-        let (_dir, mut dataset, results, _options) = fixture().await;
+        let (_dir, mut dataset, results, _options) = fixture(false).await;
         let transaction = Transaction::new(
             results[0].read_version,
             Operation::Rewrite {
@@ -246,6 +262,59 @@ mod tests {
         assert_eq!(
             surviving_groups(&mut dataset, &transaction).await.unwrap(),
             vec![false, false]
+        );
+    }
+
+    #[tokio::test]
+    async fn committed_rows_exclude_deletions_present_in_the_plan() {
+        let (_dir, mut dataset, _, options) = fixture(false).await;
+        dataset.delete("a = 0").await.unwrap();
+        let plan = plan_compaction(&dataset, &options).await.unwrap();
+        let mut results = Vec::new();
+        for task in plan.compaction_tasks() {
+            results.push(task.execute(&dataset).await.unwrap());
+        }
+        dataset.delete("a = 20").await.unwrap();
+        let result = commit_compaction_with_partial_progress(
+            &mut dataset,
+            results,
+            Arc::new(DatasetIndexRemapperOptions::default()),
+            &options,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.committed_rows, 19);
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 38);
+    }
+
+    #[tokio::test]
+    async fn concurrent_tagged_rewrite_retains_disjoint_groups() {
+        let (_dir, mut dataset, results, options) = fixture(true).await;
+        super::super::commit_compaction(
+            &mut dataset,
+            vec![results[0].clone()],
+            Arc::new(DatasetIndexRemapperOptions::default()),
+            &options,
+        )
+        .await
+        .unwrap();
+        let result = commit_compaction_with_partial_progress(
+            &mut dataset,
+            results,
+            Arc::new(DatasetIndexRemapperOptions::default()),
+            &options,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.committed_groups, 1);
+        assert_eq!(result.committed_rows, 20);
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 40);
+        assert_eq!(
+            dataset
+                .count_rows(Some("a >= 20".to_string()))
+                .await
+                .unwrap(),
+            20
         );
     }
 

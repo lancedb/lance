@@ -1633,7 +1633,10 @@ impl<'a> TransactionRebase<'a> {
                         Ok(())
                     }
                 }
-                Operation::Rewrite { groups, .. } => {
+                Operation::Rewrite {
+                    groups: other_groups,
+                    ..
+                } => {
                     // Double consumption: the committed rewrite replaced
                     // fragments our tagged transitions read from or produce,
                     // so appending our transitions would record row movement
@@ -1675,7 +1678,7 @@ impl<'a> TransactionRebase<'a> {
                                     .map(|digest| digest.id)
                             })
                             .collect();
-                        if groups
+                        if other_groups
                             .iter()
                             .flat_map(|group| group.old_fragments.iter().map(|frag| frag.id))
                             .any(|id| touched.contains(&id))
@@ -1697,7 +1700,7 @@ impl<'a> TransactionRebase<'a> {
                             ));
                         }
                     }
-                    if groups
+                    if other_groups
                         .iter()
                         .flat_map(|f| f.old_fragments.iter().map(|f| f.id))
                         .any(|id| modified_fragment_ids.contains(&id))

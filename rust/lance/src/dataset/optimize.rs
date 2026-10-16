@@ -3277,6 +3277,9 @@ async fn records_stable_row_id_moves(
 /// some of the tasks have been committed, the remainder of the tasks will not
 /// be able to be committed and should be considered cancelled.
 ///
+/// Failed commits leave rewritten files for garbage collection: a lost response
+/// can hide a successful commit that already references those files.
+///
 /// With stable row IDs, tasks that recorded their row-address moves (see
 /// [`CompactionOptions::defer_index_remap`]) commit them even if `options` does not
 /// set `defer_index_remap`; either all tasks or none must have recorded them.
@@ -3288,7 +3291,12 @@ pub async fn commit_compaction(
 ) -> Result<CompactionMetrics> {
     Ok(
         commit_compaction_impl(dataset, completed_tasks, remap_options, options, false)
-            .await?
+            .await
+            .inspect_err(|error| {
+                log::warn!(
+                    "Compaction commit failed; leaving rewritten files in place for GC: {error}"
+                )
+            })?
             .metrics,
     )
 }
@@ -3650,6 +3658,11 @@ async fn commit_compaction_impl(
         // gate still rejects a v0 entry spliced by a writer without that
         // conversion.
         let frag_reuse_index = if records_row_addrs && (uses_stable_row_ids || any_group_indexed) {
+            let attempt_groups = if allow_partial {
+                frag_reuse_groups.clone()
+            } else {
+                std::mem::take(&mut frag_reuse_groups)
+            };
             // Once a table is v1, it stays v1: the sticky
             // FLAG_FRAGMENT_REUSE_INDEX is the final authority
             // (`uses_tagged_fri`), never the entry's own index_version. With NO
@@ -3688,8 +3701,8 @@ async fn commit_compaction_impl(
                     )));
                 }
                 use lance_table::format::pb::fragment_reuse_index_details as pb_fri;
-                let transitions = frag_reuse_groups
-                    .iter()
+                let transitions = attempt_groups
+                    .into_iter()
                     .map(|group| pb_fri::Transition {
                         sources: group
                             .old_frags
@@ -3703,7 +3716,7 @@ async fn commit_compaction_impl(
                             .collect(),
                         mapping: Some(pb_fri::transition::Mapping::OrderedCompaction(
                             pb_fri::OrderedCompaction {
-                                changed_row_addrs: group.changed_row_addrs.clone(),
+                                changed_row_addrs: group.changed_row_addrs,
                             },
                         )),
                     })
@@ -3733,7 +3746,7 @@ async fn commit_compaction_impl(
                 Some(
                     build_new_frag_reuse_index(
                         dataset,
-                        frag_reuse_groups.clone(),
+                        attempt_groups,
                         new_fragment_bitmap.clone(),
                         dataset_version,
                     )
@@ -3778,6 +3791,7 @@ async fn commit_compaction_impl(
                 .checked_add(*rows)
                 .ok_or_else(|| Error::invalid_input("compaction row count overflow"))?;
         }
+        let attempted_version = dataset.version().version;
         match dataset
             .apply_commit(
                 transaction.clone(),
@@ -3793,6 +3807,8 @@ async fn commit_compaction_impl(
                         error,
                         Error::RetryableCommitConflict { .. }
                             | Error::IncompatibleTransaction { .. }
+                            | Error::CommitConflict { .. }
+                            | Error::TooMuchWriteContention { .. }
                     )
                 {
                     return Err(error);
@@ -3801,7 +3817,7 @@ async fn commit_compaction_impl(
                 if !keep.iter().any(|keep| *keep) {
                     return Err(error);
                 }
-                if keep.iter().all(|keep| *keep) {
+                if keep.iter().all(|keep| *keep) && dataset.version().version <= attempted_version {
                     return Err(error);
                 }
                 partial_commit::retain_groups(&mut rewrite_groups, &keep);
@@ -8164,9 +8180,40 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn partial_compaction_retries_contention_with_all_groups_valid() {
+        let dir = TempStrDir::default();
+        let handler = Arc::new(RaceBeforeRewrite::default());
+        let mut dataset = racing_dataset(dir.as_str(), handler.clone()).await;
+        let options = CompactionOptions {
+            target_rows_per_fragment: 200,
+            defer_index_remap: true,
+            ..Default::default()
+        };
+        let plan = plan_compaction(&dataset, &options).await.unwrap();
+        let mut results = Vec::new();
+        for task in plan.compaction_tasks() {
+            results.push(task.execute(&dataset).await.unwrap());
+        }
+        let groups = results.len();
+        handler.arm(&dataset, vec![Race::AppendThenExhaust]);
+        let result = commit_compaction_with_partial_progress(
+            &mut dataset,
+            results,
+            Arc::new(DatasetIndexRemapperOptions::default()),
+            &options,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.committed_groups, groups);
+        assert_eq!(result.committed_rows, 450);
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 452);
+    }
+
     #[derive(Clone, Copy, Debug)]
     enum Race {
         Append,
+        AppendThenExhaust,
         BuildIndex,
         DeleteRows(&'static str),
         /// From another session, so the rebase reads its rewrite from the transaction file.
@@ -8214,8 +8261,10 @@ mod tests {
                 let mut handle = self.handle.lock().unwrap().clone().unwrap();
                 handle.checkout_latest().await.unwrap();
                 match race {
-                    Race::DeleteRows(predicate) => handle.delete(predicate).await.unwrap(),
-                    Race::Append => {
+                    Race::DeleteRows(predicate) => {
+                        handle.delete(predicate).await.unwrap();
+                    }
+                    Race::Append | Race::AppendThenExhaust => {
                         let batch = arrow_array::record_batch!(("i", Int32, [9000, 9001])).unwrap();
                         handle
                             .append(
@@ -8224,6 +8273,11 @@ mod tests {
                             )
                             .await
                             .unwrap();
+                        if matches!(race, Race::AppendThenExhaust) {
+                            return Err(CommitError::OtherError(Error::too_much_write_contention(
+                                "injected verified contention exhaustion".to_string(),
+                            )));
+                        }
                     }
                     Race::BuildIndex => {
                         let index = handle
