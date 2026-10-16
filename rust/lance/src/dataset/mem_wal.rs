@@ -50,7 +50,7 @@ pub mod write;
 use std::sync::Arc;
 
 use lance_core::Result;
-use lance_core::datatypes::{BlobV2Layout, Field, LANCE_FIELD_ID_KEY, Schema};
+use lance_core::datatypes::{Field, LANCE_FIELD_ID_KEY, Schema};
 
 use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
@@ -58,6 +58,7 @@ use object_store::path::Path;
 use uuid::Uuid;
 
 use self::util::{generate_random_hash, shard_base_path};
+use crate::blob::blob_v2_layout;
 use crate::dataset::fragment::write::generate_random_filename;
 
 /// Column name for the mem_wal tombstone (delete sentinel) marker.
@@ -320,20 +321,16 @@ pub fn reconcile_batches(
 
 /// `target` with each blob v2 column typed as the source holds it.
 fn with_source_blob_layouts(source: &ArrowSchema, target: &Arc<ArrowSchema>) -> Arc<ArrowSchema> {
-    let blob_layout = |field: &ArrowField| match field.data_type() {
-        DataType::Struct(children) => BlobV2Layout::classify(children),
-        _ => None,
-    };
     let fields: Vec<ArrowField> = target
         .fields()
         .iter()
         .map(|field| {
-            let held = blob_layout(field).and_then(|_| {
+            let held = blob_v2_layout(field).and_then(|_| {
                 let id = reconcile::field_id_of(field)?;
                 source
                     .fields()
                     .iter()
-                    .find(|f| reconcile::field_id_of(f) == Some(id) && blob_layout(f).is_some())
+                    .find(|f| reconcile::field_id_of(f) == Some(id) && blob_v2_layout(f).is_some())
             });
             match held {
                 Some(held) => field
@@ -503,22 +500,25 @@ mod tests {
     /// logical layout and drop the reference the prepared one carries.
     #[test]
     fn a_blob_column_keeps_the_layout_the_generation_holds() {
+        use lance_arrow::{ARROW_EXT_NAME_KEY, BLOB_V2_EXT_NAME};
         use lance_core::datatypes::{
             BLOB_V2_LOGICAL_MINIMAL_FIELDS, BLOB_V2_PREPARED_FIELDS, BLOB_V2_PREPARED_TYPE,
             BlobKind,
         };
 
+        let blob = |data_type: DataType| {
+            let field = stamped("blob", data_type, 1);
+            let mut metadata = field.metadata().clone();
+            metadata.insert(ARROW_EXT_NAME_KEY.to_string(), BLOB_V2_EXT_NAME.to_string());
+            field.with_metadata(metadata)
+        };
         let source = ArrowSchema::new(vec![
             stamped("id", DataType::Int64, 0),
-            stamped("blob", BLOB_V2_PREPARED_TYPE.clone(), 1),
+            blob(BLOB_V2_PREPARED_TYPE.clone()),
         ]);
         let target = Arc::new(ArrowSchema::new(vec![
             stamped("id", DataType::Int64, 0),
-            stamped(
-                "blob",
-                DataType::Struct(BLOB_V2_LOGICAL_MINIMAL_FIELDS.clone()),
-                1,
-            ),
+            blob(DataType::Struct(BLOB_V2_LOGICAL_MINIMAL_FIELDS.clone())),
         ]));
         let blob = arrow_array::StructArray::new(
             BLOB_V2_PREPARED_FIELDS.clone(),
@@ -561,6 +561,54 @@ mod tests {
             .downcast_ref::<arrow_array::UInt8Array>()
             .expect("uint8");
         assert_eq!(kind.value(0), BlobKind::Managed as u8);
+    }
+
+    /// A plain struct shaped like a blob is not one: its children still resolve
+    /// by id, so a child dropped and re-added under a new id comes back null.
+    #[test]
+    fn a_struct_shaped_like_a_blob_still_resolves_its_children() {
+        let asset = |uri_id| {
+            DataType::Struct(Fields::from(vec![
+                stamped("data", DataType::LargeBinary, 2),
+                stamped("uri", DataType::Utf8, uri_id),
+            ]))
+        };
+        let source = ArrowSchema::new(vec![
+            stamped("id", DataType::Int64, 0),
+            stamped("asset", asset(3), 1),
+        ]);
+        let target = Arc::new(ArrowSchema::new(vec![
+            stamped("id", DataType::Int64, 0),
+            stamped("asset", asset(4), 1),
+        ]));
+        let DataType::Struct(children) = source.field(1).data_type().clone() else {
+            unreachable!("asset is a struct");
+        };
+        let batch = RecordBatch::try_new(
+            Arc::new(source.clone()),
+            vec![
+                Arc::new(arrow_array::Int64Array::from(vec![1])),
+                Arc::new(arrow_array::StructArray::new(
+                    children,
+                    vec![
+                        Arc::new(arrow_array::LargeBinaryArray::from(vec![None::<&[u8]>]))
+                            as arrow_array::ArrayRef,
+                        Arc::new(arrow_array::StringArray::from(vec!["retired"])),
+                    ],
+                    None,
+                )),
+            ],
+        )
+        .expect("a batch under the source schema");
+
+        let out = reconcile_batches(&source, &target, &["id".to_string()], vec![batch])
+            .expect("reconcile");
+        let asset = out[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow_array::StructArray>()
+            .expect("asset is a struct");
+        assert!(asset.column_by_name("uri").expect("uri").is_null(0));
     }
 
     #[test]
