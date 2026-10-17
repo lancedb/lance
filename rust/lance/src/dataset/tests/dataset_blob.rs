@@ -398,6 +398,26 @@ async fn managed_compaction_preserves_sidecars_after_source_gc(
     assert!(values[3].as_ref().unwrap().read().await.unwrap().is_empty());
 }
 
+/// Assert the latest commit came from merge_insert's row-rewrite path. Blob
+/// input in a layout other than the table's must not reach the column updater,
+/// which cannot write it; which path a merge takes depends on how many rows of
+/// each fragment it updates, so a passing result alone does not show it.
+async fn assert_rewrote_rows(dataset: &Dataset) {
+    use crate::dataset::transaction::UpdateMode;
+    let transaction = dataset.read_transaction().await.unwrap().unwrap();
+    assert!(
+        matches!(
+            transaction.operation,
+            Operation::Update {
+                update_mode: Some(UpdateMode::RewriteRows),
+                ..
+            }
+        ),
+        "{:?}",
+        transaction.operation
+    );
+}
+
 /// merge_insert takes writer-prepared input as append does, so a Managed
 /// reference to an object already under the table is adopted, for an
 /// updated row and an inserted one, without its bytes passing through the
@@ -498,6 +518,7 @@ async fn merge_insert_adopts_prepared_managed_references(
         .await
         .unwrap();
     assert_eq!((stats.num_updated_rows, stats.num_inserted_rows), (1, 1));
+    assert_rewrote_rows(&dataset).await;
 
     let mut scan = dataset.scan();
     scan.blob_handling(BlobHandling::AllBinary);
@@ -608,6 +629,7 @@ async fn merge_insert_keeps_a_logical_blob_range() {
         .execute_reader(RecordBatchIterator::new(vec![Ok(source)], source_schema))
         .await
         .unwrap();
+    assert_rewrote_rows(&dataset).await;
 
     let mut scan = dataset.scan();
     scan.blob_handling(BlobHandling::AllBinary);
