@@ -15,11 +15,14 @@ use lance_table::io::commit::ManifestNamingScheme;
 use crate::dataset::write::{CommitBuilder, WriteMode, WriteParams};
 use arrow_array::RecordBatch;
 use arrow_array::RecordBatchReader;
+use arrow_array::cast::AsArray;
+use arrow_array::types::UInt64Type;
 use arrow_array::{RecordBatchIterator, UInt32Array, types::Int32Type};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use lance_core::utils::tempfile::{TempDir, TempStdDir, TempStrDir};
 use lance_datagen::{BatchCount, RowCount, array, gen_batch};
 use lance_file::version::LanceFileVersion;
+use lance_table::feature_flags::FLAG_STABLE_ROW_IDS;
 use mock_instant::thread_local::MockClock;
 use tokio::sync::Barrier;
 
@@ -300,6 +303,187 @@ async fn test_stale_checks_cover_fast_successor_and_latest_version(
     );
     assert!(historical.is_stale().await.unwrap());
     assert!(historical.has_successor_version().await.unwrap());
+}
+
+/// All row ids visible in `dataset`, in scan order.
+async fn scan_row_ids(dataset: &Dataset) -> Vec<u64> {
+    let batch = dataset
+        .scan()
+        .with_row_id()
+        .project(&["i"])
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    batch["_rowid"]
+        .as_primitive::<UInt64Type>()
+        .values()
+        .to_vec()
+}
+
+fn u32_batch(values: std::ops::Range<u32>) -> RecordBatch {
+    arrow_array::record_batch!(("i", UInt32, values.collect::<Vec<u32>>())).unwrap()
+}
+
+/// Restoring past activation would turn stable row ids off, putting row
+/// addresses back into a namespace this table has already issued ids from.
+#[tokio::test]
+async fn test_restore_rejects_crossing_stable_id_activation() {
+    let test_uri = TempStrDir::default();
+    let batch = u32_batch(0..10);
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+        test_uri.as_str(),
+        None,
+    )
+    .await
+    .unwrap();
+    dataset.migrate_to_stable_row_ids().await.unwrap();
+
+    let mut restored = dataset.checkout_version(1).await.unwrap();
+    let err = restored.restore().await.unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("stable row ids were enabled after"),
+        "{err}"
+    );
+}
+
+/// A restore must not rewind the row-id high-water mark, or the next append reuses old ids.
+#[tokio::test]
+async fn test_restore_preserves_row_id_high_water_mark() {
+    let test_uri = TempStrDir::default();
+    let write = |values: std::ops::Range<u32>, mode| {
+        let uri = test_uri.as_str().to_string();
+        async move {
+            let batch = u32_batch(values);
+            Dataset::write(
+                RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+                &uri,
+                Some(WriteParams {
+                    mode,
+                    enable_stable_row_ids: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap()
+        }
+    };
+
+    write(0..10, WriteMode::Create).await;
+    let appended = write(10..20, WriteMode::Append).await;
+    let mark = appended.manifest.next_row_id;
+
+    let mut restored = appended.checkout_version(1).await.unwrap();
+    restored.restore().await.unwrap();
+    assert!(
+        restored.manifest.next_row_id >= mark,
+        "restore rewound the row id high-water mark: {} < {mark}",
+        restored.manifest.next_row_id
+    );
+
+    // The rows appended after the restore must not reuse the dropped rows' ids.
+    let reused = write(20..30, WriteMode::Append).await;
+    let ids = scan_row_ids(&reused).await;
+    assert_eq!(
+        ids.iter().filter(|id| **id >= mark).count(),
+        10,
+        "appended rows did not all take fresh ids past {mark}: {ids:?}"
+    );
+}
+
+#[derive(Debug, Clone, Copy)]
+enum EmptyTableCopy {
+    ShallowClone,
+    Branch,
+    DeepClone,
+}
+
+/// Once every row is deleted no fragment is left to show that the table uses
+/// stable row ids, so only the flag records it. A copy that lost the flag would
+/// hand out row addresses from the namespace the source has already issued ids
+/// from.
+#[rstest]
+#[case::shallow_clone(EmptyTableCopy::ShallowClone)]
+#[case::branch(EmptyTableCopy::Branch)]
+#[case::deep_clone(EmptyTableCopy::DeepClone)]
+#[tokio::test]
+async fn test_copy_of_emptied_table_keeps_stable_row_ids(#[case] copy: EmptyTableCopy) {
+    let test_dir = TempStrDir::default();
+    let source_uri = format!("{}/source", test_dir.as_str());
+    let copy_uri = format!("{}/copy", test_dir.as_str());
+    let batch = u32_batch(0..20);
+    let mut source = Dataset::write(
+        RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+        &source_uri,
+        Some(WriteParams {
+            max_rows_per_file: 10,
+            enable_stable_row_ids: true,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    source.delete("i >= 0").await.unwrap();
+    assert!(source.manifest.fragments.is_empty());
+    assert!(source.manifest.uses_stable_row_ids());
+    let next_row_id = source.manifest.next_row_id;
+    assert_eq!(next_row_id, 20);
+
+    let version = source.version().version;
+    match copy {
+        EmptyTableCopy::ShallowClone => {
+            source
+                .shallow_clone(&copy_uri, version, None)
+                .await
+                .unwrap();
+        }
+        EmptyTableCopy::Branch => {
+            source.create_branch("copy", version, None).await.unwrap();
+        }
+        EmptyTableCopy::DeepClone => {
+            source.deep_clone(&copy_uri, version, None).await.unwrap();
+        }
+    }
+    let open_copy = async || match copy {
+        EmptyTableCopy::Branch => Dataset::open(&source_uri)
+            .await
+            .unwrap()
+            .checkout_branch("copy")
+            .await
+            .unwrap(),
+        EmptyTableCopy::ShallowClone | EmptyTableCopy::DeepClone => {
+            Dataset::open(&copy_uri).await.unwrap()
+        }
+    };
+    let mut copied = open_copy().await;
+    assert!(copied.manifest.fragments.is_empty());
+    assert!(
+        copied.manifest.uses_stable_row_ids(),
+        "the copy lost stable row ids: reader flags {}",
+        copied.manifest.reader_feature_flags
+    );
+    assert_ne!(
+        copied.manifest.writer_feature_flags & FLAG_STABLE_ROW_IDS,
+        0,
+        "the copy lost stable row ids: writer flags {}",
+        copied.manifest.writer_feature_flags
+    );
+    assert_eq!(copied.manifest.next_row_id, next_row_id);
+
+    let batch = u32_batch(20..25);
+    copied
+        .append(
+            RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        scan_row_ids(&open_copy().await).await,
+        (next_row_id..next_row_id + 5).collect::<Vec<_>>()
+    );
 }
 
 #[rstest]
@@ -838,14 +1022,14 @@ async fn test_commit_on_dataset_with_mixed_file_versions() {
     // A v0.16 dataset that has both v1 and v2 files also has two fragments with
     // id 1, because the id allocation of that era could hand out an id a caller
     // had already supplied. The mixture is the more actionable diagnosis, so the
-    // duplicate check must not preempt it.
+    // duplicate check must not preempt it during commit.
     let test_dir = copy_test_data_to_tmp("v0.16.0/wrong_data_version_no_fix.lance").unwrap();
     let mut dataset = Dataset::open(&test_dir.path_str()).await.unwrap();
     let ids = dataset
         .manifest
         .fragments
         .iter()
-        .map(|f| f.id)
+        .map(|fragment| fragment.id)
         .collect::<Vec<_>>();
     assert_eq!(ids, vec![0, 1, 1, 2]);
 
@@ -913,6 +1097,54 @@ async fn test_create_branch_and_shallow_clone_from_other_branch() {
         cloned_ds.count_rows(None).await.unwrap(),
         80,
         "shallow clone must read dev@2, not main@2"
+    );
+}
+
+#[tokio::test]
+async fn test_main_branch_management() {
+    let tempdir = TempDir::default();
+    let test_uri = tempdir.path_str();
+    let data = gen_batch()
+        .col("id", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+    let mut dataset = Dataset::write(data, &test_uri, None).await.unwrap();
+
+    let main_branch = dataset.checkout_branch("main").await.unwrap();
+    assert_eq!(main_branch.version().version, dataset.version().version);
+    assert_eq!(main_branch.manifest.branch, None);
+
+    let main_ref = dataset.checkout_version(("main", None)).await.unwrap();
+    assert_eq!(main_ref.version().version, dataset.version().version);
+    assert_eq!(main_ref.manifest.branch, None);
+
+    let Err(create_branch_err) = dataset.create_branch("main", ("main", None), None).await else {
+        panic!("creating a branch named main should fail");
+    };
+    assert!(matches!(create_branch_err, Error::InvalidRef { .. }));
+    assert!(
+        create_branch_err
+            .to_string()
+            .contains("\"main\" is reserved"),
+        "{create_branch_err}"
+    );
+
+    assert!(!tempdir.std_path().join("tree").join("main").exists());
+    assert!(dataset.list_branches().await.unwrap().is_empty());
+
+    let get_branch_err = dataset.branches().get("main").await.unwrap_err();
+    assert!(matches!(get_branch_err, Error::InvalidRef { .. }));
+    assert!(
+        get_branch_err.to_string().contains("\"main\" is reserved"),
+        "{get_branch_err}"
+    );
+
+    let delete_branch_err = dataset.delete_branch("main").await.unwrap_err();
+    assert!(matches!(delete_branch_err, Error::InvalidRef { .. }));
+    assert!(
+        delete_branch_err
+            .to_string()
+            .contains("\"main\" is reserved"),
+        "{delete_branch_err}"
     );
 }
 
@@ -1199,6 +1431,41 @@ async fn test_branch() {
         "branch1"
     );
 
+    // Opening a branch version that main does not have (main only has version 1)
+    // must resolve the version on the branch chain.
+    let branch_version_open = DatasetBuilder::from_uri(&test_uri)
+        .with_branch("feature/nathan/branch3", Some(3))
+        .load()
+        .await
+        .unwrap();
+    assert_eq!(
+        branch_version_open.manifest.branch.as_deref(),
+        Some("feature/nathan/branch3")
+    );
+    assert_eq!(branch_version_open.version().version, 3);
+    assert_eq!(
+        branch_version_open.count_rows(None).await.unwrap(),
+        checkout_branch3_at_version3.count_rows(None).await.unwrap()
+    );
+    // A version the branch does not have is still an error, not its latest version.
+    let err = DatasetBuilder::from_uri(&test_uri)
+        .with_branch("feature/nathan/branch3", Some(99))
+        .load()
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::DatasetNotFound { .. }), "{err}");
+    assert!(err.to_string().contains("feature/nathan/branch3"), "{err}");
+
+    // From the branch's own directory, an older version of that branch is checked out on it.
+    let branch_dir_open = DatasetBuilder::from_uri(branch1_dataset.uri())
+        .with_branch("branch1", Some(1))
+        .load()
+        .await
+        .unwrap();
+    assert_eq!(branch_dir_open.manifest.branch.as_deref(), Some("branch1"));
+    assert_eq!(branch_dir_open.version().version, 1);
+    assert_eq!(branch_dir_open.count_rows(None).await.unwrap(), 50);
+
     // Opening at a branch-pointing tag through the builder must check out the
     // tag's branch chain, not main's chain at the tag's version number.
     let tag_open = DatasetBuilder::from_uri(&test_uri)
@@ -1209,6 +1476,21 @@ async fn test_branch() {
     assert_eq!(tag_open.manifest.branch.as_deref(), Some("dev/branch2"));
     assert_eq!(tag_open.version().version, 3);
     assert_eq!(tag_open.count_rows(None).await.unwrap(), 100);
+
+    // Opening a branch URI with a tag pointing to a non-latest version on that same branch must check out the tag's version.
+    main_dataset
+        .tags()
+        .create("tag_branch1_v1", ("branch1", 1))
+        .await
+        .unwrap();
+    let branch_tag_open = DatasetBuilder::from_uri(branch1_dataset.uri())
+        .with_tag("tag_branch1_v1")
+        .load()
+        .await
+        .unwrap();
+    assert_eq!(branch_tag_open.manifest.branch.as_deref(), Some("branch1"));
+    assert_eq!(branch_tag_open.version().version, 1);
+    assert_eq!(branch_tag_open.count_rows(None).await.unwrap(), 50);
 
     // Malformed branch names are rejected at the boundary
     for bad_name in ["", "branch1/"] {
@@ -1299,6 +1581,7 @@ async fn test_branch() {
     assert!(!dataset.object_store.exists(&cleaned_path).await.unwrap());
 
     dataset.tags().delete("tag1").await.unwrap();
+    dataset.tags().delete("tag_branch1_v1").await.unwrap();
     dataset.delete_branch("dev/branch2").await.unwrap();
     dataset.delete_branch("branch1").await.unwrap();
 

@@ -71,6 +71,7 @@ pub struct CloudObjectReader {
     size: OnceCell<usize>,
 
     block_size: usize,
+    io_parallelism: usize,
     download_retry_count: usize,
 }
 
@@ -95,8 +96,20 @@ impl CloudObjectReader {
             path,
             size: OnceCell::new_with(known_size),
             block_size,
+            io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
             download_retry_count,
         })
+    }
+
+    /// Override the I/O parallelism this reader advertises.
+    ///
+    /// `ObjectStore::open` / `open_with_size` pass their normalized effective
+    /// parallelism (`LANCE_IO_THREADS` override applied, at least 1) so
+    /// consumers that size concurrency windows off the reader honor the
+    /// configured request limit instead of the hardcoded cloud default.
+    pub fn with_io_parallelism(mut self, io_parallelism: usize) -> Self {
+        self.io_parallelism = io_parallelism;
+        self
     }
 }
 
@@ -170,7 +183,7 @@ impl Reader for CloudObjectReader {
     }
 
     fn io_parallelism(&self) -> usize {
-        DEFAULT_CLOUD_IO_PARALLELISM
+        self.io_parallelism
     }
 
     /// Object/File Size.
@@ -191,26 +204,12 @@ impl Reader for CloudObjectReader {
     fn get_range(&self, range: Range<usize>) -> BoxFuture<'static, OSResult<Bytes>> {
         let object_store = self.object_store.clone();
         let path = self.path.clone();
-        let get_range = Range {
+        let range = Range {
             start: range.start as u64,
             end: range.end as u64,
         };
         Box::pin(async move {
-            let bytes = do_with_retry(move || {
-                let object_store = object_store.clone();
-                let path = path.clone();
-                let get_range = get_range.clone();
-                Box::pin(async move { object_store.get_ranges(&path, &[get_range]).await })
-            })
-            .await?;
-
-            bytes
-                .into_iter()
-                .next()
-                .ok_or_else(|| object_store::Error::Generic {
-                    store: "CloudObjectReader",
-                    source: "get_ranges returned no bytes".into(),
-                })
+            do_with_retry(|| Box::pin(object_store.get_range(&path, range.clone()))).await
         })
     }
 
@@ -297,7 +296,7 @@ impl std::fmt::Debug for SmallReaderState {
                 write!(f, "Finished({} bytes)", data.len())
             }
             Self::Finished(Err(err)) => {
-                write!(f, "Finished({})", err.0)
+                write!(f, "Finished({})", err.inner())
             }
         }
     }
@@ -315,11 +314,11 @@ impl SmallReader {
             Box::pin(async move {
                 let object_reader =
                     CloudObjectReader::new(store, path_ref, 0, None, download_retry_count)
-                        .map_err(CloneableError)?;
+                        .map_err(CloneableError::new)?;
                 object_reader
                     .get_all()
                     .await
-                    .map_err(|err| CloneableError(Error::from(err)))
+                    .map_err(|err| CloneableError::new(Error::from(err)))
             })
             .boxed()
             .shared(),
@@ -341,13 +340,13 @@ impl SmallReaderInner {
             match &*state {
                 SmallReaderState::Loading(future) => future.clone(),
                 SmallReaderState::Finished(result) => {
-                    return result.clone().map_err(|err| err.0.into());
+                    return result.clone().map_err(|err| err.into_inner().into());
                 }
             }
         };
 
         let result = future.await;
-        let result_to_return = result.clone().map_err(|err| err.0.into());
+        let result_to_return = result.clone().map_err(|err| err.into_inner().into());
         let mut state = self.state.lock().unwrap();
         if matches!(*state, SmallReaderState::Loading(_)) {
             *state = SmallReaderState::Finished(result);
