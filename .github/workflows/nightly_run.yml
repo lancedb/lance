@@ -85,11 +85,11 @@ jobs:
       # rust.yml sets this workflow-wide. It matters here once a Rust panic
       # rather than a sanitizer report is the likely failure.
       RUST_BACKTRACE: "1"
-      # rust-toolchain.toml pins 1.97.0, and a rustup override file outranks
-      # `rustup default`, so without this the sanitizer flag reaches a stable
-      # compiler and cargo stops at "the option `Z` is only accepted on the
-      # nightly compiler". daily-code-coverage.yml solves the same problem with
-      # `cargo +nightly-...`.
+      # rust-toolchain.toml pins a stable release, and a rustup override file
+      # outranks `rustup default`, so without this the sanitizer flag reaches a
+      # stable compiler and cargo stops at "the option `Z` is only accepted on
+      # the nightly compiler". daily-code-coverage.yml solves the same problem
+      # with `cargo +nightly-...`.
       RUSTUP_TOOLCHAIN: nightly-2026-07-13
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
