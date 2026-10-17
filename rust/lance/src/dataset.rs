@@ -1593,36 +1593,38 @@ impl Dataset {
     /// **Experimental.** Intended for external distributed orphan-cleanup; the shape
     /// may change. It reads the dataset's manifests and unions the files each
     /// references, without listing the (potentially huge) `data/`, `_indices/`, or
-    /// `_deletions/` trees. The caller lists storage itself and, for each file in a
-    /// managed subtree (`data/`, `_deletions/`, `_transactions/`, `_indices/`,
-    /// `_versions/*.manifest`), deletes it only if
+    /// `_deletions/` trees. The caller lists storage itself and deletes a listed file
+    /// only if
     /// [`ReferencedFileSet::is_referenced`](crate::dataset::cleanup::ReferencedFileSet::is_referenced)
-    /// returns `false` and it is older than a caller-enforced age threshold. Do not
-    /// hand-roll an anti-join against the raw paths — see
-    /// [`ReferencedFileSet`](crate::dataset::cleanup::ReferencedFileSet) for
-    /// the full contract (blob v2 sidecars, index prefixes, never-delete categories).
+    /// returns `false` and it was last modified more than a caller-chosen age
+    /// threshold before this call. Do not hand-roll an anti-join against the raw
+    /// paths — see [`ReferencedFileSet`](crate::dataset::cleanup::ReferencedFileSet)
+    /// for the full contract (blob v2 sidecars, index prefixes, the subtrees that are
+    /// never candidates, and why the age is measured from this call).
     ///
     /// Unlike version cleanup, this considers **all present manifests** (not just the
     /// latest), so a file referenced only by an older-but-present version is kept.
     ///
     /// Returns an error for datasets with branches, detached versions, external
-    /// (multi-base) fragments, external row-id files, or external row-version
-    /// metadata, whose files this set cannot fully represent.
+    /// (multi-base) fragments, or managed blob storage, whose files this set cannot
+    /// fully represent, and when a version committed during the call was missed by
+    /// the manifest listing; calling again after the commit lands succeeds.
     ///
     /// ```
     /// # use lance::{Dataset, Result};
-    /// # async fn example(dataset: &Dataset, listed_paths: Vec<String>) -> Result<()> {
-    /// # let is_in_managed_subtree = |_: &str| true;
-    /// # let older_than_threshold = |_: &str| true;
+    /// # use std::time::{Duration, SystemTime};
+    /// # async fn example(
+    /// #     dataset: &Dataset,
+    /// #     listed: Vec<(String, SystemTime)>,
+    /// #     threshold: Duration,
+    /// # ) -> Result<()> {
+    /// let started = SystemTime::now();
     /// let referenced = dataset.referenced_files().await?;
-    /// for path in listed_paths {
-    ///     // Only ever consider files in a managed subtree (never `_refs/`,
-    ///     // `_versions/.tmp*`, or the version hint), and only past your age
-    ///     // threshold. Then delete only what the set does not cover.
-    ///     if is_in_managed_subtree(&path)
-    ///         && older_than_threshold(&path)
-    ///         && !referenced.is_referenced(&path)
-    ///     {
+    /// for (path, last_modified) in listed {
+    ///     // Measure the age from before the call: a file committed afterwards is
+    ///     // not in the set however old it is by now.
+    ///     let old_enough = last_modified + threshold < started;
+    ///     if old_enough && !referenced.is_referenced(&path) {
     ///         // safe to delete `path`
     ///     }
     /// }

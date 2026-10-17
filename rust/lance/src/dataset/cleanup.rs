@@ -93,24 +93,30 @@ struct ReferencedFiles {
 ///
 /// **Experimental.** This API is intended for external orphan-cleanup drivers
 /// and may change. It is only defined for datasets without branches, detached
-/// versions, external (multi-base) fragments, external row-id files, or external
-/// row-version metadata; [`Dataset::referenced_files`] errors otherwise.
+/// versions, external (multi-base) fragments, or managed blob storage;
+/// [`Dataset::referenced_files`] errors otherwise.
 ///
 /// # How to use it safely
 ///
 /// Do **not** hand-roll an anti-join like `listed_files - exact_paths`: that
 /// deletes blob sidecars, index files, tags, and staging manifests, none of
-/// which are enumerated verbatim. Instead, for each file you listed under a
-/// *managed subtree* (`data/`, `_deletions/`, `_transactions/`, `_indices/`,
-/// and `_versions/*.manifest`), call [`is_referenced`](Self::is_referenced);
-/// delete only files it returns `false` for, and only past a caller-enforced
-/// age threshold (this is a point-in-time snapshot, so a file written just
-/// before its commit lands is referenced by no present manifest yet).
+/// which are enumerated verbatim. Instead, call
+/// [`is_referenced`](Self::is_referenced) for each listed file and delete only
+/// files it returns `false` for.
 ///
-/// Never treat these as orphan candidates — this set does not describe them:
-/// `_refs/` (tags/branches), staging manifests (`_versions/.tmp*`), the
-/// version-hint file, and `_mem_wal/` (MemWAL entries, SSTables, and PK-index
-/// sidecars, which are live data enumerated nowhere in this set).
+/// Only files in the *candidate subtrees* (`data/`, `_deletions/`,
+/// `_transactions/`, `_indices/`, and `_versions/*.manifest`) can be orphans.
+/// [`is_referenced`](Self::is_referenced) returns `true` for every other path,
+/// so listing the whole dataset root is safe. That covers `_refs/`
+/// (tags/branches), staging manifests (`_versions/.tmp*`), the version-hint
+/// file, `_mem_wal/`, `_blobs/` and `_fri/`, none of which this set describes.
+///
+/// The set is a point-in-time snapshot, so a file written just before its
+/// commit lands is referenced by no present manifest yet. Delete a file only if
+/// it was last modified more than a caller-chosen age threshold **before
+/// [`Dataset::referenced_files`] was called**, not before the deletion runs:
+/// a file committed after the call is not in the set however old it is by
+/// then.
 ///
 /// Directory-marker objects (zero-byte keys like `data/{key}/` or
 /// `_indices/{uuid}/` that some tools create) are not referenced either — they
@@ -161,12 +167,13 @@ impl ReferencedFileSet {
         }
     }
 
-    /// Whether a root-relative path is referenced by a present manifest.
+    /// Whether a root-relative path must be kept: it is referenced by a present
+    /// manifest, or it lies outside the candidate subtrees this set describes.
     ///
     /// Handles the three matching rules so callers don't have to: exact match,
     /// `_indices/{uuid}/` prefix match, and the blob v2 sidecar rule (a file
     /// under `data/{key}/` is referenced iff `data/{key}.lance` is). A file this
-    /// returns `false` for — within a managed subtree and past an age threshold —
+    /// returns `false` for, and old enough by the rule on [`ReferencedFileSet`],
     /// is an orphan.
     ///
     /// Leading/trailing slashes and empty path segments are normalized away, and
@@ -180,6 +187,9 @@ impl ReferencedFileSet {
         let normalized = normalize_path_shape(root_relative_path);
         let path = normalized.as_str();
 
+        if !is_orphan_candidate(path) {
+            return true;
+        }
         if self.contains_exact(path) {
             return true;
         }
@@ -275,6 +285,22 @@ fn normalize_path_shape(path: &str) -> String {
         .filter(|s| !s.is_empty())
         .collect::<Vec<_>>()
         .join("/")
+}
+
+/// Whether `path`, root-relative and shape-normalized, lies in a subtree whose
+/// files [`ReferencedFileSet`] describes: `data/`, `_deletions/`,
+/// `_transactions/`, `_indices/`, or a committed `_versions/*.manifest`.
+/// Staging manifests (`_versions/.tmp*`) and the version hint are not
+/// committed manifests.
+fn is_orphan_candidate(path: &str) -> bool {
+    let Some((top, rest)) = path.split_once('/') else {
+        return false;
+    };
+    match top {
+        "data" | "_deletions" | "_transactions" | "_indices" => true,
+        "_versions" => !rest.contains('/') && !rest.starts_with('.') && rest.ends_with(".manifest"),
+        _ => false,
+    }
 }
 
 /// Whether `path` lies strictly inside the directory `prefix` (i.e. `prefix/…`).
@@ -2408,9 +2434,9 @@ pub async fn cleanup_old_versions(
 /// # Safety scope
 ///
 /// The returned set is only complete for datasets **without branches, detached
-/// versions, external (multi-base) fragments, external row-id files, or external
-/// row-version metadata**; this returns an error if any of those is present,
-/// rather than silently returning an incomplete set a caller could act on:
+/// versions, external (multi-base) fragments, or managed blob storage**; this
+/// returns an error if any of those is present, rather than silently returning
+/// an incomplete set a caller could act on:
 ///
 /// * Branch lineage files (referenced across `base_id`/`base_paths`) are not
 ///   traced, so a child branch's files could be reported as orphans.
@@ -2418,11 +2444,13 @@ pub async fn cleanup_old_versions(
 ///   so files reachable only from a detached version would be reported as orphans.
 /// * External-base fragment/index paths resolve outside this dataset's root, so
 ///   they neither protect nor match files in another base.
-/// * External row-id files are a referenced artifact this set does not enumerate
-///   (matching `collect_paths`, which also rejects them).
-/// * External row-version metadata (`created_at`/`last_updated_at`) is likewise a
-///   root-relative referenced file this set does not enumerate, so a driver would
-///   list it and see it as unreferenced.
+/// * Managed blob references live in the data, not the manifest. Compaction can
+///   adopt a blob v2 sidecar `data/{key}/{id}.blob` as a managed object that
+///   outlives `data/{key}.lance`, and only a scan of the blob columns finds it.
+///
+/// It also errors if a version is committed during the manifest walk and the
+/// walk did not see it, since files only that version references could be
+/// missing. Calling again after the commit lands succeeds.
 ///
 /// See [`ReferencedFileSet`] for how to interpret the result, including the
 /// blob v2 sidecar rule.
@@ -2473,6 +2501,7 @@ pub async fn referenced_files(dataset: &Dataset) -> Result<ReferencedFileSet> {
 
     let mut exact: HashSet<String> = HashSet::new();
     let mut index_uuids: HashSet<String> = HashSet::new();
+    let mut scanned_versions: HashSet<u64> = HashSet::new();
     // Guard against a listing anomaly (e.g. an eventual-consistency blip or a
     // concurrent cleanup that emptied `_versions/`) returning an empty keep-set:
     // a raw anti-join against an empty set would treat every file as an orphan.
@@ -2484,6 +2513,17 @@ pub async fn referenced_files(dataset: &Dataset) -> Result<ReferencedFileSet> {
     while let Some(scanned) = stream.next().await {
         let scanned = scanned?;
         manifest_count += 1;
+        scanned_versions.insert(scanned.manifest.version);
+
+        // Checked on every present manifest, not only the latest: an older
+        // version that wrote managed blobs still holds them.
+        if scanned.manifest.has_managed_blobs() {
+            return Err(Error::not_supported_source(
+                "referenced_files is not supported on datasets with managed blob storage: \
+                 managed blob references live in the data and are not in the manifests"
+                    .into(),
+            ));
+        }
 
         // The manifest file itself is referenced (it is a present version).
         exact.insert(scanned.manifest_path.clone());
@@ -2559,6 +2599,19 @@ pub async fn referenced_files(dataset: &Dataset) -> Result<ReferencedFileSet> {
              return an empty keep-set (a cleanup driver would treat every file as an orphan)"
                 .into(),
         ));
+    }
+
+    // The listing is not a snapshot: a commit that lands after the lister has
+    // passed where its manifest sorts is missed, and it may be the only present
+    // manifest that still references files inherited from versions a
+    // concurrent cleanup removed during the walk. The newest version is the
+    // one such a race can hide, so require that the walk saw it.
+    let latest = dataset.latest_version_id().await?;
+    if !scanned_versions.contains(&latest) {
+        return Err(Error::too_much_write_contention(format!(
+            "referenced_files did not see version {latest}, committed while the manifests \
+             were being listed; call it again"
+        )));
     }
 
     let indices_dir = dataset.indices_dir();
@@ -7664,6 +7717,21 @@ mod tests {
         assert!(set.is_referenced("_deletions/keep.arrow"));
         // Not referenced.
         assert!(!set.is_referenced("data/gone.lance"));
+        assert!(!set.is_referenced("_transactions/gone.txn"));
+        assert!(!set.is_referenced("_versions/7.manifest"));
+        // Outside the candidate subtrees nothing is an orphan, so a caller that
+        // lists the whole root cannot delete what this set does not describe.
+        for kept in [
+            "_refs/tags/v1.json",
+            "_versions/latest_version_hint.json",
+            "_versions/.tmp_7.manifest_9c100374-3298-4537-afc6-f5ee7913666d",
+            "_blobs/9c100374-3298-4537-afc6-f5ee7913666d.blob",
+            "_fri/3/row_map.lance",
+            "_mem_wal/shard/wal.bin",
+            "unrelated.txt",
+        ] {
+            assert!(set.is_referenced(kept), "{kept} must never be an orphan");
+        }
         // Index prefix: files under the dir match, the bare prefix / siblings do not.
         assert!(set.is_referenced("_indices/abc/index.idx"));
         assert!(set.is_referenced("_indices/abc/aux/part.bin"));
@@ -7689,6 +7757,17 @@ mod tests {
             [set.index_prefixes(), set.index_prefixes()].concat(),
         );
         assert_eq!(set, round_tripped);
+        // Prefixes come back sorted and deduplicated whatever order a worker
+        // passes them in, so equal content compares equal.
+        let unordered = ReferencedFileSet::new(
+            vec![],
+            vec![
+                "_indices/b".to_string(),
+                "_indices/a/".to_string(),
+                "_indices/b".to_string(),
+            ],
+        );
+        assert_eq!(unordered.index_prefixes(), ["_indices/a", "_indices/b"]);
 
         // A worker reconstructing the set with directory-style trailing slashes
         // (a natural way to name `_indices/{uuid}/`) or leading slashes must
@@ -7723,6 +7802,113 @@ mod tests {
         // A caller whose lister reports the decoded spelling still matches:
         // extra matches only over-retain, while a miss would delete a live file.
         assert!(worker.is_referenced("data/live%name.lance"));
+    }
+
+    /// Managed blob references live in the data, not the manifests: compaction
+    /// can adopt a sidecar `data/{key}/{id}.blob` as a managed object that
+    /// outlives `data/{key}.lance`, so the sidecar rule would release it.
+    #[tokio::test]
+    async fn referenced_files_rejects_datasets_with_managed_blobs() {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        let batch = managed_blob_batch();
+        let dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+            &fixture.dataset_path,
+            Some(WriteParams {
+                store_params: Some(fixture.os_params()),
+                data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(dataset.manifest.has_managed_blobs());
+
+        let err = dataset.referenced_files().await.unwrap_err();
+        assert!(
+            matches!(err, Error::NotSupported { .. }),
+            "expected NotSupported for a dataset with managed blobs, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("managed blob"),
+            "error should mention managed blobs, got {err}"
+        );
+    }
+
+    /// Reports one version past the newest one on storage once `enabled` is
+    /// set, standing in for a commit that lands while the manifests are being
+    /// listed, after the lister has passed where its manifest sorts.
+    #[derive(Debug, Default)]
+    struct ReportsUnlistedVersion {
+        enabled: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl lance_table::io::commit::CommitHandler for ReportsUnlistedVersion {
+        async fn resolve_latest_location(
+            &self,
+            base_path: &Path,
+            object_store: &ObjectStore,
+        ) -> Result<ManifestLocation> {
+            let mut location = lance_table::io::commit::ConditionalPutCommitHandler
+                .resolve_latest_location(base_path, object_store)
+                .await?;
+            if self.enabled.load(Ordering::SeqCst) {
+                location.version += 1;
+            }
+            Ok(location)
+        }
+
+        async fn commit(
+            &self,
+            manifest: &mut Manifest,
+            indices: Option<Vec<IndexMetadata>>,
+            base_path: &Path,
+            object_store: &ObjectStore,
+            manifest_writer: lance_table::io::commit::ManifestWriter,
+            naming_scheme: lance_table::io::commit::ManifestNamingScheme,
+            transaction: Option<lance_table::format::Transaction>,
+        ) -> std::result::Result<ManifestLocation, lance_table::io::commit::CommitError> {
+            lance_table::io::commit::ConditionalPutCommitHandler
+                .commit(
+                    manifest,
+                    indices,
+                    base_path,
+                    object_store,
+                    manifest_writer,
+                    naming_scheme,
+                    transaction,
+                )
+                .await
+        }
+    }
+
+    #[tokio::test]
+    async fn referenced_files_rejects_a_scan_that_missed_the_latest_version() {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        let handler = Arc::new(ReportsUnlistedVersion::default());
+        let dataset = DatasetBuilder::from_uri(&fixture.dataset_path)
+            .with_read_params(ReadParams {
+                store_options: Some(fixture.os_params()),
+                ..Default::default()
+            })
+            .with_commit_handler(handler.clone())
+            .load()
+            .await
+            .unwrap();
+        dataset.referenced_files().await.unwrap();
+
+        handler.enabled.store(true, Ordering::SeqCst);
+        let err = dataset.referenced_files().await.unwrap_err();
+        assert!(
+            matches!(err, Error::TooMuchWriteContention { .. }),
+            "expected TooMuchWriteContention, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("call it again"),
+            "error should tell the caller to retry, got {err}"
+        );
     }
 
     #[tokio::test]
