@@ -101,7 +101,7 @@ pub fn l2_distance_uint_scalar(key: &[u8], target: &[u8]) -> f32 {
 /// It relies on LLVM for auto-vectorization and unrolling.
 ///
 /// This is pub for test/benchmark only. use [l2] instead.
-#[inline]
+#[inline(always)]
 pub fn l2_scalar<
     T: AsPrimitive<Output>,
     Output: Num + Copy + Sum + AddAssign + 'static,

@@ -30,7 +30,7 @@ use crate::distance::{
 // The following code has been tuned for auto-vectorization.
 // Please make sure run `cargo bench --bench dot` with and without AVX-512 before any change.
 // Tested `target-features`: avx512f,avx512vl,f16c
-#[inline]
+#[inline(always)]
 fn dot_scalar<
     T: AsPrimitive<Output>,
     Output: Real + Sum + AddAssign + 'static,
