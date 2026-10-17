@@ -870,6 +870,16 @@ impl WalFlusher {
             return Ok(empty_flush_result());
         }
 
+        // Blob descriptors are inserted before their shared packed sidecar is
+        // finalized so several puts can use one object. Finish that object before
+        // any of those descriptors enter the WAL: after the append succeeds,
+        // replay is allowed to expose every descriptor in this range.
+        batch_store.finish_blob_pack().await.map_err(|error| {
+            Error::writer_poisoned(format!(
+                "failed to finalize Blob v2 pack before WAL append: {error}"
+            ))
+        })?;
+
         // Every position in the range must exist. `get` returns `None` only for a
         // position past `committed_len`, so a hole means we were asked to append a
         // batch the store never committed. Silently skipping it while still
@@ -1964,8 +1974,8 @@ mod tests {
     #[tokio::test]
     async fn test_track_batch_watcher_blocks_until_flush() {
         let (store, base_path, _temp_dir) = create_local_store().await;
-        let region_id = Uuid::new_v4();
-        let flusher = build_test_flusher(store, &base_path, region_id, 1);
+        let shard_id = Uuid::new_v4();
+        let flusher = build_test_flusher(store, &base_path, shard_id, 1);
 
         let schema = create_test_schema();
         let batch_store = Arc::new(BatchStore::with_capacity(10));
@@ -2762,7 +2772,7 @@ mod tests {
         batch_store.append(create_test_batch(&schema, 1)).unwrap();
 
         // An HNSW index on `id`, which is an Int32 and not a vector, so every
-        // insert of this batch fails deterministically. `validate_index_configs`
+        // insert of this batch fails deterministically. `validate_index_specs`
         // rejects this at shard open — that is what makes poison-and-replay
         // terminating — so the store has to be built by hand to reach it at all.
         let mut idx = IndexStore::new();

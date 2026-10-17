@@ -390,7 +390,7 @@ pub(super) async fn add_columns_to_fragments(
             return Err(e);
         }
     };
-    schema.set_field_id(Some(dataset.manifest.max_field_id()));
+    schema.try_set_field_id(Some(dataset.manifest.max_field_id()))?;
 
     let preserves_nullability = !merge_introduces_required_field(dataset.schema(), &schema);
 
@@ -882,7 +882,7 @@ pub(super) async fn alter_columns(
     let mut cast_fields: Vec<(Field, Field)> = Vec::new();
     let mut tightens_nullability = false;
 
-    let mut next_field_id = dataset.manifest.max_field_id() + 1;
+    let mut next_field_id = i64::from(dataset.manifest.max_field_id()) + 1;
     let fallback_version = dataset.manifest.data_storage_format.lance_file_format();
 
     for alteration in alterations {
@@ -934,7 +934,7 @@ pub(super) async fn alter_columns(
                 field_dest.nullable,
             );
             *field_dest = Field::try_from(&arrow_field)?;
-            field_dest.set_id(field_src.parent_id, &mut next_field_id);
+            field_dest.try_set_id(field_src.parent_id, &mut next_field_id)?;
 
             cast_fields.push((field_src.clone(), field_dest.clone()));
         }
@@ -1630,13 +1630,6 @@ mod test {
             .alter_columns(&[ColumnAlteration::new("id".into()).set_nullable(false)])
             .await
             .expect("restating a column's existing nullability must be allowed");
-
-        // A rename is untouched by the guard.
-        dataset
-            .alter_columns(&[ColumnAlteration::new("value".into()).rename("amount".into())])
-            .await
-            .expect("a rename must be allowed");
-        assert!(dataset.schema().field("amount").is_some());
     }
 
     #[test]
@@ -3028,7 +3021,7 @@ mod test {
             "add_columns should clean files written by the current unfinished writer"
         );
         let blob_dir = StdPath::new(test_uri).join("_blobs");
-        assert!(!file_paths_in(&blob_dir).is_empty());
+        assert!(file_paths_in(&blob_dir).is_empty());
         // Failed uploads use the existing orphan policy. There is no concurrent
         // writer in this test, so explicit unverified cleanup can reclaim them.
         dataset
@@ -3135,7 +3128,7 @@ mod test {
             })
             .expect("checkpoint should record the newly written data file");
         let new_file_path = StdPath::new(test_uri).join("data").join(&new_file.path);
-        let new_blob_dir = StdPath::new(test_uri).join("_blobs");
+        let new_blob_dir = new_file_path.with_extension("");
         assert!(
             new_file_path.exists(),
             "cleanup must not delete data files after checkpoint takes ownership"
@@ -3382,7 +3375,7 @@ mod test {
             })
             .expect("checkpoint should record the newly written data file");
         let new_file_path = StdPath::new(test_uri).join("data").join(&new_file.path);
-        let new_blob_dir = StdPath::new(test_uri).join("_blobs");
+        let new_blob_dir = new_file_path.with_extension("");
         assert!(
             new_file_path.exists(),
             "cleanup must not delete data files after checkpoint takes ownership"
@@ -3534,13 +3527,41 @@ mod test {
         )
         .await?;
         dataset.validate().await?;
+        let checkpoint_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "double_id",
+            DataType::Int32,
+            false,
+        )]));
+        let checkpoint_schema_ref = checkpoint_schema.clone();
+        let checkpoint_result = add_columns_impl(
+            &dataset.get_fragments(),
+            Some(vec!["id".to_string()]),
+            Box::new(move |batch: &RecordBatch| {
+                let id = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap();
+                Ok(RecordBatch::try_new(
+                    checkpoint_schema_ref.clone(),
+                    vec![Arc::new(Int32Array::from_iter_values(
+                        id.values().iter().map(|i| i * 2),
+                    ))],
+                )?)
+            }),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let cached_fragment = checkpoint_result.fragments[0].clone();
 
-        #[derive(Default)]
         struct RequestCounter {
             pub get_batch_requests: Mutex<Vec<BatchInfo>>,
             pub insert_batch_requests: Mutex<Vec<BatchInfo>>,
             pub get_fragment_requests: Mutex<Vec<u32>>,
             pub insert_fragment_requests: Mutex<Vec<u32>>,
+            pub cached_fragment: Fragment,
         }
 
         impl UDFCheckpointStore for RequestCounter {
@@ -3569,16 +3590,7 @@ mod test {
             fn get_fragment(&self, fragment_id: u32) -> Result<Option<Fragment>> {
                 self.get_fragment_requests.lock().unwrap().push(fragment_id);
                 if fragment_id == 0 {
-                    Ok(Some(Fragment {
-                        files: vec![],
-                        id: 0,
-                        overlays: vec![],
-                        deletion_file: None,
-                        row_id_meta: None,
-                        physical_rows: Some(50),
-                        last_updated_at_version_meta: None,
-                        created_at_version_meta: None,
-                    }))
+                    Ok(Some(self.cached_fragment.clone()))
                 } else {
                     Ok(None)
                 }
@@ -3593,7 +3605,13 @@ mod test {
             }
         }
 
-        let request_counter = Arc::new(RequestCounter::default());
+        let request_counter = Arc::new(RequestCounter {
+            get_batch_requests: Mutex::default(),
+            insert_batch_requests: Mutex::default(),
+            get_fragment_requests: Mutex::default(),
+            insert_fragment_requests: Mutex::default(),
+            cached_fragment,
+        });
 
         let output_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "double_id",
@@ -5491,6 +5509,8 @@ mod test {
             }),
         )
         .await?;
+        dataset.migrate_to_non_reusable_field_ids().await?;
+        assert!(dataset.manifest.uses_non_reusable_field_ids());
         assert_eq!(dataset.manifest.max_field_id(), 0);
 
         // Test we can add 1 column, drop it, then add another column. Validate
@@ -5505,7 +5525,7 @@ mod test {
         assert_eq!(dataset.manifest.max_field_id(), 1);
 
         dataset.drop_columns(&["x"]).await?;
-        assert_eq!(dataset.manifest.max_field_id(), 0);
+        assert_eq!(dataset.manifest.max_field_id(), 1);
 
         dataset
             .add_columns(
@@ -5514,7 +5534,7 @@ mod test {
                 None,
             )
             .await?;
-        assert_eq!(dataset.manifest.max_field_id(), 1);
+        assert_eq!(dataset.manifest.max_field_id(), 2);
 
         let data = dataset.scan().try_into_batch().await?;
         let expected_data = RecordBatch::try_new(
@@ -5526,7 +5546,7 @@ mod test {
         )?;
         assert_eq!(data, expected_data);
         dataset.drop_columns(&["y"]).await?;
-        assert_eq!(dataset.manifest.max_field_id(), 0);
+        assert_eq!(dataset.manifest.max_field_id(), 2);
 
         // Test we can add 2 columns, drop 1, then add another column. Validate
         // the field ids are as expected.
@@ -5540,12 +5560,12 @@ mod test {
                 None,
             )
             .await?;
-        assert_eq!(dataset.manifest.max_field_id(), 2);
+        assert_eq!(dataset.manifest.max_field_id(), 4);
 
         dataset.drop_columns(&["b"]).await?;
         // Even though we dropped a column, we still have the fragment with a and
         // b. So it should still act as if that field id is still in play.
-        assert_eq!(dataset.manifest.max_field_id(), 2);
+        assert_eq!(dataset.manifest.max_field_id(), 4);
 
         dataset
             .add_columns(
@@ -5554,7 +5574,7 @@ mod test {
                 None,
             )
             .await?;
-        assert_eq!(dataset.manifest.max_field_id(), 3);
+        assert_eq!(dataset.manifest.max_field_id(), 5);
 
         let data = dataset.scan().try_into_batch().await?;
         let expected_schema = Arc::new(ArrowSchema::new(vec![

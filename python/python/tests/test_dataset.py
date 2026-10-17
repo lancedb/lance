@@ -1617,6 +1617,26 @@ def test_get_fragments(tmp_path: Path):
     assert taken == pa.Table.from_pydict({"a": [18, 20, 33, 53], "b": [18, 20, 33, 53]})
 
 
+def test_fragment_ids(tmp_path: Path):
+    lance.write_dataset(pa.table({"a": range(10)}), tmp_path, max_rows_per_file=2)
+    dataset = lance.dataset(tmp_path)
+    assert list(dataset.fragment_ids()) == [0, 1, 2, 3, 4]
+
+    ids = dataset.fragment_ids()
+    ids.add(100)
+    assert list(dataset.fragment_ids()) == [0, 1, 2, 3, 4]
+
+    dataset.delete("a < 4")
+    assert list(dataset.fragment_ids()) == [2, 3, 4]
+
+    dataset.create_scalar_index("a", "BTREE")
+    lance.write_dataset(pa.table({"a": range(2)}), tmp_path, mode="append")
+    dataset = lance.dataset(tmp_path)
+    (index,) = dataset.describe_indices()
+    indexed = index.segments[0].fragment_ids
+    assert list(dataset.fragment_ids() - indexed) == [5]
+
+
 def test_pickle_fragment(tmp_path: Path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"
@@ -1646,6 +1666,9 @@ def test_cleanup_old_versions(tmp_path):
     lance.write_dataset(table, base_dir, mode="overwrite")
 
     dataset = lance.dataset(base_dir)
+
+    with pytest.raises(OSError, match="delete_concurrency"):
+        dataset.cleanup_old_versions(delete_concurrency=0)
 
     # These calls do nothing, but make sure we can call the method ok
 
@@ -1683,6 +1706,7 @@ def test_explain_cleanup_old_versions(tmp_path):
         older_than=(datetime.now() - moment),
         include_files=True,
         max_files=1000,
+        delete_rate_limit=0,
     )
 
     assert explanation.read_version == dataset.version
@@ -1993,7 +2017,9 @@ def test_cleanup_with_rate_limit(tmp_path):
     start = time.time_ns()
     # Cleanup with a rate limit should still remove old versions correctly
     stats = dataset.cleanup_old_versions(
-        older_than=(now - latest_version_timestamp), delete_rate_limit=1
+        older_than=(now - latest_version_timestamp),
+        delete_rate_limit=1,
+        delete_concurrency=2,
     )
     finished = time.time_ns()
 
@@ -2002,15 +2028,25 @@ def test_cleanup_with_rate_limit(tmp_path):
     assert (finished - start) >= 2_000_000_000  # 2s
 
 
-def test_create_from_commit(tmp_path: Path):
-    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+@pytest.mark.parametrize("as_transaction", [False, True])
+def test_create_from_commit(tmp_path: Path, as_transaction: bool):
+    metadata = {b"source": b"user metadata"}
+    table = pa.Table.from_pydict(
+        {"a": range(100), "b": range(100)}
+    ).replace_schema_metadata(metadata)
     base_dir = tmp_path / "test"
-    fragment = lance.fragment.LanceFragment.create(base_dir, table)
+    fragments = [
+        lance.fragment.LanceFragment.create(base_dir, table.slice(offset, 50))
+        for offset in (0, 50)
+    ]
 
-    operation = lance.LanceOperation.Overwrite(table.schema, [fragment])
-    dataset = lance.LanceDataset.commit(base_dir, operation)
+    operation = lance.LanceOperation.Overwrite(table.schema, fragments)
+    transaction = lance.Transaction(0, operation) if as_transaction else operation
+    dataset = lance.LanceDataset.commit(base_dir, transaction)
     tbl = dataset.to_table()
     assert tbl == table
+    assert len(dataset.get_fragments()) == 2
+    assert dataset.schema.metadata == metadata
 
 
 def test_strict_overwrite(tmp_path: Path):
@@ -5856,6 +5892,25 @@ def test_detached_commits(tmp_path: Path):
     )
 
     assert detached2.to_table() == pa.table({"x": [0, 1, 3]})
+
+
+def test_detached_raw_arrow_merge_preserves_schema_metadata(tmp_path: Path):
+    metadata = {b"source": b"user metadata"}
+    table = pa.table({"x": [0, 1]}).replace_schema_metadata(metadata)
+    dataset = lance.write_dataset(table, tmp_path)
+    fragment = dataset.get_fragments()[0].metadata
+    with pytest.deprecated_call():
+        operation = lance.LanceOperation.Merge([fragment], dataset.schema, True)
+
+    detached = lance.LanceDataset.commit(
+        dataset,
+        operation,
+        read_version=dataset.version,
+        detached=True,
+    )
+
+    assert detached.to_table() == dataset.to_table()
+    assert detached.schema.metadata == metadata
 
 
 def test_dataset_drop(tmp_path: Path):

@@ -1024,14 +1024,23 @@ fn apply_probe_bounds(
             .map_err(|_| Error::invalid_input(format!("{name} must be non-negative")))
     };
 
+    let maximum_is_unbounded = maximum_nprobes == Some(0);
     if let Some(nprobes) = nprobes {
-        scanner.nprobes(parse_probe_count("nprobes", nprobes)?);
+        let nprobes = parse_probe_count("nprobes", nprobes)?;
+        if maximum_is_unbounded {
+            scanner.minimum_nprobes(nprobes);
+        } else {
+            scanner.nprobes(nprobes);
+        }
     }
     if let Some(minimum_nprobes) = minimum_nprobes {
         scanner.minimum_nprobes(parse_probe_count("minimum_nprobes", minimum_nprobes)?);
     }
     if let Some(maximum_nprobes) = maximum_nprobes {
-        scanner.maximum_nprobes(parse_probe_count("maximum_nprobes", maximum_nprobes)?);
+        let maximum_nprobes = parse_probe_count("maximum_nprobes", maximum_nprobes)?;
+        if maximum_nprobes != 0 {
+            scanner.maximum_nprobes(maximum_nprobes);
+        }
     }
     Ok(())
 }
@@ -2904,7 +2913,7 @@ impl DirectoryNamespace {
             return err;
         }
         let detail = err.to_string();
-        if let Error::IO { source, .. } = &err
+        if let Error::IO { source, .. } = err.find_root()
             && let Some(os_err) = source.downcast_ref::<ObjectStoreError>()
         {
             if is_throttle_error(os_err) {
@@ -2961,7 +2970,7 @@ impl DirectoryNamespace {
     /// typed via [`classify_storage_error`], while a genuine not-found (missing
     /// dataset, version, or ref) keeps the caller's `not_found` variant.
     fn map_open_error(err: Error, not_found: NamespaceError) -> Error {
-        if matches!(&err, Error::IO { .. })
+        if matches!(err.find_root(), Error::IO { .. })
             && !manifest::ManifestNamespace::is_not_found_load_error(&err)
         {
             return Self::classify_storage_error(err);
@@ -5144,7 +5153,7 @@ impl LanceNamespace for DirectoryNamespace {
     ) -> Result<InsertIntoTableResponse> {
         self.record_op("insert_into_table");
         let table_uri = self.resolve_table_location(&request.id).await?;
-        let (reader, _num_rows) =
+        let (reader, num_rows) =
             Self::ipc_reader_from_request_data(&request_data, "insert_into_table")?;
 
         let mode = match request.mode.as_deref() {
@@ -5162,16 +5171,18 @@ impl LanceNamespace for DirectoryNamespace {
             }
         };
 
-        if !self.table_uri_has_actual_manifests(&table_uri).await? {
+        let dataset = if !self.table_uri_has_actual_manifests(&table_uri).await? {
             self.write_reader_to_table(&table_uri, reader, WriteMode::Create, None)
-                .await?;
+                .await?
         } else {
             self.write_reader_to_table(&table_uri, reader, mode, None)
-                .await?;
-        }
+                .await?
+        };
 
         Ok(InsertIntoTableResponse {
             transaction_id: None,
+            num_inserted_rows: Some(num_rows as i64),
+            version: Some(dataset.version().version as i64),
             ..Default::default()
         })
     }
@@ -7143,6 +7154,41 @@ mod tests {
             mutation_error_code(DirectoryNamespace::classify_storage_error(preexisting)),
             ErrorCode::TableAlreadyExists
         );
+    }
+
+    /// A storage error coalesced through a shared cache load arrives wrapped in
+    /// `Error::Shared` while other waiters still hold it, and must be classified
+    /// as the IO error it wraps.
+    #[test]
+    fn test_storage_error_classification_sees_through_shared() {
+        let shared = |os_err: ObjectStoreError| Error::Shared {
+            source: Arc::new(os_err.into()),
+        };
+        let throttle = || ObjectStoreError::Generic {
+            store: "test",
+            source: "after 3 retries, max_retries: 3 - 503 ServerBusy".into(),
+        };
+        assert_eq!(
+            mutation_error_code(DirectoryNamespace::classify_storage_error(shared(
+                throttle()
+            ))),
+            ErrorCode::Throttling
+        );
+        assert_eq!(
+            mutation_error_code(DirectoryNamespace::map_open_error(
+                shared(throttle()),
+                NamespaceError::TableNotFound {
+                    message: "t".to_string(),
+                }
+            )),
+            ErrorCode::Throttling
+        );
+        assert!(manifest::ManifestNamespace::is_not_found_load_error(
+            &shared(ObjectStoreError::NotFound {
+                path: "x".to_string(),
+                source: "missing".into(),
+            })
+        ));
     }
 
     #[test]
@@ -11052,10 +11098,12 @@ mod tests {
         let ipc_data = create_test_ipc_data(&schema);
         let mut insert_req = InsertIntoTableRequest::new();
         insert_req.id = Some(vec!["test_table".to_string()]);
-        namespace
+        let response = namespace
             .insert_into_table(insert_req, bytes::Bytes::from(ipc_data))
             .await
             .unwrap();
+        assert_eq!(response.num_inserted_rows, Some(0));
+        assert_eq!(response.version, Some(1));
 
         let mut describe_req = DescribeTableRequest::new();
         describe_req.id = Some(vec!["test_table".to_string()]);
@@ -11144,13 +11192,15 @@ mod tests {
 
         let mut insert_req = InsertIntoTableRequest::new();
         insert_req.id = Some(vec!["test_table".to_string()]);
-        namespace
+        let response = namespace
             .insert_into_table(
                 insert_req,
                 bytes::Bytes::from(create_non_empty_test_ipc_data()),
             )
             .await
             .unwrap();
+        assert_eq!(response.num_inserted_rows, Some(2));
+        assert_eq!(response.version, Some(1));
 
         let mut describe_req = DescribeTableRequest::new();
         describe_req.id = Some(vec!["test_table".to_string()]);
@@ -13782,6 +13832,8 @@ mod tests {
                 .await
                 .unwrap();
             assert!(response.transaction_id.is_none());
+            assert_eq!(response.num_inserted_rows, Some(2));
+            assert_eq!(response.version, Some(2));
 
             // Verify total rows
             let count_req = CountTableRowsRequest {
@@ -13826,10 +13878,12 @@ mod tests {
                 ..Default::default()
             };
 
-            namespace
+            let response = namespace
                 .insert_into_table(request, Bytes::from(buffer))
                 .await
                 .unwrap();
+            assert_eq!(response.num_inserted_rows, Some(2));
+            assert_eq!(response.version, Some(2));
 
             // Verify overwrite: only 2 rows remain
             let count_req = CountTableRowsRequest {
@@ -13917,6 +13971,8 @@ mod tests {
                 .await
                 .unwrap();
             assert!(response.transaction_id.is_none());
+            assert_eq!(response.num_inserted_rows, Some(2));
+            assert_eq!(response.version, Some(2));
 
             // Verify rows were inserted
             let count_req = CountTableRowsRequest {
@@ -14418,6 +14474,35 @@ mod tests {
             let plan = namespace.explain_table_query_plan(request).await.unwrap();
             assert!(plan.contains("minimum_nprobes=20"), "{plan}");
             assert!(plan.contains("maximum_nprobes=Some(20)"), "{plan}");
+
+            let query = QueryTableRequest {
+                id: None,
+                k: 2,
+                vector: vector(),
+                nprobes: Some(1),
+                maximum_nprobes: Some(0),
+                ..Default::default()
+            };
+            let mut request = ExplainTableQueryPlanRequest::new(query);
+            request.id = Some(table_id.clone());
+
+            let plan = namespace.explain_table_query_plan(request).await.unwrap();
+            assert!(plan.contains("minimum_nprobes=1"), "{plan}");
+            assert!(plan.contains("maximum_nprobes=None"), "{plan}");
+
+            let request = QueryTableRequest {
+                id: Some(table_id.clone()),
+                k: 2,
+                vector: vector(),
+                nprobes: Some(1),
+                maximum_nprobes: Some(0),
+                ..Default::default()
+            };
+            let bytes = namespace.query_table(request).await.unwrap();
+            let cursor = Cursor::new(bytes.to_vec());
+            let reader = FileReader::try_new(cursor, None).unwrap();
+            let total_rows: usize = reader.map(|batch| batch.unwrap().num_rows()).sum();
+            assert_eq!(total_rows, 2);
 
             let query = QueryTableRequest {
                 id: None,
