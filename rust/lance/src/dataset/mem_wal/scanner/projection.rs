@@ -19,8 +19,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use datafusion::logical_expr::Operator;
 use datafusion::physical_expr::PhysicalExpr;
-use datafusion::physical_expr::expressions::{Column, Literal};
+use datafusion::physical_expr::expressions::{BinaryExpr, CastExpr, Column, Literal};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::scalar::ScalarValue;
@@ -28,6 +29,7 @@ use lance_core::datatypes::{Schema as LanceSchema, parse_field_path};
 use lance_core::{ROW_ADDR, ROW_ID, Result, is_system_column};
 
 use super::exec::SchemaRelabelExec;
+use crate::dataset::mem_wal::TOMBSTONE;
 
 /// Column name for distance in vector search results.
 pub const DISTANCE_COLUMN: &str = "_distance";
@@ -47,7 +49,7 @@ pub fn wants_row_address(projection: Option<&[String]>) -> bool {
 }
 
 /// Auto-managed by the planner; must never reach `scanner.project()`.
-fn is_auto_managed(col: &str) -> bool {
+pub(super) fn is_auto_managed(col: &str) -> bool {
     col == DISTANCE_COLUMN || is_system_column(col)
 }
 
@@ -68,6 +70,21 @@ pub(super) fn resolve_data_fields(
     }
     let lance_schema = LanceSchema::try_from(base_schema.as_ref())?;
     let projected = lance_schema.project(data_names)?;
+    let arrow_schema = Schema::from(&projected);
+    Ok(arrow_schema.fields().iter().cloned().collect())
+}
+
+/// [`resolve_data_fields`], but skips names the schema does not have instead
+/// of failing.
+pub(super) fn resolve_data_fields_or_drop(
+    data_names: &[String],
+    base_schema: &SchemaRef,
+) -> Result<Vec<Arc<Field>>> {
+    if data_names.is_empty() {
+        return Ok(Vec::new());
+    }
+    let lance_schema = LanceSchema::try_from(base_schema.as_ref())?;
+    let projected = lance_schema.project_or_drop(data_names)?;
     let arrow_schema = Schema::from(&projected);
     Ok(arrow_schema.fields().iter().cloned().collect())
 }
@@ -201,6 +218,40 @@ pub fn canonical_output_schema(
     Ok(Arc::new(Schema::new(fields)))
 }
 
+/// Multiply `plan`'s `_distance` by `factor`, forwarding other columns; no-op
+/// at `1.0`.
+pub fn scale_distance(plan: Arc<dyn ExecutionPlan>, factor: f32) -> Result<Arc<dyn ExecutionPlan>> {
+    if factor == 1.0 {
+        return Ok(plan);
+    }
+    let input_schema = plan.schema();
+    let project_exprs: Vec<(Arc<dyn PhysicalExpr>, String)> = input_schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(idx, field)| {
+            let column: Arc<dyn PhysicalExpr> = Arc::new(Column::new(field.name(), idx));
+            let expr = if field.name() == DISTANCE_COLUMN {
+                Arc::new(BinaryExpr::new(
+                    column,
+                    Operator::Multiply,
+                    Arc::new(Literal::new(ScalarValue::Float32(Some(factor)))),
+                ))
+            } else {
+                column
+            };
+            (expr, field.name().clone())
+        })
+        .collect();
+    let projection_exec = ProjectionExec::try_new(project_exprs, plan).map_err(|e| {
+        lance_core::Error::internal(format!(
+            "Failed to build scale_distance ProjectionExec: {}",
+            e
+        ))
+    })?;
+    Ok(Arc::new(projection_exec))
+}
+
 /// Wrap `plan` so the named columns become typed NULL literals; all
 /// other columns are forwarded unchanged. Schema is preserved (same
 /// fields, same dtypes). Useful for stripping the *value* of an
@@ -255,9 +306,13 @@ pub(super) fn force_schema(
     Arc::new(SchemaRelabelExec::new(plan, target_schema.clone()))
 }
 
-/// Wrap `plan` to emit exactly `target_schema`. Source columns are
-/// forwarded by name; system / `_distance` cols missing from the source
-/// are NULL-filled. Other missing columns are an internal error.
+/// Wrap `plan` to emit exactly `target_schema`. Source columns are forwarded by
+/// name; anything the source lacks is filled with typed nulls.
+///
+/// The null fill exists for MemWAL generation arms, where a column the table
+/// declares really does hold nothing for rows written before it. Do not use it
+/// to normalise a plan whose columns should all be present: a missing column is
+/// then silently null instead of an error.
 ///
 /// Reports `target_schema` exactly, nullability included — see [`force_schema`].
 pub fn project_to_canonical(
@@ -270,20 +325,33 @@ pub fn project_to_canonical(
     for field in target_schema.fields() {
         let name = field.name();
         let expr: Arc<dyn PhysicalExpr> = match input_schema.column_with_name(name) {
-            Some((idx, _)) => Arc::new(Column::new(name, idx)),
+            Some((idx, source)) if source.data_type() == field.data_type() => {
+                Arc::new(Column::new(name, idx))
+            }
+            // Arms reaching the union are already reconciled to the table's
+            // types, so this is the base arm meeting a canonical schema that
+            // widens one -- a cast the table itself declares.
+            Some((idx, _)) => Arc::new(CastExpr::new(
+                Arc::new(Column::new(name, idx)),
+                field.data_type().clone(),
+                None,
+            )),
             None if is_system_column(name) => Arc::new(Literal::new(ScalarValue::UInt64(None))),
             None if name == DISTANCE_COLUMN => Arc::new(Literal::new(ScalarValue::Float32(None))),
-            None => {
-                return Err(lance_core::Error::internal(format!(
-                    "Column '{}' missing from canonical projection source schema (have: {:?})",
-                    name,
-                    input_schema
-                        .fields()
-                        .iter()
-                        .map(|f| f.name().clone())
-                        .collect::<Vec<_>>()
-                )));
-            }
+            // A generation that predates deletes carries no tombstone column;
+            // its rows are all live. The column is non-nullable, so a null here
+            // fails the scan outright.
+            None if name == TOMBSTONE => Arc::new(Literal::new(ScalarValue::Boolean(Some(false)))),
+            // A source frozen before this column existed. Typed nulls are what
+            // it holds for those rows.
+            None => Arc::new(Literal::new(
+                ScalarValue::try_from(field.data_type()).map_err(|e| {
+                    lance_core::Error::internal(format!(
+                        "no null literal for column '{name}' of type {}: {e}",
+                        field.data_type()
+                    ))
+                })?,
+            )),
         };
         project_exprs.push((expr, name.clone()));
     }
