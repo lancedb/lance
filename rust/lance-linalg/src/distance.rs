@@ -18,6 +18,44 @@ use arrow_array::{
 };
 use arrow_schema::{ArrowError, DataType};
 
+/// Declares a pair kernel with [`lance_core::target_kernel!`], plus a
+/// [`BatchKernel`] candidate with the same target features that runs the pair
+/// kernel on each vector of the batch.
+///
+/// Matching features let LLVM inline the pair body into the batch loop, so a
+/// batch call selects its kernel once, not once per vector through an
+/// indirect call. This is for element types without a hand-written batch
+/// kernel; one feature list for both keeps their candidates in step.
+macro_rules! pair_and_batch_kernel {
+    (
+        #[target_features($($feature:literal),* $(,)?)]
+        #[candidate($candidate_vis:vis $candidate:ident: PairKernel<$t:ty>)]
+        #[batch($batch_vis:vis $batch_candidate:ident = $batch_name:ident)]
+        $(#[doc = $doc:literal])*
+        $(#[inline $(($inline:ident))?])?
+        $vis:vis fn $name:ident($x:ident: &[$tx:ty], $y:ident: &[$ty:ty]) -> f32 $body:block
+    ) => {
+        lance_core::target_kernel! {
+            #[target_features($($feature),*)]
+            #[candidate($candidate_vis $candidate: $crate::distance::PairKernel<$t>)]
+            $(#[doc = $doc])*
+            $(#[inline $(($inline))?])?
+            $vis fn $name($x: &[$tx], $y: &[$ty]) -> f32 $body
+        }
+
+        lance_core::target_kernel! {
+            #[target_features($($feature),*)]
+            #[candidate($batch_vis $batch_candidate: $crate::distance::BatchKernel<$t>)]
+            /// The pair kernel declared with it, on each vector of `batch`.
+            $vis fn $batch_name(x: &[$t], batch: &[$t], dimension: usize, output: &mut [f32]) {
+                for (distance, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
+                    *distance = $name(x, y);
+                }
+            }
+        }
+    };
+}
+
 /// Declares a safe [`lance_core::target_kernel!`] wrapper and its candidate
 /// for each half-precision C kernel in the caller's `ffi` module.
 ///
@@ -28,8 +66,32 @@ use arrow_schema::{ArrowError, DataType};
 ///
 /// The C arguments must clamp lengths so the kernel only reads within the
 /// slices: the wrapper is safe to call on any host with the listed features.
+///
+/// Pair kernels (`fn (x: &[T], y: &[T])`) also name a batch candidate and
+/// function, `PAIR, BATCH = pair_fn, batch_fn(features)`, and get both from
+/// [`pair_and_batch_kernel!`].
 #[cfg(kernel_support = "half")]
 macro_rules! half_c_kernels {
+    (
+        fn ($x:ident: &[$t:ty], $y:ident: &[$t2:ty]) -> f32 => $args:tt;
+        $(
+            $(#[$attr:meta])*
+            $candidate:ident, $batch_candidate:ident = $name:ident, $batch_name:ident($($feature:literal),*);
+        )*
+    ) => {
+        $(
+            $(#[$attr])*
+            pair_and_batch_kernel! {
+                #[target_features($($feature),*)]
+                #[candidate(pub(super) $candidate: PairKernel<$t>)]
+                #[batch(pub(super) $batch_candidate = $batch_name)]
+                fn $name($x: &[$t], $y: &[$t2]) -> f32 {
+                    // SAFETY: as in the other arm.
+                    unsafe { ffi::$name $args }
+                }
+            }
+        )*
+    };
     (
         fn $params:tt -> f32 => $args:tt;
         $(
@@ -166,7 +228,7 @@ pub(crate) type PairKernel<T = f32> = unsafe fn(&[T], &[T]) -> f32;
 
 /// Writes the distance from `key` to each `dimension`-sized vector of `batch`
 /// into the matching element of `output`.
-pub(crate) type BatchKernel = unsafe fn(&[f32], &[f32], usize, &mut [f32]);
+pub(crate) type BatchKernel<T = f32> = unsafe fn(&[T], &[T], usize, &mut [f32]);
 
 pub use cosine::*;
 pub use dot::*;
