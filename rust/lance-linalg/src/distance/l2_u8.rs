@@ -21,29 +21,49 @@
 //! zero-extended to i16 and squared via VPMADDWD (which also pairwise-
 //! accumulates adjacent products into i32).
 
-use std::sync::OnceLock;
-
 use super::{U8_U32_ACCUMULATOR_MAX_LEN, assert_equal_lengths};
 
-/// Portable scalar u8 squared L2 distance, also used for SIMD tail elements.
-///
-/// The result is the low 32 bits of the exact squared distance. Use
-/// [`l2_u8_u64`] when the full result is required.
-#[inline]
-pub fn l2_u8_scalar(a: &[u8], b: &[u8]) -> u32 {
-    assert_equal_lengths(a.len(), b.len());
-    a.iter().zip(b.iter()).fold(0, |sum, (&x, &y)| {
-        sum.wrapping_add((x.abs_diff(y) as u32).pow(2))
-    })
+type L2U8Kernel = unsafe fn(&[u8], &[u8]) -> u32;
+
+lance_core::dispatch! {
+    static L2_U8: Dispatch<L2U8Kernel> = {
+        #[cfg(target_arch = "x86_64")]
+        {
+            &[x86::L2_U8_AVX512_VNNI, x86::L2_U8_AVX2, L2_U8_SCALAR]
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            &[L2_U8_SCALAR]
+        }
+    };
+}
+
+lance_core::target_kernel! {
+    #[target_features()]
+    #[candidate(L2_U8_SCALAR: L2U8Kernel)]
+    /// Portable scalar u8 squared L2 distance, also used for SIMD tail elements.
+    ///
+    /// The result is the low 32 bits of the exact squared distance. Use
+    /// [`l2_u8_u64`] when the full result is required.
+    #[inline]
+    pub fn l2_u8_scalar(a: &[u8], b: &[u8]) -> u32 {
+        assert_equal_lengths(a.len(), b.len());
+        a.iter().zip(b.iter()).fold(0, |sum, (&x, &y)| {
+            sum.wrapping_add((x.abs_diff(y) as u32).pow(2))
+        })
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
 mod x86 {
     use std::arch::x86_64::*;
 
+    use super::L2U8Kernel;
+
     /// Horizontal sum of all 8 × i32 lanes in a __m256i.
-    #[inline(always)]
-    unsafe fn hsum_epi32_avx2(v: __m256i) -> u32 {
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    fn hsum_epi32_avx2(v: __m256i) -> u32 {
         let lo128 = _mm256_castsi256_si128(v);
         let hi128 = _mm256_extracti128_si256(v, 1);
         let mut sum128 = _mm_add_epi32(lo128, hi128);
@@ -52,109 +72,98 @@ mod x86 {
         _mm_cvtsi128_si32(sum128) as u32
     }
 
-    /// AVX2 path: saturating-sub abs diff, unpack to i16, VPMADDWD to square.
-    /// 32 elements/iter.
-    #[target_feature(enable = "avx2")]
-    pub unsafe fn l2_u8_avx2(a: &[u8], b: &[u8]) -> u32 {
-        debug_assert_eq!(a.len(), b.len());
-        let n = a.len();
-        let zeros = _mm256_setzero_si256();
-        let mut acc = _mm256_setzero_si256();
-        let mut i = 0usize;
+    lance_core::target_kernel! {
+        #[target_features("avx2")]
+        #[candidate(pub(super) L2_U8_AVX2: L2U8Kernel)]
+        /// AVX2 path: saturating-sub abs diff, unpack to i16, VPMADDWD to square.
+        /// 32 elements/iter.
+        pub(super) fn l2_u8_avx2(a: &[u8], b: &[u8]) -> u32 {
+            // Callers pass equal lengths; `min` keeps the unchecked loads in
+            // bounds for any input, as a safe function must.
+            let n = a.len().min(b.len());
+            let zeros = _mm256_setzero_si256();
+            let mut acc = _mm256_setzero_si256();
+            let mut i = 0usize;
 
-        while i + 32 <= n {
-            let av = _mm256_loadu_si256(a.as_ptr().add(i) as *const __m256i);
-            let bv = _mm256_loadu_si256(b.as_ptr().add(i) as *const __m256i);
+            while i + 32 <= n {
+                let (av, bv) = unsafe {
+                    (
+                        _mm256_loadu_si256(a.as_ptr().add(i) as *const __m256i),
+                        _mm256_loadu_si256(b.as_ptr().add(i) as *const __m256i),
+                    )
+                };
 
-            // |a - b| via saturating subtraction: max(a-b, 0) | max(b-a, 0)
-            let abs_diff = _mm256_or_si256(_mm256_subs_epu8(av, bv), _mm256_subs_epu8(bv, av));
+                // |a - b| via saturating subtraction: max(a-b, 0) | max(b-a, 0)
+                let abs_diff = _mm256_or_si256(_mm256_subs_epu8(av, bv), _mm256_subs_epu8(bv, av));
 
-            // Zero-extend u8→i16 via interleave with zeros.
-            // unpacklo/hi within each 128-bit lane.
-            let diff_lo = _mm256_unpacklo_epi8(abs_diff, zeros);
-            let diff_hi = _mm256_unpackhi_epi8(abs_diff, zeros);
+                // Zero-extend u8→i16 via interleave with zeros.
+                // unpacklo/hi within each 128-bit lane.
+                let diff_lo = _mm256_unpacklo_epi8(abs_diff, zeros);
+                let diff_hi = _mm256_unpackhi_epi8(abs_diff, zeros);
 
-            // VPMADDWD squares adjacent i16 pairs and sums into i32.
-            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(diff_lo, diff_lo));
-            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(diff_hi, diff_hi));
-            i += 32;
+                // VPMADDWD squares adjacent i16 pairs and sums into i32.
+                acc = _mm256_add_epi32(acc, _mm256_madd_epi16(diff_lo, diff_lo));
+                acc = _mm256_add_epi32(acc, _mm256_madd_epi16(diff_hi, diff_hi));
+                i += 32;
+            }
+
+            let mut result = hsum_epi32_avx2(acc);
+
+            // Scalar tail
+            while i < n {
+                let d = a[i].abs_diff(b[i]) as u32;
+                result = result.wrapping_add(d * d);
+                i += 1;
+            }
+            result
         }
-
-        let mut result = hsum_epi32_avx2(acc);
-
-        // Scalar tail
-        while i < n {
-            let d = a[i].abs_diff(b[i]) as u32;
-            result = result.wrapping_add(d * d);
-            i += 1;
-        }
-        result
     }
 
-    /// AVX-512 VNNI path: abs diff + VPDPWSSD for fused square-accumulate.
-    /// 64 elements/iter.
-    #[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
-    pub unsafe fn l2_u8_avx512_vnni(a: &[u8], b: &[u8]) -> u32 {
-        debug_assert_eq!(a.len(), b.len());
-        let n = a.len();
-        let zeros = _mm512_setzero_si512();
-        let mut acc = _mm512_setzero_si512();
-        let mut i = 0usize;
+    lance_core::target_kernel! {
+        #[target_features("avx512f", "avx512bw", "avx512vnni")]
+        #[candidate(pub(super) L2_U8_AVX512_VNNI: L2U8Kernel)]
+        /// AVX-512 VNNI path: abs diff + VPDPWSSD for fused square-accumulate.
+        /// 64 elements/iter.
+        pub(super) fn l2_u8_avx512_vnni(a: &[u8], b: &[u8]) -> u32 {
+            // See `l2_u8_avx2`.
+            let n = a.len().min(b.len());
+            let zeros = _mm512_setzero_si512();
+            let mut acc = _mm512_setzero_si512();
+            let mut i = 0usize;
 
-        while i + 64 <= n {
-            let av = _mm512_loadu_si512(a.as_ptr().add(i) as *const __m512i);
-            let bv = _mm512_loadu_si512(b.as_ptr().add(i) as *const __m512i);
+            while i + 64 <= n {
+                let (av, bv) = unsafe {
+                    (
+                        _mm512_loadu_si512(a.as_ptr().add(i) as *const __m512i),
+                        _mm512_loadu_si512(b.as_ptr().add(i) as *const __m512i),
+                    )
+                };
 
-            // |a - b| via saturating subtraction
-            let abs_diff = _mm512_or_si512(_mm512_subs_epu8(av, bv), _mm512_subs_epu8(bv, av));
+                // |a - b| via saturating subtraction
+                let abs_diff = _mm512_or_si512(_mm512_subs_epu8(av, bv), _mm512_subs_epu8(bv, av));
 
-            // Zero-extend u8→i16 via interleave with zeros
-            let diff_lo = _mm512_unpacklo_epi8(abs_diff, zeros);
-            let diff_hi = _mm512_unpackhi_epi8(abs_diff, zeros);
+                // Zero-extend u8→i16 via interleave with zeros
+                let diff_lo = _mm512_unpacklo_epi8(abs_diff, zeros);
+                let diff_hi = _mm512_unpackhi_epi8(abs_diff, zeros);
 
-            // VPDPWSSD: signed i16 pairwise multiply-add into i32 accumulator.
-            // diff values are 0..255, fitting in i16 as positive, so signed is fine.
-            acc = _mm512_dpwssd_epi32(acc, diff_lo, diff_lo);
-            acc = _mm512_dpwssd_epi32(acc, diff_hi, diff_hi);
-            i += 64;
+                // VPDPWSSD: signed i16 pairwise multiply-add into i32 accumulator.
+                // diff values are 0..255, fitting in i16 as positive, so signed is fine.
+                acc = _mm512_dpwssd_epi32(acc, diff_lo, diff_lo);
+                acc = _mm512_dpwssd_epi32(acc, diff_hi, diff_hi);
+                i += 64;
+            }
+
+            let mut result = _mm512_reduce_add_epi32(acc) as u32;
+
+            // Scalar tail
+            while i < n {
+                let d = a[i].abs_diff(b[i]) as u32;
+                result = result.wrapping_add(d * d);
+                i += 1;
+            }
+            result
         }
-
-        let mut result = _mm512_reduce_add_epi32(acc) as u32;
-
-        // Scalar tail
-        while i < n {
-            let d = a[i].abs_diff(b[i]) as u32;
-            result = result.wrapping_add(d * d);
-            i += 1;
-        }
-        result
     }
-}
-
-type L2U8Fn = fn(&[u8], &[u8]) -> u32;
-
-static DISPATCH: OnceLock<L2U8Fn> = OnceLock::new();
-
-fn select_backend() -> L2U8Fn {
-    #[cfg(target_arch = "x86_64")]
-    {
-        if is_x86_feature_detected!("avx512f")
-            && is_x86_feature_detected!("avx512bw")
-            && is_x86_feature_detected!("avx512vnni")
-        {
-            return |a, b| unsafe { x86::l2_u8_avx512_vnni(a, b) };
-        }
-
-        if is_x86_feature_detected!("avx2") {
-            return |a, b| unsafe { x86::l2_u8_avx2(a, b) };
-        }
-        // AvxFma and Avx hosts (AMD Piledriver / Steamroller, Intel Sandy
-        // Bridge / Ivy Bridge) fall through to scalar: the AVX2 inner uses
-        // AVX2 integer ops (`vpsubusb` / `vpmaddwd`) which neither AVX nor
-        // AVX+FMA provides.
-    }
-
-    l2_u8_scalar
 }
 
 /// Dispatched u8 squared L2 distance, selecting the best available SIMD backend.
@@ -164,7 +173,7 @@ fn select_backend() -> L2U8Fn {
 #[inline]
 pub fn l2_u8(a: &[u8], b: &[u8]) -> u32 {
     assert_equal_lengths(a.len(), b.len());
-    (DISPATCH.get_or_init(select_backend))(a, b)
+    L2_U8.get().call(a, b)
 }
 
 /// Calculates the exact u8 squared L2 distance with a u64 accumulator.
