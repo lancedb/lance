@@ -2448,25 +2448,16 @@ pub async fn cleanup_old_versions(
 ///   adopt a blob v2 sidecar `data/{key}/{id}.blob` as a managed object that
 ///   outlives `data/{key}.lance`, and only a scan of the blob columns finds it.
 ///
-/// It also errors if a version committed during the manifest walk was not
-/// read, since files only that version references could be missing: after the
-/// walk it lists the manifests again and resolves the latest version, and
-/// requires the walk to have read both. Calling again after the commit lands
-/// succeeds.
+/// Branches and detached versions are checked again after the walk. It also
+/// returns a retryable [`Error::TooMuchWriteContention`] if, after the walk, a
+/// second manifest listing or the latest version names a version the walk did
+/// not read, since files only that version references could be missing. A
+/// retry succeeds once commits pause.
 ///
 /// See [`ReferencedFileSet`] for how to interpret the result, including the
 /// blob v2 sidecar rule.
 pub async fn referenced_files(dataset: &Dataset) -> Result<ReferencedFileSet> {
-    // Tracing branch lineage requires reading every referenced branch's
-    // manifests and resolving `base_id`; rather than silently under-report and
-    // let a caller delete a child branch's files, refuse and let them handle it.
-    if !dataset.branches().list().await?.is_empty() {
-        return Err(Error::not_supported_source(
-            "referenced_files is not supported on datasets with branches: \
-             a child branch may reference files this set would omit"
-                .into(),
-        ));
-    }
+    refuse_branches_and_detached_versions(dataset).await?;
 
     // External (multi-base) fragments/indices live outside this dataset's root,
     // so their paths neither protect nor match files here; refuse rather than
@@ -2475,17 +2466,6 @@ pub async fn referenced_files(dataset: &Dataset) -> Result<ReferencedFileSet> {
         return Err(Error::not_supported_source(
             "referenced_files is not supported on datasets with external base paths: \
              files in another base cannot be represented in this dataset's keep set"
-                .into(),
-        ));
-    }
-
-    // Detached versions (`d{version}.manifest`) are skipped by the manifest
-    // listing below, so a set built here would omit their files; refuse if any
-    // exist rather than let a caller delete them.
-    if !dataset.list_detached_manifests().await?.is_empty() {
-        return Err(Error::not_supported_source(
-            "referenced_files is not supported on datasets with detached versions: \
-             files reachable only from a detached version would be reported as orphans"
                 .into(),
         ));
     }
@@ -2607,9 +2587,10 @@ pub async fn referenced_files(dataset: &Dataset) -> Result<ReferencedFileSet> {
     // passed where its manifest sorts is missed, and it may be the only present
     // manifest that still references files inherited from versions a
     // concurrent cleanup removed during the walk. Listing order is the store's,
-    // not version order, so the missed version need not be the newest. A second
-    // listing returns every manifest present throughout it, and a version
-    // committed after it started makes the latest one the walk did not read.
+    // not version order, so the missed version need not be the newest. On a
+    // strongly consistent store a second listing returns every manifest present
+    // throughout it, and a version committed after it started makes the latest
+    // one the walk did not read.
     let missed = |version: u64| {
         Error::too_much_write_contention(format!(
             "referenced_files did not read version {version}, which the manifest listing \
@@ -2630,6 +2611,7 @@ pub async fn referenced_files(dataset: &Dataset) -> Result<ReferencedFileSet> {
     if !scanned_versions.contains(&latest) {
         return Err(missed(latest));
     }
+    refuse_branches_and_detached_versions(dataset).await?;
 
     let indices_dir = dataset.indices_dir();
     let index_prefixes: Vec<String> = index_uuids
@@ -2641,6 +2623,34 @@ pub async fn referenced_files(dataset: &Dataset) -> Result<ReferencedFileSet> {
         exact.into_iter().collect(),
         index_prefixes,
     ))
+}
+
+/// Refuses the lineage [`referenced_files`] cannot trace. Run before the walk
+/// to fail fast and again after it, since a branch or detached version created
+/// mid-walk is invisible to the manifest listing.
+async fn refuse_branches_and_detached_versions(dataset: &Dataset) -> Result<()> {
+    // Tracing branch lineage requires reading every referenced branch's
+    // manifests and resolving `base_id`; rather than silently under-report and
+    // let a caller delete a child branch's files, refuse and let them handle it.
+    if !dataset.branches().list().await?.is_empty() {
+        return Err(Error::not_supported_source(
+            "referenced_files is not supported on datasets with branches: \
+             a child branch may reference files this set would omit"
+                .into(),
+        ));
+    }
+
+    // Detached versions (`d{version}.manifest`) are skipped by the manifest
+    // listing, so a set built from it would omit their files; refuse if any
+    // exist rather than let a caller delete them.
+    if !dataset.list_detached_manifests().await?.is_empty() {
+        return Err(Error::not_supported_source(
+            "referenced_files is not supported on datasets with detached versions: \
+             files reachable only from a detached version would be reported as orphans"
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
 /// If the dataset config has `lance.auto_cleanup` parameters set,
@@ -7856,11 +7866,13 @@ mod tests {
     /// after the lister has passed where its manifest sorts. With
     /// `latest_ahead` set it reports one version past the newest one on
     /// storage; `hide_from_next_listing` (0 for none) drops that version from
-    /// the next listing only.
+    /// the next listing only; `hide_detached_once` hides detached versions from
+    /// the next detached listing, as if they were committed just after it.
     #[derive(Debug, Default)]
     struct RacyListing {
         latest_ahead: std::sync::atomic::AtomicBool,
         hide_from_next_listing: std::sync::atomic::AtomicU64,
+        hide_detached_once: std::sync::atomic::AtomicBool,
     }
 
     #[async_trait::async_trait]
@@ -7890,6 +7902,18 @@ mod tests {
                 .list_manifest_locations(base_path, object_store, sorted_descending)
                 .try_filter(move |location| std::future::ready(location.version != hidden))
                 .boxed()
+        }
+
+        fn list_detached_manifest_locations<'a>(
+            &self,
+            base_path: &Path,
+            object_store: &'a ObjectStore,
+        ) -> futures::stream::BoxStream<'a, Result<ManifestLocation>> {
+            if self.hide_detached_once.swap(false, Ordering::SeqCst) {
+                return futures::stream::empty().boxed();
+            }
+            lance_table::io::commit::ConditionalPutCommitHandler
+                .list_detached_manifest_locations(base_path, object_store)
         }
 
         async fn commit(
@@ -8032,16 +8056,33 @@ mod tests {
             .await
             .unwrap();
 
+        let assert_refused = |err: Error| {
+            assert!(
+                matches!(err, Error::NotSupported { .. }),
+                "expected NotSupported for a dataset with detached versions, got {err:?}"
+            );
+            assert!(
+                err.to_string().contains("detached"),
+                "error should mention detached versions, got {err}"
+            );
+        };
         let db = fixture.open().await.unwrap();
-        let err = db.referenced_files().await.unwrap_err();
-        assert!(
-            matches!(err, Error::NotSupported { .. }),
-            "expected NotSupported for a dataset with detached versions, got {err:?}"
-        );
-        assert!(
-            err.to_string().contains("detached"),
-            "error should mention detached versions, got {err}"
-        );
+        assert_refused(db.referenced_files().await.unwrap_err());
+
+        // A detached version committed during the walk is invisible to the
+        // check before it, so it must be caught by the one after.
+        let handler = Arc::new(RacyListing::default());
+        let db = DatasetBuilder::from_uri(&fixture.dataset_path)
+            .with_read_params(ReadParams {
+                store_options: Some(fixture.os_params()),
+                ..Default::default()
+            })
+            .with_commit_handler(handler.clone())
+            .load()
+            .await
+            .unwrap();
+        handler.hide_detached_once.store(true, Ordering::SeqCst);
+        assert_refused(db.referenced_files().await.unwrap_err());
     }
 
     #[tokio::test]
