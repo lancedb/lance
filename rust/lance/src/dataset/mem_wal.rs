@@ -469,12 +469,17 @@ mod tests {
         assert_eq!(a.value(0), 20, "id 2's value follows its id to `a`");
     }
 
-    /// A prepared column of one `Managed` reference, five bytes at `offset`.
+    /// A prepared column named `name` of one `Managed` reference, five bytes at
+    /// `offset`, under the ids of the table field `of` when given.
     fn managed_blob(
-        builder: crate::blob::BlobDescriptorArrayBuilder,
+        name: &str,
+        of: Option<&ArrowField>,
         offset: u64,
     ) -> (ArrowField, arrow_array::ArrayRef) {
-        let mut builder = builder;
+        let mut builder = crate::blob::BlobDescriptorArrayBuilder::new(name);
+        if let Some(of) = of {
+            builder = builder.with_field_ids_of(of).expect("the table's ids");
+        }
         builder
             .push(crate::blob::BlobDescriptor::Managed {
                 base_id: None,
@@ -514,138 +519,34 @@ mod tests {
         Arc::new(arrow_schema_with_field_ids(&table))
     }
 
-    /// A blob column held writer-prepared, as the MemTable stores it, keeps its
-    /// reference though the table declares it logical. A blob column held
-    /// logical beside it still resolves as declared.
-    #[test]
-    fn a_prepared_blob_column_stays_prepared() {
-        use crate::blob::{BlobArrayBuilder, BlobDescriptorArrayBuilder, blob_field};
-        use arrow_array::cast::AsArray;
-
-        let target = table_schema(vec![
-            ArrowField::new("id", DataType::Int64, false),
-            blob_field("blob", true),
-            blob_field("logical", true),
-        ]);
-        let (blob_field, blob) = managed_blob(
-            BlobDescriptorArrayBuilder::new("blob")
-                .with_field_ids_of(target.field(1))
-                .expect("prepared under the table's ids"),
-            3,
-        );
-        let mut logical = BlobArrayBuilder::new(1);
-        logical.push_bytes(b"bytes").expect("logical bytes");
-        let logical = logical.finish().expect("logical column");
-        let source = ArrowSchema::new(vec![
-            target.field(0).clone(),
-            blob_field,
-            target
-                .field(2)
-                .clone()
-                .with_data_type(logical.data_type().clone()),
-        ]);
-        let batch = RecordBatch::try_new(
-            Arc::new(source.clone()),
-            vec![
-                Arc::new(arrow_array::Int64Array::from(vec![1])),
-                blob,
-                logical,
-            ],
-        )
-        .expect("a batch under the source schema");
-
-        let out = reconcile_batches(&source, &target, &["id".to_string()], vec![batch])
-            .expect("reconcile");
-        assert_managed(out[0].column(1).as_struct(), 3);
-        let logical = out[0].column(2).as_struct();
-        assert_eq!(
-            BlobV2Layout::classify(logical.fields()),
-            Some(BlobV2Layout::Logical)
-        );
-        let data = logical.column_by_name("data").expect("data");
-        assert_eq!(data.as_binary::<i64>().value(0), b"bytes");
+    /// One row `id = 1` with `columns`, reconciled from `id` and `fields` to
+    /// `target`. A batch carries ids on every field or on none.
+    fn reconcile_one(
+        id: ArrowField,
+        fields: Vec<ArrowField>,
+        columns: Vec<arrow_array::ArrayRef>,
+        target: &Arc<ArrowSchema>,
+    ) -> RecordBatch {
+        let mut source = vec![id];
+        source.extend(fields);
+        let mut arrays: Vec<arrow_array::ArrayRef> =
+            vec![Arc::new(arrow_array::Int64Array::from(vec![1]))];
+        arrays.extend(columns);
+        let source = ArrowSchema::new(source);
+        let batch = RecordBatch::try_new(Arc::new(source.clone()), arrays)
+            .expect("a batch under the source schema");
+        reconcile_batches(&source, target, &["id".to_string()], vec![batch])
+            .expect("reconcile")
+            .remove(0)
     }
 
-    /// Batches without field ids resolve by name, and a prepared blob in them
-    /// keeps its reference just the same.
+    /// A blob held writer-prepared, as the MemTable stores it, keeps its
+    /// reference though the table declares it logical: at the top level, inside
+    /// a struct, as a list element and as a map value. A blob held logical
+    /// beside it still resolves as declared.
     #[test]
-    fn a_prepared_blob_without_field_ids_stays_prepared() {
-        use crate::blob::{BlobDescriptorArrayBuilder, blob_field};
-        use arrow_array::cast::AsArray;
-
-        let target = table_schema(vec![
-            ArrowField::new("id", DataType::Int64, false),
-            blob_field("blob", true),
-        ]);
-        let (blob_field, blob) = managed_blob(BlobDescriptorArrayBuilder::new("blob"), 3);
-        let source = ArrowSchema::new(vec![
-            ArrowField::new("id", DataType::Int64, false),
-            blob_field,
-        ]);
-        let batch = RecordBatch::try_new(
-            Arc::new(source.clone()),
-            vec![Arc::new(arrow_array::Int64Array::from(vec![1])), blob],
-        )
-        .expect("a batch under the source schema");
-
-        let out = reconcile_batches(&source, &target, &["id".to_string()], vec![batch])
-            .expect("reconcile");
-        assert_managed(out[0].column(1).as_struct(), 3);
-    }
-
-    /// A prepared blob inside a struct keeps its reference too.
-    #[test]
-    fn a_prepared_blob_inside_a_struct_stays_prepared() {
-        use crate::blob::{BlobDescriptorArrayBuilder, blob_field};
-        use arrow_array::cast::AsArray;
-
-        let target = table_schema(vec![
-            ArrowField::new("id", DataType::Int64, false),
-            ArrowField::new(
-                "meta",
-                DataType::Struct(vec![blob_field("payload", true)].into()),
-                true,
-            ),
-        ]);
-        let DataType::Struct(meta) = target.field(1).data_type() else {
-            unreachable!("meta is a struct");
-        };
-        let (payload_field, payload) = managed_blob(
-            BlobDescriptorArrayBuilder::new("payload")
-                .with_field_ids_of(&meta[0])
-                .expect("prepared under the table's ids"),
-            7,
-        );
-        let children: Fields = vec![payload_field].into();
-        let source = ArrowSchema::new(vec![
-            target.field(0).clone(),
-            target
-                .field(1)
-                .clone()
-                .with_data_type(DataType::Struct(children.clone())),
-        ]);
-        let batch = RecordBatch::try_new(
-            Arc::new(source.clone()),
-            vec![
-                Arc::new(arrow_array::Int64Array::from(vec![1])),
-                Arc::new(arrow_array::StructArray::new(children, vec![payload], None)),
-            ],
-        )
-        .expect("a batch under the source schema");
-
-        let out = reconcile_batches(&source, &target, &["id".to_string()], vec![batch])
-            .expect("reconcile");
-        let meta = out[0].column(1).as_struct();
-        assert_managed(
-            meta.column_by_name("payload").expect("payload").as_struct(),
-            7,
-        );
-    }
-
-    /// A prepared blob as a list element or a map value keeps its reference too.
-    #[test]
-    fn a_prepared_blob_in_a_list_or_map_stays_prepared() {
-        use crate::blob::{BlobDescriptorArrayBuilder, blob_field};
+    fn a_prepared_blob_stays_prepared_wherever_it_sits() {
+        use crate::blob::{BlobArrayBuilder, blob_field};
         use arrow_array::cast::AsArray;
         use arrow_buffer::OffsetBuffer;
 
@@ -654,6 +555,13 @@ mod tests {
         };
         let target = table_schema(vec![
             ArrowField::new("id", DataType::Int64, false),
+            blob_field("blob", true),
+            blob_field("logical", true),
+            ArrowField::new(
+                "meta",
+                DataType::Struct(vec![blob_field("payload", true)].into()),
+                true,
+            ),
             ArrowField::new(
                 "items",
                 DataType::List(Arc::new(blob_field("item", true))),
@@ -671,73 +579,96 @@ mod tests {
                 true,
             ),
         ]);
-        let DataType::List(item) = target.field(1).data_type() else {
-            unreachable!("items is a list");
+        let children = |index: usize| match target.field(index).data_type() {
+            DataType::Struct(children) => children.clone(),
+            DataType::List(item) => vec![item.clone()].into(),
+            DataType::Map(entries, _) => match entries.data_type() {
+                DataType::Struct(children) => children.clone(),
+                _ => unreachable!("map entries are a struct"),
+            },
+            _ => unreachable!("a nested column"),
         };
-        let DataType::Map(target_entries, _) = target.field(2).data_type() else {
-            unreachable!("attrs is a map");
-        };
-        let DataType::Struct(target_entries) = target_entries.data_type() else {
-            unreachable!("map entries are a struct");
-        };
-        let prepared = |name: &str, of: &ArrowField| {
-            managed_blob(
-                BlobDescriptorArrayBuilder::new(name)
-                    .with_field_ids_of(of)
-                    .expect("prepared under the table's ids"),
-                7,
-            )
-        };
-        let (item_field, items) = prepared("item", item);
+
+        let (blob_field, blob) = managed_blob("blob", Some(target.field(1)), 3);
+        let mut logical = BlobArrayBuilder::new(1);
+        logical.push_bytes(b"bytes").expect("logical bytes");
+        let logical = logical.finish().expect("logical column");
+        let (payload_field, payload) = managed_blob("payload", Some(&children(3)[0]), 7);
+        let meta_fields: Fields = vec![payload_field].into();
+        let (item_field, item) = managed_blob("item", Some(&children(4)[0]), 7);
         let item_field = Arc::new(item_field);
-        let items = arrow_array::ListArray::new(
-            Arc::clone(&item_field),
-            OffsetBuffer::from_lengths([1]),
-            items,
-            None,
-        );
-        let (value_field, values) = prepared("value", &target_entries[1]);
-        let entries_field = entries(target_entries[0].as_ref().clone(), value_field);
+        let (value_field, value) = managed_blob("value", Some(&children(5)[1]), 7);
+        let entries_field = entries(children(5)[0].as_ref().clone(), value_field);
         let DataType::Struct(entry_fields) = entries_field.data_type().clone() else {
             unreachable!("map entries are a struct");
         };
-        let attrs = arrow_array::MapArray::new(
-            Arc::new(entries_field.clone()),
-            OffsetBuffer::from_lengths([1]),
-            arrow_array::StructArray::new(
-                entry_fields,
-                vec![Arc::new(arrow_array::StringArray::from(vec!["k"])), values],
-                None,
-            ),
-            None,
-            false,
-        );
-        let source = ArrowSchema::new(vec![
+        let with_type = |index: usize, data_type: DataType| {
+            target.field(index).clone().with_data_type(data_type)
+        };
+        let out = reconcile_one(
             target.field(0).clone(),
-            target
-                .field(1)
-                .clone()
-                .with_data_type(DataType::List(item_field)),
-            target
-                .field(2)
-                .clone()
-                .with_data_type(DataType::Map(Arc::new(entries_field), false)),
-        ]);
-        let batch = RecordBatch::try_new(
-            Arc::new(source.clone()),
             vec![
-                Arc::new(arrow_array::Int64Array::from(vec![1])),
-                Arc::new(items),
-                Arc::new(attrs),
+                blob_field,
+                with_type(2, logical.data_type().clone()),
+                with_type(3, DataType::Struct(meta_fields.clone())),
+                with_type(4, DataType::List(Arc::clone(&item_field))),
+                with_type(5, DataType::Map(Arc::new(entries_field.clone()), false)),
             ],
-        )
-        .expect("a batch under the source schema");
+            vec![
+                blob,
+                logical,
+                Arc::new(arrow_array::StructArray::new(
+                    meta_fields,
+                    vec![payload],
+                    None,
+                )),
+                Arc::new(arrow_array::ListArray::new(
+                    item_field,
+                    OffsetBuffer::from_lengths([1]),
+                    item,
+                    None,
+                )),
+                Arc::new(arrow_array::MapArray::new(
+                    Arc::new(entries_field),
+                    OffsetBuffer::from_lengths([1]),
+                    arrow_array::StructArray::new(
+                        entry_fields,
+                        vec![Arc::new(arrow_array::StringArray::from(vec!["k"])), value],
+                        None,
+                    ),
+                    None,
+                    false,
+                )),
+            ],
+            &target,
+        );
 
-        let out = reconcile_batches(&source, &target, &["id".to_string()], vec![batch])
-            .expect("reconcile");
-        assert_managed(out[0].column(1).as_list::<i32>().values().as_struct(), 7);
-        let entries = out[0].column(2).as_map().entries();
-        assert_managed(entries.column(1).as_struct(), 7);
+        assert_managed(out["blob"].as_struct(), 3);
+        let logical = out["logical"].as_struct();
+        assert_eq!(
+            BlobV2Layout::classify(logical.fields()),
+            Some(BlobV2Layout::Logical)
+        );
+        assert_eq!(logical["data"].as_binary::<i64>().value(0), b"bytes");
+        assert_managed(out["meta"].as_struct()["payload"].as_struct(), 7);
+        assert_managed(out["items"].as_list::<i32>().values().as_struct(), 7);
+        assert_managed(out["attrs"].as_map().entries().column(1).as_struct(), 7);
+    }
+
+    /// Batches without field ids resolve by name, and a prepared blob in them
+    /// keeps its reference just the same.
+    #[test]
+    fn a_prepared_blob_without_field_ids_stays_prepared() {
+        use arrow_array::cast::AsArray;
+
+        let target = table_schema(vec![
+            ArrowField::new("id", DataType::Int64, false),
+            crate::blob::blob_field("blob", true),
+        ]);
+        let (blob_field, blob) = managed_blob("blob", None, 3);
+        let id = ArrowField::new("id", DataType::Int64, false);
+        let out = reconcile_one(id, vec![blob_field], vec![blob], &target);
+        assert_managed(out["blob"].as_struct(), 3);
     }
 
     /// A plain struct shaped like a blob is not one: its children still resolve
