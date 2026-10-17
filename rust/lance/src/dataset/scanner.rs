@@ -15542,6 +15542,107 @@ mod test {
         );
     }
 
+    /// Zone map pruning over NaN-bearing float zones returns exactly what the
+    /// unindexed scan returns, for every filter shape, while really going
+    /// through the index.
+    #[tokio::test]
+    async fn test_zonemap_nan_scan_matches_unindexed_scan() {
+        use arrow_array::Float32Array;
+
+        let pos_nan = f32::from_bits(0x7FC0_0000);
+        let pos_nan_payload = f32::from_bits(0x7FFF_FFFF);
+        let neg_nan = f32::from_bits(0xFFC0_0000);
+        let neg_nan_payload = f32::from_bits(0xFFFF_FFFF);
+
+        // One fragment (= one zone) per value class: all positive NaNs, all
+        // negative NaNs, NaN plus null, finite plus NaN, finite only.
+        let values: Vec<Option<f32>> = vec![
+            Some(pos_nan),
+            Some(pos_nan_payload),
+            Some(neg_nan),
+            Some(neg_nan_payload),
+            Some(neg_nan),
+            None,
+            Some(1.0),
+            Some(pos_nan),
+            Some(-5.0),
+            Some(7.0),
+        ];
+        let ids: Vec<i32> = (0..values.len() as i32).collect();
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("id", DataType::Int32, false),
+                ArrowField::new("val", DataType::Float32, true),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(ids)),
+                Arc::new(Float32Array::from(values)),
+            ],
+        )
+        .unwrap();
+        let schema = batch.schema();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let mut dataset = Dataset::write(
+            reader,
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 5);
+        dataset
+            .create_index(
+                &["val"],
+                IndexType::ZoneMap,
+                None,
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap),
+                false,
+            )
+            .await
+            .unwrap();
+
+        for filter in [
+            "val < 0.0",
+            "val > 0.0",
+            "val >= 0.0 AND val <= 5.0",
+            "val <= -1.0",
+            "val > 100.0",
+            "val = 7.0",
+            "val IS NULL",
+        ] {
+            let mut full_scan = dataset.scan();
+            full_scan
+                .use_scalar_index(false)
+                .filter(filter)
+                .unwrap()
+                .project(&["id"])
+                .unwrap();
+            let full = full_scan.try_into_batch().await.unwrap();
+            let full_ids: Vec<i32> = full["id"].as_primitive::<Int32Type>().values().to_vec();
+
+            let mut indexed_scan = dataset.scan();
+            indexed_scan
+                .filter(filter)
+                .unwrap()
+                .project(&["id"])
+                .unwrap();
+            let plan = indexed_scan.explain_plan(false).await.unwrap();
+            assert!(
+                plan.contains("ScalarIndexQuery") && plan.contains("ZoneMap"),
+                "filter {filter} must go through the zone map index: {plan}"
+            );
+            let indexed = indexed_scan.try_into_batch().await.unwrap();
+            let indexed_ids: Vec<i32> = indexed["id"].as_primitive::<Int32Type>().values().to_vec();
+            assert_eq!(
+                indexed_ids, full_ids,
+                "indexed and unindexed scans disagree for filter {filter}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_fm_index_with_stable_row_ids() {
         let batch = arrow_array::record_batch!(

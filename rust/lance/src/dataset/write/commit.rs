@@ -602,6 +602,14 @@ impl<'a> CommitBuilder<'a> {
 
         let read_version = transactions.iter().map(|t| t.read_version).min().unwrap();
 
+        // The merged write-path fact: known only when every part knows it.
+        let wrote_v1_seeds = if transactions.iter().any(|t| t.wrote_v1_seeds == Some(true)) {
+            Some(true)
+        } else if transactions.iter().all(|t| t.wrote_v1_seeds == Some(false)) {
+            Some(false)
+        } else {
+            None
+        };
         let merged = Transaction {
             uuid: uuid::Uuid::new_v4().hyphenated().to_string(),
             operation: Operation::Append {
@@ -616,6 +624,7 @@ impl<'a> CommitBuilder<'a> {
             read_version,
             tag: None,
             transaction_properties: None,
+            wrote_v1_seeds,
         };
         let dataset = self.execute(merged.clone()).await?;
         Ok(BatchCommitResult { dataset, merged })
@@ -768,6 +777,9 @@ mod tests {
             read_version,
             tag: None,
             transaction_properties: None,
+            // A fixture write that collected nothing: keeps the commit free of
+            // the published-file seed scan the unknown state would trigger.
+            wrote_v1_seeds: Some(false),
         }
     }
 
@@ -1411,6 +1423,7 @@ mod tests {
             read_version: 1,
             tag: None,
             transaction_properties: None,
+            wrote_v1_seeds: None,
         };
         let res = CommitBuilder::new(dataset.clone())
             .execute_batch(vec![update_transaction])

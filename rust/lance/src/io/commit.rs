@@ -1372,13 +1372,20 @@ pub(crate) async fn do_commit_detached_transaction(
                 let prepared =
                     prepare_attempt(dataset, transaction, &build_config, FragReuseUpdate::None)
                         .await?;
-                transaction.build_manifest_prepared(
+                let (mut manifest, indices) = transaction.build_manifest_prepared(
                     Some(dataset.manifest.as_ref()),
                     prepared,
                     &transaction_file,
                     &build_config,
                     None,
-                )?
+                )?;
+                crate::dataset::write::seeds::apply_v1_seed_feature_flags(
+                    &mut manifest,
+                    dataset,
+                    transaction,
+                )
+                .await?;
+                (manifest, indices)
             }
         };
 
@@ -1878,13 +1885,23 @@ pub(crate) async fn commit_transaction(
                 let prepared =
                     prepare_attempt(&dataset, &attempt_transaction, &build_config, frag_reuse)
                         .await?;
-                attempt_transaction.build_manifest_prepared(
+                let (mut manifest, indices) = attempt_transaction.build_manifest_prepared(
                     Some(dataset.manifest.as_ref()),
                     prepared,
                     transaction_file,
                     &build_config,
                     read_version_state,
-                )?
+                )?;
+                // Version 1 seed presence cannot be derived from the manifest
+                // (seeds live in data file footers), so the committing writer
+                // sets the paired bits; stickiness preserves them afterwards.
+                crate::dataset::write::seeds::apply_v1_seed_feature_flags(
+                    &mut manifest,
+                    &dataset,
+                    &attempt_transaction,
+                )
+                .await?;
+                (manifest, indices)
             }
         };
 

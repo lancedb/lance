@@ -132,7 +132,7 @@ pub async fn write_fragments(
     file_row_counts: Option<Vec<usize>>,
     preassigned_data_file_name: Option<Arc<String>>,
     keep_field_ids: bool,
-) -> Result<(Vec<Fragment>, Schema)> {
+) -> Result<(Vec<Fragment>, Schema, bool)> {
     // A writer that spills row lineage into the fragment's own data file
     // carries the hidden columns in its stream. They are not dataset fields:
     // set them aside before the schema is checked against the dataset's and
@@ -173,6 +173,11 @@ pub async fn write_fragments(
     // Overwrite drops every index, so its seeds would have no consumer.
     let consult_indices = !matches!(params.mode, WriteMode::Overwrite);
     let seeds = SeedCollector::for_write(version, dataset, &schema, consult_indices).await?;
+    // The write-path fact carried to the commit so it can set the paired
+    // `FLAG_ZONE_WRITE_SEEDS` bits without re-deriving seed emission from
+    // index configuration. Over-approximates an empty write (a collector with
+    // writers that observed no rows embeds nothing), which only over-fences.
+    let wrote_v1_seeds = seeds.has_writers();
     let fragments = write_fragments_direct(
         version,
         dataset,
@@ -187,7 +192,7 @@ pub async fn write_fragments(
         preassigned_data_file_name,
     )
     .await?;
-    Ok((fragments, schema))
+    Ok((fragments, schema, wrote_v1_seeds))
 }
 
 /// Take the hidden row lineage columns out of a write schema.

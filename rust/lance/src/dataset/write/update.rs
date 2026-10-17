@@ -12,7 +12,7 @@ use crate::dataset::rowids::{
     get_row_id_index, inline_row_lineage_max_bytes, place_carried_row_lineage,
 };
 use crate::dataset::transaction::UpdateMode::RewriteRows;
-use crate::dataset::transaction::{Operation, Transaction};
+use crate::dataset::transaction::{Operation, TransactionBuilder};
 use crate::dataset::utils::make_rowid_capture_stream;
 use crate::{Dataset, io::exec::Planner};
 use crate::{Error, Result};
@@ -318,6 +318,7 @@ pub struct UpdateData {
     new_fragments: Vec<Fragment>,
     affected_rows: RowAddrTreeMap,
     num_updated_rows: u64,
+    wrote_v1_seeds: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -506,7 +507,7 @@ impl UpdateJob {
             });
         let stream = RecordBatchStreamAdapter::new(schema, stream);
 
-        let (mut new_fragments, _) = write_fragments_internal(
+        let (mut new_fragments, _, wrote_v1_seeds) = write_fragments_internal(
             self.write_version,
             Some(&self.dataset),
             self.dataset.object_store.clone(),
@@ -573,6 +574,7 @@ impl UpdateJob {
             new_fragments,
             affected_rows,
             num_updated_rows,
+            wrote_v1_seeds,
         })
     }
 
@@ -658,7 +660,9 @@ impl UpdateJob {
             updated_fragment_offsets: None,
         };
 
-        let transaction = Transaction::new(dataset.manifest.version, operation, None);
+        let transaction = TransactionBuilder::new(dataset.manifest.version, operation)
+            .wrote_v1_seeds(update_data.wrote_v1_seeds)
+            .build();
 
         let new_dataset = CommitBuilder::new(dataset)
             .with_affected_rows(update_data.affected_rows)

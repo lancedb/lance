@@ -94,6 +94,11 @@ impl SeedCollector {
         self.writers.is_empty()
     }
 
+    /// Whether any column of this write receives a seed.
+    pub(crate) fn has_writers(&self) -> bool {
+        !self.writers.is_empty()
+    }
+
     /// Feed one written batch to every seed writer whose column it contains.
     pub fn observe(&mut self, batch: &RecordBatch) -> Result<()> {
         for writer in self.writers.iter_mut() {
@@ -117,4 +122,168 @@ impl SeedCollector {
         }
         Ok(())
     }
+}
+
+/// Set the paired `FLAG_ZONE_WRITE_SEEDS` bits on the manifest being built
+/// when this transaction publishes data files that carry version 1 seeds.
+///
+/// The write-path fact on the transaction is authoritative when present; a
+/// transaction that lost it (serialized round trip, pre-written fragments
+/// committed from outside the write path) falls back to reading the published
+/// files, which no concurrent index change can race. When the built manifest
+/// already inherited both sticky bits from its base, nothing needs checking.
+pub async fn apply_v1_seed_feature_flags(
+    manifest: &mut lance_table::format::Manifest,
+    dataset: &Dataset,
+    transaction: &crate::dataset::transaction::Transaction,
+) -> Result<()> {
+    use lance_table::feature_flags::FLAG_ZONE_WRITE_SEEDS;
+
+    if manifest.reader_feature_flags & FLAG_ZONE_WRITE_SEEDS != 0
+        && manifest.writer_feature_flags & FLAG_ZONE_WRITE_SEEDS != 0
+    {
+        return Ok(());
+    }
+    let publishes = match transaction.wrote_v1_seeds {
+        Some(known) => known,
+        None => transaction_publishes_v1_seeds(dataset, &transaction.operation).await?,
+    };
+    if publishes {
+        manifest.reader_feature_flags |= FLAG_ZONE_WRITE_SEEDS;
+        manifest.writer_feature_flags |= FLAG_ZONE_WRITE_SEEDS;
+    }
+    Ok(())
+}
+
+/// The data files an operation publishes: the files its commit makes visible
+/// that were written for this transaction. Updated fragments are listed whole,
+/// which over-approximates (they also carry pre-existing files); the caller
+/// treats "carries a seed" as a one-way answer, so over-scanning stays safe.
+/// Data overlays are excluded because no overlay write path attaches a seed
+/// collector.
+fn operation_published_data_files(
+    operation: &crate::dataset::transaction::Operation,
+) -> Vec<&lance_table::format::DataFile> {
+    use crate::dataset::transaction::Operation;
+    use lance_table::format::{DataFile, Fragment};
+
+    fn fragment_files(fragments: &[Fragment]) -> impl Iterator<Item = &DataFile> {
+        fragments.iter().flat_map(|fragment| fragment.files.iter())
+    }
+
+    match operation {
+        Operation::Append { fragments }
+        | Operation::Overwrite { fragments, .. }
+        | Operation::Merge { fragments, .. } => fragment_files(fragments).collect(),
+        Operation::Update {
+            updated_fragments,
+            new_fragments,
+            ..
+        } => fragment_files(updated_fragments)
+            .chain(fragment_files(new_fragments))
+            .collect(),
+        Operation::Rewrite { groups, .. } => groups
+            .iter()
+            .flat_map(|group| fragment_files(&group.new_fragments))
+            .collect(),
+        Operation::DataReplacement { replacements } => replacements
+            .iter()
+            .map(|replacement| &replacement.1)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Whether any data file this transaction publishes carries a version 1 zone
+/// write seed, read from the files themselves.
+///
+/// The commit must set the paired `FLAG_ZONE_WRITE_SEEDS` bits in the same
+/// manifest that first references such files, so builds that cannot read
+/// version 1 seeds refuse the dataset instead of misreading them. This is the
+/// fallback for transactions whose [`Transaction::wrote_v1_seeds`] write-path
+/// fact is unknown (rebuilt from a serialized transaction, or assembled
+/// outside the lance write path from pre-written fragments). The files are
+/// the durable record, so no concurrent index change can race this answer.
+///
+/// Short-circuits on the first version 1 seed. Concluding "no seeds" costs
+/// one footer read per published file, paid only while the dataset does not
+/// yet carry the sticky flags.
+///
+/// [`Transaction::wrote_v1_seeds`]: lance_table::transaction::Transaction::wrote_v1_seeds
+pub async fn transaction_publishes_v1_seeds(
+    dataset: &Dataset,
+    operation: &crate::dataset::transaction::Operation,
+) -> Result<bool> {
+    for data_file in operation_published_data_files(operation) {
+        if data_file_carries_v1_seed(dataset, data_file).await? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+async fn data_file_carries_v1_seed(
+    dataset: &Dataset,
+    data_file: &lance_table::format::DataFile,
+) -> Result<bool> {
+    use lance_file::reader::{FileReader, FileReaderOptions};
+    use lance_index::scalar::seed::SEED_META_KEY_PREFIX;
+    use lance_index::scalar::zonemap::ZoneMapSeedWriter;
+    use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
+    use lance_io::utils::CachedFileSize;
+
+    // Legacy files have no global buffers, so they cannot hold a seed.
+    if data_file.file_version()? == ConcreteFileVersion::V1 {
+        return Ok(false);
+    }
+
+    let path = dataset
+        .data_file_dir(data_file)?
+        .join(data_file.path.as_str());
+    let store = dataset.object_store(data_file.base_id).await?;
+    let scheduler = ScanScheduler::new(store.clone(), SchedulerConfig::max_bandwidth(&store));
+    // A file that is not there carries no seed a reader could misread; commits
+    // of fabricated fragments (tests, manifest tooling) stay possible. Other
+    // errors propagate: a transient failure must not skip the flag.
+    let file_scheduler = match scheduler.open_file(&path, &CachedFileSize::unknown()).await {
+        Ok(file_scheduler) => file_scheduler,
+        Err(lance_core::Error::NotFound { .. }) => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    let reader = FileReader::try_open(
+        file_scheduler,
+        None,
+        Default::default(),
+        &dataset.metadata_cache.file_metadata_cache(&path),
+        FileReaderOptions::default(),
+    )
+    .await?;
+
+    let file_schema = &reader.metadata().file_schema;
+    for (key, value) in file_schema.metadata.iter() {
+        if !key.starts_with(SEED_META_KEY_PREFIX) {
+            continue;
+        }
+        // The buffer index is the portion before the first ':'. A value this
+        // build cannot parse comes from a newer writer; claiming the flag for
+        // it only over-fences old readers, while missing it would let them
+        // misread the seed, so unparsable seeds count as version 1.
+        let Some(buf_index) = value
+            .split(':')
+            .next()
+            .and_then(|index| index.parse::<u32>().ok())
+        else {
+            return Ok(true);
+        };
+        let Ok(bytes) = reader.read_global_buffer(buf_index).await else {
+            return Ok(true);
+        };
+        match ZoneMapSeedWriter::seed_bytes_format_version(&bytes) {
+            // Version 0 buffers predate the version key and need no flag.
+            Ok(None) => continue,
+            Ok(Some(_)) => return Ok(true),
+            Err(_) => return Ok(true),
+        }
+    }
+    Ok(false)
 }

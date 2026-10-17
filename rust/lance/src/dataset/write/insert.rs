@@ -247,22 +247,24 @@ impl<'a> InsertBuilder<'a> {
                 "a fixed data file name cannot be combined with target bases",
             ));
         }
-        let (written_fragments, written_schema) = Box::pin(write_fragments_internal_impl(
-            context.storage_version,
-            context.dest.dataset(),
-            context.object_store.clone(),
-            &context.base_path,
-            schema.clone(),
-            stream,
-            context.params.clone(),
-            target_base_info,
-            None,
-            self.preassigned_data_file_name.clone(),
-            self.keep_field_ids,
-        ))
-        .await?;
+        let (written_fragments, written_schema, wrote_v1_seeds) =
+            Box::pin(write_fragments_internal_impl(
+                context.storage_version,
+                context.dest.dataset(),
+                context.object_store.clone(),
+                &context.base_path,
+                schema.clone(),
+                stream,
+                context.params.clone(),
+                target_base_info,
+                None,
+                self.preassigned_data_file_name.clone(),
+                self.keep_field_ids,
+            ))
+            .await?;
 
-        let transaction = Self::build_transaction(written_schema, written_fragments, &context)?;
+        let transaction =
+            Self::build_transaction(written_schema, written_fragments, wrote_v1_seeds, &context)?;
 
         Ok((transaction, context))
     }
@@ -270,6 +272,7 @@ impl<'a> InsertBuilder<'a> {
     fn build_transaction(
         schema: Schema,
         fragments: Vec<Fragment>,
+        wrote_v1_seeds: bool,
         context: &WriteContext<'_>,
     ) -> Result<Transaction> {
         let operation = match context.params.mode {
@@ -321,6 +324,7 @@ impl<'a> InsertBuilder<'a> {
             operation,
         )
         .transaction_properties(context.params.transaction_properties.clone())
+        .wrote_v1_seeds(wrote_v1_seeds)
         .build();
 
         Ok(transaction)

@@ -724,7 +724,7 @@ impl FullSchemaMergeInsertExec {
                         Box::pin(RecordBatchStreamAdapter::new(schema, validated))
                             as SendableRecordBatchStream
                     };
-                    let (fragments, _) = write_fragments_internal(
+                    let (fragments, _, _) = write_fragments_internal(
                         params.write_version(dataset),
                         Some(dataset),
                         dataset.object_store.clone(),

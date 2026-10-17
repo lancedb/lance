@@ -2149,7 +2149,7 @@ impl MergeInsertJob {
                     OnTypeMismatch::Error,
                 )?;
 
-                let (fragments, _) = write_fragments_internal(
+                let (fragments, _, _) = write_fragments_internal(
                     write_version,
                     Some(dataset.as_ref()),
                     dataset.object_store.clone(),
@@ -3161,7 +3161,7 @@ impl MergeInsertJob {
             (operation, None)
         } else {
             let cleanup_bases = target_bases_info.clone();
-            let (mut new_fragments, _) = write_fragments_internal(
+            let (mut new_fragments, _, _) = write_fragments_internal(
                 self.params.write_version(&self.dataset),
                 Some(&self.dataset),
                 self.dataset.object_store.clone(),

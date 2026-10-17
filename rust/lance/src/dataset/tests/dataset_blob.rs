@@ -1828,6 +1828,7 @@ async fn test_data_replacement_uses_blob_descriptor_array_builder_prepared_packe
         operation: Operation::DataReplacement {
             replacements: vec![DataReplacementGroup(0, data_file)],
         },
+        wrote_v1_seeds: None,
         tag: None,
         transaction_properties: None,
     };
@@ -2009,6 +2010,7 @@ async fn test_data_replacement_uses_blob_descriptor_array_builder_prepared_neste
         operation: Operation::DataReplacement {
             replacements: vec![DataReplacementGroup(0, data_file)],
         },
+        wrote_v1_seeds: None,
         tag: None,
         transaction_properties: None,
     };

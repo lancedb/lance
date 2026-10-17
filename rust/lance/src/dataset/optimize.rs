@@ -2425,6 +2425,14 @@ pub struct RewriteResult {
     ///   deferred index remap post-processing, or (2) used with reserved
     ///   fragment IDs to build old-to-new mappings.
     pub row_addrs: Option<Vec<u8>>,
+    /// Whether this task's rewritten files embed version 1 zone write seeds,
+    /// recorded at write time so the commit can set the paired
+    /// `FLAG_ZONE_WRITE_SEEDS` bits. Deliberately not serialized: a result
+    /// that crossed a process boundary comes back `None`, and the commit then
+    /// derives the answer from the published files instead of trusting a
+    /// claim that could have been produced by a different build.
+    #[serde(skip)]
+    pub wrote_v1_seeds: Option<bool>,
 }
 
 /// Returns the version the reservation committed at; `dataset` is not moved to it.
@@ -2541,6 +2549,7 @@ async fn rewrite_files(
             read_version: dataset.manifest.version,
             original_fragments: task.fragments,
             row_addrs: None,
+            wrote_v1_seeds: Some(false),
         });
     }
 
@@ -2570,6 +2579,9 @@ async fn rewrite_files(
                 .await?
                 .is_some());
     let mut new_fragments: Vec<Fragment>;
+    // Binary copy carries pages verbatim and regenerates footers without
+    // seeds; only the re-encoding branch can embed them.
+    let mut task_wrote_v1_seeds = false;
     let task_id = uuid::Uuid::new_v4();
     log::info!(
         "Compaction task {}: Begin compacting {} rows across {} fragments",
@@ -2798,7 +2810,7 @@ async fn rewrite_files(
             }
             None => None,
         };
-        let (frags, _) = write_fragments_internal_with_file_row_counts(
+        let (frags, _, wrote_v1_seeds) = write_fragments_internal_with_file_row_counts(
             write_version,
             Some(dataset.as_ref()),
             dataset.object_store.clone(),
@@ -2811,6 +2823,7 @@ async fn rewrite_files(
         )
         .await?;
         new_fragments = frags;
+        task_wrote_v1_seeds = wrote_v1_seeds;
         lineage_plan
     };
 
@@ -2879,6 +2892,7 @@ async fn rewrite_files(
         read_version: dataset.manifest.version,
         original_fragments: fragments,
         row_addrs,
+        wrote_v1_seeds: Some(task_wrote_v1_seeds),
     })
 }
 
@@ -3323,6 +3337,24 @@ pub async fn commit_compaction(
     // Address-style results require immediate index remapping unless it is deferred.
     let needs_remapping = !uses_stable_row_ids && !options.defer_index_remap && has_address_style;
 
+    // The write-path fact for the whole rewrite: known only when every task
+    // reports it. A result that crossed a process boundary (distributed
+    // compaction) comes back unknown, and the commit then reads the published
+    // files instead.
+    let wrote_v1_seeds = if completed_tasks
+        .iter()
+        .any(|task| task.wrote_v1_seeds == Some(true))
+    {
+        Some(true)
+    } else if completed_tasks
+        .iter()
+        .all(|task| task.wrote_v1_seeds == Some(false))
+    {
+        Some(false)
+    } else {
+        None
+    };
+
     // Confirm there is a remapper before materializing the potentially very large row address map.
     let index_remapper = if needs_remapping {
         remap_options.create_remapper(dataset).await?
@@ -3737,7 +3769,11 @@ pub async fn commit_compaction(
             frag_reuse_index,
         },
     )
-    .transaction_properties(options.transaction_properties.clone())
+    .transaction_properties(options.transaction_properties.clone());
+    let transaction = match wrote_v1_seeds {
+        Some(known) => transaction.wrote_v1_seeds(known),
+        None => transaction,
+    }
     .build();
 
     if let Err(e) = dataset

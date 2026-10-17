@@ -1722,7 +1722,7 @@ pub async fn write_fragments_internal(
     data: SendableRecordBatchStream,
     params: WriteParams,
     target_bases_info: Option<Vec<TargetBaseInfo>>,
-) -> Result<(Vec<Fragment>, Schema)> {
+) -> Result<(Vec<Fragment>, Schema, bool)> {
     write_fragments_internal_with_file_row_counts(
         storage_version,
         dataset,
@@ -1749,7 +1749,7 @@ pub(crate) async fn write_fragments_internal_with_file_row_counts(
     params: WriteParams,
     target_bases_info: Option<Vec<TargetBaseInfo>>,
     file_row_counts: Option<Vec<usize>>,
-) -> Result<(Vec<Fragment>, Schema)> {
+) -> Result<(Vec<Fragment>, Schema, bool)> {
     write_fragments_internal_impl(
         storage_version,
         dataset,
@@ -1779,7 +1779,7 @@ pub(crate) async fn write_fragments_internal_impl(
     file_row_counts: Option<Vec<usize>>,
     preassigned_data_file_name: Option<Arc<String>>,
     keep_field_ids: bool,
-) -> Result<(Vec<Fragment>, Schema)> {
+) -> Result<(Vec<Fragment>, Schema, bool)> {
     let mut params = params;
 
     // Make sure the max rows per group is not larger than the max rows per file
@@ -2603,8 +2603,8 @@ mod tests {
     use std::path::{Component, Prefix};
 
     use arrow_array::{
-        Int32Array, LargeBinaryArray, RecordBatchIterator, RecordBatchReader, StringArray,
-        StringViewArray, StructArray,
+        Int32Array, Int64Array, LargeBinaryArray, RecordBatchIterator, RecordBatchReader,
+        StringArray, StringViewArray, StructArray,
     };
     use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
     use datafusion::{error::DataFusionError, physical_plan::stream::RecordBatchStreamAdapter};
@@ -2855,7 +2855,7 @@ mod tests {
                 .into_reader_rows(RowCount::from(10 * 1024), BatchCount::from(2)),
         );
 
-        let (fragments, _) = reader_to_frags(data_reader).await.unwrap();
+        let (fragments, _, _) = reader_to_frags(data_reader).await.unwrap();
 
         assert_eq!(fragments.len(), 2);
     }
@@ -2908,7 +2908,7 @@ mod tests {
         let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
         let object_store = Arc::new(ObjectStore::memory());
 
-        let (fragments, _) = write_fragments_internal_with_file_row_counts(
+        let (fragments, _, _) = write_fragments_internal_with_file_row_counts(
             ConcreteFileVersion::V2_0,
             None,
             object_store,
@@ -2964,7 +2964,7 @@ mod tests {
         let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
         let object_store = Arc::new(ObjectStore::memory());
 
-        let (fragments, _) = write_fragments_internal_with_file_row_counts(
+        let (fragments, _, _) = write_fragments_internal_with_file_row_counts(
             ConcreteFileVersion::V2_0,
             None,
             object_store,
@@ -3039,7 +3039,7 @@ mod tests {
                 .into_reader_rows(RowCount::from(12000), BatchCount::from(1)),
         );
 
-        let (fragments, _) = reader_to_frags(data_reader).await.unwrap();
+        let (fragments, _, _) = reader_to_frags(data_reader).await.unwrap();
 
         // Should have 3 fragments
         assert_eq!(fragments.len(), 3);
@@ -3106,7 +3106,7 @@ mod tests {
                 .into_reader_rows(RowCount::from(9000), BatchCount::from(1)),
         );
 
-        let (fragments_v1, _) = reader_to_frags(data_reader_v1, LanceFileVersion::Legacy)
+        let (fragments_v1, _, _) = reader_to_frags(data_reader_v1, LanceFileVersion::Legacy)
             .await
             .unwrap();
         let row_counts_v1: Vec<usize> = fragments_v1
@@ -3130,7 +3130,7 @@ mod tests {
                 .into_reader_rows(RowCount::from(9000), BatchCount::from(1)),
         );
 
-        let (fragments_v2, _) = reader_to_frags(data_reader_v2, LanceFileVersion::Stable)
+        let (fragments_v2, _, _) = reader_to_frags(data_reader_v2, LanceFileVersion::Stable)
             .await
             .unwrap();
         let row_counts_v2: Vec<usize> = fragments_v2
@@ -3192,7 +3192,7 @@ mod tests {
             let schema = Schema::try_from(schema.as_ref()).unwrap();
 
             let object_store = Arc::new(ObjectStore::memory());
-            let (fragments, _) = write_fragments_internal(
+            let (fragments, _, _) = write_fragments_internal(
                 version.resolve(),
                 None,
                 object_store,
@@ -3268,7 +3268,7 @@ mod tests {
 
         let object_store = Arc::new(ObjectStore::memory());
         let base_path = Path::from("test");
-        let (fragments, written_schema) = write_fragments_internal(
+        let (fragments, written_schema, _) = write_fragments_internal(
             ConcreteFileVersion::V1,
             None,
             object_store.clone(),
@@ -4470,7 +4470,7 @@ mod tests {
         // Empty stream should be handled gracefully
         // It should create an empty dataset or return an appropriate result
         match result {
-            Ok((fragments, _)) => {
+            Ok((fragments, _, _)) => {
                 // If successful, verify it creates an empty result
                 assert!(
                     fragments.is_empty(),
@@ -5815,6 +5815,286 @@ mod tests {
             .unwrap();
         let expected = RowAddrTreeMap::from_iter(null_rows.iter().copied());
         assert_eq!(result, SearchResult::exact(expected));
+    }
+
+    /// The first commit whose data files carry version 1 seeds sets the
+    /// paired FLAG_ZONE_WRITE_SEEDS bits; later commits keep them (sticky).
+    #[tokio::test]
+    async fn test_v1_seed_commit_sets_feature_flags() {
+        use lance_table::feature_flags::FLAG_ZONE_WRITE_SEEDS;
+
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "val",
+            DataType::Int64,
+            false,
+        )]));
+        let make_batch = |start: i64| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int64Array::from_iter_values(start..start + 10))],
+            )
+            .unwrap()
+        };
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(make_batch(0))], schema.clone()),
+            "memory://",
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            dataset.manifest.reader_feature_flags & FLAG_ZONE_WRITE_SEEDS,
+            0
+        );
+
+        // Creating the index writes no data files, so no flag yet.
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap)
+            .with_params(&serde_json::json!({"use_seeds": true}));
+        dataset
+            .create_index(&["val"], IndexType::ZoneMap, None, &params, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            dataset.manifest.reader_feature_flags & FLAG_ZONE_WRITE_SEEDS,
+            0
+        );
+
+        // The first seeded append sets both bits.
+        let dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(make_batch(10))], schema.clone()),
+            Arc::new(dataset),
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_ne!(
+            dataset.manifest.reader_feature_flags & FLAG_ZONE_WRITE_SEEDS,
+            0
+        );
+        assert_ne!(
+            dataset.manifest.writer_feature_flags & FLAG_ZONE_WRITE_SEEDS,
+            0
+        );
+
+        // Sticky across later commits.
+        let dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(make_batch(20))], schema),
+            Arc::new(dataset),
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_ne!(
+            dataset.manifest.reader_feature_flags & FLAG_ZONE_WRITE_SEEDS,
+            0
+        );
+        assert_ne!(
+            dataset.manifest.writer_feature_flags & FLAG_ZONE_WRITE_SEEDS,
+            0
+        );
+    }
+
+    fn seed_flag_schema() -> Arc<ArrowSchema> {
+        Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "val",
+            DataType::Int64,
+            false,
+        )]))
+    }
+
+    fn seed_flag_batch(schema: &Arc<ArrowSchema>, start: i64) -> RecordBatch {
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from_iter_values(start..start + 10))],
+        )
+        .unwrap()
+    }
+
+    fn assert_seed_flags(dataset: &Dataset, set: bool) {
+        use lance_table::feature_flags::FLAG_ZONE_WRITE_SEEDS;
+        assert_eq!(
+            dataset.manifest.reader_feature_flags & FLAG_ZONE_WRITE_SEEDS != 0,
+            set,
+            "reader_feature_flags"
+        );
+        assert_eq!(
+            dataset.manifest.writer_feature_flags & FLAG_ZONE_WRITE_SEEDS != 0,
+            set,
+            "writer_feature_flags"
+        );
+    }
+
+    /// A v2 dataset with data written before its seeded zone map index, so no
+    /// data file carries a seed and the flags are still clear.
+    async fn seeded_zonemap_dataset(initial_batches: usize) -> (Arc<ArrowSchema>, Dataset) {
+        let schema = seed_flag_schema();
+        let batches: Vec<_> = (0..initial_batches as i64)
+            .map(|batch| Ok(seed_flag_batch(&schema, batch * 10)))
+            .collect();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(batches, schema.clone()),
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 10,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap)
+            .with_params(&serde_json::json!({"use_seeds": true}));
+        dataset
+            .create_index(&["val"], IndexType::ZoneMap, None, &params, false)
+            .await
+            .unwrap();
+        assert_seed_flags(&dataset, false);
+        (schema, dataset)
+    }
+
+    /// The first publication of v1 seeds through a re-encoding compaction
+    /// (`Operation::Rewrite`) must set both sticky flags in the same commit.
+    #[tokio::test]
+    async fn test_v1_seed_flags_set_by_reencode_compaction() {
+        use crate::dataset::optimize::{CompactionMode, CompactionOptions, compact_files};
+
+        let (_schema, mut dataset) = seeded_zonemap_dataset(2).await;
+        let metrics = compact_files(
+            &mut dataset,
+            CompactionOptions {
+                compaction_mode: Some(CompactionMode::Reencode),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            metrics.fragments_added > 0,
+            "the test needs a real rewrite to cover the Rewrite operation"
+        );
+        assert_seed_flags(&dataset, true);
+    }
+
+    /// The write-path fact must survive a concurrent DROP INDEX between the
+    /// write and the commit: the files carry seeds whatever the commit-time
+    /// index configuration says.
+    #[tokio::test]
+    async fn test_v1_seed_flags_survive_index_drop_before_commit() {
+        let (schema, dataset) = seeded_zonemap_dataset(1).await;
+        let index_name = dataset.load_indices().await.unwrap()[0].name.clone();
+        let dataset = Arc::new(dataset);
+
+        let transaction = InsertBuilder::new(dataset.clone())
+            .with_params(&WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            })
+            .execute_uncommitted(vec![seed_flag_batch(&schema, 100)])
+            .await
+            .unwrap();
+        assert_eq!(transaction.wrote_v1_seeds, Some(true));
+
+        let mut latest = (*dataset).clone();
+        latest.drop_index(&index_name).await.unwrap();
+        assert_seed_flags(&latest, false);
+
+        let committed = CommitBuilder::new(Arc::new(latest))
+            .execute(transaction)
+            .await
+            .unwrap();
+        assert_seed_flags(&committed, true);
+    }
+
+    /// A transaction rebuilt outside the write path (serialized handoff,
+    /// pre-written files committed through the bindings) has no write-path
+    /// fact; the commit must read the published files and still set the flags,
+    /// even when the index is gone by commit time.
+    #[tokio::test]
+    async fn test_v1_seed_flags_from_files_when_fact_unknown() {
+        let (schema, dataset) = seeded_zonemap_dataset(1).await;
+        let index_name = dataset.load_indices().await.unwrap()[0].name.clone();
+        let dataset = Arc::new(dataset);
+
+        let transaction = InsertBuilder::new(dataset.clone())
+            .with_params(&WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            })
+            .execute_uncommitted(vec![seed_flag_batch(&schema, 100)])
+            .await
+            .unwrap();
+        let rebuilt = Transaction::new(
+            transaction.read_version,
+            transaction.operation.clone(),
+            None,
+        );
+        assert_eq!(rebuilt.wrote_v1_seeds, None);
+
+        let mut latest = (*dataset).clone();
+        latest.drop_index(&index_name).await.unwrap();
+
+        let committed = CommitBuilder::new(Arc::new(latest))
+            .execute(rebuilt)
+            .await
+            .unwrap();
+        assert_seed_flags(&committed, true);
+    }
+
+    /// Retries and rebases keep the write-path fact; a detached commit sets
+    /// the flags on its detached manifest; restore keeps the sticky bits.
+    #[tokio::test]
+    async fn test_v1_seed_flags_survive_rebase_detached_and_restore() {
+        let (schema, dataset) = seeded_zonemap_dataset(1).await;
+        let dataset = Arc::new(dataset);
+
+        // A detached commit of a seed-writing transaction flags its manifest.
+        let detached_tx = InsertBuilder::new(dataset.clone())
+            .with_params(&WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            })
+            .execute_uncommitted(vec![seed_flag_batch(&schema, 200)])
+            .await
+            .unwrap();
+        let detached = CommitBuilder::new(dataset.clone())
+            .with_detached(true)
+            .execute(detached_tx)
+            .await
+            .unwrap();
+        assert_seed_flags(&detached, true);
+
+        // A seed-writing transaction committed against a stale handle rebases
+        // over an interleaved non-seeding commit and still sets the flags.
+        let transaction = InsertBuilder::new(dataset.clone())
+            .with_params(&WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            })
+            .execute_uncommitted(vec![seed_flag_batch(&schema, 100)])
+            .await
+            .unwrap();
+        assert_eq!(transaction.wrote_v1_seeds, Some(true));
+        let mut interleaved = (*dataset).clone();
+        interleaved.delete("val = 0").await.unwrap();
+        assert_seed_flags(&interleaved, false);
+
+        let committed = CommitBuilder::new(dataset.clone())
+            .execute(transaction)
+            .await
+            .unwrap();
+        assert_seed_flags(&committed, true);
+
+        // Restoring a pre-flag version keeps the sticky bits.
+        let pre_flag_version = 1;
+        let mut restored = committed.checkout_version(pre_flag_version).await.unwrap();
+        restored.restore().await.unwrap();
+        assert_seed_flags(&restored, true);
     }
 
     /// Seed observers see the values the data file stores, so appending a

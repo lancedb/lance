@@ -419,6 +419,9 @@ impl TryFrom<pb::Transaction> for Transaction {
             } else {
                 Some(Arc::new(message.transaction_properties))
             },
+            // The serialized form does not carry the write-path fact; the
+            // commit derives it from the published files instead.
+            wrote_v1_seeds: None,
         })
     }
 }
