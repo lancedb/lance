@@ -1270,13 +1270,13 @@ mod tests {
     fn test_cosine() {
         let x: Float32Array = (1..9).map(|v| v as f32).collect();
         let y: Float32Array = (100..108).map(|v| v as f32).collect();
-        let d = cosine_distance_batch(x.values(), y.values(), 8).collect::<Vec<_>>();
+        let d = cosine_distance_batch_vec(x.values(), y.values(), 8);
         // from scipy.spatial.distance.cosine
         assert_relative_eq!(d[0], 1.0 - 0.900_957);
 
         let x = Float32Array::from_iter_values([3.0, 45.0, 7.0, 2.0, 5.0, 20.0, 13.0, 12.0]);
         let y = Float32Array::from_iter_values([2.0, 54.0, 13.0, 15.0, 22.0, 34.0, 50.0, 1.0]);
-        let d = cosine_distance_batch(x.values(), y.values(), 8).collect::<Vec<_>>();
+        let d = cosine_distance_batch_vec(x.values(), y.values(), 8);
         // from sklearn.metrics.pairwise import cosine_similarity
         assert_relative_eq!(d[0], 1.0 - 0.873_580_63);
     }
@@ -1286,7 +1286,7 @@ mod tests {
         let total = 1024;
         let x = (0..total).map(|v| v as f32).collect::<Vec<_>>();
         let y = (1024..1024 + total).map(|v| v as f32).collect::<Vec<_>>();
-        let d = cosine_distance_batch(&x, &y, total).collect::<Vec<_>>();
+        let d = cosine_distance_batch_vec(&x, &y, total);
         assert_relative_eq!(d[0], cosine_dist_brute_force(&x, &y));
     }
 
@@ -1294,7 +1294,7 @@ mod tests {
     fn test_cosine_not_aligned() {
         let x: Float32Array = vec![16_f32, 32_f32].into();
         let y: Float32Array = vec![1_f32, 2_f32, 4_f32, 8_f32].into();
-        let d = cosine_distance_batch(x.values(), y.values(), 2).collect::<Vec<_>>();
+        let d = cosine_distance_batch_vec(x.values(), y.values(), 2);
         assert_relative_eq!(d[0], 0.0);
         assert_relative_eq!(d[0], 0.0);
     }
@@ -1515,30 +1515,51 @@ mod tests {
         }
     }
 
-    /// `cosine_batch` must agree with the per-vector `cosine`, including across
-    /// the iterator's 64-distance buffer refills.
+    fn cosine_distance_batch_vec<T: Cosine>(from: &[T], to: &[T], dimension: usize) -> Vec<f32> {
+        let mut distances = vec![0.0; to.len() / dimension];
+        cosine_distance_batch_into(from, to, dimension, &mut distances);
+        distances
+    }
+
+    /// `cosine_batch_into` must agree with the per-vector `cosine`, both for
+    /// the f32 batch kernel and for the per-vector default that f64 uses.
     #[rstest::rstest]
     #[case::dim_8(8)]
     #[case::dim_12(12)]
     #[case::dim_16(16)]
     #[case::dim_40(40)]
     #[case::dim_1024(1024)]
-    fn test_cosine_batch_matches_per_vector(#[case] dimension: usize) {
-        // Spans two full buffers and a partial one.
-        let num_vectors = 130;
-        let x: Vec<f32> = (0..dimension)
-            .map(|index| (index % 13) as f32 * 0.25 + 1.0)
-            .collect();
-        let batch: Vec<f32> = (0..dimension * num_vectors)
-            .map(|index| (index % 11) as f32 * 0.5 - 2.0)
-            .collect();
+    fn test_cosine_batch_into_matches_per_vector(#[case] dimension: usize) {
+        fn check<T: Cosine + num_traits::FromPrimitive + Copy>(dimension: usize) {
+            let num_vectors = 130;
+            let x: Vec<T> = (0..dimension)
+                .map(|index| T::from_f32((index % 13) as f32 * 0.25 + 1.0).unwrap())
+                .collect();
+            let batch: Vec<T> = (0..dimension * num_vectors)
+                .map(|index| T::from_f32((index % 11) as f32 * 0.5 - 2.0).unwrap())
+                .collect();
 
-        let got: Vec<f32> = f32::cosine_batch(&x, &batch, dimension).collect();
+            let mut got = vec![f32::NAN; num_vectors];
+            T::cosine_batch_into(&x, &batch, dimension, &mut got);
 
-        assert_eq!(got.len(), num_vectors);
-        for (distance, vector) in got.iter().zip(batch.chunks_exact(dimension)) {
-            let expected = f32::cosine(&x, vector);
-            assert_relative_eq!(*distance, expected, max_relative = 1e-5, epsilon = 1e-6);
+            for (distance, vector) in got.iter().zip(batch.chunks_exact(dimension)) {
+                let expected = T::cosine(&x, vector);
+                assert_relative_eq!(*distance, expected, max_relative = 1e-5, epsilon = 1e-6);
+            }
         }
+        check::<f32>(dimension);
+        check::<f64>(dimension);
+    }
+
+    #[rstest::rstest]
+    #[case::short(1)]
+    #[case::long(3)]
+    fn test_cosine_batch_into_rejects_wrong_output_len(#[case] output_len: usize) {
+        let batch = [1.0_f32; 4];
+        let mut output = vec![0.0; output_len];
+        let result = std::panic::catch_unwind(move || {
+            cosine_distance_batch_into(&[1.0_f32, 2.0], &batch, 2, &mut output)
+        });
+        assert!(result.is_err());
     }
 }

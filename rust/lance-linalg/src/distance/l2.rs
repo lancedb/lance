@@ -963,9 +963,14 @@ mod tests {
         assert!(std::panic::catch_unwind(|| l2_f32(&short, &long)).is_err());
         assert!(std::panic::catch_unwind(|| f32::l2(&short, &long)).is_err());
         assert!(std::panic::catch_unwind(|| l2_distance(&short, &long)).is_err());
-        assert!(std::panic::catch_unwind(|| l2_distance_batch(&short, &long, 2)).is_err());
-        assert!(std::panic::catch_unwind(|| l2_distance_batch(&long, &[1.0_f32; 3], 2)).is_err());
-        assert!(std::panic::catch_unwind(|| l2_distance_batch::<f32>(&[], &[], 0)).is_err());
+        assert!(std::panic::catch_unwind(|| l2_distance_batch_vec(&short, &long, 2)).is_err());
+        assert!(
+            std::panic::catch_unwind(|| l2_distance_batch_vec(&long, &[1.0_f32; 3], 2)).is_err()
+        );
+        assert!(
+            std::panic::catch_unwind(|| l2_distance_batch_into::<f32>(&[], &[], 0, &mut []))
+                .is_err()
+        );
         assert!(std::panic::catch_unwind(|| l2_distance_uint_scalar(&[1, 2], &[1])).is_err());
         assert!(std::panic::catch_unwind(|| l2_scalar::<u8, f32, 16>(&[1, 2], &[1])).is_err());
     }
@@ -974,6 +979,12 @@ mod tests {
         arbitrary_bf16, arbitrary_f16, arbitrary_f32, arbitrary_f64, arbitrary_vector_pair,
         dimension_shard, run_vector_pair_proptest,
     };
+
+    fn l2_distance_batch_vec<T: L2>(from: &[T], to: &[T], dimension: usize) -> Vec<f32> {
+        let mut distances = vec![0.0; to.len() / dimension.max(1)];
+        l2_distance_batch_into(from, to, dimension, &mut distances);
+        distances
+    }
 
     #[test]
     fn test_l2_f32_dispatch_matches_scalar() {
@@ -1008,12 +1019,11 @@ mod tests {
             8,
         );
         let point = Float32Array::from((2..10).map(|v| Some(v as f32)).collect::<Vec<_>>());
-        let distances = l2_distance_batch(
+        let distances = l2_distance_batch_vec(
             point.values(),
             mat.values().as_primitive::<Float32Type>().values(),
             8,
-        )
-        .collect::<Vec<_>>();
+        );
 
         assert_eq!(distances, vec![32.0, 8.0, 0.0, 8.0]);
     }
@@ -1028,7 +1038,7 @@ mod tests {
             .map(|v| v as f32)
             .collect::<Vec<_>>();
         let point = Float32Array::from((0..10).map(|v| Some(v as f32)).collect::<Vec<_>>());
-        let distances = l2_distance_batch(&point.values()[2..], &mat[6..], 8).collect::<Vec<_>>();
+        let distances = l2_distance_batch_vec(&point.values()[2..], &mat[6..], 8);
 
         assert_eq!(distances, vec![32.0, 8.0, 0.0, 8.0]);
     }
@@ -1037,7 +1047,7 @@ mod tests {
     fn test_odd_length_vector() {
         let mat = Float32Array::from_iter((0..5).map(|v| Some(v as f32)));
         let point = Float32Array::from((2..7).map(|v| Some(v as f32)).collect::<Vec<_>>());
-        let distances = l2_distance_batch(point.values(), mat.values(), 5).collect::<Vec<_>>();
+        let distances = l2_distance_batch_vec(point.values(), mat.values(), 5);
 
         assert_eq!(distances, vec![20.0]);
     }
@@ -1089,7 +1099,7 @@ mod tests {
         ]
         .into();
 
-        let d = l2_distance_batch(q.values(), values.values(), 32).collect::<Vec<_>>();
+        let d = l2_distance_batch_vec(q.values(), values.values(), 32);
         assert_relative_eq!(0.319_357_84, d[0]);
     }
 
@@ -1338,39 +1348,47 @@ mod tests {
         assert_relative_eq!(d2[1], 0.0); // q2 == target[1]
     }
 
-    /// `l2_batch` must agree with the per-vector `l2`, including across the
-    /// iterator's 64-distance buffer refills.
+    /// `l2_batch_into` must agree with the per-vector `l2`, both for the f32
+    /// batch kernel and for the per-vector default that f64 uses.
     #[rstest::rstest]
     #[case::dim_8(8)]
     #[case::dim_16(16)]
     #[case::dim_32(32)]
     #[case::dim_1024(1024)]
-    fn test_l2_batch_f32_matches_per_vector_l2(#[case] dimension: usize) {
-        // Spans two full buffers and a partial one.
-        let num_vectors = 130;
-        let x: Vec<f32> = (0..dimension)
-            .map(|i| ((i % 13) as f32) * 0.25 + 1.0)
-            .collect();
-        let batch: Vec<f32> = (0..dimension * num_vectors)
-            .map(|i| ((i % 11) as f32) * 0.5 - 2.0)
-            .collect();
+    fn test_l2_batch_into_matches_per_vector_l2(#[case] dimension: usize) {
+        fn check<T: L2 + num_traits::FromPrimitive + Copy>(dimension: usize) {
+            let num_vectors = 130;
+            let x: Vec<T> = (0..dimension)
+                .map(|i| T::from_f32(((i % 13) as f32) * 0.25 + 1.0).unwrap())
+                .collect();
+            let batch: Vec<T> = (0..dimension * num_vectors)
+                .map(|i| T::from_f32(((i % 11) as f32) * 0.5 - 2.0).unwrap())
+                .collect();
 
-        let got: Vec<f32> = f32::l2_batch(&x, &batch, dimension).collect();
-        let want: Vec<f32> = batch
-            .chunks_exact(dimension)
-            .map(|y| f32::l2(&x, y))
-            .collect();
+            let mut got = vec![f32::NAN; num_vectors];
+            T::l2_batch_into(&x, &batch, dimension, &mut got);
 
-        assert_eq!(got.len(), num_vectors);
-        for (g, w) in got.iter().zip(want.iter()) {
-            assert!(
-                approx::relative_eq!(g, w, epsilon = 1e-4, max_relative = 1e-5),
-                "dim {dimension}: batch {g} != per-vector {w}"
-            );
+            for (g, y) in got.iter().zip(batch.chunks_exact(dimension)) {
+                let w = T::l2(&x, y);
+                assert!(
+                    approx::relative_eq!(*g, w, epsilon = 1e-4, max_relative = 1e-5),
+                    "dim {dimension}: batch {g} != per-vector {w}"
+                );
+            }
         }
+        check::<f32>(dimension);
+        check::<f64>(dimension);
+    }
 
-        // `sum` drives the iterator's `fold` override rather than `next`.
-        let sum: f32 = f32::l2_batch(&x, &batch, dimension).sum();
-        assert_eq!(sum, got.iter().sum::<f32>());
+    #[rstest::rstest]
+    #[case::short(1)]
+    #[case::long(3)]
+    fn test_l2_batch_into_rejects_wrong_output_len(#[case] output_len: usize) {
+        let batch = [1.0_f32; 4];
+        let mut output = vec![0.0; output_len];
+        let result = std::panic::catch_unwind(move || {
+            l2_distance_batch_into(&[1.0_f32, 2.0], &batch, 2, &mut output)
+        });
+        assert!(result.is_err());
     }
 }
