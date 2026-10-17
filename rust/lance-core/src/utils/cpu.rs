@@ -58,6 +58,9 @@ impl CpuFeatures {
     pub const FP16: Self = Self(1 << 19);
     pub const LSX: Self = Self(1 << 20);
     pub const LASX: Self = Self(1 << 21);
+    pub const AVX512VNNI: Self = Self(1 << 22);
+    pub const AVX512VPOPCNTDQ: Self = Self(1 << 23);
+    pub const AVX512VBMI: Self = Self(1 << 24);
 
     /// The set with no features, which every host supports.
     pub const fn empty() -> Self {
@@ -227,6 +230,9 @@ const FEATURE_TABLE: &[FeatureInfo] = {
             "avx512fp16",
             F::AVX512BW.union(F::AVX512DQ).union(F::AVX512VL),
         ),
+        x86(F::AVX512VNNI, "avx512vnni", F::AVX512F),
+        x86(F::AVX512VPOPCNTDQ, "avx512vpopcntdq", F::AVX512F),
+        x86(F::AVX512VBMI, "avx512vbmi", F::AVX512BW),
         other(F::NEON, "neon", F::empty()),
         other(F::FP16, "fp16", F::NEON),
         other(F::LSX, "lsx", F::empty()),
@@ -270,6 +276,12 @@ const BASELINE: CpuFeatures = {
         (cfg!(target_feature = "avx512dq"), CpuFeatures::AVX512DQ),
         (cfg!(target_feature = "avx512vl"), CpuFeatures::AVX512VL),
         (cfg!(target_feature = "avx512fp16"), CpuFeatures::AVX512FP16),
+        (cfg!(target_feature = "avx512vnni"), CpuFeatures::AVX512VNNI),
+        (
+            cfg!(target_feature = "avx512vpopcntdq"),
+            CpuFeatures::AVX512VPOPCNTDQ,
+        ),
+        (cfg!(target_feature = "avx512vbmi"), CpuFeatures::AVX512VBMI),
         (cfg!(target_feature = "neon"), CpuFeatures::NEON),
         (cfg!(target_feature = "fp16"), CpuFeatures::FP16),
         (cfg!(target_feature = "lsx"), CpuFeatures::LSX),
@@ -324,6 +336,18 @@ fn detect_host_features() -> CpuFeatures {
     add(
         is_x86_feature_detected!("avx512fp16"),
         CpuFeatures::AVX512FP16,
+    );
+    add(
+        is_x86_feature_detected!("avx512vnni"),
+        CpuFeatures::AVX512VNNI,
+    );
+    add(
+        is_x86_feature_detected!("avx512vpopcntdq"),
+        CpuFeatures::AVX512VPOPCNTDQ,
+    );
+    add(
+        is_x86_feature_detected!("avx512vbmi"),
+        CpuFeatures::AVX512VBMI,
     );
     features
 }
@@ -601,6 +625,9 @@ mod tests {
         CpuFeatures::AVX2.union(CpuFeatures::FMA).union(CpuFeatures::F16C)
     )]
     #[case::avx512fp16("avx512fp16", CpuFeatures::AVX512BW.union(CpuFeatures::AVX512F))]
+    #[case::avx512vnni("avx512vnni", CpuFeatures::AVX512F.union(CpuFeatures::FMA))]
+    #[case::avx512vpopcntdq("avx512vpopcntdq", CpuFeatures::AVX512F.union(CpuFeatures::F16C))]
+    #[case::avx512vbmi("avx512vbmi", CpuFeatures::AVX512BW.union(CpuFeatures::AVX2))]
     #[case::fp16("fp16", CpuFeatures::NEON)]
     #[case::lasx("lasx", CpuFeatures::LSX)]
     fn target_feature_mask_includes_implied_features(
@@ -612,6 +639,16 @@ mod tests {
             features.contains(implied),
             "{name} -> {features:?} is missing {implied:?}"
         );
+    }
+
+    #[test]
+    fn features_are_distinct_bits() {
+        let mut seen = CpuFeatures::empty();
+        for feature in CpuFeatures::all() {
+            assert_eq!(feature.0.count_ones(), 1, "{feature:?}");
+            assert!(!seen.contains(feature), "{feature:?} reuses a bit");
+            seen = seen.union(feature);
+        }
     }
 
     #[test]
