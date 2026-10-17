@@ -402,16 +402,30 @@ async fn managed_compaction_preserves_sidecars_after_source_gc(
 /// reference to an object already under the table is adopted, for an
 /// updated row and an inserted one, without its bytes passing through the
 /// writer. A source may also leave out table columns, which then keep their
-/// values, and the table may declare the blob in either logical layout.
+/// values, the table may declare the blob in either logical layout, and the
+/// blob may sit inside a struct.
 #[rstest]
 #[tokio::test]
 async fn merge_insert_adopts_prepared_managed_references(
     #[values(false, true)] partial: bool,
     #[values(false, true)] complete: bool,
+    #[values(false, true)] nested: bool,
 ) {
     use crate::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched};
     use arrow_array::types::Int32Type;
 
+    // The blob column as written, inside a `meta` struct when nested.
+    let place = |field: Field, column: ArrayRef| -> (Field, ArrayRef) {
+        if !nested {
+            return (field, column);
+        }
+        let fields: arrow_schema::Fields = vec![field].into();
+        (
+            Field::new("meta", DataType::Struct(fields.clone()), true),
+            Arc::new(StructArray::new(fields, vec![column], None)),
+        )
+    };
+    let path = if nested { "meta.blob" } else { "blob" };
     let test_dir = TempStrDir::default();
     let id = Field::new("id", DataType::Int32, false);
     let (blob, seed) = if complete {
@@ -429,6 +443,7 @@ async fn merge_insert_adopts_prepared_managed_references(
         seed.push_bytes(b"seed").unwrap();
         (blob_field("blob", true), seed.finish().unwrap())
     };
+    let (blob, seed) = place(blob, seed);
     let mut fields = vec![id.clone(), blob];
     let mut columns = vec![Arc::new(Int32Array::from(vec![0, 1])) as ArrayRef, seed];
     if partial {
@@ -440,7 +455,10 @@ async fn merge_insert_adopts_prepared_managed_references(
     let dataset = Dataset::write(
         RecordBatchIterator::new(vec![Ok(seed)], schema),
         &test_dir,
-        None,
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
     )
     .await
     .unwrap();
@@ -461,6 +479,7 @@ async fn merge_insert_adopts_prepared_managed_references(
             .unwrap();
     }
     let (blob, prepared) = prepared.finish().unwrap().into_parts();
+    let (blob, prepared) = place(blob, prepared);
     let source_schema = Arc::new(managed_blob_schema(vec![id, blob]));
     let source = RecordBatch::try_new(
         source_schema.clone(),
@@ -484,7 +503,11 @@ async fn merge_insert_adopts_prepared_managed_references(
     scan.blob_handling(BlobHandling::AllBinary);
     let rows = scan.try_into_batch().await.unwrap();
     let ids = rows["id"].as_primitive::<Int32Type>();
-    let blobs = rows["blob"].as_binary::<i64>();
+    let blobs = if nested {
+        rows["meta"].as_struct()["blob"].as_binary::<i64>()
+    } else {
+        rows["blob"].as_binary::<i64>()
+    };
     let read: HashMap<i32, &[u8]> = (0..rows.num_rows())
         .map(|row| (ids.value(row), blobs.value(row)))
         .collect();
@@ -508,15 +531,101 @@ async fn merge_insert_adopts_prepared_managed_references(
             HashMap::from([(0, Some(6)), (1, Some(7)), (2, None)])
         );
     }
-    for blob in dataset
-        .take_blobs_by_indices(&[1, 2], "blob")
-        .await
-        .unwrap()
-    {
+    for blob in dataset.take_blobs_by_indices(&[1, 2], path).await.unwrap() {
         let blob = blob.unwrap();
         assert_eq!(blob.kind(), BlobKind::Managed);
         assert_eq!(blob.uri(), Some("_blobs/adopted.blob"));
     }
+}
+
+/// A logical blob's byte range survives a merge_insert that leaves out other
+/// table columns: the row reads back only its range of the object.
+#[tokio::test]
+async fn merge_insert_keeps_a_logical_blob_range() {
+    use crate::dataset::{MergeInsertBuilder, WhenMatched};
+    use arrow_array::types::Int32Type;
+
+    let test_dir = TempStrDir::default();
+    let external_dir = TempDir::default();
+    let external = external_dir.std_path().join("external.bin");
+    std::fs::write(&external, b"0123456789").unwrap();
+    let mut seed = BlobArrayBuilder::new(2);
+    seed.push_bytes(b"seed").unwrap();
+    seed.push_bytes(b"seed").unwrap();
+    let id = Field::new("id", DataType::Int32, false);
+    let schema = Arc::new(Schema::new(vec![
+        id.clone(),
+        blob_field("blob", true),
+        Field::new("other", DataType::Int32, true),
+    ]));
+    let seed = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![0, 1])),
+            seed.finish().unwrap(),
+            Arc::new(Int32Array::from(vec![6, 7])),
+        ],
+    )
+    .unwrap();
+    let dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(seed)], schema),
+        &test_dir,
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            initial_bases: Some(vec![BasePath {
+                id: 1,
+                name: Some("external".to_string()),
+                path: format!("file://{}", external_dir.std_path().display()),
+                is_dataset_root: false,
+            }]),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let source_schema = Arc::new(Schema::new(vec![id, complete_blob_v2_field("blob", true)]));
+    let source = RecordBatch::try_new(
+        source_schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![1])),
+            complete_blob_v2_array(
+                vec![None],
+                vec![Some(format!("file://{}", external.display()))],
+                vec![Some(2)],
+                vec![Some(3)],
+                None,
+            ),
+        ],
+    )
+    .unwrap();
+    let mut builder =
+        MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".to_string()]).unwrap();
+    builder.when_matched(WhenMatched::UpdateAll);
+    let (dataset, _) = builder
+        .try_build()
+        .unwrap()
+        .execute_reader(RecordBatchIterator::new(vec![Ok(source)], source_schema))
+        .await
+        .unwrap();
+
+    let mut scan = dataset.scan();
+    scan.blob_handling(BlobHandling::AllBinary);
+    let rows = scan.try_into_batch().await.unwrap();
+    let ids = rows["id"].as_primitive::<Int32Type>();
+    let read: HashMap<i32, (&[u8], i32)> = (0..rows.num_rows())
+        .map(|row| {
+            let blob = rows["blob"].as_binary::<i64>().value(row);
+            (
+                ids.value(row),
+                (blob, rows["other"].as_primitive::<Int32Type>().value(row)),
+            )
+        })
+        .collect();
+    assert_eq!(
+        read,
+        HashMap::from([(0, (&b"seed"[..], 6)), (1, (&b"234"[..], 7))])
+    );
 }
 
 #[tokio::test]
