@@ -424,6 +424,20 @@ mod x86 {
                     let diff = _mm256_sub_ps(key, unsafe { _mm256_loadu_ps(y.as_ptr()) });
                     *distance = unsafe { hsum256_ps(_mm256_mul_ps(diff, diff)) };
                 }
+            } else if dimension == 16
+                && let Ok(key) = <&[f32; 16]>::try_from(x)
+            {
+                // Same sums as `l2_f32_avx_fma`, whose first FMA adds to zero,
+                // with the key loaded once per batch.
+                let (key_lo, key_hi) =
+                    unsafe { (_mm256_loadu_ps(key.as_ptr()), _mm256_loadu_ps(key.as_ptr().add(8))) };
+                for (distance, y) in output.iter_mut().zip(batch.as_chunks::<16>().0) {
+                    let (y_lo, y_hi) =
+                        unsafe { (_mm256_loadu_ps(y.as_ptr()), _mm256_loadu_ps(y.as_ptr().add(8))) };
+                    let (diff_lo, diff_hi) = (_mm256_sub_ps(key_lo, y_lo), _mm256_sub_ps(key_hi, y_hi));
+                    let sum = _mm256_fmadd_ps(diff_hi, diff_hi, _mm256_mul_ps(diff_lo, diff_lo));
+                    *distance = unsafe { hsum256_ps(sum) };
+                }
             } else if dimension <= 16 {
                 for (distance, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
                     *distance = l2_f32_avx_fma(x, y);
@@ -1178,6 +1192,25 @@ mod tests {
                         approx::relative_eq!(got, want, max_relative = 1e-3),
                         "{} at dim {dimension}: {got} != {want}",
                         candidate.name()
+                    );
+                }
+
+                // Up to 16 dimensions the batch kernel must match the pair
+                // kernel bit for bit; above that it uses the scalar kernel.
+                #[cfg(target_arch = "x86_64")]
+                if dimension <= 16
+                    && let (Some(pair), Some(batch)) = (
+                        x86::L2_F32_AVX_FMA.kernel(),
+                        x86::L2_F32_BATCH_AVX_FMA.kernel(),
+                    )
+                {
+                    let mut got = [f32::NAN];
+                    batch.call(x, y, dimension, &mut got);
+                    prop_assert_eq!(
+                        got[0].to_bits(),
+                        pair.call(x, y).to_bits(),
+                        "dim {}",
+                        dimension
                     );
                 }
 
