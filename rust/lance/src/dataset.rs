@@ -1607,8 +1607,9 @@ impl Dataset {
     ///
     /// Returns an error for datasets with branches, detached versions, external
     /// (multi-base) fragments, or managed blob storage, whose files this set cannot
-    /// fully represent, and a retryable error when a version committed during the
-    /// call was missed by the manifest listing; a retry succeeds once commits pause.
+    /// fully represent, and a retryable error when, after the walk, a second
+    /// manifest listing or the latest version names a version the walk did not
+    /// read; a retry succeeds once commits pause.
     ///
     /// ```
     /// # use lance::{Dataset, Result};

@@ -2627,7 +2627,7 @@ pub async fn referenced_files(dataset: &Dataset) -> Result<ReferencedFileSet> {
 
 /// Refuses the lineage [`referenced_files`] cannot trace. Run before the walk
 /// to fail fast and again after it, since a branch or detached version created
-/// mid-walk is invisible to the manifest listing.
+/// mid-walk did not exist when the first check ran.
 async fn refuse_branches_and_detached_versions(dataset: &Dataset) -> Result<()> {
     // Tracing branch lineage requires reading every referenced branch's
     // manifests and resolving `base_id`; rather than silently under-report and
