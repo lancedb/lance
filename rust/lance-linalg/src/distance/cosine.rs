@@ -396,9 +396,9 @@ mod x86 {
     use crate::simd::x86::{hsum256_pd, hsum256_ps};
     use crate::simd::{FloatSimd, SIMD};
 
-    /// A preloaded 8-dimension key for the portable batch kernel. SSE is part
-    /// of the x86_64 baseline, so this needs no runtime selection. Its
-    /// reduction order matches `f32x8::reduce_sum`.
+    /// A preloaded 8-dimension key for every x86 batch kernel. SSE is part of
+    /// the x86_64 baseline, so this needs no runtime selection. Its reduction
+    /// order matches `f32x8::reduce_sum`.
     pub(super) struct Sse8 {
         lo: __m128,
         hi: __m128,
@@ -457,14 +457,11 @@ mod x86 {
         if dimension == 8
             && let Ok(key) = <&[f32; 8]>::try_from(x)
         {
-            // SAFETY: the load reads within the eight-element array.
-            let key = unsafe { f32x8::load_unaligned(key.as_ptr()) };
+            // The SSE path benchmarks faster than `f32x8` at this width and
+            // keeps every candidate bit-identical.
+            let key = Sse8::new(key);
             for (distance, y) in output.iter_mut().zip(batch.as_chunks::<8>().0) {
-                // SAFETY: the load reads within the eight-element array.
-                let y = unsafe { f32x8::load_unaligned(y.as_ptr()) };
-                let xy = key * y;
-                let y2 = y * y;
-                *distance = 1.0 - xy.reduce_sum() / x_norm / y2.reduce_sum().sqrt();
+                *distance = key.cosine(x_norm, y);
             }
             true
         } else if dimension == 16
@@ -1391,6 +1388,7 @@ mod tests {
                 }
 
                 let batch = [y, x].concat();
+                let mut pq_width_result = None;
                 for candidate in COSINE_F32_BATCH.candidates() {
                     let Some(kernel) = candidate.kernel() else {
                         continue;
@@ -1399,6 +1397,27 @@ mod tests {
                     kernel.call(x, &batch, dimension, &mut got);
                     check_cosine(got[0], want, candidate.name(), dimension)?;
                     check_cosine(got[1], want_self, candidate.name(), dimension)?;
+
+                    // At the PQ widths every candidate shares one reduction
+                    // order, except the x86 portable kernel at 16 dimensions,
+                    // which cannot use the AVX `f32x16`.
+                    let shares_pq_path = dimension == 8
+                        || (dimension == 16
+                            && (cfg!(not(target_arch = "x86_64"))
+                                || !candidate.features().is_empty()));
+                    if shares_pq_path {
+                        let bits = got.map(f32::to_bits);
+                        let (first, first_bits) =
+                            *pq_width_result.get_or_insert((candidate.name(), bits));
+                        prop_assert_eq!(
+                            bits,
+                            first_bits,
+                            "{} and {} differ at dim {}",
+                            candidate.name(),
+                            first,
+                            dimension
+                        );
+                    }
                 }
             }
             Ok(())
