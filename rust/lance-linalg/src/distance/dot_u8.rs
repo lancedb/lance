@@ -185,6 +185,7 @@ pub fn dot_u8_u64(a: &[u8], b: &[u8]) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use super::super::l2_u8::test_inputs::{LENGTHS, Pattern};
     use super::*;
 
     #[test]
@@ -193,108 +194,38 @@ mod tests {
         assert!(std::panic::catch_unwind(|| dot_u8(&[1, 2], &[1])).is_err());
     }
 
-    fn fill_random(buf: &mut [u8], seed: &mut u32) {
-        for slot in buf.iter_mut() {
-            *seed = seed.wrapping_mul(1103515245).wrapping_add(12345);
-            *slot = (*seed >> 16) as u8;
+    /// Every host-supported kernel, and the dispatched entry point, must equal
+    /// the low 32 bits of the exact dot product.
+    fn assert_kernels_match_reference(a: &[u8], b: &[u8], label: &str) {
+        let exact: u64 = a.iter().zip(b).map(|(&x, &y)| x as u64 * y as u64).sum();
+        let want = exact as u32;
+        for candidate in DOT_U8.candidates() {
+            let Some(kernel) = candidate.kernel() else {
+                continue;
+            };
+            let got = kernel.call(a, b);
+            assert_eq!(got, want, "{} [{label}] n={}", candidate.name(), a.len());
         }
+        assert_eq!(dot_u8(a, b), want, "dot_u8 [{label}] n={}", a.len());
     }
 
-    const SIZES: &[usize] = &[
-        0, 1, 7, 15, 16, 31, 32, 33, 63, 64, 65, 127, 128, 255, 256, 1024, 4096, 4097,
-    ];
-
-    fn check_all_backends(a: &[u8], b: &[u8], case: &str) {
-        let reference = dot_u8_scalar(a, b);
-
-        #[cfg(target_arch = "x86_64")]
-        {
-            if is_x86_feature_detected!("avx2") {
-                let got = unsafe { x86::dot_u8_avx2(a, b) };
-                assert_eq!(got, reference, "avx2 [{case}] n={}", a.len());
-            }
-
-            if is_x86_feature_detected!("avx512f")
-                && is_x86_feature_detected!("avx512bw")
-                && is_x86_feature_detected!("avx512vnni")
-            {
-                let got = unsafe { x86::dot_u8_avx512_vnni(a, b) };
-                assert_eq!(got, reference, "avx512_vnni [{case}] n={}", a.len());
-            }
-        }
-
-        assert_eq!(dot_u8(a, b), reference, "dispatch [{case}] n={}", a.len());
-    }
-
-    #[test]
-    fn random_inputs_across_sizes_and_seeds() {
-        let mut a = vec![0u8; 4097];
-        let mut b = vec![0u8; 4097];
-
-        for seed_idx in 0..4u32 {
-            let mut seed = 0xC0FFEE_u32.wrapping_add(seed_idx.wrapping_mul(7919));
-            for &n in SIZES {
-                fill_random(&mut a[..n], &mut seed);
-                fill_random(&mut b[..n], &mut seed);
-                check_all_backends(&a[..n], &b[..n], "random");
+    #[rstest::rstest]
+    #[case::random(Pattern::Random)]
+    #[case::extremes(Pattern::Extremes)]
+    #[case::one_sided_zeros(Pattern::OneSidedZeros)]
+    fn test_dot_u8_kernels_match_reference(#[case] pattern: Pattern) {
+        for &len in LENGTHS {
+            for (label, a, b) in pattern.pairs(len) {
+                assert_kernels_match_reference(&a, &b, label);
             }
         }
     }
 
     #[test]
-    fn boundary_values() {
-        let mut a = vec![0u8; 4097];
-        let mut b = vec![0u8; 4097];
-
-        for &n in SIZES {
-            a[..n].fill(u8::MAX);
-            b[..n].fill(u8::MAX);
-            check_all_backends(&a[..n], &b[..n], "max*max");
-
-            a[..n].fill(u8::MAX);
-            b[..n].fill(0);
-            check_all_backends(&a[..n], &b[..n], "max*0");
-
-            a[..n].fill(0);
-            b[..n].fill(u8::MAX);
-            check_all_backends(&a[..n], &b[..n], "0*max");
-
-            for i in 0..n {
-                a[i] = if i & 1 == 0 { 0 } else { u8::MAX };
-                b[i] = if i & 1 == 0 { u8::MAX } else { 0 };
-            }
-            check_all_backends(&a[..n], &b[..n], "alt 0/max");
-        }
-    }
-
-    #[test]
-    fn one_sided_zeros() {
-        let mut a = vec![0u8; 4097];
-        let mut b = vec![0u8; 4097];
-
-        for &n in SIZES {
-            let mut seed = 0xDEAD_BEEF_u32;
-            fill_random(&mut a[..n], &mut seed);
-            b[..n].fill(0);
-            check_all_backends(&a[..n], &b[..n], "b=0");
-
-            a[..n].fill(0);
-            fill_random(&mut b[..n], &mut seed);
-            check_all_backends(&a[..n], &b[..n], "a=0");
-        }
-    }
-
-    #[test]
-    fn all_ones_pattern() {
-        let mut a = vec![0u8; 4097];
-        let mut b = vec![0u8; 4097];
-
-        for &n in SIZES {
-            a[..n].fill(1);
-            b[..n].fill(1);
-            check_all_backends(&a[..n], &b[..n], "1*1");
-            assert_eq!(dot_u8_scalar(&a[..n], &b[..n]), n as u32);
-        }
+    fn known_values() {
+        assert_eq!(dot_u8_scalar(&[2, 3], &[4, 5]), 23);
+        assert_eq!(dot_u8(&[2, 3], &[4, 5]), 23);
+        assert_eq!(dot_u8(&[1; 4097], &[1; 4097]), 4097);
     }
 
     #[test]
@@ -304,7 +235,7 @@ mod tests {
         let b = vec![u8::MAX; len];
         let exact = u8::MAX as u64 * u8::MAX as u64 * len as u64;
 
-        check_all_backends(&a, &b, "u32 overflow");
+        assert_kernels_match_reference(&a, &b, "u32 overflow");
         assert_eq!(dot_u8_scalar(&a, &b), exact as u32);
         assert_eq!(dot_u8_u64(&a, &b), exact);
         assert_eq!(crate::distance::dot::dot::<u8>(&a, &b), exact as f32);
