@@ -939,6 +939,17 @@ mod tests {
         }
     }
 
+    /// PQ distance tables call this per sub-vector, so Haswell-baseline
+    /// builds must reach the kernel without a runtime dispatch.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_l2_f32_batch_is_static_on_haswell() {
+        use lance_core::utils::cpu::CpuFeatures;
+        let haswell =
+            CpuFeatures::from_target_features(&["avx2", "fma", "f16c", "bmi1", "bmi2", "popcnt"]);
+        assert!(haswell.contains(L2_F32_BATCH.candidates()[0].features()));
+    }
+
     #[test]
     fn test_euclidean_distance() {
         let mat = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(

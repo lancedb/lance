@@ -100,8 +100,21 @@ pub struct Dispatch<F: 'static> {
     // Kept outside `Dispatch` so a `static Dispatch` has no interior
     // mutability; the compiler can then constant-fold `is_static` and the
     // first kernel in `get`.
-    selected: &'static OnceLock<F>,
+    selected: &'static Selection<F>,
     is_static: bool,
+}
+
+/// Where a [`Dispatch`] caches its host-selected kernel.
+///
+/// Only [`Dispatch::get`] writes it, and only with a kernel the host supports,
+/// so safe code cannot plant a kernel that skips the host check.
+pub struct Selection<F>(OnceLock<F>);
+
+impl<F> Selection<F> {
+    #[allow(clippy::new_without_default)]
+    pub const fn new() -> Self {
+        Self(OnceLock::new())
+    }
 }
 
 impl<F: Copy> Dispatch<F> {
@@ -112,7 +125,7 @@ impl<F: Copy> Dispatch<F> {
     /// Panics if `candidates` is empty or its last candidate needs any
     /// feature, so that every host has a kernel. Evaluated in a `static`, this
     /// is a compile error.
-    pub const fn new(candidates: &'static [Candidate<F>], selected: &'static OnceLock<F>) -> Self {
+    pub const fn new(candidates: &'static [Candidate<F>], selected: &'static Selection<F>) -> Self {
         let Some(fallback) = candidates.last() else {
             panic!("a Dispatch needs at least one candidate");
         };
@@ -133,7 +146,7 @@ impl<F: Copy> Dispatch<F> {
         if self.is_static {
             return Kernel(self.candidates[0].kernel);
         }
-        Kernel(*self.selected.get_or_init(|| self.selected().kernel))
+        Kernel(*self.selected.0.get_or_init(|| self.selected().kernel))
     }
 
     /// The candidate [`Self::get`] returns.
@@ -171,15 +184,21 @@ fn select<F>(candidates: &[Candidate<F>], host: CpuFeatures) -> usize {
 /// [`Kernel`]. Unknown feature names fail to compile.
 ///
 /// The candidate type must be the `unsafe fn` pointer type of the kernel.
+///
+/// The kernel takes only doc comments and `#[inline]`. Arbitrary attributes
+/// are rejected because a `#[target_feature]` among them would enable
+/// features the candidate does not require.
 #[macro_export]
 macro_rules! target_kernel {
     (
         #[target_features($($feature:literal),* $(,)?)]
         #[candidate($candidate_vis:vis $candidate:ident: $kernel_type:ty)]
-        $(#[$attr:meta])*
+        $(#[doc = $doc:literal])*
+        $(#[inline $(($inline:ident))?])?
         $vis:vis fn $name:ident($($params:tt)*) $(-> $ret:ty)? $body:block
     ) => {
-        $(#[$attr])*
+        $(#[doc = $doc])*
+        $(#[inline $(($inline))?])?
         $(#[target_feature(enable = $feature)])*
         $vis fn $name($($params)*) $(-> $ret)? $body
 
@@ -205,7 +224,8 @@ macro_rules! dispatch {
     ) => {
         $(#[$attr])*
         $vis static $name: $crate::utils::cpu::Dispatch<$kernel_type> = {
-            static SELECTED: ::std::sync::OnceLock<$kernel_type> = ::std::sync::OnceLock::new();
+            static SELECTED: $crate::utils::cpu::Selection<$kernel_type> =
+                $crate::utils::cpu::Selection::new();
             $crate::utils::cpu::Dispatch::new($candidates, &SELECTED)
         };
     };

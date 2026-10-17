@@ -12,7 +12,7 @@ use std::sync::LazyLock;
 
 mod dispatch;
 
-pub use dispatch::{Candidate, Dispatch, Kernel};
+pub use dispatch::{Candidate, Dispatch, Kernel, Selection};
 
 /// A set of CPU features, named after rustc `target_feature`s.
 ///
@@ -341,6 +341,7 @@ fn detect_host_features() -> CpuFeatures {
     CpuFeatures::empty()
 }
 
+/// A level of SIMD support for some feature.
 ///
 /// `#[non_exhaustive]` so future tiers (e.g. AVX-512 BF16, AMX) can be added
 /// without breaking external `match` consumers.
@@ -549,8 +550,7 @@ mod tests {
     /// The `Avx2` and `AvxFma` tiers both dispatch to kernels declared
     /// `#[target_feature(enable = "avx,fma")]`, so neither may be selected on a
     /// host without FMA. AVX2 does not imply FMA in the ISA, so the detection
-    /// checks it explicitly. (`Avx512*` is excluded: its kernels declare
-    /// `avx512f`, which is what `has_avx512` verifies.)
+    /// checks it explicitly.
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn avx_fma_tiers_are_only_selected_when_fma_is_detected() {
