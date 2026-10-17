@@ -1606,10 +1606,11 @@ impl Dataset {
     /// latest), so a file referenced only by an older-but-present version is kept.
     ///
     /// Returns an error for datasets with branches, detached versions, external
-    /// (multi-base) fragments, or managed blob storage, whose files this set cannot
-    /// fully represent, and a retryable error when, after the walk, a second
-    /// manifest listing or the latest version names a version the walk did not
-    /// read; a retry succeeds once commits pause.
+    /// (multi-base) fragments, managed blob storage, or feature flags this build
+    /// does not support, whose files this set cannot fully represent. It returns a
+    /// retryable error when, after the walk, a second manifest listing or the
+    /// latest version names a version the walk did not read; a retry succeeds once
+    /// commits pause.
     ///
     /// ```
     /// # use lance::{Dataset, Result};

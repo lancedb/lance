@@ -2448,6 +2448,10 @@ pub async fn cleanup_old_versions(
 ///   adopt a blob v2 sidecar `data/{key}/{id}.blob` as a managed object that
 ///   outlives `data/{key}.lance`, and only a scan of the blob columns finds it.
 ///
+/// It refuses any present manifest whose reader or writer feature flags this
+/// build does not support, as cleanup does, since such a feature may record
+/// references this set does not read.
+///
 /// Branches and detached versions are checked again after the walk. It also
 /// returns a retryable [`Error::TooMuchWriteContention`] if, after the walk, a
 /// second manifest listing or the latest version names a version the walk did
@@ -2496,6 +2500,12 @@ pub async fn referenced_files(dataset: &Dataset) -> Result<ReferencedFileSet> {
         let scanned = scanned?;
         manifest_count += 1;
         scanned_versions.insert(scanned.manifest.version);
+
+        // A feature this build does not know can move references out of the
+        // fields read below, so refuse it the way cleanup does rather than
+        // return a set that omits them. The scan only decodes manifests.
+        ensure_can_read_manifest(&scanned.manifest)?;
+        ensure_can_write_manifest(&scanned.manifest)?;
 
         // Checked on every present manifest, not only the latest: an older
         // version that wrote managed blobs still holds them.
@@ -7829,6 +7839,53 @@ mod tests {
         // A caller whose lister reports the decoded spelling still matches:
         // extra matches only over-retain, while a miss would delete a live file.
         assert!(worker.is_referenced("data/live%name.lance"));
+    }
+
+    /// A version committed by a newer writer, with feature flags this build
+    /// does not support, is refused rather than read as if it had none.
+    #[rstest]
+    #[case::reader(true, false)]
+    #[case::writer(false, true)]
+    #[tokio::test]
+    async fn referenced_files_rejects_unsupported_manifest_features(
+        #[case] reader: bool,
+        #[case] writer: bool,
+    ) {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        let dataset = fixture.open().await.unwrap();
+
+        let mut newer = dataset.manifest.as_ref().clone();
+        newer.version += 1;
+        if reader {
+            newer.reader_feature_flags |= lance_table::feature_flags::FLAG_UNKNOWN;
+        }
+        if writer {
+            newer.writer_feature_flags |= lance_table::feature_flags::FLAG_UNKNOWN;
+        }
+        dataset
+            .commit_handler
+            .commit(
+                &mut newer,
+                None,
+                &dataset.base,
+                &dataset.object_store,
+                lance_table::io::commit::write_manifest_file_to_path,
+                dataset.manifest_location.naming_scheme,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let err = dataset.referenced_files().await.unwrap_err();
+        assert!(
+            matches!(err, Error::NotSupported { .. }),
+            "expected NotSupported for unsupported feature flags, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("version of Lance"),
+            "error should say this build cannot handle the dataset, got {err}"
+        );
     }
 
     /// Managed blob references live in the data, not the manifests: compaction
