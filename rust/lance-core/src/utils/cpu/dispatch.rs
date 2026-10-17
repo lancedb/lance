@@ -82,6 +82,14 @@ impl<A: ?Sized, B: ?Sized, R> Kernel<unsafe fn(&A, &B) -> R> {
     }
 }
 
+impl<A: ?Sized, R> Kernel<unsafe fn(&A) -> R> {
+    #[inline(always)]
+    pub fn call(self, a: &A) -> R {
+        // SAFETY: see the two-argument `call`.
+        unsafe { (self.0)(a) }
+    }
+}
+
 impl<A: ?Sized, B: ?Sized, C, D: ?Sized, R> Kernel<unsafe fn(&A, &B, C, &mut D) -> R> {
     #[inline(always)]
     pub fn call(self, a: &A, b: &B, c: C, d: &mut D) -> R {
