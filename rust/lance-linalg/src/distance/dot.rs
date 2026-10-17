@@ -21,7 +21,7 @@ use crate::Result;
 #[cfg(feature = "fp16kernels")]
 use crate::distance::HalfBackend;
 use crate::distance::{
-    BatchDistances, BatchKernel, HALF_KERNELS_COMPILED, HalfType, PairKernel, assert_batch_layout,
+    BatchKernel, HALF_KERNELS_COMPILED, HalfType, PairKernel, assert_batch_output_layout,
     assert_equal_lengths, half_backend, int8_query_to_f32, x86_half_features,
 };
 
@@ -85,23 +85,22 @@ pub trait Dot: Num {
     /// Dot product.
     fn dot(x: &[Self], y: &[Self]) -> f32;
 
-    /// Dot product of `x` against each `dimension`-sized vector in `batch`.
+    /// Writes the dot product of `x` with each `dimension`-sized vector in
+    /// `batch` into the matching element of `output`.
     ///
-    /// The default calls [`Dot::dot`] per vector. `f32` overrides it so the
-    /// SIMD tier is chosen once for the whole batch instead of once per
-    /// vector — on a build whose baseline already implies AVX2, per-vector
-    /// dispatch costs more than the kernel it selects.
+    /// The default calls [`Dot::dot`] per vector. `f32` overrides it with one
+    /// batch kernel call, so the SIMD tier is chosen once for the whole batch
+    /// instead of once per vector.
     ///
-    /// Returns `impl Iterator` rather than a trait object: hot consumers drive
-    /// this one element at a time, so a `Box<dyn Iterator>` would cost a
-    /// virtual call per element and an allocation per batch.
-    fn dot_batch<'a>(
-        x: &'a [Self],
-        batch: &'a [Self],
-        dimension: usize,
-    ) -> impl Iterator<Item = f32> + 'a {
-        assert_batch_layout(x.len(), batch.len(), dimension);
-        batch.chunks_exact(dimension).map(move |y| Self::dot(x, y))
+    /// # Panics
+    ///
+    /// Panics if `x.len() != dimension`, if `batch.len()` is not a multiple of
+    /// `dimension`, or if `output.len() != batch.len() / dimension`.
+    fn dot_batch_into(x: &[Self], batch: &[Self], dimension: usize, output: &mut [f32]) {
+        assert_batch_output_layout(x.len(), batch.len(), dimension, output.len());
+        for (product, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
+            *product = Self::dot(x, y);
+        }
     }
 }
 
@@ -238,13 +237,9 @@ impl Dot for f32 {
         DOT_F32.get().call(x, y)
     }
 
-    fn dot_batch<'a>(
-        x: &'a [Self],
-        batch: &'a [Self],
-        dimension: usize,
-    ) -> impl Iterator<Item = Self> + 'a {
-        assert_batch_layout(x.len(), batch.len(), dimension);
-        BatchDistances::new(x, batch, dimension, DOT_F32_BATCH.get())
+    fn dot_batch_into(x: &[Self], batch: &[Self], dimension: usize, output: &mut [f32]) {
+        assert_batch_output_layout(x.len(), batch.len(), dimension, output.len());
+        DOT_F32_BATCH.get().call(x, batch, dimension, output);
     }
 }
 
@@ -678,13 +673,26 @@ impl Dot for u8 {
     }
 }
 
-/// Negative dot product, to present the relative order of dot distance.
-pub fn dot_distance_batch<'a, T: Dot>(
-    from: &'a [T],
-    to: &'a [T],
-    dimension: usize,
-) -> Box<dyn Iterator<Item = f32> + 'a> {
-    Box::new(T::dot_batch(from, to, dimension).map(|d| 1.0 - d))
+/// Writes the dot distance, `1 - dot`, from `from` to each `dimension`-sized
+/// vector in `to` into the matching element of `output`.
+///
+/// # Panics
+///
+/// Panics if `from.len() != dimension`, if `to.len()` is not a multiple of
+/// `dimension`, or if `output.len() != to.len() / dimension`.
+///
+/// ```
+/// # use lance_linalg::distance::dot_distance_batch_into;
+/// let mut distances = [0.0; 2];
+/// dot_distance_batch_into(&[1.0_f32, 2.0], &[1.0, 0.0, 0.0, 1.0], 2, &mut distances);
+/// assert_eq!(distances, [0.0, -1.0]);
+/// ```
+#[inline]
+pub fn dot_distance_batch_into<T: Dot>(from: &[T], to: &[T], dimension: usize, output: &mut [f32]) {
+    T::dot_batch_into(from, to, dimension, output);
+    for distance in output.iter_mut() {
+        *distance = 1.0 - *distance;
+    }
 }
 
 fn do_dot_distance_arrow_batch<T: ArrowFloatType>(
@@ -708,12 +716,16 @@ where
                 to.value_type()
             )))?;
 
-    // Route through `dot_distance_batch` rather than mapping `dot_distance` per
-    // vector, so this entry point gets the same hoisted dispatch.
-    let dists = dot_distance_batch(from.as_slice(), to_values.as_slice(), dimension);
+    let mut distances = vec![0.0; to.len()];
+    dot_distance_batch_into(
+        from.as_slice(),
+        to_values.as_slice(),
+        dimension,
+        &mut distances,
+    );
 
     Ok(Arc::new(Float32Array::new(
-        dists.collect(),
+        distances.into(),
         to.nulls().cloned(),
     )))
 }

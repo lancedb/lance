@@ -22,8 +22,8 @@ use lance_core::utils::cpu::SIMD_SUPPORT;
 #[cfg(feature = "fp16kernels")]
 use super::HalfBackend;
 use super::{
-    BatchDistances, BatchKernel, Dot, HALF_KERNELS_COMPILED, HalfType, Normalize,
-    assert_batch_layout, assert_equal_lengths,
+    BatchKernel, Dot, HALF_KERNELS_COMPILED, HalfType, Normalize, assert_batch_output_layout,
+    assert_equal_lengths,
     dot::dot,
     half_backend, int8_query_to_f32,
     norm_l2::{norm_l2, norm_l2_impl},
@@ -57,15 +57,23 @@ pub trait Cosine: Dot + Normalize {
         cosine_scalar_fast(x, x_norm, y, y_norm)
     }
 
-    fn cosine_batch<'a>(
-        x: &'a [Self],
-        batch: &'a [Self],
-        dimension: usize,
-    ) -> impl Iterator<Item = f32> + 'a {
+    /// Writes the cosine distance from `x` to each `dimension`-sized vector
+    /// in `batch` into the matching element of `output`.
+    ///
+    /// The default computes the norm of `x` once and calls
+    /// [`Cosine::cosine_fast`] per vector. `f32` overrides it with one batch
+    /// kernel call.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `x.len() != dimension`, if `batch.len()` is not a multiple of
+    /// `dimension`, or if `output.len() != batch.len() / dimension`.
+    fn cosine_batch_into(x: &[Self], batch: &[Self], dimension: usize, output: &mut [f32]) {
+        assert_batch_output_layout(x.len(), batch.len(), dimension, output.len());
         let x_norm = norm_l2(x);
-        batch
-            .chunks_exact(dimension)
-            .map(move |y| Self::cosine_fast(x, x_norm, y))
+        for (distance, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
+            *distance = Self::cosine_fast(x, x_norm, y);
+        }
     }
 }
 
@@ -229,13 +237,9 @@ impl Cosine for f32 {
         COSINE_WITH_NORMS_F32.get().call(x, x_norm, y_norm, y)
     }
 
-    fn cosine_batch<'a>(
-        x: &'a [Self],
-        batch: &'a [Self],
-        dimension: usize,
-    ) -> impl Iterator<Item = Self> + 'a {
-        assert_batch_layout(x.len(), batch.len(), dimension);
-        BatchDistances::new(x, batch, dimension, COSINE_F32_BATCH.get())
+    fn cosine_batch_into(x: &[Self], batch: &[Self], dimension: usize, output: &mut [f32]) {
+        assert_batch_output_layout(x.len(), batch.len(), dimension, output.len());
+        COSINE_F32_BATCH.get().call(x, batch, dimension, output);
     }
 }
 
@@ -1088,27 +1092,29 @@ pub fn cosine_distance<T: Cosine>(from: &[T], to: &[T]) -> f32 {
     T::cosine(from, to)
 }
 
-/// Cosine Distance
+/// Writes the [cosine distance](https://en.wikipedia.org/wiki/Cosine_similarity)
+/// from `from` to each `dimension`-sized vector in `batch` into the matching
+/// element of `output`.
 ///
-/// <https://en.wikipedia.org/wiki/Cosine_similarity>
+/// # Panics
 ///
-/// Parameters
-/// -----------
+/// Panics if `from.len() != dimension`, if `batch.len()` is not a multiple of
+/// `dimension`, or if `output.len() != batch.len() / dimension`.
 ///
-/// - *from*: the vector to compute distance from.
-/// - *to*: the batch of vectors to compute distance to.
-/// - *dimension*: the dimension of the vector.
-///
-/// Returns
-/// -------
-/// An iterator of pair-wise cosine distance between from vector to each vector in the batch.
-///
-pub fn cosine_distance_batch<'a, T: Cosine>(
-    from: &'a [T],
-    batch: &'a [T],
+/// ```
+/// # use lance_linalg::distance::cosine_distance_batch_into;
+/// let mut distances = [0.0; 2];
+/// cosine_distance_batch_into(&[1.0_f32, 0.0], &[2.0, 0.0, 0.0, 3.0], 2, &mut distances);
+/// assert_eq!(distances, [0.0, 1.0]);
+/// ```
+#[inline]
+pub fn cosine_distance_batch_into<T: Cosine>(
+    from: &[T],
+    batch: &[T],
     dimension: usize,
-) -> impl Iterator<Item = f32> + 'a {
-    T::cosine_batch(from, batch, dimension)
+    output: &mut [f32],
+) {
+    T::cosine_batch_into(from, batch, dimension, output);
 }
 
 fn do_cosine_distance_arrow_batch<T: ArrowFloatType>(
@@ -1119,37 +1125,14 @@ where
     T::Native: Cosine,
 {
     let dimension = to.value_length() as usize;
-    debug_assert_eq!(from.len(), dimension);
-
-    // TODO: if we detect there is a run of nulls, should we skip those?
     let to_values = downcast_to_values::<T>(from, to)?;
-    let dists = cosine_distance_batch(from.as_slice(), to_values.as_slice(), dimension);
-
-    Ok(Arc::new(Float32Array::new(
-        dists.collect(),
-        to.nulls().cloned(),
-    )))
-}
-
-/// The f32 case of [`do_cosine_distance_arrow_batch`], which writes every
-/// distance with one batch kernel call. Collecting [`Cosine::cosine_batch`]
-/// instead drives its buffered iterator one `next` at a time, which costs
-/// half again as much at dimension 8.
-fn do_cosine_distance_arrow_batch_f32(
-    from: &Float32Array,
-    to: &FixedSizeListArray,
-) -> Result<Arc<Float32Array>> {
-    let dimension = to.value_length() as usize;
-    let (from, batch) = (
+    let mut distances = vec![0.0; to.len()];
+    cosine_distance_batch_into(
         from.as_slice(),
-        downcast_to_values::<Float32Type>(from, to)?.as_slice(),
+        to_values.as_slice(),
+        dimension,
+        &mut distances,
     );
-    assert_batch_layout(from.len(), batch.len(), dimension);
-
-    let mut distances = vec![0.0; batch.len() / dimension];
-    COSINE_F32_BATCH
-        .get()
-        .call(from, batch, dimension, &mut distances);
     Ok(Arc::new(Float32Array::new(
         distances.into(),
         to.nulls().cloned(),
@@ -1188,16 +1171,16 @@ fn downcast_to_values<'a, T: ArrowFloatType>(
 /// # Panics
 ///
 /// Panics if the length of `from` is not equal to the dimension (value length)
-/// of `to`. Only `Float32` and `Int8` queries check this when `to` is empty.
+/// of `to`.
 pub fn cosine_distance_arrow_batch(
     from: &dyn Array,
     to: &FixedSizeListArray,
 ) -> Result<Arc<Float32Array>> {
     match *from.data_type() {
         DataType::Float16 => do_cosine_distance_arrow_batch::<Float16Type>(from.as_primitive(), to),
-        DataType::Float32 => do_cosine_distance_arrow_batch_f32(from.as_primitive(), to),
+        DataType::Float32 => do_cosine_distance_arrow_batch::<Float32Type>(from.as_primitive(), to),
         DataType::Float64 => do_cosine_distance_arrow_batch::<Float64Type>(from.as_primitive(), to),
-        DataType::Int8 => do_cosine_distance_arrow_batch_f32(
+        DataType::Int8 => do_cosine_distance_arrow_batch::<Float32Type>(
             &int8_query_to_f32(from.as_primitive::<Int8Type>())?,
             &to.convert_to_floating_point()?,
         ),

@@ -24,9 +24,9 @@ use num_traits::{AsPrimitive, Num};
 #[cfg(feature = "fp16kernels")]
 use crate::distance::HalfBackend;
 use crate::distance::{
-    BatchDistances, BatchKernel, HALF_KERNELS_COMPILED, HalfType, PairKernel,
-    U8_U32_ACCUMULATOR_MAX_LEN, assert_batch_layout, assert_equal_lengths, half_backend,
-    int8_query_to_f32, x86_half_features,
+    BatchKernel, HALF_KERNELS_COMPILED, HalfType, PairKernel, U8_U32_ACCUMULATOR_MAX_LEN,
+    assert_batch_output_layout, assert_equal_lengths, half_backend, int8_query_to_f32,
+    x86_half_features,
 };
 
 /// Calculate the L2 distance between two vectors.
@@ -35,24 +35,22 @@ pub trait L2: Num {
     /// Calculate the L2 distance between two vectors.
     fn l2(x: &[Self], y: &[Self]) -> f32;
 
-    /// L2 distance from `x` to each `dimension`-sized vector in `y`.
+    /// Writes the L2 distance from `x` to each `dimension`-sized vector in
+    /// `batch` into the matching element of `output`.
     ///
-    /// The default calls [`L2::l2`] per vector. `f32` overrides it so the SIMD
-    /// tier is chosen once for the whole batch instead of once per vector —
-    /// on a build whose baseline already implies AVX2, per-vector dispatch
-    /// costs more than the kernel it selects.
+    /// The default calls [`L2::l2`] per vector. `f32` overrides it with one
+    /// batch kernel call, so the SIMD tier is chosen once for the whole batch
+    /// instead of once per vector.
     ///
-    /// Returns `impl Iterator` rather than a trait object: the k-means
-    /// assignment loop drives this one element at a time, so a
-    /// `Box<dyn Iterator>` would cost a virtual call per element and an
-    /// allocation per batch.
-    fn l2_batch<'a>(
-        x: &'a [Self],
-        y: &'a [Self],
-        dimension: usize,
-    ) -> impl Iterator<Item = f32> + 'a {
-        assert_batch_layout(x.len(), y.len(), dimension);
-        y.chunks_exact(dimension).map(move |v| Self::l2(x, v))
+    /// # Panics
+    ///
+    /// Panics if `x.len() != dimension`, if `batch.len()` is not a multiple of
+    /// `dimension`, or if `output.len() != batch.len() / dimension`.
+    fn l2_batch_into(x: &[Self], batch: &[Self], dimension: usize, output: &mut [f32]) {
+        assert_batch_output_layout(x.len(), batch.len(), dimension, output.len());
+        for (distance, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
+            *distance = Self::l2(x, y);
+        }
     }
 }
 
@@ -281,13 +279,9 @@ impl L2 for f32 {
         L2_F32.get().call(x, y)
     }
 
-    fn l2_batch<'a>(
-        x: &'a [Self],
-        y: &'a [Self],
-        dimension: usize,
-    ) -> impl Iterator<Item = Self> + 'a {
-        assert_batch_layout(x.len(), y.len(), dimension);
-        BatchDistances::new(x, y, dimension, L2_F32_BATCH.get())
+    fn l2_batch_into(x: &[Self], batch: &[Self], dimension: usize, output: &mut [f32]) {
+        assert_batch_output_layout(x.len(), batch.len(), dimension, output.len());
+        L2_F32_BATCH.get().call(x, batch, dimension, output);
     }
 }
 
@@ -778,7 +772,7 @@ fn accumulate_l2_dimension(q: f32, row: &[f32], result: &mut [f32]) {
 /// `num_targets × dimension × 4` fits in L1 cache (~32 KB), such as PQ
 /// sub-vector codebooks (e.g. 256 centroids × 16 dims = 16 KB).
 /// For large target sets the SoA layout causes L1 thrashing and
-/// [`l2_distance_batch`] with its AoS per-target locality is faster.
+/// [`l2_distance_batch_into`] with its AoS per-target locality is faster.
 #[derive(Debug, Clone, DeepSizeOf)]
 pub struct L2Prepared {
     transposed: Vec<f32>,
@@ -862,23 +856,23 @@ pub fn l2_distance(from: &[f32], to: &[f32]) -> f32 {
     l2(from, to)
 }
 
-/// Compute L2 distance between a vector and a batch of vectors.
+/// Writes the L2 distance from `from` to each `dimension`-sized vector in `to`
+/// into the matching element of `output`.
 ///
-/// Parameters
+/// # Panics
 ///
-/// - `from`: the vector to compute distance from.
-/// - `to`: a list of vectors to compute distance to.
-/// - `dimension`: the dimension of the vectors.
+/// Panics if `from.len() != dimension`, if `to.len()` is not a multiple of
+/// `dimension`, or if `output.len() != to.len() / dimension`.
 ///
-/// Returns
-///
-/// An iterator of pair-wise distance between `from` vector to each vector in the batch.
-pub fn l2_distance_batch<'a, T: L2>(
-    from: &'a [T],
-    to: &'a [T],
-    dimension: usize,
-) -> impl Iterator<Item = f32> + 'a {
-    T::l2_batch(from, to, dimension)
+/// ```
+/// # use lance_linalg::distance::l2_distance_batch_into;
+/// let mut distances = [0.0; 2];
+/// l2_distance_batch_into(&[1.0_f32, 2.0], &[1.0, 2.0, 3.0, 4.0], 2, &mut distances);
+/// assert_eq!(distances, [0.0, 8.0]);
+/// ```
+#[inline]
+pub fn l2_distance_batch_into<T: L2>(from: &[T], to: &[T], dimension: usize, output: &mut [f32]) {
+    T::l2_batch_into(from, to, dimension, output);
 }
 
 fn do_l2_distance_arrow_batch<T: ArrowFloatType>(
@@ -901,10 +895,16 @@ where
                 T::FLOAT_TYPE,
                 to.value_type()
             )))?;
-    let dists = l2_distance_batch(from.as_slice(), to_values.as_slice(), dimension);
+    let mut distances = vec![0.0; to.len()];
+    l2_distance_batch_into(
+        from.as_slice(),
+        to_values.as_slice(),
+        dimension,
+        &mut distances,
+    );
 
     Ok(Arc::new(Float32Array::new(
-        dists.collect(),
+        distances.into(),
         to.nulls().cloned(),
     )))
 }
@@ -981,7 +981,7 @@ mod tests {
     };
 
     fn l2_distance_batch_vec<T: L2>(from: &[T], to: &[T], dimension: usize) -> Vec<f32> {
-        let mut distances = vec![0.0; to.len() / dimension.max(1)];
+        let mut distances = vec![0.0; to.len() / dimension];
         l2_distance_batch_into(from, to, dimension, &mut distances);
         distances
     }
