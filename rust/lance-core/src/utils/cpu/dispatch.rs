@@ -77,6 +77,18 @@ impl<F: Copy> Candidate<F> {
 #[derive(Clone, Copy)]
 pub struct Kernel<F>(F);
 
+impl<F: Copy> Kernel<F> {
+    /// The kernel as its `unsafe fn` pointer, for signatures `call` cannot
+    /// cover, such as a parameter type with its own lifetime. Prefer `call`.
+    ///
+    /// The pointer came from a `Kernel`, so its host-feature precondition is
+    /// already met. The caller still owns any other precondition of the
+    /// kernel, such as slice lengths, alignment or aliasing.
+    pub fn as_fn(self) -> F {
+        self.0
+    }
+}
+
 /// Implements `call` for one kernel signature, generic over the listed types.
 ///
 /// Each signature needs its own impl: a reference parameter makes the pointer
@@ -101,6 +113,10 @@ macro_rules! impl_call {
 
 impl_call!(<A: ?Sized, B: ?Sized> fn(a: &A, b: &B));
 impl_call!(<A: ?Sized, B: ?Sized, D: ?Sized> fn(a: &A, b: &B, c: usize, d: &mut D));
+impl_call!(
+    <A: ?Sized, B: ?Sized, D: ?Sized, E: ?Sized>
+    fn(a: &A, b: &B, c: usize, d: &D, e: &mut E)
+);
 
 /// One operation's kernels, best first, with the host's choice made once.
 ///
