@@ -47,6 +47,7 @@ impl CpuFeatures {
     pub const AVX512VNNI: Self = Self(1 << 22);
     pub const AVX512VPOPCNTDQ: Self = Self(1 << 23);
     pub const AVX512VBMI: Self = Self(1 << 24);
+    pub const AVX512BF16: Self = Self(1 << 25);
 
     pub const fn empty() -> Self {
         Self(0)
@@ -215,6 +216,7 @@ const FEATURE_TABLE: &[FeatureInfo] = {
         x86(F::AVX512VNNI, "avx512vnni", F::AVX512F),
         x86(F::AVX512VPOPCNTDQ, "avx512vpopcntdq", F::AVX512F),
         x86(F::AVX512VBMI, "avx512vbmi", F::AVX512BW),
+        x86(F::AVX512BF16, "avx512bf16", F::AVX512BW),
         other(F::NEON, "neon", F::empty()),
         other(F::FP16, "fp16", F::NEON),
         other(F::LSX, "lsx", F::empty()),
@@ -264,6 +266,7 @@ const BASELINE: CpuFeatures = {
             CpuFeatures::AVX512VPOPCNTDQ,
         ),
         (cfg!(target_feature = "avx512vbmi"), CpuFeatures::AVX512VBMI),
+        (cfg!(target_feature = "avx512bf16"), CpuFeatures::AVX512BF16),
         (cfg!(target_feature = "neon"), CpuFeatures::NEON),
         (cfg!(target_feature = "fp16"), CpuFeatures::FP16),
         (cfg!(target_feature = "lsx"), CpuFeatures::LSX),
@@ -326,6 +329,10 @@ fn detect_host_features() -> CpuFeatures {
     add(
         is_x86_feature_detected!("avx512vbmi"),
         CpuFeatures::AVX512VBMI,
+    );
+    add(
+        is_x86_feature_detected!("avx512bf16"),
+        CpuFeatures::AVX512BF16,
     );
     features
 }
@@ -606,6 +613,7 @@ mod tests {
     #[case::avx512vnni("avx512vnni", CpuFeatures::AVX512F.union(CpuFeatures::FMA))]
     #[case::avx512vpopcntdq("avx512vpopcntdq", CpuFeatures::AVX512F.union(CpuFeatures::F16C))]
     #[case::avx512vbmi("avx512vbmi", CpuFeatures::AVX512BW.union(CpuFeatures::AVX2))]
+    #[case::avx512bf16("avx512bf16", CpuFeatures::AVX512BW.union(CpuFeatures::FMA))]
     #[case::fp16("fp16", CpuFeatures::NEON)]
     #[case::lasx("lasx", CpuFeatures::LSX)]
     fn target_feature_mask_includes_implied_features(
