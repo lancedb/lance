@@ -2448,9 +2448,11 @@ pub async fn cleanup_old_versions(
 ///   adopt a blob v2 sidecar `data/{key}/{id}.blob` as a managed object that
 ///   outlives `data/{key}.lance`, and only a scan of the blob columns finds it.
 ///
-/// It also errors if a version is committed during the manifest walk and the
-/// walk did not see it, since files only that version references could be
-/// missing. Calling again after the commit lands succeeds.
+/// It also errors if a version committed during the manifest walk was not
+/// read, since files only that version references could be missing: after the
+/// walk it lists the manifests again and resolves the latest version, and
+/// requires the walk to have read both. Calling again after the commit lands
+/// succeeds.
 ///
 /// See [`ReferencedFileSet`] for how to interpret the result, including the
 /// blob v2 sidecar rule.
@@ -2604,14 +2606,29 @@ pub async fn referenced_files(dataset: &Dataset) -> Result<ReferencedFileSet> {
     // The listing is not a snapshot: a commit that lands after the lister has
     // passed where its manifest sorts is missed, and it may be the only present
     // manifest that still references files inherited from versions a
-    // concurrent cleanup removed during the walk. The newest version is the
-    // one such a race can hide, so require that the walk saw it.
+    // concurrent cleanup removed during the walk. Listing order is the store's,
+    // not version order, so the missed version need not be the newest. A second
+    // listing returns every manifest present throughout it, and a version
+    // committed after it started makes the latest one the walk did not read.
+    let missed = |version: u64| {
+        Error::too_much_write_contention(format!(
+            "referenced_files did not read version {version}, which the manifest listing \
+             missed; call it again"
+        ))
+    };
+    let mut relisted =
+        dataset
+            .commit_handler
+            .list_manifest_locations(&dataset.base, &dataset.object_store, false);
+    while let Some(location) = relisted.next().await {
+        let version = location?.version;
+        if !scanned_versions.contains(&version) {
+            return Err(missed(version));
+        }
+    }
     let latest = dataset.latest_version_id().await?;
     if !scanned_versions.contains(&latest) {
-        return Err(Error::too_much_write_contention(format!(
-            "referenced_files did not see version {latest}, committed while the manifests \
-             were being listed; call it again"
-        )));
+        return Err(missed(latest));
     }
 
     let indices_dir = dataset.indices_dir();
@@ -7835,16 +7852,19 @@ mod tests {
         );
     }
 
-    /// Reports one version past the newest one on storage once `enabled` is
-    /// set, standing in for a commit that lands while the manifests are being
-    /// listed, after the lister has passed where its manifest sorts.
+    /// Stands in for a commit that lands while the manifests are being listed,
+    /// after the lister has passed where its manifest sorts. With
+    /// `latest_ahead` set it reports one version past the newest one on
+    /// storage; `hide_from_next_listing` (0 for none) drops that version from
+    /// the next listing only.
     #[derive(Debug, Default)]
-    struct ReportsUnlistedVersion {
-        enabled: std::sync::atomic::AtomicBool,
+    struct RacyListing {
+        latest_ahead: std::sync::atomic::AtomicBool,
+        hide_from_next_listing: std::sync::atomic::AtomicU64,
     }
 
     #[async_trait::async_trait]
-    impl lance_table::io::commit::CommitHandler for ReportsUnlistedVersion {
+    impl lance_table::io::commit::CommitHandler for RacyListing {
         async fn resolve_latest_location(
             &self,
             base_path: &Path,
@@ -7853,10 +7873,23 @@ mod tests {
             let mut location = lance_table::io::commit::ConditionalPutCommitHandler
                 .resolve_latest_location(base_path, object_store)
                 .await?;
-            if self.enabled.load(Ordering::SeqCst) {
+            if self.latest_ahead.load(Ordering::SeqCst) {
                 location.version += 1;
             }
             Ok(location)
+        }
+
+        fn list_manifest_locations<'a>(
+            &self,
+            base_path: &Path,
+            object_store: &'a ObjectStore,
+            sorted_descending: bool,
+        ) -> futures::stream::BoxStream<'a, Result<ManifestLocation>> {
+            let hidden = self.hide_from_next_listing.swap(0, Ordering::SeqCst);
+            lance_table::io::commit::ConditionalPutCommitHandler
+                .list_manifest_locations(base_path, object_store, sorted_descending)
+                .try_filter(move |location| std::future::ready(location.version != hidden))
+                .boxed()
         }
 
         async fn commit(
@@ -7884,10 +7917,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn referenced_files_rejects_a_scan_that_missed_the_latest_version() {
+    async fn referenced_files_rejects_a_scan_that_missed_a_version() {
         let fixture = MockDatasetFixture::try_new().unwrap();
         fixture.create_some_data().await.unwrap();
-        let handler = Arc::new(ReportsUnlistedVersion::default());
+        fixture.append_some_data().await.unwrap();
+        fixture.append_some_data().await.unwrap();
+        let handler = Arc::new(RacyListing::default());
         let dataset = DatasetBuilder::from_uri(&fixture.dataset_path)
             .with_read_params(ReadParams {
                 store_options: Some(fixture.os_params()),
@@ -7897,18 +7932,27 @@ mod tests {
             .load()
             .await
             .unwrap();
+        assert_eq!(dataset.version().version, 3);
         dataset.referenced_files().await.unwrap();
 
-        handler.enabled.store(true, Ordering::SeqCst);
-        let err = dataset.referenced_files().await.unwrap_err();
-        assert!(
-            matches!(err, Error::TooMuchWriteContention { .. }),
-            "expected TooMuchWriteContention, got {err:?}"
-        );
-        assert!(
-            err.to_string().contains("call it again"),
-            "error should tell the caller to retry, got {err}"
-        );
+        let assert_retryable = |err: Error| {
+            assert!(
+                matches!(err, Error::TooMuchWriteContention { .. }),
+                "expected TooMuchWriteContention, got {err:?}"
+            );
+            assert!(
+                err.to_string().contains("call it again"),
+                "error should tell the caller to retry, got {err}"
+            );
+        };
+
+        // A version older than the newest, missed by the walk's listing only.
+        handler.hide_from_next_listing.store(2, Ordering::SeqCst);
+        assert_retryable(dataset.referenced_files().await.unwrap_err());
+
+        // A newest version that no listing has seen yet.
+        handler.latest_ahead.store(true, Ordering::SeqCst);
+        assert_retryable(dataset.referenced_files().await.unwrap_err());
     }
 
     #[tokio::test]
