@@ -87,7 +87,6 @@ pub(super) async fn list_metadata_files(
     Ok(part_metadata_files)
 }
 
-/// Merge partition metadata files with partition ID remapping to sequential IDs starting from 0
 async fn merge_metadata_files(
     store: Arc<dyn IndexStore>,
     part_metadata_files: &[String],
@@ -209,7 +208,6 @@ async fn merge_metadata_files(
 }
 
 const MAX_FINALIZATION_CONCURRENCY: usize = 16;
-const MAX_MERGE_GROUP_PARTITIONS: usize = 8;
 // Stored size selects consolidation candidates; decoded groups still obey the builder budget.
 const PARTITION_COPY_SIZE_RATIO: u64 = 8;
 
@@ -241,8 +239,7 @@ fn plan_partitions(
             groups.push(vec![partition]);
         } else {
             if !small.is_empty()
-                && (small_size.saturating_add(size) > copy_threshold.saturating_mul(2)
-                    || small.len() == MAX_MERGE_GROUP_PARTITIONS)
+                && small_size.saturating_add(size) > copy_threshold.saturating_mul(2)
             {
                 groups.push(std::mem::take(&mut small));
                 small_size = 0;
@@ -434,6 +431,15 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(vec![1], 0), (vec![3], 1), (vec![2, 4], 2)]
         );
+        let small_partitions = (5..21).collect::<Vec<_>>();
+        for &partition in &small_partitions {
+            for suffix in PARTITION_FILE_SUFFIXES {
+                sizes.insert(staged_partition_file_path(partition, suffix), 1);
+            }
+        }
+        let small_jobs = plan_partitions(&small_partitions, &sizes, 300).unwrap();
+        assert_eq!(small_jobs.len(), 1);
+        assert_eq!(small_jobs[0].sources, small_partitions);
         sizes.remove(&staged_partition_file_path(1, DOCS_FILE));
         let error = plan_partitions(&partitions, &sizes, 300).err().unwrap();
         assert!(matches!(error, Error::Index { .. }));
