@@ -3836,8 +3836,11 @@ mod tests {
         }
     }
 
+    #[rstest::rstest]
+    #[case::single(true)]
+    #[case::multiple(false)]
     #[tokio::test]
-    async fn test_merge_existing_index_segments_supports_fts_segments() {
+    async fn test_merge_existing_index_segments_supports_fts_segments(#[case] single: bool) {
         let tmpdir = TempStrDir::default();
         let dataset_uri = format!("file://{}", tmpdir.as_str());
 
@@ -3862,25 +3865,56 @@ mod tests {
         .await
         .unwrap();
 
-        let params = InvertedIndexParams::default();
+        let params = InvertedIndexParams::default()
+            .block_size(256)
+            .unwrap()
+            .format_version(lance_index::scalar::inverted::InvertedListFormatVersion::V3);
         let mut input_segments = Vec::new();
         let mut expected_fragments = roaring::RoaringBitmap::new();
-        for fragment in dataset.get_fragments() {
-            expected_fragments.insert(fragment.id() as u32);
+        let fragment_ids = dataset
+            .get_fragments()
+            .iter()
+            .map(|fragment| fragment.id() as u32)
+            .collect::<Vec<_>>();
+        expected_fragments.extend(fragment_ids.iter().copied());
+        let groups = if single {
+            vec![fragment_ids]
+        } else {
+            fragment_ids.into_iter().map(|id| vec![id]).collect()
+        };
+        for fragments in groups {
             let segment =
                 CreateIndexBuilder::new(&mut dataset, &["text"], IndexType::Inverted, &params)
                     .name("text_idx".to_string())
-                    .fragments(vec![fragment.id() as u32])
+                    .fragments(fragments)
                     .execute_uncommitted()
                     .await
                     .unwrap();
             input_segments.push(segment);
         }
 
+        let first_uuid = input_segments[0].uuid;
         let merged = dataset
             .merge_existing_index_segments(input_segments)
             .await
             .unwrap();
+        assert_eq!(merged.uuid == first_uuid, single);
+        assert!(
+            merged
+                .files
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|file| file.path == "metadata.lance")
+        );
+        assert!(
+            merged
+                .files
+                .as_ref()
+                .unwrap()
+                .iter()
+                .all(|file| !file.path.starts_with("staging/"))
+        );
         assert_eq!(
             merged
                 .fragment_bitmap

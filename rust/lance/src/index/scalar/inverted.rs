@@ -21,13 +21,14 @@ use lance_core::{
 };
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::pbold::InvertedIndexDetails;
-use lance_index::scalar::index_files_to_table;
 use lance_index::scalar::inverted::{
-    DocumentGranularity, InvertedIndex, InvertedIndexParams, doc_index_storage_column,
+    DocumentGranularity, INVERTED_INDEX_VERSION_V3, InvertedIndex, InvertedIndexParams,
+    doc_index_storage_column,
 };
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::registry::VALUE_COLUMN_NAME;
-use lance_table::format::IndexMetadata;
+use lance_index::scalar::{IndexStore, index_files_to_table};
+use lance_table::format::{IndexMetadata, list_index_files_with_sizes};
 use prost::Message;
 use roaring::RoaringBitmap;
 use uuid::Uuid;
@@ -959,6 +960,36 @@ pub(crate) async fn merge_segments(
     let document_granularity = DocumentGranularity::try_from(details.document_granularity)?;
     let resolved = resolve_fts_field_by_id(dataset.schema(), field_id, document_granularity)?;
     load_segment_details(dataset, &resolved.canonical_path, &segments).await?;
+
+    if segments.len() == 1
+        && segments[0].dataset_version == dataset.manifest.version
+        && segments[0].index_version == INVERTED_INDEX_VERSION_V3 as i32
+        && staged.is_none()
+    {
+        let segment = &segments[0];
+        finalize_segment_files_if_needed(dataset, segment).await?;
+        let store = LanceIndexStore::from_dataset_for_new(dataset, &segment.uuid)?;
+        let metadata = store
+            .open_index_file(lance_index::scalar::inverted::METADATA_FILE)
+            .await?;
+        if metadata
+            .schema()
+            .metadata
+            .get("format_version")
+            .is_some_and(|version| version == "3")
+        {
+            let mut files = list_index_files_with_sizes(
+                &dataset.object_store,
+                &dataset.indices_dir().join(segment.uuid.to_string()),
+            )
+            .await?;
+            files.retain(|file| !file.path.starts_with("staging/"));
+            return Ok(IndexMetadata {
+                files: Some(files),
+                ..segment.clone()
+            });
+        }
+    }
 
     let mut source_indices = Vec::with_capacity(segments.len());
     let mut fragment_bitmap = RoaringBitmap::new();
