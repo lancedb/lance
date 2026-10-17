@@ -73,6 +73,27 @@ impl<F: Copy> Candidate<F> {
 #[derive(Clone, Copy)]
 pub struct Kernel<F>(F);
 
+impl<F: Copy> Kernel<F> {
+    /// The kernel as a function pointer, for a signature no `call` covers.
+    ///
+    /// `call` cannot cover a parameter whose type carries the reference's own
+    /// lifetime, such as `&mut dyn FnMut(..)`. Calling the pointer is sound
+    /// for the same reason `call` is.
+    pub fn into_fn(self) -> F {
+        self.0
+    }
+}
+
+impl<A: ?Sized, B: ?Sized, C, D: ?Sized, E: ?Sized, R>
+    Kernel<unsafe fn(&A, &B, C, &D, &mut E) -> R>
+{
+    #[inline(always)]
+    pub fn call(self, a: &A, b: &B, c: C, d: &D, e: &mut E) -> R {
+        // SAFETY: see the two-argument `call`.
+        unsafe { (self.0)(a, b, c, d, e) }
+    }
+}
+
 impl<A: ?Sized, B: ?Sized, R> Kernel<unsafe fn(&A, &B) -> R> {
     #[inline(always)]
     pub fn call(self, a: &A, b: &B) -> R {
