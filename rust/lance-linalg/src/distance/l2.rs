@@ -332,6 +332,12 @@ lance_core::target_kernel! {
     /// Portable L2 distance for f32, relying on LLVM to auto-vectorize it.
     #[inline]
     fn l2_f32_scalar(x: &[f32], y: &[f32]) -> f32 {
+        // Below one 16-lane chunk (e.g. dimension-8 PQ sub-vectors) the
+        // 16-lane kernel is all scalar remainder: a serial add chain whose
+        // speed swings with code layout. 8 lanes vectorizes it.
+        if x.len() < 16 {
+            return l2_scalar::<f32, f32, 8>(x, y);
+        }
         // 16 = 512 (avx512) / 8 bits / 4 (sizeof(f32))
         // See https://github.com/lance-format/lance/pull/2450.
         l2_scalar::<f32, f32, 16>(x, y)
@@ -1346,6 +1352,7 @@ mod tests {
     /// batch kernel and for the per-vector default that f64 uses.
     #[rstest::rstest]
     #[case::dim_8(8)]
+    #[case::dim_12(12)]
     #[case::dim_16(16)]
     #[case::dim_32(32)]
     #[case::dim_1024(1024)]
