@@ -1258,6 +1258,10 @@ mod tests {
         for filter in ["is_valid()", "is_valid(s, s)"] {
             let err = planner.parse_filter(filter).unwrap_err();
             assert!(
+                matches!(err, Error::InvalidInput { .. }),
+                "expected InvalidInput for {filter}, got {err:?}"
+            );
+            assert!(
                 err.to_string()
                     .contains("is_valid() takes exactly one argument"),
                 "unexpected error for {filter}: {err}"
@@ -1276,7 +1280,15 @@ mod tests {
 
         // A misplaced parenthesis turns `coalesce(s, 'x')` into two items;
         // keeping only the first would silently compute `coalesce(s)`.
-        assert!(planner.parse_expr("coalesce(s), 'x'").is_err());
+        let err = planner.parse_expr("coalesce(s), 'x'").unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "expected InvalidInput, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("Expression is not valid"),
+            "unexpected error: {err}"
+        );
         assert!(planner.parse_expr("coalesce(s, 'x')").is_ok());
     }
 
@@ -1775,7 +1787,8 @@ mod tests {
 
     /// A literal under NOT is narrowed to the column type like one outside it.
     /// Otherwise the Float32 column is cast to Float64 and `0.1f32` no longer
-    /// equals `0.1`, so a predicate and its negation both match that row.
+    /// equals `0.1`, so a predicate and its negation can both match, or both
+    /// miss, that row.
     #[rstest]
     #[case::eq("f = 0.1", vec![true, false])]
     #[case::gt("f > 0.1", vec![false, true])]
@@ -1801,11 +1814,19 @@ mod tests {
                 .unwrap()
         };
 
-        let negated: Vec<bool> = expected.iter().map(|matched| !matched).collect();
-        assert_eq!(evaluate(filter).as_ref(), &BooleanArray::from(expected));
+        let negated = BooleanArray::from(expected.iter().map(|m| !m).collect::<Vec<_>>());
+        let expected = BooleanArray::from(expected);
+        assert_eq!(evaluate(filter).as_ref(), &expected);
+        assert_eq!(evaluate(&format!("NOT ({filter})")).as_ref(), &negated);
+        assert_eq!(evaluate(&format!("({filter}) IS TRUE")).as_ref(), &expected);
+        assert_eq!(evaluate(&format!("({filter}) IS FALSE")).as_ref(), &negated);
         assert_eq!(
-            evaluate(&format!("NOT ({filter})")).as_ref(),
-            &BooleanArray::from(negated)
+            evaluate(&format!("({filter}) IS NOT TRUE")).as_ref(),
+            &negated
+        );
+        assert_eq!(
+            evaluate(&format!("({filter}) IS NOT FALSE")).as_ref(),
+            &expected
         );
     }
 
