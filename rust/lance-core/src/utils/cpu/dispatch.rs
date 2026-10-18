@@ -73,6 +73,18 @@ impl<F: Copy> Candidate<F> {
 #[derive(Clone, Copy)]
 pub struct Kernel<F>(F);
 
+impl<F: Copy> Kernel<F> {
+    /// The kernel as its `unsafe fn` pointer, for signatures `call` cannot
+    /// cover, such as a parameter type with its own lifetime. Prefer `call`.
+    ///
+    /// The pointer came from a `Kernel`, so its host-feature precondition is
+    /// already met. The caller still owns any other precondition of the
+    /// kernel, such as slice lengths, alignment or aliasing.
+    pub fn as_fn(self) -> F {
+        self.0
+    }
+}
+
 /// Implements `call` for one kernel signature, generic over the listed types.
 ///
 /// Each signature needs its own impl: a reference parameter makes the pointer
@@ -110,12 +122,20 @@ impl_call!(
     fn(a: &A, b: &B, c: &mut C, d: &mut D, e: &mut E)
 );
 impl_call!(
+    <A: ?Sized, B: ?Sized, C: ?Sized, D: ?Sized, E: ?Sized>
+    fn(a: &A, b: &B, c: &C, d: &D, e: &mut E)
+);
+impl_call!(
     <A: ?Sized, B: ?Sized, C, D: ?Sized, E, F: ?Sized>
     fn(a: &A, b: &B, c: C, d: &D, e: E, f: &mut F)
 );
 impl_call!(
     <A: ?Sized, B: ?Sized, C: ?Sized, D: ?Sized, E, F, G>
     fn(a: &A, b: &B, c: &C, d: &D, e: E, f: F, g: G)
+);
+impl_call!(
+    <A: ?Sized, C: ?Sized, D: ?Sized, E: ?Sized, G: ?Sized>
+    fn(a: &A, b: u64, c: &C, d: &D, e: &E, f: f32, g: &mut G)
 );
 
 /// One operation's kernels, best first, with the host's choice made once.
@@ -175,6 +195,13 @@ impl<F: Copy> Dispatch<F> {
             return Kernel(self.candidates[0].kernel);
         }
         Kernel(*self.selected.0.get_or_init(|| self.selected().kernel))
+    }
+
+    /// The last candidate, which every host supports.
+    pub fn fallback(&self) -> Kernel<F> {
+        let fallback = self.candidates[self.candidates.len() - 1];
+        debug_assert!(fallback.features.is_empty());
+        Kernel(fallback.kernel)
     }
 
     /// The candidate [`Self::get`] returns.
