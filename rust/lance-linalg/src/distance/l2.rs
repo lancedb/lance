@@ -501,7 +501,7 @@ mod x86 {
 
     use crate::distance::{BatchKernel, PairKernel};
     use crate::simd::f64::{f64x4, f64x8};
-    use crate::simd::x86::{fixed_width_rows, hsum256_ps};
+    use crate::simd::x86::{fixed_width_batch, hsum256_ps};
     use crate::simd::{FloatSimd, SIMD};
 
     lance_core::target_kernel! {
@@ -509,9 +509,9 @@ mod x86 {
         #[candidate(pub(super) L2_F32_BATCH_AVX_FMA: BatchKernel)]
         /// Up to 16 dimensions the scalar kernel's 16-lane chunking degenerates
         /// to its remainder loop, so the explicit AVX kernel wins; above that
-        /// the auto-vectorized scalar kernel is as good or better. That is
-        /// `l2_scalar` itself: LLVM declines to inline the `#[inline]`
-        /// `l2_f32_scalar` wrapper into this many loops.
+        /// the auto-vectorized scalar kernel is as good or better. That arm
+        /// calls `l2_scalar` directly because LLVM declines to inline the
+        /// `#[inline]` `l2_f32_scalar` wrapper into this many loops.
         pub(super) fn l2_batch_f32_avx_fma(
             x: &[f32],
             batch: &[f32],
@@ -521,15 +521,16 @@ mod x86 {
             if dimension == 8
                 && let Ok(key) = <&[f32; 8]>::try_from(x)
             {
-                let key = unsafe { _mm256_loadu_ps(key.as_ptr()) };
-                for (distance, y) in output.iter_mut().zip(batch.as_chunks::<8>().0) {
-                    let diff = _mm256_sub_ps(key, unsafe { _mm256_loadu_ps(y.as_ptr()) });
-                    *distance = unsafe { hsum256_ps(_mm256_mul_ps(diff, diff)) };
-                }
+                let key_lanes = unsafe { _mm256_loadu_ps(key.as_ptr()) };
+                // Adding -0.0 leaves every value, signed zeros included, as is.
+                fixed_width_batch(batch, output, |y: &[f32; 8]| {
+                    let diff = _mm256_sub_ps(key_lanes, unsafe { _mm256_loadu_ps(y.as_ptr()) });
+                    (_mm256_mul_ps(diff, diff), -0.0)
+                });
             } else if dimension == 16
                 && let Ok(key) = <&[f32; 16]>::try_from(x)
             {
-                fixed_width_rows(key, batch, output, |x, y| l2_f32_avx_fma(x, y));
+                fixed_width_batch(batch, output, |y: &[f32; 16]| l2_f32_avx_fma_parts(key, y));
             } else if dimension <= 16 {
                 for (distance, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
                     *distance = l2_f32_avx_fma(x, y);
@@ -554,15 +555,16 @@ mod x86 {
             if dimension == 8
                 && let Ok(key) = <&[f32; 8]>::try_from(x)
             {
-                let key = unsafe { _mm256_loadu_ps(key.as_ptr()) };
-                for (distance, y) in output.iter_mut().zip(batch.as_chunks::<8>().0) {
-                    let diff = _mm256_sub_ps(key, unsafe { _mm256_loadu_ps(y.as_ptr()) });
-                    *distance = unsafe { hsum256_ps(_mm256_mul_ps(diff, diff)) };
-                }
+                let key_lanes = unsafe { _mm256_loadu_ps(key.as_ptr()) };
+                // Adding -0.0 leaves every value, signed zeros included, as is.
+                fixed_width_batch(batch, output, |y: &[f32; 8]| {
+                    let diff = _mm256_sub_ps(key_lanes, unsafe { _mm256_loadu_ps(y.as_ptr()) });
+                    (_mm256_mul_ps(diff, diff), -0.0)
+                });
             } else if dimension == 16
                 && let Ok(key) = <&[f32; 16]>::try_from(x)
             {
-                fixed_width_rows(key, batch, output, |x, y| l2_f32_avx(x, y));
+                fixed_width_batch(batch, output, |y: &[f32; 16]| l2_f32_avx_parts(key, y));
             } else {
                 for (distance, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
                     *distance = l2_f32_avx(x, y);
@@ -745,34 +747,43 @@ mod x86 {
         /// AVX + FMA path for f32. Covers both AvxFma and AVX2 hosts (body uses no AVX2-specific intrinsics).
         #[inline]
         pub(super) fn l2_f32_avx_fma(x: &[f32], y: &[f32]) -> f32 {
-            // See `l2_f32_avx512` for `min`.
-            let dim = x.len().min(y.len());
-            let unrolled_len = dim / 8 * 8;
-
-            let mut acc = _mm256_setzero_ps();
-            for i in (0..unrolled_len).step_by(8) {
-                let (a, b) = unsafe {
-                    (
-                        _mm256_loadu_ps(x.as_ptr().add(i)),
-                        _mm256_loadu_ps(y.as_ptr().add(i)),
-                    )
-                };
-                let diff = _mm256_sub_ps(a, b);
-                acc = _mm256_fmadd_ps(diff, diff, acc);
-            }
-
-            let tail: f32 = x[unrolled_len..]
-                .iter()
-                .zip(y[unrolled_len..].iter())
-                .map(|(&a, &b)| {
-                    let diff = a - b;
-                    diff * diff
-                })
-                .sum();
-
+            let (acc, tail) = l2_f32_avx_fma_parts(x, y);
             let sum = unsafe { hsum256_ps(acc) };
             sum + tail
         }
+    }
+
+    /// The accumulator and tail that [`l2_f32_avx_fma`] sums, so batch
+    /// kernels can reduce eight vectors' accumulators at once.
+    #[inline]
+    #[target_feature(enable = "avx,fma")]
+    fn l2_f32_avx_fma_parts(x: &[f32], y: &[f32]) -> (__m256, f32) {
+        // See `l2_f32_avx512` for `min`.
+        let dim = x.len().min(y.len());
+        let unrolled_len = dim / 8 * 8;
+
+        let mut acc = _mm256_setzero_ps();
+        for i in (0..unrolled_len).step_by(8) {
+            let (a, b) = unsafe {
+                (
+                    _mm256_loadu_ps(x.as_ptr().add(i)),
+                    _mm256_loadu_ps(y.as_ptr().add(i)),
+                )
+            };
+            let diff = _mm256_sub_ps(a, b);
+            acc = _mm256_fmadd_ps(diff, diff, acc);
+        }
+
+        let tail: f32 = x[unrolled_len..]
+            .iter()
+            .zip(y[unrolled_len..].iter())
+            .map(|(&a, &b)| {
+                let diff = a - b;
+                diff * diff
+            })
+            .sum();
+
+        (acc, tail)
     }
 
     lance_core::target_kernel! {
@@ -781,34 +792,43 @@ mod x86 {
         /// AVX-only path for f32 (no FMA): squared diff via `_mm256_mul_ps` + `_mm256_add_ps` for Sandy/Ivy Bridge.
         #[inline]
         pub(super) fn l2_f32_avx(x: &[f32], y: &[f32]) -> f32 {
-            // See `l2_f32_avx512` for `min`.
-            let dim = x.len().min(y.len());
-            let unrolled_len = dim / 8 * 8;
-
-            let mut acc = _mm256_setzero_ps();
-            for i in (0..unrolled_len).step_by(8) {
-                let (a, b) = unsafe {
-                    (
-                        _mm256_loadu_ps(x.as_ptr().add(i)),
-                        _mm256_loadu_ps(y.as_ptr().add(i)),
-                    )
-                };
-                let diff = _mm256_sub_ps(a, b);
-                acc = _mm256_add_ps(acc, _mm256_mul_ps(diff, diff));
-            }
-
-            let tail: f32 = x[unrolled_len..]
-                .iter()
-                .zip(y[unrolled_len..].iter())
-                .map(|(&a, &b)| {
-                    let diff = a - b;
-                    diff * diff
-                })
-                .sum();
-
+            let (acc, tail) = l2_f32_avx_parts(x, y);
             let sum = unsafe { hsum256_ps(acc) };
             sum + tail
         }
+    }
+
+    /// The accumulator and tail that [`l2_f32_avx`] sums, so batch
+    /// kernels can reduce eight vectors' accumulators at once.
+    #[inline]
+    #[target_feature(enable = "avx")]
+    fn l2_f32_avx_parts(x: &[f32], y: &[f32]) -> (__m256, f32) {
+        // See `l2_f32_avx512` for `min`.
+        let dim = x.len().min(y.len());
+        let unrolled_len = dim / 8 * 8;
+
+        let mut acc = _mm256_setzero_ps();
+        for i in (0..unrolled_len).step_by(8) {
+            let (a, b) = unsafe {
+                (
+                    _mm256_loadu_ps(x.as_ptr().add(i)),
+                    _mm256_loadu_ps(y.as_ptr().add(i)),
+                )
+            };
+            let diff = _mm256_sub_ps(a, b);
+            acc = _mm256_add_ps(acc, _mm256_mul_ps(diff, diff));
+        }
+
+        let tail: f32 = x[unrolled_len..]
+            .iter()
+            .zip(y[unrolled_len..].iter())
+            .map(|(&a, &b)| {
+                let diff = a - b;
+                diff * diff
+            })
+            .sum();
+
+        (acc, tail)
     }
 }
 
@@ -1098,7 +1118,8 @@ mod tests {
 
     use crate::test_utils::{
         arbitrary_bf16, arbitrary_f16, arbitrary_f32, arbitrary_f64, arbitrary_vector_pair,
-        check_batch_matches_pair, dimension_shard, run_vector_pair_proptest,
+        check_batch_matches_pair, check_batch_position_independent, dimension_shard,
+        run_vector_pair_proptest,
     };
 
     fn l2_distance_batch_vec<T: L2>(from: &[T], to: &[T], dimension: usize) -> Vec<f32> {
@@ -1271,8 +1292,9 @@ mod tests {
     }
 
     /// Every host-supported f32 kernel, single-pair and batch, must agree with
-    /// an f64 reference. Prefixes of length 8, 16 and 32 pin the batch
-    /// kernels' PQ-width fast paths regardless of the generated dimension.
+    /// an f64 reference. Prefixes of length 8 and 16 pin the batch kernels'
+    /// PQ-width fast paths, and 32 the scalar arm above them, regardless of
+    /// the generated dimension.
     #[rstest::rstest]
     fn test_l2_f32_kernels_match_reference(
         #[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)] shard: usize,
@@ -1296,21 +1318,33 @@ mod tests {
                     );
                 }
 
-                // Up to 16 dimensions the batch kernel must match the pair
-                // kernel bit for bit; above that it uses the scalar kernel.
+                // Each x86 batch kernel must match, bit for bit, the pair
+                // kernel it stands in for: its own tier's, except the scalar
+                // kernel above 16 dimensions on AVX+FMA.
                 #[cfg(target_arch = "x86_64")]
-                if dimension <= 16
-                    && let (Some(pair), Some(batch)) = (
-                        x86::L2_F32_AVX_FMA.kernel(),
-                        x86::L2_F32_BATCH_AVX_FMA.kernel(),
-                    )
-                {
+                for (pair, batch) in [
+                    (
+                        if dimension <= 16 {
+                            x86::L2_F32_AVX_FMA
+                        } else {
+                            L2_F32_SCALAR
+                        },
+                        x86::L2_F32_BATCH_AVX_FMA,
+                    ),
+                    (x86::L2_F32_AVX, x86::L2_F32_BATCH_AVX),
+                ] {
+                    let (Some(pair_kernel), Some(batch_kernel)) = (pair.kernel(), batch.kernel())
+                    else {
+                        continue;
+                    };
                     let mut got = [f32::NAN];
-                    batch.call(x, y, dimension, &mut got);
+                    batch_kernel.call(x, y, dimension, &mut got);
                     prop_assert_eq!(
                         got[0].to_bits(),
-                        pair.call(x, y).to_bits(),
-                        "dim {}",
+                        pair_kernel.call(x, y).to_bits(),
+                        "{} vs {} at dim {}",
+                        batch.name(),
+                        pair.name(),
                         dimension
                     );
                 }
@@ -1329,6 +1363,7 @@ mod tests {
                         candidate.name()
                     );
                 }
+                check_batch_position_independent(&L2_F32_BATCH, x, y)?;
             }
             Ok(())
         });
