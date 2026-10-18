@@ -1315,6 +1315,45 @@ mod tests {
     }
 
     #[test]
+    fn key_values_probes_both_zero_encodings() {
+        fn float_bits(values: &[ScalarValue]) -> Vec<u64> {
+            values
+                .iter()
+                .map(|value| match value {
+                    ScalarValue::Float64(Some(v)) => v.to_bits(),
+                    other => panic!("unexpected key value {other:?}"),
+                })
+                .collect()
+        }
+        fn bits(values: &[f64]) -> Vec<u64> {
+            values.iter().map(|v| v.to_bits()).collect()
+        }
+
+        let floats: ArrayRef = Arc::new(arrow_array::Float64Array::from(vec![
+            1.0,
+            0.0,
+            1.0,
+            f64::NAN,
+        ]));
+
+        // A zero row yields both encodings, so without dedupe there are more
+        // values than rows. The values only build an `IsIn` set, so nothing
+        // depends on them lining up with input rows.
+        let values = MapIndexExec::key_values(&floats, false).unwrap();
+        assert_eq!(float_bits(&values), bits(&[1.0, -0.0, 0.0, 1.0, f64::NAN]));
+
+        let deduped = MapIndexExec::key_values(&floats, true).unwrap();
+        assert_eq!(float_bits(&deduped), bits(&[1.0, -0.0, 0.0, f64::NAN]));
+
+        // Integer zero has a single encoding and is not expanded.
+        let ints: ArrayRef = Arc::new(Int32Array::from(vec![0, 1]));
+        assert_eq!(
+            MapIndexExec::key_values(&ints, false).unwrap(),
+            vec![ScalarValue::Int32(Some(0)), ScalarValue::Int32(Some(1))]
+        );
+    }
+
+    #[test]
     fn test_map_index_candidates_accept_empty_first_batch() {
         let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1024));
         let reservation = MemoryConsumer::new(MAP_INDEX_CANDIDATES_MEMORY_CONSUMER).register(&pool);
