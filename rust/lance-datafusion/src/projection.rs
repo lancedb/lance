@@ -98,32 +98,16 @@ impl ProjectionBuilder {
             self.planner.optimize_expr(expr)?
         };
 
-        // If the expression is a bare column reference to a system column, mark that we need it
-        if let Expr::Column(Column {
-            name,
-            relation: None,
-            ..
-        }) = &expr
-        {
-            if name == ROW_ID {
-                self.needs_row_id = true;
-            } else if name == ROW_ADDR {
-                self.needs_row_addr = true;
-            } else if name == ROW_OFFSET {
-                self.must_add_row_offset = true;
-            } else if name == ROW_LAST_UPDATED_AT_VERSION {
-                self.needs_row_last_updated_at = true;
-            } else if name == ROW_CREATED_AT_VERSION {
-                self.needs_row_created_at = true;
-            }
-        }
-
         for col in Planner::column_names_in_expr(&expr) {
-            // A system column referenced inside a larger expression (e.g.
-            // `_rowoffset + 1`) must request its supporting exec node too;
-            // the bare-column check above only catches whole-column outputs.
-            if col == ROW_OFFSET {
-                self.must_add_row_offset = true;
+            // A system column has to be requested whether it is the whole
+            // expression or part of one, such as `_rowid + 1`.
+            match col.as_str() {
+                ROW_ID => self.needs_row_id = true,
+                ROW_ADDR => self.needs_row_addr = true,
+                ROW_OFFSET => self.must_add_row_offset = true,
+                ROW_LAST_UPDATED_AT_VERSION => self.needs_row_last_updated_at = true,
+                ROW_CREATED_AT_VERSION => self.needs_row_created_at = true,
+                _ => {}
             }
             // Discovery can bind an exact provisional scoring field beside a mixed-case stored
             // field. Load the stored field too so final-schema replanning can select the stored

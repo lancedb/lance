@@ -97,7 +97,6 @@ fn is_literal_only_same_type_expr(expr: &Expr) -> bool {
 /// - *schema*: lance schema.
 pub fn resolve_expr(expr: &Expr, schema: &Schema) -> Result<Expr> {
     match expr {
-        Expr::Not(inner) => Ok(Expr::Not(Box::new(resolve_expr(inner.as_ref(), schema)?))),
         Expr::Between(Between {
             expr: inner_expr,
             low,

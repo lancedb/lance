@@ -13867,9 +13867,26 @@ mod test {
         // Make sure we can reference * fields in exprs and add new columns
         check_exprs(&["_rowid", "*", "x * 2"], &["_rowid", "x", "y", "x * 2"]).await;
 
-        // A system column referenced inside a larger expression must request
-        // its supporting exec node just like a bare reference does.
-        check_exprs(&["_rowoffset + 1"], &["_rowoffset + 1"]).await;
+        // A system column inside a larger expression is requested just like a
+        // bare reference.
+        for expr in [
+            "_rowid + 1",
+            "_rowaddr + 1",
+            "_rowoffset + 1",
+            "_row_last_updated_at_version + 1",
+            "_row_created_at_version + 1",
+        ] {
+            check_exprs(&[expr], &[expr]).await;
+        }
+        let mut scan = data.scan();
+        scan.project_with_transform(&[("o", "_rowoffset + 1")])
+            .unwrap();
+        let batch = scan.try_into_batch().await.unwrap();
+        let offsets = arrow::compute::cast(&batch["o"], &DataType::Int64).unwrap();
+        assert_eq!(
+            offsets.as_primitive::<Int64Type>().values(),
+            &(1..=100).collect::<Vec<i64>>()[..]
+        );
 
         let check_fails = |projection: &[&str]| {
             let mut scan = data.scan();
