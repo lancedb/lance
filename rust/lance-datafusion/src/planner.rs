@@ -47,7 +47,7 @@ use datafusion::{
     scalar::ScalarValue,
 };
 use datafusion_functions::core::getfield::GetFieldFunc;
-use lance_core::datatypes::Schema;
+use lance_core::datatypes::{Schema, parse_field_path};
 use lance_core::error::LanceOptionExt;
 
 use chrono::Utc;
@@ -962,14 +962,34 @@ impl Planner {
 
     /// Create Logical [Expr] from a SQL expression.
     ///
+    /// Plain column names (e.g. `id`) and backtick-quoted column names (e.g.
+    /// `` `order` ``), as produced by
+    /// [`lance_core::datatypes::escape_field_path_for_project`], are resolved
+    /// directly against the schema without going through the SQL parser,
+    /// producing the same expression the SQL parser would. Anything else,
+    /// including nested field paths, falls through to the full SQL parser.
+    ///
     /// Note: the returned expression must be passed through `optimize_filter()`
     /// before being passed to `create_physical_expr()`.
     pub fn parse_expr(&self, expr: &str) -> Result<Expr> {
         // First check if it's a simple column reference (no operators, functions, etc.)
-        // resolve_column_name tries exact match first, then falls back to case-insensitive
+        // resolve_column_name tries exact match first, then falls back to case-insensitive.
+        // This also covers literal column names containing dots, which must win over a
+        // nested path interpretation.
         let resolved_name = self.resolve_column_name(expr);
         if self.schema.field_with_name(&resolved_name).is_ok() {
             return Ok(Expr::Column(Column::from_name(resolved_name)));
+        }
+
+        // A single backtick-quoted name is looked up exactly, as the SQL parser
+        // would. Multi-segment paths are left to the SQL parser: unquoted
+        // segments may carry SQL syntax (e.g. `parent.child + 1`) that
+        // `parse_field_path` does not reject.
+        if let Ok(path) = parse_field_path(expr)
+            && let [name] = path.as_slice()
+            && self.schema.field_with_name(name).is_ok()
+        {
+            return Ok(Expr::Column(Column::from_name(name)));
         }
 
         // Parse as SQL expression
@@ -1264,6 +1284,90 @@ mod tests {
         );
     }
 
+    #[rstest]
+    #[case::not_equal_to_integer_expression(
+        "flag != (id > 0)",
+        [false, false, true]
+    )]
+    #[case::equal_to_float_expression("flag = (x > 1.0)", [false, false, false])]
+    #[case::expression_on_left("(id > 0) != flag", [false, false, true])]
+    #[case::literal_expression("flag != (1 > 0)", [false, true, false])]
+    #[case::boolean_literal("flag != TRUE", [false, true, false])]
+    fn test_parse_boolean_column_compared_to_expression(
+        #[case] filter: &str,
+        #[case] expected: [bool; 3],
+    ) {
+        let batch = arrow_array::record_batch!(
+            ("flag", Boolean, [true, false, true]),
+            ("id", Int32, [1, 0, -1]),
+            ("x", Float32, [0.5, 2.0, 1.0])
+        )
+        .unwrap();
+        let planner = Planner::new(batch.schema());
+
+        let expr = planner.parse_filter(filter).unwrap();
+        let expr = planner.optimize_expr(expr).unwrap();
+        let physical_expr = planner.create_physical_expr(&expr).unwrap();
+        let predicates = physical_expr.evaluate(&batch).unwrap();
+
+        assert_eq!(
+            predicates.into_array(0).unwrap().as_ref(),
+            &BooleanArray::from(expected.to_vec())
+        );
+    }
+
+    #[rstest]
+    #[case::shift("u = (1 << 63)", [true, false, false])]
+    #[case::string_concat("s = ('a' || 'b')", [true, false, false])]
+    fn test_parse_comparison_to_same_type_literal_expression(
+        #[case] filter: &str,
+        #[case] expected: [bool; 3],
+    ) {
+        let batch = arrow_array::record_batch!(
+            ("u", UInt64, [1_u64 << 63, 3, 0]),
+            ("s", LargeUtf8, ["ab", "a", "b"])
+        )
+        .unwrap();
+        let planner = Planner::new(batch.schema());
+
+        let expr = planner.parse_filter(filter).unwrap();
+        let physical_expr = planner.create_physical_expr(&expr).unwrap();
+        let predicates = physical_expr.evaluate(&batch).unwrap();
+
+        assert_eq!(
+            predicates.into_array(0).unwrap().as_ref(),
+            &BooleanArray::from(expected.to_vec())
+        );
+    }
+
+    #[rstest]
+    #[case::float_literal("f = n + 0.5")]
+    #[case::float_literal_on_left("f = 0.5 + n")]
+    #[case::float_expression_on_left("n + 0.5 = f")]
+    #[case::wide_integer_literal("wide = small + 128")]
+    #[case::wide_integer_literal_on_left("wide = 128 + small")]
+    #[case::integer_expression_on_left("small + 128 = wide")]
+    fn test_parse_comparison_to_mixed_type_expression(#[case] filter: &str) {
+        let batch = arrow_array::record_batch!(
+            ("f", Float64, [Some(1.5), Some(1.5), None, Some(1.5)]),
+            ("n", Int64, [Some(1), Some(2), Some(1), None]),
+            ("wide", Int64, [Some(129), Some(129), Some(129), None]),
+            ("small", Int8, [Some(1), Some(2), None, Some(1)])
+        )
+        .unwrap();
+        let planner = Planner::new(batch.schema());
+
+        let expr = planner.parse_filter(filter).unwrap();
+        let expr = planner.optimize_expr(expr).unwrap();
+        let physical_expr = planner.create_physical_expr(&expr).unwrap();
+        let predicates = physical_expr.evaluate(&batch).unwrap();
+
+        assert_eq!(
+            predicates.into_array(batch.num_rows()).unwrap().as_ref(),
+            &BooleanArray::from(vec![Some(true), Some(false), None, None])
+        );
+    }
+
     #[test]
     fn test_parse_filter_uint64_literal_above_i64_max() {
         let value = u64::MAX - 1;
@@ -1285,6 +1389,124 @@ mod tests {
             .unwrap();
         let expr = planner.optimize_expr(expr).unwrap();
         assert_eq!(expr, Expr::Literal(ScalarValue::Time32Second(None), None));
+    }
+
+    fn column_resolution_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("order", DataType::Utf8, true),
+            Field::new("a`b", DataType::Int32, false),
+            Field::new(
+                "parent",
+                DataType::Struct(Fields::from(vec![Field::new(
+                    "child",
+                    DataType::Int32,
+                    false,
+                )])),
+                false,
+            ),
+        ]))
+    }
+
+    /// Parse `input` through the SQL parser only, bypassing the field path
+    /// fast path in `parse_expr`.
+    fn parse_expr_via_sql(planner: &Planner, input: &str) -> Expr {
+        let ast_expr = parse_sql_expr(input).unwrap();
+        let expr = planner.parse_sql_expr(&ast_expr).unwrap();
+        let schema = lance_core::datatypes::Schema::try_from(planner.schema.as_ref()).unwrap();
+        resolve_expr(&expr, &schema).unwrap()
+    }
+
+    #[rstest]
+    #[case::bare("id", col("id"))]
+    #[case::backtick_quoted("`id`", col("id"))]
+    #[case::case_insensitive("ID", col("id"))]
+    #[case::reserved_word("`order`", col("order"))]
+    #[case::escaped_backtick("`a``b`", col("a`b"))]
+    fn test_parse_expr_column_resolution(#[case] input: &str, #[case] expected: Expr) {
+        let planner = Planner::new(column_resolution_schema());
+
+        let expr = planner.parse_expr(input).unwrap();
+        assert_eq!(expr, expected);
+        // The fast path must produce the same expression as the SQL parser.
+        assert_eq!(expr, parse_expr_via_sql(&planner, input));
+    }
+
+    /// Inputs the fast path does not resolve must behave exactly like the SQL path.
+    #[rstest]
+    #[case::unknown_column("`missing`")]
+    #[case::quoted_wrong_case("`ID`")]
+    #[case::unknown_nested_root("`missing`.`child`")]
+    #[case::not_a_path("id + 1")]
+    #[case::nested("`parent`.`child`")]
+    #[case::nested_unquoted("parent.child")]
+    #[case::nested_case_insensitive("`PARENT`.`child`")]
+    #[case::nested_arithmetic("parent.child + 1")]
+    #[case::nested_comparison("parent.child > 1")]
+    #[case::nested_null_test("parent.child IS NULL")]
+    #[case::nested_cast("parent.child::BIGINT")]
+    #[case::quoted_nested_arithmetic("`parent`.`child` + 1")]
+    fn test_parse_expr_column_resolution_falls_back_to_sql(#[case] input: &str) {
+        let planner = Planner::new(column_resolution_schema());
+
+        let fast = planner.parse_expr(input);
+        let sql = parse_sql_expr(input)
+            .and_then(|ast| planner.parse_sql_expr(&ast))
+            .and_then(|expr| {
+                let schema = lance_core::datatypes::Schema::try_from(planner.schema.as_ref())?;
+                resolve_expr(&expr, &schema)
+            });
+        assert_eq!(fast.is_ok(), sql.is_ok(), "{input}: {fast:?} vs {sql:?}");
+        if let (Ok(fast), Ok(sql)) = (fast, sql) {
+            assert_eq!(fast, sql);
+        }
+    }
+
+    /// A literal column whose name contains a dot must win over the nested
+    /// field interpretation of the same string (see #4825).
+    #[test]
+    fn test_parse_expr_literal_dotted_column_beats_nested_path() {
+        let child = Arc::new(Field::new("child", DataType::Int32, false));
+        let parent = StructArray::new(
+            vec![child].into(),
+            vec![Arc::new(Int32Array::from(vec![7, 10]))],
+            None,
+        );
+        let batch = RecordBatch::try_from_iter([
+            ("parent", Arc::new(parent) as ArrayRef),
+            (
+                "parent.child",
+                Arc::new(Int32Array::from(vec![100, 200])) as ArrayRef,
+            ),
+        ])
+        .unwrap();
+        let planner = Planner::new(batch.schema());
+
+        let expr = planner.parse_expr("parent.child").unwrap();
+        assert_eq!(expr, Expr::Column(Column::from_name("parent.child")));
+        let expr = planner.optimize_expr(expr).unwrap();
+        let physical = planner.create_physical_expr(&expr).unwrap();
+        let actual = physical.evaluate(&batch).unwrap().into_array(2).unwrap();
+        let expected: ArrayRef = Arc::new(Int32Array::from(vec![100, 200]));
+        assert_eq!(actual.as_ref(), expected.as_ref());
+    }
+
+    #[test]
+    fn test_parse_expr_with_relations_uses_sql_path() {
+        let planner = Planner::new(column_resolution_schema()).with_enable_relations(true);
+
+        // With relations enabled, the first segment is a relation name.
+        let expr = planner.parse_expr("`t`.`id`").unwrap();
+        assert_eq!(expr, Expr::Column(Column::new(Some("t"), "id")));
+    }
+
+    #[test]
+    fn test_parse_expr_sql_fallback() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let planner = Planner::new(schema);
+
+        let expr = planner.parse_expr("id + 1").unwrap();
+        assert_eq!(expr, col("id") + lit(1_i32));
     }
 
     #[test]

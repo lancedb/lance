@@ -2671,14 +2671,16 @@ public class Dataset implements Closeable {
     return cleanup(policy).execute();
   }
 
-  RemovalStats executeCleanup(CleanupPolicy policy) {
+  RemovalStats executeCleanup(
+      CleanupPolicy policy, Optional<Long> deleteConcurrency, Optional<Long> deleteRateLimit) {
     try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-      return nativeCleanupWithPolicy(policy);
+      return nativeCleanupWithPolicy(policy, deleteConcurrency, deleteRateLimit);
     }
   }
 
-  private native RemovalStats nativeCleanupWithPolicy(CleanupPolicy policy);
+  private native RemovalStats nativeCleanupWithPolicy(
+      CleanupPolicy policy, Optional<Long> deleteConcurrency, Optional<Long> deleteRateLimit);
 
   CleanupExplanation explainCleanup(CleanupPolicy policy, Optional<Long> maxCandidateFiles) {
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
