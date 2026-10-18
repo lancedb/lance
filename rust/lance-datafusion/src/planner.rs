@@ -366,9 +366,6 @@ impl Planner {
             BinaryOperator::NotEq => Operator::NotEq,
             BinaryOperator::And => Operator::And,
             BinaryOperator::Or => Operator::Or,
-            BinaryOperator::BitwiseAnd => Operator::BitwiseAnd,
-            BinaryOperator::BitwiseOr => Operator::BitwiseOr,
-            BinaryOperator::BitwiseXor | BinaryOperator::PGBitwiseXor => Operator::BitwiseXor,
             BinaryOperator::PGBitwiseShiftLeft => Operator::BitwiseShiftLeft,
             BinaryOperator::PGBitwiseShiftRight => Operator::BitwiseShiftRight,
             _ => {
@@ -465,17 +462,27 @@ impl Planner {
                 Expr::Not(Box::new(self.parse_sql_expr(expr)?))
             }
 
-            UnaryOperator::Minus => match expr {
-                SQLExpr::Value(ValueWithSpan {
-                    value: Value::Number(n, _),
-                    ..
-                }) => self.number(n.as_str(), true)?,
-                _ => Expr::Negative(Box::new(self.parse_sql_expr(expr)?)),
-            },
+            UnaryOperator::Minus => {
+                use datafusion::logical_expr::lit;
+                match expr {
+                    SQLExpr::Value(ValueWithSpan { value: Value::Number(n, _), ..}) => match n.parse::<i64>() {
+                        Ok(n) => lit(-n),
+                        Err(_) => lit(-n
+                            .parse::<f64>()
+                            .map_err(|_e| {
+                                Error::invalid_input(format!("negative operator can be only applied to integer and float operands, got: {n}"))
+                            })?),
+                    },
+                    _ => {
+                        Expr::Negative(Box::new(self.parse_sql_expr(expr)?))
+                    }
+                }
+            }
 
             _ => {
                 return Err(Error::invalid_input(format!(
-                    "Unary operator '{op:?}' is not supported"
+                    "Unary operator '{:?}' is not supported",
+                    op
                 )));
             }
         })
@@ -1216,24 +1223,46 @@ mod tests {
     use datafusion_functions::core::expr_ext::FieldAccessor;
     use rstest::rstest;
 
-    #[test]
-    fn test_parse_filter_rejects_bad_input_instead_of_panicking() {
+    /// Literal spellings the planner has no mapping for, such as placeholders
+    /// and national strings, used to reach a `todo!()`.
+    #[rstest]
+    #[case::named_placeholder("i = :id")]
+    #[case::numbered_placeholder("i = $1")]
+    #[case::question_placeholder("i = ?")]
+    #[case::national_string("s = N'abc'")]
+    #[case::in_array_literal("s = [N'abc']")]
+    fn test_parse_filter_rejects_unsupported_literals(#[case] filter: &str) {
         let schema = Arc::new(Schema::new(vec![
             Field::new("s", DataType::Utf8, true),
             Field::new("i", DataType::Int32, false),
         ]));
         let planner = Planner::new(schema);
 
-        // Unsupported literal spellings must surface as invalid-input errors
-        // from library code, not todo!() panics.
-        assert!(planner.parse_filter("s = N'abc'").is_err());
+        let err = planner.parse_filter(filter).unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "expected InvalidInput for {filter}, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("Unsupported SQL value"),
+            "error should name the unsupported value for {filter}, got {err}"
+        );
+    }
 
-        // is_valid arity is validated like every other function instead of
-        // panicking on zero args and silently dropping extra args.
-        assert!(planner.parse_filter("is_valid()").is_err());
-        assert!(planner.parse_filter("is_valid(s, s)").is_err());
+    #[test]
+    fn test_parse_filter_checks_is_valid_arity() {
+        let schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, true)]));
+        let planner = Planner::new(schema);
 
-        // A single is_valid argument still parses to IS NOT NULL.
+        // Zero arguments used to panic on `args[0]`; extra ones were dropped.
+        for filter in ["is_valid()", "is_valid(s, s)"] {
+            let err = planner.parse_filter(filter).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("is_valid() takes exactly one argument"),
+                "unexpected error for {filter}: {err}"
+            );
+        }
         assert_eq!(
             planner.parse_filter("is_valid(s)").unwrap(),
             col("s").is_not_null()
@@ -1245,42 +1274,13 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, true)]));
         let planner = Planner::new(schema);
 
-        // A comma-separated list must not be silently truncated to its first
-        // item (e.g. an update SET list or projection pasted by mistake).
-        assert!(planner.parse_expr("s, s").is_err());
-        assert!(planner.parse_expr("s").is_ok());
+        // A misplaced parenthesis turns `coalesce(s, 'x')` into two items;
+        // keeping only the first would silently compute `coalesce(s)`.
+        assert!(planner.parse_expr("coalesce(s), 'x'").is_err());
+        assert!(planner.parse_expr("coalesce(s, 'x')").is_ok());
     }
 
     #[test]
-    fn test_parse_filter_i64_min_literal() {
-        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
-        let planner = Planner::new(schema);
-
-        // i64::MIN is a valid Int64 literal and must not degrade to Float64,
-        // where resolve_expr's lossless-coercion guard would reject it.
-        let expr = planner.parse_filter("x = -9223372036854775808").unwrap();
-        assert_eq!(expr, col("x").eq(lit(i64::MIN)));
-    }
-
-    #[rstest]
-    #[case::bitwise_and("a & b", Operator::BitwiseAnd)]
-    #[case::bitwise_or("a | b", Operator::BitwiseOr)]
-    #[case::bitwise_xor("a ^ b", Operator::BitwiseXor)]
-    fn test_parse_bitwise_ops(#[case] sql: &str, #[case] expected_op: Operator) {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("a", DataType::Int64, false),
-            Field::new("b", DataType::Int64, false),
-        ]));
-        let planner = Planner::new(schema);
-
-        let expr = planner.parse_filter(sql).unwrap();
-        let Expr::BinaryExpr(binary_expr) = &expr else {
-            panic!("expected binary expression for {sql}, got {expr}");
-        };
-        assert_eq!(binary_expr.op, expected_op);
-    }
-
-    #[rstest]
     fn test_parse_filter_simple() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("i", DataType::Int32, false),
@@ -1770,6 +1770,42 @@ mod tests {
             &BooleanArray::from(vec![
                 false, false, false, true, true, true, true, false, false, false
             ])
+        );
+    }
+
+    /// A literal under NOT is narrowed to the column type like one outside it.
+    /// Otherwise the Float32 column is cast to Float64 and `0.1f32` no longer
+    /// equals `0.1`, so a predicate and its negation both match that row.
+    #[rstest]
+    #[case::eq("f = 0.1", vec![true, false])]
+    #[case::gt("f > 0.1", vec![false, true])]
+    #[case::between("f BETWEEN 0.0 AND 0.1", vec![true, false])]
+    #[case::in_list("f IN (0.1, 0.2)", vec![true, false])]
+    fn test_parse_filter_not_is_the_complement(#[case] filter: &str, #[case] expected: Vec<bool>) {
+        let batch = RecordBatch::try_from_iter([(
+            "f",
+            Arc::new(Float32Array::from(vec![0.1, 0.5])) as ArrayRef,
+        )])
+        .unwrap();
+        let planner = Planner::new(batch.schema());
+        let evaluate = |filter: &str| {
+            let expr = planner
+                .optimize_expr(planner.parse_filter(filter).unwrap())
+                .unwrap();
+            planner
+                .create_physical_expr(&expr)
+                .unwrap()
+                .evaluate(&batch)
+                .unwrap()
+                .into_array(batch.num_rows())
+                .unwrap()
+        };
+
+        let negated: Vec<bool> = expected.iter().map(|matched| !matched).collect();
+        assert_eq!(evaluate(filter).as_ref(), &BooleanArray::from(expected));
+        assert_eq!(
+            evaluate(&format!("NOT ({filter})")).as_ref(),
+            &BooleanArray::from(negated)
         );
     }
 

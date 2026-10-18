@@ -1037,6 +1037,14 @@ mod tests {
         );
 
         assert!(
+            matches!(
+                builder.clone().set("id", "coalesce(id), 0"),
+                Err(Error::InvalidInput { .. })
+            ),
+            "Should return error instead of keeping only the first of two expressions"
+        );
+
+        assert!(
             matches!(builder.build(), Err(Error::InvalidInput { .. })),
             "Should return error if no update expressions are provided"
         );
