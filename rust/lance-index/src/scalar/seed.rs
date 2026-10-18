@@ -41,8 +41,9 @@ pub trait IndexSeedWriter: Send + std::fmt::Debug {
 
     /// Create a string to store in the file's schema metadata. This will normally
     /// contain the buffer index (provided by the caller after `add_global_buffer`)
-    /// as well as any other information needed to validate or understand the seed
-    /// (e.g. `rows_per_zone` for zone map seeds).
+    /// and, for formats that need it, extra locator information (version 0
+    /// zone map seeds append their fixed stride; version 1 seeds are
+    /// self-describing and store only the index).
     fn schema_metadata_value(&self, buf_index: u32) -> String;
 }
 
@@ -50,6 +51,9 @@ pub trait IndexSeedWriter: Send + std::fmt::Debug {
 #[derive(Debug, Clone)]
 pub struct FragmentSeed {
     pub fragment_id: u64,
+    /// The fragment's physical row count: the rows the seed must cover
+    /// completely for its statistics to stand in for a scan.
+    pub physical_rows: u64,
     pub bytes: Bytes,
     /// The raw value that was stored in the data file's schema metadata under
     /// the seed key (i.e. the output of [`IndexSeedWriter::schema_metadata_value`]).
