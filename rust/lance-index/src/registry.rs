@@ -41,6 +41,7 @@ impl PluginRegistrations {
         PluginType: ScalarIndexPlugin + Default + 'static,
     >(
         &mut self,
+        builtins: &IndexPluginRegistry,
     ) -> Result<()> {
         if self.is_frozen {
             return Err(Error::invalid_input(
@@ -54,7 +55,6 @@ impl PluginRegistrations {
                 "scalar index plugin name must not be empty",
             ));
         }
-        let builtins = IndexPluginRegistry::with_builtin_plugins();
         if builtins.plugins.contains_key(&name)
             || builtins.details_type_names.contains(&details_type_name)
             || self
@@ -113,10 +113,11 @@ pub fn register_scalar_index_plugin<
     DetailsType: prost::Message + prost::Name,
     PluginType: ScalarIndexPlugin + Default + 'static,
 >() -> Result<()> {
+    let builtins = IndexPluginRegistry::with_builtin_plugins();
     PLUGIN_REGISTRATIONS
         .lock()
         .map_err(|_| Error::internal("scalar index plugin registration lock poisoned"))?
-        .register::<DetailsType, PluginType>()
+        .register::<DetailsType, PluginType>(&builtins)
 }
 
 /// Derive the scalar index plugin name from a details type URL.
@@ -316,10 +317,10 @@ mod tests {
     #[test]
     fn test_external_registration_installs_name_and_details() {
         let mut registrations = PluginRegistrations::default();
-        registrations
-            .register::<ExampleIndexDetails, ZoneMapIndexPlugin>()
-            .unwrap();
         let mut registry = IndexPluginRegistry::with_builtin_plugins();
+        registrations
+            .register::<ExampleIndexDetails, ZoneMapIndexPlugin>(&registry)
+            .unwrap();
         for install in registrations.freeze() {
             install(&mut registry);
         }
@@ -337,22 +338,23 @@ mod tests {
     #[test]
     fn test_external_registration_rejects_collisions() {
         let mut registrations = PluginRegistrations::default();
+        let builtins = IndexPluginRegistry::with_builtin_plugins();
         let err = registrations
-            .register::<pbold::ZoneMapIndexDetails, ZoneMapIndexPlugin>()
+            .register::<pbold::ZoneMapIndexDetails, ZoneMapIndexPlugin>(&builtins)
             .unwrap_err();
         assert!(matches!(err, Error::InvalidInput { .. }));
         assert!(err.to_string().contains("already registered"));
 
         registrations
-            .register::<ExampleIndexDetails, ZoneMapIndexPlugin>()
+            .register::<ExampleIndexDetails, ZoneMapIndexPlugin>(&builtins)
             .unwrap();
         let err = registrations
-            .register::<ExampleIndexDetails, ZoneMapIndexPlugin>()
+            .register::<ExampleIndexDetails, ZoneMapIndexPlugin>(&builtins)
             .unwrap_err();
         assert!(matches!(err, Error::InvalidInput { .. }));
         assert!(err.to_string().contains("already registered"));
         let err = registrations
-            .register::<ConflictingIndexDetails, ZoneMapIndexPlugin>()
+            .register::<ConflictingIndexDetails, ZoneMapIndexPlugin>(&builtins)
             .unwrap_err();
         assert!(matches!(err, Error::InvalidInput { .. }));
         assert!(err.to_string().contains("already registered"));
@@ -367,11 +369,12 @@ mod tests {
             let registrations = registrations.clone();
             let barrier = barrier.clone();
             move || {
+                let builtins = IndexPluginRegistry::with_builtin_plugins();
                 barrier.wait();
                 registrations
                     .lock()
                     .unwrap()
-                    .register::<ExampleIndexDetails, ZoneMapIndexPlugin>()
+                    .register::<ExampleIndexDetails, ZoneMapIndexPlugin>(&builtins)
             }
         });
         barrier.wait();
@@ -387,9 +390,10 @@ mod tests {
     #[test]
     fn test_external_registration_rejects_late_registration() {
         let mut registrations = PluginRegistrations::default();
+        let builtins = IndexPluginRegistry::with_builtin_plugins();
         assert!(registrations.freeze().is_empty());
         let err = registrations
-            .register::<ExampleIndexDetails, ZoneMapIndexPlugin>()
+            .register::<ExampleIndexDetails, ZoneMapIndexPlugin>(&builtins)
             .unwrap_err();
         assert!(matches!(err, Error::InvalidInput { .. }));
         assert!(err.to_string().contains("before the first plugin registry"));

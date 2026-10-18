@@ -3,13 +3,10 @@
 
 //! Exercise registration from a downstream crate, without changing the builtin registry.
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicUsize, Ordering},
-};
+use std::sync::{Arc, LazyLock};
 
 use arrow_array::{RecordBatchIterator, record_batch};
-use arrow_schema::Field;
+use arrow_schema::{DataType, Field};
 use async_trait::async_trait;
 use datafusion::{common::ScalarValue, execution::SendableRecordBatchStream};
 use lance::{
@@ -19,6 +16,7 @@ use lance::{
     io::exec::scalar_index::ScalarIndexExec,
 };
 use lance_core::{Error, Result, cache::LanceCache};
+use lance_file::reader::{FileReader, FileReaderOptions};
 use lance_index::{
     IndexType,
     metrics::NoOpMetricsCollector,
@@ -27,10 +25,17 @@ use lance_index::{
         CreatedIndex, IndexStore, RowIdRemapper, SargableQuery, ScalarIndex, ScalarIndexParams,
         expression::{ScalarIndexExpr, ScalarIndexSearch, ScalarQueryParser},
         registry::{BasicTrainer, ScalarIndexPlugin, TrainingRequest},
-        zonemap::ZoneMapIndexPlugin,
+        seed::{IndexSeedWriter, SEED_META_KEY_PREFIX},
+        zonemap::{ZoneMapIndexPlugin, ZoneMapSeedWriter},
     },
 };
+use lance_io::{
+    scheduler::{ScanScheduler, SchedulerConfig},
+    utils::CachedFileSize,
+};
 use prost::Name;
+use rstest::rstest;
+use tempfile::tempdir;
 
 #[derive(Clone, PartialEq, prost::Message)]
 struct ExampleIndexDetails {}
@@ -43,7 +48,12 @@ impl Name for ExampleIndexDetails {
 #[derive(Debug, Default)]
 struct ExampleIndexPlugin;
 
-static LOADS: AtomicUsize = AtomicUsize::new(0);
+const ROWS_PER_ZONE: u64 = 2;
+
+// Every test registers before its first dataset operation, even when tests run concurrently.
+static REGISTRATION: LazyLock<()> = LazyLock::new(|| {
+    register_scalar_index_plugin::<ExampleIndexDetails, ExampleIndexPlugin>().unwrap();
+});
 
 #[async_trait]
 impl BasicTrainer for ExampleIndexPlugin {
@@ -105,7 +115,6 @@ impl ScalarIndexPlugin for ExampleIndexPlugin {
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
-        LOADS.fetch_add(1, Ordering::Relaxed);
         ZoneMapIndexPlugin
             .load_index(
                 index_store,
@@ -116,13 +125,25 @@ impl ScalarIndexPlugin for ExampleIndexPlugin {
             )
             .await
     }
+
+    async fn create_seed_writer(
+        &self,
+        field_path: &str,
+        data_type: &DataType,
+        index_details: &prost_types::Any,
+    ) -> Result<Option<Box<dyn IndexSeedWriter>>> {
+        index_details.to_msg::<ExampleIndexDetails>()?;
+        Ok(Some(Box::new(ZoneMapSeedWriter::new(
+            field_path,
+            ROWS_PER_ZONE,
+            data_type.clone(),
+        )?)))
+    }
 }
 
-// One test owns this process's registration lifecycle; it must register before
-// any dataset operation initializes the process-global registry.
 #[tokio::test]
 async fn register_create_open_and_cache_external_index() {
-    register_scalar_index_plugin::<ExampleIndexDetails, ExampleIndexPlugin>().unwrap();
+    LazyLock::force(&REGISTRATION);
     let batch = record_batch!(("value", Int64, [1, 2, 3, 4])).unwrap();
     let schema = batch.schema();
     let mut dataset = Dataset::write(
@@ -163,7 +184,6 @@ async fn register_create_open_and_cache_external_index() {
         .await
         .unwrap();
     assert!(Arc::ptr_eq(&first, &second));
-    assert_eq!(LOADS.load(Ordering::Relaxed), 1);
 
     let query = ScalarIndexExpr::Query(ScalarIndexSearch {
         column: "value".to_string(),
@@ -196,4 +216,210 @@ async fn register_create_open_and_cache_external_index() {
         register_scalar_index_plugin::<ExampleIndexDetails, ExampleIndexPlugin>().unwrap_err();
     assert!(matches!(err, Error::InvalidInput { .. }));
     assert!(err.to_string().contains("before the first plugin registry"));
+}
+
+#[rstest]
+#[case::empty(0)]
+#[case::populated(4)]
+#[tokio::test]
+async fn register_only_external_index_can_be_reopened(#[case] rows: usize) {
+    LazyLock::force(&REGISTRATION);
+    let directory = tempdir().unwrap();
+    let batch = record_batch!(("value", Int64, [1, 2, 3, 4]))
+        .unwrap()
+        .slice(0, rows);
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        directory.path().to_str().unwrap(),
+        None,
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index_builder(
+            &["value"],
+            IndexType::Scalar,
+            &ScalarIndexParams::new("example".to_string()),
+        )
+        .name("example_index".to_string())
+        .train(false)
+        .await
+        .unwrap();
+
+    let reopened = Dataset::open(dataset.uri()).await.unwrap();
+    let indices = reopened.load_indices().await.unwrap();
+    assert_eq!(indices.len(), 1);
+    let metadata = &indices[0];
+    assert_eq!(
+        metadata.index_details.as_ref().unwrap().type_url,
+        ExampleIndexDetails::type_url()
+    );
+    assert!(metadata.fragment_bitmap.as_ref().unwrap().is_empty());
+    reopened
+        .open_scalar_index("value", &metadata.uuid, &NoOpMetricsCollector)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn append_collects_seeds_from_external_plugin() {
+    LazyLock::force(&REGISTRATION);
+    let batch = record_batch!(("value", Int64, [Some(3), None, Some(9)])).unwrap();
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch.slice(0, 0))], schema.clone()),
+        "memory://",
+        None,
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index_builder(
+            &["value"],
+            IndexType::Scalar,
+            &ScalarIndexParams::new("example".to_string()),
+        )
+        .name("example_index".to_string())
+        .train(false)
+        .await
+        .unwrap();
+    dataset
+        .append(RecordBatchIterator::new([Ok(batch)], schema), None)
+        .await
+        .unwrap();
+
+    assert_eq!(dataset.fragments().len(), 1);
+    let fragment = &dataset.fragments()[0];
+    let file = &fragment.files[0];
+    let path = dataset.data_dir().join(file.path.as_str());
+    let object_store = dataset.object_store(file.base_id).await.unwrap();
+    let scheduler = ScanScheduler::new(
+        object_store.clone(),
+        SchedulerConfig::max_bandwidth(&object_store),
+    );
+    let file_scheduler = scheduler
+        .open_file(&path, &CachedFileSize::unknown())
+        .await
+        .unwrap();
+    let reader = FileReader::try_open(
+        file_scheduler,
+        None,
+        Default::default(),
+        dataset.session().file_metadata_cache(),
+        FileReaderOptions::default(),
+    )
+    .await
+    .unwrap();
+    let location = &reader.metadata().file_schema.metadata[&format!("{SEED_META_KEY_PREFIX}value")];
+    let (buffer_index, rows_per_zone) = location.split_once(':').unwrap();
+    assert_eq!(rows_per_zone.parse::<u64>().unwrap(), ROWS_PER_ZONE);
+    let bytes = reader
+        .read_global_buffer(buffer_index.parse().unwrap())
+        .await
+        .unwrap();
+    let (zones, null_rows) =
+        ZoneMapSeedWriter::deserialize_seed(fragment.id, &bytes, ROWS_PER_ZONE).unwrap();
+    assert_eq!(zones.len(), 2);
+    assert_eq!(zones[0].min, ScalarValue::Int64(Some(3)));
+    assert_eq!(zones[0].max, ScalarValue::Int64(Some(3)));
+    assert_eq!(zones[0].null_count, 1);
+    assert_eq!(zones[0].bound.length, 2);
+    assert_eq!(zones[1].min, ScalarValue::Int64(Some(9)));
+    assert_eq!(zones[1].max, ScalarValue::Int64(Some(9)));
+    assert_eq!(zones[1].bound.length, 1);
+    assert_eq!(null_rows.unwrap().iter().collect::<Vec<_>>(), [1]);
+    let indices = dataset.load_indices().await.unwrap();
+    assert!(indices[0].fragment_bitmap.as_ref().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn commit_external_segments_replaces_only_overlapping_coverage() {
+    LazyLock::force(&REGISTRATION);
+    let batch = record_batch!(("value", Int64, [1, 2, 3, 4])).unwrap();
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let params = ScalarIndexParams::new("example".to_string());
+    let placeholder = dataset
+        .create_index_builder(&["value"], IndexType::Scalar, &params)
+        .name("example_index".to_string())
+        .train(false)
+        .await
+        .unwrap();
+    let first_id = dataset.fragments()[0].id as u32;
+    let second_id = dataset.fragments()[1].id as u32;
+
+    let first = dataset
+        .create_index_builder(&["value"], IndexType::Scalar, &params)
+        .name("example_index".to_string())
+        .fragments(vec![first_id])
+        .replace(true)
+        .execute_uncommitted()
+        .await
+        .unwrap();
+    dataset
+        .commit_existing_index_segments("example_index", "value", vec![first.clone()])
+        .await
+        .unwrap();
+    let indices = dataset.load_indices().await.unwrap();
+    assert_eq!(indices.len(), 1);
+    assert_eq!(indices[0].uuid, first.uuid);
+    assert_ne!(indices[0].uuid, placeholder.uuid);
+
+    let second = dataset
+        .create_index_builder(&["value"], IndexType::Scalar, &params)
+        .name("example_index".to_string())
+        .fragments(vec![second_id])
+        .replace(true)
+        .execute_uncommitted()
+        .await
+        .unwrap();
+    dataset
+        .commit_existing_index_segments("example_index", "value", vec![second.clone()])
+        .await
+        .unwrap();
+    let indices = dataset.load_indices().await.unwrap();
+    assert_eq!(indices.len(), 2);
+    assert!(indices.iter().any(|index| index.uuid == first.uuid));
+    assert!(indices.iter().any(|index| index.uuid == second.uuid));
+
+    let replacement = dataset
+        .create_index_builder(&["value"], IndexType::Scalar, &params)
+        .name("example_index".to_string())
+        .fragments(vec![first_id])
+        .replace(true)
+        .execute_uncommitted()
+        .await
+        .unwrap();
+    dataset
+        .commit_existing_index_segments("example_index", "value", vec![replacement.clone()])
+        .await
+        .unwrap();
+    let indices = dataset.load_indices().await.unwrap();
+    assert_eq!(indices.len(), 2);
+    assert!(!indices.iter().any(|index| index.uuid == first.uuid));
+    assert!(indices.iter().any(|index| index.uuid == second.uuid));
+    let replaced = indices
+        .iter()
+        .find(|index| index.uuid == replacement.uuid)
+        .unwrap();
+    assert_eq!(replaced.fragment_bitmap, replacement.fragment_bitmap);
+    assert_eq!(replaced.dataset_version, replacement.dataset_version);
+    assert_eq!(
+        replaced.index_details.as_ref().unwrap().type_url,
+        ExampleIndexDetails::type_url()
+    );
+    dataset
+        .open_scalar_index("value", &replaced.uuid, &NoOpMetricsCollector)
+        .await
+        .unwrap();
 }
