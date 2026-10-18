@@ -1089,17 +1089,28 @@ impl Transaction {
 
                 if next_row_id.is_some() {
                     // We can re-use indices, but need to rewrite the fragment bitmaps
-                    debug_assert!(rewritten_indices.is_empty());
                     // If there is an FRI and the index uses addresses then we can
                     // migrate fragment support.
                     //
                     // If there is an FRI and the index uses row ids (this is getting phased
                     // out) then we can migrate fragment support without need for remap.
                     let deferred_remap = frag_reuse_index.is_some();
+                    if !rewritten_indices.is_empty() {
+                        Self::handle_rewrite_indices(
+                            &mut final_indices,
+                            rewritten_indices,
+                            &ordered_groups,
+                        )?;
+                    }
+                    let remapped_ids: HashSet<_> =
+                        rewritten_indices.iter().map(|idx| idx.new_id).collect();
                     for index in final_indices.iter_mut() {
                         // Its bitmap is lineage, not coverage, and a straddling
                         // group would fail the recalculation.
                         if is_frag_reuse_index_entry(index) {
+                            continue;
+                        }
+                        if remapped_ids.contains(&index.uuid) {
                             continue;
                         }
                         let results_are_row_addrs = index.results_are_row_addrs();
