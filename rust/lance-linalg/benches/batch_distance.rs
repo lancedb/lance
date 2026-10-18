@@ -19,12 +19,15 @@ fn bench_batch_distance(c: &mut Criterion) {
         .collect::<Vec<_>>();
     let mut output = vec![0.0; TOTAL_VALUES / DIMENSION];
 
+    // Callers pass the dimension at runtime. A constant would let LLVM unroll
+    // the dim-8 loop only where the kernel inlines into this closure, so the
+    // comparison would measure inlining rather than the kernel.
     c.bench_function("Batch distance dot f32 dim 8", |b| {
         b.iter(|| {
             <f32 as Dot>::dot_batch_into(
                 black_box(&key),
                 black_box(&batch),
-                DIMENSION,
+                black_box(DIMENSION),
                 &mut output,
             );
             black_box(&mut output);
@@ -32,15 +35,24 @@ fn bench_batch_distance(c: &mut Criterion) {
     });
     c.bench_function("Batch distance l2 f32 dim 8", |b| {
         b.iter(|| {
-            <f32 as L2>::l2_batch_into(black_box(&key), black_box(&batch), DIMENSION, &mut output);
+            <f32 as L2>::l2_batch_into(
+                black_box(&key),
+                black_box(&batch),
+                black_box(DIMENSION),
+                &mut output,
+            );
             black_box(&mut output);
         })
     });
     c.bench_function("Batch distance cosine f32 dim 8", |b| {
         b.iter(|| {
             black_box(
-                <f32 as Cosine>::cosine_batch(black_box(&key), black_box(&batch), DIMENSION)
-                    .sum::<f32>(),
+                <f32 as Cosine>::cosine_batch(
+                    black_box(&key),
+                    black_box(&batch),
+                    black_box(DIMENSION),
+                )
+                .sum::<f32>(),
             )
         })
     });
