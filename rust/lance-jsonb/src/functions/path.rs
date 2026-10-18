@@ -15,14 +15,17 @@ use crate::error::*;
 /// An owning iterator over the elements of a JSONB array.
 ///
 /// Created by [`RawJsonb::array_elements`]. Iterates the elements in order in
-/// a single pass over the array's JEntries.
+/// a single pass over the array's JEntries, and ends after the first decode
+/// error.
 pub struct ArrayElementIterator<'a> {
-    inner: ArrayIterator<'a>,
+    // `None` after a decode error: the inner iterator does not advance past a
+    // bad JEntry, so it would return the same error forever.
+    inner: Option<ArrayIterator<'a>>,
 }
 
 impl<'a> ArrayElementIterator<'a> {
     fn new(inner: ArrayIterator<'a>) -> Self {
-        Self { inner }
+        Self { inner: Some(inner) }
     }
 }
 
@@ -30,17 +33,20 @@ impl Iterator for ArrayElementIterator<'_> {
     type Item = Result<OwnedJsonb>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.inner
-            .next()
-            .map(|item| item.and_then(OwnedJsonb::from_item))
+        match self.inner.as_mut()?.next()?.and_then(OwnedJsonb::from_item) {
+            Ok(element) => Some(Ok(element)),
+            Err(e) => {
+                self.inner = None;
+                Some(Err(e))
+            }
+        }
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        self.inner.size_hint()
+        let remaining = self.inner.as_ref().map_or(0, |inner| inner.size_hint().0);
+        (0, Some(remaining))
     }
 }
-
-impl ExactSizeIterator for ArrayElementIterator<'_> {}
 
 impl RawJsonb<'_> {
     /// Gets the element at the specified index in a JSONB array.
