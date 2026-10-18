@@ -324,7 +324,10 @@ pub fn get_query(env: &mut JNIEnv, query_obj: JObject) -> Result<Option<Query>> 
         let approx_mode_str = env.get_string_from_method(&java_obj, "getApproxModeString")?;
         let approx_mode = parse_approx_mode(&approx_mode_str)?;
 
-        Ok(Query {
+        let search_effort = env
+            .call_method(&java_obj, "getSearchEffort", "()D", &[])?
+            .d()?;
+        let query = Query {
             column,
             key,
             k,
@@ -332,6 +335,7 @@ pub fn get_query(env: &mut JNIEnv, query_obj: JObject) -> Result<Option<Query>> 
             upper_bound,
             minimum_nprobes,
             maximum_nprobes,
+            search_effort,
             ef,
             refine_factor,
             metric_type: distance_type,
@@ -339,7 +343,9 @@ pub fn get_query(env: &mut JNIEnv, query_obj: JObject) -> Result<Option<Query>> 
             dist_q_c: 0.0,
             query_parallelism,
             approx_mode,
-        })
+        };
+        query.validate_search_effort()?;
+        Ok(query)
     })?;
 
     Ok(query)

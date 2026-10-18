@@ -24,11 +24,13 @@ public class Query {
 
   private final String column;
   private final float[] key;
+  private final int queryVectorDim;
   private final int k;
   private final Optional<Float> lowerBound;
   private final Optional<Float> upperBound;
   private final int minimumNprobes;
   private final Optional<Integer> maximumNprobes;
+  private final Optional<Double> searchEffort;
   private final Optional<Integer> ef;
   private final Optional<Integer> refineFactor;
   private final Optional<DistanceType> distanceType;
@@ -40,18 +42,27 @@ public class Query {
     this.column = Preconditions.checkNotNull(builder.column, "Columns must be set");
     Preconditions.checkArgument(!builder.column.isEmpty(), "Column must not be empty");
     this.key = Preconditions.checkNotNull(builder.key, "Key must be set");
+    Preconditions.checkArgument(
+        builder.queryVectorDim >= 0, "Query vector dimension must not be negative");
+    if (builder.queryVectorDim > 0) {
+      Preconditions.checkArgument(
+          builder.key.length > 0 && builder.key.length % builder.queryVectorDim == 0,
+          "Batch query buffer length must be a positive multiple of the query vector dimension");
+    }
+    this.queryVectorDim = builder.queryVectorDim;
+    Optional<Integer> fixedNprobes =
+        builder.searchEffort.isPresent() ? Optional.empty() : builder.nprobes;
+    this.minimumNprobes = builder.minimumNprobes.orElse(fixedNprobes.orElse(1));
+    this.maximumNprobes = builder.maximumNprobes.or(() -> fixedNprobes);
     Preconditions.checkArgument(builder.k > 0, "K must be greater than 0");
+    Preconditions.checkArgument(minimumNprobes > 0, "Minimum Nprobes must be greater than 0");
     Preconditions.checkArgument(
-        builder.minimumNprobes > 0, "Minimum Nprobes must be greater than 0");
-    Preconditions.checkArgument(
-        !builder.maximumNprobes.isPresent()
-            || builder.maximumNprobes.get() >= builder.minimumNprobes,
+        !maximumNprobes.isPresent() || maximumNprobes.get() >= minimumNprobes,
         "Maximum Nprobes must be greater than minimum Nprobes");
     this.k = builder.k;
     this.lowerBound = builder.lowerBound;
     this.upperBound = builder.upperBound;
-    this.minimumNprobes = builder.minimumNprobes;
-    this.maximumNprobes = builder.maximumNprobes;
+    this.searchEffort = builder.searchEffort;
     this.ef = builder.ef;
     this.refineFactor = builder.refineFactor;
     this.distanceType = builder.distanceType;
@@ -66,6 +77,16 @@ public class Query {
 
   public float[] getKey() {
     return key;
+  }
+
+  /**
+   * Returns the length of each query vector when {@link #getKey()} packs a batch of query vectors,
+   * or {@code 0} for a single-vector query.
+   *
+   * @return The per-vector dimension of a batch query, or {@code 0} for a single-vector query.
+   */
+  public int getQueryVectorDim() {
+    return queryVectorDim;
   }
 
   public int getK() {
@@ -96,6 +117,21 @@ public class Query {
 
   public Optional<Integer> getMaximumNprobes() {
     return maximumNprobes;
+  }
+
+  /** Returns the resolved initial IVF search effort; absent effort resolves to 0.5. */
+  public double getSearchEffort() {
+    return searchEffort.orElse(0.5);
+  }
+
+  /**
+   * Returns the configured effort, or empty when it was omitted.
+   *
+   * <p>An explicit effort, including 0.5, ignores fixed nprobes. For example, {@code new
+   * Query.Builder().setColumn("vector").setKey(vector).build() .getSearchEffortOption()} is empty.
+   */
+  public Optional<Double> getSearchEffortOption() {
+    return searchEffort;
   }
 
   public Optional<Integer> getEf() {
@@ -135,11 +171,13 @@ public class Query {
     return MoreObjects.toStringHelper(this)
         .add("column", column)
         .add("key", key)
+        .add("queryVectorDim", queryVectorDim)
         .add("k", k)
         .add("lowerBound", lowerBound.orElse(null))
         .add("upperBound", upperBound.orElse(null))
         .add("minimumNprobes", minimumNprobes)
         .add("maximumNprobes", maximumNprobes.orElse(null))
+        .add("searchEffort", searchEffort.orElse(null))
         .add("ef", ef.orElse(null))
         .add("refineFactor", refineFactor.orElse(null))
         .add("distanceType", distanceType.orElse(null))
@@ -152,11 +190,14 @@ public class Query {
   public static class Builder {
     private String column;
     private float[] key;
+    private int queryVectorDim = 0;
     private int k = 10;
     private Optional<Float> lowerBound = Optional.empty();
     private Optional<Float> upperBound = Optional.empty();
-    private int minimumNprobes = 1;
+    private Optional<Integer> nprobes = Optional.empty();
+    private Optional<Integer> minimumNprobes = Optional.empty();
     private Optional<Integer> maximumNprobes = Optional.empty();
+    private Optional<Double> searchEffort = Optional.empty();
     private Optional<Integer> ef = Optional.empty();
     private Optional<Integer> refineFactor = Optional.empty();
     private Optional<DistanceType> distanceType = Optional.empty();
@@ -179,14 +220,58 @@ public class Query {
      * Sets the vector to be searched.
      *
      * <p>This API accepts a single query vector. The array length must match the target vector
-     * column dimension. Batch nearest-neighbor search with multiple query vectors requires a
-     * list-shaped query input and is not available through this {@code float[]} entry point.
+     * column dimension. To search multiple query vectors in one scan, use {@link
+     * #setKeys(float[][])}.
      *
      * @param key The search vector.
      * @return The Builder instance for method chaining.
      */
     public Builder setKey(float[] key) {
       this.key = key;
+      this.queryVectorDim = 0;
+      return this;
+    }
+
+    /**
+     * Sets multiple query vectors for a batch nearest-neighbor search.
+     *
+     * <p>Every row must be non-null and share the same length, which must match the target vector
+     * column dimension. The rows are flattened row-major into a single query buffer.
+     *
+     * <p>Unlike {@link #setKey(float[])}, a batch query prepends a non-nullable {@code query_index}
+     * column holding the zero-based offset of the query vector that produced each row, and returns
+     * up to {@code k} rows per query vector (results are grouped by {@code query_index}, ordered by
+     * distance within each group). This column is added even when a single query vector is
+     * supplied. The scan fails if the dataset already contains a column named {@code query_index}.
+     *
+     * <p>Scan-level {@code limit} / {@code offset} apply to the combined result across all query
+     * vectors, not per query vector. Batch search is not supported on multivector columns.
+     *
+     * @param keys The search vectors, one per row.
+     * @return The Builder instance for method chaining.
+     */
+    public Builder setKeys(float[][] keys) {
+      Preconditions.checkNotNull(keys, "Keys must not be null");
+      Preconditions.checkArgument(keys.length > 0, "Keys must not be empty");
+      Preconditions.checkNotNull(keys[0], "Query vector must not be null");
+      int dim = keys[0].length;
+      Preconditions.checkArgument(dim > 0, "Query vector dimension must be greater than 0");
+      long totalLength = (long) keys.length * dim;
+      Preconditions.checkArgument(
+          totalLength <= Integer.MAX_VALUE,
+          "Batch query of %s vectors x %s dimensions exceeds the maximum buffer length %s",
+          keys.length,
+          dim,
+          Integer.MAX_VALUE);
+      float[] flattened = new float[(int) totalLength];
+      for (int i = 0; i < keys.length; i++) {
+        Preconditions.checkNotNull(keys[i], "Query vector must not be null");
+        Preconditions.checkArgument(
+            keys[i].length == dim, "All query vectors must have the same dimension");
+        System.arraycopy(keys[i], 0, flattened, i * dim, dim);
+      }
+      this.key = flattened;
+      this.queryVectorDim = dim;
       return this;
     }
 
@@ -232,15 +317,14 @@ public class Query {
     /**
      * Sets the number of probes to load and search.
      *
-     * <p>This is a convenience method that sets both the minimum and maximum number of probes to
-     * the same value.
+     * <p>Used only when search effort is absent. Explicit minimum and maximum bounds override the
+     * corresponding fixed-count bounds, regardless of setter order.
      *
      * @param nprobes The number of probes.
      * @return The Builder instance for method chaining.
      */
     public Builder setNprobes(int nprobes) {
-      this.minimumNprobes = nprobes;
-      this.maximumNprobes = Optional.of(nprobes);
+      this.nprobes = Optional.of(nprobes);
       return this;
     }
 
@@ -254,24 +338,45 @@ public class Query {
      * @return The Builder instance for method chaining.
      */
     public Builder setMinimumNprobes(int minimumNprobes) {
-      this.minimumNprobes = minimumNprobes;
+      this.minimumNprobes = Optional.of(minimumNprobes);
       return this;
     }
 
     /**
      * Sets the maximum number of partitions to search.
      *
-     * <p>These partitions will only be loaded and searched if we have not found the desired number
-     * of results after searching the minimum number of partitions. Increasing this number can avoid
-     * false negatives on queries with a highly selective prefilter. This setting does not affect
-     * the recall of the query and will only affect the latency if the prefilter is highly
-     * selective.
+     * <p>This bounds both the initial budget and later probing to find enough candidates. An unset
+     * maximum allows all available partitions. With {@link #setSearchEffort(double)} set to 1, all
+     * partitions up to this limit are included in the initial search. At lower efforts, additional
+     * partitions may be searched if the initial budget does not find enough candidates.
      *
      * @param maximumNprobes The maximum number of partitions to search.
      * @return The Builder instance for method chaining.
      */
     public Builder setMaximumNprobes(int maximumNprobes) {
       this.maximumNprobes = Optional.of(maximumNprobes);
+      return this;
+    }
+
+    /**
+     * Sets the initial IVF search effort, a finite value in [0, 1].
+     *
+     * <p>Absent effort resolves to 0.5 and preserves Auto. Zero starts at the caller minimum (at
+     * least one available partition); one starts at all available partitions, subject to the caller
+     * maximum. Intermediate values interpolate geometrically. Later expansion to find enough
+     * candidates is unchanged. This is independent of approximation mode, HNSW ef and refinement,
+     * and is not a recall guarantee. Any explicit effort, including 0.5, ignores fixed nprobes
+     * regardless of setter order. Explicit minimum and maximum bounds remain effective. Effort
+     * validation occurs in the Rust core when the query is executed.
+     *
+     * <p>Example: {@code new
+     * Query.Builder().setColumn("vector").setKey(vector).setSearchEffort(0.75).build()}.
+     *
+     * @param searchEffort The initial partition search effort.
+     * @return The Builder instance for method chaining.
+     */
+    public Builder setSearchEffort(double searchEffort) {
+      this.searchEffort = Optional.of(searchEffort);
       return this;
     }
 
