@@ -756,7 +756,8 @@ mod tests {
         })
     }
 
-    /// A zero row limit used to panic on V2 and, on V1, write no rows.
+    /// A zero row limit used to panic on V2. On V1 a zero group size wrote
+    /// nothing, and a zero file limit was ignored by `write`.
     #[rstest]
     #[case::v2_rows_per_file(LanceFileVersion::Stable, 0, 1024, "max_rows_per_file")]
     #[case::v1_rows_per_file(LanceFileVersion::Legacy, 0, 1024, "max_rows_per_file")]

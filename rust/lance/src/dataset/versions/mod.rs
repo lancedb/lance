@@ -265,11 +265,6 @@ pub async fn write_fragments_direct(
         }
         match version {
             ConcreteFileVersion::V1 => {
-                if params.max_rows_per_group == 0 {
-                    return Err(Error::invalid_input(
-                        "max_rows_per_group must be greater than zero when file row counts are specified",
-                    ));
-                }
                 let max_rows_per_group = params.max_rows_per_group;
                 let batch_row_counts =
                     file_row_counts
