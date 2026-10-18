@@ -114,6 +114,14 @@ impl<A: ?Sized, B, C, D: ?Sized, R> Kernel<unsafe fn(&A, B, C, &D) -> R> {
     }
 }
 
+impl<A, B: ?Sized, C: ?Sized, R> Kernel<unsafe fn(A, &B, &mut C) -> R> {
+    #[inline(always)]
+    pub fn call(self, a: A, b: &B, c: &mut C) -> R {
+        // SAFETY: see the two-argument `call`.
+        unsafe { (self.0)(a, b, c) }
+    }
+}
+
 /// One operation's kernels, best first, with the host's choice made once.
 ///
 /// Declare with [`dispatch!`](crate::dispatch). When the build baseline already
@@ -409,10 +417,29 @@ mod tests {
         static DOUBLY_SCALED: Dispatch<DoublyScaledSumFn> = &[DOUBLY_SCALED_SUM];
     }
 
+    type BroadcastFn = unsafe fn(f32, &[f32], &mut [f32]);
+
+    crate::target_kernel! {
+        #[target_features()]
+        #[candidate(BROADCAST_ADD: BroadcastFn)]
+        fn broadcast_add(x: f32, y: &[f32], out: &mut [f32]) {
+            for (o, y) in out.iter_mut().zip(y) {
+                *o = x + y;
+            }
+        }
+    }
+
+    crate::dispatch! {
+        static BROADCAST: Dispatch<BroadcastFn> = &[BROADCAST_ADD];
+    }
+
     #[test]
     fn scalar_argument_kernels_are_callable() {
         assert_eq!(SCALED.get().call(&[1.0], 2.0, &[3.0]), 8.0);
         assert_eq!(DOUBLY_SCALED.get().call(&[1.0], 2.0, 3.0, &[3.0]), 24.0);
+        let mut out = [0.0; 2];
+        BROADCAST.get().call(1.0, &[2.0, 3.0], &mut out);
+        assert_eq!(out, [3.0, 4.0]);
     }
 
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
