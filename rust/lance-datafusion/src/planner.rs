@@ -1785,16 +1785,19 @@ mod tests {
         );
     }
 
-    /// A literal under NOT is narrowed to the column type like one outside it.
-    /// Otherwise the Float32 column is cast to Float64 and `0.1f32` no longer
-    /// equals `0.1`, so a predicate and its negation can both match, or both
-    /// miss, that row.
+    /// A literal under NOT or IS [NOT] TRUE/FALSE is narrowed to the column
+    /// type like one outside it. Otherwise the Float32 column is cast to
+    /// Float64, `0.1f32` no longer equals `0.1`, and the wrapped predicate
+    /// disagrees with the bare one on that row.
     #[rstest]
     #[case::eq("f = 0.1", vec![true, false])]
     #[case::gt("f > 0.1", vec![false, true])]
     #[case::between("f BETWEEN 0.0 AND 0.1", vec![true, false])]
     #[case::in_list("f IN (0.1, 0.2)", vec![true, false])]
-    fn test_parse_filter_not_is_the_complement(#[case] filter: &str, #[case] expected: Vec<bool>) {
+    fn test_parse_filter_narrows_under_not_and_is(
+        #[case] filter: &str,
+        #[case] expected: Vec<bool>,
+    ) {
         let batch = RecordBatch::try_from_iter([(
             "f",
             Arc::new(Float32Array::from(vec![0.1, 0.5])) as ArrayRef,
