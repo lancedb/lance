@@ -797,7 +797,7 @@ impl DirectoryNamespace {
             return err;
         }
         let detail = err.to_string();
-        if let Error::IO { source, .. } = &err
+        if let Error::IO { source, .. } = err.find_root()
             && let Some(os_err) = source.downcast_ref::<ObjectStoreError>()
         {
             if is_throttle_error(os_err) {
@@ -854,7 +854,7 @@ impl DirectoryNamespace {
     /// typed via [`classify_storage_error`], while a genuine not-found (missing
     /// dataset, version, or ref) keeps the caller's `not_found` variant.
     pub(super) fn map_open_error(err: Error, not_found: NamespaceError) -> Error {
-        if matches!(&err, Error::IO { .. })
+        if matches!(err.find_root(), Error::IO { .. })
             && !manifest::ManifestNamespace::is_not_found_load_error(&err)
         {
             return Self::classify_storage_error(err);

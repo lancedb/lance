@@ -263,6 +263,41 @@ fn test_classify_storage_error_maps_variants_and_preserves_evidence() {
     );
 }
 
+/// A storage error coalesced through a shared cache load arrives wrapped in
+/// `Error::Shared` while other waiters still hold it, and must be classified
+/// as the IO error it wraps.
+#[test]
+fn test_storage_error_classification_sees_through_shared() {
+    let shared = |os_err: ObjectStoreError| Error::Shared {
+        source: Arc::new(os_err.into()),
+    };
+    let throttle = || ObjectStoreError::Generic {
+        store: "test",
+        source: "after 3 retries, max_retries: 3 - 503 ServerBusy".into(),
+    };
+    assert_eq!(
+        mutation_error_code(DirectoryNamespace::classify_storage_error(shared(
+            throttle()
+        ))),
+        ErrorCode::Throttling
+    );
+    assert_eq!(
+        mutation_error_code(DirectoryNamespace::map_open_error(
+            shared(throttle()),
+            NamespaceError::TableNotFound {
+                message: "t".to_string(),
+            }
+        )),
+        ErrorCode::Throttling
+    );
+    assert!(manifest::ManifestNamespace::is_not_found_load_error(
+        &shared(ObjectStoreError::NotFound {
+            path: "x".to_string(),
+            source: "missing".into(),
+        })
+    ));
+}
+
 #[test]
 fn test_is_manifest_table_absent_error() {
     let table_not_found: Error = NamespaceError::TableNotFound {
