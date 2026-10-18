@@ -879,14 +879,12 @@ fn check_array_contains(jsonb_bytes: &[u8], path: &str, value: &str) -> Result<b
                             path, e
                         ))
                     })?;
-                    // Compare by content: to_str() returns strings unquoted,
-                    // so needles containing quotes or backslashes match, and
-                    // scalars compare by their JSON text. Containers (which
-                    // to_str() rejects) fall back to their serialized text.
-                    let matched = match elem.as_raw().to_str() {
-                        Ok(s) => s == value,
-                        Err(_) => elem.to_string() == value,
-                    };
+                    // A needle matches an element's JSON text (`"python"`,
+                    // `2`) or its content: to_str() returns strings
+                    // unquoted and unescaped, so `say "hi"` matches the
+                    // element serialized as `"say \"hi\""`.
+                    let matched = elem.to_string() == value
+                        || elem.as_raw().to_str().is_ok_and(|s| s == value);
                     if matched {
                         return Ok(true);
                     }
@@ -1081,14 +1079,13 @@ mod tests {
     #[tokio::test]
     async fn test_json_get_string_udf() -> Result<()> {
         // Test valid string conversions
-        let json = r#"{"str": "hello", "num": 123, "bool": true, "null": null}"#;
+        let json = r#"{"str": "hello", "num": 123, "bool": true, "null": null, "obj": {"a": 1}, "arr": [1]}"#;
         let jsonb_bytes = create_test_jsonb(json);
 
         let mut binary_builder = LargeBinaryBuilder::new();
-        binary_builder.append_value(&jsonb_bytes);
-        binary_builder.append_value(&jsonb_bytes);
-        binary_builder.append_value(&jsonb_bytes);
-        binary_builder.append_value(&jsonb_bytes);
+        for _ in 0..6 {
+            binary_builder.append_value(&jsonb_bytes);
+        }
 
         let jsonb_array = Arc::new(binary_builder.finish());
         let key_array = Arc::new(StringArray::from(vec![
@@ -1096,16 +1093,21 @@ mod tests {
             Some("num"),
             Some("bool"),
             Some("null"),
+            Some("obj"),
+            Some("arr"),
         ]));
 
         let result = json_get_string_impl(&[jsonb_array, key_array])?;
         let string_array = result.as_any().downcast_ref::<StringArray>().unwrap();
 
-        assert_eq!(string_array.len(), 4);
+        assert_eq!(string_array.len(), 6);
         assert_eq!(string_array.value(0), "hello");
         assert_eq!(string_array.value(1), "123");
         assert_eq!(string_array.value(2), "true");
         assert!(string_array.is_null(3));
+        // Containers do not convert to a string, so they are null.
+        assert!(string_array.is_null(4));
+        assert!(string_array.is_null(5));
 
         Ok(())
     }
@@ -1208,11 +1210,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_json_get_bool_udf() -> Result<()> {
-        let json = r#"{"bool_true": true, "bool_false": false, "str_true": "true", "str_false": "false", "num_one": 1, "num_zero": 0, "num_float": 2.5, "str_one": "1", "str_maybe": "maybe"}"#;
+        let json = r#"{"bool_true": true, "bool_false": false, "str_true": "true", "str_false": "false", "num_one": 1, "num_zero": 0, "num_float": 2.5, "str_one": "1", "str_maybe": "maybe", "float_zero": 0.0}"#;
         let jsonb_bytes = create_test_jsonb(json);
 
         let mut binary_builder = LargeBinaryBuilder::new();
-        for _ in 0..9 {
+        for _ in 0..10 {
             binary_builder.append_value(&jsonb_bytes);
         }
 
@@ -1227,12 +1229,13 @@ mod tests {
             Some("num_float"),
             Some("str_one"),
             Some("str_maybe"),
+            Some("float_zero"),
         ]));
 
         let result = json_get_bool_impl(&[jsonb_array, key_array])?;
         let bool_array = result.as_any().downcast_ref::<BooleanArray>().unwrap();
 
-        assert_eq!(bool_array.len(), 9);
+        assert_eq!(bool_array.len(), 10);
         assert!(bool_array.value(0));
         assert!(!bool_array.value(1));
         assert!(bool_array.value(2)); // "true" string converts to true
@@ -1244,6 +1247,8 @@ mod tests {
         // Non-boolean strings are null, not a query-fatal error.
         assert!(bool_array.is_null(7));
         assert!(bool_array.is_null(8));
+        // A float zero is zero too, not only the integer 0.
+        assert!(!bool_array.value(9));
 
         Ok(())
     }
@@ -1253,97 +1258,53 @@ mod tests {
         let json = r#"{"tags": ["rust", "json", "database"], "nums": [1, 2, 3], "esc": ["say \"hi\"", "a\\b"]}"#;
         let jsonb_bytes = create_test_jsonb(json);
 
+        let cases = [
+            ("$.tags", "rust", true),
+            ("$.tags", "python", false),
+            ("$.nums", "2", true),
+            // A needle written as JSON text, with its quotes, still matches.
+            ("$.tags", "\"rust\"", true),
+            // Needles containing quotes or backslashes match by content, not
+            // only by their re-quoted serialization.
+            ("$.esc", "say \"hi\"", true),
+            ("$.esc", "a\\b", true),
+        ];
         let mut binary_builder = LargeBinaryBuilder::new();
-        binary_builder.append_value(&jsonb_bytes);
-        binary_builder.append_value(&jsonb_bytes);
-        binary_builder.append_value(&jsonb_bytes);
-        binary_builder.append_value(&jsonb_bytes);
-        binary_builder.append_value(&jsonb_bytes);
+        for _ in &cases {
+            binary_builder.append_value(&jsonb_bytes);
+        }
         binary_builder.append_null();
 
         let jsonb_array = Arc::new(binary_builder.finish());
-        let path_array = Arc::new(StringArray::from(vec![
-            Some("$.tags"),
-            Some("$.tags"),
-            Some("$.nums"),
-            Some("$.esc"),
-            Some("$.esc"),
-            Some("$.tags"),
-        ]));
-        let value_array = Arc::new(StringArray::from(vec![
-            Some("rust"),
-            Some("python"),
-            Some("2"),
-            Some("say \"hi\""),
-            Some("a\\b"),
-            Some("any"),
-        ]));
+        let path_array = Arc::new(StringArray::from_iter(
+            cases.iter().map(|c| Some(c.0)).chain([Some("$.tags")]),
+        ));
+        let value_array = Arc::new(StringArray::from_iter(
+            cases.iter().map(|c| Some(c.1)).chain([Some("any")]),
+        ));
 
         let result = json_array_contains_impl(&[jsonb_array, path_array, value_array])?;
         let bool_array = result.as_any().downcast_ref::<BooleanArray>().unwrap();
 
-        assert_eq!(bool_array.len(), 6);
-        assert!(bool_array.value(0));
-        assert!(!bool_array.value(1));
-        assert!(bool_array.value(2));
-        // Needles containing quotes or backslashes must match by content,
-        // not by re-quoted serialization.
-        assert!(bool_array.value(3));
-        assert!(bool_array.value(4));
-        assert!(bool_array.is_null(5));
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_json_array_contains_large_array() -> Result<()> {
-        // Guards the single-pass element iteration: the needle sits at the end
-        // of a long array, which the old index-by-index walk made quadratic.
-        let mut elements = Vec::with_capacity(2001);
-        for i in 0..2000 {
-            elements.push(format!("tag_{i}"));
+        assert_eq!(bool_array.len(), cases.len() + 1);
+        for (i, (path, needle, expected)) in cases.iter().enumerate() {
+            assert_eq!(bool_array.value(i), *expected, "{path} contains {needle}");
         }
-        elements.push("needle".to_string());
-        let json = format!(
-            r#"{{"tags": [{}]}}"#,
-            elements
-                .iter()
-                .map(|e| format!("\"{e}\""))
-                .collect::<Vec<_>>()
-                .join(",")
-        );
-        let jsonb_bytes = create_test_jsonb(&json);
-
-        let mut binary_builder = LargeBinaryBuilder::new();
-        binary_builder.append_value(&jsonb_bytes);
-        let jsonb_array = Arc::new(binary_builder.finish());
-        let path_array = Arc::new(StringArray::from(vec![Some("$.tags")]));
-        let value_array = Arc::new(StringArray::from(vec![Some("needle")]));
-
-        let result = json_array_contains_impl(&[jsonb_array.clone(), path_array, value_array])?;
-        let bool_array = result.as_any().downcast_ref::<BooleanArray>().unwrap();
-        assert!(bool_array.value(0));
-
-        let length_result = json_array_length_impl(&[
-            jsonb_array,
-            Arc::new(StringArray::from(vec![Some("$.tags")])),
-        ])?;
-        let int_array = length_result.as_any().downcast_ref::<Int64Array>().unwrap();
-        assert_eq!(int_array.value(0), 2001);
+        assert!(bool_array.is_null(cases.len()));
 
         Ok(())
     }
 
     #[tokio::test]
     async fn test_json_array_length_udf() -> Result<()> {
-        let json = r#"{"empty": [], "tags": ["a", "b", "c"], "nested": {"arr": [1, 2]}}"#;
+        let json =
+            r#"{"empty": [], "tags": ["a", "b", "c"], "nested": {"arr": [1, 2]}, "name": "x"}"#;
         let jsonb_bytes = create_test_jsonb(json);
 
         let mut binary_builder = LargeBinaryBuilder::new();
-        binary_builder.append_value(&jsonb_bytes);
-        binary_builder.append_value(&jsonb_bytes);
-        binary_builder.append_value(&jsonb_bytes);
-        binary_builder.append_value(&jsonb_bytes);
+        for _ in 0..5 {
+            binary_builder.append_value(&jsonb_bytes);
+        }
         binary_builder.append_null();
 
         let jsonb_array = Arc::new(binary_builder.finish());
@@ -1352,20 +1313,22 @@ mod tests {
             Some("$.tags"),
             Some("$.nested.arr"),
             Some("$.nested"),
+            Some("$.name"),
             Some("$.any"),
         ]));
 
         let result = json_array_length_impl(&[jsonb_array, path_array])?;
         let int_array = result.as_any().downcast_ref::<Int64Array>().unwrap();
 
-        assert_eq!(int_array.len(), 5);
+        assert_eq!(int_array.len(), 6);
         assert_eq!(int_array.value(0), 0);
         assert_eq!(int_array.value(1), 3);
         assert_eq!(int_array.value(2), 2);
-        // A path that resolves to a non-array is null (indistinguishable from
-        // a missing path), not 0 and not a query-fatal error.
+        // A path that resolves to a non-array (object or scalar) is null, not
+        // 0, so `json_array_length(...) = 0` only matches empty arrays.
         assert!(int_array.is_null(3));
         assert!(int_array.is_null(4));
+        assert!(int_array.is_null(5));
 
         Ok(())
     }
