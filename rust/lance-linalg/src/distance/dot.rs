@@ -737,9 +737,27 @@ mod tests {
         assert!(std::panic::catch_unwind(|| dot_f32(&short, &long)).is_err());
         assert!(std::panic::catch_unwind(|| f32::dot(&short, &long)).is_err());
         assert!(std::panic::catch_unwind(|| dot_distance(&short, &long)).is_err());
-        assert!(std::panic::catch_unwind(|| dot_distance_batch(&short, &long, 2)).is_err());
-        assert!(std::panic::catch_unwind(|| dot_distance_batch(&long, &[1.0_f32; 3], 2)).is_err());
-        assert!(std::panic::catch_unwind(|| dot_distance_batch::<f32>(&[], &[], 0)).is_err());
+        assert!(
+            std::panic::catch_unwind(|| dot_distance_batch_into(&short, &long, 2, &mut [0.0]))
+                .is_err()
+        );
+        assert!(
+            std::panic::catch_unwind(|| dot_distance_batch_into(
+                &long,
+                &[1.0_f32; 3],
+                2,
+                &mut [0.0]
+            ))
+            .is_err()
+        );
+        assert!(
+            std::panic::catch_unwind(|| dot_distance_batch_into::<f32>(&[], &[], 0, &mut []))
+                .is_err()
+        );
+        assert!(
+            std::panic::catch_unwind(|| dot_distance_batch_into(&long, &long, 2, &mut [0.0; 2]))
+                .is_err()
+        );
     }
 
     #[test]
@@ -974,50 +992,47 @@ mod tests {
         }
     }
 
-    /// `dot_batch` must agree with the per-vector `dot`, including across the
-    /// iterator's 64-distance buffer refills.
+    /// `dot_batch_into` must agree with the per-vector `dot`, both for the
+    /// f32 batch kernel and for the per-vector default that f64 uses.
     #[rstest::rstest]
     #[case::dim_8(8)]
     #[case::dim_16(16)]
     #[case::dim_32(32)]
     #[case::dim_1024(1024)]
-    fn test_dot_batch_f32_matches_per_vector_dot(#[case] dimension: usize) {
-        // Spans two full buffers and a partial one.
-        let num_vectors = 130;
-        let x: Vec<f32> = (0..dimension)
-            .map(|i| ((i % 13) as f32) * 0.25 + 1.0)
-            .collect();
-        let batch: Vec<f32> = (0..dimension * num_vectors)
-            .map(|i| ((i % 11) as f32) * 0.5 - 2.0)
-            .collect();
+    fn test_dot_batch_into_matches_per_vector_dot(#[case] dimension: usize) {
+        fn check<T: Dot + FromPrimitive + Copy>(dimension: usize) {
+            let num_vectors = 130;
+            let x: Vec<T> = (0..dimension)
+                .map(|i| T::from_f32(((i % 13) as f32) * 0.25 + 1.0).unwrap())
+                .collect();
+            let batch: Vec<T> = (0..dimension * num_vectors)
+                .map(|i| T::from_f32(((i % 11) as f32) * 0.5 - 2.0).unwrap())
+                .collect();
 
-        let got: Vec<f32> = f32::dot_batch(&x, &batch, dimension).collect();
-        let want: Vec<f32> = batch
-            .chunks_exact(dimension)
-            .map(|y| f32::dot(&x, y))
-            .collect();
+            let mut got = vec![f32::NAN; num_vectors];
+            T::dot_batch_into(&x, &batch, dimension, &mut got);
 
-        assert_eq!(got.len(), num_vectors);
-        for (g, w) in got.iter().zip(want.iter()) {
-            assert!(
-                approx::relative_eq!(g, w, epsilon = 1e-4, max_relative = 1e-5),
-                "dim {dimension}: batch {g} != per-vector {w}"
-            );
+            for (g, y) in got.iter().zip(batch.chunks_exact(dimension)) {
+                let w = T::dot(&x, y);
+                assert!(
+                    approx::relative_eq!(*g, w, epsilon = 1e-4, max_relative = 1e-5),
+                    "dim {dimension}: batch {g} != per-vector {w}"
+                );
+            }
         }
-
-        // `sum` drives the iterator's `fold` override rather than `next`.
-        let sum: f32 = f32::dot_batch(&x, &batch, dimension).sum();
-        assert_eq!(sum, got.iter().sum::<f32>());
+        check::<f32>(dimension);
+        check::<f64>(dimension);
     }
 
-    /// `dot_distance_batch` still yields `1.0 - dot`, unchanged by the hoist.
+    /// `dot_distance_batch_into` writes `1.0 - dot`.
     #[test]
-    fn test_dot_distance_batch_preserves_distance_semantics() {
+    fn test_dot_distance_batch_into_preserves_distance_semantics() {
         let dimension = 32;
         let x: Vec<f32> = (0..dimension).map(|i| (i as f32) * 0.1).collect();
         let batch: Vec<f32> = (0..dimension * 3).map(|i| (i as f32) * 0.05).collect();
 
-        let got: Vec<f32> = dot_distance_batch(&x, &batch, dimension).collect();
+        let mut got = vec![f32::NAN; 3];
+        dot_distance_batch_into(&x, &batch, dimension, &mut got);
         for (chunk, &g) in batch.chunks_exact(dimension).zip(got.iter()) {
             assert!(approx::relative_eq!(
                 g,
