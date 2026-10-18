@@ -21,12 +21,12 @@ use lance_core::{
 };
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::pbold::InvertedIndexDetails;
-use lance_index::scalar::index_files_to_table;
 use lance_index::scalar::inverted::{
     DocumentGranularity, InvertedIndex, InvertedIndexParams, doc_index_storage_column,
 };
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::registry::VALUE_COLUMN_NAME;
+use lance_index::scalar::{IndexFile, IndexStore, index_files_to_table};
 use lance_table::format::IndexMetadata;
 use prost::Message;
 use roaring::RoaringBitmap;
@@ -903,29 +903,85 @@ fn empty_inverted_update_stream(
     )))
 }
 
+/// Finalize a staged segment in place. Returns the final index files, or
+/// `None` when the segment already had its root metadata.
 pub(crate) async fn finalize_segment_files_if_needed(
     dataset: &Dataset,
     segment: &IndexMetadata,
-) -> Result<()> {
+) -> Result<Option<Vec<IndexFile>>> {
     let index_dir = dataset.indices_dir().join(segment.uuid.to_string());
     let metadata_path = index_dir
         .clone()
         .join(lance_index::scalar::inverted::METADATA_FILE);
     if dataset.object_store.as_ref().exists(&metadata_path).await? {
-        return Ok(());
+        return Ok(None);
     }
 
     let store = Arc::new(LanceIndexStore::from_dataset_for_new(
         dataset,
         &segment.uuid,
     )?);
-    lance_index::scalar::inverted::builder::merge_index_files(
+    let files = lance_index::scalar::inverted::builder::merge_index_files_with_options(
         dataset.object_store.as_ref(),
         &index_dir,
         store,
+        lance_index::scalar::inverted::builder::FinalizeOptions::default(),
         lance_index::progress::noop_progress(),
     )
-    .await
+    .await?;
+    Ok(Some(files))
+}
+
+/// A lone staged segment is the merged segment as it stands only while its
+/// files hold live row addresses: no reuse mapping moved its coverage and no
+/// tagged plan asks to translate it. Anything else must be rewritten.
+fn single_segment_keeps_row_addresses(
+    staged: Option<&crate::index::frag_reuse::StagedRemappingPlans>,
+    uuid: &Uuid,
+    has_remapped_source_coverage: bool,
+) -> bool {
+    use crate::index::frag_reuse::SegmentRemappingPlan;
+    if has_remapped_source_coverage {
+        return false;
+    }
+    match staged.and_then(|plans| plans.get(uuid)) {
+        None | Some(SegmentRemappingPlan::Identity) => true,
+        Some(SegmentRemappingPlan::Translate { .. })
+        | Some(SegmentRemappingPlan::MissingCoverage(_)) => false,
+    }
+}
+
+/// Promote a lone staged segment under its own uuid: finalize its files in
+/// place and return its metadata with the final file list, with no second
+/// copy of the index.
+async fn promote_finalized_segment(
+    dataset: &Dataset,
+    segment: &IndexMetadata,
+    details: InvertedIndexDetails,
+) -> Result<IndexMetadata> {
+    let files = match finalize_segment_files_if_needed(dataset, segment).await? {
+        Some(files) => files,
+        None => {
+            let store = LanceIndexStore::from_dataset_for_new(dataset, &segment.uuid)?;
+            store
+                .list_files_with_sizes()
+                .await?
+                .into_iter()
+                .filter(|file| !lance_index::scalar::inverted::builder::is_staged_path(&file.path))
+                .collect()
+        }
+    };
+    let details_any = prost_types::Any::from_msg(&details).map_err(|error| {
+        Error::io(format!(
+            "failed to encode InvertedIndexDetails payload: {error}"
+        ))
+    })?;
+    Ok(IndexMetadata {
+        dataset_version: dataset.manifest.version,
+        index_details: Some(Arc::new(details_any)),
+        files: Some(index_files_to_table(files)),
+        ..segment.clone()
+    })
 }
 
 /// Merge one caller-defined group of source FTS segments into a single segment.
@@ -933,6 +989,7 @@ pub(crate) async fn merge_segments(
     dataset: &Dataset,
     segments: Vec<IndexMetadata>,
     staged: Option<&crate::index::frag_reuse::StagedRemappingPlans>,
+    has_remapped_source_coverage: bool,
 ) -> Result<IndexMetadata> {
     if segments.is_empty() {
         return Err(Error::index("No segment metadata was provided".to_string()));
@@ -959,6 +1016,12 @@ pub(crate) async fn merge_segments(
     let document_granularity = DocumentGranularity::try_from(details.document_granularity)?;
     let resolved = resolve_fts_field_by_id(dataset.schema(), field_id, document_granularity)?;
     load_segment_details(dataset, &resolved.canonical_path, &segments).await?;
+
+    if let [segment] = segments.as_slice()
+        && single_segment_keeps_row_addresses(staged, &segment.uuid, has_remapped_source_coverage)
+    {
+        return promote_finalized_segment(dataset, segment, details).await;
+    }
 
     let mut source_indices = Vec::with_capacity(segments.len());
     let mut fragment_bitmap = RoaringBitmap::new();
@@ -1360,5 +1423,257 @@ mod tests {
         right.with_position = !left.with_position;
 
         assert!(!inverted_index_details_semantically_equal(&left, &right));
+    }
+
+    #[test]
+    fn test_single_segment_keeps_row_addresses_only_without_translation() {
+        use crate::index::frag_reuse::{MissingCoverageReason, SegmentRemappingPlan};
+        let uuid = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        assert!(single_segment_keeps_row_addresses(None, &uuid, false));
+        assert!(!single_segment_keeps_row_addresses(None, &uuid, true));
+
+        let mut plans = crate::index::frag_reuse::StagedRemappingPlans::new();
+        plans.insert(other, SegmentRemappingPlan::Identity);
+        assert!(
+            single_segment_keeps_row_addresses(Some(&plans), &uuid, false),
+            "a plan for another segment says nothing about this one"
+        );
+        plans.insert(uuid, SegmentRemappingPlan::Identity);
+        assert!(single_segment_keeps_row_addresses(
+            Some(&plans),
+            &uuid,
+            false
+        ));
+        plans.insert(
+            uuid,
+            SegmentRemappingPlan::Translate {
+                coverage: RoaringBitmap::new(),
+                excluded_fragments: RoaringBitmap::new(),
+                fingerprint: [0; 32],
+            },
+        );
+        assert!(!single_segment_keeps_row_addresses(
+            Some(&plans),
+            &uuid,
+            false
+        ));
+        plans.insert(
+            uuid,
+            SegmentRemappingPlan::MissingCoverage(MissingCoverageReason::Withdrawn),
+        );
+        assert!(!single_segment_keeps_row_addresses(
+            Some(&plans),
+            &uuid,
+            false
+        ));
+    }
+
+    async fn write_text_dataset(uri: &str, rows_per_fragment: usize, fragments: usize) -> Dataset {
+        use lance_datagen::{BatchCount, RowCount, array, gen_batch};
+        let reader = gen_batch()
+            .col("id", array::step::<arrow_array::types::Int32Type>())
+            .col("text", array::random_sentence(4, 12, false))
+            .into_reader_rows(
+                RowCount::from(rows_per_fragment as u64),
+                BatchCount::from(fragments as u32),
+            );
+        Dataset::write(
+            reader,
+            uri,
+            Some(crate::dataset::WriteParams {
+                max_rows_per_file: rows_per_fragment,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn fts_hits(dataset: &Dataset, column: &str, terms: &str) -> Vec<(u64, u32)> {
+        use lance_index::scalar::FullTextSearchQuery;
+        let mut scan = dataset.scan();
+        scan.full_text_search(
+            FullTextSearchQuery::new(terms.to_string())
+                .with_column(column.to_string())
+                .unwrap()
+                .limit(Some(1_000_000)),
+        )
+        .unwrap();
+        scan.with_row_id();
+        let batch = scan.try_into_batch().await.unwrap();
+        let row_ids = batch
+            .column_by_name(ROW_ID)
+            .unwrap()
+            .as_primitive::<arrow_array::types::UInt64Type>();
+        let scores = batch
+            .column_by_name(lance_index::scalar::inverted::SCORE_COL)
+            .unwrap()
+            .as_primitive::<arrow_array::types::Float32Type>();
+        let mut hits = row_ids
+            .values()
+            .iter()
+            .zip(scores.values())
+            .map(|(row_id, score)| (*row_id, score.to_bits()))
+            .collect::<Vec<_>>();
+        // Score descending, then row id: ties are ordered deterministically
+        // and scores compare bit for bit.
+        hits.sort_by(|a, b| {
+            f32::from_bits(b.1)
+                .total_cmp(&f32::from_bits(a.1))
+                .then(a.0.cmp(&b.0))
+        });
+        hits
+    }
+
+    /// A single staged intermediate covering every fragment is finalized in
+    /// place and committed under its own uuid (ENT-1419 kept: the root
+    /// metadata exists), with no second copy of the index.
+    #[tokio::test]
+    async fn test_single_intermediate_is_promoted_in_place() {
+        use futures::TryStreamExt;
+        use lance_core::utils::tempfile::TempStrDir;
+        use lance_index::IndexType;
+        use lance_index::scalar::inverted::METADATA_FILE;
+
+        let test_dir = TempStrDir::default();
+        let mut dataset = write_text_dataset(&test_dir, 200, 4).await;
+        let fragment_ids = dataset
+            .get_fragments()
+            .iter()
+            .map(|fragment| fragment.id() as u32)
+            .collect::<Vec<_>>();
+        // A tiny worker budget leaves several small staged partitions.
+        let params = InvertedIndexParams::default()
+            .num_workers(2)
+            .memory_limit_mb(1);
+        let segment = dataset
+            .create_index_builder(&["text"], IndexType::Inverted, &params)
+            .name("text_idx".to_string())
+            .fragments(fragment_ids)
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        let index_dir = dataset.indices_dir().join(segment.uuid.to_string());
+        let staged_paths = dataset
+            .object_store
+            .read_dir_all(&index_dir, None)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert!(
+            staged_paths
+                .iter()
+                .any(|meta| meta.location.as_ref().contains("/staging/")),
+            "an uncommitted fragment-scoped build must be staged"
+        );
+        assert!(
+            !dataset
+                .object_store
+                .exists(&index_dir.clone().join(METADATA_FILE))
+                .await
+                .unwrap()
+        );
+
+        let merged = dataset
+            .merge_existing_index_segments(vec![segment.clone()])
+            .await
+            .unwrap();
+        assert_eq!(merged.uuid, segment.uuid, "the lone segment keeps its uuid");
+        assert_eq!(merged.fragment_bitmap, segment.fragment_bitmap);
+        assert!(
+            dataset
+                .object_store
+                .exists(&index_dir.clone().join(METADATA_FILE))
+                .await
+                .unwrap(),
+            "finalize publishes the root metadata"
+        );
+        let final_paths = dataset
+            .object_store
+            .read_dir_all(&index_dir, None)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert!(
+            final_paths
+                .iter()
+                .all(|meta| !meta.location.as_ref().contains("/staging/")),
+            "staging is cleared after the root metadata is published"
+        );
+        let listed = final_paths
+            .iter()
+            .map(|meta| meta.location.filename().unwrap().to_string())
+            .collect::<std::collections::BTreeSet<_>>();
+        let reported = merged
+            .files
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|file| file.path.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(listed, reported, "metadata lists exactly the final files");
+        let index_dirs = dataset
+            .object_store
+            .read_dir(dataset.indices_dir())
+            .await
+            .unwrap();
+        assert_eq!(index_dirs.len(), 1, "no second index directory is written");
+
+        dataset
+            .commit_existing_index_segments("text_idx", "text", vec![merged])
+            .await
+            .unwrap();
+        let committed = dataset.load_indices().await.unwrap();
+        assert_eq!(committed.len(), 1);
+        assert_eq!(committed[0].uuid, segment.uuid);
+
+        // Reference: the same column indexed in one committed build.
+        let reference_dir = TempStrDir::default();
+        let mut reference = Dataset::write(
+            dataset
+                .scan()
+                .try_into_batch()
+                .await
+                .map(|batch| {
+                    arrow_array::RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema())
+                })
+                .unwrap(),
+            &reference_dir,
+            Some(crate::dataset::WriteParams {
+                max_rows_per_file: 200,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        reference
+            .create_index(
+                &["text"],
+                IndexType::Inverted,
+                Some("text_idx".into()),
+                &InvertedIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+        let probe = dataset
+            .scan()
+            .limit(Some(1), None)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let first_text = probe
+            .column_by_name("text")
+            .unwrap()
+            .as_string::<i32>()
+            .value(0)
+            .to_string();
+        let first_word = first_text.split_whitespace().next().unwrap().to_string();
+        let expected = fts_hits(&reference, "text", &first_word).await;
+        let actual = fts_hits(&dataset, "text", &first_word).await;
+        assert!(!expected.is_empty());
+        assert_eq!(expected, actual);
     }
 }

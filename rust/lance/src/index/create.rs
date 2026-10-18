@@ -1729,7 +1729,8 @@ mod tests {
         // - the build callback should surface public build stages such as load_data,
         //   tokenize_docs, copy_partitions, and write_metadata
         // - the merge callback should surface public merge stages such as
-        //   read_partition_metadata, remap_partition_files, and write_merged_metadata
+        //   read_partition_metadata, remap_partition_files, consolidate_partitions,
+        //   and write_merged_metadata
         // - merge stages should be reported in execution order
         let tmpdir = TempStrDir::default();
         let dataset_uri = format!("file://{}", tmpdir.as_str());
@@ -1849,11 +1850,19 @@ mod tests {
                 .any(|e| e == "progress:read_partition_metadata"),
             "expected read_partition_metadata progress during public merge"
         );
+        // Three tiny shards consolidate into one partition, so the finalize
+        // reports the merge group rather than per-file copies; either way the
+        // root metadata is published only after that stage completes.
+        let consolidate_complete = merge_tags
+            .iter()
+            .position(|e| e == "complete:consolidate_partitions")
+            .expect("missing consolidate_partitions complete");
+        assert!(consolidate_complete < metadata_start);
         assert!(
             merge_tags
                 .iter()
-                .any(|e| e == "progress:remap_partition_files"),
-            "expected remap_partition_files progress during public merge"
+                .any(|e| e == "progress:consolidate_partitions"),
+            "expected consolidate_partitions progress during public merge"
         );
         assert!(
             merge_tags

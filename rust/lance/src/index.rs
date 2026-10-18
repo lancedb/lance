@@ -1182,7 +1182,7 @@ pub(crate) async fn build_index_metadata_from_segments(
 }
 
 fn retain_committed_inverted_files(files: &mut Vec<IndexFile>) {
-    files.retain(|file| !file.path.starts_with("staging/"));
+    files.retain(|file| !lance_index::scalar::inverted::builder::is_staged_path(&file.path));
 }
 
 async fn prewarm_opened_index(
@@ -2906,7 +2906,13 @@ impl DatasetIndexExt for Dataset {
         let mut merged_segment = if all_vector {
             crate::index::vector::ivf::merge_segments(self, source_segments).await?
         } else if all_inverted {
-            crate::index::scalar::inverted::merge_segments(self, source_segments, staged).await?
+            crate::index::scalar::inverted::merge_segments(
+                self,
+                source_segments,
+                staged,
+                has_remapped_source_coverage,
+            )
+            .await?
         } else if all_fmindex {
             crate::index::scalar::fmindex::merge_segments(
                 self,
