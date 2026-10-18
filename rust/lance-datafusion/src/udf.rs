@@ -214,6 +214,7 @@ mod tests {
         let text_col = Arc::new(StringArray::from(vec![
             Some("a cat catch a fish"),
             Some("dog runs"),
+            Some("dog runs"),
             None,
         ]));
         let args = ScalarFunctionArgs {
@@ -222,7 +223,7 @@ mod tests {
                 Arc::new(Field::new("text_col".to_string(), DataType::Utf8, true)),
                 Arc::new(Field::new("query".to_string(), DataType::Utf8, true)),
             ],
-            number_rows: 3,
+            number_rows: 4,
             return_field: Arc::new(Field::new("res".to_string(), DataType::Boolean, true)),
             config_options: Arc::new(Default::default()),
         };
@@ -242,14 +243,24 @@ mod tests {
         // The tokens of a NULL query used to be read as "", an empty token
         // list that every text contains.
         let result = invoke_contains_tokens(ColumnarValue::Scalar(ScalarValue::Utf8(None)));
-        assert_eq!(result, BooleanArray::from(vec![None, None, None]));
+        assert_eq!(result, BooleanArray::from(vec![None, None, None, None]));
     }
 
     #[test]
     fn test_contains_tokens_reads_a_column_query_per_row() {
-        // Only the first row's query used to be read, for every row.
-        let queries = Arc::new(StringArray::from(vec![None, Some("dog"), Some("cat")]));
+        // Only the first row's query used to be read, for every row, so the
+        // second row was matched against "fish". A NULL query is NULL on its
+        // own row only.
+        let queries = Arc::new(StringArray::from(vec![
+            Some("fish"),
+            Some("dog"),
+            None,
+            Some("cat"),
+        ]));
         let result = invoke_contains_tokens(ColumnarValue::Array(queries));
-        assert_eq!(result, BooleanArray::from(vec![None, Some(true), None]));
+        assert_eq!(
+            result,
+            BooleanArray::from(vec![Some(true), Some(true), None, None])
+        );
     }
 }
