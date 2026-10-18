@@ -22,6 +22,8 @@ import java.util.UUID;
  *
  * <p>The JSON payload is opaque. Segments covering no fragments have an empty type URI and {@code
  * "{}"} payload.
+ *
+ * <p>Detached dataset versions may appear as negative Java {@code long} values.
  */
 public final class IndexSegmentStatistics implements Serializable {
   private static final long serialVersionUID = 1L;
@@ -33,9 +35,6 @@ public final class IndexSegmentStatistics implements Serializable {
 
   private IndexSegmentStatistics(
       long readVersion, String indexUuid, String indexTypeUri, String statisticsJson) {
-    if (readVersion <= 0) {
-      throw new IllegalArgumentException("readVersion must be positive");
-    }
     this.readVersion = readVersion;
     this.indexUuid = UUID.fromString(Objects.requireNonNull(indexUuid, "indexUuid"));
     this.indexTypeUri = Objects.requireNonNull(indexTypeUri, "indexTypeUri");

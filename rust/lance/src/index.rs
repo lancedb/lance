@@ -3080,11 +3080,10 @@ impl DatasetIndexExt for Dataset {
         serialize_regular_index_statistics(self, index_name, &metadatas, segment_statistics)
             .await?
             .ok_or_else(|| {
-                Error::index(
-                    "Outdated fragment metadata: use index_statistics to migrate before \
-                     collecting distributed segment statistics"
-                        .to_string(),
-                )
+                Error::index(format!(
+                    "Outdated fragment metadata for index {index_name}: collect index statistics \
+                     in non-distributed mode to migrate before retrying"
+                ))
             })
     }
 
@@ -6397,7 +6396,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("Outdated fragment metadata: use index_statistics to migrate"),
+                .contains("collect index statistics in non-distributed mode to migrate"),
             "{error}"
         );
         assert_eq!(dataset.manifest.version, original_version);

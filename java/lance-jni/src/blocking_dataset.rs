@@ -4061,9 +4061,7 @@ fn inner_get_index_statistics_from_segments<'local>(
         env.with_local_frame(8, |env| {
             let read_version = env
                 .call_method(&statistics, "getReadVersion", "()J", &[])?
-                .j()?;
-            let read_version = u64::try_from(read_version)
-                .map_err(|error| Error::input_error(error.to_string()))?;
+                .j()? as u64;
             let index_uuid = env
                 .call_method(&statistics, "getIndexUuid", "()Ljava/util/UUID;", &[])?
                 .l()?;

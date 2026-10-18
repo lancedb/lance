@@ -2459,6 +2459,43 @@ public class DatasetTest {
   }
 
   @Test
+  public void testIndexStatisticsForDetachedVersion(@TempDir Path tempDir) throws Exception {
+    try (RootAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, tempDir.toString());
+      testDataset.createEmptyDataset(true).close();
+      try (Dataset dataset = testDataset.write(1, 5)) {
+        dataset.createIndex(
+            Collections.singletonList("id"),
+            IndexType.BTREE,
+            Optional.of("id_idx"),
+            IndexParams.builder().setScalarIndexParams(ScalarIndexParams.create("btree")).build(),
+            true);
+        Append append =
+            Append.builder()
+                .fragments(Collections.singletonList(testDataset.createNewFragment(3)))
+                .build();
+        SourcedTransaction transaction = dataset.newTransactionBuilder().operation(append).build();
+        try (Dataset detached = dataset.commitTransaction(transaction.transaction(), true, false)) {
+          assertTrue(detached.version() < 0);
+          Map<String, Object> expected = detached.getIndexStatistics("id_idx");
+          assertEquals(5L, ((Number) expected.get("num_indexed_rows")).longValue());
+          assertEquals(3L, ((Number) expected.get("num_unindexed_rows")).longValue());
+          List<IndexSegmentStatistics> statistics =
+              detached.getIndexSegmentStatistics(
+                  "id_idx", Collections.singletonList(detached.getIndexes().get(0).uuid()));
+          assertEquals(1, statistics.size());
+          assertEquals(detached.version(), statistics.get(0).getReadVersion());
+          assertEquals(expected, detached.getIndexStatisticsFromSegments("id_idx", statistics));
+          assertThrows(
+              IllegalArgumentException.class,
+              () -> dataset.getIndexStatisticsFromSegments("id_idx", statistics));
+        }
+      }
+    }
+  }
+
+  @Test
   public void testDescribeIndicesByName(@TempDir Path tempDir) throws Exception {
     Path datasetPath = tempDir.resolve("testDescribeIndicesByName");
 
