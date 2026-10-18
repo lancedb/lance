@@ -147,6 +147,26 @@ fn sstable_distance_scale(distance_type: lance_linalg::distance::DistanceType) -
     }
 }
 
+/// Whether `dataset` holds an index the scanner would answer a `distance_type`
+/// search on `column` with. Mirrors the scanner's own choice: keyed on the
+/// column, a known type, and a compatible metric. A generation without one
+/// must be searched flat, since `fast_search` over it returns nothing.
+async fn has_usable_vector_index(
+    dataset: &Dataset,
+    column: &str,
+    distance_type: lance_linalg::distance::DistanceType,
+) -> Result<bool> {
+    use crate::index::DatasetIndexExt;
+
+    let column_id = dataset.schema().field_id(column)?;
+    Ok(dataset.load_indices().await?.iter().any(|index| {
+        index.fields.first() == Some(&column_id)
+            && crate::index::index_type_is_known(index)
+            && crate::index::vector::details::metric_type_from_index_metadata(index)
+                .is_none_or(|metric| metric == distance_type)
+    }))
+}
+
 impl LsmVectorSearchPlanner {
     /// Create a new planner.
     ///
@@ -674,8 +694,16 @@ impl LsmVectorSearchPlanner {
                     }
                 };
                 scanner.nearest(&vector_column, query_arr.as_ref(), k)?;
-                let scale =
-                    self.arm_scale(refine_factor, sstable_distance_scale(self.distance_type));
+                // A generation flushed while the column was not maintained has
+                // no index on it: search it flat, which reports exact distances.
+                let indexed =
+                    has_usable_vector_index(&dataset, &vector_column, self.distance_type).await?;
+                let native_scale = if indexed {
+                    sstable_distance_scale(self.distance_type)
+                } else {
+                    1.0
+                };
+                let scale = self.arm_scale(refine_factor, native_scale);
                 scanner.distance_range(
                     self.distance_range.0.map(|lower| lower / scale),
                     self.distance_range.1.map(|upper| upper / scale),
@@ -690,9 +718,11 @@ impl LsmVectorSearchPlanner {
                 if let Some(ef) = self.ef {
                     scanner.ef(ef);
                 }
-                scanner.fast_search();
-                if let Some(refine_factor) = refine_factor {
-                    scanner.refine(refine_factor);
+                if indexed {
+                    scanner.fast_search();
+                    if let Some(refine_factor) = refine_factor {
+                        scanner.refine(refine_factor);
+                    }
                 }
                 // Boxed for the reason the scan planner's arm gives: a
                 // generation resolves its own schema before scanning, and
@@ -3592,6 +3622,86 @@ mod tests {
             vec![3, 2],
             "distance_range must apply on the scale it is given in"
         );
+    }
+
+    #[tokio::test]
+    async fn test_vector_search_sstable_without_vector_index_is_searched_flat() {
+        // A generation flushed while the column was not maintained carries no
+        // vector index; `fast_search` over it returned nothing and its rows
+        // vanished from every vector search.
+        use crate::dataset::mem_wal::scanner::data_source::ShardSnapshot;
+        use datafusion::prelude::SessionContext;
+        use futures::TryStreamExt;
+        use lance_linalg::distance::DistanceType;
+
+        let at = |cos_distance: f32, norm: f32| {
+            let cos = 1.0 - cos_distance;
+            [norm * cos, norm * (1.0 - cos * cos).sqrt(), 0.0, 0.0]
+        };
+        let query = {
+            use arrow_array::builder::Float32Builder;
+            let mut builder = FixedSizeListBuilder::new(Float32Builder::new(), 4);
+            builder.values().append_slice(&[1.0, 0.0, 0.0, 0.0]);
+            builder.append(true);
+            builder.finish()
+        };
+        let expected = [(1, 0.05), (2, 0.4)];
+
+        let schema = create_vector_schema();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp_dir.path().to_str().unwrap());
+        let shard_id = uuid::Uuid::new_v4();
+        let mut rows = vec![(1, at(0.05, 3.0)), (2, at(0.4, 2.0))];
+        rows.extend((10..20).map(|id| (id, at(1.9, 1.0))));
+        let gen1_uri = format!("{}/_mem_wal/{}/gen_1", base_uri, shard_id);
+        create_dataset(&gen1_uri, vec![batch_rows(&schema, &rows)]).await;
+
+        let search = |scale: f32, refine: Option<u32>| {
+            let snapshot = ShardSnapshot::new(shard_id)
+                .with_current_generation(2)
+                .with_sstable(1, "gen_1".to_string());
+            let collector =
+                LsmDataSourceCollector::without_base_table(base_uri.clone(), vec![snapshot]);
+            let planner = LsmVectorSearchPlanner::new(
+                collector,
+                vec!["id".to_string()],
+                schema.clone(),
+                "vector".to_string(),
+                DistanceType::Cosine,
+            )
+            .with_distance_scale(scale)
+            .with_refine_factor(refine);
+            let query = query.clone();
+            async move {
+                let plan = planner
+                    .plan_search(&query, 2, 1, None, false, 1.0)
+                    .await
+                    .unwrap();
+                let batches: Vec<RecordBatch> = plan
+                    .execute(0, SessionContext::new().task_ctx())
+                    .unwrap()
+                    .try_collect()
+                    .await
+                    .unwrap();
+                collect_id_dist(&batches)
+            }
+        };
+        for (scale, refine, reported) in [(1.0, None, 1.0), (2.0, None, 2.0), (2.0, Some(1), 1.0)] {
+            let rows = search(scale, refine).await;
+            let ids: Vec<i32> = rows.iter().map(|(id, _)| *id).collect();
+            assert_eq!(
+                ids,
+                vec![1, 2],
+                "scale={scale} refine={refine:?}: got {rows:?}"
+            );
+            for ((id, distance), (_, exact)) in rows.iter().zip(expected) {
+                assert!(
+                    (distance - exact * reported).abs() < 1e-4,
+                    "scale={scale} refine={refine:?}: id={id} reported {distance}, expected {}",
+                    exact * reported
+                );
+            }
+        }
     }
 
     #[tokio::test]
