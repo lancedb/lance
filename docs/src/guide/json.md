@@ -160,7 +160,7 @@ Extracts a boolean value with strict type conversion.
 
 **Returns:** Boolean, null if conversion fails
 
-**Type Conversion:** Uses JSONB's strict `to_bool()` conversion:
+**Type Conversion:**
 - Numbers: 0 → false, non-zero → true
 - Strings: "true"/"yes" → true, "false"/"no" → false, case-insensitive
 - Other values are null
