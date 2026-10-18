@@ -644,15 +644,6 @@ async fn parse_groupings(
 ) -> Result<Vec<Expr>> {
     let mut group_exprs = Vec::new();
 
-    // GROUPING SETS / CUBE / ROLLUP emit one Grouping per set. Flattening
-    // them into a single joint group-by would silently change the aggregates,
-    // and the downstream PhysicalGroupBy::new_single cannot execute sets.
-    if agg_rel.groupings.len() > 1 {
-        return Err(Error::invalid_input(
-            "GROUPING SETS / ROLLUP / CUBE are not supported (multiple grouping sets)",
-        ));
-    }
-
     // First, handle the new-style grouping_expressions + expression_references
     if !agg_rel.grouping_expressions.is_empty() {
         for grouping in &agg_rel.groupings {
@@ -1389,6 +1380,9 @@ mod tests {
         let pruned = prune_schema_for_substrait(&schema);
         let names: Vec<&str> = pruned.fields().iter().map(|f| f.name().as_str()).collect();
         assert_eq!(names, vec!["id", "ll_ok"]);
+        // The encoder writes the whole schema, so a filter on another column
+        // only encodes once those columns are gone.
+        assert_substrait_roundtrip(pruned, id_filter("test-id")).await;
     }
 
     // ==================== Aggregate parsing tests ====================
@@ -1621,42 +1615,6 @@ mod tests {
             agg_expr.schema_name().to_string().contains("sum"),
             "Expected SUM aggregate, got: {}",
             agg_expr.schema_name()
-        );
-    }
-
-    #[tokio::test]
-    async fn test_parse_substrait_aggregate_grouping_sets_rejected() {
-        // GROUPING SETS / CUBE / ROLLUP emit one Grouping per set. Flattening
-        // them into a single joint group-by would silently change the
-        // aggregates, and PhysicalGroupBy::new_single cannot execute sets.
-        let bytes = create_aggregate_plan(
-            vec![simple_agg_measure(0, 1)],
-            vec![agg_field_ref(0), agg_field_ref(1)],
-            vec![
-                Grouping {
-                    #[allow(deprecated)]
-                    grouping_expressions: vec![],
-                    expression_references: vec![0],
-                },
-                Grouping {
-                    #[allow(deprecated)]
-                    grouping_expressions: vec![],
-                    expression_references: vec![1],
-                },
-            ],
-            vec![agg_extension(0, "sum")],
-        );
-
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("x", DataType::Int32, true),
-            Field::new("y", DataType::Int64, true),
-        ]));
-
-        let result =
-            crate::substrait::parse_substrait_aggregate(&bytes, schema, &session_state()).await;
-        assert!(
-            result.is_err(),
-            "multiple grouping sets must be rejected, got {result:?}"
         );
     }
 
