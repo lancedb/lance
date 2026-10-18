@@ -491,7 +491,17 @@ def test_merge_index_metadata_inverted_index_progress_callback(tmp_path):
     )
     assert metadata_progress
     assert metadata_progress[-1] == len(ds.get_fragments())
-    assert "progress:remap_partition_files" in tags
+    # Small staged partitions are consolidated instead of copied, so the work
+    # is reported under consolidate_partitions; either stage must complete
+    # before the root metadata is written.
+    assert (
+        "progress:remap_partition_files" in tags
+        or "progress:consolidate_partitions" in tags
+    )
+    if "complete:consolidate_partitions" in tags:
+        assert tags.index("complete:consolidate_partitions") < tags.index(
+            "start:write_merged_metadata"
+        )
     assert "progress:write_merged_metadata" in tags
 
 
