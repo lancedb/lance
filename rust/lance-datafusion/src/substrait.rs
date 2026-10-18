@@ -1348,8 +1348,22 @@ mod tests {
         let fsl = |width: i32| {
             DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), width)
         };
+        let map_of = |value: DataType| {
+            DataType::Map(
+                Arc::new(Field::new(
+                    "entries",
+                    DataType::Struct(Fields::from(vec![
+                        Field::new("key", DataType::Utf8, false),
+                        Field::new("value", value, true),
+                    ])),
+                    false,
+                )),
+                false,
+            )
+        };
         let schema = Schema::new(vec![
             Field::new("id", DataType::Utf8, false),
+            Field::new("map_ok", map_of(DataType::Int32), true),
             Field::new(
                 "ll_ok",
                 DataType::LargeList(Arc::new(Field::new("item", DataType::Int32, true))),
@@ -1360,26 +1374,12 @@ mod tests {
                 DataType::LargeList(Arc::new(Field::new("item", fsl(16), true))),
                 true,
             ),
-            Field::new(
-                "map_fsl",
-                DataType::Map(
-                    Arc::new(Field::new(
-                        "entries",
-                        DataType::Struct(Fields::from(vec![
-                            Field::new("key", DataType::Utf8, false),
-                            Field::new("value", fsl(8), true),
-                        ])),
-                        false,
-                    )),
-                    false,
-                ),
-                true,
-            ),
+            Field::new("map_fsl", map_of(fsl(8)), true),
         ]);
 
         let pruned = prune_schema_for_substrait(&schema);
         let names: Vec<&str> = pruned.fields().iter().map(|f| f.name().as_str()).collect();
-        assert_eq!(names, vec!["id", "ll_ok"]);
+        assert_eq!(names, vec!["id", "map_ok", "ll_ok"]);
         // The encoder writes the whole schema, so a filter on another column
         // only encodes once those columns are gone.
         assert_substrait_roundtrip(pruned, id_filter("test-id")).await;
