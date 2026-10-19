@@ -627,7 +627,7 @@ impl LsmVectorSearchPlanner {
                     asked_for,
                 );
                 // The index is on this generation's own column, under the name
-                // it had when the generation was sealed.
+                // it had when the generation was frozen.
                 let Some(vector_column) = generation.stored_name(&self.vector_column) else {
                     // The table dropped the column the search names, so this
                     // generation has no candidates to offer.
@@ -4025,7 +4025,7 @@ mod tests {
         assert_eq!(
             id1.len(),
             1,
-            "newest-wins: id=1 must appear exactly once after a same-L0 override, got {:?}",
+            "newest-wins: id=1 must appear exactly once after a same-generation override, got {:?}",
             rows
         );
         assert!(
