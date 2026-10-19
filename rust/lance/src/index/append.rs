@@ -4947,7 +4947,16 @@ mod tests {
                 &["vector"],
                 IndexType::Vector,
                 None,
-                &VectorIndexParams::ivf_flat(num_partitions, MetricType::L2),
+                // Pin the type default target: the join case needs its partitions
+                // under a quarter of it, and a build from a partition count would
+                // record its own.
+                &VectorIndexParams::with_ivf_flat_params(
+                    MetricType::L2,
+                    IvfBuildParams {
+                        target_partition_size: Some(IndexType::IvfFlat.target_partition_size()),
+                        ..IvfBuildParams::new(num_partitions)
+                    },
+                ),
                 true,
             )
             .await

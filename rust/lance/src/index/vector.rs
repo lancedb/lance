@@ -771,6 +771,19 @@ async fn prepare_vector_segment_build(
     };
     let mut ivf_params = ivf_params0.clone();
     ivf_params.num_partitions = Some(num_partitions);
+    // An index built from a partition count has no target partition size, so
+    // optimize would split and join it against the index type's default and
+    // merge every partition built smaller than a quarter of that. Record the
+    // rows per partition the trained count gives instead. A fragment subset is
+    // one segment of a logical index, and its rows say nothing about the
+    // index's, so it records nothing.
+    if ivf_params.target_partition_size.is_none()
+        && ivf_params0.num_partitions.is_some()
+        && fragment_ids.is_none()
+    {
+        let num_rows = dataset.count_rows(None).await?;
+        ivf_params.target_partition_size = Some(num_rows.div_ceil(num_partitions).max(1));
+    }
 
     let format_version = dataset_format_version(dataset);
     let temp_dir = TempStdDir::default();
@@ -1146,6 +1159,14 @@ pub(crate) async fn build_distributed_vector_index(
     }
 }
 
+/// The files of a built vector index segment, and the rows per partition its
+/// IVF model was built for, when it was built for one. The latter goes into the
+/// index details, where optimize reads it back to decide splits and joins.
+pub(crate) struct BuiltVectorSegment {
+    pub files: Vec<IndexFile>,
+    pub target_partition_size: Option<usize>,
+}
+
 /// Build a Vector Index
 #[instrument(level = "debug", skip(dataset))]
 pub(crate) async fn build_vector_index(
@@ -1156,7 +1177,7 @@ pub(crate) async fn build_vector_index(
     params: &VectorIndexParams,
     frag_reuse_index: Option<Arc<CompactFragReuseIndex>>,
     progress: Arc<dyn IndexBuildProgress>,
-) -> Result<Vec<IndexFile>> {
+) -> Result<BuiltVectorSegment> {
     build_vector_index_impl(
         dataset,
         column,
@@ -1185,7 +1206,7 @@ pub(crate) async fn build_vector_model_segment(
     params: &VectorIndexParams,
     frag_reuse_index: Option<Arc<CompactFragReuseIndex>>,
     progress: Arc<dyn IndexBuildProgress>,
-) -> Result<Vec<IndexFile>> {
+) -> Result<BuiltVectorSegment> {
     build_vector_index_impl(
         dataset,
         column,
@@ -1211,7 +1232,7 @@ pub(crate) async fn build_filtered_vector_index(
     frag_reuse_index: Option<Arc<CompactFragReuseIndex>>,
     fragment_ids: &[u32],
     progress: Arc<dyn IndexBuildProgress>,
-) -> Result<Vec<IndexFile>> {
+) -> Result<BuiltVectorSegment> {
     build_vector_index_impl(
         dataset,
         column,
@@ -1237,7 +1258,7 @@ async fn build_vector_index_impl(
     progress: Arc<dyn IndexBuildProgress>,
     fragment_ids: Option<&[u32]>,
     train_only: bool,
-) -> Result<Vec<IndexFile>> {
+) -> Result<BuiltVectorSegment> {
     let (element_type, index_type, ivf_params, shuffler, _shuffle_temp_dir) =
         prepare_vector_segment_build(
             dataset,
@@ -1260,7 +1281,8 @@ async fn build_vector_index_impl(
         )));
     }
 
-    match index_type {
+    let target_partition_size = ivf_params.target_partition_size;
+    let files = match index_type {
         IndexType::IvfFlat => match element_type {
             DataType::Float16 | DataType::Float32 | DataType::Float64 => {
                 let summary = IvfIndexBuilder::<FlatIndex, FlatQuantizer>::new(
@@ -1534,7 +1556,11 @@ async fn build_vector_index_impl(
             "Build Vector Index: invalid index type: {:?}",
             index_type
         ))),
-    }
+    }?;
+    Ok(BuiltVectorSegment {
+        files,
+        target_partition_size,
+    })
 }
 
 /// Build a Vector Index incrementally using an existing index's IVF model and quantizer

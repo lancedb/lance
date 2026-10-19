@@ -7582,6 +7582,37 @@ mod tests {
         assert_eq!(trained_partitions(&dataset).await, vec![1]);
     }
 
+    /// An index built from a partition count keeps the count it trained through
+    /// an optimize with nothing new to index. With no target partition size
+    /// recorded, optimize joined every partition under a quarter of the index
+    /// type's default, and 500 rows a partition is under that for every IVF
+    /// type. The target recorded comes from the count trained, not the one
+    /// requested: 1,000 partitions asked of 300 rows trains one, and a target
+    /// of 300 / 1,000 rows would have optimize split it apart.
+    #[rstest]
+    #[case::num_partitions(10_000, VectorIndexParams::ivf_flat(20, DistanceType::L2), 20)]
+    #[case::reduced_to_rows(300, VectorIndexParams::ivf_pq(1000, 8, 4, DistanceType::L2, 1), 1)]
+    #[tokio::test]
+    async fn test_optimize_keeps_trained_partitions(
+        #[case] rows: usize,
+        #[case] params: VectorIndexParams,
+        #[case] partitions: usize,
+    ) {
+        let test_dir = tempfile::tempdir().unwrap();
+        let mut dataset = small_vector_dataset(test_dir.path(), rows).await;
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, false)
+            .await
+            .unwrap();
+        assert_eq!(trained_partitions(&dataset).await, vec![partitions]);
+
+        dataset
+            .optimize_indices(&OptimizeOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(trained_partitions(&dataset).await, vec![partitions]);
+    }
+
     /// Partition counts for a trained logical vector index, one per segment.
     /// Whether a segment covers no rows, which is how a definition reads back
     /// from the manifest.

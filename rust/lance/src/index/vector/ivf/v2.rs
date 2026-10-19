@@ -8464,7 +8464,12 @@ mod tests {
         .await
         .unwrap();
 
-        let ivf_params = IvfBuildParams::try_with_centroids(NLIST, centroids).unwrap();
+        // Pin the type default target so the limits above are the ones this test
+        // reasons about; a build from a partition count would record its own.
+        let ivf_params = IvfBuildParams {
+            target_partition_size: Some(IndexType::IvfPq.target_partition_size()),
+            ..IvfBuildParams::try_with_centroids(NLIST, centroids).unwrap()
+        };
         let params = VectorIndexParams::with_ivf_pq_params(
             DistanceType::L2,
             ivf_params,
@@ -8551,9 +8556,14 @@ mod tests {
 
         let (mut dataset, _) =
             generate_multivec_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await;
+        // Pin the type default target so the threshold above is the one this test
+        // reasons about; a build from a partition count would record its own.
         let params = VectorIndexParams::with_ivf_pq_params(
             DistanceType::Cosine,
-            IvfBuildParams::new(1),
+            IvfBuildParams {
+                target_partition_size: Some(IndexType::IvfPq.target_partition_size()),
+                ..IvfBuildParams::new(1)
+            },
             lightweight_pq_params(),
         );
         dataset
@@ -8650,7 +8660,12 @@ mod tests {
         .unwrap();
 
         let centroids = build_centroids_for_offsets(&offsets);
-        let ivf_params = IvfBuildParams::try_with_centroids(2, centroids).unwrap();
+        // Pin the type default target so the threshold above is the one this test
+        // reasons about; a build from a partition count would record its own.
+        let ivf_params = IvfBuildParams {
+            target_partition_size: Some(IndexType::IvfFlat.target_partition_size()),
+            ..IvfBuildParams::try_with_centroids(2, centroids).unwrap()
+        };
         let params = VectorIndexParams::with_ivf_flat_params(DistanceType::L2, ivf_params);
         dataset
             .create_index(
@@ -8963,7 +8978,16 @@ mod tests {
         .await
         .unwrap();
 
-        let params = VectorIndexParams::ivf_flat(nlist, DistanceType::L2);
+        // Pin the type default target: both callers size their partitions against
+        // its split and join thresholds, and a build from a partition count would
+        // record its own.
+        let params = VectorIndexParams::with_ivf_flat_params(
+            DistanceType::L2,
+            IvfBuildParams {
+                target_partition_size: Some(IndexType::IvfFlat.target_partition_size()),
+                ..IvfBuildParams::new(nlist)
+            },
+        );
         dataset
             .create_index(
                 &["vector"],

@@ -3625,7 +3625,15 @@ mod tests {
         let reader = RecordBatchIterator::new(initial, schema.clone());
         let mut dataset = crate::Dataset::write(reader, uri, None).await.unwrap();
 
-        let params = VectorIndexParams::ivf_flat(2, MetricType::L2);
+        // Pin the type default target so the thresholds above are the ones this
+        // test reasons about; a build from a partition count would record its own.
+        let params = VectorIndexParams::with_ivf_flat_params(
+            MetricType::L2,
+            IvfBuildParams {
+                target_partition_size: Some(IndexType::IvfFlat.target_partition_size()),
+                ..IvfBuildParams::new(2)
+            },
+        );
         dataset
             .create_index(
                 &["vec"],
@@ -3891,7 +3899,15 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let uri = tmp.path().to_str().unwrap();
         let mut dataset = write_clusters(uri, &[(15_000, 0.0), (1_500, 1000.0)]).await;
-        let params = VectorIndexParams::ivf_flat(2, MetricType::L2);
+        // Pin the type default target so the split below is the one this test
+        // reasons about; a build from a partition count would record its own.
+        let params = VectorIndexParams::with_ivf_flat_params(
+            MetricType::L2,
+            IvfBuildParams {
+                target_partition_size: Some(IndexType::IvfFlat.target_partition_size()),
+                ..IvfBuildParams::new(2)
+            },
+        );
         dataset
             .create_index(
                 &["vec"],
@@ -3946,7 +3962,12 @@ mod tests {
             &[(2_000, 0.0), (100, 1000.0), (100, 2000.0), (100, 3000.0)],
         )
         .await;
-        let params = ivf_flat_at_centers(&[0.0, 1000.0, 2000.0, 3000.0], None);
+        // Pin the type default target the threshold above is computed from; a
+        // build from a partition count would record its own.
+        let params = ivf_flat_at_centers(
+            &[0.0, 1000.0, 2000.0, 3000.0],
+            Some(IndexType::IvfFlat.target_partition_size()),
+        );
         dataset
             .create_index(
                 &["vec"],
