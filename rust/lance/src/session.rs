@@ -12,6 +12,7 @@ use lance_io::object_store::ObjectStoreRegistry;
 use lance_io::spill::{LocalSpillStore, SpillStore};
 
 use crate::dataset::{DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE};
+use crate::index::optimizer::ScalarIndexOptimizer;
 use crate::session::caches::GlobalMetadataCache;
 use crate::session::index_caches::GlobalIndexCache;
 
@@ -71,6 +72,8 @@ pub struct Session {
 
     pub(crate) index_extensions: HashMap<(IndexType, String), Arc<dyn IndexExtension>>,
 
+    pub(crate) index_optimizers: HashMap<String, Arc<dyn ScalarIndexOptimizer>>,
+
     store_registry: Arc<ObjectStoreRegistry>,
 
     spill_store: Arc<dyn SpillStore>,
@@ -85,6 +88,7 @@ impl DeepSizeOf for Session {
         for ext in self.index_extensions.values() {
             size += ext.deep_size_of_children(context);
         }
+        size += self.index_optimizers.deep_size_of_children(context);
         size
     }
 }
@@ -103,6 +107,10 @@ impl std::fmt::Debug for Session {
             .field(
                 "index_extensions",
                 &self.index_extensions.keys().collect::<Vec<_>>(),
+            )
+            .field(
+                "index_optimizers",
+                &self.index_optimizers.keys().collect::<Vec<_>>(),
             )
             .finish()
     }
@@ -136,6 +144,7 @@ impl Session {
                 QuickCacheShardPolicy::Recommended,
             )),
             index_extensions: HashMap::new(),
+            index_optimizers: HashMap::new(),
             store_registry,
             spill_store: Arc::new(LocalSpillStore::default()),
         }
@@ -157,6 +166,7 @@ impl Session {
                 QuickCacheShardPolicy::Recommended,
             )),
             index_extensions: HashMap::new(),
+            index_optimizers: HashMap::new(),
             store_registry,
             spill_store: Arc::new(LocalSpillStore::default()),
         }
@@ -236,6 +246,7 @@ impl Session {
             index_cache: GlobalIndexCache(index_cache),
             metadata_cache: GlobalMetadataCache(metadata_cache),
             index_extensions: HashMap::new(),
+            index_optimizers: HashMap::new(),
             store_registry,
             spill_store: Arc::new(LocalSpillStore::default()),
         }
@@ -305,6 +316,53 @@ impl Session {
         }
 
         Ok(())
+    }
+
+    /// Associate a scalar details type with its custom optimize algorithm.
+    ///
+    /// Configure the session before sharing it with datasets. Duplicate details
+    /// types are rejected; session clones share the same optimizer instances.
+    /// This is independent of registering the index's scalar reader plugin.
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use lance::{Result, session::Session, index::optimizer::ScalarIndexOptimizer};
+    /// # fn configure<D: prost::Message + prost::Name>(session: &mut Session,
+    /// #     optimizer: Arc<dyn ScalarIndexOptimizer>) -> Result<()> {
+    /// session.register_scalar_index_optimizer::<D>(optimizer)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn register_scalar_index_optimizer<D: prost::Message + prost::Name>(
+        &mut self,
+        optimizer: Arc<dyn ScalarIndexOptimizer>,
+    ) -> Result<()> {
+        if D::NAME.is_empty() {
+            return Err(Error::invalid_input(
+                "index optimizer details name must not be empty",
+            ));
+        }
+        let name = D::full_name().to_ascii_lowercase();
+        match self.index_optimizers.entry(name) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(optimizer);
+            }
+            std::collections::hash_map::Entry::Occupied(entry) => {
+                return Err(Error::invalid_input(format!(
+                    "index optimizer for '{}' is already registered",
+                    entry.key()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn index_optimizer(
+        &self,
+        details: &prost_types::Any,
+    ) -> Option<&Arc<dyn ScalarIndexOptimizer>> {
+        let (_, name) = details.type_url.rsplit_once('/')?;
+        self.index_optimizers.get(&name.to_ascii_lowercase())
     }
 
     /// Return the current size of the session in bytes

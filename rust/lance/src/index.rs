@@ -87,6 +87,7 @@ mod frag_reuse_remapping;
 pub(crate) mod frag_reuse_with_stable_row_ids;
 pub mod mem_wal;
 pub mod optimize;
+pub mod optimizer;
 pub mod prefilter;
 pub mod scalar;
 pub(crate) mod scalar_logical;
@@ -3349,13 +3350,66 @@ impl DatasetIndexExt for Dataset {
         // new segment claiming fragments an existing one already holds.
         let indices = load_all_indices(self).await?;
 
+        let session = self.session();
+        let groups = if session.index_optimizers.is_empty() {
+            Vec::new()
+        } else {
+            optimizable_indices(self, &indices, options)?
+        };
+        let mut custom = Vec::new();
+        let mut default_names = Vec::new();
+        for (name, segments) in groups {
+            let handler = segments[0]
+                .index_details
+                .as_ref()
+                .and_then(|details| session.index_optimizer(details));
+            if let Some(handler) = handler {
+                if options.retrain
+                    || options.max_rows_per_task.is_some()
+                    || options.max_rows_per_segment.is_some()
+                {
+                    return Err(Error::not_supported(format!(
+                        "custom scalar optimize for '{name}' does not support retrain or distributed row bounds"
+                    )));
+                }
+                if segments
+                    .iter()
+                    .any(|segment| segment_has_vector_details(segment))
+                {
+                    return Err(Error::not_supported(
+                        "custom scalar optimizers cannot maintain vector indices",
+                    ));
+                }
+                custom.push((segments, handler.clone()));
+            } else {
+                default_names.push(name);
+            }
+        }
+        let mut default_options = options.clone();
+        if !custom.is_empty() {
+            default_options.index_names = Some(default_names);
+        }
+
         // The stages a distributed optimize runs across workers, run here in
         // turn: without row bounds every index is one task that does the
         // whole single-process optimize, and every merge passes it through.
-        let Some(plan) = optimize::plan_optimize_indices_or_skip(self, &indices, options).await?
+        let Some(plan) =
+            optimize::plan_optimize_indices_or_skip(self, &indices, &default_options).await?
         else {
             return Ok(());
         };
+        let mut merged = Vec::new();
+        for (segments, handler) in custom {
+            let context = optimizer::ScalarIndexOptimizeContext {
+                dataset: self,
+                segments: &segments,
+            };
+            let result = handler.optimize(context, options).await?;
+            merged.extend(
+                optimizer::prepare_optimization(context, options, result, &indices, plan.plan_id)
+                    .await?,
+            );
+        }
         let mut built = Vec::with_capacity(plan.tasks.len());
         for task in &plan.tasks {
             built.extend(
@@ -3363,7 +3417,7 @@ impl DatasetIndexExt for Dataset {
                     .await?,
             );
         }
-        let mut merged = Vec::with_capacity(plan.merges.len());
+        merged.reserve(plan.merges.len());
         for merge in &plan.merges {
             merged.extend(
                 merge
@@ -3472,15 +3526,18 @@ pub(crate) fn optimizable_indices<'a>(
             );
             continue;
         }
-        // Scalar indices have no rebalance concept, so skip them entirely
-        // when every fragment is already covered and the caller hasn't
-        // asked for retrain or an explicit delta merge. Vector indices
-        // fall through and use a rebalance-aware no-op check inside
-        // merge_indices_with_unindexed_frags.
+        // Builtin scalar indices have no rebalance concept, so skip them when
+        // fully covered unless retrain or an explicit merge was requested.
+        // Custom optimizers may still need cleanup. Vector indices use a
+        // rebalance-aware no-op check inside merge_indices_with_unindexed_frags.
         if !options.retrain
             && options.num_indices_to_merge.is_none_or(|n| n == 0)
             && index_group_is_scalar(dataset, &deltas)
             && index_group_has_no_unindexed(dataset, &deltas)
+            && !deltas[0]
+                .index_details
+                .as_ref()
+                .is_some_and(|details| dataset.session.index_optimizer(details).is_some())
         {
             continue;
         }
