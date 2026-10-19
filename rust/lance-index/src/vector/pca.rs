@@ -19,8 +19,6 @@ use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_core::{Error, Result};
 use ndarray::Array2;
 use prost::Message;
-use rand::SeedableRng;
-use rand::rngs::SmallRng;
 
 use crate::pb;
 use crate::scalar::{IndexReader, IndexWriter};
@@ -68,7 +66,6 @@ const PCA_FINGERPRINT_DOMAIN: &[u8] = b"lance-vector-pre-transform:pca:v1";
 
 const DEFAULT_SAMPLE_SIZE: usize = 65_536;
 const DEFAULT_SAMPLING_SEED: u64 = 42;
-const DEFAULT_ROTATION_SEED: u64 = 5;
 const TRANSFORM_BATCH_SIZE: usize = 4096;
 
 /// Configuration for training a PCA vector transform.
@@ -80,21 +77,17 @@ const TRANSFORM_BATCH_SIZE: usize = 4096;
 /// ```
 /// use lance_index::vector::pca::PcaParams;
 ///
-/// let params = PcaParams::new(64).with_random_rotation(false);
+/// let params = PcaParams::new(64);
 /// assert_eq!(params.dimension, 64);
 /// ```
 #[derive(Debug, Clone, PartialEq)]
 pub struct PcaParams {
     /// Number of dimensions produced by the transform.
     pub dimension: usize,
-    /// Whether to apply a deterministic orthogonal rotation after PCA.
-    pub random_rotation: bool,
     /// Target number of valid rows used by dataset-aware training.
     pub sample_size: usize,
     /// Seed used by dataset-aware sampling.
     pub sampling_seed: u64,
-    /// Seed used to construct the deterministic random rotation.
-    pub rotation_seed: u64,
 }
 
 impl PcaParams {
@@ -102,16 +95,9 @@ impl PcaParams {
     pub fn new(dimension: usize) -> Self {
         Self {
             dimension,
-            random_rotation: false,
             sample_size: DEFAULT_SAMPLE_SIZE,
             sampling_seed: DEFAULT_SAMPLING_SEED,
-            rotation_seed: DEFAULT_ROTATION_SEED,
         }
-    }
-
-    pub fn with_random_rotation(mut self, enabled: bool) -> Self {
-        self.random_rotation = enabled;
-        self
     }
 
     pub fn with_sample_size(mut self, sample_size: usize) -> Self {
@@ -121,11 +107,6 @@ impl PcaParams {
 
     pub fn with_sampling_seed(mut self, sampling_seed: u64) -> Self {
         self.sampling_seed = sampling_seed;
-        self
-    }
-
-    pub fn with_rotation_seed(mut self, rotation_seed: u64) -> Self {
-        self.rotation_seed = rotation_seed;
         self
     }
 
@@ -684,24 +665,10 @@ impl PcaModel {
         }
         basis.truncate(retained_basis_len);
         normalize_component_signs(&mut basis, params.dimension, input_dimension)?;
-        let rotation = if params.random_rotation {
-            Some(deterministic_rotation(
-                params.dimension,
-                params.rotation_seed,
-            )?)
-        } else {
-            None
-        };
-        let matrix_f64 = assemble_transform(
-            &basis,
-            rotation.as_deref(),
-            input_dimension,
-            params.dimension,
-        )?;
         let transform_matrix = Arc::new(Float32Array::from(
-            matrix_f64
-                .iter()
-                .map(|value| canonical_f32(*value))
+            basis
+                .into_iter()
+                .map(canonical_f32)
                 .collect::<Result<Vec<_>>>()?,
         ));
         let mean = Arc::new(Float32Array::from(
@@ -1313,74 +1280,6 @@ fn canonicalize_sign(vector: &mut [f64]) -> Result<()> {
     Ok(())
 }
 
-fn deterministic_rotation(dimension: usize, seed: u64) -> Result<Vec<f64>> {
-    let mut rng = SmallRng::seed_from_u64(seed);
-    let mut rotation = crate::vector::bq::builder::random_orthogonal_with_rng(dimension, &mut rng)?;
-    for column in 0..dimension {
-        let mut pivot = 0;
-        for row in 1..dimension {
-            if rotation[[row, column]].abs() > rotation[[pivot, column]].abs() {
-                pivot = row;
-            }
-        }
-        if rotation[[pivot, column]] < 0.0 {
-            for row in 0..dimension {
-                rotation[[row, column]] = -rotation[[row, column]];
-            }
-        }
-    }
-    let tolerance = 64.0 * dimension as f64 * f64::EPSILON;
-    let mut row_major = Vec::with_capacity(dimension.saturating_mul(dimension));
-    for row in 0..dimension {
-        for column in 0..dimension {
-            let mut dot = 0.0;
-            for inner in 0..dimension {
-                dot += rotation[[inner, row]] * rotation[[inner, column]];
-            }
-            let expected = if row == column { 1.0 } else { 0.0 };
-            if (dot - expected).abs() > tolerance {
-                return Err(Error::index(format!(
-                    "PCA random rotation failed orthogonality validation: row={row}, column={column}, value={dot}, tolerance={tolerance}"
-                )));
-            }
-            row_major.push(rotation[[row, column]]);
-        }
-    }
-    Ok(row_major)
-}
-
-fn assemble_transform(
-    basis: &[f64],
-    rotation: Option<&[f64]>,
-    input_dimension: usize,
-    output_dimension: usize,
-) -> Result<Vec<f64>> {
-    let length = output_dimension
-        .checked_mul(input_dimension)
-        .ok_or_else(|| Error::invalid_input("PCA transform matrix shape overflows usize"))?;
-    if basis.len() != length {
-        return Err(Error::index(format!(
-            "PCA retained basis length={} does not match shape [{output_dimension}, {input_dimension}]",
-            basis.len()
-        )));
-    }
-    let Some(rotation) = rotation else {
-        return Ok(basis.to_vec());
-    };
-    let mut transform = vec![0.0; length];
-    for row in 0..output_dimension {
-        for column in 0..input_dimension {
-            let mut value = 0.0;
-            for inner in 0..output_dimension {
-                value += rotation[row * output_dimension + inner]
-                    * basis[inner * input_dimension + column];
-            }
-            transform[row * input_dimension + column] = value;
-        }
-    }
-    Ok(transform)
-}
-
 fn canonical_f32(value: f64) -> Result<f32> {
     let value = value as f32;
     if !value.is_finite() {
@@ -1839,9 +1738,7 @@ mod tests {
         let mut scatter = vec![0.0; dimension * dimension];
         accumulate_centered_scatter(&values, &mean, &mut scatter)
             .expect("scatter accumulation should work");
-        let params = PcaParams::new(2)
-            .with_random_rotation(true)
-            .with_rotation_seed(31);
+        let params = PcaParams::new(2);
 
         let in_memory = PcaModel::train(&vectors, &params).expect("array training should work");
         let from_scatter = PcaModel::train_from_scatter(&mean, rows, &scatter, &params)
@@ -1937,46 +1834,6 @@ mod tests {
             5.0,
             epsilon = 1.0e-12
         );
-    }
-
-    #[test]
-    fn random_rotation_is_deterministic_and_preserves_distance() {
-        let vectors = f32_vectors(full_rank_values(9, 4), 4);
-        let plain =
-            PcaModel::train(&vectors, &PcaParams::new(3)).expect("plain training should work");
-        let rotated_params = PcaParams::new(3)
-            .with_random_rotation(true)
-            .with_rotation_seed(17);
-        let rotated =
-            PcaModel::train(&vectors, &rotated_params).expect("rotation training should work");
-        let repeated =
-            PcaModel::train(&vectors, &rotated_params).expect("repeated training should work");
-        assert_eq!(
-            rotated.transform_matrix.values(),
-            repeated.transform_matrix.values()
-        );
-        assert_eq!(rotated.fingerprint(), repeated.fingerprint());
-        let plain_output = plain
-            .transform(&vectors)
-            .expect("plain transform should work");
-        let rotated_output = rotated
-            .transform(&vectors)
-            .expect("rotation transform should work");
-        let plain_values = plain_output.values().as_primitive::<Float32Type>();
-        let rotated_values = rotated_output.values().as_primitive::<Float32Type>();
-        let plain_distance: f32 = (0..3)
-            .map(|column| {
-                let difference = plain_values.value(column) - plain_values.value(3 + column);
-                difference * difference
-            })
-            .sum();
-        let rotated_distance: f32 = (0..3)
-            .map(|column| {
-                let difference = rotated_values.value(column) - rotated_values.value(3 + column);
-                difference * difference
-            })
-            .sum();
-        assert_relative_eq!(plain_distance, rotated_distance, max_relative = 1.0e-4);
     }
 
     #[test]

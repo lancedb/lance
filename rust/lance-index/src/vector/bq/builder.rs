@@ -1196,23 +1196,10 @@ impl From<RabitQuantizer> for Quantizer {
     }
 }
 
-/// Dense Gaussian matrix followed by Householder QR.
-///
-/// Callers supply the RNG so PCA can keep a rotation seed and RQ can keep its
-/// process-wide generator. The returned matrix is Q from `A = QR`.
-pub(crate) fn random_orthogonal_with_rng<R: rand::Rng>(
-    dimension: usize,
-    rng: &mut R,
-) -> Result<ndarray::Array2<f64>> {
-    let normal = rand_distr::Normal::new(0.0, 1.0).map_err(|error| {
-        Error::invalid_input(format!(
-            "orthogonal rotation standard normal distribution is invalid: {error}"
-        ))
-    })?;
-    let gaussian =
-        ndarray::Array2::from_shape_simple_fn((dimension, dimension), || normal.sample(rng));
-    let (q, _) = householder_qr(gaussian);
-    Ok(q)
+fn random_normal_matrix(n: usize) -> ndarray::Array2<f64> {
+    let mut rng = rand::rng();
+    let normal = rand_distr::Normal::new(0.0, 1.0).expect("standard normal distribution");
+    ndarray::Array2::from_shape_simple_fn((n, n), || normal.sample(&mut rng))
 }
 
 // implement the householder qr decomposition referenced from https://en.wikipedia.org/wiki/Householder_transformation#QR_decomposition
@@ -1262,9 +1249,8 @@ fn random_orthogonal<T: ArrowFloatType>(n: usize) -> ndarray::Array2<T::Native>
 where
     T::Native: FromPrimitive,
 {
-    let mut rng = rand::rng();
-    let q = random_orthogonal_with_rng(n, &mut rng)
-        .expect("standard normal orthogonal rotation must be constructible");
+    let a = random_normal_matrix(n);
+    let (q, _) = householder_qr(a);
 
     // cast f64 matrix to T::Native matrix
     q.mapv(|v| T::Native::from_f64(v).unwrap())
@@ -1282,12 +1268,6 @@ mod tests {
     use rstest::rstest;
 
     use crate::vector::bq::storage::RABIT_BLOCKED_EX_CODE_COLUMN;
-
-    fn random_normal_matrix(n: usize) -> ndarray::Array2<f64> {
-        let mut rng = rand::rng();
-        let normal = rand_distr::Normal::new(0.0, 1.0).expect("standard normal distribution");
-        ndarray::Array2::from_shape_simple_fn((n, n), || normal.sample(&mut rng))
-    }
 
     #[rstest::rstest]
     #[case::one(1)]
