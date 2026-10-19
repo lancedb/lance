@@ -110,6 +110,23 @@ pub fn l2_scalar<
     from: &[T],
     to: &[T],
 ) -> Output {
+    l2_scalar_mixed::<T, T, Output, LANES>(from, to)
+}
+
+/// [`l2_scalar`] with differently typed inputs, so a caller can convert a
+/// query once and reuse it across a batch. Converting to `Output` up front
+/// gives the same values as converting inside the loop, so results match
+/// [`l2_scalar`] on the unconverted inputs bit for bit.
+#[inline(always)]
+fn l2_scalar_mixed<
+    X: AsPrimitive<Output>,
+    Y: AsPrimitive<Output>,
+    Output: Num + Copy + Sum + AddAssign + 'static,
+    const LANES: usize,
+>(
+    from: &[X],
+    to: &[Y],
+) -> Output {
     assert_equal_lengths(from.len(), to.len());
     let (x_chunks, x_remainder) = from.as_chunks::<LANES>();
     let (y_chunks, y_remainder) = to.as_chunks::<LANES>();
@@ -250,9 +267,18 @@ impl L2 for f16 {
         assert_batch_output_layout(x.len(), batch.len(), dimension, output.len());
         // Selecting the backend reads several runtime feature flags, which
         // costs as much as a dimension-8 distance, so select it once per batch.
+        // The scalar backend converts the query to f32 once, instead of once
+        // per vector, and gets its own loop so the scalar kernel inlines.
         let backend = f16_backend();
-        for (distance, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
-            *distance = l2_f16_with(backend, x, y);
+        if backend == HalfBackend::Scalar {
+            let x: Vec<f32> = x.iter().map(|v| v.to_f32()).collect();
+            for (distance, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
+                *distance = l2_scalar_mixed::<f32, Self, f32, 16>(&x, y);
+            }
+        } else {
+            for (distance, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
+                *distance = l2_f16_with(backend, x, y);
+            }
         }
     }
 }
@@ -368,46 +394,53 @@ impl L2 for f64 {
     #[inline]
     fn l2(x: &[Self], y: &[Self]) -> f32 {
         assert_equal_lengths(x.len(), y.len());
-        #[cfg(target_arch = "x86_64")]
-        {
-            l2_f64_with(*SIMD_SUPPORT, x, y)
-        }
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            l2_f64_simd_other(x, y)
-        }
+        l2_f64_simd(x, y)
     }
 
     fn l2_batch_into(x: &[Self], batch: &[Self], dimension: usize, output: &mut [f32]) {
         assert_batch_output_layout(x.len(), batch.len(), dimension, output.len());
         // Reading `SIMD_SUPPORT` per vector costs a large share of a
-        // dimension-8 distance, so read it once per batch.
+        // dimension-8 distance, so pick the tier once per batch. Each tier's
+        // loop carries that tier's target features, so its kernel inlines.
         #[cfg(target_arch = "x86_64")]
-        let support = *SIMD_SUPPORT;
+        match *SIMD_SUPPORT {
+            SimdSupport::Avx512 | SimdSupport::Avx512FP16 => unsafe {
+                x86::l2_batch_f64_avx512(x, batch, dimension, output)
+            },
+            SimdSupport::Avx2 | SimdSupport::AvxFma => unsafe {
+                x86::l2_batch_f64_avx_fma(x, batch, dimension, output)
+            },
+            SimdSupport::Avx => unsafe { x86::l2_batch_f64_avx(x, batch, dimension, output) },
+            _ => {
+                for (distance, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
+                    *distance = l2_f64_scalar(x, y);
+                }
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
         for (distance, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
-            #[cfg(target_arch = "x86_64")]
-            {
-                *distance = l2_f64_with(support, x, y);
-            }
-            #[cfg(not(target_arch = "x86_64"))]
-            {
-                *distance = l2_f64_simd_other(x, y);
-            }
+            *distance = l2_f64_simd_other(x, y);
         }
     }
 }
 
-/// L2 distance for f64 on x86_64 at a given SIMD tier
-/// (AVX-512 / AVX2+FMA / AVX+FMA / AVX / scalar). Non-x86 uses
-/// `l2_f64_simd_other`, unconditionally backed by NEON / LSX-LASX.
-#[cfg(target_arch = "x86_64")]
-#[inline(always)]
-fn l2_f64_with(support: SimdSupport, x: &[f64], y: &[f64]) -> f32 {
-    match support {
-        SimdSupport::Avx512 | SimdSupport::Avx512FP16 => unsafe { x86::l2_f64_avx512(x, y) },
-        SimdSupport::Avx2 | SimdSupport::AvxFma => unsafe { x86::l2_f64_avx_fma(x, y) },
-        SimdSupport::Avx => unsafe { x86::l2_f64_avx(x, y) },
-        _ => l2_f64_scalar(x, y),
+/// L2 distance for f64, runtime-dispatched via `SIMD_SUPPORT` on x86_64
+/// (AVX-512 / AVX2+FMA / AVX+FMA / AVX / scalar). Non-x86 uses the SIMD
+/// primitives in `crate::simd::f64`, unconditionally backed by NEON / LSX-LASX.
+#[inline]
+fn l2_f64_simd(x: &[f64], y: &[f64]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        match *SIMD_SUPPORT {
+            SimdSupport::Avx512 | SimdSupport::Avx512FP16 => unsafe { x86::l2_f64_avx512(x, y) },
+            SimdSupport::Avx2 | SimdSupport::AvxFma => unsafe { x86::l2_f64_avx_fma(x, y) },
+            SimdSupport::Avx => unsafe { x86::l2_f64_avx(x, y) },
+            _ => l2_f64_scalar(x, y),
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        l2_f64_simd_other(x, y)
     }
 }
 
@@ -505,8 +538,40 @@ mod x86 {
         }
     }
 
+    #[target_feature(enable = "avx512f")]
+    pub unsafe fn l2_batch_f64_avx512(
+        x: &[f64],
+        batch: &[f64],
+        dimension: usize,
+        output: &mut [f32],
+    ) {
+        for (distance, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
+            *distance = unsafe { l2_f64_avx512(x, y) };
+        }
+    }
+
+    #[target_feature(enable = "avx,fma")]
+    pub unsafe fn l2_batch_f64_avx_fma(
+        x: &[f64],
+        batch: &[f64],
+        dimension: usize,
+        output: &mut [f32],
+    ) {
+        for (distance, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
+            *distance = unsafe { l2_f64_avx_fma(x, y) };
+        }
+    }
+
+    #[target_feature(enable = "avx")]
+    pub unsafe fn l2_batch_f64_avx(x: &[f64], batch: &[f64], dimension: usize, output: &mut [f32]) {
+        for (distance, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
+            *distance = unsafe { l2_f64_avx(x, y) };
+        }
+    }
+
     /// AVX-512 path for f64: 8-wide `__m512d` with `vsubpd` + `vfmadd231pd` per iteration.
     #[target_feature(enable = "avx512f")]
+    #[inline]
     pub unsafe fn l2_f64_avx512(x: &[f64], y: &[f64]) -> f32 {
         let dim = x.len();
         let unrolled_len = dim / 8 * 8;
@@ -533,6 +598,7 @@ mod x86 {
 
     /// AVX + FMA path for f64. Covers both AvxFma and AVX2 dispatch (body uses no AVX2-specific intrinsics).
     #[target_feature(enable = "avx,fma")]
+    #[inline]
     pub unsafe fn l2_f64_avx_fma(x: &[f64], y: &[f64]) -> f32 {
         let dim = x.len();
         let unrolled_len = dim / 8 * 8;
@@ -568,6 +634,7 @@ mod x86 {
 
     /// AVX-only path for f64 (no FMA): squared diff via `_mm256_mul_pd` + `_mm256_add_pd` for Sandy/Ivy Bridge.
     #[target_feature(enable = "avx")]
+    #[inline]
     pub unsafe fn l2_f64_avx(x: &[f64], y: &[f64]) -> f32 {
         let dim = x.len();
         let unrolled_len = dim / 4 * 4;
@@ -1240,7 +1307,7 @@ mod tests {
             (x, y) in arbitrary_vector_pair(arbitrary_f64, 4..4048)
         ) {
             let scalar = l2_f64_scalar(&x, &y);
-            let simd = <f64 as L2>::l2(&x, &y);
+            let simd = l2_f64_simd(&x, &y);
             prop_assert!(approx::relative_eq!(scalar, simd, max_relative = 1e-6));
         }
 
