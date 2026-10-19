@@ -138,11 +138,12 @@ impl<'a> CreateIndexBuilder<'a> {
     }
 
     /// Train from rows already in the B-tree's shape: sorted by value, each
-    /// with its row id. An index that trains from another shape is refused.
+    /// with its row address. An index that trains from another shape is
+    /// refused.
     pub fn preprocessed_data(self, reader: Box<dyn RecordBatchReader + Send + 'static>) -> Self {
         self.preprocessed_stream(
             reader_to_stream(reader),
-            TrainingCriteria::new(TrainingOrdering::Values).with_row_id(),
+            TrainingCriteria::new(TrainingOrdering::Values).with_row_addr(),
         )
     }
 
@@ -1728,7 +1729,8 @@ mod tests {
         // - the build callback should surface public build stages such as load_data,
         //   tokenize_docs, copy_partitions, and write_metadata
         // - the merge callback should surface public merge stages such as
-        //   read_partition_metadata, remap_partition_files, and write_merged_metadata
+        //   read_partition_metadata, remap_partition_files, consolidate_partitions,
+        //   and write_merged_metadata
         // - merge stages should be reported in execution order
         let tmpdir = TempStrDir::default();
         let dataset_uri = format!("file://{}", tmpdir.as_str());
@@ -1848,11 +1850,19 @@ mod tests {
                 .any(|e| e == "progress:read_partition_metadata"),
             "expected read_partition_metadata progress during public merge"
         );
+        // Three tiny shards consolidate into one partition, so the finalize
+        // reports the merge group rather than per-file copies; either way the
+        // root metadata is published only after that stage completes.
+        let consolidate_complete = merge_tags
+            .iter()
+            .position(|e| e == "complete:consolidate_partitions")
+            .expect("missing consolidate_partitions complete");
+        assert!(consolidate_complete < metadata_start);
         assert!(
             merge_tags
                 .iter()
-                .any(|e| e == "progress:remap_partition_files"),
-            "expected remap_partition_files progress during public merge"
+                .any(|e| e == "progress:consolidate_partitions"),
+            "expected consolidate_partitions progress during public merge"
         );
         assert!(
             merge_tags
@@ -2197,8 +2207,8 @@ mod tests {
         let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
         let mut dataset = Dataset::write(reader, &dataset_uri, None).await.unwrap();
 
-        // The worker scans the dataset's `(id, _rowid)` rows and sorts them by value,
-        // producing the BTree training stream `(value, _rowid)` externally — the "scan,
+        // The worker scans the dataset's `(id, _rowaddr)` rows and sorts them by value,
+        // producing the BTree training stream `(value, _rowaddr)` externally — the "scan,
         // sort, then hand a pre-sorted reader to the builder" path; no `range_id`.
         let sorted_batches: Vec<RecordBatch> = {
             let mut scan = dataset.scan();
@@ -2206,7 +2216,7 @@ mod tests {
                 "id".to_string(),
             )]))
             .unwrap();
-            scan.with_row_id();
+            scan.with_row_address();
             scan.project_with_transform(&[("value", "id")]).unwrap();
             scan.try_into_stream()
                 .await
@@ -2220,6 +2230,10 @@ mod tests {
             RecordBatchIterator::new(sorted_batches.into_iter().map(Ok), train_schema);
 
         // Build one self-contained segment directly from the sorted reader.
+        // This is also what the Java binding's generic preprocessed-data path
+        // exercises for a BTree index (see `execute_create_index` in
+        // `java/lance-jni/src/blocking_dataset.rs`), so this doubles as that
+        // path's regression coverage.
         let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::BTree);
         let segment = CreateIndexBuilder::new(&mut dataset, &["id"], IndexType::BTree, &params)
             .name("id_btree".to_string())

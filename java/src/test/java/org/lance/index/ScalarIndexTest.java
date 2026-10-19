@@ -1086,13 +1086,13 @@ public class ScalarIndexTest {
                   dataset.newScan(
                       new ScanOptions.Builder()
                           .fragmentIds(Collections.singletonList(fragment.getId()))
-                          .withRowId(true)
+                          .withRowAddress(true)
                           .columns(Collections.singletonList("id"))
                           .build());
               ArrowReader arrowReader = scanner.scanBatches(); ) {
             while (arrowReader.loadNextBatch()) {
               VectorSchemaRoot root = arrowReader.getVectorSchemaRoot();
-              UInt8Vector rowIdVec = (UInt8Vector) root.getVector("_rowid");
+              UInt8Vector rowIdVec = (UInt8Vector) root.getVector("_rowaddr");
               IntVector idVec = (IntVector) root.getVector("id");
               for (int i = 0; i < root.getRowCount(); i++) {
                 data.add(new long[] {idVec.get(i), rowIdVec.get(i)});
@@ -1126,12 +1126,12 @@ public class ScalarIndexTest {
         new Schema(
             Arrays.asList(
                 Field.nullable("value", new ArrowType.Int(32, true)),
-                Field.nullable("_rowid", new ArrowType.Int(64, false))),
+                Field.nullable("_rowaddr", new ArrowType.Int(64, false))),
             null);
     try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
       root.allocateNew();
       IntVector idVec = (IntVector) root.getVector("value");
-      UInt8Vector rowIdVec = (UInt8Vector) root.getVector("_rowid");
+      UInt8Vector rowIdVec = (UInt8Vector) root.getVector("_rowaddr");
       for (int i = 0; i < preprocessedData.size(); i++) {
         long[] dataPair = preprocessedData.get(i);
         idVec.setSafe(i, (int) dataPair[0]);
@@ -1893,9 +1893,20 @@ public class ScalarIndexTest {
         assertTrue(
             events.contains("progress:read_partition_metadata:2"),
             "Expected metadata progress to reach both fragments, got: " + events);
+        // Small staged partitions are consolidated instead of copied, so the
+        // finalize reports its work under consolidate_partitions; either stage
+        // must finish before the root metadata is written.
         assertTrue(
-            events.stream().anyMatch(event -> event.startsWith("progress:remap_partition_files:")),
-            "Expected remap progress, got: " + events);
+            events.stream()
+                .anyMatch(
+                    event ->
+                        event.startsWith("progress:remap_partition_files:")
+                            || event.startsWith("progress:consolidate_partitions:")),
+            "Expected copy or consolidation progress, got: " + events);
+        if (events.contains("complete:consolidate_partitions")) {
+          assertEventsInOrder(
+              events, "complete:consolidate_partitions", "start:write_merged_metadata:");
+        }
         assertTrue(
             events.contains("progress:write_merged_metadata:1"),
             "Expected merged metadata write progress, got: " + events);

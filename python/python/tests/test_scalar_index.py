@@ -491,7 +491,17 @@ def test_merge_index_metadata_inverted_index_progress_callback(tmp_path):
     )
     assert metadata_progress
     assert metadata_progress[-1] == len(ds.get_fragments())
-    assert "progress:remap_partition_files" in tags
+    # Small staged partitions are consolidated instead of copied, so the work
+    # is reported under consolidate_partitions; either stage must complete
+    # before the root metadata is written.
+    assert (
+        "progress:remap_partition_files" in tags
+        or "progress:consolidate_partitions" in tags
+    )
+    if "complete:consolidate_partitions" in tags:
+        assert tags.index("complete:consolidate_partitions") < tags.index(
+            "start:write_merged_metadata"
+        )
     assert "progress:write_merged_metadata" in tags
 
 
@@ -6329,6 +6339,10 @@ def test_describe_indices(tmp_path, format_version, expected_format_version):
         "{}",
         "{}",
     ]
+    # BTree only stores row addresses (bumping its on-disk format version to
+    # 1) on a dataset with stable row ids; this dataset doesn't enable them,
+    # so BTree stays at version 0 along with every other index type here.
+    index_versions = [0, 0, 0, 0, 0, 0]
 
     for i in range(len(indices)):
         assert indices[i].name == names[i]
@@ -6340,7 +6354,7 @@ def test_describe_indices(tmp_path, format_version, expected_format_version):
         assert len(indices[i].segments) == 1
         assert indices[i].segments[0].fragment_ids == {0}
         assert indices[i].segments[0].dataset_version_at_last_update == i + 2
-        assert indices[i].segments[0].index_version == 0
+        assert indices[i].segments[0].index_version == index_versions[i]
         assert indices[i].segments[0].created_at is not None
         assert isinstance(indices[i].segments[0].created_at, datetime)
         assert indices[i].segments[0].size_bytes is not None
