@@ -7,6 +7,9 @@
 #[path = "stop_word_filter/stopwords.rs"]
 mod stopwords;
 
+#[path = "stop_word_filter/cjk.rs"]
+mod cjk;
+
 #[cfg(test)]
 #[path = "stop_word_filter/russian_tests.rs"]
 mod russian_tests;
@@ -41,12 +44,13 @@ fn all_stop_words() -> impl Iterator<Item = &'static str> {
         stopwords::SWEDISH,
         stop_words::get("ta"),
         stop_words::get("tr"),
-        stop_words::get("zh"),
-        stop_words::get("ja"),
+        cjk::CHINESE,
+        cjk::JAPANESE,
         stop_words::get("ko"),
     ]
     .into_iter()
     .flat_map(|words| words.iter().copied())
+    .filter(|word| !cjk::UNION_EXCLUSIONS.contains(word))
 }
 
 #[derive(Clone)]

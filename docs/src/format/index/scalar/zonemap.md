@@ -11,6 +11,13 @@ false positives that require rechecking.
 In addition, since finding NULLs is a common query pattern, the index also maintains a
 bitmap of null rows which allows it to return exact results for IS NULL queries.
 
+Table writers can collect column statistics as
+[write seeds](zone_write_seeds.md), using the data file's generic metadata
+and global buffers. An index builder may interpret compatible seeds instead of
+scanning column values. The file reader and writer do not interpret statistics
+or filters. Seeds have their own format and version, separate from the index file
+described below.
+
 ## Index Details
 
 ```protobuf
