@@ -427,6 +427,321 @@ fn base_value(i: i32) -> Option<i32> {
     (i % 7 != 3).then_some(i)
 }
 
+async fn dataset_without_seed_index(uri: &str) -> Dataset {
+    Dataset::write(
+        RecordBatchIterator::new([Ok(rows(0..30, base_value))], schema()),
+        uri,
+        Some(WriteParams {
+            max_rows_per_file: ROWS_PER_FILE,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap()
+}
+
+async fn assert_configured_seed_matches_physical(dataset: &Dataset, path: &str, column: &str) {
+    let physical = physical_column(dataset, path, column).await;
+    let mut expected = ZoneMapSeedWriter::new(column, 8192, physical.data_type().clone()).unwrap();
+    expected.observe_batch(&physical).unwrap();
+    assert_eq!(
+        seed_in_file(dataset, path, column).await.unwrap(),
+        expected.finish().unwrap().unwrap(),
+        "{path}: {column}"
+    );
+}
+
+#[tokio::test]
+async fn test_zone_write_seed_columns_select_replace_and_disable() {
+    let dir = TempStrDir::default();
+    let mut dataset = dataset_without_seed_index(dir.as_str()).await;
+    let original_files = data_file_paths(&dataset);
+    for fragment in dataset.fragments().iter() {
+        assert!(
+            seed_in_file(&dataset, &fragment.files[0].path, "val")
+                .await
+                .is_none()
+        );
+    }
+    assert_eq!(
+        dataset.manifest.reader_feature_flags & FLAG_ZONE_WRITE_SEEDS,
+        0
+    );
+
+    dataset
+        .set_zone_write_seed_columns(&["val", "untouched"])
+        .await
+        .unwrap();
+    assert_eq!(data_file_paths(&dataset), original_files, "no backfill");
+    assert_eq!(
+        dataset.manifest.reader_feature_flags & FLAG_ZONE_WRITE_SEEDS,
+        0
+    );
+    let mut dataset = Dataset::open(dir.as_str()).await.unwrap();
+    dataset
+        .append(
+            RecordBatchIterator::new([Ok(rows(30..40, base_value))], schema()),
+            None,
+        )
+        .await
+        .unwrap();
+    let file = &dataset.fragments().last().unwrap().files[0];
+    for column in ["val", "untouched"] {
+        assert_configured_seed_matches_physical(&dataset, &file.path, column).await;
+    }
+    assert!(seed_in_file(&dataset, &file.path, "id").await.is_none());
+    assert!(dataset.load_indices().await.unwrap().is_empty());
+    assert_ne!(
+        dataset.manifest.reader_feature_flags & FLAG_ZONE_WRITE_SEEDS,
+        0
+    );
+    assert_ne!(
+        dataset.manifest.writer_feature_flags & FLAG_ZONE_WRITE_SEEDS,
+        0
+    );
+
+    dataset.set_zone_write_seed_columns(&["id"]).await.unwrap();
+    dataset
+        .append(
+            RecordBatchIterator::new([Ok(rows(40..50, base_value))], schema()),
+            None,
+        )
+        .await
+        .unwrap();
+    let file = &dataset.fragments().last().unwrap().files[0];
+    assert_configured_seed_matches_physical(&dataset, &file.path, "id").await;
+    for column in ["val", "untouched"] {
+        assert!(seed_in_file(&dataset, &file.path, column).await.is_none());
+    }
+
+    dataset.set_zone_write_seed_columns(&[]).await.unwrap();
+    let mut dataset = Dataset::open(dir.as_str()).await.unwrap();
+    dataset
+        .append(
+            RecordBatchIterator::new([Ok(rows(50..60, base_value))], schema()),
+            None,
+        )
+        .await
+        .unwrap();
+    let file = &dataset.fragments().last().unwrap().files[0];
+    for column in ["id", "val", "untouched"] {
+        assert!(seed_in_file(&dataset, &file.path, column).await.is_none());
+    }
+    assert_ne!(
+        dataset.manifest.reader_feature_flags & FLAG_ZONE_WRITE_SEEDS,
+        0
+    );
+    assert_ne!(
+        dataset.manifest.writer_feature_flags & FLAG_ZONE_WRITE_SEEDS,
+        0
+    );
+    for path in &original_files {
+        assert!(seed_in_file(&dataset, path, "val").await.is_none());
+    }
+}
+
+#[tokio::test]
+async fn test_zone_write_seed_columns_follow_rename() {
+    let dir = TempStrDir::default();
+    let mut dataset = dataset_without_seed_index(dir.as_str()).await;
+    dataset.set_zone_write_seed_columns(&["val"]).await.unwrap();
+    dataset
+        .alter_columns(&[ColumnAlteration::new("val".into()).rename("renamed".into())])
+        .await
+        .unwrap();
+    let mut dataset = Dataset::open(dir.as_str()).await.unwrap();
+    let arrow_schema = Arc::new(ArrowSchema::from(dataset.schema()));
+    let batch = RecordBatch::try_new(
+        arrow_schema.clone(),
+        rows(30..40, base_value).columns().to_vec(),
+    )
+    .unwrap();
+    dataset
+        .append(RecordBatchIterator::new([Ok(batch)], arrow_schema), None)
+        .await
+        .unwrap();
+    let file = &dataset.fragments().last().unwrap().files[0];
+    assert_configured_seed_matches_physical(&dataset, &file.path, "renamed").await;
+    assert!(seed_in_file(&dataset, &file.path, "val").await.is_none());
+}
+
+#[tokio::test]
+async fn test_zone_write_seed_columns_reject_invalid_selection_atomically() {
+    let dir = TempStrDir::default();
+    let mut dataset = dataset_without_seed_index(dir.as_str()).await;
+    dataset.set_zone_write_seed_columns(&["val"]).await.unwrap();
+    let version = dataset.version_id();
+    let error = dataset
+        .set_zone_write_seed_columns(&["id", "missing"])
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("missing"));
+    assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+    assert_eq!(dataset.version_id(), version);
+    dataset
+        .append(
+            RecordBatchIterator::new([Ok(rows(30..40, base_value))], schema()),
+            None,
+        )
+        .await
+        .unwrap();
+    let file = &dataset.fragments().last().unwrap().files[0];
+    assert_configured_seed_matches_physical(&dataset, &file.path, "val").await;
+    assert!(seed_in_file(&dataset, &file.path, "id").await.is_none());
+}
+
+#[tokio::test]
+async fn test_zone_write_seed_columns_reject_nested_column() {
+    let dir = TempStrDir::default();
+    let child = Arc::new(ArrowField::new("age", DataType::Int32, false));
+    let values = StructArray::from(vec![(
+        child,
+        Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
+    )]);
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "customer",
+        values.data_type().clone(),
+        false,
+    )]));
+    let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(values)]).unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        dir.as_str(),
+        None,
+    )
+    .await
+    .unwrap();
+    let version = dataset.version_id();
+    for column in ["customer", "customer.age"] {
+        let error = dataset
+            .set_zone_write_seed_columns(&[column])
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains(column));
+        assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+        assert_eq!(dataset.version_id(), version);
+    }
+}
+
+#[tokio::test]
+async fn test_zone_write_seed_columns_boolean() {
+    let dir = TempStrDir::default();
+    let batch =
+        arrow_array::record_batch!(("flag", Boolean, [Some(true), None, Some(false)])).unwrap();
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch.clone())], schema.clone()),
+        dir.as_str(),
+        None,
+    )
+    .await
+    .unwrap();
+    dataset
+        .set_zone_write_seed_columns(&["flag"])
+        .await
+        .unwrap();
+    dataset
+        .append(RecordBatchIterator::new([Ok(batch)], schema), None)
+        .await
+        .unwrap();
+    let file = &dataset.fragments().last().unwrap().files[0];
+    assert_configured_seed_matches_physical(&dataset, &file.path, "flag").await;
+}
+
+#[rstest::rstest]
+#[case::index_requests_seeds(true)]
+#[case::index_declines_seeds(false)]
+#[tokio::test]
+async fn test_zone_write_seed_columns_preserve_index_writer(#[case] use_seeds: bool) {
+    let dir = TempStrDir::default();
+    let mut dataset = dataset_with_val_index(dir.as_str(), use_seeds).await;
+    dataset.set_zone_write_seed_columns(&["val"]).await.unwrap();
+    dataset
+        .append(
+            RecordBatchIterator::new([Ok(rows(30..40, base_value))], schema()),
+            None,
+        )
+        .await
+        .unwrap();
+    if use_seeds {
+        assert_seed_matches_data(&dataset, &[3], "val").await;
+    } else {
+        let file = &dataset.fragments().last().unwrap().files[0];
+        assert_configured_seed_matches_physical(&dataset, &file.path, "val").await;
+    }
+    dataset.set_zone_write_seed_columns(&[]).await.unwrap();
+    dataset
+        .append(
+            RecordBatchIterator::new([Ok(rows(40..50, base_value))], schema()),
+            None,
+        )
+        .await
+        .unwrap();
+    if use_seeds {
+        assert_seed_matches_data(&dataset, &[4], "val").await;
+    } else {
+        let file = &dataset.fragments().last().unwrap().files[0];
+        assert!(seed_in_file(&dataset, &file.path, "val").await.is_none());
+    }
+}
+
+#[rstest::rstest]
+#[case::full_rewrite("full")]
+#[case::partial_rewrite("partial")]
+#[case::refresh("refresh")]
+#[case::row_update("update")]
+#[case::compaction("compact")]
+#[tokio::test]
+async fn test_zone_write_seed_columns_rewrite_paths(#[case] path: &str) {
+    let dir = TempStrDir::default();
+    let mut dataset = dataset_without_seed_index(dir.as_str()).await;
+    dataset.set_zone_write_seed_columns(&["val"]).await.unwrap();
+    let before = data_file_paths(&dataset);
+    let dataset = match path {
+        "full" => merge_insert_val(dataset, 10..30).await,
+        "partial" => merge_insert_val(dataset, 13..27).await,
+        "refresh" => replace_column(dataset, "val", |_| true, replacement_value).await,
+        "update" => UpdateBuilder::new(Arc::new(dataset))
+            .update_where("id >= 10")
+            .unwrap()
+            .set("val", "val + 1000")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap()
+            .new_dataset
+            .as_ref()
+            .clone(),
+        "compact" => {
+            compact_files(
+                &mut dataset,
+                CompactionOptions {
+                    target_rows_per_fragment: 100,
+                    compaction_mode: Some(CompactionMode::Reencode),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+            dataset
+        }
+        _ => unreachable!(),
+    };
+    let mut checked = 0;
+    for fragment in dataset.fragments().iter() {
+        let file = serving_file(fragment, field_id(&dataset, "val"));
+        if !before.contains(&file.path) {
+            assert_configured_seed_matches_physical(&dataset, &file.path, "val").await;
+            checked += 1;
+        }
+    }
+    assert!(checked > 0);
+    assert!(dataset.load_indices().await.unwrap().is_empty());
+}
+
 fn zone_map_params(use_seeds: bool) -> ScalarIndexParams {
     ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap)
         .with_params(&serde_json::json!({"rows_per_zone": ROWS_PER_ZONE, "use_seeds": use_seeds}))
