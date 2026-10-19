@@ -9524,6 +9524,72 @@ mod tests {
         assert_zonemap_answers_match_scan(&dataset).await;
     }
 
+    /// When a remap-capable index (BTree) shares a stable-row-id table with a
+    /// ZoneMap, an eager compaction must still remap the BTree in place and
+    /// drop the ZoneMap's coverage of the rewritten fragments -- the same
+    /// outcome as each index alone -- even though `DatasetIndexRemapper`
+    /// never opens the ZoneMap to find that out (it isn't
+    /// `supports_eager_remap`, so it's excluded up front rather than opened
+    /// and found to report `RemapResult::Drop`).
+    #[tokio::test]
+    async fn test_eager_compaction_remaps_btree_and_drops_zonemap_coverage_together() {
+        let mut dataset = zonemap_stable_row_id_dataset("memory://").await;
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::BTree,
+                Some("id_idx".into()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        let id_idx_before = dataset.load_indices_by_name("id_idx").await.unwrap();
+        assert_eq!(id_idx_before.len(), 1);
+
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 512,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            dataset
+                .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+                .await
+                .unwrap()
+                .is_none(),
+            "an eager compaction writes no fragment-reuse index"
+        );
+
+        let id_idx_after = dataset.load_indices_by_name("id_idx").await.unwrap();
+        assert_eq!(id_idx_after.len(), 1);
+        assert_ne!(
+            id_idx_before[0].uuid, id_idx_after[0].uuid,
+            "the BTree must be remapped onto the rewritten fragments"
+        );
+        assert!(
+            zonemap_coverage(&dataset).await.is_empty(),
+            "the ZoneMap's coverage should have been dropped rather than remapped"
+        );
+
+        assert_zonemap_answers_match_scan(&dataset).await;
+        let mut by_id = dataset.scan();
+        by_id.filter("id = 7").unwrap();
+        by_id.project(&["id"]).unwrap();
+        assert_eq!(
+            by_id.try_into_batch().await.unwrap()["id"]
+                .as_primitive::<Int32Type>()
+                .values(),
+            &[7],
+        );
+    }
+
     /// The same compaction with `defer_index_remap` keeps the zone map covering
     /// its data: the FRI records the address moves and the index applies them on
     /// load, then bakes them in when the segments are merged.
