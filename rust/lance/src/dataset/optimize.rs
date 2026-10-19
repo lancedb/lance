@@ -2544,10 +2544,9 @@ async fn reject_eager_remap_over_undrained_fri(dataset: &Dataset) -> Result<()> 
         && !fri.is_empty()
     {
         return Err(Error::not_supported(
-            "Cannot eagerly compact: this stable-row-id table carries a fragment reuse \
-             index that is not fully drained, and an address-domain index exists that an \
-             eager remap would have to re-read through it. Drain the fragment reuse index \
-             first (run optimize_indices), or compact with defer_index_remap set",
+            "Cannot eagerly compact: defer_index_remap was activated by an earlier
+            compaction. Please run optimize_indices first or continue compacting
+            with defer_index_remap activated.",
         ));
     }
     Ok(())
