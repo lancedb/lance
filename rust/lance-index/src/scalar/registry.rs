@@ -145,25 +145,6 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
     /// newer version than this, it cannot be read
     fn version(&self) -> u32;
 
-    /// Whether this index type may support physically remapping row identifiers.
-    ///
-    /// Return `false` only when no instance supports [`ScalarIndex::remap`].
-    /// Compaction uses this declaration before opening index files or collecting
-    /// row addresses. It is independent of whether search results are row IDs or
-    /// physical addresses, and of query-time fragment-reuse translation.
-    ///
-    /// The default keeps remap preparation enabled for existing plugins and types
-    /// whose capability depends on the stored index. The loaded index's
-    /// [`ScalarIndex::can_remap`] remains the final check.
-    ///
-    /// ```
-    /// use lance_index::scalar::{registry::ScalarIndexPlugin, zonemap::ZoneMapIndexPlugin};
-    /// assert!(!ZoneMapIndexPlugin.can_remap());
-    /// ```
-    fn can_remap(&self) -> bool {
-        true
-    }
-
     /// Returns a new query parser for the index
     ///
     /// Can return None if this index cannot participate in query optimization

@@ -798,7 +798,7 @@ impl ScalarIndex for RTreeIndex {
     }
 
     fn can_remap(&self) -> bool {
-        RTreeIndexPlugin.can_remap()
+        false
     }
 
     async fn remap(
@@ -1231,10 +1231,6 @@ impl BasicTrainer for RTreeIndexPlugin {
 
 #[async_trait]
 impl ScalarIndexPlugin for RTreeIndexPlugin {
-    fn can_remap(&self) -> bool {
-        false
-    }
-
     fn basic_trainer(&self) -> Option<&dyn BasicTrainer> {
         Some(self)
     }

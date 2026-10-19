@@ -1657,7 +1657,7 @@ impl ScalarIndex for FMIndexScalarIndex {
     }
 
     fn can_remap(&self) -> bool {
-        FMIndexPlugin.can_remap()
+        false
     }
     async fn remap(&self, _: &RowAddrRemap, _: &dyn IndexStore) -> Result<CreatedIndex> {
         Err(Error::not_supported("Fm does not support remap"))
@@ -2305,10 +2305,6 @@ impl BasicTrainer for FMIndexPlugin {
 
 #[async_trait]
 impl ScalarIndexPlugin for FMIndexPlugin {
-    fn can_remap(&self) -> bool {
-        false
-    }
-
     fn basic_trainer(&self) -> Option<&dyn BasicTrainer> {
         Some(self)
     }

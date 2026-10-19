@@ -5661,9 +5661,9 @@ mod tests {
     #[rstest]
     #[case::without_index(&[], false, false, true)]
     #[case::btree(&[BuiltinIndexType::BTree], false, true, false)]
-    #[case::zonemap(&[BuiltinIndexType::ZoneMap], false, false, false)]
-    #[case::zonemap_stale_worker(&[BuiltinIndexType::ZoneMap], false, false, true)]
-    #[case::bloom_filter(&[BuiltinIndexType::BloomFilter], false, false, false)]
+    #[case::zonemap(&[BuiltinIndexType::ZoneMap], false, true, false)]
+    #[case::zonemap_skips_mapping(&[BuiltinIndexType::ZoneMap], false, true, true)]
+    #[case::bloom_filter(&[BuiltinIndexType::BloomFilter], false, true, false)]
     #[case::mixed(&[BuiltinIndexType::BTree, BuiltinIndexType::ZoneMap], false, true, false)]
     #[case::deferred_zonemap(&[BuiltinIndexType::ZoneMap], true, true, false)]
     #[tokio::test]
@@ -5671,7 +5671,7 @@ mod tests {
         #[case] index_types: &[BuiltinIndexType],
         #[case] defer_index_remap: bool,
         #[case] expect_row_addrs: bool,
-        #[case] has_stale_row_addrs: bool,
+        #[case] has_unused_row_addrs: bool,
     ) {
         let data = sample_data();
         let reader = RecordBatchIterator::new(vec![Ok(data.slice(0, 9_000))], data.schema());
@@ -5705,14 +5705,6 @@ mod tests {
             ..Default::default()
         };
         let original_indices = dataset.load_indices().await.unwrap();
-        let remappable = load_indices_for_remapping(&dataset).await.unwrap();
-        assert_eq!(
-            remappable.as_ref().map_or(0, |indices| indices.len()),
-            index_types
-                .iter()
-                .filter(|builtin| **builtin == BuiltinIndexType::BTree)
-                .count(),
-        );
         let plan = plan_compaction(&dataset, &options).await.unwrap();
         assert_eq!(plan.tasks().len(), 1);
 
@@ -5742,10 +5734,9 @@ mod tests {
                 row_addrs.len()
             );
         }
-        if has_stale_row_addrs {
-            // Simulate a stale worker result that captured row addresses before the
-            // dataset no longer needed a remapper. Invalid bytes ensure the commit
-            // does not attempt to deserialize or materialize the unused map.
+        if has_unused_row_addrs {
+            // Invalid bytes prove commit skips decoding and building the map
+            // when no index supports remapping, even if the worker captured it.
             result.row_addrs = Some(b"not a roaring treemap".to_vec());
         }
         commit_compaction(
