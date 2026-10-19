@@ -38,7 +38,8 @@ pub fn build_distance_table_l2_impl<const NUM_BITS: u32, T: L2>(
     let num_centroids = 2_usize.pow(NUM_BITS);
     let mut result = vec![0.0; num_sub_vectors * num_centroids];
     // Legacy writers allowed non-divisible dimensions and truncated the tail.
-    // Limit iteration to the sub-vectors that were persisted by those writers.
+    // Zipping with `result`, which has one row per persisted sub-vector,
+    // stops before that tail.
     for (i, (sub_vec, distances)) in query
         .chunks_exact(sub_vector_length)
         .zip(result.chunks_exact_mut(num_centroids))
@@ -98,7 +99,8 @@ pub fn build_distance_table_dot_impl<const NUM_BITS: u32, T: Dot>(
     let num_centroids = 2_usize.pow(NUM_BITS);
     let mut result = vec![0.0; num_sub_vectors * num_centroids];
     // Legacy writers allowed non-divisible dimensions and truncated the tail.
-    // Limit iteration to the sub-vectors that were persisted by those writers.
+    // Zipping with `result`, which has one row per persisted sub-vector,
+    // stops before that tail.
     for (i, (sub_vec, distances)) in query
         .chunks_exact(sub_vector_length)
         .zip(result.chunks_exact_mut(num_centroids))

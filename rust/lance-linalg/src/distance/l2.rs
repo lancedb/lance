@@ -538,8 +538,11 @@ mod x86 {
         }
     }
 
+    /// # Safety
+    ///
+    /// The host must support AVX-512F.
     #[target_feature(enable = "avx512f")]
-    pub unsafe fn l2_batch_f64_avx512(
+    pub(super) unsafe fn l2_batch_f64_avx512(
         x: &[f64],
         batch: &[f64],
         dimension: usize,
@@ -550,8 +553,11 @@ mod x86 {
         }
     }
 
+    /// # Safety
+    ///
+    /// The host must support AVX and FMA.
     #[target_feature(enable = "avx,fma")]
-    pub unsafe fn l2_batch_f64_avx_fma(
+    pub(super) unsafe fn l2_batch_f64_avx_fma(
         x: &[f64],
         batch: &[f64],
         dimension: usize,
@@ -562,8 +568,16 @@ mod x86 {
         }
     }
 
+    /// # Safety
+    ///
+    /// The host must support AVX.
     #[target_feature(enable = "avx")]
-    pub unsafe fn l2_batch_f64_avx(x: &[f64], batch: &[f64], dimension: usize, output: &mut [f32]) {
+    pub(super) unsafe fn l2_batch_f64_avx(
+        x: &[f64],
+        batch: &[f64],
+        dimension: usize,
+        output: &mut [f32],
+    ) {
         for (distance, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
             *distance = unsafe { l2_f64_avx(x, y) };
         }
@@ -1482,17 +1496,20 @@ mod tests {
     #[rstest::rstest]
     #[case::dim_8(8)]
     #[case::dim_12(12)]
+    #[case::dim_13(13)]
     #[case::dim_16(16)]
     #[case::dim_32(32)]
     #[case::dim_1024(1024)]
     fn test_l2_batch_into_matches_per_vector_l2(#[case] dimension: usize) {
-        fn check<T: L2 + num_traits::FromPrimitive + Copy>(dimension: usize) {
+        fn check<T: L2 + num_traits::FromPrimitive + Copy>(dimension: usize, bit_exact: bool) {
             let num_vectors = 130;
+            // Values that are not multiples of a power of two, so the sums
+            // round and a different summation order changes the result.
             let x: Vec<T> = (0..dimension)
-                .map(|i| T::from_f32(((i % 13) as f32) * 0.25 + 1.0).unwrap())
+                .map(|i| T::from_f32((i as f32 * 0.37).sin()).unwrap())
                 .collect();
             let batch: Vec<T> = (0..dimension * num_vectors)
-                .map(|i| T::from_f32(((i % 11) as f32) * 0.5 - 2.0).unwrap())
+                .map(|i| T::from_f32((i as f32 * 0.73).cos() * 2.0).unwrap())
                 .collect();
 
             let mut got = vec![f32::NAN; num_vectors];
@@ -1500,15 +1517,82 @@ mod tests {
 
             for (g, y) in got.iter().zip(batch.chunks_exact(dimension)) {
                 let w = T::l2(&x, y);
-                assert!(
-                    approx::relative_eq!(*g, w, epsilon = 1e-4, max_relative = 1e-5),
-                    "dim {dimension}: batch {g} != per-vector {w}"
+                if bit_exact {
+                    assert_eq!(
+                        g.to_bits(),
+                        w.to_bits(),
+                        "dim {dimension}: batch {g} != per-vector {w}"
+                    );
+                } else {
+                    assert!(
+                        approx::relative_eq!(*g, w, epsilon = 1e-4, max_relative = 1e-5),
+                        "dim {dimension}: batch {g} != per-vector {w}"
+                    );
+                }
+            }
+        }
+        // Above dimension 16 the f32 batch kernel is a different kernel from
+        // the pair kernel, so only f32 is compared with a tolerance. The f64
+        // and f16 batch loops run the pair kernel's arithmetic.
+        check::<f32>(dimension, false);
+        check::<f64>(dimension, true);
+        check::<f16>(dimension, true);
+    }
+
+    /// Each x86 f64 batch loop must match its pair kernel bit for bit,
+    /// including the tiers this host's `SIMD_SUPPORT` doesn't select.
+    #[cfg(target_arch = "x86_64")]
+    #[rstest::rstest]
+    #[case::dim_8(8)]
+    #[case::dim_13(13)]
+    #[case::dim_1024(1024)]
+    fn test_l2_batch_f64_tiers_match_pair_kernels(#[case] dimension: usize) {
+        type BatchFn = unsafe fn(&[f64], &[f64], usize, &mut [f32]);
+        type PairFn = unsafe fn(&[f64], &[f64]) -> f32;
+
+        let num_vectors = 37;
+        let x: Vec<f64> = (0..dimension).map(|i| (i as f64 * 0.37).sin()).collect();
+        let batch: Vec<f64> = (0..dimension * num_vectors)
+            .map(|i| (i as f64 * 0.73).cos() * 2.0)
+            .collect();
+
+        let tiers: [(&str, bool, BatchFn, PairFn); 3] = [
+            (
+                "avx512",
+                std::is_x86_feature_detected!("avx512f"),
+                x86::l2_batch_f64_avx512,
+                x86::l2_f64_avx512,
+            ),
+            (
+                "avx_fma",
+                std::is_x86_feature_detected!("avx") && std::is_x86_feature_detected!("fma"),
+                x86::l2_batch_f64_avx_fma,
+                x86::l2_f64_avx_fma,
+            ),
+            (
+                "avx",
+                std::is_x86_feature_detected!("avx"),
+                x86::l2_batch_f64_avx,
+                x86::l2_f64_avx,
+            ),
+        ];
+        for (name, is_supported, batch_fn, pair_fn) in tiers {
+            if !is_supported {
+                continue;
+            }
+            let mut got = vec![f32::NAN; num_vectors];
+            // SAFETY: the host supports this tier's target features.
+            unsafe { batch_fn(&x, &batch, dimension, &mut got) };
+            for (g, y) in got.iter().zip(batch.chunks_exact(dimension)) {
+                // SAFETY: as above.
+                let want = unsafe { pair_fn(&x, y) };
+                assert_eq!(
+                    g.to_bits(),
+                    want.to_bits(),
+                    "{name} dim {dimension}: batch {g} != pair {want}"
                 );
             }
         }
-        check::<f32>(dimension);
-        check::<f64>(dimension);
-        check::<f16>(dimension);
     }
 
     #[rstest::rstest]
