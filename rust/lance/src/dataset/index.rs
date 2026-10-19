@@ -12,7 +12,7 @@ use crate::Dataset;
 use crate::dataset::optimize::RemappedIndex;
 use crate::dataset::optimize::remapping::RemapResult;
 use crate::index::remap_index;
-use crate::index::scalar::{IndexDetails, infer_scalar_index_details};
+use crate::index::scalar::infer_scalar_index_details;
 use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
 use arrow_schema::DataType;
 use async_trait::async_trait;
@@ -56,57 +56,46 @@ impl IndexRemapperOptions for DatasetIndexRemapperOptions {
             return Ok(None);
         };
 
-        // During compaction, this runs after the data rewrite and before commit
-        // materializes the address map. Keep the rewrite-time metadata check free of index I/O.
-        let mut has_remappable_index = false;
+        // Check capabilities after rewriting data but before materializing the
+        // address map. Opening here uses the same loaders and cache as remap_index.
         for index in indices.iter().filter(|index| !is_system_index(index)) {
-            // can_remap() belongs to ScalarIndex, not VectorIndex. Metadata without
-            // type details also keeps its existing type-inference/loading path.
-            let is_known_scalar = index
-                .index_details
-                .as_ref()
-                .is_some_and(|details| IndexDetails(details.clone()).get_plugin().is_ok());
-            // remap_index validates covering fields before withdrawing a covered
-            // index. An early can_remap() == false must not bypass that validation.
-            let field_path = if is_known_scalar && index.covering_fields.is_empty() {
-                // Composite indices and unresolved fields must still reach the
-                // existing remap validation, not be treated as safe to skip.
-                index
-                    .keyed_field()
-                    .and_then(|field_id| dataset.schema().field_path(field_id).ok())
-            } else {
-                None
-            };
-
-            if let Some(field_path) = field_path {
-                match dataset
-                    .open_scalar_index(&field_path, &index.uuid, &NoOpMetricsCollector)
-                    .await
-                {
-                    Ok(scalar_index) if !scalar_index.can_remap() => continue,
-                    Ok(_) => {}
-                    // A failed load does not establish that remapping is unnecessary.
-                    Err(error) => log::warn!(
-                        "Cannot check remap support for index '{}': {}. \
-                         Retaining the existing remap path.",
-                        index.uuid,
-                        error
-                    ),
+            let can_remap: Result<bool> = async {
+                // Do not let an early skip hide corrupt covering metadata.
+                index.validate_covering_fields()?;
+                let [field_id] = index.fields.as_slice() else {
+                    // Covered and composite indices need remap_index's handling.
+                    return Ok(true);
+                };
+                let field_path = dataset.schema().field_path(*field_id)?;
+                let generic = dataset
+                    .open_generic_index(&field_path, &index.uuid, &NoOpMetricsCollector)
+                    .await?;
+                if !generic.index_type().is_scalar() {
+                    return Ok(true);
                 }
+                let scalar = dataset
+                    .open_scalar_index(&field_path, &index.uuid, &NoOpMetricsCollector)
+                    .await?;
+                Ok(scalar.can_remap())
             }
-            // One index needing the map is enough; keep the existing remapper
-            // and its affected-fragment filtering without opening more indices.
-            has_remappable_index = true;
-            break;
+            .await;
+            match can_remap {
+                Ok(false) => continue,
+                Ok(true) => {}
+                // Preserve error handling after the remapper filters affected fragments.
+                Err(error) => log::warn!(
+                    "Cannot check remap support for index '{}': {}. \
+                     Retaining the existing remap path.",
+                    index.uuid,
+                    error
+                ),
+            }
+            return Ok(Some(Box::new(DatasetIndexRemapper {
+                dataset: Arc::new(dataset.clone()),
+                indices,
+            })));
         }
-        if !has_remappable_index {
-            return Ok(None);
-        }
-
-        Ok(Some(Box::new(DatasetIndexRemapper {
-            dataset: Arc::new(dataset.clone()),
-            indices,
-        })))
+        Ok(None)
     }
 }
 
@@ -604,23 +593,17 @@ mod tests {
         let _ = index_uuid;
     }
 
-    /// The same migration path must reject -- cleanly, not with a panic -- a
-    /// malformed `covering_fields` longer than `fields`.
-    ///
-    /// Note this is a genuinely synthetic scenario, not one a real commit can
-    /// produce: `crate::index::remap_index`'s own `keyed > 1` guard (a sibling
-    /// fix in this same phase) already rejects every organically-committable
-    /// composite index *before* this migration path ever runs, since it is
-    /// only reached from that function's `RemapResult::Keep` arm. And
-    /// `validate_covering_fields` rejects a fully-consumed `covering_fields`
-    /// (`keyed == 0` with non-empty `fields`) at `Operation::CreateIndex`
-    /// commit time, and `TryFrom<pb::IndexMetadata>` rejects it again when a
-    /// manifest is decoded. The only way left to reach this branch's rejection
-    /// is metadata that passed through neither, which is how this test reaches
-    /// it: seeding the index cache directly rather than committing through a
-    /// `Transaction`.
+    // Seed the cache directly: normal commits and manifest decoding already
+    // reject malformed covering fields. Even an unremappable index must reach
+    // the existing validation instead of being silently skipped.
+    #[rstest]
+    #[case::legacy_btree(BuiltinIndexType::BTree, false)]
+    #[case::zonemap(BuiltinIndexType::ZoneMap, true)]
     #[tokio::test]
-    async fn test_remapper_migration_path_rejects_malformed_covering_fields() {
+    async fn test_remapper_rejects_malformed_covering_fields(
+        #[case] index_type: BuiltinIndexType,
+        #[case] has_details: bool,
+    ) {
         let reader = lance_datagen::gen_batch()
             .col("a", array::step::<arrow_array::types::Int32Type>())
             .into_reader_rows(RowCount::from(20), BatchCount::from(1));
@@ -628,9 +611,9 @@ mod tests {
         dataset
             .create_index(
                 &["a"],
-                IndexType::BTree,
+                IndexType::Scalar,
                 None,
-                &ScalarIndexParams::for_builtin(BuiltinIndexType::BTree),
+                &ScalarIndexParams::for_builtin(index_type),
                 false,
             )
             .await
@@ -640,15 +623,12 @@ mod tests {
         let mut indices = dataset.load_indices().await.unwrap().as_ref().clone();
         for idx in &mut indices {
             if idx.uuid == index_uuid {
-                // Force the legacy migration path, and malform `covering_fields`
-                // to be longer than `fields` -- more carried fields than fields
-                // at all. No normal commit can produce this.
-                idx.index_details = None;
-                // A real `index_details: None` entry predates every version bump
-                // too, so `index_version` must go back to 0 along with it --
-                // otherwise `unsupported_index_version` hides it as a too-new
-                // version of an unrecognized type before this path is even reached.
-                idx.index_version = 0;
+                if !has_details {
+                    // Missing details predate versioned indices; preserve that
+                    // legacy case alongside the current ZoneMap case.
+                    idx.index_details = None;
+                    idx.index_version = 0;
+                }
                 idx.covering_fields = idx
                     .fields
                     .iter()
