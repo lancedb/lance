@@ -14,7 +14,8 @@ index segments can reference different definitions.
 
 - `id`: a unique, non-zero table-local ID, not a position in the list.
 - `columns`: the ordered, non-empty list of distinct clustering column field IDs.
-- `provider`: the provider's non-empty, case-sensitive name.
+- `provider`: a unique, non-empty, case-sensitive identifier for the clustering
+  implementation, for example `com.example.zorder`.
 - `version`: a non-zero version assigned by the provider to these layout rules.
 
 The ID identifies the whole definition, including its provider and version.

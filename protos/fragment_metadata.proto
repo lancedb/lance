@@ -87,6 +87,7 @@ message DataFragment {
   uint64 physical_rows = 4;
 
   /* Optional reference to a clustering definition in the same manifest.
+   * References the clustering definition used to organize this fragment when it was created.
    * When present, the ID must be non-zero. Requires FLAG_OBJECT_METADATA (1 << 17)
    * in writer_feature_flags; no clustering reader flag is required.
    */
