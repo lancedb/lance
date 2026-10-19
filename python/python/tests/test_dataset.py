@@ -647,6 +647,30 @@ def test_row_id_btree_requires_stable_ids(tmp_path: Path):
         ds.create_scalar_index("_rowid", "BTREE")
 
 
+@pytest.mark.parametrize("start_empty", [True, False])
+def test_row_id_btree_empty_and_reinsert(tmp_path: Path, start_empty: bool):
+    data = pa.table({"i": pa.array([] if start_empty else range(4), type=pa.int64())})
+    ds = lance.write_dataset(
+        data, tmp_path, enable_stable_row_ids=True, max_rows_per_file=2
+    )
+    ds.create_scalar_index("_rowid", "BTREE", name="row_ids")
+    ds.delete("true")
+    assert ds.count_rows() == 0
+    assert ds.describe_indices()[0].fields == [-3]
+    assert ds._take_rows([]).num_rows == 0
+    empty_version = ds.version
+
+    ds = lance.write_dataset(pa.table({"i": [10, 11]}), tmp_path, mode="append")
+    first_id = 0 if start_empty else 4
+    keys = [first_id + 1, first_id, first_id + 1]
+    assert ds._take_rows(keys)["i"].to_pylist() == [11, 10, 11]
+    ds.optimize.optimize_indices()
+    reopened = lance.dataset(tmp_path)
+    assert reopened.describe_indices()[0].fields == [-3]
+    assert reopened._take_rows(keys)["i"].to_pylist() == [11, 10, 11]
+    assert lance.dataset(tmp_path, version=empty_version).count_rows() == 0
+
+
 @pytest.mark.parametrize("enable_stable_row_ids", [True, False])
 @pytest.mark.parametrize(
     "rows",
