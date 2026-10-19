@@ -766,6 +766,8 @@ impl FileReader {
         }
         let rel_start = (start - tail_offset) as usize;
         let rel_end = (end - tail_offset) as usize;
+        // Copied rather than sliced so the cached index does not pin the whole tail
+        // buffer, as `retained_global_buffers_from_tail` does.
         Some((
             start,
             Bytes::copy_from_slice(&tail_bytes[rel_start..rel_end]),
@@ -3796,6 +3798,110 @@ mod tests {
             stats.read_iops, 0,
             "column metadata already captured by the tail read must not be fetched again"
         );
+    }
+
+    #[tokio::test]
+    async fn test_lazy_reader_fetches_only_columns_outside_the_tail() {
+        let fs = FsFixture::default();
+        // Many columns: the column metadata region outgrows the tail read, so the
+        // retained window starts inside it. Columns before the window need a
+        // request, columns inside it do not.
+        let written_file = create_wide_direct_file(&fs, 128).await;
+
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let metadata_index = FileReader::read_metadata_index(&file_scheduler)
+            .await
+            .unwrap();
+        let (window_start, window) = metadata_index
+            .retained_column_metadata
+            .as_ref()
+            .expect("the tail must reach into the column metadata region");
+        let offsets = &metadata_index.column_metadata_offsets;
+        let (first_position, first_length) = offsets[0];
+        let (last_position, last_length) = offsets[offsets.len() - 1];
+        assert!(
+            first_position + first_length <= *window_start,
+            "c0 must lie before the retained window to be fetched"
+        );
+        assert!(
+            last_position >= *window_start
+                && last_position + last_length <= window_start + window.len() as u64,
+            "the last column must lie inside the retained window"
+        );
+
+        let projection = versions::reader_projection_from_column_names(
+            ConcreteFileVersion::V2_1,
+            &written_file.schema,
+            &["c0", "c127"],
+        )
+        .unwrap();
+        let eager_reader = FileReader::try_open(
+            file_scheduler.clone(),
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &test_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+        let expected = eager_reader
+            .read_stream_projected(
+                lance_io::ReadBatchParams::RangeFull,
+                127,
+                16,
+                projection.clone(),
+                FilterExpression::no_filter(),
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        let lazy_reader = ProjectedFileReader::try_open(
+            file_scheduler,
+            Some(projection.clone()),
+            Arc::<DecoderPlugins>::default(),
+            &test_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+        fs.object_store.io_stats_incremental();
+        let tasks = lazy_reader
+            .read_tasks(
+                lance_io::ReadBatchParams::Range(0..0),
+                127,
+                Some(projection),
+                FilterExpression::no_filter(),
+            )
+            .await
+            .unwrap();
+        assert!(collect_read_tasks(tasks, 1).await.is_empty());
+        let stats = fs.object_store.io_stats_incremental();
+        assert_eq!(
+            stats.read_iops, 1,
+            "only the column outside the tail window needs a request"
+        );
+        assert_eq!(
+            stats.read_bytes, first_length,
+            "the request must cover exactly the uncovered column's metadata"
+        );
+
+        let tasks = lazy_reader
+            .read_tasks(
+                lance_io::ReadBatchParams::RangeFull,
+                127,
+                None,
+                FilterExpression::no_filter(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(expected, collect_read_tasks(tasks, 16).await);
     }
 
     async fn assert_lazy_projection_matches_eager_and_reads_metadata_subset(
