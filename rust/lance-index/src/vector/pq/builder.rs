@@ -201,6 +201,45 @@ impl PQBuildParams {
     /// Build a [ProductQuantizer] from the given data.
     ///
     /// If the [`DistanceType`] is [`DistanceType::Cosine`], the input data will be normalized.
+    /// f16 k-means is scalar and accumulates in half precision: train on a
+    /// widened copy of the training rows and store the codebook narrowed back.
+    fn build_from_f16(
+        &self,
+        fsl: &FixedSizeListArray,
+        distance_type: DistanceType,
+    ) -> Result<ProductQuantizer> {
+        let f32_list = DataType::FixedSizeList(
+            Arc::new(arrow_schema::Field::new("item", DataType::Float32, true)),
+            fsl.value_length(),
+        );
+        let params = Self {
+            codebook: self
+                .codebook
+                .as_ref()
+                .map(|codebook| cast(codebook, &f32_list))
+                .transpose()?,
+            ..self.clone()
+        };
+        // The same leading rows `build_from_fsl` trains on (see
+        // `divide_to_subvectors`), so only the rows that are used get widened.
+        let training_rows = fsl.len().min(self.try_sample_size()?);
+        let training = cast(&fsl.slice(0, training_rows), &f32_list)?;
+        let pq =
+            params.build_from_fsl::<Float32Type>(training.as_fixed_size_list(), distance_type)?;
+        let codebook = cast(pq.codebook.values(), &DataType::Float16)?;
+        let codebook = FixedSizeListArray::try_new_from_values(
+            codebook.as_primitive::<Float16Type>().clone(),
+            pq.codebook.value_length(),
+        )?;
+        Ok(ProductQuantizer::new(
+            pq.num_sub_vectors,
+            pq.num_bits,
+            pq.dimension,
+            codebook,
+            pq.distance_type,
+        ))
+    }
+
     pub fn build(&self, data: &dyn Array, distance_type: DistanceType) -> Result<ProductQuantizer> {
         assert_eq!(data.null_count(), 0);
         let fsl = data.as_fixed_size_list_opt().ok_or(Error::index(format!(
@@ -237,38 +276,7 @@ impl PQBuildParams {
 
         // TODO: support bf16 later.
         match fsl.value_type() {
-            DataType::Float16 => {
-                // f16 k-means is scalar and accumulates in half precision: train on a
-                // widened copy of the training rows, store the codebook narrowed back.
-                let f32_list = DataType::FixedSizeList(
-                    Arc::new(arrow_schema::Field::new("item", DataType::Float32, true)),
-                    fsl.value_length(),
-                );
-                let params = Self {
-                    codebook: self
-                        .codebook
-                        .as_ref()
-                        .map(|codebook| cast(codebook, &f32_list))
-                        .transpose()?,
-                    ..self.clone()
-                };
-                let training_rows = fsl.len().min(self.try_sample_size()?);
-                let training = cast(&fsl.slice(0, training_rows), &f32_list)?;
-                let pq = params
-                    .build_from_fsl::<Float32Type>(training.as_fixed_size_list(), distance_type)?;
-                let codebook = cast(pq.codebook.values(), &DataType::Float16)?;
-                let codebook = FixedSizeListArray::try_new_from_values(
-                    codebook.as_primitive::<Float16Type>().clone(),
-                    pq.codebook.value_length(),
-                )?;
-                Ok(ProductQuantizer::new(
-                    pq.num_sub_vectors,
-                    pq.num_bits,
-                    pq.dimension,
-                    codebook,
-                    pq.distance_type,
-                ))
-            }
+            DataType::Float16 => self.build_from_f16(fsl, distance_type),
             DataType::Float32 => self.build_from_fsl::<Float32Type>(fsl, distance_type),
             DataType::Float64 => self.build_from_fsl::<Float64Type>(fsl, distance_type),
             _ => Err(Error::index(format!(
