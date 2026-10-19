@@ -33,7 +33,7 @@ use lance_table::format::{
 use lance_table::io::deletion::deletion_file_path;
 use object_store::path::Path;
 use pyo3::basic::CompareOp;
-use pyo3::types::PyTuple;
+use pyo3::types::{PyList, PyTuple};
 use pyo3::{exceptions::*, types::PyDict};
 use pyo3::{intern, prelude::*};
 
@@ -608,12 +608,14 @@ pub struct PyDeletionFile(pub DeletionFile);
 #[pymethods]
 impl PyDeletionFile {
     #[new]
+    #[pyo3(signature = (read_version, id, file_type, num_deleted_rows, base_id=None, inline=None))]
     fn new(
         read_version: u64,
         id: u64,
         file_type: &str,
         num_deleted_rows: usize,
         base_id: Option<u32>,
+        inline: Option<Vec<u8>>,
     ) -> PyResult<Self> {
         let file_type = match file_type {
             "array" => DeletionFileType::Array,
@@ -631,6 +633,7 @@ impl PyDeletionFile {
             file_type,
             num_deleted_rows: Some(num_deleted_rows),
             base_id,
+            inline,
         }))
     }
 
@@ -645,6 +648,14 @@ impl PyDeletionFile {
             slf.0.num_deleted_rows,
         )?;
         dict.set_item(intern!(slf.py(), "base_id"), slf.0.base_id)?;
+        // A list of ints rather than bytes, so the dict stays JSON-serializable.
+        let inline = match &slf.0.inline {
+            Some(bytes) => PyList::new(slf.py(), bytes.iter().copied())?
+                .into_any()
+                .unbind(),
+            None => slf.py().None(),
+        };
+        dict.set_item(intern!(slf.py(), "inline"), inline)?;
 
         Ok(dict)
     }
@@ -685,6 +696,12 @@ impl PyDeletionFile {
     #[getter]
     fn base_id(&self) -> &Option<u32> {
         &self.0.base_id
+    }
+
+    /// The serialized deletion bitmap when it is stored in the manifest, else None.
+    #[getter]
+    fn inline(&self) -> Option<Vec<u8>> {
+        self.0.inline.clone()
     }
 
     #[pyo3(signature = (fragment_id, base_uri=None))]

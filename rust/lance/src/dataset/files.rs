@@ -130,7 +130,8 @@ fn manifest_file_rows<'a>(
     });
 
     let deletion_files = manifest.fragments.iter().filter_map(|fragment| {
-        fragment.deletion_file.as_ref().map(|del_file| FileRow {
+        let del_file = fragment.deletion_file.as_ref().filter(|f| !f.is_inline())?;
+        Some(FileRow {
             version: manifest.version,
             base_uri: Cow::Borrowed(resolve_file_base(manifest, del_file.base_id, base_uri).uri),
             path: Cow::Owned(relative_deletion_file_path(fragment.id, del_file)),
@@ -929,6 +930,7 @@ mod tests {
                 file_type: DeletionFileType::Bitmap,
                 num_deleted_rows: Some(1),
                 base_id: Some(2),
+                inline: None,
             }),
             row_id_meta: None,
             physical_rows: Some(3),

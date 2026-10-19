@@ -2687,6 +2687,7 @@ impl<'a> TransactionRebase<'a> {
                         dataset.manifest.version,
                         &dv,
                         dataset.object_store.as_ref(),
+                        dataset.inline_deletions_max_bytes()?,
                     )
                     .await?;
 
@@ -3829,6 +3830,7 @@ mod tests {
             dataset.manifest.version,
             &current_deletions,
             dataset.object_store.as_ref(),
+            0,
         )
         .await
         .unwrap();

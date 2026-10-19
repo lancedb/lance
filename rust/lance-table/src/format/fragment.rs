@@ -486,6 +486,17 @@ pub struct DeletionFile {
     /// Number of deleted rows in this file. If None, this is unknown.
     pub num_deleted_rows: Option<usize>,
     pub base_id: Option<u32>,
+    /// The serialized Roaring bitmap of deleted row offsets, when the deletion
+    /// vector is stored in the manifest rather than in a file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inline: Option<Vec<u8>>,
+}
+
+impl DeletionFile {
+    /// Whether the deletion vector lives in the manifest, so no file exists for it.
+    pub fn is_inline(&self) -> bool {
+        self.inline.is_some()
+    }
 }
 
 impl TryFrom<pb::DeletionFile> for DeletionFile {
@@ -512,6 +523,7 @@ impl TryFrom<pb::DeletionFile> for DeletionFile {
             file_type,
             num_deleted_rows,
             base_id: value.base_id,
+            inline: value.inline,
         })
     }
 }
@@ -881,6 +893,7 @@ impl From<&Fragment> for pb::DataFragment {
                 file_type: file_type.into(),
                 num_deleted_rows: f.num_deleted_rows.unwrap_or_default() as u64,
                 base_id: f.base_id,
+                inline: f.inline.clone(),
             }
         });
 
@@ -1056,6 +1069,7 @@ mod tests {
             file_type: DeletionFileType::Array,
             num_deleted_rows: Some(10),
             base_id: None,
+            inline: None,
         });
 
         let proto = pb::DataFragment::from(&fragment);
@@ -1210,6 +1224,7 @@ mod tests {
             file_type: DeletionFileType::Array,
             num_deleted_rows: Some(10),
             base_id: None,
+            inline: None,
         });
 
         let json = serde_json::to_string(&fragment).unwrap();
