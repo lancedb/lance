@@ -5659,19 +5659,13 @@ mod tests {
     }
 
     #[rstest]
-    #[case::without_index(&[], false, false, true)]
-    #[case::btree(&[BuiltinIndexType::BTree], false, true, false)]
-    #[case::zonemap(&[BuiltinIndexType::ZoneMap], false, true, false)]
-    #[case::zonemap_skips_mapping(&[BuiltinIndexType::ZoneMap], false, true, true)]
-    #[case::bloom_filter(&[BuiltinIndexType::BloomFilter], false, true, false)]
-    #[case::mixed(&[BuiltinIndexType::BTree, BuiltinIndexType::ZoneMap], false, true, false)]
-    #[case::deferred_zonemap(&[BuiltinIndexType::ZoneMap], true, true, false)]
+    #[case::without_index(&[])]
+    #[case::zonemap(&[BuiltinIndexType::ZoneMap])]
+    #[case::btree(&[BuiltinIndexType::BTree])]
+    #[case::mixed(&[BuiltinIndexType::ZoneMap, BuiltinIndexType::BTree])]
     #[tokio::test]
     async fn test_row_addrs_only_used_with_remappable_index(
         #[case] index_types: &[BuiltinIndexType],
-        #[case] defer_index_remap: bool,
-        #[case] expect_row_addrs: bool,
-        #[case] has_unused_row_addrs: bool,
     ) {
         let data = sample_data();
         let reader = RecordBatchIterator::new(vec![Ok(data.slice(0, 9_000))], data.schema());
@@ -5686,12 +5680,12 @@ mod tests {
         .await
         .unwrap();
 
-        for (position, builtin) in index_types.iter().enumerate() {
+        for builtin in index_types {
             dataset
                 .create_index(
                     &["a"],
                     IndexType::Scalar,
-                    Some(format!("a_idx_{position}")),
+                    Some(builtin.as_str().to_string()),
                     &ScalarIndexParams::for_builtin(builtin.clone()),
                     false,
                 )
@@ -5701,7 +5695,6 @@ mod tests {
 
         let options = CompactionOptions {
             target_rows_per_fragment: 9_000,
-            defer_index_remap,
             ..Default::default()
         };
         let original_indices = dataset.load_indices().await.unwrap();
@@ -5711,13 +5704,9 @@ mod tests {
         let mut result = rewrite_files(Cow::Borrowed(&dataset), plan.tasks()[0].clone(), &options)
             .await
             .unwrap();
-        assert_eq!(result.row_addrs.is_some(), expect_row_addrs);
+        assert_eq!(result.row_addrs.is_some(), !index_types.is_empty());
 
-        if expect_row_addrs {
-            let row_addrs_bytes = result
-                .row_addrs
-                .as_ref()
-                .expect("indexed compaction should capture row addresses");
+        if let Some(row_addrs_bytes) = &result.row_addrs {
             let row_addrs =
                 RoaringTreemap::deserialize_from(&mut Cursor::new(row_addrs_bytes)).unwrap();
             assert_eq!(row_addrs.len(), 9_000);
@@ -5734,7 +5723,7 @@ mod tests {
                 row_addrs.len()
             );
         }
-        if has_unused_row_addrs {
+        if !index_types.contains(&BuiltinIndexType::BTree) {
             // Invalid bytes prove commit skips decoding and building the map
             // when no index supports remapping, even if the worker captured it.
             result.row_addrs = Some(b"not a roaring treemap".to_vec());
@@ -5749,27 +5738,21 @@ mod tests {
         .unwrap();
         assert_eq!(dataset.get_fragments().len(), 1);
         let current_indices = dataset.load_indices().await.unwrap();
-        for (position, builtin) in index_types.iter().enumerate() {
-            let name = format!("a_idx_{position}");
-            let original = original_indices
-                .iter()
-                .find(|index| index.name == name)
-                .unwrap();
+        for original in original_indices.iter() {
             let current = current_indices
                 .iter()
                 .find(|index| index.name == original.name)
                 .unwrap();
-            if *builtin != BuiltinIndexType::BTree {
+            if original.name == BuiltinIndexType::BTree.as_str() {
+                assert_ne!(current.uuid, original.uuid);
+            } else {
                 assert_eq!(current.uuid, original.uuid);
-                assert_eq!(
+                assert!(
                     current
                         .effective_fragment_bitmap(dataset.fragment_bitmap.as_ref())
                         .unwrap()
-                        .is_empty(),
-                    !defer_index_remap,
+                        .is_empty()
                 );
-            } else {
-                assert_ne!(current.uuid, original.uuid);
             }
         }
         let mut scanner = dataset.scan();

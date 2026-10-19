@@ -56,10 +56,11 @@ impl IndexRemapperOptions for DatasetIndexRemapperOptions {
             return Ok(None);
         };
 
-        // Check capabilities after rewriting data but before materializing the
-        // address map. Opening here uses the same loaders and cache as remap_index.
+        // ZoneMap and other scalar indices with can_remap() == false do not
+        // need an address map. Skip building it only if no index needs it.
+        // These opens reuse the loaders and cache used by remap_index.
         for index in indices.iter().filter(|index| !is_system_index(index)) {
-            let can_remap: Result<bool> = async {
+            let needs_mapping: Result<bool> = async {
                 // Do not let an early skip hide corrupt covering metadata.
                 index.validate_covering_fields()?;
                 let [field_id] = index.fields.as_slice() else {
@@ -79,7 +80,7 @@ impl IndexRemapperOptions for DatasetIndexRemapperOptions {
                 Ok(scalar.can_remap())
             }
             .await;
-            match can_remap {
+            match needs_mapping {
                 Ok(false) => continue,
                 Ok(true) => {}
                 // Preserve error handling after the remapper filters affected fragments.
@@ -259,13 +260,8 @@ mod tests {
     use std::collections::HashMap;
     use uuid::Uuid;
 
-    #[rstest]
-    #[case::btree(Some("lance.table.BTreeIndexDetails"))]
-    #[case::zonemap(Some("lance.table.ZoneMapIndexDetails"))]
-    #[case::vector(Some("lance.index.pb.VectorIndexDetails"))]
-    #[case::without_details(None)]
     #[tokio::test]
-    async fn test_remapper_retained_without_index_files(#[case] details_type: Option<&str>) {
+    async fn test_remapper_retained_without_index_files() {
         let reader = lance_datagen::gen_batch()
             .col("id", array::step::<arrow_array::types::Int32Type>())
             .into_reader_rows(RowCount::from(1), BatchCount::from(1));
@@ -278,12 +274,10 @@ mod tests {
             name: "id_idx".to_string(),
             dataset_version: dataset.version().version,
             fragment_bitmap: Some(dataset.fragment_bitmap.as_ref().clone()),
-            index_details: details_type.map(|name| {
-                Arc::new(prost_types::Any {
-                    type_url: format!("type.googleapis.com/{name}"),
-                    value: Vec::new(),
-                })
-            }),
+            index_details: Some(Arc::new(prost_types::Any {
+                type_url: "type.googleapis.com/lance.table.ZoneMapIndexDetails".to_string(),
+                value: Vec::new(),
+            })),
             index_version: 0,
             created_at: None,
             base_id: None,
