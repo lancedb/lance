@@ -465,9 +465,12 @@ mod test {
     use super::*;
 
     use crate::dataset::optimize::{CompactionOptions, compact_files};
-    use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
+    use crate::index::optimize::{commit_optimize_indices, plan_optimize_indices};
+    use crate::index::{DatasetIndexExt, DatasetIndexInternalExt, scalar::open_scalar_index};
     use crate::session::Session;
-    use crate::utils::test::{DatagenExt, FailingProxyStore, FragmentCount, FragmentRowCount};
+    use crate::utils::test::{
+        DatagenExt, FailingProxyStore, FragmentCount, FragmentRowCount, copy_test_data_to_tmp,
+    };
     use arrow_array::cast::AsArray;
     use arrow_array::types::{Float32Type, Int32Type, UInt64Type};
     use arrow_array::{Array, ArrayRef, Int32Array, RecordBatch, RecordBatchIterator, UInt64Array};
@@ -476,9 +479,13 @@ mod test {
     use lance_core::datatypes::Schema;
     use lance_core::{ROW_ADDR, ROW_ID, utils::address::RowAddress};
     use lance_datagen::{ArrayGeneratorExt, Dimension};
-    use lance_index::{IndexType, scalar::ScalarIndexParams};
+    use lance_index::{
+        IndexType, metrics::NoOpMetricsCollector, optimize::OptimizeOptions,
+        scalar::ScalarIndexParams,
+    };
     use lance_io::object_store::ObjectStoreParams;
     use lance_table::rowids::segment::U64Segment;
+    use roaring::RoaringBitmap;
     use std::collections::HashMap;
     use std::collections::HashSet;
 
@@ -536,6 +543,51 @@ mod test {
             .map(|key| key.and_then(|key| expected.get(&key).copied()))
             .collect::<Vec<_>>();
         assert_eq!(actual, expected);
+    }
+
+    async fn assert_row_id_btree_entries_match_scan(dataset: &Dataset) {
+        let keys = UInt64Array::from_iter_values(0..dataset.manifest.next_row_id);
+        let mut actual = Vec::new();
+        for segment in dataset.load_indices_by_name("row_ids").await.unwrap() {
+            let index = open_scalar_index(dataset, ROW_ID, &segment, &NoOpMetricsCollector)
+                .await
+                .unwrap();
+            let matches = index.lookup(&keys, &NoOpMetricsCollector).await.unwrap();
+            actual.extend(
+                matches
+                    .key_indices
+                    .values()
+                    .iter()
+                    .map(|position| u64::from(*position))
+                    .zip(matches.row_ids.values().iter().copied()),
+            );
+        }
+        let scan = dataset
+            .scan()
+            .with_row_id()
+            .with_row_address()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let mut expected = scan[ROW_ID]
+            .as_primitive::<UInt64Type>()
+            .values()
+            .iter()
+            .copied()
+            .zip(
+                scan[ROW_ADDR]
+                    .as_primitive::<UInt64Type>()
+                    .values()
+                    .iter()
+                    .copied(),
+            )
+            .collect::<Vec<_>>();
+        actual.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(
+            actual, expected,
+            "index files must contain exactly the live addresses"
+        );
     }
 
     #[rstest::rstest]
@@ -718,6 +770,163 @@ mod test {
             })
             .collect();
         assert_eq!(&covered, dataset.fragment_bitmap().as_ref());
+    }
+
+    #[tokio::test]
+    async fn test_row_id_btree_optimize_prunes_deleted_addresses() {
+        let mut dataset = row_id_lookup_dataset().await;
+        dataset
+            .create_index(
+                &[ROW_ID],
+                IndexType::BTree,
+                Some("row_ids".into()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        let before_update = dataset.clone();
+        let update = UpdateBuilder::new(Arc::new(dataset))
+            .update_where("i = 5")
+            .unwrap()
+            .set("i", "100")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+        dataset = Arc::try_unwrap(update.new_dataset).unwrap();
+        dataset.delete("i = 1").await.unwrap();
+        dataset
+            .optimize_indices(&OptimizeOptions::append())
+            .await
+            .unwrap();
+        let segments = dataset.load_indices_by_name("row_ids").await.unwrap();
+        assert_eq!(segments.len(), 2);
+        dataset
+            .optimize_indices(&OptimizeOptions::merge(segments.len()))
+            .await
+            .unwrap();
+
+        let segments = dataset.load_indices_by_name("row_ids").await.unwrap();
+        assert_eq!(segments.len(), 1);
+        assert_row_id_btree_entries_match_scan(&dataset).await;
+        assert_row_id_lookup_matches_scan(&dataset).await;
+        assert_row_id_lookup_matches_scan(&before_update).await;
+    }
+
+    #[tokio::test]
+    async fn test_row_id_btree_distributed_build_and_optimize() {
+        let mut dataset = row_id_lookup_dataset().await;
+        let source = dataset.clone();
+        let params = ScalarIndexParams::default();
+        let mut segments = Vec::new();
+        for fragment_id in 0..3 {
+            let mut worker = source.clone();
+            let segment = worker
+                .create_index_builder(&[ROW_ID], IndexType::BTree, &params)
+                .name("row_ids".into())
+                .fragments(vec![fragment_id])
+                .execute_uncommitted()
+                .await
+                .unwrap();
+            assert_eq!(segment.fields, vec![ROW_ID_FIELD_ID]);
+            assert!(segment.results_are_row_addrs());
+            segments.push(segment);
+        }
+        assert!(source.load_indices().await.unwrap().is_empty());
+
+        // A write after the workers' snapshot must remain outside their coverage.
+        dataset
+            .append(
+                lance_datagen::gen_batch()
+                    .col("i", lance_datagen::array::step_custom::<Int32Type>(12, 1))
+                    .into_reader_rows(4.into(), 1.into()),
+                None,
+            )
+            .await
+            .unwrap();
+        dataset
+            .commit_existing_index_segments("row_ids", ROW_ID, segments)
+            .await
+            .unwrap();
+        let segments = dataset.load_indices_by_name("row_ids").await.unwrap();
+        assert_eq!(segments.len(), 3);
+        let coverage = segments
+            .iter()
+            .flat_map(|segment| segment.fragment_bitmap.as_ref().unwrap().iter())
+            .collect::<RoaringBitmap>();
+        assert_eq!(coverage, RoaringBitmap::from_iter([0, 1, 2]));
+        assert_row_id_lookup_matches_scan(&dataset).await;
+
+        let options = OptimizeOptions::merge(3)
+            .max_rows_per_task(Some(4))
+            .max_rows_per_segment(Some(8));
+        let plan = plan_optimize_indices(&dataset, &options).await.unwrap();
+        assert!(!plan.tasks.is_empty());
+        let mut built = Vec::new();
+        for task in &plan.tasks {
+            built.extend(task.execute(&dataset).await.unwrap());
+        }
+        let mut merged = Vec::new();
+        for merge in &plan.merges {
+            merged.extend(merge.execute(&dataset, &built).await.unwrap());
+        }
+        commit_optimize_indices(&mut dataset, merged, &options)
+            .await
+            .unwrap();
+        assert_row_id_btree_entries_match_scan(&dataset).await;
+        assert_row_id_lookup_matches_scan(&dataset).await;
+        assert_row_id_lookup_matches_scan(&source).await;
+    }
+
+    #[tokio::test]
+    async fn test_row_id_btree_on_released_table() {
+        let directory = copy_test_data_to_tmp("v13.0.0/stable_row_id_btree.lance").unwrap();
+        let mut dataset = Dataset::open(&directory.path_str()).await.unwrap();
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 10);
+        let historical = dataset.clone();
+        let original_schema = dataset.schema().clone();
+        let legacy = dataset
+            .load_indices_by_name("legacy_key_idx")
+            .await
+            .unwrap();
+        assert_eq!(legacy.len(), 1);
+        assert!(!legacy[0].results_are_row_addrs());
+        let legacy_uuid = legacy[0].uuid;
+        assert_row_id_lookup_matches_scan(&dataset).await;
+
+        dataset
+            .create_index(
+                &[ROW_ID],
+                IndexType::BTree,
+                Some("row_ids".into()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        let dataset = Dataset::open(&directory.path_str()).await.unwrap();
+        assert_eq!(dataset.schema(), &original_schema);
+        assert!(dataset.schema().field(ROW_ID).is_none());
+        let retained = dataset
+            .load_indices_by_name("legacy_key_idx")
+            .await
+            .unwrap();
+        assert_eq!(retained[0].uuid, legacy_uuid);
+        assert!(!retained[0].results_are_row_addrs());
+        let indexed = dataset
+            .scan()
+            .filter("key >= 4")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(indexed.num_rows(), 7);
+        assert_row_id_btree_entries_match_scan(&dataset).await;
+        assert_row_id_lookup_matches_scan(&dataset).await;
+        assert_row_id_lookup_matches_scan(&historical).await;
     }
 
     #[rstest::rstest]

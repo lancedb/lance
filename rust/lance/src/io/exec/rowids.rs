@@ -567,7 +567,10 @@ impl ExecutionPlan for AddRowOffsetExec {
 mod test {
     use arrow_array::{Array, Int32Array, RecordBatchIterator, record_batch};
     use arrow_schema::{DataType, Field};
-    use datafusion::{datasource::memory::MemorySourceConfig, prelude::SessionContext};
+    use datafusion::physical_optimizer::{PhysicalOptimizerRule, enforce_sorting::EnforceSorting};
+    use datafusion::{
+        config::ConfigOptions, datasource::memory::MemorySourceConfig, prelude::SessionContext,
+    };
     use datafusion_physical_expr::{LexOrdering, PhysicalSortExpr, expressions::col};
     use datafusion_physical_plan::sorts::sort::SortExec;
     use futures::TryStreamExt;
@@ -749,6 +752,30 @@ mod test {
         .unwrap();
         assert_eq!(exec.maintains_input_order(), vec![true]);
         assert_eq!(exec.properties().output_ordering(), Some(&expected));
+
+        let redundant = Arc::new(SortExec::new(expected, Arc::new(exec)));
+        let optimized = EnforceSorting::new()
+            .optimize(redundant, &ConfigOptions::new())
+            .unwrap();
+        let rendered = datafusion_physical_plan::displayable(optimized.as_ref())
+            .indent(false)
+            .to_string();
+        assert_eq!(rendered.matches("SortExec:").count(), 1, "{rendered}");
+        let batches =
+            datafusion_physical_plan::collect(optimized, SessionContext::new().task_ctx())
+                .await
+                .unwrap();
+        let ids = batches
+            .iter()
+            .flat_map(|batch| {
+                batch[ROW_ID]
+                    .as_primitive::<arrow_array::types::UInt64Type>()
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec![0, 1, 2]);
     }
 
     #[rstest]

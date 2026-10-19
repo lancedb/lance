@@ -4,7 +4,7 @@
 use std::collections::{HashMap, hash_map::Entry};
 use std::sync::Arc;
 
-use futures::{FutureExt, TryStreamExt};
+use futures::{FutureExt, StreamExt, TryStreamExt, stream};
 use lance_core::{Error, Result};
 use lance_file::reader::FileReaderOptions;
 use lance_file::versions::data_file_columns;
@@ -153,17 +153,9 @@ async fn live_row_ids(
 /// row addresses rather than row ids (see
 /// `ScalarIndex::results_are_row_addresses`). `build_stable_row_id_filter`
 /// below produces row ids, which would be the wrong domain to filter such an
-/// index's stored addresses against, so an address-domain index always falls
-/// back to coarse `Fragments` filtering instead, regardless of the dataset's
-/// row-id scheme.
-///
-/// That coarse filtering cannot tell a still-"effective" fragment's live rows
-/// from ones a same-fragment update superseded (under stable row ids,
-/// updating an indexed column deletes the row's old physical copy and writes
-/// the new value elsewhere, but the old fragment keeps its id and stays
-/// "effective"), so an address-domain index can merge in a stale posting this
-/// way. Exact address-level filtering would avoid that; left as a future
-/// optimization.
+/// index's stored addresses against. Address-domain indices instead use fragment
+/// membership and deletion vectors, without reading row-ID sequences or building
+/// an allow-list of every live row. The filter is applied after address remapping.
 pub async fn build_old_data_filter(
     dataset: &Dataset,
     effective_old_frags: &RoaringBitmap,
@@ -174,6 +166,41 @@ pub async fn build_old_data_filter(
         let valid_old_row_ids = build_stable_row_id_filter(dataset, effective_old_frags).await?;
         Ok(Some(OldIndexDataFilter::RowIds(valid_old_row_ids)))
     } else {
+        if address_domain {
+            let reader_dataset = Arc::new(dataset.clone());
+            let fragments = effective_old_frags.iter().filter_map(|fragment_id| {
+                dataset
+                    .find_fragment(u64::from(fragment_id))
+                    .filter(|fragment| fragment.deletion_file.is_some())
+                    .map(|fragment| (fragment_id, fragment.clone()))
+            });
+            let mut deletions = stream::iter(fragments)
+                .map(|(fragment_id, metadata)| {
+                    let reader_dataset = reader_dataset.clone();
+                    async move {
+                        let fragment =
+                            crate::dataset::fragment::FileFragment::new(reader_dataset, metadata);
+                        let deleted = fragment.get_deletion_vector().await?;
+                        Ok::<_, Error>((fragment_id, deleted))
+                    }
+                })
+                .buffer_unordered(dataset.object_store.io_parallelism());
+            let mut deleted_rows = RowAddrTreeMap::new();
+            while let Some((fragment_id, deleted)) = deletions.try_next().await? {
+                if let Some(deleted) = deleted
+                    && !deleted.is_empty()
+                {
+                    deleted_rows.insert_bitmap(fragment_id, RoaringBitmap::from(deleted.as_ref()));
+                }
+            }
+            if !deleted_rows.is_empty() {
+                return Ok(Some(OldIndexDataFilter::RowAddresses {
+                    to_keep: effective_old_frags.clone(),
+                    to_remove: deleted_old_frags.clone(),
+                    deleted_rows,
+                }));
+            }
+        }
         Ok(Some(OldIndexDataFilter::Fragments {
             to_keep: effective_old_frags.clone(),
             to_remove: deleted_old_frags.clone(),
@@ -5351,11 +5378,16 @@ mod tests {
     /// silently reintroduce the stale entries this fix removes. Simulate an
     /// unreadable deletion vector by deleting the file the manifest still
     /// references, then assert optimize errors instead of succeeding.
+    #[rstest::rstest]
+    #[case::legacy_bitmap(IndexType::Bitmap, BuiltinIndexType::Bitmap)]
+    #[case::address_btree(IndexType::BTree, BuiltinIndexType::BTree)]
     #[tokio::test]
-    async fn test_optimize_errors_when_deletion_vector_unreadable() {
+    async fn test_optimize_errors_when_deletion_vector_unreadable(
+        #[case] index_type: IndexType,
+        #[case] builtin: BuiltinIndexType,
+    ) {
         use crate::dataset::UpdateBuilder;
         use arrow_array::Int32Array;
-        use lance_index::scalar::BuiltinIndexType;
         use lance_table::io::deletion::deletion_file_path;
 
         let test_dir = TempStrDir::default();
@@ -5388,9 +5420,9 @@ mod tests {
         dataset
             .create_index(
                 &["num"],
-                IndexType::Bitmap,
+                index_type,
                 None,
-                &ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap),
+                &ScalarIndexParams::for_builtin(builtin),
                 true,
             )
             .await
@@ -5426,12 +5458,16 @@ mod tests {
             "update should have left exactly one deletion file"
         );
 
-        let result = dataset.optimize_indices(&OptimizeOptions::default()).await;
+        let error = dataset
+            .optimize_indices(&OptimizeOptions::default())
+            .await
+            .unwrap_err();
         assert!(
-            result.is_err(),
+            matches!(error, Error::IO { .. } | Error::NotFound { .. }),
             "optimize must fail when a deletion vector cannot be read, not \
-             silently keep the deleted rows in the index"
+             silently keep the deleted rows in the index: {error}"
         );
+        assert!(error.to_string().contains("_deletions"), "{error}");
     }
 
     #[tokio::test]

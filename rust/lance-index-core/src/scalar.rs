@@ -13,6 +13,7 @@ use datafusion_common::scalar::ScalarValue;
 use datafusion_expr::Expr;
 use futures::{StreamExt, TryStreamExt};
 use lance_core::deepsize::DeepSizeOf;
+use lance_core::utils::address::RowAddress;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{Error, Result};
@@ -564,6 +565,13 @@ pub enum OldIndexDataFilter {
         to_keep: RoaringBitmap,
         to_remove: RoaringBitmap,
     },
+    /// Keep addresses in retained fragments except for deletion-marked positions.
+    /// The exclusion set stores only deleted offsets, not a mapping for every live row.
+    RowAddresses {
+        to_keep: RoaringBitmap,
+        to_remove: RoaringBitmap,
+        deleted_rows: RowAddrTreeMap,
+    },
     /// Keep old rows whose identifier is in this exact allow-list, used for id-domain
     /// indexes when stable row id is enabled.
     RowIds(RowAddrTreeMap),
@@ -581,6 +589,19 @@ impl OldIndexDataFilter {
                 .iter()
                 .map(|id| id.map(|id| valid_row_ids.contains(id)))
                 .collect(),
+            Self::RowAddresses {
+                to_keep,
+                deleted_rows,
+                ..
+            } => row_ids
+                .iter()
+                .map(|address| {
+                    address.map(|address| {
+                        to_keep.contains(RowAddress::from(address).fragment_id())
+                            && !deleted_rows.contains(address)
+                    })
+                })
+                .collect(),
         }
     }
 
@@ -592,6 +613,14 @@ impl OldIndexDataFilter {
         match self {
             Self::Fragments { to_keep, .. } => rows.retain_fragments(to_keep.iter()),
             Self::RowIds(valid_row_ids) => *rows &= valid_row_ids,
+            Self::RowAddresses {
+                to_keep,
+                deleted_rows,
+                ..
+            } => {
+                rows.retain_fragments(to_keep.iter());
+                *rows -= deleted_rows;
+            }
         }
     }
 }

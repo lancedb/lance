@@ -1285,7 +1285,7 @@ mod tests {
         indices[1].created_at = None;
         indices[2].created_at = at(100);
 
-        Transaction::retain_relevant_indices(&mut indices, &schema, &fragments);
+        Transaction::retain_relevant_indices(&mut indices, &schema, &fragments, false);
 
         assert_eq!(indices.len(), 1);
         assert_eq!(indices[0].dataset_version, 3);
@@ -1302,7 +1302,7 @@ mod tests {
         indices[1].created_at = at(200);
         indices[2].created_at = at(200);
 
-        Transaction::retain_relevant_indices(&mut indices, &schema, &fragments);
+        Transaction::retain_relevant_indices(&mut indices, &schema, &fragments, false);
 
         assert_eq!(indices.len(), 1);
         assert_eq!(indices[0].dataset_version, 4);
