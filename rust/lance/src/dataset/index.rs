@@ -13,7 +13,7 @@ use crate::dataset::optimize::RemappedIndex;
 use crate::dataset::optimize::remapping::RemapResult;
 use crate::index::DatasetIndexExt;
 use crate::index::remap_index;
-use crate::index::scalar::infer_scalar_index_details;
+use crate::index::scalar::{IndexDetails, infer_scalar_index_details};
 use arrow_schema::DataType;
 use async_trait::async_trait;
 use lance_core::{Error, Result};
@@ -31,11 +31,11 @@ use super::versions;
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DatasetIndexRemapperOptions {}
 
-/// Loads index metadata when compaction has at least one index to remap.
+/// Loads usable non-system indices that may support physical remapping.
 ///
-/// Returns all usable index metadata, including system indices, so the remapper
-/// uses a consistent snapshot. Returns `None` when there are no usable
-/// non-system indices.
+/// Uses plugin capabilities without opening index files. Indices without a
+/// scalar plugin declaration retain the existing remap path. Returns `None`
+/// when no indices need remap preparation.
 pub(crate) async fn load_indices_for_remapping(
     dataset: &Dataset,
 ) -> Result<Option<Arc<Vec<IndexMetadata>>>> {
@@ -44,8 +44,20 @@ pub(crate) async fn load_indices_for_remapping(
     }
 
     let indices = dataset.load_indices().await?;
-    let has_remappable_index = indices.iter().any(|index| !is_system_index(index));
-    Ok(has_remappable_index.then_some(indices))
+    let mut remappable_indices = Vec::with_capacity(indices.len());
+    for index in indices.iter().filter(|index| !is_system_index(index)) {
+        // Only an explicit opt-out skips preparation. Vector indices and old
+        // metadata without details still go through the existing remap path.
+        if let Some(details) = &index.index_details
+            && IndexDetails(details.clone())
+                .get_plugin()
+                .is_ok_and(|plugin| !plugin.can_remap())
+        {
+            continue;
+        }
+        remappable_indices.push(index.clone());
+    }
+    Ok((!remappable_indices.is_empty()).then(|| Arc::new(remappable_indices)))
 }
 
 #[async_trait]
@@ -90,13 +102,12 @@ impl IndexRemapper for DatasetIndexRemapper {
         let mapping = RowAddrTranslator::sync(mapping);
         let mut remapped = Vec::with_capacity(self.indices.len());
         for index in self.indices.iter() {
-            let needs_remapped = !is_system_index(index)
-                && match &index.fragment_bitmap {
-                    None => true,
-                    Some(fragment_bitmap) => fragment_bitmap
-                        .iter()
-                        .any(|frag_idx| affected_frag_ids.contains(&(frag_idx as u64))),
-                };
+            let needs_remapped = match &index.fragment_bitmap {
+                None => true,
+                Some(fragment_bitmap) => fragment_bitmap
+                    .iter()
+                    .any(|frag_idx| affected_frag_ids.contains(&(frag_idx as u64))),
+            };
             if needs_remapped {
                 // Box the remap future at the call site: inlining `remap_index` into this
                 // loop's async layout otherwise exceeds rustc's depth limit. It has to be
@@ -218,8 +229,69 @@ mod tests {
     use lance_index::frag_reuse::{FRAG_REUSE_INDEX_NAME, FragReuseIndexDetails};
     use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
     use lance_linalg::distance::MetricType;
+    use rstest::rstest;
     use std::collections::HashMap;
     use uuid::Uuid;
+
+    #[rstest]
+    #[case::btree(Some("lance.table.BTreeIndexDetails"), true)]
+    #[case::zonemap(Some("lance.table.ZoneMapIndexDetails"), false)]
+    #[case::zonemap_case_insensitive(Some("LANCE.TABLE.ZONEMAPINDEXDETAILS"), false)]
+    #[case::bloom_filter(Some("lance.index.pb.BloomFilterIndexDetails"), false)]
+    #[case::fm(Some("lance.index.pb.FmIndexDetails"), false)]
+    #[case::rtree(Some("lance.index.pb.RTreeIndexDetails"), false)]
+    #[case::vector(Some("lance.index.pb.VectorIndexDetails"), true)]
+    #[case::without_details(None, true)]
+    #[tokio::test]
+    async fn test_remapping_eligibility_without_index_files(
+        #[case] details_type: Option<&str>,
+        #[case] can_remap: bool,
+    ) {
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<arrow_array::types::Int32Type>())
+            .into_reader_rows(RowCount::from(1), BatchCount::from(1));
+        let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+        // No index files are written: checking eligibility must only read metadata.
+        let index = IndexMetadata {
+            uuid: Uuid::new_v4(),
+            fields: vec![dataset.schema().field("id").unwrap().id],
+            covering_fields: Vec::new(),
+            name: "id_idx".to_string(),
+            dataset_version: dataset.version().version,
+            fragment_bitmap: Some(dataset.fragment_bitmap.as_ref().clone()),
+            index_details: details_type.map(|name| {
+                Arc::new(prost_types::Any {
+                    type_url: format!("type.googleapis.com/{name}"),
+                    value: Vec::new(),
+                })
+            }),
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+            files: None,
+        };
+        let transaction = Transaction::new(
+            dataset.manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![index],
+                removed_indices: Vec::new(),
+            },
+            None,
+        );
+        dataset
+            .apply_commit(transaction, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            DatasetIndexRemapperOptions::default()
+                .create_remapper(&dataset)
+                .await
+                .unwrap()
+                .is_some(),
+            can_remap,
+        );
+    }
 
     #[tokio::test]
     async fn test_remapper_not_created_without_remappable_indices() {
