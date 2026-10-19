@@ -87,11 +87,11 @@ impl ProbeBounds {
 ///
 /// # Index-Only Search (fast_search)
 ///
-/// For base table and SSTables we use `fast_search()` to only
-/// search indexed data. This is correct because:
-/// - Each SSTable has its own vector index built during flush.
-/// - The active memtable covers any unindexed data.
-/// - Searching unindexed data in base/SSTable would be redundant.
+/// The base table uses `fast_search()` to only search indexed data; the
+/// active memtable covers rows not yet indexed there. An SSTable uses
+/// `fast_search()` only when it holds a usable index on the column: a
+/// generation flushed while the column was not maintained has none, and is
+/// searched flat. [`Self::with_use_index`]`(false)` searches every arm flat.
 pub struct LsmVectorSearchPlanner {
     /// Data source collector.
     collector: LsmDataSourceCollector,
@@ -136,6 +136,8 @@ pub struct LsmVectorSearchPlanner {
     refine_factor: Option<u32>,
     /// See [`Self::with_distance_scale`].
     distance_scale: f32,
+    /// See [`Self::with_use_index`].
+    use_index: bool,
 }
 
 /// Multiple of the exact distance a flushed generation's `IVF_HNSW_SQ` index
@@ -201,6 +203,7 @@ impl LsmVectorSearchPlanner {
             ef: None,
             refine_factor: None,
             distance_scale: 1.0,
+            use_index: true,
         }
     }
 
@@ -243,6 +246,13 @@ impl LsmVectorSearchPlanner {
     /// so `2.0` matches such a base. Ignored when refining; defaults to `1.0`.
     pub fn with_distance_scale(mut self, scale: f32) -> Self {
         self.distance_scale = scale;
+        self
+    }
+
+    /// Search every arm by exact KNN instead of its vector index, as the
+    /// dataset scanner's `use_index(false)` does. Defaults to `true`.
+    pub fn with_use_index(mut self, use_index: bool) -> Self {
+        self.use_index = use_index;
         self
     }
 
@@ -606,7 +616,17 @@ impl LsmVectorSearchPlanner {
                 }
                 let query_arr = single_query_array(query_vector);
                 scanner.nearest(&self.vector_column, query_arr.as_ref(), k)?;
-                scanner.distance_range(self.distance_range.0, self.distance_range.1);
+                // The base index reports on the plan's scale; a flat search
+                // reports exact distances.
+                let scale = if self.use_index {
+                    1.0
+                } else {
+                    self.arm_scale(refine_factor, 1.0)
+                };
+                scanner.distance_range(
+                    self.distance_range.0.map(|lower| lower / scale),
+                    self.distance_range.1.map(|upper| upper / scale),
+                );
                 if let Some(minimum_nprobes) = probe_bounds.minimum_nprobes {
                     scanner.minimum_nprobes(minimum_nprobes);
                 }
@@ -617,12 +637,16 @@ impl LsmVectorSearchPlanner {
                 if let Some(ef) = self.ef {
                     scanner.ef(ef);
                 }
-                // Memtables cover unindexed rows; only search indexed data here.
-                scanner.fast_search();
-                if let Some(refine_factor) = refine_factor {
-                    scanner.refine(refine_factor);
+                if self.use_index {
+                    // Memtables cover unindexed rows; only search indexed data here.
+                    scanner.fast_search();
+                    if let Some(refine_factor) = refine_factor {
+                        scanner.refine(refine_factor);
+                    }
+                } else {
+                    scanner.use_index(false);
                 }
-                scanner.create_plan().await
+                scale_distance(scanner.create_plan().await?, scale)
             }
             LsmDataSource::SsTable { path, .. } => {
                 let dataset = open_sstable(
@@ -696,8 +720,9 @@ impl LsmVectorSearchPlanner {
                 scanner.nearest(&vector_column, query_arr.as_ref(), k)?;
                 // A generation flushed while the column was not maintained has
                 // no index on it: search it flat, which reports exact distances.
-                let indexed =
-                    has_usable_vector_index(&dataset, &vector_column, self.distance_type).await?;
+                let indexed = self.use_index
+                    && has_usable_vector_index(&dataset, &vector_column, self.distance_type)
+                        .await?;
                 let native_scale = if indexed {
                     sstable_distance_scale(self.distance_type)
                 } else {
@@ -723,6 +748,8 @@ impl LsmVectorSearchPlanner {
                     if let Some(refine_factor) = refine_factor {
                         scanner.refine(refine_factor);
                     }
+                } else {
+                    scanner.use_index(false);
                 }
                 // Boxed for the reason the scan planner's arm gives: a
                 // generation resolves its own schema before scanning, and
@@ -801,6 +828,9 @@ impl LsmVectorSearchPlanner {
                         batch_store.total_rows().max(1)
                     }
                 };
+                if !self.use_index {
+                    scanner.use_index(false);
+                }
                 scanner.nearest(&vector_column, query_vector, k)?;
                 // This arm's distances are exact.
                 let scale = self.arm_scale(refine_factor, 1.0);
@@ -3701,6 +3731,93 @@ mod tests {
                     exact * reported
                 );
             }
+        }
+    }
+
+    /// An indexed generation answers from its index while an unindexed one
+    /// beside it is scanned flat; `with_use_index(false)` scans both flat.
+    #[tokio::test]
+    async fn test_vector_search_sstable_index_choice_per_generation() {
+        use crate::dataset::mem_wal::scanner::data_source::ShardSnapshot;
+        use crate::index::DatasetIndexExt;
+        use crate::index::vector::VectorIndexParams;
+        use datafusion::prelude::SessionContext;
+        use futures::TryStreamExt;
+        use lance_index::IndexType;
+        use lance_linalg::distance::DistanceType;
+
+        let schema = create_vector_schema();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp_dir.path().to_str().unwrap());
+        let shard_id = uuid::Uuid::new_v4();
+
+        // Gen 1 is unindexed and holds the nearest row; gen 2 is indexed and
+        // holds the second nearest.
+        let mut gen1_rows = vec![(1, [0.1, 0.2, 0.3, 0.4])];
+        gen1_rows.extend((10..20).map(|id| (id, [9.0, 9.0, 9.0, 9.0])));
+        let gen1_uri = format!("{}/_mem_wal/{}/gen_1", base_uri, shard_id);
+        create_dataset(&gen1_uri, vec![batch_rows(&schema, &gen1_rows)]).await;
+        let gen2_uri = format!("{}/_mem_wal/{}/gen_2", base_uri, shard_id);
+        let mut gen2 = create_dataset(
+            &gen2_uri,
+            vec![batch_rows(
+                &schema,
+                &[(2, [0.2, 0.3, 0.4, 0.5]), (3, [8.0, 8.0, 8.0, 8.0])],
+            )],
+        )
+        .await;
+        gen2.create_index(
+            &["vector"],
+            IndexType::Vector,
+            None,
+            &VectorIndexParams::ivf_flat(1, DistanceType::L2),
+            true,
+        )
+        .await
+        .unwrap();
+
+        for use_index in [true, false] {
+            let snapshot = ShardSnapshot::new(shard_id)
+                .with_current_generation(3)
+                .with_sstable(1, "gen_1".to_string())
+                .with_sstable(2, "gen_2".to_string());
+            let collector =
+                LsmDataSourceCollector::without_base_table(base_uri.clone(), vec![snapshot]);
+            let plan = LsmVectorSearchPlanner::new(
+                collector,
+                vec!["id".to_string()],
+                schema.clone(),
+                "vector".to_string(),
+                DistanceType::L2,
+            )
+            .with_use_index(use_index)
+            .plan_search(&create_query_vector(), 2, 1, None, false, 1.0)
+            .await
+            .unwrap();
+            let plan_str = format!(
+                "{}",
+                datafusion::physical_plan::displayable(plan.as_ref()).indent(true)
+            );
+            let ann_arms = plan_str.matches("ANNIvfPartition").count();
+            let flat_arms = plan_str.matches("KNNVectorDistance").count();
+            let expected = if use_index { (1, 1) } else { (0, 2) };
+            assert_eq!(
+                (ann_arms, flat_arms),
+                expected,
+                "use_index={use_index}: (ANN arms, flat arms), plan:\n{plan_str}"
+            );
+
+            let batches: Vec<RecordBatch> = plan
+                .execute(0, SessionContext::new().task_ctx())
+                .unwrap()
+                .try_collect()
+                .await
+                .unwrap();
+            let ids: Vec<i32> = collect_id_dist(&batches)
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
+            assert_eq!(ids, vec![1, 2], "use_index={use_index}");
         }
     }
 
