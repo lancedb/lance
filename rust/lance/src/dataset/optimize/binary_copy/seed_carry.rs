@@ -151,8 +151,8 @@ pub async fn extract_source_seeds(
                 data_file.path, previous, key, buf_index
             )));
         }
-        // Renames keep field ids but seed keys keep write-time names: resolve
-        // the stored field, whose id is the stable column identity.
+        // Seed keys keep their write-time names. Resolve that stored field
+        // first, then translate its physical column to the current field id.
         let Some(stored_field) = file_schema
             .fields
             .iter()

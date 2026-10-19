@@ -2281,11 +2281,8 @@ async fn staged_file_seeded(dataset: &Dataset, staged: &Transaction) -> bool {
     seed_in_file(dataset, &file.path, "val").await.is_some()
 }
 
-/// A detached commit whose supplied handle is OLDER than the snapshot the
-/// transaction was written against: the handle has neither the index nor
-/// the bits, the staged file carries a seed. Either the base is rejected or
-/// the detached manifest carries both bits; publishing the seed unflagged is
-/// the failure.
+/// A detached commit cannot use a base older than its writing snapshot: the
+/// base lacks state (including feature flags) that the staged files rely on.
 #[tokio::test]
 async fn test_zone_seed_flags_detached_commit_with_older_handle() {
     let dir = TempStrDir::default();
@@ -2313,26 +2310,15 @@ async fn test_zone_seed_flags_detached_commit_with_older_handle() {
     assert!(staged_file_seeded(&v2, &staged).await);
     assert!(staged.read_version > v1.manifest.version);
 
-    match CommitBuilder::new(Arc::new(v1.clone()))
+    let result = CommitBuilder::new(Arc::new(v1.clone()))
         .with_detached(true)
         .execute(staged)
-        .await
-    {
-        Err(e) => {
-            // Rejecting the incompatible base is acceptable; record why.
-            assert!(
-                e.to_string().contains("version"),
-                "rejection should name the version mismatch: {e}"
-            );
-        }
-        Ok(detached) => {
-            assert!(last_fragment_seeded(&detached).await);
-            assert!(
-                seed_flags_set(&detached),
-                "a detached manifest publishing a version 1 seed must carry both bits"
-            );
-        }
-    }
+        .await;
+    let Err(error) = result else {
+        panic!("an older detached-commit base must be rejected");
+    };
+    assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+    assert!(error.to_string().contains("base version"));
 }
 
 /// The same direction through `execute_batch`: one transaction staged at the
@@ -2365,32 +2351,105 @@ async fn test_zone_seed_flags_detached_batch_with_older_handle() {
     assert!(!staged_file_seeded(&v1, &staged_old).await);
     assert!(staged_file_seeded(&v2, &staged_new).await);
 
-    match CommitBuilder::new(v1.clone())
+    let result = CommitBuilder::new(v1.clone())
         .with_detached(true)
         .execute_batch(vec![staged_old, staged_new])
+        .await;
+    let Err(error) = result else {
+        panic!("a detached batch must reject a base older than any input snapshot");
+    };
+    assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+    assert!(error.to_string().contains("base version"));
+}
+
+/// A detached base has a numerically larger ID than any mainline version,
+/// but that does not make it a descendant of the writer's flagged snapshot.
+#[rstest::rstest]
+#[tokio::test]
+async fn test_zone_seed_flags_reject_unrelated_detached_base(
+    #[values(false, true)] is_batch: bool,
+) {
+    let dir = TempStrDir::default();
+    let initial = Arc::new(
+        Dataset::write(
+            RecordBatchIterator::new([Ok(rows(0..8, base_value))], schema()),
+            dir.as_str(),
+            None,
+        )
         .await
-    {
-        Err(e) => {
-            assert!(
-                e.to_string().contains("version") || e.to_string().contains("detached"),
-                "rejection should name the reason: {e}"
-            );
-        }
-        Ok(result) => {
-            let detached = result.dataset;
-            let max_before = v1.fragments().iter().map(|f| f.id).max().unwrap();
-            let added = new_fragments_with_ids(&detached, max_before).await;
-            let mut any_seeded = false;
-            for (fragment, _) in &added {
-                any_seeded |= fragment_seeded(&detached, fragment).await;
-            }
-            assert!(any_seeded, "the flagged-staged file is seeded");
-            assert!(
-                seed_flags_set(&detached),
-                "a detached manifest publishing a version 1 seed must carry both bits"
-            );
-        }
-    }
+        .unwrap(),
+    );
+    let unflagged = stage_append(&initial, 100..108).await;
+    let detached_base = Arc::new(
+        CommitBuilder::new(initial.clone())
+            .with_detached(true)
+            .execute(unflagged.clone())
+            .await
+            .unwrap(),
+    );
+    assert!(!seed_flags_set(&detached_base));
+
+    let mut flagged = (*initial).clone();
+    flagged
+        .create_index(
+            &["val"],
+            IndexType::ZoneMap,
+            None,
+            &zone_map_params(true),
+            false,
+        )
+        .await
+        .unwrap();
+    let flagged = Arc::new(flagged);
+    let seeded = stage_append(&flagged, 200..208).await;
+    assert!(staged_file_seeded(&flagged, &seeded).await);
+    assert!(detached_base.manifest.version > seeded.read_version);
+
+    let builder = CommitBuilder::new(detached_base).with_detached(true);
+    let result = if is_batch {
+        builder
+            .execute_batch(vec![unflagged, seeded])
+            .await
+            .map(|result| result.dataset)
+    } else {
+        builder.execute(seeded).await
+    };
+    let Err(error) = result else {
+        panic!("an unrelated detached base must not publish a seeded file");
+    };
+    assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+    assert!(error.to_string().contains("base version"));
+}
+
+/// Detached snapshots remain valid writing bases when the commit uses that
+/// exact snapshot, including the batch publication path.
+#[rstest::rstest]
+#[tokio::test]
+async fn test_zone_seed_flags_same_detached_snapshot(#[values(false, true)] is_batch: bool) {
+    let dir = TempStrDir::default();
+    let initial = Arc::new(dataset_with_seeded_index(dir.as_str()).await);
+    let staged = stage_append(&initial, 100..108).await;
+    let detached = Arc::new(
+        CommitBuilder::new(initial)
+            .with_detached(true)
+            .execute(staged)
+            .await
+            .unwrap(),
+    );
+    let first = stage_append(&detached, 200..208).await;
+    let builder = CommitBuilder::new(detached.clone()).with_detached(true);
+    let committed = if is_batch {
+        let second = stage_append(&detached, 300..308).await;
+        builder
+            .execute_batch(vec![first, second])
+            .await
+            .unwrap()
+            .dataset
+    } else {
+        builder.execute(first).await.unwrap()
+    };
+    assert!(seed_flags_set(&committed));
+    assert!(last_fragment_seeded(&committed).await);
 }
 
 /// Imported files may remap field ids in `DataFile.fields` while their

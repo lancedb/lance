@@ -21,11 +21,7 @@ use lance_core::Result;
 use lance_core::datatypes::Schema;
 use lance_file::version::ConcreteFileVersion;
 use lance_index::scalar::seed::IndexSeedWriter;
-use lance_table::feature_flags::FLAG_ZONE_WRITE_SEEDS;
 use lance_table::format::{IndexMetadata, Manifest};
-
-/// Every feature flag a seed writer can require today.
-const SEED_FEATURE_FLAGS: u64 = FLAG_ZONE_WRITE_SEEDS;
 
 use super::GenericWriter;
 use crate::Dataset;
@@ -193,13 +189,7 @@ pub async fn apply_seed_feature_flags(
     indices: &[IndexMetadata],
     dataset: &Dataset,
 ) -> Result<()> {
-    // Sticky: once every flag a seed writer can require is set, nothing
-    // remains to derive, and tables without seeds never reach the index
-    // lookups when the prepared list is empty.
-    if manifest.reader_feature_flags & SEED_FEATURE_FLAGS == SEED_FEATURE_FLAGS
-        && manifest.writer_feature_flags & SEED_FEATURE_FLAGS == SEED_FEATURE_FLAGS
-        || indices.is_empty()
-    {
+    if indices.is_empty() {
         return Ok(());
     }
     let writers = seed_writers_for(dataset, indices, &manifest.schema).await?;
