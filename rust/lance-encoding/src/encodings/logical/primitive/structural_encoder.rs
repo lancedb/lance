@@ -1605,9 +1605,6 @@ impl PrimitiveStructuralEncoder {
         let max_encoded_size = (data_size as f64 * threshold_ratio) as u64;
         let max_encoded_size = usize::try_from(max_encoded_size).ok()?;
 
-        // The reader loads a page's dictionary whole the first time the page is touched,
-        // so a dictionary of large values (images, documents) turns every point read into
-        // a read of the whole dictionary even when it shrinks the page.
         let max_dict_bytes: usize = field
             .metadata
             .get(DICT_MAX_SIZE_META_KEY)

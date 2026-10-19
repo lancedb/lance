@@ -64,9 +64,7 @@ const FILL_BYTE: u8 = 0xFE;
 const DEFAULT_DICT_DIVISOR: u64 = 2;
 const DEFAULT_DICT_MAX_CARDINALITY: u64 = 100_000;
 const DEFAULT_DICT_SIZE_RATIO: f64 = 0.8;
-/// Largest dictionary a page is encoded with unless `lance-encoding:dict-max-size` says
-/// otherwise. The reader loads a page's dictionary whole on first touch, so this bounds
-/// the read amplification of a point lookup into a dictionary-encoded page.
+/// Default for `DICT_MAX_SIZE_META_KEY`.
 const DEFAULT_DICT_MAX_SIZE_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_DICT_VALUES_COMPRESSION: &str = "lz4";
 
