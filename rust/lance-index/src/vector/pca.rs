@@ -16,7 +16,6 @@ use arrow_array::{
     types::{Float16Type, Float32Type, Float64Type},
 };
 use arrow_schema::DataType;
-use bytes::Bytes;
 use lance_arrow::FixedSizeListArrayExt;
 use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_core::{Error, Result};
@@ -26,7 +25,6 @@ use ndarray::{Array2, ArrayView2};
 use prost::Message;
 
 use crate::pb;
-use crate::scalar::{IndexReader, IndexWriter};
 
 /// Arrow schema metadata key containing the PCA model global-buffer index.
 pub const PCA_METADATA_KEY: &str = "lance:pca";
@@ -451,48 +449,6 @@ pub fn decode_pca_model(data: &[u8]) -> Result<PcaModel> {
         )
     })?;
     model.try_into()
-}
-
-/// Writes a PCA protobuf payload to an index-file global buffer.
-///
-/// Returns the global-buffer index stored under [`PCA_METADATA_KEY`].
-pub async fn write_pca_model<W: IndexWriter + ?Sized>(
-    writer: &mut W,
-    model: &PcaModel,
-) -> Result<u32> {
-    writer
-        .add_global_buffer(Bytes::from(encode_pca_model(model)?))
-        .await
-}
-
-/// Loads a PCA model from the global buffer referenced by schema metadata.
-///
-/// `metadata_value` must represent a non-negative `u32` global-buffer index.
-pub async fn read_pca_model<R: IndexReader + ?Sized>(
-    reader: &R,
-    metadata_value: &str,
-) -> Result<PcaModel> {
-    let buffer_index = metadata_value.parse::<u32>().map_err(|error| {
-        Error::corrupt_file_named(
-            PCA_MODEL_NAME,
-            format!(
-                "metadata key {PCA_METADATA_KEY} has invalid global buffer index {metadata_value:?}: {error}"
-            ),
-        )
-    })?;
-    let data = match reader.read_global_buffer(buffer_index).await {
-        Ok(data) => data,
-        Err(error @ (Error::NotFound { .. } | Error::InvalidInput { .. })) => {
-            return Err(Error::corrupt_file_named(
-                PCA_MODEL_NAME,
-                format!(
-                    "metadata key {PCA_METADATA_KEY} references missing or invalid global buffer index={buffer_index}: {error}"
-                ),
-            ));
-        }
-        Err(error) => return Err(error),
-    };
-    decode_pca_model(&data)
 }
 
 impl PcaModel {
@@ -1151,13 +1107,9 @@ mod tests {
     use super::*;
 
     use approx::assert_relative_eq;
-    use arrow_array::{Float16Array, Float64Array, RecordBatch};
-    use async_trait::async_trait;
+    use arrow_array::{Float16Array, Float64Array};
     use half::f16;
-    use lance_core::datatypes::Schema;
     use rstest::rstest;
-    use std::collections::HashMap;
-    use std::sync::Mutex;
 
     fn persisted_model(matrix: Vec<f32>, mean: Vec<f32>) -> PcaModel {
         PcaModel {
@@ -1186,87 +1138,6 @@ mod tests {
             error.to_string().contains(context),
             "error {error} must contain {context:?}"
         );
-    }
-
-    struct BufferWriter {
-        buffers: Arc<Mutex<Vec<Bytes>>>,
-    }
-
-    #[async_trait]
-    impl IndexWriter for BufferWriter {
-        async fn write_record_batch(&mut self, _batch: RecordBatch) -> Result<u64> {
-            Err(Error::not_supported(
-                "record batches are unused by this test",
-            ))
-        }
-
-        async fn add_global_buffer(&mut self, data: Bytes) -> Result<u32> {
-            let mut buffers = self
-                .buffers
-                .lock()
-                .expect("test mutex must not be poisoned");
-            buffers.push(data);
-            u32::try_from(buffers.len() - 1)
-                .map_err(|_| Error::index("test global buffer index exceeds u32"))
-        }
-
-        async fn finish(&mut self) -> Result<crate::scalar::IndexFile> {
-            Err(Error::not_supported("finish is unused by this test"))
-        }
-
-        async fn finish_with_metadata(
-            &mut self,
-            _metadata: HashMap<String, String>,
-        ) -> Result<crate::scalar::IndexFile> {
-            Err(Error::not_supported("finish is unused by this test"))
-        }
-    }
-
-    struct BufferReader {
-        buffers: Arc<Mutex<Vec<Bytes>>>,
-        schema: Schema,
-        fail_reads_with_io: bool,
-    }
-
-    #[async_trait]
-    impl IndexReader for BufferReader {
-        async fn read_record_batch(&self, _n: u64, _batch_size: u64) -> Result<RecordBatch> {
-            Err(Error::not_supported(
-                "record batches are unused by this test",
-            ))
-        }
-
-        async fn read_global_buffer(&self, index: u32) -> Result<Bytes> {
-            if self.fail_reads_with_io {
-                return Err(Error::io("injected PCA global buffer read failure"));
-            }
-            self.buffers
-                .lock()
-                .expect("test mutex must not be poisoned")
-                .get(index as usize)
-                .cloned()
-                .ok_or_else(|| Error::not_found(format!("global buffer index={index}")))
-        }
-
-        async fn read_range(
-            &self,
-            _range: std::ops::Range<usize>,
-            _projection: Option<&[&str]>,
-        ) -> Result<RecordBatch> {
-            Err(Error::not_supported("ranges are unused by this test"))
-        }
-
-        async fn num_batches(&self, _batch_size: u64) -> u32 {
-            0
-        }
-
-        fn num_rows(&self) -> usize {
-            0
-        }
-
-        fn schema(&self) -> &Schema {
-            &self.schema
-        }
     }
 
     fn f32_vectors(values: Vec<f32>, dimension: i32) -> FixedSizeListArray {
@@ -1831,85 +1702,6 @@ mod tests {
             decode_f32_tensor(&tensor, 3, "overflow_tensor", PCA_MODEL_VERSION)
                 .expect_err("dimension multiplication must overflow"),
             "overflows",
-        );
-    }
-
-    #[rstest]
-    #[case("")]
-    #[case("-1")]
-    #[case("abc")]
-    #[case("4294967296")]
-    #[tokio::test]
-    async fn rejects_invalid_metadata_indices(#[case] metadata: &str) {
-        let reader = BufferReader {
-            buffers: Arc::new(Mutex::new(Vec::new())),
-            schema: Schema::default(),
-            fail_reads_with_io: false,
-        };
-        assert_corrupt(
-            read_pca_model(&reader, metadata)
-                .await
-                .expect_err("invalid metadata must fail"),
-            PCA_METADATA_KEY,
-        );
-    }
-
-    #[tokio::test]
-    async fn preserves_global_buffer_io_error_variant() {
-        let reader = BufferReader {
-            buffers: Arc::new(Mutex::new(Vec::new())),
-            schema: Schema::default(),
-            fail_reads_with_io: true,
-        };
-        let error = read_pca_model(&reader, "0")
-            .await
-            .expect_err("I/O errors must be propagated");
-        assert!(
-            matches!(&error, Error::IO { .. }),
-            "expected IO, got {error:?}"
-        );
-        assert!(
-            error
-                .to_string()
-                .contains("injected PCA global buffer read failure"),
-            "propagated error must preserve its source: {error}"
-        );
-    }
-
-    #[tokio::test]
-    async fn global_buffer_helpers_round_trip_and_reject_missing_index() {
-        let buffers = Arc::new(Mutex::new(vec![
-            Bytes::from_static(b"zero"),
-            Bytes::from_static(b"one"),
-            Bytes::from_static(b"two"),
-        ]));
-        let model = persisted_model(vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0], vec![1.0, 2.0, 3.0]);
-        let mut writer = BufferWriter {
-            buffers: buffers.clone(),
-        };
-        let index = write_pca_model(&mut writer, &model)
-            .await
-            .expect("write must succeed");
-        assert_eq!(index, 3);
-        let reader = BufferReader {
-            buffers,
-            schema: Schema::default(),
-            fail_reads_with_io: false,
-        };
-        let decoded = read_pca_model(&reader, "3")
-            .await
-            .expect("metadata index 3 must load");
-        assert_eq!(decoded.transform_matrix(), model.transform_matrix());
-        assert_eq!(decoded.mean(), model.mean());
-        read_pca_model(&reader, "03")
-            .await
-            .expect("any valid decimal u32 representation must load");
-
-        assert_corrupt(
-            read_pca_model(&reader, "4")
-                .await
-                .expect_err("missing buffer must fail"),
-            "index=4",
         );
     }
 
