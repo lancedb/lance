@@ -2885,6 +2885,10 @@ impl DatasetIndexExt for Dataset {
             frag_reuse::plan_staged_segments(self, &source_segments).await?
         };
         // Before the staleness pass, which drops the retired fragments this remaps.
+        let staged_coverage: Vec<Option<RoaringBitmap>> = source_segments
+            .iter()
+            .map(|segment| segment.fragment_bitmap.clone())
+            .collect();
         let remapped_fragments = if !all_vector {
             let index_name = source_segments[0].name.clone();
             remap_merged_segment_coverage(self, &index_name, &mut source_segments, staged.as_ref())
@@ -2893,6 +2897,12 @@ impl DatasetIndexExt for Dataset {
             None
         };
         let has_remapped_source_coverage = remapped_fragments.is_some();
+        // A tagged history reports its remap even when every plan is the
+        // identity, so whether row addresses moved is read off the coverage.
+        let source_coverage_moved = source_segments
+            .iter()
+            .zip(&staged_coverage)
+            .any(|(segment, staged)| &segment.fragment_bitmap != staged);
 
         if all_rtree {
             let mut source_coverage = source_segments
@@ -2922,7 +2932,7 @@ impl DatasetIndexExt for Dataset {
                 self,
                 source_segments,
                 staged,
-                has_remapped_source_coverage,
+                source_coverage_moved,
             )
             .await?
         } else if all_fmindex {
