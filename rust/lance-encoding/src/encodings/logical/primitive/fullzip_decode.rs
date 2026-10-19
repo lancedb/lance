@@ -127,6 +127,16 @@ impl FullZipReadSource {
     }
 }
 
+/// The most a full read of one full-zip page requests as a single read, the
+/// size blob payloads are loaded in.
+///
+/// Structural writers split large pages on read, not on write, so a page can be
+/// as large as the batch it was written from. Read as one request, it is held
+/// whole until every row is decoded, and the I/O buffer does not bound it: the
+/// I/O scheduler lets the rest of a request through once its first part is
+/// admitted. A larger page is read in row chunks of about this size instead.
+const MAX_PAGE_LOAD_BYTES: u64 = super::blob::TARGET_SHARD_SIZE;
+
 /// A scheduler for full-zip encoded data
 ///
 /// When the data type has a fixed-width then we simply need to map from
@@ -147,6 +157,9 @@ pub struct FullZipScheduler {
     cached_state: Option<Arc<FullZipCacheableState>>,
     /// Whether repetition index metadata should be cached during initialize.
     pub(super) enable_cache: bool,
+    /// Pages larger than this are read in row chunks; see
+    /// [`MAX_PAGE_LOAD_BYTES`].
+    max_page_load_bytes: u64,
 }
 
 impl FullZipScheduler {
@@ -229,6 +242,7 @@ impl FullZipScheduler {
             bits_per_offset,
             cached_state: None,
             enable_cache: false,
+            max_page_load_bytes: MAX_PAGE_LOAD_BYTES,
         })
     }
 
@@ -376,16 +390,47 @@ impl FullZipScheduler {
             .collect()
     }
 
+    fn schedule_rows(
+        &self,
+        ranges: &[Range<u64>],
+        io: &Arc<dyn EncodingsIo>,
+        priority: u64,
+    ) -> Result<Vec<PageLoadTask>> {
+        if let Some(rep_index) = self.rep_index {
+            self.schedule_ranges_rep(ranges, io, rep_index, priority)
+        } else {
+            self.schedule_ranges_simple(ranges, io, priority)
+        }
+    }
+
+    /// Schedules a whole page too large to read at once as row chunks of about
+    /// `max_page_load_bytes`, each its own load task and its own read at the
+    /// row priority of its first row, so the I/O scheduler admits each chunk
+    /// against its buffer and the decoder frees a chunk once it is decoded.
+    fn schedule_page_in_chunks(&self, io: &Arc<dyn EncodingsIo>) -> Result<Vec<PageLoadTask>> {
+        let rows_per_chunk = (u128::from(self.rows_in_page) * u128::from(self.max_page_load_bytes)
+            / u128::from(self.data_buf_size))
+        .max(1) as u64;
+        let mut tasks = Vec::new();
+        let mut start = 0;
+        while start < self.rows_in_page {
+            let end = (start + rows_per_chunk).min(self.rows_in_page);
+            tasks.extend(self.schedule_rows(&[start..end], io, self.priority + start)?);
+            start = end;
+        }
+        Ok(tasks)
+    }
+
     /// Schedules ranges in the presence of a repetition index
     fn schedule_ranges_rep(
         &self,
         ranges: &[Range<u64>],
         io: &Arc<dyn EncodingsIo>,
         rep_index: FullZipRepIndexDetails,
+        priority: u64,
     ) -> Result<Vec<PageLoadTask>> {
         let num_rows = ranges.iter().map(|r| r.end - r.start).sum();
         let data_buf_position = self.data_buf_position;
-        let priority = self.priority;
         let details = self.details.clone();
         let bits_per_offset = self.bits_per_offset;
 
@@ -458,6 +503,7 @@ impl FullZipScheduler {
         &self,
         ranges: &[Range<u64>],
         io: &Arc<dyn EncodingsIo>,
+        priority: u64,
     ) -> Result<Vec<PageLoadTask>> {
         // Convert row ranges to item ranges (i.e. multiply by items per row)
         let num_rows = ranges.iter().map(|r| r.end - r.start).sum();
@@ -490,7 +536,7 @@ impl FullZipScheduler {
             })
             .collect::<Vec<_>>();
 
-        let io_future = io.submit_request(byte_ranges, self.priority);
+        let io_future = io.submit_request(byte_ranges, priority);
         let page_load_task = Self::create_page_load_task(
             io_future,
             num_rows,
@@ -571,11 +617,13 @@ impl StructuralPageScheduler for FullZipScheduler {
         ranges: &[Range<u64>],
         io: &Arc<dyn EncodingsIo>,
     ) -> Result<Vec<PageLoadTask>> {
-        if let Some(rep_index) = self.rep_index {
-            self.schedule_ranges_rep(ranges, io, rep_index)
-        } else {
-            self.schedule_ranges_simple(ranges, io)
+        if self.data_buf_size > self.max_page_load_bytes
+            && self.rows_in_page > 1
+            && Self::covers_entire_page(ranges, self.rows_in_page)
+        {
+            return self.schedule_page_in_chunks(io);
         }
+        self.schedule_rows(ranges, io, self.priority)
     }
 }
 
@@ -1281,10 +1329,12 @@ impl DecodePageTask for FixedFullZipDecodeTask {
 #[allow(clippy::single_range_in_vec_init)]
 mod tests {
     use std::collections::HashMap;
-    use std::sync::Arc;
+    use std::ops::Range;
+    use std::sync::{Arc, Mutex};
 
-    use arrow_array::{Array, FixedSizeListArray, Float32Array, UInt8Array, make_array};
+    use arrow_array::{Array, ArrayRef, FixedSizeListArray, Float32Array, UInt8Array, make_array};
     use arrow_schema::{DataType, Field as ArrowField};
+    use futures::{FutureExt, future::BoxFuture};
 
     use crate::buffer::LanceBuffer;
     use crate::compression::FixedPerValueDecompressor;
@@ -1572,76 +1622,84 @@ mod tests {
         assert!(err.to_string().contains("less than base"));
     }
 
-    #[tokio::test]
-    async fn test_fullzip_initialize_is_lazy() {
-        use futures::{FutureExt, future::BoxFuture};
-        use std::ops::Range;
-        use std::sync::Mutex;
+    /// One request's ranges and the priority it was submitted at.
+    type Request = (Vec<Range<u64>>, u64);
 
-        #[derive(Debug, Clone)]
-        struct RecordingScheduler {
-            data: bytes::Bytes,
-            requests: Arc<Mutex<Vec<Vec<Range<u64>>>>>,
-        }
+    /// An I/O source over `data` that records each request.
+    #[derive(Debug, Clone)]
+    struct RecordingScheduler {
+        data: bytes::Bytes,
+        requests: Arc<Mutex<Vec<Request>>>,
+    }
 
-        impl RecordingScheduler {
-            fn new(data: bytes::Bytes) -> Self {
-                Self {
-                    data,
-                    requests: Arc::new(Mutex::new(Vec::new())),
-                }
-            }
-
-            fn requests(&self) -> Vec<Vec<Range<u64>>> {
-                self.requests.lock().unwrap().clone()
+    impl RecordingScheduler {
+        fn new(data: Vec<u8>) -> Self {
+            Self {
+                data: bytes::Bytes::from(data),
+                requests: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
-        impl crate::EncodingsIo for RecordingScheduler {
-            fn submit_request(
-                &self,
-                ranges: Vec<Range<u64>>,
-                _priority: u64,
-            ) -> BoxFuture<'static, crate::Result<Vec<bytes::Bytes>>> {
-                self.requests.lock().unwrap().push(ranges.clone());
-                let data = ranges
-                    .into_iter()
-                    .map(|range| self.data.slice(range.start as usize..range.end as usize))
-                    .collect::<Vec<_>>();
-                std::future::ready(Ok(data)).boxed()
-            }
+        fn requests(&self) -> Vec<Request> {
+            self.requests.lock().unwrap().clone()
         }
 
-        #[derive(Debug)]
-        struct TestFixedDecompressor;
+        fn ranges(&self) -> Vec<Vec<Range<u64>>> {
+            self.requests()
+                .into_iter()
+                .map(|(ranges, _)| ranges)
+                .collect()
+        }
+    }
 
-        impl FixedPerValueDecompressor for TestFixedDecompressor {
-            fn decompress(
-                &self,
-                _data: FixedWidthDataBlock,
-                _num_rows: u64,
-            ) -> crate::Result<DataBlock> {
-                unimplemented!("Test decompressor")
-            }
+    impl crate::EncodingsIo for RecordingScheduler {
+        fn submit_request(
+            &self,
+            ranges: Vec<Range<u64>>,
+            priority: u64,
+        ) -> BoxFuture<'static, crate::Result<Vec<bytes::Bytes>>> {
+            self.requests
+                .lock()
+                .unwrap()
+                .push((ranges.clone(), priority));
+            let data = ranges
+                .into_iter()
+                .map(|range| self.data.slice(range.start as usize..range.end as usize))
+                .collect::<Vec<_>>();
+            std::future::ready(Ok(data)).boxed()
+        }
+    }
 
-            fn bits_per_value(&self) -> u64 {
-                32
-            }
+    #[derive(Debug)]
+    struct TestFixedDecompressor;
+
+    impl FixedPerValueDecompressor for TestFixedDecompressor {
+        fn decompress(
+            &self,
+            _data: FixedWidthDataBlock,
+            _num_rows: u64,
+        ) -> crate::Result<DataBlock> {
+            unimplemented!("Test decompressor")
         }
 
-        let io = Arc::new(RecordingScheduler::new(bytes::Bytes::from(vec![
-            0;
-            16 * 1024
-        ])));
-        let mut scheduler = FullZipScheduler {
-            data_buf_position: 0,
-            data_buf_size: 4096,
-            rep_index: Some(FullZipRepIndexDetails {
-                buf_position: 1000,
-                bytes_per_value: 4,
-            }),
+        fn bits_per_value(&self) -> u64 {
+            32
+        }
+    }
+
+    /// A scheduler for a page of `rows_in_page` rows stored at `data`, located
+    /// through `rep_index`.
+    fn test_scheduler(
+        data: Range<u64>,
+        rep_index: FullZipRepIndexDetails,
+        rows_in_page: u64,
+    ) -> FullZipScheduler {
+        FullZipScheduler {
+            data_buf_position: data.start,
+            data_buf_size: data.end - data.start,
+            rep_index: Some(rep_index),
             priority: 0,
-            rows_in_page: 100,
+            rows_in_page,
             bits_per_offset: 32,
             details: Arc::new(FullZipDecodeDetails {
                 value_decompressor: PerValueDecompressor::Fixed(Arc::new(TestFixedDecompressor)),
@@ -1652,7 +1710,38 @@ mod tests {
             }),
             cached_state: None,
             enable_cache: false,
+            max_page_load_bytes: super::MAX_PAGE_LOAD_BYTES,
+        }
+    }
+
+    /// File bytes holding a repetition index at `rep_index` for
+    /// `rows_in_page` rows of `bytes_per_row` bytes each.
+    fn bytes_with_rep_index(
+        rep_index: FullZipRepIndexDetails,
+        rows_in_page: u64,
+        bytes_per_row: u64,
+    ) -> Vec<u8> {
+        let mut bytes = vec![0_u8; 16 * 1024];
+        for row in 0..=rows_in_page {
+            let pos = (rep_index.buf_position + row * rep_index.bytes_per_value) as usize;
+            bytes[pos..pos + 4].copy_from_slice(&((row * bytes_per_row) as u32).to_le_bytes());
+        }
+        bytes
+    }
+
+    fn rep_index_range(rep_index: FullZipRepIndexDetails, rows_in_page: u64) -> Range<u64> {
+        rep_index.buf_position
+            ..rep_index.buf_position + (rows_in_page + 1) * rep_index.bytes_per_value
+    }
+
+    #[tokio::test]
+    async fn test_fullzip_initialize_is_lazy() {
+        let io = Arc::new(RecordingScheduler::new(vec![0; 16 * 1024]));
+        let rep_index = FullZipRepIndexDetails {
+            buf_position: 1000,
+            bytes_per_value: 4,
         };
+        let mut scheduler = test_scheduler(0..4096, rep_index, 100);
 
         let io_dyn: Arc<dyn crate::EncodingsIo> = io.clone();
         let initialization = scheduler.init_layout().unwrap();
@@ -1696,89 +1785,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_fullzip_initialize_caches_rep_index_when_enabled() {
-        use futures::{FutureExt, future::BoxFuture};
-        use std::ops::Range;
-        use std::sync::Mutex;
-
-        #[derive(Debug, Clone)]
-        struct RecordingScheduler {
-            data: bytes::Bytes,
-            requests: Arc<Mutex<Vec<Vec<Range<u64>>>>>,
-        }
-
-        impl RecordingScheduler {
-            fn new(data: bytes::Bytes) -> Self {
-                Self {
-                    data,
-                    requests: Arc::new(Mutex::new(Vec::new())),
-                }
-            }
-
-            fn requests(&self) -> Vec<Vec<Range<u64>>> {
-                self.requests.lock().unwrap().clone()
-            }
-        }
-
-        impl crate::EncodingsIo for RecordingScheduler {
-            fn submit_request(
-                &self,
-                ranges: Vec<Range<u64>>,
-                _priority: u64,
-            ) -> BoxFuture<'static, crate::Result<Vec<bytes::Bytes>>> {
-                self.requests.lock().unwrap().push(ranges.clone());
-                let data = ranges
-                    .into_iter()
-                    .map(|range| self.data.slice(range.start as usize..range.end as usize))
-                    .collect::<Vec<_>>();
-                std::future::ready(Ok(data)).boxed()
-            }
-        }
-
-        #[derive(Debug)]
-        struct TestFixedDecompressor;
-
-        impl FixedPerValueDecompressor for TestFixedDecompressor {
-            fn decompress(
-                &self,
-                _data: FixedWidthDataBlock,
-                _num_rows: u64,
-            ) -> crate::Result<DataBlock> {
-                unimplemented!("Test decompressor")
-            }
-
-            fn bits_per_value(&self) -> u64 {
-                32
-            }
-        }
-
         let rows_in_page = 100_u64;
-        let bytes_per_value = 4_u64;
-        let rep_start = 1000_u64;
-        let rep_size = ((rows_in_page + 1) * bytes_per_value) as usize;
-        let mut data = vec![0_u8; 16 * 1024];
-        data[rep_start as usize..rep_start as usize + rep_size].fill(7);
-        let io = Arc::new(RecordingScheduler::new(bytes::Bytes::from(data)));
-
-        let mut scheduler = FullZipScheduler {
-            data_buf_position: 0,
-            data_buf_size: 4096,
-            rep_index: Some(FullZipRepIndexDetails {
-                buf_position: rep_start,
-                bytes_per_value,
-            }),
-            priority: 0,
-            rows_in_page,
-            bits_per_offset: 32,
-            details: Arc::new(FullZipDecodeDetails {
-                value_decompressor: PerValueDecompressor::Fixed(Arc::new(TestFixedDecompressor)),
-                def_meaning: Arc::new([crate::repdef::DefinitionInterpretation::NullableItem]),
-                ctrl_word_parser: crate::repdef::ControlWordParser::new(0, 1),
-                max_rep: 0,
-                max_visible_def: 0,
-            }),
-            cached_state: None,
-            enable_cache: true,
+        let rep_index = FullZipRepIndexDetails {
+            buf_position: 1000,
+            bytes_per_value: 4,
         };
+        let rep_range = rep_index_range(rep_index, rows_in_page);
+        let mut data = vec![0_u8; 16 * 1024];
+        data[rep_range.start as usize..rep_range.end as usize].fill(7);
+        let io = Arc::new(RecordingScheduler::new(data));
+        let mut scheduler = test_scheduler(0..4096, rep_index, rows_in_page);
+        scheduler.enable_cache = true;
 
         let io_dyn: Arc<dyn crate::EncodingsIo> = io.clone();
         let initialization = scheduler.init_layout().unwrap();
@@ -1786,10 +1803,7 @@ mod tests {
             .required_ranges()
             .cloned()
             .collect::<Vec<_>>();
-        assert_eq!(
-            ranges,
-            vec![rep_start..(rep_start + (rows_in_page + 1) * bytes_per_value)]
-        );
+        assert_eq!(ranges, vec![rep_range.clone()]);
         // The field scheduler fetches the declared ranges (coalesced across all
         // pages) and hands the bytes back to the page to finish initialization.
         let buffers = io_dyn.submit_request(ranges, 0).await.unwrap();
@@ -1805,129 +1819,187 @@ mod tests {
         assert!(scheduler.cached_state.is_none());
         scheduler.try_load(&cached_data).unwrap();
         assert!(scheduler.cached_state.is_some());
-        assert_eq!(
-            io.requests(),
-            vec![vec![
-                rep_start..(rep_start + (rows_in_page + 1) * bytes_per_value)
-            ]]
-        );
+        assert_eq!(io.ranges(), vec![vec![rep_range]]);
     }
 
     #[tokio::test]
     async fn test_fullzip_full_page_bypasses_rep_index_io() {
-        use futures::{FutureExt, future::BoxFuture};
-        use std::ops::Range;
-        use std::sync::Mutex;
-
-        #[derive(Debug, Clone)]
-        struct RecordingScheduler {
-            data: bytes::Bytes,
-            requests: Arc<Mutex<Vec<Vec<Range<u64>>>>>,
-        }
-
-        impl RecordingScheduler {
-            fn new(data: bytes::Bytes) -> Self {
-                Self {
-                    data,
-                    requests: Arc::new(Mutex::new(Vec::new())),
-                }
-            }
-
-            fn requests(&self) -> Vec<Vec<Range<u64>>> {
-                self.requests.lock().unwrap().clone()
-            }
-        }
-
-        impl crate::EncodingsIo for RecordingScheduler {
-            fn submit_request(
-                &self,
-                ranges: Vec<Range<u64>>,
-                _priority: u64,
-            ) -> BoxFuture<'static, crate::Result<Vec<bytes::Bytes>>> {
-                self.requests.lock().unwrap().push(ranges.clone());
-                let data = ranges
-                    .into_iter()
-                    .map(|range| self.data.slice(range.start as usize..range.end as usize))
-                    .collect::<Vec<_>>();
-                std::future::ready(Ok(data)).boxed()
-            }
-        }
-
-        #[derive(Debug)]
-        struct TestFixedDecompressor;
-
-        impl FixedPerValueDecompressor for TestFixedDecompressor {
-            fn decompress(
-                &self,
-                _data: FixedWidthDataBlock,
-                _num_rows: u64,
-            ) -> crate::Result<DataBlock> {
-                unimplemented!("Test decompressor")
-            }
-
-            fn bits_per_value(&self) -> u64 {
-                32
-            }
-        }
-
         let rows_in_page = 100_u64;
-        let data_start = 256_u64;
-        let data_size = 500_u64;
-        let rep_start = 4096_u64;
-        let bytes_per_value = 4_u64;
-
-        let mut bytes = vec![0_u8; 16 * 1024];
-        for i in 0..=rows_in_page {
-            let offset = (i * 5) as u32;
-            let pos = rep_start as usize + (i * bytes_per_value) as usize;
-            bytes[pos..pos + 4].copy_from_slice(&offset.to_le_bytes());
-        }
-        let io = Arc::new(RecordingScheduler::new(bytes::Bytes::from(bytes)));
-
-        let scheduler = FullZipScheduler {
-            data_buf_position: data_start,
-            data_buf_size: data_size,
-            rep_index: Some(FullZipRepIndexDetails {
-                buf_position: rep_start,
-                bytes_per_value,
-            }),
-            priority: 0,
+        let data = 256..756_u64;
+        let rep_index = FullZipRepIndexDetails {
+            buf_position: 4096,
+            bytes_per_value: 4,
+        };
+        let io = Arc::new(RecordingScheduler::new(bytes_with_rep_index(
+            rep_index,
             rows_in_page,
-            bits_per_offset: 32,
-            details: Arc::new(FullZipDecodeDetails {
-                value_decompressor: PerValueDecompressor::Fixed(Arc::new(TestFixedDecompressor)),
-                def_meaning: Arc::new([crate::repdef::DefinitionInterpretation::NullableItem]),
-                ctrl_word_parser: crate::repdef::ControlWordParser::new(0, 1),
-                max_rep: 0,
-                max_visible_def: 0,
-            }),
-            cached_state: None,
-            enable_cache: false,
+            5,
+        )));
+        let scheduler = test_scheduler(data.clone(), rep_index, rows_in_page);
+
+        let io_dyn: Arc<dyn crate::EncodingsIo> = io.clone();
+        let tasks = scheduler
+            .schedule_ranges(&[0..rows_in_page], &io_dyn)
+            .unwrap();
+        assert_eq!(io.ranges(), vec![vec![data]]);
+
+        let _ = tasks.into_iter().next().unwrap().decoder_fut.await.unwrap();
+        assert_eq!(
+            io.requests().len(),
+            1,
+            "full page path should not issue rep-index I/O"
+        );
+    }
+
+    /// How the page under test locates a row's bytes.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum RowLookup {
+        RepIndex,
+        CachedRepIndex,
+        FixedWidth,
+    }
+
+    /// A whole page larger than `max_page_load_bytes` is read as row chunks,
+    /// each its own read of its own bytes at the priority of its first row.
+    /// Through an uncached repetition index, a chunk reads its data only when
+    /// its load task runs.
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn test_fullzip_oversized_page_reads_in_chunks(
+        #[values(RowLookup::RepIndex, RowLookup::CachedRepIndex, RowLookup::FixedWidth)]
+        lookup: RowLookup,
+    ) {
+        let rows_in_page = 100_u64;
+        // A 4-byte value and a 1-byte control word.
+        let bytes_per_row = 5_u64;
+        let data = 256..(256 + rows_in_page * bytes_per_row);
+        let rep_index = FullZipRepIndexDetails {
+            buf_position: 4096,
+            bytes_per_value: 4,
+        };
+        let bytes = bytes_with_rep_index(rep_index, rows_in_page, bytes_per_row);
+        let mut scheduler = test_scheduler(data.clone(), rep_index, rows_in_page);
+        scheduler.priority = 1000;
+        scheduler.max_page_load_bytes = 100;
+        match lookup {
+            RowLookup::RepIndex => {}
+            RowLookup::CachedRepIndex => {
+                let rep_range = rep_index_range(rep_index, rows_in_page);
+                scheduler.cached_state = Some(Arc::new(FullZipCacheableState {
+                    rep_index_buffer: LanceBuffer::copy_slice(
+                        &bytes[rep_range.start as usize..rep_range.end as usize],
+                    ),
+                }));
+            }
+            RowLookup::FixedWidth => scheduler.rep_index = None,
+        }
+        let io = Arc::new(RecordingScheduler::new(bytes));
+        let data_reads = || {
+            io.requests()
+                .into_iter()
+                .filter(|(ranges, _)| {
+                    ranges
+                        .iter()
+                        .all(|r| r.start >= data.start && r.end <= data.end)
+                })
+                .collect::<Vec<_>>()
         };
 
         let io_dyn: Arc<dyn crate::EncodingsIo> = io.clone();
         let tasks = scheduler
-            .schedule_ranges_rep(
-                &[0..rows_in_page],
-                &io_dyn,
-                FullZipRepIndexDetails {
-                    buf_position: rep_start,
-                    bytes_per_value,
-                },
-            )
+            .schedule_ranges(&[0..rows_in_page], &io_dyn)
             .unwrap();
-
-        let requests = io.requests();
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0], vec![data_start..(data_start + data_size)]);
-
-        let _ = tasks.into_iter().next().unwrap().decoder_fut.await.unwrap();
-        let requests_after_await = io.requests();
         assert_eq!(
-            requests_after_await.len(),
-            1,
-            "full page path should not issue rep-index I/O"
+            tasks.iter().map(|task| task.num_rows).collect::<Vec<_>>(),
+            vec![20; 5]
         );
+        if lookup == RowLookup::RepIndex {
+            assert_eq!(data_reads(), vec![]);
+        }
+        for task in tasks {
+            let _ = task.decoder_fut.await.unwrap();
+        }
+
+        let chunk_bytes = 20 * bytes_per_row;
+        let expected = (0..5)
+            .map(|chunk| {
+                let start = data.start + chunk * chunk_bytes;
+                (vec![start..start + chunk_bytes], 1000 + chunk * 20)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(data_reads(), expected);
+    }
+
+    /// Rows of `bytes_per_row` that fill one page just over
+    /// [`super::MAX_PAGE_LOAD_BYTES`], so a full scan reads it as full chunks
+    /// and a short one.
+    fn rows_just_over_load_limit(bytes_per_row: u64) -> u64 {
+        super::MAX_PAGE_LOAD_BYTES / bytes_per_row + 1
+    }
+
+    fn random_binary(rows: u64, bytes_per_value: u64) -> ArrayRef {
+        use lance_datagen::{ByteCount, RowCount, array, gen_array};
+        gen_array(array::rand_varbin(
+            ByteCount::from(bytes_per_value),
+            ByteCount::from(bytes_per_value),
+        ))
+        .into_array_rows(RowCount::from(rows))
+        .unwrap()
+    }
+
+    fn oversized_binary() -> ArrayRef {
+        const VALUE_BYTES: u64 = 8 * 1024 * 1024;
+        random_binary(rows_just_over_load_limit(VALUE_BYTES), VALUE_BYTES)
+    }
+
+    /// Fixed-width rows, located by their width rather than a repetition index.
+    fn oversized_vectors() -> ArrayRef {
+        use lance_datagen::{RowCount, array, gen_array};
+        const DIMENSION: i32 = 16 * 1024;
+        let data_type = DataType::FixedSizeList(
+            Arc::new(ArrowField::new("item", DataType::Float32, true)),
+            DIMENSION,
+        );
+        gen_array(array::rand_type(&data_type))
+            .into_array_rows(RowCount::from(rows_just_over_load_limit(
+                DIMENSION as u64 * 4,
+            )))
+            .unwrap()
+    }
+
+    /// Lists of two values each, then an empty list and a null one, so a chunk
+    /// boundary counts rows rather than values.
+    fn oversized_lists() -> ArrayRef {
+        use arrow_array::ListArray;
+        use arrow_buffer::{NullBuffer, OffsetBuffer};
+        const VALUE_BYTES: u64 = 4 * 1024 * 1024;
+        let full_rows = rows_just_over_load_limit(2 * VALUE_BYTES) as i32;
+        let items = random_binary(2 * full_rows as u64, VALUE_BYTES);
+        let ends = (0..=full_rows).map(|row| 2 * row);
+        let offsets = ends
+            .chain([2 * full_rows, 2 * full_rows])
+            .collect::<Vec<_>>();
+        let validity = (0..full_rows + 2).map(|row| row != full_rows + 1);
+        Arc::new(ListArray::new(
+            Arc::new(ArrowField::new("item", DataType::Binary, true)),
+            OffsetBuffer::new(offsets.into()),
+            items,
+            Some(NullBuffer::from_iter(validity)),
+        ))
+    }
+
+    /// A page larger than [`super::MAX_PAGE_LOAD_BYTES`] decodes the same when
+    /// a full scan reads it in chunks.
+    #[rstest::rstest]
+    #[case::binary(oversized_binary)]
+    #[case::vectors(oversized_vectors)]
+    #[case::lists(oversized_lists)]
+    #[tokio::test]
+    async fn test_fullzip_oversized_page_round_trips(#[case] values: fn() -> ArrayRef) {
+        let test_cases = TestCases::default()
+            .with_u32_structural_encodings()
+            .with_page_sizes(vec![4096]);
+        check_round_trip_encoding_of_data(vec![values()], &test_cases, HashMap::new()).await;
     }
 
     /// This test is used to reproduce fuzz test https://github.com/lancedb/lance/issues/4492
