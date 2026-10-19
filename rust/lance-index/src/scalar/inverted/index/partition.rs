@@ -856,11 +856,37 @@ impl InvertedPartition {
         index_cache: &LanceCache,
         token_set_format: TokenSetFormat,
     ) -> Result<Self> {
-        let token_file = store.open_index_file(&token_file_path(id)).await?;
+        Self::load_with_paths(
+            store,
+            id,
+            &token_file_path(id),
+            &posting_file_path(id),
+            &doc_file_path(id),
+            frag_reuse_index,
+            index_cache,
+            token_set_format,
+        )
+        .await
+    }
+
+    /// Load a partition whose three files sit at explicit paths, such as a
+    /// staged partition that has not been renumbered into the final layout.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn load_with_paths(
+        store: Arc<dyn IndexStore>,
+        id: u64,
+        token_path: &str,
+        posting_path: &str,
+        docs_path: &str,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        index_cache: &LanceCache,
+        token_set_format: TokenSetFormat,
+    ) -> Result<Self> {
+        let token_file = store.open_index_file(token_path).await?;
         let tokens = TokenSet::load(token_file, token_set_format).await?;
-        let invert_list_file = store.open_index_file(&posting_file_path(id)).await?;
+        let invert_list_file = store.open_index_file(posting_path).await?;
         let mut inverted_list = PostingListReader::try_new(invert_list_file, index_cache).await?;
-        let docs_path = doc_file_path(id);
+        let docs_path = docs_path.to_string();
         let docs_reader = store.open_index_file(&docs_path).await?;
         let docs = PartitionDocuments::try_new(
             store.clone(),

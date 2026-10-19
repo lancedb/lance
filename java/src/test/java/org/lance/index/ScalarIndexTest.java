@@ -1893,9 +1893,20 @@ public class ScalarIndexTest {
         assertTrue(
             events.contains("progress:read_partition_metadata:2"),
             "Expected metadata progress to reach both fragments, got: " + events);
+        // Small staged partitions are consolidated instead of copied, so the
+        // finalize reports its work under consolidate_partitions; either stage
+        // must finish before the root metadata is written.
         assertTrue(
-            events.stream().anyMatch(event -> event.startsWith("progress:remap_partition_files:")),
-            "Expected remap progress, got: " + events);
+            events.stream()
+                .anyMatch(
+                    event ->
+                        event.startsWith("progress:remap_partition_files:")
+                            || event.startsWith("progress:consolidate_partitions:")),
+            "Expected copy or consolidation progress, got: " + events);
+        if (events.contains("complete:consolidate_partitions")) {
+          assertEventsInOrder(
+              events, "complete:consolidate_partitions", "start:write_merged_metadata:");
+        }
         assertTrue(
             events.contains("progress:write_merged_metadata:1"),
             "Expected merged metadata write progress, got: " + events);
