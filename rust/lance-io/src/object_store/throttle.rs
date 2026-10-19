@@ -197,7 +197,7 @@ impl AimdThrottleConfig {
     /// |----------------------|----------------------------------|----------------------------------|---------|
     /// | Initial rate         | `lance_aimd_initial_rate`        | `LANCE_AIMD_INITIAL_RATE`        | 2000    |
     /// | Min rate             | `lance_aimd_min_rate`            | `LANCE_AIMD_MIN_RATE`            | 1       |
-    /// | Max rate             | `lance_aimd_max_rate`            | `LANCE_AIMD_MAX_RATE`            | 5000    |
+    /// | Max rate             | `lance_aimd_max_rate`            | `LANCE_AIMD_MAX_RATE`            | 10000   |
     /// | Decrease factor      | `lance_aimd_decrease_factor`     | `LANCE_AIMD_DECREASE_FACTOR`     | 0.5     |
     /// | Additive increment   | `lance_aimd_additive_increment`  | `LANCE_AIMD_ADDITIVE_INCREMENT`  | 300     |
     /// | Burst capacity       | `lance_aimd_burst_capacity`      | `LANCE_AIMD_BURST_CAPACITY`      | 100     |
@@ -301,7 +301,11 @@ impl AimdThrottleConfig {
 
         let initial_rate = resolve_f64("lance_aimd_initial_rate", storage_options, 2000.0)?;
         let min_rate = resolve_f64("lance_aimd_min_rate", storage_options, 1.0)?;
-        let max_rate = resolve_f64("lance_aimd_max_rate", storage_options, 5000.0)?;
+        let max_rate = resolve_f64(
+            "lance_aimd_max_rate",
+            storage_options,
+            AimdConfig::default().max_rate,
+        )?;
         let decrease_factor = resolve_f64("lance_aimd_decrease_factor", storage_options, 0.5)?;
         let additive_increment =
             resolve_f64("lance_aimd_additive_increment", storage_options, 300.0)?;
