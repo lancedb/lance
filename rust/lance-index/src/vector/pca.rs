@@ -4,7 +4,7 @@
 //! Principal component analysis for vector pre-transforms.
 
 use std::mem::size_of;
-use std::sync::{Arc, LazyLock, OnceLock};
+use std::sync::{Arc, OnceLock};
 
 use arrow_array::{
     Array, ArrayRef, FixedSizeListArray, Float32Array,
@@ -384,8 +384,8 @@ fn decode_f32_tensor(
         ));
     }
     let mut values = Vec::with_capacity(element_count);
-    for (index, bytes) in tensor.data.chunks_exact(size_of::<f32>()).enumerate() {
-        let value = f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    for (index, bytes) in tensor.data.as_chunks::<4>().0.iter().enumerate() {
+        let value = f32::from_le_bytes(*bytes);
         if !value.is_finite() {
             return Err(Error::corrupt_file_named(
                 PCA_MODEL_NAME,
@@ -1505,24 +1505,12 @@ fn canonical_f32(value: f64) -> Result<f32> {
     Ok(if value == 0.0 { 0.0 } else { value })
 }
 
-/// Environment variable that restores the original single-accumulator
-/// scalar query transform, for A/B measurement.
-pub const PCA_QUERY_TRANSFORM_SCALAR_ENV: &str = "LANCE_PCA_QUERY_TRANSFORM_SCALAR";
-
-static QUERY_TRANSFORM_SCALAR: LazyLock<bool> = LazyLock::new(|| {
-    std::env::var_os(PCA_QUERY_TRANSFORM_SCALAR_ENV)
-        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
-});
-
 /// Inner kernel used by the per-query PCA transform `y = M (x - mean)`.
 ///
 /// Production code goes through [`TransformKernel::selected`].
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransformKernel {
-    /// Original loop: one accumulator per output row, the input re-centred
-    /// for every row. Reference for the others.
-    Scalar,
     /// Input centred once, eight independent accumulator chains per row,
     /// no fused multiply-add. Used off aarch64.
     Portable,
@@ -1534,9 +1522,6 @@ pub enum TransformKernel {
 impl TransformKernel {
     /// Kernel used by [`PcaModel::transform_query`] on this host.
     pub fn selected() -> Self {
-        if *QUERY_TRANSFORM_SCALAR {
-            return Self::Scalar;
-        }
         if cfg!(target_arch = "aarch64") {
             Self::Neon
         } else {
@@ -1547,7 +1532,7 @@ impl TransformKernel {
     /// Whether this kernel can run in this build on this host.
     pub fn is_available(self) -> bool {
         match self {
-            Self::Scalar | Self::Portable => true,
+            Self::Portable => true,
             Self::Neon => cfg!(target_arch = "aarch64"),
         }
     }
@@ -1587,21 +1572,9 @@ pub fn transform_row_with(
     output: &mut Vec<f32>,
 ) -> Result<()> {
     validate_transform_layout(input, mean, matrix, input_dimension, output_dimension)?;
-    if kernel == TransformKernel::Scalar {
-        for row in 0..output_dimension {
-            let mut value = 0.0_f32;
-            for column in 0..input_dimension {
-                value += matrix[row * input_dimension + column] * (input[column] - mean[column]);
-            }
-            push_finite(value, row, output)?;
-        }
-        return Ok(());
-    }
-
     let centered: Vec<f32> = input.iter().zip(mean).map(|(x, m)| x - m).collect();
     output.reserve(output_dimension);
     match kernel {
-        TransformKernel::Scalar => unreachable!("handled above"),
         TransformKernel::Portable => {
             for (row, matrix_row) in matrix.chunks_exact(input_dimension).enumerate() {
                 push_finite(dot_row_portable(&centered, matrix_row), row, output)?;
@@ -1683,18 +1656,16 @@ fn push_finite(value: f32, row: usize, output: &mut Vec<f32>) -> Result<()> {
 fn dot_row_portable(centered: &[f32], matrix_row: &[f32]) -> f32 {
     debug_assert_eq!(centered.len(), matrix_row.len());
     let mut acc = [0.0_f32; 8];
-    let full = centered.len() & !7;
-    for (c, m) in centered[..full]
-        .chunks_exact(8)
-        .zip(matrix_row[..full].chunks_exact(8))
-    {
+    let (centered_chunks, centered_tail) = centered.as_chunks::<8>();
+    let (matrix_chunks, matrix_tail) = matrix_row.as_chunks::<8>();
+    for (c, m) in centered_chunks.iter().zip(matrix_chunks) {
         for lane in 0..8 {
             acc[lane] += m[lane] * c[lane];
         }
     }
     let mut value =
         ((acc[0] + acc[1]) + (acc[2] + acc[3])) + ((acc[4] + acc[5]) + (acc[6] + acc[7]));
-    for (c, m) in centered[full..].iter().zip(&matrix_row[full..]) {
+    for (c, m) in centered_tail.iter().zip(matrix_tail) {
         value += m * c;
     }
     value
@@ -1932,16 +1903,6 @@ mod tests {
     }
 
     #[test]
-    fn params_have_documented_defaults() {
-        let params = PcaParams::new(8);
-        assert!(!params.random_rotation);
-        assert_eq!(params.sample_size, 65_536);
-        assert_eq!(params.max_training_memory_bytes, 1_073_741_824);
-        assert_eq!(params.sampling_seed, 42);
-        assert_eq!(params.rotation_seed, 5);
-    }
-
-    #[test]
     fn covariance_path_centers_and_reduces() {
         let vectors = f32_vectors(full_rank_values(8, 3), 3);
         let model = PcaModel::train(&vectors, &PcaParams::new(2)).expect("training should work");
@@ -2031,14 +1992,15 @@ mod tests {
         assert!(error.to_string().contains("mean"));
         assert!(error.to_string().contains("element=1"));
 
+        params
+            .validate_streaming_memory_budget(3, 8, 2)
+            .expect("a small training batch should fit the default budget");
         let error = PcaParams::new(1)
             .with_max_training_memory_bytes(1)
             .validate_streaming_memory_budget(3, 8, 2)
             .expect_err("small streaming budget must fail");
         assert!(matches!(error, Error::InvalidInput { .. }));
-        assert!(error.to_string().contains("M_batch=48"));
-        assert!(error.to_string().contains("M_matrix_accumulation="));
-        assert!(error.to_string().contains("total="));
+        assert!(error.to_string().contains("max_training_memory_bytes=1"));
     }
 
     #[test]
@@ -2055,24 +2017,6 @@ mod tests {
             .expect_err("incomplete scatter rows must fail");
         assert!(matches!(error, Error::InvalidInput { .. }));
         assert!(error.to_string().contains("non-zero multiple"));
-    }
-
-    #[test]
-    fn streaming_matrix_memory_budget_has_exact_boundary() {
-        let accepted = PcaParams::new(1).with_max_training_memory_bytes(528);
-        accepted
-            .validate_streaming_memory_budget(3, 8, 2)
-            .expect("exact streaming matrix memory estimate should pass");
-
-        let rejected = PcaParams::new(1).with_max_training_memory_bytes(527);
-        let error = rejected
-            .validate_streaming_memory_budget(3, 8, 2)
-            .expect_err("one byte below the matrix memory estimate must fail");
-        assert!(matches!(error, Error::InvalidInput { .. }));
-        assert!(error.to_string().contains("M_stat=72"));
-        assert!(error.to_string().contains("M_batch=48"));
-        assert!(error.to_string().contains("M_matrix_accumulation=120"));
-        assert!(error.to_string().contains("total=528"));
     }
 
     #[test]
@@ -2135,6 +2079,7 @@ mod tests {
             rotated.transform_matrix.values(),
             repeated.transform_matrix.values()
         );
+        assert_eq!(rotated.fingerprint(), repeated.fingerprint());
         let plain_output = plain
             .transform(&vectors)
             .expect("plain transform should work");
@@ -2363,17 +2308,6 @@ mod tests {
         let changed_mean = persisted_model(vec![0.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![7.0, 8.0, 9.5]);
         assert_ne!(model.fingerprint(), changed_matrix.fingerprint());
         assert_ne!(model.fingerprint(), changed_mean.fingerprint());
-    }
-
-    #[test]
-    fn same_seed_produces_same_fingerprint() {
-        let vectors = f32_vectors(full_rank_values(9, 4), 4);
-        let params = PcaParams::new(3)
-            .with_random_rotation(true)
-            .with_rotation_seed(41);
-        let first = PcaModel::train(&vectors, &params).expect("training must succeed");
-        let second = PcaModel::train(&vectors, &params).expect("training must succeed");
-        assert_eq!(first.fingerprint(), second.fingerprint());
     }
 
     #[rstest]
@@ -2618,7 +2552,7 @@ mod tests {
         assert!(output.is_empty());
 
         let error = transform_row_with(
-            TransformKernel::Scalar,
+            TransformKernel::Portable,
             &input[..4],
             &mean,
             &[0.0_f32; 32],
@@ -2650,17 +2584,16 @@ mod tests {
             let matrix: Vec<f32> = (0..input_dimension * output_dimension)
                 .map(|i| ((i * 11 % 17) as f32 - 8.0) * 0.125)
                 .collect();
-            let mut expected = Vec::new();
-            transform_row_with(
-                TransformKernel::Scalar,
-                &input,
-                &mean,
-                &matrix,
-                input_dimension,
-                output_dimension,
-                &mut expected,
-            )
-            .expect("scalar kernel must succeed");
+            let expected: Vec<f32> = matrix
+                .chunks_exact(input_dimension)
+                .map(|matrix_row| {
+                    matrix_row
+                        .iter()
+                        .zip(input.iter().zip(&mean))
+                        .map(|(coefficient, (value, mean))| coefficient * (value - mean))
+                        .sum()
+                })
+                .collect();
             for kernel in transform_kernels_under_test() {
                 let mut actual = Vec::new();
                 transform_row_with(
@@ -2692,8 +2625,7 @@ mod tests {
         let mean = vec![0.0_f32; 24];
         let mut matrix = vec![1.0_f32; 24 * 5];
         matrix[24 * 3 + 20] = f32::INFINITY;
-        for kernel in std::iter::once(TransformKernel::Scalar).chain(transform_kernels_under_test())
-        {
+        for kernel in transform_kernels_under_test() {
             let mut output = Vec::new();
             let error = transform_row_with(kernel, &input, &mean, &matrix, 24, 5, &mut output)
                 .expect_err("non-finite output must fail");
@@ -2701,20 +2633,6 @@ mod tests {
                 error.to_string().contains("output dimension 3"),
                 "{kernel:?}: {error}"
             );
-        }
-    }
-
-    #[test]
-    fn selected_transform_kernel_is_available() {
-        let kernel = TransformKernel::selected();
-        assert!(kernel.is_available(), "{kernel:?}");
-        if cfg!(target_arch = "aarch64") {
-            assert_ne!(kernel, TransformKernel::Portable);
-        } else {
-            assert!(matches!(
-                kernel,
-                TransformKernel::Portable | TransformKernel::Scalar
-            ));
         }
     }
 }

@@ -1215,12 +1215,6 @@ pub(crate) fn random_orthogonal_with_rng<R: rand::Rng>(
     Ok(q)
 }
 
-fn random_normal_matrix(n: usize) -> ndarray::Array2<f64> {
-    let mut rng = rand::rng();
-    let normal = rand_distr::Normal::new(0.0, 1.0).expect("standard normal distribution");
-    ndarray::Array2::from_shape_simple_fn((n, n), || normal.sample(&mut rng))
-}
-
 // implement the householder qr decomposition referenced from https://en.wikipedia.org/wiki/Householder_transformation#QR_decomposition
 fn householder_qr(a: ndarray::Array2<f64>) -> (ndarray::Array2<f64>, ndarray::Array2<f64>) {
     let (m, n) = a.dim();
@@ -1288,6 +1282,12 @@ mod tests {
     use rstest::rstest;
 
     use crate::vector::bq::storage::RABIT_BLOCKED_EX_CODE_COLUMN;
+
+    fn random_normal_matrix(n: usize) -> ndarray::Array2<f64> {
+        let mut rng = rand::rng();
+        let normal = rand_distr::Normal::new(0.0, 1.0).expect("standard normal distribution");
+        ndarray::Array2::from_shape_simple_fn((n, n), || normal.sample(&mut rng))
+    }
 
     #[rstest::rstest]
     #[case::one(1)]

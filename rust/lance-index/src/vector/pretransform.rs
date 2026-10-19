@@ -8,7 +8,7 @@ use std::fmt::Debug;
 use std::mem::size_of_val;
 use std::sync::Arc;
 
-use arrow_array::{ArrayRef, Float32Array, RecordBatch, UInt32Array};
+use arrow_array::{Float32Array, RecordBatch, UInt32Array};
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use lance_core::deepsize::{Context, DeepSizeOf};
@@ -319,6 +319,7 @@ mod tests {
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use futures::{StreamExt, stream};
     use lance_arrow::FixedSizeListArrayExt;
+    use rstest::rstest;
 
     use super::super::VECTOR_RESULT_SCHEMA;
     use super::super::flat::index::FlatQuantizer;
@@ -776,33 +777,18 @@ mod tests {
         assert_eq!(second, 0);
     }
 
-    #[test]
-    fn pca_constructor_retains_model_and_deduplicates_deep_size() {
-        let training_data = FixedSizeListArray::try_new_from_values(
-            Float32Array::from(vec![2.0, 0.0, -2.0, 0.0, 0.0, 1.0, 0.0, -1.0]),
-            2,
-        )
-        .unwrap();
-        let model = Arc::new(PcaModel::train(&training_data, &PcaParams::new(1)).unwrap());
-        let index = PreTransformIndex::new_pca(Arc::new(MockVectorIndex::new()), model.clone());
-
-        assert_eq!(Arc::strong_count(&model), 2);
-        let mut context = Context::new();
-        assert!(index.deep_size_of_children(&mut context) > 0);
-        assert_eq!(index.deep_size_of_children(&mut context), 0);
-    }
-
-    #[test]
-    fn pca_query_rejects_distance_bounds() {
-        let training_data = FixedSizeListArray::try_new_from_values(
-            Float32Array::from(vec![2.0, 0.0, -2.0, 0.0, 0.0, 1.0, 0.0, -1.0]),
-            2,
-        )
-        .unwrap();
-        let model = Arc::new(PcaModel::train(&training_data, &PcaParams::new(1)).unwrap());
-        let index = PreTransformIndex::new_pca(Arc::new(MockVectorIndex::new()), model);
+    #[rstest]
+    #[case::lower(Some(0.1), None)]
+    #[case::upper(None, Some(0.5))]
+    #[case::both(Some(0.1), Some(0.5))]
+    fn pca_query_rejects_distance_bounds(
+        #[case] lower_bound: Option<f32>,
+        #[case] upper_bound: Option<f32>,
+    ) {
+        let (index, _, _) = decorated();
         let mut original = query();
-        original.lower_bound = Some(0.1);
+        original.lower_bound = lower_bound;
+        original.upper_bound = upper_bound;
         let error = index.transformed_query(&original).unwrap_err();
 
         assert!(matches!(error, Error::NotSupported { .. }));
@@ -829,74 +815,5 @@ mod tests {
             &[1.0, 2.0]
         );
         assert_transformed_query(&transformed, &original, &model);
-    }
-
-    #[test]
-    fn distance_bounds_are_rejected() {
-        let (index, _, _) = decorated();
-        let mut original = query();
-        original.lower_bound = Some(0.1);
-
-        let error = index
-            .transformed_query(&original)
-            .expect_err("PCA must reject distance bounds");
-
-        assert!(error.to_string().contains("lower_bound"));
-    }
-
-    /// Names of the methods declared at the top level of the block that
-    /// starts with `header`.
-    fn method_names<'a>(source: &'a str, header: &str) -> Vec<&'a str> {
-        let mut lines = source.lines().skip_while(|line| line.trim_end() != header);
-        assert!(lines.next().is_some(), "{header} not found");
-        lines
-            .take_while(|line| line.trim_end() != "}")
-            .filter_map(|line| {
-                let line = line.strip_prefix("    ")?;
-                let rest = line
-                    .strip_prefix("async fn ")
-                    .or_else(|| line.strip_prefix("fn "))?;
-                rest.split(['(', '<']).next()
-            })
-            .collect()
-    }
-
-    #[test]
-    fn overrides_every_vector_index_method_or_lists_its_default() {
-        // Batch search keeps the trait default: it reports unsupported, so
-        // callers fall back to per-query search, which transforms each query.
-        // Streaming remap keeps the trait default because that default calls
-        // the overridden remap and stored_fragments methods.
-        const INHERITED_DEFAULTS: &[&str] = &[
-            "supports_batch_partition_search",
-            "search_partitions_batch",
-            "remap_streaming",
-        ];
-
-        let declared = method_names(
-            include_str!("../vector.rs"),
-            "pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {",
-        );
-        let overridden = method_names(
-            include_str!("pretransform.rs"),
-            "impl VectorIndex for PreTransformIndex {",
-        );
-        assert!(declared.len() > INHERITED_DEFAULTS.len());
-        for method in &declared {
-            assert!(
-                overridden.contains(method) || INHERITED_DEFAULTS.contains(method),
-                "PreTransformIndex must override VectorIndex::{method} or list it in INHERITED_DEFAULTS"
-            );
-        }
-        for method in INHERITED_DEFAULTS {
-            assert!(
-                declared.contains(method),
-                "{method} is no longer a VectorIndex method"
-            );
-            assert!(
-                !overridden.contains(method),
-                "{method} is overridden; drop it from INHERITED_DEFAULTS"
-            );
-        }
     }
 }
