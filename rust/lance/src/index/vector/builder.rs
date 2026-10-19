@@ -4014,7 +4014,15 @@ mod tests {
         let uri = tmp.path().to_str().unwrap();
         // Two partitions of 1_500 rows, above the join threshold (25% of 4096).
         let mut dataset = write_clusters(uri, &[(1_500, 0.0), (1_500, 1000.0)]).await;
-        let params = VectorIndexParams::ivf_flat(2, MetricType::L2);
+        // Pin the type default target so the threshold above is the one this
+        // test reasons about; a build from a partition count would record its own.
+        let params = VectorIndexParams::with_ivf_flat_params(
+            MetricType::L2,
+            IvfBuildParams {
+                target_partition_size: Some(IndexType::IvfFlat.target_partition_size()),
+                ..IvfBuildParams::new(2)
+            },
+        );
         dataset
             .create_index(
                 &["vec"],

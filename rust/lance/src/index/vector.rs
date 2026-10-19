@@ -771,15 +771,20 @@ async fn prepare_vector_segment_build(
     };
     let mut ivf_params = ivf_params0.clone();
     ivf_params.num_partitions = Some(num_partitions);
-    // An index built from a partition count has no target partition size, so
-    // optimize would split and join it against the index type's default and
-    // merge every partition built smaller than a quarter of that. Record the
-    // rows per partition the trained count gives instead. A fragment subset is
-    // one segment of a logical index, and its rows say nothing about the
-    // index's, so it records nothing.
+    // An index built from a partition count or centroids has no target
+    // partition size, so optimize would split and join it against the index
+    // type's default and merge every partition built smaller than a quarter of
+    // that. Record the rows per partition the trained count gives instead. A
+    // fragment subset is one segment of a logical index, and its rows say
+    // nothing about the index's, so it records nothing; nor does a multivector
+    // column, whose partitions count vectors, not rows. An explicit count of
+    // zero records nothing either: it has no partition size, and dividing by it
+    // would panic.
     if ivf_params.target_partition_size.is_none()
-        && ivf_params0.num_partitions.is_some()
+        && (ivf_params0.num_partitions.is_some() || ivf_params0.centroids.is_some())
+        && num_partitions > 0
         && fragment_ids.is_none()
+        && !matches!(vector_type, DataType::List(_))
     {
         let num_rows = dataset.count_rows(None).await?;
         ivf_params.target_partition_size = Some(num_rows.div_ceil(num_partitions).max(1));
@@ -1160,11 +1165,14 @@ pub(crate) async fn build_distributed_vector_index(
 }
 
 /// The files of a built vector index segment, and the rows per partition its
-/// IVF model was built for, when it was built for one. The latter goes into the
-/// index details, where optimize reads it back to decide splits and joins.
+/// IVF model was built for. That size goes into the index details, where
+/// optimize reads it back to decide splits and joins.
 pub(crate) struct BuiltVectorSegment {
-    pub files: Vec<IndexFile>,
-    pub target_partition_size: Option<usize>,
+    pub(crate) files: Vec<IndexFile>,
+    /// `None` when the build was neither given a target nor derived one (a
+    /// fragment subset, a multivector column, or a count of zero), so optimize
+    /// falls back to the index type's default.
+    pub(crate) target_partition_size: Option<usize>,
 }
 
 /// Build a Vector Index

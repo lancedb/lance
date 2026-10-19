@@ -3085,6 +3085,7 @@ mod tests {
     use crate::dataset::{InsertBuilder, UpdateBuilder, WriteMode, WriteParams};
     use crate::index::DatasetIndexExt;
     use crate::index::DatasetIndexInternalExt;
+    use crate::index::vector::details::target_partition_size_from_details;
     use crate::index::vector::ivf::v2::{
         IVFPartitionKey, IvfFlatIndex, IvfHnswSqIndex, IvfPq, IvfStateEntryBox, PartitionEntry,
     };
@@ -8543,6 +8544,32 @@ mod tests {
         .await;
     }
 
+    /// A multivector index built from a partition count records no target
+    /// partition size: its partitions hold one entry per vector, so a target in
+    /// rows would be a fraction of their size and optimize would split them all.
+    #[tokio::test]
+    async fn test_multivec_build_from_partition_count_records_no_target() {
+        let test_dir = TempStrDir::default();
+        let (mut dataset, _) =
+            generate_multivec_test_dataset::<Float32Type>(test_dir.as_str(), 0.0..1.0).await;
+        let params = VectorIndexParams::with_ivf_pq_params(
+            DistanceType::Cosine,
+            IvfBuildParams::new(1),
+            lightweight_pq_params(),
+        );
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, true)
+            .await
+            .unwrap();
+
+        let indices = dataset.load_indices().await.unwrap();
+        let details = indices[0]
+            .index_details
+            .as_ref()
+            .expect("a vector index records its details");
+        assert_eq!(target_partition_size_from_details(details), None);
+    }
+
     #[tokio::test]
     async fn test_partition_split_on_append_multivec() {
         const INDEX_NAME: &str = "vector_idx";
@@ -8556,14 +8583,9 @@ mod tests {
 
         let (mut dataset, _) =
             generate_multivec_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await;
-        // Pin the type default target so the threshold above is the one this test
-        // reasons about; a build from a partition count would record its own.
         let params = VectorIndexParams::with_ivf_pq_params(
             DistanceType::Cosine,
-            IvfBuildParams {
-                target_partition_size: Some(IndexType::IvfPq.target_partition_size()),
-                ..IvfBuildParams::new(1)
-            },
+            IvfBuildParams::new(1),
             lightweight_pq_params(),
         );
         dataset
