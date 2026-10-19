@@ -52,6 +52,22 @@ pub async fn filtered_read_exec_to_proto(
     state: &SessionState,
 ) -> Result<pb::FilteredReadExecProto> {
     let table = table_identifier_from_dataset(exec.dataset()).await?;
+    filtered_read_exec_to_proto_with_table(exec, state, table)
+}
+
+/// Encode a [`FilteredReadExec`] whose table identifier the caller has already
+/// resolved.
+///
+/// [`filtered_read_exec_to_proto`] is async only because it resolves the
+/// dataset's latest storage options into the identifier. A caller that holds
+/// the identifier (or the storage options) can encode synchronously, for
+/// example from a DataFusion `PhysicalExtensionCodec`, whose `try_encode` is
+/// not async.
+pub fn filtered_read_exec_to_proto_with_table(
+    exec: &FilteredReadExec,
+    state: &SessionState,
+    table: pb::TableIdentifier,
+) -> Result<pb::FilteredReadExecProto> {
     // Use the pruned dataset schema for filter encoding — filters can reference columns
     // outside the projection (e.g. SELECT name WHERE age > 10), and some dataset columns
     // may have types that Substrait cannot serialize (e.g. FixedSizeList, Float16).
@@ -539,6 +555,7 @@ mod tests {
     use super::*;
     use arrow_array::types::UInt32Type;
     use arrow_schema::{DataType, Field};
+    use datafusion::execution::TaskContext;
     use datafusion::prelude::SessionContext;
     use lance_core::datatypes::OnMissing;
     use lance_datagen::{array, gen_batch};
@@ -930,6 +947,47 @@ mod tests {
         );
     }
 
+    /// The synchronous encoder produces what the async one does, with the
+    /// caller's table identifier carried verbatim.
+    #[tokio::test]
+    async fn test_exec_to_proto_with_table_matches_async_encoding() {
+        let dataset = make_test_dataset().await;
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+
+        let filter = datafusion_expr::col("x").gt(datafusion_expr::lit(10_i32));
+        let options = FilteredReadOptions::basic_full_read(&dataset)
+            .with_filter(Some(filter.clone()), Some(filter))
+            .unwrap()
+            .with_scan_range_after_filter(5..30)
+            .unwrap();
+        let exec = FilteredReadExec::try_new(dataset.clone(), options, None).unwrap();
+
+        let from_async = filtered_read_exec_to_proto(&exec, &state).await.unwrap();
+        let table = pb::TableIdentifier {
+            uri: dataset.uri().to_string(),
+            version: dataset.manifest.version,
+            manifest_etag: dataset.manifest_location.e_tag.clone(),
+            serialized_manifest: None,
+            storage_options: [("region".to_string(), "test".to_string())].into(),
+        };
+        let from_sync =
+            filtered_read_exec_to_proto_with_table(&exec, &state, table.clone()).unwrap();
+
+        assert_eq!(from_sync.options, from_async.options);
+        assert_eq!(from_sync.plan, from_async.plan);
+        assert_eq!(from_sync.table, Some(table));
+
+        let back = filtered_read_exec_from_proto(from_sync, Some(dataset.clone()), None, &state)
+            .await
+            .unwrap();
+        assert_eq!(
+            exec.options().scan_range_after_filter,
+            back.options().scan_range_after_filter
+        );
+        assert_eq!(exec.options().full_filter, back.options().full_filter);
+    }
+
     #[tokio::test]
     async fn test_unplanned_physical_row_addr_prefilter_roundtrip() {
         let dataset = make_test_dataset().await;
@@ -1139,5 +1197,29 @@ mod tests {
         assert!(back.filters.contains_key(&1));
         // After roundtrip, the decoded expressions should be shared via Arc too
         assert!(Arc::ptr_eq(&back.filters[&0], &back.filters[&1]));
+    }
+
+    /// A planned read hands every fragment the same filter, so the encoded
+    /// plan carries the filter once rather than once per fragment
+    #[tokio::test]
+    async fn test_planned_filter_encoded_once() {
+        let dataset = make_test_dataset().await;
+        let state = SessionContext::new().state();
+        let filter = datafusion_expr::col("x").gt(datafusion_expr::lit(5u32));
+        let options = FilteredReadOptions::basic_full_read(&dataset)
+            .with_filter(None, Some(filter))
+            .unwrap();
+        let exec = FilteredReadExec::try_new(dataset, options, None).unwrap();
+        exec.get_or_create_plan(Arc::new(TaskContext::default()))
+            .await
+            .unwrap();
+
+        let plan = filtered_read_exec_to_proto(&exec, &state)
+            .await
+            .unwrap()
+            .plan
+            .unwrap();
+        assert_eq!(plan.fragment_filter_ids.len(), 2);
+        assert_eq!(plan.filter_expressions.len(), 1);
     }
 }

@@ -319,6 +319,7 @@ impl ExistingIndex {
                     &coverage.dataset,
                     &coverage.effective_frags,
                     &coverage.deleted_frags,
+                    false,
                 )
             })
             .await?;
@@ -698,6 +699,15 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
     pub fn with_optional_fragment_filter(&mut self, fragment_ids: Option<&[u32]>) -> &mut Self {
         if let Some(fragment_ids) = fragment_ids {
             self.fragment_filter = Some(Dataset::normalize_fragment_ids(fragment_ids));
+        }
+        self
+    }
+
+    /// Train the IVF model and quantizer but shuffle no rows, so `build()`
+    /// writes an index that carries the model and nothing else.
+    pub fn with_train_only(&mut self, train_only: bool) -> &mut Self {
+        if train_only {
+            self.shuffle_reader = Some(Arc::new(EmptyReader));
         }
         self
     }

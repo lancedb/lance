@@ -2100,6 +2100,25 @@ class LanceDataset(pa.dataset.Dataset):
             for f in self._ds.get_fragments()
         ]
 
+    def fragment_ids(self) -> Bitmap:
+        """Get the ids of all fragments in the currently checked out version.
+
+        Unlike :meth:`get_fragments`, this does not create an object for every
+        fragment.
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> data = pa.table({"x": range(4)})
+        >>> dataset = lance.write_dataset(
+        ...     data, "memory://fragment_ids", max_rows_per_file=2
+        ... )
+        >>> list(dataset.fragment_ids())
+        [0, 1]
+        """
+        return self._ds.fragment_ids()
+
     def get_fragment(self, fragment_id: int) -> Optional[LanceFragment]:
         """Get the fragment with fragment id."""
         raw_fragment = self._ds.get_fragment(fragment_id)
@@ -3393,6 +3412,7 @@ class LanceDataset(pa.dataset.Dataset):
         error_if_tagged_old_versions: bool = True,
         delete_rate_limit: Optional[int] = None,
         versions: Optional[List[int]] = None,
+        delete_concurrency: Optional[int] = None,
     ) -> CleanupStats:
         """
         Cleans up old versions of the dataset.
@@ -3433,6 +3453,11 @@ class LanceDataset(pa.dataset.Dataset):
             be ignored without any error and only untagged versions will be
             cleaned up.
 
+        delete_concurrency: int, optional
+            Maximum concurrent file deletions across this cleanup and its cascaded
+            branches. Defaults to the object store's I/O parallelism.
+            Must be positive (at most 2**61 - 1 on 64-bit platforms).
+
         delete_rate_limit: int, optional
             Maximum number of delete operations per second. When not set (default),
             deletions run at full speed. Set this to a positive integer to avoid
@@ -3454,6 +3479,7 @@ class LanceDataset(pa.dataset.Dataset):
             error_if_tagged_old_versions,
             delete_rate_limit,
             versions,
+            delete_concurrency,
         )
 
     def explain_cleanup_old_versions(
@@ -3489,8 +3515,7 @@ class LanceDataset(pa.dataset.Dataset):
             match the parameters. Otherwise, tagged versions will be ignored.
 
         delete_rate_limit: int, optional
-            Accepted for parity with :meth:`cleanup_old_versions`; no deletes are
-            issued by explain.
+            Retained for compatibility; ignored because explain does not delete files.
 
         versions: list[int], optional
             Explain cleanup only for the specified dataset versions.
@@ -3551,12 +3576,13 @@ class LanceDataset(pa.dataset.Dataset):
                 "FTS",
                 "BLOOMFILTER",
                 "RTREE",
+                "MINHASHLSH",
             ]:
                 raise NotImplementedError(
                     (
                         'Only "BTREE", "BITMAP", "NGRAM", "ZONEMAP", "LABEL_LIST", '
-                        '"INVERTED", "BLOOMFILTER" or "RTREE" are supported for '
-                        f"scalar columns.  Received {index_type}",
+                        '"INVERTED", "BLOOMFILTER", "RTREE" or "MINHASHLSH" are '
+                        f"supported for scalar columns.  Received {index_type}",
                     )
                 )
 
@@ -3658,6 +3684,7 @@ class LanceDataset(pa.dataset.Dataset):
             "ZONEMAP",
             "BLOOMFILTER",
             "LABEL_LIST",
+            "MINHASHLSH",
         }
 
     @classmethod
@@ -3673,6 +3700,7 @@ class LanceDataset(pa.dataset.Dataset):
             "ZONEMAP",
             "BLOOMFILTER",
             "LABEL_LIST",
+            "MINHASHLSH",
         }
 
     def create_scalar_index(
@@ -3688,6 +3716,7 @@ class LanceDataset(pa.dataset.Dataset):
             Literal["ZONEMAP"],
             Literal["BLOOMFILTER"],
             Literal["RTREE"],
+            Literal["MINHASHLSH"],
             IndexConfig,
         ],
         name: Optional[str] = None,
@@ -3792,7 +3821,7 @@ class LanceDataset(pa.dataset.Dataset):
         index_type : str
             The type of the index.  One of ``"BTREE"``, ``"BITMAP"``,
             ``"LABEL_LIST"``, ``"NGRAM"``, ``"ZONEMAP"``, ``"INVERTED"``,
-            ``"FTS"``, ``"BLOOMFILTER"``, ``"RTREE"``.
+            ``"FTS"``, ``"BLOOMFILTER"``, ``"RTREE"``, ``"MINHASHLSH"``.
         name : str, optional
             The index name. If not provided, it will be generated from the
             column name.
@@ -4679,7 +4708,8 @@ class LanceDataset(pa.dataset.Dataset):
 
         This is the public distributed-build API for vector, BTREE scalar,
         canonical bitmap scalar, INVERTED scalar, NGRAM scalar, RTREE scalar,
-        ZONEMAP scalar, BLOOMFILTER scalar, and LABEL_LIST scalar index construction.
+        ZONEMAP scalar, BLOOMFILTER scalar, LABEL_LIST scalar, and MINHASHLSH
+        scalar index construction.
         Unlike :meth:`create_index`, this method does not publish the index into
         the dataset manifest. Instead, it writes one segment under
         ``_indices/<segment_uuid>/`` and returns the resulting
@@ -4695,9 +4725,10 @@ class LanceDataset(pa.dataset.Dataset):
         4. commit the final segment list with
            :meth:`commit_existing_index_segments`
 
-        BTREE, BITMAP, INVERTED, NGRAM, RTREE, ZONEMAP, BLOOMFILTER, and
-        LABEL_LIST segments may be merged with
-        :meth:`merge_existing_index_segments` before commit. NGRAM segments
+        BTREE, BITMAP, INVERTED, NGRAM, RTREE, ZONEMAP, BLOOMFILTER,
+        LABEL_LIST, and MINHASHLSH segments may be merged with
+        :meth:`merge_existing_index_segments` before commit. MINHASHLSH
+        segments of one index must share parameters. NGRAM segments
         built before a deferred compaction must be merged before commit so
         their postings can be rebuilt against current row addresses.
         Parameters are the same as :meth:`create_index`, with one additional
@@ -7066,7 +7097,9 @@ class ScannerBuilder:
         if isinstance(filter, FullTextQuery):
             self._search_filter = PySearchFilter.from_full_text_query(filter.inner)
         elif isinstance(filter, VectorSearchQuery):
-            self._search_filter = PySearchFilter.from_vector_search_query(filter.inner)
+            self._search_filter = PySearchFilter.from_vector_search_query(
+                filter.inner()
+            )
         elif isinstance(filter, str):
             self._filter = filter
         elif isinstance(filter, pa.compute.Expression):
@@ -7203,6 +7236,7 @@ class ScannerBuilder:
         query_parallelism: Optional[int] = None,
         approx_mode: Literal["fast", "normal", "accurate"] = "normal",
         distance_range: Optional[tuple[Optional[float], Optional[float]]] = None,
+        search_effort: Optional[float] = None,
     ) -> ScannerBuilder:
         """Configure nearest neighbor search.
 
@@ -7225,6 +7259,15 @@ class ScannerBuilder:
             the CPU pool size. Value 1 uses the single-worker sequential path.
             Values >= 2 use the partition-parallel path and are clamped to the
             CPU pool size.
+        search_effort: float, optional
+            Initial IVF search budget, a finite value in [0, 1]. None resolves
+            to 0.5, preserving Auto. Zero starts at the caller minimum (at least one
+            available partition); one starts at all available partitions, subject
+            to maximum_nprobes. Intermediate values interpolate geometrically.
+            Later expansion to find enough candidates is unchanged. This is
+            independent of approx_mode, ef and refinement, and is not a recall
+            guarantee. When supplied, effort ignores nprobes, including an explicit
+            0.5. With None, an explicitly supplied nprobes remains effective.
         approx_mode: {"fast", "normal", "accurate"}, default "normal"
             Controls the speed / accuracy tradeoff for approximate vector search
             when supported by the selected index. This currently only affects
@@ -7247,6 +7290,7 @@ class ScannerBuilder:
             ef=ef,
             query_parallelism=query_parallelism,
             approx_mode=approx_mode,
+            search_effort=search_effort,
             distance_range=distance_range,
         )
         return self
@@ -8486,6 +8530,7 @@ def _build_vector_search_query(
     query_parallelism: Optional[int] = None,
     approx_mode: Literal["fast", "normal", "accurate"] = "normal",
     distance_range: Optional[tuple[Optional[float], Optional[float]]] = None,
+    search_effort: Optional[float] = None,
 ) -> dict:
     """Configure nearest neighbor search.
 
@@ -8512,7 +8557,8 @@ def _build_vector_search_query(
     minimum_nprobes: int, optional
         The minimum number of partitions to search.
     maximum_nprobes: int, optional
-        The maximum number of partitions to search.
+        The maximum number of partitions to search per index segment. This bounds
+        both initial and later probing without disabling Auto probing.
     refine_factor: int, optional
         The refine factor for the search.
     use_index: bool, default True
@@ -8525,6 +8571,15 @@ def _build_vector_search_query(
         maps to the single-worker sequential path. Value -1 uses the CPU pool
         size. Value 1 uses the single-worker sequential path. Values >= 2 use
         the partition-parallel path and are clamped to the CPU pool size.
+    search_effort: float, optional
+        Initial IVF search budget, a finite value in [0, 1]. None resolves
+        to 0.5, preserving Auto. Zero starts at the caller minimum (at least one
+        available partition); one starts at all available partitions, subject
+        to maximum_nprobes. Intermediate values interpolate geometrically.
+        Later expansion to find enough candidates is unchanged. This is
+        independent of approx_mode, ef and refinement, and is not a recall
+        guarantee. When supplied, effort ignores nprobes, including an explicit
+        0.5. With None, an explicitly supplied nprobes remains effective.
     approx_mode: {"fast", "normal", "accurate"}, default "normal"
         Controls the speed / accuracy tradeoff for approximate vector search
         when supported by the selected index. This currently only affects
@@ -8545,33 +8600,34 @@ def _build_vector_search_query(
     """
     q, q_dim = _coerce_query_vector(q)
 
-    lance_field = dataset._ds.lance_schema.field_case_insensitive(column)
-    if lance_field is None:
-        raise ValueError(f"Embedding column {column} is not in the dataset")
+    if dataset is not None:
+        lance_field = dataset._ds.lance_schema.field_case_insensitive(column)
+        if lance_field is None:
+            raise ValueError(f"Embedding column {column} is not in the dataset")
 
-    column_field = lance_field.to_arrow()
-    column_type = column_field.type
-    if hasattr(column_type, "storage_type"):
-        column_type = column_type.storage_type
-    if pa.types.is_fixed_size_list(column_type):
-        dim = column_type.list_size
-    elif pa.types.is_list(column_type) and pa.types.is_fixed_size_list(
-        column_type.value_type
-    ):
-        dim = column_type.value_type.list_size
-    else:
-        raise TypeError(
-            f"Query column {column} must be a vector. Got {column_field.type}."
-        )
+        column_field = lance_field.to_arrow()
+        column_type = column_field.type
+        if hasattr(column_type, "storage_type"):
+            column_type = column_type.storage_type
+        if pa.types.is_fixed_size_list(column_type):
+            dim = column_type.list_size
+        elif pa.types.is_list(column_type) and pa.types.is_fixed_size_list(
+            column_type.value_type
+        ):
+            dim = column_type.value_type.list_size
+        else:
+            raise TypeError(
+                f"Query column {column} must be a vector. Got {column_field.type}."
+            )
 
-    if q_dim != dim:
-        raise ValueError(
-            f"Query vector size {len(q)} does not match index column size {dim}"
-        )
+        if q_dim != dim:
+            raise ValueError(
+                f"Query vector size {len(q)} does not match index column size {dim}"
+            )
 
     if k is not None and int(k) <= 0:
         raise ValueError(f"Nearest-K must be > 0 but got {k}")
-    if nprobes is not None and int(nprobes) <= 0:
+    if search_effort is None and nprobes is not None and int(nprobes) <= 0:
         raise ValueError(f"Nprobes must be > 0 but got {nprobes}")
     if minimum_nprobes is not None and int(minimum_nprobes) < 0:
         raise ValueError(f"Minimum nprobes must be >= 0 but got {minimum_nprobes}")
@@ -8621,6 +8677,7 @@ def _build_vector_search_query(
         "ef": ef,
         "query_parallelism": query_parallelism,
         "approx_mode": approx_mode,
+        "search_effort": search_effort,
         "distance_range": distance_range,
     }
 
@@ -8762,6 +8819,13 @@ class VectorIndexReader:
 
 
 class VectorSearchQuery:
+    """Vector search parameters, including continuous ``search_effort`` in [0, 1].
+
+    Effort defaults to None, which resolves to 0.5 (Auto). Explicit effort
+    ignores nprobes. See :meth:`ScannerBuilder.nearest` for probe bounds and
+    other search parameters.
+    """
+
     _inner: dict
 
     def __init__(
@@ -8778,6 +8842,7 @@ class VectorSearchQuery:
         ef: Optional[int] = None,
         query_parallelism: Optional[int] = None,
         approx_mode: Literal["fast", "normal", "accurate"] = "normal",
+        search_effort: Optional[float] = None,
     ):
         self._inner = _build_vector_search_query(
             column,
@@ -8792,6 +8857,7 @@ class VectorSearchQuery:
             ef=ef,
             query_parallelism=query_parallelism,
             approx_mode=approx_mode,
+            search_effort=search_effort,
         )
 
     def inner(self):
