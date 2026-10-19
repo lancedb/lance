@@ -456,19 +456,37 @@ impl PcaModel {
     ///
     /// Training rejects null or non-finite values. All statistics and matrix
     /// decompositions use `f64`; the returned runtime model uses `f32`.
+    /// Input values are converted while accumulating statistics, without a
+    /// full-size `f64` copy of the training data.
     pub fn train(data: &FixedSizeListArray, params: &PcaParams) -> Result<Self> {
         let (input_dimension, values) = vector_values(data)?;
         params.validate(input_dimension, data.len())?;
-        let values = values_as_f64(values.as_ref())?;
-        let mean = compensated_mean(&values, data.len(), input_dimension)?;
-        let mut scatter = new_scatter(input_dimension)?;
-        let batch_values = TRANSFORM_BATCH_SIZE
-            .checked_mul(input_dimension)
-            .ok_or_else(|| Error::invalid_input("PCA training batch shape overflows usize"))?;
-        for batch in values.chunks(batch_values) {
-            accumulate_scatter(batch, &mean, &mut scatter)?;
+        if values.null_count() != 0 {
+            return Err(Error::invalid_input(format!(
+                "PCA input contains {} null scalar values",
+                values.null_count()
+            )));
         }
-        Self::train_from_scatter(&mean, data.len(), &scatter, params)
+        match values.data_type() {
+            DataType::Float16 => train_values(
+                values.as_primitive::<Float16Type>().values(),
+                input_dimension,
+                params,
+            ),
+            DataType::Float32 => train_values(
+                values.as_primitive::<Float32Type>().values(),
+                input_dimension,
+                params,
+            ),
+            DataType::Float64 => train_values(
+                values.as_primitive::<Float64Type>().values(),
+                input_dimension,
+                params,
+            ),
+            data_type => Err(Error::invalid_input(format!(
+                "PCA input must be Float16, Float32, or Float64, got {data_type}"
+            ))),
+        }
     }
 
     /// Trains a model from a mean and row-major centered scatter matrix.
@@ -719,41 +737,21 @@ fn validate_symmetric_matrix(values: &[f64], dimension: usize, label: &str) -> R
     Ok(())
 }
 
-fn values_as_f64(values: &dyn Array) -> Result<Cow<'_, [f64]>> {
-    if values.null_count() != 0 {
-        return Err(Error::invalid_input(format!(
-            "PCA input contains {} null scalar values",
-            values.null_count()
-        )));
+fn train_values<T: Copy + Into<f64>>(
+    values: &[T],
+    dimension: usize,
+    params: &PcaParams,
+) -> Result<PcaModel> {
+    let rows = values.len() / dimension;
+    let mean = compensated_mean(values, rows, dimension)?;
+    let mut scatter = new_scatter(dimension)?;
+    let batch_values = TRANSFORM_BATCH_SIZE
+        .checked_mul(dimension)
+        .ok_or_else(|| Error::invalid_input("PCA training batch shape overflows usize"))?;
+    for batch in values.chunks(batch_values) {
+        accumulate_scatter(batch, &mean, &mut scatter)?;
     }
-    let converted: Cow<'_, [_]> = match values.data_type() {
-        DataType::Float16 => values
-            .as_primitive::<Float16Type>()
-            .values()
-            .iter()
-            .map(|value| f64::from(value.to_f32()))
-            .collect::<Vec<_>>()
-            .into(),
-        DataType::Float32 => values
-            .as_primitive::<Float32Type>()
-            .values()
-            .iter()
-            .map(|value| f64::from(*value))
-            .collect::<Vec<_>>()
-            .into(),
-        DataType::Float64 => Cow::Borrowed(values.as_primitive::<Float64Type>().values().as_ref()),
-        data_type => {
-            return Err(Error::invalid_input(format!(
-                "PCA input must be Float16, Float32, or Float64, got {data_type}"
-            )));
-        }
-    };
-    if converted.iter().any(|value| !value.is_finite()) {
-        return Err(Error::invalid_input(
-            "PCA input contains non-finite values".to_string(),
-        ));
-    }
-    Ok(converted)
+    PcaModel::train_from_scatter(&mean, rows, &scatter, params)
 }
 
 fn values_as_f32(values: &dyn Array) -> Result<Cow<'_, [f32]>> {
@@ -793,12 +791,17 @@ fn values_as_f32(values: &dyn Array) -> Result<Cow<'_, [f32]>> {
     Ok(converted)
 }
 
-fn compensated_mean(values: &[f64], rows: usize, dimension: usize) -> Result<Vec<f64>> {
+fn compensated_mean<T: Copy + Into<f64>>(
+    values: &[T],
+    rows: usize,
+    dimension: usize,
+) -> Result<Vec<f64>> {
     let mut sums = vec![0.0; dimension];
     let mut corrections = vec![0.0; dimension];
     for row in values.chunks_exact(dimension) {
         for (column, value) in row.iter().enumerate() {
-            let adjusted = *value - corrections[column];
+            let value = (*value).into();
+            let adjusted = value - corrections[column];
             let next = sums[column] + adjusted;
             corrections[column] = (next - sums[column]) - adjusted;
             sums[column] = next;
@@ -845,11 +848,15 @@ pub fn accumulate_centered_scatter(
     accumulate_scatter(values, mean, scatter)
 }
 
-fn accumulate_scatter(values: &[f64], mean: &[f64], scatter: &mut [f64]) -> Result<()> {
+fn accumulate_scatter<T: Copy + Into<f64>>(
+    values: &[T],
+    mean: &[f64],
+    scatter: &mut [f64],
+) -> Result<()> {
     let dimension = mean.len();
     let rows = values.len() / dimension;
     let centered = Array2::from_shape_fn((rows, dimension), |(row, column)| {
-        values[row * dimension + column] - mean[column]
+        values[row * dimension + column].into() - mean[column]
     });
     let batch_scatter = centered.t().dot(&centered);
     for row in 0..dimension {
@@ -1107,6 +1114,7 @@ mod tests {
     use super::*;
 
     use approx::assert_relative_eq;
+    use arrow::compute::cast;
     use arrow_array::{Float16Array, Float64Array};
     use half::f16;
     use rstest::rstest;
@@ -1223,11 +1231,17 @@ mod tests {
     #[rstest]
     #[case::small_batches(17)]
     #[case::training_batches(TRANSFORM_BATCH_SIZE)]
-    fn scatter_training_matches_across_batch_boundaries(#[case] batch_rows: usize) {
+    fn scatter_training_matches_across_batch_boundaries(
+        #[case] batch_rows: usize,
+        #[values(DataType::Float16, DataType::Float32, DataType::Float64)] data_type: DataType,
+    ) {
         let rows = TRANSFORM_BATCH_SIZE + 3;
-        let values: Vec<f32> = (0..rows)
+        let values: Vec<f64> = (0..rows + 2)
             .flat_map(|row| {
-                let phase = row as f32 * 0.037;
+                if row == 0 || row == rows + 1 {
+                    return [f64::NAN; 3];
+                }
+                let phase = row as f64 * 0.037;
                 [
                     phase.sin(),
                     0.5 * (2.0 * phase).cos(),
@@ -1235,9 +1249,13 @@ mod tests {
                 ]
             })
             .collect();
-        let vectors = f32_vectors(values.clone(), 3);
-        let values: Vec<f64> = values.into_iter().map(f64::from).collect();
-        let mean = compensated_mean(&values, rows, 3).unwrap();
+        let values = cast(&Float64Array::from(values), &data_type).unwrap();
+        let vectors = FixedSizeListArray::try_new_from_values(values, 3)
+            .unwrap()
+            .slice(1, rows);
+        let values = cast(vectors.values().as_ref(), &DataType::Float64).unwrap();
+        let values = values.as_primitive::<Float64Type>().values();
+        let mean = compensated_mean(values, rows, 3).unwrap();
         let mut scatter = new_scatter(3).unwrap();
         for batch in values.chunks(batch_rows * 3) {
             accumulate_centered_scatter(batch, &mean, &mut scatter).unwrap();
