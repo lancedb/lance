@@ -6142,13 +6142,16 @@ mod tests {
             .unwrap();
 
         async fn index_by_name(dataset: &Dataset) -> HashMap<String, Uuid> {
-            dataset
-                .load_indices()
-                .await
-                .unwrap()
-                .iter()
-                .map(|index| (index.name.clone(), index.uuid))
-                .collect()
+            let mut by_name = HashMap::new();
+            for index in dataset.load_indices().await.unwrap().iter() {
+                if let Some(existing) = by_name.insert(index.name.clone(), index.uuid) {
+                    panic!(
+                        "index name {:?} is not unique: segments {existing} and {} share it",
+                        index.name, index.uuid
+                    );
+                }
+            }
+            by_name
         }
         let indices = index_by_name(&dataset).await;
 
