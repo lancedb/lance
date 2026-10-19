@@ -8,7 +8,7 @@ use std::fmt::Debug;
 use std::mem::size_of_val;
 use std::sync::Arc;
 
-use arrow_array::{ArrayRef, Float32Array, RecordBatch, UInt32Array};
+use arrow_array::{Float32Array, RecordBatch, UInt32Array};
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use lance_core::deepsize::{Context, DeepSizeOf};

@@ -8,7 +8,6 @@ use lance_linalg::distance::MetricType;
 
 use crate::dataset::Dataset;
 
-use crate::index::vector::training_source::TrainingVectorTransform;
 use super::super::{
     FixedIvfTrainingRanges, FixedIvfTrainingSampler, KMeansProgressCallback,
     StreamingFloatKMeansMetricPolicy, StreamingKMeansMetricPolicy, WeightedCoreset,
@@ -18,6 +17,7 @@ use super::super::{
     train_weighted_hierarchical_f32_kmeans,
 };
 use super::StreamingCoresetAlgorithm;
+use crate::index::vector::training_source::TrainingVectorTransform;
 
 pub(in crate::index::vector::ivf) struct FloatCoresetAlgorithm<'a> {
     metric_policy: &'a dyn StreamingFloatKMeansMetricPolicy,

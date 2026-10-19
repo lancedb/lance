@@ -5,22 +5,16 @@
 
 use std::sync::Arc;
 
-use arrow_array::RecordBatch;
 use arrow_schema::DataType;
-use async_trait::async_trait;
 use lance_core::cache::{
     CacheCodecImpl, CacheEntryReader, CacheEntryWriter, CacheKey, CacheKeySchema, KeyBuilder,
     LanceCache,
 };
-use lance_core::datatypes::Schema as LanceSchema;
 use lance_core::deepsize::DeepSizeOf;
 use lance_file::reader::FileReader;
 use lance_index::pb::PcaParameters;
-use lance_index::scalar::IndexReader;
 use lance_index::vector::VectorIndex;
-use lance_index::vector::pca::{
-    PCA_METADATA_KEY, PcaModel, decode_pca_model, encode_pca_model, read_pca_model,
-};
+use lance_index::vector::pca::{PCA_METADATA_KEY, PcaModel, decode_pca_model, encode_pca_model};
 use lance_index::vector::pretransform::PreTransformIndex;
 use lance_index::vector::quantizer::Quantizer;
 use lance_index::{INDEX_FILE_NAME, IndexType};
@@ -35,65 +29,32 @@ use super::{PcaComponentMismatch, pca_component_mismatch};
 use crate::session::index_caches::write_index_identity;
 use crate::{Error, Result};
 
-struct PcaFileReaderAdapter<'a> {
-    reader: &'a FileReader,
-    schema: LanceSchema,
-}
-
-impl<'a> PcaFileReaderAdapter<'a> {
-    fn new(reader: &'a FileReader) -> Result<Self> {
-        Ok(Self {
-            reader,
-            schema: reader.schema().as_ref().try_into()?,
-        })
-    }
-}
-
-#[async_trait]
-impl IndexReader for PcaFileReaderAdapter<'_> {
-    async fn read_record_batch(&self, _n: u64, _batch_size: u64) -> Result<RecordBatch> {
-        Err(Error::not_supported(
-            "PCA file-reader adapter does not read record batches",
-        ))
-    }
-
-    async fn read_global_buffer(&self, index: u32) -> Result<bytes::Bytes> {
-        self.reader.read_global_buffer(index).await
-    }
-
-    async fn read_range(
-        &self,
-        _range: std::ops::Range<usize>,
-        _projection: Option<&[&str]>,
-    ) -> Result<RecordBatch> {
-        Err(Error::not_supported(
-            "PCA file-reader adapter does not read row ranges",
-        ))
-    }
-
-    async fn num_batches(&self, _batch_size: u64) -> u32 {
-        0
-    }
-
-    fn num_rows(&self) -> usize {
-        self.reader.metadata().num_rows as usize
-    }
-
-    fn schema(&self) -> &LanceSchema {
-        &self.schema
-    }
-}
-
 /// Reads the optional pre-transform declared by an index file's schema metadata.
 pub async fn read_pre_transform(reader: &FileReader) -> Result<Option<Arc<PcaModel>>> {
     let Some(buffer_index) = reader.schema().metadata.get(PCA_METADATA_KEY) else {
         return Ok(None);
     };
-    let adapter = PcaFileReaderAdapter::new(reader)?;
-    read_pca_model(&adapter, buffer_index)
-        .await
-        .map(Arc::new)
-        .map(Some)
+    let buffer_index = buffer_index.parse::<u32>().map_err(|error| {
+        Error::corrupt_file_named(
+            INDEX_FILE_NAME,
+            format!(
+                "metadata key {PCA_METADATA_KEY} has invalid global buffer index {buffer_index:?}: {error}"
+            ),
+        )
+    })?;
+    let data = match reader.read_global_buffer(buffer_index).await {
+        Ok(data) => data,
+        Err(error @ (Error::NotFound { .. } | Error::InvalidInput { .. })) => {
+            return Err(Error::corrupt_file_named(
+                INDEX_FILE_NAME,
+                format!(
+                    "metadata key {PCA_METADATA_KEY} references missing or invalid global buffer index={buffer_index}: {error}"
+                ),
+            ));
+        }
+        Err(error) => return Err(error),
+    };
+    Ok(Some(Arc::new(decode_pca_model(&data)?)))
 }
 
 pub fn format_pca_fingerprint(fingerprint: &[u8; 32]) -> String {
@@ -609,11 +570,17 @@ impl CacheCodecImpl for PreTransformIndexState {
 mod tests {
     use std::sync::Arc;
 
-    use arrow_array::{FixedSizeListArray, Float32Array};
+    use arrow_array::{FixedSizeListArray, Float32Array, record_batch};
     use arrow_schema::DataType;
     use lance_arrow::FixedSizeListArrayExt;
+    use lance_file::reader::FileReaderOptions;
+    use lance_file::version::ConcreteFileVersion;
     use lance_index::vector::pca::PcaModel;
+    use lance_io::object_store::ObjectStore;
+    use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
+    use lance_io::utils::CachedFileSize;
     use lance_table::format::IndexMetadata;
+    use object_store::path::Path;
     use rstest::rstest;
     use uuid::Uuid;
 
@@ -629,6 +596,67 @@ mod tests {
         )
         .unwrap();
         Arc::new(PcaModel::train(&vectors, &lance_index::vector::pca::PcaParams::new(2)).unwrap())
+    }
+
+    #[rstest]
+    #[case::absent(None, None)]
+    #[case::round_trip(Some("1"), None)]
+    #[case::invalid_index(Some("abc"), Some("invalid global buffer index"))]
+    #[case::missing_buffer(Some("999"), Some("index=999"))]
+    #[tokio::test]
+    async fn test_read_pre_transform_from_file(
+        #[case] metadata: Option<&str>,
+        #[case] expected_error: Option<&str>,
+    ) {
+        let store = Arc::new(ObjectStore::memory());
+        let path = Path::from("pca.idx");
+        let model = test_pca_model();
+        let batch = record_batch!(("value", Int32, [1])).unwrap();
+        let mut writer = lance_file::versions::create_writer(
+            ConcreteFileVersion::V2_1,
+            store.create(&path).await.unwrap(),
+            batch.schema_ref().as_ref().try_into().unwrap(),
+            Default::default(),
+        )
+        .unwrap();
+        writer.write_batch(&batch).await.unwrap();
+        let index = writer
+            .add_global_buffer(encode_pca_model(&model).unwrap().into())
+            .await
+            .unwrap();
+        assert_eq!(index, 1);
+        if let Some(metadata) = metadata {
+            writer.add_schema_metadata(PCA_METADATA_KEY, metadata);
+        }
+        writer.finish().await.unwrap();
+        let scheduler = ScanScheduler::new(store, SchedulerConfig::default_for_testing());
+        let reader = FileReader::try_open(
+            scheduler
+                .open_file(&path, &CachedFileSize::unknown())
+                .await
+                .unwrap(),
+            None,
+            Default::default(),
+            &LanceCache::no_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+        match (read_pre_transform(&reader).await, expected_error) {
+            (Err(error), Some(message)) => {
+                assert!(matches!(error, Error::CorruptFile { .. }), "{error}");
+                assert!(error.to_string().contains(message), "{error}");
+            }
+            (Ok(Some(actual)), None) => {
+                assert!(metadata.is_some());
+                assert_eq!(actual.transform_matrix(), model.transform_matrix());
+                assert_eq!(actual.mean(), model.mean());
+            }
+            (Ok(None), None) => assert!(metadata.is_none()),
+            (actual, expected) => {
+                panic!("unexpected read result: {actual:?}, expected {expected:?}")
+            }
+        }
     }
 
     fn test_pca_details(fingerprint: [u8; 32]) -> Arc<prost_types::Any> {

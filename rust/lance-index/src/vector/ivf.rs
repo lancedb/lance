@@ -436,7 +436,6 @@ mod tests {
         );
     }
 
-
     use arrow_array::cast::AsArray;
     use arrow_array::types::UInt64Type;
     use arrow_array::{ArrayRef, FixedSizeListArray, Float32Array, UInt64Array};

@@ -20,7 +20,6 @@ use arrow_array::{
     RecordBatch, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, Field, Fields};
-use async_trait::async_trait;
 use futures::{FutureExt, SinkExt, stream};
 use futures::{
     Stream,
@@ -39,12 +38,12 @@ use lance_index::frag_reuse::{CompactFragReuseIndex, CompactFragReuseIndexHandle
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::progress::{IndexBuildProgress, NoopIndexBuildProgress};
-use lance_index::scalar::{IndexFile as ScalarIndexFile, IndexWriter, RowIdRemapper};
+use lance_index::scalar::RowIdRemapper;
 use lance_index::vector::bq::storage::{RABIT_CODE_COLUMN, unpack_codes};
 use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::hnsw::remap::{remap_graph_batch, remap_graph_repair};
 use lance_index::vector::kmeans::KMeansParams;
-use lance_index::vector::pca::{PCA_METADATA_KEY, PcaModel, PcaParams, write_pca_model};
+use lance_index::vector::pca::{PCA_METADATA_KEY, PcaModel, PcaParams, encode_pca_model};
 use lance_index::vector::pq::storage::transpose;
 use lance_index::vector::quantizer::{
     QuantizationMetadata, QuantizationType, QuantizerBuildParams,
@@ -444,36 +443,6 @@ pub struct VectorIndexBuildSummary {
     pub indices_merged: usize,
     pub files: Vec<IndexFile>,
     pub pca_fingerprint: Option<[u8; 32]>,
-}
-
-struct PcaFileWriterAdapter<'a>(&'a mut FileWriter);
-
-#[async_trait]
-impl IndexWriter for PcaFileWriterAdapter<'_> {
-    async fn write_record_batch(&mut self, _batch: RecordBatch) -> Result<u64> {
-        Err(Error::not_supported(
-            "PCA file-writer adapter does not write record batches",
-        ))
-    }
-
-    async fn add_global_buffer(&mut self, data: bytes::Bytes) -> Result<u32> {
-        self.0.add_global_buffer(data).await
-    }
-
-    async fn finish(&mut self) -> Result<ScalarIndexFile> {
-        Err(Error::not_supported(
-            "PCA file-writer adapter does not finish files",
-        ))
-    }
-
-    async fn finish_with_metadata(
-        &mut self,
-        _metadata: HashMap<String, String>,
-    ) -> Result<ScalarIndexFile> {
-        Err(Error::not_supported(
-            "PCA file-writer adapter does not finish files",
-        ))
-    }
 }
 
 fn validate_pca_writer_shape(
@@ -2119,8 +2088,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
 
     async fn write_pre_transform(&self, index_writer: &mut FileWriter) -> Result<()> {
         if let Some(pca_model) = self.pca_model.as_deref() {
-            let mut adapter = PcaFileWriterAdapter(&mut *index_writer);
-            let buffer_index = write_pca_model(&mut adapter, pca_model).await?;
+            let buffer_index = index_writer
+                .add_global_buffer(encode_pca_model(pca_model)?.into())
+                .await?;
             index_writer.add_schema_metadata(PCA_METADATA_KEY, buffer_index.to_string());
         }
         Ok(())
