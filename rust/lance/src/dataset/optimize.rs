@@ -351,6 +351,22 @@ pub struct CompactionOptions {
     /// (e.g., job_id for tracking completed compaction jobs).
     #[serde(skip)]
     pub transaction_properties: Option<Arc<HashMap<String, String>>>,
+    /// Internal: cached result of `has_eager_remappable_index` for the
+    /// dataset state the plan was computed against. Not meant to be set by
+    /// callers; `pub` only because `CompactionOptions` is constructed with
+    /// struct literal syntax outside this crate, which requires every field
+    /// to be visible even when filled in via `..Default::default()`.
+    ///
+    /// [`DefaultCompactionPlanner::plan`] fills this in once, and
+    /// `rewrite_files` reuses it instead of reloading index metadata for
+    /// every task. Left as `None` by any options a caller builds directly
+    /// (including via [`Default`]), which makes `rewrite_files` fall back to
+    /// loading it itself. `commit_compaction` never reads this: it always
+    /// reloads live, since its dataset handle can have moved past the plan's
+    /// read version by the time it runs.
+    #[doc(hidden)]
+    #[serde(default)]
+    pub has_eager_remappable_index: Option<bool>,
 }
 
 #[allow(deprecated)]
@@ -379,6 +395,7 @@ impl Default for CompactionOptions {
             max_overlays_per_fragment: Some(10),
             data_storage_version: None,
             transaction_properties: None,
+            has_eager_remappable_index: None,
         }
     }
 }
@@ -839,10 +856,16 @@ impl CompactionPlanner for DefaultCompactionPlanner {
                 &load_all_indices(dataset).await?,
             )?;
         }
-        if !self.options.defer_index_remap
-            && dataset.manifest.uses_stable_row_ids()
-            && has_eager_remappable_index(dataset).await?
-        {
+        // Computed at most once here, rather than reloaded by every task in
+        // `rewrite_files` and the planner above: see the doc comment on
+        // `CompactionOptions::has_eager_remappable_index`.
+        let eager_remap_capable =
+            if !self.options.defer_index_remap && dataset.manifest.uses_stable_row_ids() {
+                Some(has_eager_remappable_index(dataset).await?)
+            } else {
+                None
+            };
+        if eager_remap_capable == Some(true) {
             reject_eager_remap_over_undrained_fri(dataset).await?;
         }
 
@@ -1035,6 +1058,7 @@ impl CompactionPlanner for DefaultCompactionPlanner {
 
         let mut options = self.options.clone();
         options.data_storage_version = Some(write_version.to_selector());
+        options.has_eager_remappable_index = eager_remap_capable;
         let mut compaction_plan = CompactionPlan::new(dataset.manifest.version, options);
         compaction_plan.extend_tasks(tasks);
 
@@ -2631,7 +2655,15 @@ async fn rewrite_files(
     // A scan captures stable row ids, not row addresses; derive old addresses
     // from fragment metadata instead, whenever something will consume them.
     let records_from_fragment_metadata = uses_stable_row_ids
-        && (options.defer_index_remap || has_eager_remappable_index(dataset.as_ref()).await?);
+        && (options.defer_index_remap || {
+            // The planner precomputes this once for the whole plan (see
+            // `CompactionOptions::has_eager_remappable_index`); fall back to
+            // loading it here for options built outside the planner.
+            match options.has_eager_remappable_index {
+                Some(value) => value,
+                None => has_eager_remappable_index(dataset.as_ref()).await?,
+            }
+        });
     // Capturing row addresses is only useful if something will consume them:
     // an index to remap now, or a deferred remap through the FRI.
     let capture_row_addrs = !uses_stable_row_ids
@@ -5909,6 +5941,72 @@ mod tests {
             expect_capture,
             "eager stable-row-id compaction must capture row addresses exactly when an \
              eager-remap-capable index needs them to remap"
+        );
+    }
+
+    /// `DefaultCompactionPlanner::plan` computes `has_eager_remappable_index`
+    /// once and stashes it on `CompactionPlan::options`; `rewrite_files` must
+    /// trust that cached value instead of reloading index metadata itself,
+    /// and must fall back to a live reload only when a caller hands it
+    /// options that were never produced by the planner.
+    #[tokio::test]
+    async fn test_rewrite_files_trusts_planners_cached_eager_remap_capability() {
+        let data = sample_data();
+        let reader = RecordBatchIterator::new(vec![Ok(data.slice(0, 9_000))], data.schema());
+        let mut dataset = Dataset::write(
+            reader,
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 3_000,
+                enable_stable_row_ids: true,
+                data_storage_version: Some(LanceFileVersion::Legacy),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let options = CompactionOptions {
+            target_rows_per_fragment: 9_000,
+            defer_index_remap: false,
+            ..Default::default()
+        };
+        let plan = plan_compaction(&dataset, &options).await.unwrap();
+        assert_eq!(plan.tasks().len(), 1);
+        assert_eq!(
+            plan.options().has_eager_remappable_index,
+            Some(false),
+            "no index existed at plan time, so the planner should have cached a negative answer"
+        );
+
+        // Diverge from the planned state: a remap-capable index now exists,
+        // but the plan's cached answer still says it doesn't.
+        create_scalar_index(&mut dataset, "a", false).await;
+
+        let stale_cached_result = rewrite_files(
+            Cow::Borrowed(&dataset),
+            plan.tasks()[0].clone(),
+            plan.options(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            stale_cached_result.row_addrs.is_none(),
+            "rewrite_files must trust the plan's cached capability instead of reloading, even \
+             though reloading now would (incorrectly, for this plan) say an index needs it"
+        );
+
+        // Options a caller builds directly, bypassing the planner, carry no
+        // cached answer and so fall back to a live reload that does see the
+        // new index.
+        assert_eq!(options.has_eager_remappable_index, None);
+        let live_reload_result =
+            rewrite_files(Cow::Borrowed(&dataset), plan.tasks()[0].clone(), &options)
+                .await
+                .unwrap();
+        assert!(
+            live_reload_result.row_addrs.is_some(),
+            "without a cached answer, rewrite_files must fall back to loading index metadata live"
         );
     }
 
