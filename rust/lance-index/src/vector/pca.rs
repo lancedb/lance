@@ -4,6 +4,9 @@
 //! Principal component analysis for vector pre-transforms.
 
 use std::alloc::Layout;
+#[cfg(target_arch = "aarch64")]
+use std::arch::aarch64::*;
+use std::borrow::Cow;
 use std::mem::size_of;
 use std::sync::{Arc, OnceLock};
 
@@ -17,7 +20,9 @@ use bytes::Bytes;
 use lance_arrow::FixedSizeListArrayExt;
 use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_core::{Error, Result};
-use ndarray::Array2;
+#[cfg(not(target_arch = "aarch64"))]
+use lance_linalg::distance::dot::dot_f32 as dot_row;
+use ndarray::{Array2, ArrayView2};
 use prost::Message;
 
 use crate::pb;
@@ -26,12 +31,12 @@ use crate::scalar::{IndexReader, IndexWriter};
 /// Arrow schema metadata key containing the PCA model global-buffer index.
 pub const PCA_METADATA_KEY: &str = "lance:pca";
 
-/// Current stable PCA model serialization version.
+/// Current experimental PCA model serialization version.
 pub const PCA_MODEL_VERSION: u32 = 1;
 
 /// A PCA projection that produced a non-finite output component.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct PcaNonFiniteOutput {
+pub(crate) struct PcaNonFiniteOutput {
     pub row: usize,
     pub output_dimension: usize,
     pub value: f32,
@@ -50,7 +55,7 @@ impl std::fmt::Display for PcaNonFiniteOutput {
 impl std::error::Error for PcaNonFiniteOutput {}
 
 /// Returns the structured non-finite PCA output carried by `error`, if any.
-pub fn non_finite_output(error: &Error) -> Option<PcaNonFiniteOutput> {
+pub(crate) fn non_finite_output(error: &Error) -> Option<PcaNonFiniteOutput> {
     let mut current = Some(error as &(dyn std::error::Error + 'static));
     while let Some(err) = current {
         if let Some(found) = err.downcast_ref::<PcaNonFiniteOutput>() {
@@ -145,48 +150,6 @@ impl PcaParams {
     }
 }
 
-/// Diagnostics produced while training a PCA model.
-#[derive(Debug, Clone)]
-pub struct PcaTrainingStats {
-    sampled_rows: usize,
-    valid_rows: usize,
-    effective_rank: usize,
-    total_variance: f64,
-    retained_variance: f64,
-}
-
-impl PcaTrainingStats {
-    /// Number of rows supplied to the in-memory trainer.
-    pub fn sampled_rows(&self) -> usize {
-        self.sampled_rows
-    }
-
-    /// Number of valid rows used for training.
-    pub fn valid_rows(&self) -> usize {
-        self.valid_rows
-    }
-
-    /// Number of eigenvalues above the numerical rank threshold.
-    pub fn effective_rank(&self) -> usize {
-        self.effective_rank
-    }
-
-    /// Sum of all sanitized population-covariance eigenvalues.
-    pub fn total_variance(&self) -> f64 {
-        self.total_variance
-    }
-
-    /// Sum of the retained population-covariance eigenvalues.
-    pub fn retained_variance(&self) -> f64 {
-        self.retained_variance
-    }
-
-    /// Fraction of total variance retained by the model.
-    pub fn retained_variance_ratio(&self) -> f64 {
-        self.retained_variance / self.total_variance
-    }
-}
-
 /// A trained PCA transform represented as `y = A * (x - mean)`.
 ///
 /// This is an experimental format feature. The stored model may change
@@ -218,33 +181,19 @@ impl PcaTrainingStats {
 pub struct PcaModel {
     input_dimension: usize,
     output_dimension: usize,
-    transform_matrix: Arc<Float32Array>,
-    mean: Arc<Float32Array>,
-    training_stats: Option<PcaTrainingStats>,
+    transform_matrix: Float32Array,
+    mean: Float32Array,
     fingerprint: OnceLock<[u8; 32]>,
 }
 
 impl DeepSizeOf for PcaModel {
     fn deep_size_of_children(&self, context: &mut Context) -> usize {
-        fn array_size(array: &Arc<Float32Array>, context: &mut Context) -> usize {
-            if context.mark_seen(Arc::as_ptr(array) as usize) {
-                std::mem::size_of_val(array.as_ref())
-                    + (array.as_ref() as &dyn Array).deep_size_of_children(context)
-            } else {
-                0
-            }
-        }
-
-        array_size(&self.transform_matrix, context) + array_size(&self.mean, context)
+        (&self.transform_matrix as &dyn Array).deep_size_of_children(context)
+            + (&self.mean as &dyn Array).deep_size_of_children(context)
     }
 }
 
 fn encode_f32_tensor(values: &[f32], shape: Vec<u32>, label: &str) -> Result<pb::Tensor> {
-    if values.iter().any(|value| !value.is_finite()) {
-        return Err(Error::index(format!(
-            "{PCA_MODEL_NAME} {label} contains NaN or infinity"
-        )));
-    }
     let byte_len = values
         .len()
         .checked_mul(size_of::<f32>())
@@ -374,27 +323,6 @@ impl TryFrom<&PcaModel> for pb::PcaModel {
                 model.input_dimension
             ))
         })?;
-        let expected_matrix_len = model
-            .output_dimension
-            .checked_mul(model.input_dimension)
-            .ok_or_else(|| {
-                Error::index(format!("{PCA_MODEL_NAME} matrix shape overflows usize"))
-            })?;
-        if model.output_dimension == 0
-            || model.input_dimension == 0
-            || model.output_dimension >= model.input_dimension
-            || model.transform_matrix.len() != expected_matrix_len
-            || model.mean.len() != model.input_dimension
-        {
-            return Err(Error::index(format!(
-                "{PCA_MODEL_NAME} has invalid shape: matrix=[{}, {}] matrix data length={}, mean shape=[{}] mean data length={}",
-                model.output_dimension,
-                model.input_dimension,
-                model.transform_matrix.len(),
-                model.input_dimension,
-                model.mean.len()
-            )));
-        }
         Ok(Self {
             model_version: PCA_MODEL_VERSION,
             transform_matrix: Some(encode_f32_tensor(
@@ -496,20 +424,19 @@ impl TryFrom<pb::PcaModel> for PcaModel {
         Ok(Self {
             input_dimension,
             output_dimension,
-            transform_matrix: Arc::new(Float32Array::from(transform_matrix)),
-            mean: Arc::new(Float32Array::from(mean)),
-            training_stats: None,
+            transform_matrix: Float32Array::from(transform_matrix),
+            mean: Float32Array::from(mean),
             fingerprint: OnceLock::new(),
         })
     }
 }
 
-/// Encodes a PCA model as the stable protobuf payload stored in a global buffer.
+/// Encodes a PCA model as the versioned protobuf payload stored in a global buffer.
 pub fn encode_pca_model(model: &PcaModel) -> Result<Vec<u8>> {
     Ok(pb::PcaModel::try_from(model)?.encode_to_vec())
 }
 
-/// Decodes and strictly validates a stable PCA protobuf payload.
+/// Decodes and strictly validates a versioned PCA protobuf payload.
 ///
 /// Malformed protobuf data and invalid model contents are reported as
 /// [`Error::CorruptFile`].
@@ -574,41 +501,25 @@ impl PcaModel {
     /// Training rejects null or non-finite values. All statistics and matrix
     /// decompositions use `f64`; the returned runtime model uses `f32`.
     pub fn train(data: &FixedSizeListArray, params: &PcaParams) -> Result<Self> {
-        let input_dimension = usize::try_from(data.value_length()).map_err(|_| {
-            Error::invalid_input(format!(
-                "PCA input value_length={} is not a valid dimension",
-                data.value_length()
-            ))
-        })?;
-        let row_count = data.len();
-        params.validate(input_dimension, row_count)?;
-        validate_training_array(data)?;
-
-        let logical_values = logical_values(data)?;
-        let values = values_as_f64(logical_values.as_ref())?;
-        let value_count = row_count.checked_mul(input_dimension).ok_or_else(|| {
-            Error::invalid_input(format!(
-                "PCA input shape [{row_count}, {input_dimension}] overflows usize"
-            ))
-        })?;
-        if values.len() != value_count {
-            return Err(Error::invalid_input(format!(
-                "PCA input values length {} does not match shape [{row_count}, {input_dimension}]",
-                values.len()
-            )));
+        let (input_dimension, values) = vector_values(data)?;
+        params.validate(input_dimension, data.len())?;
+        let values = values_as_f64(values.as_ref())?;
+        let mean = compensated_mean(&values, data.len(), input_dimension)?;
+        let mut scatter = new_scatter(input_dimension)?;
+        let batch_values = TRANSFORM_BATCH_SIZE
+            .checked_mul(input_dimension)
+            .ok_or_else(|| Error::invalid_input("PCA training batch shape overflows usize"))?;
+        for batch in values.chunks(batch_values) {
+            accumulate_scatter(batch, &mean, &mut scatter)?;
         }
-
-        let mean = compensated_mean(&values, row_count, input_dimension)?;
-        let covariance = covariance_matrix(&values, &mean, row_count, input_dimension)?;
-        let (eigenvalues, basis) = eigenpairs_descending(&covariance, input_dimension)?;
-        Self::from_eigenpairs(mean, row_count, input_dimension, eigenvalues, basis, params)
+        Self::train_from_scatter(&mean, data.len(), &scatter, params)
     }
 
     /// Trains a model from a mean and row-major centered scatter matrix.
     ///
     /// `scatter` must equal the sum of centered outer products and must be a
     /// finite, symmetric `mean.len() * mean.len()` matrix. Population
-    /// covariance is computed as `scatter / sample_count`. This is the
+    /// covariance has the same eigenvectors as scatter. This is the
     /// statistics entry point used by streaming dataset training.
     pub fn train_from_scatter(
         mean: &[f64],
@@ -620,99 +531,42 @@ impl PcaModel {
         params.validate(input_dimension, sample_count)?;
         validate_finite_slice(mean, "mean")?;
         validate_symmetric_matrix(scatter, input_dimension, "scatter")?;
-        let (eigenvalues, basis) =
-            covariance_eigenvectors(scatter, input_dimension, sample_count as f64)?;
-        Self::from_eigenpairs(
-            mean.to_vec(),
-            sample_count,
-            input_dimension,
-            eigenvalues,
-            basis,
-            params,
-        )
-    }
-
-    fn from_eigenpairs(
-        mean: Vec<f64>,
-        sample_count: usize,
-        input_dimension: usize,
-        eigenvalues: Vec<f64>,
-        mut basis: Vec<f64>,
-        params: &PcaParams,
-    ) -> Result<Self> {
-        let (sanitized, effective_rank, tau) = sanitize_eigenvalues(eigenvalues, params.dimension)?;
-        if effective_rank < params.dimension {
-            let selected_min = sanitized
-                .get(params.dimension.saturating_sub(1))
-                .copied()
-                .unwrap_or(0.0);
-            return Err(Error::invalid_input(format!(
-                "PCA training data has effective_rank={effective_rank}, smaller than output_dimension={}; lambda_max={}, minimum_selected_eigenvalue={selected_min}, tau={tau}",
-                params.dimension, sanitized[0]
-            )));
-        }
-
-        let retained_basis_len = params
-            .dimension
-            .checked_mul(input_dimension)
-            .ok_or_else(|| Error::invalid_input("PCA retained basis shape overflows usize"))?;
-        if basis.len() < retained_basis_len {
-            return Err(Error::index(format!(
-                "PCA eigendecomposition basis length={} is smaller than retained shape [{}, {input_dimension}] requiring {retained_basis_len} values",
-                basis.len(),
-                params.dimension
-            )));
-        }
-        basis.truncate(retained_basis_len);
-        normalize_component_signs(&mut basis, params.dimension, input_dimension)?;
-        let transform_matrix = Arc::new(Float32Array::from(
-            basis
-                .into_iter()
-                .map(canonical_f32)
-                .collect::<Result<Vec<_>>>()?,
-        ));
-        let mean = Arc::new(Float32Array::from(
+        let transform_matrix =
+            principal_components(scatter, input_dimension, sample_count, params.dimension)?;
+        let mean = Float32Array::from(
             mean.iter()
                 .map(|value| canonical_f32(*value))
                 .collect::<Result<Vec<_>>>()?,
-        ));
-        let total_variance = sanitized.iter().sum();
-        let retained_variance = sanitized[..params.dimension].iter().sum();
-        let model = Self {
+        );
+        Ok(Self {
             input_dimension,
             output_dimension: params.dimension,
             transform_matrix,
             mean,
-            training_stats: Some(PcaTrainingStats {
-                sampled_rows: sample_count,
-                valid_rows: sample_count,
-                effective_rank,
-                total_variance,
-                retained_variance,
-            }),
             fingerprint: OnceLock::new(),
-        };
-        model.validate_model()?;
-        Ok(model)
+        })
     }
 
     /// Applies the PCA transform to a batch of vectors.
     pub fn transform(&self, vectors: &FixedSizeListArray) -> Result<FixedSizeListArray> {
-        validate_runtime_array(vectors, self.input_dimension)?;
+        let (dimension, values) = vector_values(vectors)?;
+        if dimension != self.input_dimension {
+            return Err(Error::invalid_input(format!(
+                "PCA vector dimension {dimension} does not match input_dimension={}",
+                self.input_dimension,
+            )));
+        }
         let row_count = vectors.len();
-        let logical_values = logical_values(vectors)?;
-        let input = values_as_f32(logical_values.as_ref())?;
+        let input = values_as_f32(values.as_ref())?;
         let output_len = row_count
             .checked_mul(self.output_dimension)
             .ok_or_else(|| Error::invalid_input("PCA output shape overflows usize"))?;
         let mut output = Vec::with_capacity(output_len);
-        let matrix = Array2::from_shape_fn(
+        let matrix = ArrayView2::from_shape(
             (self.output_dimension, self.input_dimension),
-            |(row, column)| {
-                self.transform_matrix
-                    .value(row * self.input_dimension + column)
-            },
-        );
+            self.transform_matrix.values().as_ref(),
+        )
+        .map_err(|error| Error::internal(format!("invalid PCA model matrix shape: {error}")))?;
         for chunk_start in (0..row_count).step_by(TRANSFORM_BATCH_SIZE) {
             let chunk_end = chunk_start
                 .saturating_add(TRANSFORM_BATCH_SIZE)
@@ -752,12 +606,6 @@ impl PcaModel {
 
     /// Applies the PCA transform to one one-dimensional query vector.
     pub fn transform_query(&self, query: &dyn Array) -> Result<ArrayRef> {
-        if query.null_count() != 0 {
-            return Err(Error::invalid_input(format!(
-                "PCA query contains {} null values",
-                query.null_count()
-            )));
-        }
         if query.len() != self.input_dimension {
             return Err(Error::invalid_input(format!(
                 "PCA query dimension {} does not match input_dimension={}",
@@ -766,15 +614,35 @@ impl PcaModel {
             )));
         }
         let input = values_as_f32(query)?;
+        let centered: Vec<f32> = input
+            .iter()
+            .zip(self.mean.values())
+            .map(|(value, mean)| value - mean)
+            .collect();
         let mut output = Vec::with_capacity(self.output_dimension);
-        transform_row(
-            &input,
-            self.mean.values(),
-            self.transform_matrix.values(),
-            self.input_dimension,
-            self.output_dimension,
-            &mut output,
-        )?;
+        let matrix = self.transform_matrix.values().as_ref();
+        #[cfg(target_arch = "aarch64")]
+        let matrix = {
+            let mut groups = matrix.chunks_exact(4 * self.input_dimension);
+            for rows in groups.by_ref() {
+                output.extend(dot_4rows(&centered, rows));
+            }
+            groups.remainder()
+        };
+        output.extend(
+            matrix
+                .chunks_exact(self.input_dimension)
+                .map(|row| dot_row(&centered, row)),
+        );
+        if let Some((row, _)) = output
+            .iter()
+            .enumerate()
+            .find(|(_, value)| !value.is_finite())
+        {
+            return Err(Error::invalid_input(format!(
+                "PCA transform produced a non-finite value at output dimension {row}"
+            )));
+        }
         Ok(Arc::new(Float32Array::from(output)))
     }
 
@@ -792,11 +660,6 @@ impl PcaModel {
 
     pub fn mean(&self) -> &Float32Array {
         &self.mean
-    }
-
-    /// Returns training diagnostics when this model was trained in memory.
-    pub fn training_stats(&self) -> Option<&PcaTrainingStats> {
-        self.training_stats.as_ref()
     }
 
     /// Returns the stable BLAKE3 identity of this model's numerical transform.
@@ -823,63 +686,21 @@ impl PcaModel {
         }
         *hasher.finalize().as_bytes()
     }
-
-    fn validate_model(&self) -> Result<()> {
-        let expected_matrix_len = self
-            .output_dimension
-            .checked_mul(self.input_dimension)
-            .ok_or_else(|| Error::index("PCA trained model matrix shape overflows usize"))?;
-        if self.transform_matrix.len() != expected_matrix_len
-            || self.mean.len() != self.input_dimension
-        {
-            return Err(Error::index(format!(
-                "PCA trained model has matrix length {} and mean length {}, expected {} and {}",
-                self.transform_matrix.len(),
-                self.mean.len(),
-                expected_matrix_len,
-                self.input_dimension
-            )));
-        }
-        if self
-            .transform_matrix
-            .values()
-            .iter()
-            .chain(self.mean.values())
-            .any(|value| !value.is_finite())
-        {
-            return Err(Error::index(
-                "PCA trained model contains non-finite values".to_string(),
-            ));
-        }
-
-        Ok(())
-    }
 }
 
-fn validate_training_array(data: &FixedSizeListArray) -> Result<()> {
-    let logical_values = logical_values(data)?;
-    if data.null_count() != 0 || logical_values.null_count() != 0 {
-        return Err(Error::invalid_input(format!(
-            "PCA training data contains nulls: vector_nulls={}, value_nulls={}",
-            data.null_count(),
-            logical_values.null_count()
-        )));
-    }
-    match data.value_type() {
-        DataType::Float16 | DataType::Float32 | DataType::Float64 => Ok(()),
-        data_type => Err(Error::invalid_input(format!(
-            "PCA training data must contain Float16, Float32, or Float64 values, got {data_type}"
-        ))),
-    }
-}
-
-fn logical_values(data: &FixedSizeListArray) -> Result<ArrayRef> {
+fn vector_values(data: &FixedSizeListArray) -> Result<(usize, ArrayRef)> {
     let dimension = usize::try_from(data.value_length()).map_err(|_| {
         Error::invalid_input(format!(
-            "PCA vector value_length={} is not a valid dimension",
+            "PCA vector value_length={} is invalid",
             data.value_length()
         ))
     })?;
+    if data.null_count() != 0 {
+        return Err(Error::invalid_input(format!(
+            "PCA vectors contain {} null rows",
+            data.null_count(),
+        )));
+    }
     let start = data
         .offset()
         .checked_mul(dimension)
@@ -894,26 +715,10 @@ fn logical_values(data: &FixedSizeListArray) -> Result<ArrayRef> {
     if end > data.values().len() {
         return Err(Error::invalid_input(format!(
             "PCA vector value range [{start}, {end}) exceeds child values length {}",
-            data.values().len()
+            data.values().len(),
         )));
     }
-    Ok(data.values().slice(start, length))
-}
-
-fn validate_runtime_array(data: &FixedSizeListArray, expected_dimension: usize) -> Result<()> {
-    validate_training_array(data)?;
-    let dimension = usize::try_from(data.value_length()).map_err(|_| {
-        Error::invalid_input(format!(
-            "PCA vector dimension {} is invalid",
-            data.value_length()
-        ))
-    })?;
-    if dimension != expected_dimension {
-        return Err(Error::invalid_input(format!(
-            "PCA vector dimension {dimension} does not match input_dimension={expected_dimension}"
-        )));
-    }
-    Ok(())
+    Ok((dimension, data.values().slice(start, length)))
 }
 
 fn validate_finite_slice(values: &[f64], label: &str) -> Result<()> {
@@ -958,27 +763,29 @@ fn validate_symmetric_matrix(values: &[f64], dimension: usize, label: &str) -> R
     Ok(())
 }
 
-fn values_as_f64(values: &dyn Array) -> Result<Vec<f64>> {
+fn values_as_f64(values: &dyn Array) -> Result<Cow<'_, [f64]>> {
     if values.null_count() != 0 {
         return Err(Error::invalid_input(format!(
             "PCA input contains {} null scalar values",
             values.null_count()
         )));
     }
-    let converted = match values.data_type() {
+    let converted: Cow<'_, [_]> = match values.data_type() {
         DataType::Float16 => values
             .as_primitive::<Float16Type>()
             .values()
             .iter()
             .map(|value| f64::from(value.to_f32()))
-            .collect(),
+            .collect::<Vec<_>>()
+            .into(),
         DataType::Float32 => values
             .as_primitive::<Float32Type>()
             .values()
             .iter()
             .map(|value| f64::from(*value))
-            .collect(),
-        DataType::Float64 => values.as_primitive::<Float64Type>().values().to_vec(),
+            .collect::<Vec<_>>()
+            .into(),
+        DataType::Float64 => Cow::Borrowed(values.as_primitive::<Float64Type>().values().as_ref()),
         data_type => {
             return Err(Error::invalid_input(format!(
                 "PCA input must be Float16, Float32, or Float64, got {data_type}"
@@ -993,27 +800,29 @@ fn values_as_f64(values: &dyn Array) -> Result<Vec<f64>> {
     Ok(converted)
 }
 
-fn values_as_f32(values: &dyn Array) -> Result<Vec<f32>> {
+fn values_as_f32(values: &dyn Array) -> Result<Cow<'_, [f32]>> {
     if values.null_count() != 0 {
         return Err(Error::invalid_input(format!(
             "PCA input contains {} null scalar values",
             values.null_count()
         )));
     }
-    let converted = match values.data_type() {
+    let converted: Cow<'_, [_]> = match values.data_type() {
         DataType::Float16 => values
             .as_primitive::<Float16Type>()
             .values()
             .iter()
             .map(|value| value.to_f32())
-            .collect(),
-        DataType::Float32 => values.as_primitive::<Float32Type>().values().to_vec(),
+            .collect::<Vec<_>>()
+            .into(),
+        DataType::Float32 => Cow::Borrowed(values.as_primitive::<Float32Type>().values().as_ref()),
         DataType::Float64 => values
             .as_primitive::<Float64Type>()
             .values()
             .iter()
             .map(|value| *value as f32)
-            .collect(),
+            .collect::<Vec<_>>()
+            .into(),
         data_type => {
             return Err(Error::invalid_input(format!(
                 "PCA input must be Float16, Float32, or Float64, got {data_type}"
@@ -1077,6 +886,11 @@ pub fn accumulate_centered_scatter(
     validate_finite_slice(mean, "scatter mean")?;
     validate_symmetric_matrix(scatter, dimension, "accumulated scatter")?;
 
+    accumulate_scatter(values, mean, scatter)
+}
+
+fn accumulate_scatter(values: &[f64], mean: &[f64], scatter: &mut [f64]) -> Result<()> {
+    let dimension = mean.len();
     let rows = values.len() / dimension;
     let centered = Array2::from_shape_fn((rows, dimension), |(row, column)| {
         values[row * dimension + column] - mean[column]
@@ -1097,72 +911,30 @@ pub fn accumulate_centered_scatter(
     Ok(())
 }
 
-fn covariance_matrix(
-    values: &[f64],
-    mean: &[f64],
-    rows: usize,
-    dimension: usize,
-) -> Result<Vec<f64>> {
+fn new_scatter(dimension: usize) -> Result<Vec<f64>> {
     let matrix_len = dimension
         .checked_mul(dimension)
-        .ok_or_else(|| Error::invalid_input("PCA covariance matrix shape overflows usize"))?;
+        .ok_or_else(|| Error::invalid_input("PCA scatter matrix shape overflows usize"))?;
     Layout::array::<f64>(matrix_len).map_err(|_| {
         Error::invalid_input(format!(
-            "PCA covariance shape [{dimension}, {dimension}] exceeds the maximum allocation size"
+            "PCA scatter shape [{dimension}, {dimension}] exceeds the maximum allocation size"
         ))
     })?;
-    let mut covariance = vec![0.0; matrix_len];
-    let denominator = rows as f64;
-    for column in 0..dimension {
-        for other in column..dimension {
-            let mut sum = 0.0;
-            for row in 0..rows {
-                sum += (values[row * dimension + column] - mean[column])
-                    * (values[row * dimension + other] - mean[other]);
-            }
-            let value = sum / denominator;
-            if !value.is_finite() {
-                return Err(Error::invalid_input(format!(
-                    "PCA population covariance contains non-finite value={value} at row={column}, column={other}, shape=[{dimension}, {dimension}]"
-                )));
-            }
-            covariance[column * dimension + other] = value;
-            covariance[other * dimension + column] = value;
-        }
-    }
-    Ok(covariance)
+    Ok(vec![0.0; matrix_len])
 }
 
-fn covariance_eigenvectors(
-    covariance: &[f64],
+fn principal_components(
+    scatter: &[f64],
     dimension: usize,
-    denominator: f64,
-) -> Result<(Vec<f64>, Vec<f64>)> {
-    if denominator == 0.0 || !denominator.is_finite() {
-        return Err(Error::invalid_input(format!(
-            "PCA covariance denominator={denominator} must be finite and non-zero"
-        )));
-    }
-    let scaled = covariance
-        .iter()
-        .map(|value| value / denominator)
-        .collect::<Vec<_>>();
-    eigenpairs_descending(&scaled, dimension)
-}
-
-fn eigenpairs_descending(matrix: &[f64], dimension: usize) -> Result<(Vec<f64>, Vec<f64>)> {
-    let expected_len = dimension
-        .checked_mul(dimension)
-        .ok_or_else(|| Error::invalid_input("PCA eigenvector shape overflows usize".to_string()))?;
-    if matrix.len() != expected_len {
-        return Err(Error::invalid_input(format!(
-            "PCA eigendecomposition matrix length={} does not match shape [{dimension}, {dimension}]",
-            matrix.len()
-        )));
-    }
-    let dense = nalgebra::DMatrix::from_row_slice(dimension, dimension, matrix);
-    // Each Jacobi sweep is O(dimension^2) rotations. Cap the solver at about
-    // 30 sweeps so a non-converging matrix fails instead of looping forever.
+    sample_count: usize,
+    output_dimension: usize,
+) -> Result<Float32Array> {
+    // Normalize while creating the solver-owned matrix: raw scatter eigenvalues
+    // can overflow even when the covariance eigenvalues are finite.
+    let dense = nalgebra::DMatrix::from_fn(dimension, dimension, |row, column| {
+        scatter[row * dimension + column] / sample_count as f64
+    });
+    // Bound solver work so a non-converging matrix fails instead of looping forever.
     let max_iterations = dimension
         .saturating_mul(dimension)
         .saturating_mul(15)
@@ -1178,35 +950,35 @@ fn eigenpairs_descending(matrix: &[f64], dimension: usize) -> Result<(Vec<f64>, 
     order.sort_by(|&left, &right| {
         decomposition.eigenvalues[right].total_cmp(&decomposition.eigenvalues[left])
     });
-    let mut descending_values = Vec::with_capacity(dimension);
-    let mut descending_vectors = Vec::with_capacity(expected_len);
-    for component in order {
-        descending_values.push(decomposition.eigenvalues[component]);
+    let eigenvalues = order
+        .iter()
+        .map(|&index| decomposition.eigenvalues[index])
+        .collect::<Vec<_>>();
+    validate_eigenvalues(&eigenvalues, output_dimension)?;
+    let mut basis = Vec::with_capacity(output_dimension * dimension);
+    for component in order.into_iter().take(output_dimension) {
         for row in 0..dimension {
-            descending_vectors.push(decomposition.eigenvectors[(row, component)]);
+            basis.push(decomposition.eigenvectors[(row, component)]);
         }
     }
-    Ok((descending_values, descending_vectors))
+    normalize_component_signs(&mut basis, output_dimension, dimension)?;
+    Ok(Float32Array::from(
+        basis
+            .into_iter()
+            .map(canonical_f32)
+            .collect::<Result<Vec<_>>>()?,
+    ))
 }
 
-fn sanitize_eigenvalues(
-    eigenvalues: Vec<f64>,
-    output_dimension: usize,
-) -> Result<(Vec<f64>, usize, f64)> {
-    let Some(lambda_max) = eigenvalues.first().copied() else {
-        return Err(Error::invalid_input(
-            "PCA eigendecomposition returned no eigenvalues".to_string(),
+fn validate_eigenvalues(eigenvalues: &[f64], output_dimension: usize) -> Result<()> {
+    let Some(&lambda_max) = eigenvalues.first() else {
+        return Err(Error::index(
+            "PCA eigendecomposition returned no eigenvalues",
         ));
     };
-    if !lambda_max.is_finite() {
-        return Err(Error::index(
-            "PCA eigendecomposition returned a non-finite maximum eigenvalue".to_string(),
-        ));
-    }
     let tau = f64::MIN_POSITIVE.max(1.0e-10 * lambda_max.abs());
-    let mut sanitized = Vec::with_capacity(eigenvalues.len());
     let mut effective_rank = 0;
-    for (index, eigenvalue) in eigenvalues.into_iter().enumerate() {
+    for (index, &eigenvalue) in eigenvalues.iter().enumerate() {
         if !eigenvalue.is_finite() {
             return Err(Error::index(format!(
                 "PCA eigenvalue at descending index {index} is non-finite"
@@ -1215,23 +987,19 @@ fn sanitize_eigenvalues(
         if eigenvalue < -tau {
             return Err(Error::index(format!(
                 "PCA eigenvalue at descending index {index} is {eigenvalue}, below -tau={}",
-                -tau
+                -tau,
             )));
         }
-        if eigenvalue.abs() <= tau {
-            sanitized.push(0.0);
-        } else {
+        if eigenvalue > tau {
             effective_rank += 1;
-            sanitized.push(eigenvalue);
         }
     }
-    if sanitized.len() < output_dimension {
-        return Err(Error::index(format!(
-            "PCA eigendecomposition returned {} eigenvalues, fewer than output_dimension={output_dimension}",
-            sanitized.len()
+    if effective_rank < output_dimension {
+        return Err(Error::invalid_input(format!(
+            "PCA training data has effective_rank={effective_rank}, smaller than output_dimension={output_dimension}; lambda_max={lambda_max}, tau={tau}"
         )));
     }
-    Ok((sanitized, effective_rank, tau))
+    Ok(())
 }
 
 fn normalize_vector(vector: &mut [f64], label: &str) -> Result<()> {
@@ -1290,260 +1058,92 @@ fn canonical_f32(value: f64) -> Result<f32> {
     Ok(if value == 0.0 { 0.0 } else { value })
 }
 
-/// Inner kernel used by the per-query PCA transform `y = M (x - mean)`.
-///
-/// Production code goes through [`TransformKernel::selected`].
-#[doc(hidden)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TransformKernel {
-    /// Input centred once, eight independent accumulator chains per row,
-    /// no fused multiply-add. Used off aarch64.
-    Portable,
-    /// NEON: four output rows per pass share each loaded chunk of the
-    /// centred input. aarch64 only, and the default there.
-    Neon,
-}
-
-impl TransformKernel {
-    /// Kernel used by [`PcaModel::transform_query`] on this host.
-    pub fn selected() -> Self {
-        if cfg!(target_arch = "aarch64") {
-            Self::Neon
-        } else {
-            Self::Portable
-        }
-    }
-
-    /// Whether this kernel can run in this build on this host.
-    pub fn is_available(self) -> bool {
-        match self {
-            Self::Portable => true,
-            Self::Neon => cfg!(target_arch = "aarch64"),
-        }
-    }
-}
-
-/// Appends `matrix * (input - mean)` to `output` with the kernel selected
-/// for this host.
-fn transform_row(
-    input: &[f32],
-    mean: &[f32],
-    matrix: &[f32],
-    input_dimension: usize,
-    output_dimension: usize,
-    output: &mut Vec<f32>,
-) -> Result<()> {
-    transform_row_with(
-        TransformKernel::selected(),
-        input,
-        mean,
-        matrix,
-        input_dimension,
-        output_dimension,
-        output,
-    )
-}
-
-/// [`transform_row`] with an explicit kernel. Every kernel checks each output
-/// value for finiteness.
-#[doc(hidden)]
-pub fn transform_row_with(
-    kernel: TransformKernel,
-    input: &[f32],
-    mean: &[f32],
-    matrix: &[f32],
-    input_dimension: usize,
-    output_dimension: usize,
-    output: &mut Vec<f32>,
-) -> Result<()> {
-    validate_transform_layout(input, mean, matrix, input_dimension, output_dimension)?;
-    let centered: Vec<f32> = input.iter().zip(mean).map(|(x, m)| x - m).collect();
-    output.reserve(output_dimension);
-    match kernel {
-        TransformKernel::Portable => {
-            for (row, matrix_row) in matrix.chunks_exact(input_dimension).enumerate() {
-                push_finite(dot_row_portable(&centered, matrix_row), row, output)?;
-            }
-        }
-        TransformKernel::Neon => {
-            #[cfg(target_arch = "aarch64")]
-            {
-                let mut row = 0;
-                while row + 4 <= output_dimension {
-                    let values = neon::dot_4rows(
-                        &centered,
-                        &matrix[row * input_dimension..],
-                        input_dimension,
-                    );
-                    for (offset, value) in values.into_iter().enumerate() {
-                        push_finite(value, row + offset, output)?;
-                    }
-                    row += 4;
-                }
-                while row < output_dimension {
-                    let matrix_row = &matrix[row * input_dimension..(row + 1) * input_dimension];
-                    push_finite(neon::dot_row(&centered, matrix_row), row, output)?;
-                    row += 1;
-                }
-            }
-            #[cfg(not(target_arch = "aarch64"))]
-            {
-                let _ = centered;
-                return Err(Error::invalid_input(
-                    "PCA NEON transform kernel is only available on aarch64".to_string(),
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
-fn validate_transform_layout(
-    input: &[f32],
-    mean: &[f32],
-    matrix: &[f32],
-    input_dimension: usize,
-    output_dimension: usize,
-) -> Result<()> {
-    if input.len() != input_dimension || mean.len() != input_dimension {
-        return Err(Error::invalid_input(format!(
-            "PCA transform input length={} and mean length={} must both equal input_dimension={input_dimension}",
-            input.len(),
-            mean.len()
-        )));
-    }
-    let expected_matrix_len = input_dimension
-        .checked_mul(output_dimension)
-        .ok_or_else(|| {
-            Error::invalid_input("PCA transform matrix shape overflows usize".to_string())
-        })?;
-    if matrix.len() != expected_matrix_len {
-        return Err(Error::invalid_input(format!(
-            "PCA transform matrix length={} does not match input_dimension={input_dimension} * output_dimension={output_dimension}",
-            matrix.len()
-        )));
-    }
-    Ok(())
-}
-
+// Sharing input loads across four rows beats independent dot products on ARM.
+#[cfg(target_arch = "aarch64")]
 #[inline]
-fn push_finite(value: f32, row: usize, output: &mut Vec<f32>) -> Result<()> {
-    if !value.is_finite() {
-        return Err(Error::invalid_input(format!(
-            "PCA transform produced a non-finite value at output dimension {row}"
-        )));
+fn dot_4rows(centered: &[f32], rows: &[f32]) -> [f32; 4] {
+    let n = centered.len();
+    let stride = n;
+    debug_assert_eq!(rows.len(), 4 * n);
+    let full = n & !7;
+    // SAFETY: rows contains four complete n-element rows; each vector load
+    // stays within its row and the centered input. NEON is required on aarch64.
+    let (mut out, mut i) = unsafe {
+        let cp = centered.as_ptr();
+        let m0 = rows.as_ptr();
+        let m1 = m0.add(stride);
+        let m2 = m1.add(stride);
+        let m3 = m2.add(stride);
+        let zero = vdupq_n_f32(0.0);
+        let (mut a0, mut b0, mut a1, mut b1) = (zero, zero, zero, zero);
+        let (mut a2, mut b2, mut a3, mut b3) = (zero, zero, zero, zero);
+        let mut i = 0;
+        while i < full {
+            let c0 = vld1q_f32(cp.add(i));
+            let c1 = vld1q_f32(cp.add(i + 4));
+            a0 = vfmaq_f32(a0, vld1q_f32(m0.add(i)), c0);
+            b0 = vfmaq_f32(b0, vld1q_f32(m0.add(i + 4)), c1);
+            a1 = vfmaq_f32(a1, vld1q_f32(m1.add(i)), c0);
+            b1 = vfmaq_f32(b1, vld1q_f32(m1.add(i + 4)), c1);
+            a2 = vfmaq_f32(a2, vld1q_f32(m2.add(i)), c0);
+            b2 = vfmaq_f32(b2, vld1q_f32(m2.add(i + 4)), c1);
+            a3 = vfmaq_f32(a3, vld1q_f32(m3.add(i)), c0);
+            b3 = vfmaq_f32(b3, vld1q_f32(m3.add(i + 4)), c1);
+            i += 8;
+        }
+        (
+            [
+                vaddvq_f32(vaddq_f32(a0, b0)),
+                vaddvq_f32(vaddq_f32(a1, b1)),
+                vaddvq_f32(vaddq_f32(a2, b2)),
+                vaddvq_f32(vaddq_f32(a3, b3)),
+            ],
+            i,
+        )
+    };
+    while i < n {
+        let c = centered[i];
+        out[0] += rows[i] * c;
+        out[1] += rows[stride + i] * c;
+        out[2] += rows[2 * stride + i] * c;
+        out[3] += rows[3 * stride + i] * c;
+        i += 1;
     }
-    output.push(value);
-    Ok(())
+    out
 }
 
-/// Dot product of the centred input with one matrix row.
-fn dot_row_portable(centered: &[f32], matrix_row: &[f32]) -> f32 {
-    debug_assert_eq!(centered.len(), matrix_row.len());
-    let mut acc = [0.0_f32; 8];
-    let (centered_chunks, centered_tail) = centered.as_chunks::<8>();
-    let (matrix_chunks, matrix_tail) = matrix_row.as_chunks::<8>();
-    for (c, m) in centered_chunks.iter().zip(matrix_chunks) {
-        for lane in 0..8 {
-            acc[lane] += m[lane] * c[lane];
+// Handle the remaining rows with the existing ARM row kernel.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn dot_row(centered: &[f32], matrix_row: &[f32]) -> f32 {
+    let n = centered.len();
+    debug_assert_eq!(matrix_row.len(), n);
+    let full = n & !15;
+    // SAFETY: both slices contain n elements and every vector load ends
+    // before full <= n. NEON is required on aarch64.
+    let (mut value, mut i) = unsafe {
+        let cp = centered.as_ptr();
+        let mp = matrix_row.as_ptr();
+        let zero = vdupq_n_f32(0.0);
+        let (mut a0, mut a1, mut a2, mut a3) = (zero, zero, zero, zero);
+        let mut i = 0;
+        while i < full {
+            a0 = vfmaq_f32(a0, vld1q_f32(mp.add(i)), vld1q_f32(cp.add(i)));
+            a1 = vfmaq_f32(a1, vld1q_f32(mp.add(i + 4)), vld1q_f32(cp.add(i + 4)));
+            a2 = vfmaq_f32(a2, vld1q_f32(mp.add(i + 8)), vld1q_f32(cp.add(i + 8)));
+            a3 = vfmaq_f32(a3, vld1q_f32(mp.add(i + 12)), vld1q_f32(cp.add(i + 12)));
+            i += 16;
         }
-    }
-    let mut value =
-        ((acc[0] + acc[1]) + (acc[2] + acc[3])) + ((acc[4] + acc[5]) + (acc[6] + acc[7]));
-    for (c, m) in centered_tail.iter().zip(matrix_tail) {
-        value += m * c;
+        (
+            vaddvq_f32(vaddq_f32(vaddq_f32(a0, a1), vaddq_f32(a2, a3))),
+            i,
+        )
+    };
+    while i < n {
+        value += matrix_row[i] * centered[i];
+        i += 1;
     }
     value
-}
-
-/// NEON kernels for the per-query transform. Results differ from the scalar
-/// loop at the ulp level because of fused multiply-add.
-#[cfg(target_arch = "aarch64")]
-mod neon {
-    use std::arch::aarch64::*;
-
-    /// Dot products of `centered` with the first four `stride`-long rows of
-    /// `rows`.
-    #[inline]
-    pub(super) fn dot_4rows(centered: &[f32], rows: &[f32], stride: usize) -> [f32; 4] {
-        let n = centered.len();
-        debug_assert!(stride >= n);
-        debug_assert!(rows.len() >= 3 * stride + n);
-        let full = n & !7;
-        let (mut out, mut i) = unsafe {
-            let cp = centered.as_ptr();
-            let m0 = rows.as_ptr();
-            let m1 = m0.add(stride);
-            let m2 = m1.add(stride);
-            let m3 = m2.add(stride);
-            let zero = vdupq_n_f32(0.0);
-            let (mut a0, mut b0, mut a1, mut b1) = (zero, zero, zero, zero);
-            let (mut a2, mut b2, mut a3, mut b3) = (zero, zero, zero, zero);
-            let mut i = 0;
-            while i < full {
-                let c0 = vld1q_f32(cp.add(i));
-                let c1 = vld1q_f32(cp.add(i + 4));
-                a0 = vfmaq_f32(a0, vld1q_f32(m0.add(i)), c0);
-                b0 = vfmaq_f32(b0, vld1q_f32(m0.add(i + 4)), c1);
-                a1 = vfmaq_f32(a1, vld1q_f32(m1.add(i)), c0);
-                b1 = vfmaq_f32(b1, vld1q_f32(m1.add(i + 4)), c1);
-                a2 = vfmaq_f32(a2, vld1q_f32(m2.add(i)), c0);
-                b2 = vfmaq_f32(b2, vld1q_f32(m2.add(i + 4)), c1);
-                a3 = vfmaq_f32(a3, vld1q_f32(m3.add(i)), c0);
-                b3 = vfmaq_f32(b3, vld1q_f32(m3.add(i + 4)), c1);
-                i += 8;
-            }
-            (
-                [
-                    vaddvq_f32(vaddq_f32(a0, b0)),
-                    vaddvq_f32(vaddq_f32(a1, b1)),
-                    vaddvq_f32(vaddq_f32(a2, b2)),
-                    vaddvq_f32(vaddq_f32(a3, b3)),
-                ],
-                i,
-            )
-        };
-        while i < n {
-            let c = centered[i];
-            out[0] += rows[i] * c;
-            out[1] += rows[stride + i] * c;
-            out[2] += rows[2 * stride + i] * c;
-            out[3] += rows[3 * stride + i] * c;
-            i += 1;
-        }
-        out
-    }
-
-    /// Dot product of `centered` with one matrix row.
-    #[inline]
-    pub(super) fn dot_row(centered: &[f32], matrix_row: &[f32]) -> f32 {
-        let n = centered.len();
-        debug_assert_eq!(matrix_row.len(), n);
-        let full = n & !15;
-        let (mut value, mut i) = unsafe {
-            let cp = centered.as_ptr();
-            let mp = matrix_row.as_ptr();
-            let zero = vdupq_n_f32(0.0);
-            let (mut a0, mut a1, mut a2, mut a3) = (zero, zero, zero, zero);
-            let mut i = 0;
-            while i < full {
-                a0 = vfmaq_f32(a0, vld1q_f32(mp.add(i)), vld1q_f32(cp.add(i)));
-                a1 = vfmaq_f32(a1, vld1q_f32(mp.add(i + 4)), vld1q_f32(cp.add(i + 4)));
-                a2 = vfmaq_f32(a2, vld1q_f32(mp.add(i + 8)), vld1q_f32(cp.add(i + 8)));
-                a3 = vfmaq_f32(a3, vld1q_f32(mp.add(i + 12)), vld1q_f32(cp.add(i + 12)));
-                i += 16;
-            }
-            (
-                vaddvq_f32(vaddq_f32(vaddq_f32(a0, a1), vaddq_f32(a2, a3))),
-                i,
-            )
-        };
-        while i < n {
-            value += matrix_row[i] * centered[i];
-            i += 1;
-        }
-        value
-    }
 }
 
 #[cfg(test)]
@@ -1563,9 +1163,8 @@ mod tests {
         PcaModel {
             input_dimension: mean.len(),
             output_dimension: matrix.len() / mean.len(),
-            transform_matrix: Arc::new(Float32Array::from(matrix)),
-            mean: Arc::new(Float32Array::from(mean)),
-            training_stats: None,
+            transform_matrix: Float32Array::from(matrix),
+            mean: Float32Array::from(mean),
             fingerprint: OnceLock::new(),
         }
     }
@@ -1703,11 +1302,6 @@ mod tests {
                 / 8.0;
             assert!(mean.abs() < 1.0e-3);
         }
-        let stats = model.training_stats().expect("training has stats");
-        assert_eq!(stats.sampled_rows(), 8);
-        assert!(stats.effective_rank() >= 2);
-        assert!(stats.retained_variance_ratio() > 0.0);
-        assert!(stats.retained_variance_ratio() <= 1.0 + 1.0e-12);
     }
 
     #[test]
@@ -1753,6 +1347,64 @@ mod tests {
                 .transform(&vectors)
                 .expect("in-memory model transform should work")
         );
+    }
+
+    #[rstest]
+    #[case::small_batches(17)]
+    #[case::training_batches(TRANSFORM_BATCH_SIZE)]
+    fn scatter_training_matches_across_batch_boundaries(#[case] batch_rows: usize) {
+        let rows = TRANSFORM_BATCH_SIZE + 3;
+        let values: Vec<f32> = (0..rows)
+            .flat_map(|row| {
+                let phase = row as f32 * 0.037;
+                [
+                    phase.sin(),
+                    0.5 * (2.0 * phase).cos(),
+                    0.1 * (3.0 * phase).sin(),
+                ]
+            })
+            .collect();
+        let vectors = f32_vectors(values.clone(), 3);
+        let values: Vec<f64> = values.into_iter().map(f64::from).collect();
+        let mean = compensated_mean(&values, rows, 3).unwrap();
+        let mut scatter = new_scatter(3).unwrap();
+        for batch in values.chunks(batch_rows * 3) {
+            accumulate_centered_scatter(batch, &mean, &mut scatter).unwrap();
+        }
+        let params = PcaParams::new(2);
+        let from_array = PcaModel::train(&vectors, &params).unwrap();
+        let from_scatter = PcaModel::train_from_scatter(&mean, rows, &scatter, &params).unwrap();
+        let expected = from_array.transform(&vectors.slice(0, 8)).unwrap();
+        let actual = from_scatter.transform(&vectors.slice(0, 8)).unwrap();
+        for (actual, expected) in actual
+            .values()
+            .as_primitive::<Float32Type>()
+            .values()
+            .iter()
+            .zip(expected.values().as_primitive::<Float32Type>().values())
+        {
+            assert_relative_eq!(actual, expected, epsilon = 1.0e-5);
+        }
+    }
+
+    #[test]
+    fn scatter_training_accepts_finite_covariance_with_large_scatter() {
+        let model =
+            PcaModel::train_from_scatter(&[0.0; 3], 4, &[f64::MAX * 0.5; 9], &PcaParams::new(1))
+                .expect("finite covariance must not overflow when decomposing scatter");
+        let expected = 1.0 / 3.0_f32.sqrt();
+        for value in model.transform_matrix().values() {
+            assert_relative_eq!(*value, expected, epsilon = 1.0e-6);
+        }
+    }
+
+    #[test]
+    fn transform_accepts_an_empty_batch() {
+        let model = persisted_model(vec![1.0, 0.0, 0.0], vec![0.0; 3]);
+        let result = model.transform(&f32_vectors(Vec::new(), 3)).unwrap();
+        assert_eq!(result.len(), 0);
+        assert_eq!(result.value_length(), 1);
+        assert_eq!(result.value_type(), DataType::Float32);
     }
 
     #[test]
@@ -1826,14 +1478,6 @@ mod tests {
         assert_relative_eq!(matrix[1], 0.0, epsilon = 1.0e-6);
         assert_relative_eq!(matrix[5], 0.0, epsilon = 1.0e-6);
         assert_relative_eq!(matrix[6], 1.0, epsilon = 1.0e-6);
-        assert_relative_eq!(
-            model
-                .training_stats()
-                .expect("training has stats")
-                .retained_variance(),
-            5.0,
-            epsilon = 1.0e-12
-        );
     }
 
     #[test]
@@ -1853,15 +1497,23 @@ mod tests {
         let f64_vectors =
             FixedSizeListArray::try_new_from_values(Float64Array::from(f64_values), 3)
                 .expect("f64 vectors should be valid");
-        for vectors in [&f16_vectors, &f64_vectors] {
+        let f32_vectors = f32_vectors(values, 3);
+        for vectors in [&f16_vectors, &f32_vectors, &f64_vectors] {
             let model = PcaModel::train(vectors, &PcaParams::new(2)).expect("training should work");
-            assert_eq!(
-                model
-                    .transform(vectors)
-                    .expect("transform should work")
-                    .value_type(),
-                DataType::Float32
-            );
+            let batch = model.transform(vectors).expect("transform should work");
+            assert_eq!(batch.value_type(), DataType::Float32);
+            for row in 0..vectors.len() {
+                let query = model.transform_query(vectors.value(row).as_ref()).unwrap();
+                let expected = batch.value(row);
+                for (actual, expected) in query
+                    .as_primitive::<Float32Type>()
+                    .values()
+                    .iter()
+                    .zip(expected.as_primitive::<Float32Type>().values())
+                {
+                    assert_relative_eq!(actual, expected, epsilon = 1.0e-5);
+                }
+            }
         }
     }
 
@@ -1919,9 +1571,9 @@ mod tests {
     #[rstest]
     #[case::shape_overflow(usize::MAX, "shape overflows")]
     #[case::allocation_overflow(1 << (usize::BITS / 2 - 1), "maximum allocation size")]
-    fn rejects_covariance_allocation_overflow(#[case] dimension: usize, #[case] message: &str) {
-        let error = covariance_matrix(&[], &[], 1, dimension)
-            .expect_err("unrepresentable covariance allocation must fail before allocating");
+    fn rejects_scatter_allocation_overflow(#[case] dimension: usize, #[case] message: &str) {
+        let error = new_scatter(dimension)
+            .expect_err("unrepresentable scatter allocation must fail before allocating");
         assert!(matches!(error, Error::InvalidInput { .. }));
         assert!(error.to_string().contains(message));
     }
@@ -1940,14 +1592,15 @@ mod tests {
 
     #[test]
     fn eigenvalue_threshold_handles_zero_and_negative_values() {
-        let (values, rank, tau) = sanitize_eigenvalues(vec![4.0, 1.0e-12, -1.0e-12], 1)
-            .expect("near-zero eigenvalues should be sanitized");
-        assert_eq!(rank, 1);
-        assert_eq!(values, vec![4.0, 0.0, 0.0]);
-        assert_relative_eq!(tau, 4.0e-10);
-
-        let error = sanitize_eigenvalues(vec![4.0, -1.0], 1)
+        validate_eigenvalues(&[4.0, 1.0e-12, -1.0e-12], 1)
+            .expect("near-zero eigenvalues should be tolerated");
+        let error = validate_eigenvalues(&[4.0, 1.0e-12, -1.0e-12], 2)
+            .expect_err("near-zero eigenvalues must not contribute to rank");
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("effective_rank=1"));
+        let error = validate_eigenvalues(&[4.0, -1.0], 1)
             .expect_err("significant negative eigenvalue must fail");
+        assert!(matches!(error, Error::Index { .. }));
         assert!(error.to_string().contains("below -tau"));
     }
 
@@ -2013,7 +1666,6 @@ mod tests {
             .expect("decode must succeed");
         assert_eq!(decoded.transform_matrix(), model.transform_matrix());
         assert_eq!(decoded.mean(), model.mean());
-        assert!(decoded.training_stats().is_none());
         assert_eq!(
             decoded
                 .transform(&vectors)
@@ -2261,114 +1913,66 @@ mod tests {
         );
     }
 
-    fn transform_kernels_under_test() -> Vec<TransformKernel> {
-        [TransformKernel::Portable, TransformKernel::Neon]
-            .into_iter()
-            .filter(|kernel| kernel.is_available())
-            .collect()
-    }
-
-    #[test]
-    fn transform_row_with_rejects_inconsistent_lengths() {
-        let input = [1.0_f32; 8];
-        let mean = [0.0_f32; 8];
-        let matrix = [0.0_f32; 8];
-        let mut output = Vec::new();
-        let error = transform_row_with(
-            TransformKernel::Portable,
-            &input,
-            &mean,
-            &matrix,
-            8,
-            4,
-            &mut output,
-        )
-        .expect_err("a 4 by 8 matrix cannot be stored in 8 floats");
-        assert!(error.to_string().contains("matrix length=8"));
-        assert!(output.is_empty());
-
-        let error = transform_row_with(
-            TransformKernel::Portable,
-            &input[..4],
-            &mean,
-            &[0.0_f32; 32],
-            8,
-            4,
-            &mut output,
-        )
-        .expect_err("short input must fail before any kernel reads it");
-        assert!(error.to_string().contains("input length=4"));
-    }
-
-    #[test]
-    fn transform_kernels_match_scalar_loop() {
-        for (input_dimension, output_dimension) in [
-            (1usize, 1usize),
-            (5, 3),
-            (16, 4),
-            (23, 5),
-            (64, 7),
-            (960, 9),
-            (960, 256),
-        ] {
-            let input: Vec<f32> = (0..input_dimension)
-                .map(|i| ((i * 7 % 13) as f32 - 6.0) * 0.25)
-                .collect();
-            let mean: Vec<f32> = (0..input_dimension)
-                .map(|i| ((i * 5 % 11) as f32 - 5.0) * 0.5)
-                .collect();
-            let matrix: Vec<f32> = (0..input_dimension * output_dimension)
-                .map(|i| ((i * 11 % 17) as f32 - 8.0) * 0.125)
-                .collect();
-            let expected: Vec<f32> = matrix
-                .chunks_exact(input_dimension)
-                .map(|matrix_row| {
-                    matrix_row
-                        .iter()
-                        .zip(input.iter().zip(&mean))
-                        .map(|(coefficient, (value, mean))| coefficient * (value - mean))
-                        .sum()
-                })
-                .collect();
-            for kernel in transform_kernels_under_test() {
-                let mut actual = Vec::new();
-                transform_row_with(
-                    kernel,
-                    &input,
-                    &mean,
-                    &matrix,
-                    input_dimension,
-                    output_dimension,
-                    &mut actual,
-                )
-                .unwrap_or_else(|error| panic!("{kernel:?} kernel must succeed: {error}"));
-                for (row, (actual_value, expected_value)) in
-                    actual.iter().zip(&expected).enumerate()
-                {
-                    assert!(
-                        (actual_value - expected_value).abs()
-                            <= 1.0e-4 * (1.0 + expected_value.abs()),
-                        "{kernel:?} {input_dimension}x{output_dimension} row {row}: {actual_value} vs {expected_value}"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn transform_kernels_reject_non_finite_output() {
-        let input = vec![1.0_f32; 24];
-        let mean = vec![0.0_f32; 24];
-        let mut matrix = vec![1.0_f32; 24 * 5];
-        matrix[24 * 3 + 20] = f32::INFINITY;
-        for kernel in transform_kernels_under_test() {
-            let mut output = Vec::new();
-            let error = transform_row_with(kernel, &input, &mean, &matrix, 24, 5, &mut output)
-                .expect_err("non-finite output must fail");
-            assert!(
-                error.to_string().contains("output dimension 3"),
-                "{kernel:?}: {error}"
+    #[rstest]
+    #[case::small(2, 1)]
+    #[case::tail(5, 3)]
+    #[case::aligned(16, 4)]
+    #[case::unaligned(23, 5)]
+    #[case::medium(64, 7)]
+    #[case::wide(960, 9)]
+    #[case::embedding(960, 256)]
+    fn query_projection_matches_scalar_reference(
+        #[case] input_dimension: usize,
+        #[case] output_dimension: usize,
+    ) {
+        let input: Vec<f32> = (0..input_dimension)
+            .map(|i| ((i * 7 % 13) as f32 - 6.0) * 0.25)
+            .collect();
+        let mean: Vec<f32> = (0..input_dimension)
+            .map(|i| ((i * 5 % 11) as f32 - 5.0) * 0.5)
+            .collect();
+        let matrix: Vec<f32> = (0..input_dimension * output_dimension)
+            .map(|i| ((i * 11 % 17) as f32 - 8.0) * 0.125)
+            .collect();
+        let expected: Vec<f64> = matrix
+            .chunks_exact(input_dimension)
+            .map(|row| {
+                row.iter()
+                    .zip(input.iter().zip(&mean))
+                    .map(|(coefficient, (value, mean))| {
+                        f64::from(*coefficient) * f64::from(value - mean)
+                    })
+                    .sum()
+            })
+            .collect();
+        let model = persisted_model(matrix, mean);
+        let actual = model.transform_query(&Float32Array::from(input)).unwrap();
+        let actual = actual.as_primitive::<Float32Type>();
+        assert_eq!(actual.len(), output_dimension);
+        for (actual, expected) in actual.values().iter().zip(expected) {
+            assert_relative_eq!(
+                f64::from(*actual),
+                expected,
+                epsilon = 1.0e-4,
+                max_relative = 1.0e-4
             );
         }
+    }
+
+    #[rstest]
+    #[case::single_row(1)]
+    #[case::four_rows(4)]
+    #[case::four_rows_and_tail(5)]
+    fn query_projection_rejects_non_finite_output(#[case] output_dimension: usize) {
+        let model = persisted_model(vec![1.0; output_dimension * 6], vec![0.0; 6]);
+        let error = model
+            .transform_query(&Float32Array::from(vec![f32::MAX; 6]))
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("non-finite value at output dimension 0")
+        );
     }
 }

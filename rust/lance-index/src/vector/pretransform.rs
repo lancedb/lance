@@ -54,11 +54,6 @@ impl PreTransformIndex {
         transformed.key = self.model.transform_query(query.key.as_ref())?;
         Ok(transformed)
     }
-
-    /// Returns the wrapped index for cache reconstruction.
-    pub fn inner(&self) -> &Arc<dyn VectorIndex> {
-        &self.inner
-    }
 }
 
 impl DeepSizeOf for PreTransformIndex {
@@ -687,7 +682,6 @@ mod tests {
     async fn delegates_index_and_vector_capabilities() {
         let (index, inner, _) = decorated();
 
-        assert!(index.inner().as_any().is::<MockVectorIndex>());
         assert_eq!(
             index.statistics().unwrap(),
             serde_json::json!({"mock": true})
