@@ -60,20 +60,32 @@ impl IndexRemapperOptions for DatasetIndexRemapperOptions {
         // materializes the address map. Keep the rewrite-time metadata check free of index I/O.
         let mut has_remappable_index = false;
         for index in indices.iter().filter(|index| !is_system_index(index)) {
-            // Leave legacy, vector, and covered/composite metadata on the existing
-            // path, including its validation and error handling.
-            if index.covering_fields.is_empty()
-                && let [field_id] = index.fields.as_slice()
-                && let Some(details) = &index.index_details
-                && IndexDetails(details.clone()).get_plugin().is_ok()
-                && let Ok(field_path) = dataset.schema().field_path(*field_id)
-            {
+            // can_remap() belongs to ScalarIndex, not VectorIndex. Metadata without
+            // type details also keeps its existing type-inference/loading path.
+            let is_known_scalar = index
+                .index_details
+                .as_ref()
+                .is_some_and(|details| IndexDetails(details.clone()).get_plugin().is_ok());
+            // remap_index validates covering fields before withdrawing a covered
+            // index. An early can_remap() == false must not bypass that validation.
+            let field_path = if is_known_scalar && index.covering_fields.is_empty() {
+                // Composite indices and unresolved fields must still reach the
+                // existing remap validation, not be treated as safe to skip.
+                index
+                    .keyed_field()
+                    .and_then(|field_id| dataset.schema().field_path(field_id).ok())
+            } else {
+                None
+            };
+
+            if let Some(field_path) = field_path {
                 match dataset
                     .open_scalar_index(&field_path, &index.uuid, &NoOpMetricsCollector)
                     .await
                 {
                     Ok(scalar_index) if !scalar_index.can_remap() => continue,
                     Ok(_) => {}
+                    // A failed load does not establish that remapping is unnecessary.
                     Err(error) => log::warn!(
                         "Cannot check remap support for index '{}': {}. \
                          Retaining the existing remap path.",
