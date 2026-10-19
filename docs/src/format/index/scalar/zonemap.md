@@ -81,7 +81,7 @@ the column values.
 | Key                 | Type   | Description                               |
 |---------------------|--------|-------------------------------------------|
 | `rows_per_zone`     | String | Number of rows per zone (default: "8192") |
-| `null_bitmap`       | String | Optional decimal index of the null bitmap global buffer |
+| `null_bitmap`       | UInt32 | Optional index of the null bitmap global buffer |
 
 ### Global Buffers
 
@@ -91,6 +91,8 @@ the column values.
 
 The bitmap covers all zones in this segment. Its absence means exact null
 positions are unavailable, not that there are no nulls. Counts remain available.
+When omitted, leave out both the metadata key and the buffer, and set
+`ZoneMapIndexDetails.has_null_bitmap` to false.
 
 ## Compatibility
 
