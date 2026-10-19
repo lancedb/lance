@@ -28,7 +28,7 @@ use tokio::runtime::Handle;
 /// Start at 5MB.
 const INITIAL_UPLOAD_STEP: usize = 1024 * 1024 * 5;
 
-pub(crate) fn max_upload_parallelism() -> usize {
+pub fn max_upload_parallelism() -> usize {
     static MAX_UPLOAD_PARALLELISM: OnceLock<usize> = OnceLock::new();
     *MAX_UPLOAD_PARALLELISM.get_or_init(|| {
         std::env::var("LANCE_UPLOAD_CONCURRENCY")
@@ -36,6 +36,26 @@ pub(crate) fn max_upload_parallelism() -> usize {
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(10)
     })
+}
+
+/// Upper bound on the bytes one multipart upload of `total_bytes` holds at
+/// once: the parts in flight plus the buffer being filled, each at the part
+/// size the growth rule in `ObjectWriter::next_part_buffer` has reached by the
+/// end of the upload.
+pub fn upload_memory_bound_bytes(total_bytes: u64, constant_upload_size: bool) -> u64 {
+    let initial = initial_upload_size() as u64;
+    let step = INITIAL_UPLOAD_STEP as u64;
+    let mut part_size = initial;
+    if !constant_upload_size {
+        let mut covered = 0u64;
+        let mut tier = 0u64;
+        while covered < total_bytes {
+            part_size = initial.max((tier + 1) * step);
+            covered = covered.saturating_add(part_size.saturating_mul(100));
+            tier += 1;
+        }
+    }
+    part_size.saturating_mul(max_upload_parallelism() as u64 + 1)
 }
 
 /// Maximum body size for a single S3 PUT: strictly less than 5 GiB.
@@ -52,7 +72,7 @@ fn clamp_initial_upload_size(raw: usize) -> (usize, bool) {
     (clamped, clamped != raw)
 }
 
-pub(crate) fn initial_upload_size() -> usize {
+pub fn initial_upload_size() -> usize {
     static LANCE_INITIAL_UPLOAD_SIZE: OnceLock<usize> = OnceLock::new();
     *LANCE_INITIAL_UPLOAD_SIZE.get_or_init(|| {
         let Some(raw) = std::env::var("LANCE_INITIAL_UPLOAD_SIZE")

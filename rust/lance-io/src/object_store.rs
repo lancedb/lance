@@ -818,6 +818,15 @@ impl ObjectStore {
         self.block_size
     }
 
+    /// Bytes one multipart upload of `total_bytes` to this store can hold in
+    /// memory at once. See [`crate::object_writer::upload_memory_bound_bytes`].
+    pub fn upload_memory_bound_bytes(&self, total_bytes: u64) -> u64 {
+        crate::object_writer::upload_memory_bound_bytes(
+            total_bytes,
+            self.use_constant_size_upload_parts,
+        )
+    }
+
     pub fn max_iop_size(&self) -> u64 {
         self.max_iop_size
     }
