@@ -3,6 +3,7 @@
 
 //! Principal component analysis for vector pre-transforms.
 
+use std::alloc::Layout;
 use std::mem::size_of;
 use std::sync::{Arc, OnceLock};
 
@@ -66,7 +67,6 @@ const PCA_MODEL_NAME: &str = "PCA model";
 const PCA_FINGERPRINT_DOMAIN: &[u8] = b"lance-vector-pre-transform:pca:v1";
 
 const DEFAULT_SAMPLE_SIZE: usize = 65_536;
-const DEFAULT_MAX_TRAINING_MEMORY_BYTES: usize = 1_073_741_824;
 const DEFAULT_SAMPLING_SEED: u64 = 42;
 const DEFAULT_ROTATION_SEED: u64 = 5;
 const TRANSFORM_BATCH_SIZE: usize = 4096;
@@ -91,8 +91,6 @@ pub struct PcaParams {
     pub random_rotation: bool,
     /// Target number of valid rows used by dataset-aware training.
     pub sample_size: usize,
-    /// Maximum estimated peak bytes permitted for training.
-    pub max_training_memory_bytes: usize,
     /// Seed used by dataset-aware sampling.
     pub sampling_seed: u64,
     /// Seed used to construct the deterministic random rotation.
@@ -106,7 +104,6 @@ impl PcaParams {
             dimension,
             random_rotation: false,
             sample_size: DEFAULT_SAMPLE_SIZE,
-            max_training_memory_bytes: DEFAULT_MAX_TRAINING_MEMORY_BYTES,
             sampling_seed: DEFAULT_SAMPLING_SEED,
             rotation_seed: DEFAULT_ROTATION_SEED,
         }
@@ -119,11 +116,6 @@ impl PcaParams {
 
     pub fn with_sample_size(mut self, sample_size: usize) -> Self {
         self.sample_size = sample_size;
-        self
-    }
-
-    pub fn with_max_training_memory_bytes(mut self, bytes: usize) -> Self {
-        self.max_training_memory_bytes = bytes;
         self
     }
 
@@ -168,23 +160,7 @@ impl PcaParams {
                 "PCA training requires at least output_dimension+1={required_rows} valid vectors, got {row_count}"
             )));
         }
-        if self.max_training_memory_bytes == 0 {
-            return Err(Error::invalid_input(
-                "pca.max_training_memory_bytes must be greater than 0".to_string(),
-            ));
-        }
         Ok(())
-    }
-
-    /// Rejects a build when the estimated peak training memory exceeds the budget.
-    pub fn validate_streaming_memory_budget(
-        &self,
-        input_dimension: usize,
-        row_count: usize,
-        batch_rows: usize,
-    ) -> Result<()> {
-        self.validate(input_dimension, row_count)?;
-        validate_memory_budget(row_count, input_dimension, batch_rows, true, self)
     }
 }
 
@@ -626,7 +602,6 @@ impl PcaModel {
         let row_count = data.len();
         params.validate(input_dimension, row_count)?;
         validate_training_array(data)?;
-        validate_memory_budget(row_count, input_dimension, row_count, false, params)?;
 
         let logical_values = logical_values(data)?;
         let values = values_as_f64(logical_values.as_ref())?;
@@ -664,7 +639,6 @@ impl PcaModel {
         params.validate(input_dimension, sample_count)?;
         validate_finite_slice(mean, "mean")?;
         validate_symmetric_matrix(scatter, input_dimension, "scatter")?;
-        validate_memory_budget(sample_count, input_dimension, 0, false, params)?;
         let (eigenvalues, basis) =
             covariance_eigenvectors(scatter, input_dimension, sample_count as f64)?;
         Self::from_eigenpairs(
@@ -1017,102 +991,6 @@ fn validate_symmetric_matrix(values: &[f64], dimension: usize, label: &str) -> R
     Ok(())
 }
 
-fn checked_bytes(elements: usize, element_size: usize, label: &str) -> Result<usize> {
-    elements.checked_mul(element_size).ok_or_else(|| {
-        Error::invalid_input(format!(
-            "PCA training memory estimate for {label} overflows usize"
-        ))
-    })
-}
-
-fn validate_memory_budget(
-    row_count: usize,
-    input_dimension: usize,
-    batch_rows: usize,
-    uses_matrix_accumulation: bool,
-    params: &PcaParams,
-) -> Result<()> {
-    let matrix_elements = input_dimension
-        .checked_mul(input_dimension)
-        .ok_or_else(|| Error::invalid_input("PCA statistics matrix shape overflows usize"))?;
-    let stat = checked_bytes(matrix_elements, size_of::<f64>(), "statistics")?;
-    let eig = checked_bytes(
-        matrix_elements.checked_mul(3).ok_or_else(|| {
-            Error::invalid_input("PCA eigensolver workspace estimate overflows usize")
-        })?,
-        size_of::<f64>(),
-        "eigensolver",
-    )?;
-    let final_model_elements = params
-        .dimension
-        .checked_mul(input_dimension)
-        .and_then(|matrix| matrix.checked_add(input_dimension))
-        .ok_or_else(|| Error::invalid_input("PCA model shape overflows usize"))?;
-    let final_model = checked_bytes(final_model_elements, size_of::<f32>(), "model")?;
-    let transform_elements = params
-        .dimension
-        .checked_mul(input_dimension)
-        .ok_or_else(|| Error::invalid_input("PCA transform workspace shape overflows usize"))?;
-    // Training can concurrently hold the retained basis and the rotated
-    // transform before conversion to f32.
-    let transform_workspace = checked_bytes(
-        transform_elements
-            .checked_mul(2)
-            .ok_or_else(|| Error::invalid_input("PCA transform workspace overflows usize"))?,
-        size_of::<f64>(),
-        "transform workspace",
-    )?;
-    // Rotation construction holds the Gaussian input, QR factors, and Q.
-    let rotation_elements = params
-        .dimension
-        .checked_mul(params.dimension)
-        .and_then(|elements| elements.checked_mul(3))
-        .ok_or_else(|| Error::invalid_input("PCA rotation workspace shape overflows usize"))?;
-    let rotation_workspace = if params.random_rotation {
-        checked_bytes(rotation_elements, size_of::<f64>(), "rotation workspace")?
-    } else {
-        0
-    };
-    let model = final_model
-        .checked_add(transform_workspace)
-        .and_then(|value| value.checked_add(rotation_workspace))
-        .ok_or_else(|| Error::invalid_input("PCA model memory estimate overflows usize"))?;
-    // The in-memory entry point converts its complete Arrow input to f64. The
-    // dataset trainer can replace this term with its bounded streaming batch.
-    let effective_batch_rows = batch_rows.min(row_count);
-    let batch_elements = effective_batch_rows
-        .checked_mul(input_dimension)
-        .ok_or_else(|| {
-            Error::invalid_input(format!(
-                "PCA training batch shape [{effective_batch_rows}, {input_dimension}] overflows usize"
-            ))
-        })?;
-    let batch = checked_bytes(batch_elements, size_of::<f64>(), "batch")?;
-    // Streaming covariance uses a centered batch matrix and a batch-local
-    // scatter matrix in addition to the converted input batch and accumulated
-    // statistics.
-    let matrix_accumulation_workspace = if uses_matrix_accumulation {
-        batch.checked_add(stat).ok_or_else(|| {
-            Error::invalid_input("PCA matrix accumulation workspace estimate overflows usize")
-        })?
-    } else {
-        0
-    };
-    let total = stat
-        .checked_add(eig)
-        .and_then(|value| value.checked_add(model))
-        .and_then(|value| value.checked_add(batch))
-        .and_then(|value| value.checked_add(matrix_accumulation_workspace))
-        .ok_or_else(|| Error::invalid_input("PCA total memory estimate overflows usize"))?;
-    if total > params.max_training_memory_bytes {
-        return Err(Error::invalid_input(format!(
-            "PCA training memory estimate exceeds max_training_memory_bytes={}: M_stat={stat}, M_eig={eig}, M_model={model}, M_batch={batch}, M_matrix_accumulation={matrix_accumulation_workspace}, total={total}",
-            params.max_training_memory_bytes
-        )));
-    }
-    Ok(())
-}
-
 fn values_as_f64(values: &dyn Array) -> Result<Vec<f64>> {
     if values.null_count() != 0 {
         return Err(Error::invalid_input(format!(
@@ -1258,7 +1136,15 @@ fn covariance_matrix(
     rows: usize,
     dimension: usize,
 ) -> Result<Vec<f64>> {
-    let mut covariance = vec![0.0; dimension * dimension];
+    let matrix_len = dimension
+        .checked_mul(dimension)
+        .ok_or_else(|| Error::invalid_input("PCA covariance matrix shape overflows usize"))?;
+    Layout::array::<f64>(matrix_len).map_err(|_| {
+        Error::invalid_input(format!(
+            "PCA covariance shape [{dimension}, {dimension}] exceeds the maximum allocation size"
+        ))
+    })?;
+    let mut covariance = vec![0.0; matrix_len];
     let denominator = rows as f64;
     for column in 0..dimension {
         for other in column..dimension {
@@ -1973,7 +1859,7 @@ mod tests {
     }
 
     #[test]
-    fn statistics_apis_validate_shapes_values_and_streaming_memory() {
+    fn statistics_apis_validate_shapes_and_values() {
         let params = PcaParams::new(1);
         let error = PcaModel::train_from_scatter(&[0.0, 0.0], 3, &[1.0, 0.0, 0.0], &params)
             .expect_err("incorrect scatter length must fail");
@@ -1991,16 +1877,6 @@ mod tests {
         assert!(matches!(error, Error::InvalidInput { .. }));
         assert!(error.to_string().contains("mean"));
         assert!(error.to_string().contains("element=1"));
-
-        params
-            .validate_streaming_memory_budget(3, 8, 2)
-            .expect("a small training batch should fit the default budget");
-        let error = PcaParams::new(1)
-            .with_max_training_memory_bytes(1)
-            .validate_streaming_memory_budget(3, 8, 2)
-            .expect_err("small streaming budget must fail");
-        assert!(matches!(error, Error::InvalidInput { .. }));
-        assert!(error.to_string().contains("max_training_memory_bytes=1"));
     }
 
     #[test]
@@ -2183,23 +2059,26 @@ mod tests {
         assert!(error.to_string().contains("null"));
     }
 
+    #[rstest]
+    #[case::shape_overflow(usize::MAX, "shape overflows")]
+    #[case::allocation_overflow(1 << (usize::BITS / 2 - 1), "maximum allocation size")]
+    fn rejects_covariance_allocation_overflow(#[case] dimension: usize, #[case] message: &str) {
+        let error = covariance_matrix(&[], &[], 1, dimension)
+            .expect_err("unrepresentable covariance allocation must fail before allocating");
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains(message));
+    }
+
     #[test]
-    fn rejects_low_rank_and_small_memory_budget() {
+    fn rejects_low_rank_training_data() {
         let low_rank = f32_vectors(
             vec![1.0, 2.0, 3.0, 2.0, 4.0, 6.0, 3.0, 6.0, 9.0, 4.0, 8.0, 12.0],
             3,
         );
         let error =
             PcaModel::train(&low_rank, &PcaParams::new(2)).expect_err("low-rank input must fail");
+        assert!(matches!(error, Error::InvalidInput { .. }));
         assert!(error.to_string().contains("effective_rank=1"));
-
-        let full_rank = f32_vectors(full_rank_values(8, 3), 3);
-        let error = PcaModel::train(
-            &full_rank,
-            &PcaParams::new(2).with_max_training_memory_bytes(1),
-        )
-        .expect_err("small memory budget must fail");
-        assert!(error.to_string().contains("M_stat="));
     }
 
     #[test]
