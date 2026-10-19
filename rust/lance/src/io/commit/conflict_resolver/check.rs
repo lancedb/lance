@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+mod create_index;
+mod rewrite;
+
 use super::*;
 
 impl<'a> TransactionRebase<'a> {

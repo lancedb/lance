@@ -242,9 +242,70 @@ fn updates_schema_or_field_metadata(operation: &Operation) -> bool {
 }
 
 mod check;
-mod check_index;
 mod finish;
-mod rebase;
+mod init;
+
+impl<'a> TransactionRebase<'a> {
+    #[track_caller]
+    fn retryable_conflict_err(&self, other_transaction: &Transaction, other_version: u64) -> Error {
+        Error::retryable_commit_conflict_source(
+            other_version,
+            format!(
+                "This {} transaction was preempted by concurrent transaction {} at version {}. Please retry.",
+                self.transaction.operation, other_transaction.operation, other_version
+            )
+            .into(),
+        )
+    }
+
+    #[track_caller]
+    fn incompatible_conflict_err(
+        &self,
+        other_transaction: &Transaction,
+        other_version: u64,
+    ) -> Error {
+        Error::incompatible_transaction_source(
+            format!(
+                "This {} transaction is incompatible with concurrent transaction {} at version {}.",
+                self.transaction.operation, other_transaction.operation, other_version
+            )
+            .into(),
+        )
+    }
+
+    #[track_caller]
+    fn data_replacement_target_removed_err(
+        &self,
+        fragment_id: u64,
+        other_transaction: &Transaction,
+        other_version: u64,
+    ) -> Error {
+        Error::incompatible_transaction_source(
+            format!(
+                "DataReplacement target fragment {} was removed by concurrent {} at version {}.",
+                fragment_id, other_transaction.operation, other_version
+            )
+            .into(),
+        )
+    }
+
+    #[track_caller]
+    fn data_replacement_field_removed_err(
+        &self,
+        field_id: i32,
+        fragment_id: u64,
+        other_transaction: &Transaction,
+        other_version: u64,
+    ) -> Error {
+        Error::incompatible_transaction_source(
+            format!(
+                "DataReplacement target field {} in fragment {} was dropped by concurrent {} at version {}.",
+                field_id, fragment_id, other_transaction.operation, other_version
+            )
+            .into(),
+        )
+    }
+}
 
 /// The physical offsets a group's overlays cover, unioned across every overlay
 /// and every field. This is the set of cells whose values the overlay supplies,
