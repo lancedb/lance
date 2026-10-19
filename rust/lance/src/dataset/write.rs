@@ -49,7 +49,7 @@ use tracing::{info, instrument};
 use crate::Dataset;
 use crate::blob::prepared_to_logical_blob_schema;
 use crate::dataset::blob::{
-    BlobPreprocessor, ExternalBaseCandidate, ExternalBaseResolver,
+    BlobPayloadInventory, BlobPreprocessor, ExternalBaseCandidate, ExternalBaseResolver,
     blob_dedicated_threshold_from_metadata, blob_inline_threshold_from_metadata,
     blob_pack_file_threshold_from_metadata,
 };
@@ -939,6 +939,7 @@ pub(super) async fn do_write_fragments_impl<OpenWriter, OpenWriterFuture>(
     mut seeds: seeds::SeedCollector,
     file_row_counts: Option<Vec<usize>>,
     preassigned_data_file_name: Option<Arc<String>>,
+    created_blob_payloads: Option<BlobPayloadInventory>,
 ) -> Result<Vec<Fragment>>
 where
     OpenWriter: Fn(Arc<ObjectStore>, Schema, Path, WriterOptions) -> OpenWriterFuture + Send + Sync,
@@ -965,6 +966,7 @@ where
         params.blob_pack_file_size_threshold,
         file_writer_options,
         preassigned_data_file_name,
+        created_blob_payloads,
     );
     let mut writer: Option<Box<dyn GenericWriter>> = None;
     let mut num_rows_in_current_file = 0;
@@ -1762,6 +1764,7 @@ pub(crate) async fn write_fragments_internal_with_file_row_counts(
         file_row_counts,
         None,
         false,
+        None,
     )
     .await
 }
@@ -1779,6 +1782,7 @@ pub(crate) async fn write_fragments_internal_impl(
     file_row_counts: Option<Vec<usize>>,
     preassigned_data_file_name: Option<Arc<String>>,
     keep_field_ids: bool,
+    created_blob_payloads: Option<BlobPayloadInventory>,
 ) -> Result<(Vec<Fragment>, Schema)> {
     let mut params = params;
 
@@ -1799,6 +1803,7 @@ pub(crate) async fn write_fragments_internal_impl(
         file_row_counts,
         preassigned_data_file_name,
         keep_field_ids,
+        created_blob_payloads,
     )
     .await
 }
@@ -2201,6 +2206,7 @@ pub(crate) struct WriterOptions {
     source_store_params: ObjectStoreParams,
     blob_pack_file_size_threshold: Option<usize>,
     file_writer_options: FileWriterOptions,
+    created_blob_payloads: Option<BlobPayloadInventory>,
 }
 
 impl WriterOptions {
@@ -2328,6 +2334,7 @@ where
         source_store_params,
         blob_pack_file_size_threshold,
         file_writer_options,
+        created_blob_payloads,
     } = options;
     let (data_file_key, filename, data_dir, final_path) = prepare_data_file_path(
         base_dir,
@@ -2370,7 +2377,9 @@ where
             ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3
         )
     {
-        preprocessor = preprocessor.with_managed_base(base_id, base_dir.clone());
+        preprocessor = preprocessor
+            .with_managed_base(base_id, base_dir.clone())
+            .with_created_payloads(created_blob_payloads);
     }
     Ok(Box::new(V2WriterAdapter::new(
         file_writer,
@@ -2448,6 +2457,7 @@ struct WriterGenerator<OpenWriter> {
     blob_pack_file_size_threshold: Option<usize>,
     file_writer_options: FileWriterOptions,
     preassigned_data_file_name: Option<Arc<String>>,
+    created_blob_payloads: Option<BlobPayloadInventory>,
     writers_created: AtomicUsize,
     /// Counter for round-robin selection
     next_base_index: AtomicUsize,
@@ -2473,6 +2483,7 @@ where
         blob_pack_file_size_threshold: Option<usize>,
         file_writer_options: FileWriterOptions,
         preassigned_data_file_name: Option<Arc<String>>,
+        created_blob_payloads: Option<BlobPayloadInventory>,
     ) -> Self {
         Self {
             object_store,
@@ -2488,6 +2499,7 @@ where
             blob_pack_file_size_threshold,
             file_writer_options,
             preassigned_data_file_name,
+            created_blob_payloads,
             writers_created: AtomicUsize::new(0),
             next_base_index: AtomicUsize::new(0),
         }
@@ -2534,6 +2546,7 @@ where
                     source_store_params: self.source_store_params.clone(),
                     blob_pack_file_size_threshold: self.blob_pack_file_size_threshold,
                     file_writer_options: self.file_writer_options.clone(),
+                    created_blob_payloads: self.created_blob_payloads.clone(),
                 },
             )
             .await?
@@ -2553,6 +2566,7 @@ where
                     source_store_params: self.source_store_params.clone(),
                     blob_pack_file_size_threshold: self.blob_pack_file_size_threshold,
                     file_writer_options: self.file_writer_options.clone(),
+                    created_blob_payloads: self.created_blob_payloads.clone(),
                 },
             )
             .await?
@@ -3498,6 +3512,7 @@ mod tests {
             None,
             FileWriterOptions::default(),
             None,
+            None,
         );
 
         // Create a writer
@@ -3617,6 +3632,7 @@ mod tests {
             ObjectStoreParams::default(),
             None,
             FileWriterOptions::default(),
+            None,
             None,
         );
 
@@ -4876,6 +4892,7 @@ mod tests {
             seeds::SeedCollector::disabled(),
             None,
             None,
+            None,
         )
         .await;
 
@@ -4937,6 +4954,7 @@ mod tests {
             },
             None,
             seeds::SeedCollector::disabled(),
+            None,
             None,
             None,
         )
@@ -5167,6 +5185,7 @@ mod tests {
             },
             Some(target_bases),
             seeds::SeedCollector::disabled(),
+            None,
             None,
             None,
         )

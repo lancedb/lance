@@ -4,7 +4,7 @@
 use std::{
     collections::{HashMap, HashSet},
     ops::Range,
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use arrow::array::AsArray;
@@ -38,6 +38,60 @@ use lance_table::feature_flags::MANAGED_BLOBS_META_KEY;
 pub(super) const INLINE_MAX: usize = 64 * 1024; // 64KB inline cutoff
 const DEDICATED_THRESHOLD: usize = 4 * 1024 * 1024; // 4MB dedicated cutoff
 const PACK_FILE_MAX_SIZE: usize = 1024 * 1024 * 1024; // 1GiB per .pack sidecar
+
+/// The `_blobs/<uuid>.blob` payload objects a write created.
+///
+/// Nothing else records them: they are not part of any fragment's file list,
+/// and a descriptor scan over the written fragments cannot tell a payload this
+/// write created from a reused Managed descriptor that points at a live one.
+/// A caller that discards the write's result uses this inventory to delete
+/// exactly what the write created. Clones share the same inventory.
+#[derive(Debug, Clone, Default)]
+pub struct BlobPayloadInventory(Arc<Mutex<Vec<(ObjectStore, Path)>>>);
+
+impl BlobPayloadInventory {
+    fn record(&self, object_store: &ObjectStore, path: &Path) {
+        self.0
+            .lock()
+            .unwrap()
+            .push((object_store.clone(), path.clone()));
+    }
+
+    /// Delete every recorded payload and clear the inventory.
+    ///
+    /// Failures are logged rather than returned: the payloads are unreferenced
+    /// either way, so ordinary garbage collection still reclaims them.
+    pub async fn delete_all(&self) {
+        let payloads = std::mem::take(&mut *self.0.lock().unwrap());
+        for (object_store, path) in payloads {
+            match object_store.delete(&path).await {
+                // A path is recorded before its writer opens, so a writer that
+                // failed to open leaves nothing behind.
+                Ok(()) | Err(Error::NotFound { .. }) => {}
+                Err(e) => {
+                    log::warn!("Failed to clean up orphaned blob payload '{}': {}", path, e);
+                }
+            }
+        }
+    }
+}
+
+/// Allocate a fresh managed payload path under `root`, recording it before any
+/// bytes are written so a partially uploaded payload is still accounted for.
+fn new_managed_payload_path(
+    root: &Path,
+    object_store: &ObjectStore,
+    created_payloads: Option<&BlobPayloadInventory>,
+) -> Path {
+    let path = root
+        .clone()
+        .join("_blobs")
+        .join(format!("{}.blob", uuid::Uuid::new_v4()));
+    if let Some(created_payloads) = created_payloads {
+        created_payloads.record(object_store, &path);
+    }
+    path
+}
 
 pub(in crate::dataset) fn blob_inline_threshold_from_metadata(
     metadata: &HashMap<String, String>,
@@ -132,16 +186,14 @@ impl RollingPackedBlobWriter {
         object_store: ObjectStore,
         data_file_path: Path,
         managed_base: Option<&(Option<u32>, Path)>,
+        created_payloads: Option<&BlobPayloadInventory>,
         blob_id_allocator: BlobIdAllocator,
         max_pack_size: usize,
     ) -> Result<()> {
         self.finish().await?;
         let blob_id = blob_id_allocator.next()?;
         self.current = Some(if let Some((_, root)) = managed_base {
-            let path = root
-                .clone()
-                .join("_blobs")
-                .join(format!("{}.blob", uuid::Uuid::new_v4()));
+            let path = new_managed_payload_path(root, &object_store, created_payloads);
             PackedBlobWriter::try_new_at(object_store, path, blob_id).await?
         } else {
             PackedBlobWriter::try_new(object_store, data_file_path, blob_id).await?
@@ -151,11 +203,13 @@ impl RollingPackedBlobWriter {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn write(
         &mut self,
         object_store: ObjectStore,
         data_file_path: Path,
         managed_base: Option<&(Option<u32>, Path)>,
+        created_payloads: Option<&BlobPayloadInventory>,
         blob_id_allocator: BlobIdAllocator,
         max_pack_size: usize,
         source: BlobWriteSource<'_>,
@@ -173,6 +227,7 @@ impl RollingPackedBlobWriter {
                 object_store,
                 data_file_path,
                 managed_base,
+                created_payloads,
                 blob_id_allocator,
                 max_pack_size,
             )
@@ -216,6 +271,7 @@ impl RollingPackedBlobWriter {
 /// - Leaves small inline blobs and URI rows unchanged for compatibility.
 pub struct BlobPreprocessor {
     managed_base: Option<(Option<u32>, Path)>,
+    created_payloads: Option<BlobPayloadInventory>,
     object_store: ObjectStore,
     data_dir: Path,
     data_file_key: String,
@@ -426,6 +482,7 @@ impl BlobPreprocessor {
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             managed_base: None,
+            created_payloads: None,
             object_store,
             data_dir,
             data_file_key,
@@ -448,6 +505,16 @@ impl BlobPreprocessor {
         root: Path,
     ) -> Self {
         self.managed_base = Some((base_id, root));
+        self
+    }
+
+    /// Record every managed payload object this preprocessor creates into
+    /// `created_payloads`.
+    pub(in crate::dataset) fn with_created_payloads(
+        mut self,
+        created_payloads: Option<BlobPayloadInventory>,
+    ) -> Self {
+        self.created_payloads = created_payloads;
         self
     }
 
@@ -506,10 +573,8 @@ impl BlobPreprocessor {
     async fn write_dedicated(&mut self, source: BlobWriteSource<'_>) -> Result<BlobDescriptor> {
         let blob_id = self.blob_id_allocator.next()?;
         let mut writer = if let Some((_, root)) = &self.managed_base {
-            let path = root
-                .clone()
-                .join("_blobs")
-                .join(format!("{}.blob", uuid::Uuid::new_v4()));
+            let path =
+                new_managed_payload_path(root, &self.object_store, self.created_payloads.as_ref());
             crate::blob::DedicatedBlobWriter::try_new_at(self.object_store.clone(), path, blob_id)
                 .await?
         } else {
@@ -551,6 +616,7 @@ impl BlobPreprocessor {
                     .clone()
                     .join(format!("{}.lance", self.data_file_key)),
                 self.managed_base.as_ref(),
+                self.created_payloads.as_ref(),
                 self.blob_id_allocator.clone(),
                 max_pack_size,
                 source,
