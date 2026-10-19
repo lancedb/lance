@@ -58,6 +58,10 @@ pub struct CommitBuilder<'a> {
     /// Set only by `Dataset::deep_clone`, after it has copied the source files.
     deep_clone_files_copied: bool,
     keep_field_ids: bool,
+    /// Set by `execute_batch`: the newest read version among its inputs. A
+    /// detached base must not predate it (the merged transaction keeps only
+    /// the oldest).
+    detached_read_version: Option<u64>,
 }
 
 /// Default timeout applied to [`CommitBuilder::execute`] when none is set.
@@ -80,6 +84,7 @@ impl<'a> CommitBuilder<'a> {
             retry_timeout: default_commit_retry_timeout(),
             affected_rows: None,
             transaction_properties: None,
+            detached_read_version: None,
             timeout: Some(DEFAULT_COMMIT_TIMEOUT),
             migration_next_row_id: None,
             activate_non_reusable_field_ids: false,
@@ -473,6 +478,20 @@ impl<'a> CommitBuilder<'a> {
                         "detached commits cannot be used with v1 manifest paths".into(),
                     ));
                 }
+                // A detached manifest descends only from the supplied base, so
+                // the base must be at least as new as what the transaction
+                // read: an older base lacks that snapshot's state (including
+                // the sticky feature flags its files may rely on).
+                let read_version = self
+                    .detached_read_version
+                    .unwrap_or(transaction.read_version);
+                if read_version > dataset.manifest.version {
+                    return Err(Error::invalid_input(format!(
+                        "detached commit base version {} is older than the transaction's \
+                         read version {}",
+                        dataset.manifest.version, read_version
+                    )));
+                }
                 commit_detached_transaction(
                     dataset,
                     object_store.as_ref(),
@@ -617,7 +636,11 @@ impl<'a> CommitBuilder<'a> {
             tag: None,
             transaction_properties: None,
         };
-        let dataset = self.execute(merged.clone()).await?;
+        let mut this = self;
+        if this.detached {
+            this.detached_read_version = transactions.iter().map(|t| t.read_version).max();
+        }
+        let dataset = this.execute(merged.clone()).await?;
         Ok(BatchCommitResult { dataset, merged })
     }
 }

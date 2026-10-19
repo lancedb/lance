@@ -736,16 +736,22 @@ pub(super) async fn can_use_binary_copy_current(
                 .open_file_with_priority(&full_path, 0, &data_file.file_size_bytes)
                 .await?;
             let file_meta = LFReader::read_all_metadata(&file_scheduler).await?;
-            // Binary copy only preserves page and column-buffer bytes. The output file's footer
-            // (including global buffers) is re-generated, not copied from inputs.
-            //
-            // Therefore, we reject input files that contain any additional global buffers beyond
-            // the required schema / file descriptor global buffer (global buffer index 0).
-            if file_meta.file_buffers.len() > 1 {
-                log::debug!(
-                    "Binary copy disabled: data file has extra global buffers (len={})",
-                    file_meta.file_buffers.len()
-                );
+            // Binary copy only preserves page and column-buffer bytes; the
+            // output footer (including global buffers) is re-generated. Extra
+            // global buffers are allowed only when every one of them is a
+            // recognized zone write seed, which the copy then carries or
+            // drops by explicit per-column rules. Anything unrecognized keeps
+            // disqualifying the file, so no unknown buffer is ever silently
+            // dropped.
+            if file_meta.file_buffers.len() > 1
+                && let Err(e) = binary_copy::seed_carry::extract_source_seeds(
+                    &file_meta,
+                    &file_scheduler,
+                    data_file,
+                )
+                .await
+            {
+                log::debug!("Binary copy disabled: {}", e);
                 return Ok(false);
             }
         }
