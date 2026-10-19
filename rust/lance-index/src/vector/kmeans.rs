@@ -457,9 +457,9 @@ const L2_PREPARED_MAX_BYTES: usize = 32 * 1024;
 /// update, whose redundant passes over the data cost less than replicating the
 /// table per chunk.
 const SINGLE_PASS_SUMS_MAX_BYTES: usize = 1024 * 1024;
-/// Upper bound on the chunks, hence partial tables, of a single-pass update.
-/// Fixed rather than derived from the CPU count so the summation order, and
-/// with it the trained centroids, is the same on every host.
+/// Chunks, hence partial tables and workers, of a single-pass update. Fixed
+/// rather than derived from the CPU count so the summation order, and with it
+/// the trained centroids, is the same on every host.
 const SINGLE_PASS_MAX_CHUNKS: usize = 64;
 
 /// Sums the members of each centroid with one partial table per chunk of
@@ -738,10 +738,7 @@ where
     ) -> KMeans {
         let mut centroids = if k * dimension * size_of::<T::Native>() <= SINGLE_PASS_SUMS_MAX_BYTES
         {
-            let row_bytes = dimension * size_of::<T::Native>();
-            let rows_per_chunk = (MEMBERSHIP_CHUNK_BYTES / row_bytes)
-                .max(membership.len().div_ceil(SINGLE_PASS_MAX_CHUNKS))
-                .max(1);
+            let rows_per_chunk = membership.len().div_ceil(SINGLE_PASS_MAX_CHUNKS).max(1);
             sum_members_single_pass(data, dimension, k, membership, rows_per_chunk)
         } else {
             sum_members_centroid_split(data, dimension, k, membership)
