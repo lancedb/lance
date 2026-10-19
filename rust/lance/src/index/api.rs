@@ -15,7 +15,7 @@ use uuid::Uuid;
 
 use crate::{Error, Result};
 
-/// Opaque native statistics tied to the collecting dataset's read version.
+/// Opaque statistics for one physical index segment.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IndexSegmentStatistics {
     /// Manifest read version, not the segment's build version.

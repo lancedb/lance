@@ -18,12 +18,11 @@ import java.util.Objects;
 import java.util.UUID;
 
 /**
- * Native statistics tied to the collecting dataset's read version, not the segment's build version.
+ * Statistics at the collecting dataset's read version, not the segment's build version. Detached
+ * versions may be negative.
  *
  * <p>The JSON payload is opaque. Segments covering no fragments have an empty type URI and {@code
  * "{}"} payload.
- *
- * <p>Detached dataset versions may appear as negative Java {@code long} values.
  */
 public final class IndexSegmentStatistics implements Serializable {
   private static final long serialVersionUID = 1L;
