@@ -38,6 +38,7 @@ use lance_table::format::{DataFile, DataStorageFormat, Fragment, Manifest};
 use object_store::path::Path;
 
 use super::Dataset;
+use super::blob::BlobPayloadInventory;
 use super::fragment::{
     FileFragment, FragReadConfig, GenericFileReader, MetadataMode, V1FragmentReader,
     write::FragmentCreateBuilder,
@@ -132,6 +133,7 @@ pub async fn write_fragments(
     file_row_counts: Option<Vec<usize>>,
     preassigned_data_file_name: Option<Arc<String>>,
     keep_field_ids: bool,
+    created_blob_payloads: Option<BlobPayloadInventory>,
 ) -> Result<(Vec<Fragment>, Schema)> {
     // A writer that spills row lineage into the fragment's own data file
     // carries the hidden columns in its stream. They are not dataset fields:
@@ -185,6 +187,7 @@ pub async fn write_fragments(
         seeds,
         file_row_counts,
         preassigned_data_file_name,
+        created_blob_payloads,
     )
     .await?;
     Ok((fragments, schema))
@@ -238,6 +241,7 @@ pub async fn write_fragments_direct(
     seeds: SeedCollector,
     file_row_counts: Option<Vec<usize>>,
     preassigned_data_file_name: Option<Arc<String>>,
+    created_blob_payloads: Option<BlobPayloadInventory>,
 ) -> Result<Vec<Fragment>> {
     let buffered_reader = if let Some(file_row_counts) = file_row_counts.as_ref() {
         if file_row_counts.contains(&0) {
@@ -301,6 +305,7 @@ pub async fn write_fragments_direct(
         seeds,
         file_row_counts,
         preassigned_data_file_name,
+        created_blob_payloads,
     )
     .await
 }

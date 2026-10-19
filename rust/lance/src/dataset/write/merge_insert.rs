@@ -56,6 +56,7 @@ use super::{
     CommitBuilder, TargetBaseInfo, WriteMode, WriteParams,
     validate_and_resolve_target_bases_with_primary, write_fragments_internal,
 };
+use crate::dataset::blob::BlobPayloadInventory;
 use crate::dataset::rowids::{
     get_row_id_index, inline_row_lineage_max_bytes, load_spilled_row_lineage,
 };
@@ -3508,6 +3509,12 @@ impl MergeInsertJob {
         if let Some(transaction) = uncommitted_transaction(plan.as_ref()) {
             self.cleanup_uncommitted_files(&transaction).await;
         }
+        // Managed blob payloads are separate objects no fragment lists. The
+        // write node records each one as it creates it, including in a run
+        // that failed before building a transaction.
+        if let Some(created_blob_payloads) = created_blob_payloads(plan.as_ref()) {
+            created_blob_payloads.delete_all().await;
+        }
         let full_analysis = analysis_result?;
 
         // Remove the AnalyzeExec and TracedExec lines from the output
@@ -3615,6 +3622,16 @@ fn uncommitted_transaction(plan: &dyn ExecutionPlan) -> Option<Transaction> {
     } else {
         None
     }
+}
+
+/// The managed blob payloads a merge insert write node created.
+///
+/// Only the full-schema node can create any. The in-place node refuses a source
+/// that carries a blob column and never inserts rows, and the delete-only node
+/// writes no data.
+fn created_blob_payloads(plan: &dyn ExecutionPlan) -> Option<&BlobPayloadInventory> {
+    plan.downcast_ref::<exec::FullSchemaMergeInsertExec>()
+        .map(|full_exec| full_exec.created_blob_payloads())
 }
 
 /// Merger will store these statistics as it runs (for each batch)
@@ -13195,6 +13212,85 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
         dataset.checkout_latest().await.unwrap();
         assert_eq!(dataset.version().version, 1);
         assert_eq!(dataset.count_rows(None).await.unwrap(), 8);
+    }
+
+    /// With managed blobs enabled, Blob v2 payloads above the inline threshold
+    /// live in their own `_blobs/<uuid>.blob` objects rather than beside the
+    /// data file, so removing the analyzed data files alone leaves them behind. Repeated
+    /// analyses must not accumulate those objects, and the committed blobs the
+    /// target rows still reference must stay readable.
+    #[rstest::rstest]
+    #[case::packed(65 * 1024)]
+    #[case::dedicated(4 * 1024 * 1024 + 1)]
+    #[tokio::test]
+    async fn test_analyze_plan_removes_written_blob_payloads(#[case] payload_size: usize) {
+        let tempdir = TempStrDir::default();
+        let schema = Arc::new(crate::dataset::blob::test_util::managed_blob_schema(vec![
+            Field::new("id", DataType::Int64, true),
+            crate::blob_field("payload", true),
+        ]));
+        let make_batch = |ids: Vec<i64>, value: u8| {
+            let payload = vec![value; payload_size];
+            let mut blobs = crate::BlobArrayBuilder::new(ids.len());
+            for _ in &ids {
+                blobs.push_bytes(&payload).unwrap();
+            }
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int64Array::from(ids)), blobs.finish().unwrap()],
+            )
+            .unwrap()
+        };
+        let dataset = Arc::new(
+            Dataset::write(
+                RecordBatchIterator::new(vec![Ok(make_batch(vec![0, 1], 1))], schema.clone()),
+                &tempdir,
+                Some(WriteParams {
+                    max_rows_per_file: 1,
+                    data_storage_version: Some(LanceFileVersion::V2_2),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(dataset.get_fragments().len(), 2);
+        let files_before = list_dataset_files(&tempdir);
+        let blobs_dir = std::path::Path::new(tempdir.as_ref() as &str).join("_blobs");
+        assert!(
+            files_before.iter().any(|path| path.starts_with(&blobs_dir)),
+            "the fixture must store its payloads as managed objects: {files_before:?}"
+        );
+
+        let job = MergeInsertBuilder::try_new(dataset.clone(), vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .try_build()
+            .unwrap();
+        for _ in 0..2 {
+            let analysis = job
+                .analyze_plan_batches(vec![make_batch(vec![0, 2], 2)])
+                .await
+                .unwrap();
+            assert!(
+                analysis.trim_start().starts_with("MergeInsert:"),
+                "expected the full-schema write node:\n{analysis}"
+            );
+        }
+
+        assert_eq!(list_dataset_files(&tempdir), files_before);
+        assert_eq!(dataset.version().version, 1);
+        for blob in dataset
+            .take_blobs_by_indices(&[0, 1], "payload")
+            .await
+            .unwrap()
+        {
+            assert_eq!(
+                blob.unwrap().read().await.unwrap().as_ref(),
+                vec![1; payload_size]
+            );
+        }
     }
 
     #[tokio::test]
