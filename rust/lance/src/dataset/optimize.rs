@@ -3513,16 +3513,6 @@ pub async fn commit_compaction(
     } else {
         None
     };
-    if index_remapper.is_none() || !remap_options.supports_vector_segment_replacement() {
-        validate_fragment_groups_preserve_index_boundaries(
-            dataset,
-            completed_tasks
-                .iter()
-                .map(|task| task.original_fragments.as_slice()),
-        )
-        .await?;
-    }
-
     // Determine the earliest version at which compaction tasks were planned/executed.
     //
     // In distributed mode (e.g. Spark) the caller opens *two separate* Dataset
@@ -3541,6 +3531,21 @@ pub async fn commit_compaction(
         .map(|t| t.read_version)
         .min()
         .unwrap_or(dataset.manifest.version);
+
+    if index_remapper.is_none() || !remap_options.supports_vector_segment_replacement() {
+        let read_snapshot = if dataset.manifest.version == tasks_read_version {
+            Cow::Borrowed(&*dataset)
+        } else {
+            Cow::Owned(dataset.checkout_version(tasks_read_version).await?)
+        };
+        validate_fragment_groups_preserve_index_boundaries(
+            read_snapshot.as_ref(),
+            completed_tasks
+                .iter()
+                .map(|task| task.original_fragments.as_slice()),
+        )
+        .await?;
+    }
 
     let mut completed_tasks = completed_tasks;
 
@@ -11102,6 +11107,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_compaction_preserves_legacy_nullable_label_list_version() {
+        let dir =
+            crate::utils::test::copy_test_data_to_tmp("v3.0.1/nullable_label_list/data.lance")
+                .unwrap();
+        let mut dataset = Dataset::open(&dir.path_str()).await.unwrap();
+        assert_eq!(dataset.get_fragments().len(), 2);
+        let original = dataset.load_indices_by_name("labels_idx").await.unwrap();
+        assert_eq!(original[0].index_version, 0);
+        let predicate = "NOT array_has_any(labels, [1])";
+        // Version 0 cannot recover list-level NULLs. Keep its existing reader
+        // behavior rather than advertise the current NULL-aware format.
+        let legacy_count = dataset.count_rows(Some(predicate.into())).await.unwrap();
+        compact_files(&mut dataset, CompactionOptions::default(), None)
+            .await
+            .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 1);
+        let remapped = dataset.load_indices_by_name("labels_idx").await.unwrap();
+        assert_eq!(remapped[0].index_version, 0);
+        assert_eq!(remapped[0].index_details, original[0].index_details);
+        assert_ne!(remapped[0].uuid, original[0].uuid);
+        assert_eq!(
+            dataset.count_rows(Some(predicate.into())).await.unwrap(),
+            legacy_count
+        );
+        for (predicate, expected) in [("array_has_any(labels, [1])", 2), ("labels IS NULL", 2)] {
+            for indexed in [false, true] {
+                let mut scan = dataset.scan();
+                scan.use_scalar_index(indexed).filter(predicate).unwrap();
+                assert_eq!(scan.try_into_batch().await.unwrap().num_rows(), expected);
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn test_read_label_list_index_with_defer_index_remap() {
         // Create a dataset with list data for labels
         let mut dataset = lance_datagen::gen_batch()
@@ -11900,12 +11939,15 @@ mod tests {
     }
 
     #[rstest]
-    #[case::stable_row_ids(true, false)]
-    #[case::deferred_remap(false, true)]
+    #[case::stable_row_ids(true, false, false)]
+    #[case::deferred_remap(false, true, false)]
+    #[case::immediate_remap(false, false, false)]
+    #[case::different_versions(false, false, true)]
     #[tokio::test]
     async fn test_compaction_preserves_vector_boundaries_without_immediate_remap(
         #[case] enable_stable_row_ids: bool,
         #[case] defer_index_remap: bool,
+        #[case] has_different_versions: bool,
     ) {
         const DIM: u32 = 16;
         let test_dir = TempStrDir::default();
@@ -11953,22 +11995,40 @@ mod tests {
                     .unwrap(),
             );
         }
+        if has_different_versions {
+            assert_ne!(segments[0].index_version, 0);
+            segments[0].index_version = 0;
+        }
         dataset
             .commit_existing_index_segments("vec_idx", "vec", segments)
             .await
             .unwrap();
 
-        let plan = plan_compaction(
-            &dataset,
-            &CompactionOptions {
-                target_rows_per_fragment: 1_000,
-                defer_index_remap,
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-        assert_eq!(plan.num_tasks(), 0);
+        let options = CompactionOptions {
+            target_rows_per_fragment: 1_000,
+            defer_index_remap,
+            ..Default::default()
+        };
+        assert_eq!(
+            plan_compaction(&dataset, &options)
+                .await
+                .unwrap()
+                .num_tasks(),
+            0
+        );
+        let plan = DefaultCompactionPlanner::new(options)
+            .unwrap()
+            .with_index_remapper(&DatasetIndexRemapperOptions::default())
+            .plan(&dataset)
+            .await
+            .unwrap();
+        assert_eq!(
+            plan.num_tasks(),
+            usize::from(!enable_stable_row_ids && !defer_index_remap && !has_different_versions)
+        );
+        if plan.num_tasks() == 1 {
+            assert_eq!(plan.tasks[0].fragments.len(), 2);
+        }
     }
 
     #[tokio::test]
@@ -13805,8 +13865,11 @@ mod tests {
     // group mixes indexed and unindexed fragments, commit succeeds and later
     // queries fail at load_indices with "split of indexed and non-indexed
     // data".
+    #[rstest]
+    #[case::stale(false)]
+    #[case::fresh(true)]
     #[tokio::test]
-    async fn test_rewrite_fri_vs_create_index_conflict() {
+    async fn test_rewrite_fri_vs_create_index_conflict(#[case] is_fresh_handle: bool) {
         use crate::index::DatasetIndexExt;
         use crate::index::vector::VectorIndexParams;
         use futures::TryStreamExt;
@@ -13880,6 +13943,13 @@ mod tests {
             .await
             .unwrap();
 
+        let before_commit = Dataset::open(&uri).await.unwrap();
+        let expected_fragments = before_commit.manifest.fragments.clone();
+        let expected_indices = load_all_indices(&before_commit).await.unwrap();
+        if is_fresh_handle {
+            dataset = before_commit;
+        }
+
         // Commit the pre-executed Rewrite. The FRI group [frag1, frag2]
         // straddles the new CreateIndex bitmap (frag1 indexed, frag2 not), so
         // check_rewrite_txn must reject this as a retryable conflict rather
@@ -13896,6 +13966,9 @@ mod tests {
             matches!(err, Error::RetryableCommitConflict { .. }),
             "unexpected error: {err}"
         );
+        let latest = Dataset::open(&uri).await.unwrap();
+        assert_eq!(latest.manifest.fragments, expected_fragments);
+        assert_eq!(load_all_indices(&latest).await.unwrap(), expected_indices);
     }
 
     /// Reproduce the distributed-compaction concurrent-delete data-resurrection bug.

@@ -338,6 +338,7 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
         dataset,
         index_id,
         &RowAddrTranslator::sync(frag_reuse_index.row_addr_remap().clone()),
+        None,
     )
     .await?;
 
@@ -1036,7 +1037,7 @@ async fn remap_index_tagged(dataset: &mut Dataset, index_id: &Uuid) -> Result<()
         // is dropped.
         let translator =
             materialize_hops(dataset, &ledger, hops, admitted, coverage.clone()).await?;
-        match index::remap_index(dataset, index_id, &translator).await {
+        match index::remap_index(dataset, index_id, &translator, None).await {
             Ok(result) => result,
             // The index only knows the legacy in-memory remap and this build
             // cannot prepare a complete mapping for it within budget: not an

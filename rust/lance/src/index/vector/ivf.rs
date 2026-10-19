@@ -5,9 +5,8 @@
 
 use super::details::target_partition_size_from_details;
 use super::{
-    LogicalIvfView, derive_hnsw_params, has_unowned_fragment_rows,
+    LogicalIvfView, derive_hnsw_params,
     pq::{PQIndex, build_pq_model},
-    remap_for_owned_fragments, resolve_shared_remap,
     utils::{filter_finite_training_data, maybe_sample_training_data},
 };
 use super::{
@@ -490,7 +489,6 @@ enum VectorModelMismatch {
     StorageFormat,
     IvfCentroids,
     QuantizerMetadata,
-    HnswBuildParameters,
 }
 
 fn vector_index_dimension(index: &dyn VectorIndex) -> usize {
@@ -563,8 +561,6 @@ fn vector_model_mismatch(indices: &[Arc<dyn VectorIndex>]) -> Option<VectorModel
     let first = indices.first()?;
     let first_centroids = first.ivf_model().centroids_array();
     let first_quantizer = first.quantizer();
-    let first_hnsw_params = matches!(first.sub_index_type().0, SubIndexType::Hnsw)
-        .then(|| derive_hnsw_params(first.as_ref()));
 
     for index in indices.iter().skip(1) {
         if first.as_any().type_id() != index.as_any().type_id() {
@@ -582,12 +578,6 @@ fn vector_model_mismatch(indices: &[Arc<dyn VectorIndex>]) -> Option<VectorModel
 
         if !shared_quantizer_model(&first_quantizer, &index.quantizer()) {
             return Some(VectorModelMismatch::QuantizerMetadata);
-        }
-
-        if let Some(first_hnsw_params) = first_hnsw_params.as_ref()
-            && !hnsw_build_params_eq(first_hnsw_params, &derive_hnsw_params(index.as_ref()))
-        {
-            return Some(VectorModelMismatch::HnswBuildParameters);
         }
     }
 
@@ -607,10 +597,24 @@ fn vector_segments_share_merge_model(
         && vector_model_mismatch(&indices).is_none()
 }
 
-fn partition_vector_segment_merge_groups(
+/// Partition a logical vector index into groups that remain acceptable to the
+/// distributed merger after compaction remaps their row addresses.
+pub(crate) fn compaction_vector_segment_merge_groups(
     logical_index: &LogicalIvfView<'_>,
-    can_merge_after_remap: impl Fn(&dyn VectorIndex) -> bool,
 ) -> Vec<Vec<Uuid>> {
+    let can_merge_after_remap = |index: &dyn VectorIndex| {
+        // Legacy readers have no v2 model inspection. HNSW remapping preserves
+        // graphs, whereas merging would rebuild them. PQ/RQ remaps write query
+        // layouts that the row-major distributed merger cannot consume.
+        !index.as_any().is::<IVFIndex>()
+            && matches!(
+                index.sub_index_type(),
+                (
+                    SubIndexType::Flat,
+                    QuantizationType::Flat | QuantizationType::Scalar
+                )
+            )
+    };
     let segments = logical_index.segments().collect::<Vec<_>>();
     let mut groups = Vec::<Vec<usize>>::new();
 
@@ -640,26 +644,6 @@ fn partition_vector_segment_merge_groups(
         .collect()
 }
 
-/// Partition a logical vector index into groups that remain acceptable to the
-/// distributed merger after compaction remaps their row addresses.
-pub(crate) fn compaction_vector_segment_merge_groups(
-    logical_index: &LogicalIvfView<'_>,
-) -> Vec<Vec<Uuid>> {
-    partition_vector_segment_merge_groups(logical_index, |index| {
-        // Legacy readers have no v2 model inspection. HNSW remapping preserves
-        // graphs, whereas merging would rebuild them. PQ/RQ remaps write query
-        // layouts that the row-major distributed merger cannot consume.
-        !index.as_any().is::<IVFIndex>()
-            && matches!(
-                index.sub_index_type(),
-                (
-                    SubIndexType::Flat,
-                    QuantizationType::Flat | QuantizationType::Scalar
-                )
-            )
-    })
-}
-
 pub(crate) fn vector_segment_compatibility(
     logical_index: &LogicalIvfView<'_>,
     operation: &str,
@@ -667,13 +651,11 @@ pub(crate) fn vector_segment_compatibility(
     let indices = logical_index.indices().cloned().collect::<Vec<_>>();
     validate_vector_query_compatibility(&indices, operation)?;
 
-    Ok(
-        if partition_vector_segment_merge_groups(logical_index, |_| true).len() == 1 {
-            VectorSegmentCompatibility::SharedModel
-        } else {
-            VectorSegmentCompatibility::QueryCompatibleModelsDiffer
-        },
-    )
+    Ok(if vector_model_mismatch(&indices).is_none() {
+        VectorSegmentCompatibility::SharedModel
+    } else {
+        VectorSegmentCompatibility::QueryCompatibleModelsDiffer
+    })
 }
 
 fn validate_shared_vector_model(indices: &[Arc<dyn VectorIndex>], operation: &str) -> Result<()> {
@@ -687,9 +669,6 @@ fn validate_shared_vector_model(indices: &[Arc<dyn VectorIndex>], operation: &st
         ))),
         Some(VectorModelMismatch::QuantizerMetadata) => Err(Error::index(format!(
             "{operation}: vector index segments do not share quantizer metadata"
-        ))),
-        Some(VectorModelMismatch::HnswBuildParameters) => Err(Error::index(format!(
-            "{operation}: vector index segments do not share HNSW build parameters"
         ))),
         None => Ok(()),
     }
@@ -2115,28 +2094,12 @@ impl RemapPageTask {
         reader: Arc<dyn Reader>,
         index: &IVFIndex,
         mapping: Arc<RowAddrTranslator>,
-        owned_fragments: Option<Arc<RoaringBitmap>>,
     ) -> Result<Self> {
         let mut page = index
             .sub_index
             .load(reader, self.offset, self.length as usize)
             .await?;
-        let row_ids: Vec<u64> = page.row_ids().copied().collect();
-        let mapping = resolve_shared_remap(&mapping, row_ids).await?;
-        let filtered_mapping;
-        let mapping = if let Some(owned_fragments) = owned_fragments.as_deref()
-            && has_unowned_fragment_rows(page.row_ids().copied(), owned_fragments)
-        {
-            filtered_mapping = remap_for_owned_fragments(
-                mapping.clone(),
-                page.row_ids().copied(),
-                owned_fragments,
-            );
-            &filtered_mapping
-        } else {
-            mapping.as_ref()
-        };
-        page.remap(mapping).await?;
+        page.remap_streaming(&mapping).await?;
         self.page = Some(page);
         Ok(self)
     }
@@ -2341,7 +2304,6 @@ pub(crate) async fn remap_index_file(
     name: String,
     column: String,
     transforms: Vec<pb::Transform>,
-    owned_fragments: Option<&RoaringBitmap>,
 ) -> Result<IndexFile> {
     let object_store = dataset.object_store.as_ref();
     let old_path = dataset
@@ -2366,17 +2328,9 @@ pub(crate) async fn remap_index_file(
 
     let tasks = generate_remap_tasks(&index.ivf.offsets, &index.ivf.lengths)?;
     let mapping = Arc::new(mapping.clone());
-    let owned_fragments = owned_fragments.cloned().map(Arc::new);
 
     let mut task_stream = stream::iter(tasks)
-        .map(|task| {
-            task.load_and_remap(
-                reader.clone(),
-                index,
-                mapping.clone(),
-                owned_fragments.clone(),
-            )
-        })
+        .map(|task| task.load_and_remap(reader.clone(), index, mapping.clone()))
         .buffered(object_store.io_parallelism());
 
     let mut ivf = IvfModel {
@@ -6424,7 +6378,6 @@ mod tests {
             INDEX_NAME.to_string(),
             WellKnownIvfPqData::COLUMN.to_string(),
             vec![],
-            None,
         )
         .await
         .unwrap();

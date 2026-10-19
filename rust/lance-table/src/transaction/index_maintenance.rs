@@ -801,8 +801,13 @@ impl Transaction {
             {
                 replacement.base_id = None;
             }
-            replacement.index_details = Some(Arc::new(rewritten_index.new_index_details.clone()));
-            replacement.index_version = rewritten_index.new_index_version as i32;
+            // Independent remaps preserve the source's historical metadata. Only
+            // a physical merge publishes a new segment's details and version.
+            if replacements.len() > 1 {
+                replacement.index_details =
+                    Some(Arc::new(rewritten_index.new_index_details.clone()));
+                replacement.index_version = rewritten_index.new_index_version as i32;
+            }
             replacement.dataset_version = source_indices
                 .iter()
                 .map(|(_, source)| source.dataset_version)
@@ -1632,6 +1637,58 @@ mod tests {
         assert_eq!(
             indices[0].fragment_bitmap.as_ref().unwrap(),
             &RoaringBitmap::from_iter([5])
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::missing(None)]
+    #[case::opaque(Some(prost_types::Any {
+        type_url: "future.index".into(),
+        value: vec![0x98, 0x06, 0x01],
+    }))]
+    // JsonIndexDetails { path: "x", target_details: {}, target_data_type: 999 }.
+    #[case::json_future_type(Some(prost_types::Any {
+        type_url: "type.googleapis.com/lance.index.pb.JsonIndexDetails".into(),
+        value: vec![0x0a, 0x01, b'x', 0x12, 0x00, 0x18, 0xe7, 0x07],
+    }))]
+    fn test_handle_rewrite_indices_preserves_single_source_metadata(
+        #[case] details: Option<prost_types::Any>,
+    ) {
+        let mut index =
+            create_test_index("idx", 1, 3, Some(RoaringBitmap::from_iter([1, 2])), true);
+        index.index_details = details.map(Arc::new);
+        index.index_version = 0;
+        index.base_id = Some(7);
+        let source_details = index.index_details.clone();
+        let new_id = Uuid::new_v4();
+        let replacement = RewrittenIndex {
+            old_id: index.uuid,
+            new_id,
+            new_index_details: prost_types::Any {
+                type_url: "different".into(),
+                value: vec![],
+            },
+            new_index_version: 2,
+            new_index_files: Some(vec![]),
+        };
+        let mut indices = vec![index];
+        Transaction::handle_rewrite_indices(
+            &mut indices,
+            &[replacement],
+            &[RewriteGroup {
+                old_fragments: vec![Fragment::new(1), Fragment::new(2)],
+                new_fragments: vec![Fragment::new(3)],
+            }],
+        )
+        .unwrap();
+        assert_eq!(indices[0].index_details, source_details);
+        assert_eq!(indices[0].index_version, 0);
+        assert_eq!(indices[0].uuid, new_id);
+        assert_eq!(indices[0].base_id, None);
+        assert_eq!(indices[0].files, Some(vec![]));
+        assert_eq!(
+            indices[0].fragment_bitmap,
+            Some(RoaringBitmap::from_iter([3]))
         );
     }
 

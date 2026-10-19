@@ -1814,11 +1814,11 @@ pub(crate) async fn remap_vector_index(
     new_uuid: &Uuid,
     old_metadata: &IndexMetadata,
     mapping: &RowAddrTranslator,
+    owned_fragments: Option<&RoaringBitmap>,
 ) -> Result<Vec<IndexFile>> {
     let old_index = dataset
         .open_vector_index(column, old_uuid, &NoOpMetricsCollector)
         .await?;
-    let owned_fragments = old_metadata.fragment_bitmap.as_ref();
 
     if let Some(ivf_index) = old_index.as_any().downcast_ref::<IVFIndex>() {
         let file = remap_index_file(
@@ -1834,7 +1834,6 @@ pub(crate) async fn remap_vector_index(
             // top stage is IVF and IVF does not support transforms between IVF and PQ.  This
             // will be fixed in the future.
             vec![],
-            owned_fragments,
         )
         .await?;
         Ok(vec![file])

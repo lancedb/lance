@@ -82,7 +82,7 @@ impl DatasetIndexRemapper {
         index: &IndexMetadata,
         mapping: &RowAddrTranslator,
     ) -> Result<RemapResult> {
-        remap_index(&self.dataset, &index.uuid, mapping).await
+        remap_index(&self.dataset, &index.uuid, mapping, None).await
     }
 
     async fn remapped_index_from_result(
@@ -156,7 +156,13 @@ impl DatasetIndexRemapper {
         let mut segment_results = Vec::with_capacity(segments.len());
         for segment in segments {
             // See the call-site note in `remap_indices` about boxing this future.
-            let result = Box::pin(self.remap_index(segment, mapping)).await?;
+            let result = Box::pin(crate::index::remap_index(
+                &self.dataset,
+                &segment.uuid,
+                mapping,
+                segment.fragment_bitmap.as_ref(),
+            ))
+            .await?;
             segment_results.push((*segment, result));
         }
 
@@ -380,7 +386,8 @@ mod tests {
     use crate::dataset::transaction::{Operation, Transaction};
     use crate::index::frag_reuse::build_frag_reuse_index_metadata;
     use crate::index::vector::VectorIndexParams;
-    use crate::index::{DatasetIndexExt, IntoIndexSegment};
+    use crate::index::{DatasetIndexExt, DatasetIndexInternalExt, IntoIndexSegment};
+    use futures::TryStreamExt;
     use lance_datagen::{BatchCount, RowCount, array};
     use lance_index::IndexType;
     use lance_index::frag_reuse::{FRAG_REUSE_INDEX_NAME, FragReuseIndexDetails};
@@ -576,6 +583,49 @@ mod tests {
             })
             .map(|segment| segment.uuid)
             .expect("expected one committed segment to cover the unaffected fragment");
+
+        // Both files store all fragments, but metadata assigns each only one.
+        // Independent remaps retain stored rows; staging remaps enforce ownership.
+        for owned_fragments in [None, committed[0].fragment_bitmap.as_ref()] {
+            let result = crate::index::remap_index(
+                &dataset,
+                &committed[0].uuid,
+                &RowAddrTranslator::sync(RowAddrRemap::empty()),
+                owned_fragments,
+            )
+            .await
+            .unwrap();
+            let RemapResult::Remapped(remapped) = result else {
+                panic!("expected a remapped segment");
+            };
+            let mut metadata = committed[0].clone();
+            metadata.uuid = remapped.new_id;
+            metadata.files = remapped.files;
+            metadata.base_id = None;
+            let index = dataset
+                .open_vector_index_from_metadata(
+                    "vector",
+                    &metadata,
+                    &lance_index::metrics::NoOpMetricsCollector,
+                )
+                .await
+                .unwrap();
+            let mut rows = 0;
+            for partition in 0..index.ivf_model().num_partitions() {
+                let mut batches = index
+                    .partition_reader(
+                        partition,
+                        false,
+                        &lance_index::metrics::NoOpMetricsCollector,
+                    )
+                    .await
+                    .unwrap();
+                while let Some(batch) = batches.try_next().await.unwrap() {
+                    rows += batch.num_rows();
+                }
+            }
+            assert_eq!(rows, if owned_fragments.is_some() { 20 } else { 80 });
+        }
 
         let remapper = DatasetIndexRemapperOptions::default()
             .create_remapper(&dataset)
