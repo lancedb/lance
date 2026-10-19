@@ -7582,8 +7582,13 @@ mod tests {
         // 300 / 256 = 1, not the 1000 requested.
         assert_eq!(trained_partitions(&dataset).await, vec![1]);
 
-        // The target recorded is the 300 rows the one partition holds, not
+        // The target recorded is the 300 vectors the one partition holds, not
         // 300 / 1000, which would have optimize split it apart.
+        let details = dataset.load_indices().await.unwrap()[0]
+            .index_details
+            .clone()
+            .unwrap();
+        assert_eq!(target_partition_size_from_details(&details), Some(300));
         dataset
             .optimize_indices(&OptimizeOptions::default())
             .await
@@ -7592,18 +7597,23 @@ mod tests {
     }
 
     /// An index built from a partition count, or from centroids that fix one,
-    /// records the rows per partition it was built at and keeps its partitions
-    /// through an optimize with nothing new to index. With no target partition
-    /// size recorded, optimize joined every partition under a quarter of the
-    /// index type's default, and 500 rows a partition is under that for every
-    /// IVF type.
+    /// records the vectors per partition it was built at and keeps its
+    /// partitions through an optimize with nothing new to index. With no target
+    /// partition size recorded, optimize joined every partition under a quarter
+    /// of the index type's default, and 500 vectors a partition is under that
+    /// for every IVF type. Null rows are not indexed, so they do not count: a
+    /// target taken from 50,000 rows would join partitions under 625.
     #[rstest]
     #[case::num_partitions(VectorIndexParams::ivf_flat(20, DistanceType::L2))]
     #[case::centroids(ivf_flat_from_centroids(20))]
     #[tokio::test]
-    async fn test_optimize_keeps_trained_partitions(#[case] params: VectorIndexParams) {
+    async fn test_optimize_keeps_trained_partitions(
+        #[case] params: VectorIndexParams,
+        #[values(0, 40_000)] null_rows: usize,
+    ) {
         let test_dir = tempfile::tempdir().unwrap();
-        let mut dataset = small_vector_dataset(test_dir.path(), 10_000).await;
+        let mut dataset =
+            partly_null_vector_dataset(test_dir.path(), 10_000 + null_rows, 10_000).await;
         dataset
             .create_index(&["vector"], IndexType::Vector, None, &params, false)
             .await
@@ -7913,7 +7923,8 @@ mod tests {
             .unwrap()
     }
 
-    /// A dataset of `rows` rows where only the first `non_null` hold a vector.
+    /// A dataset of `rows` rows where only the first `non_null` hold a vector,
+    /// each random.
     async fn partly_null_vector_dataset(
         dir: &std::path::Path,
         rows: usize,
@@ -7933,11 +7944,13 @@ mod tests {
             arrow_array::builder::Float32Builder::new(),
             dimensions,
         );
+        let values = generate_random_array(non_null * dimensions as usize);
         for row in 0..rows {
             if row < non_null {
-                for value in 0..dimensions {
-                    builder.values().append_value(value as f32);
-                }
+                let start = row * dimensions as usize;
+                builder
+                    .values()
+                    .append_slice(&values.values()[start..start + dimensions as usize]);
                 builder.append(true);
             } else {
                 for _ in 0..dimensions {

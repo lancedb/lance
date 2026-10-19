@@ -435,6 +435,10 @@ type UnindexedStream = Box<dyn Stream<Item = Result<RecordBatch>> + Send + Unpin
 pub struct VectorIndexBuildSummary {
     pub indices_merged: usize,
     pub files: Vec<IndexFile>,
+    /// Vectors the shuffle assigned to partitions. Null and non-finite vectors
+    /// are not indexed and existing indices merged in are not shuffled, so
+    /// neither is counted; a train-only build shuffles nothing and counts zero.
+    pub num_vectors_shuffled: usize,
 }
 
 impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> {
@@ -579,6 +583,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             progress.stage_complete("shuffle").await?;
         }
 
+        // Counted before the partitions are built: a split or join replaces the
+        // IVF model, and the shuffle's partition ids belong to the trained one.
+        let num_vectors_shuffled = self.num_vectors_shuffled()?;
+
         // step 3. build and merge partitions
         let num_partitions = self.ivf.as_ref().map(|ivf| ivf.num_partitions() as u64);
         progress
@@ -591,6 +599,16 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         Ok(VectorIndexBuildSummary {
             indices_merged: self.merged_num,
             files,
+            num_vectors_shuffled,
+        })
+    }
+
+    fn num_vectors_shuffled(&self) -> Result<usize> {
+        let (Some(ivf), Some(reader)) = (self.ivf.as_ref(), self.shuffle_reader.as_ref()) else {
+            return Ok(0);
+        };
+        (0..ivf.num_partitions()).try_fold(0, |total, partition| {
+            Ok(total + reader.partition_size(partition)?)
         })
     }
 

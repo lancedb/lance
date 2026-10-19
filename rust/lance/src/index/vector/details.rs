@@ -84,9 +84,9 @@ enum CompressionDetailsJson {
 
 /// Build a `VectorIndexDetails` proto from build params at index creation time.
 ///
-/// `built_target` is the rows per partition the build settled on, which
-/// `params` may not carry: an index built from a partition count records the
-/// size that count gave. A target in `params` wins.
+/// `built_target` is the vectors per partition the build settled on, which
+/// `params` may not carry: an index built from a partition count or centroids
+/// records the size they gave. A target in `params` wins.
 pub fn vector_index_details(
     params: &VectorIndexParams,
     built_target: Option<usize>,

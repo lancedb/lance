@@ -771,24 +771,6 @@ async fn prepare_vector_segment_build(
     };
     let mut ivf_params = ivf_params0.clone();
     ivf_params.num_partitions = Some(num_partitions);
-    // An index built from a partition count or centroids has no target
-    // partition size, so optimize would split and join it against the index
-    // type's default and merge every partition built smaller than a quarter of
-    // that. Record the rows per partition the trained count gives instead. A
-    // fragment subset is one segment of a logical index, and its rows say
-    // nothing about the index's, so it records nothing; nor does a multivector
-    // column, whose partitions count vectors, not rows. An explicit count of
-    // zero records nothing either: it has no partition size, and dividing by it
-    // would panic.
-    if ivf_params.target_partition_size.is_none()
-        && (ivf_params0.num_partitions.is_some() || ivf_params0.centroids.is_some())
-        && num_partitions > 0
-        && fragment_ids.is_none()
-        && !matches!(vector_type, DataType::List(_))
-    {
-        let num_rows = dataset.count_rows(None).await?;
-        ivf_params.target_partition_size = Some(num_rows.div_ceil(num_partitions).max(1));
-    }
 
     let format_version = dataset_format_version(dataset);
     let temp_dir = TempStdDir::default();
@@ -1164,14 +1146,14 @@ pub(crate) async fn build_distributed_vector_index(
     }
 }
 
-/// The files of a built vector index segment, and the rows per partition its
-/// IVF model was built for. That size goes into the index details, where
+/// The files of a built vector index segment, and the vectors per partition
+/// its IVF model was built for. That size goes into the index details, where
 /// optimize reads it back to decide splits and joins.
 pub(crate) struct BuiltVectorSegment {
     pub(crate) files: Vec<IndexFile>,
     /// `None` when the build was neither given a target nor derived one (a
-    /// fragment subset, a multivector column, or a count of zero), so optimize
-    /// falls back to the index type's default.
+    /// fragment subset, a multivector column, or a build that shuffled no
+    /// vectors), so optimize falls back to the index type's default.
     pub(crate) target_partition_size: Option<usize>,
 }
 
@@ -1289,8 +1271,9 @@ async fn build_vector_index_impl(
         )));
     }
 
-    let target_partition_size = ivf_params.target_partition_size;
-    let files = match index_type {
+    let explicit_target = ivf_params.target_partition_size;
+    let num_partitions = ivf_params.num_partitions.unwrap_or(0);
+    let summary = match index_type {
         IndexType::IvfFlat => match element_type {
             DataType::Float16 | DataType::Float32 | DataType::Float64 => {
                 let summary = IvfIndexBuilder::<FlatIndex, FlatQuantizer>::new(
@@ -1309,7 +1292,7 @@ async fn build_vector_index_impl(
                 .with_progress(progress.clone())
                 .build()
                 .await?;
-                Ok(summary.files)
+                Ok(summary)
             }
             DataType::UInt8 => {
                 let summary = IvfIndexBuilder::<FlatIndex, FlatBinQuantizer>::new(
@@ -1328,7 +1311,7 @@ async fn build_vector_index_impl(
                 .with_progress(progress.clone())
                 .build()
                 .await?;
-                Ok(summary.files)
+                Ok(summary)
             }
             _ => Err(Error::index(format!(
                 "Build Vector Index: invalid data type: {:?}",
@@ -1369,7 +1352,13 @@ async fn build_vector_index_impl(
                         progress.clone(),
                     )
                     .await?;
-                    Ok(files)
+                    // The v1 format never splits or joins its partitions, so
+                    // it needs no target.
+                    Ok(VectorIndexBuildSummary {
+                        indices_merged: 0,
+                        files,
+                        num_vectors_shuffled: 0,
+                    })
                 }
                 IndexFileVersion::V3 => {
                     let mut builder = IvfIndexBuilder::<FlatIndex, ProductQuantizer>::new(
@@ -1391,7 +1380,7 @@ async fn build_vector_index_impl(
                         .with_progress(progress.clone())
                         .build()
                         .await?;
-                    Ok(summary.files)
+                    Ok(summary)
                 }
             }
         }
@@ -1419,7 +1408,7 @@ async fn build_vector_index_impl(
             .with_progress(progress.clone())
             .build()
             .await?;
-            Ok(summary.files)
+            Ok(summary)
         }
         IndexType::IvfRq => {
             let StageParams::RQ(rq_params) = &stages[1] else {
@@ -1448,7 +1437,7 @@ async fn build_vector_index_impl(
                 .with_progress(progress.clone())
                 .build()
                 .await?;
-            Ok(summary.files)
+            Ok(summary)
         }
         IndexType::IvfHnswFlat => {
             let StageParams::Hnsw(hnsw_params) = &stages[1] else {
@@ -1475,7 +1464,7 @@ async fn build_vector_index_impl(
                     .with_progress(progress.clone())
                     .build()
                     .await?;
-                    Ok(summary.files)
+                    Ok(summary)
                 }
                 _ => {
                     let summary = IvfIndexBuilder::<HNSW, FlatQuantizer>::new(
@@ -1494,7 +1483,7 @@ async fn build_vector_index_impl(
                     .with_progress(progress.clone())
                     .build()
                     .await?;
-                    Ok(summary.files)
+                    Ok(summary)
                 }
             }
         }
@@ -1527,7 +1516,7 @@ async fn build_vector_index_impl(
             .with_progress(progress.clone())
             .build()
             .await?;
-            Ok(summary.files)
+            Ok(summary)
         }
         IndexType::IvfHnswSq => {
             let StageParams::Hnsw(hnsw_params) = &stages[1] else {
@@ -1558,15 +1547,40 @@ async fn build_vector_index_impl(
             .with_progress(progress.clone())
             .build()
             .await?;
-            Ok(summary.files)
+            Ok(summary)
         }
         _ => Err(Error::index(format!(
             "Build Vector Index: invalid index type: {:?}",
             index_type
         ))),
     }?;
+    // An index built from a partition count or centroids has no target
+    // partition size, so optimize would split and join it against the index
+    // type's default and merge every partition built smaller than a quarter of
+    // that. Record the vectors per partition the build indexed instead, counted
+    // by its shuffle rather than taken from the table's rows, which include
+    // null vectors the index never holds. A fragment subset is one segment of
+    // a logical index, and its vectors say nothing about the index's, so it
+    // records nothing, and so does a build that shuffled no vectors (a
+    // train-only model, an all-null column), which has no size to measure. A
+    // multivector column records nothing either: a retrain sizes its partitions
+    // from the table's rows over the recorded target, and with several vectors
+    // to a row a target in vectors would retrain a fraction of the partitions.
+    let partition_count_given = matches!(
+        params.stages.first(),
+        Some(StageParams::Ivf(ivf)) if ivf.num_partitions.is_some() || ivf.centroids.is_some()
+    );
+    let multivector = is_multivector(dataset, column)?;
+    let target_partition_size = explicit_target.or_else(|| {
+        (partition_count_given
+            && fragment_ids.is_none()
+            && !multivector
+            && num_partitions > 0
+            && summary.num_vectors_shuffled > 0)
+            .then(|| summary.num_vectors_shuffled.div_ceil(num_partitions))
+    });
     Ok(BuiltVectorSegment {
-        files,
+        files: summary.files,
         target_partition_size,
     })
 }

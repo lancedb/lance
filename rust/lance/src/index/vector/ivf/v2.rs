@@ -8545,8 +8545,8 @@ mod tests {
     }
 
     /// A multivector index built from a partition count records no target
-    /// partition size: its partitions hold one entry per vector, so a target in
-    /// rows would be a fraction of their size and optimize would split them all.
+    /// partition size: a retrain divides the table's rows by the target, so a
+    /// target in vectors would train a fraction of the partitions.
     #[tokio::test]
     async fn test_multivec_build_from_partition_count_records_no_target() {
         let test_dir = TempStrDir::default();
