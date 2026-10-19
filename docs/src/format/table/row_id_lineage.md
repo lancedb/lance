@@ -279,34 +279,38 @@ message DataFragment {
 
 ### Row ID Index
 
-#### Construction
+Row ID resolution maps a stable row ID to its live physical row address in a chosen
+dataset snapshot. The format does not require readers to build a complete mapping
+when opening the table.
 
-The row ID index is built at table load time by aggregating row ID sequences from all fragments:
+#### Persisted Reverse Lookup
 
-```
-For each fragment F with ID f:
-  For each (position p, row_id r) in F.row_id_sequence:
-    index[r] = (f, p)
-```
+An ordinary [BTree index](../index/scalar/btree.md#stable-row-id-reverse-lookup)
+may index the logical `_rowid` field, using reserved field ID `-3` in its index
+metadata. This field has the same identity for inline and spilled row-ID sequences
+and does not become part of the user schema. The BTree stores stable IDs as keys
+and physical addresses as payloads, using its existing address-domain format.
 
-This creates a mapping from row ID to current row address.
+The index is optional and may cover only part of the table. Readers resolve any
+remaining fragments through their row-ID sequences, including hidden columns.
+An index miss alone cannot distinguish an absent row from an uncovered row.
+
+#### In-Memory Construction
+
+An in-memory reverse index may instead be derived from the snapshot's fragment
+sequences. For each fragment, the reader pairs each row's position with its stable
+ID, excludes positions marked deleted, and maps each remaining ID to that
+fragment and position. This is a reader implementation, not a separate persisted
+index format. It remains valid for existing tables and historical readers.
 
 #### Index Invalidation with Updates
 
-When rows are updated and stable row IDs are enabled, the row ID index for a given dataset version only contains mappings for live physical rows. Tombstoned rows are excluded using deletion vectors, and logical row IDs whose contents have changed simply map to new row addresses.
-
-**Example Scenario:**
-
-1. Initial state (version V): Fragment 1 contains rows with IDs `[1, 2, 3]` at offsets `[0, 1, 2]`.
-2. An update operation modifies the row with `_rowid = 2`:
-    - A new fragment 2 is created with a row for `_rowid = 2` at offset `0`.
-    - In fragment 1, the original physical row at offset `1` is marked deleted in the deletion vector.
-3. Row ID index in version V+1:
-    - `1 → (1, 0)` ✓ Valid
-    - `2 → (2, 0)` ✓ Valid (updated row in fragment 2)
-    - `3 → (1, 2)` ✓ Valid
-
-The address `(1, 1)` is no longer reachable via the row ID index because it is filtered out by the deletion vector when the index is constructed.
+When an update moves a row, the new physical row keeps its stable ID and the old
+physical row is tombstoned. Resolution in the new snapshot must return only the
+new live address. An in-memory index can exclude the old address during
+construction; an immutable BTree can retain it on disk and exclude it during
+lookup. Both must apply the selected snapshot's deletion and coverage metadata.
+Historical snapshots continue to resolve using their own data and index state.
 
 #### Fragment Bitmaps for Index Masking
 

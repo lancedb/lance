@@ -334,6 +334,11 @@ message IndexMetadata {
 
   /* The columns the index is keyed on, in key order. These refer to file.Field.id.
    *
+   * On a stable-row-ID table, -3 may reference the logical _rowid column even
+   * though it is absent from the user schema. This identity is independent of
+   * whether a fragment stores its row IDs inline or in a hidden data column.
+   * An index on this field must store physical row addresses as its payload.
+   *
    * When the manifest has feature flag 1 << 13, this list contains only key
    * fields. `covering_fields` independently declares the values the index
    * carries.
