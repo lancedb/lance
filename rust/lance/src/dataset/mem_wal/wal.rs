@@ -871,7 +871,7 @@ impl WalFlusher {
         }
 
         // Blob descriptors are inserted before their shared packed sidecar is
-        // finalized so several puts can use one object. Seal that object before
+        // finalized so several puts can use one object. Finish that object before
         // any of those descriptors enter the WAL: after the append succeeds,
         // replay is allowed to expose every descriptor in this range.
         batch_store.finish_blob_pack().await.map_err(|error| {
@@ -1974,8 +1974,8 @@ mod tests {
     #[tokio::test]
     async fn test_track_batch_watcher_blocks_until_flush() {
         let (store, base_path, _temp_dir) = create_local_store().await;
-        let region_id = Uuid::new_v4();
-        let flusher = build_test_flusher(store, &base_path, region_id, 1);
+        let shard_id = Uuid::new_v4();
+        let flusher = build_test_flusher(store, &base_path, shard_id, 1);
 
         let schema = create_test_schema();
         let batch_store = Arc::new(BatchStore::with_capacity(10));
