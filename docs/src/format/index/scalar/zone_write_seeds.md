@@ -39,10 +39,8 @@ Data-file schema metadata locates each column's seed:
 `lance.seed.<column_name> = <buffer_index>:<rows_per_zone>`.
 The referenced global buffer contains a complete Arrow IPC file.
 
-Version 1 records follow physical row order and need not have equal lengths.
-Record `i` starts at the checked sum of the preceding `zone_length` values.
-Seeds contain no fragment ID or zone-start field. Consumers use the containing
-file's row coverage to place these ranges within a fragment.
+Each zone covers `zone_length` consecutive physical rows. Together, the zones
+cover the file's column data in order, without gaps or overlaps.
 
 ### Version 1 seed schema
 
@@ -71,9 +69,6 @@ pa.schema([
 `rows_per_zone` is stored in the outer locator, not the IPC schema metadata.
 
 ## Version 0: existing seeds
-
-Version 0 retains its fixed-stride layout: record `i` starts at local row offset
-`i * rows_per_zone`, and only the final zone may be shorter.
 
 Seeds without `version` metadata use this existing schema:
 
