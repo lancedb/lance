@@ -38,9 +38,9 @@ pub trait L2: Num {
     /// Writes the L2 distance from `x` to each `dimension`-sized vector in
     /// `batch` into the matching element of `output`.
     ///
-    /// The default calls [`L2::l2`] per vector. `f32` overrides it with one
-    /// batch kernel call, so the SIMD tier is chosen once for the whole batch
-    /// instead of once per vector.
+    /// The default calls [`L2::l2`] per vector. `f32`, `f16` and `f64`
+    /// override it so the SIMD tier is chosen once for the whole batch instead
+    /// of once per vector.
     ///
     /// # Panics
     ///
