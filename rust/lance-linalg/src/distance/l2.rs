@@ -23,12 +23,10 @@ use lance_core::utils::cpu::SIMD_SUPPORT;
 use lance_core::utils::cpu::SimdSupport;
 use num_traits::{AsPrimitive, Num};
 
-#[cfg(feature = "fp16kernels")]
-use crate::distance::HalfBackend;
 use crate::distance::{
-    BatchKernel, HALF_KERNELS_COMPILED, HalfType, PairKernel, U8_U32_ACCUMULATOR_MAX_LEN,
-    assert_batch_output_layout, assert_equal_lengths, half_backend, int8_query_to_f32,
-    x86_half_features,
+    BatchKernel, HALF_KERNELS_COMPILED, HalfBackend, HalfType, PairKernel,
+    U8_U32_ACCUMULATOR_MAX_LEN, assert_batch_output_layout, assert_equal_lengths, half_backend,
+    int8_query_to_f32, x86_half_features,
 };
 
 /// Calculate the L2 distance between two vectors.
@@ -231,46 +229,57 @@ mod kernel {
     }
 }
 
+fn f16_backend() -> HalfBackend {
+    half_backend(
+        *SIMD_SUPPORT,
+        HalfType::F16,
+        HALF_KERNELS_COMPILED,
+        cfg!(all(kernel_support = "avx512_f16", target_arch = "x86_64")),
+        x86_half_features(),
+    )
+}
+
 impl L2 for f16 {
     #[inline]
     fn l2(x: &[Self], y: &[Self]) -> f32 {
         assert_equal_lengths(x.len(), y.len());
-        match half_backend(
-            *SIMD_SUPPORT,
-            HalfType::F16,
-            HALF_KERNELS_COMPILED,
-            cfg!(all(kernel_support = "avx512_f16", target_arch = "x86_64")),
-            x86_half_features(),
-        ) {
-            #[cfg(all(feature = "fp16kernels", target_arch = "aarch64"))]
-            HalfBackend::Neon => unsafe {
-                kernel::l2_f16_neon(x.as_ptr(), y.as_ptr(), x.len() as u32)
-            },
-            #[cfg(all(
-                feature = "fp16kernels",
-                kernel_support = "avx512_f16",
-                target_arch = "x86_64"
-            ))]
-            HalfBackend::Avx512 => unsafe {
-                kernel::l2_f16_avx512(x.as_ptr(), y.as_ptr(), x.len() as u32)
-            },
-            #[cfg(all(feature = "fp16kernels", target_arch = "x86_64"))]
-            HalfBackend::Avx2 => unsafe {
-                kernel::l2_f16_avx2(x.as_ptr(), y.as_ptr(), x.len() as u32)
-            },
-            #[cfg(all(feature = "fp16kernels", target_arch = "loongarch64"))]
-            HalfBackend::Lasx => unsafe {
-                kernel::l2_f16_lasx(x.as_ptr(), y.as_ptr(), x.len() as u32)
-            },
-            #[cfg(all(feature = "fp16kernels", target_arch = "loongarch64"))]
-            HalfBackend::Lsx => unsafe {
-                kernel::l2_f16_lsx(x.as_ptr(), y.as_ptr(), x.len() as u32)
-            },
-            // SimdSupport::AvxFma and SimdSupport::Avx retain their scalar
-            // route; this fallback only extends the tiers the C kernel already
-            // served to Avx512FP16 after checking F16C and FMA.
-            _ => l2_scalar::<Self, f32, 16>(x, y),
+        l2_f16_with(f16_backend(), x, y)
+    }
+
+    fn l2_batch_into(x: &[Self], batch: &[Self], dimension: usize, output: &mut [f32]) {
+        assert_batch_output_layout(x.len(), batch.len(), dimension, output.len());
+        // Selecting the backend reads several runtime feature flags, which
+        // costs as much as a dimension-8 distance, so select it once per batch.
+        let backend = f16_backend();
+        for (distance, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
+            *distance = l2_f16_with(backend, x, y);
         }
+    }
+}
+
+#[inline(always)]
+fn l2_f16_with(backend: HalfBackend, x: &[f16], y: &[f16]) -> f32 {
+    match backend {
+        #[cfg(all(feature = "fp16kernels", target_arch = "aarch64"))]
+        HalfBackend::Neon => unsafe { kernel::l2_f16_neon(x.as_ptr(), y.as_ptr(), x.len() as u32) },
+        #[cfg(all(
+            feature = "fp16kernels",
+            kernel_support = "avx512_f16",
+            target_arch = "x86_64"
+        ))]
+        HalfBackend::Avx512 => unsafe {
+            kernel::l2_f16_avx512(x.as_ptr(), y.as_ptr(), x.len() as u32)
+        },
+        #[cfg(all(feature = "fp16kernels", target_arch = "x86_64"))]
+        HalfBackend::Avx2 => unsafe { kernel::l2_f16_avx2(x.as_ptr(), y.as_ptr(), x.len() as u32) },
+        #[cfg(all(feature = "fp16kernels", target_arch = "loongarch64"))]
+        HalfBackend::Lasx => unsafe { kernel::l2_f16_lasx(x.as_ptr(), y.as_ptr(), x.len() as u32) },
+        #[cfg(all(feature = "fp16kernels", target_arch = "loongarch64"))]
+        HalfBackend::Lsx => unsafe { kernel::l2_f16_lsx(x.as_ptr(), y.as_ptr(), x.len() as u32) },
+        // SimdSupport::AvxFma and SimdSupport::Avx retain their scalar
+        // route; this fallback only extends the tiers the C kernel already
+        // served to Avx512FP16 after checking F16C and FMA.
+        _ => l2_scalar::<f16, f32, 16>(x, y),
     }
 }
 
@@ -359,27 +368,46 @@ impl L2 for f64 {
     #[inline]
     fn l2(x: &[Self], y: &[Self]) -> f32 {
         assert_equal_lengths(x.len(), y.len());
-        l2_f64_simd(x, y)
+        #[cfg(target_arch = "x86_64")]
+        {
+            l2_f64_with(*SIMD_SUPPORT, x, y)
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            l2_f64_simd_other(x, y)
+        }
+    }
+
+    fn l2_batch_into(x: &[Self], batch: &[Self], dimension: usize, output: &mut [f32]) {
+        assert_batch_output_layout(x.len(), batch.len(), dimension, output.len());
+        // Reading `SIMD_SUPPORT` per vector costs a large share of a
+        // dimension-8 distance, so read it once per batch.
+        #[cfg(target_arch = "x86_64")]
+        let support = *SIMD_SUPPORT;
+        for (distance, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
+            #[cfg(target_arch = "x86_64")]
+            {
+                *distance = l2_f64_with(support, x, y);
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                *distance = l2_f64_simd_other(x, y);
+            }
+        }
     }
 }
 
-/// L2 distance for f64, runtime-dispatched via `SIMD_SUPPORT` on x86_64
-/// (AVX-512 / AVX2+FMA / AVX+FMA / AVX / scalar). Non-x86 uses the SIMD
-/// primitives in `crate::simd::f64`, unconditionally backed by NEON / LSX-LASX.
-#[inline]
-fn l2_f64_simd(x: &[f64], y: &[f64]) -> f32 {
-    #[cfg(target_arch = "x86_64")]
-    {
-        match *SIMD_SUPPORT {
-            SimdSupport::Avx512 | SimdSupport::Avx512FP16 => unsafe { x86::l2_f64_avx512(x, y) },
-            SimdSupport::Avx2 | SimdSupport::AvxFma => unsafe { x86::l2_f64_avx_fma(x, y) },
-            SimdSupport::Avx => unsafe { x86::l2_f64_avx(x, y) },
-            _ => l2_f64_scalar(x, y),
-        }
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        l2_f64_simd_other(x, y)
+/// L2 distance for f64 on x86_64 at a given SIMD tier
+/// (AVX-512 / AVX2+FMA / AVX+FMA / AVX / scalar). Non-x86 uses
+/// `l2_f64_simd_other`, unconditionally backed by NEON / LSX-LASX.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn l2_f64_with(support: SimdSupport, x: &[f64], y: &[f64]) -> f32 {
+    match support {
+        SimdSupport::Avx512 | SimdSupport::Avx512FP16 => unsafe { x86::l2_f64_avx512(x, y) },
+        SimdSupport::Avx2 | SimdSupport::AvxFma => unsafe { x86::l2_f64_avx_fma(x, y) },
+        SimdSupport::Avx => unsafe { x86::l2_f64_avx(x, y) },
+        _ => l2_f64_scalar(x, y),
     }
 }
 
@@ -1212,7 +1240,7 @@ mod tests {
             (x, y) in arbitrary_vector_pair(arbitrary_f64, 4..4048)
         ) {
             let scalar = l2_f64_scalar(&x, &y);
-            let simd = l2_f64_simd(&x, &y);
+            let simd = <f64 as L2>::l2(&x, &y);
             prop_assert!(approx::relative_eq!(scalar, simd, max_relative = 1e-6));
         }
 
@@ -1381,8 +1409,9 @@ mod tests {
         assert_relative_eq!(d2[1], 0.0); // q2 == target[1]
     }
 
-    /// `l2_batch_into` must agree with the per-vector `l2`, both for the f32
-    /// batch kernel and for the per-vector default that f64 uses.
+    /// `l2_batch_into` must agree with the per-vector `l2` for the f32 batch
+    /// kernel and for the f64 and f16 loops that select their backend once
+    /// per batch.
     #[rstest::rstest]
     #[case::dim_8(8)]
     #[case::dim_12(12)]
@@ -1412,6 +1441,7 @@ mod tests {
         }
         check::<f32>(dimension);
         check::<f64>(dimension);
+        check::<f16>(dimension);
     }
 
     #[rstest::rstest]
