@@ -2056,7 +2056,7 @@ mod composite {
     use lance_table::transaction::action::{
         Action, AddBase, AddDataFile, AddField, AddFragment, AlterField, CompositeOperation,
         ConfigUpdate, DropField, Ref, RemoveFragment, ReserveFragmentIds, ReserveRowIds,
-        ResetTable, SetDeletionFile, TombstoneFieldData, UserAction,
+        ResetTable, SetDeletionFile, TombstoneFieldData, UserStep,
     };
     use lance_table::transaction::{Operation, Transaction, UpdateMap, UpdateMapEntry};
     use roaring::RoaringBitmap;
@@ -2093,7 +2093,7 @@ mod composite {
     fn composite_txn(read_version: u64, actions: Vec<Action>) -> Transaction {
         Transaction::new(
             read_version,
-            Operation::CompositeOperation(CompositeOperation::new(vec![UserAction::new(
+            Operation::CompositeOperation(CompositeOperation::new(vec![UserStep::new(
                 "step", actions,
             )])),
             None,
@@ -2776,7 +2776,7 @@ mod composite {
             .with_experimental_composite_operations(true)
             .execute(Transaction::new(
                 read_version,
-                Operation::CompositeOperation(CompositeOperation::new(vec![UserAction::new(
+                Operation::CompositeOperation(CompositeOperation::new(vec![UserStep::new(
                     "step",
                     append(0),
                 )])),
@@ -2792,7 +2792,7 @@ mod composite {
             .with_experimental_composite_operations(true)
             .execute(Transaction::new(
                 read_version,
-                Operation::CompositeOperation(CompositeOperation::new(vec![UserAction::new(
+                Operation::CompositeOperation(CompositeOperation::new(vec![UserStep::new(
                     "step",
                     append(0),
                 )])),
@@ -2814,7 +2814,7 @@ mod composite {
         let tombstone = || {
             Transaction::new(
                 read_version,
-                Operation::CompositeOperation(CompositeOperation::new(vec![UserAction::new(
+                Operation::CompositeOperation(CompositeOperation::new(vec![UserStep::new(
                     "step",
                     vec![Action::TombstoneFieldData(TombstoneFieldData {
                         fragment: Ref::Committed(fragment_id),

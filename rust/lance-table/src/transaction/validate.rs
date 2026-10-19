@@ -1063,7 +1063,7 @@ mod tests {
     use crate::format::overlay::{DataOverlayFile, OverlayCoverage};
     use crate::format::{DataFile, DataStorageFormat};
     use crate::transaction::action::{
-        AddField, AlterField, CompositeOperation, DropField, Ref, SetDeletionFile, UserAction,
+        AddField, AlterField, CompositeOperation, DropField, Ref, SetDeletionFile, UserStep,
     };
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use lance_core::datatypes::{Field as LanceCoreField, LogicalType, Schema as LanceSchema};
@@ -1790,7 +1790,7 @@ mod tests {
     ) {
         let manifest = activated_manifest();
         let operation =
-            Operation::CompositeOperation(CompositeOperation::new(vec![UserAction::new(
+            Operation::CompositeOperation(CompositeOperation::new(vec![UserStep::new(
                 "step",
                 vec![action],
             )]));
