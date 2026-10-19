@@ -27,7 +27,7 @@ use crate::buffer::LanceBuffer;
 use crate::compression::{CompressionStrategy, compress_required_block};
 use crate::constants::{
     COMPRESSION_LEVEL_META_KEY, COMPRESSION_META_KEY, DICT_DIVISOR_META_KEY,
-    DICT_SIZE_RATIO_META_KEY, DICT_VALUES_COMPRESSION_ENV_VAR,
+    DICT_MAX_SIZE_META_KEY, DICT_SIZE_RATIO_META_KEY, DICT_VALUES_COMPRESSION_ENV_VAR,
     DICT_VALUES_COMPRESSION_LEVEL_ENV_VAR, DICT_VALUES_COMPRESSION_LEVEL_META_KEY,
     DICT_VALUES_COMPRESSION_META_KEY, STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY,
     STRUCTURAL_ENCODING_MINIBLOCK, STRUCTURAL_ENCODING_SPARSE,
@@ -52,8 +52,8 @@ use crate::utils::accumulation::AccumulationQueue;
 use crate::utils::bytepack::BytepackedIntegerEncoder;
 
 use super::{
-    DEFAULT_DICT_DIVISOR, DEFAULT_DICT_MAX_CARDINALITY, DEFAULT_DICT_SIZE_RATIO,
-    DEFAULT_DICT_VALUES_COMPRESSION, FILL_BYTE, MINIBLOCK_ALIGNMENT,
+    DEFAULT_DICT_DIVISOR, DEFAULT_DICT_MAX_CARDINALITY, DEFAULT_DICT_MAX_SIZE_BYTES,
+    DEFAULT_DICT_SIZE_RATIO, DEFAULT_DICT_VALUES_COMPRESSION, FILL_BYTE, MINIBLOCK_ALIGNMENT,
 };
 use super::{constant, dict, layout, miniblock, sparse};
 
@@ -233,6 +233,8 @@ struct SerializedMiniBlockPage {
 struct DictEncodingBudget {
     max_dict_entries: u32,
     max_encoded_size: usize,
+    /// Upper bound on the dictionary's value bytes; see `DICT_MAX_SIZE_META_KEY`.
+    max_dict_bytes: usize,
 }
 
 enum PrimitivePageStructure {
@@ -1603,6 +1605,15 @@ impl PrimitiveStructuralEncoder {
         let max_encoded_size = (data_size as f64 * threshold_ratio) as u64;
         let max_encoded_size = usize::try_from(max_encoded_size).ok()?;
 
+        // The reader loads a page's dictionary whole the first time the page is touched,
+        // so a dictionary of large values (images, documents) turns every point read into
+        // a read of the whole dictionary even when it shrinks the page.
+        let max_dict_bytes: usize = field
+            .metadata
+            .get(DICT_MAX_SIZE_META_KEY)
+            .and_then(|val| val.parse().ok())
+            .unwrap_or(DEFAULT_DICT_MAX_SIZE_BYTES);
+
         // Avoid probing dictionary encoding on data that appears to be near-unique
         // or likely to exceed the dictionary budget.
         if let Some(sample_unique_ratio) =
@@ -1622,6 +1633,7 @@ impl PrimitiveStructuralEncoder {
         Some(DictEncodingBudget {
             max_dict_entries,
             max_encoded_size,
+            max_dict_bytes,
         })
     }
 
@@ -2102,6 +2114,7 @@ impl PrimitiveStructuralEncoder {
                 &data_block,
                 budget.max_dict_entries,
                 budget.max_encoded_size,
+                budget.max_dict_bytes,
             )
         });
 
