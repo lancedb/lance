@@ -566,6 +566,22 @@ async fn test_zone_write_seed_columns_follow_rename() {
 }
 
 #[tokio::test]
+async fn test_zone_write_seed_columns_use_8192_row_zones() {
+    let dir = TempStrDir::default();
+    let mut dataset = dataset_without_seed_index(dir.as_str()).await;
+    dataset.set_zone_write_seed_columns(&["val"]).await.unwrap();
+    dataset
+        .append(
+            RecordBatchIterator::new([Ok(rows(30..8225, base_value))], schema()),
+            None,
+        )
+        .await
+        .unwrap();
+    let file = &dataset.fragments().last().unwrap().files[0];
+    assert_configured_seed_matches_physical(&dataset, &file.path, "val").await;
+}
+
+#[tokio::test]
 async fn test_zone_write_seed_columns_reject_invalid_selection_atomically() {
     let dir = TempStrDir::default();
     let mut dataset = dataset_without_seed_index(dir.as_str()).await;
