@@ -38,8 +38,8 @@ use lance_arrow::{
 };
 use lance_core::{
     datatypes::{
-        BLOB_V2_DESC_TYPE, BLOB_V2_LOGICAL_MINIMAL_FIELDS, BLOB_V2_PREPARED_FIELDS,
-        BLOB_V2_PREPARED_TYPE, BlobKind, BlobV2Layout, Field as LanceField, Schema as LanceSchema,
+        BLOB_V2_DESC_TYPE, BLOB_V2_LOGICAL_MINIMAL_FIELDS, BLOB_V2_PREPARED_TYPE, BlobKind,
+        BlobV2Layout, Field as LanceField, Schema as LanceSchema,
     },
     utils::blob::blob_path,
 };
@@ -142,16 +142,29 @@ pub(crate) fn prepared_blob_field_with_metadata(
     Field::new(name, BLOB_V2_PREPARED_TYPE.clone(), nullable).with_metadata(metadata)
 }
 
+/// `prepared` under the field ids `source` carries: its own, and each
+/// same-named child's. A stored blob keeps only `data` and `uri`, under the ids
+/// of its prepared children, so this is what keeps a generation's blob children
+/// under the table's ids.
+pub(crate) fn with_field_ids_of(prepared: Field, source: &Field) -> Result<Field> {
+    let source = LanceField::try_from(source)?;
+    Ok(crate::dataset::mem_wal::stamp_field_id(
+        &prepared,
+        std::slice::from_ref(&source),
+    ))
+}
+
 fn logical_to_prepared_blob_field(field: &Field) -> Result<Field> {
     if field.is_blob_v2() {
         return match blob_v2_layout(field) {
-            Some(BlobV2Layout::Logical) | Some(BlobV2Layout::Prepared) => {
-                Ok(prepared_blob_field_with_metadata(
+            Some(BlobV2Layout::Logical) | Some(BlobV2Layout::Prepared) => with_field_ids_of(
+                prepared_blob_field_with_metadata(
                     field.name(),
                     field.is_nullable(),
                     field.metadata().clone(),
-                ))
-            }
+                ),
+                field,
+            ),
             _ => Err(blob_v2_shape_error(
                 field,
                 &[BlobV2Layout::Logical, BlobV2Layout::Prepared],
@@ -723,6 +736,12 @@ impl BlobDescriptorArrayBuilder {
         }
     }
 
+    /// Prepare the column under the field ids `source` carries.
+    pub(crate) fn with_field_ids_of(mut self, source: &Field) -> Result<Self> {
+        self.field = with_field_ids_of(self.field, source)?;
+        Ok(self)
+    }
+
     /// Append one packed blob descriptor.
     pub fn push_packed(&mut self, blob_id: u32, range: BlobRange) -> Result<()> {
         self.push(BlobDescriptor::Packed {
@@ -882,8 +901,14 @@ impl BlobDescriptorArrayBuilder {
             }
         }
 
+        let DataType::Struct(children) = self.field.data_type() else {
+            return Err(Error::internal(format!(
+                "prepared blob field '{}' is not a struct",
+                self.field.name()
+            )));
+        };
         let array = Arc::new(StructArray::try_new(
-            BLOB_V2_PREPARED_FIELDS.clone(),
+            children.clone(),
             vec![
                 Arc::new(kind_builder.finish()),
                 Arc::new(data_builder.finish()),
@@ -1312,6 +1337,7 @@ mod tests {
     use arrow_schema::{Fields, Schema as ArrowSchema};
     use async_trait::async_trait;
     use futures::task::noop_waker;
+    use lance_core::datatypes::BLOB_V2_PREPARED_FIELDS;
     use lance_core::datatypes::{BLOB_V2_DESC_FIELDS, BLOB_V2_LOGICAL_FIELDS};
     use lance_core::utils::tempfile::TempDir;
     use lance_io::object_writer::WriteResult;
