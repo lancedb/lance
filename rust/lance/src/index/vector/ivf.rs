@@ -118,6 +118,7 @@ use lance_linalg::{distance::Normalize, kernels::normalize_fsl_owned};
 use lance_select::RowAddrTreeMap;
 use lance_table::format::{IndexFile, IndexMetadata as TableIndexMetadata};
 use log::{info, warn};
+use num_traits::{AsPrimitive, Float, FromPrimitive};
 use object_store::path::Path;
 use prost::Message;
 use rand::rngs::SmallRng;
@@ -3631,42 +3632,9 @@ impl<'a> FixedIvfTrainingSampler<'a> {
 
 type KMeansProgressCallback = Arc<dyn Fn(u32, u32) + Send + Sync>;
 
-trait StreamingKMeansFloat:
-    Copy
-    + Default
-    + PartialOrd
-    + std::ops::Add<Output = Self>
-    + std::ops::AddAssign
-    + std::ops::Div<Output = Self>
-    + std::ops::Mul<Output = Self>
-    + std::ops::Sub<Output = Self>
+trait StreamingKMeansArrowType:
+    ArrowPrimitiveType<Native: Float + FromPrimitive + AsPrimitive<f64> + std::ops::AddAssign> + Sized
 {
-    fn from_f64(value: f64) -> Self;
-
-    fn to_f64(self) -> f64;
-}
-
-impl StreamingKMeansFloat for f32 {
-    fn from_f64(value: f64) -> Self {
-        value as Self
-    }
-
-    fn to_f64(self) -> f64 {
-        self as f64
-    }
-}
-
-impl StreamingKMeansFloat for f64 {
-    fn from_f64(value: f64) -> Self {
-        value
-    }
-
-    fn to_f64(self) -> f64 {
-        self
-    }
-}
-
-trait StreamingKMeansArrowType: ArrowPrimitiveType<Native: StreamingKMeansFloat> + Sized {
     fn from_values(values: Vec<Self::Native>) -> PrimitiveArray<Self>;
 }
 
@@ -3680,6 +3648,18 @@ impl StreamingKMeansArrowType for Float64Type {
     fn from_values(values: Vec<Self::Native>) -> PrimitiveArray<Self> {
         PrimitiveArray::from(values)
     }
+}
+
+fn cast_weight<T: StreamingKMeansArrowType>(
+    weight: f64,
+    context: impl std::fmt::Display,
+) -> Result<T::Native> {
+    T::Native::from_f64(weight).ok_or_else(|| {
+        Error::invalid_input(format!(
+            "streaming kmeans cannot convert {context} weight {weight} to {}",
+            T::DATA_TYPE
+        ))
+    })
 }
 
 fn streaming_kmeans_values<T: StreamingKMeansArrowType>(
@@ -3729,13 +3709,6 @@ fn prepare_streaming_coreset_sample<T: StreamingKMeansArrowType>(
         }
     };
 
-    if prepared.value_type() != T::DATA_TYPE {
-        return Err(Error::invalid_input(format!(
-            "streaming coreset kmeans prepared {} values, expected {}",
-            prepared.value_type(),
-            T::DATA_TYPE
-        )));
-    }
     Ok(prepared)
 }
 
@@ -3985,11 +3958,11 @@ fn streaming_float_kmeans_metric_policy<T: StreamingKMeansArrowType>(
     }
 }
 
-fn squared_l2<N: StreamingKMeansFloat>(left: &[N], right: &[N]) -> f64 {
+fn squared_l2<N: AsPrimitive<f64>>(left: &[N], right: &[N]) -> f64 {
     left.iter()
         .zip(right)
         .map(|(left, right)| {
-            let diff = left.to_f64() - right.to_f64();
+            let diff = left.as_() - right.as_();
             diff * diff
         })
         .sum()
@@ -4152,8 +4125,9 @@ fn update_refined_centroids<T: StreamingKMeansArrowType>(
         }
         let centroid = &mut next[cluster_id * dimension..(cluster_id + 1) * dimension];
         let sum = &cluster_sums[cluster_id * dimension..(cluster_id + 1) * dimension];
+        let weight = cast_weight::<T>(weight, format_args!("refinement cluster {cluster_id}"))?;
         for (value, sum) in centroid.iter_mut().zip(sum) {
-            *value = *sum / T::Native::from_f64(weight);
+            *value = *sum / weight;
         }
     }
     streaming_kmeans_fsl_from_values::<T>(next, dimension)
@@ -4413,7 +4387,7 @@ impl<T: StreamingKMeansArrowType> WeightedCoreset<T> {
         for (row_idx, vector) in self.values.chunks_exact(dimension).enumerate() {
             let weight = self.weights[row_idx];
             for dim in 0..dimension {
-                let value = vector[dim].to_f64();
+                let value: f64 = vector[dim].as_();
                 weighted_sums[dim] += weight * value;
                 weighted_square_sums[dim] += weight * value * value;
             }
@@ -4456,9 +4430,10 @@ impl<T: StreamingKMeansArrowType> WeightedCoreset<T> {
                 for &idx in &indices[group_start..group_end] {
                     let weight = self.weights[idx];
                     weight_sum += weight;
+                    let weight = cast_weight::<T>(weight, format_args!("coreset row {idx}"))?;
                     let vector = &self.values[idx * dimension..(idx + 1) * dimension];
                     for (sum, value) in centroid.iter_mut().zip(vector) {
-                        *sum += *value * T::Native::from_f64(weight);
+                        *sum += *value * weight;
                     }
                 }
             }
@@ -4466,15 +4441,16 @@ impl<T: StreamingKMeansArrowType> WeightedCoreset<T> {
                 reduced.values.truncate(centroid_start);
                 continue;
             }
+            let weight = cast_weight::<T>(weight_sum, format_args!("coreset group {group_idx}"))?;
             {
                 let centroid = &mut reduced.values[centroid_start..centroid_start + dimension];
                 for value in centroid {
-                    *value = *value / T::Native::from_f64(weight_sum);
+                    *value = *value / weight;
                 }
             }
             if reduced.values[centroid_start..centroid_start + dimension]
                 .iter()
-                .any(|value| !value.to_f64().is_finite())
+                .any(|value| !value.is_finite())
             {
                 return Err(Error::invalid_input(format!(
                     "streaming coreset reduction produced nonfinite centroid for metric {}",
@@ -4622,8 +4598,9 @@ fn assign_weighted_points<T: StreamingKMeansArrowType>(
         cluster_losses[cluster_id] += base_losses[row_idx] + weight * distance as f64;
         let vector = &data_values[row_idx * dimension..(row_idx + 1) * dimension];
         let centroid_sum = &mut centroid_sums[cluster_id * dimension..(cluster_id + 1) * dimension];
+        let weight = cast_weight::<T>(weight, format_args!("weighted row {row_idx}"))?;
         for (sum, value) in centroid_sum.iter_mut().zip(vector) {
-            *sum += *value * T::Native::from_f64(weight);
+            *sum += *value * weight;
         }
     }
 
@@ -4631,10 +4608,12 @@ fn assign_weighted_points<T: StreamingKMeansArrowType>(
     for cluster_id in 0..k {
         let next_centroid =
             &mut next_centroids[cluster_id * dimension..(cluster_id + 1) * dimension];
-        if cluster_weights[cluster_id] > 0.0 {
+        let weight = cluster_weights[cluster_id];
+        if weight > 0.0 {
             let centroid_sum = &centroid_sums[cluster_id * dimension..(cluster_id + 1) * dimension];
+            let weight = cast_weight::<T>(weight, format_args!("weighted cluster {cluster_id}"))?;
             for (value, sum) in next_centroid.iter_mut().zip(centroid_sum) {
-                *value = *sum / T::Native::from_f64(cluster_weights[cluster_id]);
+                *value = *sum / weight;
             }
         } else {
             next_centroid.copy_from_slice(
@@ -4642,10 +4621,7 @@ fn assign_weighted_points<T: StreamingKMeansArrowType>(
             );
         }
     }
-    if next_centroids
-        .iter()
-        .any(|value| !value.to_f64().is_finite())
-    {
+    if next_centroids.iter().any(|value| !value.is_finite()) {
         return Err(Error::invalid_input(format!(
             "weighted kmeans produced nonfinite centroid for metric {}",
             metric_policy.metric_type()
@@ -4758,7 +4734,7 @@ fn append_local_coreset<T: StreamingKMeansArrowType>(
     let centroids = FixedSizeListArray::try_new_from_values(kmeans.centroids, dimension as i32)?;
     if streaming_kmeans_values::<T>(&centroids)?
         .iter()
-        .any(|value| !value.to_f64().is_finite())
+        .any(|value| !value.is_finite())
     {
         return Err(Error::invalid_input(format!(
             "local streaming kmeans produced nonfinite centroid for metric {}",
@@ -7480,6 +7456,92 @@ mod tests {
         );
     }
 
+    #[rstest]
+    #[case::l2(MetricType::L2)]
+    #[case::cosine(MetricType::Cosine)]
+    #[tokio::test]
+    async fn test_streaming_coreset_f64_index_roundtrip(#[case] metric_type: MetricType) {
+        const NUM_PARTITIONS: usize = 257;
+        const EXPECTED_ROW: usize = 321;
+        const K: usize = 5;
+
+        let test_dir = TempStrDir::default();
+        let batch = gen_batch()
+            .with_seed(42.into())
+            .col("id", array::step::<UInt64Type>())
+            .col("vector", array::rand_vec::<Float64Type>(4.into()))
+            .into_batch_rows(600.into())
+            .unwrap();
+        let query = batch["vector"].as_fixed_size_list().value(EXPECTED_ROW);
+        let mut dataset = InsertBuilder::new(test_dir.as_str())
+            .with_params(&WriteParams {
+                max_rows_per_file: 300,
+                ..Default::default()
+            })
+            .execute(vec![batch])
+            .await
+            .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 2);
+
+        // Both settings are needed to select streaming coreset training.
+        let mut ivf_params = IvfBuildParams::new(NUM_PARTITIONS);
+        ivf_params.sample_rate = 2;
+        ivf_params.streaming_sample_rate = Some(1);
+        ivf_params.max_iters = 1;
+        let params = VectorIndexParams::with_ivf_flat_params(metric_type, ivf_params);
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, false)
+            .await
+            .unwrap();
+        drop(dataset);
+
+        let dataset = Dataset::open(test_dir.as_str()).await.unwrap();
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 1);
+        let index = dataset
+            .open_vector_index("vector", &indices[0].uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let model = index.ivf_model();
+        assert_eq!(model.num_partitions(), NUM_PARTITIONS);
+        let centroids = model.centroids.as_ref().unwrap();
+        assert_eq!(centroids.value_type(), DataType::Float64);
+        assert!(
+            centroids
+                .values()
+                .as_primitive::<Float64Type>()
+                .values()
+                .iter()
+                .any(|value| *value != *value as f32 as f64)
+        );
+
+        let mut scanner = dataset.scan();
+        scanner
+            .nearest("vector", query.as_ref(), K)
+            .unwrap()
+            .distance_metric(metric_type)
+            .minimum_nprobes(16);
+        let plan = scanner.explain_plan(false).await.unwrap();
+        assert!(plan.contains("ANNIvfPartition"), "{plan}");
+        let result = scanner.try_into_batch().await.unwrap();
+        assert_eq!(result.num_rows(), K);
+        let ids = result["id"].as_primitive::<UInt64Type>().values();
+        assert_eq!(ids[0], EXPECTED_ROW as u64);
+
+        let ground_truth = dataset
+            .scan()
+            .nearest("vector", query.as_ref(), K)
+            .unwrap()
+            .distance_metric(metric_type)
+            .use_index(false)
+            .try_into_batch()
+            .await
+            .unwrap();
+        let expected_ids = ground_truth["id"].as_primitive::<UInt64Type>().values();
+        let recall = ids.iter().filter(|id| expected_ids.contains(id)).count() as f32 / K as f32;
+        assert!(recall >= 0.5, "recall: {recall}, row ids: {ids:?}");
+    }
+
     #[test]
     fn test_fixed_training_ranges_are_sorted_and_bounded() {
         let ranges = generate_fixed_training_ranges(10_000, 1_234, 1_024, 16);
@@ -7577,14 +7639,14 @@ mod tests {
     fn assert_weighted_coreset_reduction<T: StreamingKMeansArrowType>() {
         let mut coreset = WeightedCoreset::<T>::new(1, 4);
         for value in [0.0, 100.0, 1.0, 101.0] {
-            coreset.push(&[T::Native::from_f64(value)], 1.0, 0.0);
+            coreset.push(&[T::Native::from_f64(value).unwrap()], 1.0, 0.0);
         }
 
         coreset.reduce_to_budget(1, 2, &L2_METRIC_POLICY).unwrap();
 
         assert_eq!(coreset.len(), 2);
-        assert!((coreset.values[0].to_f64() - 0.5).abs() < 1e-6);
-        assert!((coreset.values[1].to_f64() - 100.5).abs() < 1e-6);
+        assert!((coreset.values[0].as_() - 0.5).abs() < 1e-6);
+        assert!((coreset.values[1].as_() - 100.5).abs() < 1e-6);
 
         let (data, weights, losses) = coreset.into_fsl_parts(1).unwrap();
         assert_eq!(data.value_type(), T::DATA_TYPE);
@@ -7601,7 +7663,7 @@ mod tests {
             streaming_kmeans_values::<T>(&subset)
                 .unwrap()
                 .iter()
-                .map(|value| value.to_f64())
+                .map(|value| value.as_())
                 .collect::<Vec<_>>(),
             vec![100.5, 0.5]
         );
@@ -8098,14 +8160,17 @@ mod tests {
 
     fn assert_weighted_assignment_preserves_empty_centroid<T: StreamingKMeansArrowType>() {
         let data = streaming_kmeans_fsl_from_values::<T>(
-            vec![T::Native::from_f64(0.0), T::Native::from_f64(10.0)],
+            vec![
+                T::Native::from_f64(0.0).unwrap(),
+                T::Native::from_f64(10.0).unwrap(),
+            ],
             1,
         )
         .unwrap();
         let centroids = vec![
-            T::Native::from_f64(0.0),
-            T::Native::from_f64(10.0),
-            T::Native::from_f64(20.0),
+            T::Native::from_f64(0.0).unwrap(),
+            T::Native::from_f64(10.0).unwrap(),
+            T::Native::from_f64(20.0).unwrap(),
         ];
         let result = assign_weighted_points::<T>(
             &data,
@@ -8117,7 +8182,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(result.cluster_weights, vec![1.0, 1.0, 0.0]);
-        assert_eq!(result.centroids[2].to_f64(), 20.0);
+        assert_eq!(result.centroids[2].as_(), 20.0);
     }
 
     #[test]
