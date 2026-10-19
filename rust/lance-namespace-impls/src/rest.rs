@@ -251,7 +251,8 @@ impl RestNamespaceBuilder {
     /// - `tls.cert_file`: Path to client certificate file (optional)
     /// - `tls.key_file`: Path to client private key file (optional)
     /// - `tls.ssl_ca_cert`: Path to CA certificate file (optional)
-    /// - `tls.assert_hostname`: Whether to verify hostname (optional, defaults to true)
+    /// - `tls.assert_hostname`: Whether to verify hostname (optional, defaults to true). Setting
+    ///   it to `false` requires `tls.ssl_ca_cert` and trusts only that CA
     /// - `tls.reload_interval_seconds`: How often the TLS files above are checked for rotation
     ///   (optional, defaults to 300, `0` disables reloading)
     ///
@@ -316,6 +317,17 @@ impl RestNamespaceBuilder {
             .get("tls.assert_hostname")
             .and_then(|v| str_to_bool(v))
             .unwrap_or(true);
+        // reqwest only allows skipping hostname verification when the supplied CA is the sole
+        // trust root, so the option is meaningless without one.
+        if !assert_hostname && ssl_ca_cert.is_none() {
+            return Err(NamespaceError::InvalidInput {
+                message: "'tls.assert_hostname=false' requires 'tls.ssl_ca_cert': it trusts only \
+                          the given CA and disables the system roots. Provide a CA certificate \
+                          or leave hostname verification enabled"
+                    .to_string(),
+            }
+            .into());
+        }
         let reload_interval_seconds = match properties.get("tls.reload_interval_seconds") {
             Some(value) => value.parse::<u64>().map_err(|e| {
                 lance_core::Error::from(NamespaceError::InvalidInput {
@@ -1872,11 +1884,24 @@ mod tests {
         properties.insert("uri".to_string(), "https://api.example.com".to_string());
         properties.insert("tls.cert_file".to_string(), "/path/to/cert.pem".to_string());
         properties.insert("tls.key_file".to_string(), "/path/to/key.pem".to_string());
+        properties.insert("tls.ssl_ca_cert".to_string(), "/path/to/ca.pem".to_string());
         properties.insert("tls.assert_hostname".to_string(), "false".to_string());
 
         let builder = RestNamespaceBuilder::from_properties(properties)
             .expect("Failed to create namespace builder");
         assert!(!builder.assert_hostname);
+    }
+
+    #[test]
+    fn test_disable_hostname_verification_requires_ca_cert() {
+        let mut properties = HashMap::new();
+        properties.insert("uri".to_string(), "https://api.example.com".to_string());
+        properties.insert("tls.assert_hostname".to_string(), "false".to_string());
+
+        let error = RestNamespaceBuilder::from_properties(properties)
+            .expect_err("hostname opt-out without a CA should be rejected")
+            .to_string();
+        assert!(error.contains("tls.ssl_ca_cert"), "{error}");
     }
 
     #[test]
