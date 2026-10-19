@@ -1103,3 +1103,263 @@ async fn do_test_binary_copy_compaction_with_complex_schema(version: LanceFileVe
     assert_eq!(before, after);
     assert_eq!(batch_before, batch_after);
 }
+
+// --- Zone write seed carrying ----------------------------------------------
+
+fn seed_test_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![Field::new("val", DataType::Int64, true)]))
+}
+
+fn seed_test_batch(start: i64, rows: i64) -> RecordBatch {
+    RecordBatch::try_new(
+        seed_test_schema(),
+        vec![Arc::new(Int64Array::from_iter(
+            (start..start + rows).map(|i| (i % 7 != 3).then_some(i)),
+        ))],
+    )
+    .unwrap()
+}
+
+/// Pins the premise the seed concatenation relies on: binary copy flushes an
+/// output only after a whole source file, so no source is ever split across
+/// outputs or filtered.
+#[tokio::test]
+async fn test_binary_copy_splits_only_at_source_boundaries() {
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(seed_test_batch(0, 30))], seed_test_schema()),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 10,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 3);
+
+    // 15 rows per output: the first output takes two whole sources (20 rows,
+    // overshooting the target), the third source lands alone.
+    let metrics = compact_files(
+        &mut dataset,
+        CompactionOptions {
+            target_rows_per_fragment: 15,
+            compaction_mode: Some(CompactionMode::ForceBinaryCopy),
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(metrics.fragments_added, 2);
+    let rows: Vec<usize> = dataset
+        .fragments()
+        .iter()
+        .map(|fragment| fragment.physical_rows.unwrap())
+        .collect();
+    assert_eq!(
+        rows,
+        vec![20, 10],
+        "a source file must never be split across outputs"
+    );
+}
+
+/// Hand-writes a data file with extra global buffers and appends it, then
+/// checks the gate: an unclaimed extra buffer or a `lance.seed.*` key whose
+/// payload is not a zone map seed must keep disqualifying binary copy.
+#[tokio::test]
+async fn test_binary_copy_gate_rejects_unrecognized_extra_buffers() {
+    use crate::dataset::transaction::{Operation, TransactionBuilder};
+    use crate::dataset::write::CommitBuilder;
+    use lance_file::versions as file_versions;
+    use lance_file::writer::FileWriterOptions;
+    use lance_table::format::DataFile;
+
+    for (claim_key, expect_copyable) in [
+        (None, false),
+        (Some("lance.seed.val"), false),
+        (Some("lance.seed.ghost"), false),
+    ] {
+        let dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(seed_test_batch(0, 10))], seed_test_schema()),
+            "memory://",
+            None,
+        )
+        .await
+        .unwrap();
+        let version = dataset.manifest.data_storage_format.lance_file_format();
+        let schema = dataset.schema().clone();
+
+        // A second data file with one extra global buffer that is not a seed.
+        let filename = "doctored.lance".to_string();
+        let path = dataset
+            .base
+            .clone()
+            .join(crate::dataset::DATA_DIR)
+            .join(filename.as_str());
+        let object_writer = dataset.object_store.create(&path).await.unwrap();
+        let mut writer = file_versions::create_writer(
+            version,
+            object_writer,
+            schema.clone(),
+            FileWriterOptions::default(),
+        )
+        .unwrap();
+        writer.write_batch(&seed_test_batch(10, 10)).await.unwrap();
+        let buf_index = writer
+            .add_global_buffer(bytes::Bytes::from_static(b"not a zone map seed"))
+            .await
+            .unwrap();
+        if let Some(key) = claim_key {
+            writer.add_schema_metadata(key, format!("{}", buf_index));
+        }
+        writer.finish().await.unwrap();
+
+        let mut fragment = Fragment::new(0);
+        let (field_ids, column_indices) = file_versions::data_file_columns(version, &schema);
+        let mut data_file = DataFile::new_unstarted(filename, version);
+        data_file.fields = field_ids.into();
+        data_file.column_indices = column_indices.into();
+        fragment.files.push(data_file);
+        fragment.physical_rows = Some(10);
+        let transaction = TransactionBuilder::new(
+            dataset.manifest.version,
+            Operation::Append {
+                fragments: vec![fragment],
+            },
+        )
+        .wrote_v1_seeds(false)
+        .build();
+        let mut dataset = CommitBuilder::new(Arc::new(dataset))
+            .execute(transaction)
+            .await
+            .unwrap();
+
+        let options = CompactionOptions {
+            target_rows_per_fragment: 1_000_000,
+            compaction_mode: Some(CompactionMode::ForceBinaryCopy),
+            ..Default::default()
+        };
+        assert_eq!(
+            can_use_binary_copy(&dataset, &options, &dataset.manifest.fragments).await,
+            expect_copyable,
+            "claim {claim_key:?}"
+        );
+        let error = compact_files(&mut dataset, options, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }), "{claim_key:?}");
+    }
+}
+
+/// Measures binary copy with and without carried seeds: wall time, extra
+/// bytes read, and output seed sizes. Prints the numbers; asserts only that
+/// both runs really used binary copy and that the seeded outputs carry seeds.
+#[allow(clippy::print_stdout)]
+#[tokio::test]
+async fn test_binary_copy_seed_carry_measurement() {
+    use lance_index::IndexType;
+    use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
+
+    for (label, rows_per_file, files) in [
+        ("short files", 2_048usize, 8usize),
+        ("large files", 131_072, 4),
+    ] {
+        for seeded in [false, true] {
+            // Both runs copy `files` inputs of `rows_per_file` rows. The
+            // seeded run appends them after a zone map index exists (the
+            // covered training fragment forms its own bin and stays put).
+            let mut dataset = Dataset::write(
+                RecordBatchIterator::new([Ok(seed_test_batch(0, 16))], seed_test_schema()),
+                "memory://",
+                None,
+            )
+            .await
+            .unwrap();
+            if seeded {
+                let params = ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap)
+                    .with_params(&serde_json::json!({"use_seeds": true}));
+                dataset
+                    .create_index(&["val"], IndexType::ZoneMap, None, &params, false)
+                    .await
+                    .unwrap();
+            }
+            for file in 0..files {
+                dataset
+                    .append(
+                        RecordBatchIterator::new(
+                            [Ok(seed_test_batch(
+                                (16 + file * rows_per_file) as i64,
+                                rows_per_file as i64,
+                            ))],
+                            seed_test_schema(),
+                        ),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+            }
+            let max_before = dataset.fragments().iter().map(|f| f.id).max().unwrap();
+
+            dataset.object_store.io_stats_incremental();
+            let start = std::time::Instant::now();
+            let metrics = compact_files(
+                &mut dataset,
+                CompactionOptions {
+                    target_rows_per_fragment: rows_per_file * files,
+                    compaction_mode: Some(CompactionMode::ForceBinaryCopy),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+            let elapsed = start.elapsed();
+            let io = dataset.object_store.io_stats_incremental();
+            assert_eq!(metrics.fragments_added, 1, "{label} seeded={seeded}");
+
+            let mut seed_bytes_out = 0u64;
+            for fragment in dataset.fragments().iter() {
+                if fragment.id <= max_before {
+                    continue;
+                }
+                for file in &fragment.files {
+                    let path = dataset
+                        .base
+                        .clone()
+                        .join(crate::dataset::DATA_DIR)
+                        .join(file.path.as_str());
+                    let store = dataset.object_store.clone();
+                    let scheduler = lance_io::scheduler::ScanScheduler::new(
+                        store.clone(),
+                        lance_io::scheduler::SchedulerConfig::max_bandwidth(&store),
+                    );
+                    let file_scheduler = scheduler
+                        .open_file(&path, &lance_io::utils::CachedFileSize::unknown())
+                        .await
+                        .unwrap();
+                    let meta = lance_file::reader::FileReader::read_all_metadata(&file_scheduler)
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        meta.file_buffers.len() > 1,
+                        seeded,
+                        "{label}: seeds must be carried exactly when inputs had them"
+                    );
+                    seed_bytes_out += meta
+                        .file_buffers
+                        .iter()
+                        .skip(1)
+                        .map(|b| b.size)
+                        .sum::<u64>();
+                }
+            }
+            println!(
+                "binary-copy seed carry [{label}] seeded={seeded}: rows={} elapsed={elapsed:?} \
+                 read_iops={} read_bytes={} output_seed_bytes={seed_bytes_out}",
+                rows_per_file * files,
+                io.read_iops,
+                io.read_bytes,
+            );
+        }
+    }
+}

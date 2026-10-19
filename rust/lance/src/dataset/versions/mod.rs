@@ -347,7 +347,7 @@ pub async fn rewrite_files_binary_copy(
     fragments: &[Fragment],
     params: &WriteParams,
     read_batch_bytes: Option<usize>,
-) -> Result<Vec<Fragment>> {
+) -> Result<(Vec<Fragment>, bool)> {
     match version {
         ConcreteFileVersion::V1 => Err(Error::not_supported(
             "binary-copy compaction is not supported for Lance file version 1".to_string(),

@@ -50,7 +50,7 @@ use lance_core::deepsize::DeepSizeOf;
 use roaring::RoaringBitmap;
 
 use super::zoned::{ZoneBound, ZoneProcessor, ZoneTrainer, rebuild_zones, search_zones};
-const ROWS_PER_ZONE_DEFAULT: u64 = 8192; // 1 zone every two batches
+pub const ROWS_PER_ZONE_DEFAULT: u64 = 8192; // 1 zone every two batches
 
 const ZONEMAP_FILENAME: &str = "zonemap.lance";
 const ZONEMAP_SIZE_META_KEY: &str = "rows_per_zone";
@@ -958,6 +958,22 @@ impl ZoneMapIndex {
                 &seed.bytes,
                 self.rows_per_zone,
             )?;
+            // The statistics stand in for a scan of the fragment, so they
+            // must cover exactly its physical rows.
+            let covered: u64 = zones
+                .iter()
+                .try_fold(0u64, |total, zone| {
+                    total.checked_add(zone.bound.length as u64)
+                })
+                .ok_or_else(|| {
+                    Error::invalid_input("seed zone lengths overflow u64".to_string())
+                })?;
+            if covered != seed.physical_rows {
+                return Err(Error::invalid_input(format!(
+                    "seed for fragment {} covers {} rows but the fragment holds {}",
+                    seed.fragment_id, covered, seed.physical_rows
+                )));
+            }
             new_zones.append(&mut zones);
 
             if !any_missing_bitmap {
@@ -2002,12 +2018,31 @@ impl ZoneMapSeedWriter {
 
         let num_zones = batch.num_rows();
         let mut zones = Vec::with_capacity(num_zones);
+        // Each zone covers `zone_length` consecutive physical rows and the
+        // zones cover the file's column data in order without gaps, so zone
+        // `i` starts at the checked cumulative sum of the earlier lengths. A
+        // zone shorter or longer than `rows_per_zone` may appear anywhere
+        // (binary-copy compaction concatenates inputs' records, so an input's
+        // tail zone can land mid file and inputs may have been collected at
+        // other granularities); `rows_per_zone` is the writer's collection
+        // granularity, never a read-time stride.
+        let _ = rows_per_zone;
+        let mut next_zone_start: u64 = 0;
         for i in 0..num_zones {
-            let zone_start = i as u64 * rows_per_zone;
+            let zone_start = next_zone_start;
             let zone_length = zone_length_col.value(i);
             let null_count = null_count_col.value(i);
             let nan_count = nan_count_col.value(i);
             let negative_nan_count = negative_nan_count_col.map(|col| col.value(i));
+            if zone_length == 0 {
+                return Err(lance_core::Error::invalid_input(format!(
+                    "seed zone {} has zero length",
+                    i
+                )));
+            }
+            next_zone_start = next_zone_start.checked_add(zone_length).ok_or_else(|| {
+                lance_core::Error::invalid_input("seed zone lengths overflow u64")
+            })?;
             if is_v1 {
                 // Validate per the format: exact counts that fit the zone,
                 // checked without overflow.
@@ -2217,6 +2252,323 @@ fn hex_decode(s: &str) -> std::result::Result<Vec<u8>, String> {
         .collect()
 }
 
+/// A zone write seed parsed and shape-validated for binary-copy carrying.
+///
+/// Binary-copy compaction moves whole data files' pages verbatim, so an
+/// output file's correct seed is the concatenation of its inputs' zone
+/// records in copy order. Parsing proves the buffer really is a zone map
+/// seed of a supported version whose statistics satisfy that version's
+/// layout contract; merging refuses anything it cannot reproduce exactly.
+#[derive(Debug)]
+pub struct MergeableSeed {
+    /// `None` is version 0; `"1"` is version 1. Other versions never parse.
+    version: Option<String>,
+    /// The zone records under a metadata-free schema, so sources concatenate.
+    batch: RecordBatch,
+    /// Exact null offsets within the covered rows; `None` when the source
+    /// predates the bitmap.
+    null_bitmap: Option<RoaringBitmap>,
+    /// Checked sum of `zone_length`: the rows this seed covers.
+    total_rows: u64,
+    /// The collection granularity the locator declares (write-time
+    /// configuration, not a layout rule).
+    rows_per_zone: u64,
+}
+
+impl MergeableSeed {
+    /// The rows this seed covers; the caller must check it against the file's
+    /// physical row count before treating the seed as complete coverage.
+    pub fn total_rows(&self) -> u64 {
+        self.total_rows
+    }
+
+    /// Whether this seed declares format version 1, whose presence in a
+    /// commit requires the paired `FLAG_ZONE_WRITE_SEEDS` bits.
+    pub fn is_version_1(&self) -> bool {
+        self.version.as_deref() == Some(SEED_FORMAT_VERSION)
+    }
+
+    /// The collection granularity the source's locator declared.
+    pub fn rows_per_zone(&self) -> u64 {
+        self.rows_per_zone
+    }
+}
+
+fn seed_parse_error(message: impl std::fmt::Display) -> lance_core::Error {
+    lance_core::Error::invalid_input(format!("zone map seed: {}", message))
+}
+
+/// Parse and validate one seed buffer for binary-copy carrying.
+///
+/// `rows_per_zone` is the collection granularity the locator declares
+/// (`<buffer_index>:<rows_per_zone>`); zones are located by their lengths,
+/// never by it. An error means the buffer must be neither carried nor
+/// silently dropped: an unrecognized shape, an unsupported version, or
+/// statistics that contradict the layout (zero-length zones, counts beyond
+/// the zone, a bitmap outside the covered rows). The caller then refuses
+/// binary copy for the file, preserving the existing protection against
+/// unknown global buffers.
+pub fn parse_seed_for_binary_copy(
+    bytes: &bytes::Bytes,
+    rows_per_zone: u64,
+) -> Result<MergeableSeed> {
+    if rows_per_zone == 0 {
+        return Err(seed_parse_error("locator declares rows_per_zone 0"));
+    }
+    use arrow_ipc::reader::FileReader;
+    use std::io::Cursor;
+
+    let mut reader = FileReader::try_new(Cursor::new(bytes.as_ref()), None)
+        .map_err(|e| seed_parse_error(format!("not a readable IPC buffer: {}", e)))?;
+    let schema = reader.schema();
+    let version = schema.metadata.get(SEED_VERSION_META_KEY).cloned();
+    let is_v1 = match version.as_deref() {
+        None => false,
+        Some(SEED_FORMAT_VERSION) => true,
+        Some(other) => {
+            return Err(lance_core::Error::not_supported_source(
+                format!(
+                    "zone map seed format version '{}' is not supported by this build; \
+                     please upgrade Lance",
+                    other
+                )
+                .into(),
+            ));
+        }
+    };
+    let null_bitmap_hex = schema.metadata.get(SEED_NULL_BITMAP_META_KEY).cloned();
+
+    let batch = match reader.next() {
+        Some(Ok(batch)) => batch,
+        Some(Err(e)) => {
+            return Err(seed_parse_error(format!("unreadable zone batch: {}", e)));
+        }
+        None => return Err(seed_parse_error("no zone batch")),
+    };
+    if reader.next().is_some() {
+        return Err(seed_parse_error("more than one zone batch"));
+    }
+
+    let expected_columns = if is_v1 { 6 } else { 5 };
+    if batch.num_columns() != expected_columns {
+        return Err(seed_parse_error(format!(
+            "expected {} columns, found {}",
+            expected_columns,
+            batch.num_columns()
+        )));
+    }
+    let min_col = batch
+        .column_by_name("min")
+        .ok_or_else(|| seed_parse_error("missing 'min' column"))?;
+    let max_col = batch
+        .column_by_name("max")
+        .ok_or_else(|| seed_parse_error("missing 'max' column"))?;
+    if min_col.data_type() != max_col.data_type() {
+        return Err(seed_parse_error("'min' and 'max' column types differ"));
+    }
+    let null_count_col = batch
+        .column_by_name("null_count")
+        .and_then(|col| col.as_any().downcast_ref::<UInt32Array>())
+        .ok_or_else(|| seed_parse_error("missing or mistyped 'null_count' column"))?
+        .clone();
+    let nan_count_col = batch
+        .column_by_name("nan_count")
+        .and_then(|col| col.as_any().downcast_ref::<UInt32Array>())
+        .ok_or_else(|| seed_parse_error("missing or mistyped 'nan_count' column"))?
+        .clone();
+    let zone_length_col = batch
+        .column_by_name("zone_length")
+        .and_then(|col| col.as_any().downcast_ref::<UInt64Array>())
+        .ok_or_else(|| seed_parse_error("missing or mistyped 'zone_length' column"))?
+        .clone();
+    let negative_nan_count_col = if is_v1 {
+        Some(
+            batch
+                .column_by_name("negative_nan_count")
+                .and_then(|col| col.as_any().downcast_ref::<UInt32Array>())
+                .ok_or_else(|| seed_parse_error("missing or mistyped 'negative_nan_count' column"))?
+                .clone(),
+        )
+    } else {
+        None
+    };
+    // The count columns are non-null by contract; `min`/`max` are nullable
+    // (a null bound means unknown or no ordinary values).
+    for name in [
+        "null_count",
+        "nan_count",
+        "negative_nan_count",
+        "zone_length",
+    ] {
+        if let Some(col) = batch.column_by_name(name)
+            && col.null_count() > 0
+        {
+            return Err(seed_parse_error(format!(
+                "'{}' column must be non-null",
+                name
+            )));
+        }
+    }
+
+    let num_zones = batch.num_rows();
+    if num_zones == 0 {
+        return Err(seed_parse_error("zero zones"));
+    }
+    let mut total_rows: u64 = 0;
+    for i in 0..num_zones {
+        let zone_length = zone_length_col.value(i);
+        if zone_length == 0 {
+            return Err(seed_parse_error(format!("zone {} has zero length", i)));
+        }
+        let null_count = null_count_col.value(i);
+        let nan_count = nan_count_col.value(i);
+        if u64::from(null_count) + u64::from(nan_count) > zone_length {
+            return Err(seed_parse_error(format!(
+                "zone {} counts exceed zone_length: null_count={} nan_count={} zone_length={}",
+                i, null_count, nan_count, zone_length
+            )));
+        }
+        if let Some(negative) = negative_nan_count_col.as_ref().map(|col| col.value(i))
+            && negative > nan_count
+        {
+            return Err(seed_parse_error(format!(
+                "zone {} negative_nan_count {} exceeds nan_count {}",
+                i, negative, nan_count
+            )));
+        }
+        total_rows = total_rows
+            .checked_add(zone_length)
+            .ok_or_else(|| seed_parse_error("zone_length sum overflows u64"))?;
+    }
+
+    let null_bitmap = match null_bitmap_hex {
+        None => None,
+        Some(hex) => {
+            let bitmap_bytes = hex_decode(&hex)
+                .map_err(|e| seed_parse_error(format!("bad null bitmap hex: {}", e)))?;
+            let bitmap = if bitmap_bytes.is_empty() {
+                RoaringBitmap::default()
+            } else {
+                RoaringBitmap::deserialize_from(bitmap_bytes.as_slice())
+                    .map_err(|e| seed_parse_error(format!("bad null bitmap: {}", e)))?
+            };
+            if let Some(max) = bitmap.max()
+                && u64::from(max) >= total_rows
+            {
+                return Err(seed_parse_error(format!(
+                    "null bitmap offset {} outside the {} covered rows",
+                    max, total_rows
+                )));
+            }
+            Some(bitmap)
+        }
+    };
+
+    // A metadata-free schema, so batches from different sources concatenate.
+    let canonical_schema = Arc::new(arrow_schema::Schema::new(batch.schema().fields().clone()));
+    let batch = RecordBatch::try_new(canonical_schema, batch.columns().to_vec())?;
+
+    Ok(MergeableSeed {
+        version,
+        batch,
+        null_bitmap,
+        total_rows,
+        rows_per_zone,
+    })
+}
+
+/// Merge the seeds of the files an output binary-copies, in copy order, into
+/// the output file's seed.
+///
+/// Every record keeps its original statistics; nothing is recomputed or
+/// re-chunked. Zones are located by their lengths, so sources collected at
+/// different granularities concatenate freely and short zones may land
+/// anywhere in the output (the caller picks the output locator's
+/// `rows_per_zone` from the current configuration). `Ok(None)` means the
+/// sources cannot be carried: any version 0 source (no implicit format
+/// conversion) or mismatched value types.
+///
+/// The null bitmap is the union of the sources' bitmaps shifted by each
+/// source's cumulative row offset; any source without a bitmap leaves the
+/// output without one (absence is "unknown", never zero).
+pub fn merge_seeds_for_binary_copy(sources: &[&MergeableSeed]) -> Result<Option<bytes::Bytes>> {
+    use arrow_ipc::writer::FileWriter;
+    use std::io::Cursor;
+
+    let Some(first) = sources.first() else {
+        return Ok(None);
+    };
+    if sources
+        .iter()
+        .any(|source| !source.is_version_1() || source.batch.schema() != first.batch.schema())
+    {
+        return Ok(None);
+    }
+
+    let mut null_bitmap = sources
+        .iter()
+        .all(|source| source.null_bitmap.is_some())
+        .then(RoaringBitmap::new);
+    let mut offset: u64 = 0;
+    for source in sources {
+        if let Some(merged) = null_bitmap.as_mut() {
+            for value in source.null_bitmap.as_ref().expect("checked above") {
+                let shifted = offset
+                    .checked_add(u64::from(value))
+                    .and_then(|shifted| u32::try_from(shifted).ok());
+                let Some(shifted) = shifted else {
+                    // The offsets no longer fit the bitmap's 32-bit space.
+                    return Ok(None);
+                };
+                merged.insert(shifted);
+            }
+        }
+        offset = offset
+            .checked_add(source.total_rows)
+            .ok_or_else(|| seed_parse_error("merged row count overflows u64"))?;
+    }
+
+    let batches: Vec<&RecordBatch> = sources.iter().map(|source| &source.batch).collect();
+    let merged = arrow_select::concat::concat_batches(&first.batch.schema(), batches)
+        .map_err(|e| seed_parse_error(format!("failed to concatenate zone records: {}", e)))?;
+
+    let mut schema = merged.schema().as_ref().clone();
+    schema.metadata.insert(
+        SEED_VERSION_META_KEY.to_string(),
+        SEED_FORMAT_VERSION.to_string(),
+    );
+    if let Some(mut bitmap) = null_bitmap {
+        bitmap.optimize();
+        let bitmap_bytes = if bitmap.is_empty() {
+            Vec::default()
+        } else {
+            let mut bitmap_bytes = Vec::with_capacity(bitmap.serialized_size());
+            bitmap
+                .serialize_into(&mut bitmap_bytes)
+                .map_err(|e| seed_parse_error(format!("failed to serialize null bitmap: {}", e)))?;
+            bitmap_bytes
+        };
+        schema.metadata.insert(
+            SEED_NULL_BITMAP_META_KEY.to_string(),
+            hex_encode(&bitmap_bytes),
+        );
+    }
+    let batch = RecordBatch::try_new(Arc::new(schema), merged.columns().to_vec())?;
+
+    let mut buf = Cursor::new(Vec::new());
+    {
+        let mut writer = FileWriter::try_new(&mut buf, batch.schema_ref())
+            .map_err(|e| seed_parse_error(format!("failed to create IPC writer: {}", e)))?;
+        writer
+            .write(&batch)
+            .map_err(|e| seed_parse_error(format!("failed to write IPC batch: {}", e)))?;
+        writer
+            .finish()
+            .map_err(|e| seed_parse_error(format!("failed to finish IPC writer: {}", e)))?;
+    }
+    Ok(Some(bytes::Bytes::from(buf.into_inner())))
+}
+
 #[cfg(test)]
 mod tests {
     use crate::scalar::registry::VALUE_COLUMN_NAME;
@@ -2254,8 +2606,10 @@ mod tests {
         RowIdRemapper, SargableQuery, ScalarIndex, SearchResult,
         lance_format::LanceIndexStore,
         zonemap::{
-            ZONEMAP_FILENAME, ZONEMAP_SIZE_META_KEY, ZoneMapIndex, ZoneMapIndexBuilderParams,
-            ZoneMapProcessor, ZoneMapSeedWriter, merge_zonemap_indices, remap_zone,
+            SEED_NULL_BITMAP_META_KEY, SEED_VERSION_META_KEY, ZONEMAP_FILENAME,
+            ZONEMAP_SIZE_META_KEY, ZoneMapIndex, ZoneMapIndexBuilderParams, ZoneMapProcessor,
+            ZoneMapSeedWriter, merge_seeds_for_binary_copy, merge_zonemap_indices,
+            parse_seed_for_binary_copy, remap_zone,
         },
     };
     use arrow_array::Int32Array;
@@ -4678,8 +5032,9 @@ mod tests {
 
         let seed = FragmentSeed {
             fragment_id: 1,
+            physical_rows: 4,
             bytes: seed_bytes,
-            metadata_value: format!("0:{}", rows_per_zone),
+            metadata_value: "0".to_string(),
         };
 
         // Update the index with the seed.
@@ -4802,8 +5157,9 @@ mod tests {
             .try_update_with_seeds(
                 &[FragmentSeed {
                     fragment_id: 1,
+                    physical_rows: 2,
                     bytes: seed_bytes,
-                    metadata_value: format!("0:{}", rows_per_zone),
+                    metadata_value: "0".to_string(),
                 }],
                 dest_store.as_ref(),
             )
@@ -5310,6 +5666,277 @@ mod tests {
         assert!(
             index.evaluate_zone_against_query(&legacy, &query).unwrap(),
             "an unknown sign split stays conservative for NaN targets"
+        );
+    }
+
+    // --- Binary-copy seed parsing and merging ------------------------------
+
+    fn seed_bytes_f32(values: &[Option<f32>], rows_per_zone: u64) -> bytes::Bytes {
+        use crate::scalar::seed::IndexSeedWriter;
+        let mut writer = ZoneMapSeedWriter::new("val", rows_per_zone, DataType::Float32).unwrap();
+        let array: ArrayRef = Arc::new(arrow_array::Float32Array::from(values.to_vec()));
+        writer.observe_batch(&array).unwrap();
+        writer.finish().unwrap().unwrap()
+    }
+
+    /// Rewrite a seed buffer's schema metadata and zone batch, to fabricate
+    /// version 0 buffers and corrupt inputs.
+    fn transform_seed(
+        bytes: &bytes::Bytes,
+        transform: impl FnOnce(
+            &mut std::collections::HashMap<String, String>,
+            RecordBatch,
+        ) -> RecordBatch,
+    ) -> bytes::Bytes {
+        use arrow_ipc::reader::FileReader as IpcReader;
+        use arrow_ipc::writer::FileWriter as IpcWriter;
+        use std::io::Cursor;
+
+        let mut reader = IpcReader::try_new(Cursor::new(bytes.as_ref()), None).unwrap();
+        let mut metadata = reader.schema().metadata.clone();
+        let batch = reader.next().unwrap().unwrap();
+        let batch = transform(&mut metadata, batch);
+        let mut schema = batch.schema().as_ref().clone();
+        schema.metadata = metadata;
+        let batch = RecordBatch::try_new(Arc::new(schema), batch.columns().to_vec()).unwrap();
+        let mut buf = Cursor::new(Vec::new());
+        {
+            let mut writer = IpcWriter::try_new(&mut buf, batch.schema_ref()).unwrap();
+            writer.write(&batch).unwrap();
+            writer.finish().unwrap();
+        }
+        bytes::Bytes::from(buf.into_inner())
+    }
+
+    fn to_v0(bytes: &bytes::Bytes) -> bytes::Bytes {
+        transform_seed(bytes, |metadata, batch| {
+            metadata.remove(SEED_VERSION_META_KEY);
+            metadata.remove(SEED_NULL_BITMAP_META_KEY);
+            let keep: Vec<usize> = batch
+                .schema()
+                .fields()
+                .iter()
+                .enumerate()
+                .filter(|(_, field)| field.name() != "negative_nan_count")
+                .map(|(i, _)| i)
+                .collect();
+            batch.project(&keep).unwrap()
+        })
+    }
+
+    fn set_zone_lengths(bytes: &bytes::Bytes, lengths: &[u64]) -> bytes::Bytes {
+        transform_seed(bytes, |_, batch| {
+            let columns: Vec<ArrayRef> = batch
+                .schema()
+                .fields()
+                .iter()
+                .zip(batch.columns())
+                .map(|(field, col)| {
+                    if field.name() == "zone_length" {
+                        Arc::new(UInt64Array::from(lengths.to_vec())) as ArrayRef
+                    } else {
+                        col.clone()
+                    }
+                })
+                .collect();
+            RecordBatch::try_new(batch.schema(), columns).unwrap()
+        })
+    }
+
+    /// Merged ragged sources: zone starts are the cumulative lengths, with
+    /// short zones mid file, and the statistics equal a concatenation.
+    #[test]
+    fn test_merge_seeds_cumulative_starts() {
+        let a_values: Vec<Option<f32>> = vec![
+            Some(1.0),
+            None,
+            Some(-f32::NAN),
+            Some(3.0),
+            // Tail zone of 2 rows under rows_per_zone = 4.
+            Some(f32::NAN),
+            None,
+        ];
+        let b_values: Vec<Option<f32>> = vec![Some(10.0), Some(-2.5), None];
+        // Different collection granularities concatenate: zones are located
+        // by their lengths, and the caller picks the output locator's value.
+        let a = seed_bytes_f32(&a_values, 4);
+        let b = seed_bytes_f32(&b_values, 8);
+        let parsed = [
+            parse_seed_for_binary_copy(&a, 4).unwrap(),
+            parse_seed_for_binary_copy(&b, 8).unwrap(),
+        ];
+        assert_eq!(
+            (parsed[0].rows_per_zone(), parsed[1].rows_per_zone()),
+            (4, 8)
+        );
+        assert_eq!(parsed[0].total_rows(), 6);
+        assert_eq!(parsed[1].total_rows(), 3);
+
+        let merged = merge_seeds_for_binary_copy(&[&parsed[0], &parsed[1]])
+            .unwrap()
+            .unwrap();
+        // Zones are located by length; the locator's rows_per_zone is never
+        // a read-time stride (a source zone may even exceed it).
+        let (zones, bitmap) = ZoneMapSeedWriter::deserialize_seed(7, &merged, 2).unwrap();
+        let bounds: Vec<(u64, usize)> = zones
+            .iter()
+            .map(|z| (z.bound.start, z.bound.length))
+            .collect();
+        assert_eq!(bounds, vec![(0, 4), (4, 2), (6, 3)]);
+        assert!(zones.iter().all(|z| z.bound.fragment_id == 7));
+        assert_eq!(
+            zones.iter().map(|z| z.null_count).collect::<Vec<_>>(),
+            vec![1, 1, 1]
+        );
+        assert_eq!(
+            zones.iter().map(|z| z.nan_count).collect::<Vec<_>>(),
+            vec![1, 1, 0]
+        );
+        assert_eq!(
+            zones
+                .iter()
+                .map(|z| z.negative_nan_count)
+                .collect::<Vec<_>>(),
+            vec![Some(1), Some(0), Some(0)]
+        );
+        // Null offsets shifted by each source's cumulative rows: 1, 5, 6 + 2.
+        let bitmap = bitmap.unwrap();
+        assert_eq!(bitmap.iter().collect::<Vec<_>>(), vec![1, 5, 8]);
+    }
+
+    /// Any version 0 source refuses the merge; a bitmap missing on one source
+    /// leaves the output without one.
+    #[test]
+    fn test_merge_seeds_version_and_bitmap_rules() {
+        let a = seed_bytes_f32(&[Some(1.0), Some(2.0)], 2);
+        let b = seed_bytes_f32(&[Some(3.0), None], 2);
+        let a_parsed = parse_seed_for_binary_copy(&a, 2).unwrap();
+
+        let b_v0 = to_v0(&b);
+        let b_v0_parsed = parse_seed_for_binary_copy(&b_v0, 2).unwrap();
+        assert!(!b_v0_parsed.is_version_1());
+        assert!(
+            merge_seeds_for_binary_copy(&[&a_parsed, &b_v0_parsed])
+                .unwrap()
+                .is_none(),
+            "version 0 sources are never converted"
+        );
+
+        // A version 1 source without a bitmap (older writer) merges, but the
+        // output then has no bitmap: absence is unknown, not zero.
+        let b_no_bitmap = transform_seed(&b, |metadata, batch| {
+            metadata.remove(SEED_NULL_BITMAP_META_KEY);
+            batch
+        });
+        let b_parsed = parse_seed_for_binary_copy(&b_no_bitmap, 2).unwrap();
+        let merged = merge_seeds_for_binary_copy(&[&a_parsed, &b_parsed])
+            .unwrap()
+            .unwrap();
+        let (zones, bitmap) = ZoneMapSeedWriter::deserialize_seed(0, &merged, 2).unwrap();
+        assert!(bitmap.is_none());
+        assert_eq!(
+            zones.iter().map(|z| z.null_count).collect::<Vec<_>>(),
+            vec![0, 1],
+            "exact null counts survive a missing bitmap"
+        );
+    }
+
+    /// Corrupt or contradictory buffers refuse parsing instead of posing as
+    /// missing statistics; unknown versions keep the refusal contract.
+    #[test]
+    fn test_parse_seed_rejects_corrupt_and_unknown() {
+        let good = seed_bytes_f32(&[Some(1.0), Some(2.0), Some(3.0)], 2);
+        assert!(parse_seed_for_binary_copy(&good, 2).is_ok());
+
+        let unknown_version = transform_seed(&good, |metadata, batch| {
+            metadata.insert(SEED_VERSION_META_KEY.to_string(), "9".to_string());
+            batch
+        });
+        let error = parse_seed_for_binary_copy(&unknown_version, 2).unwrap_err();
+        assert!(matches!(error, lance_core::Error::NotSupported { .. }));
+
+        let zero_length = set_zone_lengths(&good, &[2, 0]);
+        assert!(parse_seed_for_binary_copy(&zero_length, 2).is_err());
+
+        // Counts exceeding the zone length contradict the statistics.
+        let shrunk = set_zone_lengths(&good, &[2, 1]);
+        let lying = transform_seed(&shrunk, |_, batch| {
+            let columns: Vec<ArrayRef> = batch
+                .schema()
+                .fields()
+                .iter()
+                .zip(batch.columns())
+                .map(|(field, col)| {
+                    if field.name() == "null_count" {
+                        Arc::new(UInt32Array::from(vec![0u32, 5])) as ArrayRef
+                    } else {
+                        col.clone()
+                    }
+                })
+                .collect();
+            RecordBatch::try_new(batch.schema(), columns).unwrap()
+        });
+        assert!(parse_seed_for_binary_copy(&lying, 2).is_err());
+
+        assert!(
+            parse_seed_for_binary_copy(&bytes::Bytes::from_static(b"not an ipc buffer"), 2)
+                .is_err()
+        );
+        assert!(
+            parse_seed_for_binary_copy(&good, 0).is_err(),
+            "a locator must declare a non-zero rows_per_zone"
+        );
+
+        // A version 0 buffer parses (so the gate can account for it) but is
+        // never carried.
+        let v0 = to_v0(&good);
+        let v0_parsed = parse_seed_for_binary_copy(&v0, 2).unwrap();
+        assert!(!v0_parsed.is_version_1());
+    }
+
+    /// deserialize_seed locates every zone by the cumulative lengths, for
+    /// both versions: a well-formed fixed-stride seed reads unchanged, and
+    /// mid-file short zones read at their true offsets.
+    #[test]
+    fn test_deserialize_seed_locates_zones_by_length() {
+        let values: Vec<Option<f32>> = (0..6).map(|i| Some(i as f32)).collect();
+        let v1 = seed_bytes_f32(&values, 4);
+        let (zones, _) = ZoneMapSeedWriter::deserialize_seed(0, &v1, 4).unwrap();
+        assert_eq!(
+            zones
+                .iter()
+                .map(|z| (z.bound.start, z.bound.length))
+                .collect::<Vec<_>>(),
+            vec![(0, 4), (4, 2)]
+        );
+        let v1_ragged = set_zone_lengths(&v1, &[2, 4]);
+        let (zones, _) = ZoneMapSeedWriter::deserialize_seed(0, &v1_ragged, 4).unwrap();
+        assert_eq!(
+            zones
+                .iter()
+                .map(|z| (z.bound.start, z.bound.length))
+                .collect::<Vec<_>>(),
+            vec![(0, 2), (2, 4)]
+        );
+        // A zone longer than the declared rows_per_zone (a source collected at
+        // a coarser granularity) is still located by its length.
+        let (zones, _) = ZoneMapSeedWriter::deserialize_seed(0, &v1, 2).unwrap();
+        assert_eq!(
+            zones
+                .iter()
+                .map(|z| (z.bound.start, z.bound.length))
+                .collect::<Vec<_>>(),
+            vec![(0, 4), (4, 2)]
+        );
+
+        let v0 = to_v0(&v1);
+        let (zones, _) = ZoneMapSeedWriter::deserialize_seed(0, &v0, 4).unwrap();
+        assert_eq!(
+            zones
+                .iter()
+                .map(|z| (z.bound.start, z.bound.length))
+                .collect::<Vec<_>>(),
+            vec![(0, 4), (4, 2)]
         );
     }
 

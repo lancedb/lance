@@ -481,8 +481,12 @@ async fn try_harvest_seeds(
             return Ok(None);
         };
 
+        let Some(physical_rows) = fragment.physical_rows else {
+            return Ok(None);
+        };
         seeds.push(FragmentSeed {
             fragment_id: fragment.id,
+            physical_rows: physical_rows as u64,
             bytes,
             metadata_value: meta_value,
         });

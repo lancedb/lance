@@ -736,16 +736,22 @@ pub(super) async fn can_use_binary_copy_current(
                 .open_file_with_priority(&full_path, 0, &data_file.file_size_bytes)
                 .await?;
             let file_meta = LFReader::read_all_metadata(&file_scheduler).await?;
-            // Binary copy only preserves page and column-buffer bytes. The output file's footer
-            // (including global buffers) is re-generated, not copied from inputs.
-            //
-            // Therefore, we reject input files that contain any additional global buffers beyond
-            // the required schema / file descriptor global buffer (global buffer index 0).
-            if file_meta.file_buffers.len() > 1 {
-                log::debug!(
-                    "Binary copy disabled: data file has extra global buffers (len={})",
-                    file_meta.file_buffers.len()
-                );
+            // Binary copy only preserves page and column-buffer bytes; the
+            // output footer (including global buffers) is re-generated. Extra
+            // global buffers are allowed only when every one of them is a
+            // recognized zone write seed, which the copy then carries or
+            // drops by explicit per-column rules. Anything unrecognized keeps
+            // disqualifying the file, so no unknown buffer is ever silently
+            // dropped.
+            if file_meta.file_buffers.len() > 1
+                && let Err(e) = binary_copy::seed_carry::extract_source_seeds(
+                    &file_meta,
+                    &file_scheduler,
+                    data_file,
+                )
+                .await
+            {
+                log::debug!("Binary copy disabled: {}", e);
                 return Ok(false);
             }
         }
@@ -2579,9 +2585,9 @@ async fn rewrite_files(
                 .await?
                 .is_some());
     let mut new_fragments: Vec<Fragment>;
-    // Binary copy carries pages verbatim and regenerates footers without
-    // seeds; only the re-encoding branch can embed them.
-    let mut task_wrote_v1_seeds = false;
+    // Whether this task's outputs embed version 1 seeds: re-encoding collects
+    // them afresh, binary copy carries the inputs' seeds forward.
+    let task_wrote_v1_seeds;
     let task_id = uuid::Uuid::new_v4();
     log::info!(
         "Compaction task {}: Begin compacting {} rows across {} fragments",
@@ -2734,7 +2740,7 @@ async fn rewrite_files(
     }
 
     let lineage_plan = if can_binary_copy {
-        new_fragments = versions::rewrite_files_binary_copy(
+        let (copied_fragments, copied_wrote_v1_seeds) = versions::rewrite_files_binary_copy(
             write_version,
             dataset.as_ref(),
             &fragments,
@@ -2742,6 +2748,8 @@ async fn rewrite_files(
             options.binary_copy_read_batch_bytes,
         )
         .await?;
+        new_fragments = copied_fragments;
+        task_wrote_v1_seeds = copied_wrote_v1_seeds;
 
         if new_fragments.is_empty() && matches!(mode, CompactionMode::ForceBinaryCopy) {
             return Err(Error::not_supported_source(
