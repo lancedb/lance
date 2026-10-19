@@ -203,6 +203,19 @@ pub fn load_row_id_sequences<'a>(
 }
 
 pub async fn get_row_id_index(dataset: &Dataset) -> Result<Option<Arc<RowIdIndex>>> {
+    get_row_id_index_with(dataset, true).await
+}
+
+/// The row id index, built with or without the deletion vectors.
+///
+/// Without them the index maps a deleted row id to its address instead of
+/// `None`, but reads no deletion file: on a table with many fragments that is
+/// one request per fragment saved for a caller that already knows its ids are
+/// live.
+pub(crate) async fn get_row_id_index_with(
+    dataset: &Dataset,
+    with_deletions: bool,
+) -> Result<Option<Arc<RowIdIndex>>> {
     if !dataset.manifest.uses_stable_row_ids() {
         return Ok(None);
     }
@@ -211,15 +224,18 @@ pub async fn get_row_id_index(dataset: &Dataset) -> Result<Option<Arc<RowIdIndex
     // manifest generation a cached index could be the old generation's, so
     // build a private one instead of sharing.
     let Some(e_tag) = dataset.manifest_location.e_tag.as_deref() else {
-        return Ok(Some(Arc::new(load_row_id_index(dataset).await?)));
+        return Ok(Some(Arc::new(
+            load_row_id_index(dataset, with_deletions).await?,
+        )));
     };
     let key = RowIdIndexKey {
         version: dataset.manifest.version,
+        with_deletions,
         e_tag: Some(e_tag),
     };
     let index = dataset
         .metadata_cache
-        .get_or_insert_with_key(key, || load_row_id_index(dataset))
+        .get_or_insert_with_key(key, || load_row_id_index(dataset, with_deletions))
         .await?;
     Ok(Some(index))
 }
@@ -371,8 +387,8 @@ async fn row_addrs_to_row_ids_impl(
 /// that needs a sequence still caches its own copy under `RowIdSequenceKey`,
 /// keyed by the fragment's content; the index is keyed by manifest generation
 /// and cannot stand in for it.
-async fn load_row_id_index(dataset: &Dataset) -> Result<RowIdIndex> {
-    load_row_id_index_for_fragments(dataset, &dataset.manifest.fragments).await
+async fn load_row_id_index(dataset: &Dataset, with_deletions: bool) -> Result<RowIdIndex> {
+    load_row_id_index_for_fragments(dataset, &dataset.manifest.fragments, with_deletions).await
 }
 
 /// Build a row id index covering only `fragments`, not the whole dataset.
@@ -386,12 +402,17 @@ async fn load_row_id_index(dataset: &Dataset) -> Result<RowIdIndex> {
 pub(crate) async fn load_row_id_index_for_fragments(
     dataset: &Dataset,
     fragments: &[Fragment],
+    with_deletions: bool,
 ) -> Result<RowIdIndex> {
     // A `for` loop rather than `map`: a closure returning a future that borrows
     // its argument trips the higher-ranked lifetime check on the outer future.
     let mut loads = Vec::with_capacity(fragments.len());
     for fragment in fragments.iter() {
-        loads.push(read_fragment_row_id_index(dataset, fragment));
+        loads.push(read_fragment_row_id_index(
+            dataset,
+            fragment,
+            with_deletions,
+        ));
     }
     let fragment_indices: Vec<FragmentRowIdIndex> = futures::stream::iter(loads)
         .buffer_unordered(dataset.object_store.io_parallelism())
@@ -403,13 +424,14 @@ pub(crate) async fn load_row_id_index_for_fragments(
 async fn read_fragment_row_id_index(
     dataset: &Dataset,
     fragment: &Fragment,
+    with_deletions: bool,
 ) -> Result<FragmentRowIdIndex> {
     let row_id_sequence = Arc::new(read_row_id_sequence(dataset, fragment).await?);
     let deletion_vector = match &fragment.deletion_file {
-        None => Arc::new(DeletionVector::default()),
-        Some(deletion_file) => {
+        Some(deletion_file) if with_deletions => {
             read_dataset_deletion_file(dataset, fragment.id, deletion_file).await?
         }
+        _ => Arc::new(DeletionVector::default()),
     };
     Ok(FragmentRowIdIndex {
         fragment_id: fragment.id as u32,

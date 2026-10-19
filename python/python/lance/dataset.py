@@ -2334,6 +2334,8 @@ class LanceDataset(pa.dataset.Dataset):
         self,
         row_ids: Union[List[int], pa.Array],
         columns: Optional[Union[List[str], Dict[str, str]]] = None,
+        *,
+        ignore_deletions: bool = False,
         **kargs,
     ) -> pa.Table:
         """Select rows by row_ids.
@@ -2348,6 +2350,12 @@ class LanceDataset(pa.dataset.Dataset):
             List of column names to be fetched.
             Or a dictionary of column names to SQL expressions.
             All columns are fetched if None or unspecified.
+        ignore_deletions: bool, default False
+            Take the rows as if the dataset had no deletions. No deletion file
+            is read, which on a table with many fragments saves one request per
+            fragment, but a deleted row comes back with its stored values. Only
+            for row ids known to be live, for example ids read from an index
+            built after the last deletion.
         **kwargs : dict, optional
             See scanner() method for full parameter description.
 
@@ -2360,7 +2368,14 @@ class LanceDataset(pa.dataset.Dataset):
             columns_with_transform = list(columns.items())
             columns = None
         return pa.Table.from_batches(
-            [self._ds.take_rows(row_ids, columns, columns_with_transform)]
+            [
+                self._ds.take_rows(
+                    row_ids,
+                    columns,
+                    columns_with_transform,
+                    ignore_deletions=ignore_deletions,
+                )
+            ]
         )
 
     def take_blobs(

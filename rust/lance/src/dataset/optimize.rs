@@ -6564,6 +6564,7 @@ mod tests {
             // Recording reads fragment metadata, not a row-id index of the table.
             let row_id_index = RowIdIndexKey {
                 version: worker.manifest.version,
+                with_deletions: true,
                 e_tag: worker.manifest_location.e_tag.as_deref(),
             };
             assert!(
