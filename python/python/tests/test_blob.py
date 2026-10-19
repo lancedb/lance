@@ -29,6 +29,74 @@ lance_dataset_module = importlib.import_module("lance.dataset")
 LEGACY_BLOB_STORAGE_VERSION = "2.1"
 
 
+@pytest.mark.parametrize("complete", [False, True], ids=["minimal", "complete"])
+@pytest.mark.parametrize("nested", [False, True], ids=["top-level", "nested"])
+@pytest.mark.parametrize(
+    "child, value",
+    [
+        ("kind", 0),
+        ("position", 0),
+        ("size", 5),
+        ("blob_id", 1),
+        ("blob_uri", "external.bin"),
+    ],
+)
+def test_blob_v2_descriptor_subfield_queries(tmp_path, complete, nested, child, value):
+    external = tmp_path / "external.bin"
+    external.write_bytes(b"world!")
+    blobs = lance.blob_array([b"hello", external.as_uri(), None])
+    if not complete:
+        storage_type = pa.struct(list(blobs.type.storage_type)[:2])
+        blob_type = BlobType.__arrow_ext_deserialize__(storage_type, b"")
+        storage = pa.StructArray.from_arrays(
+            [blobs.storage.field("data"), blobs.storage.field("uri")],
+            fields=list(storage_type),
+            mask=blobs.is_null(),
+        )
+        blobs = pa.ExtensionArray.from_storage(blob_type, storage)
+    if nested:
+        data = pa.table(
+            {
+                "id": [0, 1, 2],
+                "meta": pa.StructArray.from_arrays([blobs], names=["video"]),
+            }
+        )
+        parent = "meta.video"
+    else:
+        data = pa.table({"id": [0, 1, 2], "video": blobs})
+        parent = "video"
+    ds = lance.write_dataset(
+        data,
+        tmp_path / "dataset",
+        data_storage_version="2.2",
+        initial_bases=[DatasetBasePath(tmp_path.as_uri(), name="external", id=1)],
+        max_rows_per_file=2,
+        max_rows_per_group=2,
+    )
+    assert len(ds.get_fragments()) == 2
+    descriptors = ds.to_table(columns=[parent])[parent].to_pylist()
+    expected = [None if row is None else row[child] for row in descriptors]
+    column = f"{parent}.{child}"
+    for columns in [[column], [parent, column]]:
+        result = ds.to_table(columns=columns)
+        assert result.column_names == columns
+        assert result[column].to_pylist() == expected
+
+    literal = f"'{value}'" if isinstance(value, str) else str(value)
+    expected_ids = [i for i, item in enumerate(expected) if item == value]
+    for columns in [["id"], ["id", parent]]:
+        result = ds.to_table(columns=columns, filter=f"{column} = {literal}")
+        assert result.column_names == columns
+        assert result["id"].to_pylist() == expected_ids
+        if parent in columns:
+            assert result[parent].to_pylist() == [descriptors[i] for i in expected_ids]
+        result = ds.to_table(columns=columns, filter=f"{column} IS NULL")
+        assert result.column_names == columns
+        assert result["id"].to_pylist() == [
+            i for i, item in enumerate(expected) if item is None
+        ]
+
+
 def _blob_row_ids(dataset):
     return dataset.to_table(columns=[], with_row_id=True).column("_rowid").to_pylist()
 
