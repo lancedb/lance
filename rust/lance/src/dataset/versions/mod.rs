@@ -170,7 +170,7 @@ pub async fn write_fragments(
             write::validate_blob_v2_write_schema(&schema)?;
         }
     }
-    // Overwrite drops every index, so its seeds would have no consumer.
+    // Overwrite discards index requests; field-level seed collection is independent.
     let consult_indices = !matches!(params.mode, WriteMode::Overwrite);
     let seeds = SeedCollector::for_write(version, dataset, &schema, consult_indices).await?;
     // The write-path fact carried to the commit so it can set the paired
