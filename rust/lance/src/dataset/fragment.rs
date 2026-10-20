@@ -1585,26 +1585,36 @@ impl FileFragment {
         metadata_mode: MetadataMode,
     ) -> BoxFuture<'a, Result<Vec<Box<dyn GenericFileReader>>>> {
         async move {
+            // A fragment written through several `add_columns` holds one file
+            // per column group. Projecting the full schema through every file
+            // only to learn that it holds none of the requested fields was the
+            // hottest CPU path of a take on a wide table, so test the ids first.
+            let projected_ids: HashSet<i32> = projection.field_ids().into_iter().collect();
             // Each open is at least one object-store round trip for the file's
             // metadata; a fragment with several data files (one per
             // `add_columns` / merge) would otherwise pay them back to back.
             // `try_join_all` keeps the readers in data-file order.
-            let opens = self.metadata.files.iter().map(|data_file| async move {
-                match metadata_mode {
-                    MetadataMode::LazyAllowed => {
-                        self.open_reader(data_file, Some(projection), read_config)
+            let opens = self
+                .metadata
+                .files
+                .iter()
+                .filter(|data_file| data_file.fields.iter().any(|id| projected_ids.contains(id)))
+                .map(|data_file| async move {
+                    match metadata_mode {
+                        MetadataMode::LazyAllowed => {
+                            self.open_reader(data_file, Some(projection), read_config)
+                                .await
+                        }
+                        MetadataMode::Full => {
+                            self.open_reader_with_full_metadata(
+                                data_file,
+                                Some(projection),
+                                read_config,
+                            )
                             .await
+                        }
                     }
-                    MetadataMode::Full => {
-                        self.open_reader_with_full_metadata(
-                            data_file,
-                            Some(projection),
-                            read_config,
-                        )
-                        .await
-                    }
-                }
-            });
+                });
             let mut opened_files: Vec<Box<dyn GenericFileReader>> =
                 try_join_all(opens).await?.into_iter().flatten().collect();
 
@@ -6011,6 +6021,43 @@ mod tests {
             .validate()
             .await
             .unwrap();
+    }
+
+    /// A fragment with one data file per column group reads only the files
+    /// that hold a requested field: the others are not even opened.
+    #[tokio::test]
+    async fn test_take_opens_only_files_with_projected_fields() {
+        let test_dir = TempStrDir::default();
+        let mut dataset = create_dataset_v2(&test_dir).await;
+        dataset
+            .add_columns(
+                NewColumnTransform::SqlExpressions(vec![("col1".into(), "i * 2".into())]),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let fragment = dataset.get_fragment(0).unwrap();
+        assert_eq!(fragment.metadata().files.len(), 2);
+        let added_file = fragment.metadata().files[1].path.clone();
+
+        let projection = dataset.schema().project(&["col1"]).unwrap();
+        dataset.object_store.io_stats_incremental();
+        let reader = fragment
+            .open(&projection, FragReadConfig::default())
+            .await
+            .unwrap();
+        let rows = reader.take_as_batch(&[1, 5], None).await.unwrap();
+        assert_eq!(rows.num_rows(), 2);
+        let data_files_read: HashSet<String> = dataset
+            .object_store
+            .io_stats_incremental()
+            .requests
+            .iter()
+            .filter(|request| request.path.as_ref().contains("/data/"))
+            .map(|request| request.path.filename().unwrap().to_string())
+            .collect();
+        assert_eq!(data_files_read, HashSet::from([added_file]));
     }
 
     #[tokio::test]
