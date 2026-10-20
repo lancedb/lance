@@ -539,11 +539,9 @@ fn indexed_projection_column_count(field: &Field) -> Option<usize> {
 pub(crate) fn normalized_column_num_rows(info: &ColumnInfo) -> Result<u64> {
     info.page_infos.iter().try_fold(0_u64, |rows, page| {
         let page_rows = match &page.encoding {
-            PageEncoding::Structural(layout) => match &layout.layout {
-                Some(pbenc21::page_layout::Layout::SparseLayout(sparse)) => {
-                    sparse.row_count_and_scale(page.num_rows)?.0
-                }
-                _ => page.num_rows,
+            PageEncoding::Planar(layout) => match layout.sparse() {
+                Some(sparse) => sparse.row_count_and_scale(page.num_rows)?.0,
+                None => page.num_rows,
             },
             _ => page.num_rows,
         };
@@ -612,6 +610,23 @@ impl FileReader {
         stats: Arc<dyn lance_core::utils::io_stats::IoStatsRecorder>,
     ) -> Self {
         match self.core.scheduler.with_io_stats(stats) {
+            Some(scheduler) => self.with_scheduler(scheduler),
+            None => self.clone(),
+        }
+    }
+
+    /// Returns a clone of this reader whose I/O merges requested byte ranges
+    /// that are at most `gap` bytes apart into one request, instead of those
+    /// within the object store's block size.
+    ///
+    /// Each range is cut back out of the merged request and decoded as
+    /// before, so reads return the same data at every gap; a wider gap reads
+    /// the bytes between the ranges too, in fewer requests. All cached
+    /// metadata is shared with `self`. If the underlying I/O service does not
+    /// coalesce requests (e.g. an in-memory scheduler), the returned reader is
+    /// an ordinary clone.
+    pub fn with_coalesce_gap(&self, gap: u64) -> Self {
+        match self.core.scheduler.with_coalesce_gap(gap) {
             Some(scheduler) => self.with_scheduler(scheduler),
             None => self.clone(),
         }
@@ -2310,6 +2325,11 @@ pub fn describe_encoding(page: &pbfile::column_metadata::Page) -> String {
                                 format!("Unsupported(decode_err={})", err)
                             }
                         }
+                    } else if encoding_any.type_url == "/lance.encodings23.PlanarLayout" {
+                        match encoding_any.to_msg::<lance_encoding::format::pb23::PlanarLayout>() {
+                            Ok(encoding) => format!("{encoding:#?}"),
+                            Err(err) => format!("Unsupported(decode_err={err})"),
+                        }
                     } else {
                         format!("Unrecognized(type_url={})", encoding_any.type_url)
                     }
@@ -2429,6 +2449,7 @@ mod tests {
     };
     use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Field, Fields, Schema as ArrowSchema};
+    use arrow_select::concat::concat_batches;
     use bytes::Bytes;
     use futures::{StreamExt, prelude::stream::TryStreamExt};
     use lance_arrow::{BLOB_META_KEY, RecordBatchExt};
@@ -2441,9 +2462,9 @@ mod tests {
             PageEncoding, ReadBatchTask, decode_batch,
         },
         encoder::{EncodedBatch, EncodingOptions, encode_batch},
-        format::pb21,
+        format::metadata,
     };
-    use lance_io::{stream::RecordBatchStream, utils::CachedFileSize};
+    use lance_io::{scheduler::IoStats, stream::RecordBatchStream, utils::CachedFileSize};
     use log::debug;
     use rstest::rstest;
     use tokio::sync::mpsc;
@@ -2548,6 +2569,10 @@ mod tests {
                     STRUCTURAL_ENCODING_SPARSE.to_string(),
                 ),
                 ("lance-encoding:compression".to_string(), "none".to_string()),
+                (
+                    "lance-encoding:dict-divisor".to_string(),
+                    "100000".to_string(),
+                ),
             ]);
             let values = Arc::new(StringArray::from_iter_values((0..2048).map(|i| {
                 let len = if kind == "binary_range" {
@@ -2557,7 +2582,8 @@ mod tests {
                 };
                 char::from(b'a' + (i % 26) as u8).to_string().repeat(len)
             })));
-            let item = Arc::new(Field::new("item", DataType::Utf8, true));
+            let item =
+                Arc::new(Field::new("item", DataType::Utf8, true).with_metadata(metadata.clone()));
             let lists = ListArray::try_new(
                 item.clone(),
                 OffsetBuffer::new(ScalarBuffer::from((0..=2048).collect::<Vec<i32>>())),
@@ -2599,19 +2625,22 @@ mod tests {
         .unwrap();
         assert_eq!(file_reader.metadata().column_infos.len(), 2);
         if matches!(kind, "rle" | "dictionary") {
-            let PageEncoding::Structural(layout) =
+            let PageEncoding::Planar(layout) =
                 &file_reader.metadata().column_infos[1].page_infos[0].encoding
             else {
                 panic!("expected structural page")
             };
-            let Some(pb21::page_layout::Layout::SparseLayout(sparse)) = &layout.layout else {
+            let Some(sparse) = layout.sparse() else {
                 panic!("expected sparse page")
             };
             let counts = sparse
-                .structural_layers
+                .layers
                 .iter()
                 .find_map(|layer| {
-                    if let Some(pb21::sparse_structural_layer::Layer::List(list)) = &layer.layer {
+                    if let Some(
+                        lance_encoding::format::pb23::sparse_structural_layer::Layer::List(list),
+                    ) = &layer.layer
+                    {
                         list.counts.as_ref()
                     } else {
                         None
@@ -2621,25 +2650,29 @@ mod tests {
             assert!(
                 matches!(
                     (kind, &counts.compression),
-                    ("rle", Some(pb21::compressive_encoding::Compression::Rle(_)))
-                        | (
-                            "dictionary",
-                            Some(pb21::compressive_encoding::Compression::Dictionary(_))
-                        )
+                    (
+                        "rle",
+                        Some(metadata::compressive_encoding::Compression::Rle(_))
+                    ) | (
+                        "dictionary",
+                        Some(metadata::compressive_encoding::Compression::Dictionary(_))
+                    )
                 ),
                 "unexpected count codec: {counts:?}"
             );
         }
         if kind.starts_with("binary_") {
             for column in &file_reader.metadata().column_infos {
-                let PageEncoding::Structural(layout) = &column.page_infos[0].encoding else {
+                let PageEncoding::Planar(layout) = &column.page_infos[0].encoding else {
                     panic!("expected structural page")
                 };
-                let Some(pb21::page_layout::Layout::SparseLayout(sparse)) = &layout.layout else {
-                    panic!("expected sparse page")
+                let Some(lance_encoding::format::pb23::value_plane::Codec::Chunked(values)) =
+                    layout.values.as_ref().and_then(|v| v.codec.as_ref())
+                else {
+                    panic!("expected chunked values")
                 };
-                let Some(pb21::compressive_encoding::Compression::Variable(variable)) =
-                    &sparse.value_compression.as_ref().unwrap().compression
+                let Some(metadata::compressive_encoding::Compression::Variable(variable)) =
+                    &values.compression.as_ref().unwrap().compression
                 else {
                     panic!("expected variable values")
                 };
@@ -2647,12 +2680,12 @@ mod tests {
                 if kind == "binary_range" {
                     assert!(matches!(
                         offsets,
-                        Some(pb21::compressive_encoding::Compression::Range(_))
+                        Some(metadata::compressive_encoding::Compression::Range(_))
                     ));
                 } else {
                     assert!(matches!(
                         offsets,
-                        Some(pb21::compressive_encoding::Compression::Delta(_))
+                        Some(metadata::compressive_encoding::Compression::Delta(_))
                     ));
                 }
             }
@@ -2666,11 +2699,8 @@ mod tests {
                 .all(|page| {
                     matches!(
                         &page.encoding,
-                        PageEncoding::Structural(layout)
-                            if matches!(
-                                layout.layout,
-                                Some(pb21::page_layout::Layout::SparseLayout(_))
-                            )
+                        PageEncoding::Planar(layout)
+                            if layout.structure.is_some() && layout.values.is_some()
                     )
                 })
         );
@@ -4221,6 +4251,135 @@ mod tests {
             stats.read_iops, 1,
             "{num_pages} adjacent pages must be read together, not one request each"
         );
+    }
+
+    /// Read `ranges` of every column through a clone of `reader` that merges
+    /// requested byte ranges at most `gap` bytes apart (the store's block size
+    /// when `None`), returning the batch and the requests the read made.
+    async fn read_ranges_with_gap(
+        reader: &FileReader,
+        ranges: &[std::ops::Range<u64>],
+        gap: Option<u64>,
+    ) -> (RecordBatch, u64) {
+        let stats = IoStats::new();
+        let mut reader = reader.with_io_stats(stats.recorder());
+        if let Some(gap) = gap {
+            reader = reader.with_coalesce_gap(gap);
+        }
+        let batches = reader
+            .read_stream(
+                lance_io::ReadBatchParams::Ranges(ranges.into()),
+                u32::MAX,
+                1,
+                FilterExpression::no_filter(),
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let batch = concat_batches(&batches[0].schema(), &batches).unwrap();
+        (batch, stats.snapshot().iops)
+    }
+
+    /// A reader's coalescing gap changes only the requests that a read of
+    /// scattered rows makes: every gap returns the same batch, a wider gap
+    /// makes no more requests than a narrower one, and a gap that covers the
+    /// file makes at most one request per column page.
+    #[rstest]
+    #[case::v2_0(ConcreteFileVersion::V2_0)]
+    #[case::v2_2(ConcreteFileVersion::V2_2)]
+    #[tokio::test]
+    async fn test_coalesce_gap_keeps_ranges_reads(#[case] version: ConcreteFileVersion) {
+        const PAGES: u32 = 4;
+        const PAGE_ROWS: u64 = 1024;
+        let fs = FsFixture::default();
+        let codes =
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::UInt8, true)), 64);
+        let reader = gen_batch()
+            .col("x", array::step::<Int32Type>())
+            .col("codes", array::rand_type(&codes))
+            .into_reader_rows(RowCount::from(PAGE_ROWS), BatchCount::from(PAGES));
+        // Without a cache, every written batch is a page of each column.
+        let WrittenFile { data, .. } = write_lance_file(
+            reader,
+            &fs,
+            version,
+            FileWriterOptions {
+                data_cache_bytes: Some(1),
+                ..Default::default()
+            },
+        )
+        .await;
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let file_reader = FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &test_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+        let num_pages = file_reader
+            .metadata()
+            .column_infos
+            .iter()
+            .map(|column| column.page_infos.len() as u64)
+            .sum::<u64>();
+        assert!(
+            num_pages >= 2 * u64::from(PAGES),
+            "the writer must cut a page of each column per batch, got {num_pages}"
+        );
+
+        // Single rows 97 apart, a run across the end of the first page and
+        // a run inside a page.
+        let rows = (0..PAGE_ROWS * u64::from(PAGES))
+            .filter(|row| {
+                row.is_multiple_of(97) || (1020..1030).contains(row) || (3000..3003).contains(row)
+            })
+            .collect::<Vec<_>>();
+        let mut ranges: Vec<std::ops::Range<u64>> = Vec::new();
+        for &row in &rows {
+            match ranges.last_mut() {
+                Some(last) if last.end == row => last.end += 1,
+                _ => ranges.push(row..row + 1),
+            }
+        }
+        let indices = UInt32Array::from_iter_values(rows.iter().map(|&row| row as u32));
+        let expected = concat_batches(&data[0].schema(), &data)
+            .unwrap()
+            .take(&indices)
+            .unwrap();
+
+        // The first read also initializes the page metadata; the cache keeps
+        // it, so the reads below are data I/O only.
+        let (baseline, _) = read_ranges_with_gap(&file_reader, &ranges, None).await;
+        assert_eq!(baseline.columns(), expected.columns());
+        let mut requests = Vec::new();
+        for gap in [0, 64 * 1024, 256 * 1024, 1024 * 1024, u64::MAX] {
+            let (batch, gap_requests) =
+                read_ranges_with_gap(&file_reader, &ranges, Some(gap)).await;
+            assert_eq!(batch, baseline, "gap={gap}");
+            requests.push(gap_requests);
+        }
+        assert!(
+            requests.windows(2).all(|pair| pair[1] <= pair[0]),
+            "{requests:?}"
+        );
+        let covering = requests[requests.len() - 1];
+        assert!(
+            covering <= num_pages,
+            "{covering} requests for {num_pages} column pages"
+        );
+        if version == ConcreteFileVersion::V2_0 {
+            // Each run of each column is its own request at gap 0.
+            assert!(requests[0] > covering, "{requests:?}");
+        }
     }
 
     #[rstest]

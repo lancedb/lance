@@ -1617,6 +1617,26 @@ def test_get_fragments(tmp_path: Path):
     assert taken == pa.Table.from_pydict({"a": [18, 20, 33, 53], "b": [18, 20, 33, 53]})
 
 
+def test_fragment_ids(tmp_path: Path):
+    lance.write_dataset(pa.table({"a": range(10)}), tmp_path, max_rows_per_file=2)
+    dataset = lance.dataset(tmp_path)
+    assert list(dataset.fragment_ids()) == [0, 1, 2, 3, 4]
+
+    ids = dataset.fragment_ids()
+    ids.add(100)
+    assert list(dataset.fragment_ids()) == [0, 1, 2, 3, 4]
+
+    dataset.delete("a < 4")
+    assert list(dataset.fragment_ids()) == [2, 3, 4]
+
+    dataset.create_scalar_index("a", "BTREE")
+    lance.write_dataset(pa.table({"a": range(2)}), tmp_path, mode="append")
+    dataset = lance.dataset(tmp_path)
+    (index,) = dataset.describe_indices()
+    indexed = index.segments[0].fragment_ids
+    assert list(dataset.fragment_ids() - indexed) == [5]
+
+
 def test_pickle_fragment(tmp_path: Path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"
@@ -1646,6 +1666,9 @@ def test_cleanup_old_versions(tmp_path):
     lance.write_dataset(table, base_dir, mode="overwrite")
 
     dataset = lance.dataset(base_dir)
+
+    with pytest.raises(OSError, match="delete_concurrency"):
+        dataset.cleanup_old_versions(delete_concurrency=0)
 
     # These calls do nothing, but make sure we can call the method ok
 
@@ -1683,6 +1706,7 @@ def test_explain_cleanup_old_versions(tmp_path):
         older_than=(datetime.now() - moment),
         include_files=True,
         max_files=1000,
+        delete_rate_limit=0,
     )
 
     assert explanation.read_version == dataset.version
@@ -1993,7 +2017,9 @@ def test_cleanup_with_rate_limit(tmp_path):
     start = time.time_ns()
     # Cleanup with a rate limit should still remove old versions correctly
     stats = dataset.cleanup_old_versions(
-        older_than=(now - latest_version_timestamp), delete_rate_limit=1
+        older_than=(now - latest_version_timestamp),
+        delete_rate_limit=1,
+        delete_concurrency=2,
     )
     finished = time.time_ns()
 

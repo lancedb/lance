@@ -1289,6 +1289,11 @@ impl Projection {
         Self::empty(base).union_schema(&schema)
     }
 
+    /// The schema the projection selects from
+    pub fn base_schema(&self) -> &Schema {
+        self.base.schema()
+    }
+
     pub fn with_row_id(mut self) -> Self {
         self.with_row_id = true;
         self

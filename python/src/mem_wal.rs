@@ -333,7 +333,8 @@ impl PyShardWriter {
     /// Return a snapshot of current write statistics.
     ///
     /// Returns a dict with keys: put_count, put_time_ms, wal_flush_count,
-    /// wal_flush_bytes, memtable_flush_count, memtable_flush_rows.
+    /// wal_flush_bytes, memtable_flush_count, memtable_flush_rows,
+    /// memtable_flush_failures.
     pub fn stats(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let inner = self.inner.clone();
         let closed_state = self.closed_state.clone();
@@ -728,7 +729,7 @@ impl PyLsmPointLookupPlanner {
             None => get_pk_columns(&ds)?,
         };
         let base_schema = Arc::new(ArrowSchema::from(ds.schema()));
-        // A sealed generation stores the names it was written with, so the
+        // A flushed generation stores the names it was written with, so the
         // planner resolves its columns by id; `base_schema` carries none.
         let identity_schema = Arc::new(arrow_schema_with_field_ids(ds.schema()));
         let collector = LsmDataSourceCollector::new(ds.clone(), snapshots);
@@ -950,6 +951,7 @@ fn write_stats_to_pydict(py: Python<'_>, stats: &WriteStatsSnapshot) -> PyResult
     dict.set_item("wal_flush_time_ms", stats.wal_flush_time.as_millis() as u64)?;
     dict.set_item("memtable_flush_count", stats.memtable_flush_count)?;
     dict.set_item("memtable_flush_rows", stats.memtable_flush_rows)?;
+    dict.set_item("memtable_flush_failures", stats.memtable_flush_failures)?;
     dict.set_item(
         "memtable_flush_time_ms",
         stats.memtable_flush_time.as_millis() as u64,

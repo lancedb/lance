@@ -34,7 +34,8 @@ use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
 /// the segments into a `LogicalScalarIndex` so the scanner can treat them as one index: queries
 /// are fanned out to every segment in parallel and the row-address results are unioned together.
 ///
-/// All segments must share the same [`IndexType`]; mixing types is rejected at construction.
+/// All segments must share the same [`IndexType`] and result row domain; mixing either is
+/// rejected at construction.
 /// Per-segment [`SearchResult`] precision is preserved when combining: a union of `Exact`
 /// results stays `Exact`, a union containing `AtMost` results yields `AtMost`, and a union
 /// containing `AtLeast` results yields `AtLeast`. Combining `AtMost` and `AtLeast` segments in
@@ -75,6 +76,16 @@ impl LogicalScalarIndex {
         {
             return Err(Error::invalid_input(format!(
                 "LogicalScalarIndex '{}' on column '{}' mixes scalar index types",
+                name, column
+            )));
+        }
+        if segments
+            .iter()
+            .any(|segment| segment.results_are_row_addresses() != first.results_are_row_addresses())
+        {
+            return Err(Error::invalid_input(format!(
+                "LogicalScalarIndex '{}' on column '{}' mixes row-ID and row-address segments; \
+                 rebuild every segment in one commit",
                 name, column
             )));
         }
@@ -166,8 +177,7 @@ impl ScalarIndex for LogicalScalarIndex {
     }
 
     fn results_are_row_addresses(&self) -> bool {
-        // All segments of a logical index share the same underlying index type,
-        // so they agree on the result domain.
+        // Construction validates that every segment uses this result domain.
         self.segments[0].results_are_row_addresses()
     }
 
@@ -431,9 +441,61 @@ mod tests {
     use crate::dataset::optimize::{CompactionOptions, compact_files};
     use crate::dataset::write::WriteMode;
     use crate::index::create::CreateIndexBuilder;
-    use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+    use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount, copy_test_data_to_tmp};
 
     use super::*;
+
+    #[rstest::rstest]
+    #[case::legacy_first(false)]
+    #[case::address_first(true)]
+    #[tokio::test]
+    async fn test_staged_btree_row_domains_reject_mixed_logical_view(#[case] reverse: bool) {
+        let dir = copy_test_data_to_tmp("v14.0.0-beta.15/stable_row_id_btree.lance").unwrap();
+        let mut dataset = Dataset::open(&dir.path_str()).await.unwrap();
+        let legacy = dataset.load_indices_by_name("value_idx").await.unwrap();
+        let legacy = legacy
+            .iter()
+            .find(|segment| segment.fragment_bitmap.as_ref().unwrap().contains(0))
+            .unwrap();
+        let legacy_index = dataset
+            .open_scalar_index("value", &legacy.uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert!(!legacy_index.results_are_row_addresses());
+
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
+        let mut current = Vec::with_capacity(2);
+        for fragment_id in [0, 1] {
+            current.push(
+                dataset
+                    .create_index_builder(&["value"], IndexType::BTree, &params)
+                    .name("value_idx".into())
+                    .replace(true)
+                    .fragments(vec![fragment_id])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+            );
+        }
+        dataset
+            .commit_existing_index_segments("value_idx", "value", current.clone())
+            .await
+            .unwrap();
+        let current_index = dataset
+            .open_scalar_index("value", &current[1].uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert!(current_index.results_are_row_addresses());
+
+        let mut segments = vec![legacy_index, current_index];
+        if reverse {
+            segments.reverse();
+        }
+        let error =
+            LogicalScalarIndex::try_new("value_idx".into(), "value".into(), segments).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(error.to_string().contains("mixes row-ID and row-address"));
+    }
 
     #[tokio::test]
     async fn test_open_named_scalar_index_uses_all_zonemap_segments() {
