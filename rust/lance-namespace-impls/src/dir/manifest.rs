@@ -3491,14 +3491,22 @@ impl LanceNamespace for ManifestNamespace {
                     message: object_id.to_string(),
                 }
                 .into()),
-                // ExistOk keeps the existing namespace and reports its properties.
+                // ExistOk keeps the existing namespace and reports its properties. The
+                // manifest hit above can also be a table, so require a namespace entry:
+                // reporting success for a table would claim a namespace exists where
+                // `describe_namespace` then fails.
                 CreateNamespaceMode::ExistOk => {
-                    let properties = self
+                    let info = self
                         .query_manifest_for_namespace(&object_id)
                         .await?
-                        .and_then(|info| info.metadata);
+                        .ok_or_else(|| NamespaceError::NamespaceAlreadyExists {
+                            message: format!(
+                                "'{}' is already taken by a table, not a namespace",
+                                object_id
+                            ),
+                        })?;
                     Ok(CreateNamespaceResponse {
-                        properties,
+                        properties: info.metadata,
                         ..Default::default()
                     })
                 }
@@ -5914,6 +5922,56 @@ mod tests {
         assert!(
             dir_namespace.create_namespace(create_req).await.is_ok(),
             "exist_ok should succeed when the namespace already exists"
+        );
+    }
+
+    /// The manifest hit for `exist_ok` can be a table. Only a real namespace
+    /// entry may be reported as an idempotent success; a table must be
+    /// rejected so callers don't assume `describe_namespace` will work.
+    #[rstest]
+    #[case::with_optimization(true)]
+    #[case::without_optimization(false)]
+    #[tokio::test]
+    async fn test_create_namespace_exist_ok_rejects_table_collision(
+        #[case] inline_optimization: bool,
+    ) {
+        use lance_namespace::models::{
+            CreateNamespaceRequest, DeclareTableRequest, DescribeNamespaceRequest,
+        };
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let dir_namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .inline_optimization_enabled(inline_optimization)
+            .build()
+            .await
+            .unwrap();
+
+        let id = vec!["same".to_string()];
+        let mut declare_req = DeclareTableRequest::new();
+        declare_req.id = Some(id.clone());
+        dir_namespace.declare_table(declare_req).await.unwrap();
+
+        // The object at this ID is a table, so there is no namespace to keep.
+        let mut create_req = CreateNamespaceRequest::new();
+        create_req.id = Some(id.clone());
+        create_req.mode = Some("exist_ok".to_string());
+        let result = dir_namespace.create_namespace(create_req).await;
+        assert!(
+            result.is_err(),
+            "a table collision must not report successful namespace creation: {result:?}"
+        );
+
+        // The table is untouched and still not a namespace.
+        let mut describe_req = DescribeNamespaceRequest::new();
+        describe_req.id = Some(id);
+        assert!(
+            dir_namespace
+                .describe_namespace(describe_req)
+                .await
+                .is_err(),
+            "the collision must not have materialized a namespace"
         );
     }
 
