@@ -4,10 +4,13 @@
 //! Sparse dictionary indices are initialized once; item payloads are read on demand.
 
 use super::*;
-use crate::compression::{create_fixed_width_block_decompressor, field_metadata_params};
+use crate::compression::{
+    BlockDecompressor, create_fixed_width_block_decompressor, field_metadata_params,
+};
 use crate::data::DictionaryDataBlock;
 use crate::encodings::physical::checked_fixed_values;
 use crate::encodings::physical::sequence::{BlockCost, select_block_codec};
+use lance_core::utils::tokio::spawn_cpu;
 
 pub(in crate::encodings::logical::primitive) fn validate(
     layout: &pb23::IndexedValues,
