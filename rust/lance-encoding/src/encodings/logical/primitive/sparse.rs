@@ -1,10 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use super::structural_encoder::{
+    FixedWidthDictionaryEncoding, MiniblockChunkSize, PrimitiveEncodeContext,
+};
 use super::*;
+use crate::compression::CompressionStrategy;
+use crate::data::{BlockInfo, FixedWidthDataBlock};
+use crate::decoder::{PageEncoding, PageInfo};
+use crate::encoder::EncodedPage;
 use crate::encodings::physical::sequence::{SequenceDecoder, SequenceMetadata};
 use crate::format::pb23;
+use crate::repdef::{DefinitionInterpretation, SerializedRepDefs};
+use crate::statistics::ComputeStat;
+use arrow_array::{Array, ArrayRef, make_array};
 use arrow_buffer::ArrowNativeType;
+use arrow_buffer::BooleanBuffer;
+use lance_arrow::DataTypeExt;
+use lance_core::datatypes::Field;
 
 fn invalid_enum<T>(
     value: std::result::Result<T, prost::UnknownEnumValue>,
