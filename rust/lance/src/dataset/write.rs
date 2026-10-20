@@ -32,7 +32,7 @@ use lance_io::object_store::{
 };
 use lance_io::traits::Writer;
 use lance_table::feature_flags::managed_blobs_enabled;
-use lance_table::format::{BasePath, DataFile, Fragment, IndexMetadata};
+use lance_table::format::{BasePath, DataFile, Fragment};
 use lance_table::io::commit::{CommitHandler, commit_handler_from_url};
 use lance_table::io::manifest::ManifestDescribing;
 use lance_table::transaction::{Operation, resolve_arrow_field_ids};
@@ -53,8 +53,6 @@ use crate::dataset::blob::{
     blob_dedicated_threshold_from_metadata, blob_inline_threshold_from_metadata,
     blob_pack_file_threshold_from_metadata,
 };
-use crate::index::scalar::{IndexDetails, fetch_index_details};
-use crate::index::{index_is_usable, load_all_indices};
 use crate::session::Session;
 
 use super::fragment::write::generate_random_filename;
@@ -69,6 +67,7 @@ pub mod delete;
 mod insert;
 pub mod merge_insert;
 mod retry;
+pub(crate) mod seeds;
 pub mod update;
 
 pub use super::progress::{WriteProgressFn, WriteStats};
@@ -124,17 +123,19 @@ impl Dataset {
     /// `_blobs/<uuid>.blob` objects in that base. Otherwise payloads use sidecars
     /// addressed relative to the final data file. Every
     /// non-empty logical Inline value is spilled so final concatenation never
-    /// copies Blob payload bytes. Parts still require disjoint `blob_ids`
-    /// reservations; Managed descriptors encode base IDs rather than these IDs.
+    /// copies Blob payload bytes. Managed parts accept `blob_ids=None`; only
+    /// file-relative sidecars require disjoint reservations. Supplied ranges
+    /// are ignored for Managed parts.
     /// Every use of `target` must refer to the same dataset and resolved base;
     /// associating a target with that storage context is the caller's
     /// responsibility.
     /// Persist the target before writing. A failed write may leave files; after
     /// stopping all users of the target, [`DataFileTarget::cleanup`] removes
     /// staging files and file-relative sidecars without a completed part description.
-    /// Retries must use fresh, disjoint Blob ID ranges, including ranges from
-    /// failed writes. Independent Managed objects follow ordinary dataset GC
-    /// rules, which must be coordinated with uncommitted writes and checkpoints.
+    /// File-relative retries must use fresh, disjoint Blob ID ranges, including
+    /// ranges from failed writes. Independent Managed objects follow ordinary
+    /// dataset GC rules, which must be coordinated with uncommitted writes
+    /// and checkpoints.
     ///
     /// # Example
     ///
@@ -164,18 +165,19 @@ impl Dataset {
     ) -> Result<DataFilePart> {
         self.validate_data_file_target(target)?;
         validate_blob_v2_write_schema(target.schema.as_ref())?;
-        let part_blob_ids = blob_ids.clone();
+        let managed = managed_blobs_enabled(target.schema.as_ref())?;
+        let part_blob_ids = if managed { None } else { blob_ids.clone() };
         let has_blob = target
             .schema
             .fields_pre_order()
             .any(|field| field.is_blob_v2());
-        if has_blob && blob_ids.is_none() {
+        if has_blob && !managed && blob_ids.is_none() {
             return Err(Error::invalid_input(
                 "write_data_file_part requires a non-empty Blob ID range for a schema containing Blob v2 fields",
             ));
         }
 
-        let mut preprocessor = if let Some(blob_ids) = blob_ids {
+        let mut preprocessor = if has_blob || blob_ids.is_some() {
             let data_dir = self.data_file_dir_for_base(target.base_id)?;
             let object_store = self.object_store(target.base_id).await?;
             let external_base_resolver = blob_v2_external_base_resolver(
@@ -197,14 +199,12 @@ impl Dataset {
                     self.store_params().cloned().unwrap_or_default(),
                     None,
                 )?
-                .with_part_blob_ids(blob_ids)?,
+                .with_part_blob_ids(if managed { None } else { blob_ids })?,
             )
         } else {
             None
         };
-        if managed_blobs_enabled(target.schema.as_ref())?
-            && let Some(writer) = preprocessor.take()
-        {
+        if managed && let Some(writer) = preprocessor.take() {
             let root = self.blob_base_path(target.base_id)?;
             preprocessor = Some(writer.with_managed_base(target.base_id, root));
         }
@@ -937,7 +937,7 @@ pub(super) async fn do_write_fragments_impl<OpenWriter, OpenWriterFuture>(
     open_writer: OpenWriter,
     external_base_resolver: Option<Arc<ExternalBaseResolver>>,
     target_bases_info: Option<Vec<TargetBaseInfo>>,
-    mut seed_writers: Vec<Box<dyn lance_index::scalar::seed::IndexSeedWriter>>,
+    mut seeds: seeds::SeedCollector,
     file_row_counts: Option<Vec<usize>>,
     preassigned_data_file_name: Option<Arc<String>>,
 ) -> Result<Vec<Fragment>>
@@ -1029,13 +1029,8 @@ where
                     Error::internal("Writer was not initialized before writing a batch")
                 })?;
                 active_writer.write(&batch_chunk).await?;
-                for seed_writer in seed_writers.iter_mut() {
-                    let col_name = seed_writer.column_name().to_owned();
-                    for batch in &batch_chunk {
-                        if let Some(col) = batch.column_by_name(&col_name) {
-                            seed_writer.observe_batch(col)?;
-                        }
-                    }
+                for batch in &batch_chunk {
+                    seeds.observe(batch)?;
                 }
                 let batch_chunk_rows =
                     batch_chunk.iter().map(RecordBatch::num_rows).sum::<usize>();
@@ -1115,7 +1110,7 @@ where
                     let mut w = writer.take().ok_or_else(|| {
                         Error::internal("Writer disappeared before completing a file")
                     })?;
-                    flush_seed_writers(w.as_mut(), &mut seed_writers).await?;
+                    seeds.flush(w.as_mut()).await?;
                     let (num_rows, data_file) = w.finish().await?;
                     info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_DATA, path = &data_file.path);
                     debug_assert_eq!(num_rows, num_rows_in_current_file);
@@ -1171,7 +1166,7 @@ where
 
     // Complete the final writer
     if let Some(mut writer) = writer.take() {
-        if let Err(e) = flush_seed_writers(writer.as_mut(), &mut seed_writers).await {
+        if let Err(e) = seeds.flush(writer.as_mut()).await {
             drop(writer);
             cleanup_data_fragments(
                 &object_store,
@@ -1214,23 +1209,6 @@ where
     }
 
     Ok(fragments)
-}
-
-/// Flush all seed writers into the given file writer, embedding seed buffers
-/// and schema metadata before `finish()` is called.
-async fn flush_seed_writers(
-    writer: &mut dyn GenericWriter,
-    seed_writers: &mut [Box<dyn lance_index::scalar::seed::IndexSeedWriter>],
-) -> Result<()> {
-    for seed_writer in seed_writers.iter_mut() {
-        if let Some(bytes) = seed_writer.finish()? {
-            let buf_index = writer.add_global_buffer(bytes).await?;
-            let key = seed_writer.schema_metadata_key();
-            let value = seed_writer.schema_metadata_value(buf_index);
-            writer.add_schema_metadata(key, value);
-        }
-    }
-    Ok(())
 }
 
 /// Best-effort cleanup of data files for fragments that were written but not committed.
@@ -1956,54 +1934,6 @@ pub(super) fn validate_blob_v2_write_schema(schema: &Schema) -> Result<()> {
         )));
     }
     Ok(())
-}
-
-pub(crate) async fn create_seed_writers_current(
-    dataset: Option<&Dataset>,
-    params: &WriteParams,
-) -> Result<Vec<Box<dyn lance_index::scalar::seed::IndexSeedWriter>>> {
-    // Seeds only make sense when appending to an existing dataset.
-    if !matches!(params.mode, WriteMode::Append) {
-        return Ok(Vec::new());
-    }
-    let Some(dataset) = dataset else {
-        return Ok(Vec::new());
-    };
-
-    // Seeds depend on index configuration, not FRI-derived query coverage.
-    let indices: Arc<Vec<IndexMetadata>> = load_all_indices(dataset).await?;
-    let mut writers: Vec<Box<dyn lance_index::scalar::seed::IndexSeedWriter>> = Vec::new();
-
-    for index in indices.iter().filter(|index| index_is_usable(index)) {
-        // A covered index lists its carried columns in `fields` too; the seed
-        // writer keys on the single keyed column. System indices commit no
-        // fields at all, so this also skips them.
-        let Some(field_id) = index.keyed_field() else {
-            continue;
-        };
-        let Ok(field_path) = dataset.schema().field_path(field_id) else {
-            continue;
-        };
-        let Some(data_type) = dataset.schema().field(&field_path).map(|f| f.data_type()) else {
-            continue;
-        };
-
-        let Ok(index_details) = fetch_index_details(dataset, &field_path, index).await else {
-            continue;
-        };
-        let details = IndexDetails(index_details.clone());
-        let Ok(plugin) = details.get_plugin() else {
-            continue;
-        };
-        if let Some(writer) = plugin
-            .create_seed_writer(&field_path, &data_type, &index_details)
-            .await?
-        {
-            writers.push(writer);
-        }
-    }
-
-    Ok(writers)
 }
 
 fn legacy_blob_field_path(schema: &Schema) -> Option<String> {
@@ -4944,7 +4874,7 @@ mod tests {
             stream,
             WriteParams::default(),
             None,
-            Vec::new(),
+            seeds::SeedCollector::disabled(),
             None,
             None,
         )
@@ -5007,7 +4937,7 @@ mod tests {
                 ..Default::default()
             },
             None,
-            Vec::new(),
+            seeds::SeedCollector::disabled(),
             None,
             None,
         )
@@ -5237,7 +5167,7 @@ mod tests {
                 ..Default::default()
             },
             Some(target_bases),
-            vec![],
+            seeds::SeedCollector::disabled(),
             None,
             None,
         )
@@ -5915,15 +5845,16 @@ mod tests {
             .create_index(&["val"], IndexType::ZoneMap, None, &params, false)
             .await
             .unwrap();
-        let append_params = WriteParams {
-            mode: WriteMode::Append,
-            ..Default::default()
-        };
         assert!(
-            !create_seed_writers_current(Some(&dataset), &append_params)
-                .await
-                .unwrap()
-                .is_empty(),
+            !seeds::SeedCollector::for_write(
+                dataset.manifest.data_storage_format.lance_file_format(),
+                Some(&dataset),
+                dataset.schema(),
+                true,
+            )
+            .await
+            .unwrap()
+            .is_empty(),
             "the append must observe seeds for this test to cover them"
         );
 
@@ -5940,7 +5871,10 @@ mod tests {
         let dataset = Dataset::write(
             RecordBatchIterator::new([Ok(view_batch)], view_schema),
             Arc::new(dataset),
-            Some(append_params),
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
         )
         .await
         .unwrap();
@@ -5988,14 +5922,14 @@ mod tests {
             .await
             .unwrap();
 
-        let append_params = WriteParams {
-            mode: WriteMode::Append,
-            ..Default::default()
-        };
-
-        let baseline = create_seed_writers_current(Some(&dataset), &append_params)
-            .await
-            .unwrap();
+        let baseline = seeds::SeedCollector::for_write(
+            dataset.manifest.data_storage_format.lance_file_format(),
+            Some(&dataset),
+            dataset.schema(),
+            true,
+        )
+        .await
+        .unwrap();
         assert!(
             !baseline.is_empty(),
             "a plain scalar index should produce a seed writer; if this is empty \
@@ -6023,9 +5957,14 @@ mod tests {
             .await
             .unwrap();
 
-        let covered_writers = create_seed_writers_current(Some(&dataset), &append_params)
-            .await
-            .unwrap();
+        let covered_writers = seeds::SeedCollector::for_write(
+            dataset.manifest.data_storage_format.lance_file_format(),
+            Some(&dataset),
+            dataset.schema(),
+            true,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             covered_writers.len(),
             baseline.len(),

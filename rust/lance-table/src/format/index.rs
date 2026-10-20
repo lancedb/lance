@@ -137,8 +137,12 @@ impl IndexMetadata {
     /// True when the index reports matches as physical row addresses rather than row ids
     /// (`ScalarIndex::results_are_row_addresses`).
     ///
-    /// Such an index cannot follow its data through a rewrite: the addresses it stores
-    /// name fragments and offsets, and neither kind supports remap.
+    /// Such an index cannot follow its data through a rewrite the way a row-id-domain
+    /// index can: the addresses it stores name fragments and offsets, which a rewrite
+    /// invalidates. A type whose index supports remap (BTree) can still be rewritten in
+    /// place; a type that cannot (ZoneMap, BloomFilter, FM) instead loses coverage of the
+    /// rewritten fragments until it is rebuilt, or is kept in step through the fragment
+    /// reuse index's read-time translation.
     ///
     /// Currently this is a rather short list.  We will soon be migrating the remaining
     /// row-id-domain indexes to use row addresses.  At that point this list will grow and
@@ -154,7 +158,35 @@ impl IndexMetadata {
             details.type_url.ends_with("ZoneMapIndexDetails")
                 || details.type_url.ends_with("BloomFilterIndexDetails")
                 || is_fm
+                || Self::is_btree_addr_domain(details, self.index_version)
         })
+    }
+
+    // A BTree segment stores row addresses only from format version 1
+    // onward (`lance_index::scalar::btree::BTREE_ROW_ADDR_DOMAIN_VERSION`,
+    // kept in sync with this literal). A segment persisted before that
+    // by an older Lance version stores row ids directly and must not be
+    // reinterpreted as addresses.
+    fn is_btree_addr_domain(details: &prost_types::Any, index_version: i32) -> bool {
+        details.type_url.ends_with("BTreeIndexDetails") && index_version >= 1
+    }
+
+    /// True when this index both stores row addresses ([`Self::results_are_row_addrs`])
+    /// and its type actively supports being remapped in place onto a rewrite's new
+    /// fragments, rather than just losing coverage of them until rebuilt.
+    ///
+    /// Of the address-domain types, only BTree's index supports this today
+    /// (`ScalarIndex::can_remap`); ZoneMap, BloomFilter and FM always report
+    /// `RemapResult::Drop`, so remapping is never worth attempting for them.
+    /// `can_remap()` lives on the opened index and can vary per instance in
+    /// principle, but every implementation today is a type-level constant, so
+    /// this metadata-only check -- answering whether a remap is worth
+    /// attempting, not whether one will succeed opening the index -- is exact
+    /// in practice, not just a cheap approximation.
+    pub fn supports_eager_remap(&self) -> bool {
+        self.index_details
+            .as_ref()
+            .is_some_and(|details| Self::is_btree_addr_domain(details, self.index_version))
     }
 
     /// The prefix of [`Self::fields`] this index is keyed on, with the carried
@@ -378,6 +410,8 @@ impl From<&IndexMetadata> for pb::IndexMetadata {
                 .as_ref()
                 .map(|details| details.as_ref().clone()),
             index_version: Some(idx.index_version),
+            clustering_id: None,
+            metadata: Default::default(),
             created_at: idx.created_at.map(|dt| dt.timestamp_millis() as u64),
             base_id: idx.base_id,
             files,
@@ -714,15 +748,37 @@ mod tests {
     #[case::fm("type.googleapis.com/lance.index.pb.FMIndexDetails", true)]
     #[case::fm_case_insensitive("type.googleapis.com/LANCE.INDEX.PB.FMINDEXDETAILS", true)]
     #[case::foreign_fm_terminal_name("type.googleapis.com/example.FMIndexDetails", false)]
-    #[case::btree("type.googleapis.com/lance.table.BTreeIndexDetails", false)]
+    #[case::btree_legacy("type.googleapis.com/lance.table.BTreeIndexDetails", false)]
     fn test_results_are_row_addrs(#[case] type_url: &str, #[case] expected: bool) {
         let mut metadata = index_metadata_with(vec![0], vec![]);
         metadata.index_details = Some(Arc::new(prost_types::Any {
             type_url: type_url.to_string(),
             value: Vec::new(),
         }));
+        metadata.index_version = 0;
 
         assert_eq!(metadata.results_are_row_addrs(), expected);
+    }
+
+    #[test]
+    fn test_results_are_row_addrs_btree_is_version_gated() {
+        let mut metadata = index_metadata_with(vec![0], vec![]);
+        metadata.index_details = Some(Arc::new(prost_types::Any {
+            type_url: "type.googleapis.com/lance.table.BTreeIndexDetails".to_string(),
+            value: Vec::new(),
+        }));
+
+        metadata.index_version = 0;
+        assert!(
+            !metadata.results_are_row_addrs(),
+            "a legacy BTree segment stores row ids directly"
+        );
+
+        metadata.index_version = 1;
+        assert!(
+            metadata.results_are_row_addrs(),
+            "a BTree segment built with address-domain support stores row addresses"
+        );
     }
 
     #[rstest]
