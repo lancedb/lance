@@ -50,7 +50,8 @@ use crate::{
                 FsstPerValueEncoder,
             },
             general::{
-                FixedWidthGeneralBlockDecompressor, GeneralMiniBlockCompressor,
+                FixedWidthGeneralBlockDecompressor, GeneralFixedPerValueCompressor,
+                GeneralFixedPerValueDecompressor, GeneralMiniBlockCompressor,
                 GeneralMiniBlockDecompressor,
             },
             packed::{
@@ -763,6 +764,33 @@ pub fn try_raw_per_value(data: &DataBlock) -> Option<Box<dyn PerValueCompressor>
         .then(|| Box::new(ValueEncoder::default()) as _)
 }
 
+/// Compress full-zip fixed-width and fixed-size-list values one value at a time with an
+/// explicitly requested general compression scheme, byte-stream-splitting each value first
+/// unless `lance-encoding:bss` is `off`.
+///
+/// Only the unstable Lance 2.3 compression strategy may select this grammar. Released stable
+/// readers decode every general-compressed full-zip page as variable-width bytes, so stable
+/// 2.1/2.2 strategies must keep [`try_raw_per_value`].
+pub fn try_general_fixed_per_value(
+    data: &DataBlock,
+    params: &CompressionFieldParams,
+) -> Result<Option<Box<dyn PerValueCompressor>>> {
+    if !matches!(data, DataBlock::FixedWidth(_) | DataBlock::FixedSizeList(_)) {
+        return Ok(None);
+    }
+    let Some(scheme) = params.compression.as_deref() else {
+        return Ok(None);
+    };
+    let scheme: CompressionScheme = scheme.parse()?;
+    if matches!(scheme, CompressionScheme::None | CompressionScheme::Fsst) {
+        return Ok(None);
+    }
+    Ok(Some(Box::new(GeneralFixedPerValueCompressor::try_new(
+        CompressionConfig::new(scheme, params.compression_level),
+        params.bss.unwrap_or(BssMode::Auto),
+    )?)))
+}
+
 fn validate_packed_struct(field: &Field, data: &DataBlock) -> Result<Option<bool>> {
     let DataBlock::Struct(data) = data else {
         return Ok(None);
@@ -1235,6 +1263,25 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
                 LanceBuffer::from_bytes(fsst.symbol_table.clone(), 1),
                 Box::new(VariableDecoder::default()),
             ))),
+            // Stable writers only wrap variable-width values (`Variable` offsets). Lance 2.3
+            // also compresses fixed-width and fixed-size-list values one value at a time.
+            Compression::General(general)
+                if matches!(
+                    general
+                        .values
+                        .as_deref()
+                        .and_then(|values| values.compression.as_ref()),
+                    Some(
+                        Compression::Flat(_)
+                            | Compression::FixedSizeList(_)
+                            | Compression::ByteStreamSplit(_)
+                    )
+                ) =>
+            {
+                Ok(Box::new(GeneralFixedPerValueDecompressor::try_new(
+                    general,
+                )?))
+            }
             Compression::General(general) => Ok(Box::new(CompressedBufferEncoder::from_scheme(
                 general.compression.as_ref().expect_ok()?.scheme(),
             )?)),
@@ -2470,6 +2517,40 @@ mod tests {
         let compressor = strategy.create_per_value(&field, &variable_data).unwrap();
         let (_block, encoding) = compressor.compress(variable_data).unwrap();
         check_uncompressed_encoding(&encoding, true);
+    }
+
+    #[test]
+    fn test_general_fixed_per_value_requires_explicit_general_scheme() {
+        let fixed_data = create_fixed_width_block(32, 1000);
+        let variable_data = create_variable_width_block(32, 10, 32 * 1024);
+        let params = |compression: Option<&str>| CompressionFieldParams {
+            compression: compression.map(str::to_string),
+            ..Default::default()
+        };
+
+        for compression in [None, Some("none"), Some("fsst")] {
+            assert!(
+                try_general_fixed_per_value(&fixed_data, &params(compression))
+                    .unwrap()
+                    .is_none(),
+                "{compression:?}"
+            );
+        }
+        for compression in ["zstd", "lz4"] {
+            assert!(
+                try_general_fixed_per_value(&fixed_data, &params(Some(compression)))
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(
+                try_general_fixed_per_value(&variable_data, &params(Some(compression)))
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        let error = try_general_fixed_per_value(&fixed_data, &params(Some("snappy"))).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(error.to_string().contains("snappy"), "{error}");
     }
 
     #[test]

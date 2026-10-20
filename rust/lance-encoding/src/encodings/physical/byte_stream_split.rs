@@ -54,6 +54,13 @@
 //!   - f64: 512 values (4KB per chunk)
 //! - All chunks share a single global buffer
 //! - Non-last chunks always contain power-of-2 values
+//!
+//! ## Per-Value Form
+//!
+//! Full-zip pages compress each value independently, so [`split_value_bytes`] transposes the
+//! items inside a single value (for example the `u16` pixels of one image chip) instead of
+//! values across a chunk. Any item width is supported because the value is never split across
+//! items.
 
 use std::fmt::Debug;
 
@@ -323,9 +330,112 @@ fn evaluate_entropy_for_bss(data: &FixedWidthDataBlock, sensitivity: f32) -> boo
     avg_entropy < entropy_threshold
 }
 
+/// Splits one value made of `item_bytes`-wide items into byte streams.
+///
+/// This is the per-value form of byte stream split used by full-zip pages, where every value
+/// must stay independently decodable. Byte `j` of item `i` moves to
+/// `streams[j * num_items + i]`. `value.len()` must be a multiple of `item_bytes` and equal to
+/// `streams.len()`.
+pub(crate) fn split_value_bytes(value: &[u8], item_bytes: usize, streams: &mut [u8]) {
+    debug_assert_eq!(value.len(), streams.len());
+    debug_assert!(item_bytes > 0 && value.len().is_multiple_of(item_bytes));
+    if value.is_empty() {
+        return;
+    }
+    match item_bytes {
+        2 => split_items::<2>(value, streams),
+        4 => split_items::<4>(value, streams),
+        8 => split_items::<8>(value, streams),
+        _ => split_items_of_width(value, item_bytes, streams),
+    }
+}
+
+/// Reverses [`split_value_bytes`] for one value.
+pub(crate) fn join_value_bytes(streams: &[u8], item_bytes: usize, value: &mut [u8]) {
+    debug_assert_eq!(value.len(), streams.len());
+    debug_assert!(item_bytes > 0 && value.len().is_multiple_of(item_bytes));
+    if value.is_empty() {
+        return;
+    }
+    match item_bytes {
+        2 => join_items::<2>(streams, value),
+        4 => join_items::<4>(streams, value),
+        8 => join_items::<8>(streams, value),
+        _ => join_items_of_width(streams, item_bytes, value),
+    }
+}
+
+fn split_items<const N: usize>(value: &[u8], streams: &mut [u8]) {
+    let (items, _) = value.as_chunks::<N>();
+    let num_items = items.len();
+    for byte in 0..N {
+        let stream = &mut streams[byte * num_items..][..num_items];
+        for (out, item) in stream.iter_mut().zip(items) {
+            *out = item[byte];
+        }
+    }
+}
+
+fn join_items<const N: usize>(streams: &[u8], value: &mut [u8]) {
+    let (items, _) = value.as_chunks_mut::<N>();
+    let num_items = items.len();
+    for byte in 0..N {
+        let stream = &streams[byte * num_items..][..num_items];
+        for (item, in_byte) in items.iter_mut().zip(stream) {
+            item[byte] = *in_byte;
+        }
+    }
+}
+
+fn split_items_of_width(value: &[u8], item_bytes: usize, streams: &mut [u8]) {
+    let num_items = value.len() / item_bytes;
+    for byte in 0..item_bytes {
+        let stream = &mut streams[byte * num_items..][..num_items];
+        for (out, item) in stream.iter_mut().zip(value.chunks_exact(item_bytes)) {
+            *out = item[byte];
+        }
+    }
+}
+
+fn join_items_of_width(streams: &[u8], item_bytes: usize, value: &mut [u8]) {
+    let num_items = value.len() / item_bytes;
+    for byte in 0..item_bytes {
+        let stream = &streams[byte * num_items..][..num_items];
+        for (item, in_byte) in value.chunks_exact_mut(item_bytes).zip(stream) {
+            item[byte] = *in_byte;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
+
+    #[rstest]
+    #[case::u16_items(2, 7)]
+    #[case::u32_items(4, 3)]
+    #[case::u64_items(8, 5)]
+    #[case::u128_items(16, 3)]
+    #[case::single_item(4, 1)]
+    #[case::empty(4, 0)]
+    fn test_split_value_bytes_round_trip(#[case] item_bytes: usize, #[case] num_items: usize) {
+        let value: Vec<u8> = (0..item_bytes * num_items).map(|i| i as u8).collect();
+        let mut streams = vec![0; value.len()];
+        split_value_bytes(&value, item_bytes, &mut streams);
+        for item in 0..num_items {
+            for byte in 0..item_bytes {
+                assert_eq!(
+                    streams[byte * num_items + item],
+                    value[item * item_bytes + byte]
+                );
+            }
+        }
+
+        let mut joined = vec![0; value.len()];
+        join_value_bytes(&streams, item_bytes, &mut joined);
+        assert_eq!(joined, value);
+    }
 
     #[test]
     fn test_round_trip_f32() {
