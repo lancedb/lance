@@ -49,6 +49,10 @@ impl Dataset {
     /// become unreferenced and are removed by a later cleanup. Requires the
     /// budget to be set in the table config, see
     /// [`INLINE_DELETIONS_MAX_BYTES_CONFIG_KEY`].
+    ///
+    /// The move is one way: every later snapshot carries
+    /// `FLAG_INLINE_DELETIONS`, and setting the budget back to `0` only stops
+    /// new inline writes. Upgrade every reader of the table before calling this.
     pub async fn inline_deletions(&mut self) -> Result<usize> {
         let max_bytes = self.inline_deletions_max_bytes()?;
         if max_bytes == 0 {

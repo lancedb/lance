@@ -7854,7 +7854,10 @@ class DatasetOptimizer:
         encoding is at most that many bytes is stored inline, both by this
         call and by later deletes. Set it with :meth:`LanceDataset.update_config`
         first. Readers must support the ``FLAG_INLINE_DELETIONS`` feature flag
-        once a fragment stores its deletions inline.
+        once a fragment stores its deletions inline, and the move is one way:
+        setting the budget back to ``0`` stops new inline writes but leaves the
+        moved vectors in the manifest, so upgrade every reader of the table
+        before calling this.
 
         Returns
         -------
