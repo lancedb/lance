@@ -2354,10 +2354,11 @@ class LanceDataset(pa.dataset.Dataset):
             Take the rows as if the dataset had no deletions. Deletion files
             are read only where a row id could name more than one physical
             copy (fragments whose id spans overlap, as after an update), which
-            on a table with many fragments saves one request per fragment, but
-            a deleted row comes back with its stored values. Only for row ids
-            known to be live, for example ids read from an index built after
-            the last deletion.
+            on a table with many fragments saves one request per fragment. A
+            deleted row may come back with its stored values or be dropped, so
+            the result is only complete for live ids: use it only for ids known
+            to be live, for example ids read from an index built after the
+            last deletion.
         **kwargs : dict, optional
             See scanner() method for full parameter description.
 

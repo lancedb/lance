@@ -524,9 +524,10 @@ impl TakeBuilder {
     /// physical copy (fragments whose id spans overlap, as after an update),
     /// neither to filter the rows nor for the other fragments, so on a table
     /// with many fragments the take saves one request per fragment. A deleted
-    /// row comes back with its stored values, so this is only for a caller
-    /// that knows its rows are live, for example row ids from an index built
-    /// after the last deletion.
+    /// row may come back with its stored values or be dropped, depending on
+    /// whether its fragment's deletion vector was needed, so the output is
+    /// only complete for live ids: use this only when the ids are known to be
+    /// live, for example row ids from an index built after the last deletion.
     pub fn with_ignore_deletions(mut self, ignore_deletions: bool) -> Self {
         self.ignore_deletions = ignore_deletions;
         self

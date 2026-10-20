@@ -482,6 +482,30 @@ fn overlapping_id_spans(sequences: &[Arc<RowIdSequence>]) -> Vec<bool> {
 mod test {
     use std::ops::Range;
 
+    /// Containment, a chain of pairwise overlaps, a disjoint span and an empty
+    /// sequence; the sweep must mark exactly the spans that touch another.
+    #[test]
+    fn test_overlapping_id_spans() {
+        let seq = |ids: Vec<u64>| Arc::new(RowIdSequence::try_from_iter(ids).unwrap());
+        let contained = vec![
+            seq((0..=100).collect()),
+            seq(vec![1, 2]),
+            seq(vec![50, 60]),
+            seq(vec![200, 201]),
+            seq(vec![]),
+        ];
+        assert_eq!(
+            overlapping_id_spans(&contained),
+            vec![true, true, true, false, false]
+        );
+        // The last span overlaps only the middle one, not the one that set the
+        // reach first.
+        let chain = vec![seq(vec![0, 10]), seq(vec![20, 30]), seq(vec![5, 25])];
+        assert_eq!(overlapping_id_spans(&chain), vec![true, true, true]);
+        let disjoint = vec![seq(vec![0, 10]), seq(vec![11, 20]), seq(vec![21])];
+        assert_eq!(overlapping_id_spans(&disjoint), vec![false, false, false]);
+    }
+
     use crate::dataset::{
         ProjectionRequest, ReadParams, UpdateBuilder, WriteMode, WriteParams,
         builder::DatasetBuilder,
