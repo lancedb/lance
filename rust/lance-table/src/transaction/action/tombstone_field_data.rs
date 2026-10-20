@@ -67,8 +67,7 @@ impl TombstoneFieldData {
             .collect();
         crate::format::overlay::tombstone_overlay_fields(&mut fragment.overlays, &overlaid);
 
-        state.rebind_fields(fragment_id, field_ids.iter().copied());
-        Ok(())
+        state.rebind_fields(fragment_id, field_ids.iter().copied())
     }
 
     pub(super) fn is_data_change(&self) -> bool {
