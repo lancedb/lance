@@ -103,9 +103,10 @@ pub(super) enum ComplexNullEncoding {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum FixedWidthDictionaryEncoding {
-    Exclude64Bit,
-    Include64Bit,
+pub(super) enum DictionaryEncodingPolicy {
+    LegacyU16,
+    LegacyU32,
+    Planar,
 }
 
 pub(super) trait PrimitivePageEncodingBehavior: Send + Sync + Debug {
@@ -1515,7 +1516,7 @@ impl PrimitiveStructuralEncoder {
     pub(super) fn should_dictionary_encode(
         data_block: &DataBlock,
         field: &Field,
-        fixed_width_dictionary_encoding: FixedWidthDictionaryEncoding,
+        dictionary_policy: DictionaryEncodingPolicy,
     ) -> Option<DictEncodingBudget> {
         const DEFAULT_SAMPLE_SIZE: usize = 4096;
         const DEFAULT_SAMPLE_UNIQUE_RATIO: f64 = 0.98;
@@ -1525,7 +1526,7 @@ impl PrimitiveStructuralEncoder {
         match data_block {
             DataBlock::FixedWidth(fixed) => {
                 if fixed.bits_per_value == 64
-                    && fixed_width_dictionary_encoding == FixedWidthDictionaryEncoding::Exclude64Bit
+                    && dictionary_policy == DictionaryEncodingPolicy::LegacyU16
                 {
                     return None;
                 }
@@ -1555,8 +1556,7 @@ impl PrimitiveStructuralEncoder {
 
         let num_values = data_block.num_values();
 
-        // Apply divisor threshold and cap. This is intentionally conservative: the goal is to
-        // avoid spending too much CPU trying to estimate very high cardinalities.
+        // Bound actual dictionary construction by the configured cardinality and size budgets.
         let divisor: u64 = field
             .metadata
             .get(DICT_DIVISOR_META_KEY)
@@ -1608,8 +1608,9 @@ impl PrimitiveStructuralEncoder {
         let max_encoded_size = (data_size as f64 * threshold_ratio) as u64;
         let max_encoded_size = usize::try_from(max_encoded_size).ok()?;
 
-        // Avoid probing dictionary encoding on data that appears to be near-unique
-        // or likely to exceed the dictionary budget.
+        // A repeated sample can come from either a small dictionary or a high-cardinality
+        // page with short runs. Its unique ratio cannot be extrapolated to the whole page.
+        // Planar leaves that decision to bounded dictionary construction.
         if let Some(sample_unique_ratio) =
             Self::sample_unique_ratio(data_block, DEFAULT_SAMPLE_SIZE)?
         {
@@ -1617,9 +1618,12 @@ impl PrimitiveStructuralEncoder {
                 return None;
             }
 
-            let projected_cardinality = (sample_unique_ratio * num_values as f64).ceil() as u64;
-            if projected_cardinality > threshold_cardinality {
-                return None;
+            // Preserve the existing candidate selection for legacy writers.
+            if dictionary_policy != DictionaryEncodingPolicy::Planar {
+                let projected_cardinality = (sample_unique_ratio * num_values as f64).ceil() as u64;
+                if projected_cardinality > threshold_cardinality {
+                    return None;
+                }
             }
         }
 
@@ -1851,7 +1855,7 @@ impl PrimitiveStructuralEncoder {
         compression_strategy: Arc<dyn CompressionStrategy>,
         miniblock_chunk_size: MiniblockChunkSize,
         complex_null_encoding: ComplexNullEncoding,
-        fixed_width_dictionary_encoding: FixedWidthDictionaryEncoding,
+        dictionary_policy: DictionaryEncodingPolicy,
     ) -> Result<EncodedPage> {
         let PrimitiveEncodeContext {
             column_idx,
@@ -2095,7 +2099,7 @@ impl PrimitiveStructuralEncoder {
         let dict_result = Self::should_dictionary_encode(
             &data_block,
             &field,
-            fixed_width_dictionary_encoding,
+            dictionary_policy,
         )
         .and_then(|budget| {
             log::debug!(
@@ -2434,7 +2438,7 @@ impl PrimitivePageEncodingBehavior for DenseU16PrimitiveEncoding {
                 self.compression.clone(),
                 MiniblockChunkSize::U16,
                 ComplexNullEncoding::RawLevels,
-                FixedWidthDictionaryEncoding::Exclude64Bit,
+                DictionaryEncodingPolicy::LegacyU16,
             )?,
         ))
     }
@@ -2470,7 +2474,7 @@ impl PrimitivePageEncodingBehavior for DenseU32PrimitiveEncoding {
                 self.compression.clone(),
                 MiniblockChunkSize::U32,
                 ComplexNullEncoding::CompressedLevels,
-                FixedWidthDictionaryEncoding::Include64Bit,
+                DictionaryEncodingPolicy::LegacyU32,
             )?,
         ))
     }

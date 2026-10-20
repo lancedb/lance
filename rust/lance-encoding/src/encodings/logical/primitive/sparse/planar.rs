@@ -287,7 +287,7 @@ pub(in crate::encodings::logical::primitive) fn encode(
         PrimitiveStructuralEncoder::should_dictionary_encode(
             data,
             &ctx.field,
-            FixedWidthDictionaryEncoding::Include64Bit,
+            DictionaryEncodingPolicy::Planar,
         )
         .and_then(|budget| {
             dict::dictionary_encode(data, budget.max_dict_entries, budget.max_encoded_size)

@@ -7,7 +7,8 @@ use std::sync::{Arc, Mutex};
 
 use arrow_array::types::Int32Type;
 use arrow_array::{
-    Array, ArrayRef, DictionaryArray, Int8Array, PrimitiveArray, StringArray, new_null_array,
+    Array, ArrayRef, DictionaryArray, Float64Array, Int8Array, PrimitiveArray, StringArray,
+    new_null_array,
 };
 use arrow_buffer::{BooleanBuffer, NullBuffer, ScalarBuffer};
 use arrow_schema::DataType;
@@ -21,11 +22,12 @@ use crate::buffer::LanceBuffer;
 use crate::compression::DefaultDecompressionStrategy;
 use crate::constants::{
     COMPRESSION_LEVEL_META_KEY, COMPRESSION_META_KEY, DICT_DIVISOR_META_KEY,
-    DICT_VALUES_COMPRESSION_LEVEL_META_KEY, DICT_VALUES_COMPRESSION_META_KEY,
-    STRUCTURAL_ENCODING_META_KEY, STRUCTURAL_ENCODING_MINIBLOCK,
+    DICT_SIZE_RATIO_META_KEY, DICT_VALUES_COMPRESSION_LEVEL_META_KEY,
+    DICT_VALUES_COMPRESSION_META_KEY, STRUCTURAL_ENCODING_META_KEY, STRUCTURAL_ENCODING_MINIBLOCK,
 };
 use crate::data::{BlockInfo, DataBlock, FixedWidthDataBlock};
 use crate::decoder::PageEncoding;
+use crate::encodings::logical::primitive::dict::dictionary_encode;
 use crate::encodings::logical::primitive::miniblock::{MiniBlockChunk, MiniBlockCompressed};
 use crate::encodings::logical::primitive::{MiniBlockScheduler, StructuralPageScheduler};
 use crate::format::metadata;
@@ -33,7 +35,7 @@ use crate::format::metadata::compressive_encoding::Compression;
 use crate::repdef::build_control_word_iterator;
 use crate::testing::{TestCases, TestEncoding, check_round_trip_encoding_of_data};
 
-use super::{FixedWidthDictionaryEncoding, MiniblockChunkSize, PrimitiveStructuralEncoder};
+use super::{DictionaryEncodingPolicy, MiniblockChunkSize, PrimitiveStructuralEncoder};
 
 #[test]
 fn test_is_narrow() {
@@ -544,6 +546,56 @@ async fn test_dictionary_encode_float64() {
     check_round_trip_encoding_of_data(vec![array], &test_cases, metadata).await;
 }
 
+#[rstest::rstest]
+#[case::dense(false)]
+#[case::nullable(true)]
+#[tokio::test]
+async fn test_planar_dictionary_encode_repeated_float64(#[case] nullable: bool) {
+    let num_values = 262_144u64;
+    // Spread repeated values across the sample blocks instead of repeating the same
+    // short prefix at every block boundary.
+    let values = (0..num_values)
+        .map(|i| {
+            let value = (((i * 7919) ^ (i >> 7)) % 2048) as f64 / 100.0;
+            (!nullable || i % 8 != 0).then_some(value)
+        })
+        .collect::<Vec<_>>();
+    let array = Arc::new(Float64Array::from(values)) as ArrayRef;
+    let block = DataBlock::from_array(array.clone()).remove_outer_validity();
+    let ratio = PrimitiveStructuralEncoder::sample_unique_ratio(&block, 4096)
+        .unwrap()
+        .unwrap();
+    assert!(ratio < 0.98);
+    assert!(
+        ratio * num_values as f64 > 100_000.0,
+        "the old sample projection must reject this 2,048-value dictionary"
+    );
+    let field = lance_core::datatypes::Field::try_from(&arrow_schema::Field::new(
+        "values",
+        DataType::Float64,
+        nullable,
+    ))
+    .unwrap();
+    let budget = PrimitiveStructuralEncoder::should_dictionary_encode(
+        &block,
+        &field,
+        DictionaryEncodingPolicy::Planar,
+    )
+    .expect("repeated values should reach dictionary construction");
+    assert_eq!(budget.max_dict_entries, 100_000);
+
+    let test_cases = TestCases::default()
+        .with_encoding(TestEncoding::StructuralSparse)
+        .with_page_sizes(vec![8 * 1024 * 1024])
+        .with_ingest_batch_counts([1])
+        .with_slicing_modes([false])
+        .with_batch_size(65_536)
+        .with_range(0..num_values)
+        .with_indices(vec![0, 1, 127, 128, 65_535, 65_536, num_values - 1])
+        .with_expected_encoding("dictionary");
+    check_round_trip_encoding_of_data(vec![array], &test_cases, HashMap::new()).await;
+}
+
 // Dictionary encoding decision tests
 fn create_test_fixed_data_block(
     num_values: u64,
@@ -632,7 +684,7 @@ fn test_should_dictionary_encode() {
     let result = PrimitiveStructuralEncoder::should_dictionary_encode(
         &block,
         &field,
-        FixedWidthDictionaryEncoding::Exclude64Bit,
+        DictionaryEncodingPolicy::LegacyU16,
     );
 
     assert!(
@@ -679,7 +731,7 @@ fn test_should_dictionary_encode_sorted_low_cardinality() {
     let result = PrimitiveStructuralEncoder::should_dictionary_encode(
         &block,
         &field,
-        FixedWidthDictionaryEncoding::Include64Bit,
+        DictionaryEncodingPolicy::LegacyU32,
     );
 
     assert!(
@@ -706,7 +758,7 @@ fn test_should_not_dictionary_encode_sorted_high_cardinality_short_runs() {
     let result = PrimitiveStructuralEncoder::should_dictionary_encode(
         &block,
         &field,
-        FixedWidthDictionaryEncoding::Include64Bit,
+        DictionaryEncodingPolicy::LegacyU32,
     );
 
     assert!(
@@ -744,7 +796,7 @@ fn test_should_not_dictionary_encode_unsupported_bits() {
     let result = PrimitiveStructuralEncoder::should_dictionary_encode(
         &block,
         &field,
-        FixedWidthDictionaryEncoding::Exclude64Bit,
+        DictionaryEncodingPolicy::LegacyU16,
     );
 
     assert!(
@@ -753,8 +805,11 @@ fn test_should_not_dictionary_encode_unsupported_bits() {
     );
 }
 
-#[test]
-fn test_should_not_dictionary_encode_near_unique_sample() {
+#[rstest::rstest]
+#[case::legacy_u16(DictionaryEncodingPolicy::LegacyU16)]
+#[case::legacy_u32(DictionaryEncodingPolicy::LegacyU32)]
+#[case::planar(DictionaryEncodingPolicy::Planar)]
+fn test_should_not_dictionary_encode_near_unique_sample(#[case] policy: DictionaryEncodingPolicy) {
     use crate::constants::DICT_SIZE_RATIO_META_KEY;
     use lance_core::datatypes::Field as LanceField;
 
@@ -767,16 +822,41 @@ fn test_should_not_dictionary_encode_near_unique_sample() {
         arrow_schema::Field::new("test", DataType::Utf8, false).with_metadata(metadata);
     let field = LanceField::try_from(&arrow_field).unwrap();
 
-    let result = PrimitiveStructuralEncoder::should_dictionary_encode(
-        &block,
-        &field,
-        FixedWidthDictionaryEncoding::Exclude64Bit,
-    );
+    let result = PrimitiveStructuralEncoder::should_dictionary_encode(&block, &field, policy);
 
     assert!(
         result.is_none(),
         "Should not probe dictionary encoding for near-unique data"
     );
+}
+
+#[rstest::rstest]
+#[case::cardinality(8, 1.0)]
+#[case::encoded_size(2, 0.25)]
+fn test_planar_dictionary_probe_preserves_budgets(#[case] divisor: u64, #[case] size_ratio: f64) {
+    let block = create_test_fixed_data_block(4096, 2048, 64);
+    let field =
+        arrow_schema::Field::new("values", DataType::UInt64, false).with_metadata(HashMap::from([
+            (DICT_DIVISOR_META_KEY.to_string(), divisor.to_string()),
+            (DICT_SIZE_RATIO_META_KEY.to_string(), size_ratio.to_string()),
+        ]));
+    let field = lance_core::datatypes::Field::try_from(&field).unwrap();
+    let budget = PrimitiveStructuralEncoder::should_dictionary_encode(
+        &block,
+        &field,
+        DictionaryEncodingPolicy::Planar,
+    )
+    .expect("a repeated sample should reach bounded dictionary construction");
+    assert_eq!(budget.max_dict_entries, (4096 / divisor) as u32);
+    assert_eq!(
+        budget.max_encoded_size,
+        (block.data_size() as f64 * size_ratio) as usize
+    );
+    assert!(
+        dictionary_encode(&block, budget.max_dict_entries, budget.max_encoded_size).is_none(),
+        "actual construction must abort at the unchanged budget"
+    );
+    assert!(dictionary_encode(&block, 4096, block.data_size() as usize).is_some());
 }
 
 #[test]
