@@ -619,7 +619,7 @@ async fn test_planar_dictionary_encode_repeated_vectors(
             .map(|i| {
                 let row = (i / DIMENSION) % 17;
                 let column = i % DIMENSION;
-                (!null_children || (row + column) % 7 != 0)
+                (!null_children || !(row + column).is_multiple_of(7))
                     .then_some((row * DIMENSION + column) as f32 / 10.0)
             })
             .collect::<Vec<_>>(),
@@ -628,7 +628,13 @@ async fn test_planar_dictionary_encode_repeated_vectors(
         Arc::new(arrow_schema::Field::new("item", DataType::Float32, true)),
         if nested { DIMENSION / 2 } else { DIMENSION } as i32,
         Arc::new(values),
-        nested.then(|| NullBuffer::from((0..ROWS * 2).map(|i| i % 9 != 0).collect::<Vec<_>>())),
+        nested.then(|| {
+            NullBuffer::from(
+                (0..ROWS * 2)
+                    .map(|i| !i.is_multiple_of(9))
+                    .collect::<Vec<_>>(),
+            )
+        }),
     ));
     if nested {
         array = Arc::new(FixedSizeListArray::new(
@@ -647,7 +653,7 @@ async fn test_planar_dictionary_encode_repeated_vectors(
             .to_data()
             .into_builder()
             .nulls(Some(NullBuffer::from(
-                (0..ROWS).map(|i| i % 8 != 0).collect::<Vec<_>>(),
+                (0..ROWS).map(|i| !i.is_multiple_of(8)).collect::<Vec<_>>(),
             )))
             .build()
             .unwrap();
