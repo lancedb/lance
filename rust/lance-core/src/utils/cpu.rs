@@ -268,6 +268,10 @@ const BASELINE: CpuFeatures = {
     features
 };
 
+// Runtime detection checks only some features per target, and none on
+// targets without a detector, so it can miss features the build already
+// assumes. `Dispatch` relies on the host set containing the baseline, so add
+// it explicitly.
 static HOST_FEATURES: LazyLock<CpuFeatures> =
     LazyLock::new(|| detect_host_features().union(BASELINE));
 

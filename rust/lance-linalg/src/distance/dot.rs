@@ -90,7 +90,8 @@ pub trait Dot: Num {
     ///
     /// The default calls [`Dot::dot`] per vector. `f32` overrides it with one
     /// batch kernel call, so the SIMD tier is chosen once for the whole batch
-    /// instead of once per vector.
+    /// instead of once per vector. `f64` overrides it off x86_64 to specialize
+    /// the loop for the common PQ sub-vector lengths.
     ///
     /// # Panics
     ///
@@ -309,11 +310,15 @@ impl Dot for f64 {
 
     fn dot_batch_into(x: &[Self], batch: &[Self], dimension: usize, output: &mut [f32]) {
         assert_batch_output_layout(x.len(), batch.len(), dimension, output.len());
+        // Interim: on x86_64 f64 keeps the per-vector loop, since its PQ dot
+        // tables already beat the pre-`Dispatch` code; f64 moves onto
+        // `Dispatch` batch candidates later in #10083.
         #[cfg(target_arch = "x86_64")]
         for (product, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
             *product = dot_f64_simd(x, y);
         }
-        // Fixed query lengths for the same reason as `L2::l2_batch_into` for f64.
+        // Fixed query lengths and the pointer walk below are for the same
+        // reasons as in `L2::l2_batch_into` for f64.
         #[cfg(not(target_arch = "x86_64"))]
         if let Ok(x) = <&[Self; 8]>::try_from(x) {
             dot_batch_f64_fixed(x, batch, output);
@@ -383,6 +388,10 @@ mod x86 {
         /// Up to 16 dimensions the scalar kernel's 16-lane chunking degenerates
         /// to its remainder loop, so the explicit AVX kernel wins; above that
         /// the auto-vectorized scalar kernel is as good or better.
+        ///
+        /// Unlike `l2_batch_f32_avx_fma` there is no dimension-16 fast path:
+        /// that one closed a Haswell regression in PQ L2 tables, while dot at
+        /// dimension 16 was already faster than before `Dispatch`.
         pub(super) fn dot_batch_f32_avx_fma(
             x: &[f32],
             batch: &[f32],
@@ -794,6 +803,20 @@ mod tests {
             ))
             .is_err()
         );
+        // The f64 batch loops off x86 walk `batch` by pointer, sized by
+        // `output`, so a wrong `output` length must be rejected for f64 too.
+        for output_len in [1, 3] {
+            assert!(
+                std::panic::catch_unwind(|| dot_distance_batch_into(
+                    &[1.0_f64, 2.0],
+                    &[1.0_f64; 4],
+                    2,
+                    &mut vec![0.0; output_len]
+                ))
+                .is_err(),
+                "f64 accepted output length {output_len}"
+            );
+        }
         assert!(
             std::panic::catch_unwind(|| dot_distance_batch_into::<f32>(&[], &[], 0, &mut []))
                 .is_err()

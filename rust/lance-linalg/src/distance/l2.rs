@@ -38,9 +38,11 @@ pub trait L2: Num {
     /// Writes the L2 distance from `x` to each `dimension`-sized vector in
     /// `batch` into the matching element of `output`.
     ///
-    /// The default calls [`L2::l2`] per vector. `f32`, `f16` and `f64`
-    /// override it so the SIMD tier is chosen once for the whole batch instead
-    /// of once per vector.
+    /// The default calls [`L2::l2`] per vector. `f32` overrides it with one
+    /// batch kernel call and `f16` selects its backend once per batch, so
+    /// neither chooses a kernel per vector. `f64` picks its x86_64 SIMD tier
+    /// once per batch, and on other targets specializes the loop for the
+    /// common PQ sub-vector lengths.
     ///
     /// # Panics
     ///
@@ -269,6 +271,9 @@ impl L2 for f16 {
         // costs as much as a dimension-8 distance, so select it once per batch.
         // The scalar backend converts the query to f32 once, instead of once
         // per vector, and gets its own loop so the scalar kernel inlines.
+        // Interim: f16 still selects through `half_backend`, not `Dispatch`;
+        // it moves onto `Dispatch` batch candidates later in #10083, which
+        // must keep the convert-the-query-once step.
         let backend = f16_backend();
         if backend == HalfBackend::Scalar {
             let x: Vec<f32> = x.iter().map(|v| v.to_f32()).collect();
@@ -402,6 +407,13 @@ impl L2 for f64 {
         // Reading `SIMD_SUPPORT` per vector costs a large share of a
         // dimension-8 distance, so pick the tier once per batch. Each tier's
         // loop carries that tier's target features, so its kernel inlines.
+        // Interim: f64 still selects through `SIMD_SUPPORT`, not `Dispatch`;
+        // these per-tier loops become its `Dispatch` batch candidates later
+        // in #10083.
+        //
+        // SAFETY (all three calls): `SIMD_SUPPORT` reports a tier only when
+        // the host has its features: avx512f for the AVX-512 tiers, avx and
+        // fma for `Avx2`/`AvxFma`, and avx for `Avx`.
         #[cfg(target_arch = "x86_64")]
         match *SIMD_SUPPORT {
             SimdSupport::Avx512 | SimdSupport::Avx512FP16 => unsafe {
@@ -427,6 +439,9 @@ impl L2 for f64 {
         } else if let Ok(x) = <&[Self; 16]>::try_from(x) {
             l2_batch_f64_fixed(x, batch, output);
         } else {
+            // A pointer walk rather than `zip` with `chunks_exact`: on aarch64
+            // the zip indexed each vector with a multiply, which measurably
+            // slowed short vectors.
             let mut y = batch.as_ptr();
             for distance in output.iter_mut() {
                 // SAFETY: the layout assert guarantees `batch.len() == output.len() * dimension`.
@@ -1618,15 +1633,27 @@ mod tests {
         }
     }
 
+    /// The f64 batch loops off x86 walk `batch` by pointer, sized by `output`,
+    /// so the layout check must reject a wrong `output` length for every type.
     #[rstest::rstest]
     #[case::short(1)]
     #[case::long(3)]
     fn test_l2_batch_into_rejects_wrong_output_len(#[case] output_len: usize) {
-        let batch = [1.0_f32; 4];
-        let mut output = vec![0.0; output_len];
-        let result = std::panic::catch_unwind(move || {
-            l2_distance_batch_into(&[1.0_f32, 2.0], &batch, 2, &mut output)
-        });
-        assert!(result.is_err());
+        fn rejects<T: L2 + num_traits::FromPrimitive + Copy>(output_len: usize) {
+            let x = [T::from_f32(1.0).unwrap(), T::from_f32(2.0).unwrap()];
+            let batch = [T::from_f32(1.0).unwrap(); 4];
+            let mut output = vec![0.0; output_len];
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                l2_distance_batch_into(&x, &batch, 2, &mut output)
+            }));
+            assert!(
+                result.is_err(),
+                "{} accepted output length {output_len}",
+                std::any::type_name::<T>()
+            );
+        }
+        rejects::<f16>(output_len);
+        rejects::<f32>(output_len);
+        rejects::<f64>(output_len);
     }
 }

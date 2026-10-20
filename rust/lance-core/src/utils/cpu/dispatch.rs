@@ -108,6 +108,10 @@ pub struct Dispatch<F: 'static> {
 ///
 /// Only [`Dispatch::get`] writes it, and only with a kernel the host supports,
 /// so safe code cannot plant a kernel that skips the host check.
+///
+/// Each `Selection` must belong to exactly one [`Dispatch`]. Two dispatches
+/// sharing one is still sound, but the second returns the first's kernel.
+/// [`dispatch!`](crate::dispatch) creates a private one per dispatch.
 pub struct Selection<F>(OnceLock<F>);
 
 impl<F> Selection<F> {
@@ -144,6 +148,9 @@ impl<F: Copy> Dispatch<F> {
     #[inline(always)]
     pub fn get(&self) -> Kernel<F> {
         if self.is_static {
+            // Sound without a host check: `new` set `is_static` only if the
+            // build baseline covers the first candidate's features, and every
+            // host that can run this binary has the baseline.
             return Kernel(self.candidates[0].kernel);
         }
         Kernel(*self.selected.0.get_or_init(|| self.selected().kernel))
