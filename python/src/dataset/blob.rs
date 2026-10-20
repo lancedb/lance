@@ -27,7 +27,7 @@ use crate::{error::PythonErrorExt, rt};
 
 #[pyclass]
 pub struct LanceBlobFile {
-    inner: Arc<InnerBlobFile>,
+    pub(crate) inner: Arc<InnerBlobFile>,
 }
 
 #[pymethods]

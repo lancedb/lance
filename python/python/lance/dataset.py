@@ -95,6 +95,7 @@ if TYPE_CHECKING:
 
     from . import mem_wal
     from .commit import CommitLock
+    from .lance import LanceBlobFile
     from .lance.indices import IndexDescription
     from .progress import FragmentWriteProgress, IndexProgress
     from .types import ReaderLike
@@ -373,6 +374,16 @@ def _resolve_blob_selection(
     if indices is not None:
         return "indices", indices
     raise ValueError("Either ids, addresses, or indices must be specified")
+
+
+def _lance_blob_file(blob_file: Optional[BlobFile]) -> Optional[LanceBlobFile]:
+    if blob_file is None:
+        return None
+    if not isinstance(blob_file, BlobFile):
+        raise TypeError(
+            f"Expected a lance.BlobFile or None, got {type(blob_file).__name__}"
+        )
+    return blob_file.inner
 
 
 class MergeInsertBuilder(_MergeInsertBuilder):
@@ -2550,6 +2561,124 @@ class LanceDataset(pa.dataset.Dataset):
             list(requests),
             blob_column,
             selector,
+            io_buffer_size=io_buffer_size,
+            preserve_order=preserve_order,
+        )
+
+    def read_blob_files(
+        self,
+        blob_files: Sequence[Optional[BlobFile]],
+        *,
+        io_buffer_size: Optional[int] = None,
+        preserve_order: Optional[bool] = None,
+    ) -> List[Tuple[int, Optional[bytes]]]:
+        """
+        Read whole blobs through :py:class:`lance.BlobFile` handles you already hold.
+
+        :py:meth:`read_blobs` reads the blob column's descriptors for its row
+        selection on every call before it reads any payload. A handle returned
+        by :py:meth:`take_blobs` already holds that descriptor, so when the same
+        blobs are read repeatedly, take them once and pass the handles here:
+        each call then issues only the payload requests, planned, coalesced
+        across handles that share a backing file, and executed in Rust.
+
+        Every handle produces one result. Pass ``None``, which
+        :py:meth:`take_blobs` returns for a null blob, to get ``None`` back.
+        Handles are read as they are: they are not checked against this
+        dataset, its version or its columns, and a handle keeps returning the
+        bytes of the version it was taken from for as long as that version's
+        files are retained. Reading does not move a handle's cursor; a closed
+        handle raises ``ValueError``.
+
+        Parameters
+        ----------
+        blob_files : Sequence[Optional[BlobFile]]
+            Handles from :py:meth:`take_blobs`, or ``None`` for null blobs.
+        io_buffer_size : int, optional
+            Override the scheduler I/O buffer size used while materializing blobs.
+        preserve_order : bool, optional
+            If True (the default), results follow the order of ``blob_files``.
+            If False, ``request_index`` still identifies every result.
+
+        Examples
+        --------
+        .. code-block:: python
+
+            handles = dataset.take_blobs("images", indices=[0, 1, 2])
+            payloads = [data for _, data in dataset.read_blob_files(handles)]
+
+        Returns
+        -------
+        results : List[Tuple[int, Optional[bytes]]]
+            One ``(request_index, data)`` pair per handle, where
+            ``request_index`` is the handle's position in ``blob_files``. Valid
+            empty blobs return ``b""``.
+        """
+        return self._ds.read_blob_files(
+            [_lance_blob_file(blob_file) for blob_file in blob_files],
+            io_buffer_size=io_buffer_size,
+            preserve_order=preserve_order,
+        )
+
+    def read_blob_file_ranges(
+        self,
+        requests: Sequence[Tuple[Optional[BlobFile], int, int]],
+        *,
+        io_buffer_size: Optional[int] = None,
+        preserve_order: Optional[bool] = None,
+    ) -> List[Tuple[int, Optional[bytes]]]:
+        """
+        Read blob-local byte ranges through :py:class:`lance.BlobFile` handles
+        you already hold.
+
+        This is the handle counterpart of :py:meth:`read_blob_ranges`, and skips
+        the descriptor read for the same reason as :py:meth:`read_blob_files`.
+        Each request is a ``(blob_file, offset, length)`` tuple. Repeat a handle
+        to read several ranges from one blob; ranges on the same backing file
+        are coalesced across handles.
+
+        Every request produces one result. A request whose handle is ``None``
+        returns ``None``, and its range is not checked against a blob size.
+        Empty ranges on a handle return ``b""`` without payload I/O. For every
+        request, offset plus length must fit in an unsigned 64-bit integer, and
+        a range on a handle must not extend beyond the blob's size. Handles are
+        read as described in :py:meth:`read_blob_files`.
+
+        Parameters
+        ----------
+        requests : Sequence[Tuple[Optional[BlobFile], int, int]]
+            Complete ``(blob_file, offset, length)`` requests.
+        io_buffer_size : int, optional
+            Override the scheduler I/O buffer size used while materializing ranges.
+        preserve_order : bool, optional
+            If True (the default), results follow request order. If False,
+            ``request_index`` still identifies every result.
+
+        Examples
+        --------
+        Read a shard index from the end of a blob, then two chunks from it:
+
+        .. code-block:: python
+
+            (shard,) = dataset.take_blobs("shards", indices=[7])
+            [(_, index)] = dataset.read_blob_file_ranges(
+                [(shard, shard.size() - 1024, 1024)]
+            )
+            chunks = dataset.read_blob_file_ranges(
+                [(shard, 0, 4096), (shard, 4096, 4096)]
+            )
+
+        Returns
+        -------
+        results : List[Tuple[int, Optional[bytes]]]
+            One ``(request_index, data)`` pair per request. The Python list
+            retains all returned payload bytes in memory.
+        """
+        return self._ds.read_blob_file_ranges(
+            [
+                (_lance_blob_file(blob_file), offset, length)
+                for blob_file, offset, length in requests
+            ],
             io_buffer_size=io_buffer_size,
             preserve_order=preserve_order,
         )
