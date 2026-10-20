@@ -6,6 +6,7 @@ import importlib
 import io
 import queue
 import random
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -44,7 +45,7 @@ LEGACY_BLOB_STORAGE_VERSION = "2.1"
 def test_blob_v2_descriptor_subfield_queries(tmp_path, complete, nested, child, value):
     external = tmp_path / "external.bin"
     external.write_bytes(b"world!")
-    blobs = lance.blob_array([b"hello", external.as_uri(), None])
+    blobs = lance.blob_array([b"hello", None, external.as_uri(), b"again"])
     if not complete:
         storage_type = pa.struct(list(blobs.type.storage_type)[:2])
         blob_type = BlobType.__arrow_ext_deserialize__(storage_type, b"")
@@ -57,21 +58,21 @@ def test_blob_v2_descriptor_subfield_queries(tmp_path, complete, nested, child, 
     if nested:
         data = pa.table(
             {
-                "id": [0, 1, 2],
+                "id": [0, 1, 2, 3],
                 "meta": pa.StructArray.from_arrays([blobs], names=["video"]),
             }
         )
         parent = "meta.video"
     else:
-        data = pa.table({"id": [0, 1, 2], "video": blobs})
+        data = pa.table({"id": [0, 1, 2, 3], "video": blobs})
         parent = "video"
     ds = lance.write_dataset(
         data,
         tmp_path / "dataset",
         data_storage_version="2.2",
         initial_bases=[DatasetBasePath(tmp_path.as_uri(), name="external", id=1)],
-        max_rows_per_file=2,
-        max_rows_per_group=2,
+        max_rows_per_file=3,
+        max_rows_per_group=3,
     )
     assert len(ds.get_fragments()) == 2
     descriptors = ds.to_table(columns=[parent])[parent].to_pylist()
@@ -95,6 +96,24 @@ def test_blob_v2_descriptor_subfield_queries(tmp_path, complete, nested, child, 
         assert result["id"].to_pylist() == [
             i for i, item in enumerate(expected) if item is None
         ]
+
+    for index, (predicate, deleted_ids) in enumerate(
+        [
+            (f"{column} = {literal}", expected_ids),
+            (f"{column} IS NULL", [1]),
+            (f"{column} IS NOT NULL", [0, 2, 3]),
+        ]
+    ):
+        assert ds.to_table(columns=["id"], filter=predicate)["id"].to_pylist() == (
+            deleted_ids
+        )
+        path = shutil.copytree(tmp_path / "dataset", tmp_path / f"delete_{index}")
+        deleted = lance.dataset(path)
+        deleted.delete(predicate)
+        remaining_ids = [i for i in range(4) if i not in deleted_ids]
+        result = deleted.to_table(columns=["id", parent])
+        assert result["id"].to_pylist() == remaining_ids
+        assert result[parent].to_pylist() == [descriptors[i] for i in remaining_ids]
 
 
 def _blob_row_ids(dataset):
