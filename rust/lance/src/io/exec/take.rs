@@ -712,7 +712,6 @@ impl ExecutionPlan for TakeExec {
         vec![false]
     }
 
-    /// This preserves the output schema.
     fn apply_expressions(
         &self,
         _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
@@ -720,6 +719,7 @@ impl ExecutionPlan for TakeExec {
         Ok(TreeNodeRecursion::Continue)
     }
 
+    /// This preserves the output schema.
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
