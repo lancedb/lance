@@ -11,15 +11,14 @@ use std::sync::Arc;
 use crate::Dataset;
 use crate::dataset::optimize::RemappedIndex;
 use crate::dataset::optimize::remapping::RemapResult;
+use crate::index::DatasetIndexExt;
 use crate::index::remap_index;
 use crate::index::scalar::infer_scalar_index_details;
-use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
 use arrow_schema::DataType;
 use async_trait::async_trait;
 use lance_core::{Error, Result};
 use lance_file::version::ConcreteFileVersion;
 use lance_index::is_system_index;
-use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::pb::VectorIndexDetails;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_table::format::IndexMetadata;
@@ -56,48 +55,39 @@ impl IndexRemapperOptions for DatasetIndexRemapperOptions {
             return Ok(None);
         };
 
-        // ZoneMap and other scalar indices with can_remap() == false do not
-        // need an address map. Skip building it only if no index needs it.
-        // These opens reuse the loaders and cache used by remap_index.
-        for index in indices.iter().filter(|index| !is_system_index(index)) {
-            let needs_mapping: Result<bool> = async {
-                // Do not let an early skip hide corrupt covering metadata.
-                index.validate_covering_fields()?;
-                let [field_id] = index.fields.as_slice() else {
-                    // Covered and composite indices need remap_index's handling.
-                    return Ok(true);
-                };
-                let field_path = dataset.schema().field_path(*field_id)?;
-                let generic = dataset
-                    .open_generic_index(&field_path, &index.uuid, &NoOpMetricsCollector)
-                    .await?;
-                if !generic.index_type().is_scalar() {
-                    return Ok(true);
-                }
-                let scalar = dataset
-                    .open_scalar_index(&field_path, &index.uuid, &NoOpMetricsCollector)
-                    .await?;
-                Ok(scalar.can_remap())
-            }
-            .await;
-            match needs_mapping {
-                Ok(false) => continue,
-                Ok(true) => {}
-                // Preserve error handling after the remapper filters affected fragments.
-                Err(error) => log::warn!(
-                    "Cannot check remap support for index '{}': {}. \
-                     Retaining the existing remap path.",
-                    index.uuid,
-                    error
-                ),
-            }
-            return Ok(Some(Box::new(DatasetIndexRemapper {
-                dataset: Arc::new(dataset.clone()),
-                indices,
-            })));
+        if !needs_index_remap(dataset, &indices) {
+            return Ok(None);
         }
-        Ok(None)
+
+        Ok(Some(Box::new(DatasetIndexRemapper {
+            dataset: Arc::new(dataset.clone()),
+            indices,
+        })))
     }
+}
+
+/// Whether any index still needs the normal remap path. Inspect metadata only:
+/// opening a ZoneMap to call can_remap() would load its zone statistics needlessly.
+fn needs_index_remap(dataset: &Dataset, indices: &[IndexMetadata]) -> bool {
+    indices.iter().any(|index| {
+        if is_system_index(index) {
+            return false;
+        }
+        // Preserve remap_index's handling of multi-field or invalid declarations.
+        let [field_id] = index.fields.as_slice() else {
+            return true;
+        };
+        if !index.covering_fields.is_empty() || dataset.schema().field_by_id(*field_id).is_none() {
+            return true;
+        }
+        // ZoneMap cannot remap. All other types, including missing details,
+        // retain the existing path rather than guessing their capabilities.
+        !index.index_details.as_ref().is_some_and(|details| {
+            details
+                .type_url
+                .ends_with("/lance.table.ZoneMapIndexDetails")
+        })
+    })
 }
 
 struct DatasetIndexRemapper {
@@ -261,12 +251,12 @@ mod tests {
     use uuid::Uuid;
 
     #[tokio::test]
-    async fn test_remapper_retained_without_index_files() {
+    async fn test_remapper_skips_zonemap_without_index_files() {
         let reader = lance_datagen::gen_batch()
             .col("id", array::step::<arrow_array::types::Int32Type>())
             .into_reader_rows(RowCount::from(1), BatchCount::from(1));
         let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
-        // A failed early open must retain the existing remap/error-handling path.
+        // No index files exist: deciding to skip ZoneMap must use metadata alone.
         let index = IndexMetadata {
             uuid: Uuid::new_v4(),
             fields: vec![dataset.schema().field("id").unwrap().id],
@@ -301,7 +291,7 @@ mod tests {
                 .create_remapper(&dataset)
                 .await
                 .unwrap()
-                .is_some(),
+                .is_none(),
         );
     }
 
