@@ -936,22 +936,20 @@ mod tests {
     use super::ValueEncoder;
 
     #[rstest::rstest]
-    #[case::raw("none")]
-    #[case::lz4("lz4")]
-    #[case::zstd("zstd")]
+    #[case::raw("none", false)]
+    #[case::lz4("lz4", false)]
+    #[case::zstd("zstd", false)]
+    #[case::all_null_children("lz4", true)]
     #[test]
-    fn test_vector_dictionary_block_lengths(#[case] compression: &str) {
+    fn test_vector_dictionary_block_lengths(#[case] compression: &str, #[case] all_null: bool) {
         let array = FixedSizeListArray::new(
             Arc::new(Field::new("item", DataType::Int32, true)),
             3,
-            Arc::new(Int32Array::from(vec![
-                Some(1),
-                None,
-                Some(3),
-                Some(4),
-                Some(5),
-                None,
-            ])),
+            Arc::new(if all_null {
+                Int32Array::new_null(6)
+            } else {
+                Int32Array::from(vec![Some(1), None, Some(3), Some(4), Some(5), None])
+            }),
             None,
         );
         let data_type = array.data_type().clone();

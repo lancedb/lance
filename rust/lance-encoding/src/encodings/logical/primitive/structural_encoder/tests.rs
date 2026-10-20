@@ -628,7 +628,7 @@ async fn test_planar_dictionary_encode_repeated_vectors(
         Arc::new(arrow_schema::Field::new("item", DataType::Float32, true)),
         if nested { DIMENSION / 2 } else { DIMENSION } as i32,
         Arc::new(values),
-        None,
+        nested.then(|| NullBuffer::from((0..ROWS * 2).map(|i| i % 9 != 0).collect::<Vec<_>>())),
     ));
     if nested {
         array = Arc::new(FixedSizeListArray::new(
