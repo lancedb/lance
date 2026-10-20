@@ -3325,7 +3325,10 @@ pub async fn commit_compaction(
 
     // Confirm there is a remapper before materializing the potentially very large row address map.
     let index_remapper = if needs_remapping {
-        remap_options.create_remapper(dataset).await?
+        remap_options
+            .create_remapper(dataset)
+            .await?
+            .filter(|remapper| remapper.needs_row_address_map(&completed_tasks))
     } else {
         None
     };
@@ -5661,11 +5664,13 @@ mod tests {
     #[rstest]
     #[case::without_index(&[])]
     #[case::zonemap(&[BuiltinIndexType::ZoneMap])]
+    #[case::bloom_filter(&[BuiltinIndexType::BloomFilter])]
     #[case::btree(&[BuiltinIndexType::BTree])]
     #[case::mixed(&[BuiltinIndexType::ZoneMap, BuiltinIndexType::BTree])]
     #[tokio::test]
     async fn test_row_addrs_only_used_with_remappable_index(
         #[case] index_types: &[BuiltinIndexType],
+        #[values(IndexRemapMode::Direct, IndexRemapMode::Compact)] index_remap_mode: IndexRemapMode,
     ) {
         let data = sample_data();
         let reader = RecordBatchIterator::new(vec![Ok(data.slice(0, 9_000))], data.schema());
@@ -5695,6 +5700,7 @@ mod tests {
 
         let options = CompactionOptions {
             target_rows_per_fragment: 9_000,
+            index_remap_mode,
             ..Default::default()
         };
         let original_indices = dataset.load_indices().await.unwrap();

@@ -697,10 +697,6 @@ impl ScalarIndex for NGramIndex {
         }
     }
 
-    fn can_remap(&self) -> bool {
-        true
-    }
-
     async fn remap(
         &self,
         mapping: &RowAddrRemap,
@@ -1840,6 +1836,10 @@ impl BasicTrainer for NGramIndexPlugin {
 
 #[async_trait]
 impl ScalarIndexPlugin for NGramIndexPlugin {
+    fn can_remap(&self, _details: &prost_types::Any) -> Result<bool> {
+        Ok(true)
+    }
+
     fn basic_trainer(&self) -> Option<&dyn BasicTrainer> {
         Some(self)
     }

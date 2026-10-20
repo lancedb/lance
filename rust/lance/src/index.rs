@@ -2004,7 +2004,7 @@ pub(crate) async fn remap_index(
     // values in the first place, and each index type's `remap` rewrites only the
     // schema that type knows about, so the remapped segment would still declare
     // payload its storage no longer holds. Withdraw it instead, exactly as an
-    // index whose type reports `can_remap() == false` is withdrawn below: an
+    // index whose plugin reports `can_remap(details) == false` is withdrawn below: an
     // absent index costs a fallback scan, whereas a surviving false declaration
     // is answered from data that is not there. Erroring here would instead block
     // compaction of the whole table.
@@ -2073,7 +2073,11 @@ pub(crate) async fn remap_index(
             let scalar_index = dataset
                 .open_scalar_index(&field_path, index_id, &NoOpMetricsCollector)
                 .await?;
-            if !scalar_index.can_remap() {
+            let details = fetch_index_details(dataset, &field_path, matched).await?;
+            if !IndexDetails(details.clone())
+                .get_plugin()?
+                .can_remap(details.as_ref())?
+            {
                 return Ok(RemapResult::Drop);
             }
 
@@ -6739,16 +6743,46 @@ mod tests {
         assert_eq!(stats["num_indexed_rows"], 512);
     }
 
+    #[rstest]
+    #[case::missing_details("v0.18.2/index_no_details.lance", None)]
+    #[case::v036(
+        "0.36.0/btree_in_index_pkg.lance",
+        Some("/lance.index.pb.BTreeIndexDetails")
+    )]
     #[tokio::test]
-    async fn test_v036_scalar_details_are_still_known() {
-        let test_dir = copy_test_data_to_tmp("0.36.0/btree_in_index_pkg.lance").unwrap();
+    async fn test_historical_scalar_indices_support_remapping(
+        #[case] fixture: &str,
+        #[case] type_url: Option<&str>,
+    ) {
+        let test_dir = copy_test_data_to_tmp(fixture).unwrap();
         let dataset = Dataset::open(&test_dir.path_str()).await.unwrap();
         let indices = dataset.load_indices().await.unwrap();
-        let details = indices[0].index_details.clone().unwrap();
+        assert!(!indices.is_empty());
 
-        assert_eq!(details.type_url, "/lance.index.pb.BTreeIndexDetails");
-        assert_eq!(IndexDetails(details).get_plugin().unwrap().name(), "BTree");
-        assert!(index_type_is_known(&indices[0]));
+        for index in indices.iter() {
+            assert_eq!(
+                index
+                    .index_details
+                    .as_ref()
+                    .map(|details| details.type_url.as_str()),
+                type_url
+            );
+            if let Some(details) = &index.index_details {
+                assert_eq!(
+                    IndexDetails(details.clone()).get_plugin().unwrap().name(),
+                    "BTree"
+                );
+            }
+            assert!(index_type_is_known(index));
+            let result = remap_index(
+                &dataset,
+                &index.uuid,
+                &RowAddrTranslator::sync(RowAddrRemap::empty()),
+            )
+            .await
+            .unwrap();
+            assert!(matches!(result, RemapResult::Remapped(_)), "{result:?}");
+        }
     }
 
     #[tokio::test]
@@ -8655,8 +8689,11 @@ mod tests {
         assert!(frag_reuse_index.is_some());
     }
 
+    #[rstest]
+    #[case::vector(true)]
+    #[case::zonemap(false)]
     #[tokio::test]
-    async fn test_remap_empty_chain() {
+    async fn test_remap_empty_chain(#[case] is_vector: bool) {
         let data = gen_batch()
             .col("int", array::step::<Int32Type>())
             .col(
@@ -8666,11 +8703,24 @@ mod tests {
             .into_reader_rows(RowCount::from(256), BatchCount::from(1));
         let mut dataset = Dataset::write(data, "memory://", None).await.unwrap();
 
-        let params = VectorIndexParams::ivf_pq(1, 8, 1, DistanceType::L2, 1);
-        dataset
-            .create_index(&["vector"], IndexType::Vector, None, &params, false)
-            .await
-            .unwrap();
+        if is_vector {
+            let params = VectorIndexParams::ivf_pq(1, 8, 1, DistanceType::L2, 1);
+            dataset
+                .create_index(&["vector"], IndexType::Vector, None, &params, false)
+                .await
+                .unwrap();
+        } else {
+            dataset
+                .create_index(
+                    &["int"],
+                    IndexType::Scalar,
+                    None,
+                    &ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap),
+                    false,
+                )
+                .await
+                .unwrap();
+        }
 
         let index_uuid = dataset.load_indices().await.unwrap()[0].uuid;
         let row_count = dataset.count_all_rows().await.unwrap();
