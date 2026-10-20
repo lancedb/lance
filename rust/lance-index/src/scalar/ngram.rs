@@ -2047,11 +2047,10 @@ mod tests {
                 .clone()
                 .read_record_batch_stream(batch_size, batch_readahead)
                 .await?;
-            let batches = batches.map(move |batch| {
-                batch.map(|batch| {
+            let batches = batches.inspect(move |batch| {
+                if let Ok(batch) = batch {
                     max_rows_seen.fetch_max(batch.num_rows(), Ordering::Relaxed);
-                    batch
-                })
+                }
             });
             Ok(Box::pin(LanceRecordBatchStreamAdapter::new(
                 schema, batches,
