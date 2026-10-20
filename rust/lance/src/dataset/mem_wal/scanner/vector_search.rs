@@ -238,6 +238,18 @@ impl LsmVectorSearchPlanner {
         self
     }
 
+    /// The caller's `ef`, else the default a flushed generation's HNSW index
+    /// would use for a refined search (`1.5 * k * refine_factor`); `None` keeps
+    /// the memtable graph's own default, which this never lowers.
+    fn memtable_arm_ef(&self, k: usize) -> Option<usize> {
+        if self.ef.is_some() {
+            return self.ef;
+        }
+        let candidates = k.saturating_mul(self.refine_factor? as usize);
+        let ef = candidates.saturating_add(candidates / 2);
+        (ef > k.max(crate::dataset::mem_wal::index::HNSW_DEFAULT_SEARCH_EF)).then_some(ef)
+    }
+
     /// Report unrefined distances, and take the distance range, as `scale`
     /// times the exact distance. Cosine SQ/PQ indexes report `2 * (1 - cos)`,
     /// so `2.0` matches such a base. Ignored when refining; defaults to `1.0`.
@@ -812,7 +824,7 @@ impl LsmVectorSearchPlanner {
                     scanner.maximum_nprobes(maximum_nprobes);
                 }
                 scanner.distance_metric(self.distance_type);
-                if let Some(ef) = self.ef {
+                if let Some(ef) = self.memtable_arm_ef(k) {
                     scanner.ef(ef);
                 }
                 let plan = scale_distance(Box::pin(scanner.create_plan()).await?, scale)?;
@@ -1134,7 +1146,8 @@ mod tests {
     }
 
     /// `ef` is the fresh tier's only meaningful recall knob — its arms are
-    /// HNSW-backed, and probe counts have nothing to probe here. Before
+    /// HNSW-backed, and probe counts have nothing to probe here. A refined
+    /// search defaults it to what a flushed generation's index would use. Before
     /// `with_ef` the planner had no way to express it at all, so every
     /// fresh-tier search ran at the graph default while the base arm honored
     /// whatever the caller asked for.
@@ -1217,6 +1230,23 @@ mod tests {
         assert!(
             widened.contains("ef=97"),
             "with_ef must reach the memtable HNSW arm: {widened}"
+        );
+
+        let refined = |refine_factor, ef| {
+            let planner = build_planner()
+                .with_refine_factor(Some(refine_factor))
+                .with_ef(ef);
+            let query = query.clone();
+            async move { planner.plan_search(&query, 10, 1, None, false, 1.0).await }
+        };
+        let plan = render(refined(10, None).await.unwrap());
+        assert!(plan.contains("ef=150"), "1.5 * k * refine_factor: {plan}");
+        let plan = render(refined(10, Some(97)).await.unwrap());
+        assert!(plan.contains("ef=97"), "the caller's ef wins: {plan}");
+        let plan = render(refined(1, None).await.unwrap());
+        assert!(
+            !plan.contains("ef="),
+            "never below the graph default: {plan}"
         );
     }
 
