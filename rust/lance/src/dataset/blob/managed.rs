@@ -20,7 +20,7 @@ use super::locate::{
 };
 use crate::blob::{BlobDescriptor, BlobDescriptorArrayBuilder};
 use crate::dataset::Dataset;
-use lance_core::datatypes::{BlobKind, Field as LanceField};
+use lance_core::datatypes::{BlobKind, BlobV2Layout, Field as LanceField};
 use lance_core::utils::blob::blob_path;
 use lance_core::{Error, ROW_ADDR, Result, utils::address::RowAddress};
 
@@ -242,7 +242,29 @@ pub(in crate::dataset) async fn managed_paths(
 /// Preserve Managed references and adopt Packed/Dedicated objects in place.
 /// Only Inline payloads are copied. Implicit source bases become explicit when
 /// a shallow clone rewrites descriptors into its own table base.
-pub(in crate::dataset) async fn preserve_managed_descriptors(
+/// Convert scanned descriptors into prepared write values without reading
+/// out-of-line payloads. `row_addrs` must identify each descriptor's source
+/// row in `dataset`; `field_id` identifies its blob leaf. Inline values are
+/// read from their source data file. The caller must retain the source snapshot
+/// until the new references have been committed.
+///
+/// `field` supplies the destination name, nullability and metadata. The returned
+/// array has the prepared Blob v2 layout and can be interleaved with values from
+/// [`BlobDescriptorArrayBuilder`] before writing.
+///
+/// ```
+/// # use std::sync::Arc;
+/// # use arrow_array::StructArray;
+/// # use arrow_schema::Field;
+/// # use lance::Dataset;
+/// # async fn preserve(dataset: Arc<Dataset>, values: &StructArray, rows: &[u64], field: &Field) -> lance::Result<()> {
+/// let prepared = lance::dataset::preserve_managed_descriptors(
+///     &dataset, 0, values, rows, field,
+/// ).await?;
+/// # let _ = prepared;
+/// # Ok(()) }
+/// ```
+pub async fn preserve_managed_descriptors(
     dataset: &Arc<Dataset>,
     field_id: u32,
     values: &StructArray,
@@ -250,9 +272,25 @@ pub(in crate::dataset) async fn preserve_managed_descriptors(
     field: &ArrowField,
 ) -> Result<ArrayRef> {
     if values.len() != row_addrs.len() {
-        return Err(Error::internal(
-            "Blob descriptors and row addresses have different lengths",
-        ));
+        return Err(Error::invalid_input(format!(
+            "Blob descriptor count {} does not match row address count {}",
+            values.len(),
+            row_addrs.len()
+        )));
+    }
+    if BlobV2Layout::classify(values.fields()) != Some(BlobV2Layout::Descriptor) {
+        return Err(Error::invalid_input(format!(
+            "Expected Blob v2 descriptors, got {:?}",
+            values.data_type()
+        )));
+    }
+    let source_field = i32::try_from(field_id)
+        .ok()
+        .and_then(|id| dataset.schema().field_by_id(id));
+    if !source_field.is_some_and(|field| field.is_blob_v2()) {
+        return Err(Error::invalid_input(format!(
+            "Source field {field_id} is not a Blob v2 field"
+        )));
     }
     let columns = BlobV2DescriptorColumns::new(values);
     let mut builder = BlobDescriptorArrayBuilder::new_with_metadata(
