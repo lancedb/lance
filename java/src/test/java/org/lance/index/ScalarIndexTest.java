@@ -18,6 +18,7 @@ import org.lance.Fragment;
 import org.lance.LockManager;
 import org.lance.TestUtils;
 import org.lance.WriteParams;
+import org.lance.index.scalar.FmIndexParams;
 import org.lance.index.scalar.InvertedIndexParams;
 import org.lance.index.scalar.MinHashLshIndexParams;
 import org.lance.index.scalar.ScalarIndexParams;
@@ -822,6 +823,37 @@ public class ScalarIndexTest {
             "whitespace",
             ((Map<String, Object>) JsonUtils.fromJson(detailsJson).get("tokenizer"))
                 .get("base_tokenizer"));
+      }
+    }
+  }
+
+  @Test
+  public void testCreateFmIndex(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("fm_index").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      testDataset.write(1, 10).close();
+      try (Dataset dataset = testDataset.write(2, 10)) {
+        IndexParams indexParams =
+            IndexParams.builder()
+                .setScalarIndexParams(FmIndexParams.builder().numSegments(2).build())
+                .build();
+        dataset.createIndex(
+            IndexOptions.builder(Collections.singletonList("name"), IndexType.FM, indexParams)
+                .withIndexName("name_fm")
+                .build());
+
+        List<Index> segments = dataset.describeIndices().get(0).getSegments();
+        assertEquals(2, segments.size());
+        assertEquals(IndexType.FM, segments.get(0).indexType());
+        // Each fragment holds "Person 0" through "Person 9"; a one-character
+        // pattern is answered by the index as well.
+        assertEquals(
+            2, dataset.countIndexedRows("name_fm", "contains(name, 'Person 7')", Optional.empty()));
+        assertEquals(
+            2, dataset.countIndexedRows("name_fm", "contains(name, '7')", Optional.empty()));
       }
     }
   }
