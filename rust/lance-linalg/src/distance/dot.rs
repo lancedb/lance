@@ -306,6 +306,38 @@ impl Dot for f64 {
         assert_equal_lengths(x.len(), y.len());
         dot_f64_simd(x, y)
     }
+
+    fn dot_batch_into(x: &[Self], batch: &[Self], dimension: usize, output: &mut [f32]) {
+        assert_batch_output_layout(x.len(), batch.len(), dimension, output.len());
+        #[cfg(target_arch = "x86_64")]
+        for (product, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
+            *product = dot_f64_simd(x, y);
+        }
+        // Fixed query lengths for the same reason as `L2::l2_batch_into` for f64.
+        #[cfg(not(target_arch = "x86_64"))]
+        if let Ok(x) = <&[Self; 8]>::try_from(x) {
+            dot_batch_f64_fixed(x, batch, output);
+        } else if let Ok(x) = <&[Self; 16]>::try_from(x) {
+            dot_batch_f64_fixed(x, batch, output);
+        } else {
+            let mut y = batch.as_ptr();
+            for product in output.iter_mut() {
+                // SAFETY: the layout assert guarantees `batch.len() == output.len() * dimension`.
+                unsafe {
+                    *product = dot_f64_simd_other(x, std::slice::from_raw_parts(y, dimension));
+                    y = y.add(dimension);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+fn dot_batch_f64_fixed<const N: usize>(x: &[f64; N], batch: &[f64], output: &mut [f32]) {
+    for (product, y) in output.iter_mut().zip(batch.as_chunks::<N>().0) {
+        *product = dot_f64_simd_other(x, y);
+    }
 }
 
 /// Dot product for f64, runtime-dispatched via `SIMD_SUPPORT` on x86_64
@@ -1004,21 +1036,26 @@ mod tests {
         }
     }
 
-    /// `dot_batch_into` must agree with the per-vector `dot`, both for the
-    /// f32 batch kernel and for the per-vector default that f64 uses.
+    /// `dot_batch_into` must agree with the per-vector `dot`. The f32 batch
+    /// kernel may differ in rounding; the f64 batch loops run the pair
+    /// kernel's arithmetic, so f64 must match bit for bit.
     #[rstest::rstest]
     #[case::dim_8(8)]
+    #[case::dim_12(12)]
+    #[case::dim_13(13)]
     #[case::dim_16(16)]
     #[case::dim_32(32)]
     #[case::dim_1024(1024)]
     fn test_dot_batch_into_matches_per_vector_dot(#[case] dimension: usize) {
-        fn check<T: Dot + FromPrimitive + Copy>(dimension: usize) {
+        fn check<T: Dot + FromPrimitive + Copy>(dimension: usize, bit_exact: bool) {
             let num_vectors = 130;
+            // Values that are not multiples of a power of two, so the sums
+            // round and a different summation order changes the result.
             let x: Vec<T> = (0..dimension)
-                .map(|i| T::from_f32(((i % 13) as f32) * 0.25 + 1.0).unwrap())
+                .map(|i| T::from_f32((i as f32 * 0.37).sin()).unwrap())
                 .collect();
             let batch: Vec<T> = (0..dimension * num_vectors)
-                .map(|i| T::from_f32(((i % 11) as f32) * 0.5 - 2.0).unwrap())
+                .map(|i| T::from_f32((i as f32 * 0.73).cos() * 2.0).unwrap())
                 .collect();
 
             let mut got = vec![f32::NAN; num_vectors];
@@ -1026,14 +1063,22 @@ mod tests {
 
             for (g, y) in got.iter().zip(batch.chunks_exact(dimension)) {
                 let w = T::dot(&x, y);
-                assert!(
-                    approx::relative_eq!(*g, w, epsilon = 1e-4, max_relative = 1e-5),
-                    "dim {dimension}: batch {g} != per-vector {w}"
-                );
+                if bit_exact {
+                    assert_eq!(
+                        g.to_bits(),
+                        w.to_bits(),
+                        "dim {dimension}: batch {g} != per-vector {w}"
+                    );
+                } else {
+                    assert!(
+                        approx::relative_eq!(*g, w, epsilon = 1e-4, max_relative = 1e-5),
+                        "dim {dimension}: batch {g} != per-vector {w}"
+                    );
+                }
             }
         }
-        check::<f32>(dimension);
-        check::<f64>(dimension);
+        check::<f32>(dimension, false);
+        check::<f64>(dimension, true);
     }
 
     /// `dot_distance_batch_into` writes `1.0 - dot`.

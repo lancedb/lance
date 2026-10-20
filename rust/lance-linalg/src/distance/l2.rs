@@ -417,10 +417,33 @@ impl L2 for f64 {
                 }
             }
         }
+        // A compile-time query length lets LLVM keep the query in registers
+        // and drop the kernel's 4-lane and scalar tail stages, which it
+        // otherwise doesn't reliably unswitch out of the loop. 8 and 16 are
+        // the PQ sub-vector lengths of 128-dimension vectors.
         #[cfg(not(target_arch = "x86_64"))]
-        for (distance, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
-            *distance = l2_f64_simd_other(x, y);
+        if let Ok(x) = <&[Self; 8]>::try_from(x) {
+            l2_batch_f64_fixed(x, batch, output);
+        } else if let Ok(x) = <&[Self; 16]>::try_from(x) {
+            l2_batch_f64_fixed(x, batch, output);
+        } else {
+            let mut y = batch.as_ptr();
+            for distance in output.iter_mut() {
+                // SAFETY: the layout assert guarantees `batch.len() == output.len() * dimension`.
+                unsafe {
+                    *distance = l2_f64_simd_other(x, std::slice::from_raw_parts(y, dimension));
+                    y = y.add(dimension);
+                }
+            }
         }
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+fn l2_batch_f64_fixed<const N: usize>(x: &[f64; N], batch: &[f64], output: &mut [f32]) {
+    for (distance, y) in output.iter_mut().zip(batch.as_chunks::<N>().0) {
+        *distance = l2_f64_simd_other(x, y);
     }
 }
 
