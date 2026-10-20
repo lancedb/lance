@@ -312,6 +312,7 @@ Choose the read API based on the payload shape you want:
 | `read_blobs` | `List[Tuple[int, Optional[bytes]]]` | You need complete blob payloads in memory, such as training loaders or batch preprocessing. |
 | `read_blob_ranges` | `List[Tuple[int, int, Optional[bytes]]]` | You need selected byte ranges from multiple rows without materializing complete blobs. |
 | `take_blobs` | `List[Optional[BlobFile]]` | You need file-like objects for streaming, seeking, or partial reads. |
+| `read_blob_files` / `read_blob_file_ranges` | `List[Tuple[int, Optional[bytes]]]` | You already hold `BlobFile` handles and read the same blobs repeatedly, such as a shard index followed by chunk ranges. |
 | `scanner(..., blob_handling="all_binary")` | Arrow binary columns | You want blob columns in a scan result or `pyarrow.Table`. |
 
 Do not wrap `take_blobs` in your own thread pool just to call `read()` or
@@ -401,6 +402,32 @@ empty range on a non-null blob returns `b""` without payload I/O. For every
 request, `offset + length` must fit in an unsigned 64-bit integer. A range on a
 non-null blob must not extend beyond its logical size; blob-local bounds are not
 evaluated for null blobs because they have no logical payload length.
+
+### Read through handles you already hold
+
+`read_blobs` and `read_blob_ranges` look up the selected rows' blob descriptors
+on every call before they read any payload bytes. On object storage that lookup
+is a separate request the payload reads wait for. When you read the same blobs
+repeatedly, take handles once with `take_blobs` and pass them to
+`read_blob_files` or `read_blob_file_ranges`: each call then issues only the
+payload requests, planned and coalesced the same way.
+
+```python
+import lance
+
+ds = lance.dataset("./blobs_v22.lance")
+handles = ds.take_blobs("blob", indices=[0, 1, 2])
+
+payloads = [data for _request_index, data in ds.read_blob_files(handles)]
+headers = ds.read_blob_file_ranges(
+    [(handle, 0, 16) for handle in handles if handle is not None]
+)
+```
+
+Each result is a `(request_index, data)` pair. A `None` handle, which
+`take_blobs` returns for a null blob, returns `None`. Handles are not tied to a
+dataset version: a handle keeps returning the bytes of the version it was taken
+from until cleanup removes that version's files.
 
 ### Read blob columns as Arrow binary
 

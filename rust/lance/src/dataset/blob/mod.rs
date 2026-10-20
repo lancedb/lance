@@ -27,8 +27,9 @@ pub use materialize::{
 };
 pub use prepared::{prepared_blob_batch_to_descriptors, prepared_blob_ids};
 pub use read::{
-    BlobRangeRequest, BlobReadRange, ReadBlob, ReadBlobRange, ReadBlobRangesBuilder,
-    ReadBlobRangesStream, ReadBlobsBuilder, ReadBlobsStream, take_blobs_by_addresses,
+    BlobRangeRequest, BlobReadRange, ReadBlob, ReadBlobFile, ReadBlobFilesBuilder,
+    ReadBlobFilesStream, ReadBlobRange, ReadBlobRangesBuilder, ReadBlobRangesStream,
+    ReadBlobsBuilder, ReadBlobsStream, take_blobs_by_addresses,
 };
 pub(super) use read::{take_blobs, validate_blob_column};
 pub use write::BlobPreprocessor;

@@ -397,6 +397,20 @@ impl BlobFile {
         )
     }
 
+    /// Another handle on the same blob that shares this handle's cursor and
+    /// open state, so a planned read can hold a caller's handle without taking
+    /// ownership and still observe it being closed.
+    pub(super) fn share(&self) -> Self {
+        Self {
+            source: self.source.clone(),
+            state: self.state.clone(),
+            position: self.position,
+            size: self.size,
+            kind: self.kind,
+            uri: self.uri.clone(),
+        }
+    }
+
     /// Close the blob file, releasing any associated resources
     pub async fn close(&self) -> Result<()> {
         let mut state = self.state.lock().await;

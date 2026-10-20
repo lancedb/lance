@@ -488,6 +488,18 @@ class _Dataset:
         io_buffer_size: Optional[int] = None,
         preserve_order: Optional[bool] = None,
     ) -> List[Tuple[int, int, Optional[bytes]]]: ...
+    def read_blob_files(
+        self,
+        blob_files: List[Optional[LanceBlobFile]],
+        io_buffer_size: Optional[int] = None,
+        preserve_order: Optional[bool] = None,
+    ) -> List[Tuple[int, Optional[bytes]]]: ...
+    def read_blob_file_ranges(
+        self,
+        requests: List[Tuple[Optional[LanceBlobFile], int, int]],
+        io_buffer_size: Optional[int] = None,
+        preserve_order: Optional[bool] = None,
+    ) -> List[Tuple[int, Optional[bytes]]]: ...
     def take_scan(
         self,
         row_slices: Iterable[Tuple[int, int]],

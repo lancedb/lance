@@ -56,7 +56,7 @@ use prost::Message;
 use roaring::RoaringBitmap;
 use rowids::get_row_id_index;
 use serde::{Deserialize, Serialize};
-use std::borrow::Cow;
+use std::borrow::{Borrow, Cow};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Debug;
 use std::num::NonZero;
@@ -143,8 +143,9 @@ use crate::session::Session;
 use crate::utils::temporal::{SystemTime, timestamp_to_nanos, utc_now};
 use crate::{Error, Result};
 pub use blob::{
-    BlobFile, BlobRangeRequest, BlobReadRange, ReadBlob, ReadBlobRange, ReadBlobRangesBuilder,
-    ReadBlobRangesStream, ReadBlobsBuilder, ReadBlobsStream,
+    BlobFile, BlobRangeRequest, BlobReadRange, ReadBlob, ReadBlobFile, ReadBlobFilesBuilder,
+    ReadBlobFilesStream, ReadBlobRange, ReadBlobRangesBuilder, ReadBlobRangesStream,
+    ReadBlobsBuilder, ReadBlobsStream,
 };
 use hash_joiner::HashJoiner;
 pub use lance_core::ROW_ID;
@@ -2006,6 +2007,77 @@ impl Dataset {
         column: impl AsRef<str>,
     ) -> Result<ReadBlobRangesBuilder> {
         Ok(ReadBlobRangesBuilder::new(self.read_blobs(column)?))
+    }
+
+    /// Create a planned reader for whole blobs through [`BlobFile`] handles the
+    /// caller already holds.
+    ///
+    /// [`Self::read_blobs`] reads the blob column's descriptors for its row
+    /// selection on every call before it can read payloads. Handles returned by
+    /// [`Self::take_blobs`], [`Self::take_blobs_by_addresses`] or
+    /// [`Self::take_blobs_by_indices`] already hold those descriptors, so a
+    /// caller that reads the same blobs repeatedly can take them once and skip
+    /// that request on every later read. Every handle produces one result;
+    /// pass `None`, as `take_blobs` returns for a null blob, to get a result
+    /// with `data` set to `None`. See [`ReadBlobFilesBuilder`] for how handles
+    /// relate to this dataset and its versions.
+    ///
+    /// ```rust
+    /// # use std::sync::Arc;
+    /// # use lance::dataset::Dataset;
+    /// # use lance::Result;
+    /// # async fn example(dataset: Arc<Dataset>) -> Result<()> {
+    /// let handles = dataset.take_blobs_by_indices(&[0, 1, 2], "images").await?;
+    /// let blobs = dataset
+    ///     .read_blob_files(handles.iter().map(Option::as_ref))
+    ///     .execute()
+    ///     .await?;
+    /// for blob in blobs {
+    ///     let _payload = blob.data;
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn read_blob_files<B: Borrow<BlobFile>>(
+        self: &Arc<Self>,
+        blob_files: impl IntoIterator<Item = Option<B>>,
+    ) -> ReadBlobFilesBuilder {
+        ReadBlobFilesBuilder::new(self.clone(), blob_files)
+    }
+
+    /// Create a planned reader for blob-local byte ranges through [`BlobFile`]
+    /// handles the caller already holds.
+    ///
+    /// This is the handle counterpart of [`Self::read_blob_ranges`], and skips
+    /// the descriptor read for the same reason as [`Self::read_blob_files`].
+    /// Each request pairs a handle with a range in that blob, so a handle can be
+    /// repeated to read several ranges, and requests on the same backing object
+    /// are coalesced across handles. Every request produces one result. A
+    /// `None` handle has `data` set to `None` and its range is not checked
+    /// against a blob size; an empty range on a handle contains an empty buffer.
+    ///
+    /// ```rust
+    /// # use std::sync::Arc;
+    /// # use lance::dataset::{BlobReadRange, Dataset};
+    /// # use lance::Result;
+    /// # async fn example(dataset: Arc<Dataset>) -> Result<()> {
+    /// let handles = dataset.take_blobs_by_indices(&[7], "images").await?;
+    /// let ranges = dataset
+    ///     .read_blob_file_ranges([
+    ///         (handles[0].as_ref(), BlobReadRange::new(0, 1024)),
+    ///         (handles[0].as_ref(), BlobReadRange::new(4096, 1024)),
+    ///     ])
+    ///     .execute()
+    ///     .await?;
+    /// # let _ = ranges;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn read_blob_file_ranges<B: Borrow<BlobFile>>(
+        self: &Arc<Self>,
+        requests: impl IntoIterator<Item = (Option<B>, BlobReadRange)>,
+    ) -> ReadBlobFilesBuilder {
+        ReadBlobFilesBuilder::new_ranges(self.clone(), requests)
     }
 
     /// Get a stream of batches based on iterator of ranges of row numbers.

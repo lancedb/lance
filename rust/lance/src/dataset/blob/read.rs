@@ -4,6 +4,7 @@
 mod plan;
 
 use std::{
+    borrow::Borrow,
     collections::{BTreeMap, HashMap},
     ops::Range,
     sync::Arc,
@@ -27,6 +28,7 @@ use super::locate::{blob_version_from_descriptions, collect_blob_files_v1, colle
 use crate::dataset::take::{MissingRowPolicy, TakeBuilder};
 use crate::dataset::{Dataset, ProjectionRequest};
 use lance_core::datatypes::{BlobVersion, parse_field_path};
+use lance_core::utils::address::RowAddress;
 use lance_core::{Error, Result};
 
 /// Blob bytes materialized by [`ReadBlobsBuilder`].
@@ -102,11 +104,30 @@ pub struct ReadBlobRange {
     pub data: Option<Bytes>,
 }
 
+/// Bytes materialized for one request submitted through [`ReadBlobFilesBuilder`].
+///
+/// A request names a [`BlobFile`] handle rather than a row, so the result is
+/// identified by its position in the request list instead of a row address.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadBlobFile {
+    /// Zero-based position of this request in the caller's request list.
+    pub request_index: usize,
+    /// Requested bytes, or `None` when the request passed `None` instead of a
+    /// handle, which is how [`Dataset::take_blobs`] reports a null blob.
+    ///
+    /// A valid empty blob, or an empty range on any handle, is
+    /// `Some(Bytes::new())`.
+    pub data: Option<Bytes>,
+}
+
 /// Stream returned by [`ReadBlobsBuilder::try_into_stream`].
 pub type ReadBlobsStream = BoxStream<'static, Result<ReadBlob>>;
 
 /// Stream returned by [`ReadBlobRangesBuilder::try_into_stream`].
 pub type ReadBlobRangesStream = BoxStream<'static, Result<ReadBlobRange>>;
+
+/// Stream returned by [`ReadBlobFilesBuilder::try_into_stream`].
+pub type ReadBlobFilesStream = BoxStream<'static, Result<ReadBlobFile>>;
 
 /// Row selector configured on [`ReadBlobsBuilder`].
 #[derive(Debug, Clone)]
@@ -253,27 +274,9 @@ impl ReadBlobsBuilder {
                     data: None,
                 })
             })?;
-        let physical_buffer_size = self.options.io_buffer_size_bytes.unwrap_or_else(|| {
-            SchedulerConfig::max_bandwidth(self.dataset.object_store.as_ref()).io_buffer_size_bytes
-        });
-        let batches = plan_blob_read_batches(partitioned.reads, physical_buffer_size)?;
-        let execution = Arc::new(ReadBlobsExecution::new(self.options.io_buffer_size_bytes));
-        let non_null_blobs = execute_blob_read_batches_stream(
-            batches,
-            execution,
-            self.dataset.object_store.io_parallelism(),
-        )
-        .map_ok(|blob| {
-            let selection_index = blob.selection_index;
-            (selection_index, into_read_blob(blob))
+        read_partitioned_blob_selection(&self.dataset, &self.options, partitioned, |blob| {
+            Ok(into_read_blob(blob))
         })
-        .boxed();
-        Ok(totalize_blob_selection_stream(
-            non_null_blobs,
-            partitioned.ready_values,
-            partitioned.selection_count,
-            self.options.preserve_order,
-        ))
     }
 
     /// Execute the planned blob read and collect the full result in memory.
@@ -398,32 +401,12 @@ impl ReadBlobRangesBuilder {
                 })
             },
         )?;
-        let physical_buffer_size = self.inner.options.io_buffer_size_bytes.unwrap_or_else(|| {
-            SchedulerConfig::max_bandwidth(self.inner.dataset.object_store.as_ref())
-                .io_buffer_size_bytes
-        });
-        let batches = plan_blob_read_batches(partitioned.reads, physical_buffer_size)?;
-        let execution = Arc::new(ReadBlobsExecution::new(
-            self.inner.options.io_buffer_size_bytes,
-        ));
-        let non_null_ranges = execute_blob_read_batches_stream(
-            batches,
-            execution,
-            self.inner.dataset.object_store.io_parallelism(),
+        read_partitioned_blob_selection(
+            &self.inner.dataset,
+            &self.inner.options,
+            partitioned,
+            into_read_blob_range,
         )
-        .map(|result| {
-            result.and_then(|blob| {
-                let selection_index = blob.selection_index;
-                into_read_blob_range(blob).map(|range| (selection_index, range))
-            })
-        })
-        .boxed();
-        Ok(totalize_blob_selection_stream(
-            non_null_ranges,
-            partitioned.ready_values,
-            partitioned.selection_count,
-            self.inner.options.preserve_order,
-        ))
     }
 
     /// Execute the planned range read and collect all returned bytes in memory.
@@ -446,6 +429,164 @@ impl ReadBlobRangesBuilder {
             request.range.checked_range(request_index)?;
         }
         Ok(())
+    }
+}
+
+/// One read requested through [`ReadBlobFilesBuilder`]. `range` is `None` for
+/// a whole-blob read.
+#[derive(Debug)]
+struct BlobFileRead {
+    blob_file: Option<BlobFile>,
+    range: Option<BlobReadRange>,
+}
+
+/// Builder for planned reads through [`BlobFile`] handles the caller already
+/// holds, created by [`Dataset::read_blob_files`] or
+/// [`Dataset::read_blob_file_ranges`].
+///
+/// [`ReadBlobsBuilder`] and [`ReadBlobRangesBuilder`] resolve their row
+/// selection by reading the blob column's descriptors on every execution, a
+/// request that the payload reads then wait for. A handle returned by
+/// [`Dataset::take_blobs`] already holds its descriptor, so this builder issues
+/// only payload reads. They are planned the same way: grouped by backing
+/// object, coalesced when nearby, and batched by the I/O buffer size.
+///
+/// Handles are read as they are. They are not checked against the dataset that
+/// created this builder, its version, or its columns: a handle names an
+/// immutable object and a byte range in it, so it returns the bytes of the
+/// version it was taken from for as long as that version's files are retained.
+/// Handles from different datasets or versions can be mixed in one read. The
+/// dataset only supplies I/O defaults (parallelism and buffer size).
+#[derive(Debug, Clone)]
+pub struct ReadBlobFilesBuilder {
+    dataset: Arc<Dataset>,
+    reads: Arc<[BlobFileRead]>,
+    options: ReadBlobsOptions,
+}
+
+impl ReadBlobFilesBuilder {
+    pub(crate) fn new<B: Borrow<BlobFile>>(
+        dataset: Arc<Dataset>,
+        blob_files: impl IntoIterator<Item = Option<B>>,
+    ) -> Self {
+        let reads = blob_files
+            .into_iter()
+            .map(|blob_file| BlobFileRead {
+                blob_file: blob_file.map(|blob_file| blob_file.borrow().share()),
+                range: None,
+            })
+            .collect();
+        Self {
+            dataset,
+            reads,
+            options: ReadBlobsOptions::default(),
+        }
+    }
+
+    pub(crate) fn new_ranges<B: Borrow<BlobFile>>(
+        dataset: Arc<Dataset>,
+        requests: impl IntoIterator<Item = (Option<B>, BlobReadRange)>,
+    ) -> Self {
+        let reads = requests
+            .into_iter()
+            .map(|(blob_file, range)| BlobFileRead {
+                blob_file: blob_file.map(|blob_file| blob_file.borrow().share()),
+                range: Some(range),
+            })
+            .collect();
+        Self {
+            dataset,
+            reads,
+            options: ReadBlobsOptions::default(),
+        }
+    }
+
+    /// Set the scheduler I/O buffer size used while materializing payloads.
+    pub fn with_io_buffer_size_bytes(mut self, bytes: u64) -> Self {
+        self.options.io_buffer_size_bytes = Some(bytes);
+        self
+    }
+
+    /// Whether results must follow the caller's request order.
+    pub fn preserve_order(mut self, preserve: bool) -> Self {
+        self.options.preserve_order = preserve;
+        self
+    }
+
+    /// Execute the planned read and return one result per request.
+    ///
+    /// A `None` request has `data` set to `None` and issues no I/O. Empty
+    /// ranges and empty blobs contain an empty buffer without payload I/O. By
+    /// default, results follow request order; `request_index` identifies the
+    /// original request even when ordering is disabled.
+    ///
+    /// Returns an error before any payload I/O when a range's `offset + length`
+    /// overflows `u64` (checked for every request), when a range extends past
+    /// its handle's blob size (not checked for `None` requests, which have no
+    /// size), or when a handle has been closed.
+    pub async fn try_into_stream(self) -> Result<ReadBlobFilesStream> {
+        if self.options.io_buffer_size_bytes == Some(0) {
+            return Err(Error::invalid_input(
+                "ReadBlobFilesBuilder io_buffer_size must be greater than 0".to_string(),
+            ));
+        }
+        let mut reads = Vec::with_capacity(self.reads.len());
+        let mut ready_values = Vec::new();
+        for (request_index, read) in self.reads.iter().enumerate() {
+            let requested_range = read
+                .range
+                .map(|range| range.checked_range(request_index))
+                .transpose()?;
+            let Some(blob_file) = &read.blob_file else {
+                ready_values.push((
+                    request_index,
+                    ReadBlobFile {
+                        request_index,
+                        data: None,
+                    },
+                ));
+                continue;
+            };
+            if blob_file.is_closed().await {
+                return Err(Error::invalid_input(format!(
+                    "Blob file in request {request_index} is already closed"
+                )));
+            }
+            // Checked here rather than by the planner, whose error names a row
+            // address that handle requests do not have.
+            blob_file
+                .read_phys_range(requested_range.unwrap_or(0..blob_file.size))
+                .map_err(|err| {
+                    Error::invalid_input(format!(
+                        "Blob range request {request_index} is invalid: {err}"
+                    ))
+                })?;
+            reads.push(BlobEntry {
+                selection_index: request_index,
+                // Results are identified by request index and every range was
+                // checked above, so this placeholder never reaches a result or
+                // an error message.
+                row_address: RowAddress::TOMBSTONE_ROW,
+                file: blob_file.share(),
+                requested_range: read.range,
+            });
+        }
+        let partitioned = PartitionedBlobSelection {
+            selection_count: self.reads.len(),
+            reads,
+            ready_values,
+        };
+        read_partitioned_blob_selection(&self.dataset, &self.options, partitioned, |blob| {
+            Ok(ReadBlobFile {
+                request_index: blob.selection_index,
+                data: Some(blob.data),
+            })
+        })
+    }
+
+    /// Execute the planned read and collect all returned bytes in memory.
+    pub async fn execute(self) -> Result<Vec<ReadBlobFile>> {
+        self.try_into_stream().await?.try_collect().await
     }
 }
 
@@ -545,6 +686,37 @@ fn partition_blob_selections<T>(
         reads,
         ready_values,
     })
+}
+
+/// Plan and execute the payload reads of a partitioned selection, returning one
+/// value per selection. `into_value` maps each completed payload read;
+/// `partitioned.ready_values` already holds the values that need no payload I/O.
+fn read_partitioned_blob_selection<T: Send + 'static>(
+    dataset: &Dataset,
+    options: &ReadBlobsOptions,
+    partitioned: PartitionedBlobSelection<T>,
+    into_value: impl Fn(IndexedReadBlob) -> Result<T> + Send + 'static,
+) -> Result<BoxStream<'static, Result<T>>> {
+    let physical_buffer_size = options.io_buffer_size_bytes.unwrap_or_else(|| {
+        SchedulerConfig::max_bandwidth(dataset.object_store.as_ref()).io_buffer_size_bytes
+    });
+    let batches = plan_blob_read_batches(partitioned.reads, physical_buffer_size)?;
+    let execution = Arc::new(ReadBlobsExecution::new(options.io_buffer_size_bytes));
+    let read_values =
+        execute_blob_read_batches_stream(batches, execution, dataset.object_store.io_parallelism())
+            .map(move |result| {
+                result.and_then(|blob| {
+                    let selection_index = blob.selection_index;
+                    into_value(blob).map(|value| (selection_index, value))
+                })
+            })
+            .boxed();
+    Ok(totalize_blob_selection_stream(
+        read_values,
+        partitioned.ready_values,
+        partitioned.selection_count,
+        options.preserve_order,
+    ))
 }
 
 fn totalize_blob_selection_stream<T: Send + 'static>(
@@ -1191,6 +1363,46 @@ mod tests {
             .await
             .unwrap();
 
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| (result.request_index, result.data.as_deref()))
+                .collect::<Vec<_>>(),
+            vec![
+                (0, None),
+                (1, None),
+                (2, Some(b"".as_slice())),
+                (3, Some(b"b".as_slice())),
+            ]
+        );
+
+        let blobs = dataset
+            .read_blob_files(blob_files.iter().map(Option::as_ref))
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(
+            blobs
+                .iter()
+                .map(|blob| (blob.request_index, blob.data.as_deref()))
+                .collect::<Vec<_>>(),
+            vec![
+                (0, Some(b"abc".as_slice())),
+                (1, Some(b"".as_slice())),
+                (2, None),
+            ]
+        );
+
+        let results = dataset
+            .read_blob_file_ranges([
+                (blob_files[2].as_ref(), BlobReadRange::new(0, 0)),
+                (blob_files[2].as_ref(), BlobReadRange::new(0, 1)),
+                (blob_files[1].as_ref(), BlobReadRange::new(0, 0)),
+                (blob_files[0].as_ref(), BlobReadRange::new(1, 1)),
+            ])
+            .execute()
+            .await
+            .unwrap();
         assert_eq!(
             results
                 .iter()

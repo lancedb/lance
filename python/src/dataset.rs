@@ -131,6 +131,7 @@ const INDEX_PROGRESS_QUEUE_SIZE: usize = 1024;
 type PyBlobBytes = Option<Py<PyBytes>>;
 type PyReadBlob = (u64, PyBlobBytes);
 type PyReadBlobRange = (usize, u64, PyBlobBytes);
+type PyReadBlobFile = (usize, PyBlobBytes);
 
 fn read_blobs_to_python(py: Python<'_>, blobs: Vec<lance::dataset::ReadBlob>) -> Vec<PyReadBlob> {
     blobs
@@ -155,6 +156,21 @@ fn read_blob_ranges_to_python(
                 range.request_index,
                 range.row_address,
                 range.data.map(|data| PyBytes::new(py, &data).unbind()),
+            )
+        })
+        .collect()
+}
+
+fn read_blob_files_to_python(
+    py: Python<'_>,
+    blobs: Vec<lance::dataset::ReadBlobFile>,
+) -> Vec<PyReadBlobFile> {
+    blobs
+        .into_iter()
+        .map(|blob| {
+            (
+                blob.request_index,
+                blob.data.map(|data| PyBytes::new(py, &data).unbind()),
             )
         })
         .collect()
@@ -188,6 +204,20 @@ fn configure_read_blob_ranges_builder(
     io_buffer_size: Option<u64>,
     preserve_order: Option<bool>,
 ) -> lance::dataset::ReadBlobRangesBuilder {
+    if let Some(bytes) = io_buffer_size {
+        builder = builder.with_io_buffer_size_bytes(bytes);
+    }
+    if let Some(preserve) = preserve_order {
+        builder = builder.preserve_order(preserve);
+    }
+    builder
+}
+
+fn configure_read_blob_files_builder(
+    mut builder: lance::dataset::ReadBlobFilesBuilder,
+    io_buffer_size: Option<u64>,
+    preserve_order: Option<bool>,
+) -> lance::dataset::ReadBlobFilesBuilder {
     if let Some(bytes) = io_buffer_size {
         builder = builder.with_io_buffer_size_bytes(bytes);
     }
@@ -1892,6 +1922,61 @@ impl Dataset {
             .block_on(Some(self_.py()), builder.execute())?
             .infer_error()?;
         Ok(read_blob_ranges_to_python(self_.py(), ranges))
+    }
+
+    #[pyo3(signature=(
+        blob_files,
+        io_buffer_size=None,
+        preserve_order=None
+    ))]
+    fn read_blob_files(
+        self_: PyRef<'_, Self>,
+        blob_files: Vec<Option<PyRef<'_, LanceBlobFile>>>,
+        io_buffer_size: Option<u64>,
+        preserve_order: Option<bool>,
+    ) -> PyResult<Vec<PyReadBlobFile>> {
+        let builder = configure_read_blob_files_builder(
+            self_.ds.read_blob_files(
+                blob_files
+                    .iter()
+                    .map(|blob_file| blob_file.as_ref().map(|blob_file| blob_file.inner.as_ref())),
+            ),
+            io_buffer_size,
+            preserve_order,
+        );
+        let blobs = rt()
+            .block_on(Some(self_.py()), builder.execute())?
+            .infer_error()?;
+        Ok(read_blob_files_to_python(self_.py(), blobs))
+    }
+
+    #[pyo3(signature=(
+        requests,
+        io_buffer_size=None,
+        preserve_order=None
+    ))]
+    fn read_blob_file_ranges(
+        self_: PyRef<'_, Self>,
+        requests: Vec<(Option<PyRef<'_, LanceBlobFile>>, u64, u64)>,
+        io_buffer_size: Option<u64>,
+        preserve_order: Option<bool>,
+    ) -> PyResult<Vec<PyReadBlobFile>> {
+        let builder = configure_read_blob_files_builder(
+            self_
+                .ds
+                .read_blob_file_ranges(requests.iter().map(|(blob_file, offset, length)| {
+                    (
+                        blob_file.as_ref().map(|blob_file| blob_file.inner.as_ref()),
+                        lance::dataset::BlobReadRange::new(*offset, *length),
+                    )
+                })),
+            io_buffer_size,
+            preserve_order,
+        );
+        let blobs = rt()
+            .block_on(Some(self_.py()), builder.execute())?
+            .infer_error()?;
+        Ok(read_blob_files_to_python(self_.py(), blobs))
     }
 
     #[pyo3(signature = (row_slices, columns = None, batch_readahead = 10))]
