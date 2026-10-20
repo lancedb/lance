@@ -18,6 +18,20 @@ pub use dispatch::{Candidate, Dispatch, Kernel, Selection};
 ///
 /// Unlike [`SimdSupport`], this is not a ladder: a kernel can require any
 /// combination, such as AVX-512 without FMA or F16C on an AVX host.
+///
+/// ```
+/// use lance_core::utils::cpu::CpuFeatures;
+///
+/// // Implied features are included: AVX2 brings AVX along with it.
+/// let needed = CpuFeatures::from_target_features(&["avx2", "fma"]);
+/// assert!(needed.contains(CpuFeatures::AVX));
+///
+/// // A kernel can run here if the host has every feature it needs, and can
+/// // be called directly, without dispatch, if the build baseline does.
+/// let runnable = CpuFeatures::host().contains(needed);
+/// let inlinable = CpuFeatures::baseline().contains(needed);
+/// assert!(runnable || !inlinable);
+/// ```
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct CpuFeatures(u32);
 
@@ -45,14 +59,17 @@ impl CpuFeatures {
     pub const LSX: Self = Self(1 << 20);
     pub const LASX: Self = Self(1 << 21);
 
+    /// The set with no features, which every host supports.
     pub const fn empty() -> Self {
         Self(0)
     }
 
+    /// Whether the set has no features.
     pub const fn is_empty(self) -> bool {
         self.0 == 0
     }
 
+    /// The features in either set.
     pub const fn union(self, other: Self) -> Self {
         Self(self.0 | other.0)
     }
@@ -112,6 +129,7 @@ impl CpuFeatures {
     }
 
     /// Every known feature, one per set.
+    #[cfg(test)]
     pub fn all() -> impl Iterator<Item = Self> {
         FEATURE_TABLE.iter().map(|info| info.feature)
     }

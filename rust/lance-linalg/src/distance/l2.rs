@@ -1296,21 +1296,29 @@ mod tests {
                     );
                 }
 
-                // Up to 16 dimensions the batch kernel must match the pair
-                // kernel bit for bit; above that it uses the scalar kernel.
+                // Where an x86 batch kernel reuses its tier's pair kernel or a
+                // fast path for it, the two must match bit for bit: up to 16
+                // dimensions for AVX+FMA (above that it uses the scalar
+                // kernel), and at every dimension for AVX.
                 #[cfg(target_arch = "x86_64")]
-                if dimension <= 16
-                    && let (Some(pair), Some(batch)) = (
-                        x86::L2_F32_AVX_FMA.kernel(),
-                        x86::L2_F32_BATCH_AVX_FMA.kernel(),
-                    )
-                {
+                for (pair, batch, max_dimension) in [
+                    (x86::L2_F32_AVX_FMA, x86::L2_F32_BATCH_AVX_FMA, 16),
+                    (x86::L2_F32_AVX, x86::L2_F32_BATCH_AVX, usize::MAX),
+                ] {
+                    if dimension > max_dimension {
+                        continue;
+                    }
+                    let (Some(pair_kernel), Some(batch_kernel)) = (pair.kernel(), batch.kernel())
+                    else {
+                        continue;
+                    };
                     let mut got = [f32::NAN];
-                    batch.call(x, y, dimension, &mut got);
+                    batch_kernel.call(x, y, dimension, &mut got);
                     prop_assert_eq!(
                         got[0].to_bits(),
-                        pair.call(x, y).to_bits(),
-                        "dim {}",
+                        pair_kernel.call(x, y).to_bits(),
+                        "{} at dim {}",
+                        batch.name(),
                         dimension
                     );
                 }
@@ -1655,5 +1663,21 @@ mod tests {
         rejects::<f16>(output_len);
         rejects::<f32>(output_len);
         rejects::<f64>(output_len);
+    }
+
+    /// An empty batch with a valid dimension, e.g. no centroids, writes
+    /// nothing and does not panic. 8 and 16 take the fixed-length paths.
+    #[rstest::rstest]
+    #[case::dim_8(8)]
+    #[case::dim_16(16)]
+    #[case::dim_13(13)]
+    fn test_l2_batch_into_accepts_empty_batch(#[case] dimension: usize) {
+        fn accepts<T: L2 + num_traits::FromPrimitive + Copy>(dimension: usize) {
+            let x = vec![T::from_f32(1.0).unwrap(); dimension];
+            l2_distance_batch_into::<T>(&x, &[], dimension, &mut []);
+        }
+        accepts::<f16>(dimension);
+        accepts::<f32>(dimension);
+        accepts::<f64>(dimension);
     }
 }

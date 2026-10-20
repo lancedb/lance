@@ -40,6 +40,10 @@ pub struct Candidate<F> {
 }
 
 impl<F: Copy> Candidate<F> {
+    /// A candidate named `name` that runs `kernel` on hosts with `features`.
+    /// Prefer [`target_kernel!`](crate::target_kernel), which derives
+    /// `features` from the kernel's `#[target_feature]` list.
+    ///
     /// # Safety
     ///
     /// Calling `kernel` must be sound on every host that supports `features`.
@@ -74,6 +78,7 @@ impl<F: Copy> Candidate<F> {
 pub struct Kernel<F>(F);
 
 impl<A: ?Sized, B: ?Sized, R> Kernel<unsafe fn(&A, &B) -> R> {
+    /// Runs a pair kernel, such as a distance between two vectors.
     #[inline(always)]
     pub fn call(self, a: &A, b: &B) -> R {
         // SAFETY: a `Kernel` only exists for a candidate whose features the
@@ -83,6 +88,8 @@ impl<A: ?Sized, B: ?Sized, R> Kernel<unsafe fn(&A, &B) -> R> {
 }
 
 impl<A: ?Sized, B: ?Sized, C, D: ?Sized, R> Kernel<unsafe fn(&A, &B, C, &mut D) -> R> {
+    /// Runs a slice-output kernel, such as distances from one query to a
+    /// batch written into an output slice.
     #[inline(always)]
     pub fn call(self, a: &A, b: &B, c: C, d: &mut D) -> R {
         // SAFETY: see the two-argument `call`.
@@ -115,6 +122,7 @@ pub struct Dispatch<F: 'static> {
 pub struct Selection<F>(OnceLock<F>);
 
 impl<F> Selection<F> {
+    /// An empty cache, filled on the owning dispatch's first non-static `get`.
     #[allow(clippy::new_without_default)]
     pub const fn new() -> Self {
         Self(OnceLock::new())
@@ -163,6 +171,7 @@ impl<F: Copy> Dispatch<F> {
 
     /// Whether the build baseline supports the best candidate, so selection
     /// happens at compile time.
+    #[cfg(test)]
     pub const fn is_static(&self) -> bool {
         self.is_static
     }
@@ -241,7 +250,6 @@ macro_rules! dispatch {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utils::cpu::CpuFeatures;
 
     type SumFn = unsafe fn(&[f32], &[f32]) -> f32;
     type FillFn = unsafe fn(&[f32], &[f32], usize, &mut [f32]);
@@ -337,6 +345,42 @@ mod tests {
         assert!(PORTABLE_ONLY.is_static());
         assert_eq!(PORTABLE_ONLY.get().call(&[1.0, 2.0], &[3.0]), 6.0);
         assert_eq!(PORTABLE_ONLY.selected().name(), "macro_sum");
+    }
+
+    /// A feature no host of this architecture has, as a `const` so it can
+    /// gate a `static` dispatch.
+    const OTHER_ARCH_FEATURE: CpuFeatures = if cfg!(target_arch = "x86_64") {
+        CpuFeatures::NEON
+    } else {
+        CpuFeatures::AVX512F
+    };
+
+    // SAFETY: the kernel is a plain Rust function without target features.
+    const UNSUPPORTED_SUM: Candidate<SumFn> =
+        unsafe { Candidate::new("unsupported", OTHER_ARCH_FEATURE, doubled_sum) };
+
+    crate::dispatch! {
+        static UNSUPPORTED_FIRST: Dispatch<SumFn> = &[UNSUPPORTED_SUM, PORTABLE_SUM];
+    }
+
+    #[test]
+    fn runtime_dispatch_selects_and_caches_the_supported_kernel() {
+        assert!(!UNSUPPORTED_FIRST.is_static());
+        assert_eq!(UNSUPPORTED_FIRST.selected().name(), "macro_sum");
+        // The first call selects and caches; the second reads the cache.
+        assert_eq!(UNSUPPORTED_FIRST.get().call(&[1.0, 2.0], &[3.0]), 6.0);
+        assert_eq!(UNSUPPORTED_FIRST.get().call(&[1.0, 2.0], &[3.0]), 6.0);
+    }
+
+    #[test]
+    fn new_rejects_candidate_lists_without_a_portable_fallback() {
+        static SELECTED: Selection<SumFn> = Selection::new();
+        // Called at runtime: in a `static` these are compile errors.
+        let empty = std::panic::catch_unwind(|| Dispatch::<SumFn>::new(&[], &SELECTED));
+        assert!(empty.is_err());
+        let needs_features =
+            std::panic::catch_unwind(|| Dispatch::new(&[UNSUPPORTED_SUM], &SELECTED));
+        assert!(needs_features.is_err());
     }
 
     #[test]

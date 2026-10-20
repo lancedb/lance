@@ -961,6 +961,37 @@ mod tests {
                     );
                 }
 
+                // Where an x86 batch kernel reuses its tier's pair kernel or a
+                // fast path for it, the two must agree bit for bit: up to 16
+                // dimensions for AVX+FMA (above that it uses the scalar
+                // kernel), and at every dimension for AVX. The one allowed
+                // difference is the sign of a zero result: the pair kernels
+                // add products to a +0.0 accumulator, which turns -0.0 into
+                // +0.0, while the dimension-8 fast paths sum the products
+                // directly.
+                #[cfg(target_arch = "x86_64")]
+                for (pair, batch, max_dimension) in [
+                    (x86::DOT_F32_AVX_FMA, x86::DOT_F32_BATCH_AVX_FMA, 16),
+                    (x86::DOT_F32_AVX, x86::DOT_F32_BATCH_AVX, usize::MAX),
+                ] {
+                    if dimension > max_dimension {
+                        continue;
+                    }
+                    let (Some(pair_kernel), Some(batch_kernel)) = (pair.kernel(), batch.kernel())
+                    else {
+                        continue;
+                    };
+                    let mut got = [f32::NAN];
+                    batch_kernel.call(x, y, dimension, &mut got);
+                    let want = pair_kernel.call(x, y);
+                    prop_assert!(
+                        got[0].to_bits() == want.to_bits() || (got[0] == 0.0 && want == 0.0),
+                        "{} at dim {dimension}: {} != {want}",
+                        batch.name(),
+                        got[0]
+                    );
+                }
+
                 // The zero vector pins the second output to exactly 0.
                 let batch = [y, &vec![0.0; dimension]].concat();
                 for candidate in DOT_F32_BATCH.candidates() {
@@ -1057,6 +1088,22 @@ mod tests {
             let max_error = max_error::<f64>(&x, &y);
             prop_assert!(approx::relative_eq!(scalar, avx, epsilon = max_error));
         }
+    }
+
+    /// An empty batch with a valid dimension, e.g. no centroids, writes
+    /// nothing and does not panic. 8 and 16 take the fixed-length paths.
+    #[rstest::rstest]
+    #[case::dim_8(8)]
+    #[case::dim_16(16)]
+    #[case::dim_13(13)]
+    fn test_dot_batch_into_accepts_empty_batch(#[case] dimension: usize) {
+        fn accepts<T: Dot + FromPrimitive + Copy>(dimension: usize) {
+            let x = vec![T::from_f32(1.0).unwrap(); dimension];
+            dot_distance_batch_into::<T>(&x, &[], dimension, &mut []);
+        }
+        accepts::<f16>(dimension);
+        accepts::<f32>(dimension);
+        accepts::<f64>(dimension);
     }
 
     /// `dot_batch_into` must agree with the per-vector `dot`. The f32 batch
