@@ -159,14 +159,9 @@ impl PreparedHighlightQuery {
                 }
             }
         }
-        let results = self
-            .leaves
-            .iter()
-            .map(|leaf| match_leaf(leaf, &analyzed))
-            .collect::<Result<Vec<_>>>()?;
-        let mut cursor = 0;
-        let (_, evidence) = evaluate(&self.query, &results, &mut cursor)?;
-        if cursor != results.len() {
+        let mut results = self.leaves.iter().map(|leaf| match_leaf(leaf, &analyzed));
+        let (_, evidence) = evaluate(&self.query, &mut results)?;
+        if results.next().is_some() {
             return Err(Error::internal(
                 "highlight prepared leaf count does not match query",
             ));
@@ -228,22 +223,22 @@ fn display_ranges(text: &str, ranges: Vec<Range<usize>>) -> Vec<HighlightMatch> 
 
 type MatchResult = (bool, Vec<Evidence>);
 
-fn evaluate(query: &FtsQuery, results: &[MatchResult], cursor: &mut usize) -> Result<MatchResult> {
+fn evaluate(
+    query: &FtsQuery,
+    results: &mut impl Iterator<Item = Result<MatchResult>>,
+) -> Result<MatchResult> {
     match query {
-        FtsQuery::Match(_) | FtsQuery::Phrase(_) | FtsQuery::CombinedFields(_) => {
-            let result = results
-                .get(*cursor)
-                .ok_or_else(|| Error::internal("highlight prepared leaf is missing"))?
-                .clone();
-            *cursor += 1;
-            Ok(result)
-        }
-        FtsQuery::Boost(query) => evaluate(&query.positive, results, cursor),
+        FtsQuery::Match(_) | FtsQuery::Phrase(_) | FtsQuery::CombinedFields(_) => results
+            .next()
+            .ok_or_else(|| Error::internal("highlight prepared leaf is missing"))?,
+        FtsQuery::Boost(query) => evaluate(&query.positive, results),
         FtsQuery::MultiMatch(query) => {
             let mut matched = false;
             let mut evidence = Vec::new();
-            for query in &query.match_queries {
-                let (hit, spans) = evaluate(&FtsQuery::Match(query.clone()), results, cursor)?;
+            for _ in &query.match_queries {
+                let (hit, spans) = results
+                    .next()
+                    .ok_or_else(|| Error::internal("highlight prepared leaf is missing"))??;
                 matched |= hit;
                 if hit {
                     evidence.extend(spans);
@@ -257,21 +252,21 @@ fn evaluate(query: &FtsQuery, results: &[MatchResult], cursor: &mut usize) -> Re
             let mut excluded = false;
             let mut evidence = Vec::new();
             for child in &query.must {
-                let (matched, spans) = evaluate(child, results, cursor)?;
+                let (matched, spans) = evaluate(child, results)?;
                 must_match &= matched;
                 if matched {
                     evidence.extend(spans);
                 }
             }
             for child in &query.should {
-                let (matched, spans) = evaluate(child, results, cursor)?;
+                let (matched, spans) = evaluate(child, results)?;
                 should_match |= matched;
                 if matched {
                     evidence.extend(spans);
                 }
             }
             for child in &query.must_not {
-                excluded |= evaluate(child, results, cursor)?.0;
+                excluded |= evaluate(child, results)?.0;
             }
             let matched = must_match && !excluded && (!query.must.is_empty() || should_match);
             Ok((matched, if matched { evidence } else { Vec::new() }))
@@ -352,7 +347,6 @@ fn analyze_document(
 
 fn match_leaf(leaf: &HighlightLeaf, documents: &[AnalyzedDocument]) -> Result<MatchResult> {
     let mut found = BTreeSet::new();
-    let mut required = BTreeSet::new();
     let mut matched_phrase = false;
     let mut evidence = Vec::new();
     for field in &leaf.fields {
@@ -363,9 +357,6 @@ fn match_leaf(leaf: &HighlightLeaf, documents: &[AnalyzedDocument]) -> Result<Ma
                 Error::internal(format!("highlight source field '{field}' is missing"))
             })?;
         let tokens = &leaf.tokens;
-        for i in 0..tokens.len() {
-            required.insert(tokens.position(i));
-        }
         let mut occurrences = vec![Vec::new(); tokens.len()];
         for token in &doc.tokens {
             for (i, hits) in occurrences.iter_mut().enumerate() {
@@ -380,10 +371,10 @@ fn match_leaf(leaf: &HighlightLeaf, documents: &[AnalyzedDocument]) -> Result<Ma
                 }
             }
         }
-        for hits in &mut occurrences {
-            hits.sort_by_key(|hit| hit.position);
-        }
         let ranges = if let Some(slop) = leaf.phrase_slop {
+            for hits in &mut occurrences {
+                hits.sort_by_key(|hit| hit.position);
+            }
             phrase_ranges(tokens, &occurrences, slop)
         } else {
             occurrences
@@ -419,7 +410,9 @@ fn match_leaf(leaf: &HighlightLeaf, documents: &[AnalyzedDocument]) -> Result<Ma
     let matched = if leaf.phrase_slop.is_some() {
         matched_phrase
     } else {
-        !found.is_empty() && (leaf.operator == Operator::Or || found == required)
+        !found.is_empty()
+            && (leaf.operator == Operator::Or
+                || (0..leaf.tokens.len()).all(|i| found.contains(&leaf.tokens.position(i))))
     };
     Ok((matched, if matched { evidence } else { Vec::new() }))
 }

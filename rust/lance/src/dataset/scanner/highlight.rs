@@ -34,16 +34,13 @@ impl Scanner {
         query: &FullTextSearchQuery,
     ) -> Result<(Arc<dyn ExecutionPlan>, Arc<dyn PhysicalExpr>)> {
         let granularity = self.fts_document_granularity(&query.query)?;
-        let canonical = |column: &str| {
-            Ok(resolve_fts_field(self.dataset.schema(), column, granularity)?.canonical_path)
-        };
-        let query = canonicalize_fields(query.query.clone(), &canonical)?;
+        let query = &query.query;
         let mut queries = Vec::new();
-        collect_leaves(&query, &mut queries);
+        collect_leaves(query, &mut queries);
         let mut fields = HashMap::<String, PreparedField>::new();
         let mut leaves = Vec::with_capacity(queries.len());
         for leaf in queries {
-            let (columns, text, operator, slop, params) = match &leaf {
+            let (mut columns, text, operator, slop, params) = match &leaf {
                 FtsQuery::Match(query) => (
                     vec![query.column.clone().ok_or_else(|| {
                         Error::internal("highlight Match column was not resolved")
@@ -73,9 +70,10 @@ impl Scanner {
                 ),
                 _ => return Err(Error::internal("highlight expected a lexical leaf")),
             };
-            for column in &columns {
+            for column in &mut columns {
+                let source = resolve_fts_field(self.dataset.schema(), column, granularity)?;
+                *column = source.canonical_path.clone();
                 if !fields.contains_key(column) {
-                    let source = resolve_fts_field(self.dataset.schema(), column, granularity)?;
                     if self
                         .dataset
                         .schema()
@@ -139,53 +137,12 @@ impl Scanner {
             .union_columns(roots, OnMissing::Error)?;
         let input = self.take(input, projection)?;
         let expression = HighlightExpr::try_new(
-            PreparedHighlightQuery::new(query, leaves),
+            PreparedHighlightQuery::new(query.clone(), leaves),
             sources,
             input.schema().as_ref(),
         )?;
         Ok((input, Arc::new(expression)))
     }
-}
-
-fn canonicalize_fields(
-    mut query: FtsQuery,
-    canonical: &impl Fn(&str) -> Result<String>,
-) -> Result<FtsQuery> {
-    match &mut query {
-        FtsQuery::Match(query) => {
-            query.column = query.column.as_deref().map(canonical).transpose()?
-        }
-        FtsQuery::Phrase(query) => {
-            query.column = query.column.as_deref().map(canonical).transpose()?
-        }
-        FtsQuery::MultiMatch(query) => {
-            for query in &mut query.match_queries {
-                query.column = query.column.as_deref().map(canonical).transpose()?;
-            }
-        }
-        FtsQuery::Boost(query) => {
-            *query.positive = canonicalize_fields(*query.positive.clone(), canonical)?;
-        }
-        FtsQuery::Boolean(query) => {
-            for child in query
-                .must
-                .iter_mut()
-                .chain(&mut query.should)
-                .chain(&mut query.must_not)
-            {
-                *child = canonicalize_fields(child.clone(), canonical)?;
-            }
-        }
-        FtsQuery::CombinedFields(query) => {
-            *query = lance_index::scalar::inverted::query::CombinedFieldsQuery::try_new(
-                query.terms().to_owned(),
-                query.column_names().map(canonical).collect::<Result<_>>()?,
-            )?
-            .with_operator(query.operator())
-            .try_with_boosts(query.weighted_columns().map(|(_, weight)| weight).collect())?;
-        }
-    }
-    Ok(query)
 }
 
 fn collect_leaves(query: &FtsQuery, leaves: &mut Vec<FtsQuery>) {
@@ -444,8 +401,8 @@ mod tests {
             (
                 Occur::Should,
                 BooleanQuery::new([
-                    (Occur::Must, text_match("alpha", "body")),
-                    (Occur::Must, text_match("beta", "title")),
+                    (Occur::Must, text_match("alpha", "`body`")),
+                    (Occur::Must, text_match("beta", "`title`")),
                 ])
                 .into(),
             ),
