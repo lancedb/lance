@@ -955,7 +955,7 @@ mod tests {
             None,
         );
         let data_type = array.data_type().clone();
-        let data = DataBlock::from_array(Arc::new(array.clone()));
+        let data = DataBlock::from_array(array.clone());
         let params = CompressionFieldParams {
             compression: Some(compression.to_string()),
             ..Default::default()
