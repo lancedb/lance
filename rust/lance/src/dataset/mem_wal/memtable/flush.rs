@@ -88,7 +88,7 @@ pub struct MemTableFlusher {
 ///
 /// Read off the memtable being flushed, which is frozen. That matters: an
 /// appending store bumps these counters before it publishes the batch, so only
-/// a sealed one agrees with what a scan of it will see.
+/// a frozen one agrees with what a scan of it will see.
 #[derive(Clone, Copy)]
 struct FlushedSize {
     in_memory_bytes: Option<u64>,
@@ -288,6 +288,12 @@ impl MemTableFlusher {
         durable: usize,
     ) -> Result<FlushResult> {
         self.manifest_store.check_fenced(epoch).await?;
+        if let Some(published) = self
+            .already_published(memtable, covered_wal_entry_position)
+            .await?
+        {
+            return Ok(published);
+        }
 
         if memtable.row_count() == 0 {
             return Err(Error::invalid_input("Cannot flush empty MemTable"));
@@ -560,6 +566,12 @@ impl MemTableFlusher {
         durable: usize,
     ) -> Result<FlushResult> {
         self.manifest_store.check_fenced(epoch).await?;
+        if let Some(published) = self
+            .already_published(memtable, covered_wal_entry_position)
+            .await?
+        {
+            return Ok(published);
+        }
 
         if memtable.row_count() == 0 {
             return Err(Error::invalid_input("Cannot flush empty MemTable"));
@@ -757,6 +769,50 @@ impl MemTableFlusher {
         ));
         train_btree_index(stream, &store, TRAINING_BATCH_SIZE as u64, None, None).await?;
         Ok(())
+    }
+
+    /// The flush result if `memtable`'s generation is already published, `None`
+    /// if it is next to publish.
+    ///
+    /// Errors when an earlier generation is unpublished: publishing would move
+    /// the replay position past its WAL entries. Reads the cached manifest, so
+    /// call after `check_fenced` refreshes it.
+    async fn already_published(
+        &self,
+        memtable: &MemTable,
+        covered_wal_entry_position: u64,
+    ) -> Result<Option<FlushResult>> {
+        let generation = memtable.generation();
+        let manifest = self.manifest_store.latest().await?.ok_or_else(|| {
+            Error::io(format!(
+                "Shard manifest not found for shard {}",
+                self.shard_id
+            ))
+        })?;
+        match manifest.current_generation.cmp(&generation) {
+            std::cmp::Ordering::Equal => Ok(None),
+            std::cmp::Ordering::Less => Err(Error::internal(format!(
+                "MemTable generation {generation} cannot flush before generation {} of shard {}, \
+                 which has not flushed",
+                manifest.current_generation, self.shard_id
+            ))),
+            std::cmp::Ordering::Greater => {
+                // A compactor may already have drained the SSTable from the
+                // manifest, leaving no path to report.
+                let sstable = manifest
+                    .sstables
+                    .into_iter()
+                    .find(|sstable| sstable.generation == generation)
+                    .unwrap_or_else(|| {
+                        FlushedSize::of(memtable).sstable(generation, String::new())
+                    });
+                Ok(Some(FlushResult {
+                    sstable,
+                    rows_flushed: memtable.row_count(),
+                    covered_wal_entry_position,
+                }))
+            }
+        }
     }
 
     /// Update the shard manifest with the new SSTable.
@@ -981,7 +1037,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Nothing is durable yet, so the L0 flush must refuse.
+        // Nothing is durable yet, so the SSTable flush must refuse.
         let durable = 0;
         assert!(!memtable.all_flushed_to_wal(durable));
 
@@ -1065,6 +1121,50 @@ mod tests {
         assert_eq!(updated_manifest.replay_after_wal_entry_position, 1);
         assert_eq!(updated_manifest.current_generation, 2);
         assert_eq!(updated_manifest.sstables.len(), 1);
+    }
+
+    /// A later generation is refused; a published one is reported without a
+    /// second commit.
+    #[tokio::test]
+    async fn a_flush_publishes_only_the_next_generation() {
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let shard_id = Uuid::new_v4();
+        let manifest_store = Arc::new(ShardManifestStore::new(
+            store.clone(),
+            &base_path,
+            shard_id,
+            2,
+        ));
+        let (epoch, _manifest) = manifest_store.claim_epoch(0).await.unwrap();
+        let flusher = MemTableFlusher::new(
+            store.clone(),
+            base_path,
+            base_uri,
+            shard_id,
+            manifest_store.clone(),
+        );
+        let schema = create_test_schema();
+        let mut first = MemTable::new(schema.clone(), 1, vec![]).unwrap();
+        let durable = first.insert(create_test_batch(&schema, 10)).await.unwrap() + 1;
+        let mut second = MemTable::new(schema.clone(), 2, vec![]).unwrap();
+        second.insert(create_test_batch(&schema, 10)).await.unwrap();
+
+        let refused = flusher.flush(&second, epoch, 2, durable).await.unwrap_err();
+        assert!(
+            refused
+                .to_string()
+                .contains("cannot flush before generation 1"),
+            "{refused}"
+        );
+        let untouched = manifest_store.latest().await.unwrap().unwrap();
+        assert_eq!(untouched.current_generation, 1);
+        assert!(untouched.sstables.is_empty());
+
+        flusher.flush(&first, epoch, 1, durable).await.unwrap();
+        let published = manifest_store.latest().await.unwrap().unwrap();
+        let again = flusher.flush(&first, epoch, 1, durable).await.unwrap();
+        assert_eq!(again.sstable, published.sstables[0]);
+        assert_eq!(manifest_store.latest().await.unwrap().unwrap(), published);
     }
 
     /// A flushed generation records what it holds, read back off storage.

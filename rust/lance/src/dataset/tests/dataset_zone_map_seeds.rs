@@ -14,7 +14,7 @@ use std::sync::Arc;
 use arrow::compute::concat_batches;
 use arrow_array::{
     Array, ArrayRef, BinaryArray, BinaryViewArray, Int32Array, RecordBatch, RecordBatchIterator,
-    StringArray, StringViewArray,
+    StringArray, StringViewArray, StructArray,
 };
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use bytes::Bytes;
@@ -24,7 +24,9 @@ use lance_core::utils::tempfile::TempStrDir;
 use lance_datafusion::utils::reader_to_stream;
 use lance_encoding::decoder::FilterExpression;
 use lance_file::reader::{FileReader, FileReaderOptions};
+use lance_file::version::LanceFileVersion;
 use lance_index::IndexType;
+use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::seed::{IndexSeedWriter, SEED_META_KEY_PREFIX};
 use lance_index::scalar::zonemap::ZoneMapSeedWriter;
 use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
@@ -34,7 +36,8 @@ use lance_io::utils::CachedFileSize;
 use lance_table::format::{DataFile, Fragment};
 
 use crate::Dataset;
-use crate::dataset::schema_evolution::NewColumnTransform;
+use crate::blob::{BlobArrayBuilder, blob_field};
+use crate::dataset::schema_evolution::{ColumnAlteration, NewColumnTransform};
 use crate::dataset::transaction::{DataReplacementGroup, Operation};
 use crate::dataset::write::merge_insert::{WhenMatched, WhenNotMatched};
 use crate::dataset::{
@@ -45,6 +48,360 @@ use crate::index::DatasetIndexExt;
 
 const ROWS_PER_ZONE: u64 = 4;
 const ROWS_PER_FILE: usize = 10;
+
+#[rstest::rstest]
+#[case::current_seed(true, true, Some(100), false)]
+#[case::current_all_null_seed(true, true, None, false)]
+#[case::missing_current_seed(true, false, Some(100), false)]
+#[case::seeds_disabled(false, false, Some(100), false)]
+#[case::shallow_clone(true, true, Some(100), true)]
+#[tokio::test]
+async fn test_zone_map_seed_harvest_after_repeated_column_replacement(
+    #[case] use_seeds: bool,
+    #[case] seed_current_file: bool,
+    #[case] replacement_value: Option<i32>,
+    #[case] shallow_clone: bool,
+) {
+    let dir = TempStrDir::default();
+    let dataset = dataset_with_val_index(dir.as_str(), use_seeds).await;
+    let full_schema = dataset.schema().clone();
+    let replacement = dataset
+        .get_fragment(0)
+        .unwrap()
+        .write_columns(stream::iter([Ok(rows(0..10, |_| Some(1)))]), &full_schema)
+        .await
+        .unwrap();
+    let read_version = dataset.version_id();
+    let mut dataset = Dataset::commit(
+        WriteDestination::Dataset(Arc::new(dataset)),
+        Operation::DataReplacement {
+            replacements: vec![replacement],
+        },
+        Some(read_version),
+        None,
+        None,
+        Arc::new(Default::default()),
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.fragments()[0].files.len(), 1);
+    let original_file = dataset.fragments()[0].files[0].path.clone();
+    assert_eq!(
+        seed_in_file(&dataset, &original_file, "val")
+            .await
+            .is_some(),
+        use_seeds
+    );
+    let index_name = dataset.load_indices().await.unwrap()[0].name.clone();
+    if !seed_current_file {
+        dataset.drop_index(&index_name).await.unwrap();
+    }
+    dataset = replace_column(dataset, "val", |id| id == 0, |_, _| replacement_value).await;
+    assert_eq!(dataset.fragments()[0].files.len(), 2);
+    let current_file = serving_file(&dataset.fragments()[0], field_id(&dataset, "val"));
+    assert_ne!(current_file.path, original_file);
+    assert_eq!(
+        seed_in_file(&dataset, &current_file.path, "val")
+            .await
+            .is_some(),
+        seed_current_file
+    );
+    if !seed_current_file {
+        // Recreate the index on the other fragments. Maintenance must scan
+        // fragment 0's current file, which was written while no index existed.
+        let segment = dataset
+            .create_index_builder(&["val"], IndexType::ZoneMap, &zone_map_params(use_seeds))
+            .name(index_name.clone())
+            .fragments(vec![1, 2])
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        dataset
+            .commit_existing_index_segments(&index_name, "val", vec![segment])
+            .await
+            .unwrap();
+    }
+    let clone_dir = TempStrDir::default();
+    let uri = if shallow_clone {
+        dataset = dataset
+            .shallow_clone(clone_dir.as_str(), dataset.version_id(), None)
+            .await
+            .unwrap();
+        assert!(
+            dataset.fragments()[0]
+                .files
+                .iter()
+                .all(|file| file.base_id.is_some())
+        );
+        clone_dir.as_str()
+    } else {
+        dir.as_str()
+    };
+    dataset
+        .optimize_indices(&OptimizeOptions::default())
+        .await
+        .unwrap();
+    let dataset = Dataset::open(uri).await.unwrap();
+    for filter in ["val = 100", "val IS NULL", "val < 10"] {
+        let mut flat = dataset.scan();
+        flat.use_scalar_index(false).filter(filter).unwrap();
+        let expected = flat.try_into_batch().await.unwrap().num_rows();
+        if filter == "val = 100" {
+            assert_eq!(expected, if replacement_value.is_some() { 10 } else { 0 });
+        }
+        let mut indexed = dataset.scan();
+        indexed.filter(filter).unwrap();
+        assert_eq!(
+            indexed.try_into_batch().await.unwrap().num_rows(),
+            expected,
+            "{filter}"
+        );
+    }
+}
+
+#[rstest::rstest]
+#[case::same_name("val")]
+#[case::different_name("other")]
+#[tokio::test]
+async fn test_zone_map_seed_harvest_respects_field_identity(#[case] top_level_name: &str) {
+    let dir = TempStrDir::default();
+    let child_field = Arc::new(ArrowField::new("val", DataType::Int32, false));
+    let nested = StructArray::from(vec![(
+        child_field,
+        Arc::new(Int32Array::from(vec![100, 100])) as ArrayRef,
+    )]);
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new(top_level_name, DataType::Int32, false),
+        ArrowField::new("st", nested.data_type().clone(), false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from(vec![1, 1])), Arc::new(nested)],
+    )
+    .unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch.clone())], schema.clone()),
+        dir.as_str(),
+        None,
+    )
+    .await
+    .unwrap();
+    for column in [top_level_name, "st.val"] {
+        dataset
+            .create_index(
+                &[column],
+                IndexType::ZoneMap,
+                None,
+                &zone_map_params(true),
+                false,
+            )
+            .await
+            .unwrap();
+    }
+    dataset
+        .append(RecordBatchIterator::new([Ok(batch)], schema), None)
+        .await
+        .unwrap();
+    assert_eq!(dataset.fragments().len(), 2);
+    let appended = &dataset.fragments()[1].files[0];
+    assert!(
+        seed_in_file(&dataset, &appended.path, top_level_name)
+            .await
+            .is_some()
+    );
+    assert!(
+        seed_in_file(&dataset, &appended.path, "st.val")
+            .await
+            .is_none()
+    );
+
+    dataset
+        .optimize_indices(&OptimizeOptions::default())
+        .await
+        .unwrap();
+    let dataset = Dataset::open(dir.as_str()).await.unwrap();
+    for indexed in [false, true] {
+        let mut scan = dataset.scan();
+        scan.use_scalar_index(indexed)
+            .filter("st.val = 100")
+            .unwrap();
+        assert_eq!(scan.try_into_batch().await.unwrap().num_rows(), 4);
+    }
+}
+
+#[tokio::test]
+async fn test_zone_map_seed_harvest_after_column_name_swap() {
+    let dir = TempStrDir::default();
+    let mut dataset = dataset_with_val_index(dir.as_str(), true).await;
+    dataset
+        .create_index(
+            &["id"],
+            IndexType::ZoneMap,
+            None,
+            &zone_map_params(true),
+            false,
+        )
+        .await
+        .unwrap();
+    dataset
+        .optimize_indices(&OptimizeOptions::default())
+        .await
+        .unwrap();
+    let replacement_schema = dataset.schema().project(&["id", "val"]).unwrap();
+    let arrow_schema = Arc::new(ArrowSchema::from(&replacement_schema));
+    let batch = RecordBatch::try_new(
+        arrow_schema,
+        vec![
+            Arc::new(Int32Array::from(vec![1; 10])),
+            Arc::new(Int32Array::from(vec![100; 10])),
+        ],
+    )
+    .unwrap();
+    let replacement = dataset
+        .get_fragment(0)
+        .unwrap()
+        .write_columns(stream::iter([Ok(batch)]), &replacement_schema)
+        .await
+        .unwrap();
+    let read_version = dataset.version_id();
+    dataset = Dataset::commit(
+        WriteDestination::Dataset(Arc::new(dataset)),
+        Operation::DataReplacement {
+            replacements: vec![replacement],
+        },
+        Some(read_version),
+        None,
+        None,
+        Arc::new(Default::default()),
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.fragments()[0].files.len(), 2);
+    let current_file = serving_file(&dataset.fragments()[0], field_id(&dataset, "val"));
+    assert!(
+        seed_in_file(&dataset, &current_file.path, "id")
+            .await
+            .is_some()
+    );
+    assert!(
+        seed_in_file(&dataset, &current_file.path, "val")
+            .await
+            .is_some()
+    );
+    assert!(
+        seed_in_file(&dataset, &dataset.fragments()[0].files[0].path, "val")
+            .await
+            .is_none()
+    );
+    dataset
+        .alter_columns(&[
+            ColumnAlteration::new("id".into()).rename("val".into()),
+            ColumnAlteration::new("val".into()).rename("id".into()),
+        ])
+        .await
+        .unwrap();
+    dataset
+        .optimize_indices(&OptimizeOptions::default())
+        .await
+        .unwrap();
+    let dataset = Dataset::open(dir.as_str()).await.unwrap();
+    let mut flat = dataset.scan();
+    flat.use_scalar_index(false).filter("id = 100").unwrap();
+    let expected = flat.try_into_batch().await.unwrap().num_rows();
+    assert_eq!(expected, 10);
+    let mut indexed = dataset.scan();
+    indexed.filter("id = 100").unwrap();
+    assert_eq!(indexed.try_into_batch().await.unwrap().num_rows(), expected);
+}
+
+#[rstest::rstest]
+#[case::blob_first(true, false)]
+#[case::blob_last(false, false)]
+#[case::blob_first_renamed(true, true)]
+#[tokio::test]
+async fn test_zone_map_seed_harvest_with_blob_columns(
+    #[case] blob_first: bool,
+    #[case] rename: bool,
+) {
+    let dir = TempStrDir::default();
+    let mut fields = ["a", "b", "c", "d", "e", "f"]
+        .map(|name| ArrowField::new(name, DataType::Int32, false))
+        .to_vec();
+    let blob_position = if blob_first { 0 } else { fields.len() };
+    fields.insert(blob_position, blob_field("blob", false));
+    let schema = Arc::new(ArrowSchema::new(fields));
+    let make_batch = || {
+        let mut blobs = BlobArrayBuilder::new(10);
+        for _ in 0..10 {
+            blobs.push_bytes(b"blob").unwrap();
+        }
+        let mut arrays = [1, 2, 3, 4, 5, 100]
+            .map(|v| Arc::new(Int32Array::from(vec![v; 10])) as ArrayRef)
+            .to_vec();
+        arrays.insert(blob_position, blobs.finish().unwrap());
+        RecordBatch::try_new(schema.clone(), arrays).unwrap()
+    };
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(make_batch())], schema.clone()),
+        dir.as_str(),
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    for name in ["a", "f"] {
+        dataset
+            .create_index(
+                &[name],
+                IndexType::ZoneMap,
+                None,
+                &zone_map_params(true),
+                false,
+            )
+            .await
+            .unwrap();
+    }
+    dataset
+        .append(RecordBatchIterator::new([Ok(make_batch())], schema), None)
+        .await
+        .unwrap();
+    let file = &dataset.fragments()[1].files[0];
+    assert!(seed_in_file(&dataset, &file.path, "a").await.is_some());
+    assert!(seed_in_file(&dataset, &file.path, "f").await.is_some());
+    let column = if rename {
+        dataset
+            .alter_columns(&[
+                ColumnAlteration::new("a".into()).rename("f".into()),
+                ColumnAlteration::new("f".into()).rename("a".into()),
+            ])
+            .await
+            .unwrap();
+        "a"
+    } else {
+        "f"
+    };
+    let filter = format!("{column} = 100");
+    dataset
+        .optimize_indices(&OptimizeOptions::default())
+        .await
+        .unwrap();
+    let dataset = Dataset::open(dir.as_str()).await.unwrap();
+    let mut flat = dataset.scan();
+    flat.use_scalar_index(false)
+        .project(&[column])
+        .unwrap()
+        .filter(&filter)
+        .unwrap();
+    let expected = flat.try_into_batch().await.unwrap().num_rows();
+    assert_eq!(expected, 20);
+    let mut indexed = dataset.scan();
+    indexed.project(&[column]).unwrap().filter(&filter).unwrap();
+    assert_eq!(indexed.try_into_batch().await.unwrap().num_rows(), expected);
+}
 
 fn schema() -> Arc<ArrowSchema> {
     Arc::new(ArrowSchema::new(vec![
