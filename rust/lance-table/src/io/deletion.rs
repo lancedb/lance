@@ -85,7 +85,7 @@ pub async fn write_deletion_file(
                 file_type: DeletionFileType::Bitmap,
                 num_deleted_rows: Some(bitmap.len() as usize),
                 base_id: None,
-                inline: Some(encoded),
+                inline: Some(encoded.into()),
             }));
         }
     }
@@ -170,7 +170,7 @@ pub async fn read_deletion_file(
 ) -> Result<DeletionVector> {
     let span = tracing::Span::current();
     if let Some(encoded) = &deletion_file.inline {
-        let bitmap = RoaringBitmap::deserialize_from(encoded.as_slice())
+        let bitmap = RoaringBitmap::deserialize_from(&encoded[..])
             .map_err(box_error)
             .context(CorruptFileSnafu {
                 path: deletion_file_path(base, fragment_id, deletion_file),

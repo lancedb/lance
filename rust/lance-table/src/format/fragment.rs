@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::num::NonZero;
 use std::sync::Arc;
 
+use bytes::Bytes;
 use lance_core::Error;
 use lance_core::deepsize::DeepSizeOf;
 use lance_file::version::ConcreteFileVersion;
@@ -487,9 +488,35 @@ pub struct DeletionFile {
     pub num_deleted_rows: Option<usize>,
     pub base_id: Option<u32>,
     /// The serialized Roaring bitmap of deleted row offsets, when the deletion
-    /// vector is stored in the manifest rather than in a file.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub inline: Option<Vec<u8>>,
+    /// vector is stored in the manifest rather than in a file. `Bytes`, so the
+    /// many clones of a fragment share it instead of copying it.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "inline_deletion_bytes"
+    )]
+    pub inline: Option<Bytes>,
+}
+
+/// `Option<Bytes>` as serde sees a byte sequence, without the `serde` feature of `bytes`.
+mod inline_deletion_bytes {
+    use super::*;
+
+    pub fn serialize<S: Serializer>(
+        value: &Option<Bytes>,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        match value {
+            Some(bytes) => serializer.serialize_some(&bytes[..]),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Option<Bytes>, D::Error> {
+        Option::<Vec<u8>>::deserialize(deserializer).map(|bytes| bytes.map(Bytes::from))
+    }
 }
 
 impl DeletionFile {

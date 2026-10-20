@@ -117,7 +117,7 @@ impl Dataset {
         }
         deletion_file.file_type = DeletionFileType::Bitmap;
         deletion_file.num_deleted_rows = Some(bitmap.len() as usize);
-        deletion_file.inline = Some(encoded);
+        deletion_file.inline = Some(encoded.into());
         Ok(Some(fragment))
     }
 }

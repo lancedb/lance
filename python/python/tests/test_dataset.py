@@ -5279,6 +5279,7 @@ def test_inline_deletions(tmp_path: Path):
         if deletion_file is not None:
             assert deletion_file.inline is not None
             assert deletion_file.file_type == "bitmap"
+            assert deletion_file.path(fragment.fragment_id) is None
             # Round-tripping the metadata through JSON keeps the vector.
             round_trip = lance.fragment.FragmentMetadata.from_json(
                 json.dumps(fragment.metadata.to_json())

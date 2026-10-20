@@ -617,6 +617,7 @@ impl PyDeletionFile {
         base_id: Option<u32>,
         inline: Option<Vec<u8>>,
     ) -> PyResult<Self> {
+        let inline = inline.map(bytes::Bytes::from);
         let file_type = match file_type {
             "array" => DeletionFileType::Array,
             "bitmap" => DeletionFileType::Bitmap,
@@ -701,11 +702,16 @@ impl PyDeletionFile {
     /// The serialized deletion bitmap when it is stored in the manifest, else None.
     #[getter]
     fn inline(&self) -> Option<Vec<u8>> {
-        self.0.inline.clone()
+        self.0.inline.as_ref().map(|bytes| bytes.to_vec())
     }
 
+    /// The path of the deletion file, or None when the vector is stored inline
+    /// and no file exists.
     #[pyo3(signature = (fragment_id, base_uri=None))]
-    fn path(&self, fragment_id: u64, base_uri: Option<&str>) -> PyResult<String> {
+    fn path(&self, fragment_id: u64, base_uri: Option<&str>) -> PyResult<Option<String>> {
+        if self.0.is_inline() {
+            return Ok(None);
+        }
         let base_path = if let Some(base_uri) = base_uri {
             Path::from_url_path(base_uri).map_err(|e| {
                 PyValueError::new_err(format!("Invalid base URI: {}: {}", base_uri, e))
@@ -713,7 +719,9 @@ impl PyDeletionFile {
         } else {
             Path::default()
         };
-        Ok(deletion_file_path(&base_path, fragment_id, &self.0).to_string())
+        Ok(Some(
+            deletion_file_path(&base_path, fragment_id, &self.0).to_string(),
+        ))
     }
 
     pub fn json(&self) -> PyResult<String> {
