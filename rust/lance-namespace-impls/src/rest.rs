@@ -27,10 +27,12 @@ use lance_namespace::models::{
     AlterTableAlterColumnsResponse, AlterTableBackfillColumnsRequest,
     AlterTableBackfillColumnsResponse, AlterTableDropColumnsRequest, AlterTableDropColumnsResponse,
     AlterTransactionRequest, AlterTransactionResponse, AnalyzeTableQueryPlanRequest,
-    BatchDeleteTableVersionsRequest, BatchDeleteTableVersionsResponse, CountTableRowsRequest,
-    CreateMaterializedViewRequest, CreateMaterializedViewResponse, CreateNamespaceRequest,
-    CreateNamespaceResponse, CreateTableBranchRequest, CreateTableBranchResponse,
-    CreateTableIndexRequest, CreateTableIndexResponse, CreateTableRequest, CreateTableResponse,
+    BatchCommitTablesRequest, BatchCommitTablesResponse, BatchCreateTableVersionsRequest,
+    BatchCreateTableVersionsResponse, BatchDeleteTableVersionsRequest,
+    BatchDeleteTableVersionsResponse, CountTableRowsRequest, CreateMaterializedViewRequest,
+    CreateMaterializedViewResponse, CreateNamespaceRequest, CreateNamespaceResponse,
+    CreateTableBranchRequest, CreateTableBranchResponse, CreateTableIndexRequest,
+    CreateTableIndexResponse, CreateTableRequest, CreateTableResponse,
     CreateTableScalarIndexResponse, CreateTableTagRequest, CreateTableTagResponse,
     CreateTableVersionRequest, CreateTableVersionResponse, DeclareTableRequest,
     DeclareTableResponse, DeleteFromTableRequest, DeleteFromTableResponse,
@@ -50,9 +52,10 @@ use lance_namespace::models::{
     MergeInsertIntoTableRequest, MergeInsertIntoTableResponse, NamespaceExistsRequest,
     QueryTableRequest, RefreshMaterializedViewRequest, RefreshMaterializedViewResponse,
     RegisterTableRequest, RegisterTableResponse, RenameTableRequest, RenameTableResponse,
-    RestoreTableRequest, RestoreTableResponse, TableExistsRequest, UpdateTableRequest,
-    UpdateTableResponse, UpdateTableSchemaMetadataRequest, UpdateTableSchemaMetadataResponse,
-    UpdateTableTagRequest, UpdateTableTagResponse,
+    RestoreTableRequest, RestoreTableResponse, TableExistsRequest, UpdateFieldMetadataRequest,
+    UpdateFieldMetadataResponse, UpdateTableRequest, UpdateTableResponse,
+    UpdateTableSchemaMetadataRequest, UpdateTableSchemaMetadataResponse, UpdateTableTagRequest,
+    UpdateTableTagResponse,
 };
 use serde::{Serialize, de::DeserializeOwned};
 
@@ -1490,6 +1493,28 @@ impl LanceNamespace for RestNamespace {
             .await
     }
 
+    async fn batch_create_table_versions(
+        &self,
+        request: BatchCreateTableVersionsRequest,
+    ) -> Result<BatchCreateTableVersionsResponse> {
+        self.record_op("batch_create_table_versions");
+        let path = "/v1/table/version/batch-create";
+        let query = [("delimiter", self.delimiter.as_str())];
+        self.post_json(path, &query, &request, "batch_create_table_versions", "")
+            .await
+    }
+
+    async fn batch_commit_tables(
+        &self,
+        request: BatchCommitTablesRequest,
+    ) -> Result<BatchCommitTablesResponse> {
+        self.record_op("batch_commit_tables");
+        let path = "/v1/table/batch-commit";
+        let query = [("delimiter", self.delimiter.as_str())];
+        self.post_json(path, &query, &request, "batch_commit_tables", "")
+            .await
+    }
+
     async fn update_table_schema_metadata(
         &self,
         request: UpdateTableSchemaMetadataRequest,
@@ -1516,6 +1541,19 @@ impl LanceNamespace for RestNamespace {
             context: Some(response_context(&headers)),
             ..Default::default()
         })
+    }
+
+    async fn update_field_metadata(
+        &self,
+        request: UpdateFieldMetadataRequest,
+    ) -> Result<UpdateFieldMetadataResponse> {
+        self.record_op("update_field_metadata");
+        let id = object_id_str(&request.id, &self.delimiter)?;
+        let encoded_id = urlencode(&id);
+        let path = format!("/v1/table/{}/update_field_metadata", encoded_id);
+        let query = [("delimiter", self.delimiter.as_str())];
+        self.post_json(&path, &query, &request, "update_field_metadata", &id)
+            .await
     }
 
     async fn get_table_stats(
