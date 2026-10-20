@@ -3,8 +3,23 @@
 
 //! The 2.3 writer chooses structure independently from value storage.
 
+use super::structural_encoder::{
+    FixedWidthDictionaryEncoding, MiniblockChunkSize, PrimitiveEncodeAttempt,
+    PrimitiveEncodeContext, PrimitivePageData, PrimitivePageEncodingBehavior,
+    PrimitivePageStructure, PrimitivePlanContext,
+};
 use super::*;
+use crate::compression::CompressionStrategy;
+use crate::constants::{
+    STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY, STRUCTURAL_ENCODING_MINIBLOCK,
+    STRUCTURAL_ENCODING_SPARSE,
+};
+use crate::decoder::{PageEncoding, PageInfo};
 use crate::format::planar::from_dense_execution;
+use crate::repdef::{NormalizedStructuralPlan, SerializedRepDefs};
+use arrow_array::{Array, ArrayRef, cast::AsArray};
+use lance_arrow::DataTypeExt;
+use lance_core::datatypes::Field;
 
 pub(super) fn inline_type(data_type: &DataType) -> bool {
     *data_type == DataType::Boolean
