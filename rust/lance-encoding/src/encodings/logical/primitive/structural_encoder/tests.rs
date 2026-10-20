@@ -7,7 +7,8 @@ use std::sync::{Arc, Mutex};
 
 use arrow_array::types::Int32Type;
 use arrow_array::{
-    Array, ArrayRef, DictionaryArray, Int8Array, PrimitiveArray, StringArray, new_null_array,
+    Array, ArrayRef, DictionaryArray, Float64Array, Int8Array, PrimitiveArray, StringArray,
+    new_null_array,
 };
 use arrow_buffer::{BooleanBuffer, NullBuffer, ScalarBuffer};
 use arrow_schema::DataType;
@@ -21,19 +22,20 @@ use crate::buffer::LanceBuffer;
 use crate::compression::DefaultDecompressionStrategy;
 use crate::constants::{
     COMPRESSION_LEVEL_META_KEY, COMPRESSION_META_KEY, DICT_DIVISOR_META_KEY,
-    DICT_VALUES_COMPRESSION_LEVEL_META_KEY, DICT_VALUES_COMPRESSION_META_KEY,
-    STRUCTURAL_ENCODING_META_KEY, STRUCTURAL_ENCODING_MINIBLOCK,
+    DICT_SIZE_RATIO_META_KEY, DICT_VALUES_COMPRESSION_LEVEL_META_KEY,
+    DICT_VALUES_COMPRESSION_META_KEY, STRUCTURAL_ENCODING_META_KEY, STRUCTURAL_ENCODING_MINIBLOCK,
 };
 use crate::data::{BlockInfo, DataBlock, FixedWidthDataBlock};
 use crate::decoder::PageEncoding;
+use crate::encodings::logical::primitive::dict::dictionary_encode;
 use crate::encodings::logical::primitive::miniblock::{MiniBlockChunk, MiniBlockCompressed};
 use crate::encodings::logical::primitive::{MiniBlockScheduler, StructuralPageScheduler};
-use crate::format::pb21;
-use crate::format::pb21::compressive_encoding::Compression;
+use crate::format::metadata;
+use crate::format::metadata::compressive_encoding::Compression;
 use crate::repdef::build_control_word_iterator;
 use crate::testing::{TestCases, TestEncoding, check_round_trip_encoding_of_data};
 
-use super::{FixedWidthDictionaryEncoding, MiniblockChunkSize, PrimitiveStructuralEncoder};
+use super::{DictionaryEncodingPolicy, MiniblockChunkSize, PrimitiveStructuralEncoder};
 
 #[test]
 fn test_is_narrow() {
@@ -259,7 +261,7 @@ async fn test_large_dictionary_general_compression() {
             // Navigate to the dictionary encoding in the page layout
             if let Some(PageEncoding::Structural(page_layout)) =
                 &col.final_pages.first().map(|p| &p.description)
-                && let Some(pb21::page_layout::Layout::MiniBlockLayout(mini_block)) =
+                && let Some(metadata::page_layout::Layout::MiniBlockLayout(mini_block)) =
                     &page_layout.layout
                 && let Some(dictionary_encoding) = &mini_block.dictionary
             {
@@ -269,9 +271,9 @@ async fn test_large_dictionary_general_compression() {
                         let compression = general.compression.as_ref().unwrap();
                         assert!(
                             compression.scheme()
-                                == pb21::CompressionScheme::CompressionAlgorithmLz4
+                                == metadata::CompressionScheme::CompressionAlgorithmLz4
                                 || compression.scheme()
-                                    == pb21::CompressionScheme::CompressionAlgorithmZstd,
+                                    == metadata::CompressionScheme::CompressionAlgorithmZstd,
                             "Expected LZ4 or Zstd compression for large dictionary"
                         );
                     }
@@ -285,11 +287,12 @@ async fn test_large_dictionary_general_compression() {
 
 fn dictionary_encoding_from_page(
     page: &crate::encoder::EncodedPage,
-) -> &crate::format::pb21::CompressiveEncoding {
+) -> &crate::format::metadata::CompressiveEncoding {
     let PageEncoding::Structural(layout) = &page.description else {
         panic!("Expected structural page encoding");
     };
-    let pb21::page_layout::Layout::MiniBlockLayout(layout) = layout.layout.as_ref().unwrap() else {
+    let metadata::page_layout::Layout::MiniBlockLayout(layout) = layout.layout.as_ref().unwrap()
+    else {
         panic!("Expected mini-block layout");
     };
     layout
@@ -363,7 +366,7 @@ async fn test_dict_values_general_compression_default_lz4_for_variable_dict_valu
     let compression = general.compression.as_ref().unwrap();
     assert_eq!(
         compression.scheme(),
-        pb21::CompressionScheme::CompressionAlgorithmLz4
+        metadata::CompressionScheme::CompressionAlgorithmLz4
     );
 }
 
@@ -377,7 +380,7 @@ async fn test_dict_values_general_compression_default_lz4_for_fixed_dict_values(
     let compression = general.compression.as_ref().unwrap();
     assert_eq!(
         compression.scheme(),
-        pb21::CompressionScheme::CompressionAlgorithmLz4
+        metadata::CompressionScheme::CompressionAlgorithmLz4
     );
 }
 
@@ -396,7 +399,7 @@ async fn test_dict_values_general_compression_zstd() {
     let compression = general.compression.as_ref().unwrap();
     assert_eq!(
         compression.scheme(),
-        pb21::CompressionScheme::CompressionAlgorithmZstd
+        metadata::CompressionScheme::CompressionAlgorithmZstd
     );
 }
 
@@ -543,6 +546,56 @@ async fn test_dictionary_encode_float64() {
     check_round_trip_encoding_of_data(vec![array], &test_cases, metadata).await;
 }
 
+#[rstest::rstest]
+#[case::dense(false)]
+#[case::nullable(true)]
+#[tokio::test]
+async fn test_planar_dictionary_encode_repeated_float64(#[case] nullable: bool) {
+    let num_values = 262_144u64;
+    // Spread repeated values across the sample blocks instead of repeating the same
+    // short prefix at every block boundary.
+    let values = (0..num_values)
+        .map(|i| {
+            let value = (((i * 7919) ^ (i >> 7)) % 2048) as f64 / 100.0;
+            (!nullable || i % 8 != 0).then_some(value)
+        })
+        .collect::<Vec<_>>();
+    let array = Arc::new(Float64Array::from(values)) as ArrayRef;
+    let block = DataBlock::from_array(array.clone()).remove_outer_validity();
+    let ratio = PrimitiveStructuralEncoder::sample_unique_ratio(&block, 4096)
+        .unwrap()
+        .unwrap();
+    assert!(ratio < 0.98);
+    assert!(
+        ratio * num_values as f64 > 100_000.0,
+        "the old sample projection must reject this 2,048-value dictionary"
+    );
+    let field = lance_core::datatypes::Field::try_from(&arrow_schema::Field::new(
+        "values",
+        DataType::Float64,
+        nullable,
+    ))
+    .unwrap();
+    let budget = PrimitiveStructuralEncoder::should_dictionary_encode(
+        &block,
+        &field,
+        DictionaryEncodingPolicy::Planar,
+    )
+    .expect("repeated values should reach dictionary construction");
+    assert_eq!(budget.max_dict_entries, 100_000);
+
+    let test_cases = TestCases::default()
+        .with_encoding(TestEncoding::StructuralSparse)
+        .with_page_sizes(vec![8 * 1024 * 1024])
+        .with_ingest_batch_counts([1])
+        .with_slicing_modes([false])
+        .with_batch_size(65_536)
+        .with_range(0..num_values)
+        .with_indices(vec![0, 1, 127, 128, 65_535, 65_536, num_values - 1])
+        .with_expected_encoding("dictionary");
+    check_round_trip_encoding_of_data(vec![array], &test_cases, HashMap::new()).await;
+}
+
 // Dictionary encoding decision tests
 fn create_test_fixed_data_block(
     num_values: u64,
@@ -631,7 +684,7 @@ fn test_should_dictionary_encode() {
     let result = PrimitiveStructuralEncoder::should_dictionary_encode(
         &block,
         &field,
-        FixedWidthDictionaryEncoding::Exclude64Bit,
+        DictionaryEncodingPolicy::LegacyU16,
     );
 
     assert!(
@@ -704,7 +757,7 @@ fn test_should_dictionary_encode_sorted_low_cardinality() {
     let result = PrimitiveStructuralEncoder::should_dictionary_encode(
         &block,
         &field,
-        FixedWidthDictionaryEncoding::Include64Bit,
+        DictionaryEncodingPolicy::LegacyU32,
     );
 
     assert!(
@@ -731,7 +784,7 @@ fn test_should_not_dictionary_encode_sorted_high_cardinality_short_runs() {
     let result = PrimitiveStructuralEncoder::should_dictionary_encode(
         &block,
         &field,
-        FixedWidthDictionaryEncoding::Include64Bit,
+        DictionaryEncodingPolicy::LegacyU32,
     );
 
     assert!(
@@ -769,7 +822,7 @@ fn test_should_not_dictionary_encode_unsupported_bits() {
     let result = PrimitiveStructuralEncoder::should_dictionary_encode(
         &block,
         &field,
-        FixedWidthDictionaryEncoding::Exclude64Bit,
+        DictionaryEncodingPolicy::LegacyU16,
     );
 
     assert!(
@@ -778,8 +831,11 @@ fn test_should_not_dictionary_encode_unsupported_bits() {
     );
 }
 
-#[test]
-fn test_should_not_dictionary_encode_near_unique_sample() {
+#[rstest::rstest]
+#[case::legacy_u16(DictionaryEncodingPolicy::LegacyU16)]
+#[case::legacy_u32(DictionaryEncodingPolicy::LegacyU32)]
+#[case::planar(DictionaryEncodingPolicy::Planar)]
+fn test_should_not_dictionary_encode_near_unique_sample(#[case] policy: DictionaryEncodingPolicy) {
     use crate::constants::DICT_SIZE_RATIO_META_KEY;
     use lance_core::datatypes::Field as LanceField;
 
@@ -792,16 +848,47 @@ fn test_should_not_dictionary_encode_near_unique_sample() {
         arrow_schema::Field::new("test", DataType::Utf8, false).with_metadata(metadata);
     let field = LanceField::try_from(&arrow_field).unwrap();
 
-    let result = PrimitiveStructuralEncoder::should_dictionary_encode(
-        &block,
-        &field,
-        FixedWidthDictionaryEncoding::Exclude64Bit,
-    );
+    let result = PrimitiveStructuralEncoder::should_dictionary_encode(&block, &field, policy);
 
     assert!(
         result.is_none(),
         "Should not probe dictionary encoding for near-unique data"
     );
+}
+
+#[rstest::rstest]
+#[case::cardinality(8, 1.0)]
+#[case::encoded_size(2, 0.25)]
+fn test_planar_dictionary_probe_preserves_budgets(#[case] divisor: u64, #[case] size_ratio: f64) {
+    let block = create_test_fixed_data_block(4096, 2048, 64);
+    let field =
+        arrow_schema::Field::new("values", DataType::UInt64, false).with_metadata(HashMap::from([
+            (DICT_DIVISOR_META_KEY.to_string(), divisor.to_string()),
+            (DICT_SIZE_RATIO_META_KEY.to_string(), size_ratio.to_string()),
+        ]));
+    let field = lance_core::datatypes::Field::try_from(&field).unwrap();
+    let budget = PrimitiveStructuralEncoder::should_dictionary_encode(
+        &block,
+        &field,
+        DictionaryEncodingPolicy::Planar,
+    )
+    .expect("a repeated sample should reach bounded dictionary construction");
+    assert_eq!(budget.max_dict_entries, (4096 / divisor) as u32);
+    assert_eq!(
+        budget.max_encoded_size,
+        (block.data_size() as f64 * size_ratio) as usize
+    );
+    assert!(
+        dictionary_encode(
+            &block,
+            budget.max_dict_entries,
+            budget.max_encoded_size,
+            budget.max_dict_bytes,
+        )
+        .is_none(),
+        "actual construction must abort at the unchanged budget"
+    );
+    assert!(dictionary_encode(&block, 4096, block.data_size() as usize, usize::MAX).is_some());
 }
 
 #[test]
@@ -903,20 +990,24 @@ fn variable_offset_test_array(lengths: &[usize], num_rows: usize) -> ArrayRef {
     })))
 }
 
-fn miniblock_layout(page: &crate::encoder::EncodedPage) -> &pb21::MiniBlockLayout {
-    let PageEncoding::Structural(layout) = &page.description else {
-        panic!("expected structural page encoding");
+fn miniblock_layout(page: &crate::encoder::EncodedPage) -> metadata::MiniBlockLayout {
+    let layout = match &page.description {
+        PageEncoding::Structural(layout) => layout.clone(),
+        PageEncoding::Planar(layout) => layout.dense_execution_layout().unwrap(),
+        _ => panic!("expected structural page encoding"),
     };
-    let Some(pb21::page_layout::Layout::MiniBlockLayout(layout)) = layout.layout.as_ref() else {
+    let Some(metadata::page_layout::Layout::MiniBlockLayout(layout)) = layout.layout.as_ref()
+    else {
         panic!("expected mini-block page layout");
     };
-    layout
+    layout.clone()
 }
 
 fn variable_offset_compression(
     page: &crate::encoder::EncodedPage,
-) -> &pb21::compressive_encoding::Compression {
-    let value_encoding = miniblock_layout(page).value_compression.as_ref().unwrap();
+) -> metadata::compressive_encoding::Compression {
+    let layout = miniblock_layout(page);
+    let value_encoding = layout.value_compression.as_ref().unwrap();
     let Compression::Variable(variable) = value_encoding.compression.as_ref().unwrap() else {
         panic!("expected Variable value compression");
     };
@@ -925,6 +1016,7 @@ fn variable_offset_compression(
         .as_deref()
         .and_then(|offsets| offsets.compression.as_ref())
         .unwrap()
+        .clone()
 }
 
 fn variable_value_wire_bytes(page: &crate::encoder::EncodedPage) -> usize {
@@ -990,7 +1082,7 @@ async fn miniblock_take_request_shape(page: &crate::encoder::EncodedPage) -> [us
         &buffer_offsets_and_sizes,
         0,
         page.num_rows,
-        miniblock_layout(page),
+        &miniblock_layout(page),
         &decompression,
     )
     .unwrap();
@@ -1012,7 +1104,7 @@ async fn miniblock_take_request_shape(page: &crate::encoder::EncodedPage) -> [us
         &buffer_offsets_and_sizes,
         0,
         page.num_rows,
-        miniblock_layout(page),
+        &miniblock_layout(page),
         &decompression,
     )
     .unwrap();
@@ -1079,7 +1171,7 @@ async fn test_v2_3_generic_offsets_preserve_legacy_and_take_io() {
 
 #[tokio::test]
 async fn test_constant_layout_out_of_line_fixed_size_binary_v2_2() {
-    use crate::format::pb21::page_layout::Layout;
+    use crate::format::metadata::page_layout::Layout;
 
     let val = vec![0xABu8; 33];
     let arr: ArrayRef = Arc::new(
@@ -1109,7 +1201,7 @@ async fn test_constant_layout_out_of_line_fixed_size_binary_v2_2() {
 
 #[tokio::test]
 async fn test_constant_layout_out_of_line_utf8_v2_2() {
-    use crate::format::pb21::page_layout::Layout;
+    use crate::format::metadata::page_layout::Layout;
 
     let arr: ArrayRef = Arc::new(arrow_array::StringArray::from_iter_values(
         std::iter::repeat_n("hello", 512),
@@ -1134,7 +1226,7 @@ async fn test_constant_layout_out_of_line_utf8_v2_2() {
 
 #[tokio::test]
 async fn test_constant_layout_null_padded_large_value_v2_2() {
-    use crate::format::pb21::page_layout::Layout;
+    use crate::format::metadata::page_layout::Layout;
 
     // One large non-null value plus many nulls still qualifies for constant
     // encoding.  Materializing the scalar for every slot (including nulls)
@@ -1161,7 +1253,7 @@ async fn test_constant_layout_null_padded_large_value_v2_2() {
 
 #[tokio::test]
 async fn test_constant_layout_null_padded_binary_v2_2() {
-    use crate::format::pb21::page_layout::Layout;
+    use crate::format::metadata::page_layout::Layout;
 
     let big = vec![0xCDu8; 32 * 1024 * 1024];
     let mut values: Vec<Option<&[u8]>> = vec![None; 1200];
@@ -1185,7 +1277,7 @@ async fn test_constant_layout_null_padded_binary_v2_2() {
 
 #[tokio::test]
 async fn test_constant_layout_nullable_item_v2_2() {
-    use crate::format::pb21::page_layout::Layout;
+    use crate::format::metadata::page_layout::Layout;
 
     let arr: ArrayRef = Arc::new(arrow_array::Int32Array::from(vec![
         Some(7),
@@ -1214,7 +1306,7 @@ async fn test_constant_layout_nullable_item_v2_2() {
 
 #[tokio::test]
 async fn test_constant_layout_list_repdef_v2_2() {
-    use crate::format::pb21::page_layout::Layout;
+    use crate::format::metadata::page_layout::Layout;
     use arrow_array::builder::{Int32Builder, ListBuilder};
 
     let mut builder = ListBuilder::new(Int32Builder::new());
@@ -1259,7 +1351,7 @@ async fn test_constant_layout_list_repdef_v2_2() {
 
 #[tokio::test]
 async fn test_constant_layout_fixed_size_list_not_used_v2_2() {
-    use crate::format::pb21::page_layout::Layout;
+    use crate::format::metadata::page_layout::Layout;
     use arrow_array::builder::{FixedSizeListBuilder, Int32Builder};
 
     let mut builder = FixedSizeListBuilder::new(Int32Builder::new(), 3);
@@ -1295,7 +1387,7 @@ async fn test_constant_layout_fixed_size_list_not_used_v2_2() {
 
 #[tokio::test]
 async fn test_constant_layout_not_written_before_v2_2() {
-    use crate::format::pb21::page_layout::Layout;
+    use crate::format::metadata::page_layout::Layout;
 
     let arr: ArrayRef = Arc::new(arrow_array::Int32Array::from(vec![7; 1024]));
     let field = arrow_schema::Field::new("c", DataType::Int32, true);
@@ -1317,7 +1409,7 @@ async fn test_constant_layout_not_written_before_v2_2() {
 
 #[tokio::test]
 async fn test_all_null_constant_layout_still_works_v2_2() {
-    use crate::format::pb21::page_layout::Layout;
+    use crate::format::metadata::page_layout::Layout;
 
     let arr: ArrayRef = Arc::new(arrow_array::Int32Array::from(vec![None, None, None]));
     let field = arrow_schema::Field::new("c", DataType::Int32, true);
@@ -1418,7 +1510,7 @@ fn test_encode_decode_complex_all_null_vals_roundtrip() {
 
 #[tokio::test]
 async fn test_complex_all_null_compression_gated_by_version() {
-    use crate::format::pb21::page_layout::Layout;
+    use crate::format::metadata::page_layout::Layout;
     use arrow_array::ListArray;
 
     let list_array = ListArray::from_iter_primitive::<arrow_array::types::Int32Type, _, _>(
@@ -1582,6 +1674,29 @@ async fn test_dictionary_round_trip_high_cardinality_strings() {
         dictionary_miniblock_metadata(),
     )
     .await;
+}
+
+/// Three single-value dictionary chunks merged into one page leave the merged
+/// dictionary values as a run of identical entries, so the writer RLE-compresses
+/// the dictionary values block.  The mini-block reader must accept the encodings
+/// the writer emits (regression: it rejected `Compression::Rle`, so no scan
+/// could read a file the writer had just produced).
+#[tokio::test]
+async fn test_dictionary_round_trip_rle_encoded_dictionary_values() {
+    use arrow_array::{UInt32Array, UInt64Array, types::UInt32Type};
+
+    let single_value = |rows: usize| -> ArrayRef {
+        let values = Arc::new(UInt64Array::from(vec![5_881_210_131_331_364_753u64]));
+        let keys = UInt32Array::from(vec![0u32; rows]);
+        Arc::new(DictionaryArray::<UInt32Type>::try_new(keys, values).unwrap())
+    };
+    let chunks: Vec<ArrayRef> = (0..3).map(|_| single_value(2)).collect();
+
+    let test_cases = TestCases::default()
+        .with_encoding(TestEncoding::StructuralU32)
+        .with_page_sizes(vec![4096]);
+
+    check_round_trip_encoding_of_data(chunks, &test_cases, HashMap::new()).await;
 }
 
 /// Values above the 32 KiB per-value threshold take the per-value zstd path.

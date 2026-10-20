@@ -4557,6 +4557,7 @@ dependencies = [
  "lzma-sys",
  "mock_instant",
  "moka",
+ "num-traits",
  "object_store 0.14.2",
  "parquet",
  "permutation",
