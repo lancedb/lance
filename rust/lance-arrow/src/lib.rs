@@ -911,10 +911,13 @@ fn project(struct_array: &StructArray, fields: &Fields) -> Result<StructArray> {
     StructArray::try_new(fields.clone(), columns, struct_array.nulls().cloned())
 }
 
-fn lists_have_same_offsets_helper<T: OffsetSizeTrait>(left: &dyn Array, right: &dyn Array) -> bool {
-    let left_list: &GenericListArray<T> = left.as_list();
-    let right_list: &GenericListArray<T> = right.as_list();
-    left_list.offsets().inner() == right_list.offsets().inner()
+/// Whether `data_type` has a struct somewhere below it, through lists.
+fn holds_struct(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Struct(_) => true,
+        DataType::List(item) | DataType::LargeList(item) => holds_struct(item.data_type()),
+        _ => false,
+    }
 }
 
 /// The values of `list`, with the items of every entry that is null in `list`
@@ -949,109 +952,89 @@ fn hide_items_revealed_by<T: OffsetSizeTrait>(
     )
 }
 
-fn merge_list_structs_helper<T: OffsetSizeTrait>(
+/// Merge the values of two lists: structs field by field, nested lists
+/// recursively, anything else keeps the left side.
+fn merge_list_values(left: &ArrayRef, right: &ArrayRef) -> Result<ArrayRef> {
+    Ok(match (left.data_type(), right.data_type()) {
+        (DataType::Struct(_), DataType::Struct(_)) => {
+            Arc::new(merge(left.as_struct(), right.as_struct())?)
+        }
+        (DataType::List(_), DataType::List(_))
+        | (DataType::LargeList(_), DataType::LargeList(_))
+            if left.data_type() != right.data_type()
+                && holds_struct(left.data_type())
+                && holds_struct(right.data_type()) =>
+        {
+            merge_list_struct(left, right, None, None)?
+        }
+        _ => left.clone(),
+    })
+}
+
+fn merge_list_struct_helper<T: OffsetSizeTrait>(
     left: &dyn Array,
     right: &dyn Array,
-    items_field_name: impl Into<String>,
-    items_nullable: bool,
+    null_left: bool,
+    null_right: bool,
 ) -> Result<ArrayRef> {
     let left_list: &GenericListArray<T> = left.as_list();
     let right_list: &GenericListArray<T> = right.as_list();
-    // The lists share offsets, and an entry is valid if either side has it, as
-    // for struct rows. Each side's items under its own null entries are hidden
-    // first, so the other side's validity cannot expose them.
-    let left_items = hide_items_revealed_by(left_list, right_list.nulls());
-    let right_items = hide_items_revealed_by(right_list, left_list.nulls());
-    let merged_items = Arc::new(merge(left_items.as_struct(), right_items.as_struct())?);
+    let ((DataType::List(left_item), DataType::List(right_item))
+    | (DataType::LargeList(left_item), DataType::LargeList(right_item))) =
+        (left.data_type(), right.data_type())
+    else {
+        unreachable!()
+    };
+    let (merged_items, list, nulls, items_nullable) = if null_left || null_right {
+        // One side all-null (a placeholder for columns this fragment lacks) has
+        // no values, so stand in nulls shaped like the other side's.
+        let not_null = if null_left { right_list } else { left_list };
+        let values_len = not_null.values().len();
+        let values = |list: &GenericListArray<T>, is_null: bool| {
+            if is_null {
+                new_null_array(list.values().data_type(), values_len)
+            } else {
+                list.values().clone()
+            }
+        };
+        let merged = merge_list_values(
+            &values(left_list, null_left),
+            &values(right_list, null_right),
+        )?;
+        (merged, not_null, not_null.nulls().cloned(), true)
+    } else {
+        if left_list.offsets().inner() != right_list.offsets().inner() {
+            panic!("Attempt to merge list struct arrays which do not have same offsets");
+        }
+        // The lists share offsets, and an entry is valid if either side has it,
+        // as for struct rows. Each side's items under its own null entries are
+        // hidden first, so the other side's validity cannot expose them.
+        let left_items = hide_items_revealed_by(left_list, right_list.nulls());
+        let right_items = hide_items_revealed_by(right_list, left_list.nulls());
+        let merged = merge_list_values(&left_items, &right_items)?;
+        (
+            merged,
+            left_list,
+            merge_struct_validity(left_list.nulls(), right_list.nulls()),
+            left_item.is_nullable() || right_item.is_nullable(),
+        )
+    };
     let items_field = Arc::new(Field::new(
-        items_field_name,
+        left_item.name(),
         merged_items.data_type().clone(),
         items_nullable,
     ));
     Ok(Arc::new(GenericListArray::<T>::new(
         items_field,
-        left_list.offsets().clone(),
+        list.offsets().clone(),
         merged_items,
-        merge_struct_validity(left_list.nulls(), right_list.nulls()),
+        nulls,
     )))
 }
 
-fn merge_list_struct_null_helper<T: OffsetSizeTrait>(
-    left: &dyn Array,
-    right: &dyn Array,
-    not_null: &dyn Array,
-    items_field_name: impl Into<String>,
-) -> Arc<dyn Array> {
-    let left_list: &GenericListArray<T> = left.as_list::<T>();
-    let not_null_list = not_null.as_list::<T>();
-    let right_list = right.as_list::<T>();
-
-    let left_struct = left_list.values().as_struct();
-    let not_null_struct: &StructArray = not_null_list.values().as_struct();
-    let right_struct = right_list.values().as_struct();
-
-    let values_len = not_null_list.values().len();
-    let mut merged_fields =
-        Vec::with_capacity(not_null_struct.num_columns() + right_struct.num_columns());
-    let mut merged_columns =
-        Vec::with_capacity(not_null_struct.num_columns() + right_struct.num_columns());
-
-    for (_, field) in left_struct.columns().iter().zip(left_struct.fields()) {
-        merged_fields.push(field.clone());
-        if let Some(val) = not_null_struct.column_by_name(field.name()) {
-            merged_columns.push(val.clone());
-        } else {
-            merged_columns.push(new_null_array(field.data_type(), values_len))
-        }
-    }
-    for (_, field) in right_struct
-        .columns()
-        .iter()
-        .zip(right_struct.fields())
-        .filter(|(_, field)| left_struct.column_by_name(field.name()).is_none())
-    {
-        merged_fields.push(field.clone());
-        if let Some(val) = not_null_struct.column_by_name(field.name()) {
-            merged_columns.push(val.clone());
-        } else {
-            merged_columns.push(new_null_array(field.data_type(), values_len));
-        }
-    }
-
-    let merged_struct = Arc::new(StructArray::new(
-        Fields::from(merged_fields),
-        merged_columns,
-        not_null_struct.nulls().cloned(),
-    ));
-    let items_field = Arc::new(Field::new(
-        items_field_name,
-        merged_struct.data_type().clone(),
-        true,
-    ));
-    Arc::new(GenericListArray::<T>::new(
-        items_field,
-        not_null_list.offsets().clone(),
-        merged_struct,
-        not_null_list.nulls().cloned(),
-    ))
-}
-
-fn merge_list_struct_null(
-    left: &dyn Array,
-    right: &dyn Array,
-    not_null: &dyn Array,
-) -> Arc<dyn Array> {
-    match left.data_type() {
-        DataType::List(left_field) => {
-            merge_list_struct_null_helper::<i32>(left, right, not_null, left_field.name())
-        }
-        DataType::LargeList(left_field) => {
-            merge_list_struct_null_helper::<i64>(left, right, not_null, left_field.name())
-        }
-        _ => unreachable!(),
-    }
-}
-
+/// Merge two lists whose items hold structs. Only succeeds if both lists have
+/// the same offsets or one of them is all-null; panics otherwise.
+///
 /// `left_parent` and `right_parent`, when given, null each side's entries under
 /// its null parent rows before the merge.
 fn merge_list_struct(
@@ -1060,43 +1043,20 @@ fn merge_list_struct(
     left_parent: Option<&NullBuffer>,
     right_parent: Option<&NullBuffer>,
 ) -> Result<ArrayRef> {
-    // Merging fields into a list<struct<...>> is tricky and can only succeed
-    // in two ways.  First, if both lists have the same offsets.  Second, if
-    // one of the lists is all-null.  The all-null side is picked before the
-    // parents are applied: a side whose rows all sit under null parents still
-    // supplies the values and types of the result, which are null there anyway.
-    let left_is_null = left.null_count() == left.len();
-    let right_is_null = right.null_count() == right.len();
+    // The all-null side is picked before the parents are applied: a side whose
+    // rows all sit under null parents still supplies the values and types of
+    // the result, which are null there anyway.
+    let null_left = left.null_count() == left.len();
+    let null_right = !null_left && right.null_count() == right.len();
     let left = adjust_child_validity(left, left_parent);
     let right = adjust_child_validity(right, right_parent);
     let (left, right) = (left.as_ref(), right.as_ref());
-    if left_is_null {
-        return Ok(merge_list_struct_null(left, right, right));
-    } else if right_is_null {
-        return Ok(merge_list_struct_null(left, right, left));
-    }
     match (left.data_type(), right.data_type()) {
-        (DataType::List(left_field), DataType::List(right_field)) => {
-            if !lists_have_same_offsets_helper::<i32>(left, right) {
-                panic!("Attempt to merge list struct arrays which do not have same offsets");
-            }
-            merge_list_structs_helper::<i32>(
-                left,
-                right,
-                left_field.name(),
-                left_field.is_nullable() || right_field.is_nullable(),
-            )
+        (DataType::List(_), DataType::List(_)) => {
+            merge_list_struct_helper::<i32>(left, right, null_left, null_right)
         }
-        (DataType::LargeList(left_field), DataType::LargeList(right_field)) => {
-            if !lists_have_same_offsets_helper::<i64>(left, right) {
-                panic!("Attempt to merge list struct arrays which do not have same offsets");
-            }
-            merge_list_structs_helper::<i64>(
-                left,
-                right,
-                left_field.name(),
-                left_field.is_nullable() || right_field.is_nullable(),
-            )
+        (DataType::LargeList(_), DataType::LargeList(_)) => {
+            merge_list_struct_helper::<i64>(left, right, null_left, null_right)
         }
         _ => unreachable!(),
     }
@@ -1337,8 +1297,8 @@ fn merge(left_struct_array: &StructArray, right_struct_array: &StructArray) -> R
                     }
                     (DataType::List(left_list), DataType::List(right_list))
                     | (DataType::LargeList(left_list), DataType::LargeList(right_list))
-                        if left_list.data_type().is_struct()
-                            && right_list.data_type().is_struct() =>
+                        if holds_struct(left_list.data_type())
+                            && holds_struct(right_list.data_type()) =>
                     {
                         // Identical inner types: nothing to merge, keep the left column.
                         if left_list.data_type() == right_list.data_type() {
@@ -1961,6 +1921,108 @@ mod tests {
             RecordBatch::try_new(Arc::new(both_schema), vec![Arc::new(both_null_list)]).unwrap();
         let merged = x_batch.merge(&y_null_batch).unwrap();
         assert_eq!(merged, expected);
+    }
+
+    #[test]
+    fn test_merge_all_null_list_adds_nested_child() {
+        // An all-null placeholder (what a fragment reader merges in for children
+        // missing from its files) adds `b` to a struct below one or two lists.
+        let strukt = |cols: Vec<(&str, ArrayRef)>| -> ArrayRef {
+            let fields = cols
+                .iter()
+                .map(|(name, col)| Field::new(*name, col.data_type().clone(), true))
+                .collect::<Vec<_>>();
+            Arc::new(StructArray::new(
+                fields.into(),
+                cols.into_iter().map(|(_, col)| col).collect(),
+                None,
+            ))
+        };
+        // Two rows: `[values]` and null.
+        let list = |values: ArrayRef, large: bool| -> ArrayRef {
+            let field = Arc::new(Field::new("item", values.data_type().clone(), true));
+            let lengths = [values.len(), 0];
+            let nulls = Some(arrow_buffer::NullBuffer::from(vec![true, false]));
+            if large {
+                Arc::new(LargeListArray::new(
+                    field,
+                    OffsetBuffer::from_lengths(lengths),
+                    values,
+                    nulls,
+                ))
+            } else {
+                Arc::new(ListArray::new(
+                    field,
+                    OffsetBuffer::from_lengths(lengths),
+                    values,
+                    nulls,
+                ))
+            }
+        };
+        let a = || Arc::new(Int32Array::from(vec![7])) as ArrayRef;
+        let b = || new_null_array(&DataType::Utf8, 1);
+        for large in [false, true] {
+            // list<struct<t, in: struct<..>>>, built with or without `t`.
+            let under_list = |inner: ArrayRef, with_t: bool| {
+                let mut cols = vec![("in", inner)];
+                if with_t {
+                    cols.insert(0, ("t", Arc::new(Int32Array::from(vec![1])) as ArrayRef));
+                }
+                list(strukt(cols), large)
+            };
+            // list<list<struct<..>>>
+            let under_two_lists = |inner: ArrayRef, _: bool| {
+                let inner_list: ArrayRef = if large {
+                    let field = Arc::new(Field::new("item", inner.data_type().clone(), true));
+                    Arc::new(LargeListArray::new(
+                        field,
+                        OffsetBuffer::from_lengths([1]),
+                        inner,
+                        None,
+                    ))
+                } else {
+                    let field = Arc::new(Field::new("item", inner.data_type().clone(), true));
+                    Arc::new(ListArray::new(
+                        field,
+                        OffsetBuffer::from_lengths([1]),
+                        inner,
+                        None,
+                    ))
+                };
+                list(inner_list, large)
+            };
+            let shapes: [&dyn Fn(ArrayRef, bool) -> ArrayRef; 2] = [&under_list, &under_two_lists];
+            for shape in shapes {
+                let data = shape(strukt(vec![("a", a())]), true);
+                let expected = shape(strukt(vec![("a", a()), ("b", b())]), true);
+                let placeholder =
+                    new_null_array(shape(strukt(vec![("b", b())]), false).data_type(), 2);
+                let batch = |col: ArrayRef| {
+                    RecordBatch::try_new(
+                        Arc::new(Schema::new(vec![Field::new(
+                            "c",
+                            col.data_type().clone(),
+                            true,
+                        )])),
+                        vec![col],
+                    )
+                    .unwrap()
+                };
+                let expected = batch(expected);
+                // Either side may be the placeholder; field order follows the left.
+                for merged in [
+                    batch(data.clone())
+                        .merge(&batch(placeholder.clone()))
+                        .unwrap(),
+                    batch(placeholder.clone())
+                        .merge(&batch(data.clone()))
+                        .unwrap(),
+                ] {
+                    let merged = merged.project_by_schema(expected.schema_ref()).unwrap();
+                    assert_eq!(merged, expected, "large={large}");
+                }
+            }
+        }
     }
 
     #[test]

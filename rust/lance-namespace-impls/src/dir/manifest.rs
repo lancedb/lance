@@ -2320,7 +2320,7 @@ impl ManifestNamespace {
     }
 
     pub(crate) fn is_not_found_load_error(err: &LanceError) -> bool {
-        match err {
+        match err.find_root() {
             LanceError::NotFound { .. } => true,
             LanceError::IO { source, .. } => source
                 .downcast_ref::<ObjectStoreError>()
