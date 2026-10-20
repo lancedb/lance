@@ -23,8 +23,8 @@ use crate::buffer::LanceBuffer;
 use crate::compression::{BlockDecompressor, DecompressionStrategy, MiniBlockDecompressor};
 use crate::data::{DataBlock, DataBlockBuilder, DictionaryDataBlock};
 use crate::decoder::{DecodePageTask, DecodedPage, StructuralPageDecoder};
-use crate::format::pb21::compressive_encoding::Compression;
-use crate::format::{ProtobufUtils21, pb21};
+use crate::format::metadata::compressive_encoding::Compression;
+use crate::format::{EncodingUtils, metadata};
 use crate::repdef::{DefinitionInterpretation, LevelBuffer, RepDefUnraveler, max_visible_level};
 
 use super::chunk_index::{
@@ -814,7 +814,7 @@ impl CachedPageData for MiniBlockCacheableState {
 #[derive(Debug)]
 pub struct MiniBlockScheduler {
     // These come from the protobuf
-    buffer_offsets_and_sizes: Vec<(u64, u64)>,
+    pub(super) buffer_offsets_and_sizes: Vec<(u64, u64)>,
     priority: u64,
     items_in_page: u64,
     repetition_index_depth: u16,
@@ -834,7 +834,7 @@ impl MiniBlockScheduler {
         buffer_offsets_and_sizes: &[(u64, u64)],
         priority: u64,
         items_in_page: u64,
-        layout: &pb21::MiniBlockLayout,
+        layout: &metadata::MiniBlockLayout,
         decompressors: &dyn DecompressionStrategy,
     ) -> Result<Self> {
         let rep_decompressor = layout
@@ -858,7 +858,7 @@ impl MiniBlockScheduler {
         let def_meaning = layout
             .layers
             .iter()
-            .map(|l| ProtobufUtils21::repdef_layer_to_def_interp(*l))
+            .map(|l| EncodingUtils::repdef_layer_to_def_interp(*l))
             .collect::<Vec<_>>();
         let value_decompressor = decompressors.create_miniblock_decompressor(
             layout.value_compression.as_ref().unwrap(),
@@ -1619,7 +1619,7 @@ mod tests {
     use crate::encodings::logical::primitive::{LoadedChunk, MINIBLOCK_ALIGNMENT};
     use crate::encodings::physical::rle::{RleDecompressor, RunLengthWidth};
     use crate::encodings::physical::value::ValueDecompressor;
-    use crate::format::{ProtobufUtils21, pb21};
+    use crate::format::{EncodingUtils, metadata};
 
     use super::{
         ChunkDrainInstructions, ChunkInstructions, DecodeMiniBlockTask, PreambleAction, Words,
@@ -2544,14 +2544,14 @@ mod tests {
         let unique_values = 2_000;
 
         let dictionary_encoding =
-            ProtobufUtils21::out_of_line_bitpacking(64, ProtobufUtils21::flat(11, None));
-        let layout = pb21::MiniBlockLayout {
+            EncodingUtils::out_of_line_bitpacking(64, EncodingUtils::flat(11, None));
+        let layout = metadata::MiniBlockLayout {
             rep_compression: None,
             def_compression: None,
-            value_compression: Some(ProtobufUtils21::flat(64, None)),
+            value_compression: Some(EncodingUtils::flat(64, None)),
             dictionary: Some(dictionary_encoding),
             num_dictionary_items: unique_values,
-            layers: vec![pb21::RepDefLayer::RepdefAllValidItem as i32],
+            layers: vec![metadata::RepDefLayer::RepdefAllValidItem as i32],
             num_buffers: 1,
             repetition_index_depth: 0,
             num_items: rows,
@@ -2584,17 +2584,15 @@ mod tests {
         // merged values buffer is dominated by runs (e.g. several batches each
         // contributing the same single dictionary value into one page).  The
         // reader must accept the same encoding the writer emits.
-        let dictionary_encoding = ProtobufUtils21::rle(
-            ProtobufUtils21::flat(64, None),
-            ProtobufUtils21::flat(8, None),
-        );
-        let layout = pb21::MiniBlockLayout {
+        let dictionary_encoding =
+            EncodingUtils::rle(EncodingUtils::flat(64, None), EncodingUtils::flat(8, None));
+        let layout = metadata::MiniBlockLayout {
             rep_compression: None,
             def_compression: None,
-            value_compression: Some(ProtobufUtils21::flat(64, None)),
+            value_compression: Some(EncodingUtils::flat(64, None)),
             dictionary: Some(dictionary_encoding),
             num_dictionary_items: 1,
-            layers: vec![pb21::RepDefLayer::RepdefAllValidItem as i32],
+            layers: vec![metadata::RepDefLayer::RepdefAllValidItem as i32],
             num_buffers: 1,
             repetition_index_depth: 0,
             num_items: rows,
@@ -2623,7 +2621,7 @@ mod tests {
         let rep_frame = encoded_u16_frame(&levels, RunLengthWidth::U8);
         let rep_decompressor = RleDecompressor::new(16);
         let def_frame = LanceBuffer::reinterpret_slice(Arc::from(levels.clone()));
-        let def_decompressor = ValueDecompressor::from_flat(&pb21::Flat {
+        let def_decompressor = ValueDecompressor::from_flat(&metadata::Flat {
             bits_per_value: 16,
             data: None,
         });

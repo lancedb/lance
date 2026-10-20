@@ -25,7 +25,7 @@ use crate::compression::{
 use crate::data::{BlockInfo, DataBlockBuilder, FixedWidthDataBlock, VariableWidthBlock};
 use crate::decoder::{DecodePageTask, DecodedPage, StructuralPageDecoder};
 use crate::encodings::logical::primitive::fullzip::PerValueDataBlock;
-use crate::format::{ProtobufUtils21, pb21};
+use crate::format::{EncodingUtils, metadata};
 use crate::repdef::{
     ControlWordParser, DefinitionInterpretation, RepDefUnraveler, max_visible_level,
 };
@@ -137,7 +137,7 @@ impl FullZipReadSource {
 #[derive(Debug)]
 pub struct FullZipScheduler {
     data_buf_position: u64,
-    data_buf_size: u64,
+    pub(super) data_buf_size: u64,
     rep_index: Option<FullZipRepIndexDetails>,
     priority: u64,
     rows_in_page: u64,
@@ -154,7 +154,7 @@ impl FullZipScheduler {
         buffer_offsets_and_sizes: &[(u64, u64)],
         priority: u64,
         rows_in_page: u64,
-        layout: &pb21::FullZipLayout,
+        layout: &metadata::FullZipLayout,
         decompressors: &dyn DecompressionStrategy,
     ) -> Result<Self> {
         let (data_buf_position, data_buf_size) = buffer_offsets_and_sizes[0];
@@ -175,13 +175,13 @@ impl FullZipScheduler {
         });
 
         let value_decompressor = match layout.details {
-            Some(pb21::full_zip_layout::Details::BitsPerValue(_)) => {
+            Some(metadata::full_zip_layout::Details::BitsPerValue(_)) => {
                 let decompressor = decompressors.create_fixed_per_value_decompressor(
                     layout.value_compression.as_ref().unwrap(),
                 )?;
                 PerValueDecompressor::Fixed(decompressor.into())
             }
-            Some(pb21::full_zip_layout::Details::BitsPerOffset(_)) => {
+            Some(metadata::full_zip_layout::Details::BitsPerOffset(_)) => {
                 let decompressor = decompressors.create_variable_per_value_decompressor(
                     layout.value_compression.as_ref().unwrap(),
                 )?;
@@ -198,15 +198,15 @@ impl FullZipScheduler {
         let def_meaning = layout
             .layers
             .iter()
-            .map(|l| ProtobufUtils21::repdef_layer_to_def_interp(*l))
+            .map(|l| EncodingUtils::repdef_layer_to_def_interp(*l))
             .collect::<Vec<_>>();
 
         let max_rep = def_meaning.iter().filter(|d| d.is_list()).count() as u16;
         let max_visible_def = max_visible_level(&def_meaning);
 
         let bits_per_offset = match layout.details {
-            Some(pb21::full_zip_layout::Details::BitsPerValue(_)) => 32,
-            Some(pb21::full_zip_layout::Details::BitsPerOffset(bits_per_offset)) => {
+            Some(metadata::full_zip_layout::Details::BitsPerValue(_)) => 32,
+            Some(metadata::full_zip_layout::Details::BitsPerOffset(bits_per_offset)) => {
                 bits_per_offset as u8
             }
             None => panic!("Full-zip layout must have a `details` field"),
@@ -1290,7 +1290,7 @@ mod tests {
     use crate::encodings::logical::primitive::StructuralPageScheduler;
     use crate::encodings::logical::primitive::fullzip::{PerValueCompressor, PerValueDataBlock};
     use crate::encodings::physical::value::{ValueDecompressor, ValueEncoder};
-    use crate::format::pb21::compressive_encoding::Compression;
+    use crate::format::metadata::compressive_encoding::Compression;
     use crate::testing::{TestCases, check_round_trip_encoding_of_data};
 
     use super::{

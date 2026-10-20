@@ -28,8 +28,8 @@ use crate::data::{BlockInfo, DataBlock, FixedWidthDataBlock};
 use crate::decoder::PageEncoding;
 use crate::encodings::logical::primitive::miniblock::{MiniBlockChunk, MiniBlockCompressed};
 use crate::encodings::logical::primitive::{MiniBlockScheduler, StructuralPageScheduler};
-use crate::format::pb21;
-use crate::format::pb21::compressive_encoding::Compression;
+use crate::format::metadata;
+use crate::format::metadata::compressive_encoding::Compression;
 use crate::repdef::build_control_word_iterator;
 use crate::testing::{TestCases, TestEncoding, check_round_trip_encoding_of_data};
 
@@ -259,7 +259,7 @@ async fn test_large_dictionary_general_compression() {
             // Navigate to the dictionary encoding in the page layout
             if let Some(PageEncoding::Structural(page_layout)) =
                 &col.final_pages.first().map(|p| &p.description)
-                && let Some(pb21::page_layout::Layout::MiniBlockLayout(mini_block)) =
+                && let Some(metadata::page_layout::Layout::MiniBlockLayout(mini_block)) =
                     &page_layout.layout
                 && let Some(dictionary_encoding) = &mini_block.dictionary
             {
@@ -269,9 +269,9 @@ async fn test_large_dictionary_general_compression() {
                         let compression = general.compression.as_ref().unwrap();
                         assert!(
                             compression.scheme()
-                                == pb21::CompressionScheme::CompressionAlgorithmLz4
+                                == metadata::CompressionScheme::CompressionAlgorithmLz4
                                 || compression.scheme()
-                                    == pb21::CompressionScheme::CompressionAlgorithmZstd,
+                                    == metadata::CompressionScheme::CompressionAlgorithmZstd,
                             "Expected LZ4 or Zstd compression for large dictionary"
                         );
                     }
@@ -285,11 +285,12 @@ async fn test_large_dictionary_general_compression() {
 
 fn dictionary_encoding_from_page(
     page: &crate::encoder::EncodedPage,
-) -> &crate::format::pb21::CompressiveEncoding {
+) -> &crate::format::metadata::CompressiveEncoding {
     let PageEncoding::Structural(layout) = &page.description else {
         panic!("Expected structural page encoding");
     };
-    let pb21::page_layout::Layout::MiniBlockLayout(layout) = layout.layout.as_ref().unwrap() else {
+    let metadata::page_layout::Layout::MiniBlockLayout(layout) = layout.layout.as_ref().unwrap()
+    else {
         panic!("Expected mini-block layout");
     };
     layout
@@ -363,7 +364,7 @@ async fn test_dict_values_general_compression_default_lz4_for_variable_dict_valu
     let compression = general.compression.as_ref().unwrap();
     assert_eq!(
         compression.scheme(),
-        pb21::CompressionScheme::CompressionAlgorithmLz4
+        metadata::CompressionScheme::CompressionAlgorithmLz4
     );
 }
 
@@ -377,7 +378,7 @@ async fn test_dict_values_general_compression_default_lz4_for_fixed_dict_values(
     let compression = general.compression.as_ref().unwrap();
     assert_eq!(
         compression.scheme(),
-        pb21::CompressionScheme::CompressionAlgorithmLz4
+        metadata::CompressionScheme::CompressionAlgorithmLz4
     );
 }
 
@@ -396,7 +397,7 @@ async fn test_dict_values_general_compression_zstd() {
     let compression = general.compression.as_ref().unwrap();
     assert_eq!(
         compression.scheme(),
-        pb21::CompressionScheme::CompressionAlgorithmZstd
+        metadata::CompressionScheme::CompressionAlgorithmZstd
     );
 }
 
@@ -877,20 +878,24 @@ fn variable_offset_test_array(lengths: &[usize], num_rows: usize) -> ArrayRef {
     })))
 }
 
-fn miniblock_layout(page: &crate::encoder::EncodedPage) -> &pb21::MiniBlockLayout {
-    let PageEncoding::Structural(layout) = &page.description else {
-        panic!("expected structural page encoding");
+fn miniblock_layout(page: &crate::encoder::EncodedPage) -> metadata::MiniBlockLayout {
+    let layout = match &page.description {
+        PageEncoding::Structural(layout) => layout.clone(),
+        PageEncoding::Planar(layout) => layout.dense_execution_layout().unwrap(),
+        _ => panic!("expected structural page encoding"),
     };
-    let Some(pb21::page_layout::Layout::MiniBlockLayout(layout)) = layout.layout.as_ref() else {
+    let Some(metadata::page_layout::Layout::MiniBlockLayout(layout)) = layout.layout.as_ref()
+    else {
         panic!("expected mini-block page layout");
     };
-    layout
+    layout.clone()
 }
 
 fn variable_offset_compression(
     page: &crate::encoder::EncodedPage,
-) -> &pb21::compressive_encoding::Compression {
-    let value_encoding = miniblock_layout(page).value_compression.as_ref().unwrap();
+) -> metadata::compressive_encoding::Compression {
+    let layout = miniblock_layout(page);
+    let value_encoding = layout.value_compression.as_ref().unwrap();
     let Compression::Variable(variable) = value_encoding.compression.as_ref().unwrap() else {
         panic!("expected Variable value compression");
     };
@@ -899,6 +904,7 @@ fn variable_offset_compression(
         .as_deref()
         .and_then(|offsets| offsets.compression.as_ref())
         .unwrap()
+        .clone()
 }
 
 fn variable_value_wire_bytes(page: &crate::encoder::EncodedPage) -> usize {
@@ -964,7 +970,7 @@ async fn miniblock_take_request_shape(page: &crate::encoder::EncodedPage) -> [us
         &buffer_offsets_and_sizes,
         0,
         page.num_rows,
-        miniblock_layout(page),
+        &miniblock_layout(page),
         &decompression,
     )
     .unwrap();
@@ -986,7 +992,7 @@ async fn miniblock_take_request_shape(page: &crate::encoder::EncodedPage) -> [us
         &buffer_offsets_and_sizes,
         0,
         page.num_rows,
-        miniblock_layout(page),
+        &miniblock_layout(page),
         &decompression,
     )
     .unwrap();
@@ -1053,7 +1059,7 @@ async fn test_v2_3_generic_offsets_preserve_legacy_and_take_io() {
 
 #[tokio::test]
 async fn test_constant_layout_out_of_line_fixed_size_binary_v2_2() {
-    use crate::format::pb21::page_layout::Layout;
+    use crate::format::metadata::page_layout::Layout;
 
     let val = vec![0xABu8; 33];
     let arr: ArrayRef = Arc::new(
@@ -1083,7 +1089,7 @@ async fn test_constant_layout_out_of_line_fixed_size_binary_v2_2() {
 
 #[tokio::test]
 async fn test_constant_layout_out_of_line_utf8_v2_2() {
-    use crate::format::pb21::page_layout::Layout;
+    use crate::format::metadata::page_layout::Layout;
 
     let arr: ArrayRef = Arc::new(arrow_array::StringArray::from_iter_values(
         std::iter::repeat_n("hello", 512),
@@ -1108,7 +1114,7 @@ async fn test_constant_layout_out_of_line_utf8_v2_2() {
 
 #[tokio::test]
 async fn test_constant_layout_null_padded_large_value_v2_2() {
-    use crate::format::pb21::page_layout::Layout;
+    use crate::format::metadata::page_layout::Layout;
 
     // One large non-null value plus many nulls still qualifies for constant
     // encoding.  Materializing the scalar for every slot (including nulls)
@@ -1135,7 +1141,7 @@ async fn test_constant_layout_null_padded_large_value_v2_2() {
 
 #[tokio::test]
 async fn test_constant_layout_null_padded_binary_v2_2() {
-    use crate::format::pb21::page_layout::Layout;
+    use crate::format::metadata::page_layout::Layout;
 
     let big = vec![0xCDu8; 32 * 1024 * 1024];
     let mut values: Vec<Option<&[u8]>> = vec![None; 1200];
@@ -1159,7 +1165,7 @@ async fn test_constant_layout_null_padded_binary_v2_2() {
 
 #[tokio::test]
 async fn test_constant_layout_nullable_item_v2_2() {
-    use crate::format::pb21::page_layout::Layout;
+    use crate::format::metadata::page_layout::Layout;
 
     let arr: ArrayRef = Arc::new(arrow_array::Int32Array::from(vec![
         Some(7),
@@ -1188,7 +1194,7 @@ async fn test_constant_layout_nullable_item_v2_2() {
 
 #[tokio::test]
 async fn test_constant_layout_list_repdef_v2_2() {
-    use crate::format::pb21::page_layout::Layout;
+    use crate::format::metadata::page_layout::Layout;
     use arrow_array::builder::{Int32Builder, ListBuilder};
 
     let mut builder = ListBuilder::new(Int32Builder::new());
@@ -1233,7 +1239,7 @@ async fn test_constant_layout_list_repdef_v2_2() {
 
 #[tokio::test]
 async fn test_constant_layout_fixed_size_list_not_used_v2_2() {
-    use crate::format::pb21::page_layout::Layout;
+    use crate::format::metadata::page_layout::Layout;
     use arrow_array::builder::{FixedSizeListBuilder, Int32Builder};
 
     let mut builder = FixedSizeListBuilder::new(Int32Builder::new(), 3);
@@ -1269,7 +1275,7 @@ async fn test_constant_layout_fixed_size_list_not_used_v2_2() {
 
 #[tokio::test]
 async fn test_constant_layout_not_written_before_v2_2() {
-    use crate::format::pb21::page_layout::Layout;
+    use crate::format::metadata::page_layout::Layout;
 
     let arr: ArrayRef = Arc::new(arrow_array::Int32Array::from(vec![7; 1024]));
     let field = arrow_schema::Field::new("c", DataType::Int32, true);
@@ -1291,7 +1297,7 @@ async fn test_constant_layout_not_written_before_v2_2() {
 
 #[tokio::test]
 async fn test_all_null_constant_layout_still_works_v2_2() {
-    use crate::format::pb21::page_layout::Layout;
+    use crate::format::metadata::page_layout::Layout;
 
     let arr: ArrayRef = Arc::new(arrow_array::Int32Array::from(vec![None, None, None]));
     let field = arrow_schema::Field::new("c", DataType::Int32, true);
@@ -1392,7 +1398,7 @@ fn test_encode_decode_complex_all_null_vals_roundtrip() {
 
 #[tokio::test]
 async fn test_complex_all_null_compression_gated_by_version() {
-    use crate::format::pb21::page_layout::Layout;
+    use crate::format::metadata::page_layout::Layout;
     use arrow_array::ListArray;
 
     let list_array = ListArray::from_iter_primitive::<arrow_array::types::Int32Type, _, _>(
