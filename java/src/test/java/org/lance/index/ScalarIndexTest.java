@@ -18,9 +18,12 @@ import org.lance.Fragment;
 import org.lance.LockManager;
 import org.lance.TestUtils;
 import org.lance.WriteParams;
+import org.lance.index.scalar.InvertedIndexParams;
+import org.lance.index.scalar.MinHashLshIndexParams;
 import org.lance.index.scalar.ScalarIndexParams;
 import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;
+import org.lance.util.JsonUtils;
 
 import org.apache.arrow.c.ArrowArrayStream;
 import org.apache.arrow.c.Data;
@@ -762,6 +765,63 @@ public class ScalarIndexTest {
             10,
             dataset.countIndexedRows(
                 indexName, "name >= 'Person 3' AND name < 'Person 8'", Optional.empty()));
+      }
+    }
+  }
+
+  @Test
+  @SuppressWarnings("unchecked")
+  public void testCreateMinHashLshIndexSegments(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("minhash_segments").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      testDataset.write(1, 10).close();
+      try (Dataset dataset = testDataset.write(2, 10)) {
+        ScalarIndexParams minhashParams =
+            MinHashLshIndexParams.builder()
+                .numHashes(64)
+                .numBands(16)
+                .shingleSize(2)
+                .tokenizer(
+                    InvertedIndexParams.builder().baseTokenizer("whitespace").withPosition(true))
+                .build();
+        // Only tokenizer settings are taken from the FTS builder.
+        Map<String, Object> tokenizerJson =
+            (Map<String, Object>)
+                JsonUtils.fromJson(minhashParams.getJsonParams().get()).get("tokenizer");
+        assertFalse(tokenizerJson.containsKey("with_position"));
+
+        IndexParams indexParams = IndexParams.builder().setScalarIndexParams(minhashParams).build();
+        List<Index> segments = new ArrayList<>();
+        for (Fragment fragment : dataset.getFragments()) {
+          segments.add(
+              dataset.createIndex(
+                  IndexOptions.builder(
+                          Collections.singletonList("name"), IndexType.MINHASH_LSH, indexParams)
+                      .withIndexName("name_minhash")
+                      .withFragmentIds(Collections.singletonList(fragment.getId()))
+                      .build()));
+        }
+        Index merged = dataset.mergeExistingIndexSegments(segments);
+        List<Index> committed =
+            dataset.commitExistingIndexSegments(
+                "name_minhash", "name", Collections.singletonList(merged));
+        assertEquals(IndexType.MINHASH_LSH, segments.get(0).indexType());
+        assertEquals(IndexType.MINHASH_LSH, committed.get(0).indexType());
+
+        // The parameters and the tokenizer reach the Rust index.
+        Map<String, Object> stats =
+            ((List<Map<String, Object>>) dataset.getIndexStatistics("name_minhash").get("indices"))
+                .get(0);
+        assertEquals(64, ((Number) stats.get("num_hashes")).intValue());
+        assertEquals(20, ((Number) stats.get("num_docs")).intValue());
+        String detailsJson = dataset.describeIndices().get(0).getDetailsJson();
+        assertEquals(
+            "whitespace",
+            ((Map<String, Object>) JsonUtils.fromJson(detailsJson).get("tokenizer"))
+                .get("base_tokenizer"));
       }
     }
   }
@@ -1893,20 +1953,9 @@ public class ScalarIndexTest {
         assertTrue(
             events.contains("progress:read_partition_metadata:2"),
             "Expected metadata progress to reach both fragments, got: " + events);
-        // Small staged partitions are consolidated instead of copied, so the
-        // finalize reports its work under consolidate_partitions; either stage
-        // must finish before the root metadata is written.
         assertTrue(
-            events.stream()
-                .anyMatch(
-                    event ->
-                        event.startsWith("progress:remap_partition_files:")
-                            || event.startsWith("progress:consolidate_partitions:")),
-            "Expected copy or consolidation progress, got: " + events);
-        if (events.contains("complete:consolidate_partitions")) {
-          assertEventsInOrder(
-              events, "complete:consolidate_partitions", "start:write_merged_metadata:");
-        }
+            events.stream().anyMatch(event -> event.startsWith("progress:remap_partition_files:")),
+            "Expected remap progress, got: " + events);
         assertTrue(
             events.contains("progress:write_merged_metadata:1"),
             "Expected merged metadata write progress, got: " + events);

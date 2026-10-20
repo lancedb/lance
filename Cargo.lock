@@ -3155,7 +3155,7 @@ checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
 name = "fsst"
-version = "14.0.0-beta.20"
+version = "14.0.0-beta.21"
 dependencies = [
  "arrow-array",
  "rand 0.9.5",
@@ -3871,7 +3871,6 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower-service",
- "webpki-roots 1.0.8",
 ]
 
 [[package]]
@@ -4487,7 +4486,7 @@ checksum = "e037a2e1d8d5fdbd49b16a4ea09d5d6401c1f29eca5ff29d03d3824dba16256a"
 
 [[package]]
 name = "lance"
-version = "14.0.0-beta.20"
+version = "14.0.0-beta.21"
 dependencies = [
  "all_asserts",
  "approx",
@@ -4532,6 +4531,7 @@ dependencies = [
  "geoarrow-array",
  "geoarrow-schema",
  "half",
+ "hex",
  "humantime",
  "itertools 0.14.0",
  "lance-arrow",
@@ -4557,6 +4557,7 @@ dependencies = [
  "lzma-sys",
  "mock_instant",
  "moka",
+ "num-traits",
  "object_store 0.14.2",
  "parquet",
  "permutation",
@@ -4569,7 +4570,7 @@ dependencies = [
  "protobuf-src",
  "rand 0.9.5",
  "rayon",
- "reqwest 0.12.28",
+ "reqwest 0.13.4",
  "roaring",
  "rstest",
  "rustc-hash",
@@ -4593,7 +4594,7 @@ dependencies = [
 
 [[package]]
 name = "lance-arrow"
-version = "14.0.0-beta.20"
+version = "14.0.0-beta.21"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4642,7 +4643,7 @@ dependencies = [
 
 [[package]]
 name = "lance-bitpacking"
-version = "14.0.0-beta.20"
+version = "14.0.0-beta.21"
 dependencies = [
  "arrayref",
  "bitpacking",
@@ -4653,7 +4654,7 @@ dependencies = [
 
 [[package]]
 name = "lance-core"
-version = "14.0.0-beta.20"
+version = "14.0.0-beta.21"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4694,7 +4695,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datafusion"
-version = "14.0.0-beta.20"
+version = "14.0.0-beta.21"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4729,7 +4730,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datagen"
-version = "14.0.0-beta.20"
+version = "14.0.0-beta.21"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4749,7 +4750,7 @@ dependencies = [
 
 [[package]]
 name = "lance-derive"
-version = "14.0.0-beta.20"
+version = "14.0.0-beta.21"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4758,7 +4759,7 @@ dependencies = [
 
 [[package]]
 name = "lance-encoding"
-version = "14.0.0-beta.20"
+version = "14.0.0-beta.21"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -4802,7 +4803,7 @@ dependencies = [
 
 [[package]]
 name = "lance-examples"
-version = "14.0.0-beta.20"
+version = "14.0.0-beta.21"
 dependencies = [
  "all_asserts",
  "arrow",
@@ -4828,7 +4829,7 @@ dependencies = [
 
 [[package]]
 name = "lance-file"
-version = "14.0.0-beta.20"
+version = "14.0.0-beta.21"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -4870,7 +4871,7 @@ dependencies = [
 
 [[package]]
 name = "lance-geo"
-version = "14.0.0-beta.20"
+version = "14.0.0-beta.21"
 dependencies = [
  "datafusion",
  "geo-traits",
@@ -4884,7 +4885,7 @@ dependencies = [
 
 [[package]]
 name = "lance-index"
-version = "14.0.0-beta.20"
+version = "14.0.0-beta.21"
 dependencies = [
  "approx",
  "arc-swap",
@@ -4968,7 +4969,7 @@ dependencies = [
 
 [[package]]
 name = "lance-index-core"
-version = "14.0.0-beta.20"
+version = "14.0.0-beta.21"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -4991,7 +4992,7 @@ dependencies = [
 
 [[package]]
 name = "lance-io"
-version = "14.0.0-beta.20"
+version = "14.0.0-beta.21"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -5044,7 +5045,7 @@ dependencies = [
 
 [[package]]
 name = "lance-jsonb"
-version = "14.0.0-beta.20"
+version = "14.0.0-beta.21"
 dependencies = [
  "byteorder",
  "ethnum",
@@ -5064,7 +5065,7 @@ dependencies = [
 
 [[package]]
 name = "lance-linalg"
-version = "14.0.0-beta.20"
+version = "14.0.0-beta.21"
 dependencies = [
  "approx",
  "arrow-array",
@@ -5085,7 +5086,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace"
-version = "14.0.0-beta.20"
+version = "14.0.0-beta.21"
 dependencies = [
  "arrow",
  "async-trait",
@@ -5099,7 +5100,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace-datafusion"
-version = "14.0.0-beta.20"
+version = "14.0.0-beta.21"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -5115,7 +5116,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace-impls"
-version = "14.0.0-beta.20"
+version = "14.0.0-beta.21"
 dependencies = [
  "arc-swap",
  "arrow",
@@ -5143,7 +5144,7 @@ dependencies = [
  "object_store 0.14.2",
  "quick-xml 0.40.1",
  "rand 0.9.5",
- "reqwest 0.12.28",
+ "reqwest 0.13.4",
  "ring",
  "roaring",
  "rstest",
@@ -5176,7 +5177,7 @@ dependencies = [
 
 [[package]]
 name = "lance-select"
-version = "14.0.0-beta.20"
+version = "14.0.0-beta.21"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -5192,7 +5193,7 @@ dependencies = [
 
 [[package]]
 name = "lance-table"
-version = "14.0.0-beta.20"
+version = "14.0.0-beta.21"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -5239,7 +5240,7 @@ dependencies = [
 
 [[package]]
 name = "lance-test-macros"
-version = "14.0.0-beta.20"
+version = "14.0.0-beta.21"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5248,7 +5249,7 @@ dependencies = [
 
 [[package]]
 name = "lance-testing"
-version = "14.0.0-beta.20"
+version = "14.0.0-beta.21"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -5261,7 +5262,7 @@ dependencies = [
 
 [[package]]
 name = "lance-tokenizer"
-version = "14.0.0-beta.20"
+version = "14.0.0-beta.21"
 dependencies = [
  "frostem",
  "icu_segmenter",
@@ -5274,7 +5275,7 @@ dependencies = [
 
 [[package]]
 name = "lance-tools"
-version = "14.0.0-beta.20"
+version = "14.0.0-beta.21"
 dependencies = [
  "clap",
  "lance-core",
@@ -7812,7 +7813,6 @@ dependencies = [
  "wasm-bindgen-futures",
  "wasm-streams 0.4.2",
  "web-sys",
- "webpki-roots 1.0.8",
 ]
 
 [[package]]
@@ -7823,6 +7823,7 @@ checksum = "219c5811de6525e5416c7d5d53bb656d3afdbc6c5af816e0802bcfa42dbdc1c3"
 dependencies = [
  "base64 0.22.1",
  "bytes",
+ "encoding_rs",
  "futures-core",
  "futures-util",
  "h2",
@@ -7834,6 +7835,7 @@ dependencies = [
  "hyper-util",
  "js-sys",
  "log",
+ "mime",
  "percent-encoding",
  "pin-project-lite",
  "quinn",
@@ -7842,6 +7844,7 @@ dependencies = [
  "rustls-platform-verifier",
  "serde",
  "serde_json",
+ "serde_urlencoded",
  "sync_wrapper",
  "tokio",
  "tokio-rustls",

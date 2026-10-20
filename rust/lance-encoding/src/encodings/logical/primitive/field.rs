@@ -25,13 +25,13 @@ use crate::EncodingsIo;
 use crate::compression::DecompressionStrategy;
 use crate::decoder::{
     ColumnInfo, DecodePageTask, DecodedArray, FilterExpression, IO_REQUEST_BATCH_BYTES,
-    LoadedPageShard, MessageType, PageInfo, RequestBatch, ScheduledScanLine, SchedulerContext,
-    StructuralDecodeArrayTask, StructuralFieldDecoder, StructuralFieldScheduler,
+    LoadedPageShard, MessageType, PageEncoding, PageInfo, RequestBatch, ScheduledScanLine,
+    SchedulerContext, StructuralDecodeArrayTask, StructuralFieldDecoder, StructuralFieldScheduler,
     StructuralPageDecoder, StructuralSchedulingJob, UnloadedPageShard,
 };
 use crate::encodings::logical::primitive::blob::{BlobDescriptionPageScheduler, BlobPageScheduler};
-use crate::format::pb21::PageLayout;
-use crate::format::{ProtobufUtils21, pb21};
+use crate::format::metadata::PageLayout;
+use crate::format::{EncodingUtils, metadata};
 use crate::repdef::{CompositeRepDefUnraveler, DefinitionInterpretation};
 
 use super::{
@@ -39,7 +39,7 @@ use super::{
     MiniBlockScheduler, NoCachedPageData, PageDataCacheKey, PageInitialization,
     SimpleAllNullScheduler, StructuralPageScheduler,
 };
-use super::{constant, sparse};
+use super::{constant, planar, sparse};
 
 #[derive(Debug)]
 struct StructuralPrimitiveFieldSchedulingJob<'a> {
@@ -352,7 +352,7 @@ impl StructuralPrimitiveFieldScheduler {
         cache_repetition_index: bool,
         target_field: &Field,
     ) -> Result<Box<dyn StructuralPageScheduler>> {
-        use pb21::page_layout::Layout;
+        use metadata::page_layout::Layout;
         Ok(match page_layout.layout.as_ref().expect_ok()? {
             Layout::MiniBlockLayout(mini_block) => Box::new(MiniBlockScheduler::try_new(
                 &page_info.buffer_offsets_and_sizes,
@@ -361,16 +361,6 @@ impl StructuralPrimitiveFieldScheduler {
                 mini_block,
                 decompressors,
             )?),
-            Layout::SparseLayout(sparse_layout) => {
-                Box::new(sparse::SparseStructuralScheduler::try_new(
-                    &page_info.buffer_offsets_and_sizes,
-                    page_info.priority,
-                    page_info.num_rows,
-                    target_field.data_type(),
-                    sparse_layout,
-                    decompressors,
-                )?)
-            }
             Layout::FullZipLayout(full_zip) => {
                 let mut scheduler = FullZipScheduler::try_new(
                     &page_info.buffer_offsets_and_sizes,
@@ -386,7 +376,7 @@ impl StructuralPrimitiveFieldScheduler {
                 let def_meaning = constant_layout
                     .layers
                     .iter()
-                    .map(|l| ProtobufUtils21::repdef_layer_to_def_interp(*l))
+                    .map(|l| EncodingUtils::repdef_layer_to_def_interp(*l))
                     .collect::<Vec<_>>();
                 let has_scalar_value = constant_layout.inline_value.is_some()
                     || page_info.buffer_offsets_and_sizes.len() == 1
@@ -435,7 +425,7 @@ impl StructuralPrimitiveFieldScheduler {
                 let def_meaning = blob
                     .layers
                     .iter()
-                    .map(|l| ProtobufUtils21::repdef_layer_to_def_interp(*l))
+                    .map(|l| EncodingUtils::repdef_layer_to_def_interp(*l))
                     .collect::<Vec<_>>();
                 if matches!(target_field.data_type(), DataType::Struct(_)) {
                     // User wants to decode blob into struct
@@ -464,6 +454,30 @@ impl StructuralPrimitiveFieldScheduler {
         cache_repetition_index: bool,
         target_field: &Field,
     ) -> Result<PageInfoAndScheduler> {
+        if let PageEncoding::Planar(layout) = &page_info.encoding {
+            let scheduler = if layout.sparse().is_some() {
+                Box::new(sparse::planar::PlanarSparseScheduler::try_new(
+                    page_info,
+                    layout,
+                    target_field,
+                    decompressors,
+                )?) as Box<dyn StructuralPageScheduler>
+            } else {
+                planar::validate_page(page_info, layout, target_field, decompressors)?;
+                Self::page_layout_to_scheduler(
+                    page_info,
+                    &layout.dense_execution_layout()?,
+                    decompressors,
+                    cache_repetition_index,
+                    target_field,
+                )?
+            };
+            return Ok(PageInfoAndScheduler {
+                page_index,
+                row_range,
+                scheduler,
+            });
+        }
         let page_layout = page_info.encoding.as_structural();
         let scheduler = Self::page_layout_to_scheduler(
             page_info,
@@ -662,6 +676,9 @@ impl StructuralPrimitiveFieldScheduler {
         // Serve cache hits in place; the rest are misses we must read.
         let mut misses = Vec::with_capacity(positions.len());
         for page_idx in positions {
+            self.page_schedulers[page_idx]
+                .scheduler
+                .set_cache(cache.clone());
             let page = &self.page_schedulers[page_idx];
             if !page.scheduler.needs_initialization() {
                 continue;
@@ -1098,7 +1115,7 @@ mod tests {
         CachedPage, CachedPageData, PageCacheView, PageDataCacheKey, SimpleAllNullScheduler,
         StructuralPageScheduler,
     };
-    use crate::format::pb21;
+    use crate::format::metadata;
     use crate::repdef::{CompositeRepDefUnraveler, DefinitionInterpretation, RepDefUnraveler};
     use crate::testing::SimulatedScheduler;
 
@@ -1617,10 +1634,10 @@ mod tests {
             .map(|page_index| PageInfo {
                 num_rows: ROWS_PER_PAGE,
                 priority: page_index * ROWS_PER_PAGE,
-                encoding: PageEncoding::Structural(pb21::PageLayout {
-                    layout: Some(pb21::page_layout::Layout::ConstantLayout(
-                        pb21::ConstantLayout {
-                            layers: vec![pb21::RepDefLayer::RepdefNullableItem as i32],
+                encoding: PageEncoding::Structural(metadata::PageLayout {
+                    layout: Some(metadata::page_layout::Layout::ConstantLayout(
+                        metadata::ConstantLayout {
+                            layers: vec![metadata::RepDefLayer::RepdefNullableItem as i32],
                             ..Default::default()
                         },
                     )),
