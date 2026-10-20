@@ -72,14 +72,16 @@ const NGRAM_INDEX_VERSION: u32 = 0;
 const MAX_POSTING_LIST_BATCH_BYTES: usize = i32::MAX as usize - 1024 * 1024;
 const POSTING_LIST_STREAM_BATCH_ROWS: usize = 64;
 
-/// Rows requested per input batch when streaming the postings file.
+/// Rows requested per input batch when streaming the postings file, for readers
+/// whose decoder guarantees byte splitting (V1 row groups, the V2.0 decoder).
 ///
-/// This is only a request: the file decoder may return smaller batches. The
-/// V2.0 decoder splits a batch before its i32 offsets overflow (#9225), and V1
-/// readers return one row group per batch, so a batch whose postings are
-/// individually valid is never forced into one `BinaryArray`. #7607 read one
-/// row per `read_range` call for that reason, which turned update/remap into
-/// one object-store GET per trigram (#9881).
+/// This is only a request: the file decoder may return smaller batches. For
+/// readers without that guarantee (V2.1+ structural decoding, which splits by
+/// row count only) the spill reader requests one row per batch instead, so a
+/// large posting is never batched with another row into one overflow. Both
+/// cases are a single sequential pass, unlike #7607's one `read_range` call
+/// per trigram, which turned update/remap into one object-store GET per
+/// trigram (#9881).
 const POSTING_LIST_READ_BATCH_ROWS: usize = 1024;
 
 /// Input batches decoded ahead of the consumer.
@@ -1406,16 +1408,24 @@ impl NGramIndexBuilder {
                             }
                         }
 
-                        // Stream the whole file in one sequential pass. Each batch
-                        // is byte-safe on its own, so large postings are consumed
-                        // incrementally instead of being forced into one
-                        // `BinaryArray` by `read_range`.
+                        // Stream the whole file in one sequential pass, so large
+                        // postings are consumed incrementally instead of being
+                        // forced into one `BinaryArray` by `read_range`. A
+                        // decoder that only splits by row count (V2.1+) can
+                        // still overflow its i32 offsets when one batch holds
+                        // several huge postings, so those readers get one row
+                        // per batch; the pass stays sequential either way.
                         if state.batches.is_none() {
                             let reader = state.reader.take().expect_ok()?;
+                            let batch_rows = if reader.guarantees_byte_splitting() {
+                                POSTING_LIST_READ_BATCH_ROWS as u64
+                            } else {
+                                1
+                            };
                             state.batches = Some(
                                 reader
                                     .read_record_batch_stream(
-                                        POSTING_LIST_READ_BATCH_ROWS as u64,
+                                        batch_rows,
                                         POSTING_LIST_READ_BATCH_READAHEAD,
                                     )
                                     .await?,
@@ -1975,6 +1985,7 @@ mod tests {
     use itertools::Itertools;
     use lance_core::{Error, ROW_ID, Result, cache::LanceCache, utils::tempfile::TempDir};
     use lance_datagen::{BatchCount, ByteCount, RowCount};
+    use lance_file::version::ConcreteFileVersion;
     use lance_io::object_store::ObjectStore;
     use lance_io::stream::{
         RecordBatchStream, RecordBatchStreamAdapter as LanceRecordBatchStreamAdapter,
@@ -2015,6 +2026,10 @@ mod tests {
 
     #[async_trait]
     impl IndexReader for StreamCountingReader {
+        fn guarantees_byte_splitting(&self) -> bool {
+            self.inner.guarantees_byte_splitting()
+        }
+
         async fn read_record_batch(&self, n: u64, batch_size: u64) -> Result<RecordBatch> {
             self.inner.read_record_batch(n, batch_size).await
         }
@@ -2971,7 +2986,79 @@ mod tests {
             1,
             "the postings file should be read in one streamed pass"
         );
+        assert!(
+            max_rows_seen.load(Ordering::Relaxed) > 1,
+            "a byte-splitting reader (V2.0) should still read multi-row batches"
+        );
         assert!(max_rows_seen.load(Ordering::Relaxed) <= POSTING_LIST_READ_BATCH_ROWS);
+    }
+
+    // V2.1+ structural decoding splits by row count, not bytes, so batching
+    // several huge postings together can overflow i32 offsets. The spill reader
+    // must ask for one row per batch from such readers, while still making a
+    // single sequential pass over the file.
+    #[test_log::test(tokio::test)]
+    async fn test_spill_reader_uses_one_row_batches_without_byte_splitting() {
+        const ROWS: u32 = 2000;
+        let bitmaps = (0..ROWS)
+            .map(|_| RoaringTreemap::from_iter(0..10u64))
+            .collect::<Vec<_>>();
+        let tokens = UInt32Array::from_iter_values(0..ROWS);
+        let state = NGramIndexSpillState {
+            tokens: tokens.clone(),
+            bitmaps: bitmaps.clone(),
+        };
+
+        let tmpdir = Arc::new(TempDir::default());
+        let store = LanceIndexStore::with_format_version(
+            Arc::new(ObjectStore::local()),
+            tmpdir.obj_path(),
+            Arc::new(LanceCache::no_cache()),
+            ConcreteFileVersion::V2_2,
+        );
+        let mut writer = store
+            .new_index_file(POSTINGS_FILENAME, POSTINGS_SCHEMA.clone())
+            .await
+            .unwrap();
+        for batch in state.try_into_batches().unwrap() {
+            writer.write_record_batch(batch).await.unwrap();
+        }
+        writer.finish().await.unwrap();
+
+        let reader = store.open_index_file(POSTINGS_FILENAME).await.unwrap();
+        assert!(
+            !reader.guarantees_byte_splitting(),
+            "V2.2 structural reads cannot split batches by bytes"
+        );
+        let reader = Arc::new(StreamCountingReader::new(reader));
+        let stream_calls = reader.stream_calls.clone();
+        let max_rows_seen = reader.max_rows_seen.clone();
+        let states = NGramIndexBuilder::stream_spill_reader(reader, MAX_POSTING_LIST_BATCH_BYTES)
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        let mut row = 0;
+        for state in &states {
+            for (token, bitmap) in state.tokens.values().iter().zip(state.bitmaps.iter()) {
+                assert_eq!(*token, tokens.value(row));
+                assert_eq!(bitmap, &bitmaps[row]);
+                row += 1;
+            }
+        }
+        assert_eq!(row, ROWS as usize);
+
+        assert_eq!(
+            stream_calls.load(Ordering::Relaxed),
+            1,
+            "unsafe readers must still be read in one streamed pass"
+        );
+        assert_eq!(
+            max_rows_seen.load(Ordering::Relaxed),
+            1,
+            "unsafe readers must be decoded one row per batch"
+        );
     }
 
     #[test]
