@@ -1,22 +1,33 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use arrow_buffer::ArrowNativeType;
 use log::trace;
 
 use crate::{
     Result,
     buffer::LanceBuffer,
     compression::{
-        BlockCompressor, BlockDecompressor, MiniBlockDecompressor, require_block_payload,
+        BlockCompressor, BlockDecompressor, FixedPerValueDecompressor, MiniBlockDecompressor,
+        VariablePerValueDecompressor, require_block_payload,
     },
-    data::DataBlock,
+    compression_config::BssMode,
+    data::{BlockInfo, DataBlock, FixedWidthDataBlock, VariableWidthBlock},
     encodings::{
-        logical::primitive::miniblock::{
-            MiniBlockCompressed, MiniBlockCompressionContext, MiniBlockCompressor,
+        logical::primitive::{
+            fullzip::{PerValueCompressor, PerValueDataBlock},
+            miniblock::{MiniBlockCompressed, MiniBlockCompressionContext, MiniBlockCompressor},
         },
-        physical::block::{CompressionConfig, GeneralBufferCompressor},
+        physical::{
+            block::{BufferCompressor, CompressionConfig, GeneralBufferCompressor},
+            byte_stream_split::{join_value_bytes, split_value_bytes},
+            value::{ValueDecompressor, ValueEncoder},
+        },
     },
-    format::{ProtobufUtils21, pb21::CompressiveEncoding},
+    format::{
+        ProtobufUtils21,
+        pb21::{self, CompressiveEncoding, compressive_encoding::Compression},
+    },
 };
 use lance_core::Error;
 
@@ -228,17 +239,354 @@ impl MiniBlockDecompressor for GeneralMiniBlockDecompressor {
     }
 }
 
+/// Returns the item width to byte-stream-split a flattened per-value description by.
+///
+/// Splitting needs every value to be a whole number of multi-byte items, which is not the case
+/// when a fixed-size-list layer zips item validity bytes in front of the items.
+fn byte_stream_split_item_bytes(values: &CompressiveEncoding) -> Option<usize> {
+    let mut current = values;
+    loop {
+        match current.compression.as_ref()? {
+            Compression::FixedSizeList(fsl) if !fsl.has_validity => {
+                current = fsl.values.as_deref()?;
+            }
+            Compression::Flat(flat)
+                if flat.bits_per_value >= 16 && flat.bits_per_value.is_multiple_of(8) =>
+            {
+                return usize::try_from(flat.bits_per_value / 8).ok();
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// Compresses full-zip fixed-width and fixed-size-list values one value at a time.
+///
+/// Each value is flattened the way [`ValueEncoder`] stores it (including any zipped item
+/// validity), optionally split into byte streams, and compressed on its own so that a single
+/// row can be decoded without reading its neighbors. Compressed values differ in size, so the
+/// output is variable-width. If compression does not make the page smaller the values are
+/// stored uncompressed instead.
+#[derive(Debug)]
+pub struct GeneralFixedPerValueCompressor {
+    compression: CompressionConfig,
+    compressor: Box<dyn BufferCompressor>,
+    byte_stream_split: BssMode,
+}
+
+impl GeneralFixedPerValueCompressor {
+    /// `byte_stream_split` controls whether each value is split into byte streams before
+    /// compression. [`BssMode::Auto`] and [`BssMode::On`] split whenever a value holds more than
+    /// one multi-byte item and no item validity, which matches the Blosc and Zarr default:
+    /// splitting within one value rarely hurts general compression and often helps a lot.
+    pub fn try_new(compression: CompressionConfig, byte_stream_split: BssMode) -> Result<Self> {
+        Ok(Self {
+            compression,
+            compressor: GeneralBufferCompressor::get_compressor(compression)?,
+            byte_stream_split,
+        })
+    }
+}
+
+impl PerValueCompressor for GeneralFixedPerValueCompressor {
+    fn compress(&self, data: DataBlock) -> Result<(PerValueDataBlock, CompressiveEncoding)> {
+        if !matches!(data, DataBlock::FixedWidth(_) | DataBlock::FixedSizeList(_)) {
+            return Err(Error::invalid_input(format!(
+                "General fixed-width per-value compression cannot compress a {} block",
+                data.name()
+            )));
+        }
+        let (values, values_encoding) =
+            PerValueCompressor::compress(&ValueEncoder::default(), data)?;
+        let PerValueDataBlock::Fixed(values) = values else {
+            return Err(Error::internal(
+                "ValueEncoder produced variable-width per-value data".to_string(),
+            ));
+        };
+        if !values.bits_per_value.is_multiple_of(8) {
+            return Err(Error::invalid_input(format!(
+                "General fixed-width per-value compression requires byte-aligned values, got {} bits per value",
+                values.bits_per_value
+            )));
+        }
+        let bytes_per_value = (values.bits_per_value / 8) as usize;
+        if bytes_per_value == 0 {
+            return Ok((PerValueDataBlock::Fixed(values), values_encoding));
+        }
+        let split_item_bytes = match self.byte_stream_split {
+            BssMode::Off => None,
+            BssMode::On | BssMode::Auto => byte_stream_split_item_bytes(&values_encoding)
+                .filter(|item_bytes| bytes_per_value / item_bytes > 1),
+        };
+
+        let num_values = values.num_values as usize;
+        let mut compressed = Vec::with_capacity(values.data.len() / 2);
+        let mut offsets = Vec::with_capacity(num_values + 1);
+        offsets.push(0_u64);
+        match split_item_bytes {
+            Some(item_bytes) => {
+                let mut streams = vec![0_u8; bytes_per_value];
+                for value in values.data.chunks_exact(bytes_per_value) {
+                    split_value_bytes(value, item_bytes, &mut streams);
+                    self.compressor.compress(&streams, &mut compressed)?;
+                    offsets.push(compressed.len() as u64);
+                }
+            }
+            None => {
+                for value in values.data.chunks_exact(bytes_per_value) {
+                    self.compressor.compress(value, &mut compressed)?;
+                    offsets.push(compressed.len() as u64);
+                }
+            }
+        }
+
+        let bits_per_offset: u8 = if compressed.len() <= u32::MAX as usize {
+            32
+        } else {
+            64
+        };
+        // A full-zip page stores a length prefix in front of every variable-width value.
+        let length_prefix_bytes = num_values * (bits_per_offset as usize / 8);
+        if compressed.len() + length_prefix_bytes >= values.data.len() {
+            return Ok((PerValueDataBlock::Fixed(values), values_encoding));
+        }
+
+        let offsets = if bits_per_offset == 32 {
+            LanceBuffer::reinterpret_vec(
+                offsets
+                    .into_iter()
+                    .map(|offset| offset as u32)
+                    .collect::<Vec<_>>(),
+            )
+        } else {
+            LanceBuffer::reinterpret_vec(offsets)
+        };
+        let values_encoding = if split_item_bytes.is_some() {
+            ProtobufUtils21::byte_stream_split(values_encoding)
+        } else {
+            values_encoding
+        };
+        Ok((
+            PerValueDataBlock::Variable(VariableWidthBlock {
+                data: LanceBuffer::from(compressed),
+                offsets,
+                bits_per_offset,
+                num_values: values.num_values,
+                block_info: BlockInfo::new(),
+            }),
+            ProtobufUtils21::wrapped(self.compression, values_encoding)?,
+        ))
+    }
+}
+
+/// Decompresses values written by [`GeneralFixedPerValueCompressor`].
+#[derive(Debug)]
+pub struct GeneralFixedPerValueDecompressor {
+    compressor: Box<dyn BufferCompressor>,
+    /// The item width each value was byte-stream-split by, or `None` if values were not split.
+    split_item_bytes: Option<usize>,
+    bytes_per_value: usize,
+    values: ValueDecompressor,
+}
+
+impl GeneralFixedPerValueDecompressor {
+    /// Creates a decompressor for a `General` per-value description whose values are `Flat` or
+    /// `FixedSizeList`, optionally wrapped in `ByteStreamSplit`.
+    pub fn try_new(description: &pb21::General) -> Result<Self> {
+        let compression = description.compression.as_ref().ok_or_else(|| {
+            Error::invalid_input("General per-value encoding is missing its compression config")
+        })?;
+        let compression = CompressionConfig::new(compression.scheme().try_into()?, None);
+        let values = description.values.as_deref().ok_or_else(|| {
+            Error::invalid_input("General per-value encoding is missing its values encoding")
+        })?;
+        let (values, is_split) = match values.compression.as_ref() {
+            Some(Compression::ByteStreamSplit(split)) => (
+                split.values.as_deref().ok_or_else(|| {
+                    Error::invalid_input("ByteStreamSplit encoding is missing its values codec")
+                })?,
+                true,
+            ),
+            _ => (values, false),
+        };
+        let decompressor = match values.compression.as_ref() {
+            Some(Compression::Flat(flat)) if flat.bits_per_value > 0 && flat.data.is_none() => {
+                ValueDecompressor::from_flat(flat)
+            }
+            Some(Compression::FixedSizeList(fsl)) => ValueDecompressor::from_fsl(fsl)?,
+            _ => {
+                return Err(Error::invalid_input(
+                    "General fixed-width per-value compression requires plain Flat or FixedSizeList values",
+                ));
+            }
+        };
+        let bits_per_value = FixedPerValueDecompressor::bits_per_value(&decompressor);
+        if bits_per_value == 0 || !bits_per_value.is_multiple_of(8) {
+            return Err(Error::invalid_input(format!(
+                "General fixed-width per-value compression requires positive byte-aligned values, got {bits_per_value} bits per value"
+            )));
+        }
+        let bytes_per_value = usize::try_from(bits_per_value / 8).map_err(|_| {
+            Error::invalid_input(format!(
+                "Per-value width of {bits_per_value} bits does not fit usize"
+            ))
+        })?;
+        let split_item_bytes = if is_split {
+            let item_bytes = byte_stream_split_item_bytes(values)
+                .filter(|item_bytes| bytes_per_value.is_multiple_of(*item_bytes))
+                .ok_or_else(|| {
+                    Error::invalid_input(
+                        "Per-value byte stream split requires multi-byte items without item validity",
+                    )
+                })?;
+            Some(item_bytes)
+        } else {
+            None
+        };
+        Ok(Self {
+            compressor: GeneralBufferCompressor::get_compressor(compression)?,
+            split_item_bytes,
+            bytes_per_value,
+            values: decompressor,
+        })
+    }
+
+    /// Returns the compressed bytes of one value, or `None` for a null item.
+    ///
+    /// Full-zip pages store no payload for null items, and a compressed value is never empty
+    /// because every codec prefixes its output with the decompressed length.
+    fn value_payload<'a, T: ArrowNativeType>(
+        data: &'a [u8],
+        window: &[T],
+    ) -> Result<Option<&'a [u8]>> {
+        let (start, end) = (window[0].as_usize(), window[1].as_usize());
+        let payload = data.get(start..end).ok_or_else(|| {
+            Error::invalid_input(format!(
+                "Per-value offsets {start}..{end} exceed the {} compressed bytes",
+                data.len()
+            ))
+        })?;
+        Ok((!payload.is_empty()).then_some(payload))
+    }
+
+    fn decompress_values<T: ArrowNativeType>(
+        &self,
+        data: &[u8],
+        offsets: &[T],
+        num_values: u64,
+        decompressed: &mut Vec<u8>,
+    ) -> Result<()> {
+        if offsets.len() as u64 != num_values + 1 {
+            return Err(Error::invalid_input(format!(
+                "Per-value block has {} offsets for {num_values} values",
+                offsets.len()
+            )));
+        }
+        let bytes_per_value = self.bytes_per_value;
+        match self.split_item_bytes {
+            None => {
+                for window in offsets.windows(2) {
+                    match Self::value_payload(data, window)? {
+                        Some(payload) => {
+                            self.compressor.decompress_exact(
+                                payload,
+                                decompressed,
+                                bytes_per_value,
+                            )?;
+                        }
+                        None => decompressed.resize(decompressed.len() + bytes_per_value, 0),
+                    }
+                }
+            }
+            Some(item_bytes) => {
+                let mut streams = Vec::with_capacity(bytes_per_value);
+                for window in offsets.windows(2) {
+                    let start = decompressed.len();
+                    decompressed.resize(start + bytes_per_value, 0);
+                    if let Some(payload) = Self::value_payload(data, window)? {
+                        streams.clear();
+                        self.compressor
+                            .decompress_exact(payload, &mut streams, bytes_per_value)?;
+                        join_value_bytes(&streams, item_bytes, &mut decompressed[start..]);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl VariablePerValueDecompressor for GeneralFixedPerValueDecompressor {
+    fn decompress(&self, data: VariableWidthBlock) -> Result<DataBlock> {
+        let num_values = data.num_values;
+        let output_bytes = usize::try_from(num_values)
+            .ok()
+            .and_then(|num_values| num_values.checked_mul(self.bytes_per_value))
+            .ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "{num_values} values of {} bytes overflow usize",
+                    self.bytes_per_value
+                ))
+            })?;
+        let mut decompressed = Vec::new();
+        decompressed
+            .try_reserve_exact(output_bytes)
+            .map_err(|error| {
+                Error::invalid_input(format!(
+                    "Could not reserve {output_bytes} bytes for decompressed values: {error}"
+                ))
+            })?;
+        match data.bits_per_offset {
+            32 => self.decompress_values(
+                &data.data,
+                data.offsets.borrow_to_typed_slice::<u32>().as_ref(),
+                num_values,
+                &mut decompressed,
+            )?,
+            64 => self.decompress_values(
+                &data.data,
+                data.offsets.borrow_to_typed_slice::<u64>().as_ref(),
+                num_values,
+                &mut decompressed,
+            )?,
+            bits_per_offset => {
+                return Err(Error::invalid_input(format!(
+                    "Per-value offsets must be 32 or 64 bits, got {bits_per_offset}"
+                )));
+            }
+        }
+        FixedPerValueDecompressor::decompress(
+            &self.values,
+            FixedWidthDataBlock {
+                data: LanceBuffer::from(decompressed),
+                bits_per_value: self.bytes_per_value as u64 * 8,
+                num_values,
+                block_info: BlockInfo::new(),
+            },
+            num_values,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
     use super::*;
     use crate::compression::{DecompressionStrategy, DefaultDecompressionStrategy};
-    use crate::data::{BlockInfo, FixedWidthDataBlock};
     use crate::encodings::physical::block::CompressionScheme;
     use crate::encodings::physical::rle::RleEncoder;
-    use crate::encodings::physical::value::ValueEncoder;
-    use crate::format::pb21;
-    use crate::format::pb21::compressive_encoding::Compression;
-    use arrow_array::{Float64Array, Int32Array};
+    use crate::testing::{
+        TestCases, TestEncoding, check_round_trip_encoding_of_data, extract_array_encoding_chain,
+    };
+    use arrow_array::{
+        Array, ArrayRef, FixedSizeBinaryArray, FixedSizeListArray, Float64Array, Int32Array,
+        StringArray, StructArray, UInt16Array, make_array,
+    };
+    use arrow_buffer::NullBuffer;
+    use arrow_schema::{DataType, Field, Fields};
+    use rstest::rstest;
 
     fn miniblock_context() -> MiniBlockCompressionContext {
         MiniBlockCompressionContext::new(0, true, true)
@@ -763,5 +1111,365 @@ mod tests {
                 // Empty data might not be supported by ValueEncoder
             }
         }
+    }
+
+    /// Odd, and wide enough that even `u8` items exceed the 256-byte full-zip cutoff, so values
+    /// are never a multiple of a wider power-of-two item width.
+    const WIDE_DIMENSION: usize = 257;
+    const NUM_ROWS: usize = 100;
+
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum Validity {
+        AllValid,
+        NullRows,
+        NullItems,
+    }
+
+    fn zstd_metadata() -> HashMap<String, String> {
+        HashMap::from([("lance-encoding:compression".to_string(), "zstd".to_string())])
+    }
+
+    /// Items repeat in short runs that shift from row to row, so values compress but differ.
+    fn compressible_fsl(
+        item_type: &DataType,
+        dimension: usize,
+        num_rows: usize,
+        validity: Validity,
+    ) -> ArrayRef {
+        let items = Int32Array::from_iter_values(
+            (0..num_rows * dimension).map(|i| ((i / dimension + (i % dimension) / 8) % 16) as i32),
+        );
+        let items = arrow_cast::cast(&items, item_type).unwrap();
+        // The cast allocates an all-valid null buffer, which the encoder would store as item
+        // validity, so only keep one when items are meant to be null.
+        let item_validity = (validity == Validity::NullItems)
+            .then(|| NullBuffer::from((0..items.len()).map(|i| i % 7 != 0).collect::<Vec<_>>()));
+        let items = make_array(
+            items
+                .to_data()
+                .into_builder()
+                .nulls(item_validity)
+                .build()
+                .unwrap(),
+        );
+        let row_validity = (validity == Validity::NullRows)
+            .then(|| NullBuffer::from((0..num_rows).map(|row| row % 5 != 0).collect::<Vec<_>>()));
+        // Decoded fixed-size-list items are always nullable.
+        let item_field = Arc::new(Field::new("item", item_type.clone(), true));
+        Arc::new(FixedSizeListArray::new(
+            item_field,
+            dimension as i32,
+            items,
+            row_validity,
+        ))
+    }
+
+    /// Smooth 16-bit rasters with mild noise, the kind of data Blosc with shuffle compresses well.
+    fn smooth_u16_fsl(num_rows: usize, dimension: usize) -> ArrayRef {
+        let items = UInt16Array::from_iter_values((0..num_rows * dimension).map(|i| {
+            let (row, item) = ((i / dimension) as f64, i % dimension);
+            let (y, x) = ((item / 64) as f64, (item % 64) as f64);
+            let noise = ((i as u64).wrapping_mul(2_654_435_761) >> 8) % 81;
+            (2000.0 + 800.0 * ((y + row) / 9.0).sin() * ((x - row) / 13.0).cos()) as u16
+                + noise as u16
+        }));
+        Arc::new(FixedSizeListArray::new(
+            Arc::new(Field::new("item", DataType::UInt16, false)),
+            dimension as i32,
+            Arc::new(items),
+            None,
+        ))
+    }
+
+    fn compress_per_value(
+        array: &ArrayRef,
+        scheme: CompressionScheme,
+        byte_stream_split: BssMode,
+    ) -> (PerValueDataBlock, CompressiveEncoding) {
+        let compressor = GeneralFixedPerValueCompressor::try_new(
+            CompressionConfig::new(scheme, None),
+            byte_stream_split,
+        )
+        .unwrap();
+        compressor
+            .compress(DataBlock::from_array(array.clone()))
+            .unwrap()
+    }
+
+    fn decompress_per_value(
+        data: VariableWidthBlock,
+        encoding: &CompressiveEncoding,
+        data_type: &DataType,
+    ) -> Result<ArrayRef> {
+        let decompressor = DefaultDecompressionStrategy::default()
+            .create_variable_per_value_decompressor(encoding)?;
+        Ok(make_array(
+            decompressor
+                .decompress(data)?
+                .into_arrow(data_type.clone(), true)?,
+        ))
+    }
+
+    #[rstest]
+    #[test_log::test(tokio::test)]
+    async fn test_general_fixed_per_value_fsl_round_trip(
+        #[values(
+            DataType::UInt8,
+            DataType::Int16,
+            DataType::Float16,
+            DataType::UInt32,
+            DataType::Float32,
+            DataType::Int64,
+            DataType::Float64,
+            DataType::Decimal128(38, 0)
+        )]
+        item_type: DataType,
+        #[values(Validity::AllValid, Validity::NullRows, Validity::NullItems)] validity: Validity,
+    ) {
+        let array = compressible_fsl(&item_type, WIDE_DIMENSION, NUM_ROWS, validity);
+        let mut expected_chain = vec!["general", "zstd", "fixed_size_list", "flat"];
+        // Item validity is zipped in front of the items, so only null-free items are split.
+        if item_type.primitive_width().is_some_and(|width| width > 1)
+            && validity != Validity::NullItems
+        {
+            expected_chain.push("byte_stream_split");
+        }
+        let test_cases = TestCases::default()
+            .with_encoding(TestEncoding::StructuralSparse)
+            .with_expected_encoding_chain(expected_chain)
+            .with_range(37..61)
+            .with_indices(vec![0])
+            .with_indices(vec![59])
+            .with_indices(vec![60])
+            .with_indices(vec![NUM_ROWS as u64 - 1])
+            .with_indices(vec![3, 41, 42, 98]);
+
+        // Two arrays so takes cross a page boundary.
+        check_round_trip_encoding_of_data(
+            vec![array.slice(0, 60), array.slice(60, NUM_ROWS - 60)],
+            &test_cases,
+            zstd_metadata(),
+        )
+        .await;
+    }
+
+    #[rstest]
+    #[case::lz4("lz4", "auto")]
+    #[case::zstd_without_split("zstd", "off")]
+    #[test_log::test(tokio::test)]
+    async fn test_general_fixed_per_value_fsl_options(
+        #[case] compression: &str,
+        #[case] byte_stream_split: &str,
+        #[values(3, WIDE_DIMENSION, 4096)] dimension: usize,
+    ) {
+        // Narrow values only reach full-zip when it is requested.
+        let metadata = HashMap::from([
+            (
+                "lance-encoding:compression".to_string(),
+                compression.to_string(),
+            ),
+            (
+                "lance-encoding:bss".to_string(),
+                byte_stream_split.to_string(),
+            ),
+            (
+                "lance-encoding:structural-encoding".to_string(),
+                "fullzip".to_string(),
+            ),
+        ]);
+        let array = compressible_fsl(&DataType::Float32, dimension, NUM_ROWS, Validity::NullRows);
+        let test_cases = TestCases::default()
+            .with_encoding(TestEncoding::StructuralSparse)
+            .with_range(10..20)
+            .with_indices(vec![0])
+            .with_indices(vec![NUM_ROWS as u64 - 1])
+            .with_indices(vec![5, 6, 50]);
+
+        check_round_trip_encoding_of_data(vec![array], &test_cases, metadata).await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_general_fixed_per_value_fixed_size_binary_round_trip() {
+        let values = (0..NUM_ROWS)
+            .map(|row| {
+                (0..1024)
+                    .map(|i| ((row + i / 16) % 8) as u8)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let array = Arc::new(FixedSizeBinaryArray::try_from_iter(values.into_iter()).unwrap());
+        let test_cases = TestCases::default()
+            .with_encoding(TestEncoding::StructuralSparse)
+            .with_expected_encoding_chain(["general", "zstd", "flat"])
+            .with_indices(vec![0])
+            .with_indices(vec![17, 18, 99]);
+
+        check_round_trip_encoding_of_data(vec![array], &test_cases, zstd_metadata()).await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_general_fixed_per_value_variable_packed_struct_child() {
+        let pixels = compressible_fsl(
+            &DataType::UInt16,
+            WIDE_DIMENSION,
+            NUM_ROWS,
+            Validity::AllValid,
+        );
+        let names = Arc::new(StringArray::from_iter_values(
+            (0..NUM_ROWS).map(|row| format!("chip-{row}")),
+        )) as ArrayRef;
+        let fields = Fields::from(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("pixels", pixels.data_type().clone(), false).with_metadata(zstd_metadata()),
+        ]);
+        let array = Arc::new(StructArray::new(fields, vec![names, pixels], None)) as ArrayRef;
+        let test_cases = TestCases::default()
+            .with_encoding(TestEncoding::StructuralSparse)
+            .with_expected_encoding_chain([
+                "variable_packed_struct",
+                "general",
+                "byte_stream_split",
+            ])
+            .with_indices(vec![0])
+            .with_indices(vec![50, 99]);
+
+        check_round_trip_encoding_of_data(
+            vec![array],
+            &test_cases,
+            HashMap::from([("lance-encoding:packed".to_string(), "true".to_string())]),
+        )
+        .await;
+    }
+
+    #[test]
+    fn test_general_fixed_per_value_compresses_smooth_values() {
+        const DIMENSION: usize = 4096;
+        let array = smooth_u16_fsl(16, DIMENSION);
+        let raw_bytes = (array.len() * DIMENSION * 2) as f64;
+        let mut ratios = Vec::with_capacity(2);
+        for byte_stream_split in [BssMode::Off, BssMode::Auto] {
+            let (data, encoding) =
+                compress_per_value(&array, CompressionScheme::Zstd, byte_stream_split);
+            let PerValueDataBlock::Variable(data) = data else {
+                panic!("smooth values should compress with {byte_stream_split:?}");
+            };
+            let chain = extract_array_encoding_chain(&encoding);
+            assert_eq!(
+                chain.iter().any(|tag| tag == "byte_stream_split"),
+                byte_stream_split == BssMode::Auto,
+                "{chain:?}"
+            );
+            ratios.push((data.data.len() + 4 * data.num_values as usize) as f64 / raw_bytes);
+            let decoded = decompress_per_value(data, &encoding, array.data_type()).unwrap();
+            assert_eq!(decoded.as_ref(), array.as_ref());
+        }
+        let (unsplit, split) = (ratios[0], ratios[1]);
+        assert!(split < 0.65, "split ratio {split}");
+        assert!(split < unsplit - 0.1, "split {split} vs unsplit {unsplit}");
+    }
+
+    #[test]
+    fn test_general_fixed_per_value_keeps_incompressible_values_raw() {
+        // splitmix64 output has no structure for a general compressor to find.
+        let items = UInt16Array::from_iter_values((0..8 * 1024_u64).map(|i| {
+            let mut z = i.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            (z ^ (z >> 31)) as u16
+        }));
+        let array = Arc::new(FixedSizeListArray::new(
+            Arc::new(Field::new("item", DataType::UInt16, false)),
+            1024,
+            Arc::new(items),
+            None,
+        )) as ArrayRef;
+
+        let (data, encoding) = compress_per_value(&array, CompressionScheme::Zstd, BssMode::Auto);
+        assert!(matches!(data, PerValueDataBlock::Fixed(_)));
+        assert_eq!(
+            extract_array_encoding_chain(&encoding),
+            ["fixed_size_list", "flat"]
+        );
+    }
+
+    #[test]
+    fn test_general_fixed_per_value_decodes_empty_slots_as_null_placeholders() {
+        let array = compressible_fsl(&DataType::UInt16, WIDE_DIMENSION, 3, Validity::AllValid);
+        let (data, encoding) = compress_per_value(&array, CompressionScheme::Lz4, BssMode::Auto);
+        let PerValueDataBlock::Variable(data) = data else {
+            panic!("values should compress");
+        };
+        // A full-zip page stores no payload for a null item, so its slot reaches the decoder empty.
+        let offsets = data.offsets.borrow_to_typed_slice::<u32>();
+        let (row_1_start, row_1_end) = (offsets[1] as usize, offsets[2] as usize);
+        let mut payload = data.data[..row_1_start].to_vec();
+        payload.extend_from_slice(&data.data[row_1_end..]);
+        let payload_len = payload.len() as u32;
+        let block = VariableWidthBlock {
+            data: LanceBuffer::from(payload),
+            offsets: LanceBuffer::reinterpret_vec(vec![
+                0,
+                row_1_start as u32,
+                row_1_start as u32,
+                payload_len,
+            ]),
+            bits_per_offset: 32,
+            num_values: 3,
+            block_info: BlockInfo::new(),
+        };
+
+        let decoded = decompress_per_value(block, &encoding, array.data_type()).unwrap();
+        let expected = array.to_data();
+        let decoded = decoded.to_data();
+        let items = decoded.child_data()[0].buffer::<u16>(0);
+        let expected_items = expected.child_data()[0].buffer::<u16>(0);
+        assert_eq!(items[..WIDE_DIMENSION], expected_items[..WIDE_DIMENSION]);
+        assert!(
+            items[WIDE_DIMENSION..2 * WIDE_DIMENSION]
+                .iter()
+                .all(|item| *item == 0)
+        );
+        assert_eq!(
+            items[2 * WIDE_DIMENSION..],
+            expected_items[2 * WIDE_DIMENSION..]
+        );
+    }
+
+    #[test]
+    fn test_general_fixed_per_value_rejects_offsets_past_payload() {
+        let array = compressible_fsl(&DataType::UInt16, WIDE_DIMENSION, 2, Validity::AllValid);
+        let (data, encoding) = compress_per_value(&array, CompressionScheme::Zstd, BssMode::Auto);
+        let PerValueDataBlock::Variable(data) = data else {
+            panic!("values should compress");
+        };
+        let payload_len = data.data.len() as u32;
+        let block = VariableWidthBlock {
+            offsets: LanceBuffer::reinterpret_vec(vec![0, payload_len + 1, payload_len + 1]),
+            ..data
+        };
+
+        let error = decompress_per_value(block, &encoding, array.data_type()).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(error.to_string().contains("exceed"), "{error}");
+    }
+
+    #[test]
+    fn test_general_fixed_per_value_rejects_split_items_with_validity() {
+        let description = pb21::General {
+            compression: Some(pb21::BufferCompression {
+                scheme: pb21::CompressionScheme::CompressionAlgorithmZstd as i32,
+                level: None,
+            }),
+            values: Some(Box::new(ProtobufUtils21::byte_stream_split(
+                ProtobufUtils21::fsl(4, true, ProtobufUtils21::flat(16, None)),
+            ))),
+        };
+
+        let error = GeneralFixedPerValueDecompressor::try_new(&description).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(
+            error.to_string().contains("without item validity"),
+            "{error}"
+        );
     }
 }

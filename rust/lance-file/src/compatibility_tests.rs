@@ -8,7 +8,8 @@ use arrow_array::builder::StringDictionaryBuilder;
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Int8Type, Int32Type};
 use arrow_array::{
-    Array, ArrayRef, Int32Array, LargeBinaryArray, ListArray, RecordBatch, StringArray, UInt32Array,
+    Array, ArrayRef, FixedSizeListArray, Int32Array, LargeBinaryArray, ListArray, RecordBatch,
+    StringArray, UInt16Array, UInt32Array,
 };
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use bytes::Bytes;
@@ -17,7 +18,9 @@ use lance_core::cache::LanceCache;
 use lance_core::datatypes::Schema as LanceSchema;
 use lance_encoding::decoder::{DecoderPlugins, EncodedBatchLayout, FilterExpression, decode_batch};
 use lance_encoding::encoder::{EncodedBatch, EncodingOptions, encode_batch};
-use lance_encoding::format::pb21::{compressive_encoding::Compression, page_layout::Layout};
+use lance_encoding::format::pb21::{
+    compressive_encoding::Compression, full_zip_layout::Details, page_layout::Layout,
+};
 use lance_io::ReadBatchParams;
 use lance_io::traits::Writer;
 use lance_io::utils::CachedFileSize;
@@ -616,6 +619,110 @@ async fn generic_offsets_are_gated_by_file_version(
     let indices = UInt32Array::from(vec![0, 1023, 1024, 2048, 4096]);
     for (selection, expected) in [
         (ReadBatchParams::Range(1020..1030), batch.slice(1020, 10)),
+        (
+            ReadBatchParams::Indices(indices.clone()),
+            arrow_select::take::take_record_batch(&batch, &indices).unwrap(),
+        ),
+    ] {
+        let actual = reader
+            .read_stream(selection, 1024, 1, FilterExpression::no_filter())
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let actual = arrow_select::concat::concat_batches(&batch.schema(), &actual).unwrap();
+        assert_record_batch_eq(&actual, &expected);
+    }
+}
+
+#[rstest]
+#[case::v2_1(ConcreteFileVersion::V2_1)]
+#[case::v2_2(ConcreteFileVersion::V2_2)]
+#[case::v2_3(ConcreteFileVersion::V2_3)]
+#[tokio::test]
+async fn general_fixed_per_value_is_gated_by_file_version(#[case] version: ConcreteFileVersion) {
+    // Wide enough for full-zip, with enough rows for the fixture writer to emit two pages.
+    const DIMENSION: usize = 257;
+    const NUM_ROWS: usize = 1100;
+    let items = UInt16Array::from_iter_values(
+        (0..NUM_ROWS * DIMENSION).map(|i| (1000 + i / DIMENSION + (i % DIMENSION) / 8) as u16),
+    );
+    let item_field = Arc::new(Field::new("item", DataType::UInt16, true));
+    let pixels =
+        FixedSizeListArray::new(item_field.clone(), DIMENSION as i32, Arc::new(items), None);
+    let field = Field::new(
+        "pixels",
+        DataType::FixedSizeList(item_field, DIMENSION as i32),
+        false,
+    )
+    .with_metadata(HashMap::from([(
+        "lance-encoding:compression".into(),
+        "zstd".into(),
+    )]));
+    let batch = RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![field])),
+        vec![Arc::new(pixels)],
+    )
+    .unwrap();
+    let schema = LanceSchema::try_from(batch.schema().as_ref()).unwrap();
+    let bytes = write_current_fixture(version, &batch, &schema).await;
+    let reader = assert_current_reader_roundtrip(&bytes, version, &batch).await;
+
+    let mut value_bytes = 0;
+    for page in reader.metadata().column_infos[0].page_infos.iter() {
+        let Some(Layout::FullZipLayout(layout)) = &page.encoding.as_structural().layout else {
+            panic!("expected full-zip layout");
+        };
+        value_bytes += page.buffer_offsets_and_sizes[0].1;
+        let values = layout
+            .value_compression
+            .as_ref()
+            .unwrap()
+            .compression
+            .as_ref()
+            .unwrap();
+        if version == ConcreteFileVersion::V2_3 {
+            assert!(matches!(layout.details, Some(Details::BitsPerOffset(_))));
+            let Compression::General(general) = values else {
+                panic!("expected general compression, got {values:?}");
+            };
+            assert!(matches!(
+                general.values.as_ref().unwrap().compression,
+                Some(Compression::ByteStreamSplit(_))
+            ));
+        } else {
+            assert!(matches!(layout.details, Some(Details::BitsPerValue(_))));
+            assert!(
+                matches!(values, Compression::FixedSizeList(_)),
+                "{values:?}"
+            );
+        }
+    }
+    let raw_bytes = (NUM_ROWS * DIMENSION * 2) as u64;
+    if version == ConcreteFileVersion::V2_3 {
+        assert!(value_bytes * 2 < raw_bytes, "{value_bytes} of {raw_bytes}");
+        // The same persisted metadata must be rejected by the stable grammars, which share the
+        // protobuf definitions but decode general-compressed full-zip values as raw bytes.
+        let column_metadatas = &reader.metadata().column_metadatas;
+        for error in [
+            versions::v2_1::decode_column_metadata(column_metadatas).unwrap_err(),
+            versions::v2_2::decode_column_metadata(column_metadatas).unwrap_err(),
+        ] {
+            assert!(matches!(&error, lance_core::Error::InvalidInput { .. }));
+            assert!(error.to_string().contains("requires Lance v2.3"), "{error}");
+        }
+    } else {
+        assert_eq!(value_bytes, raw_bytes);
+    }
+
+    let indices = UInt32Array::from(vec![0, 1023, 1024, 1099]);
+    for (selection, expected) in [
+        (ReadBatchParams::Range(1020..1030), batch.slice(1020, 10)),
+        (
+            ReadBatchParams::Indices(UInt32Array::from(vec![517])),
+            batch.slice(517, 1),
+        ),
         (
             ReadBatchParams::Indices(indices.clone()),
             arrow_select::take::take_record_batch(&batch, &indices).unwrap(),

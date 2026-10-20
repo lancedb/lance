@@ -114,6 +114,39 @@ fn validate_compressive_encoding(encoding: &pb21::CompressiveEncoding) -> Result
     }
 }
 
+/// Stable readers decode a general-compressed full-zip value as variable-width bytes, so the
+/// v2.2 grammar only wraps variable-width values. Lance v2.3 also wraps fixed-width values.
+fn validate_per_value_general_compression(encoding: &pb21::CompressiveEncoding) -> Result<()> {
+    use pb21::compressive_encoding::Compression;
+
+    match encoding.compression.as_ref() {
+        Some(Compression::General(general))
+            if !matches!(
+                general
+                    .values
+                    .as_deref()
+                    .and_then(|values| values.compression.as_ref()),
+                Some(Compression::Variable(_))
+            ) =>
+        {
+            Err(Error::invalid_input_source(
+                "General compression of fixed-width full-zip values requires Lance v2.3".into(),
+            ))
+        }
+        Some(Compression::VariablePackedStruct(packed)) => {
+            for value in packed
+                .fields
+                .iter()
+                .filter_map(|field| field.value.as_ref())
+            {
+                validate_per_value_general_compression(value)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
 fn validate_page_layout(layout: &pb21::PageLayout) -> Result<()> {
     use pb21::page_layout::Layout;
 
@@ -139,10 +172,11 @@ fn validate_page_layout(layout: &pb21::PageLayout) -> Result<()> {
             }
             Ok(())
         }
-        Some(Layout::FullZipLayout(fullzip)) => validate_compressive_encoding(required(
-            fullzip.value_compression.as_ref(),
-            "full-zip values",
-        )?),
+        Some(Layout::FullZipLayout(fullzip)) => {
+            let values = required(fullzip.value_compression.as_ref(), "full-zip values")?;
+            validate_compressive_encoding(values)?;
+            validate_per_value_general_compression(values)
+        }
         Some(Layout::ConstantLayout(constant)) => {
             if let Some(rep) = constant.rep_compression.as_ref() {
                 validate_compressive_encoding(rep)?;
@@ -271,6 +305,8 @@ pub fn finish_metadata_index(index: FileMetadataIndex) -> Result<FileMetadataInd
 #[cfg(test)]
 mod grammar_tests {
     use super::*;
+    use lance_encoding::encodings::physical::block::{CompressionConfig, CompressionScheme};
+    use lance_encoding::format::ProtobufUtils21;
     use pb21::{
         CompressiveEncoding, Dictionary, Flat, FullZipLayout, PageLayout, Rle,
         compressive_encoding::Compression, page_layout::Layout,
@@ -365,5 +401,51 @@ mod grammar_tests {
                 .to_string()
                 .contains("Generic variable offsets require Lance v2.3")
         );
+    }
+
+    fn zstd(values: CompressiveEncoding) -> CompressiveEncoding {
+        ProtobufUtils21::wrapped(
+            CompressionConfig::new(CompressionScheme::Zstd, None),
+            values,
+        )
+        .unwrap()
+    }
+
+    fn full_zip(values: CompressiveEncoding) -> PageLayout {
+        PageLayout {
+            layout: Some(Layout::FullZipLayout(FullZipLayout {
+                value_compression: Some(values),
+                ..Default::default()
+            })),
+        }
+    }
+
+    #[test]
+    fn accepts_general_compression_of_variable_width_full_zip_values() {
+        let variable = ProtobufUtils21::variable(flat(32), None);
+        validate_page_layout(&full_zip(zstd(variable))).unwrap();
+    }
+
+    #[test]
+    fn rejects_general_compression_of_fixed_width_full_zip_values() {
+        let fixed_size_list = ProtobufUtils21::fsl(257, false, flat(16));
+        let packed = ProtobufUtils21::packed_struct_variable(vec![
+            ProtobufUtils21::packed_struct_field_variable(zstd(fixed_size_list.clone()), 32),
+        ]);
+        for values in [
+            zstd(flat(8192)),
+            zstd(fixed_size_list.clone()),
+            zstd(ProtobufUtils21::byte_stream_split(fixed_size_list)),
+            packed,
+        ] {
+            let error = validate_page_layout(&full_zip(values)).unwrap_err();
+            assert!(matches!(&error, Error::InvalidInput { .. }));
+            assert!(
+                error
+                    .to_string()
+                    .contains("full-zip values requires Lance v2.3"),
+                "{error}"
+            );
+        }
     }
 }
