@@ -3938,6 +3938,7 @@ mod tests {
 
     use arrow::datatypes::{Float32Type, Float64Type, Int32Type, UInt64Type};
     use arrow_array::{FixedSizeListArray, record_batch};
+    use arrow_schema::{DataType, Field, Schema};
     use datafusion::{
         execution::{SendableRecordBatchStream, TaskContext},
         physical_plan::{ExecutionPlan, sorts::sort::SortExec, stream::RecordBatchStreamAdapter},
@@ -5560,9 +5561,49 @@ mod tests {
             "part_456_page_data.lance".to_string(),
         ];
 
-        // The cleanup function should handle both valid and invalid file patterns gracefully
-        // This test mainly verifies that the function doesn't panic and handles edge cases
+        // Materialize every file so that deletion is observable.
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
+        for name in lookup_files.iter().chain(page_files.iter()) {
+            let mut writer = test_store
+                .new_index_file(name, schema.clone())
+                .await
+                .unwrap();
+            writer
+                .write_record_batch(record_batch!(("v", Int32, [1])).unwrap())
+                .await
+                .unwrap();
+            writer.finish().await.unwrap();
+        }
+
+        let partition_files = [
+            "part_123_page_lookup.lance",
+            "part_456_page_lookup.lance",
+            "part_123_page_data.lance",
+            "part_456_page_data.lance",
+        ];
+        for name in partition_files {
+            assert!(
+                test_store.open_index_file(name).await.is_ok(),
+                "{name} should exist before cleanup"
+            );
+        }
+
         super::cleanup_partition_files(test_store.as_ref(), &lookup_files, &page_files).await;
+
+        // Files matching part_*_page_{lookup,data}.lance are deleted ...
+        for name in partition_files {
+            assert!(
+                test_store.open_index_file(name).await.is_err(),
+                "{name} should have been deleted"
+            );
+        }
+        // ... while files outside the partition naming pattern are left alone.
+        for name in ["invalid_lookup_file.lance", "invalid_page_file.lance"] {
+            assert!(
+                test_store.open_index_file(name).await.is_ok(),
+                "{name} should not have been deleted"
+            );
+        }
     }
 
     #[tokio::test]
@@ -6292,11 +6333,12 @@ mod tests {
             .await
             .unwrap();
 
-        // Create a mapping that simulates deleting rows where value > 1000 AND value < 10000
-        // Since values match row_ids in our test data:
-        // - Rows 0-1000 (values 0-1000) are kept with same row_ids
-        // - Rows 1001-9999 (values 1001-9999) are deleted (mapped to None)
-        // - Rows 10000-14999 (values 10000-14999) are remapped to new row_ids 1001-5999
+        // Create a mapping that simulates deleting rows where 1000 < value < 10000.
+        // Since values match row addresses in our test data:
+        // - Rows 0-999 survive and are remapped to addresses 100_000-100_999
+        // - Row 1000 is absent from the mapping, so it keeps its address
+        // - Rows 1001-9999 are deleted (mapped to None)
+        // - Rows 10000-14999 survive and are remapped to addresses 101_000-105_999
         let mut mapping: HashMap<u64, Option<u64>> = HashMap::new();
 
         // Mark deleted rows (values 1001-9999)
@@ -6327,11 +6369,19 @@ mod tests {
                 .await
                 .unwrap();
 
-        // Verify values that should exist (values 0-1000 and 10000-14999)
-        // These correspond to: original values 0-1000 at row_ids 0-1000
-        // and original values 10000-14999 at new row_ids 1001-5999
-        let should_exist = vec![0, 500, 1000, 10000, 13000, 14000, 14999];
-        for value in should_exist {
+        // Verify surviving values resolve to their remapped row addresses; an
+        // untranslated or wrongly shifted remap would still return a non-empty
+        // result, so the exact address is what guards the mapping.
+        let should_exist = [
+            (0, 100_000_u64),
+            (500, 100_500),
+            (1000, 1000), // absent from the mapping: keeps its original address
+            (10000, 101_000),
+            (13000, 104_000),
+            (14000, 105_000),
+            (14999, 105_999),
+        ];
+        for (value, expected_addr) in should_exist {
             let query = SargableQuery::Equals(ScalarValue::Int32(Some(value)));
             let result = remapped_index
                 .search(&query, &NoOpMetricsCollector)
@@ -6339,10 +6389,12 @@ mod tests {
                 .unwrap();
             match result {
                 SearchResult::Exact(row_id_map) => {
-                    assert!(
-                        !row_id_map.is_empty(),
-                        "Value {} should exist in remapped index but was not found",
-                        value
+                    assert_eq!(
+                        row_id_map.true_rows(),
+                        RowAddrTreeMap::from_iter([expected_addr]),
+                        "Value {} should map to row address {} in remapped index",
+                        value,
+                        expected_addr
                     );
                 }
                 _ => {
@@ -7336,6 +7388,12 @@ mod tests {
         assert_eq!(restored.lookup_batch, state.lookup_batch);
         assert_eq!(restored.batch_size, state.batch_size);
         assert_eq!(restored.ranges_to_files, state.ranges_to_files);
+        // This flag decides whether search results are translated from row
+        // addresses to row ids; a wrong domain silently drops matches (#7434).
+        assert_eq!(
+            restored.results_are_row_addresses,
+            state.results_are_row_addresses
+        );
     }
 
     #[test]
