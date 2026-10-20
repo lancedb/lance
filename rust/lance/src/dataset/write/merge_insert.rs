@@ -15229,6 +15229,129 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
         assert_eq!(remaining_keys, vec![1, 2, 3, 4, 5, 6]);
     }
 
+    /// Test WhenMatched::Delete combined with deleting rows not matched by source,
+    /// when the source carries dataset columns besides the key. This is not
+    /// delete-only, so the general write exec runs and needs those columns.
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn test_when_matched_delete_with_delete_not_matched_by_source(
+        #[values(true, false)] full_source: bool,
+        #[values(true, false)] delete_if: bool,
+    ) {
+        let test_uri = "memory://test_delete_with_delete_by_source.lance";
+
+        // Create dataset with keys 1-6 (full schema: key, value, filterme)
+        let ds = create_test_dataset(test_uri, LanceFileVersion::V2_0, false).await;
+        // Keys 4, 5, 6 match and are deleted; 1, 2, 3 are only in the target
+        let full_batch = create_new_batch(create_test_schema());
+        let new_batch = if full_source {
+            full_batch
+        } else {
+            full_batch.project(&[0, 1]).unwrap()
+        };
+
+        let when_not_matched_by_source = if delete_if {
+            WhenNotMatchedBySource::delete_if(&ds, "key < 3").unwrap()
+        } else {
+            WhenNotMatchedBySource::Delete
+        };
+        let job = MergeInsertBuilder::try_new(ds.clone(), vec!["key".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::Delete)
+            .when_not_matched(WhenNotMatched::DoNothing)
+            .when_not_matched_by_source(when_not_matched_by_source)
+            .try_build()
+            .unwrap();
+
+        let new_schema = new_batch.schema();
+        let new_reader = Box::new(RecordBatchIterator::new([Ok(new_batch)], new_schema));
+        let (merged_dataset, merge_stats) =
+            job.execute(reader_to_stream(new_reader)).await.unwrap();
+
+        let expected_keys: Vec<u32> = if delete_if { vec![3] } else { vec![] };
+        assert_eq!(merge_stats.num_deleted_rows, 6 - expected_keys.len() as u64);
+        assert_eq!(merge_stats.num_inserted_rows, 0);
+        assert_eq!(merge_stats.num_updated_rows, 0);
+
+        let batches = merged_dataset
+            .scan()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let merged = concat_batches(&create_test_schema(), &batches).unwrap();
+        let mut remaining_keys: Vec<u32> = merged
+            .column(0)
+            .as_primitive::<UInt32Type>()
+            .values()
+            .to_vec();
+        remaining_keys.sort();
+        assert_eq!(remaining_keys, expected_keys);
+    }
+
+    /// A source column the dataset lacks is never written, so it is not carried
+    /// through the join even when the merge is not delete-only.
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn test_delete_by_source_drops_source_columns_not_in_dataset(
+        #[values(WhenMatched::Delete, WhenMatched::DoNothing)] when_matched: WhenMatched,
+        #[values(true, false)] delete_if: bool,
+    ) {
+        let ds = create_test_dataset(
+            "memory://test_delete_by_source_drops_columns.lance",
+            LanceFileVersion::V2_0,
+            false,
+        )
+        .await;
+        // Keys 4, 5, 6 match; 1, 2, 3 are only in the target
+        let source_schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::UInt32, true),
+            Field::new("extra", DataType::Utf8, true),
+        ]));
+        let new_batch = RecordBatch::try_new(
+            source_schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![4, 5, 6, 7, 8, 9])),
+                Arc::new(StringArray::from(vec!["x"; 6])),
+            ],
+        )
+        .unwrap();
+
+        let when_not_matched_by_source = if delete_if {
+            WhenNotMatchedBySource::delete_if(&ds, "key < 3").unwrap()
+        } else {
+            WhenNotMatchedBySource::Delete
+        };
+        let job = MergeInsertBuilder::try_new(ds.clone(), vec!["key".to_string()])
+            .unwrap()
+            .when_matched(when_matched.clone())
+            .when_not_matched(WhenNotMatched::DoNothing)
+            .when_not_matched_by_source(when_not_matched_by_source)
+            .try_build()
+            .unwrap();
+
+        let plan = job
+            .explain_plan(Some(source_schema.as_ref()), false)
+            .await
+            .unwrap();
+        assert!(!plan.contains("extra"), "{plan}");
+
+        let new_reader = Box::new(RecordBatchIterator::new([Ok(new_batch)], source_schema));
+        let (_, merge_stats) = job.execute(reader_to_stream(new_reader)).await.unwrap();
+        let matched_deleted = if when_matched == WhenMatched::Delete {
+            3
+        } else {
+            0
+        };
+        let unmatched_deleted = if delete_if { 2 } else { 3 };
+        assert_eq!(
+            merge_stats.num_deleted_rows,
+            matched_deleted + unmatched_deleted
+        );
+    }
+
     /// Test that MergeInsertPlanner::is_delete_only correctly identifies delete-only operations.
     ///
     /// Delete-only is true only when:
