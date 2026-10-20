@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, hash_map::Entry},
+    sync::Arc,
+};
 
 /// Bits per value for FixedWidth dictionary values (legacy default for 128-bit values)
 pub const DICT_FIXED_WIDTH_BITS_PER_VALUE: u64 = 128;
@@ -435,8 +438,6 @@ pub(super) fn encode_fixed_rows(
     max_dict_entries: u32,
     max_encoded_size: usize,
 ) -> Option<(DataBlock, FixedWidthDataBlock)> {
-    use std::collections::hash_map::Entry;
-
     let width = usize::try_from(data.bits_per_value / 8).ok()?;
     let count = usize::try_from(data.num_values).ok()?;
     if width == 0
@@ -495,6 +496,8 @@ mod tests {
         buffer::LanceBuffer,
         data::{BlockInfo, FixedWidthDataBlock},
     };
+    use arrow_array::{Array, StringArray};
+    use std::sync::Arc;
 
     #[test]
     fn test_fixed_row_dictionary_preserves_float_bits_and_budgets() {
@@ -527,9 +530,6 @@ mod tests {
             assert_eq!(*index, (i % 4) as u32);
         }
     }
-    use arrow_array::{Array, StringArray};
-    use std::sync::Arc;
-
     #[test]
     fn test_dictionary_encode_abort_fixed_width() {
         // Create a u128 block with very high cardinality where dict encoding
