@@ -3568,9 +3568,10 @@ class LanceDataset(pa.dataset.Dataset):
         :meth:`CleanupPlan.finish`. Tasks are pickle-able and can be retried. Files
         are removed with the same rules as :meth:`cleanup_old_versions`, and each
         task first reads the versions committed after the plan so their files are
-        kept. If the tasks are abandoned, a later cleanup removes the files they
-        left once those are seven days old. Cleaning referenced branches is not
-        supported.
+        kept. If the tasks are abandoned, no version references the files they
+        left, so later cleanups only remove them as unverified files. With
+        ``delete_unverified=True``, nothing may write to the dataset from the plan
+        until the last task has run. Cleaning referenced branches is not supported.
 
         Parameters
         ----------

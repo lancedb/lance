@@ -9,8 +9,8 @@
 //! retained version references, using the same rules as
 //! [`CleanupOperation::execute`]. The finish checks that every range was swept.
 //!
-//! The expired manifests go first so that no expired version can be restored,
-//! tagged or branched from while its files are being removed. Each task also reads
+//! The expired manifests go first, so the commit handler no longer resolves an
+//! expired version while its files are being removed. Each task also reads
 //! the manifests committed after the plan and keeps their files. The age threshold
 //! for files no manifest references is fixed when the plan is created, so a task
 //! that runs later is only more conservative.
@@ -48,9 +48,10 @@ impl CleanupOperation<'_> {
     /// The plan removes the expired manifests. Run every task from
     /// [`CleanupPlan::tasks`], in any order and on any machine with access to the
     /// dataset, then pass all of their results to [`CleanupPlan::finish`]. Tasks are
-    /// idempotent and may be retried. If the tasks are abandoned, a later cleanup
-    /// removes the files they left once those are older than the unverified-retention
-    /// threshold.
+    /// idempotent and may be retried. If the tasks are abandoned, no version
+    /// references the files they left, so later cleanups only remove them as
+    /// unverified files. With `delete_unverified`, nothing may write to the dataset
+    /// from the plan until the last task has run.
     ///
     /// Returns [`Error::NotSupported`] when the policy cleans referenced branches, and
     /// [`Error::Cleanup`] without creating a plan when an expired manifest cannot be
@@ -283,8 +284,8 @@ impl CleanupPlan {
     ///
     /// `results` must hold exactly one result for each task of one [`Self::tasks`]
     /// call; otherwise an invalid-input error is returned, since some files the
-    /// expired manifests proved removable were not swept. A later cleanup removes
-    /// those once they are older than the unverified-retention threshold.
+    /// expired manifests proved removable were not swept. Later cleanups only
+    /// remove those as unverified files.
     pub async fn finish(
         &self,
         dataset: &Dataset,
