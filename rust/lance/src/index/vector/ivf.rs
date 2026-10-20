@@ -1964,12 +1964,6 @@ pub async fn train_ivf_model_from_sample(
     // Normalization can produce non-finite values, so filter after preprocessing.
     let training_data = filter_finite_training_data(training_data)?;
 
-    if training_data.len() < num_partitions {
-        return Err(Error::invalid_input(format!(
-            "IVF training requires at least {num_partitions} valid vectors, got {} after filtering",
-            training_data.len()
-        )));
-    }
     info!("Start to train IVF model");
     let start = std::time::Instant::now();
     let ivf = train_ivf_model(
@@ -6907,8 +6901,12 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(matches!(error, Error::InvalidInput { .. }));
-        assert!(error.to_string().contains("at least 1 valid vectors"));
+        assert!(matches!(error, Error::Unprocessable { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("cannot train 1 centroids with 0 vectors")
+        );
     }
 
     #[rstest]
