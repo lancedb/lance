@@ -875,6 +875,11 @@ impl MiniBlockScheduler {
                 Compression::Variable(_) => 4,
                 Compression::Flat(_) => 16,
                 Compression::General(_) => 1,
+                // The RLE frame starts with an 8-byte length prefix and slices its
+                // values/run-length sub-buffers at byte offsets, so no stricter
+                // alignment can be assumed (same reasoning as `General`).  Typed
+                // views taken later re-align (copying) as needed.
+                Compression::Rle(_) => 1,
                 Compression::InlineBitpacking(_) | Compression::OutOfLineBitpacking(_) => {
                     crate::encoder::MIN_PAGE_BUFFER_ALIGNMENT
                 }
@@ -2569,6 +2574,46 @@ mod tests {
             dictionary.dictionary_data_alignment,
             crate::encoder::MIN_PAGE_BUFFER_ALIGNMENT
         );
+    }
+
+    #[test]
+    fn test_miniblock_dictionary_rle_decode() {
+        let rows = 10_000;
+
+        // `create_block_compressor` picks RLE for dictionary values when the
+        // merged values buffer is dominated by runs (e.g. several batches each
+        // contributing the same single dictionary value into one page).  The
+        // reader must accept the same encoding the writer emits.
+        let dictionary_encoding = ProtobufUtils21::rle(
+            ProtobufUtils21::flat(64, None),
+            ProtobufUtils21::flat(8, None),
+        );
+        let layout = pb21::MiniBlockLayout {
+            rep_compression: None,
+            def_compression: None,
+            value_compression: Some(ProtobufUtils21::flat(64, None)),
+            dictionary: Some(dictionary_encoding),
+            num_dictionary_items: 1,
+            layers: vec![pb21::RepDefLayer::RepdefAllValidItem as i32],
+            num_buffers: 1,
+            repetition_index_depth: 0,
+            num_items: rows,
+            has_large_chunk: false,
+        };
+
+        let buffer_offsets_and_sizes = vec![(0, 0), (0, 0), (0, 0)];
+        let scheduler = super::MiniBlockScheduler::try_new(
+            &buffer_offsets_and_sizes,
+            /*priority=*/ 0,
+            /*items_in_page=*/ rows,
+            &layout,
+            &DefaultDecompressionStrategy::default(),
+        )
+        .unwrap();
+
+        let dictionary = scheduler.dictionary.unwrap();
+        assert_eq!(dictionary.num_dictionary_items, 1);
+        assert_eq!(dictionary.dictionary_data_alignment, 1);
     }
 
     #[test]

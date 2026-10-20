@@ -1558,6 +1558,29 @@ async fn test_dictionary_round_trip_high_cardinality_strings() {
     .await;
 }
 
+/// Three single-value dictionary chunks merged into one page leave the merged
+/// dictionary values as a run of identical entries, so the writer RLE-compresses
+/// the dictionary values block.  The mini-block reader must accept the encodings
+/// the writer emits (regression: it rejected `Compression::Rle`, so no scan
+/// could read a file the writer had just produced).
+#[tokio::test]
+async fn test_dictionary_round_trip_rle_encoded_dictionary_values() {
+    use arrow_array::{UInt32Array, UInt64Array, types::UInt32Type};
+
+    let single_value = |rows: usize| -> ArrayRef {
+        let values = Arc::new(UInt64Array::from(vec![5_881_210_131_331_364_753u64]));
+        let keys = UInt32Array::from(vec![0u32; rows]);
+        Arc::new(DictionaryArray::<UInt32Type>::try_new(keys, values).unwrap())
+    };
+    let chunks: Vec<ArrayRef> = (0..3).map(|_| single_value(2)).collect();
+
+    let test_cases = TestCases::default()
+        .with_encoding(TestEncoding::StructuralU32)
+        .with_page_sizes(vec![4096]);
+
+    check_round_trip_encoding_of_data(chunks, &test_cases, HashMap::new()).await;
+}
+
 /// Values above the 32 KiB per-value threshold take the per-value zstd path.
 /// Mixed with nulls, empty and small values, at several levels (and the
 /// default when no level is set), every page is zstd and every value survives.
