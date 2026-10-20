@@ -52,6 +52,7 @@ reqsign-google = { version = "3.0.3", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = { workspace = true }
+libc.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
