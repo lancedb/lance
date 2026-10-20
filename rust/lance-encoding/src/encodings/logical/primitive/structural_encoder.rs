@@ -1052,7 +1052,7 @@ impl PrimitiveStructuralEncoder {
         metadata
     }
 
-    fn build_dict_values_compressor_field(field: &Field) -> Result<Field> {
+    pub(super) fn build_dict_values_compressor_field(field: &Field) -> Result<Field> {
         // This is an internal synthetic field used only to feed metadata into
         // `create_block_compressor` for dictionary values. The concrete type/name here
         // are not semantically meaningful; we rely on explicit metadata below to control
