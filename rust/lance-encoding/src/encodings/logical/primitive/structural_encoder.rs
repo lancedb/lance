@@ -26,7 +26,7 @@ use crate::buffer::LanceBuffer;
 use crate::compression::{CompressionStrategy, compress_required_block};
 use crate::constants::{
     COMPRESSION_LEVEL_META_KEY, COMPRESSION_META_KEY, DICT_DIVISOR_META_KEY,
-    DICT_SIZE_RATIO_META_KEY, DICT_VALUES_COMPRESSION_ENV_VAR,
+    DICT_MAX_SIZE_META_KEY, DICT_SIZE_RATIO_META_KEY, DICT_VALUES_COMPRESSION_ENV_VAR,
     DICT_VALUES_COMPRESSION_LEVEL_ENV_VAR, DICT_VALUES_COMPRESSION_LEVEL_META_KEY,
     DICT_VALUES_COMPRESSION_META_KEY, STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY,
     STRUCTURAL_ENCODING_MINIBLOCK, STRUCTURAL_ENCODING_SPARSE,
@@ -51,8 +51,8 @@ use crate::utils::accumulation::AccumulationQueue;
 use crate::utils::bytepack::BytepackedIntegerEncoder;
 
 use super::{
-    DEFAULT_DICT_DIVISOR, DEFAULT_DICT_MAX_CARDINALITY, DEFAULT_DICT_SIZE_RATIO,
-    DEFAULT_DICT_VALUES_COMPRESSION, FILL_BYTE, MINIBLOCK_ALIGNMENT,
+    DEFAULT_DICT_DIVISOR, DEFAULT_DICT_MAX_CARDINALITY, DEFAULT_DICT_MAX_SIZE_BYTES,
+    DEFAULT_DICT_SIZE_RATIO, DEFAULT_DICT_VALUES_COMPRESSION, FILL_BYTE, MINIBLOCK_ALIGNMENT,
 };
 use super::{constant, dict, miniblock, planar, sparse};
 
@@ -236,6 +236,8 @@ struct SerializedMiniBlockPage {
 pub(super) struct DictEncodingBudget {
     pub(super) max_dict_entries: u32,
     pub(super) max_encoded_size: usize,
+    /// Upper bound on the dictionary's value bytes; see `DICT_MAX_SIZE_META_KEY`.
+    pub(super) max_dict_bytes: usize,
 }
 
 pub(super) enum PrimitivePageStructure {
@@ -1608,6 +1610,13 @@ impl PrimitiveStructuralEncoder {
         let max_encoded_size = (data_size as f64 * threshold_ratio) as u64;
         let max_encoded_size = usize::try_from(max_encoded_size).ok()?;
 
+        let max_dict_bytes: usize = match field.metadata.get(DICT_MAX_SIZE_META_KEY) {
+            Some(val) => val.parse().unwrap_or_else(|_| {
+                panic!("Invalid parameter: dict-max-size is {val} which is not a byte count")
+            }),
+            None => DEFAULT_DICT_MAX_SIZE_BYTES,
+        };
+
         // A repeated sample can come from either a small dictionary or a high-cardinality
         // page with short runs. Its unique ratio cannot be extrapolated to the whole page.
         // Planar leaves that decision to bounded dictionary construction.
@@ -1631,6 +1640,7 @@ impl PrimitiveStructuralEncoder {
         Some(DictEncodingBudget {
             max_dict_entries,
             max_encoded_size,
+            max_dict_bytes,
         })
     }
 
@@ -2111,6 +2121,7 @@ impl PrimitiveStructuralEncoder {
                 &data_block,
                 budget.max_dict_entries,
                 budget.max_encoded_size,
+                budget.max_dict_bytes,
             )
         });
 

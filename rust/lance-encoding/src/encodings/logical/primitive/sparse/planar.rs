@@ -290,7 +290,12 @@ pub(in crate::encodings::logical::primitive) fn encode(
             DictionaryEncodingPolicy::Planar,
         )
         .and_then(|budget| {
-            dict::dictionary_encode(data, budget.max_dict_entries, budget.max_encoded_size)
+            dict::dictionary_encode(
+                data,
+                budget.max_dict_entries,
+                budget.max_encoded_size,
+                budget.max_dict_bytes,
+            )
         })
     });
     let (values, mut buffers) = if positions.is_empty()

@@ -693,6 +693,45 @@ fn test_should_dictionary_encode() {
     );
 }
 
+#[tokio::test]
+async fn test_encode_skips_dictionary_above_max_dict_size() {
+    use crate::constants::DICT_MAX_SIZE_META_KEY;
+
+    // 2000 values of 64 bytes with 500 distinct: the dictionary alone is 32 KiB,
+    // well within the size ratio, so only the byte cap can veto it.
+    let array = Arc::new(StringArray::from_iter_values(
+        (0..2000).map(|i| format!("{:064}", i % 500)),
+    )) as ArrayRef;
+
+    let field = arrow_schema::Field::new("test", DataType::Utf8, false);
+    let page = encode_first_page(field, array.clone(), TestEncoding::StructuralU32).await;
+    assert!(
+        miniblock_layout(&page).dictionary.is_some(),
+        "a 32 KiB dictionary must be used under the default cap"
+    );
+
+    let metadata = HashMap::from([(DICT_MAX_SIZE_META_KEY.to_string(), "4096".to_string())]);
+    let field = arrow_schema::Field::new("test", DataType::Utf8, false).with_metadata(metadata);
+    let page = encode_first_page(field, array, TestEncoding::StructuralU32).await;
+    assert!(
+        miniblock_layout(&page).dictionary.is_none(),
+        "a dictionary over lance-encoding:dict-max-size must not be written"
+    );
+}
+
+#[tokio::test]
+#[should_panic(expected = "dict-max-size is 8MiB")]
+async fn test_encode_rejects_unparsable_max_dict_size() {
+    use crate::constants::DICT_MAX_SIZE_META_KEY;
+
+    let array = Arc::new(StringArray::from_iter_values(
+        (0..2000).map(|i| format!("{:064}", i % 500)),
+    )) as ArrayRef;
+    let metadata = HashMap::from([(DICT_MAX_SIZE_META_KEY.to_string(), "8MiB".to_string())]);
+    let field = arrow_schema::Field::new("test", DataType::Utf8, false).with_metadata(metadata);
+    encode_first_page(field, array, TestEncoding::StructuralU32).await;
+}
+
 #[test]
 fn test_block_sampling_detects_low_cardinality_in_short_sorted_runs() {
     let sample_count: usize = 4096;
@@ -853,10 +892,16 @@ fn test_planar_dictionary_probe_preserves_budgets(#[case] divisor: u64, #[case] 
         (block.data_size() as f64 * size_ratio) as usize
     );
     assert!(
-        dictionary_encode(&block, budget.max_dict_entries, budget.max_encoded_size).is_none(),
+        dictionary_encode(
+            &block,
+            budget.max_dict_entries,
+            budget.max_encoded_size,
+            budget.max_dict_bytes,
+        )
+        .is_none(),
         "actual construction must abort at the unchanged budget"
     );
-    assert!(dictionary_encode(&block, 4096, block.data_size() as usize).is_some());
+    assert!(dictionary_encode(&block, 4096, block.data_size() as usize, usize::MAX).is_some());
 }
 
 #[test]
