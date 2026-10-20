@@ -113,10 +113,10 @@ fn reduce(py: Python<'_>, class: &str, json: String) -> PyResult<(Py<PyAny>, Py<
 
 /// A cleanup whose listing and deletion can be split across processes.
 ///
-/// Created by :py:meth:`lance.LanceDataset.plan_cleanup_old_versions`. Run every
-/// task from :py:meth:`tasks`, then pass all of their results to :py:meth:`finish`.
-/// The plan stays on the process that created it; only its tasks are sent to
-/// workers.
+/// Created by :py:meth:`lance.LanceDataset.plan_cleanup_old_versions`, which has
+/// already removed the expired manifests. Run every task from :py:meth:`tasks`,
+/// then pass all of their results to :py:meth:`finish`. The plan stays on the
+/// process that created it; only its tasks are sent to workers.
 #[pyclass(name = "CleanupPlan", module = "lance.cleanup")]
 pub struct PyCleanupPlan(pub(crate) CleanupPlan);
 
@@ -136,9 +136,10 @@ impl PyCleanupPlan {
         self.0.read_version()
     }
 
-    /// int : The number of manifests :py:meth:`finish` removes.
+    /// int : The number of expired manifests the plan removed, or would remove
+    /// when explaining.
     #[getter]
-    fn num_old_versions(&self) -> usize {
+    fn num_old_versions(&self) -> u64 {
         self.0.num_old_versions()
     }
 
@@ -157,10 +158,11 @@ impl PyCleanupPlan {
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
         Ok(tasks.into_iter().map(PyCleanupSweepTask).collect())
     }
-    /// Remove the expired manifests once every task has run.
+
+    /// Check that every task has run.
     ///
     /// ``results`` must hold exactly one result for each task of one
-    /// :py:meth:`tasks` call; otherwise nothing is removed.
+    /// :py:meth:`tasks` call.
     ///
     /// Returns
     /// -------
@@ -183,8 +185,8 @@ impl PyCleanupPlan {
         Ok(cleanup_stats(stats))
     }
 
-    /// Like :py:meth:`finish` for a plan created with ``explain=True``: removes
-    /// nothing and explains what the cleanup would remove.
+    /// Like :py:meth:`finish` for a plan created with ``explain=True``: explains
+    /// what the cleanup would remove.
     ///
     /// Returns
     /// -------

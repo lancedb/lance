@@ -229,7 +229,7 @@ impl RemovalStats {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct CleanupRunResult {
     stats: RemovalStats,
     removed_manifests: HashSet<Path>,

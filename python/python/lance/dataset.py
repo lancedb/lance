@@ -3562,12 +3562,15 @@ class LanceDataset(pa.dataset.Dataset):
         Plan a :meth:`cleanup_old_versions` whose listing and deletion can be split
         across processes.
 
-        Run every task from :meth:`CleanupPlan.tasks`, in any order and on any
-        worker that can open this dataset, then pass all of their results to
+        The plan removes the expired manifests, so those versions are gone once it
+        returns. Run every task from :meth:`CleanupPlan.tasks`, in any order and on
+        any worker that can open this dataset, then pass all of their results to
         :meth:`CleanupPlan.finish`. Tasks are pickle-able and can be retried. Files
         are removed with the same rules as :meth:`cleanup_old_versions`, and each
         task first reads the versions committed after the plan so their files are
-        kept. Cleaning referenced branches is not supported.
+        kept. If the tasks are abandoned, a later cleanup removes the files they
+        left once those are seven days old. Cleaning referenced branches is not
+        supported.
 
         Parameters
         ----------
@@ -3576,11 +3579,11 @@ class LanceDataset(pa.dataset.Dataset):
             As for :meth:`cleanup_old_versions`.
 
         delete_concurrency, delete_rate_limit: int, optional
-            Limits for removing the expired manifests in :meth:`CleanupPlan.finish`.
-            Each task takes its own limits in :meth:`CleanupSweepTask.execute`.
+            Limits for removing the expired manifests while planning. Each task
+            takes its own limits in :meth:`CleanupSweepTask.execute`.
 
         explain: bool, default False
-            Plan an explanation instead: the tasks delete nothing, and
+            Plan an explanation instead: nothing is removed, and
             :meth:`CleanupPlan.finish_explain` returns what
             :meth:`explain_cleanup_old_versions` would.
 

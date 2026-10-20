@@ -3,15 +3,17 @@
 
 //! Cleanup split into a plan, sweep tasks that other processes can run, and a finish.
 //!
-//! The plan reads every manifest once, as a single-process cleanup does, and splits
-//! the listing of the Lance-managed directories into key ranges. Each sweep task lists
-//! one range and removes the files there that no retained version references, using
-//! the same rules as [`CleanupOperation::execute`]. The finish removes the expired
-//! manifests once every task has reported.
+//! The plan reads every manifest once, as a single-process cleanup does, removes the
+//! expired manifests, and splits the listing of the Lance-managed directories into
+//! key ranges. Each sweep task lists one range and removes the files there that no
+//! retained version references, using the same rules as
+//! [`CleanupOperation::execute`]. The finish checks that every range was swept.
 //!
-//! Each task first reads the manifests committed after the plan and keeps their
-//! files. The age threshold for files no manifest references is fixed when the plan
-//! is created, so a task that runs later is only more conservative.
+//! The expired manifests go first so that no expired version can be restored,
+//! tagged or branched from while its files are being removed. Each task also reads
+//! the manifests committed after the plan and keeps their files. The age threshold
+//! for files no manifest references is fixed when the plan is created, so a task
+//! that runs later is only more conservative.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
@@ -28,10 +30,11 @@ use super::shard::{self, KeyRange, ReferenceSlice};
 use super::{
     CleanupAction, CleanupCandidateFile, CleanupExplanation, CleanupInspection, CleanupOperation,
     CleanupPolicy, CleanupReferencedBranch, CleanupRunResult, CleanupSubtree, CleanupTask,
-    DEFAULT_EXPLANATION_MAX_CANDIDATE_FILES, ExpiredManifest, ReferencedFiles, RemovalStats,
-    SweepEvidence, tag_is_on_branch, validate_delete_concurrency, validate_delete_rate_limit,
+    DEFAULT_EXPLANATION_MAX_CANDIDATE_FILES, ReferencedFiles, RemovalStats, SweepEvidence,
+    tag_is_on_branch, validate_delete_concurrency, validate_delete_rate_limit,
 };
 use crate::Dataset;
+use crate::dataset::refs::BranchIdentifier;
 
 /// Version of the serialized [`CleanupSweepTask`] and [`CleanupSweepResult`].
 const SWEEP_FORMAT: u32 = 1;
@@ -42,12 +45,16 @@ const LANCE_VERSION: &str = env!("CARGO_PKG_VERSION");
 impl CleanupOperation<'_> {
     /// Plan a cleanup whose listing and deletion can be split across processes.
     ///
-    /// Run every task from [`CleanupPlan::tasks`], in any order and on any machine
-    /// with access to the dataset, then pass all of their results to
-    /// [`CleanupPlan::finish`]. Tasks are idempotent and may be retried. Nothing is
-    /// deleted by the plan itself.
+    /// The plan removes the expired manifests. Run every task from
+    /// [`CleanupPlan::tasks`], in any order and on any machine with access to the
+    /// dataset, then pass all of their results to [`CleanupPlan::finish`]. Tasks are
+    /// idempotent and may be retried. If the tasks are abandoned, a later cleanup
+    /// removes the files they left once those are older than the unverified-retention
+    /// threshold.
     ///
-    /// Returns [`Error::NotSupported`] when the policy cleans referenced branches.
+    /// Returns [`Error::NotSupported`] when the policy cleans referenced branches, and
+    /// [`Error::Cleanup`] without creating a plan when an expired manifest cannot be
+    /// removed.
     ///
     /// ```
     /// # use lance::{Dataset, Result};
@@ -67,8 +74,8 @@ impl CleanupOperation<'_> {
         CleanupPlan::try_new(self, CleanupAction::Execute).await
     }
 
-    /// Like [`Self::plan`], but its tasks delete nothing and the plan is finished
-    /// with [`CleanupPlan::finish_explain`], which matches [`Self::explain`].
+    /// Like [`Self::plan`], but nothing is removed and the plan is finished with
+    /// [`CleanupPlan::finish_explain`], which matches [`Self::explain`].
     pub async fn plan_explain(&self) -> Result<CleanupPlan> {
         let action = CleanupAction::Explain {
             max_candidate_files: self.max_candidate_files,
@@ -121,14 +128,12 @@ pub struct CleanupPlan {
     listings: Vec<(CleanupSubtree, Option<DateTime<Utc>>)>,
     referenced: ReferenceSlice,
     verified: ReferenceSlice,
-    old_manifests: HashMap<Path, ExpiredManifest>,
-    retired_records: HashMap<u64, String>,
+    /// The expired manifests the plan removed, or would remove when explaining.
+    manifests: CleanupRunResult,
     referenced_branches: Vec<(String, u64)>,
     /// False when a ranged listing would list the whole subtree again, so each
     /// subtree gets a single task.
     is_shardable: bool,
-    delete_concurrency: Option<usize>,
-    delete_rate_limit: Option<u64>,
 }
 impl CleanupPlan {
     async fn try_new(operation: &CleanupOperation<'_>, action: CleanupAction) -> Result<Self> {
@@ -140,7 +145,15 @@ impl CleanupPlan {
         }
         let dataset = operation.dataset;
         let task = CleanupTask::new(operation, action)?;
+        // Listed before the lineage is inspected: a branch replaced in between gets
+        // another identifier, and the plan then fails instead of trusting it.
+        let branches = dataset.branches().list().await?;
         let referenced_branches = task.find_referenced_branches().await?;
+        let referenced_branch_ids = referenced_branches
+            .iter()
+            .filter_map(|(name, _)| branches.get(name))
+            .map(|branch| branch.identifier.clone())
+            .collect::<Vec<_>>();
         let inspection = task.inspect(&referenced_branches, &HashSet::new()).await?;
         let evidence = task.prepare_sweep(inspection).await;
         let listings = evidence.listings(operation.policy.delete_unverified);
@@ -149,6 +162,8 @@ impl CleanupPlan {
             verification_threshold,
             ..
         } = evidence;
+        let manifests =
+            expire_manifests(&task, &inspection, &referenced_branch_ids, action).await?;
         let store = &dataset.object_store;
         let plan = Self {
             id: Uuid::new_v4(),
@@ -162,21 +177,16 @@ impl CleanupPlan {
             listings,
             referenced: ReferenceSlice::from_files(&inspection.referenced_files),
             verified: ReferenceSlice::from_files(&inspection.verified_files),
-            old_manifests: inspection.old_manifests,
-            retired_records: inspection.retired_records,
+            manifests,
             referenced_branches,
             // A local filesystem lists the whole directory for every range, but
             // that is cheap there.
             is_shardable: store.list_is_lexically_ordered || task.removes_empty_dirs(),
-            delete_concurrency: operation.delete_concurrency,
-            delete_rate_limit: operation
-                .delete_rate_limit
-                .or(operation.policy.delete_rate_limit),
         };
         info!(
             plan_id = %plan.id,
             read_version = plan.read_version,
-            old_versions = plan.old_manifests.len(),
+            old_versions = plan.num_old_versions(),
             "Planned distributed cleanup"
         );
         Ok(plan)
@@ -187,9 +197,9 @@ impl CleanupPlan {
         self.read_version
     }
 
-    /// Number of manifests [`Self::finish`] removes.
-    pub fn num_old_versions(&self) -> usize {
-        self.old_manifests.len()
+    /// Number of expired manifests the plan removed, or would remove when explaining.
+    pub fn num_old_versions(&self) -> u64 {
+        self.manifests.stats.old_versions
     }
 
     /// Split the sweep into tasks.
@@ -242,12 +252,6 @@ impl CleanupPlan {
         let count = u32::try_from(shards.len()).map_err(|_| {
             Error::invalid_input(format!("too many cleanup tasks: {}", shards.len()))
         })?;
-        let mut expired_versions = self
-            .old_manifests
-            .values()
-            .map(|expired| expired.version)
-            .collect::<Vec<_>>();
-        expired_versions.sort_unstable();
         Ok(shards
             .into_iter()
             .zip(0..)
@@ -261,8 +265,6 @@ impl CleanupPlan {
                 base: self.base.to_string(),
                 branch: self.branch.clone(),
                 read_version: self.read_version,
-                expired_versions: expired_versions.clone(),
-                referenced_branches: self.referenced_branches.clone(),
                 explain_max_candidate_files: self.action.candidate_file_limit(),
                 delete_unverified: self.delete_unverified,
                 verification_threshold: self.verification_threshold,
@@ -274,14 +276,15 @@ impl CleanupPlan {
             })
             .collect())
     }
-    /// Remove the expired manifests once every task has run, returning the
-    /// statistics of the whole cleanup.
+
+    /// Check that every task has run and return the statistics of the whole
+    /// cleanup, removing the index directories the tasks emptied on stores that
+    /// materialize directories.
     ///
-    /// `results` must hold exactly one result for each task of one
-    /// [`Self::tasks`] call; otherwise nothing is removed and an invalid-input error
-    /// is returned. A sweep that did not finish leaves files that the expired
-    /// manifests prove removable, and removing the manifests would make those files
-    /// wait out the unverified-retention period instead.
+    /// `results` must hold exactly one result for each task of one [`Self::tasks`]
+    /// call; otherwise an invalid-input error is returned, since some files the
+    /// expired manifests proved removable were not swept. A later cleanup removes
+    /// those once they are older than the unverified-retention threshold.
     pub async fn finish(
         &self,
         dataset: &Dataset,
@@ -292,7 +295,22 @@ impl CleanupPlan {
                 "this cleanup plan only explains; call finish_explain",
             ));
         }
-        let mut stats = self.finish_run(dataset, results).await?.stats;
+        self.check_finish(dataset, results)?;
+        let task = cleanup_task(dataset, self.action, self.delete_unverified, None, None)?;
+        let index_dirs = results
+            .iter()
+            .flat_map(|result| &result.index_dirs_to_remove)
+            .map(|dir| absolute(&self.base, dir))
+            .collect::<Result<HashSet<_>>>()?;
+        let retained = self
+            .referenced
+            .index_uuids()
+            .iter()
+            .cloned()
+            .collect::<HashSet<_>>();
+        task.remove_empty_index_dirs(&retained, index_dirs, self.verification_threshold)
+            .await;
+        let mut stats = self.manifests.stats.clone();
         for result in results {
             stats.merge(&result.stats);
         }
@@ -307,7 +325,7 @@ impl CleanupPlan {
     }
 
     /// Like [`Self::finish`] for a plan from [`CleanupOperation::plan_explain`]:
-    /// removes nothing and explains what the cleanup would remove.
+    /// explains what the cleanup would remove.
     pub async fn finish_explain(
         &self,
         dataset: &Dataset,
@@ -318,7 +336,7 @@ impl CleanupPlan {
                 "this cleanup plan deletes files; call finish",
             ));
         };
-        let manifests = self.finish_run(dataset, results).await?;
+        self.check_finish(dataset, results)?;
         let mut sorted_results = results.iter().collect::<Vec<_>>();
         sorted_results.sort_by_key(|result| result.index);
         let mut run = CleanupRunResult::default();
@@ -335,7 +353,8 @@ impl CleanupPlan {
             );
             warnings.extend(result.warnings.iter().cloned());
         }
-        run.merge(manifests, Some(limit));
+        // Single-process cleanup lists the expired manifests last.
+        run.merge(self.manifests.clone(), Some(limit));
         if run.candidate_files_truncated {
             warnings.push(format!("candidate_files truncated to {limit} entries"));
         }
@@ -358,53 +377,14 @@ impl CleanupPlan {
         })
     }
 
-    /// Removes, or when explaining records, the expired manifests.
-    async fn finish_run(
-        &self,
-        dataset: &Dataset,
-        results: &[CleanupSweepResult],
-    ) -> Result<CleanupRunResult> {
+    fn check_finish(&self, dataset: &Dataset, results: &[CleanupSweepResult]) -> Result<()> {
         check_dataset(
             dataset,
             &self.store_prefix,
             self.base.as_ref(),
             &self.branch,
         )?;
-        self.check_results(results)?;
-        let task = cleanup_task(
-            dataset,
-            self.action,
-            self.delete_unverified,
-            self.read_version,
-            self.delete_concurrency,
-            self.delete_rate_limit,
-        )?;
-        let expired_versions = self
-            .old_manifests
-            .values()
-            .map(|expired| expired.version)
-            .collect::<HashSet<_>>();
-        check_protection(dataset, &expired_versions, &self.referenced_branches).await?;
-        let manifests = task.expired_manifest_files(self.old_manifests.clone());
-        let outcome = task.remove_files(manifests, &self.old_manifests).await?;
-        if self.action.deletes_files() {
-            task.retire_records(&self.retired_records, &outcome.undeleted_manifest_versions)
-                .await?;
-            let index_dirs = results
-                .iter()
-                .flat_map(|result| &result.index_dirs_to_remove)
-                .map(|dir| absolute(&self.base, dir))
-                .collect::<Result<HashSet<_>>>()?;
-            let retained = self
-                .referenced
-                .index_uuids()
-                .iter()
-                .cloned()
-                .collect::<HashSet<_>>();
-            task.remove_empty_index_dirs(&retained, index_dirs, self.verification_threshold)
-                .await;
-        }
-        Ok(outcome.result)
+        self.check_results(results)
     }
 
     /// Checks that `results` are those of one [`Self::tasks`] call and that their
@@ -419,7 +399,10 @@ impl CleanupPlan {
         let Some(count) = results.first().map(|result| result.count) else {
             return mismatch("no sweep results".to_string());
         };
-        let mut seen = vec![false; count as usize];
+        if results.len() != count as usize {
+            return mismatch(format!("{} results for {count} tasks", results.len()));
+        }
+        let mut seen = vec![false; results.len()];
         let mut ranges = HashMap::<CleanupSubtree, Vec<&KeyRange>>::new();
         for result in results {
             if result.format != SWEEP_FORMAT || result.plan_id != self.id {
@@ -442,9 +425,6 @@ impl CleanupPlan {
                 .entry(result.subtree)
                 .or_default()
                 .push(&result.range);
-        }
-        if let Some(missing) = seen.iter().position(|is_seen| !is_seen) {
-            return mismatch(format!("no result for task {missing} of {count}"));
         }
         for (subtree, _) in &self.listings {
             let mut subtree_ranges = ranges.remove(subtree).unwrap_or_default();
@@ -485,8 +465,6 @@ pub struct CleanupSweepTask {
     base: String,
     branch: Option<String>,
     read_version: u64,
-    expired_versions: Vec<u64>,
-    referenced_branches: Vec<(String, u64)>,
     /// Set when the plan only explains.
     explain_max_candidate_files: Option<usize>,
     delete_unverified: bool,
@@ -529,9 +507,8 @@ impl CleanupSweepTask {
     /// the plan explains.
     ///
     /// `dataset` must be the planned dataset and branch; any version of it will do.
-    /// The task fails without deleting anything if a tag or a new branch has
-    /// protected a version the plan expires. A file that fails to delete is counted
-    /// in [`RemovalStats::failed_deletes`] and does not fail the task.
+    /// A file that fails to delete is counted in [`RemovalStats::failed_deletes`] and
+    /// does not fail the task.
     pub async fn execute(
         &self,
         dataset: &Dataset,
@@ -551,14 +528,15 @@ impl CleanupSweepTask {
             },
             None => CleanupAction::Execute,
         };
-        let task = cleanup_task(
+        let mut task = cleanup_task(
             dataset,
             action,
             self.delete_unverified,
-            self.read_version,
             options.delete_concurrency,
             options.delete_rate_limit,
         )?;
+        // The manifests after the plan's version are the ones to refresh.
+        task.read_version = self.read_version;
         info!(
             plan_id = %self.plan_id,
             task = self.index,
@@ -567,8 +545,6 @@ impl CleanupSweepTask {
             end_inclusive = self.end_inclusive(),
             "Starting cleanup sweep task"
         );
-        let expired_versions = self.expired_versions.iter().copied().collect();
-        check_protection(dataset, &expired_versions, &self.referenced_branches).await?;
         let (refresh, refreshed_versions) = self.refresh(&task).await?;
         let result = match refresh {
             Some(refresh) => {
@@ -771,16 +747,54 @@ fn check_dataset(
     Ok(())
 }
 
-/// Fails when a version the plan expires is now protected: by a tag on this
-/// branch, or by a branch the plan did not know about.
+/// Removes the expired manifests, or only records them when explaining, then retires
+/// the records of those removed. Fails if one could not be removed: its files must not
+/// be swept while its version can still be restored.
+async fn expire_manifests(
+    task: &CleanupTask<'_>,
+    inspection: &CleanupInspection,
+    referenced_branch_ids: &[BranchIdentifier],
+    action: CleanupAction,
+) -> Result<CleanupRunResult> {
+    let old_manifests = &inspection.old_manifests;
+    if action.deletes_files() {
+        let expired_versions = old_manifests
+            .values()
+            .map(|expired| expired.version)
+            .collect::<HashSet<_>>();
+        check_protection(task.dataset, &expired_versions, referenced_branch_ids).await?;
+    }
+    let files = task.expired_manifest_files(old_manifests.clone());
+    let outcome = task.remove_files(files, old_manifests).await?;
+    if !action.deletes_files() {
+        return Ok(outcome.result);
+    }
+    let undeleted = &outcome.undeleted_manifest_versions;
+    task.retire_records(&inspection.retired_records, undeleted)
+        .await?;
+    if !undeleted.is_empty() {
+        let mut versions = undeleted.iter().copied().collect::<Vec<_>>();
+        versions.sort_unstable();
+        return Err(Error::Cleanup {
+            message: format!(
+                "could not remove the manifests of versions {versions:?}; no other file was \
+                 removed, retry the cleanup"
+            ),
+        });
+    }
+    Ok(outcome.result)
+}
+
+/// Fails when a version about to expire is protected: by a tag on this branch, or by
+/// a branch the inspection did not cover.
 async fn check_protection(
     dataset: &Dataset,
     expired_versions: &HashSet<u64>,
-    referenced_branches: &[(String, u64)],
+    referenced_branch_ids: &[BranchIdentifier],
 ) -> Result<()> {
     let changed = |what: String| {
         Err(Error::Cleanup {
-            message: format!("{what} since the cleanup plan was created; create a new plan"),
+            message: format!("{what} while the cleanup was being planned; retry the cleanup"),
         })
     };
     let branch = dataset.manifest.branch.as_ref();
@@ -799,10 +813,12 @@ async fn check_protection(
         .branch_identifier()
         .await?
         .collect_referenced_versions(&branches);
-    if let Some((name, version)) = children
-        .iter()
-        .find(|child| expired_versions.contains(&child.1) && !referenced_branches.contains(child))
-    {
+    if let Some((name, version)) = children.iter().find(|(name, version)| {
+        expired_versions.contains(version)
+            && !branches
+                .get(name)
+                .is_some_and(|branch| referenced_branch_ids.contains(&branch.identifier))
+    }) {
         return changed(format!(
             "branch {name:?} was created from version {version}"
         ));
@@ -810,12 +826,11 @@ async fn check_protection(
     Ok(())
 }
 
-/// A task that runs the cleanup phases of a plan, not of `dataset`'s version.
+/// A task that runs the cleanup phases of a plan, not of a policy.
 fn cleanup_task<'a>(
     dataset: &'a Dataset,
     action: CleanupAction,
     delete_unverified: bool,
-    read_version: u64,
     delete_concurrency: Option<usize>,
     delete_rate_limit: Option<u64>,
 ) -> Result<CleanupTask<'a>> {
@@ -829,9 +844,7 @@ fn cleanup_task<'a>(
         delete_concurrency,
         delete_rate_limit,
     };
-    let mut task = CleanupTask::new(&operation, action)?;
-    task.read_version = read_version;
-    Ok(task)
+    CleanupTask::new(&operation, action)
 }
 
 fn absolute(base: &Path, relative: &str) -> Result<Path> {
@@ -1137,15 +1150,9 @@ mod tests {
             let action = CleanupAction::Explain {
                 max_candidate_files: 0,
             };
-            let cleanup = cleanup_task(
-                dataset,
-                action,
-                task.delete_unverified,
-                task.read_version,
-                None,
-                None,
-            )
-            .unwrap();
+            let mut cleanup =
+                cleanup_task(dataset, action, task.delete_unverified, None, None).unwrap();
+            cleanup.read_version = task.read_version;
             let result = task
                 .sweep(&cleanup, ReferenceSlice::default(), 0)
                 .await
@@ -1155,36 +1162,20 @@ mod tests {
         removed
     }
 
-    #[rstest]
-    #[case::restored_expired_version(false)]
-    #[case::appended_with_delete_unverified(true)]
     #[tokio::test]
-    async fn sweep_keeps_files_of_versions_committed_after_the_plan(
-        #[case] delete_unverified: bool,
-    ) {
+    async fn sweep_keeps_files_of_versions_committed_after_the_plan() {
         MockClock::set_system_time(std::time::Duration::ZERO);
         let fixture = MockDatasetFixture::try_new().unwrap();
         fixture.create_some_data().await.unwrap();
-        if !delete_unverified {
-            fixture.overwrite_some_data().await.unwrap();
-        }
         MockClock::set_system_time(days(10));
         let dataset = fixture.open().await.unwrap();
         let policy = CleanupPolicyBuilder::default()
             .before_timestamp(utc_now())
-            .delete_unverified(delete_unverified)
+            .delete_unverified(true)
             .build();
         let plan = dataset.cleanup(policy).plan().await.unwrap();
-
-        if delete_unverified {
-            fixture.append_some_data().await.unwrap();
-        } else {
-            // Version 1 expires, then comes back as version 3.
-            assert_eq!(plan.num_old_versions(), 1);
-            let mut restored = dataset.checkout_version(1).await.unwrap();
-            restored.restore().await.unwrap();
-        }
-        // The race is real: without the refresh a data file of the new version goes.
+        fixture.append_some_data().await.unwrap();
+        // The race is real: without the refresh the appended data file goes.
         assert_eq!(unrefreshed_data_removals(&dataset, &plan).await, 1);
 
         let results = run_tasks(&dataset, &plan, 1).await.unwrap();
@@ -1193,8 +1184,7 @@ mod tests {
         assert_eq!(stats.data_files_removed, 0);
         let latest = fixture.open().await.unwrap();
         assert_eq!(latest.version_id(), plan.read_version() + 1);
-        let expected_rows = if delete_unverified { 1024 } else { 512 };
-        assert_eq!(latest.count_rows(None).await.unwrap(), expected_rows);
+        assert_eq!(latest.count_rows(None).await.unwrap(), 1024);
     }
 
     #[tokio::test]
@@ -1246,37 +1236,62 @@ mod tests {
         (fixture, dataset, policy)
     }
 
-    fn assert_plan_is_stale(error: Error) {
+    fn assert_protected(error: Error) {
         assert!(matches!(error, Error::Cleanup { .. }), "{error}");
-        assert!(error.to_string().contains("create a new plan"), "{error}");
+        assert!(error.to_string().contains("retry the cleanup"), "{error}");
     }
 
-    #[rstest]
-    #[case::tag(false)]
-    #[case::branch(true)]
     #[tokio::test]
-    async fn protecting_an_expired_version_after_the_plan_fails(#[case] is_branch: bool) {
+    async fn expired_versions_are_gone_once_planned() {
         let (fixture, mut dataset, policy) = two_versions().await;
+        let mut old_handle = dataset.checkout_version(1).await.unwrap();
         let plan = dataset.cleanup(policy).plan().await.unwrap();
-        let results = run_tasks(&dataset, &plan, 1).await.unwrap();
-        let files = list_files(&dataset).await;
-        if is_branch {
+        assert_eq!(plan.num_old_versions(), 1);
+        assert_eq!(fixture.count_files().await.unwrap().num_manifest_files, 1);
+        // Nothing can bring back version 1 while its files are being swept, not
+        // even a handle opened before the plan.
+        let error = dataset.checkout_version(1).await.unwrap_err();
+        assert!(error.to_string().contains("not found"), "{error}");
+        assert!(old_handle.restore().await.is_err());
+        assert!(dataset.tags().create("late", 1).await.is_err());
+        assert!(
             fixture
                 .create_branch_and_load(&mut dataset, "late", 1)
                 .await
-                .unwrap();
-        } else {
-            dataset.tags().create("late", 1).await.unwrap();
-        }
-        assert_plan_is_stale(plan.finish(&dataset, &results).await.unwrap_err());
-        assert_plan_is_stale(run_tasks(&dataset, &plan, 1).await.unwrap_err());
-        // Nothing of the main branch was removed.
-        let main_files = list_files(&dataset)
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn protection_check_rejects_tags_and_unknown_branches() {
+        let (fixture, mut dataset, _policy) = two_versions().await;
+        let expired = HashSet::from([1]);
+        fixture
+            .create_branch_and_load(&mut dataset, "dev", 1)
             .await
-            .into_iter()
-            .filter(|path| !path.contains("/tree/") && !path.contains("/_refs/"))
-            .collect::<BTreeSet<_>>();
-        assert_eq!(main_files, files);
+            .unwrap();
+        let inspected = dataset.branches().list().await.unwrap()["dev"]
+            .identifier
+            .clone();
+        check_protection(&dataset, &expired, std::slice::from_ref(&inspected))
+            .await
+            .unwrap();
+        assert_protected(check_protection(&dataset, &expired, &[]).await.unwrap_err());
+
+        // A branch recreated under the same name is not the one inspected.
+        dataset.delete_branch("dev").await.unwrap();
+        fixture
+            .create_branch_and_load(&mut dataset, "dev", 1)
+            .await
+            .unwrap();
+        let error = check_protection(&dataset, &expired, std::slice::from_ref(&inspected))
+            .await
+            .unwrap_err();
+        assert_protected(error);
+
+        dataset.delete_branch("dev").await.unwrap();
+        dataset.tags().create("late", 1).await.unwrap();
+        assert_protected(check_protection(&dataset, &expired, &[]).await.unwrap_err());
     }
 
     #[tokio::test]
@@ -1290,7 +1305,7 @@ mod tests {
 
     #[tokio::test]
     async fn finish_requires_one_result_per_task() {
-        let (fixture, dataset, policy) = two_versions().await;
+        let (_fixture, dataset, policy) = two_versions().await;
         let plan = dataset.cleanup(policy.clone()).plan().await.unwrap();
         let results = run_tasks(&dataset, &plan, 64).await.unwrap();
         assert!(results.len() > plan.listings.len());
@@ -1307,7 +1322,7 @@ mod tests {
         with_end.range.end_inclusive = Some("data/a".to_string());
         let rejected = [
             (Vec::new(), "no sweep results"),
-            (results[1..].to_vec(), "no result for task"),
+            (results[1..].to_vec(), "results for"),
             (duplicated, "repeats"),
             (other_results, "belongs to plan"),
             (gap, "gap"),
@@ -1317,7 +1332,6 @@ mod tests {
             assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
             assert!(error.to_string().contains(message), "{message}: {error}");
         }
-        assert_eq!(fixture.count_files().await.unwrap().num_manifest_files, 2);
 
         let error = plan.finish_explain(&dataset, &results).await.unwrap_err();
         assert!(error.to_string().contains("call finish"), "{error}");
@@ -1362,7 +1376,7 @@ mod tests {
         }
     }
     #[tokio::test]
-    async fn finish_keeps_the_record_of_a_manifest_it_cannot_delete() {
+    async fn plan_fails_when_an_expired_manifest_cannot_be_removed() {
         use crate::dataset::cleanup::tests::{IdentifiedStore, MockObjectStore};
         use crate::dataset::{InsertBuilder, WriteDestination};
         use lance_io::object_store::ObjectStoreParams;
@@ -1402,9 +1416,6 @@ mod tests {
         let policy = CleanupPolicyBuilder::default()
             .before_timestamp(utc_now())
             .build();
-        let plan = dataset.cleanup(policy).plan().await.unwrap();
-        assert_eq!(plan.num_old_versions(), 2);
-        let results = run_tasks(&dataset, &plan, 1).await.unwrap();
         mock_store.policy.lock().unwrap().set_before_policy(
             "block_delete_manifest",
             Arc::new(|op: &str, path: &Path| -> Result<()> {
@@ -1415,10 +1426,13 @@ mod tests {
                 }
             }),
         );
+        let files = list_files(&dataset).await;
 
-        let stats = plan.finish(&dataset, &results).await.unwrap();
-        assert_eq!(stats.failed_deletes, 2);
-        assert_eq!(stats.old_versions, 0);
+        let error = dataset.cleanup(policy.clone()).plan().await.unwrap_err();
+        assert!(matches!(error, Error::Cleanup { .. }), "{error}");
+        assert!(error.to_string().contains("versions [1, 2]"), "{error}");
+        assert_eq!(list_files(&dataset).await, files);
+        // Every record survives, because every manifest survives.
         let mut remaining = store
             .rows
             .lock()
@@ -1428,5 +1442,14 @@ mod tests {
             .collect::<Vec<_>>();
         remaining.sort_unstable();
         assert_eq!(remaining, vec![1, 2, 3]);
+
+        mock_store
+            .policy
+            .lock()
+            .unwrap()
+            .clear_before_policy("block_delete_manifest");
+        let plan = dataset.cleanup(policy).plan().await.unwrap();
+        assert_eq!(plan.num_old_versions(), 2);
+        assert_eq!(store.rows.lock().unwrap().len(), 1);
     }
 }

@@ -1756,6 +1756,8 @@ def test_plan_cleanup_old_versions(tmp_path):
     plan = dataset.plan_cleanup_old_versions(older_than=older_than)
     assert plan.read_version == dataset.version
     assert plan.num_old_versions == 1
+    # The expired manifest is gone before any task runs.
+    assert len(lance.dataset(base_dir).versions()) == 1
     tasks = [pickle.loads(pickle.dumps(task)) for task in plan.tasks(8)]
     assert len({task.subtree for task in tasks}) == len(tasks)
     results = [
@@ -1764,9 +1766,8 @@ def test_plan_cleanup_old_versions(tmp_path):
     ]
     assert sorted(result.index for result in results) == list(range(len(tasks)))
 
-    with pytest.raises(OSError, match="no result for task"):
+    with pytest.raises(OSError, match="results for"):
         plan.finish(dataset, results[1:])
-    assert len(dataset.versions()) == 2
     with pytest.raises(OSError, match="call finish_explain"):
         dataset.plan_cleanup_old_versions(older_than=older_than, explain=True).finish(
             dataset, results
@@ -1776,7 +1777,6 @@ def test_plan_cleanup_old_versions(tmp_path):
     assert stats.old_versions == 1
     assert stats.bytes_removed == expected.stats.bytes_removed
     assert stats.data_files_removed == expected.stats.data_files_removed
-    assert len(lance.dataset(base_dir).versions()) == 1
     assert lance.dataset(base_dir).to_table() == table
 
     with pytest.raises(ValueError, match="max_tasks"):
