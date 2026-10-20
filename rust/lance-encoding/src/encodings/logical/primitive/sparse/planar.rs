@@ -1372,6 +1372,137 @@ mod tests {
         assert!(requested[0].end - requested[0].start < value_size);
     }
 
+    fn indexed_page() -> (PageInfo, Field, Arc<RecordingIo>) {
+        let array: ArrayRef =
+            Arc::new(StringArray::from_iter((0..1000).map(|i| {
+                (i % 11 != 0).then(|| format!("{:03}{}", i % 100, "x".repeat(1024)))
+            })));
+        let result = page(array.clone(), flat_plan(&array), 1000);
+        let PageEncoding::Planar(layout) = &result.0.encoding else {
+            panic!("expected planar page");
+        };
+        assert!(matches!(
+            layout.values.as_ref().unwrap().codec,
+            Some(pb23::value_plane::Codec::Indexed(_))
+        ));
+        result
+    }
+
+    #[rstest::rstest]
+    #[case::cached(1 << 20)]
+    #[case::disabled(0)]
+    #[tokio::test]
+    async fn indexed_item_io_and_cache_reuse(#[case] capacity: usize) {
+        let (page, field, recorder) = indexed_page();
+        let io: Arc<dyn EncodingsIo> = recorder.clone();
+        let item_cache = Arc::new(LanceCache::with_capacity(capacity));
+        let mut cold = scheduler(&page, &field).unwrap();
+        cold.set_cache(item_cache.clone());
+        let state = initialize(&mut cold, &io).await.unwrap();
+        let (start, size) = page.buffer_offsets_and_sizes[1];
+        assert!(
+            recorder
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|range| { range.end <= start || range.start >= start + size })
+        );
+
+        let mut warm = scheduler(&page, &field).unwrap();
+        warm.set_cache(item_cache);
+        warm.try_load(&state).unwrap();
+        recorder.requests.lock().unwrap().clear();
+        // Distinct rows share one dictionary item. The selected index domain
+        // must be remapped before decoding, and the payload is fetched once.
+        let mut tasks = warm.schedule_ranges(&[1..2, 101..102], &io).unwrap();
+        assert_eq!(tasks.len(), 1);
+        let mut decoder = tasks.remove(0).decoder_fut.await.unwrap();
+        for _ in 0..2 {
+            let decoded = decoder.drain(1).unwrap().decode().unwrap();
+            let actual = make_array(decoded.data.into_arrow(DataType::Utf8, true).unwrap());
+            let expected = StringArray::from(vec![format!("001{}", "x".repeat(1024))]);
+            assert_eq!(actual.to_data(), expected.to_data());
+        }
+        let first_reads = recorder.requests.lock().unwrap().clone();
+        assert_eq!(first_reads.len(), 1);
+        assert!(first_reads[0].start >= start && first_reads[0].end <= start + size);
+        assert!(first_reads[0].end - first_reads[0].start <= 1040);
+        assert!(first_reads[0].end - first_reads[0].start < size);
+
+        recorder.requests.lock().unwrap().clear();
+        let decoded = read(&warm, &io, 201..202).await.unwrap();
+        let actual = make_array(decoded.data.into_arrow(DataType::Utf8, true).unwrap());
+        let expected = StringArray::from(vec![format!("001{}", "x".repeat(1024))]);
+        assert_eq!(actual.to_data(), expected.to_data());
+        if capacity == 0 {
+            assert_eq!(*recorder.requests.lock().unwrap(), first_reads);
+        } else {
+            assert!(recorder.requests.lock().unwrap().is_empty());
+        }
+        recorder.requests.lock().unwrap().clear();
+        let decoded = read(&warm, &io, 20..21).await.unwrap();
+        let actual = make_array(decoded.data.into_arrow(DataType::Utf8, true).unwrap());
+        let expected = StringArray::from(vec![format!("020{}", "x".repeat(1024))]);
+        assert_eq!(actual.to_data(), expected.to_data());
+        let new_reads = recorder.requests.lock().unwrap().clone();
+        assert_eq!(new_reads.len(), 1);
+        assert_ne!(new_reads, first_reads);
+        assert!(new_reads[0].end - new_reads[0].start <= 1040);
+    }
+
+    #[rstest::rstest]
+    #[case::index("index", "Dictionary index exceeds item count")]
+    #[case::first_offset("first", "offsets are out of bounds")]
+    #[case::decreasing_offset("decreasing", "offsets are out of bounds")]
+    #[case::oversized_offset("oversized", "offsets are out of bounds")]
+    #[case::final_offset("final", "final offset does not match payload size")]
+    #[case::offset_length("length", "offset buffer has an invalid length")]
+    #[tokio::test]
+    async fn indexed_corrupt_addressing_is_rejected(#[case] mutation: &str, #[case] message: &str) {
+        let (mut page, field, mut recorder) = indexed_page();
+        let PageEncoding::Planar(layout) = &mut page.encoding else {
+            unreachable!();
+        };
+        let Some(pb23::value_plane::Codec::Indexed(indexed)) =
+            &mut layout.values.as_mut().unwrap().codec
+        else {
+            unreachable!();
+        };
+        let num_items = indexed.items.as_ref().unwrap().num_items;
+        let mut buffers = page.buffer_offsets_and_sizes.to_vec();
+        if mutation == "index" {
+            indexed.indices = Some(crate::format::EncodingUtils::constant(Some(
+                Bytes::copy_from_slice(&(num_items as u32).to_le_bytes()),
+            )));
+            buffers[0].1 = 0;
+        } else if mutation == "length" {
+            buffers[2].1 -= 1;
+        } else {
+            let (start, size) = buffers[2];
+            let width = (size / (num_items + 1)) as usize;
+            let (position, value) = match mutation {
+                "first" => (0, 1),
+                "decreasing" => (2, 0),
+                "oversized" => (num_items, buffers[1].1 + 1),
+                "final" => (num_items, buffers[1].1 - 1),
+                _ => unreachable!(),
+            };
+            let offset = start as usize + position as usize * width;
+            let mut data = recorder.data.to_vec();
+            data[offset..offset + width].copy_from_slice(&value.to_le_bytes()[..width]);
+            Arc::get_mut(&mut recorder).unwrap().data = Bytes::from(data);
+        }
+        page.buffer_offsets_and_sizes = buffers.into();
+        let io: Arc<dyn EncodingsIo> = recorder;
+        let error = match scheduler(&page, &field) {
+            Ok(mut scheduler) => initialize(&mut scheduler, &io).await.err().unwrap(),
+            Err(error) => error,
+        };
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains(message), "{error}");
+    }
+
     #[rstest::rstest]
     #[case::constant(false)]
     #[case::none(true)]

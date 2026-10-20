@@ -466,6 +466,59 @@ mod tests {
         check_round_trip_encoding_of_data(vec![array], &cases, HashMap::new()).await;
     }
 
+    #[rstest::rstest]
+    #[case::utf8(DataType::Utf8)]
+    #[case::large_utf8(DataType::LargeUtf8)]
+    #[case::binary(DataType::Binary)]
+    #[case::large_binary(DataType::LargeBinary)]
+    #[tokio::test]
+    async fn planar_indexed_round_trip(
+        #[case] data_type: DataType,
+        #[values("leaf", "struct", "list")] nesting: &str,
+    ) {
+        // A dictionary larger than 64 KiB reaches automatic Indexed selection.
+        // Relatively prime null periods retain every item in the dictionary.
+        let strings = StringArray::from_iter(
+            (0..1000).map(|i| (i % 11 != 0).then(|| format!("{:03}{}", i % 100, "x".repeat(1024)))),
+        );
+        let values = arrow_cast::cast(&strings, &data_type).unwrap();
+        let array = if nesting == "leaf" {
+            values
+        } else {
+            let structs: ArrayRef = Arc::new(arrow_array::StructArray::new(
+                vec![Arc::new(ArrowField::new("value", data_type, true))].into(),
+                vec![values],
+                Some(NullBuffer::from_iter((0..1000).map(|i| i % 7 != 0))),
+            ));
+            if nesting == "list" {
+                Arc::new(arrow_array::ListArray::new(
+                    Arc::new(ArrowField::new("item", structs.data_type().clone(), true)),
+                    arrow_buffer::OffsetBuffer::from_lengths(std::iter::repeat_n(2, 500)),
+                    structs,
+                    Some(NullBuffer::from_iter((0..500).map(|i| i % 13 != 0))),
+                )) as ArrayRef
+            } else {
+                structs
+            }
+        };
+        let rows = array.len() as u64;
+        let cases = TestCases::default()
+            .with_encoding(TestEncoding::StructuralSparse)
+            .with_page_sizes(vec![2 << 20])
+            .with_ingest_batch_counts([1])
+            .with_range(3..rows - 1)
+            .with_indices(vec![0, 1, 7, 11, 13, 99, 100, 101, rows - 1])
+            .with_indices((0..rows).step_by(7).collect())
+            .with_batch_size(37)
+            .with_expected_encoding("indexed");
+        check_round_trip_encoding_of_data(
+            vec![array],
+            &cases,
+            HashMap::from([(STRUCTURAL_ENCODING_META_KEY.to_owned(), "sparse".to_owned())]),
+        )
+        .await;
+    }
+
     #[tokio::test]
     async fn planar_sparse_wide_fixed_size_list() {
         let values: ArrayRef = Arc::new(Int32Array::from_iter_values(0..4096));

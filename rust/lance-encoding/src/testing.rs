@@ -1092,6 +1092,7 @@ fn verify_page_encoding(
                     }
                 }
                 Some(Codec::Indexed(v)) => {
+                    actual_chain.push("indexed".to_string());
                     actual_chain.push("dictionary".to_string());
                     if let Some(c) = &v.indices {
                         actual_chain.extend(extract_array_encoding_chain(c));
