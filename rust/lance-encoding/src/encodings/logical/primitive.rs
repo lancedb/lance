@@ -11,13 +11,9 @@ use futures::{FutureExt, future::BoxFuture};
 use lance_core::{
     cache::{CacheKey, CacheKeySchema, Context, DeepSizeOf, KeyBuilder, LanceCache},
     error::Error,
-    utils::bit::pad_bytes,
 };
 
-use crate::{
-    compression::{DecompressionStrategy, MiniBlockDecompressor},
-    data::DataBlock,
-};
+use crate::{compression::DecompressionStrategy, data::DataBlock};
 use lance_core::Result;
 
 use crate::{
@@ -30,7 +26,7 @@ use crate::{
 
 // Reached only by `sparse.rs` tests through `use super::*`.
 #[cfg(test)]
-use crate::{format::EncodingUtils, repdef::CompositeRepDefUnraveler};
+use crate::format::EncodingUtils;
 
 pub mod blob;
 mod chunk_index;

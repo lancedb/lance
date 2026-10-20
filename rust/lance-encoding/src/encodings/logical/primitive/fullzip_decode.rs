@@ -137,7 +137,7 @@ impl FullZipReadSource {
 #[derive(Debug)]
 pub struct FullZipScheduler {
     data_buf_position: u64,
-    data_buf_size: u64,
+    pub(super) data_buf_size: u64,
     rep_index: Option<FullZipRepIndexDetails>,
     priority: u64,
     rows_in_page: u64,

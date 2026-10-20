@@ -814,7 +814,7 @@ impl CachedPageData for MiniBlockCacheableState {
 #[derive(Debug)]
 pub struct MiniBlockScheduler {
     // These come from the protobuf
-    buffer_offsets_and_sizes: Vec<(u64, u64)>,
+    pub(super) buffer_offsets_and_sizes: Vec<(u64, u64)>,
     priority: u64,
     items_in_page: u64,
     repetition_index_depth: u16,

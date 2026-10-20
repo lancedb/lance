@@ -21,7 +21,6 @@ use lance_core::datatypes::Field;
 use lance_core::error::Error;
 use lance_core::utils::bit::pad_bytes;
 use lance_core::utils::tokio::spawn_cpu;
-use log::debug;
 
 use crate::buffer::LanceBuffer;
 use crate::compression::{CompressionStrategy, compress_required_block};
@@ -98,7 +97,7 @@ pub enum MiniblockChunkSize {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ComplexNullEncoding {
+pub(super) enum ComplexNullEncoding {
     RawLevels,
     CompressedLevels,
 }
@@ -191,7 +190,7 @@ impl PrimitivePageEncoding {
 struct RejectSparsePrimitiveEncoding;
 
 #[derive(Debug)]
-struct ConstantPrimitiveEncoding;
+pub(super) struct ConstantPrimitiveEncoding;
 
 #[derive(Debug)]
 struct DenseU16PrimitiveEncoding {
@@ -233,9 +232,9 @@ struct SerializedMiniBlockPage {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct DictEncodingBudget {
-    max_dict_entries: u32,
-    max_encoded_size: usize,
+pub(super) struct DictEncodingBudget {
+    pub(super) max_dict_entries: u32,
+    pub(super) max_encoded_size: usize,
 }
 
 pub(super) enum PrimitivePageStructure {

@@ -4,19 +4,16 @@
 //! The 2.3 writer chooses structure independently from value storage.
 
 use super::structural_encoder::{
-    FixedWidthDictionaryEncoding, MiniblockChunkSize, PrimitiveEncodeAttempt,
-    PrimitiveEncodeContext, PrimitivePageData, PrimitivePageEncodingBehavior,
-    PrimitivePageStructure, PrimitivePlanContext,
+    ComplexNullEncoding, ConstantPrimitiveEncoding, FixedWidthDictionaryEncoding,
+    MiniblockChunkSize, PrimitiveEncodeAttempt, PrimitiveEncodeContext, PrimitivePageData,
+    PrimitivePageEncodingBehavior, PrimitivePageStructure, PrimitivePlanContext,
 };
 use super::*;
 use crate::compression::CompressionStrategy;
-use crate::constants::{
-    STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY, STRUCTURAL_ENCODING_MINIBLOCK,
-    STRUCTURAL_ENCODING_SPARSE,
-};
+use crate::constants::{STRUCTURAL_ENCODING_META_KEY, STRUCTURAL_ENCODING_SPARSE};
 use crate::decoder::{PageEncoding, PageInfo};
 use crate::format::planar::from_dense_execution;
-use crate::repdef::{NormalizedStructuralPlan, SerializedRepDefs};
+use crate::repdef::NormalizedStructuralPlan;
 use arrow_array::{Array, ArrayRef, cast::AsArray};
 use lance_arrow::DataTypeExt;
 use lance_core::datatypes::Field;
@@ -387,6 +384,8 @@ mod tests {
     use crate::testing::{TestCases, TestEncoding, check_round_trip_encoding_of_data};
     use arrow_array::{FixedSizeListArray, Int32Array, StringArray};
     use arrow_buffer::NullBuffer;
+    use arrow_schema::Field as ArrowField;
+    use std::collections::HashMap;
 
     #[rstest::rstest]
     #[case::dense(false, false)]

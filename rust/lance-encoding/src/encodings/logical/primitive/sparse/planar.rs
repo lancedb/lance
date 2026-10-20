@@ -1153,6 +1153,8 @@ mod tests {
     use super::*;
     use crate::testing::{TestEncoding, test_compression_strategy};
     use arrow_array::{FixedSizeBinaryArray, Int32Array, StringArray};
+    use arrow_schema::Field as ArrowField;
+    use std::collections::HashMap;
     use std::sync::Mutex;
 
     #[derive(Debug)]
