@@ -1610,11 +1610,12 @@ impl PrimitiveStructuralEncoder {
         let max_encoded_size = (data_size as f64 * threshold_ratio) as u64;
         let max_encoded_size = usize::try_from(max_encoded_size).ok()?;
 
-        let max_dict_bytes: usize = field
-            .metadata
-            .get(DICT_MAX_SIZE_META_KEY)
-            .and_then(|val| val.parse().ok())
-            .unwrap_or(DEFAULT_DICT_MAX_SIZE_BYTES);
+        let max_dict_bytes: usize = match field.metadata.get(DICT_MAX_SIZE_META_KEY) {
+            Some(val) => val.parse().unwrap_or_else(|_| {
+                panic!("Invalid parameter: dict-max-size is {val} which is not a byte count")
+            }),
+            None => DEFAULT_DICT_MAX_SIZE_BYTES,
+        };
 
         // A repeated sample can come from either a small dictionary or a high-cardinality
         // page with short runs. Its unique ratio cannot be extrapolated to the whole page.

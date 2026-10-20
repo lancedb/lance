@@ -719,6 +719,19 @@ async fn test_encode_skips_dictionary_above_max_dict_size() {
     );
 }
 
+#[tokio::test]
+#[should_panic(expected = "dict-max-size is 8MiB")]
+async fn test_encode_rejects_unparsable_max_dict_size() {
+    use crate::constants::DICT_MAX_SIZE_META_KEY;
+
+    let array = Arc::new(StringArray::from_iter_values(
+        (0..2000).map(|i| format!("{:064}", i % 500)),
+    )) as ArrayRef;
+    let metadata = HashMap::from([(DICT_MAX_SIZE_META_KEY.to_string(), "8MiB".to_string())]);
+    let field = arrow_schema::Field::new("test", DataType::Utf8, false).with_metadata(metadata);
+    encode_first_page(field, array, TestEncoding::StructuralU32).await;
+}
+
 #[test]
 fn test_block_sampling_detects_low_cardinality_in_short_sorted_runs() {
     let sample_count: usize = 4096;

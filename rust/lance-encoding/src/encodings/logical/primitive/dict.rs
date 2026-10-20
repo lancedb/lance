@@ -224,10 +224,10 @@ where
                 if curr_idx == i32::MAX {
                     return None;
                 }
-                dictionary_buffer.extend_from_slice(key);
-                if dictionary_buffer.len() > max_dict_bytes {
+                if dictionary_buffer.len() + key.len() > max_dict_bytes {
                     return None;
                 }
+                dictionary_buffer.extend_from_slice(key);
                 let dict_offset = T::from_usize(dictionary_buffer.len())?;
                 dictionary_offsets_buffer.push(dict_offset);
                 let idx = curr_idx;
