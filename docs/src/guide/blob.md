@@ -90,17 +90,19 @@ to enable new Blob v2 writes.
 
 ### Managed objects and client compatibility
 
-Writers store out-of-line Blob v2 payloads in independently named
-`_blobs/<uuid>.blob` objects and publish the Managed Blob reader and writer
-capability on the table. This works with file formats 2.2 and 2.3; it does not
-require choosing 2.3. Clients that do not understand the capability must refuse
-to open a flagged snapshot. Updating an existing table with Blob data files can
-activate it, even if that batch contains only inline values. The capability
-remains set across later writes and restores.
+Set schema metadata `lance.blob.managed` to `"true"` to store out-of-line Blob v2
+payloads in independently named `_blobs/<uuid>.blob` objects. Without this
+opt-in, writes and compaction keep Inline/Packed/Dedicated placement. This works
+with file formats 2.2 and 2.3; it does not require choosing 2.3.
 
-Compaction preserves Managed payload objects and can adopt existing Packed or
-Dedicated sidecars in place. For example, compaction can replace `data/A.lance`
-with `data/B.lance` while B's Managed descriptor records the base and path of
+Committing the opt-in immediately publishes the Managed Blob reader and writer
+capability, even without new blob files. Clients that do not understand the
+capability must refuse to open a flagged snapshot. The capability remains set
+across later writes and restores, including after removing the opt-in.
+
+With the opt-in, compaction preserves Managed payload objects and can adopt
+existing Packed or Dedicated sidecars in place. For example, it can replace
+`data/A.lance` with `data/B.lance` while B's Managed descriptor records the base and path of
 the existing `data/A/0001.blob`. Cleanup can then delete `data/A.lance` without
 copying or deleting the blob that B still references. The blob's path may retain
 A's name, but resolving and retaining the blob no longer requires A's data file.
@@ -140,7 +142,10 @@ For example, write one payload and append two references to the same bytes:
 import lance
 import pyarrow as pa
 
-schema = pa.schema([lance.blob_field("blob", inline_size_threshold=0)])
+schema = pa.schema(
+    [lance.blob_field("blob", inline_size_threshold=0)],
+    metadata={"lance.blob.managed": "true"},
+)
 ds = lance.write_dataset(
     pa.Table.from_arrays([lance.blob_array([b"shared"])], schema=schema),
     "./shared_blobs.lance",
