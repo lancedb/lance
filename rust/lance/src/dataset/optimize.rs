@@ -7036,8 +7036,8 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(error, Error::NotSupported { .. }), "{error}");
-        assert!(error.to_string().contains("fragment reuse"), "{error}");
-        assert!(error.to_string().contains("not fully drained"), "{error}");
+        assert!(error.to_string().contains("defer_index_remap"), "{error}");
+        assert!(error.to_string().contains("optimize_indices"), "{error}");
 
         // Catch the btree up to the FRI's moves (a segment merge, not a
         // rescan), then trim the now-caught-up version: this lets eager
