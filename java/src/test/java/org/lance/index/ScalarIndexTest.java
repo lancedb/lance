@@ -18,9 +18,12 @@ import org.lance.Fragment;
 import org.lance.LockManager;
 import org.lance.TestUtils;
 import org.lance.WriteParams;
+import org.lance.index.scalar.InvertedIndexParams;
+import org.lance.index.scalar.MinHashLshIndexParams;
 import org.lance.index.scalar.ScalarIndexParams;
 import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;
+import org.lance.util.JsonUtils;
 
 import org.apache.arrow.c.ArrowArrayStream;
 import org.apache.arrow.c.Data;
@@ -767,6 +770,63 @@ public class ScalarIndexTest {
   }
 
   @Test
+  @SuppressWarnings("unchecked")
+  public void testCreateMinHashLshIndexSegments(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("minhash_segments").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      testDataset.write(1, 10).close();
+      try (Dataset dataset = testDataset.write(2, 10)) {
+        ScalarIndexParams minhashParams =
+            MinHashLshIndexParams.builder()
+                .numHashes(64)
+                .numBands(16)
+                .shingleSize(2)
+                .tokenizer(
+                    InvertedIndexParams.builder().baseTokenizer("whitespace").withPosition(true))
+                .build();
+        // Only tokenizer settings are taken from the FTS builder.
+        Map<String, Object> tokenizerJson =
+            (Map<String, Object>)
+                JsonUtils.fromJson(minhashParams.getJsonParams().get()).get("tokenizer");
+        assertFalse(tokenizerJson.containsKey("with_position"));
+
+        IndexParams indexParams = IndexParams.builder().setScalarIndexParams(minhashParams).build();
+        List<Index> segments = new ArrayList<>();
+        for (Fragment fragment : dataset.getFragments()) {
+          segments.add(
+              dataset.createIndex(
+                  IndexOptions.builder(
+                          Collections.singletonList("name"), IndexType.MINHASH_LSH, indexParams)
+                      .withIndexName("name_minhash")
+                      .withFragmentIds(Collections.singletonList(fragment.getId()))
+                      .build()));
+        }
+        Index merged = dataset.mergeExistingIndexSegments(segments);
+        List<Index> committed =
+            dataset.commitExistingIndexSegments(
+                "name_minhash", "name", Collections.singletonList(merged));
+        assertEquals(IndexType.MINHASH_LSH, segments.get(0).indexType());
+        assertEquals(IndexType.MINHASH_LSH, committed.get(0).indexType());
+
+        // The parameters and the tokenizer reach the Rust index.
+        Map<String, Object> stats =
+            ((List<Map<String, Object>>) dataset.getIndexStatistics("name_minhash").get("indices"))
+                .get(0);
+        assertEquals(64, ((Number) stats.get("num_hashes")).intValue());
+        assertEquals(20, ((Number) stats.get("num_docs")).intValue());
+        String detailsJson = dataset.describeIndices().get(0).getDetailsJson();
+        assertEquals(
+            "whitespace",
+            ((Map<String, Object>) JsonUtils.fromJson(detailsJson).get("tokenizer"))
+                .get("base_tokenizer"));
+      }
+    }
+  }
+
+  @Test
   public void testCountIndexedRowsSelectsPhysicalSegments(@TempDir Path tempDir) throws Exception {
     assertPhysicalSegmentSelection(tempDir.resolve("segments"), false);
   }
@@ -1086,13 +1146,13 @@ public class ScalarIndexTest {
                   dataset.newScan(
                       new ScanOptions.Builder()
                           .fragmentIds(Collections.singletonList(fragment.getId()))
-                          .withRowId(true)
+                          .withRowAddress(true)
                           .columns(Collections.singletonList("id"))
                           .build());
               ArrowReader arrowReader = scanner.scanBatches(); ) {
             while (arrowReader.loadNextBatch()) {
               VectorSchemaRoot root = arrowReader.getVectorSchemaRoot();
-              UInt8Vector rowIdVec = (UInt8Vector) root.getVector("_rowid");
+              UInt8Vector rowIdVec = (UInt8Vector) root.getVector("_rowaddr");
               IntVector idVec = (IntVector) root.getVector("id");
               for (int i = 0; i < root.getRowCount(); i++) {
                 data.add(new long[] {idVec.get(i), rowIdVec.get(i)});
@@ -1126,12 +1186,12 @@ public class ScalarIndexTest {
         new Schema(
             Arrays.asList(
                 Field.nullable("value", new ArrowType.Int(32, true)),
-                Field.nullable("_rowid", new ArrowType.Int(64, false))),
+                Field.nullable("_rowaddr", new ArrowType.Int(64, false))),
             null);
     try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
       root.allocateNew();
       IntVector idVec = (IntVector) root.getVector("value");
-      UInt8Vector rowIdVec = (UInt8Vector) root.getVector("_rowid");
+      UInt8Vector rowIdVec = (UInt8Vector) root.getVector("_rowaddr");
       for (int i = 0; i < preprocessedData.size(); i++) {
         long[] dataPair = preprocessedData.get(i);
         idVec.setSafe(i, (int) dataPair[0]);
