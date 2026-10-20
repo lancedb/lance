@@ -63,6 +63,7 @@ use lance_table::{
 use object_store::ObjectMeta;
 use object_store::path::Path;
 use prost::Message;
+use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
 use std::{
     collections::{HashMap, HashSet},
@@ -73,6 +74,11 @@ use std::{
 use tokio::sync::OnceCell;
 use tokio::time::{MissedTickBehavior, interval};
 use tracing::{Span, debug, info, instrument, warn};
+
+mod distributed;
+mod shard;
+
+pub use distributed::{CleanupPlan, CleanupSweepResult, CleanupSweepTask, SweepOptions};
 
 #[derive(Clone, Debug, Default)]
 struct ReferencedFiles {
@@ -87,7 +93,7 @@ struct ReferencedFiles {
     frag_reuse_map_ids: HashSet<String>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemovalStats {
     pub bytes_removed: u64,
     pub old_versions: u64,
@@ -124,7 +130,7 @@ pub struct CleanupExplanation {
 }
 
 /// A file that cleanup identified as removable.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CleanupCandidateFile {
     /// Dataset-relative or storage path for the candidate file.
     pub path: String,
@@ -148,7 +154,7 @@ pub struct CleanupReferencedBranch {
     pub cleanup_candidate: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CleanupFileKind {
     Manifest,
     Data,
@@ -400,28 +406,47 @@ impl CleanupInspection {
 }
 
 /// A Lance-managed directory that cleanup lists for unreferenced files.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CleanupSubtree {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CleanupSubtree {
+    /// `_versions/`: leftover temporary manifests.
     Versions,
+    /// `_transactions/`: transaction files.
     Transactions,
+    /// `data/`: data files and their blob v2 sidecars.
     Data,
+    /// `_blobs/`: managed blob files.
     Blobs,
+    /// `_indices/`: index files, grouped by index UUID.
     Indices,
+    /// `_deletions/`: deletion files.
     Deletions,
+    /// `_fri/`: fragment reuse row maps, grouped by map id.
     FragReuse,
 }
 
 impl CleanupSubtree {
-    fn dir(self, dataset: &Dataset) -> Path {
+    /// The directory name, relative to the dataset root.
+    pub fn relative_dir(self) -> &'static str {
         match self {
-            Self::Versions => dataset.versions_dir(),
-            Self::Transactions => dataset.transactions_dir(),
-            Self::Data => dataset.data_dir(),
-            Self::Blobs => dataset.base.clone().join("_blobs"),
-            Self::Indices => dataset.indices_dir(),
-            Self::Deletions => dataset.deletions_dir(),
-            Self::FragReuse => dataset.base.clone().join("_fri"),
+            Self::Versions => lance_table::io::commit::VERSIONS_DIR,
+            Self::Transactions => TRANSACTIONS_DIR,
+            Self::Data => crate::dataset::DATA_DIR,
+            Self::Blobs => "_blobs",
+            Self::Indices => crate::dataset::INDICES_DIR,
+            Self::Deletions => lance_table::io::deletion::DELETIONS_DIR,
+            Self::FragReuse => "_fri",
         }
+    }
+
+    fn dir(self, dataset: &Dataset) -> Path {
+        dataset.base.clone().join(self.relative_dir())
+    }
+}
+
+impl std::fmt::Display for CleanupSubtree {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.relative_dir())
     }
 }
 
@@ -703,11 +728,7 @@ impl<'a> CleanupTask<'a> {
         // Tags on other branches would take effect in retain_branch_lineage_files
         let tagged_versions: HashSet<u64> = tags
             .values()
-            .filter(|tag| match (tag.branch.as_ref(), current_branch.as_ref()) {
-                (Some(branch_of_tag), Some(current_branch)) => branch_of_tag == current_branch,
-                (None, None) => true,
-                _ => false,
-            })
+            .filter(|tag| tag_is_on_branch(tag, current_branch.as_ref()))
             .map(|tag_content| tag_content.version)
             .collect();
 
@@ -1122,7 +1143,7 @@ impl<'a> CleanupTask<'a> {
             .listings(self.policy.delete_unverified)
             .into_iter()
             .map(|(subtree, unmodified_since)| {
-                self.list_subtree(subtree, unmodified_since, &evidence)
+                self.list_subtree(subtree, None, None, unmodified_since, &evidence)
             })
             .collect::<Vec<_>>();
         let unreferenced_files = stream::iter(streams).flatten().boxed();
@@ -1179,14 +1200,23 @@ impl<'a> CleanupTask<'a> {
     fn list_subtree<'b>(
         &'b self,
         subtree: CleanupSubtree,
+        start_after: Option<&Path>,
+        end_inclusive: Option<&Path>,
         unmodified_since: Option<DateTime<Utc>>,
         evidence: &'b SweepEvidence,
     ) -> BoxStream<'b, Result<CleanupFile>> {
         let verification_threshold = evidence.verification_threshold;
         let dir = subtree.dir(self.dataset);
-        self.dataset
-            .object_store
-            .read_dir_all(&dir, unmodified_since)
+        let listing = if start_after.is_none() && end_inclusive.is_none() {
+            self.dataset
+                .object_store
+                .read_dir_all(&dir, unmodified_since)
+        } else {
+            self.dataset
+                .object_store
+                .list_range(&dir, start_after, end_inclusive, unmodified_since)
+        };
+        listing
             .map_ok(|obj| stream::once(future::ready(Ok(obj))).boxed())
             .or_else(|e| {
                 // If the directory doesn't exist then we can just return an empty stream.
@@ -2535,6 +2565,14 @@ async fn build_cleanup_operation<'a>(
     Ok(Some(operation))
 }
 
+fn tag_is_on_branch(tag: &TagContents, branch: Option<&String>) -> bool {
+    match (tag.branch.as_ref(), branch) {
+        (Some(branch_of_tag), Some(branch)) => branch_of_tag == branch,
+        (None, None) => true,
+        _ => false,
+    }
+}
+
 fn tagged_old_versions_cleanup_error(
     tags: &HashMap<String, TagContents>,
     tagged_old_versions: &HashSet<u64>,
@@ -2736,9 +2774,9 @@ mod tests {
     }
 
     #[derive(Debug)]
-    struct MockObjectStore {
+    pub(super) struct MockObjectStore {
         delete_latency: Duration,
-        policy: Arc<Mutex<ProxyObjectStorePolicy>>,
+        pub(super) policy: Arc<Mutex<ProxyObjectStorePolicy>>,
         last_modified_times: Arc<Mutex<HashMap<Path, DateTime<Utc>>>>,
     }
 
@@ -2809,25 +2847,25 @@ mod tests {
     }
 
     #[derive(Debug, PartialEq, Clone, Copy)]
-    struct FileCounts {
+    pub(super) struct FileCounts {
         num_data_files: usize,
-        num_manifest_files: usize,
+        pub(super) num_manifest_files: usize,
         num_index_files: usize,
         num_delete_files: usize,
         num_tx_files: usize,
         num_bytes: u64,
     }
 
-    struct MockDatasetFixture {
+    pub(super) struct MockDatasetFixture {
         // This is a temporary directory that will be deleted when the fixture
         // is dropped
         tmpdir: TempStrDir,
-        dataset_path: String,
-        mock_store: Arc<MockObjectStore>,
+        pub(super) dataset_path: String,
+        pub(super) mock_store: Arc<MockObjectStore>,
     }
 
     impl MockDatasetFixture {
-        fn try_new() -> Result<Self> {
+        pub(super) fn try_new() -> Result<Self> {
             let tmpdir = TempStrDir::default();
             let tmpdir_path = tmpdir.as_str();
             // Use file-object-store:// scheme so that writes go through the ObjectStore
@@ -2854,7 +2892,7 @@ mod tests {
                 .join(uuid.to_string())
         }
 
-        fn os_params(&self) -> ObjectStoreParams {
+        pub(super) fn os_params(&self) -> ObjectStoreParams {
             ObjectStoreParams {
                 object_store_wrapper: Some(self.mock_store.clone()),
                 ..Default::default()
@@ -2885,7 +2923,7 @@ mod tests {
             Ok(())
         }
 
-        async fn create_some_data(&self) -> Result<()> {
+        pub(super) async fn create_some_data(&self) -> Result<()> {
             self.write_some_data_impl(WriteMode::Create).await
         }
 
@@ -2907,11 +2945,11 @@ mod tests {
             Ok(())
         }
 
-        async fn overwrite_some_data(&self) -> Result<()> {
+        pub(super) async fn overwrite_some_data(&self) -> Result<()> {
             self.write_some_data_impl(WriteMode::Overwrite).await
         }
 
-        async fn append_some_data(&self) -> Result<()> {
+        pub(super) async fn append_some_data(&self) -> Result<()> {
             self.write_some_data_impl(WriteMode::Append).await
         }
 
@@ -2933,13 +2971,13 @@ mod tests {
             self.write_data_impl(data, WriteMode::Overwrite).await
         }
 
-        async fn delete_data(&self, predicate: &str) -> Result<()> {
+        pub(super) async fn delete_data(&self, predicate: &str) -> Result<()> {
             let mut db = self.open().await?;
             db.delete(predicate).await?;
             Ok(())
         }
 
-        async fn create_some_index(&self) -> Result<()> {
+        pub(super) async fn create_some_index(&self) -> Result<()> {
             let mut db = self.open().await?;
             let index_params = Box::new(VectorIndexParams::ivf_pq(2, 8, 2, MetricType::L2, 5));
             db.create_index(
@@ -2966,7 +3004,7 @@ mod tests {
             );
         }
 
-        fn block_delete_manifest(&mut self) {
+        pub(super) fn block_delete_manifest(&mut self) {
             let mut policy = self.mock_store.policy.lock().unwrap();
             policy.set_before_policy(
                 "block_delete_manifest",
@@ -2980,7 +3018,7 @@ mod tests {
             );
         }
 
-        fn unblock_delete_manifest(&mut self) {
+        pub(super) fn unblock_delete_manifest(&mut self) {
             let mut policy = self.mock_store.policy.lock().unwrap();
             policy.clear_before_policy("block_delete_manifest");
         }
@@ -3019,7 +3057,7 @@ mod tests {
             .await
         }
 
-        async fn open(&self) -> Result<Box<Dataset>> {
+        pub(super) async fn open(&self) -> Result<Box<Dataset>> {
             let ds = DatasetBuilder::from_uri(&self.dataset_path)
                 .with_read_params(ReadParams {
                     store_options: Some(self.os_params()),
@@ -3047,7 +3085,7 @@ mod tests {
         }
 
         // Helper to create a branch and load it as a Dataset.
-        async fn create_branch_and_load<V: Into<crate::dataset::refs::Ref>>(
+        pub(super) async fn create_branch_and_load<V: Into<crate::dataset::refs::Ref>>(
             &self,
             from_dataset: &mut Dataset,
             branch_name: &str,
@@ -3059,7 +3097,7 @@ mod tests {
             self.load_dataset(&branch_ds.uri).await
         }
 
-        async fn count_files(&self) -> Result<FileCounts> {
+        pub(super) async fn count_files(&self) -> Result<FileCounts> {
             let registry = Arc::new(ObjectStoreRegistry::default());
             let (os, path) =
                 ObjectStore::from_uri_and_params(registry, &self.dataset_path, &self.os_params())
@@ -3109,7 +3147,7 @@ mod tests {
         }
     }
 
-    async fn write_dummy_index_artifact(dataset: &Dataset, uuid: Uuid) -> Result<()> {
+    pub(super) async fn write_dummy_index_artifact(dataset: &Dataset, uuid: Uuid) -> Result<()> {
         let index_dir = dataset.indices_dir().join(uuid.to_string());
         dataset
             .object_store
@@ -3167,7 +3205,7 @@ mod tests {
         }
     }
 
-    fn blob_v2_batch(blob_len: usize) -> Box<dyn RecordBatchReader + Send> {
+    pub(super) fn blob_v2_batch(blob_len: usize) -> Box<dyn RecordBatchReader + Send> {
         let mut blobs = BlobArrayBuilder::new(1);
         blobs.push_bytes(vec![0u8; blob_len]).unwrap();
 
@@ -3190,7 +3228,7 @@ mod tests {
 
     // Tiny dedicated objects make individual row retention observable without
     // large payloads or partially live packed objects masking a missing reference.
-    fn managed_blob_batch() -> RecordBatch {
+    pub(super) fn managed_blob_batch() -> RecordBatch {
         let mut blobs = BlobArrayBuilder::new(2);
         blobs.push_bytes(b"first").unwrap();
         blobs.push_bytes(b"second").unwrap();
@@ -6966,8 +7004,8 @@ mod tests {
 
     /// `(path, size, identity)` per version.
     #[derive(Debug, Default)]
-    struct IdentifiedStore {
-        rows: Mutex<HashMap<u64, (String, u64, String)>>,
+    pub(super) struct IdentifiedStore {
+        pub(super) rows: Mutex<HashMap<u64, (String, u64, String)>>,
         next_identity: std::sync::atomic::AtomicU64,
     }
 
