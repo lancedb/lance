@@ -2351,11 +2351,13 @@ class LanceDataset(pa.dataset.Dataset):
             Or a dictionary of column names to SQL expressions.
             All columns are fetched if None or unspecified.
         ignore_deletions: bool, default False
-            Take the rows as if the dataset had no deletions. No deletion file
-            is read, which on a table with many fragments saves one request per
-            fragment, but a deleted row comes back with its stored values. Only
-            for row ids known to be live, for example ids read from an index
-            built after the last deletion.
+            Take the rows as if the dataset had no deletions. Deletion files
+            are read only where a row id could name more than one physical
+            copy (fragments whose id spans overlap, as after an update), which
+            on a table with many fragments saves one request per fragment, but
+            a deleted row comes back with its stored values. Only for row ids
+            known to be live, for example ids read from an index built after
+            the last deletion.
         **kwargs : dict, optional
             See scanner() method for full parameter description.
 

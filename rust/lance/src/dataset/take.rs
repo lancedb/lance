@@ -520,11 +520,13 @@ impl TakeBuilder {
 
     /// Takes the rows as if the dataset had no deletions.
     ///
-    /// No deletion file is read, neither to resolve row ids nor to filter the
-    /// rows, so on a table with many fragments the take saves one request per
-    /// fragment. A deleted row comes back with its stored values, so this is
-    /// only for a caller that knows its rows are live, for example row ids from
-    /// an index built after the last deletion.
+    /// Deletion files are read only where a row id could name more than one
+    /// physical copy (fragments whose id spans overlap, as after an update),
+    /// neither to filter the rows nor for the other fragments, so on a table
+    /// with many fragments the take saves one request per fragment. A deleted
+    /// row comes back with its stored values, so this is only for a caller
+    /// that knows its rows are live, for example row ids from an index built
+    /// after the last deletion.
     pub fn with_ignore_deletions(mut self, ignore_deletions: bool) -> Self {
         self.ignore_deletions = ignore_deletions;
         self
@@ -1609,6 +1611,47 @@ mod test {
             .unwrap(),
             result
         );
+    }
+
+    /// An update keeps the old copy of a row under a deletion vector and writes
+    /// its id again in a new fragment. Ignoring deletions must still resolve
+    /// the id to the live copy, which takes that fragment's deletion vector.
+    #[tokio::test]
+    async fn test_take_rows_ignore_deletions_after_update() {
+        let data = test_batch(0..8);
+        let write_params = WriteParams {
+            enable_stable_row_ids: true,
+            ..Default::default()
+        };
+        let batches = RecordBatchIterator::new([Ok(data.clone())], data.schema());
+        let dataset = Dataset::write(batches, "memory://", Some(write_params))
+            .await
+            .unwrap();
+        let dataset = UpdateBuilder::new(Arc::new(dataset))
+            .update_where("i = 1")
+            .unwrap()
+            .set("s", "'updated'")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap()
+            .new_dataset;
+
+        let checked = dataset
+            .take_rows(&[1, 2], dataset.schema().clone())
+            .await
+            .unwrap();
+        assert_eq!(checked["s"].as_string::<i32>().value(0), "updated");
+        let ignored = dataset
+            .take_builder(&[1, 2], dataset.schema().clone())
+            .unwrap()
+            .with_ignore_deletions(true)
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(ignored, checked);
     }
 
     /// Ignoring deletions resolves and reads the rows without touching a

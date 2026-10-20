@@ -408,11 +408,40 @@ pub(crate) async fn load_row_id_index_for_fragments(
     // its argument trips the higher-ranked lifetime check on the outer future.
     let mut loads = Vec::with_capacity(fragments.len());
     for fragment in fragments.iter() {
-        loads.push(read_fragment_row_id_index(
-            dataset,
-            fragment,
-            with_deletions,
-        ));
+        loads.push(read_row_id_sequence(dataset, fragment).map_ok(Arc::new));
+    }
+    let sequences: Vec<Arc<RowIdSequence>> = futures::stream::iter(loads)
+        .buffered(dataset.object_store.io_parallelism())
+        .try_collect()
+        .await?;
+
+    // Without deletions the index must still tell the copies of a row apart:
+    // an update keeps the old copy under a deletion vector and writes the id
+    // again elsewhere. Only fragments whose id spans overlap can hold such
+    // copies, so only they need their deletion vector.
+    let needs_deletions = if with_deletions {
+        vec![true; fragments.len()]
+    } else {
+        overlapping_id_spans(&sequences)
+    };
+
+    let mut loads = Vec::with_capacity(fragments.len());
+    for ((fragment, row_id_sequence), needs_deletions) in
+        fragments.iter().zip(sequences).zip(needs_deletions)
+    {
+        loads.push(async move {
+            let deletion_vector = match &fragment.deletion_file {
+                Some(deletion_file) if needs_deletions => {
+                    read_dataset_deletion_file(dataset, fragment.id, deletion_file).await?
+                }
+                _ => Arc::new(DeletionVector::default()),
+            };
+            Ok::<_, Error>(FragmentRowIdIndex {
+                fragment_id: fragment.id as u32,
+                row_id_sequence,
+                deletion_vector,
+            })
+        });
     }
     let fragment_indices: Vec<FragmentRowIdIndex> = futures::stream::iter(loads)
         .buffer_unordered(dataset.object_store.io_parallelism())
@@ -421,23 +450,32 @@ pub(crate) async fn load_row_id_index_for_fragments(
     RowIdIndex::new(&fragment_indices)
 }
 
-async fn read_fragment_row_id_index(
-    dataset: &Dataset,
-    fragment: &Fragment,
-    with_deletions: bool,
-) -> Result<FragmentRowIdIndex> {
-    let row_id_sequence = Arc::new(read_row_id_sequence(dataset, fragment).await?);
-    let deletion_vector = match &fragment.deletion_file {
-        Some(deletion_file) if with_deletions => {
-            read_dataset_deletion_file(dataset, fragment.id, deletion_file).await?
+/// For each sequence, whether its span of ids (lowest to highest) intersects
+/// another sequence's span. An empty sequence overlaps nothing.
+fn overlapping_id_spans(sequences: &[Arc<RowIdSequence>]) -> Vec<bool> {
+    let mut spans: Vec<(u64, u64, usize)> = sequences
+        .iter()
+        .enumerate()
+        .filter_map(|(index, sequence)| {
+            let span = sequence.row_id_range()?;
+            Some((*span.start(), *span.end(), index))
+        })
+        .collect();
+    spans.sort_unstable();
+    let mut overlapping = vec![false; sequences.len()];
+    let mut reach: Option<(u64, usize)> = None;
+    for &(start, end, index) in &spans {
+        if let Some((reach_end, reach_index)) = reach
+            && start <= reach_end
+        {
+            overlapping[index] = true;
+            overlapping[reach_index] = true;
         }
-        _ => Arc::new(DeletionVector::default()),
-    };
-    Ok(FragmentRowIdIndex {
-        fragment_id: fragment.id as u32,
-        row_id_sequence,
-        deletion_vector,
-    })
+        if reach.is_none_or(|(reach_end, _)| end > reach_end) {
+            reach = Some((end, index));
+        }
+    }
+    overlapping
 }
 
 #[cfg(test)]
