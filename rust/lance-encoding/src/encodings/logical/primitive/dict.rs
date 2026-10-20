@@ -520,6 +520,7 @@ mod tests {
         }
         let indices = indices
             .as_fixed_width_ref()
+            .unwrap()
             .data
             .borrow_to_typed_slice::<u32>();
         for (i, index) in indices.iter().enumerate() {
