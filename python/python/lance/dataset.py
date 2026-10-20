@@ -3577,11 +3577,12 @@ class LanceDataset(pa.dataset.Dataset):
                 "BLOOMFILTER",
                 "RTREE",
                 "MINHASHLSH",
+                "FM",
             ]:
                 raise NotImplementedError(
                     (
                         'Only "BTREE", "BITMAP", "NGRAM", "ZONEMAP", "LABEL_LIST", '
-                        '"INVERTED", "BLOOMFILTER", "RTREE" or "MINHASHLSH" are '
+                        '"INVERTED", "BLOOMFILTER", "RTREE", "MINHASHLSH" or "FM" are '
                         f"supported for scalar columns.  Received {index_type}",
                     )
                 )
@@ -3685,6 +3686,7 @@ class LanceDataset(pa.dataset.Dataset):
             "BLOOMFILTER",
             "LABEL_LIST",
             "MINHASHLSH",
+            "FM",
         }
 
     @classmethod
@@ -3701,6 +3703,7 @@ class LanceDataset(pa.dataset.Dataset):
             "BLOOMFILTER",
             "LABEL_LIST",
             "MINHASHLSH",
+            "FM",
         }
 
     def create_scalar_index(
@@ -3717,6 +3720,7 @@ class LanceDataset(pa.dataset.Dataset):
             Literal["BLOOMFILTER"],
             Literal["RTREE"],
             Literal["MINHASHLSH"],
+            Literal["FM"],
             IndexConfig,
         ],
         name: Optional[str] = None,
@@ -3793,6 +3797,8 @@ class LanceDataset(pa.dataset.Dataset):
         * ``BLOOMFILTER``. This inexact index uses a bloom filter.  It is small
              but can only handle filters with equals and not equals and may require
              more I/O than a btree or bitmap index```
+        * ``FM``. An FM-index for substring search. It answers ``contains``
+          filters exactly, including single-character patterns.
 
         Index training sorts can spill to disk under memory pressure.
         ``LANCE_MEM_POOL_SIZE`` configures this pool in bytes; it is not a limit
@@ -3821,7 +3827,7 @@ class LanceDataset(pa.dataset.Dataset):
         index_type : str
             The type of the index.  One of ``"BTREE"``, ``"BITMAP"``,
             ``"LABEL_LIST"``, ``"NGRAM"``, ``"ZONEMAP"``, ``"INVERTED"``,
-            ``"FTS"``, ``"BLOOMFILTER"``, ``"RTREE"``, ``"MINHASHLSH"``.
+            ``"FTS"``, ``"BLOOMFILTER"``, ``"RTREE"``, ``"MINHASHLSH"``, ``"FM"``.
         name : str, optional
             The index name. If not provided, it will be generated from the
             column name.
@@ -3853,6 +3859,12 @@ class LanceDataset(pa.dataset.Dataset):
             If unset, Lance uses ``LANCE_FTS_FORMAT_VERSION`` when present and
             otherwise writes v2 for text analysis with ``block_size=128`` and
             v3 for code analysis or ``block_size=256``.
+
+        num_segments: int, optional
+            This is for ``index_type="FM"``. Split the fragments, in order, into
+            at most this many segments, each an independent FM-index. There are
+            never more segments than fragments. ``create_index_uncommitted``
+            ignores it and always writes one segment.
 
         document_granularity: DocumentGranularity, default ROW
             This is for the ``INVERTED`` / ``FTS`` index. ``ROW`` treats all
@@ -4708,8 +4720,8 @@ class LanceDataset(pa.dataset.Dataset):
 
         This is the public distributed-build API for vector, BTREE scalar,
         canonical bitmap scalar, INVERTED scalar, NGRAM scalar, RTREE scalar,
-        ZONEMAP scalar, BLOOMFILTER scalar, LABEL_LIST scalar, and MINHASHLSH
-        scalar index construction.
+        ZONEMAP scalar, BLOOMFILTER scalar, LABEL_LIST scalar, MINHASHLSH
+        scalar, and FM scalar index construction.
         Unlike :meth:`create_index`, this method does not publish the index into
         the dataset manifest. Instead, it writes one segment under
         ``_indices/<segment_uuid>/`` and returns the resulting
@@ -4726,7 +4738,7 @@ class LanceDataset(pa.dataset.Dataset):
            :meth:`commit_existing_index_segments`
 
         BTREE, BITMAP, INVERTED, NGRAM, RTREE, ZONEMAP, BLOOMFILTER,
-        LABEL_LIST, and MINHASHLSH segments may be merged with
+        LABEL_LIST, MINHASHLSH, and FM segments may be merged with
         :meth:`merge_existing_index_segments` before commit. MINHASHLSH
         segments of one index must share parameters. NGRAM segments
         built before a deferred compaction must be merged before commit so
