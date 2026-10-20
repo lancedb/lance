@@ -171,9 +171,11 @@ fn collect_leaves(query: &FtsQuery, leaves: &mut Vec<FtsQuery>) {
 mod tests {
     use super::*;
     use crate::Dataset;
+    use crate::dataset::scanner::ColumnOrdering;
     use crate::dataset::{WriteMode, WriteParams};
     use crate::index::DatasetIndexExt;
     use arrow_array::{Array, RecordBatch, RecordBatchIterator, cast::AsArray, record_batch};
+    use datafusion::common::tree_node::TreeNode;
     use datafusion::datasource::memory::MemorySourceConfig;
     use datafusion::physical_plan::projection::ProjectionExec;
     use datafusion_physical_expr::expressions::col;
@@ -242,10 +244,15 @@ mod tests {
     }
 
     #[rstest]
-    #[case::flat(false)]
-    #[case::indexed(true)]
+    #[case::flat(false, false)]
+    #[case::indexed(true, false)]
+    #[case::flat_sorted(false, true)]
+    #[case::indexed_sorted(true, true)]
     #[tokio::test]
-    async fn query_shapes_preserve_results_and_hidden_projection(#[case] indexed: bool) {
+    async fn query_shapes_preserve_results_and_hidden_projection(
+        #[case] indexed: bool,
+        #[case] sorted: bool,
+    ) {
         let batch = record_batch!(
             ("id", Int32, [0, 1, 2, 3]),
             ("title", Utf8, ["beta", "none", "beta", "alpha"]),
@@ -321,6 +328,11 @@ mod tests {
                 .with_row_id()
                 .limit(Some(3), None)
                 .unwrap();
+            scan.target_parallelism(4).batch_size(1);
+            if sorted {
+                scan.order_by(Some(vec![ColumnOrdering::desc_nulls_first("id".into())]))
+                    .unwrap();
+            }
             if !indexed && requires_index {
                 let error = scan.try_into_batch().await.unwrap_err();
                 assert!(matches!(error, Error::InvalidInput { .. }));
@@ -330,6 +342,10 @@ mod tests {
             let baseline = scan.try_into_batch().await.unwrap();
             scan.with_highlight();
             let highlighted = scan.try_into_batch().await.unwrap();
+            if sorted {
+                let ids = highlighted["id"].as_primitive::<arrow_array::types::Int32Type>();
+                assert!(ids.values().windows(2).all(|pair| pair[0] >= pair[1]));
+            }
             assert_eq!(baseline.num_rows(), highlighted.num_rows());
             assert!(highlighted.column_by_name("body").is_none());
             for field in baseline.schema().fields() {
@@ -614,12 +630,17 @@ mod tests {
         let baseline = scan.try_into_batch().await.unwrap();
         let highlighted = scan.with_highlight().try_into_batch().await.unwrap();
         let plan = scan.create_plan().await.unwrap();
-        let projection = plan.downcast_ref::<ProjectionExec>().unwrap();
         assert!(
-            projection
-                .expr()
-                .iter()
-                .any(|expr| { expr.alias == HIGHLIGHTS_COL && expr.expr.is::<HighlightExpr>() })
+            plan.exists(|node| {
+                Ok(node
+                    .downcast_ref::<ProjectionExec>()
+                    .is_some_and(|projection| {
+                        projection.expr().iter().any(|expr| {
+                            expr.alias == HIGHLIGHTS_COL && expr.expr.is::<HighlightExpr>()
+                        })
+                    }))
+            })
+            .unwrap()
         );
         assert_eq!(highlighted.num_rows(), 1);
         assert_eq!(
