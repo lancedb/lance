@@ -298,7 +298,8 @@ variable-width integer encoding). Finally the value buffers themselves are appen
 | \*    | Value N data   |
 
 Note: a fixed-width data type that has no validity information (e.g. non-nullable vector embeddings) is simply a
-flat buffer of data.
+flat buffer of data, unless general compression makes its values variable-width (Lance 2.3, see
+[General](#general)).
 
 #### Repetition Index (Buffer 1)
 
@@ -545,7 +546,7 @@ on a per-value basis. We use ☑️ to mark a technique that is applied on a per
 | Bitpacking      | ✅ (2.1)              | ❓                       | ✅ (2.1)                   |
 | Fsst            | ❓                    | ✅ (2.1)                 | ✅ (2.1)                   |
 | Rle             | ✅ (2.2)              | ❌                       | ✅ (2.1)                   |
-| ByteStreamSplit | ❓                    | ❌                       | ✅ (2.1)                   |
+| ByteStreamSplit | ❓                    | ☑️ (2.3)                 | ✅ (2.1)                   |
 | General         | ✅ (2.2)              | ☑️ (2.1)                 | ✅ (2.1)                   |
 
 In the following sections we will describe each technique in a bit more detail and explain how it is utilized
@@ -713,6 +714,12 @@ only applied if general compression is also applied on the column.
 We currently determine whether or not to apply BSS by looking at an entropy statistics. There is a configurable
 sensitivity parameter. A sensitivity of 0.0 means never apply BSS and a sensitivity of 1.0 means always apply BSS.
 
+Starting with Lance 2.3, BSS can also be applied in a full zip context as part of per-value general compression
+(see [General](#general)). There it transposes the items within each value instead of values within a chunk: a
+value of `n` items that are `w` bytes wide is rewritten so that byte `j` of item `i` moves to position `j * n + i`.
+It is applied when the items are at least 2 bytes wide, the value holds more than one item, and the value carries
+no item validity bytes.
+
 ### General
 
 General compression is a catch-all term for classical opaque compression techniques such as LZ4, ZStandard, Snappy,
@@ -722,7 +729,20 @@ a spot where we already saw the value.
 When applied in a mini-block context we run general compression after all other compression and compress the entire
 mini-block.
 
-When applied in a full zip context we run general compression on each value.
+When applied in a full zip context we run general compression on each value. Lance 2.1 and 2.2 only do this for
+variable-width values, and `General.values` describes the variable-width values (`Variable`).
+
+Starting with Lance 2.3, fixed-width and fixed-size-list values in a full zip context are also compressed one value
+at a time when general compression is requested. Each value is first laid out exactly as it would be stored
+uncompressed: fixed-size-list layers are flattened and any item validity bytes precede the items. The value is then
+optionally byte stream split (see [Byte Stream Split](#byte-stream-split-bss)) and compressed on its own, so every
+value can still be decoded independently. The page uses the variable-width full zip layout (`bits_per_offset`) and
+`General.values` describes one uncompressed value as `Flat` or `FixedSizeList`, wrapped in `ByteStreamSplit` when
+the value was split. Like other variable-width full zip pages, these pages need the repetition index to locate a
+value. Null items have no payload. A compressed value is never empty: a zstd value is an 8-byte little-endian
+uncompressed length followed by a zstd frame and an LZ4 value is a 4-byte little-endian uncompressed length followed
+by an LZ4 block. If compression does not make a page smaller, the writer stores its values uncompressed with the
+fixed-width layout instead.
 
 The only time general compression is automatically applied is in a full-zip context when we have values that are at
 least 32KiB large. This is because general compression can be CPU intensive.
@@ -761,7 +781,8 @@ The `lance-encoding:compression` setting enables general-purpose compression alg
 
 General compression is applied on top of other encoding techniques (RLE, BSS, bitpacking, etc.) to further reduce
 data size. For mini-block layouts, compression is applied to entire mini-blocks. For full-zip layouts with large values
-(≥32KiB), compression is automatically applied per-value.
+(≥32KiB), compression is automatically applied per-value. In Lance 2.3, requesting a scheme also compresses full-zip
+fixed-width and fixed-size-list values (for example tensors and image chips) per value.
 
 #### Compression Level
 
@@ -809,6 +830,9 @@ BSS is a data transformation that makes floating-point data more compressible; i
 - `auto` mode: Uses entropy analysis with 0.5 sensitivity threshold
 - `on` mode: Always applies BSS for supported types
 - `off` mode: Never applies BSS
+- Full-zip fixed-width and fixed-size-list values (Lance 2.3): BSS is applied within each value for any item width of
+  2 bytes or more. `auto` and `on` both apply it whenever it is applicable, since splitting within one value rarely
+  hurts general compression; `off` disables it.
 
 BSS works by splitting multi-byte values by byte position, creating separate byte streams. This clusters similar
 bits together (especially mantissa bits in floating-point numbers), which general compression algorithms can then
