@@ -275,6 +275,10 @@ impl L2 for f16 {
         // it moves onto `Dispatch` batch candidates later in #10083, which
         // must keep the convert-the-query-once step.
         let backend = f16_backend();
+        #[cfg(all(feature = "fp16kernels", target_arch = "aarch64"))]
+        if backend == HalfBackend::Neon {
+            return l2_f16_batch_neon(x, batch, dimension, output);
+        }
         if backend == HalfBackend::Scalar {
             let x: Vec<f32> = x.iter().map(|v| v.to_f32()).collect();
             for (distance, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
@@ -285,6 +289,17 @@ impl L2 for f16 {
                 *distance = l2_f16_with(backend, x, y);
             }
         }
+    }
+}
+
+/// Out of line so the loop gets registers of its own: inlined into
+/// `l2_batch_into`, LLVM spilled the batch pointer to the stack, which put a
+/// store-to-load round trip on every dimension-8 distance.
+#[cfg(all(feature = "fp16kernels", target_arch = "aarch64"))]
+#[inline(never)]
+fn l2_f16_batch_neon(x: &[f16], batch: &[f16], dimension: usize, output: &mut [f32]) {
+    for (distance, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
+        *distance = l2_f16_with(HalfBackend::Neon, x, y);
     }
 }
 
