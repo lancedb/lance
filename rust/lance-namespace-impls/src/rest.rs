@@ -16,7 +16,8 @@ use tls::{ReloadableClient, TlsConfig};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use reqwest::header::{HeaderName, HeaderValue};
+use reqwest::Method;
+use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 
 use crate::context::{DynamicContextProvider, OperationInfo};
 
@@ -132,14 +133,18 @@ impl RestClient {
     /// Execute a request with dynamic headers applied.
     ///
     /// This method builds the request, applies headers, and executes it.
+    /// `request_headers` come from the operation request and win over the
+    /// configured headers.
     async fn execute(
         &self,
         req_builder: reqwest::RequestBuilder,
+        request_headers: HeaderMap,
         operation: &str,
         object_id: &str,
     ) -> std::result::Result<reqwest::Response, reqwest::Error> {
         let mut request = req_builder.build()?;
         self.apply_headers(&mut request, operation, object_id);
+        request.headers_mut().extend(request_headers);
         self.client().execute(request).await
     }
 
@@ -520,6 +525,75 @@ fn object_id_str(id: &Option<Vec<String>>, delimiter: &str) -> Result<String> {
     }
 }
 
+const ARROW_STREAM: &str = "application/vnd.apache.arrow.stream";
+
+/// The HTTP body of a request.
+enum Body {
+    Empty,
+    /// The operation request, as JSON.
+    Request,
+    Json(serde_json::Value),
+    Arrow(Bytes),
+}
+
+/// The headers the REST spec maps from a request: `identity` becomes
+/// `x-api-key` and a bearer `Authorization`, and each `header.<name>` context
+/// entry becomes a `<name>` header.
+fn request_headers(request: &serde_json::Value) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    let mut insert = |name: &str, value: &str| {
+        if let (Ok(name), Ok(value)) = (HeaderName::from_str(name), HeaderValue::from_str(value)) {
+            headers.insert(name, value);
+        }
+    };
+    if let Some(api_key) = request["identity"]["api_key"].as_str() {
+        insert("x-api-key", api_key);
+    }
+    if let Some(token) = request["identity"]["auth_token"].as_str() {
+        insert("authorization", &format!("Bearer {}", token));
+    }
+    for (key, value) in request["context"].as_object().into_iter().flatten() {
+        if let (Some(name), Some(value)) = (key.strip_prefix("header."), value.as_str()) {
+            insert(name, value);
+        }
+    }
+    headers
+}
+
+/// The context the REST spec maps from response headers: each header becomes
+/// a `header.<name>` entry.
+fn response_context(headers: &HeaderMap) -> HashMap<String, String> {
+    headers
+        .iter()
+        .filter_map(|(name, value)| Some((format!("header.{}", name), value.to_str().ok()?.into())))
+        .collect()
+}
+
+fn parse_error(e: serde_json::Error) -> Error {
+    NamespaceError::Internal {
+        message: format!("Failed to parse response: {:?}", e),
+    }
+    .into()
+}
+
+/// Parses a JSON response. Every object response is a model with a context
+/// field, which we fill from the response headers.
+fn parse_response<R: DeserializeOwned>(headers: &HeaderMap, body: &[u8]) -> Result<R> {
+    let mut response: serde_json::Value = serde_json::from_slice(body).map_err(parse_error)?;
+    if let Some(response) = response.as_object_mut() {
+        let context = response.entry("context").or_insert(serde_json::Value::Null);
+        if context.is_null() {
+            *context = serde_json::json!({});
+        }
+        if let Some(context) = context.as_object_mut() {
+            for (key, value) in response_context(headers) {
+                context.entry(key).or_insert(value.into());
+            }
+        }
+    }
+    serde_json::from_value(response).map_err(parse_error)
+}
+
 /// REST implementation of Lance Namespace
 ///
 /// # Examples
@@ -622,145 +696,173 @@ impl RestNamespace {
         }
     }
 
-    /// Execute a GET request and parse JSON response.
-    async fn get_json<T: DeserializeOwned>(
+    /// Sends a request for `operation` and returns the response headers and
+    /// body, or the error the response carries.
+    #[allow(clippy::too_many_arguments)]
+    async fn send<T: Serialize>(
         &self,
+        method: Method,
         path: &str,
         query: &[(&str, &str)],
+        request: &T,
+        body: Body,
         operation: &str,
         object_id: &str,
-    ) -> Result<T> {
+    ) -> Result<(HeaderMap, Bytes)> {
+        let request = serde_json::to_value(request).map_err(|e| {
+            Error::from(NamespaceError::Internal {
+                message: format!("Failed to serialize request: {:?}", e),
+            })
+        })?;
         let url = format!("{}{}", self.rest_client.base_path(), path);
-        let req_builder = self.rest_client.client().get(&url).query(query);
+        let req_builder = self.rest_client.client().request(method, &url).query(query);
+        let req_builder = match body {
+            Body::Empty => req_builder,
+            Body::Request => req_builder.json(&request),
+            Body::Json(body) => req_builder.json(&body),
+            Body::Arrow(data) => req_builder.header(CONTENT_TYPE, ARROW_STREAM).body(data),
+        };
 
         let resp = self
             .rest_client
-            .execute(req_builder, operation, object_id)
+            .execute(req_builder, request_headers(&request), operation, object_id)
             .await
             .map_err(Self::request_error)?;
 
         let status = resp.status();
-        let content = resp.text().await.map_err(|e| {
+        let headers = resp.headers().clone();
+        let content = resp.bytes().await.map_err(|e| {
             Error::from(NamespaceError::Internal {
                 message: format!("Failed to read response body: {:?}", e),
             })
         })?;
-
         if status.is_success() {
-            serde_json::from_str(&content).map_err(|e| {
-                NamespaceError::Internal {
-                    message: format!("Failed to parse response: {:?}", e),
-                }
-                .into()
-            })
+            Ok((headers, content))
         } else {
-            Err(Self::parse_error_response(status, &content))
+            Err(Self::parse_error_response(
+                status,
+                &String::from_utf8_lossy(&content),
+            ))
         }
     }
 
-    /// Execute a POST request with JSON body and parse JSON response.
+    /// Execute a GET request and parse JSON response.
+    async fn get_json<T: Serialize, R: DeserializeOwned>(
+        &self,
+        path: &str,
+        query: &[(&str, &str)],
+        request: &T,
+        operation: &str,
+        object_id: &str,
+    ) -> Result<R> {
+        let (headers, content) = self
+            .send(
+                Method::GET,
+                path,
+                query,
+                request,
+                Body::Empty,
+                operation,
+                object_id,
+            )
+            .await?;
+        parse_response(&headers, &content)
+    }
+
+    /// Execute a POST request with the request as the JSON body and parse
+    /// JSON response.
     async fn post_json<T: Serialize, R: DeserializeOwned>(
         &self,
         path: &str,
         query: &[(&str, &str)],
-        body: &T,
+        request: &T,
         operation: &str,
         object_id: &str,
     ) -> Result<R> {
-        let url = format!("{}{}", self.rest_client.base_path(), path);
-        let req_builder = self.rest_client.client().post(&url).query(query).json(body);
-
-        let resp = self
-            .rest_client
-            .execute(req_builder, operation, object_id)
-            .await
-            .map_err(Self::request_error)?;
-
-        let status = resp.status();
-        let content = resp.text().await.map_err(|e| {
-            Error::from(NamespaceError::Internal {
-                message: format!("Failed to read response body: {:?}", e),
-            })
-        })?;
-
-        if status.is_success() {
-            serde_json::from_str(&content).map_err(|e| {
-                NamespaceError::Internal {
-                    message: format!("Failed to parse response: {:?}", e),
-                }
-                .into()
-            })
-        } else {
-            Err(Self::parse_error_response(status, &content))
-        }
+        let (headers, content) = self
+            .send(
+                Method::POST,
+                path,
+                query,
+                request,
+                Body::Request,
+                operation,
+                object_id,
+            )
+            .await?;
+        parse_response(&headers, &content)
     }
 
-    /// Execute a POST request that returns nothing (204 No Content expected).
+    /// Execute a POST request without a body and parse JSON response. The
+    /// request travels in the path and query.
+    async fn post_json_no_body<T: Serialize, R: DeserializeOwned>(
+        &self,
+        path: &str,
+        query: &[(&str, &str)],
+        request: &T,
+        operation: &str,
+        object_id: &str,
+    ) -> Result<R> {
+        let (headers, content) = self
+            .send(
+                Method::POST,
+                path,
+                query,
+                request,
+                Body::Empty,
+                operation,
+                object_id,
+            )
+            .await?;
+        parse_response(&headers, &content)
+    }
+
+    /// Execute a POST request that returns no body.
     async fn post_json_no_content<T: Serialize>(
         &self,
         path: &str,
         query: &[(&str, &str)],
-        body: &T,
+        request: &T,
         operation: &str,
         object_id: &str,
     ) -> Result<()> {
-        let url = format!("{}{}", self.rest_client.base_path(), path);
-        let req_builder = self.rest_client.client().post(&url).query(query).json(body);
-
-        let resp = self
-            .rest_client
-            .execute(req_builder, operation, object_id)
-            .await
-            .map_err(Self::request_error)?;
-
-        let status = resp.status();
-        if status.is_success() {
-            Ok(())
-        } else {
-            let content = resp.text().await.map_err(|e| {
-                Error::from(NamespaceError::Internal {
-                    message: format!("Failed to read response body: {:?}", e),
-                })
-            })?;
-            Err(Self::parse_error_response(status, &content))
-        }
+        self.send(
+            Method::POST,
+            path,
+            query,
+            request,
+            Body::Request,
+            operation,
+            object_id,
+        )
+        .await?;
+        Ok(())
     }
 
-    /// Execute a POST request with binary body and parse JSON response.
-    async fn post_binary_json<R: DeserializeOwned>(
+    /// Execute a POST request with an Arrow IPC stream body and parse JSON
+    /// response.
+    async fn post_binary_json<T: Serialize, R: DeserializeOwned>(
         &self,
         path: &str,
         query: &[(&str, &str)],
-        body: Vec<u8>,
+        request: &T,
+        data: Bytes,
         operation: &str,
         object_id: &str,
     ) -> Result<R> {
-        let url = format!("{}{}", self.rest_client.base_path(), path);
-        let req_builder = self.rest_client.client().post(&url).query(query).body(body);
-
-        let resp = self
-            .rest_client
-            .execute(req_builder, operation, object_id)
-            .await
-            .map_err(Self::request_error)?;
-
-        let status = resp.status();
-        let content = resp.text().await.map_err(|e| {
-            Error::from(NamespaceError::Internal {
-                message: format!("Failed to read response body: {:?}", e),
-            })
-        })?;
-
-        if status.is_success() {
-            serde_json::from_str(&content).map_err(|e| {
-                NamespaceError::Internal {
-                    message: format!("Failed to parse response: {:?}", e),
-                }
-                .into()
-            })
-        } else {
-            Err(Self::parse_error_response(status, &content))
-        }
+        let body = Body::Arrow(data);
+        let (headers, content) = self
+            .send(
+                Method::POST,
+                path,
+                query,
+                request,
+                body,
+                operation,
+                object_id,
+            )
+            .await?;
+        parse_response(&headers, &content)
     }
 
     /// Get the base endpoint URL for this namespace
@@ -819,7 +921,8 @@ impl LanceNamespace for RestNamespace {
             limit_str = limit.to_string();
             query.push(("limit", limit_str.as_str()));
         }
-        self.get_json(&path, &query, "list_namespaces", &id).await
+        self.get_json(&path, &query, &request, "list_namespaces", &id)
+            .await
     }
 
     async fn describe_namespace(
@@ -889,7 +992,8 @@ impl LanceNamespace for RestNamespace {
             include_declared_str = include_declared.to_string();
             query.push(("include_declared", include_declared_str.as_str()));
         }
-        self.get_json(&path, &query, "list_tables", &id).await
+        self.get_json(&path, &query, &request, "list_tables", &id)
+            .await
     }
 
     async fn describe_table(&self, request: DescribeTableRequest) -> Result<DescribeTableResponse> {
@@ -943,7 +1047,7 @@ impl LanceNamespace for RestNamespace {
         let encoded_id = urlencode(&id);
         let path = format!("/v1/table/{}/drop", encoded_id);
         let query = [("delimiter", self.delimiter.as_str())];
-        self.post_json(&path, &query, &request, "drop_table", &id)
+        self.post_json_no_body(&path, &query, &request, "drop_table", &id)
             .await
     }
 
@@ -1011,7 +1115,7 @@ impl LanceNamespace for RestNamespace {
             })?;
             query.push(("storage_options", storage_options_str.as_str()));
         }
-        self.post_binary_json(&path, &query, request_data.to_vec(), "create_table", &id)
+        self.post_binary_json(&path, &query, &request, request_data, "create_table", &id)
             .await
     }
 
@@ -1035,15 +1139,17 @@ impl LanceNamespace for RestNamespace {
         let encoded_id = urlencode(&id);
         let path = format!("/v1/table/{}/insert", encoded_id);
         let mut query = vec![("delimiter", self.delimiter.as_str())];
-        let mode_str;
+        if let Some(ref branch) = request.branch {
+            query.push(("branch", branch.as_str()));
+        }
         if let Some(ref mode) = request.mode {
-            mode_str = mode.clone();
-            query.push(("mode", mode_str.as_str()));
+            query.push(("mode", mode.as_str()));
         }
         self.post_binary_json(
             &path,
             &query,
-            request_data.to_vec(),
+            &request,
+            request_data,
             "insert_into_table",
             &id,
         )
@@ -1066,6 +1172,9 @@ impl LanceNamespace for RestNamespace {
         // repeats the parameter once per column.
         let mut query = vec![("delimiter", self.delimiter.as_str())];
         query.extend(on.iter().map(|column| ("on", column.as_str())));
+        if let Some(ref branch) = request.branch {
+            query.push(("branch", branch.as_str()));
+        }
 
         let when_matched_update_all_str;
         if let Some(v) = request.when_matched_update_all {
@@ -1109,7 +1218,8 @@ impl LanceNamespace for RestNamespace {
         self.post_binary_json(
             &path,
             &query,
-            request_data.to_vec(),
+            &request,
+            request_data,
             "merge_insert_into_table",
             &id,
         )
@@ -1145,37 +1255,18 @@ impl LanceNamespace for RestNamespace {
         let encoded_id = urlencode(&id);
         let path = format!("/v1/table/{}/query", encoded_id);
         let query = [("delimiter", self.delimiter.as_str())];
-        let operation = "query_table";
-
-        let url = format!("{}{}", self.rest_client.base_path(), path);
-        let req_builder = self
-            .rest_client
-            .client()
-            .post(&url)
-            .query(&query)
-            .json(&request);
-
-        let resp = self
-            .rest_client
-            .execute(req_builder, operation, &id)
-            .await
-            .map_err(Self::request_error)?;
-
-        let status = resp.status();
-        if status.is_success() {
-            resp.bytes().await.map_err(|e| {
-                Error::from(NamespaceError::Internal {
-                    message: format!("Failed to read response bytes: {:?}", e),
-                })
-            })
-        } else {
-            let content = resp.text().await.map_err(|e| {
-                Error::from(NamespaceError::Internal {
-                    message: format!("Failed to read response body: {:?}", e),
-                })
-            })?;
-            Err(Self::parse_error_response(status, &content))
-        }
+        let (_, content) = self
+            .send(
+                Method::POST,
+                &path,
+                &query,
+                &request,
+                Body::Request,
+                "query_table",
+                &id,
+            )
+            .await?;
+        Ok(content)
     }
 
     async fn create_table_index(
@@ -1274,8 +1365,11 @@ impl LanceNamespace for RestNamespace {
             encoded_id,
             urlencode(index_name)
         );
-        let query = [("delimiter", self.delimiter.as_str())];
-        self.post_json(&path, &query, &request, "drop_table_index", &id)
+        let mut query = vec![("delimiter", self.delimiter.as_str())];
+        if let Some(ref branch) = request.branch {
+            query.push(("branch", branch.as_str()));
+        }
+        self.post_json_no_body(&path, &query, &request, "drop_table_index", &id)
             .await
     }
 
@@ -1298,7 +1392,8 @@ impl LanceNamespace for RestNamespace {
             include_declared_str = include_declared.to_string();
             query.push(("include_declared", include_declared_str.as_str()));
         }
-        self.get_json(path, &query, "list_all_tables", "").await
+        self.get_json(path, &query, &request, "list_all_tables", "")
+            .await
     }
 
     async fn restore_table(&self, request: RestoreTableRequest) -> Result<RestoreTableResponse> {
@@ -1352,7 +1447,7 @@ impl LanceNamespace for RestNamespace {
             branch_str = branch.clone();
             query.push(("branch", branch_str.as_str()));
         }
-        self.post_json(&path, &query, &(), "list_table_versions", &id)
+        self.post_json_no_body(&path, &query, &request, "list_table_versions", &id)
             .await
     }
 
@@ -1403,19 +1498,22 @@ impl LanceNamespace for RestNamespace {
         let id = object_id_str(&request.id, &self.delimiter)?;
         let encoded_id = urlencode(&id);
         let path = format!("/v1/table/{}/schema_metadata/update", encoded_id);
-        let query = [("delimiter", self.delimiter.as_str())];
-        let metadata = request.metadata.unwrap_or_default();
-        let result: HashMap<String, String> = self
-            .post_json(
-                &path,
-                &query,
-                &metadata,
-                "update_table_schema_metadata",
-                &id,
-            )
+        let mut query = vec![("delimiter", self.delimiter.as_str())];
+        if let Some(ref branch) = request.branch {
+            query.push(("branch", branch.as_str()));
+        }
+        // The REST spec sends and returns the bare metadata map.
+        let body = Body::Json(serde_json::json!(
+            request.metadata.clone().unwrap_or_default()
+        ));
+        let operation = "update_table_schema_metadata";
+        let (headers, content) = self
+            .send(Method::POST, &path, &query, &request, body, operation, &id)
             .await?;
+        let metadata = serde_json::from_slice(&content).map_err(parse_error)?;
         Ok(UpdateTableSchemaMetadataResponse {
-            metadata: Some(result),
+            metadata: Some(metadata),
+            context: Some(response_context(&headers)),
             ..Default::default()
         })
     }
@@ -1556,7 +1654,7 @@ impl LanceNamespace for RestNamespace {
             limit_str = limit.to_string();
             query.push(("limit", limit_str.as_str()));
         }
-        self.post_json(&path, &query, &request, "list_table_tags", &id)
+        self.post_json_no_body(&path, &query, &request, "list_table_tags", &id)
             .await
     }
 
@@ -1644,7 +1742,7 @@ impl LanceNamespace for RestNamespace {
             limit_str = limit.to_string();
             query.push(("limit", limit_str.as_str()));
         }
-        self.post_json(&path, &query, &request, "list_table_branches", &id)
+        self.post_json_no_body(&path, &query, &request, "list_table_branches", &id)
             .await
     }
 
