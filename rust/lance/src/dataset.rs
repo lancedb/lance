@@ -144,7 +144,7 @@ use crate::utils::temporal::{SystemTime, timestamp_to_nanos, utc_now};
 use crate::{Error, Result};
 pub use blob::{
     BlobFile, BlobRangeRequest, BlobReadRange, ReadBlob, ReadBlobRange, ReadBlobRangesBuilder,
-    ReadBlobRangesStream, ReadBlobsBuilder, ReadBlobsStream,
+    ReadBlobRangesStream, ReadBlobsBuilder, ReadBlobsStream, preserve_managed_descriptors,
 };
 use hash_joiner::HashJoiner;
 pub use lance_core::ROW_ID;
