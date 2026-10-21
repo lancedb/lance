@@ -1100,6 +1100,54 @@ async fn test_packed_group_deep_size_is_smaller_than_materialized_graph() {
 
 // ===========================================================================
 // Regression tests for index-cache size accounting of cached posting lists.
+
+#[tokio::test]
+async fn test_packed_group_charges_retained_arrow_allocations() {
+    let (index, _cache) = load_v2_index_with_grouped_postings(16, 1).await;
+    let reader = &index.partitions[0].inverted_list;
+    reader.prewarm_posting_lists(false, 1).await.unwrap();
+    let (start, end) = reader.group_range_for_token(0).unwrap();
+    let group = reader
+        .index_cache
+        .get_with_key(&posting_list_group_cache_key(
+            start,
+            end,
+            reader.has_impacts,
+        ))
+        .await
+        .unwrap();
+    let PostingListGroupStorage::Packed(packed) = &group.storage else {
+        panic!("expected packed group")
+    };
+    let arrow_bytes: usize = packed
+        .batch
+        .columns()
+        .iter()
+        .map(|array| array.get_array_memory_size())
+        .sum();
+    let expected = std::mem::size_of::<PostingListGroup>()
+        + arrow_bytes
+        + packed.first_docs_state_capacity_bytes
+        + packed.impact_state_capacity_bytes;
+    assert_eq!(group.as_ref().deep_size_of(), expected);
+}
+
+#[test]
+fn test_packed_group_deduplicates_shared_buffer_capacity() {
+    let mut builder = ListBuilder::new(LargeBinaryBuilder::new());
+    for _ in 0..4 {
+        builder.values().append_value([1u8; 256]);
+        builder.append(true);
+    }
+    let full = builder.finish();
+    let first = full.slice(0, 1);
+    let second = full.slice(2, 1);
+    let mut context = lance_core::deepsize::Context::new();
+    let first_bytes = super::super::cache::retained_cache_bytes(&first, &mut context);
+    let second_bytes = super::super::cache::retained_cache_bytes(&second, &mut context);
+    assert_eq!(first_bytes, first.get_array_memory_size());
+    assert_eq!(second_bytes, std::mem::size_of::<ListArray>());
+}
 //
 // A cached posting list is a *slice* of a buffer read for a whole posting-list
 // group, so its `DeepSizeOf` impl must charge only the bytes the slice
