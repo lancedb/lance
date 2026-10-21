@@ -10,12 +10,15 @@ mod stopwords;
 #[path = "stop_word_filter/cjk.rs"]
 mod cjk;
 
-#[path = "stop_word_filter/latin.rs"]
-mod latin;
-
 #[cfg(test)]
 #[path = "stop_word_filter/russian_tests.rs"]
 mod russian_tests;
+
+#[path = "stop_word_filter/latin.rs"]
+mod latin;
+
+#[path = "stop_word_filter/arabic.rs"]
+mod arabic;
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -24,7 +27,7 @@ use crate::{Language, Token, TokenFilter, TokenStream, Tokenizer};
 
 fn all_stop_words() -> impl Iterator<Item = &'static str> {
     [
-        stop_words::get("ar"),
+        arabic::ARABIC,
         stopwords::DANISH,
         stopwords::DUTCH,
         // Keep the full list's pronoun coverage while preserving meaningful terms.
@@ -51,6 +54,7 @@ fn all_stop_words() -> impl Iterator<Item = &'static str> {
     .flat_map(|words| words.iter().copied())
     .filter(|word| !cjk::UNION_EXCLUSIONS.contains(word))
     .filter(|word| !latin::UNION_EXCLUSIONS.contains(word))
+    .filter(|word| !arabic::UNION_EXCLUSIONS.contains(word))
 }
 
 #[derive(Clone)]
@@ -61,7 +65,7 @@ pub struct StopWordFilter {
 impl StopWordFilter {
     pub fn new(language: Language) -> Option<Self> {
         let words = match language {
-            Language::Arabic => stop_words::get("ar"),
+            Language::Arabic => arabic::ARABIC,
             Language::Danish => stopwords::DANISH,
             Language::Dutch => stopwords::DUTCH,
             // Retain common pronouns without dropping content and negation.
