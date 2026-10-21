@@ -10,6 +10,10 @@ mod stopwords;
 #[path = "stop_word_filter/cjk.rs"]
 mod cjk;
 
+#[cfg(test)]
+#[path = "stop_word_filter/russian_tests.rs"]
+mod russian_tests;
+
 #[path = "stop_word_filter/latin.rs"]
 mod latin;
 
