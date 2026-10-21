@@ -5545,18 +5545,16 @@ class LanceDataset(pa.dataset.Dataset):
             # Or using explicit version range
             delta = ds_append.delta(begin_version=1, end_version=2)
         """
-        has_compared_against = compared_against is not None
-
         builder = _DatasetDeltaBuilder(self._ds.delta())
 
-        if has_compared_against:
+        # Forward every argument as given: the Rust builder rejects conflicting
+        # or half-set selections, which filtering here would hide.
+        if compared_against is not None:
             builder = builder.compared_against_version(compared_against)
-        else:
-            if begin_version is not None:
-                builder = builder.with_begin_version(begin_version)
-
-            if end_version is not None:
-                builder = builder.with_end_version(end_version)
+        if begin_version is not None:
+            builder = builder.with_begin_version(begin_version)
+        if end_version is not None:
+            builder = builder.with_end_version(end_version)
 
         return builder.build()
 
