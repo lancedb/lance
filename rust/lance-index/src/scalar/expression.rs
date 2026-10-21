@@ -2668,7 +2668,7 @@ mod tests {
     use rstest::rstest;
 
     use crate::metrics::LocalMetricsCollector;
-    use crate::scalar::btree::{BTreeIndexPlugin, train_btree_index};
+    use crate::scalar::btree::{BTREE_INDEX_VERSION, BTreeIndexPlugin, train_btree_index};
     use crate::scalar::json::{JsonQuery, JsonQueryParser};
     use crate::scalar::lance_format::LanceIndexStore;
     use crate::scalar::registry::ScalarIndexPlugin;
@@ -2948,7 +2948,7 @@ mod tests {
         ));
         let data = gen_batch()
             .col("value", array::step::<Float64Type>())
-            .col("_rowid", array::step::<UInt64Type>())
+            .col("_rowaddr", array::step::<UInt64Type>())
             .into_df_stream(RowCount::from(64), BatchCount::from(8));
         train_btree_index(data, store.as_ref(), 64, None, None)
             .await
@@ -2957,7 +2957,7 @@ mod tests {
             .load_index(
                 store,
                 &prost_types::Any::default(),
-                0,
+                BTREE_INDEX_VERSION,
                 None,
                 &LanceCache::no_cache(),
             )

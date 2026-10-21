@@ -125,6 +125,55 @@ inspect. Such cleanup can delete adopted sidecars that newer snapshots still
 reference, because it treats the original data file as their owner. The table
 flag therefore does not protect against these old maintenance paths.
 
+### Explicit sharing within a table
+
+Advanced writers can reuse a Managed payload through
+`BlobDescriptorArrayBuilder.append_managed(uri, offset, size, base_id=None)`.
+The builder validates the relative path and range without uploading or copying
+bytes. The new reference becomes live only when the dataset write commits.
+For example, write one payload and append two references to the same bytes:
+
+```python
+import lance
+import pyarrow as pa
+
+schema = pa.schema([lance.blob_field("blob", inline_size_threshold=0)])
+ds = lance.write_dataset(
+    pa.Table.from_arrays([lance.blob_array([b"shared"])], schema=schema),
+    "./shared_blobs.lance",
+    data_storage_version="2.2",
+)
+descriptor = ds.to_table(blob_handling="all_descriptions")["blob"][0].as_py()
+assert descriptor["kind"] == 4  # Relative to this table's primary base.
+
+builder = lance.BlobDescriptorArrayBuilder("blob")
+for _ in range(2):
+    builder.append_managed(
+        descriptor["blob_uri"], descriptor["position"], descriptor["size"]
+    )
+references = pa.Table.from_arrays(
+    [builder.finish()], schema=pa.schema([builder.field])
+)
+ds = lance.write_dataset(references, ds.uri, mode="append")
+assert [data for _, data in ds.read_blobs("blob", indices=range(3))] == [
+    b"shared", b"shared", b"shared"
+]
+```
+
+The three rows share one immutable payload object, including after compaction.
+Cleanup retains the whole object while any retained snapshot references it.
+Keep the source snapshot protected, for example with a tag, until the append
+commits if concurrent updates and cleanup can otherwise retire it. An open
+dataset handle alone does not protect a snapshot from cleanup.
+
+Use references from the same table and preserve their base identity. Kind 5
+descriptors require their registered `blob_id` as `base_id`; for kind 4, the base
+comes from the source data file. The example uses newly written data in the
+table's primary base. Do not copy an implicit reference from a shallow clone's
+source file into a destination with a different base. Cross-table sharing and
+automatic deduplication are outside this API's contract. All maintenance clients
+must support Managed Blobs as described above.
+
 ## Blob v2: Write Patterns
 
 Use `blob_field` and `blob_array` to build blob v2 columns.

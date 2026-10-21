@@ -83,6 +83,8 @@ async fn test_query_integer(#[case] data_type: DataType) {
             test_take(&original, &ds).await;
             test_filter(&original, &ds, "value > 20").await;
             test_filter(&original, &ds, "NOT (value > 20)").await;
+            test_filter(&original, &ds, "value IS DISTINCT FROM 20").await;
+            test_filter(&original, &ds, "value IS NOT DISTINCT FROM NULL").await;
             test_filter(&original, &ds, "value is null").await;
             test_filter(&original, &ds, "value is not null").await;
             test_filter(&original, &ds, "(value != 0) OR (value < 20)").await;
@@ -304,6 +306,15 @@ async fn test_query_float_special_values(#[case] data_type: DataType) {
                 assert_filter_ids(&ds, &format!("value < {zero}"), &[3, 6, 7]).await;
                 assert_filter_ids(&ds, &format!("value <= {zero}"), &[0, 1, 3, 6, 7]).await;
                 assert_filter_ids(&ds, &format!("value = {zero}"), &[0, 1]).await;
+                // Null-safe: the NULL row 9 is distinct rather than unknown.
+                assert_filter_ids(&ds, &format!("value IS NOT DISTINCT FROM {zero}"), &[0, 1])
+                    .await;
+                assert_filter_ids(
+                    &ds,
+                    &format!("value IS DISTINCT FROM {zero}"),
+                    &[2, 3, 4, 5, 6, 7, 8, 9, 10],
+                )
+                .await;
                 assert_filter_ids(&ds, &format!("value != {zero}"), &[2, 3, 4, 5, 6, 7, 8, 10])
                     .await;
                 assert_filter_ids(&ds, &format!("value > {zero}"), &[2, 4, 5, 8, 10]).await;
@@ -376,6 +387,8 @@ async fn test_nan_sign_is_ignored_in_column_comparisons() {
         .unwrap();
 
     assert_filter_ids(&dataset, "left = right", &[0, 1, 5]).await;
+    assert_filter_ids(&dataset, "left IS NOT DISTINCT FROM right", &[0, 1, 5]).await;
+    assert_filter_ids(&dataset, "left IS DISTINCT FROM right", &[2, 3, 4, 6, 7]).await;
     assert_filter_ids(&dataset, "left < right", &[2, 6]).await;
     assert_filter_ids(&dataset, "left > right", &[3, 4, 7]).await;
 }
@@ -586,6 +599,8 @@ async fn test_query_string(#[case] data_type: DataType) {
             test_take(&original, &ds).await;
             test_filter(&original, &ds, "value = 'hello'").await;
             test_filter(&original, &ds, "value != 'hello'").await;
+            test_filter(&original, &ds, "value IS DISTINCT FROM 'hello'").await;
+            test_filter(&original, &ds, "value IS NOT DISTINCT FROM 'hello'").await;
             test_filter(&original, &ds, "value = ''").await;
             test_filter(&original, &ds, "value > 'hello'").await;
             test_filter(&original, &ds, "value is null").await;
