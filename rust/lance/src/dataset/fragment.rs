@@ -1569,6 +1569,14 @@ impl FileFragment {
             .await
     }
 
+    /// The id of `field` and of every field under it.
+    fn collect_field_ids(field: &lance_core::datatypes::Field, out: &mut HashSet<i32>) {
+        out.insert(field.id);
+        for child in &field.children {
+            Self::collect_field_ids(child, out);
+        }
+    }
+
     async fn open_readers_with_full_metadata(
         &self,
         projection: &Schema,
@@ -1585,26 +1593,47 @@ impl FileFragment {
         metadata_mode: MetadataMode,
     ) -> BoxFuture<'a, Result<Vec<Box<dyn GenericFileReader>>>> {
         async move {
+            // A fragment written through several `add_columns` holds one file
+            // per column group. Projecting the full schema through every file
+            // only to learn that it holds none of the requested fields costs
+            // more CPU than the read itself on a wide table, so test the ids
+            // first. A projected struct or list takes its validity and offsets
+            // from whichever of its leaves a file holds, so every leaf under a
+            // projected parent counts as wanted even when it is not projected.
+            let mut wanted_ids: HashSet<i32> = projection.field_ids().into_iter().collect();
+            for parent in projection
+                .fields_pre_order()
+                .filter(|field| !field.children.is_empty())
+            {
+                if let Some(full) = self.dataset.schema().field_by_id(parent.id) {
+                    Self::collect_field_ids(full, &mut wanted_ids);
+                }
+            }
             // Each open is at least one object-store round trip for the file's
             // metadata; a fragment with several data files (one per
             // `add_columns` / merge) would otherwise pay them back to back.
             // `try_join_all` keeps the readers in data-file order.
-            let opens = self.metadata.files.iter().map(|data_file| async move {
-                match metadata_mode {
-                    MetadataMode::LazyAllowed => {
-                        self.open_reader(data_file, Some(projection), read_config)
+            let opens = self
+                .metadata
+                .files
+                .iter()
+                .filter(|data_file| data_file.fields.iter().any(|id| wanted_ids.contains(id)))
+                .map(|data_file| async move {
+                    match metadata_mode {
+                        MetadataMode::LazyAllowed => {
+                            self.open_reader(data_file, Some(projection), read_config)
+                                .await
+                        }
+                        MetadataMode::Full => {
+                            self.open_reader_with_full_metadata(
+                                data_file,
+                                Some(projection),
+                                read_config,
+                            )
                             .await
+                        }
                     }
-                    MetadataMode::Full => {
-                        self.open_reader_with_full_metadata(
-                            data_file,
-                            Some(projection),
-                            read_config,
-                        )
-                        .await
-                    }
-                }
-            });
+                });
             let mut opened_files: Vec<Box<dyn GenericFileReader>> =
                 try_join_all(opens).await?.into_iter().flatten().collect();
 
@@ -6011,6 +6040,113 @@ mod tests {
             .validate()
             .await
             .unwrap();
+    }
+
+    /// A fragment with one data file per column group reads only the files
+    /// that hold a requested field: the others are not even opened.
+    #[tokio::test]
+    async fn test_take_opens_only_files_with_projected_fields() {
+        let test_dir = TempStrDir::default();
+        let mut dataset = create_dataset_v2(&test_dir).await;
+        dataset
+            .add_columns(
+                NewColumnTransform::SqlExpressions(vec![("col1".into(), "i * 2".into())]),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let fragment = dataset.get_fragment(0).unwrap();
+        assert_eq!(fragment.metadata().files.len(), 2);
+        let added_file = fragment.metadata().files[1].path.clone();
+
+        let projection = dataset.schema().project(&["col1"]).unwrap();
+        dataset.object_store.io_stats_incremental();
+        let reader = fragment
+            .open(&projection, FragReadConfig::default())
+            .await
+            .unwrap();
+        let rows = reader.take_as_batch(&[1, 5], None).await.unwrap();
+        assert_eq!(rows.num_rows(), 2);
+        let data_files_read: HashSet<String> = dataset
+            .object_store
+            .io_stats_incremental()
+            .requests
+            .iter()
+            .filter(|request| request.path.as_ref().contains("/data/"))
+            .map(|request| request.path.filename().unwrap().to_string())
+            .collect();
+        assert_eq!(data_files_read, HashSet::from([added_file]));
+    }
+
+    /// Projecting only a child that lives in a later file must still open the
+    /// file holding the parent's other leaves: a list takes its offsets and a
+    /// struct its validity from whichever leaf a file has.
+    #[rstest]
+    #[case::take(false)]
+    #[case::scan(true)]
+    #[tokio::test]
+    async fn test_projected_missing_list_child_keeps_offsets(#[case] use_scan: bool) {
+        use arrow_array::{ListArray, StructArray};
+        use arrow_buffer::OffsetBuffer;
+
+        let old_values = StructArray::new(
+            vec![ArrowField::new("a", DataType::Int32, true)].into(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+            None,
+        );
+        let list = ListArray::new(
+            Arc::new(ArrowField::new(
+                "item",
+                old_values.data_type().clone(),
+                true,
+            )),
+            OffsetBuffer::new(vec![0i32, 2, 2, 3].into()),
+            Arc::new(old_values),
+            None,
+        );
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "c",
+            list.data_type().clone(),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(list)]).unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let added = ArrowSchema::new(vec![ArrowField::new(
+            "c",
+            DataType::List(Arc::new(ArrowField::new(
+                "item",
+                DataType::Struct(vec![ArrowField::new("b", DataType::Int32, true)].into()),
+                true,
+            ))),
+            true,
+        )]);
+        dataset
+            .add_columns(NewColumnTransform::AllNulls(Arc::new(added)), None, None)
+            .await
+            .unwrap();
+
+        let projection = dataset.schema().project(&["c.item.b"]).unwrap();
+        let result = if use_scan {
+            let mut scan = dataset.scan();
+            scan.project_with_schema(&projection).unwrap();
+            scan.try_into_batch().await.unwrap()
+        } else {
+            dataset.take(&[0, 1, 2], projection).await.unwrap()
+        };
+        let list = result["c"].as_any().downcast_ref::<ListArray>().unwrap();
+        assert_eq!(list.value_offsets(), &[0, 2, 2, 3][..]);
+        assert_eq!(list.null_count(), 0);
     }
 
     #[tokio::test]
