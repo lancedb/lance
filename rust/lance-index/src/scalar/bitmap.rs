@@ -115,6 +115,17 @@ pub const BITMAP_ROW_ADDR_DOMAIN_VERSION: u32 = 1;
 /// target a specific version)
 const BITMAP_INDEX_VERSION: u32 = BITMAP_ROW_ADDR_DOMAIN_VERSION;
 
+/// The index format version for a segment of the given domain: preserve a
+/// segment's own domain (row-id or row-address) rather than always writing
+/// the latest version this build can produce.
+fn bitmap_version_for_domain(results_are_row_addresses: bool) -> u32 {
+    if results_are_row_addresses {
+        BITMAP_ROW_ADDR_DOMAIN_VERSION
+    } else {
+        BITMAP_ROW_ID_DOMAIN_VERSION
+    }
+}
+
 // We only need to open a file reader if we need to load a bitmap. If all
 // bitmaps are cached we don't open it. If we do open it we should only open it once.
 #[derive(Clone)]
@@ -853,11 +864,7 @@ impl BitmapIndex {
             // merging row-id-domain segments (valid on a dataset without
             // stable row ids) must not silently flip the result to
             // address-domain.
-            index_version: if first.results_are_row_addresses {
-                BITMAP_ROW_ADDR_DOMAIN_VERSION
-            } else {
-                BITMAP_ROW_ID_DOMAIN_VERSION
-            },
+            index_version: bitmap_version_for_domain(first.results_are_row_addresses),
             files: vec![file],
         })
     }
@@ -1018,11 +1025,7 @@ impl BitmapIndex {
             // segment (valid on a dataset without stable row ids, where a
             // row id already is a row address) must not silently flip it to
             // address-domain.
-            index_version: if self.results_are_row_addresses {
-                BITMAP_ROW_ADDR_DOMAIN_VERSION
-            } else {
-                BITMAP_ROW_ID_DOMAIN_VERSION
-            },
+            index_version: bitmap_version_for_domain(self.results_are_row_addresses),
             files: vec![file],
         })
     }
@@ -1886,9 +1889,7 @@ impl BitmapIndexPlugin {
         let mut writer =
             new_bitmap_batch_writer(index_store, output_file_name, &value_type).await?;
         // A genuine Bitmap index always trains on physical row addresses --
-        // see `BITMAP_ROW_ADDR_DOMAIN_VERSION` -- unlike `LabelListIndex`,
-        // which calls the shared `build_index_map` directly with `ROW_ID`
-        // and so is unaffected by this.
+        // see `BITMAP_ROW_ADDR_DOMAIN_VERSION`.
         build_index_map(data_source, old_segments, &mut writer, ROW_ADDR).await?;
         writer.finish().await
     }

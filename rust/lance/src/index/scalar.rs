@@ -367,7 +367,9 @@ pub(super) async fn build_scalar_index(
     // all of that machinery, which assumes row-id domain by construction.
     // Reject it outright until the wrapper preserves the target's own domain
     // through its own metadata (lance-format/lance#9721); a plain (non-wrapped)
-    // index of any of these types is unaffected.
+    // index of any of these types is unaffected, and so is this same
+    // combination without stable row ids, where a row id already is a row
+    // address.
     if params.index_type.eq_ignore_ascii_case("json")
         && dataset.manifest.uses_stable_row_ids()
         && let Some(target) = params

@@ -40,8 +40,8 @@ use crate::{
     metrics::MetricsCollector,
     registry::IndexPluginRegistry,
     scalar::{
-        AnyQuery, CreatedIndex, IndexStore, RowIdRemapper, ScalarIndex, SearchOptions,
-        SearchResult, UpdateCriteria,
+        AnyQuery, BuiltinIndexType, CreatedIndex, IndexStore, RowIdRemapper, ScalarIndex,
+        SearchOptions, SearchResult, UpdateCriteria,
         expression::{IndexedExpression, ScalarIndexExpr, ScalarIndexSearch, ScalarQueryParser},
         registry::{
             BasicTrainer, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
@@ -1128,15 +1128,45 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
         // `_index_version` is this *wrapper's* version (`JSON_INDEX_VERSION`,
         // currently always 0 -- see the `// TODO` in `remap`/`update` below), not
         // the target's; `JsonIndexDetails` does not yet record the target's own
-        // version. Every target this wrapper builds comes from a fresh training
-        // pass in this same codebase, so it is always at that plugin's current
-        // format; passing the target's own max version is the accurate stand-in
-        // until the target's version is recorded here directly.
+        // version, so it has to be inferred here instead.
+        //
+        // BTree, Bitmap, and LabelList are the one case where that matters. Unlike
+        // their non-wrapped builds (`build_scalar_index`/`build_bitmap_index_segment`
+        // in the `lance` crate), training through this wrapper has no dataset
+        // awareness to downgrade the version when a row id and a row address
+        // coincide -- their own `TrainingRequest`s always ask for addresses, so a
+        // JSON-wrapped instance's postings are always address-valued. That is only
+        // safe to persist as the pre-migration, row-id-domain floor version, never
+        // the current (address-domain) max: on a dataset without stable row ids the
+        // two values coincide, and `build_scalar_index`'s guard in the `lance` crate
+        // refuses to build one of these three as a JSON target at all once stable
+        // row ids are enabled (where they would not). Passing the current max here
+        // would misread a stable-row-id instance as address-domain and silently
+        // translate its row ids as if they were addresses. Every other target type
+        // never gained a second, incompatible on-disk format, so its current max
+        // version remains the accurate stand-in.
+        let legacy_row_id_domain_version = [
+            (
+                BuiltinIndexType::BTree,
+                crate::scalar::btree::BTREE_ROW_ID_DOMAIN_VERSION,
+            ),
+            (
+                BuiltinIndexType::Bitmap,
+                crate::scalar::bitmap::BITMAP_ROW_ID_DOMAIN_VERSION,
+            ),
+            (
+                BuiltinIndexType::LabelList,
+                crate::scalar::label_list::LABEL_LIST_ROW_ID_DOMAIN_VERSION,
+            ),
+        ]
+        .into_iter()
+        .find(|(builtin, _)| target_plugin.name().eq_ignore_ascii_case(builtin.as_str()))
+        .map(|(_, version)| version);
         let target_index = target_plugin
             .load_index(
                 index_store,
                 target_details,
-                target_plugin.version(),
+                legacy_row_id_domain_version.unwrap_or_else(|| target_plugin.version()),
                 frag_reuse_index,
                 cache,
             )

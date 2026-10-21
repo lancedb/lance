@@ -10258,15 +10258,23 @@ mod tests {
         let is_separate_session = first_commit_seen_as == FirstCommitSeenAs::SeparateSession;
         // How the rebase sees the compaction does not matter: an index rebasing
         // past it finds the moves recorded in the latest manifest's reuse index.
-        // Overlapping coverage (`is_disjoint = false`) makes the rebase in the
-        // `index_commits_first = false` order surface the same raw retryable
-        // conflict the `true` order always does, rather than resolving
-        // straight to the domain rejection: one more manual retry (below)
-        // settles it the same way.
-        let expected = match (index_type, index_commits_first, is_disjoint) {
-            (IndexType::NGram, true, _) => RaceOutcome::ConflictThenRejected,
-            (IndexType::NGram, false, false) => RaceOutcome::ConflictThenRejected,
-            (IndexType::NGram, false, true) => RaceOutcome::Rejected,
+        //
+        // This is a real, NGram-specific rebase difference, not an artifact of
+        // swapping out Bitmap: `check_create_index_txn`'s deferred-remap branch
+        // in conflict_resolver.rs carries an extra check solely for a new
+        // NGram index (`ngram_coverage`, mirroring `ngram_requires_rebuild` in
+        // append.rs) -- unlike every other index type, it cannot simply keep
+        // covering a fragment a concurrent deferred-remap rewrite just
+        // consumed, so overlapping coverage (`is_disjoint = false`) always
+        // retries there, regardless of commit order. That is exactly the raw
+        // retryable conflict the `index_commits_first = true` order already
+        // handles below; `false` with overlapping coverage now needs the same
+        // one extra manual retry to reach the domain rejection.
+        let ngram_overlap_retries = index_type == IndexType::NGram && !is_disjoint;
+        let expected = match (index_type, index_commits_first) {
+            (IndexType::NGram, true) => RaceOutcome::ConflictThenRejected,
+            (IndexType::NGram, false) if ngram_overlap_retries => RaceOutcome::ConflictThenRejected,
+            (IndexType::NGram, false) => RaceOutcome::Rejected,
             _ => RaceOutcome::Committed,
         };
         let dir = TempStrDir::default();

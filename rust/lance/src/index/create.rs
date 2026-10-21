@@ -4274,6 +4274,27 @@ mod tests {
                 "wrong row count for cat = {value} after merging multi-fragment segments"
             );
         }
+
+        // A partial delete -- one row out of a fragment (2) that otherwise
+        // stays live -- is the case the coarse `Fragments` filter does NOT
+        // exclude from the merged postings: row 9 (cat = 'B') stays in
+        // `merged`'s bitmap for 'B', so this only passes end to end if the
+        // scanner's own deletion vector, not the index, is what masks it.
+        dataset.delete("id = 9").await.unwrap();
+        let mut scanner = dataset.scan();
+        scanner.filter("cat = 'B'").unwrap();
+        scanner.project(&["id"]).unwrap();
+        scanner.use_scalar_index(true);
+        let ids = scanner.try_into_batch().await.unwrap()["id"]
+            .as_primitive::<Int32Type>()
+            .values()
+            .to_vec();
+        assert_eq!(
+            ids,
+            vec![5, 13],
+            "the scanner must mask row 9 via the deletion vector even though the coarse \
+             Fragments filter leaves its posting in the merged segment"
+        );
     }
 
     #[tokio::test]

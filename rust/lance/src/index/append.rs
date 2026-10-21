@@ -4397,10 +4397,6 @@ mod tests {
         (schema, batch)
     }
 
-    fn json_btree_params() -> ScalarIndexParams {
-        json_wrapped_params("btree")
-    }
-
     fn json_wrapped_params(target_index_type: &str) -> ScalarIndexParams {
         ScalarIndexParams {
             index_type: "json".to_string(),
@@ -4410,14 +4406,20 @@ mod tests {
         }
     }
 
-    /// A JSON-wrapped BTREE index cannot yet carry the row-address-domain
+    /// A JSON-wrapped BTREE/Bitmap index cannot yet carry the row-address-domain
     /// migration through its own metadata (see the guard in
     /// `super::super::scalar::build_scalar_index`), so creating one on a
     /// stable-row-id dataset must be rejected rather than silently produce an
     /// address-domain segment none of the domain-safety checks elsewhere can
     /// see through the wrapper.
+    #[rstest]
+    #[case::btree("btree", "BTREE")]
+    #[case::bitmap("bitmap", "BITMAP")]
     #[tokio::test]
-    async fn test_json_wrapped_btree_create_rejected_with_stable_row_ids() {
+    async fn test_json_wrapped_create_rejected_with_stable_row_ids(
+        #[case] target_index_type: &str,
+        #[case] expected_name: &str,
+    ) {
         let test_dir = TempStrDir::default();
         let test_uri = test_dir.as_str();
 
@@ -4434,14 +4436,15 @@ mod tests {
         .await
         .unwrap();
 
-        let params = json_btree_params();
+        let params = json_wrapped_params(target_index_type);
         let err = dataset
             .create_index_builder(&["doc"], IndexType::Scalar, &params)
             .name("doc_idx".to_string())
             .await
             .unwrap_err();
         assert!(
-            err.to_string().contains("JSON-wrapped BTREE"),
+            err.to_string()
+                .contains(&format!("JSON-wrapped {expected_name}")),
             "unexpected error: {err}"
         );
         assert!(
@@ -4454,48 +4457,35 @@ mod tests {
         );
     }
 
-    /// The same guard must also cover a JSON-wrapped BITMAP target: Bitmap
-    /// moved to the row-address-domain format in this same PR, so it is
-    /// exposed to the identical wrapper-metadata gap as BTREE (see
-    /// lance-format/lance#9814's review discussion). Without this, a fresh
-    /// JSON index over a Bitmap target on a stable-row-id dataset would
-    /// silently write address-domain postings that query translation reads
-    /// back as row ids, dropping matches outside fragment 0.
+    /// The same JSON-wrapped BITMAP combination the guard above rejects with
+    /// stable row ids is unaffected -- and must keep working -- without them,
+    /// where a row id and a row address are the same value.
+    ///
+    /// Creation only: unlike BTree (see the matching test below), Bitmap does
+    /// not report a `training_data_type`, so `JsonIndex::update` -- and so
+    /// `optimize_indices` -- is not supported for a JSON-wrapped Bitmap target
+    /// at all, regardless of stable row ids. Pre-existing and unrelated to
+    /// this guard.
     #[tokio::test]
-    async fn test_json_wrapped_bitmap_create_rejected_with_stable_row_ids() {
+    async fn test_json_wrapped_bitmap_create_without_stable_row_ids() {
         let test_dir = TempStrDir::default();
         let test_uri = test_dir.as_str();
 
         let (schema, batch) = json_btree_schema_and_batch(0..10);
         let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
-        let mut dataset = Dataset::write(
-            reader,
-            test_uri,
-            Some(WriteParams {
-                enable_stable_row_ids: true,
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
+        let mut dataset = Dataset::write(reader, test_uri, Some(WriteParams::default()))
+            .await
+            .unwrap();
 
         let params = json_wrapped_params("bitmap");
-        let err = dataset
+        dataset
             .create_index_builder(&["doc"], IndexType::Scalar, &params)
             .name("doc_idx".to_string())
             .await
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("JSON-wrapped BITMAP"),
-            "unexpected error: {err}"
-        );
-        assert!(
-            dataset
-                .load_indices_by_name("doc_idx")
-                .await
-                .unwrap()
-                .is_empty(),
-            "the rejected index must not be committed"
+            .unwrap();
+        assert_eq!(
+            dataset.load_indices_by_name("doc_idx").await.unwrap().len(),
+            1
         );
     }
 
@@ -4513,7 +4503,7 @@ mod tests {
             .await
             .unwrap();
 
-        let params = json_btree_params();
+        let params = json_wrapped_params("btree");
         dataset
             .create_index_builder(&["doc"], IndexType::Scalar, &params)
             .name("doc_idx".to_string())

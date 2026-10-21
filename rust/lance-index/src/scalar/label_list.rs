@@ -77,6 +77,17 @@ pub const LABEL_LIST_ROW_ADDR_DOMAIN_VERSION: u32 = 2;
 /// target a specific version)
 const LABEL_LIST_INDEX_VERSION: u32 = LABEL_LIST_ROW_ADDR_DOMAIN_VERSION;
 
+/// The index format version for a segment of the given domain: preserve a
+/// segment's own domain (row-id or row-address) rather than always writing
+/// the latest version this build can produce.
+fn label_list_version_for_domain(results_are_row_addresses: bool) -> u32 {
+    if results_are_row_addresses {
+        LABEL_LIST_ROW_ADDR_DOMAIN_VERSION
+    } else {
+        LABEL_LIST_ROW_ID_DOMAIN_VERSION
+    }
+}
+
 #[async_trait]
 trait LabelListSubIndex: ScalarIndex + DeepSizeOf {
     async fn search_exact(
@@ -261,11 +272,7 @@ impl LabelListIndex {
             // segment (valid on a dataset without stable row ids, where a
             // row id already is a row address) must not silently flip it to
             // address-domain.
-            index_version: if self.results_are_row_addresses() {
-                LABEL_LIST_ROW_ADDR_DOMAIN_VERSION
-            } else {
-                LABEL_LIST_ROW_ID_DOMAIN_VERSION
-            },
+            index_version: label_list_version_for_domain(self.results_are_row_addresses()),
             files: vec![file],
         })
     }
@@ -344,11 +351,7 @@ impl ScalarIndex for LabelListIndex {
             // on `remap`. The caller is responsible for never reaching this
             // with new address-domain data to merge onto a row-id-domain
             // segment (see `legacy_domain_mismatch` in `append.rs`).
-            index_version: if self.results_are_row_addresses() {
-                LABEL_LIST_ROW_ADDR_DOMAIN_VERSION
-            } else {
-                LABEL_LIST_ROW_ID_DOMAIN_VERSION
-            },
+            index_version: label_list_version_for_domain(self.results_are_row_addresses()),
             files: vec![file],
         })
     }
@@ -409,13 +412,13 @@ fn record_list_nulls(
     list_nulls: &Arc<Mutex<RowAddrTreeMap>>,
 ) -> datafusion_common::Result<()> {
     let values = batch.column_by_name(VALUE_COLUMN_NAME).expect_ok()?;
-    let row_ids = batch.column_by_name(ROW_ADDR).expect_ok()?;
-    let row_ids = row_ids.as_any().downcast_ref::<UInt64Array>().unwrap();
+    let row_addrs = batch.column_by_name(ROW_ADDR).expect_ok()?;
+    let row_addrs = row_addrs.as_any().downcast_ref::<UInt64Array>().unwrap();
 
     let mut local_nulls = RowAddrTreeMap::new();
     for i in 0..values.len() {
         if values.is_null(i) {
-            local_nulls.insert(row_ids.value(i));
+            local_nulls.insert(row_addrs.value(i));
         }
     }
     if !local_nulls.is_empty() {
@@ -889,11 +892,7 @@ pub async fn merge_label_list_indices(
         // Preserve the source segments' own domain (checked above to agree)
         // rather than the latest version this build can write -- see the
         // matching comment on `ScalarIndex::remap` for `LabelListIndex`.
-        index_version: if results_are_row_addresses {
-            LABEL_LIST_ROW_ADDR_DOMAIN_VERSION
-        } else {
-            LABEL_LIST_ROW_ID_DOMAIN_VERSION
-        },
+        index_version: label_list_version_for_domain(results_are_row_addresses),
         files: vec![file],
     })
 }
