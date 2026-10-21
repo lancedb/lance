@@ -63,12 +63,13 @@ use crate::{
             range::RangeDecompressor,
             rle::{
                 BlockRleDecompressor, BlockRleRunCount, RleChildDecompressor, RleDecompressor,
-                RleEncoder, RunLengthWidth, rle_encoded_size, select_run_length_width,
+                RleEncoder, RunLengthWidth, rle_encoded_size, select_miniblock_run_length_width,
+                select_run_length_width,
             },
             value::{ValueDecompressor, ValueEncoder},
         },
     },
-    format::pb21::{CompressiveEncoding, compressive_encoding::Compression},
+    format::metadata::{CompressiveEncoding, compressive_encoding::Compression},
     statistics::{GetStat, Stat},
 };
 
@@ -142,6 +143,17 @@ pub trait CompressionStrategy: Send + Sync + std::fmt::Debug {
         field: &Field,
         data: &DataBlock,
     ) -> Result<Box<dyn MiniBlockCompressor>>;
+
+    /// Select a codec for indices into a page dictionary. The default uses the
+    /// ordinary value policy; implementations can account for dictionary lookup
+    /// already adding a decode stage.
+    fn create_dictionary_index_compressor(
+        &self,
+        field: &Field,
+        data: &DataBlock,
+    ) -> Result<Box<dyn MiniBlockCompressor>> {
+        self.create_miniblock_compressor(field, data)
+    }
 }
 
 pub(crate) fn compress_required_block(
@@ -243,8 +255,14 @@ fn try_child_rle_for_mini_block(
     params: &CompressionFieldParams,
 ) -> Option<Box<dyn MiniBlockCompressor>> {
     let raw_bytes = rle_is_applicable(data, params)?;
-    let (run_length_width, estimated_bytes) =
-        estimate_rle_width_and_size_from_data(data, Some(*MAX_MINIBLOCK_VALUES)).ok()?;
+    // Plain u8 runs retain full blocks. Composite RLE uses smaller blocks to
+    // bound child materialization during random reads; estimate both in one pass.
+    let (run_length_width, estimated_bytes, max_values) = select_miniblock_run_length_width(
+        data,
+        *MAX_MINIBLOCK_VALUES,
+        (*MAX_MINIBLOCK_VALUES).min(2048),
+    )
+    .ok()?;
     let child_compression = rle_child_compression_config(params);
     let encoder = || {
         RleEncoder::with_child_encoding(
@@ -253,6 +271,7 @@ fn try_child_rle_for_mini_block(
             child_compression,
             true,
         )
+        .with_max_miniblock_values(max_values as usize)
     };
 
     #[cfg(feature = "bitpacking")]
@@ -264,7 +283,7 @@ fn try_child_rle_for_mini_block(
         && (estimated_bytes >= raw_bytes
             || bitpack_bytes.is_some_and(|bytes| bytes < estimated_bytes));
     let selected_bytes = if should_measure_children {
-        encoder().selected_payload_size(data).ok()?
+        encoder().estimated_payload_size(data).ok()?
     } else {
         estimated_bytes
     };
@@ -1260,7 +1279,7 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
                     let decoder = match field.layout.as_ref().ok_or_else(|| {
                         Error::invalid_input("VariablePackedStruct field is missing layout details")
                     })? {
-                        crate::format::pb21::variable_packed_struct::field_encoding::Layout::BitsPerValue(
+                        crate::format::metadata::variable_packed_struct::field_encoding::Layout::BitsPerValue(
                             bits_per_value,
                         ) => {
                             let decompressor =
@@ -1272,7 +1291,7 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
                                 },
                             }
                         }
-                        crate::format::pb21::variable_packed_struct::field_encoding::Layout::BitsPerLength(
+                        crate::format::metadata::variable_packed_struct::field_encoding::Layout::BitsPerLength(
                             bits_per_length,
                         ) => {
                             let decompressor =
@@ -1696,7 +1715,7 @@ fn create_fixed_width_block_decompressor_inner(
 }
 
 fn decode_fixed_width_constant(
-    constant: &crate::format::pb21::Constant,
+    constant: &crate::format::metadata::Constant,
     bits_per_value: u64,
 ) -> Result<u64> {
     let value = constant
@@ -1768,7 +1787,7 @@ pub(crate) fn validate_delta_child_encoding(
 }
 
 pub(crate) fn create_rle_decompressor(
-    rle: &crate::format::pb21::Rle,
+    rle: &crate::format::metadata::Rle,
     decompression_strategy: &dyn DecompressionStrategy,
 ) -> Result<RleDecompressor> {
     let values = rle
@@ -1947,24 +1966,24 @@ mod tests {
     use crate::compression_config::CompressionParams;
     use crate::data::{BlockInfo, DataBlock, FixedWidthDataBlock};
     use crate::encodings::logical::primitive::miniblock::MiniBlockCompressionContext;
-    use crate::format::ProtobufUtils21;
+    use crate::format::EncodingUtils;
     use crate::statistics::ComputeStat;
     use crate::testing::{TestEncoding, extract_array_encoding_chain, test_compression_strategy};
     use arrow_schema::{DataType, Field as ArrowField};
     use std::collections::HashMap;
 
     #[rstest::rstest]
-    #[case(ProtobufUtils21::flat(0, None), "positive bit width")]
+    #[case(EncodingUtils::flat(0, None), "positive bit width")]
     #[case(
-        ProtobufUtils21::fsl(0, false, ProtobufUtils21::flat(32, None)),
+        EncodingUtils::fsl(0, false, EncodingUtils::flat(32, None)),
         "dimension must be positive"
     )]
     #[case(
-        ProtobufUtils21::fsl(u64::MAX, false, ProtobufUtils21::flat(32, None)),
+        EncodingUtils::fsl(u64::MAX, false, EncodingUtils::flat(32, None)),
         "overflows"
     )]
-    #[case(ProtobufUtils21::packed_struct(ProtobufUtils21::flat(32, None), vec![16]), "must match")]
-    #[case(ProtobufUtils21::packed_struct(ProtobufUtils21::flat(1, None), vec![1]), "positive byte widths")]
+    #[case(EncodingUtils::packed_struct(EncodingUtils::flat(32, None), vec![16]), "must match")]
+    #[case(EncodingUtils::packed_struct(EncodingUtils::flat(1, None), vec![1]), "positive byte widths")]
     fn mini_block_descriptor_errors_are_owned_by_codecs(
         #[case] encoding: CompressiveEncoding,
         #[case] message: &str,
@@ -2005,10 +2024,10 @@ mod tests {
     }
 
     #[rstest::rstest]
-    #[case(ProtobufUtils21::flat(32, None), vec![], 1, "buffers")]
-    #[case(ProtobufUtils21::flat(32, None), vec![vec![0; 3]], 1, "expected 4")]
-    #[case(ProtobufUtils21::fsl(2, true, ProtobufUtils21::flat(32, None)), vec![vec![], vec![0; 8]], 1, "expected 1")]
-    #[case(ProtobufUtils21::fsl(2, false, ProtobufUtils21::flat(32, None)), vec![vec![]], u64::MAX, "overflows")]
+    #[case(EncodingUtils::flat(32, None), vec![], 1, "buffers")]
+    #[case(EncodingUtils::flat(32, None), vec![vec![0; 3]], 1, "expected 4")]
+    #[case(EncodingUtils::fsl(2, true, EncodingUtils::flat(32, None)), vec![vec![], vec![0; 8]], 1, "expected 1")]
+    #[case(EncodingUtils::fsl(2, false, EncodingUtils::flat(32, None)), vec![vec![]], u64::MAX, "overflows")]
     fn mini_block_payload_errors_are_owned_by_codecs(
         #[case] encoding: CompressiveEncoding,
         #[case] buffers: Vec<Vec<u8>>,
@@ -2140,7 +2159,7 @@ mod tests {
         run_lengths.bits_per_value
     }
 
-    fn expect_rle_encoding(encoding: &CompressiveEncoding) -> &crate::format::pb21::Rle {
+    fn expect_rle_encoding(encoding: &CompressiveEncoding) -> &crate::format::metadata::Rle {
         match encoding.compression.as_ref().unwrap() {
             Compression::Rle(rle) => rle,
             Compression::General(general) => {
@@ -3194,7 +3213,7 @@ mod tests {
     #[cfg(any(feature = "lz4", feature = "zstd"))]
     fn assert_general_block_preserves_compression_level(
         compression: &str,
-        expected_scheme: crate::format::pb21::CompressionScheme,
+        expected_scheme: crate::format::metadata::CompressionScheme,
         compression_level: Option<i32>,
     ) {
         let mut params = CompressionParams::new();
@@ -3218,7 +3237,7 @@ mod tests {
 
         assert_eq!(
             general.compression.as_ref(),
-            Some(&crate::format::pb21::BufferCompression {
+            Some(&crate::format::metadata::BufferCompression {
                 scheme: expected_scheme as i32,
                 level: compression_level,
             })
@@ -3230,7 +3249,7 @@ mod tests {
     fn test_general_block_preserves_absent_zstd_level() {
         assert_general_block_preserves_compression_level(
             "zstd",
-            crate::format::pb21::CompressionScheme::CompressionAlgorithmZstd,
+            crate::format::metadata::CompressionScheme::CompressionAlgorithmZstd,
             None,
         );
     }
@@ -3240,7 +3259,7 @@ mod tests {
     fn test_general_block_preserves_explicit_lz4_level() {
         assert_general_block_preserves_compression_level(
             "lz4",
-            crate::format::pb21::CompressionScheme::CompressionAlgorithmLz4,
+            crate::format::metadata::CompressionScheme::CompressionAlgorithmLz4,
             Some(7),
         );
     }
