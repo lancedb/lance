@@ -274,6 +274,7 @@ mod tests {
 
     type SumFn = unsafe fn(&[f32], &[f32]) -> f32;
     type FillFn = unsafe fn(&[f32], &[f32], usize, &mut [f32]);
+    type ScaledFillFn = unsafe fn(&[f32], &[f32], usize, &[f32], &mut [f32]);
 
     fn portable_sum(x: &[f32], y: &[f32]) -> f32 {
         x.iter().chain(y).sum()
@@ -297,6 +298,23 @@ mod tests {
         fn macro_fill(x: &[f32], batch: &[f32], dimension: usize, out: &mut [f32]) {
             for (o, y) in out.iter_mut().zip(batch.chunks_exact(dimension)) {
                 *o = portable_sum(x, y);
+            }
+        }
+    }
+
+    crate::target_kernel! {
+        #[target_features()]
+        #[candidate(PORTABLE_SCALED_FILL: ScaledFillFn)]
+        fn macro_scaled_fill(
+            x: &[f32],
+            batch: &[f32],
+            dimension: usize,
+            scales: &[f32],
+            out: &mut [f32],
+        ) {
+            macro_fill(x, batch, dimension, out);
+            for (o, scale) in out.iter_mut().zip(scales) {
+                *o *= scale;
             }
         }
     }
@@ -361,6 +379,10 @@ mod tests {
         static FILL: Dispatch<FillFn> = &[PORTABLE_FILL];
     }
 
+    crate::dispatch! {
+        static SCALED_FILL: Dispatch<ScaledFillFn> = &[PORTABLE_SCALED_FILL];
+    }
+
     #[test]
     fn portable_only_dispatch_is_static_and_callable() {
         assert!(PORTABLE_ONLY.is_static());
@@ -409,6 +431,20 @@ mod tests {
         let mut out = [0.0; 2];
         FILL.get().call(&[1.0], &[2.0, 3.0], 1, &mut out);
         assert_eq!(out, [3.0, 4.0]);
+    }
+
+    #[test]
+    fn five_argument_kernel_is_callable_directly_and_as_fn() {
+        let kernel = SCALED_FILL.get();
+        let mut out = [0.0; 2];
+        kernel.call(&[1.0], &[2.0, 3.0], 1, &[2.0, 10.0], &mut out);
+        assert_eq!(out, [6.0, 40.0]);
+
+        let mut out = [0.0; 2];
+        // SAFETY: `get` returns only a kernel the host supports, and the
+        // kernel has no other precondition.
+        unsafe { kernel.as_fn()(&[1.0], &[2.0, 3.0], 1, &[2.0, 10.0], &mut out) };
+        assert_eq!(out, [6.0, 40.0]);
     }
 
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
