@@ -401,7 +401,7 @@ pub fn validate_operation(manifest: Option<&Manifest>, operation: &Operation) ->
 
     let result = match operation {
         Operation::Append { fragments } => {
-            // Fragments must contain all fields in the schema
+            // Missing fields must be nullable in the current schema.
             schema_fragments_valid(Some(manifest), &manifest.schema, fragments)
         }
         Operation::Project { schema, .. } => {
@@ -658,14 +658,35 @@ fn schema_fragments_valid(
     schema_fragments_modern_valid(schema, fragments)
 }
 
-pub fn schema_fragments_modern_valid(_schema: &Schema, fragments: &[Fragment]) -> Result<()> {
-    // validate that each data file at least contains one field.
+/// Check that each fragment covers non-nullable fields, allowing omitted
+/// nullable subtrees and structural fields represented by their children.
+pub fn schema_fragments_modern_valid(schema: &Schema, fragments: &[Fragment]) -> Result<()> {
     for fragment in fragments {
+        let mut field_ids = HashSet::new();
         for data_file in &fragment.files {
             if data_file.fields.iter().len() == 0 {
                 return Err(Error::invalid_input(format!(
                     "Datafile {} does not contain any fields",
                     data_file.path
+                )));
+            }
+            // Structural fields may be implicit in leaf column mappings, while
+            // packed structs and blobs store their entire subtree in one column.
+            field_ids.extend(data_file.schema(schema).fields_pre_order().map(|f| f.id));
+        }
+
+        let mut fields = schema.fields.iter().rev().collect::<Vec<_>>();
+        while let Some(field) = fields.pop() {
+            // An omitted nullable parent masks its whole subtree, including
+            // non-nullable children. Only inspect children of present parents.
+            if field_ids.contains(&field.id) {
+                fields.extend(field.children.iter().rev());
+            } else if !field.nullable {
+                return Err(Error::invalid_input(format!(
+                    "Fragment {} does not contain non-nullable field {} (id {})",
+                    fragment.id,
+                    schema.field_path(field.id)?,
+                    field.id
                 )));
             }
         }
@@ -1051,6 +1072,7 @@ mod tests {
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use lance_core::datatypes::{Field as LanceCoreField, LogicalType, Schema as LanceSchema};
     use roaring::RoaringBitmap;
+    use rstest::rstest;
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -1156,6 +1178,106 @@ mod tests {
             DataStorageFormat::new(ConcreteFileVersion::V2_0),
             HashMap::new(),
         )
+    }
+
+    #[rstest]
+    #[case::all_fields(vec![vec![0, 2, 3]], true, None)]
+    #[case::missing_required_column(vec![vec![2, 3]], true, Some("id"))]
+    #[case::missing_required_child(vec![vec![0, 3]], true, Some("value.required"))]
+    #[case::missing_nullable_child(vec![vec![0, 2]], true, None)]
+    #[case::missing_nullable_parent(vec![vec![0]], true, None)]
+    #[case::missing_required_parent(vec![vec![0]], false, Some("value"))]
+    #[case::split_files(vec![vec![0, 2], vec![3]], true, None)]
+    #[case::empty_fragment(vec![], true, Some("id"))]
+    fn test_modern_append_field_coverage(
+        #[case] file_fields: Vec<Vec<i32>>,
+        #[case] parent_nullable: bool,
+        #[case] missing_field: Option<&str>,
+        #[values(
+            ConcreteFileVersion::V2_0,
+            ConcreteFileVersion::V2_1,
+            ConcreteFileVersion::V2_2,
+            ConcreteFileVersion::V2_3
+        )]
+        version: ConcreteFileVersion,
+    ) {
+        let schema = LanceSchema::try_from(&ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new(
+                "value",
+                DataType::Struct(
+                    vec![
+                        ArrowField::new("required", DataType::Int32, false),
+                        ArrowField::new("optional", DataType::Int32, true),
+                    ]
+                    .into(),
+                ),
+                parent_nullable,
+            ),
+        ]))
+        .unwrap();
+        let make_file = |file_schema: &LanceSchema| {
+            let (fields, column_indices) = if version == ConcreteFileVersion::V2_0 {
+                let fields = file_schema.field_ids();
+                let column_indices = (0..fields.len() as i32).collect();
+                (fields, column_indices)
+            } else {
+                lance_file::versions::v2_1::data_file_columns(file_schema)
+            };
+            DataFile::new("data.lance", fields, column_indices, version, None, None)
+        };
+        let mut complete = Fragment::new(1);
+        complete.files.push(make_file(&schema));
+        let mut partial = Fragment::new(2);
+        partial.files = file_fields
+            .iter()
+            .map(|fields| make_file(&schema.project_by_ids(fields, false)))
+            .collect();
+        let manifest = Manifest::new(
+            schema,
+            Arc::new(vec![]),
+            DataStorageFormat::new(version),
+            HashMap::new(),
+        );
+        let result = validate_operation(
+            Some(&manifest),
+            &Operation::Append {
+                fragments: vec![complete, partial],
+            },
+        );
+        if let Some(missing_field) = missing_field {
+            let error = result.unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }));
+            let message = error.to_string();
+            assert!(message.contains("Fragment 2"), "{message}");
+            assert!(message.contains(missing_field), "{message}");
+        } else {
+            result.unwrap();
+        }
+    }
+
+    #[test]
+    fn test_modern_field_coverage_packed_struct() {
+        let schema = LanceSchema::try_from(&ArrowSchema::new(vec![
+            ArrowField::new(
+                "packed",
+                DataType::Struct(vec![ArrowField::new("child", DataType::Int32, false)].into()),
+                false,
+            )
+            .with_metadata(HashMap::from([("packed".to_string(), "true".to_string())])),
+        ]))
+        .unwrap();
+        // The required child is stored inside its parent's physical column.
+        let mut fragment = Fragment::new(0);
+        fragment.files.push(DataFile::new(
+            "packed.lance",
+            vec![0],
+            vec![0],
+            ConcreteFileVersion::V2_1,
+            None,
+            None,
+        ));
+        schema_fragments_modern_valid(&schema, &[fragment]).unwrap();
     }
 
     fn activated_manifest() -> Manifest {
