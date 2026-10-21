@@ -23,6 +23,9 @@ mod tamil;
 #[path = "stop_word_filter/arabic.rs"]
 mod arabic;
 
+#[path = "stop_word_filter/korean.rs"]
+mod korean;
+
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -51,7 +54,7 @@ fn all_stop_words() -> impl Iterator<Item = &'static str> {
         latin::TURKISH,
         cjk::CHINESE,
         cjk::JAPANESE,
-        stop_words::get("ko"),
+        korean::KOREAN,
     ]
     .into_iter()
     .flat_map(|words| words.iter().copied())
