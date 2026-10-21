@@ -1666,8 +1666,8 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             .collect())
     }
 
-    /// [`Self::partition_code_columns`] as a projection of a column-layout
-    /// file.
+    /// Project the partition's code columns from a column-layout file, excluding
+    /// columns kept in the resident store.
     pub fn partition_codes_projection(&self) -> Result<ReaderProjection> {
         let columns = self.partition_code_columns()?;
         let columns: Vec<&str> = columns.iter().map(String::as_str).collect();
