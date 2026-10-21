@@ -595,8 +595,30 @@ impl<Q: Quantization> StorageBuilder<Q> {
         })
     }
 
-    pub fn build(&self, batches: Vec<RecordBatch>) -> Result<Q::Storage> {
-        let mut batch = concat_batches(batches[0].schema_ref(), batches.iter())?;
+    pub fn build(&self, mut batches: Vec<RecordBatch>) -> Result<Q::Storage> {
+        let schema = batches[0].schema();
+        // Stored partitions and newly quantized rows can order the same fields
+        // differently. Arrow concatenates by position, including equal-typed factors.
+        for batch in &mut batches {
+            let batch_schema = batch.schema();
+            if batch_schema.fields() == schema.fields() {
+                continue;
+            }
+            if batch.num_columns() != schema.fields().len() {
+                return Err(Error::invalid_input(format!(
+                    "vector storage batch has {} columns, expected {}",
+                    batch.num_columns(),
+                    schema.fields().len(),
+                )));
+            }
+            let indices = schema
+                .fields()
+                .iter()
+                .map(|field| batch_schema.index_of(field.name()))
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            *batch = batch.project(&indices)?;
+        }
+        let mut batch = concat_batches(&schema, batches.iter())?;
 
         if batch.column_by_name(self.quantizer.column()).is_none() {
             let vectors = batch
@@ -3542,18 +3564,81 @@ mod tests {
         DEFAULT_ENTRY_COLUMNS, ENTRY_COLUMNS_ENV, EntryColumns, ORIGIN_LATENCY_ENV,
         OriginLatencyClass, QueryScratchCapacity, QueryScratchPool, RESIDENT_COLUMNS_ENV,
         RESIDENT_LIFETIME_ENV, ResidentColumnsSetting, ResidentLifetime, ResidentStoreSize,
-        SEQUENTIAL_PLANE_LOADS_ENV, SIGN_BOUNDS_ENV, SignBounds, compact_prewarm_batches,
-        entry_columns_from, entry_columns_setting, origin_latency_from, origin_latency_setting,
-        resident_columns_from, resident_columns_setting, resident_lifetime_from,
-        resident_lifetime_setting, resident_store_fits, sequential_plane_loads,
-        sequential_plane_loads_from, sign_bounds_from, sign_bounds_setting,
+        SEQUENTIAL_PLANE_LOADS_ENV, SIGN_BOUNDS_ENV, SignBounds, StorageBuilder, VectorStore,
+        compact_prewarm_batches, entry_columns_from, entry_columns_setting, origin_latency_from,
+        origin_latency_setting, resident_columns_from, resident_columns_setting,
+        resident_lifetime_from, resident_lifetime_setting, resident_store_fits,
+        sequential_plane_loads, sequential_plane_loads_from, sign_bounds_from, sign_bounds_setting,
         spawn_prewarm_materialization,
     };
-    use arrow_array::{Array, ArrayRef, RecordBatch, UInt64Array};
-    use lance_core::Error;
+    use arrow_array::{
+        Array, ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, UInt64Array,
+    };
+    use lance_arrow::FixedSizeListArrayExt;
     use lance_core::deepsize::DeepSizeOf;
+    use lance_core::{Error, ROW_ID};
     use lance_io::object_store::ObjectStore;
+    use lance_linalg::distance::DistanceType;
     use std::sync::Arc;
+
+    use crate::vector::flat::index::FlatQuantizer;
+    use crate::vector::flat::storage::FLAT_COLUMN;
+
+    #[rstest::rstest]
+    #[case::canonical(vec![0, 1, 2, 3], None)]
+    #[case::same_type_swap(vec![0, 1, 3, 2], None)]
+    #[case::different_types(vec![3, 1, 0, 2], None)]
+    #[case::missing_column(vec![0, 1, 2], Some("3 columns, expected 4"))]
+    fn test_storage_builder_aligns_batch_columns(
+        #[case] order: Vec<usize>,
+        #[case] expected_error: Option<&str>,
+    ) {
+        let batch = RecordBatch::try_from_iter(vec![
+            (
+                ROW_ID,
+                Arc::new(UInt64Array::from(vec![10, 20])) as ArrayRef,
+            ),
+            (
+                FLAT_COLUMN,
+                Arc::new(
+                    FixedSizeListArray::try_new_from_values(
+                        Float32Array::from(vec![0.0, 0.0, 3.0, 4.0]),
+                        2,
+                    )
+                    .unwrap(),
+                ) as ArrayRef,
+            ),
+            (
+                "scale",
+                Arc::new(Float32Array::from(vec![2.0, 3.0])) as ArrayRef,
+            ),
+            (
+                "offset",
+                Arc::new(Float32Array::from(vec![7.0, 11.0])) as ArrayRef,
+            ),
+        ])
+        .unwrap();
+        let builder = StorageBuilder::new(
+            "vector".to_owned(),
+            DistanceType::L2,
+            FlatQuantizer::new(2, DistanceType::L2),
+            None,
+        )
+        .unwrap();
+        let storage = builder.build(vec![
+            batch.slice(0, 1),
+            batch.slice(1, 1).project(&order).unwrap(),
+        ]);
+        if let Some(message) = expected_error {
+            let error = storage.unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }));
+            assert!(error.to_string().contains(message), "{error}");
+            return;
+        }
+        let storage = storage.unwrap();
+        assert_eq!(storage.row_ids().copied().collect::<Vec<_>>(), vec![10, 20]);
+        assert_eq!(storage.to_batches().unwrap().next().unwrap(), batch);
+    }
 
     #[tokio::test]
     async fn test_prewarm_materialization_uses_cpu_pool() {

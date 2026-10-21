@@ -3875,16 +3875,23 @@ async fn test_layered_rq_create_search_cascade_and_remap(
 mod layered_storage;
 
 #[rstest]
-#[case::fast(RQRotationType::Fast)]
-#[case::matrix(RQRotationType::Matrix)]
+#[case::native_one_bit(1, false)]
+#[case::native_five_bit(5, false)]
+#[case::layered_five_bit(5, true)]
+#[case::layered_nine_bit(9, true)]
 #[tokio::test]
-async fn test_ivf_rq_rotation_type_after_optimize(#[case] rotation_type: RQRotationType) {
+async fn test_ivf_rq_layout_after_optimize(
+    #[case] num_bits: u8,
+    #[case] layered: bool,
+    #[values(RQRotationType::Fast, RQRotationType::Matrix)] rotation_type: RQRotationType,
+) {
     let test_dir = TempStrDir::default();
     let test_uri = test_dir.as_str();
-    let (mut dataset, _) = generate_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await;
+    let (mut dataset, vectors) = generate_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await;
 
-    let ivf_params = IvfBuildParams::new(4);
-    let rq_params = RQBuildParams::with_rotation_type(1, rotation_type);
+    let ivf_params = IvfBuildParams::try_with_centroids(4, Arc::new(vectors.slice(0, 4))).unwrap();
+    let mut rq_params = RQBuildParams::with_rotation_type(num_bits, rotation_type);
+    rq_params.layered = Some(layered);
     let params = VectorIndexParams::with_ivf_rq_params(DistanceType::L2, ivf_params, rq_params);
     dataset
         .create_index(&["vector"], IndexType::Vector, None, &params, true)
@@ -3892,6 +3899,14 @@ async fn test_ivf_rq_rotation_type_after_optimize(#[case] rotation_type: RQRotat
         .unwrap();
 
     assert_rq_rotation_type(&dataset, rotation_type).await;
+
+    // Merging new rows into an existing partition combines writer and transform schemas.
+    append_dataset::<Float32Type>(&mut dataset, 64, 0.0..1.0).await;
+    dataset
+        .optimize_indices(&OptimizeOptions::new())
+        .await
+        .unwrap();
+    assert_eq!(dataset.load_indices().await.unwrap().len(), 1);
 
     append_dataset::<Float32Type>(&mut dataset, 64, 0.0..1.0).await;
     dataset
@@ -3918,6 +3933,26 @@ async fn test_ivf_rq_rotation_type_after_optimize(#[case] rotation_type: RQRotat
         "Expected merge optimize to merge indices into one"
     );
     assert_rq_rotation_type(&dataset, rotation_type).await;
+    let stats: serde_json::Value =
+        serde_json::from_str(&dataset.index_statistics("vector_idx").await.unwrap()).unwrap();
+    assert_eq!(
+        stats["num_indexed_rows"].as_u64(),
+        Some((NUM_ROWS + 128) as u64)
+    );
+    assert_eq!(stats["num_unindexed_rows"].as_u64(), Some(0));
+    let scheduler = ScanScheduler::new(
+        Arc::new(ObjectStore::local()),
+        SchedulerConfig::default_for_testing(),
+    );
+    let metadata = get_rq_metadata(
+        &dataset,
+        scheduler,
+        &indices_after_merge[0].uuid.to_string(),
+    )
+    .await;
+    assert_eq!(metadata.num_bits, num_bits);
+    assert_eq!(metadata.layered, layered);
+    test_recall::<Float32Type>(params, 4, 0.5, "vector", &dataset, vectors).await;
 }
 
 #[rstest]
