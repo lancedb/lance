@@ -312,6 +312,18 @@ construction; an immutable BTree can retain it on disk and exclude it during
 lookup. Both must apply the selected snapshot's deletion and coverage metadata.
 Historical snapshots continue to resolve using their own data and index state.
 
+For example, with addresses written as `(fragment_id, row_offset)`:
+
+1. In version V, fragment 1 contains row IDs `[1, 2, 3]` at offsets `[0, 1, 2]`.
+2. An update writes the row with `_rowid = 2` to fragment 2 at offset `0` and marks
+    its old position `(1, 1)` deleted in the deletion vector.
+3. In version V+1, row IDs `1`, `2`, and `3` resolve to `(1, 0)`, `(2, 0)`, and
+    `(1, 2)`, respectively.
+
+An immutable BTree may still contain the old entry for row ID `2` at `(1, 1)`, but
+the deletion vector excludes it from version V+1 lookups. Version V still resolves
+row ID `2` to `(1, 1)`.
+
 #### Fragment Bitmaps for Index Masking
 
 Secondary indices use fragment bitmaps to track which row IDs remain valid:
