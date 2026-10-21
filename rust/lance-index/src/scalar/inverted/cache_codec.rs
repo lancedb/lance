@@ -45,9 +45,9 @@ use crate::cache_pb::{
 
 use super::impact::ImpactSkipData;
 use super::index::{
-    CompressedPositionStorage, CompressedPostingList, PlainPostingList, PositionGroup,
-    PositionStreamCodec, Positions, PostingList, PostingListGroup, PostingListGroupStorage,
-    PostingTailCodec, SharedPositionStream,
+    CompressedPositionStorage, CompressedPostingList, PlainPostingList, PositionStreamCodec,
+    Positions, PostingList, PostingListGroup, PostingListGroupStorage, PostingTailCodec,
+    SharedPositionStream,
 };
 use super::tokenizer::{LEGACY_BLOCK_SIZE, validate_block_size};
 
@@ -520,32 +520,6 @@ fn deserialize_materialized_group(r: &mut CacheEntryReader<'_>) -> Result<Postin
 // Positions codec
 // ---------------------------------------------------------------------------
 
-impl CacheCodecImpl for PositionGroup {
-    const TYPE_ID: &'static str = "lance.fts.PositionGroup";
-    const CURRENT_VERSION: u32 = 1;
-
-    fn serialize(&self, w: &mut CacheEntryWriter<'_>) -> Result<()> {
-        w.write_header(&PositionsHeader {
-            position_storage: PbPositionStorage::Shared as i32,
-            position_stream_codec: position_stream_codec_to_proto(self.codec) as i32,
-        })?;
-        w.write_ipc(&self.batch)
-    }
-
-    fn deserialize(r: &mut CacheEntryReader<'_>) -> Result<Self> {
-        let header: PositionsHeader = r.read_header()?;
-        if header.position_storage() != PbPositionStorage::Shared {
-            return Err(Error::index(
-                "position groups require shared position streams",
-            ));
-        }
-        Self::new(
-            r.read_ipc()?,
-            proto_to_position_stream_codec(header.position_stream_codec()),
-        )
-    }
-}
-
 impl CacheCodecImpl for Positions {
     const TYPE_ID: &'static str = "lance.fts.Positions";
     const CURRENT_VERSION: u32 = 1;
@@ -590,50 +564,21 @@ mod tests {
 
     use arrow::buffer::ScalarBuffer;
     use arrow_array::builder::{Int32Builder, LargeBinaryBuilder, ListBuilder};
-    use arrow_array::types::UInt32Type;
-    use arrow_array::{Array, LargeBinaryArray, ListArray, RecordBatch};
+    use arrow_array::{Array, LargeBinaryArray, RecordBatch};
     use arrow_schema::{Field, Schema};
     use bytes::Bytes;
+    use lance_core::Result;
     use lance_core::cache::{CacheCodecImpl, CacheEntryReader, CacheEntryWriter};
-    use lance_core::{Error, Result};
 
     use crate::cache_pb::{CompressedPostingHeader, PostingTailCodec as PbPostingTailCodec};
 
     use super::super::impact::{ImpactSkipData, ImpactSkipDataBuilder};
     use super::super::index::{
-        COMPRESSED_POSITION_COL, CompressedPositionStorage, CompressedPostingList, IMPACT_COL,
-        POSITION_BLOCK_OFFSET_COL, POSTING_BLOCK_SIZE_KEY, POSTING_COL, PlainPostingList,
-        PositionGroup, PositionStreamCodec, Positions, PostingList, PostingListGroup,
-        PostingTailCodec, SharedPositionStream,
+        CompressedPositionStorage, CompressedPostingList, IMPACT_COL, POSTING_BLOCK_SIZE_KEY,
+        POSTING_COL, PlainPostingList, PositionStreamCodec, Positions, PostingList,
+        PostingListGroup, PostingTailCodec, SharedPositionStream,
     };
     use super::super::tokenizer::LEGACY_BLOCK_SIZE;
-
-    #[test]
-    fn test_position_group_rejects_invalid_offsets() {
-        for row_offsets in [vec![1], vec![0, 4], vec![0, 2, 1]] {
-            let payload = LargeBinaryArray::from_vec(vec![b"abc".as_slice()]);
-            let offsets = ListArray::from_iter_primitive::<UInt32Type, _, _>([Some(
-                row_offsets.into_iter().map(Some).collect::<Vec<_>>(),
-            )]);
-            let schema = Arc::new(Schema::new(vec![
-                Field::new(COMPRESSED_POSITION_COL, payload.data_type().clone(), false),
-                Field::new(
-                    POSITION_BLOCK_OFFSET_COL,
-                    offsets.data_type().clone(),
-                    false,
-                ),
-            ]));
-            let batch =
-                RecordBatch::try_new(schema, vec![Arc::new(payload), Arc::new(offsets)]).unwrap();
-            let error = PositionGroup::new(batch, PositionStreamCodec::PackedDelta).unwrap_err();
-            assert!(matches!(error, Error::Index { .. }));
-            assert!(
-                error
-                    .to_string()
-                    .contains("invalid position group offsets for slot 0")
-            );
-        }
-    }
 
     fn legacy_positions(rows: &[&[i32]]) -> arrow_array::ListArray {
         let mut builder = ListBuilder::new(Int32Builder::new());
@@ -1299,7 +1244,6 @@ mod tests {
             posting_tail_codec_to_tag,
         };
         use super::*;
-
         use crate::cache_pb::{
             CompressedPostingHeader, PostingListGroupHeader, PostingTailCodec as PbPostingTailCodec,
         };

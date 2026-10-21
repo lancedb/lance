@@ -2,6 +2,48 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::*;
+use futures::future::BoxFuture;
+use lance_core::cache::{CacheBackend, CacheEntry, InternalCacheKey, QuickCacheBackend};
+
+/// Resident probes are optional for custom and persistent cache backends.
+#[derive(Debug)]
+struct CacheWithoutResidentProbe(QuickCacheBackend);
+
+#[async_trait]
+impl CacheBackend for CacheWithoutResidentProbe {
+    async fn get(&self, key: &InternalCacheKey, codec: Option<CacheCodec>) -> Option<CacheEntry> {
+        self.0.get(key, codec).await
+    }
+
+    async fn insert(
+        &self,
+        key: &InternalCacheKey,
+        entry: CacheEntry,
+        size: usize,
+        codec: Option<CacheCodec>,
+    ) {
+        self.0.insert(key, entry, size, codec).await;
+    }
+
+    async fn get_or_insert<'a>(
+        &self,
+        key: &InternalCacheKey,
+        loader: BoxFuture<'a, Result<(CacheEntry, usize)>>,
+        codec: Option<CacheCodec>,
+    ) -> Result<(CacheEntry, bool)> {
+        self.0.get_or_insert(key, loader, codec).await
+    }
+
+    async fn clear(&self) {
+        self.0.clear().await;
+    }
+    async fn num_entries(&self) -> usize {
+        self.0.num_entries().await
+    }
+    async fn size_bytes(&self) -> usize {
+        self.0.size_bytes().await
+    }
+}
 
 #[tokio::test]
 async fn test_posting_cache_conflict_across_partitions() {
@@ -620,7 +662,9 @@ async fn test_prewarm_streams_in_chunks_with_positions(
         .unwrap();
     writer.finish_with_metadata(metadata).await.unwrap();
 
-    let cache = Arc::new(LanceCache::with_capacity(1 << 20));
+    let cache = Arc::new(LanceCache::with_backend(Arc::new(
+        CacheWithoutResidentProbe(QuickCacheBackend::with_capacity(1 << 20)),
+    )));
     let index = InvertedIndex::load(store.clone(), None, cache.as_ref())
         .await
         .unwrap();
@@ -660,50 +704,16 @@ async fn test_prewarm_streams_in_chunks_with_positions(
             "token {token_id} posting cache entry must be positions-free after prewarm"
         );
 
-        assert!(
-            inverted_list
-                .index_cache
-                .get_with_key(&PositionKey { token_id })
-                .await
-                .is_none()
-        );
-        let positions = inverted_list
-            .index_cache
-            .get_with_key(&PositionGroupKey { start, end })
+        let metrics = LocalMetricsCollector::default();
+        inverted_list
+            .read_positions(token_id, &metrics)
             .await
             .unwrap();
-        let CompressedPositionStorage::SharedStream(first) = positions.position(slot).unwrap()
-        else {
-            panic!("expected shared positions")
-        };
-        let CompressedPositionStorage::SharedStream(second) = positions.position(slot).unwrap()
-        else {
-            panic!("expected shared positions")
-        };
-        assert_eq!(first.bytes().as_ptr(), second.bytes().as_ptr());
-        assert_eq!(
-            first.block_offsets().as_ptr(),
-            second.block_offsets().as_ptr()
-        );
-        let codec = CacheCodec::from_impl::<PositionGroup>();
-        let mut encoded = Vec::new();
-        codec
-            .serialize(
-                &(positions.clone() as lance_core::cache::CacheEntry),
-                &mut encoded,
-            )
-            .unwrap();
-        let lance_core::cache::CacheDecode::Hit(decoded) = codec.deserialize(&encoded.into())
-        else {
-            panic!("position group codec must round trip")
-        };
-        let decoded = decoded.downcast::<PositionGroup>().unwrap();
-        assert_eq!(
-            decoded.position(slot).unwrap(),
-            positions.position(slot).unwrap()
-        );
+        assert_eq!(metrics.index_cache_hits(), 1);
+        assert_eq!(metrics.index_cache_misses(), 0);
+        assert!(!group.needs_external_metadata());
 
-        // Full content round-trips with positions supplied by the packed group.
+        // Full content round-trips with positions supplied by their per-term cache entries.
         let actual = inverted_list
             .posting_list(token_id, true, &NoOpMetricsCollector)
             .await

@@ -266,7 +266,7 @@ impl DeepSizeOf for CompressedPositionStorage {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SharedPositionStream {
     codec: PositionStreamCodec,
-    block_offsets: ScalarBuffer<u32>,
+    block_offsets: Arc<[u32]>,
     // Stored with shared ownership so cache hits can clone position streams
     // without copying either offsets or bytes.
     bytes: bytes::Bytes,
@@ -276,25 +276,13 @@ impl SharedPositionStream {
     pub fn new(codec: PositionStreamCodec, block_offsets: Vec<u32>, bytes: bytes::Bytes) -> Self {
         Self {
             codec,
-            block_offsets: block_offsets.into(),
+            block_offsets: Arc::from(block_offsets.into_boxed_slice()),
             bytes,
         }
     }
 
     pub fn codec(&self) -> PositionStreamCodec {
         self.codec
-    }
-
-    pub(super) fn from_buffers(
-        codec: PositionStreamCodec,
-        block_offsets: ScalarBuffer<u32>,
-        bytes: bytes::Bytes,
-    ) -> Self {
-        Self {
-            codec,
-            block_offsets,
-            bytes,
-        }
     }
 
     pub fn block_count(&self) -> usize {
