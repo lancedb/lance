@@ -7,8 +7,8 @@ use std::sync::{Arc, Mutex};
 
 use arrow_array::types::Int32Type;
 use arrow_array::{
-    Array, ArrayRef, DictionaryArray, Float64Array, Int8Array, PrimitiveArray, StringArray,
-    new_null_array,
+    Array, ArrayRef, DictionaryArray, FixedSizeListArray, Float32Array, Float64Array, Int8Array,
+    PrimitiveArray, StringArray, new_null_array,
 };
 use arrow_buffer::{BooleanBuffer, NullBuffer, ScalarBuffer};
 use arrow_schema::DataType;
@@ -594,6 +594,217 @@ async fn test_planar_dictionary_encode_repeated_float64(#[case] nullable: bool) 
         .with_indices(vec![0, 1, 127, 128, 65_535, 65_536, num_values - 1])
         .with_expected_encoding("dictionary");
     check_round_trip_encoding_of_data(vec![array], &test_cases, HashMap::new()).await;
+}
+
+#[rstest::rstest]
+#[case::dense(false, false, false, false, "lz4")]
+#[case::null_vectors(true, false, false, false, "lz4")]
+#[case::null_children(false, true, false, false, "lz4")]
+#[case::nested(true, true, true, false, "lz4")]
+#[case::sparse(true, true, false, true, "lz4")]
+#[case::uncompressed(false, true, false, false, "none")]
+#[case::zstd(false, false, false, false, "zstd")]
+#[tokio::test]
+async fn test_planar_dictionary_encode_repeated_vectors(
+    #[case] null_vectors: bool,
+    #[case] null_children: bool,
+    #[case] nested: bool,
+    #[case] sparse: bool,
+    #[case] compression: &str,
+) {
+    const ROWS: usize = 2048;
+    const DIMENSION: usize = 512;
+    let values = Float32Array::from(
+        (0..ROWS * DIMENSION)
+            .map(|i| {
+                let row = (i / DIMENSION) % 17;
+                let column = i % DIMENSION;
+                (!null_children || !(row + column).is_multiple_of(7))
+                    .then_some((row * DIMENSION + column) as f32 / 10.0)
+            })
+            .collect::<Vec<_>>(),
+    );
+    let mut array: ArrayRef = Arc::new(FixedSizeListArray::new(
+        Arc::new(arrow_schema::Field::new("item", DataType::Float32, true)),
+        if nested { DIMENSION / 2 } else { DIMENSION } as i32,
+        Arc::new(values),
+        nested.then(|| {
+            NullBuffer::from(
+                (0..ROWS * 2)
+                    .map(|i| !i.is_multiple_of(9))
+                    .collect::<Vec<_>>(),
+            )
+        }),
+    ));
+    if nested {
+        array = Arc::new(FixedSizeListArray::new(
+            Arc::new(arrow_schema::Field::new(
+                "item",
+                array.data_type().clone(),
+                true,
+            )),
+            2,
+            array,
+            None,
+        ));
+    }
+    if null_vectors {
+        let data = array
+            .to_data()
+            .into_builder()
+            .nulls(Some(NullBuffer::from(
+                (0..ROWS).map(|i| !i.is_multiple_of(8)).collect::<Vec<_>>(),
+            )))
+            .build()
+            .unwrap();
+        array = arrow_array::make_array(data);
+    }
+    let mut metadata = HashMap::from([(
+        DICT_VALUES_COMPRESSION_META_KEY.to_string(),
+        compression.to_string(),
+    )]);
+    if sparse {
+        metadata.insert(
+            STRUCTURAL_ENCODING_META_KEY.to_string(),
+            "sparse".to_string(),
+        );
+    }
+    let tests = TestCases::default()
+        .with_encoding(TestEncoding::StructuralSparse)
+        .with_page_sizes(vec![8 * 1024 * 1024])
+        .with_ingest_batch_counts([1, 2])
+        .with_slicing_modes([false])
+        .with_batch_size(256)
+        .with_range(0..ROWS as u64)
+        .with_indices(vec![0, 1, 7, 8, 127, 128, 1023, 2047])
+        .with_expected_encoding("dictionary");
+    check_round_trip_encoding_of_data(vec![array], &tests, metadata).await;
+}
+
+#[rstest::rstest]
+#[case::index_budget(32_768, 64, 100, 8192)]
+#[case::item_budget(2048, 64, 100, 512)]
+#[case::narrow_vectors(2048, 16, 400, 512)]
+#[tokio::test]
+async fn test_sparse_vector_dictionary_hidden_payload(
+    #[case] rows: usize,
+    #[case] dimension: usize,
+    #[case] valid: usize,
+    #[case] patterns: usize,
+    #[values("lz4", "none")] compression: &str,
+) {
+    // Arrow retains arbitrary child values beneath null vectors. These repeated
+    // hidden values must not make a dictionary look cheaper than sparse storage.
+    let values = Float32Array::from(
+        (0..rows * dimension)
+            .map(|i| {
+                let row = i / dimension;
+                let pattern = if row < valid { 0 } else { 1 + row % patterns };
+                let mut bits = (pattern * dimension + i % dimension) as u32;
+                bits ^= bits >> 16;
+                bits = bits.wrapping_mul(0x7feb_352d);
+                bits ^= bits >> 15;
+                bits = bits.wrapping_mul(0x846c_a68b);
+                bits ^= bits >> 16;
+                f32::from_bits(0x3f80_0000 | (bits & 0x007f_ffff))
+            })
+            .collect::<Vec<_>>(),
+    );
+    let array = Arc::new(FixedSizeListArray::new(
+        Arc::new(arrow_schema::Field::new("item", DataType::Float32, true)),
+        dimension as i32,
+        Arc::new(values),
+        Some(NullBuffer::from(
+            (0..rows).map(|i| i < valid).collect::<Vec<_>>(),
+        )),
+    )) as ArrayRef;
+    let mut metadata = HashMap::from([(
+        DICT_VALUES_COMPRESSION_META_KEY.to_string(),
+        compression.to_string(),
+    )]);
+    // Narrow vectors need an explicit sparse request; wide mostly-null vectors
+    // must also be protected when the writer selects sparse storage automatically.
+    if dimension < 64 {
+        metadata.insert(
+            STRUCTURAL_ENCODING_META_KEY.to_string(),
+            "sparse".to_string(),
+        );
+    }
+    let field = arrow_schema::Field::new("vectors", array.data_type().clone(), true)
+        .with_metadata(metadata.clone());
+    let candidate = encode_first_page(field, array.clone(), TestEncoding::StructuralSparse).await;
+    let mut fallback_metadata = metadata.clone();
+    fallback_metadata.insert(DICT_DIVISOR_META_KEY.to_string(), "1000000".to_string());
+    let field = arrow_schema::Field::new("vectors", array.data_type().clone(), true)
+        .with_metadata(fallback_metadata);
+    let fallback = encode_first_page(field, array.clone(), TestEncoding::StructuralSparse).await;
+    let candidate_bytes: usize = candidate.data.iter().map(|buffer| buffer.len()).sum();
+    let fallback_bytes: usize = fallback.data.iter().map(|buffer| buffer.len()).sum();
+    assert!(
+        candidate_bytes <= fallback_bytes,
+        "dictionary candidate {candidate_bytes} bytes exceeds sparse fallback {fallback_bytes} bytes"
+    );
+    for (page, is_candidate) in [(&candidate, true), (&fallback, false)] {
+        let PageEncoding::Planar(layout) = &page.description else {
+            panic!("expected a planar page");
+        };
+        match layout
+            .values
+            .as_ref()
+            .and_then(|values| values.codec.as_ref())
+        {
+            Some(crate::format::pb23::value_plane::Codec::Zipped(_)) => {}
+            Some(crate::format::pb23::value_plane::Codec::Chunked(values)) => {
+                assert_eq!(values.dictionary.is_some(), is_candidate && dimension < 64);
+            }
+            other => panic!("expected a non-dictionary fallback, got {other:?}"),
+        }
+    }
+    let tests = TestCases::default()
+        .with_encoding(TestEncoding::StructuralSparse)
+        .with_page_sizes(vec![32 * 1024 * 1024])
+        .with_ingest_batch_counts([1])
+        .with_slicing_modes([false])
+        .with_batch_size(256)
+        .with_range(0..rows as u64)
+        .with_indices(vec![0, valid as u64 - 1, valid as u64, rows as u64 - 1]);
+    check_round_trip_encoding_of_data(vec![array], &tests, metadata).await;
+}
+
+#[rstest::rstest]
+#[case::unique(2048, 2048, 2)]
+#[case::entry_budget(128, 64, 8)]
+fn test_planar_vector_dictionary_rejects_unhelpful_candidates(
+    #[case] rows: usize,
+    #[case] distinct: usize,
+    #[case] divisor: u64,
+) {
+    let values = Float64Array::from(
+        (0..rows)
+            .flat_map(|i| [(i % distinct) as f64, 1.0])
+            .collect::<Vec<_>>(),
+    );
+    let array = Arc::new(FixedSizeListArray::new(
+        Arc::new(arrow_schema::Field::new("item", DataType::Float64, false)),
+        2,
+        Arc::new(values),
+        None,
+    )) as ArrayRef;
+    let field =
+        arrow_schema::Field::new("vectors", array.data_type().clone(), false).with_metadata(
+            HashMap::from([(DICT_DIVISOR_META_KEY.to_string(), divisor.to_string())]),
+        );
+    let field = lance_core::datatypes::Field::try_from(&field).unwrap();
+    assert!(
+        PrimitiveStructuralEncoder::try_dictionary_encode(
+            &DataBlock::from_array(array),
+            &field,
+            DictionaryEncodingPolicy::Planar,
+            rows as u64,
+        )
+        .unwrap()
+        .is_none()
+    );
 }
 
 // Dictionary encoding decision tests

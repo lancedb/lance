@@ -875,6 +875,7 @@ impl MiniBlockScheduler {
                 Compression::Variable(_) => 4,
                 Compression::Flat(_) => 16,
                 Compression::General(_) => 1,
+                Compression::FixedSizeList(_) => 1,
                 // The RLE frame starts with an 8-byte length prefix and slices its
                 // values/run-length sub-buffers at byte offsets, so no stricter
                 // alignment can be assumed (same reasoning as `General`).  Typed

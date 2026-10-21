@@ -2495,8 +2495,8 @@ mod tests {
     };
 
     use arrow_array::{
-        DictionaryArray, Int8Array, Int32Array, ListArray, RecordBatch, RecordBatchIterator,
-        StringArray, UInt32Array,
+        Array, DictionaryArray, FixedSizeListArray, Float32Array, Int8Array, Int32Array, ListArray,
+        RecordBatch, RecordBatchIterator, StringArray, UInt32Array,
         cast::AsArray,
         types::{Float64Type, Int8Type, Int32Type},
     };
@@ -2545,6 +2545,7 @@ mod tests {
     #[case("dictionary")]
     #[case("binary_range")]
     #[case("binary_delta")]
+    #[case("vector_dictionary")]
     #[tokio::test]
     async fn sparse_file_writer_reader_scan_range_and_take_roundtrip(#[case] kind: &str) {
         let fs = FsFixture::default();
@@ -2653,6 +2654,43 @@ mod tests {
             )
             .unwrap();
         }
+        if kind == "vector_dictionary" {
+            let vectors = Arc::new(FixedSizeListArray::new(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                64,
+                Arc::new(Float32Array::from(
+                    (0..2048 * 64)
+                        .map(|i| (i % 7 != 0).then_some((i % (17 * 64)) as f32 / 10.0))
+                        .collect::<Vec<_>>(),
+                )),
+                Some(NullBuffer::from(
+                    (0..2048).map(|i| i % 8 != 0).collect::<Vec<_>>(),
+                )),
+            ));
+            let metadata = HashMap::from([(
+                STRUCTURAL_ENCODING_META_KEY.to_string(),
+                STRUCTURAL_ENCODING_SPARSE.to_string(),
+            )]);
+            let item = Arc::new(
+                Field::new("item", vectors.data_type().clone(), true)
+                    .with_metadata(metadata.clone()),
+            );
+            let lists = Arc::new(ListArray::new(
+                item.clone(),
+                OffsetBuffer::new(ScalarBuffer::from((0..=2048).collect::<Vec<i32>>())),
+                vectors.clone(),
+                None,
+            ));
+            batch = RecordBatch::try_new(
+                Arc::new(ArrowSchema::new(vec![
+                    Field::new("values", vectors.data_type().clone(), true)
+                        .with_metadata(metadata.clone()),
+                    Field::new("items", DataType::List(item), false).with_metadata(metadata),
+                ])),
+                vec![vectors, lists],
+            )
+            .unwrap();
+        }
         let input = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
         write_lance_file(
             input,
@@ -2677,6 +2715,22 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(file_reader.metadata().column_infos.len(), 2);
+        if kind == "vector_dictionary" {
+            for column in &file_reader.metadata().column_infos {
+                for page in column.page_infos.iter() {
+                    let PageEncoding::Planar(layout) = &page.encoding else {
+                        panic!("expected Planar vector page");
+                    };
+                    let Some(lance_encoding::format::pb23::value_plane::Codec::Chunked(values)) =
+                        layout.values.as_ref().and_then(|v| v.codec.as_ref())
+                    else {
+                        panic!("expected dictionary vector indices");
+                    };
+                    assert!(values.dictionary.is_some());
+                    assert!(values.num_dictionary_items < 1024);
+                }
+            }
+        }
         if matches!(kind, "rle" | "dictionary") {
             let PageEncoding::Planar(layout) =
                 &file_reader.metadata().column_infos[1].page_infos[0].encoding

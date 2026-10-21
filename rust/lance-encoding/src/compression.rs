@@ -50,8 +50,8 @@ use crate::{
                 FsstPerValueEncoder,
             },
             general::{
-                FixedWidthGeneralBlockDecompressor, GeneralMiniBlockCompressor,
-                GeneralMiniBlockDecompressor,
+                FixedWidthGeneralBlockDecompressor, GeneralBlockCompressor,
+                GeneralMiniBlockCompressor, GeneralMiniBlockDecompressor,
             },
             packed::{
                 PackedStructFixedPerValueDecompressor, PackedStructFixedPerValueEncoder,
@@ -952,6 +952,27 @@ pub fn try_raw_block(data: &DataBlock) -> Option<Box<dyn BlockCompressor>> {
     }
 }
 
+/// Encode a dictionary of fixed-size vectors using typed per-row values.
+///
+/// The current-format policy calls this before generic block selection so that
+/// dimensions and child validity survive compression.
+pub fn try_fixed_size_list_block(
+    data: &DataBlock,
+    params: &CompressionFieldParams,
+) -> Result<Option<Box<dyn BlockCompressor>>> {
+    if !matches!(data, DataBlock::FixedSizeList(_)) {
+        return Ok(None);
+    }
+    let encoder: Box<dyn BlockCompressor> = Box::new(ValueEncoder::default());
+    match params.compression.as_deref() {
+        None | Some("none") => Ok(Some(encoder)),
+        Some(scheme) => Ok(Some(Box::new(GeneralBlockCompressor::new(
+            encoder,
+            CompressionConfig::new(scheme.parse()?, params.compression_level),
+        )))),
+    }
+}
+
 pub trait MiniBlockDecompressor: std::fmt::Debug + Send + Sync {
     fn decompress(&self, data: Vec<LanceBuffer>, num_values: u64) -> Result<DataBlock>;
 
@@ -1366,6 +1387,14 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
                 })?;
                 let scheme = compression.scheme().try_into()?;
                 let config = CompressionConfig::new(scheme, compression.level);
+                if let Some(Compression::FixedSizeList(fsl)) = &inner_desc.compression {
+                    let decoder = ValueDecompressor::from_fsl(fsl)?;
+                    return Ok(Box::new(FixedWidthGeneralBlockDecompressor::new(
+                        inner_decompressor,
+                        config,
+                        FixedPerValueDecompressor::bits_per_value(&decoder),
+                    )));
+                }
                 let general_decompressor =
                     GeneralBlockDecompressor::try_new(inner_decompressor, config)?;
 

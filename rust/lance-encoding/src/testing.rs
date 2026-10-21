@@ -202,6 +202,11 @@ impl CompressionStrategy for TestCompressionStrategy {
         data: &DataBlock,
     ) -> Result<Box<dyn BlockCompressor>> {
         let params = self.field_params(field);
+        if self.encoding == TestEncoding::StructuralSparse
+            && let Some(compressor) = crate::compression::try_fixed_size_list_block(data, &params)?
+        {
+            return Ok(compressor);
+        }
         let rle = match self.encoding {
             TestEncoding::Array | TestEncoding::StructuralU16 => None,
             TestEncoding::StructuralU32 => try_fixed_u8_rle_block(data, &params)?,
