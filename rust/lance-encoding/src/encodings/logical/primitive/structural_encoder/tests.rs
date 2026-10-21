@@ -718,10 +718,18 @@ async fn test_sparse_vector_dictionary_hidden_payload(
             (0..rows).map(|i| i < valid).collect::<Vec<_>>(),
         )),
     )) as ArrayRef;
-    let metadata = HashMap::from([(
+    let mut metadata = HashMap::from([(
         DICT_VALUES_COMPRESSION_META_KEY.to_string(),
         compression.to_string(),
     )]);
+    // Narrow vectors need an explicit sparse request; wide mostly-null vectors
+    // must also be protected when the writer selects sparse storage automatically.
+    if dimension < 64 {
+        metadata.insert(
+            STRUCTURAL_ENCODING_META_KEY.to_string(),
+            "sparse".to_string(),
+        );
+    }
     let field = arrow_schema::Field::new("vectors", array.data_type().clone(), true)
         .with_metadata(metadata.clone());
     let candidate = encode_first_page(field, array.clone(), TestEncoding::StructuralSparse).await;
