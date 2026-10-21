@@ -136,7 +136,11 @@ impl RollingPackedBlobWriter {
         max_pack_size: usize,
     ) -> Result<()> {
         self.finish().await?;
-        let blob_id = blob_id_allocator.next()?;
+        let blob_id = if managed_base.is_some() {
+            0
+        } else {
+            blob_id_allocator.next()?
+        };
         self.current = Some(if let Some((_, root)) = managed_base {
             let path = root
                 .clone()
@@ -220,7 +224,7 @@ pub struct BlobPreprocessor {
     data_dir: Path,
     data_file_key: String,
     blob_id_allocator: BlobIdAllocator,
-    part_blob_ids: Option<Range<u32>>,
+    is_part: bool,
     pack_writer: RollingPackedBlobWriter,
     /// Write-param override for the pack-file roll size. When set, it takes
     /// precedence over each field's `blob-pack-file-size-threshold` metadata for
@@ -430,7 +434,7 @@ impl BlobPreprocessor {
             data_dir,
             data_file_key,
             blob_id_allocator: BlobIdAllocator::new(1),
-            part_blob_ids: None,
+            is_part: false,
             pack_writer,
             pack_file_size_override,
             field_processors,
@@ -480,9 +484,14 @@ impl BlobPreprocessor {
         })
     }
 
-    pub(in crate::dataset) fn with_part_blob_ids(mut self, blob_ids: Range<u32>) -> Result<Self> {
-        self.blob_id_allocator = BlobIdAllocator::from_range(blob_ids.clone())?;
-        self.part_blob_ids = Some(blob_ids);
+    pub(in crate::dataset) fn with_part_blob_ids(
+        mut self,
+        blob_ids: Option<Range<u32>>,
+    ) -> Result<Self> {
+        if let Some(blob_ids) = blob_ids {
+            self.blob_id_allocator = BlobIdAllocator::from_range(blob_ids)?;
+        }
+        self.is_part = true;
         for processor in &mut self.field_processors {
             processor.force_non_empty_inline_to_sidecar();
         }
@@ -504,7 +513,11 @@ impl BlobPreprocessor {
     }
 
     async fn write_dedicated(&mut self, source: BlobWriteSource<'_>) -> Result<BlobDescriptor> {
-        let blob_id = self.blob_id_allocator.next()?;
+        let blob_id = if self.managed_base.is_some() {
+            0
+        } else {
+            self.blob_id_allocator.next()?
+        };
         let mut writer = if let Some((_, root)) = &self.managed_base {
             let path = root
                 .clone()
@@ -844,7 +857,7 @@ impl BlobPreprocessor {
                     }
                 }
 
-                if self.part_blob_ids.is_some()
+                if self.is_part
                     && let BlobPreprocessFieldKind::BlobV2 {
                         pack_file_threshold,
                         writer_metadata,
