@@ -1791,6 +1791,10 @@ impl ScalarIndexPlugin for ZoneMapIndexPlugin {
 ///
 /// Zone statistics are serialized as Arrow IPC bytes and embedded in the data
 /// file footer as a global buffer, keyed by `"lance.seed.<column_name>"`.
+/// It has one output contract, seed format version 1; a target version, if
+/// one is ever added, must be refused when the writer is created, before any
+/// data file is written. Existing files' seeds are never read on the write
+/// path, so files carrying other seed versions neither block nor slow a write.
 #[derive(Debug)]
 pub struct ZoneMapSeedWriter {
     column_name: String,
@@ -2247,7 +2251,8 @@ fn hex_decode(s: &str) -> std::result::Result<Vec<u8>, String> {
 /// layout contract; merging refuses anything it cannot reproduce exactly.
 #[derive(Debug)]
 pub struct MergeableSeed {
-    /// `None` is version 0; `"1"` is version 1. Other versions never parse.
+    /// `None` is version 0; `"1"` is version 1. Other versions classify as
+    /// [`CarriedSeed::UnsupportedVersion`] before any statistic is read.
     version: Option<String>,
     /// The zone records under a metadata-free schema, so sources concatenate.
     batch: RecordBatch,
@@ -2278,6 +2283,22 @@ impl MergeableSeed {
     pub fn rows_per_zone(&self) -> u64 {
         self.rows_per_zone
     }
+
+    /// Exact null offsets within the covered rows, when the source recorded them.
+    pub fn null_bitmap(&self) -> Option<&RoaringBitmap> {
+        self.null_bitmap.as_ref()
+    }
+}
+
+/// What a seed buffer turned out to be when parsed for binary-copy carrying.
+#[derive(Debug)]
+pub enum CarriedSeed {
+    /// A seed of a supported version whose statistics passed validation.
+    Supported(MergeableSeed),
+    /// A seed declaring a format version this build cannot interpret. It is
+    /// a recognized seed (so it does not disqualify the file), but its column
+    /// is copied without a seed: unknown statistics are never relabeled.
+    UnsupportedVersion(String),
 }
 
 fn seed_parse_error(message: impl std::fmt::Display) -> lance_core::Error {
@@ -2288,16 +2309,15 @@ fn seed_parse_error(message: impl std::fmt::Display) -> lance_core::Error {
 ///
 /// `rows_per_zone` is the collection granularity the locator declares
 /// (`<buffer_index>:<rows_per_zone>`); zones are located by their lengths,
-/// never by it. An error means the buffer must be neither carried nor
-/// silently dropped: an unrecognized shape, an unsupported version, or
-/// statistics that contradict the layout (zero-length zones, counts beyond
-/// the zone, a bitmap outside the covered rows). The caller then refuses
-/// binary copy for the file, preserving the existing protection against
-/// unknown global buffers.
-pub fn parse_seed_for_binary_copy(
-    bytes: &bytes::Bytes,
-    rows_per_zone: u64,
-) -> Result<MergeableSeed> {
+/// never by it. A buffer whose `version` metadata this build does not
+/// support classifies as [`CarriedSeed::UnsupportedVersion`] without its
+/// statistics being read. An error means the buffer must be neither carried
+/// nor silently dropped: an unrecognized shape, or statistics that
+/// contradict the layout (zero-length zones, counts beyond the zone, a
+/// bitmap outside the covered rows). The caller then refuses binary copy for
+/// the file, preserving the existing protection against unknown global
+/// buffers.
+pub fn parse_seed_for_binary_copy(bytes: &bytes::Bytes, rows_per_zone: u64) -> Result<CarriedSeed> {
     if rows_per_zone == 0 {
         return Err(seed_parse_error("locator declares rows_per_zone 0"));
     }
@@ -2311,16 +2331,7 @@ pub fn parse_seed_for_binary_copy(
     let is_v1 = match version.as_deref() {
         None => false,
         Some(SEED_FORMAT_VERSION) => true,
-        Some(other) => {
-            return Err(lance_core::Error::not_supported_source(
-                format!(
-                    "zone map seed format version '{}' is not supported by this build; \
-                     please upgrade Lance",
-                    other
-                )
-                .into(),
-            ));
-        }
+        Some(other) => return Ok(CarriedSeed::UnsupportedVersion(other.to_string())),
     };
     let null_bitmap_hex = schema.metadata.get(SEED_NULL_BITMAP_META_KEY).cloned();
 
@@ -2454,13 +2465,13 @@ pub fn parse_seed_for_binary_copy(
     let canonical_schema = Arc::new(arrow_schema::Schema::new(batch.schema().fields().clone()));
     let batch = RecordBatch::try_new(canonical_schema, batch.columns().to_vec())?;
 
-    Ok(MergeableSeed {
+    Ok(CarriedSeed::Supported(MergeableSeed {
         version,
         batch,
         null_bitmap,
         total_rows,
         rows_per_zone,
-    })
+    }))
 }
 
 /// Merge the seeds of the files an output binary-copies, in copy order, into
@@ -2562,7 +2573,9 @@ mod tests {
     use std::sync::Arc;
 
     use crate::scalar::zoned::ZoneBound;
-    use crate::scalar::zonemap::{ZoneMapIndexPlugin, ZoneMapStatistics};
+    use crate::scalar::zonemap::{
+        CarriedSeed, MergeableSeed, ZoneMapIndexPlugin, ZoneMapStatistics,
+    };
     use arrow::datatypes::{
         ArrowPrimitiveType, Decimal128Type, Float32Type, Float64Type, Int64Type,
     };
@@ -5883,10 +5896,7 @@ mod tests {
         // by their lengths, and the caller picks the output locator's value.
         let a = seed_bytes_f32(&a_values, 4);
         let b = seed_bytes_f32(&b_values, 8);
-        let parsed = [
-            parse_seed_for_binary_copy(&a, 4).unwrap(),
-            parse_seed_for_binary_copy(&b, 8).unwrap(),
-        ];
+        let parsed = [parse_supported(&a, 4), parse_supported(&b, 8)];
         assert_eq!(
             (parsed[0].rows_per_zone(), parsed[1].rows_per_zone()),
             (4, 8)
@@ -5928,14 +5938,23 @@ mod tests {
 
     /// Any version 0 source refuses the merge; a bitmap missing on one source
     /// leaves the output without one.
+    fn parse_supported(bytes: &bytes::Bytes, rows_per_zone: u64) -> MergeableSeed {
+        match parse_seed_for_binary_copy(bytes, rows_per_zone).unwrap() {
+            CarriedSeed::Supported(seed) => seed,
+            CarriedSeed::UnsupportedVersion(version) => {
+                panic!("expected a supported seed, got version {version}")
+            }
+        }
+    }
+
     #[test]
     fn test_merge_seeds_version_and_bitmap_rules() {
         let a = seed_bytes_f32(&[Some(1.0), Some(2.0)], 2);
         let b = seed_bytes_f32(&[Some(3.0), None], 2);
-        let a_parsed = parse_seed_for_binary_copy(&a, 2).unwrap();
+        let a_parsed = parse_supported(&a, 2);
 
         let b_v0 = to_v0(&b);
-        let b_v0_parsed = parse_seed_for_binary_copy(&b_v0, 2).unwrap();
+        let b_v0_parsed = parse_supported(&b_v0, 2);
         assert!(!b_v0_parsed.is_version_1());
         assert!(
             merge_seeds_for_binary_copy(&[&a_parsed, &b_v0_parsed])
@@ -5950,7 +5969,7 @@ mod tests {
             metadata.remove(SEED_NULL_BITMAP_META_KEY);
             batch
         });
-        let b_parsed = parse_seed_for_binary_copy(&b_no_bitmap, 2).unwrap();
+        let b_parsed = parse_supported(&b_no_bitmap, 2);
         let merged = merge_seeds_for_binary_copy(&[&a_parsed, &b_parsed])
             .unwrap()
             .unwrap();
@@ -5964,17 +5983,33 @@ mod tests {
     }
 
     /// Corrupt or contradictory buffers refuse parsing instead of posing as
-    /// missing statistics; unknown versions keep the refusal contract.
+    /// missing statistics; a future version is recognized but never
+    /// interpreted, so no merge can relabel it as version 1.
     #[test]
     fn test_parse_seed_rejects_corrupt_and_unknown() {
         let good = seed_bytes_f32(&[Some(1.0), Some(2.0), Some(3.0)], 2);
-        assert!(parse_seed_for_binary_copy(&good, 2).is_ok());
+        let good_parsed = parse_supported(&good, 2);
 
-        let unknown_version = transform_seed(&good, |metadata, batch| {
-            metadata.insert(SEED_VERSION_META_KEY.to_string(), "9".to_string());
+        // A version 2 fixture: version 1 bytes relabeled, which a version 1
+        // build must not read as version 1 even though the columns match.
+        let future_version = transform_seed(&good, |metadata, batch| {
+            metadata.insert(SEED_VERSION_META_KEY.to_string(), "2".to_string());
             batch
         });
-        let error = parse_seed_for_binary_copy(&unknown_version, 2).unwrap_err();
+        let CarriedSeed::UnsupportedVersion(version) =
+            parse_seed_for_binary_copy(&future_version, 2).unwrap()
+        else {
+            panic!("a future version must not parse as supported statistics");
+        };
+        assert_eq!(version, "2");
+        // Only supported seeds can reach the merge; a version 1 source alone
+        // merges to itself, and the decoder refuses the version 2 bytes.
+        assert!(
+            merge_seeds_for_binary_copy(&[&good_parsed])
+                .unwrap()
+                .is_some()
+        );
+        let error = ZoneMapSeedWriter::deserialize_seed(0, &future_version).unwrap_err();
         assert!(matches!(error, lance_core::Error::NotSupported { .. }));
 
         let zero_length = set_zone_lengths(&good, &[2, 0]);
@@ -6012,7 +6047,7 @@ mod tests {
         // A version 0 buffer parses (so the gate can account for it) but is
         // never carried.
         let v0 = to_v0(&good);
-        let v0_parsed = parse_seed_for_binary_copy(&v0, 2).unwrap();
+        let v0_parsed = parse_supported(&v0, 2);
         assert!(!v0_parsed.is_version_1());
     }
 

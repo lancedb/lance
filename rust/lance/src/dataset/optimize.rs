@@ -751,7 +751,10 @@ pub(super) async fn can_use_binary_copy_current(
                 )
                 .await
             {
-                log::debug!("Binary copy disabled: {}", e);
+                log::debug!(
+                    "Binary copy disabled: extra global buffers cannot be handled safely: {}",
+                    e
+                );
                 return Ok(false);
             }
         }

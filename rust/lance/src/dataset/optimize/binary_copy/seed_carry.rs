@@ -8,8 +8,9 @@
 //! file's seeds are validated here, per output file and per column: when every
 //! contributing input carries a compatible, complete seed for a column, the
 //! zone records are concatenated in copy order into the output file's seed;
-//! otherwise that output column carries no seed and the data still binary
-//! copies. Nothing is rescanned and no statistics are recomputed.
+//! otherwise (a missing seed, a version this build cannot interpret, or a
+//! version 0 seed) that output column carries no seed and the data still
+//! binary copies. Nothing is rescanned and no statistics are recomputed.
 
 use std::collections::HashMap;
 
@@ -19,7 +20,7 @@ use lance_file::reader::CachedFileMetadata;
 use lance_file::versions::data_file_columns;
 use lance_index::scalar::seed::SEED_META_KEY_PREFIX;
 use lance_index::scalar::zonemap::{
-    MergeableSeed, merge_seeds_for_binary_copy, parse_seed_for_binary_copy,
+    CarriedSeed, MergeableSeed, merge_seeds_for_binary_copy, parse_seed_for_binary_copy,
 };
 use lance_io::scheduler::FileScheduler;
 use lance_table::format::DataFile;
@@ -28,12 +29,14 @@ use crate::Dataset;
 use crate::Result;
 use crate::datatypes::Schema;
 
-/// One input column's validated seed, keyed for merging.
-pub struct SourceColumnSeed {
-    seed: MergeableSeed,
-    /// The original buffer, carried verbatim when one source covers an
-    /// entire output file.
-    bytes: Bytes,
+/// One input column's recognized seed.
+pub enum SourceColumnSeed {
+    /// Validated and ready for merging. `bytes` is the original buffer,
+    /// carried verbatim when one source covers an entire output file.
+    Supported { seed: MergeableSeed, bytes: Bytes },
+    /// A seed version this build cannot interpret: the column copies
+    /// without a seed.
+    UnsupportedVersion(String),
 }
 
 /// The `rows_per_zone` an output column's locator declares: the current
@@ -90,12 +93,13 @@ pub struct SourceSeeds {
 ///
 /// Every extra buffer (beyond the schema descriptor at index 0) must be
 /// claimed by exactly one `lance.seed.<column>` schema metadata entry whose
-/// locator parses, resolves to a stored field, and whose buffer parses as a
-/// zone map seed of a supported version covering exactly the file's physical
-/// rows. Anything else is an error: the caller then refuses binary copy for
-/// the task, preserving the existing protection against unknown global
-/// buffers (a key prefix alone does not prove the content is a zone map
-/// seed).
+/// locator parses, resolves to a stored field, and whose buffer is a zone
+/// map seed: either of a supported version covering exactly the file's
+/// physical rows, or of a version this build does not interpret (recognized,
+/// carried as [`SourceColumnSeed::UnsupportedVersion`]). Anything else is an
+/// error: the caller then refuses binary copy for the task, preserving the
+/// existing protection against unknown global buffers (a key prefix alone
+/// does not prove the content is a zone map seed).
 pub async fn extract_source_seeds(
     file_meta: &CachedFileMetadata,
     file_scheduler: &FileScheduler,
@@ -167,16 +171,23 @@ pub async fn extract_source_seeds(
         let bytes = file_scheduler
             .submit_single(buffer.position..buffer.position + buffer.size, 0)
             .await?;
-        let seed = parse_seed_for_binary_copy(&bytes, locator_rows_per_zone)?;
-        if seed.total_rows() != num_rows {
-            return Err(Error::invalid_input(format!(
-                "data file '{}': seed '{}' covers {} rows but the file holds {}",
-                data_file.path,
-                key,
-                seed.total_rows(),
-                num_rows
-            )));
-        }
+        let seed = match parse_seed_for_binary_copy(&bytes, locator_rows_per_zone)? {
+            CarriedSeed::Supported(seed) => {
+                if seed.total_rows() != num_rows {
+                    return Err(Error::invalid_input(format!(
+                        "data file '{}': seed '{}' covers {} rows but the file holds {}",
+                        data_file.path,
+                        key,
+                        seed.total_rows(),
+                        num_rows
+                    )));
+                }
+                SourceColumnSeed::Supported { seed, bytes }
+            }
+            CarriedSeed::UnsupportedVersion(version) => {
+                SourceColumnSeed::UnsupportedVersion(version)
+            }
+        };
         recognized += 1;
         // An imported file may remap field ids in `DataFile.fields` while its
         // footer keeps the original ids, so the destination identity comes
@@ -198,7 +209,7 @@ pub async fn extract_source_seeds(
             .zip(data_file.column_indices.iter())
             .find(|(_, column_index)| **column_index >= 0 && **column_index == *stored_column)
         {
-            seeds.insert(*field_id, SourceColumnSeed { seed, bytes });
+            seeds.insert(*field_id, seed);
         }
     }
 
@@ -236,8 +247,10 @@ impl OutputSeedAccumulator {
     /// value type; zones are located by length, so differing collection
     /// granularities concatenate freely and the output locator declares the
     /// column's current `rows_per_zone` from `index_rows_per_zone` (or the
-    /// writer default). A version 0 source drops the column (no implicit
-    /// format conversion) and the data still copies.
+    /// writer default). Each column is decided on its own: an input without
+    /// a seed, with a version this build cannot interpret, or with a version
+    /// 0 seed drops that column (no conversion or relabeling), and the data
+    /// still copies.
     pub fn finish(
         &mut self,
         current_schema: &Schema,
@@ -267,30 +280,48 @@ impl OutputSeedAccumulator {
                 // Some input lacks this column's seed: partial statistics must
                 // not impersonate complete coverage of the output.
                 log::debug!(
-                    "binary copy: output carries no seed for column {}: an input has none",
+                    "Not carrying seed for column {}: an input has none",
                     current_field.name
                 );
                 continue;
             };
-            if column_seeds.iter().any(|seed| !seed.seed.is_version_1()) {
+            let mut supported = Vec::with_capacity(column_seeds.len());
+            let mut unsupported = None;
+            for column_seed in &column_seeds {
+                match column_seed {
+                    SourceColumnSeed::Supported { seed, bytes } => supported.push((seed, bytes)),
+                    SourceColumnSeed::UnsupportedVersion(version) => {
+                        unsupported.get_or_insert(version.as_str());
+                    }
+                }
+            }
+            if let Some(version) = unsupported {
+                log::debug!(
+                    "Not carrying seed for column {}: seed version '{}' is not supported by \
+                     this build and seed versions are not merged across versions",
+                    current_field.name,
+                    version
+                );
+                continue;
+            }
+            if supported.iter().any(|(seed, _)| !seed.is_version_1()) {
                 // Version 0 sources are never carried: converting them would
                 // fabricate sign counts, and their fixed-stride layout does
                 // not concatenate.
                 log::debug!(
-                    "binary copy: output carries no seed for column {}: a version 0 seed is \
-                     not carried; the next index update rescans these rows",
+                    "Not carrying seed for column {}: a version 0 seed is not carried; the \
+                     next index update rescans these rows",
                     current_field.name
                 );
                 continue;
             }
 
-            let bytes = if column_seeds.len() == 1 {
+            let bytes = if supported.len() == 1 {
                 // One input covers the whole output: its seed is already the
                 // output's seed, byte for byte.
-                column_seeds[0].bytes.clone()
+                supported[0].1.clone()
             } else {
-                let merged: Vec<&MergeableSeed> =
-                    column_seeds.iter().map(|seed| &seed.seed).collect();
+                let merged: Vec<&MergeableSeed> = supported.iter().map(|(seed, _)| *seed).collect();
                 match merge_seeds_for_binary_copy(&merged)? {
                     Some(bytes) => bytes,
                     None => continue,
