@@ -17,6 +17,9 @@ mod russian_tests;
 #[path = "stop_word_filter/latin.rs"]
 mod latin;
 
+#[path = "stop_word_filter/tamil.rs"]
+mod tamil;
+
 #[path = "stop_word_filter/arabic.rs"]
 mod arabic;
 
@@ -44,7 +47,7 @@ fn all_stop_words() -> impl Iterator<Item = &'static str> {
         stopwords::RUSSIAN,
         stopwords::SPANISH,
         stopwords::SWEDISH,
-        stop_words::get("ta"),
+        tamil::TAMIL,
         latin::TURKISH,
         cjk::CHINESE,
         cjk::JAPANESE,
@@ -82,7 +85,7 @@ impl StopWordFilter {
             Language::Russian => stopwords::RUSSIAN,
             Language::Spanish => stopwords::SPANISH,
             Language::Swedish => stopwords::SWEDISH,
-            Language::Tamil => stop_words::get("ta"),
+            Language::Tamil => tamil::TAMIL,
             Language::Turkish => latin::TURKISH,
         };
         Some(Self::remove(words.iter().map(|word| (*word).to_owned())))
