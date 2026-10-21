@@ -58,9 +58,6 @@ pub struct CommitBuilder<'a> {
     /// Set only by `Dataset::deep_clone`, after it has copied the source files.
     deep_clone_files_copied: bool,
     keep_field_ids: bool,
-    /// Read snapshots of a detached batch, before merging loses all but the
-    /// minimum. Detached snapshot IDs are not ordered by ancestry.
-    detached_batch_read_versions: Vec<u64>,
 }
 
 /// Default timeout applied to [`CommitBuilder::execute`] when none is set.
@@ -83,7 +80,6 @@ impl<'a> CommitBuilder<'a> {
             retry_timeout: default_commit_retry_timeout(),
             affected_rows: None,
             transaction_properties: None,
-            detached_batch_read_versions: Vec::new(),
             timeout: Some(DEFAULT_COMMIT_TIMEOUT),
             migration_next_row_id: None,
             activate_non_reusable_field_ids: false,
@@ -202,10 +198,6 @@ impl<'a> CommitBuilder<'a> {
     ///
     /// This can be used to stage changes or to handle "secondary" datasets
     /// whose lineage is tracked elsewhere.
-    ///
-    /// The base must be the transaction's read snapshot, or a newer mainline
-    /// snapshot when both versions are mainline. Distinct detached snapshot
-    /// IDs do not establish ancestry and are rejected.
     pub fn with_detached(mut self, detached: bool) -> Self {
         self.detached = detached;
         self
@@ -481,14 +473,6 @@ impl<'a> CommitBuilder<'a> {
                         "detached commits cannot be used with v1 manifest paths".into(),
                     ));
                 }
-                // Unlike a mainline commit, this manifest inherits only the
-                // supplied base's state, including its sticky feature flags.
-                // Check every batch input, not just the merged read version.
-                for read_version in std::iter::once(transaction.read_version)
-                    .chain(self.detached_batch_read_versions.iter().copied())
-                {
-                    validate_detached_base_version(dataset.manifest.version, read_version)?;
-                }
                 commit_detached_transaction(
                     dataset,
                     object_store.as_ref(),
@@ -596,8 +580,6 @@ impl<'a> CommitBuilder<'a> {
     }
 
     /// Commit a set of transactions as a single new version.
-    /// Transactions reading detached snapshots must all read the same snapshot;
-    /// detached IDs cannot be ordered to choose a common base.
     ///
     /// <div class="warning">
     ///   Only works for append transactions right now. Other kinds of transactions
@@ -619,16 +601,6 @@ impl<'a> CommitBuilder<'a> {
         }
 
         let read_version = transactions.iter().map(|t| t.read_version).min().unwrap();
-        if transactions
-            .iter()
-            .any(|t| is_detached_version(t.read_version))
-            && transactions.iter().any(|t| t.read_version != read_version)
-        {
-            return Err(Error::invalid_input(
-                "batch commits cannot combine a detached read snapshot with a different \
-                 read version; all inputs must read the same detached snapshot",
-            ));
-        }
 
         let merged = Transaction {
             uuid: uuid::Uuid::new_v4().hyphenated().to_string(),
@@ -645,12 +617,7 @@ impl<'a> CommitBuilder<'a> {
             tag: None,
             transaction_properties: None,
         };
-        let mut this = self;
-        if this.detached {
-            this.detached_batch_read_versions =
-                transactions.iter().map(|t| t.read_version).collect();
-        }
-        let dataset = this.execute(merged.clone()).await?;
+        let dataset = self.execute(merged.clone()).await?;
         Ok(BatchCommitResult { dataset, merged })
     }
 }
@@ -662,21 +629,6 @@ pub struct BatchCommitResult {
     // TODO: Reject conflicts that need to be retried.
     // /// Transactions that were rejected due to conflicts.
     // pub rejected: Vec<Transaction>,
-}
-
-fn validate_detached_base_version(base_version: u64, read_version: u64) -> Result<()> {
-    if base_version == read_version
-        || (!is_detached_version(base_version)
-            && !is_detached_version(read_version)
-            && base_version > read_version)
-    {
-        return Ok(());
-    }
-    Err(Error::invalid_input(format!(
-        "detached commit base version {base_version} cannot be used with transaction \
-         read version {read_version}: use the same snapshot, or a newer mainline \
-         snapshot when both versions are mainline"
-    )))
 }
 
 #[cfg(test)]
@@ -702,32 +654,6 @@ mod tests {
     use crate::dataset::{InsertBuilder, WriteMode, WriteParams};
 
     use super::*;
-
-    #[rstest::rstest]
-    #[case::same_mainline(2, 2, true)]
-    #[case::newer_mainline(3, 2, true)]
-    #[case::older_mainline(1, 2, false)]
-    #[case::same_detached(u64::MAX, u64::MAX, true)]
-    #[case::larger_detached_base(u64::MAX, u64::MAX - 1, false)]
-    #[case::smaller_detached_base(u64::MAX - 1, u64::MAX, false)]
-    #[case::detached_base_mainline_read(u64::MAX, 2, false)]
-    #[case::mainline_base_detached_read(2, u64::MAX, false)]
-    fn test_detached_base_version(
-        #[case] base_version: u64,
-        #[case] read_version: u64,
-        #[case] is_compatible: bool,
-    ) {
-        let result = validate_detached_base_version(base_version, read_version);
-        if is_compatible {
-            result.unwrap();
-        } else {
-            let error = result.unwrap_err();
-            assert!(matches!(error, Error::InvalidInput { .. }));
-            let message = error.to_string();
-            assert!(message.contains(&format!("base version {base_version}")));
-            assert!(message.contains(&format!("read version {read_version}")));
-        }
-    }
 
     #[tokio::test]
     async fn raw_arrow_new_dataset_preserves_user_metadata() {
@@ -843,29 +769,6 @@ mod tests {
             tag: None,
             transaction_properties: None,
         }
-    }
-
-    #[rstest::rstest]
-    #[case::mainline_and_detached(1, u64::MAX)]
-    #[case::different_detached(u64::MAX - 1, u64::MAX)]
-    #[tokio::test]
-    async fn test_batch_rejects_incomparable_read_versions(
-        #[case] first_version: u64,
-        #[case] second_version: u64,
-        #[values(false, true)] is_detached: bool,
-    ) {
-        let result = CommitBuilder::new("memory://")
-            .with_detached(is_detached)
-            .execute_batch(vec![
-                sample_transaction(first_version),
-                sample_transaction(second_version),
-            ])
-            .await;
-        let Err(error) = result else {
-            panic!("incomparable read versions must not be merged");
-        };
-        assert!(matches!(error, Error::InvalidInput { .. }));
-        assert!(error.to_string().contains("all inputs must read the same"));
     }
 
     #[derive(Debug)]
