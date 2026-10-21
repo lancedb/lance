@@ -1638,6 +1638,14 @@ impl Dataset {
     /// Some validation can be performed using the function
     /// [crate::dataset::transaction::validate_operation].
     ///
+    /// That responsibility includes the files' format requirements: a caller publishing
+    /// externally produced fragments must make sure their contents comply with the
+    /// destination's format and with the feature flags the destination carries. The commit
+    /// does not discover every capability from arbitrary file contents. For example, data
+    /// files that embed version 1 zone write seeds (such as files copied from another table
+    /// whose manifest carries `FLAG_ZONE_WRITE_SEEDS`) may only be committed into a
+    /// destination that already carries that flag.
+    ///
     /// If this commit is a change to an existing dataset then it will often need to be based on an
     /// existing version of the dataset.  For example, if this change is a `delete` operation then
     /// the caller will have read in the existing data (at some version) to determine which fragments
