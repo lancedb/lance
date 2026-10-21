@@ -828,11 +828,20 @@ pub struct FragReadConfig {
     /// The scan sets this so every base file it opens shares one scheduler per
     /// base. When absent, a base file falls back to building its own scheduler.
     pub base_schedulers: Option<BaseSchedulers>,
+    /// Read rows as if the fragment had no deletions: the deletion file is not
+    /// loaded and deleted rows come back with their stored values. Only for a
+    /// caller that knows the rows it asks for are live.
+    pub ignore_deletions: bool,
 }
 
 impl FragReadConfig {
     pub fn with_row_id(mut self, value: bool) -> Self {
         self.with_row_id = value;
+        self
+    }
+
+    pub fn with_ignore_deletions(mut self, value: bool) -> Self {
+        self.ignore_deletions = value;
         self
     }
 
@@ -1164,7 +1173,11 @@ impl FileFragment {
         read_config: FragReadConfig,
     ) -> Result<FragmentReader> {
         let open_files = self.open_readers(projection, &read_config);
-        let deletion_vec_load = self.get_deletion_vector();
+        let deletion_vec_load = if read_config.ignore_deletions {
+            futures::future::Either::Left(futures::future::ready(Ok(None)))
+        } else {
+            futures::future::Either::Right(self.get_deletion_vector())
+        };
 
         // Preserve the legacy reader's eager initialization. Current readers
         // can defer the sequence until a read actually requests stable row IDs.
@@ -2016,7 +2029,7 @@ impl FileFragment {
 
         // Then call take rows
         let batch = self
-            .take_rows(&row_ids, projection, false, false, false, false)
+            .take_rows(&row_ids, projection, FragReadConfig::default())
             .await?;
 
         // Convert Lance JSON columns (LargeBinary/JSONB) back to Arrow JSON (Utf8)
@@ -2205,21 +2218,9 @@ impl FileFragment {
         &self,
         row_offsets: &[u32],
         projection: &Schema,
-        with_row_id: bool,
-        with_row_address: bool,
-        with_row_created_at_version: bool,
-        with_row_last_updated_at_version: bool,
+        read_config: FragReadConfig,
     ) -> Result<RecordBatch> {
-        let reader = self
-            .open(
-                projection,
-                FragReadConfig::default()
-                    .with_row_id(with_row_id)
-                    .with_row_address(with_row_address)
-                    .with_row_created_at_version(with_row_created_at_version)
-                    .with_row_last_updated_at_version(with_row_last_updated_at_version),
-            )
-            .await?;
+        let reader = self.open(projection, read_config).await?;
 
         if row_offsets.len() > 1 && Self::row_ids_contiguous(row_offsets) {
             let range =
@@ -6848,10 +6849,7 @@ mod tests {
             .take_rows(
                 &[1, 2, 4, 5, 5, 8],
                 dataset.schema(),
-                false,
-                false,
-                false,
-                false,
+                FragReadConfig::default().with_row_address(false),
             )
             .await
             .unwrap();
@@ -6874,10 +6872,7 @@ mod tests {
             .take_rows(
                 &[1, 2, 4, 5, 8],
                 dataset.schema(),
-                false,
-                false,
-                false,
-                false,
+                FragReadConfig::default().with_row_address(false),
             )
             .await
             .unwrap();
@@ -6888,7 +6883,7 @@ mod tests {
 
         // Empty indices gives empty result
         let batch = fragment
-            .take_rows(&[], dataset.schema(), false, false, false, false)
+            .take_rows(&[], dataset.schema(), FragReadConfig::default())
             .await
             .unwrap();
         assert_eq!(
@@ -6901,10 +6896,7 @@ mod tests {
             .take_rows(
                 &[1, 2, 4, 5, 8],
                 dataset.schema(),
-                false,
-                true,
-                false,
-                false,
+                FragReadConfig::default().with_row_address(true),
             )
             .await
             .unwrap();
