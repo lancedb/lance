@@ -202,6 +202,9 @@ impl CacheKey for RowAddrMaskKey {
 #[derive(Debug)]
 pub struct RowIdIndexKey<'a> {
     pub version: u64,
+    /// Whether the index knows the deleted rows (it then maps them to `None`).
+    /// An index built without deletion vectors reads no deletion file.
+    pub with_deletions: bool,
     /// A dataset dropped and recreated at the same URI restarts its version
     /// history at 1, so a long-lived session's cache can otherwise return the
     /// previous incarnation's index for a version number the new incarnation
@@ -215,8 +218,9 @@ impl CacheKey for RowIdIndexKey<'_> {
     type ValueType = RowIdIndex;
     fn key(&self) -> Cow<'_, str> {
         Cow::Owned(format!(
-            "row_id_index/{}/{}",
+            "row_id_index/{}/{}/{}",
             self.version,
+            self.with_deletions,
             self.e_tag.unwrap_or("")
         ))
     }
@@ -230,6 +234,7 @@ impl CacheKey for RowIdIndexKey<'_> {
 
     fn write_key(&self, builder: &mut KeyBuilder) {
         builder.write_u64(self.version);
+        builder.write_u64(self.with_deletions as u64);
         match self.e_tag {
             Some(e_tag) => {
                 builder.write_some();
@@ -428,6 +433,7 @@ mod tests {
         let cache = LanceCache::with_capacity(4096);
         let key = RowIdIndexKey {
             version: 5,
+            with_deletions: true,
             e_tag: Some("first-etag"),
         };
         cache
@@ -439,6 +445,7 @@ mod tests {
             cache
                 .get_with_key(&RowIdIndexKey {
                     version: 5,
+                    with_deletions: true,
                     e_tag: Some("second-etag"),
                 })
                 .await

@@ -66,6 +66,7 @@ use crate::dataset::Dataset;
 use crate::index::DatasetIndexInternalExt;
 use crate::index::prefilter::{DatasetPreFilter, FilterLoader};
 use crate::index::vector::utils::{get_vector_type, validate_distance_type_for};
+use crate::session::index_caches::SegmentOwnershipMaskKey;
 use crate::{Error, Result};
 use lance_arrow::*;
 
@@ -1790,21 +1791,46 @@ impl PreFilter for SegmentPreFilter {
     }
 }
 
+/// The cached [`SegmentOwnershipMaskKey`] entry of `index` at the dataset's
+/// version; `None` when the segment needs no restriction.
+async fn segment_ownership_mask(
+    dataset: &Arc<Dataset>,
+    index: &IndexMetadata,
+) -> Result<Option<Arc<RowAddrMask>>> {
+    let Some(owned_fragments) = index.fragment_bitmap.as_ref() else {
+        return Ok(None);
+    };
+    let key = SegmentOwnershipMaskKey {
+        uuid: &index.uuid,
+        version: dataset.manifest.version,
+        store_identity: &dataset.object_store.store_prefix,
+        e_tag: dataset.manifest_location.e_tag.as_deref(),
+    };
+    let loader_dataset = dataset.clone();
+    let mask = dataset
+        .index_cache
+        .get_or_insert_with_key(key, || async move {
+            // Cloned only on a miss so a cache hit does not copy the bitmap.
+            futures::future::OptionFuture::from(DatasetPreFilter::create_restricted_deletion_mask(
+                loader_dataset,
+                owned_fragments.clone(),
+            ))
+            .await
+            .transpose()
+        })
+        .await?;
+    Ok((*mask).clone())
+}
+
 async fn prefilter_for_segment(
     dataset: Arc<Dataset>,
     index: &IndexMetadata,
     base: Arc<DatasetPreFilter>,
 ) -> Result<Arc<dyn PreFilter>> {
-    let Some(owned_fragments) = index.fragment_bitmap.clone() else {
-        return Ok(base);
-    };
-    let Some(ownership_mask) =
-        DatasetPreFilter::create_restricted_deletion_mask(dataset, owned_fragments)
-    else {
-        return Ok(base);
-    };
-    let ownership_mask = ownership_mask.await?;
-    Ok(Arc::new(SegmentPreFilter::new(base, ownership_mask)))
+    match segment_ownership_mask(&dataset, index).await? {
+        Some(ownership_mask) => Ok(Arc::new(SegmentPreFilter::new(base, ownership_mask))),
+        None => Ok(base),
+    }
 }
 
 impl PartitionSearchControl for LatePartitionSearchControl {
@@ -2278,14 +2304,11 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
         // fragment_bitmap, mirroring the `all_have_bitmaps` gate in
         // DatasetPreFilter::new so we never restrict more aggressively than the
         // shared prefilter's fallback.
-        let segment_bitmaps: Arc<HashMap<Uuid, RoaringBitmap>> =
+        let restricted_segments: Arc<HashSet<Uuid>> =
             Arc::new(if indices.iter().all(|idx| idx.fragment_bitmap.is_some()) {
-                indices
-                    .iter()
-                    .map(|idx| (idx.uuid, idx.fragment_bitmap.clone().unwrap()))
-                    .collect()
+                indices.iter().map(|idx| idx.uuid).collect()
             } else {
-                HashMap::new()
+                HashSet::new()
             });
         let prefilter_source = self.prefilter_source.clone();
         let metrics = Arc::new(AnnIndexMetrics::new(&self.metrics, partition));
@@ -2364,7 +2387,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                     let pre_filter = pre_filter.clone();
                     let indices_by_uuid = indices_by_uuid.clone();
                     let state = state.clone();
-                    let segment_bitmaps = segment_bitmaps.clone();
+                    let restricted_segments = restricted_segments.clone();
                     let mut query = query.clone();
                     async move {
                         let index_metadata = indices_by_uuid.get(&index_uuid).ok_or_else(|| {
@@ -2395,17 +2418,10 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                         // helper so it is correct for both row-address and stable-row-id
                         // datasets. The shared prefilter is built from the union of all
                         // segment bitmaps and cannot express this per-segment rule.
-                        let seg_mask = match segment_bitmaps.get(&index_uuid).cloned() {
-                            Some(bitmap) => {
-                                match DatasetPreFilter::create_restricted_deletion_mask(
-                                    ds.clone(),
-                                    bitmap,
-                                ) {
-                                    Some(fut) => Some(fut.await?),
-                                    None => None,
-                                }
-                            }
-                            None => None,
+                        let seg_mask = if restricted_segments.contains(&index_uuid) {
+                            segment_ownership_mask(&ds, index_metadata).await?
+                        } else {
+                            None
                         };
 
                         let early_search = Self::initial_search(
@@ -3694,6 +3710,32 @@ mod tests {
             .unwrap();
         segment_prefilter.wait_for_ready().await.unwrap();
 
+        // The ownership mask is derived from the manifest, so the same segment at
+        // the same version serves the cached entry instead of walking the fragments.
+        let first_mask = segment_ownership_mask(&dataset, &old_segment)
+            .await
+            .unwrap()
+            .expect("a segment that owns a subset of the fragments is restricted");
+        let second_mask = segment_ownership_mask(&dataset, &old_segment)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(Arc::ptr_eq(&first_mask, &second_mask));
+        let cached_mask = dataset
+            .index_cache
+            .get_with_key(&SegmentOwnershipMaskKey {
+                uuid: &old_segment.uuid,
+                version: dataset.manifest.version,
+                store_identity: &dataset.object_store.store_prefix,
+                e_tag: dataset.manifest_location.e_tag.as_deref(),
+            })
+            .await
+            .expect("the ownership mask is cached under the segment's key");
+        assert!(Arc::ptr_eq(
+            &first_mask,
+            cached_mask.as_ref().as_ref().unwrap()
+        ));
+
         assert!(
             !segment_prefilter.is_empty(),
             "the segment ownership restriction is not globally empty"
@@ -3725,6 +3767,112 @@ mod tests {
             !ordinary_segment.needs_partition_row_ids(),
             "a user filter cannot take the no-filter fast path, so partition coverage is unused"
         );
+    }
+
+    /// Rows of `fragment_id` in the space the ownership mask is built in: row
+    /// addresses, or row ids on a stable-row-id dataset where each fragment of
+    /// the fixture holds 20 consecutive ids.
+    fn fixture_rows(fragment_id: u32, stable_row_ids: bool) -> impl Iterator<Item = u64> {
+        (0..20_u64).map(move |offset| {
+            if stable_row_ids {
+                u64::from(fragment_id) * 20 + offset
+            } else {
+                (u64::from(fragment_id) << 32) | offset
+            }
+        })
+    }
+
+    #[rstest]
+    #[case::row_addresses(false)]
+    #[case::stable_row_ids(true)]
+    #[tokio::test]
+    async fn test_segment_ownership_mask_follows_dataset_version(#[case] stable_row_ids: bool) {
+        let vectors = || {
+            lance_datagen::gen_batch()
+                .col(
+                    "vector",
+                    array::rand_vec::<Float32Type>(lance_datagen::Dimension::from(4)),
+                )
+                .into_reader_rows(RowCount::from(20), BatchCount::from(1))
+        };
+        let params = WriteParams {
+            enable_stable_row_ids: stable_row_ids,
+            ..Default::default()
+        };
+        let dataset = Dataset::write(vectors(), "memory://", Some(params))
+            .await
+            .unwrap();
+        let first_fragments = dataset.fragment_bitmap.as_ref().clone();
+        let segment = IndexMetadata {
+            uuid: Uuid::new_v4(),
+            fields: vec![dataset.schema().field("vector").unwrap().id],
+            covering_fields: vec![],
+            name: "vector_idx".to_string(),
+            dataset_version: dataset.manifest.version,
+            fragment_bitmap: Some(first_fragments.clone()),
+            index_details: None,
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+            files: None,
+        };
+        fn key<'a>(
+            segment: &'a IndexMetadata,
+            dataset: &'a Dataset,
+        ) -> SegmentOwnershipMaskKey<'a> {
+            SegmentOwnershipMaskKey {
+                uuid: &segment.uuid,
+                version: dataset.manifest.version,
+                store_identity: &dataset.object_store.store_prefix,
+                e_tag: dataset.manifest_location.e_tag.as_deref(),
+            }
+        }
+
+        // A segment that owns every fragment needs no restriction, and that
+        // answer is cached like a mask is: deciding it also walks every fragment.
+        let dataset = Arc::new(dataset);
+        assert!(
+            segment_ownership_mask(&dataset, &segment)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let cached = dataset
+            .index_cache
+            .get_with_key(&key(&segment, &dataset))
+            .await
+            .expect("the no-restriction answer is cached");
+        assert!(cached.is_none());
+
+        // An append makes a new version with a fragment the segment does not own.
+        let mut appended = (*dataset).clone();
+        appended.append(vectors(), None).await.unwrap();
+        let appended = Arc::new(appended);
+        let new_fragment = (appended.fragment_bitmap.as_ref() - &first_fragments)
+            .iter()
+            .next()
+            .unwrap();
+        let mask = segment_ownership_mask(&appended, &segment)
+            .await
+            .unwrap()
+            .expect("the new version restricts the segment to the fragments it owns");
+        let owned_fragment = first_fragments.iter().next().unwrap();
+        assert!(fixture_rows(owned_fragment, stable_row_ids).all(|row| mask.selected(row)));
+        assert!(fixture_rows(new_fragment, stable_row_ids).all(|row| !mask.selected(row)));
+        let cached = appended
+            .index_cache
+            .get_with_key(&key(&segment, &appended))
+            .await
+            .expect("the mask is cached under the new version's key");
+        assert!(Arc::ptr_eq(&mask, cached.as_ref().as_ref().unwrap()));
+
+        // The old version keeps its own entry.
+        let stale = dataset
+            .index_cache
+            .get_with_key(&key(&segment, &dataset))
+            .await
+            .unwrap();
+        assert!(stale.is_none());
     }
 
     fn prepared_metrics() -> Arc<AnnIndexMetrics> {
