@@ -1001,7 +1001,12 @@ fn merge_list_struct_helper<T: OffsetSizeTrait>(
             &values(left_list, null_left),
             &values(right_list, null_right),
         )?;
-        (merged, not_null, not_null.nulls().cloned(), true)
+        (
+            merged,
+            not_null,
+            not_null.nulls().cloned(),
+            left_item.is_nullable() || right_item.is_nullable(),
+        )
     } else {
         if left_list.offsets().inner() != right_list.offsets().inner() {
             panic!("Attempt to merge list struct arrays which do not have same offsets");
@@ -1043,13 +1048,13 @@ fn merge_list_struct(
     left_parent: Option<&NullBuffer>,
     right_parent: Option<&NullBuffer>,
 ) -> Result<ArrayRef> {
-    // The all-null side is picked before the parents are applied: a side whose
-    // rows all sit under null parents still supplies the values and types of
-    // the result, which are null there anyway.
-    let null_left = left.null_count() == left.len();
-    let null_right = !null_left && right.null_count() == right.len();
+    // The parents are applied before the all-null side is picked, so a side
+    // whose rows all sit under null parents counts as the placeholder and the
+    // other side's offsets are kept.
     let left = adjust_child_validity(left, left_parent);
     let right = adjust_child_validity(right, right_parent);
+    let null_left = left.null_count() == left.len();
+    let null_right = !null_left && right.null_count() == right.len();
     let (left, right) = (left.as_ref(), right.as_ref());
     match (left.data_type(), right.data_type()) {
         (DataType::List(_), DataType::List(_)) => {
@@ -2542,6 +2547,72 @@ mod tests {
 
             let merged = left.merge(&right).unwrap();
             assert_eq!(merged.column(0).null_count(), 2, "large={large}");
+        }
+    }
+
+    /// A side whose list entries are all hidden by null parents merges like a
+    /// placeholder, so the other side's lists survive even with other offsets.
+    #[test]
+    fn test_merge_list_struct_hidden_side_keeps_the_other_offsets() {
+        for large in [false, true] {
+            let list_of = |child: &str, lengths: Vec<usize>, values: Vec<i32>| -> ArrayRef {
+                let items: ArrayRef = Arc::new(StructArray::new(
+                    vec![Field::new(child, DataType::Int32, true)].into(),
+                    vec![Arc::new(Int32Array::from(values))],
+                    None,
+                ));
+                let field = Arc::new(Field::new("item", items.data_type().clone(), true));
+                if large {
+                    Arc::new(LargeListArray::new(
+                        field,
+                        OffsetBuffer::<i64>::from_lengths(lengths),
+                        items,
+                        None,
+                    ))
+                } else {
+                    Arc::new(ListArray::new(
+                        field,
+                        OffsetBuffer::<i32>::from_lengths(lengths),
+                        items,
+                        None,
+                    ))
+                }
+            };
+            let parent = |list: ArrayRef, validity: Vec<bool>| {
+                batch_of_parent(StructArray::new(
+                    vec![Field::new("l", list.data_type().clone(), true)].into(),
+                    vec![list],
+                    Some(validity.into()),
+                ))
+            };
+            let left = parent(list_of("x", vec![1, 1], vec![1, 2]), vec![false, false]);
+            let right = parent(list_of("y", vec![2, 0], vec![7, 8]), vec![true, true]);
+
+            let merged = left.merge(&right).unwrap();
+            let list = merged.column(0).as_struct().column(0);
+            let (first, second) = if large {
+                let list = list.as_list::<i64>();
+                (list.value(0), list.value(1))
+            } else {
+                let list = list.as_list::<i32>();
+                (list.value(0), list.value(1))
+            };
+            let first = first.as_struct();
+            assert_eq!(
+                first
+                    .column_by_name("y")
+                    .unwrap()
+                    .as_primitive::<Int32Type>()
+                    .values(),
+                &[7, 8],
+                "large={large}"
+            );
+            assert_eq!(
+                first.column_by_name("x").unwrap().null_count(),
+                2,
+                "large={large}"
+            );
+            assert_eq!(second.len(), 0, "large={large}");
         }
     }
 
