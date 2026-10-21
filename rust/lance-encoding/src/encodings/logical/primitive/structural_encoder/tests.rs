@@ -711,7 +711,7 @@ async fn test_sparse_vector_dictionary_hidden_payload(
             .collect::<Vec<_>>(),
     );
     let array = Arc::new(FixedSizeListArray::new(
-        Arc::new(arrow_schema::Field::new("item", DataType::Float32, false)),
+        Arc::new(arrow_schema::Field::new("item", DataType::Float32, true)),
         dimension as i32,
         Arc::new(values),
         Some(NullBuffer::from(
