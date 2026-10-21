@@ -1187,6 +1187,7 @@ pub async fn append_vector_segment<'a>(
         scan_vector_fragments(dataset, field_path, column_nullable, fragments).await?;
     let mut append_options = options.clone();
     append_options.num_indices_to_merge = Some(0);
+    append_options.enable_partition_rebalancing = false;
     append_options.retrain = false;
     let (new_uuid, indices_merged, files) = optimize_vector_indices(
         dataset.clone(),
@@ -1894,6 +1895,9 @@ mod tests {
 
     use crate::index::DatasetIndexExt;
     use crate::index::DatasetIndexInternalExt;
+    use crate::index::optimize::{
+        OptimizeIndicesPlan, commit_optimize_indices, plan_optimize_indices,
+    };
     use arrow::datatypes::{Float32Type, UInt32Type};
     use arrow_array::cast::AsArray;
     use arrow_array::{
@@ -2049,7 +2053,163 @@ mod tests {
     }
 
     #[rstest]
+    #[case::append(OptimizeOptions::append().with_partition_rebalancing(), "num_indices_to_merge", "Some(0)")]
+    #[case::task_bound(OptimizeOptions::merge(1).with_partition_rebalancing().max_rows_per_task(Some(64)), "max_rows_per_task", "Some(64)")]
+    #[case::segment_bound(OptimizeOptions::merge(1).with_partition_rebalancing().max_rows_per_segment(Some(64)), "max_rows_per_segment", "Some(64)")]
+    #[tokio::test]
+    async fn test_partition_rebalancing_rejects_incompatible_options(
+        #[case] options: OptimizeOptions,
+        #[case] parameter: &str,
+        #[case] value: &str,
+    ) {
+        let mut dataset = lance_datagen::gen_batch()
+            .col("id", array::step::<UInt32Type>())
+            .into_dataset("memory://", FragmentCount(1), FragmentRowCount(1))
+            .await
+            .unwrap();
+        let error = dataset.optimize_indices(&options).await.unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains(parameter));
+        assert!(error.to_string().contains(value));
+    }
+
+    #[rstest]
+    #[case::unchanged(1, 128, std::cmp::Ordering::Equal)]
+    #[case::split(1, 8, std::cmp::Ordering::Greater)]
+    #[case::join(8, 64, std::cmp::Ordering::Less)]
+    #[tokio::test]
+    async fn test_merge_latest_segment_with_partition_rebalancing(
+        #[case] num_partitions: usize,
+        #[case] target_partition_size: usize,
+        #[case] expected_partition_change: std::cmp::Ordering,
+        #[values(false, true)] enable_stable_row_ids: bool,
+        #[values(false, true)] distributed: bool,
+    ) {
+        let test_dir = TempStrDir::default();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 2),
+                false,
+            ),
+        ]));
+        let (first, first_vectors) = clustered_vector_batch(schema.clone(), 0, 64, 2, 0.0);
+        let (last, last_vectors) = clustered_vector_batch(schema.clone(), 64, 64, 2, 100.0);
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(first), Ok(last)], schema.clone()),
+            test_dir.as_str(),
+            Some(WriteParams {
+                max_rows_per_file: 64,
+                enable_stable_row_ids,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let params = VectorIndexParams::with_ivf_flat_params(
+            MetricType::L2,
+            IvfBuildParams {
+                num_partitions: Some(num_partitions),
+                target_partition_size: Some(target_partition_size),
+                max_iters: 2,
+                sample_rate: 2,
+                ..Default::default()
+            },
+        );
+        let mut segments = Vec::with_capacity(2);
+        for fragment in dataset.get_fragments() {
+            segments.push(
+                CreateIndexBuilder::new(&mut dataset, &["vector"], IndexType::Vector, &params)
+                    .name("vector_idx".to_string())
+                    .fragments(vec![fragment.id() as u32])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+            );
+        }
+        let first_uuid = segments[0].uuid;
+        dataset
+            .commit_existing_index_segments("vector_idx", "vector", segments)
+            .await
+            .unwrap();
+
+        for round in 0..3 {
+            let (batch, vectors) = clustered_vector_batch(
+                schema.clone(),
+                128 + round * 16,
+                16,
+                2,
+                101.0 + round as f32,
+            );
+            dataset
+                .append(
+                    RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+                    None,
+                )
+                .await
+                .unwrap();
+            let options = OptimizeOptions::merge(1).with_partition_rebalancing();
+            if distributed {
+                let plan = plan_optimize_indices(&dataset, &options).await.unwrap();
+                let plan: OptimizeIndicesPlan =
+                    serde_json::from_str(&serde_json::to_string(&plan).unwrap()).unwrap();
+                assert_eq!(plan.tasks.len(), 1);
+                assert!(plan.tasks[0].enable_partition_rebalancing);
+                let mut built = Vec::new();
+                for task in &plan.tasks {
+                    built.extend(task.execute(&dataset).await.unwrap());
+                }
+                let mut merged = Vec::new();
+                for merge in &plan.merges {
+                    merged.extend(merge.execute(&dataset, &built).await.unwrap());
+                }
+                commit_optimize_indices(&mut dataset, merged, &options)
+                    .await
+                    .unwrap();
+            } else {
+                dataset.optimize_indices(&options).await.unwrap();
+            }
+            let segments = dataset.load_indices_by_name("vector_idx").await.unwrap();
+            assert_eq!(segments.len(), 2, "each append must replace only the tail");
+            assert_eq!(
+                segments[0].uuid, first_uuid,
+                "earlier segments must not change"
+            );
+            assert!(
+                dataset
+                    .unindexed_fragments("vector_idx")
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            let logical = dataset
+                .open_logical_vector_index("vector", "vector_idx")
+                .await
+                .unwrap();
+            let partitions = logical.as_ivf().unwrap().num_partitions_per_segment();
+            assert_eq!(partitions[0].1, num_partitions);
+            assert_eq!(
+                partitions[1].1.cmp(&num_partitions),
+                expected_partition_change
+            );
+            let nprobes = partitions.iter().map(|(_, count)| *count).max().unwrap();
+            for (expected, query) in [
+                (0, first_vectors.value(0)),
+                (64, last_vectors.value(0)),
+                (128 + round * 16, vectors.value(0)),
+            ] {
+                assert_eq!(
+                    nearest_id(&dataset, query.as_primitive::<Float32Type>(), nprobes).await,
+                    expected
+                );
+            }
+        }
+    }
+
+    #[rstest]
     #[case::append(OptimizeOptions::append(), false)]
+    #[case::default_with_rebalancing(OptimizeOptions::new().with_partition_rebalancing(), false)]
     #[case::default_with_stable_row_ids_and_delete(OptimizeOptions::default(), true)]
     #[tokio::test]
     async fn test_vector_append_is_segment_set_native_with_distinct_models(
@@ -4549,16 +4709,21 @@ mod tests {
     }
 
     /// BTree stores row addresses (`BTREE_ROW_ADDR_DOMAIN_VERSION`), so a plain
-    /// eager compaction on a stable-row-id dataset invalidates it exactly like a
-    /// zone map: with nothing to repair the addresses it stores, the rewritten
-    /// fragment drops out of its coverage (still correct -- the scanner falls
-    /// back to a full scan for it -- just uncovered). `defer_index_remap` is
-    /// what keeps the guarantee this test used to make about eager compaction:
-    /// the FRI it writes lets the btree follow its data to the new fragment, and
-    /// draining that FRI via `optimize_indices` (a segment merge, not a rescan)
-    /// must not change any answer either.
+    /// eager compaction on a stable-row-id dataset needs explicit repair, unlike
+    /// a row-id-domain index whose ids survive the rewrite for free. An eager
+    /// commit remaps the btree in place -- the same way it would on a
+    /// non-stable-row-id table -- and writes no fragment reuse index.
+    /// `defer_index_remap` instead leaves the btree untouched and writes an FRI
+    /// that lets it follow its data to the new fragment at read time; draining
+    /// that FRI via `optimize_indices` (a segment merge, not a rescan) must not
+    /// change any answer either.
+    #[rstest]
+    #[case::eager(false)]
+    #[case::deferred(true)]
     #[tokio::test]
-    async fn test_optimize_btree_keeps_rows_with_stable_row_ids_after_compaction() {
+    async fn test_optimize_btree_keeps_rows_with_stable_row_ids_after_compaction(
+        #[case] defer_index_remap: bool,
+    ) {
         async fn query_id_count(dataset: &Dataset, id: &str) -> usize {
             dataset
                 .scan()
@@ -4608,7 +4773,7 @@ mod tests {
             &mut dataset,
             crate::dataset::optimize::CompactionOptions {
                 target_rows_per_fragment: 512,
-                defer_index_remap: true,
+                defer_index_remap,
                 ..Default::default()
             },
             None,
@@ -4616,13 +4781,15 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(
-            dataset
-                .load_index_by_name(lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME)
-                .await
-                .unwrap()
-                .is_some(),
-            "a deferred compaction over an address-domain index must write an FRI"
+        let has_fri = dataset
+            .load_index_by_name(lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME)
+            .await
+            .unwrap()
+            .is_some();
+        assert_eq!(
+            has_fri, defer_index_remap,
+            "only a deferred compaction over an address-domain index writes an FRI; an \
+             eager one remaps the btree in place instead"
         );
 
         let frags = dataset.get_fragments();
@@ -4634,12 +4801,13 @@ mod tests {
                 .await
                 .unwrap()
                 .is_empty(),
-            "the FRI must let the btree follow its data to the rewritten fragment"
+            "the btree must cover the rewritten fragment, either because the FRI lets it \
+             follow its data (deferred) or because the eager commit remapped it in place"
         );
         assert_eq!(query_id_count(&dataset, "song-42").await, 1);
 
-        // Draining the FRI into the index (a segment merge, not a rescan) must
-        // not change any answer.
+        // Draining the FRI into the index (a segment merge, not a rescan), or
+        // simply reopening an eagerly-remapped index, must not change any answer.
         dataset
             .optimize_indices(&OptimizeOptions::default())
             .await
