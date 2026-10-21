@@ -48,41 +48,16 @@ The BTree index consists of two files:
 
 ## Stable Row ID Reverse Lookup
 
-An ordinary BTree may index the logical `_rowid` column of a table with stable row
-IDs enabled. Its `IndexMetadata.fields` contains the single reserved field ID `-3`.
-The field resolves to a non-nullable `UInt64` logical column even when it is absent
-from the table's user schema. Each fragment supplies that column from its inline
-row-ID sequence or its hidden row-lineage column, as specified in
+An ordinary BTree may index the logical `_rowid` column of a table, given the following rules:
+
+* Stable Row IDs **must** be enabled on the table.
+* `IndexMetadata.fields` **must** be a single field ID `-3`.
+* `_rowid` **must** be represented as a non-nullable `UInt64` field.
+* The index **must** use the address-domain format and be at least version 1.
+
+The logical field need not appear in the user schema. Its inline and spilled
+representations are defined in
 [Row ID and Lineage](../../table/row_id_lineage.md#inline-and-spilled-storage).
-
-This index uses the existing BTree storage layout and address-domain format
-version 1. The `values` column contains stable row IDs; the `ids` column contains
-their physical row addresses. Page lookup extrema are over the stable-ID values.
-No new index type, file, encoding, field ID, or address representation is introduced.
-Version 0 must not be used for this reverse lookup: its payload denotes row IDs,
-not the physical addresses needed to locate them.
-
-The index has an ordinary logical index name and segment UUIDs. Multiple segments
-may contribute to one logical index. A segment's fragment coverage identifies
-where its entries are valid; it is not a statement that every ID between its
-minimum and maximum is present. Missing or incomplete index coverage does not
-mean that the corresponding rows are deleted. A reader must also resolve the
-uncovered fragments' logical `_rowid` column before declaring an ID absent.
-
-Resolution is bound to a dataset snapshot. A reader translates candidate addresses
-through that snapshot's applicable fragment-reuse mappings, then applies effective
-coverage and deletion visibility. Obsolete entries may remain in immutable index
-files, including several candidates for a stable ID whose physical row moved.
-Only one distinct live address may remain for a given stable ID within a branch
-lineage; conflicting live addresses are an error. Compaction and index maintenance
-use the same address-remapping and coverage rules as other address-domain indices.
-
-Index creation, automatic maintenance, and consolidation scheduling are writer
-policies rather than additional file formats. A writer must not claim coverage for
-new or changed rows unless the published index entries and mappings support it.
-Readers that do not support this BTree format version must treat the segment as
-unsupported and use the ordinary uncovered-data path, subject to the table's other
-feature flags. An existing version-0 segment keeps its original interpretation.
 
 ## Accelerated Queries
 
