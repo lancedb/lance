@@ -88,6 +88,11 @@ impl RestAdapter {
                 "/v1/table/:id/version/delete",
                 post(batch_delete_table_versions),
             )
+            .route(
+                "/v1/table/version/batch-create",
+                post(batch_create_table_versions),
+            )
+            .route("/v1/table/batch-commit", post(batch_commit_tables))
             .route("/v1/table/:id/stats", post(get_table_stats))
             // Table data operations
             .route("/v1/table/:id/create", post(create_table))
@@ -136,6 +141,10 @@ impl RestAdapter {
             .route(
                 "/v1/table/:id/schema_metadata/update",
                 post(update_table_schema_metadata),
+            )
+            .route(
+                "/v1/table/:id/update_field_metadata",
+                post(update_field_metadata),
             )
             // Tag operations
             .route("/v1/table/:id/tags/list", post(list_table_tags))
@@ -1024,6 +1033,32 @@ async fn batch_delete_table_versions(
     }
 }
 
+async fn batch_create_table_versions(
+    State(backend): State<Arc<dyn LanceNamespace>>,
+    headers: HeaderMap,
+    Json(mut request): Json<BatchCreateTableVersionsRequest>,
+) -> Response {
+    request.identity = extract_identity(&headers);
+
+    match backend.batch_create_table_versions(request).await {
+        Ok(response) => json_response(StatusCode::OK, response),
+        Err(e) => error_to_response(e),
+    }
+}
+
+async fn batch_commit_tables(
+    State(backend): State<Arc<dyn LanceNamespace>>,
+    headers: HeaderMap,
+    Json(mut request): Json<BatchCommitTablesRequest>,
+) -> Response {
+    request.identity = extract_identity(&headers);
+
+    match backend.batch_commit_tables(request).await {
+        Ok(response) => json_response(StatusCode::OK, response),
+        Err(e) => error_to_response(e),
+    }
+}
+
 async fn get_table_stats(
     State(backend): State<Arc<dyn LanceNamespace>>,
     headers: HeaderMap,
@@ -1304,6 +1339,24 @@ async fn update_table_schema_metadata(
             Json(response.metadata.unwrap_or_default()),
         )
             .into_response(),
+        Err(e) => error_to_response(e),
+    }
+}
+
+async fn update_field_metadata(
+    State(backend): State<Arc<dyn LanceNamespace>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(params): Query<DelimiterQuery>,
+    Json(mut request): Json<UpdateFieldMetadataRequest>,
+) -> Response {
+    if let Err(response) = from_route(&mut request.id, parse_id(&id, params.delimiter.as_deref())) {
+        return *response;
+    }
+    request.identity = extract_identity(&headers);
+
+    match backend.update_field_metadata(request).await {
+        Ok(response) => json_response(StatusCode::OK, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -1744,7 +1797,8 @@ mod tests {
         }
 
         /// Forwards every operation to a DirectoryNamespace, and keeps the
-        /// last request each operation received.
+        /// last request each operation received. An operation listed with an
+        /// answer gets that answer instead.
         #[derive(Debug)]
         struct RecordingNamespace {
             inner: crate::DirectoryNamespace,
@@ -1760,7 +1814,7 @@ mod tests {
         }
 
         macro_rules! forward {
-            ($($method:ident($request:ty $(, $data:ident)?) -> $response:ty;)*) => {
+            ($($method:ident($request:ty $(, $data:ident)?) -> $response:ty $(= $answer:expr)?;)*) => {
                 #[async_trait::async_trait]
                 impl LanceNamespace for RecordingNamespace {
                     $(
@@ -1771,7 +1825,7 @@ mod tests {
                         ) -> Result<$response> {
                             let json = serde_json::to_value(&request).unwrap();
                             self.received.lock().unwrap().insert(stringify!($method), json);
-                            self.inner.$method(request $(, $data)?).await
+                            forward!(@answer self.inner.$method(request $(, $data)?) $(, $answer)?)
                         }
                     )*
 
@@ -1780,6 +1834,8 @@ mod tests {
                     }
                 }
             };
+            (@answer $forward:expr) => { $forward.await };
+            (@answer $forward:expr, $answer:expr) => { Ok($answer) };
         }
 
         forward! {
@@ -1819,8 +1875,13 @@ mod tests {
             describe_table_version(DescribeTableVersionRequest) -> DescribeTableVersionResponse;
             batch_delete_table_versions(BatchDeleteTableVersionsRequest)
                 -> BatchDeleteTableVersionsResponse;
+            batch_create_table_versions(BatchCreateTableVersionsRequest)
+                -> BatchCreateTableVersionsResponse;
+            batch_commit_tables(BatchCommitTablesRequest) -> BatchCommitTablesResponse;
             update_table_schema_metadata(UpdateTableSchemaMetadataRequest)
                 -> UpdateTableSchemaMetadataResponse;
+            update_field_metadata(UpdateFieldMetadataRequest) -> UpdateFieldMetadataResponse
+                = UpdateFieldMetadataResponse::new(7);
             get_table_stats(GetTableStatsRequest) -> GetTableStatsResponse;
             explain_table_query_plan(ExplainTableQueryPlanRequest) -> String;
             analyze_table_query_plan(AnalyzeTableQueryPlanRequest) -> String;
@@ -3753,8 +3814,8 @@ mod tests {
                 "branch must be forwarded in the request body and honored by the backend"
             );
 
-            // These send branch as a query param. The directory backend
-            // ignores branch on them, so we check the request it received.
+            // The directory backend ignores branch on these, or lacks the
+            // operation, so we check the request it received.
             let branch = Some("dev".to_string());
             fixture
                 .namespace
@@ -3817,14 +3878,26 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(updated.metadata.unwrap_or_default()["k"], "v");
+            let field_metadata = HashMap::from([("k".to_string(), "v".to_string())]);
+            let field_update = UpdateFieldMetadataEntry::new("id".to_string(), field_metadata);
+            let mut update_fields = UpdateFieldMetadataRequest::new(vec![field_update]);
+            update_fields.id = Some(id.clone());
+            update_fields.branch = Some("dev".to_string());
+            let updated = fixture
+                .namespace
+                .update_field_metadata(update_fields)
+                .await
+                .unwrap();
+            assert_eq!(updated.version, 7);
             let operations = [
                 "insert_into_table",
                 "merge_insert_into_table",
                 "drop_table_index",
                 "update_table_schema_metadata",
+                "update_field_metadata",
             ];
             let branches = operations.map(|op| fixture.backend.received(op)["branch"].clone());
-            assert_eq!(branches, ["dev"; 4], "{:?}", operations);
+            assert_eq!(branches, ["dev"; 5], "{:?}", operations);
 
             fixture.server_handle.shutdown();
         }
