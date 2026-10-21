@@ -116,6 +116,8 @@ pub fn sum_4bit_dist_table(
     let dists = unsafe {
         std::slice::from_raw_parts_mut(dists.as_mut_ptr().cast::<MaybeUninit<u16>>(), dists.len())
     };
+    // SAFETY: `sum_4bit_dist_table_uninit` has no precondition; its kernels
+    // check every bound.
     unsafe { sum_4bit_dist_table_uninit(n, code_len, codes, dist_table, dists) };
 }
 
@@ -125,9 +127,14 @@ pub fn sum_4bit_dist_table(
 ///
 /// # Safety
 ///
-/// `n` must be a multiple of [`BATCH_SIZE`], `codes` must contain at least
-/// `n * code_len` bytes, `dist_table` must contain at least
-/// `BATCH_SIZE * code_len` bytes, and `dists` must contain at least `n` slots.
+/// None: the dispatched kernels check every bound, so any input is sound. The
+/// function stays `unsafe` so existing callers keep compiling.
+///
+/// # Panics
+///
+/// Unless `n` is a multiple of [`BATCH_SIZE`], `codes` holds at least
+/// `n * code_len` bytes, `dist_table` at least `BATCH_SIZE * code_len` bytes
+/// and `dists` at least `n` slots.
 #[inline]
 pub unsafe fn sum_4bit_dist_table_uninit(
     n: usize,
@@ -405,15 +412,13 @@ pub fn sum_4bit_hacc_dist_table(
     hacc_dist_table: &[u8],
     dists: &mut [u32],
 ) {
-    assert!(n.is_multiple_of(BATCH_SIZE));
-    assert!(dists.len() >= n);
-    assert!(codes.len() >= n * code_len);
-    assert!(hacc_dist_table.len() >= code_len * 64);
     // A `u32` slice is also a valid `MaybeUninit<u32>` slice. The dispatched
     // kernels overwrite every output slot.
     let dists = unsafe {
         std::slice::from_raw_parts_mut(dists.as_mut_ptr().cast::<MaybeUninit<u32>>(), dists.len())
     };
+    // SAFETY: `sum_4bit_hacc_dist_table_uninit` has no precondition; its
+    // kernels check every bound.
     unsafe { sum_4bit_hacc_dist_table_uninit(n, code_len, codes, hacc_dist_table, dists) };
 }
 
@@ -423,9 +428,14 @@ pub fn sum_4bit_hacc_dist_table(
 ///
 /// # Safety
 ///
-/// `n` must be a multiple of [`BATCH_SIZE`], `codes` must contain at least
-/// `n * code_len` bytes, `hacc_dist_table` must contain at least
-/// `code_len * 64` bytes, and `dists` must contain at least `n` slots.
+/// None: the dispatched kernels check every bound, so any input is sound. The
+/// function stays `unsafe` so existing callers keep compiling.
+///
+/// # Panics
+///
+/// Unless `n` is a multiple of [`BATCH_SIZE`], `codes` holds at least
+/// `n * code_len` bytes, `hacc_dist_table` at least `code_len * 64` bytes and
+/// `dists` at least `n` slots.
 #[inline]
 pub unsafe fn sum_4bit_hacc_dist_table_uninit(
     n: usize,
@@ -907,11 +917,24 @@ fn transposed_code_len<T>(n: usize, codes: &[u8], dist_table: &[T]) -> usize {
     code_len
 }
 
+/// The `n` slots of `dists` the transposed kernels store to. The SIMD kernels
+/// store through raw pointers, so this check is what keeps them in bounds.
+#[inline]
+fn transposed_dists<T>(dists: &mut [T], n: usize) -> &mut [T] {
+    assert!(
+        dists.len() >= n,
+        "dists has {} slots, fewer than n = {n}",
+        dists.len()
+    );
+    &mut dists[..n]
+}
+
 lance_core::target_kernel! {
     #[target_features()]
     #[candidate(SUM_TRANSPOSED_SCALAR: SumTransposedFn)]
     fn sum_transposed_scalar(codes: &[u8], dist_table: &[u8], n: usize, dists: &mut [u16]) {
         let code_len = transposed_code_len(n, codes, dist_table);
+        let dists = transposed_dists(dists, n);
         sum_4bit_dist_table_transposed_scalar(0, n, code_len, codes, dist_table, dists);
     }
 }
@@ -926,7 +949,7 @@ lance_core::target_kernel! {
     #[candidate(SUM_TRANSPOSED_AVX512: SumTransposedFn)]
     fn sum_transposed_avx512(codes: &[u8], dist_table: &[u8], n: usize, dists: &mut [u16]) {
         let code_len = transposed_code_len(n, codes, dist_table);
-        let dists = &mut dists[..n];
+        let dists = transposed_dists(dists, n);
         if code_len == 0 {
             dists.fill(0);
             return;
@@ -942,7 +965,7 @@ lance_core::target_kernel! {
     #[candidate(SUM_TRANSPOSED_AVX2: SumTransposedFn)]
     fn sum_transposed_avx2(codes: &[u8], dist_table: &[u8], n: usize, dists: &mut [u16]) {
         let code_len = transposed_code_len(n, codes, dist_table);
-        let dists = &mut dists[..n];
+        let dists = transposed_dists(dists, n);
         let simd_len = if code_len == 0 {
             0
         } else {
@@ -961,7 +984,7 @@ lance_core::target_kernel! {
     #[candidate(SUM_TRANSPOSED_NEON: SumTransposedFn)]
     fn sum_transposed_neon(codes: &[u8], dist_table: &[u8], n: usize, dists: &mut [u16]) {
         let code_len = transposed_code_len(n, codes, dist_table);
-        let dists = &mut dists[..n];
+        let dists = transposed_dists(dists, n);
         let simd_len = if code_len == 0 {
             0
         } else {
@@ -1073,8 +1096,12 @@ pub fn filter_4bit_dist_table_transposed(
     mut on_batch: impl FnMut(usize, u64, &[u16; TRANSPOSED_BATCH_SIZE]) -> u16,
 ) {
     let dist_table = column_tables(dist_table, code_len);
+    // `call` cannot take `&mut OnBatch<'_>`: the trait object's lifetime is
+    // its own, so no `Kernel::call` signature matches it.
     let kernel = FILTER_TRANSPOSED.get().as_fn();
-    // SAFETY: `get` returns only a kernel the host supports.
+    // SAFETY: `get` returns only a kernel the host supports, and every
+    // `FILTER_TRANSPOSED` candidate is a safe `target_kernel!` function that
+    // checks its own bounds, so the target features are its only precondition.
     unsafe { kernel(codes, dist_table, n, threshold, &mut on_batch) };
 }
 
@@ -1389,8 +1416,10 @@ unsafe fn filter_transposed_batch_avx2(
 ///
 /// # Safety
 ///
-/// The host must support `avx512f` and `avx512bw`, and the slices must satisfy
-/// the bounds [`transposed_code_len`] checks.
+/// The host must support `avx512f` and `avx512bw`.
+/// `codes` and `dist_table` must hold the `n * code_len` bytes and
+/// `32 * code_len` entries [`transposed_code_len`] checks, and `dists` at
+/// least the `n` slots [`transposed_dists`] checks.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw")]
 unsafe fn sum_transposed_all_avx512(
@@ -1889,7 +1918,8 @@ lance_core::target_kernel! {
     #[candidate(SUM_F32_TRANSPOSED_SCALAR: SumF32TransposedFn)]
     fn sum_f32_transposed_scalar(codes: &[u8], dist_table: &[f32], n: usize, dists: &mut [f32]) {
         transposed_code_len(n, codes, dist_table);
-        sum_f32_transposed_rows_scalar(n, codes, f32_tables(dist_table), &mut dists[..n]);
+        let dists = transposed_dists(dists, n);
+        sum_f32_transposed_rows_scalar(n, codes, f32_tables(dist_table), dists);
     }
 }
 
@@ -1899,7 +1929,7 @@ lance_core::target_kernel! {
     #[candidate(SUM_F32_TRANSPOSED_AVX512: SumF32TransposedFn)]
     fn sum_f32_transposed_avx512(codes: &[u8], dist_table: &[f32], n: usize, dists: &mut [f32]) {
         let code_len = transposed_code_len(n, codes, dist_table);
-        let dists = &mut dists[..n];
+        let dists = transposed_dists(dists, n);
         if code_len == 0 || n < F32_GROUP_ROWS {
             sum_f32_transposed_rows_scalar(n, codes, f32_tables(dist_table), dists);
             return;
@@ -1915,7 +1945,7 @@ lance_core::target_kernel! {
     #[candidate(SUM_F32_TRANSPOSED_AVX2: SumF32TransposedFn)]
     fn sum_f32_transposed_avx2(codes: &[u8], dist_table: &[f32], n: usize, dists: &mut [f32]) {
         let code_len = transposed_code_len(n, codes, dist_table);
-        let dists = &mut dists[..n];
+        let dists = transposed_dists(dists, n);
         if code_len == 0 || n < F32_GROUP_ROWS / 2 {
             sum_f32_transposed_rows_scalar(n, codes, f32_tables(dist_table), dists);
             return;
@@ -1931,7 +1961,7 @@ lance_core::target_kernel! {
     #[candidate(SUM_F32_TRANSPOSED_NEON: SumF32TransposedFn)]
     fn sum_f32_transposed_neon(codes: &[u8], dist_table: &[f32], n: usize, dists: &mut [f32]) {
         let code_len = transposed_code_len(n, codes, dist_table);
-        let dists = &mut dists[..n];
+        let dists = transposed_dists(dists, n);
         if code_len == 0 || n < F32_GROUP_ROWS {
             sum_f32_transposed_rows_scalar(n, codes, f32_tables(dist_table), dists);
             return;
@@ -2129,8 +2159,10 @@ fn lookup_pair_avx512(code: __m512i, low_table: __m512, high_table: __m512) -> _
 ///
 /// # Safety
 ///
-/// The host must support `avx512f`, `n >= 16`, and the slices must satisfy
-/// the bounds [`transposed_code_len`] checks.
+/// The host must support `avx512f` and `n >= 16`.
+/// `codes` and `dist_table` must hold the `n * code_len` bytes and
+/// `32 * code_len` entries [`transposed_code_len`] checks, and `dists` at
+/// least the `n` slots [`transposed_dists`] checks.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
 unsafe fn sum_f32_transposed_all_avx512(
@@ -2284,8 +2316,10 @@ unsafe fn load_tables_avx2(dist_table: *const f32, column: usize) -> ([__m256; 2
 ///
 /// # Safety
 ///
-/// The host must support `avx2`, `n >= 8`, and the slices must satisfy the
-/// bounds [`transposed_code_len`] checks.
+/// The host must support `avx2` and `n >= 8`.
+/// `codes` and `dist_table` must hold the `n * code_len` bytes and
+/// `32 * code_len` entries [`transposed_code_len`] checks, and `dists` at
+/// least the `n` slots [`transposed_dists`] checks.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn sum_f32_transposed_all_avx2(
@@ -2436,8 +2470,10 @@ fn lookup_pair_neon(
 ///
 /// # Safety
 ///
-/// `n >= 16`, and the slices must satisfy the bounds
-/// [`transposed_code_len`] checks.
+/// `n >= 16`.
+/// `codes` and `dist_table` must hold the `n * code_len` bytes and
+/// `32 * code_len` entries [`transposed_code_len`] checks, and `dists` at
+/// least the `n` slots [`transposed_dists`] checks.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 unsafe fn sum_f32_transposed_all_neon(
@@ -2868,7 +2904,9 @@ mod tests {
                 }
                 threshold
             };
-            // SAFETY: `kernel` exists only because the host supports it.
+            // `as_fn` because no `call` signature takes `&mut OnBatch<'_>`.
+            // SAFETY: `kernel` exists only because the host supports it, and
+            // the candidate checks its own bounds.
             unsafe { kernel.as_fn()(&codes, &table, n, threshold, &mut on_batch) };
             assert_eq!(found, wanted, "{}", candidate.name());
         }
