@@ -291,6 +291,7 @@ pub(in crate::encodings::logical::primitive) fn encode(
             data,
             &ctx.field,
             DictionaryEncodingPolicy::Planar,
+            positions.len(),
         )?
     } else {
         None

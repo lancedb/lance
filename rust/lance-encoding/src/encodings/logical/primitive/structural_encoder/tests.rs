@@ -788,6 +788,7 @@ fn test_planar_vector_dictionary_rejects_unhelpful_candidates(
             &DataBlock::from_array(array),
             &field,
             DictionaryEncodingPolicy::Planar,
+            rows as u64,
         )
         .unwrap()
         .is_none()
