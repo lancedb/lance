@@ -2788,6 +2788,9 @@ def test_retrain_indices(tmp_path, retrain):
         index_type="IVF_FLAT",
         num_partitions=1,
         ivf_centroids=old_centroid,
+        # A retrain sizes partitions from the target the index records. Pin it
+        # at the 128 rows the table ends with so the retrain keeps one partition.
+        target_partition_size=128,
         index_file_version=IndexFileVersion.V3,
     )
     indexed_dataset = lance.write_dataset(
