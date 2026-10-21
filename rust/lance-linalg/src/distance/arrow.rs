@@ -10,7 +10,10 @@ use arrow_schema::{ArrowError, DataType};
 use lance_arrow::FixedSizeListArrayExt;
 use num_traits::AsPrimitive;
 
-use super::{Cosine, DistanceFunc, DistanceType, Dot, L2, Normalize, hamming, norm_l2};
+use super::{
+    Cosine, DistanceFunc, DistanceType, Dot, L2, Normalize, dot_distance_batch_into, hamming,
+    l2_distance_batch_into, norm_l2,
+};
 use crate::Result;
 
 #[derive(Clone, Copy)]
@@ -65,14 +68,20 @@ impl Operation<'_> {
         T: L2 + Dot + Cosine + Normalize + AsPrimitive<f32> + AsPrimitive<f64>,
     {
         match self {
-            Self::Batch(metric) => Ok(match metric {
-                DistanceType::L2 => T::l2_batch(query, values, dim).collect(),
-                DistanceType::Dot => T::dot_batch(query, values, dim)
-                    .map(|dot| 1.0 - dot)
-                    .collect(),
-                DistanceType::Cosine => T::cosine_batch(query, values, dim).collect(),
-                DistanceType::Hamming => return Err(self.error("Hamming requires UInt8 values")),
-            }),
+            Self::Batch(metric) => {
+                if metric == DistanceType::Cosine {
+                    return Ok(T::cosine_batch(query, values, dim).collect());
+                }
+                let mut distances = vec![0.0; values.len() / dim];
+                match metric {
+                    DistanceType::L2 => l2_distance_batch_into(query, values, dim, &mut distances),
+                    DistanceType::Dot => {
+                        dot_distance_batch_into(query, values, dim, &mut distances)
+                    }
+                    _ => return Err(self.error("Hamming requires UInt8 values")),
+                }
+                Ok(distances)
+            }
             Self::Multivec(metric, rows) => {
                 Ok(multivec(query, values, dim, rows, metric.try_func()?))
             }

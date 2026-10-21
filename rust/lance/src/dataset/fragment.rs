@@ -828,11 +828,20 @@ pub struct FragReadConfig {
     /// The scan sets this so every base file it opens shares one scheduler per
     /// base. When absent, a base file falls back to building its own scheduler.
     pub base_schedulers: Option<BaseSchedulers>,
+    /// Read rows as if the fragment had no deletions: the deletion file is not
+    /// loaded and deleted rows come back with their stored values. Only for a
+    /// caller that knows the rows it asks for are live.
+    pub ignore_deletions: bool,
 }
 
 impl FragReadConfig {
     pub fn with_row_id(mut self, value: bool) -> Self {
         self.with_row_id = value;
+        self
+    }
+
+    pub fn with_ignore_deletions(mut self, value: bool) -> Self {
+        self.ignore_deletions = value;
         self
     }
 
@@ -1164,7 +1173,11 @@ impl FileFragment {
         read_config: FragReadConfig,
     ) -> Result<FragmentReader> {
         let open_files = self.open_readers(projection, &read_config);
-        let deletion_vec_load = self.get_deletion_vector();
+        let deletion_vec_load = if read_config.ignore_deletions {
+            futures::future::Either::Left(futures::future::ready(Ok(None)))
+        } else {
+            futures::future::Either::Right(self.get_deletion_vector())
+        };
 
         // Preserve the legacy reader's eager initialization. Current readers
         // can defer the sequence until a read actually requests stable row IDs.
@@ -1423,7 +1436,7 @@ impl FileFragment {
         let data_file_schema = Arc::new(data_file.schema(full_schema));
         let projection = projection.unwrap_or(full_schema);
         let schema_per_file =
-            Arc::new(projection.intersection_ignore_types(data_file_schema.as_ref())?);
+            Arc::new(data_file_projection(projection, data_file_schema.as_ref())?);
         if schema_per_file.fields.is_empty() {
             return Ok(None);
         }
@@ -1569,6 +1582,14 @@ impl FileFragment {
             .await
     }
 
+    /// The id of `field` and of every field under it.
+    fn collect_field_ids(field: &lance_core::datatypes::Field, out: &mut HashSet<i32>) {
+        out.insert(field.id);
+        for child in &field.children {
+            Self::collect_field_ids(child, out);
+        }
+    }
+
     async fn open_readers_with_full_metadata(
         &self,
         projection: &Schema,
@@ -1585,26 +1606,47 @@ impl FileFragment {
         metadata_mode: MetadataMode,
     ) -> BoxFuture<'a, Result<Vec<Box<dyn GenericFileReader>>>> {
         async move {
+            // A fragment written through several `add_columns` holds one file
+            // per column group. Projecting the full schema through every file
+            // only to learn that it holds none of the requested fields costs
+            // more CPU than the read itself on a wide table, so test the ids
+            // first. A projected struct or list takes its validity and offsets
+            // from whichever of its leaves a file holds, so every leaf under a
+            // projected parent counts as wanted even when it is not projected.
+            let mut wanted_ids: HashSet<i32> = projection.field_ids().into_iter().collect();
+            for parent in projection
+                .fields_pre_order()
+                .filter(|field| !field.children.is_empty())
+            {
+                if let Some(full) = self.dataset.schema().field_by_id(parent.id) {
+                    Self::collect_field_ids(full, &mut wanted_ids);
+                }
+            }
             // Each open is at least one object-store round trip for the file's
             // metadata; a fragment with several data files (one per
             // `add_columns` / merge) would otherwise pay them back to back.
             // `try_join_all` keeps the readers in data-file order.
-            let opens = self.metadata.files.iter().map(|data_file| async move {
-                match metadata_mode {
-                    MetadataMode::LazyAllowed => {
-                        self.open_reader(data_file, Some(projection), read_config)
+            let opens = self
+                .metadata
+                .files
+                .iter()
+                .filter(|data_file| data_file.fields.iter().any(|id| wanted_ids.contains(id)))
+                .map(|data_file| async move {
+                    match metadata_mode {
+                        MetadataMode::LazyAllowed => {
+                            self.open_reader(data_file, Some(projection), read_config)
+                                .await
+                        }
+                        MetadataMode::Full => {
+                            self.open_reader_with_full_metadata(
+                                data_file,
+                                Some(projection),
+                                read_config,
+                            )
                             .await
+                        }
                     }
-                    MetadataMode::Full => {
-                        self.open_reader_with_full_metadata(
-                            data_file,
-                            Some(projection),
-                            read_config,
-                        )
-                        .await
-                    }
-                }
-            });
+                });
             let mut opened_files: Vec<Box<dyn GenericFileReader>> =
                 try_join_all(opens).await?.into_iter().flatten().collect();
 
@@ -1987,7 +2029,7 @@ impl FileFragment {
 
         // Then call take rows
         let batch = self
-            .take_rows(&row_ids, projection, false, false, false, false)
+            .take_rows(&row_ids, projection, FragReadConfig::default())
             .await?;
 
         // Convert Lance JSON columns (LargeBinary/JSONB) back to Arrow JSON (Utf8)
@@ -2176,21 +2218,9 @@ impl FileFragment {
         &self,
         row_offsets: &[u32],
         projection: &Schema,
-        with_row_id: bool,
-        with_row_address: bool,
-        with_row_created_at_version: bool,
-        with_row_last_updated_at_version: bool,
+        read_config: FragReadConfig,
     ) -> Result<RecordBatch> {
-        let reader = self
-            .open(
-                projection,
-                FragReadConfig::default()
-                    .with_row_id(with_row_id)
-                    .with_row_address(with_row_address)
-                    .with_row_created_at_version(with_row_created_at_version)
-                    .with_row_last_updated_at_version(with_row_last_updated_at_version),
-            )
-            .await?;
+        let reader = self.open(projection, read_config).await?;
 
         if row_offsets.len() > 1 && Self::row_ids_contiguous(row_offsets) {
             let range =
@@ -3451,6 +3481,51 @@ impl std::fmt::Display for FragmentReader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "FragmentReader(id={})", self.fragment_id)
     }
+}
+
+/// `projection` intersected with a data file's schema. A nested field none of
+/// whose projected children are in the file keeps one file leaf, which still
+/// carries its validity and offsets; the final projection drops it.
+fn data_file_projection(projection: &Schema, file_schema: &Schema) -> Result<Schema> {
+    fn keep_a_leaf(field: &mut lance_core::datatypes::Field, file_schema: &Schema) -> Result<()> {
+        if field.is_blob() || field.is_packed_struct() {
+            return Ok(());
+        }
+        if !field.children.is_empty() {
+            return field
+                .children
+                .iter_mut()
+                .try_for_each(|child| keep_a_leaf(child, file_schema));
+        }
+        let Some(file_field) = file_schema.field_by_id(field.id) else {
+            return Ok(());
+        };
+        if file_field.children.is_empty() {
+            return Ok(());
+        }
+        let path =
+            crate::io::exec::filtered_read::validity_leaf_path(file_field).unwrap_or_else(|| {
+                // No fixed-width leaf: any leaf carries the validity.
+                let mut path = vec![];
+                let mut node = file_field;
+                while !(node.is_blob()
+                    || node.is_packed_struct()
+                    || matches!(node.data_type(), DataType::Map(..)))
+                    && let Some(child) = node.children.first()
+                {
+                    path.push(child.name.as_str());
+                    node = child;
+                }
+                path
+            });
+        *field = file_field.project(&path)?;
+        Ok(())
+    }
+    let mut schema = projection.intersection_ignore_types(file_schema)?;
+    for field in &mut schema.fields {
+        keep_a_leaf(field, file_schema)?;
+    }
+    Ok(schema)
 }
 
 fn merge_batches(batches: &[RecordBatch]) -> Result<RecordBatch> {
@@ -5968,6 +6043,113 @@ mod tests {
             .unwrap();
     }
 
+    /// A fragment with one data file per column group reads only the files
+    /// that hold a requested field: the others are not even opened.
+    #[tokio::test]
+    async fn test_take_opens_only_files_with_projected_fields() {
+        let test_dir = TempStrDir::default();
+        let mut dataset = create_dataset_v2(&test_dir).await;
+        dataset
+            .add_columns(
+                NewColumnTransform::SqlExpressions(vec![("col1".into(), "i * 2".into())]),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let fragment = dataset.get_fragment(0).unwrap();
+        assert_eq!(fragment.metadata().files.len(), 2);
+        let added_file = fragment.metadata().files[1].path.clone();
+
+        let projection = dataset.schema().project(&["col1"]).unwrap();
+        dataset.object_store.io_stats_incremental();
+        let reader = fragment
+            .open(&projection, FragReadConfig::default())
+            .await
+            .unwrap();
+        let rows = reader.take_as_batch(&[1, 5], None).await.unwrap();
+        assert_eq!(rows.num_rows(), 2);
+        let data_files_read: HashSet<String> = dataset
+            .object_store
+            .io_stats_incremental()
+            .requests
+            .iter()
+            .filter(|request| request.path.as_ref().contains("/data/"))
+            .map(|request| request.path.filename().unwrap().to_string())
+            .collect();
+        assert_eq!(data_files_read, HashSet::from([added_file]));
+    }
+
+    /// Projecting only a child that lives in a later file must still open the
+    /// file holding the parent's other leaves: a list takes its offsets and a
+    /// struct its validity from whichever leaf a file has.
+    #[rstest]
+    #[case::take(false)]
+    #[case::scan(true)]
+    #[tokio::test]
+    async fn test_projected_missing_list_child_keeps_offsets(#[case] use_scan: bool) {
+        use arrow_array::{ListArray, StructArray};
+        use arrow_buffer::OffsetBuffer;
+
+        let old_values = StructArray::new(
+            vec![ArrowField::new("a", DataType::Int32, true)].into(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+            None,
+        );
+        let list = ListArray::new(
+            Arc::new(ArrowField::new(
+                "item",
+                old_values.data_type().clone(),
+                true,
+            )),
+            OffsetBuffer::new(vec![0i32, 2, 2, 3].into()),
+            Arc::new(old_values),
+            None,
+        );
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "c",
+            list.data_type().clone(),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(list)]).unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let added = ArrowSchema::new(vec![ArrowField::new(
+            "c",
+            DataType::List(Arc::new(ArrowField::new(
+                "item",
+                DataType::Struct(vec![ArrowField::new("b", DataType::Int32, true)].into()),
+                true,
+            ))),
+            true,
+        )]);
+        dataset
+            .add_columns(NewColumnTransform::AllNulls(Arc::new(added)), None, None)
+            .await
+            .unwrap();
+
+        let projection = dataset.schema().project(&["c.item.b"]).unwrap();
+        let result = if use_scan {
+            let mut scan = dataset.scan();
+            scan.project_with_schema(&projection).unwrap();
+            scan.try_into_batch().await.unwrap()
+        } else {
+            dataset.take(&[0, 1, 2], projection).await.unwrap()
+        };
+        let list = result["c"].as_any().downcast_ref::<ListArray>().unwrap();
+        assert_eq!(list.value_offsets(), &[0, 2, 2, 3][..]);
+        assert_eq!(list.null_count(), 0);
+    }
+
     #[tokio::test]
     async fn test_fragment_update() {
         let test_dir = TempStrDir::default();
@@ -6667,10 +6849,7 @@ mod tests {
             .take_rows(
                 &[1, 2, 4, 5, 5, 8],
                 dataset.schema(),
-                false,
-                false,
-                false,
-                false,
+                FragReadConfig::default().with_row_address(false),
             )
             .await
             .unwrap();
@@ -6693,10 +6872,7 @@ mod tests {
             .take_rows(
                 &[1, 2, 4, 5, 8],
                 dataset.schema(),
-                false,
-                false,
-                false,
-                false,
+                FragReadConfig::default().with_row_address(false),
             )
             .await
             .unwrap();
@@ -6707,7 +6883,7 @@ mod tests {
 
         // Empty indices gives empty result
         let batch = fragment
-            .take_rows(&[], dataset.schema(), false, false, false, false)
+            .take_rows(&[], dataset.schema(), FragReadConfig::default())
             .await
             .unwrap();
         assert_eq!(
@@ -6720,10 +6896,7 @@ mod tests {
             .take_rows(
                 &[1, 2, 4, 5, 8],
                 dataset.schema(),
-                false,
-                true,
-                false,
-                false,
+                FragReadConfig::default().with_row_address(true),
             )
             .await
             .unwrap();
