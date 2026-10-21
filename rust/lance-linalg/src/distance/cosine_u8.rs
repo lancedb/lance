@@ -29,6 +29,8 @@ pub struct CosineAccumulators {
 type CosineU8AccumKernel = unsafe fn(&[u8], &[u8]) -> CosineAccumulators;
 
 lance_core::dispatch! {
+    /// There are no AVX or AVX+FMA candidates: the SIMD kernels need AVX2
+    /// integer ops, so those hosts use the scalar kernel.
     static COSINE_U8_ACCUM: Dispatch<CosineU8AccumKernel> = {
         #[cfg(target_arch = "x86_64")]
         {

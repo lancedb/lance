@@ -33,6 +33,8 @@ use super::{U8_U32_ACCUMULATOR_MAX_LEN, assert_equal_lengths};
 type DotU8Kernel = unsafe fn(&[u8], &[u8]) -> u32;
 
 lance_core::dispatch! {
+    /// There are no AVX or AVX+FMA candidates: the SIMD kernels need AVX2
+    /// integer ops, so those hosts use the scalar kernel.
     static DOT_U8: Dispatch<DotU8Kernel> = {
         #[cfg(target_arch = "x86_64")]
         {
