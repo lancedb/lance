@@ -1052,7 +1052,7 @@ mod tests {
     use lance_core::cache::CacheCodec;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_encoding::decoder::PageEncoding;
-    use lance_encoding::format::pb21::page_layout::Layout;
+    use lance_encoding::format::metadata::page_layout::Layout;
     use lance_file::version::LanceFileVersion;
     use lance_index::IndexType;
     use lance_index::optimize::OptimizeOptions;
