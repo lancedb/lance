@@ -1904,6 +1904,26 @@ impl ZoneMapSeedWriter {
             lance_core::Error::invalid_input(format!("failed to read zone map seed IPC: {}", e))
         })?;
 
+        // Version dispatch: absence means version 0 (the original schema,
+        // whose max may carry the legacy +NaN marker and whose NaN sign split
+        // is unknown). Unknown future versions must not be misread as either,
+        // and are refused before any other metadata is interpreted.
+        let version = reader.schema().metadata.get(SEED_VERSION_META_KEY).cloned();
+        let is_v1 = match version.as_deref() {
+            None => false,
+            Some(SEED_FORMAT_VERSION) => true,
+            Some(other) => {
+                return Err(lance_core::Error::not_supported_source(
+                    format!(
+                        "zone map seed format version '{}' is not supported by this \
+                         build; please upgrade Lance",
+                        other
+                    )
+                    .into(),
+                ));
+            }
+        };
+
         let null_bitmap = if let Some(hex) = reader.schema().metadata.get(SEED_NULL_BITMAP_META_KEY)
         {
             let bitmap_bytes = hex_decode(hex).map_err(|e| {
@@ -1925,25 +1945,6 @@ impl ZoneMapSeedWriter {
             Some(bitmap)
         } else {
             None
-        };
-
-        // Version dispatch: absence means version 0 (the original schema,
-        // whose max may carry the legacy +NaN marker and whose NaN sign split
-        // is unknown). Unknown future versions must not be misread as either.
-        let version = reader.schema().metadata.get(SEED_VERSION_META_KEY).cloned();
-        let is_v1 = match version.as_deref() {
-            None => false,
-            Some(SEED_FORMAT_VERSION) => true,
-            Some(other) => {
-                return Err(lance_core::Error::not_supported_source(
-                    format!(
-                        "zone map seed format version '{}' is not supported by this \
-                         build; please upgrade Lance",
-                        other
-                    )
-                    .into(),
-                ));
-            }
         };
 
         let batch = match reader.next() {
@@ -6011,6 +6012,27 @@ mod tests {
         );
         let error = ZoneMapSeedWriter::deserialize_seed(0, &future_version).unwrap_err();
         assert!(matches!(error, lance_core::Error::NotSupported { .. }));
+
+        // A future version may also change the bitmap encoding: the version
+        // is refused before any other metadata is interpreted, so the error
+        // names the version, not a corrupt bitmap.
+        let future_bitmap = transform_seed(&good, |metadata, batch| {
+            metadata.insert(SEED_VERSION_META_KEY.to_string(), "2".to_string());
+            metadata.insert(
+                SEED_NULL_BITMAP_META_KEY.to_string(),
+                "not-hex-in-version-2".to_string(),
+            );
+            batch
+        });
+        let error = ZoneMapSeedWriter::deserialize_seed(0, &future_bitmap).unwrap_err();
+        assert!(
+            matches!(error, lance_core::Error::NotSupported { .. }),
+            "{error}"
+        );
+        assert!(matches!(
+            parse_seed_for_binary_copy(&future_bitmap, 2).unwrap(),
+            CarriedSeed::UnsupportedVersion(_)
+        ));
 
         let zero_length = set_zone_lengths(&good, &[2, 0]);
         assert!(parse_seed_for_binary_copy(&zero_length, 2).is_err());
