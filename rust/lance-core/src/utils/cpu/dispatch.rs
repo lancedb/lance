@@ -81,8 +81,8 @@ pub struct Kernel<F>(F);
 ///
 /// Each signature needs its own impl: a reference parameter makes the pointer
 /// type generic over its lifetime, which a single generic impl cannot match.
-/// A by-value parameter is a concrete type unless its arity has only one
-/// impl, since a generic `T` would overlap `&T` in another impl.
+/// By-value parameters take a concrete type, since a generic `T` would
+/// overlap `&T` in another impl of the same arity.
 macro_rules! impl_call {
     (<$($generic:ident $(: ?$bound:ident)?),*> fn($($arg:ident: $ty:ty),*)) => {
         impl<$($generic $(: ?$bound)?,)* R> Kernel<unsafe fn($($ty),*) -> R> {
@@ -100,7 +100,7 @@ macro_rules! impl_call {
 }
 
 impl_call!(<A: ?Sized, B: ?Sized> fn(a: &A, b: &B));
-impl_call!(<A: ?Sized, B: ?Sized, C, D: ?Sized> fn(a: &A, b: &B, c: C, d: &mut D));
+impl_call!(<A: ?Sized, B: ?Sized, D: ?Sized> fn(a: &A, b: &B, c: usize, d: &mut D));
 
 /// One operation's kernels, best first, with the host's choice made once.
 ///
