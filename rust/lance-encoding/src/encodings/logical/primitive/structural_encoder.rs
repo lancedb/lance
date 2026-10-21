@@ -2195,12 +2195,8 @@ impl PrimitiveStructuralEncoder {
 
         // Try dictionary encoding first if applicable. If encoding aborts, fall back to the
         // preferred structural encoding.
-        let dict_result = Self::try_dictionary_encode(
-            &data_block,
-            &field,
-            dictionary_policy,
-            data_block.num_values(),
-        )?;
+        let dict_result =
+            Self::try_dictionary_encode(&data_block, &field, dictionary_policy, num_values)?;
 
         if let Some((indices_data_block, dictionary_data_block)) = dict_result {
             Self::encode_miniblock(

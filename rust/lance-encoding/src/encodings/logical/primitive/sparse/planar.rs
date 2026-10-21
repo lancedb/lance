@@ -290,7 +290,7 @@ pub(in crate::encodings::logical::primitive) fn encode(
         // Narrow values fall back to chunks covering every slot. Zipped values
         // instead gather only materialized positions, so their budget is smaller.
         let num_fallback_values = if PrimitiveStructuralEncoder::is_narrow(data) {
-            data.num_values()
+            plan.num_visible_items
         } else {
             positions.len()
         };
