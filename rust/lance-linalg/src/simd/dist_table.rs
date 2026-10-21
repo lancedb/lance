@@ -116,19 +116,12 @@ pub fn sum_4bit_dist_table(
     let dists = unsafe {
         std::slice::from_raw_parts_mut(dists.as_mut_ptr().cast::<MaybeUninit<u16>>(), dists.len())
     };
-    // SAFETY: `sum_4bit_dist_table_uninit` has no precondition; its kernels
-    // check every bound.
-    unsafe { sum_4bit_dist_table_uninit(n, code_len, codes, dist_table, dists) };
+    sum_4bit_dist_table_uninit(n, code_len, codes, dist_table, dists);
 }
 
 /// Sum a 4-bit distance table into potentially uninitialized output storage.
 ///
 /// Every element in `dists[..n]` is initialized before this function returns.
-///
-/// # Safety
-///
-/// None: the dispatched kernels check every bound, so any input is sound. The
-/// function stays `unsafe` so existing callers keep compiling.
 ///
 /// # Panics
 ///
@@ -136,7 +129,7 @@ pub fn sum_4bit_dist_table(
 /// `n * code_len` bytes, `dist_table` at least `BATCH_SIZE * code_len` bytes
 /// and `dists` at least `n` slots.
 #[inline]
-pub unsafe fn sum_4bit_dist_table_uninit(
+pub fn sum_4bit_dist_table_uninit(
     n: usize,
     code_len: usize,
     codes: &[u8],
@@ -294,42 +287,38 @@ pub fn sum_4bit_dist_table_u32(
     dist_table: &[u8],
     dists: &mut [u32],
 ) {
-    assert!(n.is_multiple_of(BATCH_SIZE));
-    assert!(dists.len() >= n);
-    assert!(codes.len() >= n * code_len);
-    assert!(dist_table.len() >= BATCH_SIZE * code_len);
     // A `u32` slice is also a valid `MaybeUninit<u32>` slice. The chunk loop
     // overwrites every output slot.
     let dists = unsafe {
         std::slice::from_raw_parts_mut(dists.as_mut_ptr().cast::<MaybeUninit<u32>>(), dists.len())
     };
-    unsafe { sum_4bit_dist_table_u32_uninit(n, code_len, codes, dist_table, dists) };
+    sum_4bit_dist_table_u32_uninit(n, code_len, codes, dist_table, dists);
 }
 
 /// Sum a 4-bit distance table into potentially uninitialized `u32` output.
 ///
 /// Every element in `dists[..n]` is initialized before this function returns.
 ///
-/// # Safety
+/// # Panics
 ///
-/// `n` must be a multiple of [`BATCH_SIZE`], `codes` must contain at least
-/// `n * code_len` bytes, `dist_table` must contain at least
-/// `BATCH_SIZE * code_len` bytes, and `dists` must contain at least `n` slots.
+/// Unless `n` is a multiple of [`BATCH_SIZE`], `codes` holds at least
+/// `n * code_len` bytes, `dist_table` at least `BATCH_SIZE * code_len` bytes
+/// and `dists` at least `n` slots.
 #[inline]
-pub unsafe fn sum_4bit_dist_table_u32_uninit(
+pub fn sum_4bit_dist_table_u32_uninit(
     n: usize,
     code_len: usize,
     codes: &[u8],
     dist_table: &[u8],
     dists: &mut [MaybeUninit<u32>],
 ) {
-    debug_assert!(n.is_multiple_of(BATCH_SIZE));
-    debug_assert!(dists.len() >= n);
-    debug_assert!(codes.len() >= n * code_len);
-    debug_assert!(dist_table.len() >= BATCH_SIZE * code_len);
+    // The chunk kernels check only their own chunk, so the whole input is
+    // checked here for a clear panic.
+    assert_row_major_bounds(n, code_len, codes, dist_table, BATCH_SIZE);
+    let dists = &mut dists[..n];
 
     if code_len == 0 {
-        dists[..n].fill(MaybeUninit::new(0));
+        dists.fill(MaybeUninit::new(0));
         return;
     }
 
@@ -417,19 +406,12 @@ pub fn sum_4bit_hacc_dist_table(
     let dists = unsafe {
         std::slice::from_raw_parts_mut(dists.as_mut_ptr().cast::<MaybeUninit<u32>>(), dists.len())
     };
-    // SAFETY: `sum_4bit_hacc_dist_table_uninit` has no precondition; its
-    // kernels check every bound.
-    unsafe { sum_4bit_hacc_dist_table_uninit(n, code_len, codes, hacc_dist_table, dists) };
+    sum_4bit_hacc_dist_table_uninit(n, code_len, codes, hacc_dist_table, dists);
 }
 
 /// Sum a high-accuracy 4-bit distance table into uninitialized output storage.
 ///
 /// Every element in `dists[..n]` is initialized before this function returns.
-///
-/// # Safety
-///
-/// None: the dispatched kernels check every bound, so any input is sound. The
-/// function stays `unsafe` so existing callers keep compiling.
 ///
 /// # Panics
 ///
@@ -437,7 +419,7 @@ pub fn sum_4bit_hacc_dist_table(
 /// `n * code_len` bytes, `hacc_dist_table` at least `code_len * 64` bytes and
 /// `dists` at least `n` slots.
 #[inline]
-pub unsafe fn sum_4bit_hacc_dist_table_uninit(
+pub fn sum_4bit_hacc_dist_table_uninit(
     n: usize,
     code_len: usize,
     codes: &[u8],
@@ -3011,6 +2993,26 @@ mod tests {
                 candidate.name()
             );
         }
+    }
+
+    /// The `u32` entry point checks the whole input, not just each chunk.
+    #[rstest::rstest]
+    #[case::n_not_a_batch_multiple(33, 1, 64, 1, "is not a multiple of")]
+    #[case::short_codes(32, 2, 63, 2, "codes has")]
+    #[case::short_dist_table(32, 2, 64, 1, "dist_table has")]
+    fn test_sum_4bit_dist_table_u32_checks_bounds(
+        #[case] n: usize,
+        #[case] code_len: usize,
+        #[case] codes_len: usize,
+        #[case] table_codes: usize,
+        #[case] expected: &str,
+    ) {
+        let codes = vec![0u8; codes_len];
+        let table = vec![0u8; table_codes * BATCH_SIZE];
+        let mut dists = vec![0u32; 64];
+        let message =
+            panic_message(|| sum_4bit_dist_table_u32(n, code_len, &codes, &table, &mut dists));
+        assert!(message.contains(expected), "{message}");
     }
 
     /// Every transposed candidate rejects inputs its SIMD loads or stores would
