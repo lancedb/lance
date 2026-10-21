@@ -49,6 +49,6 @@ tokio = { workspace = true }
 all_asserts.workspace = true
 env_logger.workspace = true
 hf-hub = { version = "0.5.0", default-features = false, features = ["ureq"] }
-parquet = { workspace = true }
+parquet = { workspace = true, features = ["snap"] }
 tokenizers = "0.22.2"
 rand.workspace = true
