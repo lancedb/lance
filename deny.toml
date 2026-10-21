@@ -88,7 +88,6 @@ ignore = [
     #{ crate = "a-crate-that-is-yanked@0.1.1", reason = "you can specify why you are ignoring the yanked crate" },
     { id = "RUSTSEC-2024-0436", reason = "no fix: `paste` is unmaintained with no patched release; lance-bitpacking and foyer-memory (latest 0.22.6) depend on it" },
     { id = "RUSTSEC-2023-0071", reason = "no fix: no `rsa` release fixes the Marvin timing side channel; opendal's reqsign crates depend on it" },
-    { id = "RUSTSEC-2025-0119", reason = "expires 2027-01-20: `number_prefix` is unmaintained; indicatif 0.17 pulls it in via hf-hub 0.4 and tokenizers 0.15 in rust/examples, and moving those to hf-hub 0.5+ and tokenizers 0.22.2+ (indicatif 0.18) drops it" },
     { id = "RUSTSEC-2026-0194", reason = "expires 2027-01-20: fixed in `quick-xml` 0.41; lance-namespace-impls still asks for 0.40, and pprof 0.15 (tests only) pulls in 0.26 via inferno 0.11, so recheck for a pprof release on inferno 0.12.7+" },
     { id = "RUSTSEC-2026-0195", reason = "expires 2027-01-20: fixed in `quick-xml` 0.41; lance-namespace-impls still asks for 0.40, and pprof 0.15 (tests only) pulls in 0.26 via inferno 0.11, so recheck for a pprof release on inferno 0.12.7+" },
     { id = "RUSTSEC-2024-0449", reason = "no fix: `unsafe-libyaml` is unmaintained; serde_yaml pulls it in for substrait 0.63, which datafusion-substrait (latest 55.2) still requires, and serde_yaml_ng for lindera 3" },
