@@ -3952,7 +3952,32 @@ async fn test_ivf_rq_layout_after_optimize(
     .await;
     assert_eq!(metadata.num_bits, num_bits);
     assert_eq!(metadata.layered, layered);
-    test_recall::<Float32Type>(params, 4, 0.5, "vector", &dataset, vectors).await;
+    // One-bit estimates depend on the random rotation. Exercise maintenance
+    // through a refined query while keeping the candidate set below all rows.
+    let query = vectors.value(0);
+    let k = 100;
+    let result = dataset
+        .scan()
+        .nearest("vector", query.as_primitive::<Float32Type>(), k)
+        .unwrap()
+        .minimum_nprobes(4)
+        .maximum_nprobes(4)
+        .refine(4)
+        .with_row_id()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(result.num_rows(), k);
+    let actual = result[ROW_ID]
+        .as_primitive::<UInt64Type>()
+        .values()
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+    let expected = ground_truth(&dataset, "vector", &query, k, params.metric_type).await;
+    assert_eq!(actual.len(), k);
+    let recall = actual.intersection(&expected).count() as f32 / k as f32;
+    assert!(recall >= 0.5, "recall after maintenance: {recall}");
 }
 
 #[rstest]
