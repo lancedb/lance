@@ -682,6 +682,84 @@ async fn test_planar_dictionary_encode_repeated_vectors(
 }
 
 #[rstest::rstest]
+#[case::index_budget(32_768, 64, 100, 8192)]
+#[case::item_budget(2048, 64, 100, 512)]
+#[case::narrow_vectors(2048, 16, 400, 512)]
+#[tokio::test]
+async fn test_sparse_vector_dictionary_hidden_payload(
+    #[case] rows: usize,
+    #[case] dimension: usize,
+    #[case] valid: usize,
+    #[case] patterns: usize,
+    #[values("lz4", "none")] compression: &str,
+) {
+    // Arrow retains arbitrary child values beneath null vectors. These repeated
+    // hidden values must not make a dictionary look cheaper than sparse storage.
+    let values = Float32Array::from(
+        (0..rows * dimension)
+            .map(|i| {
+                let row = i / dimension;
+                let pattern = if row < valid { 0 } else { 1 + row % patterns };
+                let mut bits = (pattern * dimension + i % dimension) as u32;
+                bits ^= bits >> 16;
+                bits = bits.wrapping_mul(0x7feb_352d);
+                bits ^= bits >> 15;
+                bits = bits.wrapping_mul(0x846c_a68b);
+                bits ^= bits >> 16;
+                f32::from_bits(0x3f80_0000 | (bits & 0x007f_ffff))
+            })
+            .collect::<Vec<_>>(),
+    );
+    let array = Arc::new(FixedSizeListArray::new(
+        Arc::new(arrow_schema::Field::new("item", DataType::Float32, false)),
+        dimension as i32,
+        Arc::new(values),
+        Some(NullBuffer::from(
+            (0..rows).map(|i| i < valid).collect::<Vec<_>>(),
+        )),
+    )) as ArrayRef;
+    let metadata = HashMap::from([(
+        DICT_VALUES_COMPRESSION_META_KEY.to_string(),
+        compression.to_string(),
+    )]);
+    let field = arrow_schema::Field::new("vectors", array.data_type().clone(), true)
+        .with_metadata(metadata.clone());
+    let candidate = encode_first_page(field, array.clone(), TestEncoding::StructuralSparse).await;
+    let mut fallback_metadata = metadata.clone();
+    fallback_metadata.insert(DICT_DIVISOR_META_KEY.to_string(), "1000000".to_string());
+    let field = arrow_schema::Field::new("vectors", array.data_type().clone(), true)
+        .with_metadata(fallback_metadata);
+    let fallback = encode_first_page(field, array.clone(), TestEncoding::StructuralSparse).await;
+    let candidate_bytes: usize = candidate.data.iter().map(|buffer| buffer.len()).sum();
+    let fallback_bytes: usize = fallback.data.iter().map(|buffer| buffer.len()).sum();
+    assert!(
+        candidate_bytes <= fallback_bytes,
+        "dictionary candidate {candidate_bytes} bytes exceeds sparse fallback {fallback_bytes} bytes"
+    );
+    for page in [&candidate, &fallback] {
+        let PageEncoding::Planar(layout) = &page.description else {
+            panic!("expected a planar page");
+        };
+        assert!(matches!(
+            layout
+                .values
+                .as_ref()
+                .and_then(|values| values.codec.as_ref()),
+            Some(crate::format::pb23::value_plane::Codec::Zipped(_))
+        ));
+    }
+    let tests = TestCases::default()
+        .with_encoding(TestEncoding::StructuralSparse)
+        .with_page_sizes(vec![32 * 1024 * 1024])
+        .with_ingest_batch_counts([1])
+        .with_slicing_modes([false])
+        .with_batch_size(256)
+        .with_range(0..rows as u64)
+        .with_indices(vec![0, valid as u64 - 1, valid as u64, rows as u64 - 1]);
+    check_round_trip_encoding_of_data(vec![array], &tests, metadata).await;
+}
+
+#[rstest::rstest]
 #[case::unique(2048, 2048, 2)]
 #[case::entry_budget(128, 64, 8)]
 fn test_planar_vector_dictionary_rejects_unhelpful_candidates(
