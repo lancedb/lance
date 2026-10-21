@@ -1824,6 +1824,127 @@ pub async fn build_ivf_model(
         "Finished loading training data in {:02} seconds",
         start.elapsed().as_secs_f32()
     );
+    train_ivf_model_from_sample(training_data, metric_type, params, progress).await
+}
+
+/// Train an in-memory IVF model from caller-supplied vector samples.
+///
+/// This uses the same preprocessing, k-means, loss calculation, and progress
+/// reporting as [`build_ivf_model`], without reading or sampling a dataset.
+/// Cosine vectors are normalized before training with L2. Null vectors, vectors
+/// with null components, and non-finite vectors are excluded from training.
+/// The caller is responsible for providing a representative sample in random
+/// order, especially for hierarchical k-means, which trains on sample prefixes.
+/// The trainer may use a subset according to `params.sample_rate`.
+///
+/// `params.num_partitions` must be set and positive. At least that many valid
+/// vectors must remain after preprocessing. Streaming training is unsupported;
+/// use [`build_ivf_model`] when `streaming_sample_rate < sample_rate`.
+/// Provided centroids are initial seeds and require `params.retrain = true`.
+///
+/// ```
+/// # use arrow_array::{FixedSizeListArray, Float32Array};
+/// # use lance_arrow::FixedSizeListArrayExt;
+/// # use lance_index::vector::ivf::IvfBuildParams;
+/// # use lance_linalg::distance::MetricType;
+/// # async fn example() -> lance::Result<()> {
+/// let samples = FixedSizeListArray::try_new_from_values(
+///     Float32Array::from(vec![0.0, 0.0, 0.1, 0.1, 10.0, 10.0, 10.1, 10.1]),
+///     2,
+/// )?;
+/// let model = lance::index::vector::ivf::train_ivf_model_from_sample(
+///     samples,
+///     MetricType::L2,
+///     &IvfBuildParams::new(2),
+///     lance_index::progress::noop_progress(),
+/// ).await?;
+/// assert_eq!(model.num_partitions(), 2);
+/// # Ok(())
+/// # }
+/// ```
+pub async fn train_ivf_model_from_sample(
+    training_data: FixedSizeListArray,
+    metric_type: MetricType,
+    params: &IvfBuildParams,
+    progress: std::sync::Arc<dyn lance_index::progress::IndexBuildProgress>,
+) -> Result<IvfModel> {
+    let num_partitions = params.num_partitions.filter(|&k| k > 0).ok_or_else(|| {
+        Error::invalid_input(format!(
+            "num_partitions must be set and positive when training from samples, got {:?}",
+            params.num_partitions
+        ))
+    })?;
+    if training_data.value_length() <= 0 {
+        return Err(Error::invalid_input(format!(
+            "Training vector dimension must be positive, got {}",
+            training_data.value_length()
+        )));
+    }
+    if params.sample_rate == 0 || params.max_iters == 0 || params.max_iters > u32::MAX as usize {
+        return Err(Error::invalid_input(format!(
+            "sample_rate must be positive and max_iters must be in 1..={}, got sample_rate={} and max_iters={}",
+            u32::MAX,
+            params.sample_rate,
+            params.max_iters
+        )));
+    }
+    num_partitions.checked_mul(params.sample_rate).ok_or_else(|| {
+        Error::invalid_input(format!(
+            "Training sample count overflows usize: num_partitions={num_partitions}, sample_rate={}",
+            params.sample_rate
+        ))
+    })?;
+    if params
+        .streaming_sample_rate
+        .is_some_and(|rate| rate < params.sample_rate)
+    {
+        return Err(Error::invalid_input(
+            "Training from a supplied sample cannot use streaming_sample_rate < sample_rate"
+                .to_string(),
+        ));
+    }
+    if !matches!(
+        (training_data.value_type(), metric_type),
+        (
+            DataType::Float16 | DataType::Float32 | DataType::Float64 | DataType::Int8,
+            MetricType::L2 | MetricType::Cosine | MetricType::Dot
+        ) | (DataType::UInt8, MetricType::Hamming)
+    ) {
+        return Err(Error::invalid_input(format!(
+            "Unsupported training sample type {} with metric {}",
+            training_data.value_type(),
+            metric_type
+        )));
+    }
+    if let Some(centroids) = &params.centroids {
+        if !params.retrain {
+            return Err(Error::invalid_input(
+                "Training from samples with supplied centroids requires retrain=true".to_string(),
+            ));
+        }
+        if centroids.len() != num_partitions
+            || centroids.value_length() != training_data.value_length()
+        {
+            return Err(Error::invalid_input(format!(
+                "Initial centroid shape must be {}x{}, got {}x{}",
+                num_partitions,
+                training_data.value_length(),
+                centroids.len(),
+                centroids.value_length()
+            )));
+        }
+        let centroid_type = match training_data.value_type() {
+            DataType::Int8 => DataType::Float32,
+            data_type => data_type,
+        };
+        if centroids.value_type() != centroid_type
+            || filter_finite_training_data(centroids.as_ref().clone())?.len() != num_partitions
+        {
+            return Err(Error::invalid_input(format!(
+                "Initial centroids must contain {num_partitions} finite, non-null {centroid_type} vectors"
+            )));
+        }
+    }
     if params.sample_rate >= 1024 && training_data.value_type() == DataType::Float16 {
         warn!(
             "Large sample_rate ({} >= 1024) for float16 vectors is possible to result in all zeros cluster centroid",
@@ -1840,12 +1961,19 @@ pub async fn build_ivf_model(
         (training_data, metric_type)
     };
 
-    // we filtered out nulls when sampling, but we still need to filter out NaNs and INFs here
+    // Normalization can produce non-finite values, so filter after preprocessing.
     let training_data = filter_finite_training_data(training_data)?;
 
     info!("Start to train IVF model");
     let start = std::time::Instant::now();
-    let ivf = train_ivf_model(centroids, &training_data, mt, params, progress).await?;
+    let ivf = train_ivf_model(
+        params.centroids.clone(),
+        &training_data,
+        mt,
+        params,
+        progress,
+    )
+    .await?;
     info!(
         "Trained IVF model in {:02} seconds",
         start.elapsed().as_secs_f32()
@@ -6708,6 +6836,214 @@ mod tests {
                     )
                 });
         }
+    }
+
+    #[rstest]
+    #[case::l2(MetricType::L2, [4.5f32, 6.0])]
+    #[case::cosine(MetricType::Cosine, [0.6f32, 0.8])]
+    #[tokio::test]
+    async fn train_ivf_from_sample_preprocesses_invalid_vectors(
+        #[case] metric: MetricType,
+        #[case] expected: [f32; 2],
+    ) {
+        let values = Float32Array::from(vec![
+            Some(3.0),
+            Some(4.0),
+            Some(6.0),
+            Some(8.0),
+            Some(f32::NAN),
+            Some(1.0),
+            Some(f32::INFINITY),
+            Some(1.0),
+            None,
+            Some(1.0),
+            Some(100.0),
+            Some(100.0),
+        ]);
+        let sample = FixedSizeListArray::new(
+            Arc::new(Field::new("item", DataType::Float32, true)),
+            2,
+            Arc::new(values),
+            Some(NullBuffer::from(vec![true, true, true, true, true, false])),
+        );
+        let model =
+            train_ivf_model_from_sample(sample, metric, &IvfBuildParams::new(1), noop_progress())
+                .await
+                .unwrap();
+        let centroids = model.centroids.as_ref().unwrap();
+        assert_eq!(centroids.len(), 1);
+        for (&actual, expected) in centroids
+            .values()
+            .as_primitive::<Float32Type>()
+            .values()
+            .iter()
+            .zip(expected)
+        {
+            assert!((actual - expected).abs() < 1e-5, "{actual} != {expected}");
+        }
+    }
+
+    #[rstest]
+    #[case::empty(Vec::<Option<f32>>::new())]
+    #[case::all_null(vec![None, None])]
+    #[case::all_invalid(vec![Some(f32::NAN), Some(1.0)])]
+    #[tokio::test]
+    async fn train_ivf_from_sample_rejects_insufficient_valid_vectors(
+        #[case] values: Vec<Option<f32>>,
+    ) {
+        let sample =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(values), 2).unwrap();
+        let error = train_ivf_model_from_sample(
+            sample,
+            MetricType::L2,
+            &IvfBuildParams::new(1),
+            noop_progress(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, Error::Unprocessable { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("cannot train 1 centroids with 0 vectors")
+        );
+    }
+
+    #[rstest]
+    #[case::missing_partitions(IvfBuildParams::default(), "num_partitions")]
+    #[case::zero_partitions(IvfBuildParams::new(0), "num_partitions")]
+    #[case::zero_sample_rate(IvfBuildParams { sample_rate: 0, ..IvfBuildParams::new(1) }, "sample_rate")]
+    #[case::zero_iterations(IvfBuildParams { max_iters: 0, ..IvfBuildParams::new(1) }, "max_iters")]
+    #[case::streaming(IvfBuildParams { streaming_sample_rate: Some(1), ..IvfBuildParams::new(1) }, "streaming_sample_rate")]
+    #[case::overflow(IvfBuildParams { sample_rate: usize::MAX, ..IvfBuildParams::new(2) }, "overflows")]
+    #[tokio::test]
+    async fn train_ivf_from_sample_rejects_invalid_parameters(
+        #[case] params: IvfBuildParams,
+        #[case] message: &str,
+    ) {
+        let sample = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(vec![1.0, 2.0, 3.0, 4.0]),
+            2,
+        )
+        .unwrap();
+        let error = train_ivf_model_from_sample(sample, MetricType::L2, &params, noop_progress())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains(message), "{error}");
+    }
+
+    #[tokio::test]
+    async fn train_ivf_from_sample_retrains_initial_centroids() {
+        let sample = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(vec![3.0, 4.0, 5.0, 6.0]),
+            2,
+        )
+        .unwrap();
+        let mut params =
+            IvfBuildParams::try_with_centroids(1, Arc::new(sample.slice(0, 1))).unwrap();
+        let error =
+            train_ivf_model_from_sample(sample.clone(), MetricType::L2, &params, noop_progress())
+                .await
+                .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("retrain=true"));
+        params.retrain = true;
+        let model = train_ivf_model_from_sample(sample, MetricType::L2, &params, noop_progress())
+            .await
+            .unwrap();
+        assert_eq!(
+            model
+                .centroids
+                .as_ref()
+                .unwrap()
+                .values()
+                .as_primitive::<Float32Type>()
+                .values()
+                .as_ref(),
+            &[4.0, 5.0]
+        );
+    }
+
+    #[tokio::test]
+    async fn train_ivf_from_sample_builds_searchable_index() {
+        let sample = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(
+                (0..64)
+                    .flat_map(|i| [i as f32, (i as f32) * 0.5])
+                    .collect::<Vec<_>>(),
+            ),
+            2,
+        )
+        .unwrap();
+        let batch = RecordBatch::try_from_iter([
+            (
+                "id",
+                Arc::new(UInt32Array::from((0..64).collect::<Vec<u32>>())) as ArrayRef,
+            ),
+            ("vector", Arc::new(sample.clone()) as ArrayRef),
+        ])
+        .unwrap();
+        let schema = batch.schema();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], schema),
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 32,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 2);
+        let query = Float32Array::from(vec![17.25, 8.5]);
+        let expected = dataset
+            .scan()
+            .nearest("vector", &query, 10)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let model = train_ivf_model_from_sample(
+            sample,
+            MetricType::L2,
+            &IvfBuildParams::new(2),
+            noop_progress(),
+        )
+        .await
+        .unwrap();
+        let ivf =
+            IvfBuildParams::try_with_centroids(2, Arc::new(model.centroids.unwrap())).unwrap();
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                None,
+                &VectorIndexParams::with_ivf_flat_params(MetricType::L2, ivf),
+                false,
+            )
+            .await
+            .unwrap();
+        let found = dataset
+            .scan()
+            .nearest("vector", &query, 10)
+            .unwrap()
+            .minimum_nprobes(2)
+            .try_into_batch()
+            .await
+            .unwrap();
+        let expected_ids = expected["id"]
+            .as_primitive::<arrow_array::types::UInt32Type>()
+            .values();
+        let found_ids = found["id"]
+            .as_primitive::<arrow_array::types::UInt32Type>()
+            .values();
+        let recall = expected_ids
+            .iter()
+            .filter(|id| found_ids.contains(id))
+            .count() as f64
+            / 10.0;
+        assert_eq!(recall, 1.0);
     }
 
     #[tokio::test]
