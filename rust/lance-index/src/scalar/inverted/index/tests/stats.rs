@@ -258,6 +258,94 @@ fn set_test_posting_group_size(index: &mut Arc<InvertedIndex>, group_size: u32) 
     inverted_list.grouping = PostingGrouping::SyntheticFixed { group_size };
 }
 
+async fn load_counted_v3_index(
+    cache: LanceCache,
+) -> (Arc<InvertedIndex>, Arc<PostingMetadataCounter>, TempObjDir) {
+    let tmpdir = TempObjDir::default();
+    let store = Arc::new(LanceIndexStore::new(
+        ObjectStore::local().into(),
+        tmpdir.clone(),
+        Arc::new(LanceCache::no_cache()),
+    ));
+    let batch = arrow_array::record_batch!(
+        (
+            "doc",
+            Utf8,
+            ["t0", "t1", "t2", "t3", "t4", "t5", "t6", "t7"]
+        ),
+        (ROW_ID, UInt64, [0, 1, 2, 3, 4, 5, 6, 7])
+    )
+    .unwrap();
+    let params = InvertedIndexParams::default()
+        .with_position(true)
+        .block_size(256)
+        .unwrap()
+        .num_workers(1);
+    let mut builder = InvertedIndexBuilder::new(params);
+    builder
+        .update(
+            Box::pin(RecordBatchStreamAdapter::new(
+                batch.schema(),
+                stream::once(async move { Ok(batch) }),
+            )),
+            store.as_ref(),
+            None,
+        )
+        .await
+        .unwrap();
+    let metadata = store.open_index_file(METADATA_FILE).await.unwrap();
+    let partitions: Vec<u64> =
+        serde_json::from_str(metadata.schema().metadata.get("partitions").unwrap()).unwrap();
+    assert_eq!(partitions.len(), 1);
+    let counter = Arc::new(PostingMetadataCounter::default());
+    let store: Arc<dyn IndexStore> = Arc::new(CountingStore {
+        inner: store,
+        posting_file: posting_file_path(partitions[0]),
+        counter: counter.clone(),
+    });
+    let index = InvertedIndex::load(store, None, &cache).await.unwrap();
+    assert_eq!(index.format_version(), InvertedListFormatVersion::V3);
+    (index, counter, tmpdir)
+}
+
+#[rstest::rstest]
+#[case::cold(false, 1)]
+#[case::prewarmed(true, 0)]
+#[tokio::test]
+async fn test_modern_search_avoids_unrequested_postings(
+    #[case] is_prewarmed: bool,
+    #[case] expected_posting_rows: usize,
+) {
+    let cache = LanceCache::with_capacity(1024 * 1024);
+    let (mut index, counter, _tmpdir) = load_counted_v3_index(cache.clone()).await;
+    set_test_posting_group_size(&mut index, 4);
+    if is_prewarmed {
+        index
+            .prewarm_with_options(&FtsPrewarmOptions::default())
+            .await
+            .unwrap();
+        counter.posting_rows_read.store(0, Ordering::Relaxed);
+        counter.impact_rows_read.store(0, Ordering::Relaxed);
+    }
+    let (rows, scores) = index
+        .bm25_search(
+            Arc::new(Tokens::new(vec!["t0".to_owned()], DocType::Text)),
+            Arc::new(FtsSearchParams::new().with_limit(Some(1))),
+            Operator::Or,
+            Arc::new(NoFilter),
+            Arc::new(NoOpMetricsCollector),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(rows, [0]);
+    assert_eq!(scores.len(), 1);
+    assert!(scores[0].is_finite() && scores[0] > 0.0);
+    assert_eq!(counter.posting_rows_read(), expected_posting_rows);
+    assert_eq!(counter.impact_rows_read(), expected_posting_rows);
+}
+
 /// IO regression test for the lazy posting-metadata refactor. Builds a
 /// v2 InvertedIndex with `num_tokens` tokens in a single partition,
 /// wraps the IndexStore so reads against the posting file are counted,
