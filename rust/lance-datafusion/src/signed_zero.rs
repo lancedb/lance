@@ -43,7 +43,7 @@ use lance_core::Result;
 /// | `x != 0`                     | `x NOT IN (-0.0, 0.0)`       |
 /// | `x IN (0, ..)`               | the missing encoding is added |
 /// | `0 IN (a, b)`                | `a IN (-0.0, 0.0) OR b IN (-0.0, 0.0)` |
-/// | `x IS NOT DISTINCT FROM 0`   | `(x IN (-0.0, 0.0)) IS TRUE` |
+/// | `x IS NOT DISTINCT FROM 0`   | `(x IN (-0.0, 0.0)) IS TRUE`     |
 /// | `x IS DISTINCT FROM 0`       | `(x IN (-0.0, 0.0)) IS NOT TRUE` |
 /// | `x <op> y`                   | normalize zeros in both operands before `<op>` |
 /// | `array_has(xs, 0)`           | `array_has_any(xs, [-0.0, 0.0])` |
@@ -963,9 +963,8 @@ mod tests {
     // bare column, which is also what DataFusion requires before it shortens a
     // list. This case fails if a release ever relaxes that.
     #[case::non_column_probe("abs(value) = 0.0")]
-    // `IS [NOT] DISTINCT FROM` is missing because `Planner::parse_filter` rejects
-    // it as unsupported SQL; that arm is reachable only from a programmatically
-    // built expression, and `rewriting_twice_changes_nothing` covers it there.
+    #[case::is_not_distinct_from("value IS NOT DISTINCT FROM 0.0")]
+    #[case::is_distinct_from("value IS DISTINCT FROM 0.0")]
     fn optimizing_twice_changes_nothing(#[case] filter: &str) {
         let schema = std::sync::Arc::new(arrow_schema::Schema::new(vec![
             arrow_schema::Field::new("value", arrow_schema::DataType::Float64, true),
