@@ -3835,6 +3835,13 @@ async fn test_layered_rq_create_search_cascade_and_remap(
         .optimize_indices(&OptimizeOptions::append())
         .await
         .unwrap();
+    let appended_indices = dataset.load_indices().await.unwrap();
+    assert_eq!(appended_indices.len(), 2);
+    assert!(
+        appended_indices
+            .iter()
+            .all(|index| index.index_version == 2)
+    );
     dataset
         .optimize_indices(&OptimizeOptions::merge(10))
         .await
@@ -3845,6 +3852,7 @@ async fn test_layered_rq_create_search_cascade_and_remap(
         SchedulerConfig::default_for_testing(),
     );
     for index in indices.iter() {
+        assert_eq!(index.index_version, 2);
         assert!(
             get_rq_metadata(&dataset, scheduler.clone(), &index.uuid.to_string())
                 .await

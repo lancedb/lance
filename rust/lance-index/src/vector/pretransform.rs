@@ -568,6 +568,8 @@ mod tests {
             query_parallelism: 4,
             dist_q_c: 1.25,
             approx_mode: super::super::ApproxMode::Accurate,
+            rq_precision: super::super::bq::layered::RQPrecision::High,
+            rq_cascade_factor: Some(7),
         }
     }
 
@@ -600,6 +602,8 @@ mod tests {
         assert_eq!(actual.query_parallelism, original.query_parallelism);
         assert_eq!(actual.dist_q_c, original.dist_q_c);
         assert_eq!(actual.approx_mode, original.approx_mode);
+        assert_eq!(actual.rq_precision, original.rq_precision);
+        assert_eq!(actual.rq_cascade_factor, original.rq_cascade_factor);
     }
 
     #[tokio::test]
