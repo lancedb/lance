@@ -857,6 +857,7 @@ impl<'a> CleanupTask<'a> {
             let delpath = fragment
                 .deletion_file
                 .as_ref()
+                .filter(|delfile| !delfile.is_inline())
                 .map(|delfile| deletion_file_path(&self.dataset.base, fragment.id, delfile));
             if let Some(delpath) = delpath {
                 let relative_path = remove_prefix(&delpath, &self.dataset.base);
