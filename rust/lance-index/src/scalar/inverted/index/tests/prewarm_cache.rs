@@ -540,11 +540,15 @@ async fn test_prewarm_streams_in_chunks_preserves_content(
     }
 }
 
-/// With positions, the chunked prewarm must strip positions into their own
-/// per-token cache entries (leaving the posting cache positions-free) and still
+/// With positions, chunked prewarm keeps position data separate from postings and
 /// round-trip exact doc ids, frequencies, and positions across chunk boundaries.
+#[rstest::rstest]
+#[case::v2(InvertedListFormatVersion::V2)]
+#[case::v3(InvertedListFormatVersion::V3)]
 #[tokio::test]
-async fn test_prewarm_streams_in_chunks_with_positions() {
+async fn test_prewarm_streams_in_chunks_with_positions(
+    #[case] format_version: InvertedListFormatVersion,
+) {
     let tmpdir = TempObjDir::default();
     let store = Arc::new(LanceIndexStore::new(
         ObjectStore::local().into(),
@@ -552,7 +556,6 @@ async fn test_prewarm_streams_in_chunks_with_positions() {
         Arc::new(LanceCache::no_cache()),
     ));
 
-    let format_version = InvertedListFormatVersion::V2;
     let posting_tail_codec = format_version.posting_tail_codec();
     let num_tokens = runtime_posting_group_tokens() as u32 + 4;
     const DOCS_PER_TOKEN: u32 = 3;
@@ -587,7 +590,12 @@ async fn test_prewarm_streams_in_chunks_with_positions() {
         ),
         (
             "params".to_owned(),
-            serde_json::to_string(&InvertedIndexParams::default().with_position(true)).unwrap(),
+            serde_json::to_string(
+                &InvertedIndexParams::default()
+                    .with_position(true)
+                    .format_version(format_version),
+            )
+            .unwrap(),
         ),
         (
             TOKEN_SET_FORMAT_KEY.to_owned(),
@@ -641,21 +649,61 @@ async fn test_prewarm_streams_in_chunks_with_positions() {
             .await
             .unwrap();
         let slot = (token_id - start) as usize;
-        assert!(
-            !group.is_packed(),
-            "with-position prewarm should retain the materialized fallback"
-        );
+        assert!(group.is_packed());
+        let (max_score, length) = inverted_list.bulk_metadata_for_token(token_id);
         assert!(
             !group
-                .posting_list(slot, None, None)
+                .posting_list(slot, max_score, length)
                 .unwrap()
                 .unwrap()
                 .has_position(),
             "token {token_id} posting cache entry must be positions-free after prewarm"
         );
 
-        // Full content (doc ids, frequencies, positions) round-trips; the
-        // positions come from the dedicated per-token cache prewarm populated.
+        assert!(
+            inverted_list
+                .index_cache
+                .get_with_key(&PositionKey { token_id })
+                .await
+                .is_none()
+        );
+        let positions = inverted_list
+            .index_cache
+            .get_with_key(&PositionGroupKey { start, end })
+            .await
+            .unwrap();
+        let CompressedPositionStorage::SharedStream(first) = positions.position(slot).unwrap()
+        else {
+            panic!("expected shared positions")
+        };
+        let CompressedPositionStorage::SharedStream(second) = positions.position(slot).unwrap()
+        else {
+            panic!("expected shared positions")
+        };
+        assert_eq!(first.bytes().as_ptr(), second.bytes().as_ptr());
+        assert_eq!(
+            first.block_offsets().as_ptr(),
+            second.block_offsets().as_ptr()
+        );
+        let codec = CacheCodec::from_impl::<PositionGroup>();
+        let mut encoded = Vec::new();
+        codec
+            .serialize(
+                &(positions.clone() as lance_core::cache::CacheEntry),
+                &mut encoded,
+            )
+            .unwrap();
+        let lance_core::cache::CacheDecode::Hit(decoded) = codec.deserialize(&encoded.into())
+        else {
+            panic!("position group codec must round trip")
+        };
+        let decoded = decoded.downcast::<PositionGroup>().unwrap();
+        assert_eq!(
+            decoded.position(slot).unwrap(),
+            positions.position(slot).unwrap()
+        );
+
+        // Full content round-trips with positions supplied by the packed group.
         let actual = inverted_list
             .posting_list(token_id, true, &NoOpMetricsCollector)
             .await
@@ -670,6 +718,10 @@ async fn test_prewarm_streams_in_chunks_with_positions() {
             "token {token_id} posting list / positions mismatch after chunked prewarm"
         );
     }
+    assert_eq!(
+        inverted_list.prewarm_residency_status(true).await,
+        (true, Some(true))
+    );
 }
 
 #[tokio::test]

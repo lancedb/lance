@@ -47,7 +47,22 @@ impl PostingListReader {
     }
 
     async fn positions_resident_now(&self) -> bool {
+        let mut resident_group_end = 0;
         for token_id in 0..self.len() as u32 {
+            if token_id < resident_group_end {
+                continue;
+            }
+            if matches!(self.positions_layout, PositionsLayout::SharedStream(_))
+                && let Some((start, end)) = self.group_range_for_token(token_id)
+                && self
+                    .index_cache
+                    .get_resident_with_key(&PositionGroupKey { start, end })
+                    .await
+                    .is_some()
+            {
+                resident_group_end = end;
+                continue;
+            }
             if self
                 .index_cache
                 .get_with_key(&PositionKey { token_id })
@@ -172,7 +187,9 @@ impl PostingListReader {
         // posting lists must all be resident at once: align chunk boundaries to
         // whole groups. Without grouping, chunks are plain token ranges.
         let grouping = self.grouping.clone();
-        let use_packed_groups = grouping.is_grouped() && !with_position;
+        let use_packed_groups = grouping.is_grouped()
+            && (!with_position
+                || matches!(self.positions_layout, PositionsLayout::SharedStream(_)));
         // Packed groups reuse the reader's bulk metadata at query time, so they
         // do not need the temporary full-partition metadata clones used by the
         // materialized fallback.
@@ -194,15 +211,29 @@ impl PostingListReader {
                 async move {
                     if use_packed_groups {
                         let groups = self
-                            .build_packed_chunk_groups(tok_start, tok_end, token_count, grouping)
+                            .build_packed_chunk_groups(
+                                tok_start,
+                                tok_end,
+                                token_count,
+                                grouping,
+                                with_position,
+                            )
                             .await?;
-                        for (start, end, group) in groups {
+                        for (start, end, group, positions) in groups {
                             self.index_cache
                                 .insert_with_key(
                                     &posting_list_group_cache_key(start, end, self.has_impacts),
                                     Arc::new(group),
                                 )
                                 .await;
+                            if let Some(positions) = positions {
+                                self.index_cache
+                                    .insert_with_key(
+                                        &PositionGroupKey { start, end },
+                                        Arc::new(positions),
+                                    )
+                                    .await;
+                            }
                         }
                     } else {
                         let state = state.expect(
@@ -359,11 +390,18 @@ impl PostingListReader {
         tok_end: usize,
         token_count: usize,
         grouping: &PostingGrouping,
-    ) -> Result<Vec<(u32, u32, PostingListGroup)>> {
+        with_position: bool,
+    ) -> Result<Vec<(u32, u32, PostingListGroup, Option<PositionGroup>)>> {
         debug_assert!(grouping.is_grouped());
         debug_assert!(!self.is_legacy_layout());
 
-        let chunk_batch = self.read_chunk_batch(tok_start, tok_end, false).await?;
+        let chunk_batch = self
+            .read_chunk_batch(tok_start, tok_end, with_position)
+            .await?;
+        let position_codec = match (with_position, self.positions_layout) {
+            (true, PositionsLayout::SharedStream(codec)) => Some(codec),
+            _ => None,
+        };
         let ranges = grouping.ranges_for_chunk(tok_start, tok_end, token_count);
         let posting_tail_codec = self.posting_tail_codec;
         let block_size = self.block_size;
@@ -393,6 +431,15 @@ impl PostingListReader {
                 let local_start = start_usize - tok_start;
                 let group_len = end_usize - start_usize;
                 let group_batch = chunk_batch.slice(local_start, group_len).shrink_to_fit()?;
+                let (group_batch, positions) = if let Some(codec) = position_codec {
+                    let schema = group_batch.schema_ref();
+                    let position_columns = [schema.index_of(COMPRESSED_POSITION_COL)?, schema.index_of(POSITION_BLOCK_OFFSET_COL)?];
+                    let positions = PositionGroup::new(group_batch.project(&position_columns)?, codec)?;
+                    let posting_columns = (0..group_batch.num_columns()).filter(|column| !position_columns.contains(column)).collect::<Vec<_>>();
+                    (group_batch.project(&posting_columns)?, Some(positions))
+                } else {
+                    (group_batch, None)
+                };
                 let group = PostingListGroup::new_packed_with_block_size(
                     group_batch,
                     posting_tail_codec,
@@ -415,7 +462,7 @@ impl PostingListReader {
                         Self::validate_modern_posting(token_id, &posting, num_docs)?;
                     }
                 }
-                groups.push((start, end, group));
+                groups.push((start, end, group, positions));
             }
             Result::Ok(groups)
         })
@@ -425,7 +472,7 @@ impl PostingListReader {
                 "Failed to build packed prewarm posting groups in blocking task: {err}"
             ))
         })??;
-        for (start, end, _) in &groups {
+        for (start, end, _, _) in &groups {
             for token_id in *start..*end {
                 self.publish_modern_posting_validated(token_id).await?;
             }
@@ -730,6 +777,16 @@ impl PostingListReader {
         token_id: u32,
         metrics: &dyn MetricsCollector,
     ) -> Result<CompressedPositionStorage> {
+        if matches!(self.positions_layout, PositionsLayout::SharedStream(_))
+            && let Some((start, end)) = self.group_range_for_token(token_id)
+            && let Some(group) = self
+                .index_cache
+                .get_resident_with_key(&PositionGroupKey { start, end })
+                .await
+        {
+            metrics.record_index_cache_hit();
+            return group.position((token_id - start) as usize);
+        }
         let result = self.index_cache.get_or_insert_with_key_hit(PositionKey { token_id }, || async move {
             let positions = match self.positions_layout {
                 PositionsLayout::None => {
