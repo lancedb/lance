@@ -3813,12 +3813,21 @@ async fn test_layered_rq_create_search_cascade_and_remap(
     let loader = IvfQuantizationStorage::<RabitQuantizer>::try_new(reader, None)
         .await
         .unwrap();
-    let source = loader.load_partition(0, None).await.unwrap();
+    // K-means does not guarantee enough rows in any particular partition.
+    let partition = (0..loader.num_partitions())
+        .max_by_key(|partition| loader.partition_size(*partition))
+        .unwrap();
+    let source = loader.load_partition(partition, None).await.unwrap();
     let offsets: Vec<u32> = (0..source.len() as u32).step_by(3).take(5).collect();
     assert!(offsets.len() > 1);
     let no_cache = LanceCache::no_cache();
     let selected = loader
-        .load_candidates(0, offsets.clone(), &WeakLanceCache::from(&no_cache), None)
+        .load_candidates(
+            partition,
+            offsets.clone(),
+            &WeakLanceCache::from(&no_cache),
+            None,
+        )
         .await
         .unwrap();
     let source_calc = source.dist_calculator(query.clone(), 0.0);
