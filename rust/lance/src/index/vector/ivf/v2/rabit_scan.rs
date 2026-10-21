@@ -390,7 +390,7 @@ impl RabitScanContext {
                 ex_rows,
             )?;
             Ok(calc.accumulate_survivor_rows(
-                self.query.k,
+                self.query.k * self.query.refine_factor.unwrap_or(1) as usize,
                 self.query.lower_bound,
                 self.query.upper_bound,
                 &rows,
