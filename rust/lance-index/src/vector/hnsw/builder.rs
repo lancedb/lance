@@ -3732,6 +3732,7 @@ mod tests {
             upper_bound: None,
             minimum_nprobes: 1,
             maximum_nprobes: None,
+            search_effort: 0.5,
             ef,
             refine_factor,
             metric_type: Some(DistanceType::L2),
