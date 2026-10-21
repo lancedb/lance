@@ -255,7 +255,7 @@ mod tests {
     }
 
     /// Every host-supported kernel, and the dispatched entry point, must
-    /// produce exactly the integer accumulators.
+    /// produce exactly the reference integer accumulators.
     fn assert_kernels_match_reference(a: &[u8], b: &[u8], label: &str) {
         let (mut dot_ab, mut norm_a_sq, mut norm_b_sq) = (0u64, 0u64, 0u64);
         for (&x, &y) in a.iter().zip(b) {
