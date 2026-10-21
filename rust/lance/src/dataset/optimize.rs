@@ -3485,10 +3485,7 @@ pub async fn commit_compaction(
 
     let mut completed_tasks = completed_tasks;
 
-    let all_new_fragments: Vec<Fragment> = completed_tasks
-        .iter()
-        .flat_map(|t| t.new_fragments.iter().cloned())
-        .collect();
+    let new_fragment_count: usize = completed_tasks.iter().map(|t| t.new_fragments.len()).sum();
 
     // Single reserve_fragment_ids for all address-style tasks
     let mut reserved_version = None;
@@ -3872,7 +3869,7 @@ pub async fn commit_compaction(
         // that the rewritten files are unreferenced. Leave them for dataset GC.
         log::warn!(
             "Compaction commit failed; leaving {} rewritten fragment(s) in place for GC: {}",
-            all_new_fragments.len(),
+            new_fragment_count,
             e
         );
         return Err(e);
@@ -4950,6 +4947,14 @@ mod tests {
                 .contains("simulated outright commit failure")
         );
         assert_eq!(list_data_files(test_uri), published_files);
+        let ds = Dataset::open(test_uri).await.unwrap();
+        assert_eq!(ds.version().version, published_version);
+        assert_eq!(ds.scan().try_into_batch().await.unwrap(), expected);
+
+        // GC must still treat the replayed output as referenced by the published version.
+        ds.cleanup_old_versions(chrono::Duration::zero(), Some(true), None)
+            .await
+            .unwrap();
         let ds = Dataset::open(test_uri).await.unwrap();
         assert_eq!(ds.version().version, published_version);
         assert_eq!(ds.scan().try_into_batch().await.unwrap(), expected);
