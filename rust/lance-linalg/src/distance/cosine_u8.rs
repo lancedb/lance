@@ -239,8 +239,8 @@ pub fn cosine_u8(a: &[u8], b: &[u8]) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::super::l2_u8::test_inputs::{LENGTHS, Pattern, random};
     use super::*;
+    use crate::test_utils::u8_inputs::{LENGTHS, Pattern, random};
 
     #[rstest::rstest]
     #[case::shorter_right(64, 1)]

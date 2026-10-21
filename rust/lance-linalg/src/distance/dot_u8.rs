@@ -193,8 +193,8 @@ pub fn dot_u8_u64(a: &[u8], b: &[u8]) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::super::l2_u8::test_inputs::{LENGTHS, Pattern};
     use super::*;
+    use crate::test_utils::u8_inputs::{LENGTHS, Pattern};
 
     #[test]
     fn rejects_mismatched_lengths() {
