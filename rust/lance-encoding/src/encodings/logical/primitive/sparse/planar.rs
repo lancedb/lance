@@ -287,11 +287,18 @@ pub(in crate::encodings::logical::primitive) fn encode(
         })
     };
     let dictionary = if let Some(data) = &data {
+        // Narrow values fall back to chunks covering every slot. Zipped values
+        // instead gather only materialized positions, so their budget is smaller.
+        let num_fallback_values = if PrimitiveStructuralEncoder::is_narrow(data) {
+            data.num_values()
+        } else {
+            positions.len()
+        };
         PrimitiveStructuralEncoder::try_dictionary_encode(
             data,
             &ctx.field,
             DictionaryEncodingPolicy::Planar,
-            positions.len(),
+            num_fallback_values,
         )?
     } else {
         None

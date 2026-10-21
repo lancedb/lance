@@ -1527,7 +1527,7 @@ impl PrimitiveStructuralEncoder {
         data: &DataBlock,
         field: &Field,
         policy: DictionaryEncodingPolicy,
-        num_materialized_values: u64,
+        num_fallback_values: u64,
     ) -> Result<Option<(DataBlock, DataBlock)>> {
         if policy == DictionaryEncodingPolicy::Planar
             && let DataBlock::FixedSizeList(fsl) = data
@@ -1561,9 +1561,9 @@ impl PrimitiveStructuralEncoder {
             // Sparse zipped pages store only materialized rows. Dictionary indices
             // still cover every slot, so both indices and hidden dictionary items
             // must fit the budget for that compact payload, not the Arrow buffers.
-            debug_assert!(num_materialized_values <= values.num_values);
+            debug_assert!(num_fallback_values <= values.num_values);
             budget.max_encoded_size = (budget.max_encoded_size as u128
-                * num_materialized_values as u128
+                * num_fallback_values as u128
                 / values.num_values as u128) as usize;
             let Some((indices, items)) =
                 dict::encode_fixed_rows(&values, budget.max_dict_entries, budget.max_encoded_size)

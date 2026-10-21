@@ -744,7 +744,7 @@ async fn test_sparse_vector_dictionary_hidden_payload(
         candidate_bytes <= fallback_bytes,
         "dictionary candidate {candidate_bytes} bytes exceeds sparse fallback {fallback_bytes} bytes"
     );
-    for page in [&candidate, &fallback] {
+    for (page, is_candidate) in [(&candidate, true), (&fallback, false)] {
         let PageEncoding::Planar(layout) = &page.description else {
             panic!("expected a planar page");
         };
@@ -755,7 +755,7 @@ async fn test_sparse_vector_dictionary_hidden_payload(
         {
             Some(crate::format::pb23::value_plane::Codec::Zipped(_)) => {}
             Some(crate::format::pb23::value_plane::Codec::Chunked(values)) => {
-                assert!(values.dictionary.is_none());
+                assert_eq!(values.dictionary.is_some(), is_candidate && dimension < 64);
             }
             other => panic!("expected a non-dictionary fallback, got {other:?}"),
         }
