@@ -658,14 +658,59 @@ fn schema_fragments_valid(
     schema_fragments_modern_valid(schema, fragments)
 }
 
-pub fn schema_fragments_modern_valid(_schema: &Schema, fragments: &[Fragment]) -> Result<()> {
-    // validate that each data file at least contains one field.
+pub fn schema_fragments_modern_valid(schema: &Schema, fragments: &[Fragment]) -> Result<()> {
+    // A field must be physically present in every fragment only when it, and all
+    // of its ancestors, are non-nullable: such a field can never be null, so a
+    // fragment that omits it (which reads back as all-null) would violate the
+    // schema. Nullable fields -- and anything under a nullable ancestor -- may be
+    // legally omitted and are filled with nulls on read; that is the
+    // subschema-insert contract (#3016 / #3041). Only leaves carry data-file
+    // entries, so only leaves are collected, matching the reader's notion of a
+    // "missing field".
+    fn collect_required_leaf_ids(fields: &[Field], required_path: bool, out: &mut Vec<i32>) {
+        for field in fields {
+            let required = required_path && !field.nullable;
+            if field.children.is_empty() {
+                if required && field.id >= 0 {
+                    out.push(field.id);
+                }
+            } else {
+                collect_required_leaf_ids(&field.children, required, out);
+            }
+        }
+    }
+    let mut required_ids = Vec::new();
+    collect_required_leaf_ids(&schema.fields, true, &mut required_ids);
+
     for fragment in fragments {
+        // validate that each data file at least contains one field.
         for data_file in &fragment.files {
-            if data_file.fields.iter().len() == 0 {
+            if data_file.fields.is_empty() {
                 return Err(Error::invalid_input(format!(
                     "Datafile {} does not contain any fields",
                     data_file.path
+                )));
+            }
+        }
+
+        if required_ids.is_empty() {
+            continue;
+        }
+        let present: HashSet<i32> = fragment
+            .files
+            .iter()
+            .flat_map(|f| f.fields.iter().copied())
+            .collect();
+        for id in &required_ids {
+            if !present.contains(id) {
+                let name = schema
+                    .field_by_id(*id)
+                    .map(|f| f.name.clone())
+                    .unwrap_or_else(|| format!("<field id {id}>"));
+                return Err(Error::invalid_input(format!(
+                    "Fragment {} does not contain non-nullable field \"{}\" (id {}); \
+                     appending data that omits a non-nullable column is not allowed",
+                    fragment.id, name, id
                 )));
             }
         }
@@ -1156,6 +1201,44 @@ mod tests {
             DataStorageFormat::new(ConcreteFileVersion::V2_0),
             HashMap::new(),
         )
+    }
+
+    #[test]
+    fn test_modern_valid_rejects_missing_non_nullable_field() {
+        // Schema: id (NOT NULL, id=0), c (NOT NULL, id=1).
+        let schema = LanceSchema::try_from(&ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("c", DataType::Boolean, false),
+        ]))
+        .unwrap();
+
+        // A fragment whose data file omits the non-nullable field 1 ("c") would
+        // read back all-null, violating the schema -> commit must be rejected.
+        let missing = vec![fragment_with_file_fields(0, "f.lance", vec![0])];
+        let err = schema_fragments_modern_valid(&schema, &missing).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("non-nullable field") && msg.contains("\"c\""),
+            "unexpected error: {msg}"
+        );
+
+        // Covering both non-nullable fields is accepted.
+        let full = vec![fragment_with_file_fields(0, "f.lance", vec![0, 1])];
+        schema_fragments_modern_valid(&schema, &full).unwrap();
+    }
+
+    #[test]
+    fn test_modern_valid_allows_missing_nullable_field() {
+        // Schema: id (NOT NULL, id=0), opt (nullable, id=1).
+        let schema = LanceSchema::try_from(&ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("opt", DataType::Int32, true),
+        ]))
+        .unwrap();
+
+        // Omitting a nullable column is the subschema-insert contract (#3041).
+        let frags = vec![fragment_with_file_fields(0, "f.lance", vec![0])];
+        schema_fragments_modern_valid(&schema, &frags).unwrap();
     }
 
     fn activated_manifest() -> Manifest {
