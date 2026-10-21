@@ -61,7 +61,41 @@ const SEED_NULL_BITMAP_META_KEY: &str = "seed_null_bitmap";
 const SEED_VERSION_META_KEY: &str = "version";
 /// The seed format version this writer emits.
 const SEED_FORMAT_VERSION: &str = "1";
-const ZONEMAP_INDEX_VERSION: u32 = 0;
+/// The ZoneMap index file versions this build writes and reads
+/// (`IndexMetadata.index_version`, see `docs/src/format/index/scalar/zonemap.md`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZoneMapIndexVersion {
+    /// Seven columns; `max` may carry the legacy `+NaN` marker and the NaN
+    /// sign split is unknown. Read only; never written for a new segment.
+    V0 = 0,
+    /// Adds a non-null `negative_nan_count` column; `min`/`max` are ordinary
+    /// bounds that exclude NaNs of either sign.
+    V1 = 1,
+}
+
+impl ZoneMapIndexVersion {
+    /// The version new segments are written with.
+    pub const CURRENT: Self = Self::V1;
+
+    /// The version a segment's metadata declares, or `NotSupported` for a
+    /// version this build does not know, which must not be interpreted
+    /// under an older contract.
+    pub fn from_metadata(index_version: u32) -> Result<Self> {
+        match index_version {
+            0 => Ok(Self::V0),
+            1 => Ok(Self::V1),
+            other => Err(Error::not_supported_source(
+                format!(
+                    "zone map index version {other} is not supported by this build \
+                     (supported: 0 and 1); please upgrade Lance"
+                )
+                .into(),
+            )),
+        }
+    }
+}
+
+const ZONEMAP_INDEX_VERSION: u32 = ZoneMapIndexVersion::CURRENT as u32;
 
 /// Basic stats about zonemap index
 #[derive(Debug, PartialEq, Clone)]
@@ -124,6 +158,11 @@ pub struct ZoneMapIndex {
     // The maximum rows per zone provided by user
     rows_per_zone: u64,
     use_seeds: bool,
+    /// The file version this segment was loaded from. Governs what
+    /// `negative_nan_count` means (`V0`: unknown unless provably zero) and
+    /// what maintenance may do with the zones (a `V0` segment is never
+    /// copied into a `V1` file; it is rebuilt from source data).
+    version: ZoneMapIndexVersion,
     store: Arc<dyn IndexStore>,
     /// Legacy synchronous remapper (index_version 0). Mutually exclusive with
     /// `batch_remapper`; both `None` means no translation is needed.
@@ -143,6 +182,7 @@ impl std::fmt::Debug for ZoneMapIndex {
             .field("data_type", &self.data_type)
             .field("rows_per_zone", &self.rows_per_zone)
             .field("use_seeds", &self.use_seeds)
+            .field("version", &self.version)
             .field("store", &self.store)
             .field("fri", &self.fri)
             .field("index_cache", &self.index_cache)
@@ -160,6 +200,11 @@ impl ZoneMapIndex {
     /// Returns the rows-per-zone parameter for this index.
     pub fn rows_per_zone(&self) -> u64 {
         self.rows_per_zone
+    }
+
+    /// The file version this segment was loaded from.
+    pub fn version(&self) -> ZoneMapIndexVersion {
+        self.version
     }
 
     fn scalar_is_nan(value: &ScalarValue) -> bool {
@@ -588,9 +633,10 @@ impl ZoneMapIndex {
         remapping: Option<Arc<dyn BatchRowIdRemapper>>,
         index_cache: &LanceCache,
         use_seeds: bool,
+        version: ZoneMapIndexVersion,
     ) -> Result<Arc<Self>> {
         lance_index_core::remapping::check_batch_remapping_entry()?;
-        let index = Self::load(store, None, index_cache, use_seeds).await?;
+        let index = Self::load(store, None, index_cache, use_seeds, version).await?;
         let mut index = Arc::into_inner(index)
             .ok_or_else(|| Error::internal("freshly loaded zone map index must be unshared"))?;
         index.batch_remapper = remapping;
@@ -598,12 +644,14 @@ impl ZoneMapIndex {
         Ok(Arc::new(index))
     }
 
-    /// Load the scalar index from storage
+    /// Load the scalar index from storage, decoding the file under the
+    /// contract of `version` (the segment's `IndexMetadata.index_version`).
     async fn load(
         store: Arc<dyn IndexStore>,
         fri: Option<Arc<dyn RowIdRemapper>>,
         index_cache: &LanceCache,
         use_seeds: bool,
+        version: ZoneMapIndexVersion,
     ) -> Result<Arc<Self>>
     where
         Self: Sized,
@@ -638,9 +686,11 @@ impl ZoneMapIndex {
             rows_per_zone,
             null_rows,
             use_seeds,
+            version,
         )?))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn try_from_serialized(
         data: RecordBatch,
         store: Arc<dyn IndexStore>,
@@ -649,6 +699,7 @@ impl ZoneMapIndex {
         rows_per_zone: u64,
         null_rows: Option<RowAddrTreeMap>,
         use_seeds: bool,
+        version: ZoneMapIndexVersion,
     ) -> Result<Self> {
         // The RecordBatch should have columns: min, max, null_count
         let min_col = data
@@ -700,6 +751,36 @@ impl ZoneMapIndex {
                 Error::invalid_input("ZoneMapIndex: 'zone_start' column is not UInt64")
             })?;
 
+        // Version 1 persists the NaN sign split; version 0 has no such column.
+        let negative_nan_count_col = match version {
+            ZoneMapIndexVersion::V1 => Some(
+                data.column_by_name("negative_nan_count")
+                    .ok_or_else(|| {
+                        Error::corrupt_file_named(
+                            ZONEMAP_FILENAME,
+                            format!(
+                                "ZoneMapIndex: version 1 file is missing the 'negative_nan_count' \
+                             column (columns: {:?})",
+                                data.schema()
+                                    .fields()
+                                    .iter()
+                                    .map(|f| f.name().clone())
+                                    .collect::<Vec<_>>()
+                            ),
+                        )
+                    })?
+                    .as_any()
+                    .downcast_ref::<arrow_array::UInt32Array>()
+                    .ok_or_else(|| {
+                        Error::corrupt_file_named(
+                            ZONEMAP_FILENAME,
+                            "ZoneMapIndex: 'negative_nan_count' column is not UInt32",
+                        )
+                    })?,
+            ),
+            ZoneMapIndexVersion::V0 => None,
+        };
+
         let data_type = min_col.data_type().clone();
 
         if data.num_rows() == 0 {
@@ -708,6 +789,7 @@ impl ZoneMapIndex {
                 data_type,
                 rows_per_zone,
                 use_seeds,
+                version,
                 store,
                 fri,
                 batch_remapper: None,
@@ -733,17 +815,53 @@ impl ZoneMapIndex {
             };
             let null_count = null_count_col.value(i);
             let nan_count = nan_count_col.value(i);
+            let length = zone_length.value(i);
+            let negative_nan_count = match negative_nan_count_col {
+                Some(col) => {
+                    let negative = col.value(i);
+                    if negative > nan_count {
+                        return Err(Error::corrupt_file_named(
+                            ZONEMAP_FILENAME,
+                            format!(
+                                "ZoneMapIndex: zone {i} has negative_nan_count {negative} above \
+                             nan_count {nan_count}"
+                            ),
+                        ));
+                    }
+                    if u64::from(null_count) + u64::from(nan_count) > length {
+                        return Err(Error::corrupt_file_named(
+                            ZONEMAP_FILENAME,
+                            format!(
+                                "ZoneMapIndex: zone {i} counts null_count {null_count} plus \
+                             nan_count {nan_count} above its length {length}"
+                            ),
+                        ));
+                    }
+                    if !data_type.is_nested()
+                        && (Self::scalar_is_nan(&min) || Self::scalar_is_nan(&max))
+                    {
+                        return Err(Error::corrupt_file_named(
+                            ZONEMAP_FILENAME,
+                            format!("ZoneMapIndex: version 1 zone {i} carries a NaN bound"),
+                        ));
+                    }
+                    Some(negative)
+                }
+                // Version 0 files have no sign split. It is unknown, except
+                // that a zone without NaNs provably has none of either sign.
+                None if nan_count == 0 => Some(0),
+                None => None,
+            };
             zones.push(ZoneMapStatistics {
                 min,
                 max,
                 null_count,
                 nan_count,
-                // The index file format has no sign-split column.
-                negative_nan_count: None,
+                negative_nan_count,
                 bound: ZoneBound {
                     fragment_id: fragment_id_col.value(i),
                     start: zone_start_col.value(i),
-                    length: zone_length.value(i) as usize,
+                    length: length as usize,
                 },
             });
         }
@@ -753,6 +871,7 @@ impl ZoneMapIndex {
             data_type,
             rows_per_zone,
             use_seeds,
+            version,
             store,
             fri,
             batch_remapper: None,
@@ -902,8 +1021,13 @@ impl ScalarIndex for ZoneMapIndex {
             merged
         });
 
-        // Serialize the combined zones back into the index file
-        let mut builder = ZoneMapIndexBuilder::try_new(options, self.data_type.clone())?;
+        // Serialize the combined zones back into the index file. This entry
+        // has no fragment metadata or source data, so it keeps the segment's
+        // file version: a version 0 segment stays version 0 (its unknown
+        // NaN sign splits stay unknown) and a version 1 segment stays
+        // version 1. Migrating a segment is a rebuild from source data.
+        let mut builder = ZoneMapIndexBuilder::try_new(options, self.data_type.clone())?
+            .with_version(self.version);
         builder.options.rows_per_zone = self.rows_per_zone;
         builder.maps = updated_zones;
         builder.null_rows = merged_null_rows;
@@ -916,7 +1040,7 @@ impl ScalarIndex for ZoneMapIndex {
                 self.use_seeds,
                 has_null_bitmap,
             ),
-            index_version: ZONEMAP_INDEX_VERSION,
+            index_version: self.version as u32,
             files,
         })
     }
@@ -952,6 +1076,12 @@ impl ZoneMapIndex {
         seeds: &[crate::scalar::seed::FragmentSeed],
         dest_store: &dyn IndexStore,
     ) -> Result<Option<CreatedIndex>> {
+        // A version 0 segment's zones cannot be copied into a version 1
+        // file (their NaN sign split is unknown); the caller rebuilds it
+        // from source data instead.
+        if self.version != ZoneMapIndexVersion::V1 {
+            return Ok(None);
+        }
         let mut new_zones = self.zones.clone();
         let mut merged_null_rows = self.null_rows.clone();
         let mut any_missing_bitmap = self.null_rows.is_none();
@@ -959,6 +1089,12 @@ impl ZoneMapIndex {
         for seed in seeds {
             let (mut zones, seed_null_bitmap) =
                 ZoneMapSeedWriter::deserialize_seed(seed.fragment_id, &seed.bytes)?;
+            // A version 0 seed record with NaNs has an unknown sign split
+            // and a NaN-marker max: it cannot become a version 1 zone, so
+            // the caller scans. Without NaNs the split is provably zero.
+            if !admit_seed_zones_for_v1(&mut zones) {
+                return Ok(None);
+            }
             // The statistics stand in for a scan of the fragment, so they
             // must cover exactly its physical rows.
             let covered: u64 = zones
@@ -1019,6 +1155,22 @@ impl ZoneMapIndex {
             files,
         }))
     }
+}
+
+/// Make decoded seed zones eligible for a version 1 file: a record whose
+/// sign split is unknown (a version 0 seed) is admitted only when it holds
+/// no NaNs, in which case the split is provably zero. Returns `false` when
+/// some record cannot be admitted; the caller must scan instead.
+fn admit_seed_zones_for_v1(zones: &mut [ZoneMapStatistics]) -> bool {
+    for zone in zones.iter_mut() {
+        if zone.negative_nan_count.is_none() {
+            if zone.nan_count != 0 {
+                return false;
+            }
+            zone.negative_nan_count = Some(0);
+        }
+    }
+    true
 }
 
 fn remap_zone(
@@ -1132,6 +1284,25 @@ pub async fn merge_zonemap_indices(
     let rows_per_zone = first.rows_per_zone;
     let use_seeds = first.use_seeds;
     let data_type = first.data_type.clone();
+    // The output keeps the sources' file version: version 0 sources merge
+    // into a version 0 file under its own contract, version 1 sources into
+    // a version 1 file. Mixed inputs are refused before anything is written;
+    // this entry neither reads source data nor upgrades or downgrades a
+    // segment (`optimize_indices` rebuilds a selected older segment).
+    let version = first.version;
+    if let Some(other) = source_indices
+        .iter()
+        .find(|source| source.version != version)
+    {
+        return Err(Error::not_supported_source(
+            format!(
+                "cannot merge ZoneMap segments of different file versions ({} and {}); \
+                 rebuild them from their data (optimize_indices) instead",
+                version as u32, other.version as u32
+            )
+            .into(),
+        ));
+    }
 
     let mut zones = Vec::new();
     let mut merged_null_rows = RowAddrTreeMap::new();
@@ -1172,6 +1343,11 @@ pub async fn merge_zonemap_indices(
                     )
                 },
             )?;
+            if version == ZoneMapIndexVersion::V1 {
+                for remapped in &source_zones {
+                    reject_inexact_remapped_zone(zone, remapped, remapped_null_rows.is_some())?;
+                }
+            }
             zones.extend(source_zones.into_iter().filter(|zone| {
                 u32::try_from(zone.bound.fragment_id)
                     .is_ok_and(|fragment_id| fragment_filter.contains(fragment_id))
@@ -1188,7 +1364,8 @@ pub async fn merge_zonemap_indices(
     zones.sort_by_key(|zone| (zone.bound.fragment_id, zone.bound.start));
 
     let mut builder =
-        ZoneMapIndexBuilder::try_new(ZoneMapIndexBuilderParams::new(rows_per_zone), data_type)?;
+        ZoneMapIndexBuilder::try_new(ZoneMapIndexBuilderParams::new(rows_per_zone), data_type)?
+            .with_version(version);
     builder.maps = zones;
     if !any_missing_bitmap {
         builder.null_rows = Some(merged_null_rows);
@@ -1198,9 +1375,47 @@ pub async fn merge_zonemap_indices(
 
     Ok(CreatedIndex {
         index_details: make_zone_map_index_details(rows_per_zone, use_seeds, has_null_bitmap),
-        index_version: ZONEMAP_INDEX_VERSION,
+        index_version: version as u32,
         files,
     })
+}
+
+/// A version 1 file holds exact counts, but `remap_zone` copies a source
+/// zone's counts into every destination run, which is only exact when the
+/// run keeps all of the zone's rows. A narrower run keeps exact counts only
+/// when the zone has no NaNs (none can remain) and its null count was
+/// recomputed from an exact bitmap (or there were no nulls). Anything else
+/// is refused before the file is written; the segment has to be rebuilt.
+fn reject_inexact_remapped_zone(
+    source: &ZoneMapStatistics,
+    remapped: &ZoneMapStatistics,
+    null_positions_exact: bool,
+) -> Result<()> {
+    if remapped.bound.length == source.bound.length {
+        return Ok(());
+    }
+    let nulls_exact = null_positions_exact || source.null_count == 0;
+    if source.nan_count == 0 && nulls_exact {
+        return Ok(());
+    }
+    Err(Error::not_supported_source(
+        format!(
+            "cannot merge a remapped ZoneMap zone into a version 1 segment: the run \
+             (fragment {}, start {}, length {}) keeps only part of its source zone \
+             (fragment {}, start {}, length {}, null_count {}, nan_count {}), so the \
+             inherited counts are no longer exact; rebuild it from its data \
+             (optimize_indices) instead",
+            remapped.bound.fragment_id,
+            remapped.bound.start,
+            remapped.bound.length,
+            source.bound.fragment_id,
+            source.bound.start,
+            source.bound.length,
+            source.null_count,
+            source.nan_count
+        )
+        .into(),
+    ))
 }
 
 fn default_rows_per_zone() -> u64 {
@@ -1251,6 +1466,9 @@ impl ZoneMapIndexBuilderParams {
 // A builder for zonemap index
 pub struct ZoneMapIndexBuilder {
     options: ZoneMapIndexBuilderParams,
+    /// The file version to write. New segments use the current version; the
+    /// low-level update entry keeps its segment's existing version.
+    version: ZoneMapIndexVersion,
 
     items_type: DataType,
     maps: Vec<ZoneMapStatistics>,
@@ -1264,10 +1482,20 @@ impl ZoneMapIndexBuilder {
     pub fn try_new(options: ZoneMapIndexBuilderParams, items_type: DataType) -> Result<Self> {
         Ok(Self {
             options,
+            version: ZoneMapIndexVersion::CURRENT,
             items_type,
             maps: Vec::new(),
             null_rows: None,
         })
+    }
+
+    /// Write the file in `version` instead of the current version. This
+    /// exists only for the low-level update of an existing segment, which
+    /// keeps that segment's version; new segments never set it.
+    #[doc(hidden)]
+    pub fn with_version(mut self, version: ZoneMapIndexVersion) -> Self {
+        self.version = version;
+        self
     }
 
     /// Train the builder using the shared zone trainer.  The input stream must contain
@@ -1295,12 +1523,10 @@ impl ZoneMapIndexBuilder {
             let bounds =
                 ScalarValue::iter_to_array(std::iter::repeat_n(placeholder, self.maps.len()))?;
             (bounds.clone(), bounds)
-        } else {
-            // The ZoneMap index file format predates the NaN sign split: it
-            // has no column for it, and released readers take a NaN max as
-            // the marker that the zone holds NaNs. Keep writing that marker
-            // here so existing readers stay conservative; fresh in-memory
-            // zones and version 1 seeds carry finite bounds plus the counts.
+        } else if self.version == ZoneMapIndexVersion::V0 {
+            // Version 0 has no column for the NaN sign split, and its readers
+            // take a NaN max as the marker that the zone holds NaNs. Keep
+            // writing that marker so version 0 readers stay conservative.
             let legacy_max = |stat: &ZoneMapStatistics| {
                 if stat.nan_count > 0
                     && let Some(nan) = nan_scalar(&self.items_type)
@@ -1314,11 +1540,64 @@ impl ZoneMapIndexBuilder {
                 ScalarValue::iter_to_array(self.maps.iter().map(|stat| stat.min.clone()))?,
                 ScalarValue::iter_to_array(self.maps.iter().map(legacy_max))?,
             )
+        } else {
+            // Version 1 bounds are ordinary: NaNs are counted, not marked.
+            (
+                ScalarValue::iter_to_array(self.maps.iter().map(|stat| stat.min.clone()))?,
+                ScalarValue::iter_to_array(self.maps.iter().map(|stat| stat.max.clone()))?,
+            )
         };
         let null_counts =
             UInt32Array::from_iter_values(self.maps.iter().map(|stat| stat.null_count));
 
         let nan_counts = UInt32Array::from_iter_values(self.maps.iter().map(|stat| stat.nan_count));
+
+        // Version 1 persists the sign split, so every zone must know it, and
+        // its loader rejects counts above the zone length or NaN bounds; the
+        // same invariants are checked here so a bad zone fails the write
+        // rather than producing a file its own reader refuses.
+        let negative_nan_counts = match self.version {
+            ZoneMapIndexVersion::V1 => Some(UInt32Array::from_iter_values(
+                self.maps
+                    .iter()
+                    .map(|stat| {
+                        let negative = stat.negative_nan_count.ok_or_else(|| {
+                            Error::invalid_input(format!(
+                                "cannot write a version 1 ZoneMap zone with an unknown NaN sign \
+                                 split (fragment {}, start {})",
+                                stat.bound.fragment_id, stat.bound.start
+                            ))
+                        })?;
+                        if negative > stat.nan_count
+                            || u64::from(stat.null_count) + u64::from(stat.nan_count)
+                                > stat.bound.length as u64
+                        {
+                            return Err(Error::invalid_input(format!(
+                                "cannot write a version 1 ZoneMap zone with inconsistent \
+                                 counts (fragment {}, start {}, length {}, null_count {}, \
+                                 nan_count {}, negative_nan_count {negative})",
+                                stat.bound.fragment_id,
+                                stat.bound.start,
+                                stat.bound.length,
+                                stat.null_count,
+                                stat.nan_count
+                            )));
+                        }
+                        if ZoneMapIndex::scalar_is_nan(&stat.min)
+                            || ZoneMapIndex::scalar_is_nan(&stat.max)
+                        {
+                            return Err(Error::invalid_input(format!(
+                                "cannot write a version 1 ZoneMap zone with a NaN bound \
+                                 (fragment {}, start {})",
+                                stat.bound.fragment_id, stat.bound.start
+                            )));
+                        }
+                        Ok(negative)
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            )),
+            ZoneMapIndexVersion::V0 => None,
+        };
 
         let fragment_ids =
             UInt64Array::from_iter_values(self.maps.iter().map(|stat| stat.bound.fragment_id));
@@ -1329,26 +1608,34 @@ impl ZoneMapIndexBuilder {
         let zone_starts =
             UInt64Array::from_iter_values(self.maps.iter().map(|stat| stat.bound.start));
 
-        let schema = Arc::new(arrow_schema::Schema::new(vec![
+        let mut fields = vec![
             // min and max can be null if the entire batch is null values
             Field::new("min", self.items_type.clone(), true),
             Field::new("max", self.items_type.clone(), true),
             Field::new("null_count", DataType::UInt32, false),
             Field::new("nan_count", DataType::UInt32, false),
-            Field::new("fragment_id", DataType::UInt64, false),
-            Field::new("zone_start", DataType::UInt64, false),
-            Field::new("zone_length", DataType::UInt64, false),
-        ]));
-
-        let columns: Vec<ArrayRef> = vec![
+        ];
+        let mut columns: Vec<ArrayRef> = vec![
             mins,
             maxs,
             Arc::new(null_counts) as ArrayRef,
             Arc::new(nan_counts) as ArrayRef,
+        ];
+        if let Some(negative_nan_counts) = negative_nan_counts {
+            fields.push(Field::new("negative_nan_count", DataType::UInt32, false));
+            columns.push(Arc::new(negative_nan_counts) as ArrayRef);
+        }
+        fields.extend([
+            Field::new("fragment_id", DataType::UInt64, false),
+            Field::new("zone_start", DataType::UInt64, false),
+            Field::new("zone_length", DataType::UInt64, false),
+        ]);
+        columns.extend([
             Arc::new(fragment_ids) as ArrayRef,
             Arc::new(zone_starts) as ArrayRef,
             Arc::new(zone_lengths) as ArrayRef,
-        ];
+        ]);
+        let schema = Arc::new(arrow_schema::Schema::new(fields));
         Ok(RecordBatch::try_new(schema, columns)?)
     }
 
@@ -1687,7 +1974,7 @@ impl ScalarIndexPlugin for ZoneMapIndexPlugin {
         &self,
         index_store: Arc<dyn IndexStore>,
         index_details: &prost_types::Any,
-        _index_version: u32,
+        index_version: u32,
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
@@ -1696,8 +1983,9 @@ impl ScalarIndexPlugin for ZoneMapIndexPlugin {
             .ok()
             .and_then(|d| d.use_seeds)
             .unwrap_or(false);
+        let version = ZoneMapIndexVersion::from_metadata(index_version)?;
         Ok(
-            ZoneMapIndex::load(index_store, frag_reuse_index, cache, use_seeds).await?
+            ZoneMapIndex::load(index_store, frag_reuse_index, cache, use_seeds, version).await?
                 as Arc<dyn ScalarIndex>,
         )
     }
@@ -1710,7 +1998,7 @@ impl ScalarIndexPlugin for ZoneMapIndexPlugin {
         &self,
         index_store: Arc<dyn IndexStore>,
         index_details: &prost_types::Any,
-        _index_version: u32,
+        index_version: u32,
         frag_reuse_index: Option<Arc<dyn BatchRowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
@@ -1719,10 +2007,15 @@ impl ScalarIndexPlugin for ZoneMapIndexPlugin {
             .ok()
             .and_then(|d| d.use_seeds)
             .unwrap_or(false);
-        Ok(
-            ZoneMapIndex::load_with_remapping(index_store, frag_reuse_index, cache, use_seeds)
-                .await? as Arc<dyn ScalarIndex>,
+        let version = ZoneMapIndexVersion::from_metadata(index_version)?;
+        Ok(ZoneMapIndex::load_with_remapping(
+            index_store,
+            frag_reuse_index,
+            cache,
+            use_seeds,
+            version,
         )
+        .await? as Arc<dyn ScalarIndex>)
     }
 
     fn might_use_seeds(&self, index_details: &prost_types::Any) -> bool {
@@ -2573,9 +2866,11 @@ mod tests {
     use crate::scalar::{IndexStore, zonemap::ROWS_PER_ZONE_DEFAULT};
     use std::sync::Arc;
 
+    use crate::scalar::registry::ScalarIndexPlugin;
     use crate::scalar::zoned::ZoneBound;
     use crate::scalar::zonemap::{
-        CarriedSeed, MergeableSeed, ZoneMapIndexPlugin, ZoneMapStatistics,
+        CarriedSeed, MergeableSeed, ZoneMapIndexPlugin, ZoneMapIndexVersion, ZoneMapStatistics,
+        make_zone_map_index_details,
     };
     use arrow::datatypes::{
         ArrowPrimitiveType, Decimal128Type, Float32Type, Float64Type, Int64Type,
@@ -2597,7 +2892,7 @@ mod tests {
     use lance_datagen::ArrayGeneratorExt;
     use lance_datagen::{BatchCount, RowCount, array};
     use lance_io::object_store::ObjectStore;
-    use lance_select::RowAddrTreeMap;
+    use lance_select::{RowAddrTreeMap, RowSetOps};
     use std::ops::Bound;
 
     use crate::scalar::seed::IndexSeedWriter;
@@ -2649,12 +2944,21 @@ mod tests {
     where
         PrimitiveArray<T>: From<Vec<Option<T::Native>>>,
     {
+        // The directory goes away with this call; the loaded zones are in
+        // memory, so only tests that reopen the file need `train_and_load_in`.
         let tmpdir = TempObjDir::default();
-        let test_store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
-            tmpdir.clone(),
-            Arc::new(LanceCache::no_cache()),
-        ));
+        train_and_load_in::<T>(local_store(&tmpdir), fragments).await
+    }
+
+    /// Trains a version 1 index over `fragments` (two rows per zone) into
+    /// `test_store` and loads it back.
+    async fn train_and_load_in<T: ArrowPrimitiveType>(
+        test_store: Arc<LanceIndexStore>,
+        fragments: Vec<Vec<Option<T::Native>>>,
+    ) -> Arc<ZoneMapIndex>
+    where
+        PrimitiveArray<T>: From<Vec<Option<T::Native>>>,
+    {
         let schema = Arc::new(Schema::new(vec![Field::new(
             VALUE_COLUMN_NAME,
             T::DATA_TYPE,
@@ -2684,9 +2988,15 @@ mod tests {
         .await
         .unwrap();
 
-        ZoneMapIndex::load(test_store.clone(), None, &LanceCache::no_cache(), false)
-            .await
-            .expect("Failed to load ZoneMapIndex")
+        ZoneMapIndex::load(
+            test_store.clone(),
+            None,
+            &LanceCache::no_cache(),
+            false,
+            ZoneMapIndexVersion::V1,
+        )
+        .await
+        .expect("Failed to load ZoneMapIndex")
     }
 
     #[derive(Debug)]
@@ -2707,8 +3017,12 @@ mod tests {
             self.mappings.get(&row_id).copied()
         }
 
-        fn remap_row_addrs_tree_map(&self, _row_addrs: &RowAddrTreeMap) -> RowAddrTreeMap {
-            unreachable!()
+        fn remap_row_addrs_tree_map(&self, row_addrs: &RowAddrTreeMap) -> RowAddrTreeMap {
+            self.mappings
+                .iter()
+                .filter(|(old, _)| row_addrs.contains(**old))
+                .map(|(_, new)| *new)
+                .collect()
         }
 
         fn remap_row_ids_roaring_tree_map(
@@ -2886,11 +3200,12 @@ mod tests {
     /// Remapping copies the source zone's counts into a shorter run, so a
     /// legacy NaN-marker zone [5.0, +NaN] whose NaN row is removed must still
     /// answer bounded ranges around 5.0 from its bounds, directly and after
-    /// a merge that persists the remapped zone.
+    /// a version 0 merge that persists the remapped zone.
     #[tokio::test]
     async fn test_remapped_legacy_nan_marker_zone_keeps_bounded_range_candidate() {
         let mut source = train_and_load::<Float64Type>(vec![vec![Some(5.0), Some(f64::NAN)]]).await;
         let source_mut = Arc::get_mut(&mut source).unwrap();
+        source_mut.version = ZoneMapIndexVersion::V0;
         let zone = &mut source_mut.zones[0];
         zone.max = ScalarValue::Float64(Some(f64::NAN));
         zone.negative_nan_count = None;
@@ -2938,16 +3253,23 @@ mod tests {
             dest_tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
-        merge_zonemap_indices(
+        let created = merge_zonemap_indices(
             &[source.as_ref()],
             dest_store.as_ref(),
             &RoaringBitmap::from_iter([3]),
         )
         .await
         .unwrap();
-        let merged = ZoneMapIndex::load(dest_store, None, &LanceCache::no_cache(), false)
-            .await
-            .unwrap();
+        assert_eq!(created.index_version, 0);
+        let merged = ZoneMapIndex::load(
+            dest_store,
+            None,
+            &LanceCache::no_cache(),
+            false,
+            ZoneMapIndexVersion::V0,
+        )
+        .await
+        .unwrap();
         for query in &queries {
             let result = merged.search(query, &NoOpMetricsCollector).await.unwrap();
             assert!(
@@ -2959,11 +3281,13 @@ mod tests {
 
     /// The legacy-null variant: [5, null] without a null bitmap remapped to
     /// the single 5 row keeps `null_count = 1`; the bounds, not that count,
-    /// decide bounded ranges.
+    /// decide bounded ranges. Such an inexact count is persisted only by a
+    /// version 0 merge (a version 1 merge refuses it).
     #[tokio::test]
     async fn test_remapped_legacy_null_zone_keeps_bounded_range_candidate() {
         let mut source = train_and_load::<Int64Type>(vec![vec![Some(5), None]]).await;
         let source_mut = Arc::get_mut(&mut source).unwrap();
+        source_mut.version = ZoneMapIndexVersion::V0;
         source_mut.null_rows = None;
         let new_row = 3_u64 << 32;
         source_mut.fri = Some(Arc::new(TestRemapper::new([(0, new_row)])));
@@ -3010,9 +3334,15 @@ mod tests {
         )
         .await
         .unwrap();
-        let merged = ZoneMapIndex::load(dest_store, None, &LanceCache::no_cache(), false)
-            .await
-            .unwrap();
+        let merged = ZoneMapIndex::load(
+            dest_store,
+            None,
+            &LanceCache::no_cache(),
+            false,
+            ZoneMapIndexVersion::V0,
+        )
+        .await
+        .unwrap();
         for query in &queries {
             let result = merged.search(query, &NoOpMetricsCollector).await.unwrap();
             assert!(
@@ -3145,9 +3475,15 @@ mod tests {
         log::debug!("Successfully wrote the index file");
 
         // Read the index file back and check its contents
-        let index = ZoneMapIndex::load(test_store.clone(), None, &LanceCache::no_cache(), false)
-            .await
-            .expect("Failed to load ZoneMapIndex");
+        let index = ZoneMapIndex::load(
+            test_store.clone(),
+            None,
+            &LanceCache::no_cache(),
+            false,
+            ZoneMapIndexVersion::V1,
+        )
+        .await
+        .expect("Failed to load ZoneMapIndex");
         assert_eq!(index.zones.len(), 0);
         assert_eq!(index.data_type, DataType::Int32);
         assert_eq!(index.rows_per_zone, ROWS_PER_ZONE_DEFAULT);
@@ -3189,9 +3525,15 @@ mod tests {
         log::debug!("Successfully wrote the index file");
 
         // Read the index file back and check its contents
-        let index = ZoneMapIndex::load(test_store.clone(), None, &LanceCache::no_cache(), false)
-            .await
-            .expect("Failed to load ZoneMapIndex");
+        let index = ZoneMapIndex::load(
+            test_store.clone(),
+            None,
+            &LanceCache::no_cache(),
+            false,
+            ZoneMapIndexVersion::V1,
+        )
+        .await
+        .expect("Failed to load ZoneMapIndex");
         assert_eq!(index.zones.len(), 10);
         for (i, zone) in index.zones.iter().enumerate() {
             assert_eq!(zone.null_count, 1000);
@@ -3241,10 +3583,15 @@ mod tests {
             .unwrap();
 
         // Verify the updated index has more zones
-        let updated_index =
-            ZoneMapIndex::load(test_store.clone(), None, &LanceCache::no_cache(), false)
-                .await
-                .expect("Failed to load updated ZoneMapIndex");
+        let updated_index = ZoneMapIndex::load(
+            test_store.clone(),
+            None,
+            &LanceCache::no_cache(),
+            false,
+            ZoneMapIndexVersion::V1,
+        )
+        .await
+        .expect("Failed to load updated ZoneMapIndex");
 
         // Should have original 10 zones + 1 new zone (5000 rows with zone size 5000)
         assert_eq!(updated_index.zones.len(), 11);
@@ -3313,7 +3660,7 @@ mod tests {
             .unwrap();
 
         let cache = LanceCache::with_capacity(1024 * 1024);
-        let index = ZoneMapIndex::load(store.clone(), None, &cache, false)
+        let index = ZoneMapIndex::load(store.clone(), None, &cache, false, ZoneMapIndexVersion::V1)
             .await
             .unwrap();
 
@@ -3416,9 +3763,15 @@ mod tests {
         .unwrap();
 
         // Load the index
-        let index = ZoneMapIndex::load(test_store.clone(), None, &LanceCache::no_cache(), false)
-            .await
-            .expect("Failed to load ZoneMapIndex");
+        let index = ZoneMapIndex::load(
+            test_store.clone(),
+            None,
+            &LanceCache::no_cache(),
+            false,
+            ZoneMapIndexVersion::V1,
+        )
+        .await
+        .expect("Failed to load ZoneMapIndex");
 
         // Should have 5 zones since we have 500 rows and zone size is 100
         assert_eq!(index.zones.len(), 5);
@@ -3440,16 +3793,11 @@ mod tests {
             );
         }
 
+        // Version 1 files keep the ordinary bounds and the exact sign split.
         let zone = &index.zones[0];
-        assert!(matches!(
-            zone.max,
-            ScalarValue::Float32(Some(value)) if value.is_nan()
-        ));
-        let finite_target = ScalarValue::Float32(Some(1000.0));
-        assert!(
-            finite_target >= zone.min && finite_target <= zone.max,
-            "ScalarValue total ordering keeps finite values below NaN max"
-        );
+        assert_eq!(zone.min, ScalarValue::Float32(Some(0.0)));
+        assert_eq!(zone.max, ScalarValue::Float32(Some(99.0)));
+        assert_eq!(zone.negative_nan_count, Some(0));
 
         // Test search for NaN values using Equals with NaN
         let query = SargableQuery::Equals(ScalarValue::Float32(Some(f32::NAN)));
@@ -3473,11 +3821,9 @@ mod tests {
         let query = SargableQuery::Equals(ScalarValue::Float32(Some(1000.0)));
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
 
-        // Since zones contain NaN values, their max will be NaN, so they will be included
-        // as potential matches for any finite target (false positive, but acceptable for zone maps)
-        let mut expected = RowAddrTreeMap::new();
-        expected.insert_range(0..500);
-        assert_eq!(result, SearchResult::at_most(expected));
+        // The ordinary bounds exclude 1000.0 and NaNs never equal a finite
+        // value, so no zone survives.
+        assert_eq!(result, SearchResult::at_most(RowAddrTreeMap::new()));
 
         // Test range query that should include finite values
         let query = SargableQuery::Range(
@@ -3487,8 +3833,8 @@ mod tests {
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
 
         // NaNs of either sign fail one side of a two-sided finite range, so
-        // they never keep a zone here; the finite mins still prune the last
-        // two zones even though the legacy NaN max hides the finite maxes.
+        // they never keep a zone here; the ordinary bounds prune the last
+        // two zones.
         let mut expected = RowAddrTreeMap::new();
         expected.insert_range(0..300);
         assert_eq!(result, SearchResult::at_most(expected));
@@ -3513,11 +3859,9 @@ mod tests {
         );
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
 
-        // Since zones contain NaN values, their max will be NaN, so they will be included
-        // as potential matches for any range query (false positive, but acceptable for zone maps)
-        let mut expected = RowAddrTreeMap::new();
-        expected.insert_range(0..500);
-        assert_eq!(result, SearchResult::at_most(expected));
+        // Every ordinary max is below 1000.0 and a two-sided finite range
+        // never admits a NaN, so no zone survives.
+        assert_eq!(result, SearchResult::at_most(RowAddrTreeMap::new()));
 
         // Test IsNull query (should match nothing since there are no null values)
         let query = SargableQuery::IsNull();
@@ -3657,9 +4001,15 @@ mod tests {
         assert_eq!(metadata.get(ZONEMAP_SIZE_META_KEY).unwrap(), "100");
 
         // Read the index file back and check its contents
-        let index = ZoneMapIndex::load(test_store.clone(), None, &LanceCache::no_cache(), false)
-            .await
-            .expect("Failed to load ZoneMapIndex");
+        let index = ZoneMapIndex::load(
+            test_store.clone(),
+            None,
+            &LanceCache::no_cache(),
+            false,
+            ZoneMapIndexVersion::V1,
+        )
+        .await
+        .expect("Failed to load ZoneMapIndex");
         assert_eq!(index.zones.len(), 2);
         assert_eq!(
             index.zones,
@@ -3669,7 +4019,7 @@ mod tests {
                     max: ScalarValue::Int32(Some(99)),
                     null_count: 0,
                     nan_count: 0,
-                    negative_nan_count: None,
+                    negative_nan_count: Some(0),
                     bound: ZoneBound {
                         fragment_id: 0,
                         start: 0,
@@ -3681,7 +4031,7 @@ mod tests {
                     max: ScalarValue::Int32(Some(100)),
                     null_count: 0,
                     nan_count: 0,
-                    negative_nan_count: None,
+                    negative_nan_count: Some(0),
                     bound: ZoneBound {
                         fragment_id: 0,
                         start: 100,
@@ -3822,9 +4172,15 @@ mod tests {
         log::debug!("Successfully wrote the index file");
 
         // Read the index file back and check its contents
-        let index = ZoneMapIndex::load(test_store.clone(), None, &LanceCache::no_cache(), false)
-            .await
-            .expect("Failed to load ZoneMapIndex");
+        let index = ZoneMapIndex::load(
+            test_store.clone(),
+            None,
+            &LanceCache::no_cache(),
+            false,
+            ZoneMapIndexVersion::V1,
+        )
+        .await
+        .expect("Failed to load ZoneMapIndex");
         assert_eq!(index.zones.len(), 3);
         assert_eq!(
             index.zones,
@@ -3834,7 +4190,7 @@ mod tests {
                     max: ScalarValue::Int64(Some(8191)),
                     null_count: 0,
                     nan_count: 0,
-                    negative_nan_count: None,
+                    negative_nan_count: Some(0),
                     bound: ZoneBound {
                         fragment_id: 0,
                         start: 0,
@@ -3846,7 +4202,7 @@ mod tests {
                     max: ScalarValue::Int64(Some(16383)),
                     null_count: 0,
                     nan_count: 0,
-                    negative_nan_count: None,
+                    negative_nan_count: Some(0),
                     bound: ZoneBound {
                         fragment_id: 0,
                         start: 8192,
@@ -3858,7 +4214,7 @@ mod tests {
                     max: ScalarValue::Int64(Some(16425)),
                     null_count: 0,
                     nan_count: 0,
-                    negative_nan_count: None,
+                    negative_nan_count: Some(0),
                     bound: ZoneBound {
                         fragment_id: 0,
                         start: 16384,
@@ -3985,10 +4341,15 @@ mod tests {
             .unwrap();
 
             // Read the index file back and check its contents
-            let index =
-                ZoneMapIndex::load(test_store.clone(), None, &LanceCache::no_cache(), false)
-                    .await
-                    .expect("Failed to load ZoneMapIndex");
+            let index = ZoneMapIndex::load(
+                test_store.clone(),
+                None,
+                &LanceCache::no_cache(),
+                false,
+                ZoneMapIndexVersion::V1,
+            )
+            .await
+            .expect("Failed to load ZoneMapIndex");
             assert_eq!(index.zones.len(), 5);
             assert_eq!(
                 index.zones,
@@ -3998,7 +4359,7 @@ mod tests {
                         max: ScalarValue::Int64(Some(4999)),
                         null_count: 0,
                         nan_count: 0,
-                        negative_nan_count: None,
+                        negative_nan_count: Some(0),
                         bound: ZoneBound {
                             fragment_id: 0,
                             start: 0,
@@ -4010,7 +4371,7 @@ mod tests {
                         max: ScalarValue::Int64(Some(8191)),
                         null_count: 0,
                         nan_count: 0,
-                        negative_nan_count: None,
+                        negative_nan_count: Some(0),
                         bound: ZoneBound {
                             fragment_id: 0,
                             start: 5000,
@@ -4022,7 +4383,7 @@ mod tests {
                         max: ScalarValue::Int64(Some(13191)),
                         null_count: 0,
                         nan_count: 0,
-                        negative_nan_count: None,
+                        negative_nan_count: Some(0),
                         bound: ZoneBound {
                             fragment_id: 1,
                             start: 0,
@@ -4034,7 +4395,7 @@ mod tests {
                         max: ScalarValue::Int64(Some(16383)),
                         null_count: 0,
                         nan_count: 0,
-                        negative_nan_count: None,
+                        negative_nan_count: Some(0),
                         bound: ZoneBound {
                             fragment_id: 1,
                             start: 5000,
@@ -4046,7 +4407,7 @@ mod tests {
                         max: ScalarValue::Int64(Some(16425)),
                         null_count: 0,
                         nan_count: 0,
-                        negative_nan_count: None,
+                        negative_nan_count: Some(0),
                         bound: ZoneBound {
                             fragment_id: 2,
                             start: 0,
@@ -4199,10 +4560,15 @@ mod tests {
             .unwrap();
 
             // Read the index file back and check its contents
-            let index =
-                ZoneMapIndex::load(test_store.clone(), None, &LanceCache::no_cache(), false)
-                    .await
-                    .expect("Failed to load ZoneMapIndex");
+            let index = ZoneMapIndex::load(
+                test_store.clone(),
+                None,
+                &LanceCache::no_cache(),
+                false,
+                ZoneMapIndexVersion::V1,
+            )
+            .await
+            .expect("Failed to load ZoneMapIndex");
             assert_eq!(index.zones.len(), 3);
             assert_eq!(
                 index.zones,
@@ -4212,7 +4578,7 @@ mod tests {
                         max: ScalarValue::Int64(Some(8191)),
                         null_count: 0,
                         nan_count: 0,
-                        negative_nan_count: None,
+                        negative_nan_count: Some(0),
                         bound: ZoneBound {
                             fragment_id: 0,
                             start: 0,
@@ -4224,7 +4590,7 @@ mod tests {
                         max: ScalarValue::Int64(Some(16383)),
                         null_count: 0,
                         nan_count: 0,
-                        negative_nan_count: None,
+                        negative_nan_count: Some(0),
                         bound: ZoneBound {
                             fragment_id: 1,
                             start: 0,
@@ -4236,7 +4602,7 @@ mod tests {
                         max: ScalarValue::Int64(Some(16425)),
                         null_count: 0,
                         nan_count: 0,
-                        negative_nan_count: None,
+                        negative_nan_count: Some(0),
                         bound: ZoneBound {
                             fragment_id: 2,
                             start: 0,
@@ -4278,10 +4644,15 @@ mod tests {
             .unwrap();
 
             // Read the index file back and check its contents
-            let index =
-                ZoneMapIndex::load(test_store.clone(), None, &LanceCache::no_cache(), false)
-                    .await
-                    .expect("Failed to load ZoneMapIndex");
+            let index = ZoneMapIndex::load(
+                test_store.clone(),
+                None,
+                &LanceCache::no_cache(),
+                false,
+                ZoneMapIndexVersion::V1,
+            )
+            .await
+            .expect("Failed to load ZoneMapIndex");
             assert_eq!(index.zones.len(), 3);
             assert_eq!(
                 index.zones,
@@ -4291,7 +4662,7 @@ mod tests {
                         max: ScalarValue::Int64(Some(8191)),
                         null_count: 0,
                         nan_count: 0,
-                        negative_nan_count: None,
+                        negative_nan_count: Some(0),
                         bound: ZoneBound {
                             fragment_id: 0,
                             start: 0,
@@ -4303,7 +4674,7 @@ mod tests {
                         max: ScalarValue::Int64(Some(16383)),
                         null_count: 0,
                         nan_count: 0,
-                        negative_nan_count: None,
+                        negative_nan_count: Some(0),
                         bound: ZoneBound {
                             fragment_id: 1,
                             start: 0,
@@ -4315,7 +4686,7 @@ mod tests {
                         max: ScalarValue::Int64(Some(16425)),
                         null_count: 0,
                         nan_count: 0,
-                        negative_nan_count: None,
+                        negative_nan_count: Some(0),
                         bound: ZoneBound {
                             fragment_id: 2,
                             start: 0,
@@ -4485,6 +4856,7 @@ mod tests {
             data_type: DataType::Utf8,
             rows_per_zone: ROWS_PER_ZONE_DEFAULT,
             use_seeds: false,
+            version: ZoneMapIndexVersion::V1,
             store: test_store,
             fri: None,
             batch_remapper: None,
@@ -4563,6 +4935,7 @@ mod tests {
             data_type: DataType::Utf8,
             rows_per_zone: ROWS_PER_ZONE_DEFAULT,
             use_seeds: false,
+            version: ZoneMapIndexVersion::V1,
             store: test_store,
             fri: None,
             batch_remapper: None,
@@ -4635,6 +5008,7 @@ mod tests {
             data_type: DataType::LargeUtf8,
             rows_per_zone: ROWS_PER_ZONE_DEFAULT,
             use_seeds: false,
+            version: ZoneMapIndexVersion::V1,
             store: test_store,
             fri: None,
             batch_remapper: None,
@@ -4717,6 +5091,7 @@ mod tests {
             Field::new("max", DataType::Int32, true),
             Field::new("null_count", DataType::UInt32, false),
             Field::new("nan_count", DataType::UInt32, false),
+            Field::new("negative_nan_count", DataType::UInt32, false),
             Field::new("fragment_id", DataType::UInt64, false),
             Field::new("zone_start", DataType::UInt64, false),
             Field::new("zone_length", DataType::UInt64, false),
@@ -4727,6 +5102,7 @@ mod tests {
                 Arc::new(Int32Array::from(vec![Some(1i32)])) as _,
                 Arc::new(Int32Array::from(vec![Some(5i32)])) as _,
                 Arc::new(UInt32Array::from(vec![2u32])) as _,
+                Arc::new(UInt32Array::from(vec![0u32])) as _,
                 Arc::new(UInt32Array::from(vec![0u32])) as _,
                 Arc::new(UInt64Array::from(vec![0u64])) as _,
                 Arc::new(UInt64Array::from(vec![0u64])) as _,
@@ -4747,6 +5123,7 @@ mod tests {
                 10,
                 Some(modern_null_rows), // modern: complete bitmap
                 false,
+                ZoneMapIndexVersion::V1,
             )
             .unwrap(),
         );
@@ -4757,6 +5134,7 @@ mod tests {
             Field::new("max", DataType::Int32, true),
             Field::new("null_count", DataType::UInt32, false),
             Field::new("nan_count", DataType::UInt32, false),
+            Field::new("negative_nan_count", DataType::UInt32, false),
             Field::new("fragment_id", DataType::UInt64, false),
             Field::new("zone_start", DataType::UInt64, false),
             Field::new("zone_length", DataType::UInt64, false),
@@ -4767,6 +5145,7 @@ mod tests {
                 Arc::new(Int32Array::from(vec![Some(10i32)])) as _,
                 Arc::new(Int32Array::from(vec![Some(20i32)])) as _,
                 Arc::new(UInt32Array::from(vec![3u32])) as _,
+                Arc::new(UInt32Array::from(vec![0u32])) as _,
                 Arc::new(UInt32Array::from(vec![0u32])) as _,
                 Arc::new(UInt64Array::from(vec![1u64])) as _,
                 Arc::new(UInt64Array::from(vec![0u64])) as _,
@@ -4783,6 +5162,7 @@ mod tests {
                 10,
                 None, // legacy: null positions unknown
                 false,
+                ZoneMapIndexVersion::V1,
             )
             .unwrap(),
         );
@@ -4803,9 +5183,15 @@ mod tests {
         .await
         .unwrap();
 
-        let merged = ZoneMapIndex::load(dest_store.clone(), None, &LanceCache::no_cache(), false)
-            .await
-            .unwrap();
+        let merged = ZoneMapIndex::load(
+            dest_store.clone(),
+            None,
+            &LanceCache::no_cache(),
+            false,
+            ZoneMapIndexVersion::V1,
+        )
+        .await
+        .unwrap();
 
         // Index B had null_rows = None, so the merged index cannot know all null positions.
         // IsNull must NOT return exact — that would be a false negative for fragment 1's nulls.
@@ -4875,9 +5261,15 @@ mod tests {
         // Write a legacy index with one zone that has nulls but no null bitmap.
         write_legacy_zonemap(store.as_ref(), 10).await;
 
-        let index = ZoneMapIndex::load(store, None, &LanceCache::no_cache(), false)
-            .await
-            .expect("failed to load legacy zonemap");
+        let index = ZoneMapIndex::load(
+            store,
+            None,
+            &LanceCache::no_cache(),
+            false,
+            ZoneMapIndexVersion::V0,
+        )
+        .await
+        .expect("failed to load legacy zonemap");
 
         assert!(
             index.null_rows.is_none(),
@@ -5143,9 +5535,15 @@ mod tests {
         builder.write_index(store.as_ref()).await.unwrap();
 
         // Load the trained index.
-        let index = ZoneMapIndex::load(store.clone(), None, &LanceCache::no_cache(), true)
-            .await
-            .unwrap();
+        let index = ZoneMapIndex::load(
+            store.clone(),
+            None,
+            &LanceCache::no_cache(),
+            true,
+            ZoneMapIndexVersion::V1,
+        )
+        .await
+        .unwrap();
         assert!(
             index.null_rows.is_some(),
             "initial index must have null bitmap"
@@ -5186,9 +5584,15 @@ mod tests {
             .unwrap()
             .expect("update must produce a result");
 
-        let updated_index = ZoneMapIndex::load(dest_store, None, &LanceCache::no_cache(), true)
-            .await
-            .unwrap();
+        let updated_index = ZoneMapIndex::load(
+            dest_store,
+            None,
+            &LanceCache::no_cache(),
+            true,
+            ZoneMapIndexVersion::V1,
+        )
+        .await
+        .unwrap();
 
         // The updated index must have a null bitmap covering both fragments.
         let null_rows = updated_index
@@ -5237,6 +5641,7 @@ mod tests {
             Field::new("max", DataType::Int32, true),
             Field::new("null_count", DataType::UInt32, false),
             Field::new("nan_count", DataType::UInt32, false),
+            Field::new("negative_nan_count", DataType::UInt32, false),
             Field::new("fragment_id", DataType::UInt64, false),
             Field::new("zone_start", DataType::UInt64, false),
             Field::new("zone_length", DataType::UInt64, false),
@@ -5247,6 +5652,7 @@ mod tests {
                 Arc::new(Int32Array::from(vec![Some(0i32)])) as _,
                 Arc::new(Int32Array::from(vec![Some(9i32)])) as _,
                 Arc::new(UInt32Array::from(vec![2u32])) as _, // 2 nulls, positions unknown
+                Arc::new(UInt32Array::from(vec![0u32])) as _,
                 Arc::new(UInt32Array::from(vec![0u32])) as _,
                 Arc::new(UInt64Array::from(vec![0u64])) as _,
                 Arc::new(UInt64Array::from(vec![0u64])) as _,
@@ -5264,6 +5670,7 @@ mod tests {
                 10,
                 None, // legacy: null positions unknown
                 true,
+                ZoneMapIndexVersion::V1,
             )
             .unwrap(),
         );
@@ -5303,9 +5710,15 @@ mod tests {
             .unwrap()
             .expect("update must produce a result");
 
-        let updated = ZoneMapIndex::load(dest_store, None, &LanceCache::no_cache(), true)
-            .await
-            .unwrap();
+        let updated = ZoneMapIndex::load(
+            dest_store,
+            None,
+            &LanceCache::no_cache(),
+            true,
+            ZoneMapIndexVersion::V1,
+        )
+        .await
+        .unwrap();
 
         assert!(
             updated.null_rows.is_none(),
@@ -5344,6 +5757,7 @@ mod tests {
             Field::new("max", DataType::Int32, true),
             Field::new("null_count", DataType::UInt32, false),
             Field::new("nan_count", DataType::UInt32, false),
+            Field::new("negative_nan_count", DataType::UInt32, false),
             Field::new("fragment_id", DataType::UInt64, false),
             Field::new("zone_start", DataType::UInt64, false),
             Field::new("zone_length", DataType::UInt64, false),
@@ -5354,6 +5768,7 @@ mod tests {
                 Arc::new(Int32Array::from(vec![Some(1i32)])) as _,
                 Arc::new(Int32Array::from(vec![Some(5i32)])) as _,
                 Arc::new(UInt32Array::from(vec![1u32])) as _,
+                Arc::new(UInt32Array::from(vec![0u32])) as _,
                 Arc::new(UInt32Array::from(vec![0u32])) as _,
                 Arc::new(UInt64Array::from(vec![0u64])) as _,
                 Arc::new(UInt64Array::from(vec![0u64])) as _,
@@ -5372,6 +5787,7 @@ mod tests {
                 10,
                 Some(modern_null_rows),
                 false,
+                ZoneMapIndexVersion::V1,
             )
             .unwrap(),
         );
@@ -5383,6 +5799,7 @@ mod tests {
                 Arc::new(Int32Array::from(vec![Some(10i32)])) as _,
                 Arc::new(Int32Array::from(vec![Some(20i32)])) as _,
                 Arc::new(UInt32Array::from(vec![3u32])) as _, // 3 nulls, positions unknown
+                Arc::new(UInt32Array::from(vec![0u32])) as _,
                 Arc::new(UInt32Array::from(vec![0u32])) as _,
                 Arc::new(UInt64Array::from(vec![1u64])) as _,
                 Arc::new(UInt64Array::from(vec![0u64])) as _,
@@ -5399,6 +5816,7 @@ mod tests {
                 10,
                 None, // legacy: null positions unknown
                 false,
+                ZoneMapIndexVersion::V1,
             )
             .unwrap(),
         );
@@ -5418,9 +5836,15 @@ mod tests {
         .await
         .unwrap();
 
-        let merged = ZoneMapIndex::load(dest_store, None, &LanceCache::no_cache(), false)
-            .await
-            .unwrap();
+        let merged = ZoneMapIndex::load(
+            dest_store,
+            None,
+            &LanceCache::no_cache(),
+            false,
+            ZoneMapIndexVersion::V1,
+        )
+        .await
+        .unwrap();
 
         assert!(
             merged.null_rows.is_none(),
@@ -6165,9 +6589,15 @@ mod tests {
         .await
         .unwrap();
 
-        ZoneMapIndex::load(test_store.clone(), None, &LanceCache::no_cache(), false)
-            .await
-            .expect("failed to load ZoneMapIndex")
+        ZoneMapIndex::load(
+            test_store.clone(),
+            None,
+            &LanceCache::no_cache(),
+            false,
+            ZoneMapIndexVersion::V1,
+        )
+        .await
+        .expect("failed to load ZoneMapIndex")
     }
 
     use arrow_array::builder::Float32Builder;
@@ -6278,9 +6708,15 @@ mod tests {
         )
         .await
         .unwrap();
-        let index = ZoneMapIndex::load(test_store.clone(), None, &LanceCache::no_cache(), false)
-            .await
-            .unwrap();
+        let index = ZoneMapIndex::load(
+            test_store.clone(),
+            None,
+            &LanceCache::no_cache(),
+            false,
+            ZoneMapIndexVersion::V1,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(index.zones.len(), 1);
         assert_eq!(index.zones[0].null_count, 1, "one null list");
@@ -6389,9 +6825,15 @@ mod tests {
         )
         .await
         .unwrap();
-        let index = ZoneMapIndex::load(test_store.clone(), None, &LanceCache::no_cache(), false)
-            .await
-            .unwrap();
+        let index = ZoneMapIndex::load(
+            test_store.clone(),
+            None,
+            &LanceCache::no_cache(),
+            false,
+            ZoneMapIndexVersion::V1,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(index.zones[0].null_count, 2);
         assert!(index.zones[0].min.is_null(), "all-null zone: min is null");
@@ -6453,9 +6895,15 @@ mod tests {
         .await
         .unwrap();
 
-        let index = ZoneMapIndex::load(test_store.clone(), None, &LanceCache::no_cache(), false)
-            .await
-            .unwrap();
+        let index = ZoneMapIndex::load(
+            test_store.clone(),
+            None,
+            &LanceCache::no_cache(),
+            false,
+            ZoneMapIndexVersion::V1,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(index.zones.len(), 1);
         assert_eq!(index.zones[0].null_count, 0, "no null struct rows");
@@ -6526,9 +6974,15 @@ mod tests {
         .await
         .unwrap();
 
-        let index = ZoneMapIndex::load(test_store.clone(), None, &LanceCache::no_cache(), false)
-            .await
-            .unwrap();
+        let index = ZoneMapIndex::load(
+            test_store.clone(),
+            None,
+            &LanceCache::no_cache(),
+            false,
+            ZoneMapIndexVersion::V1,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(index.zones.len(), 1);
         assert_eq!(index.zones[0].null_count, 1, "one null list row");
@@ -6776,9 +7230,15 @@ mod tests {
         .await
         .unwrap();
 
-        let index = ZoneMapIndex::load(test_store.clone(), None, &LanceCache::no_cache(), false)
-            .await
-            .unwrap();
+        let index = ZoneMapIndex::load(
+            test_store.clone(),
+            None,
+            &LanceCache::no_cache(),
+            false,
+            ZoneMapIndexVersion::V1,
+        )
+        .await
+        .unwrap();
         assert_eq!(index.zones.len(), 1);
         assert_eq!(index.zones[0].null_count, 1, "only the null list row");
         assert_eq!(index.zones[0].nan_count, 0);
@@ -6935,25 +7395,33 @@ mod tests {
         ));
     }
 
-    /// Freshly built zones keep finite bounds plus exact counts; the index
-    /// FILE still carries the legacy +NaN max marker so released readers stay
-    /// conservative, and reloading it leaves the sign split unknown.
+    /// A version 1 index file round trip keeps the ordinary bounds and the
+    /// exact NaN sign split, so the loaded zones answer sign-dependent
+    /// queries exactly.
     #[tokio::test]
-    async fn test_index_file_keeps_legacy_nan_max() {
-        let index = train_and_load::<Float64Type>(vec![vec![
-            Some(1.0),
-            Some(-f64::NAN),
-            Some(3.0),
-            Some(4.0),
-        ]])
+    async fn test_index_file_v1_round_trip_keeps_bounds_and_sign_split() {
+        let tmpdir = TempObjDir::default();
+        let index = train_and_load_in::<Float64Type>(
+            local_store(&tmpdir),
+            vec![vec![
+                Some(1.0),
+                Some(-f64::NAN),
+                Some(3.0),
+                Some(4.0),
+                Some(f64::NAN),
+                Some(f64::INFINITY),
+            ]],
+        )
         .await;
-        // rows_per_zone = 2: zone 0 holds [1.0, -NaN], zone 1 holds [3.0, 4.0].
-        assert_eq!(index.zones[0].nan_count, 1);
-        // Round-tripped through the index file: marker max, split unknown.
-        assert!(ZoneMapIndex::scalar_is_nan(&index.zones[0].max));
-        assert_eq!(index.zones[0].negative_nan_count, None);
+        assert_eq!(index.version(), ZoneMapIndexVersion::V1);
+        // rows_per_zone = 2: [1.0, -NaN], [3.0, 4.0], [+NaN, +inf].
+        assert_eq!(index.zones.len(), 3);
         assert_eq!(index.zones[0].min, ScalarValue::Float64(Some(1.0)));
-        // Conservative on both sides without the split.
+        assert_eq!(index.zones[0].max, ScalarValue::Float64(Some(1.0)));
+        assert_eq!(index.zones[0].nan_count, 1);
+        assert_eq!(index.zones[0].negative_nan_count, Some(1));
+        // The split is known: no positive NaN sorts above 2.0 here, so x > 2
+        // is decided by the ordinary bounds alone.
         assert!(
             index
                 .evaluate_zone_against_query(
@@ -6962,9 +7430,746 @@ mod tests {
                 )
                 .unwrap()
         );
-        // The finite zone is exact.
+        assert!(
+            !index
+                .evaluate_zone_against_query(
+                    &index.zones[0],
+                    &range_q(std::ops::Bound::Excluded(2.0), std::ops::Bound::Unbounded)
+                )
+                .unwrap()
+        );
         assert!(ZoneMapIndex::zone_has_finite_extrema(&index.zones[1]));
-        assert_eq!(index.zones[1].negative_nan_count, None);
+        assert_eq!(index.zones[1].negative_nan_count, Some(0));
+        // Infinities are ordinary bounds; NaNs are counted, not marked.
+        assert_eq!(
+            index.zones[2].min,
+            ScalarValue::Float64(Some(f64::INFINITY))
+        );
+        assert_eq!(
+            index.zones[2].max,
+            ScalarValue::Float64(Some(f64::INFINITY))
+        );
+        assert_eq!(index.zones[2].nan_count, 1);
+        assert_eq!(index.zones[2].negative_nan_count, Some(0));
+
+        // The file carries the version 1 schema.
+        let reader = index.store.open_index_file(ZONEMAP_FILENAME).await.unwrap();
+        let names: Vec<String> = reader
+            .schema()
+            .fields
+            .iter()
+            .map(|f| f.name.clone())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "min",
+                "max",
+                "null_count",
+                "nan_count",
+                "negative_nan_count",
+                "fragment_id",
+                "zone_start",
+                "zone_length"
+            ]
+        );
+    }
+
+    /// One version 0 zone row: `(min, max, null_count, nan_count,
+    /// fragment_id, zone_start, zone_length)`.
+    type V0ZoneRow = (Option<f64>, Option<f64>, u32, u32, u64, u64, u64);
+
+    /// Writes a version 0 Float64 zone map file by hand: seven columns, with
+    /// the legacy `+NaN` max marker on every zone that holds NaNs.
+    async fn write_v0_float_zonemap(store: &dyn IndexStore, zones: &[V0ZoneRow]) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("min", DataType::Float64, true),
+            Field::new("max", DataType::Float64, true),
+            Field::new("null_count", DataType::UInt32, false),
+            Field::new("nan_count", DataType::UInt32, false),
+            Field::new("fragment_id", DataType::UInt64, false),
+            Field::new("zone_start", DataType::UInt64, false),
+            Field::new("zone_length", DataType::UInt64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Float64Array::from(
+                    zones.iter().map(|z| z.0).collect::<Vec<_>>(),
+                )) as _,
+                Arc::new(Float64Array::from(
+                    zones.iter().map(|z| z.1).collect::<Vec<_>>(),
+                )) as _,
+                Arc::new(UInt32Array::from_iter_values(zones.iter().map(|z| z.2))) as _,
+                Arc::new(UInt32Array::from_iter_values(zones.iter().map(|z| z.3))) as _,
+                Arc::new(UInt64Array::from_iter_values(zones.iter().map(|z| z.4))) as _,
+                Arc::new(UInt64Array::from_iter_values(zones.iter().map(|z| z.5))) as _,
+                Arc::new(UInt64Array::from_iter_values(zones.iter().map(|z| z.6))) as _,
+            ],
+        )
+        .unwrap();
+        let mut file_schema = schema.as_ref().clone();
+        file_schema
+            .metadata
+            .insert(ZONEMAP_SIZE_META_KEY.to_string(), "2".to_string());
+        let mut writer = store
+            .new_index_file(ZONEMAP_FILENAME, Arc::new(file_schema))
+            .await
+            .unwrap();
+        writer.write_record_batch(batch).await.unwrap();
+        writer.finish().await.unwrap();
+    }
+
+    fn local_store(dir: &TempObjDir) -> Arc<LanceIndexStore> {
+        Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            (**dir).clone(),
+            Arc::new(LanceCache::no_cache()),
+        ))
+    }
+
+    /// A version 0 file is read under the version 0 contract: the NaN marker
+    /// stays in `max` as data, the sign split is unknown for zones with NaNs
+    /// and provably zero without them, and the zones stay conservative.
+    #[tokio::test]
+    async fn test_index_file_v0_read_keeps_legacy_contract() {
+        let tmpdir = TempObjDir::default();
+        let store = local_store(&tmpdir);
+        write_v0_float_zonemap(
+            store.as_ref(),
+            &[
+                (Some(1.0), Some(f64::NAN), 0, 1, 0, 0, 2),
+                (Some(3.0), Some(4.0), 0, 0, 0, 2, 2),
+            ],
+        )
+        .await;
+        let index = ZoneMapIndex::load(
+            store.clone(),
+            None,
+            &LanceCache::no_cache(),
+            false,
+            ZoneMapIndexVersion::V0,
+        )
+        .await
+        .unwrap();
+        assert_eq!(index.version(), ZoneMapIndexVersion::V0);
+        assert_eq!(index.rows_per_zone, 2);
+        assert!(ZoneMapIndex::scalar_is_nan(&index.zones[0].max));
+        assert_eq!(index.zones[0].negative_nan_count, None);
+        assert_eq!(index.zones[1].negative_nan_count, Some(0));
+        // Unknown split: both signs stay possible, so x > 2 keeps the zone
+        // even though its hidden ordinary max is 1.0.
+        assert!(
+            index
+                .evaluate_zone_against_query(
+                    &index.zones[0],
+                    &range_q(std::ops::Bound::Excluded(2.0), std::ops::Bound::Unbounded)
+                )
+                .unwrap()
+        );
+        assert!(
+            index
+                .evaluate_zone_against_query(
+                    &index.zones[0],
+                    &range_q(std::ops::Bound::Unbounded, std::ops::Bound::Included(0.0))
+                )
+                .unwrap()
+        );
+        // The same file is not a valid version 1 file.
+        let err = ZoneMapIndex::load(
+            store,
+            None,
+            &LanceCache::no_cache(),
+            false,
+            ZoneMapIndexVersion::V1,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("negative_nan_count"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Version 1 files are validated on load: an impossible sign split or a
+    /// NaN bound is a corrupt file, not a conservative zone.
+    #[tokio::test]
+    async fn test_index_file_v1_rejects_invalid_zones() {
+        async fn write_v1(
+            store: &dyn IndexStore,
+            max: f64,
+            nan_count: u32,
+            negative_nan_count: u32,
+        ) {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("min", DataType::Float64, true),
+                Field::new("max", DataType::Float64, true),
+                Field::new("null_count", DataType::UInt32, false),
+                Field::new("nan_count", DataType::UInt32, false),
+                Field::new("negative_nan_count", DataType::UInt32, false),
+                Field::new("fragment_id", DataType::UInt64, false),
+                Field::new("zone_start", DataType::UInt64, false),
+                Field::new("zone_length", DataType::UInt64, false),
+            ]));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Float64Array::from(vec![Some(1.0)])) as _,
+                    Arc::new(Float64Array::from(vec![Some(max)])) as _,
+                    Arc::new(UInt32Array::from(vec![0u32])) as _,
+                    Arc::new(UInt32Array::from(vec![nan_count])) as _,
+                    Arc::new(UInt32Array::from(vec![negative_nan_count])) as _,
+                    Arc::new(UInt64Array::from(vec![0u64])) as _,
+                    Arc::new(UInt64Array::from(vec![0u64])) as _,
+                    Arc::new(UInt64Array::from(vec![4u64])) as _,
+                ],
+            )
+            .unwrap();
+            let mut file_schema = schema.as_ref().clone();
+            file_schema
+                .metadata
+                .insert(ZONEMAP_SIZE_META_KEY.to_string(), "4".to_string());
+            let mut writer = store
+                .new_index_file(ZONEMAP_FILENAME, Arc::new(file_schema))
+                .await
+                .unwrap();
+            writer.write_record_batch(batch).await.unwrap();
+            writer.finish().await.unwrap();
+        }
+        for (max, nan_count, negative, needle) in [
+            (2.0, 1, 2, "negative_nan_count"),
+            (f64::NAN, 1, 0, "NaN bound"),
+            (2.0, 5, 0, "above its length"),
+        ] {
+            let tmpdir = TempObjDir::default();
+            let store = local_store(&tmpdir);
+            write_v1(store.as_ref(), max, nan_count, negative).await;
+            let err = ZoneMapIndex::load(
+                store,
+                None,
+                &LanceCache::no_cache(),
+                false,
+                ZoneMapIndexVersion::V1,
+            )
+            .await
+            .unwrap_err();
+            assert!(err.to_string().contains(needle), "unexpected error: {err}");
+        }
+    }
+
+    /// Versions this build does not know are refused, both by the enum and
+    /// by the plugin's load entries; nothing is interpreted under the
+    /// version 0 or version 1 contract.
+    #[tokio::test]
+    async fn test_unsupported_index_version_is_refused() {
+        assert_eq!(
+            ZoneMapIndexVersion::from_metadata(0).unwrap(),
+            ZoneMapIndexVersion::V0
+        );
+        assert_eq!(
+            ZoneMapIndexVersion::from_metadata(1).unwrap(),
+            ZoneMapIndexVersion::V1
+        );
+        assert_eq!(ZoneMapIndexPlugin.version(), 1);
+        let err = ZoneMapIndexVersion::from_metadata(2).unwrap_err();
+        assert!(matches!(err, Error::NotSupported { .. }), "{err}");
+
+        let tmpdir = TempObjDir::default();
+        let index = train_and_load_in::<Float64Type>(
+            local_store(&tmpdir),
+            vec![vec![Some(1.0), Some(2.0)]],
+        )
+        .await;
+        let details = make_zone_map_index_details(2, false, true);
+        let err = ZoneMapIndexPlugin
+            .load_index(
+                index.store.clone(),
+                &details,
+                2,
+                None,
+                &LanceCache::no_cache(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::NotSupported { .. }), "{err}");
+        let err = ZoneMapIndexPlugin
+            .load_index_with_remapping(
+                index.store.clone(),
+                &details,
+                2,
+                None,
+                &LanceCache::no_cache(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::NotSupported { .. }), "{err}");
+        // Version 1 loads through the plugin.
+        let loaded = ZoneMapIndexPlugin
+            .load_index(
+                index.store.clone(),
+                &details,
+                1,
+                None,
+                &LanceCache::no_cache(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            loaded
+                .as_any()
+                .downcast_ref::<ZoneMapIndex>()
+                .unwrap()
+                .version(),
+            ZoneMapIndexVersion::V1
+        );
+    }
+
+    /// A direct merge keeps the sources' file version: version 0 sources
+    /// produce a version 0 file (marker and unknown split preserved),
+    /// version 1 sources a version 1 file, and mixed versions are refused
+    /// before anything is written.
+    #[tokio::test]
+    async fn test_merge_keeps_source_version_and_refuses_mixed_versions() {
+        let v1_a = train_and_load::<Float64Type>(vec![vec![Some(1.0), Some(-f64::NAN)]]).await;
+        let mut v1_b = train_and_load::<Float64Type>(vec![vec![Some(3.0), Some(4.0)]]).await;
+        for zone in &mut Arc::get_mut(&mut v1_b).unwrap().zones {
+            zone.bound.fragment_id = 1;
+        }
+        let tmpdir_a = TempObjDir::default();
+        let store_a = local_store(&tmpdir_a);
+        write_v0_float_zonemap(
+            store_a.as_ref(),
+            &[(Some(1.0), Some(f64::NAN), 0, 1, 0, 0, 2)],
+        )
+        .await;
+        let tmpdir_b = TempObjDir::default();
+        let store_b = local_store(&tmpdir_b);
+        write_v0_float_zonemap(store_b.as_ref(), &[(Some(3.0), Some(4.0), 0, 0, 1, 0, 2)]).await;
+        let mut v0 = Vec::new();
+        for store in [store_a, store_b] {
+            v0.push(
+                ZoneMapIndex::load(
+                    store,
+                    None,
+                    &LanceCache::no_cache(),
+                    false,
+                    ZoneMapIndexVersion::V0,
+                )
+                .await
+                .unwrap(),
+            );
+        }
+        let all_frags = RoaringBitmap::from_iter([0u32, 1]);
+
+        // Version 0 + version 0 -> version 0.
+        let dest_tmpdir = TempObjDir::default();
+        let dest_store = local_store(&dest_tmpdir);
+        let created = merge_zonemap_indices(
+            &[v0[0].as_ref(), v0[1].as_ref()],
+            dest_store.as_ref(),
+            &all_frags,
+        )
+        .await
+        .unwrap();
+        assert_eq!(created.index_version, 0);
+        let merged = ZoneMapIndex::load(
+            dest_store,
+            None,
+            &LanceCache::no_cache(),
+            false,
+            ZoneMapIndexVersion::V0,
+        )
+        .await
+        .unwrap();
+        assert_eq!(merged.zones.len(), 2);
+        assert!(ZoneMapIndex::scalar_is_nan(&merged.zones[0].max));
+        assert_eq!(merged.zones[0].negative_nan_count, None);
+        assert_eq!(merged.zones[1].negative_nan_count, Some(0));
+
+        // Version 1 + version 1 -> version 1.
+        let dest_tmpdir = TempObjDir::default();
+        let dest_store = local_store(&dest_tmpdir);
+        let created = merge_zonemap_indices(
+            &[v1_a.as_ref(), v1_b.as_ref()],
+            dest_store.as_ref(),
+            &all_frags,
+        )
+        .await
+        .unwrap();
+        assert_eq!(created.index_version, 1);
+        let merged = ZoneMapIndex::load(
+            dest_store,
+            None,
+            &LanceCache::no_cache(),
+            false,
+            ZoneMapIndexVersion::V1,
+        )
+        .await
+        .unwrap();
+        assert_eq!(merged.zones.len(), 2);
+        assert_eq!(merged.zones[0].max, ScalarValue::Float64(Some(1.0)));
+        assert_eq!(merged.zones[0].negative_nan_count, Some(1));
+
+        // Mixed versions are refused before any write, in either order.
+        let dest_tmpdir = TempObjDir::default();
+        let dest_store = local_store(&dest_tmpdir);
+        for sources in [
+            vec![v1_a.as_ref(), v0[1].as_ref()],
+            vec![v0[0].as_ref(), v1_b.as_ref()],
+        ] {
+            let err = merge_zonemap_indices(&sources, dest_store.as_ref(), &all_frags)
+                .await
+                .err()
+                .expect("merging mixed ZoneMap versions must be refused");
+            assert!(matches!(err, Error::NotSupported { .. }), "{err}");
+            assert!(
+                dest_store.open_index_file(ZONEMAP_FILENAME).await.is_err(),
+                "a refused merge must not write an index file"
+            );
+        }
+    }
+
+    /// Builds a version 1 Float64 index with `rows_per_zone` into `store`.
+    async fn train_float_index_in(
+        store: Arc<LanceIndexStore>,
+        rows_per_zone: u64,
+        values: Vec<Option<f64>>,
+    ) -> Arc<ZoneMapIndex> {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            VALUE_COLUMN_NAME,
+            DataType::Float64,
+            true,
+        )]));
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Float64Array::from(values))])
+                .unwrap();
+        let stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream::once(std::future::ready(Ok(batch))),
+        ));
+        ZoneMapIndexPlugin::train_zonemap_index(
+            add_row_addr(stream),
+            store.as_ref(),
+            Some(ZoneMapIndexBuilderParams::new(rows_per_zone)),
+        )
+        .await
+        .unwrap();
+        ZoneMapIndex::load(
+            store,
+            None,
+            &LanceCache::no_cache(),
+            false,
+            ZoneMapIndexVersion::V1,
+        )
+        .await
+        .unwrap()
+    }
+
+    /// Remapping copies a zone's counts into each destination run. A version
+    /// 1 file must hold exact counts, so a merge persists a narrowed run only
+    /// when the counts provably survive (no NaNs, nulls recomputed from an
+    /// exact bitmap or absent); otherwise it is refused before any write
+    /// rather than producing a file its own loader rejects.
+    #[tokio::test]
+    async fn test_merge_refuses_inexact_remapped_zones_in_version_1() {
+        let new_row = 3_u64 << 32;
+        // [+NaN, +NaN, 5.0]: keeping only offset 2 would carry nan_count 2
+        // into a run of length 1.
+        let tmpdir = TempObjDir::default();
+        let mut source = train_float_index_in(
+            local_store(&tmpdir),
+            3,
+            vec![Some(f64::NAN), Some(f64::NAN), Some(5.0)],
+        )
+        .await;
+        assert_eq!(source.zones[0].nan_count, 2);
+        let source_mut = Arc::get_mut(&mut source).unwrap();
+        source_mut.fri = Some(Arc::new(TestRemapper::new([(2, new_row)])));
+        let dest_tmpdir = TempObjDir::default();
+        let dest_store = local_store(&dest_tmpdir);
+        let err = merge_zonemap_indices(
+            &[source.as_ref()],
+            dest_store.as_ref(),
+            &RoaringBitmap::from_iter([3]),
+        )
+        .await
+        .err()
+        .expect("a narrowed zone with NaNs must not be persisted as version 1");
+        assert!(matches!(err, Error::NotSupported { .. }), "{err}");
+        assert!(dest_store.open_index_file(ZONEMAP_FILENAME).await.is_err());
+
+        // [null, 5.0, 6.0] without an exact bitmap: the conservative null
+        // count of the narrowed run is not exact either.
+        let tmpdir = TempObjDir::default();
+        let mut source =
+            train_float_index_in(local_store(&tmpdir), 3, vec![None, Some(5.0), Some(6.0)]).await;
+        let source_mut = Arc::get_mut(&mut source).unwrap();
+        source_mut.null_rows = None;
+        source_mut.fri = Some(Arc::new(TestRemapper::new([
+            (1, new_row),
+            (2, new_row + 1),
+        ])));
+        let dest_tmpdir = TempObjDir::default();
+        let dest_store = local_store(&dest_tmpdir);
+        let err = merge_zonemap_indices(
+            &[source.as_ref()],
+            dest_store.as_ref(),
+            &RoaringBitmap::from_iter([3]),
+        )
+        .await
+        .err()
+        .expect("a narrowed mixed-null zone without a bitmap must not be persisted");
+        assert!(matches!(err, Error::NotSupported { .. }), "{err}");
+
+        // The same zone with its exact bitmap: the run's null count is
+        // recomputed, so the merge proceeds and the file loads as version 1.
+        let tmpdir = TempObjDir::default();
+        let mut source =
+            train_float_index_in(local_store(&tmpdir), 3, vec![None, Some(5.0), Some(6.0)]).await;
+        assert!(source.null_rows.is_some());
+        let source_mut = Arc::get_mut(&mut source).unwrap();
+        source_mut.fri = Some(Arc::new(TestRemapper::new([
+            (1, new_row),
+            (2, new_row + 1),
+        ])));
+        let dest_tmpdir = TempObjDir::default();
+        let dest_store = local_store(&dest_tmpdir);
+        merge_zonemap_indices(
+            &[source.as_ref()],
+            dest_store.as_ref(),
+            &RoaringBitmap::from_iter([3]),
+        )
+        .await
+        .unwrap();
+        let merged = ZoneMapIndex::load(
+            dest_store,
+            None,
+            &LanceCache::no_cache(),
+            false,
+            ZoneMapIndexVersion::V1,
+        )
+        .await
+        .unwrap();
+        assert_eq!(merged.zones.len(), 1);
+        assert_eq!(merged.zones[0].bound.length, 2);
+        assert_eq!(merged.zones[0].null_count, 0);
+        assert_eq!(merged.zones[0].nan_count, 0);
+        assert_eq!(merged.zones[0].negative_nan_count, Some(0));
+
+        // A run that keeps every row of its zone keeps exact counts.
+        let tmpdir = TempObjDir::default();
+        let mut source = train_float_index_in(
+            local_store(&tmpdir),
+            3,
+            vec![Some(f64::NAN), Some(-f64::NAN), Some(5.0)],
+        )
+        .await;
+        let source_mut = Arc::get_mut(&mut source).unwrap();
+        source_mut.fri = Some(Arc::new(TestRemapper::new([
+            (0, new_row),
+            (1, new_row + 1),
+            (2, new_row + 2),
+        ])));
+        let dest_tmpdir = TempObjDir::default();
+        let dest_store = local_store(&dest_tmpdir);
+        merge_zonemap_indices(
+            &[source.as_ref()],
+            dest_store.as_ref(),
+            &RoaringBitmap::from_iter([3]),
+        )
+        .await
+        .unwrap();
+        let merged = ZoneMapIndex::load(
+            dest_store,
+            None,
+            &LanceCache::no_cache(),
+            false,
+            ZoneMapIndexVersion::V1,
+        )
+        .await
+        .unwrap();
+        assert_eq!(merged.zones[0].bound.length, 3);
+        assert_eq!(merged.zones[0].nan_count, 2);
+        assert_eq!(merged.zones[0].negative_nan_count, Some(1));
+    }
+
+    /// The low-level update keeps the segment's file version: a version 0
+    /// segment stays version 0 (with the legacy marker for new NaN zones)
+    /// and a version 1 segment stays version 1.
+    #[tokio::test]
+    async fn test_update_keeps_file_version() {
+        fn new_data() -> SendableRecordBatchStream {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new(VALUE_COLUMN_NAME, DataType::Float64, true),
+                Field::new(ROW_ADDR, DataType::UInt64, false),
+            ]));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Float64Array::from(vec![Some(7.0), Some(-f64::NAN)])),
+                    Arc::new(UInt64Array::from(vec![1u64 << 32, (1u64 << 32) | 1])),
+                ],
+            )
+            .unwrap();
+            Box::pin(RecordBatchStreamAdapter::new(
+                schema,
+                stream::once(std::future::ready(Ok(batch))),
+            ))
+        }
+
+        // Version 0 reference.
+        let tmpdir = TempObjDir::default();
+        let store = local_store(&tmpdir);
+        write_v0_float_zonemap(store.as_ref(), &[(Some(1.0), Some(2.0), 0, 0, 0, 0, 2)]).await;
+        let v0 = ZoneMapIndex::load(
+            store,
+            None,
+            &LanceCache::no_cache(),
+            false,
+            ZoneMapIndexVersion::V0,
+        )
+        .await
+        .unwrap();
+        let dest_tmpdir = TempObjDir::default();
+        let dest_store = local_store(&dest_tmpdir);
+        let created = v0
+            .update(new_data(), dest_store.as_ref(), None)
+            .await
+            .unwrap();
+        assert_eq!(created.index_version, 0);
+        let updated = ZoneMapIndex::load(
+            dest_store.clone(),
+            None,
+            &LanceCache::no_cache(),
+            false,
+            ZoneMapIndexVersion::V0,
+        )
+        .await
+        .unwrap();
+        assert_eq!(updated.zones.len(), 2);
+        assert_eq!(updated.zones[1].bound.fragment_id, 1);
+        assert_eq!(updated.zones[1].nan_count, 1);
+        // Written under the version 0 contract: marker max, split unknown.
+        assert!(ZoneMapIndex::scalar_is_nan(&updated.zones[1].max));
+        assert_eq!(updated.zones[1].negative_nan_count, None);
+        assert!(
+            ZoneMapIndex::load(
+                dest_store,
+                None,
+                &LanceCache::no_cache(),
+                false,
+                ZoneMapIndexVersion::V1,
+            )
+            .await
+            .is_err()
+        );
+
+        // Version 1 reference.
+        let v1 = train_and_load::<Float64Type>(vec![vec![Some(1.0), Some(2.0)]]).await;
+        let dest_tmpdir = TempObjDir::default();
+        let dest_store = local_store(&dest_tmpdir);
+        let created = v1
+            .update(new_data(), dest_store.as_ref(), None)
+            .await
+            .unwrap();
+        assert_eq!(created.index_version, 1);
+        let updated = ZoneMapIndex::load(
+            dest_store,
+            None,
+            &LanceCache::no_cache(),
+            false,
+            ZoneMapIndexVersion::V1,
+        )
+        .await
+        .unwrap();
+        assert_eq!(updated.zones.len(), 2);
+        assert_eq!(updated.zones[1].max, ScalarValue::Float64(Some(7.0)));
+        assert_eq!(updated.zones[1].negative_nan_count, Some(1));
+    }
+
+    /// Seed admission into a version 1 file: a version 0 reference is never
+    /// updated with seeds (the caller rebuilds), a version 0 seed record with
+    /// NaNs is not admitted (its split is unknown), and a version 0 seed
+    /// record without NaNs is admitted with a provably zero split.
+    #[tokio::test]
+    async fn test_update_with_seeds_version_admission() {
+        use crate::scalar::seed::FragmentSeed;
+
+        fn seed_bytes(values: &[Option<f64>]) -> bytes::Bytes {
+            let mut writer = ZoneMapSeedWriter::new("c", 2, DataType::Float64).unwrap();
+            let values: ArrayRef = Arc::new(Float64Array::from(values.to_vec()));
+            writer.observe_batch(&values).unwrap();
+            writer.finish().unwrap().unwrap()
+        }
+        fn seed(fragment_id: u64, bytes: bytes::Bytes) -> FragmentSeed {
+            FragmentSeed {
+                fragment_id,
+                physical_rows: 2,
+                bytes,
+                metadata_value: "0:2".to_string(),
+            }
+        }
+
+        let plain_v0 = to_v0(&seed_bytes(&[Some(5.0), Some(6.0)]));
+        let nan_v0 = to_v0(&seed_bytes(&[Some(5.0), Some(f64::NAN)]));
+        let nan_v1 = seed_bytes(&[Some(5.0), Some(-f64::NAN)]);
+
+        // Version 0 reference: no seed update at all.
+        let tmpdir = TempObjDir::default();
+        let store = local_store(&tmpdir);
+        write_v0_float_zonemap(store.as_ref(), &[(Some(1.0), Some(2.0), 0, 0, 0, 0, 2)]).await;
+        let v0 = ZoneMapIndex::load(
+            store,
+            None,
+            &LanceCache::no_cache(),
+            true,
+            ZoneMapIndexVersion::V0,
+        )
+        .await
+        .unwrap();
+        let dest_tmpdir = TempObjDir::default();
+        let dest_store = local_store(&dest_tmpdir);
+        assert!(
+            v0.try_update_with_seeds(&[seed(1, plain_v0.clone())], dest_store.as_ref())
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // Version 1 reference.
+        let v1 = train_and_load::<Float64Type>(vec![vec![Some(1.0), Some(2.0)]]).await;
+        let dest_tmpdir = TempObjDir::default();
+        let dest_store = local_store(&dest_tmpdir);
+        assert!(
+            v1.try_update_with_seeds(&[seed(1, nan_v0)], dest_store.as_ref())
+                .await
+                .unwrap()
+                .is_none(),
+            "a version 0 seed record with NaNs has an unknown split"
+        );
+        let created = v1
+            .try_update_with_seeds(&[seed(1, plain_v0), seed(2, nan_v1)], dest_store.as_ref())
+            .await
+            .unwrap()
+            .expect("version 1 and NaN-free version 0 seeds are admitted");
+        assert_eq!(created.index_version, 1);
+        let updated = ZoneMapIndex::load(
+            dest_store,
+            None,
+            &LanceCache::no_cache(),
+            true,
+            ZoneMapIndexVersion::V1,
+        )
+        .await
+        .unwrap();
+        assert_eq!(updated.zones.len(), 3);
+        assert_eq!(updated.zones[1].bound.fragment_id, 1);
+        assert_eq!(updated.zones[1].max, ScalarValue::Float64(Some(6.0)));
+        assert_eq!(updated.zones[1].negative_nan_count, Some(0));
+        assert_eq!(updated.zones[2].bound.fragment_id, 2);
+        assert_eq!(updated.zones[2].max, ScalarValue::Float64(Some(5.0)));
+        assert_eq!(updated.zones[2].nan_count, 1);
+        assert_eq!(updated.zones[2].negative_nan_count, Some(1));
     }
 
     /// Version 1 seed round trip: finite bounds, exact sign split, version
