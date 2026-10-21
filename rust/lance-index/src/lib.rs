@@ -43,8 +43,8 @@ pub const INDEX_METADATA_SCHEMA_KEY: &str = "lance:index";
 /// Most vector indices should use this version unless they need to bump for a
 /// format change.
 pub const VECTOR_INDEX_VERSION: u32 = 1;
-/// Version reserved for IVF_RQ indices in the plane-row layout.
-/// This build reads only column-layout indices; the plane-row reader lands separately.
+/// Version of IVF_RQ indices in the plane-row layout, and the highest IVF_RQ
+/// version this build reads.
 pub const IVF_RQ_INDEX_VERSION: u32 = 3;
 /// Version of IVF_RQ indices in the column layout, which readers that predate
 /// the plane-row layout accept.
@@ -120,10 +120,7 @@ mod tests {
 
     #[test]
     fn test_max_vector_version_tracks_highest_supported() {
-        assert_eq!(
-            IndexType::max_vector_version(),
-            IVF_RQ_COLUMNS_INDEX_VERSION
-        );
+        assert_eq!(IndexType::max_vector_version(), IVF_RQ_INDEX_VERSION);
     }
 
     #[test]
@@ -137,8 +134,8 @@ mod tests {
             ivf_rq_index_version(RQRowLayout::PlaneRows),
             IVF_RQ_INDEX_VERSION as i32
         );
-        // The declared plane-row version does not raise this build's read ceiling.
-        // Columns keep the version readers without plane-row support accept.
+        // Plane rows are the read ceiling; columns keep the version readers
+        // without plane-row support accept, which still exceeds IVF_PQ's.
         assert_eq!(
             ivf_rq_index_version(RQRowLayout::PlaneRows),
             IndexType::IvfRq.version()

@@ -28,7 +28,7 @@ use lance_linalg::distance::DistanceType;
 use lance_table::format::IndexMetadata;
 use serde::Serialize;
 
-use lance_index::vector::bq::{RQBuildParams, RQRotationType};
+use lance_index::vector::bq::{RQBuildParams, RQRotationType, RQRowLayout};
 use lance_index::vector::hnsw::builder::HnswBuildParams;
 use lance_index::vector::ivf::IvfBuildParams;
 use lance_index::vector::pq::PQBuildParams;
@@ -302,12 +302,8 @@ pub fn vector_params_from_details(details: &prost_types::Any) -> Option<VectorIn
                     .with_layered(rq.layered.unwrap_or(false))
                     .with_row_layout(
                         match rabit_quantization::RowLayout::try_from(rq.row_layout).ok()? {
-                            rabit_quantization::RowLayout::Columns => {
-                                lance_index::vector::bq::RQRowLayout::Columns
-                            }
-                            rabit_quantization::RowLayout::PlaneRows => {
-                                lance_index::vector::bq::RQRowLayout::PlaneRows
-                            }
+                            rabit_quantization::RowLayout::Columns => RQRowLayout::Columns,
+                            rabit_quantization::RowLayout::PlaneRows => RQRowLayout::PlaneRows,
                         },
                     ),
             )
@@ -703,12 +699,8 @@ async fn convert_v3_metadata_to_details(
                         }
                     };
                     let row_layout = match rq.row_layout {
-                        lance_index::vector::bq::RQRowLayout::Columns => {
-                            rabit_quantization::RowLayout::Columns
-                        }
-                        lance_index::vector::bq::RQRowLayout::PlaneRows => {
-                            rabit_quantization::RowLayout::PlaneRows
-                        }
+                        RQRowLayout::Columns => rabit_quantization::RowLayout::Columns,
+                        RQRowLayout::PlaneRows => rabit_quantization::RowLayout::PlaneRows,
                     };
                     Some(Compression::Rq(RabitQuantization {
                         layered: Some(rq.layered),
@@ -1397,6 +1389,7 @@ mod tests {
         IvfSq,
         IvfRqMatrix,
         IvfRqFast,
+        IvfRqPlaneRows,
         IvfHnswFlat,
         IvfHnswPq,
         IvfHnswSq,
@@ -1431,7 +1424,7 @@ mod tests {
 
     fn build_roundtrip_params(combo: Combo, metric: DistanceType) -> VectorIndexParams {
         use crate::index::vector::VectorIndexParams;
-        use lance_index::vector::bq::{RQBuildParams, RQRotationType};
+        use lance_index::vector::bq::{RQBuildParams, RQRotationType, RQRowLayout};
         use lance_index::vector::hnsw::builder::HnswBuildParams;
         use lance_index::vector::ivf::builder::IvfBuildParams;
         use lance_index::vector::pq::builder::PQBuildParams;
@@ -1480,6 +1473,13 @@ mod tests {
                 ivf,
                 RQBuildParams::with_rotation_type(1, RQRotationType::Fast),
             ),
+            Combo::IvfRqPlaneRows => VectorIndexParams::with_ivf_rq_params(
+                metric,
+                ivf,
+                RQBuildParams::with_rotation_type(7, RQRotationType::Fast)
+                    .with_layered(true)
+                    .with_row_layout(RQRowLayout::PlaneRows),
+            ),
             Combo::IvfHnswFlat => VectorIndexParams::ivf_hnsw(metric, ivf, hnsw),
             Combo::IvfHnswPq => VectorIndexParams::with_ivf_hnsw_pq_params(metric, ivf, hnsw, pq),
             Combo::IvfHnswSq => VectorIndexParams::with_ivf_hnsw_sq_params(metric, ivf, hnsw, sq),
@@ -1492,6 +1492,7 @@ mod tests {
     #[case::ivf_sq(Combo::IvfSq)]
     #[case::ivf_rq_matrix(Combo::IvfRqMatrix)]
     #[case::ivf_rq_fast(Combo::IvfRqFast)]
+    #[case::ivf_rq_plane_rows(Combo::IvfRqPlaneRows)]
     #[case::ivf_hnsw_flat(Combo::IvfHnswFlat)]
     #[case::ivf_hnsw_pq(Combo::IvfHnswPq)]
     #[case::ivf_hnsw_sq(Combo::IvfHnswSq)]
@@ -1500,7 +1501,7 @@ mod tests {
         #[values(DistanceType::L2, DistanceType::Cosine)] metric: DistanceType,
     ) {
         use crate::index::vector::StageParams;
-        use lance_index::vector::bq::RQRotationType;
+        use lance_index::vector::bq::{RQRotationType, RQRowLayout};
 
         let params = build_roundtrip_params(combo, metric);
 
@@ -1552,6 +1553,16 @@ mod tests {
                     _ => unreachable!(),
                 };
                 assert_eq!(rq.rotation_type, expected);
+                assert_eq!(rq.row_layout, RQRowLayout::Columns);
+                assert_eq!(rq.layered, Some(false));
+            }
+            Combo::IvfRqPlaneRows => {
+                let StageParams::RQ(rq) = &restored.stages[1] else {
+                    panic!("expected RQ stage");
+                };
+                assert_eq!(rq.num_bits, 7);
+                assert_eq!(rq.layered, Some(true));
+                assert_eq!(rq.row_layout, RQRowLayout::PlaneRows);
             }
             Combo::IvfHnswFlat => {
                 let StageParams::Hnsw(hnsw) = &restored.stages[1] else {

@@ -27,6 +27,7 @@ mod lazy_tests;
 pub(crate) mod pairwise;
 pub mod partition_codes;
 mod plane_cache;
+pub mod plane_rows;
 pub mod planes;
 pub mod prune;
 pub mod raw_body;
@@ -40,6 +41,7 @@ pub const RABIT_MIN_NUM_BITS: u8 = 1;
 pub const RABIT_MAX_NUM_BITS: u8 = 9;
 pub const RABIT_BINARY_NUM_BITS: u8 = 1;
 /// Default number of bits per dimension for IVF_RQ indexes.
+/// Default bits per dimension for both OSS and Enterprise IVF_RQ builds.
 pub const RABIT_DEFAULT_NUM_BITS: u8 = 5;
 
 #[derive(Clone, Default)]
@@ -136,8 +138,9 @@ pub struct RQBuildParams {
     /// Store prefix code planes; ignored for 1 or 2 bits.
     /// `None` leaves the choice to the product: false in OSS, true in Enterprise.
     pub layered: Option<bool>,
-    /// Auxiliary row layout. This build supports [`RQRowLayout::Columns`];
-    /// plane-row read/write support is provided by the follow-up implementation.
+    /// How the auxiliary file stores each row's fields. Default columns; the
+    /// plane-row layout is committed as index version 3, which readers
+    /// without plane-row support leave out of their usable indexes.
     pub row_layout: RQRowLayout,
 }
 
@@ -194,7 +197,8 @@ impl RQBuildParams {
         self.num_bits > 2 && self.layered.unwrap_or(false)
     }
 
-    /// Select the auxiliary row layout. Plane rows require a build with that implementation.
+    /// Write the auxiliary file in `row_layout`. Plane rows require a reader
+    /// with plane-row support.
     ///
     /// ```
     /// use lance_index::vector::bq::{RQBuildParams, RQRowLayout};
@@ -305,7 +309,6 @@ mod tests {
     #[test]
     fn test_rq_build_params_default_num_bits() {
         assert_eq!(RQBuildParams::default().num_bits, 5);
-        assert_eq!(RQBuildParams::default().row_layout, RQRowLayout::Columns);
         assert_eq!(RQBuildParams::default().layered, None);
         assert_eq!(RQBuildParams::new(5).layered, None);
         assert_eq!(
@@ -331,6 +334,21 @@ mod tests {
         let decoded = RabitQuantization::decode(details.encode_to_vec().as_slice()).unwrap();
         assert_eq!(decoded.layered, layered);
         assert_eq!(decoded.row_layout, details.row_layout);
+    }
+
+    #[test]
+    fn test_rq_build_params_row_layout_reaches_details() {
+        use crate::pb::vector_index_details::rabit_quantization::RowLayout;
+        assert_eq!(RQBuildParams::default().row_layout, RQRowLayout::Columns);
+        assert_eq!(RQBuildParams::new(7).row_layout, RQRowLayout::Columns);
+        let columns = RabitQuantization::from(&RQBuildParams::new(7));
+        assert_eq!(columns.row_layout(), RowLayout::Columns);
+        let params = RQBuildParams::new(7)
+            .with_layered(true)
+            .with_row_layout(RQRowLayout::PlaneRows);
+        let plane_rows = RabitQuantization::from(&params);
+        assert_eq!(plane_rows.row_layout(), RowLayout::PlaneRows);
+        assert_eq!(plane_rows.layered, Some(true));
     }
 
     #[test]

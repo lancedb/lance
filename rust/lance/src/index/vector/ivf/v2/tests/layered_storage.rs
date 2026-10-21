@@ -544,6 +544,8 @@ async fn write_rq_test_dataset(
 enum LazyTestCache {
     /// No capacity: every plane comes from the origin file.
     Origin,
+    /// Lance's default backend at about a tenth of the planes, prewarmed.
+    Small,
     /// Everything resident after prewarm.
     Resident,
     /// A tiered backend without sign gating, prewarmed to disk.
@@ -592,6 +594,10 @@ async fn open_lazy_test_dataset(
     let registry = Arc::new(ObjectStoreRegistry::default());
     let (session, tiered) = match cache {
         LazyTestCache::Origin => (Session::new(0, LAZY_METADATA_CACHE_BYTES, registry), None),
+        LazyTestCache::Small => (
+            Session::new(LAZY_SMALL_CACHE_BYTES, LAZY_METADATA_CACHE_BYTES, registry),
+            None,
+        ),
         LazyTestCache::Resident => (
             Session::new(LAZY_LARGE_CACHE_BYTES, LAZY_METADATA_CACHE_BYTES, registry),
             None,
@@ -890,6 +896,125 @@ fn result_bits(batch: &RecordBatch) -> (Vec<u64>, Vec<u32>) {
             .map(|dist| dist.to_bits())
             .collect(),
     )
+}
+
+/// A plane-row copy of the fixture answers every query, precision,
+/// filter, cache and origin class as the column layout does, bit for
+/// bit: eager, with a cascade, and lazily under every scan setting
+/// (far window, one far permit, dense-to-eager routing, promotions).
+#[rstest]
+#[case::rq7_l2(7, DistanceType::L2, true)]
+#[case::rq9_dot(9, DistanceType::Dot, true)]
+#[case::native_rq7_l2(7, DistanceType::L2, false)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_plane_rows_search_matches_columns(
+    #[case] bits: u8,
+    #[case] distance_type: DistanceType,
+    #[case] layered: bool,
+) {
+    use super::super::row_layout::rewrite_rq_row_layout;
+    use lance_index::vector::bq::storage::RQRowLayout;
+    let _serial = LAZY_TEST_LOCK.lock().await;
+    let columns_dir = TempStrDir::default();
+    let (_, batch) =
+        write_rq_test_dataset(columns_dir.as_str(), bits, distance_type, layered).await;
+    let rows_dir = TempStrDir::default();
+    let rows_path = format!("{}/plane_rows", rows_dir.as_str());
+    copy_test_dir(
+        std::path::Path::new(columns_dir.as_str()),
+        std::path::Path::new(&rows_path),
+    );
+    let mut converted = Dataset::open(&rows_path).await.unwrap();
+    let name = converted.load_indices().await.unwrap()[0].name.clone();
+    rewrite_rq_row_layout(&mut converted, &name, RQRowLayout::PlaneRows)
+        .await
+        .unwrap();
+
+    let vectors = batch["vector"].as_fixed_size_list();
+    let keys = [vectors.value(0), vectors.value(777)];
+    let filters = lazy_test_filters();
+    let precisions: &[RQPrecision] = if layered {
+        &[RQPrecision::Full, RQPrecision::High, RQPrecision::Sign]
+    } else {
+        &[RQPrecision::Full]
+    };
+    let mut case = 0usize;
+    for cache in [
+        LazyTestCache::Origin,
+        LazyTestCache::Small,
+        LazyTestCache::Ungated,
+    ] {
+        let (columns, _, _) = open_lazy_test_index(columns_dir.as_str(), cache).await;
+        let (rows, row_index, _) = open_lazy_test_index(&rows_path, cache).await;
+        assert_eq!(lazy_index(&row_index).row_layout(), RQRowLayout::PlaneRows);
+        for class in [OriginLatencyClass::Low, OriginLatencyClass::High] {
+            let open = move |dataset: Dataset| async move {
+                let (store, dir) = index_files(&dataset).await;
+                open_with_origin_latency(&dataset, store, dir, class).await
+            };
+            let column = open(columns.clone()).await;
+            let row = open(rows.clone()).await;
+            assert!(!lazy_index(&row).resident_columns_enabled());
+            let full_column_entries = lazy_index(&column).entry_columns() == EntryColumns::All;
+            for key in &keys {
+                for nprobes in [1, 4, LAZY_PARTITIONS] {
+                    for k in [1, 10, 100, LAZY_ROWS + 1] {
+                        for &precision in precisions {
+                            case += 1;
+                            let (filter_name, filter) = &filters[case % filters.len()];
+                            let mut query = lazy_test_query(key.clone(), k, nprobes);
+                            query.rq_precision = precision;
+                            // A cascade scores a partition's first stage at
+                            // high precision only while its high plane is
+                            // resident, so it compares the layouts where
+                            // both caches hold the same planes. The low
+                            // twin starts from prewarm; the high twin
+                            // inherits each layout's lazy-read cache
+                            // history. Resident column indexes also use
+                            // code-only keys absent from the plane-row
+                            // cache, including the low twin under `on`.
+                            if layered
+                                && precision == RQPrecision::Full
+                                && case.is_multiple_of(4)
+                                && ((class == OriginLatencyClass::Low && full_column_entries)
+                                    || cache == LazyTestCache::Origin)
+                            {
+                                query.rq_cascade_factor = Some(4);
+                            }
+                            let context = format!(
+                                "cache={cache:?} class={class} nprobes={nprobes} k={k} precision={precision:?} cascade={:?} filter={filter_name}",
+                                query.rq_cascade_factor
+                            );
+                            assert_eq!(
+                                result_bits(
+                                    &search_global(&column, &query, filter.clone())
+                                        .await
+                                        .unwrap()
+                                ),
+                                result_bits(
+                                    &search_global(&row, &query, filter.clone()).await.unwrap()
+                                ),
+                                "{context}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn copy_test_dir(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_test_dir(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), target).unwrap();
+        }
+    }
 }
 
 /// `auto` makes cloud object stores class high and local files and
@@ -4465,8 +4590,11 @@ async fn test_code_only_entries_keep_unpacked_codes_packed() {
     assert_eq!(results[0], results[1]);
 }
 
-/// Increasing gaps exercise touching reads, block-sized coalescing,
-/// wider ranges, and a whole column page.
+/// Gaps that coalesced origin reads are checked at, in strictly
+/// ascending order so that neighbours compare a narrower gap with a
+/// wider one: touching ranges only, V11's S3 block size, the gap
+/// `auto` gives a high-latency origin, the wider 1 MiB it gave
+/// before, and every range of a column page.
 const COALESCE_TEST_GAPS: [u64; 5] = [0, 64 * 1024, 256 * 1024, 1024 * 1024, u64::MAX];
 /// Spacing of the single rows of a sparse selection.
 const COALESCE_TEST_ROW_STEP: usize = 41;
@@ -4607,4 +4735,38 @@ async fn open_rq_index(
     )
     .await
     .unwrap()
+}
+
+/// Whether a twin [`open_with_origin_latency`] opens as if its origin
+/// were of `class` keeps its small columns resident, in a store of
+/// its own: as `LANCE_RQ_RESIDENT_COLUMNS` sets it when it is `on`
+/// or `off`, and under `auto`, which leaves it to the index, as the
+/// twins stand for an index on a cloud object store that keeps them
+/// and a local one that reads them from the file. Residency does not
+/// follow the class, so the twins pin it.
+fn twin_keeps_resident_store(class: OriginLatencyClass) -> bool {
+    match resident_columns_setting().unwrap() {
+        ResidentColumnsSetting::Off => false,
+        ResidentColumnsSetting::On => true,
+        ResidentColumnsSetting::Auto => class == OriginLatencyClass::High,
+    }
+}
+
+/// [`open_rq_index`], as if the index's origin were of `class`, with
+/// its small columns resident where [`twin_keeps_resident_store`]
+/// says.
+async fn open_with_origin_latency(
+    dataset: &Dataset,
+    store: Arc<ObjectStore>,
+    index_dir: object_store::path::Path,
+    class: OriginLatencyClass,
+) -> Arc<dyn VectorIndex> {
+    let ivf = open_rq_index(dataset, store, index_dir)
+        .await
+        .with_origin_latency_for_test(class)
+        .unwrap()
+        .with_resident_columns_for_test(twin_keeps_resident_store(class))
+        .await
+        .unwrap();
+    Arc::new(ivf)
 }
