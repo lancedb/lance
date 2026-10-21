@@ -747,11 +747,8 @@ pub fn try_fixed_packed_struct_miniblock(
             "Packed struct mini-block encoding supports only fixed-width children",
         ));
     }
-    // The packing writes whole bytes per child (`bits_per_value / 8`), so a
-    // sub-byte child such as Boolean would contribute no bytes while still
-    // counting towards the declared row width. The full-zip packing refuses a
-    // child that is not byte-aligned, and the decoder also requires a positive
-    // width, so refuse both here.
+    // The packing writes `bits_per_value / 8` bytes per child, so a sub-byte
+    // child such as Boolean would write no bytes.
     if let Some(bits) = data
         .children
         .iter()
@@ -760,7 +757,7 @@ pub fn try_fixed_packed_struct_miniblock(
         .find(|bits| *bits == 0 || !bits.is_multiple_of(8))
     {
         return Err(Error::invalid_input(format!(
-            "Packed struct mini-block encoding requires byte-aligned fixed-width children, got one of {bits} bits"
+            "Packed struct mini-block encoding requires byte-aligned fixed-width children, got a {bits}-bit child"
         )));
     }
     Ok(Some(Box::new(
@@ -1985,11 +1982,6 @@ mod tests {
         use arrow_array::{ArrayRef, BooleanArray, Int32Array, StructArray};
         use arrow_schema::Fields;
 
-        // A Boolean child is a fixed-width block of 1 bit, so it passes the
-        // variable-width check, and the packing would then write zero bytes for
-        // it while declaring its bit in the row width. The decoder rejects such a
-        // descriptor (see `mini_block_descriptor_errors_are_owned_by_codecs`), so
-        // the writer must not produce one.
         let fields = Fields::from(vec![
             ArrowField::new("b", DataType::Boolean, false),
             ArrowField::new("i", DataType::Int32, false),
@@ -2007,7 +1999,7 @@ mod tests {
         let error = try_fixed_packed_struct_miniblock(&block).unwrap_err();
         assert!(matches!(error, Error::InvalidInput { .. }));
         assert!(
-            error.to_string().contains("byte-aligned") && error.to_string().contains("1 bits"),
+            error.to_string().contains("byte-aligned") && error.to_string().contains("1-bit child"),
             "unexpected error: {error}"
         );
     }

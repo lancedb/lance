@@ -581,12 +581,8 @@ impl ComputeStat for StructDataBlock {
         let data_size = self.data_size();
         let data_size_array = Arc::new(UInt64Array::from(vec![data_size]));
 
-        // The packed row width is the sum of the children's widths. A child that
-        // carries no `MaxLength` (an all-null or a dictionary-encoded column, for
-        // example) has no width to contribute, which makes the sum unknown rather
-        // than zero, so the statistic is left out instead of panicking on the
-        // missing child. Such a struct cannot be packed anyway and the encoder
-        // rejects it with a typed error.
+        // A child without `MaxLength` (all-null or dictionary-encoded) makes the
+        // packed width unknown, not zero, so the statistic is left out.
         let max_len = self
             .children
             .iter()
@@ -633,10 +629,6 @@ mod tests {
     };
     use arrow_select::concat::concat;
 
-    /// A packed struct whose child is all-null (or dictionary-encoded) has no
-    /// `MaxLength` to contribute, so the struct's width is unknown. Computing the
-    /// struct's statistics used to panic on that child; the column has to reach the
-    /// encoder's typed rejection instead.
     #[test]
     fn test_struct_stat_without_child_max_length() {
         use crate::compression::try_fixed_packed_struct_miniblock;
