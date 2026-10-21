@@ -1857,6 +1857,42 @@ mod tests {
         );
     }
 
+    /// Regression test for the blocking review finding on
+    /// lance-format/lance#9814 (discussion r4319235130): `JsonIndexPlugin::load_index`
+    /// used to pass the target plugin's current max version unconditionally,
+    /// so a freshly trained JSON-wrapped Bitmap/BTree target -- whose
+    /// postings are always address-valued (see `BitmapTrainingRequest`'s and
+    /// the BTree trainer's own criteria) -- would load as address-domain.
+    /// Nothing can ever persist a genuinely address-domain instance of
+    /// either of these two through this wrapper (`build_scalar_index`'s
+    /// guard in the `lance` crate refuses to build one on a stable-row-id
+    /// dataset, and address and id coincide without one), so the loaded
+    /// target must always report the pre-migration, row-id-domain floor
+    /// version instead.
+    #[rstest]
+    #[case::btree("btree")]
+    #[case::bitmap("bitmap")]
+    #[tokio::test]
+    #[serial_test::serial(LANCE_DF_SPILL_POOL)]
+    async fn test_json_wrapped_target_loads_as_row_id_domain(#[case] target_index_type: &str) {
+        let (store, _tmpdir) = local_json_index_store();
+        let index = train_and_load_json_index(
+            store,
+            target_index_type,
+            TrainingOrdering::None,
+            "v",
+            &[r#"{"v": 1}"#, r#"{"v": 2}"#],
+        )
+        .await;
+
+        let json_index = index.as_any().downcast_ref::<JsonIndex>().unwrap();
+        assert!(
+            !json_index.target_index.results_are_row_addresses(),
+            "a JSON-wrapped {target_index_type} target must load as row-id domain, not its \
+             plugin's current (address-domain) max version"
+        );
+    }
+
     /// Regression test for https://github.com/lance-format/lance/issues/7859.
     #[rstest]
     #[case::zonemap("zonemap", TrainingOrdering::Addresses)]
