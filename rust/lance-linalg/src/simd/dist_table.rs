@@ -2955,6 +2955,181 @@ mod tests {
         }
     }
 
+    /// Runs `f`, which must panic, and returns its panic message.
+    fn panic_message(f: impl FnOnce()) -> String {
+        let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
+            .expect_err("expected a panic");
+        payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| {
+                payload
+                    .downcast_ref::<&str>()
+                    .map(|message| message.to_string())
+            })
+            .unwrap_or_default()
+    }
+
+    /// Every row-major candidate rejects inputs its SIMD loads would overrun,
+    /// including an `n * code_len` that wraps to zero.
+    #[rstest::rstest]
+    #[case::n_not_a_batch_multiple(33, 1, 33, 1, "is not a multiple of")]
+    #[case::short_codes(32, 2, 63, 2, "codes has")]
+    #[case::short_dist_table(32, 2, 64, 1, "dist_table has")]
+    #[case::wrapping_codes_product(32, usize::MAX / 32 + 1, 0, 0, "codes has")]
+    fn test_row_major_candidates_check_bounds(
+        #[case] n: usize,
+        #[case] code_len: usize,
+        #[case] codes_len: usize,
+        #[case] table_codes: usize,
+        #[case] expected: &str,
+    ) {
+        let codes = vec![0u8; codes_len];
+        let table = vec![0u8; table_codes * BATCH_SIZE];
+        for candidate in SUM_U16.candidates() {
+            let Some(kernel) = candidate.kernel() else {
+                continue;
+            };
+            let mut dists = vec![MaybeUninit::<u16>::uninit(); n];
+            let message = panic_message(|| kernel.call(&codes, &table, code_len, &mut dists));
+            assert!(
+                message.contains(expected),
+                "{}: {message}",
+                candidate.name()
+            );
+        }
+        let hacc_table = vec![0u8; table_codes * 64];
+        for candidate in SUM_HACC.candidates() {
+            let Some(kernel) = candidate.kernel() else {
+                continue;
+            };
+            let mut dists = vec![MaybeUninit::<u32>::uninit(); n];
+            let message = panic_message(|| kernel.call(&codes, &hacc_table, code_len, &mut dists));
+            assert!(
+                message.contains(expected),
+                "{}: {message}",
+                candidate.name()
+            );
+        }
+    }
+
+    /// Every transposed candidate rejects inputs its SIMD loads or stores would
+    /// overrun, including an `n * code_len` that wraps to zero.
+    #[rstest::rstest]
+    #[case::short_codes(65, 2, 129, 65, "codes has")]
+    #[case::wrapping_codes_product(usize::MAX / 2 + 1, 2, 0, 0, "codes has")]
+    #[case::short_dists(65, 2, 130, 64, "dists has")]
+    fn test_transposed_candidates_check_bounds(
+        #[case] n: usize,
+        #[case] code_len: usize,
+        #[case] codes_len: usize,
+        #[case] dists_len: usize,
+        #[case] expected: &str,
+    ) {
+        let codes = vec![0u8; codes_len];
+        let u8_table = vec![0u8; 32 * code_len];
+        let f32_table = vec![0.0f32; 32 * code_len];
+        for candidate in SUM_TRANSPOSED.candidates() {
+            let Some(kernel) = candidate.kernel() else {
+                continue;
+            };
+            let mut dists = vec![0u16; dists_len];
+            let message = panic_message(|| kernel.call(&codes, &u8_table, n, &mut dists));
+            assert!(
+                message.contains(expected),
+                "{}: {message}",
+                candidate.name()
+            );
+        }
+        for candidate in SUM_F32_TRANSPOSED.candidates() {
+            let Some(kernel) = candidate.kernel() else {
+                continue;
+            };
+            let mut dists = vec![0.0f32; dists_len];
+            let message = panic_message(|| kernel.call(&codes, &f32_table, n, &mut dists));
+            assert!(
+                message.contains(expected),
+                "{}: {message}",
+                candidate.name()
+            );
+        }
+        // The filter stores no sums, so only the `codes` bound applies to it.
+        if expected != "codes has" {
+            return;
+        }
+        for candidate in FILTER_TRANSPOSED.candidates() {
+            let Some(kernel) = candidate.kernel() else {
+                continue;
+            };
+            let mut on_batch = |_, _, _: &[u16; TRANSPOSED_BATCH_SIZE]| u16::MAX;
+            let message = panic_message(|| {
+                // SAFETY: `kernel` exists only because the host supports it,
+                // and the candidate checks its own bounds.
+                unsafe { kernel.as_fn()(&codes, &u8_table, n, u16::MAX, &mut on_batch) }
+            });
+            assert!(
+                message.contains(expected),
+                "{}: {message}",
+                candidate.name()
+            );
+        }
+    }
+
+    /// Every selected-rows candidate rejects a row past `n` and short slices.
+    #[rstest::rstest]
+    #[case::row_out_of_range(&[0, 4], 2, 4, "out of range")]
+    #[case::short_dists(&[0, 1], 1, 4, "dists has")]
+    #[case::short_codes(&[0], 1, 3, "codes has")]
+    fn test_f32_rows_candidates_check_bounds(
+        #[case] rows: &[u32],
+        #[case] dists_len: usize,
+        #[case] codes_len: usize,
+        #[case] expected: &str,
+    ) {
+        let n = 4;
+        let codes = vec![0u8; codes_len];
+        let table = vec![0.0f32; 32];
+        for candidate in SUM_F32_ROWS.candidates() {
+            let Some(kernel) = candidate.kernel() else {
+                continue;
+            };
+            let mut dists = vec![0.0f32; dists_len];
+            let message = panic_message(|| kernel.call(&codes, &table, n, rows, &mut dists));
+            assert!(
+                message.contains(expected),
+                "{}: {message}",
+                candidate.name()
+            );
+        }
+    }
+
+    /// The transposed entry points reject a short table before dispatching,
+    /// including a `32 * code_len` that wraps to zero.
+    #[rstest::rstest]
+    #[case::short_dist_table(1, 2, 63)]
+    #[case::wrapping_table_product(0, usize::MAX / 32 + 1, 0)]
+    fn test_transposed_entry_points_check_dist_table(
+        #[case] n: usize,
+        #[case] code_len: usize,
+        #[case] table_len: usize,
+    ) {
+        let codes = [0u8; 2];
+        let message = panic_message(|| {
+            sum_4bit_dist_table_transposed(n, code_len, &codes, &vec![0; table_len], &mut [0; 1])
+        });
+        assert!(message.contains("dist_table has"), "{message}");
+        let message = panic_message(|| {
+            sum_4bit_dist_table_f32_transposed(
+                n,
+                code_len,
+                &codes,
+                &vec![0.0; table_len],
+                &mut [0.0; 1],
+            )
+        });
+        assert!(message.contains("dist_table has"), "{message}");
+    }
+
     /// Each entry point's best candidate on x86_64 and aarch64 is a SIMD one,
     /// so a host with the features never falls through to scalar.
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
