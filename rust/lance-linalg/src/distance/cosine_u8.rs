@@ -294,6 +294,31 @@ mod tests {
         }
     }
 
+    /// The SIMD kernels are safe functions, so unequal lengths must stay in
+    /// bounds and use the common prefix. The lengths cross both SIMD strides.
+    #[rstest::rstest]
+    #[case::shorter_right(129, 65)]
+    #[case::longer_right(65, 129)]
+    fn simd_kernels_use_common_prefix_of_unequal_lengths(
+        #[case] a_len: usize,
+        #[case] b_len: usize,
+    ) {
+        let a = random(a_len, 0);
+        let b = random(b_len, 1);
+        let n = a_len.min(b_len);
+        let want = cosine_u8_accum_scalar(&a[..n], &b[..n]);
+        for candidate in COSINE_U8_ACCUM.candidates() {
+            // The scalar kernel asserts equal lengths instead.
+            if candidate.features().is_empty() {
+                continue;
+            }
+            let Some(kernel) = candidate.kernel() else {
+                continue;
+            };
+            assert_eq!(kernel.call(&a, &b), want, "{}", candidate.name());
+        }
+    }
+
     #[test]
     fn cosine_known_values() {
         // Identical vectors → distance 0
