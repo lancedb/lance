@@ -4,7 +4,10 @@
 use super::*;
 use crate::scalar::inverted::InvertedIndexPlugin;
 use crate::scalar::registry::ScalarIndexPlugin;
-use lance_core::cache::MokaCacheBackend;
+use futures::future::BoxFuture;
+use lance_core::cache::{
+    CacheBackend, CacheEntry, InternalCacheKey, MokaCacheBackend, QuickCacheBackend,
+};
 
 #[rstest::rstest]
 #[case::quick(Arc::new(QuickCacheBackend::with_capacity(1 << 20)))]
@@ -133,6 +136,46 @@ async fn cached_fts_versions_release_posting_readers(
         "the version states must remain cached"
     );
     assert!(cache.size_bytes().await <= 1 << 20);
+}
+
+/// Resident probes are optional for custom and persistent cache backends.
+#[derive(Debug)]
+struct CacheWithoutResidentProbe(QuickCacheBackend);
+
+#[async_trait]
+impl CacheBackend for CacheWithoutResidentProbe {
+    async fn get(&self, key: &InternalCacheKey, codec: Option<CacheCodec>) -> Option<CacheEntry> {
+        self.0.get(key, codec).await
+    }
+
+    async fn insert(
+        &self,
+        key: &InternalCacheKey,
+        entry: CacheEntry,
+        size: usize,
+        codec: Option<CacheCodec>,
+    ) {
+        self.0.insert(key, entry, size, codec).await;
+    }
+
+    async fn get_or_insert<'a>(
+        &self,
+        key: &InternalCacheKey,
+        loader: BoxFuture<'a, Result<(CacheEntry, usize)>>,
+        codec: Option<CacheCodec>,
+    ) -> Result<(CacheEntry, bool)> {
+        self.0.get_or_insert(key, loader, codec).await
+    }
+
+    async fn clear(&self) {
+        self.0.clear().await;
+    }
+    async fn num_entries(&self) -> usize {
+        self.0.num_entries().await
+    }
+    async fn size_bytes(&self) -> usize {
+        self.0.size_bytes().await
+    }
 }
 
 #[tokio::test]
@@ -672,11 +715,15 @@ async fn test_prewarm_streams_in_chunks_preserves_content(
     }
 }
 
-/// With positions, the chunked prewarm must strip positions into their own
-/// per-token cache entries (leaving the posting cache positions-free) and still
+/// With positions, chunked prewarm keeps position data separate from postings and
 /// round-trip exact doc ids, frequencies, and positions across chunk boundaries.
+#[rstest::rstest]
+#[case::v2(InvertedListFormatVersion::V2)]
+#[case::v3(InvertedListFormatVersion::V3)]
 #[tokio::test]
-async fn test_prewarm_streams_in_chunks_with_positions() {
+async fn test_prewarm_streams_in_chunks_with_positions(
+    #[case] format_version: InvertedListFormatVersion,
+) {
     let tmpdir = TempObjDir::default();
     let store = Arc::new(LanceIndexStore::new(
         ObjectStore::local().into(),
@@ -684,7 +731,6 @@ async fn test_prewarm_streams_in_chunks_with_positions() {
         Arc::new(LanceCache::no_cache()),
     ));
 
-    let format_version = InvertedListFormatVersion::V2;
     let posting_tail_codec = format_version.posting_tail_codec();
     let num_tokens = runtime_posting_group_tokens() as u32 + 4;
     const DOCS_PER_TOKEN: u32 = 3;
@@ -719,7 +765,12 @@ async fn test_prewarm_streams_in_chunks_with_positions() {
         ),
         (
             "params".to_owned(),
-            serde_json::to_string(&InvertedIndexParams::default().with_position(true)).unwrap(),
+            serde_json::to_string(
+                &InvertedIndexParams::default()
+                    .with_position(true)
+                    .format_version(format_version),
+            )
+            .unwrap(),
         ),
         (
             TOKEN_SET_FORMAT_KEY.to_owned(),
@@ -744,7 +795,9 @@ async fn test_prewarm_streams_in_chunks_with_positions() {
         .unwrap();
     writer.finish_with_metadata(metadata).await.unwrap();
 
-    let cache = Arc::new(LanceCache::with_capacity(1 << 20));
+    let cache = Arc::new(LanceCache::with_backend(Arc::new(
+        CacheWithoutResidentProbe(QuickCacheBackend::with_capacity(1 << 20)),
+    )));
     let index = InvertedIndex::load(store.clone(), None, cache.as_ref())
         .await
         .unwrap();
@@ -773,21 +826,27 @@ async fn test_prewarm_streams_in_chunks_with_positions() {
             .await
             .unwrap();
         let slot = (token_id - start) as usize;
-        assert!(
-            !group.is_packed(),
-            "with-position prewarm should retain the materialized fallback"
-        );
+        assert!(group.is_packed());
+        let (max_score, length) = inverted_list.bulk_metadata_for_token(token_id);
         assert!(
             !group
-                .posting_list(slot, None, None)
+                .posting_list(slot, max_score, length)
                 .unwrap()
                 .unwrap()
                 .has_position(),
             "token {token_id} posting cache entry must be positions-free after prewarm"
         );
 
-        // Full content (doc ids, frequencies, positions) round-trips; the
-        // positions come from the dedicated per-token cache prewarm populated.
+        let metrics = LocalMetricsCollector::default();
+        inverted_list
+            .read_positions(token_id, &metrics)
+            .await
+            .unwrap();
+        assert_eq!(metrics.index_cache_hits(), 1);
+        assert_eq!(metrics.index_cache_misses(), 0);
+        assert!(!group.needs_external_metadata());
+
+        // Full content round-trips with positions supplied by their per-term cache entries.
         let actual = inverted_list
             .posting_list(token_id, true, &NoOpMetricsCollector)
             .await
@@ -802,6 +861,10 @@ async fn test_prewarm_streams_in_chunks_with_positions() {
             "token {token_id} posting list / positions mismatch after chunked prewarm"
         );
     }
+    assert_eq!(
+        inverted_list.prewarm_residency_status(true).await,
+        (true, Some(true))
+    );
 }
 
 #[tokio::test]
