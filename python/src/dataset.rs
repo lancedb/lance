@@ -5974,6 +5974,8 @@ impl PySearchFilter {
             dist_q_c: 0.0,
             approx_mode,
             search_effort,
+            rq_precision: Default::default(),
+            rq_cascade_factor: None,
         };
         vector_query
             .validate_search_effort()
