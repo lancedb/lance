@@ -339,6 +339,11 @@ fn validate_partition_rebalancing_options(options: &OptimizeOptions) -> Result<(
 ///
 /// See the module documentation for what the plan contains and which indices
 /// it leaves alone.
+///
+/// A selected index with a session-registered custom scalar optimizer is not
+/// supported by this distributed interface. Use
+/// [`DatasetIndexExt::optimize_indices`](super::DatasetIndexExt::optimize_indices)
+/// to run that optimizer on the coordinator.
 pub async fn plan_optimize_indices(
     dataset: &Dataset,
     options: &OptimizeOptions,
@@ -402,6 +407,15 @@ pub(crate) async fn plan_optimize_indices_or_skip(
         merges: Vec::new(),
     };
     for (name, segments) in optimizable_indices(dataset, indices, options)? {
+        if segments[0]
+            .index_details
+            .as_ref()
+            .is_some_and(|details| dataset.session.index_optimizer(details).is_some())
+        {
+            return Err(Error::not_supported(format!(
+                "index '{name}' has a custom scalar optimizer; use Dataset::optimize_indices (distributed custom optimization is not supported)"
+            )));
+        }
         let last = *segments.last().expect("an index has at least one segment");
         let unindexed = dataset.unindexed_fragments(&name).await?;
         // Without an N:1 merge the single-process optimize rebuilds the
