@@ -86,6 +86,7 @@ pub struct Kernel<F>(F);
 macro_rules! impl_call {
     (<$($generic:ident $(: ?$bound:ident)?),*> fn($($arg:ident: $ty:ty),*)) => {
         impl<$($generic $(: ?$bound)?,)* R> Kernel<unsafe fn($($ty),*) -> R> {
+            /// Runs the kernel.
             #[inline(always)]
             #[allow(clippy::too_many_arguments)]
             pub fn call(self, $($arg: $ty),*) -> R {
