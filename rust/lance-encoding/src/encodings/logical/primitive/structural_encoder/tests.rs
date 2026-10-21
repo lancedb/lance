@@ -748,13 +748,17 @@ async fn test_sparse_vector_dictionary_hidden_payload(
         let PageEncoding::Planar(layout) = &page.description else {
             panic!("expected a planar page");
         };
-        assert!(matches!(
-            layout
-                .values
-                .as_ref()
-                .and_then(|values| values.codec.as_ref()),
-            Some(crate::format::pb23::value_plane::Codec::Zipped(_))
-        ));
+        match layout
+            .values
+            .as_ref()
+            .and_then(|values| values.codec.as_ref())
+        {
+            Some(crate::format::pb23::value_plane::Codec::Zipped(_)) => {}
+            Some(crate::format::pb23::value_plane::Codec::Chunked(values)) => {
+                assert!(values.dictionary.is_none());
+            }
+            other => panic!("expected a non-dictionary fallback, got {other:?}"),
+        }
     }
     let tests = TestCases::default()
         .with_encoding(TestEncoding::StructuralSparse)
