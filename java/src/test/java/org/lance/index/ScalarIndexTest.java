@@ -835,7 +835,8 @@ public class ScalarIndexTest {
           new TestUtils.SimpleTestDataset(allocator, datasetPath);
       testDataset.createEmptyDataset().close();
       testDataset.write(1, 10).close();
-      try (Dataset dataset = testDataset.write(2, 10)) {
+      // The second fragment holds two NULL names and "P0" through "P5".
+      try (Dataset dataset = testDataset.writeSortByDataset(2)) {
         IndexParams indexParams =
             IndexParams.builder()
                 .setScalarIndexParams(FmIndexParams.builder().numSegments(2).build())
@@ -848,12 +849,38 @@ public class ScalarIndexTest {
         List<Index> segments = dataset.describeIndices().get(0).getSegments();
         assertEquals(2, segments.size());
         assertEquals(IndexType.FM, segments.get(0).indexType());
-        // Each fragment holds "Person 0" through "Person 9"; a one-character
+        // The first fragment holds "Person 0" through "Person 9"; a one-character
         // pattern is answered by the index as well.
         assertEquals(
-            2, dataset.countIndexedRows("name_fm", "contains(name, 'Person 7')", Optional.empty()));
+            1, dataset.countIndexedRows("name_fm", "contains(name, 'Person 7')", Optional.empty()));
         assertEquals(
-            2, dataset.countIndexedRows("name_fm", "contains(name, '7')", Optional.empty()));
+            1, dataset.countIndexedRows("name_fm", "contains(name, '7')", Optional.empty()));
+        // Every non-NULL name contains 'P'; the two NULL rows do not match.
+        assertEquals(
+            18, dataset.countIndexedRows("name_fm", "contains(name, 'P')", Optional.empty()));
+      }
+    }
+  }
+
+  @Test
+  public void testCreateFmIndexDefaultsToOneSegment(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("fm_index_default").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      testDataset.write(1, 10).close();
+      try (Dataset dataset = testDataset.write(2, 10)) {
+        IndexParams indexParams =
+            IndexParams.builder().setScalarIndexParams(FmIndexParams.builder().build()).build();
+        dataset.createIndex(
+            IndexOptions.builder(Collections.singletonList("name"), IndexType.FM, indexParams)
+                .withIndexName("name_fm")
+                .build());
+
+        assertEquals(1, dataset.describeIndices().get(0).getSegments().size());
+        assertEquals(
+            2, dataset.countIndexedRows("name_fm", "contains(name, 'Person 7')", Optional.empty()));
       }
     }
   }
