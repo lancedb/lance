@@ -102,6 +102,13 @@ pub struct NullableDataBlock {
 
 impl NullableDataBlock {
     fn into_arrow(self, data_type: DataType, _validate: bool) -> Result<ArrayData> {
+        if data_type == DataType::Null {
+            // Every slot of a Null array is null, and arrow-rs rejects a validity buffer on it.
+            return Ok(ArrayData::new_null(
+                &data_type,
+                self.data.num_values() as usize,
+            ));
+        }
         let nulls = self.nulls.into_buffer();
         let data = self.data.into_arrow_impl(data_type, true)?.into_builder();
         let data = data.null_bit_buffer(Some(nulls));
@@ -1889,6 +1896,16 @@ impl DataBlock {
     }
 
     pub fn from_arrays(arrays: &[ArrayRef], num_values: u64) -> Self {
+        Self::from_arrays_impl(arrays, num_values, true)
+    }
+
+    /// Rewrap decoded Arrow buffers without collecting encoder statistics.
+    pub(crate) fn from_decoded_array(array: ArrayRef) -> Self {
+        let len = array.len() as u64;
+        Self::from_arrays_impl(&[array], len, false)
+    }
+
+    fn from_arrays_impl(arrays: &[ArrayRef], num_values: u64, encoding: bool) -> Self {
         if arrays.is_empty() || num_values == 0 {
             return Self::AllNull(AllNullDataBlock { num_values: 0 });
         }
@@ -1958,7 +1975,16 @@ impl DataBlock {
             | DataType::UInt32
             | DataType::UInt64
             | DataType::UInt8 => {
-                let data = encode_flat_data(arrays, num_values);
+                let data = if !encoding && arrays.len() == 1 {
+                    let data = arrays[0].to_data();
+                    let width = data_type.byte_width();
+                    LanceBuffer::from(
+                        data.buffers()[0]
+                            .slice_with_length(data.offset() * width, num_values as usize * width),
+                    )
+                } else {
+                    encode_flat_data(arrays, num_values)
+                };
                 Self::FixedWidth(FixedWidthDataBlock {
                     data,
                     bits_per_value: data_type.byte_width() as u64 * 8,
@@ -1976,7 +2002,7 @@ impl DataBlock {
                         .iter()
                         .map(|s| s.column(child_idx).clone())
                         .collect::<Vec<_>>();
-                    children.push(Self::from_arrays(&child_vec, num_values));
+                    children.push(Self::from_arrays_impl(&child_vec, num_values, encoding));
                 }
 
                 // Extract validity for the struct array
@@ -1997,7 +2023,8 @@ impl DataBlock {
                     .iter()
                     .map(|arr| arr.as_fixed_size_list().values().clone())
                     .collect::<Vec<_>>();
-                let child_block = Self::from_arrays(&children, num_values * *dim as u64);
+                let child_block =
+                    Self::from_arrays_impl(&children, num_values * *dim as u64, encoding);
                 Self::FixedSizeList(FixedSizeListBlock {
                     child: Box::new(child_block),
                     dimension: *dim as u64,
@@ -2018,7 +2045,9 @@ impl DataBlock {
         };
 
         // compute statistics
-        encoded.compute_stat();
+        if encoding {
+            encoded.compute_stat();
+        }
 
         if !matches!(data_type, DataType::Dictionary(_, _)) {
             match nulls {

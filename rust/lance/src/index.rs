@@ -27,7 +27,7 @@ use lance_file::versions::v1::reader::FileReader as V1FileReader;
 use lance_index::INDEX_METADATA_SCHEMA_KEY;
 pub use lance_index::IndexParams;
 use lance_index::frag_reuse::{
-    CompactFragReuseIndex, CompactFragReuseIndexHandle, FRAG_REUSE_INDEX_NAME,
+    CompactFragReuseIndex, CompactFragReuseIndexHandle, FRAG_REUSE_INDEX_NAME, FragReuseVersion,
 };
 use lance_index::mem_wal::{MEM_WAL_INDEX_NAME, MemWalIndex, MemWalIndexHandle};
 use lance_index::optimize::OptimizeOptions;
@@ -61,6 +61,7 @@ use lance_io::utils::{
     CachedFileSize, read_last_block, read_message, read_message_from_buf, read_metadata_offset,
     read_version,
 };
+use lance_table::format::overlay::staleness::{field_affects_index, overlay_affects_index};
 use lance_table::format::{DataFile, Fragment, SelfDescribingFileReader};
 use lance_table::format::{IndexFile, IndexMetadata, list_index_files_with_sizes};
 use lance_table::io::manifest::read_manifest_indexes;
@@ -85,12 +86,12 @@ pub mod frag_reuse_reader;
 mod frag_reuse_remapping;
 pub(crate) mod frag_reuse_with_stable_row_ids;
 pub mod mem_wal;
+pub mod optimize;
 pub mod prefilter;
 pub mod scalar;
 pub(crate) mod scalar_logical;
 pub mod vector;
 
-use self::append::merge_indices;
 use self::frag_reuse_with_stable_row_ids::{
     has_frag_reuse_with_stable_row_ids, is_hidden_by_frag_reuse,
     warn_about_indices_hidden_by_frag_reuse,
@@ -99,13 +100,14 @@ use self::vector::remap_vector_index;
 use crate::dataset::index::LanceIndexStoreExt;
 use crate::dataset::optimize::RemappedIndex;
 use crate::dataset::optimize::remapping::RemapResult;
-use crate::dataset::transaction::{Operation, ReadVersionState, Transaction, TransactionBuilder};
+use crate::dataset::transaction::{Operation, ReadVersionState, Transaction};
 pub use crate::index::api::{DatasetIndexExt, IndexSegment, IntoIndexSegment};
 use crate::index::frag_reuse::{load_frag_reuse_index_details, open_frag_reuse_index};
 use crate::index::mem_wal::open_mem_wal_index;
 pub use crate::index::prefilter::{FilterLoader, PreFilter};
 use crate::index::scalar::{IndexDetails, fetch_index_details, load_training_data};
 pub use crate::index::vector::{LogicalIvfView, LogicalVectorIndex};
+use crate::io::deletion::read_dataset_deletion_file;
 use crate::session::index_caches::{
     DerivedIndexListingKey, FragReuseIndexKey, IndexMetadataKey, write_index_identity,
 };
@@ -155,16 +157,18 @@ fn validate_segment_metadata(index_name: &str, segments: &[IndexMetadata]) -> Re
 /// merge owns the whole caller-defined group, so remap its union and use that
 /// representable group coverage while materializing every source.
 ///
-/// Returns whether coverage was remapped. Coverage only ever moves together with
-/// the row addresses the dataset's own mapping supplies, so where no mapping
-/// applies the coverage shrinks instead — reported, because those rows leave the
-/// merged index and fall back to a flat scan.
+/// Returns the fragments the remap added beyond the segments' own coverage (on
+/// a tagged history, beyond their provenance), or `None` when the coverage was
+/// left as staged. Coverage only moves with the row addresses the reuse index
+/// maps, and is kept only on fragments whose indexed data is shown unchanged
+/// since the segments were built, compacted or not; other rows fall back to a
+/// flat scan.
 async fn remap_merged_segment_coverage(
     dataset: &Dataset,
     index_name: &str,
     segments: &mut [IndexMetadata],
     staged: Option<&frag_reuse::StagedRemappingPlans>,
-) -> Result<bool> {
+) -> Result<Option<RoaringBitmap>> {
     // Under a tagged history the merge opens each source through the
     // translating loader with its staged plan, so the merged files hold live
     // addresses; the coverage moves with them to the live fragments the group
@@ -176,7 +180,11 @@ async fn remap_merged_segment_coverage(
     if let Some(plans) = staged {
         use frag_reuse::SegmentRemappingPlan;
         let mut claimed = RoaringBitmap::new();
+        let mut provenance = RoaringBitmap::new();
         for segment in segments.iter_mut() {
+            if let Some(bitmap) = &segment.fragment_bitmap {
+                provenance |= bitmap;
+            }
             let coverage = match plans.get(&segment.uuid) {
                 Some(SegmentRemappingPlan::Translate { coverage, .. }) => coverage.clone(),
                 Some(SegmentRemappingPlan::Identity) => segment
@@ -202,7 +210,7 @@ async fn remap_merged_segment_coverage(
                  claimed and those rows stay on the scan path. Rebuild the index to cover them."
             );
         }
-        return Ok(true);
+        return Ok(Some(&claimed - &provenance));
     }
     let staged_coverage = segments
         .iter()
@@ -242,8 +250,12 @@ async fn remap_merged_segment_coverage(
                  a flat scan. Rebuild the index to cover them."
             );
         }
-        return Ok(false);
+        return Ok(None);
     };
+
+    // Coverage is kept, through compactions or not, only on fragments whose
+    // indexed data is shown unchanged since the segments were built.
+    let fresh = fresh_fragments(dataset, &frag_reuse_index, segments).await?;
 
     let mut merged_coverage = staged_coverage.clone();
     frag_reuse_index.remap_fragment_bitmap(&mut merged_coverage)?;
@@ -265,26 +277,34 @@ async fn remap_merged_segment_coverage(
 
     merged_coverage &= dataset.fragment_bitmap.as_ref();
 
+    let unverified = &merged_coverage - &fresh;
+    if !unverified.is_empty() {
+        merged_coverage -= &unverified;
+        tracing::warn!(
+            index_name,
+            unverified_fragments = unverified.len(),
+            "Merged index will not cover fragments whose indexed data changed since the \
+             segments were built, or whose history to show otherwise has been cleaned up: \
+             those rows fall back to a flat scan. Rebuild the index to cover them."
+        );
+    }
     if merged_coverage.is_empty() {
-        // The union straddles: these segments together still cover only part of a
-        // rewrite group, so the group's new fragments hold rows no segment indexed
-        // and claiming them would be a lie. Covering nothing is the conservative
-        // answer. `remap_fragment_bitmap` already reports the group it healed, but
-        // it cannot say what that costs the caller, and here it costs the whole
-        // merged index.
         tracing::warn!(
             index_name,
             staged_fragments = staged_coverage.len(),
-            "Merged index covers no rows: its segments together cover only part of a \
-             rewrite group, so the fragments that group produced hold rows no segment \
-             indexed. The remapper reports the group; this is the effect on the merge."
+            "Merged index covers no rows: none of the fragments its segments cover could \
+             be carried to the current version (see the warnings above, or the remapper's \
+             report of a rewrite group the segments only partly cover)."
         );
     }
+
+    // Fragments the remap added: compaction created them after the segments were built.
+    let introduced = &merged_coverage - &staged_coverage;
 
     for segment in segments {
         segment.fragment_bitmap = Some(merged_coverage.clone());
     }
-    Ok(true)
+    Ok(Some(introduced))
 }
 
 fn collect_subtree_field_ids(field: &Field, field_ids: &mut HashSet<i32>) {
@@ -313,14 +333,14 @@ struct PhysicalDataFileIdentity<'a> {
     base_id: Option<u32>,
     base_binding: PhysicalBaseBinding<'a>,
     path: &'a str,
-    fields: &'a [i32],
-    column_indices: &'a [i32],
+    /// The column holding the field this identity is for.
+    column_index: Option<i32>,
     file_major_version: u32,
     file_minor_version: u32,
 }
 
 impl<'a> PhysicalDataFileIdentity<'a> {
-    fn try_new(dataset: &'a Dataset, file: &'a DataFile) -> Option<Self> {
+    fn try_new(dataset: &'a Dataset, file: &'a DataFile, field_position: usize) -> Option<Self> {
         let base_binding = match file.base_id {
             Some(base_id) => {
                 let base = dataset.manifest.base_paths.get(&base_id)?;
@@ -335,32 +355,428 @@ impl<'a> PhysicalDataFileIdentity<'a> {
             base_id: file.base_id,
             base_binding,
             path: &file.path,
-            fields: file.fields.as_ref(),
-            column_indices: file.column_indices.as_ref(),
+            column_index: file.column_indices.get(field_position).copied(),
             file_major_version: file.file_major_version,
             file_minor_version: file.file_minor_version,
         })
     }
 }
 
+/// Where each field `indexed_field_ids` depend on is stored in `fragment`:
+/// the indexed fields themselves, and a packed struct holding one. Other
+/// fields sharing a file do not matter.
 fn fragment_field_files<'a>(
     dataset: &'a Dataset,
     fragment: &'a Fragment,
     indexed_field_ids: &HashSet<i32>,
 ) -> Option<HashMap<i32, PhysicalDataFileIdentity<'a>>> {
+    let indexed = indexed_field_ids.iter().copied().collect::<Vec<_>>();
     fragment
         .files
         .iter()
         .flat_map(|file| {
             file.fields
                 .iter()
-                .filter(|field_id| indexed_field_ids.contains(field_id))
-                .map(|field_id| {
-                    PhysicalDataFileIdentity::try_new(dataset, file)
+                .enumerate()
+                .filter(|(_, field_id)| field_affects_index(**field_id, &indexed, dataset.schema()))
+                .map(|(position, field_id)| {
+                    PhysicalDataFileIdentity::try_new(dataset, file, position)
                         .map(|identity| (*field_id, identity))
                 })
         })
         .collect()
+}
+
+/// Whether `fragment` has an overlay on an `indexed` field committed after `version`.
+fn has_overlay_newer_than(
+    fragment: &Fragment,
+    version: u64,
+    indexed: &HashSet<i32>,
+    schema: &LanceSchema,
+) -> bool {
+    let indexed = indexed.iter().copied().collect::<Vec<_>>();
+    fragment
+        .overlays
+        .iter()
+        .any(|overlay| overlay_affects_index(overlay, &indexed, version, schema))
+}
+
+/// A dataset version with its fragments indexed by id.
+struct Snapshot {
+    dataset: Dataset,
+    fragments: HashMap<u32, usize>,
+}
+
+impl Snapshot {
+    fn new(dataset: Dataset) -> Self {
+        let fragments = dataset
+            .fragments()
+            .iter()
+            .enumerate()
+            .map(|(position, fragment)| (fragment.id as u32, position))
+            .collect();
+        Self { dataset, fragments }
+    }
+
+    fn fragment(&self, id: u32) -> Option<&Fragment> {
+        self.fragments
+            .get(&id)
+            .map(|position| &self.dataset.fragments()[*position])
+    }
+}
+
+/// Dataset versions read by the coverage check, each opened once.
+///
+/// A version is gone only if the dataset no longer lists it; any other read
+/// failure is an error, so a transient fault cannot drop coverage for good.
+struct History<'a> {
+    dataset: &'a Dataset,
+    /// Every version the dataset still lists, ascending.
+    retained: Vec<u64>,
+    snapshots: HashMap<u64, Arc<Snapshot>>,
+}
+
+impl<'a> History<'a> {
+    async fn new(dataset: &'a Dataset) -> Result<Self> {
+        // Ids only; manifests are opened on demand.
+        let retained = dataset
+            .version_refs()
+            .await?
+            .iter()
+            .map(|version| version.version)
+            .collect();
+        let mut snapshots = HashMap::new();
+        snapshots.insert(
+            dataset.manifest.version,
+            Arc::new(Snapshot::new(dataset.clone())),
+        );
+        Ok(Self {
+            dataset,
+            retained,
+            snapshots,
+        })
+    }
+
+    fn current(&self) -> Arc<Snapshot> {
+        self.snapshots[&self.dataset.manifest.version].clone()
+    }
+
+    /// The dataset at `version`, or `None` once cleanup has removed it.
+    async fn at(&mut self, version: u64) -> Result<Option<Arc<Snapshot>>> {
+        if let Some(snapshot) = self.snapshots.get(&version) {
+            return Ok(Some(snapshot.clone()));
+        }
+        if self.retained.binary_search(&version).is_err() {
+            return Ok(None);
+        }
+        let dataset = self
+            .dataset
+            .checkout_version(version)
+            .await
+            .map_err(|error| {
+                Error::io(format!(
+                    "merge_existing_index_segments: cannot read dataset version {version} to \
+                     check merged index coverage: {error}"
+                ))
+            })?;
+        let snapshot = Arc::new(Snapshot::new(dataset));
+        self.snapshots.insert(version, snapshot.clone());
+        Ok(Some(snapshot))
+    }
+
+    /// The version that committed the compaction the reuse index records at
+    /// `recorded`, or `None` unless that commit is a rewrite that produced
+    /// `produced`. The commit is `recorded + 1` because conflict resolution
+    /// restamps the record on every attempt; a record that was not restamped
+    /// fails the check and costs only coverage.
+    async fn rewrite_commit(
+        &self,
+        recorded: u64,
+        produced: impl Iterator<Item = u32>,
+    ) -> Result<Option<u64>> {
+        let committed = recorded + 1;
+        if self.retained.binary_search(&committed).is_err() {
+            return Ok(None);
+        }
+        let Some(transaction) = self.dataset.read_transaction_by_version(committed).await? else {
+            return Ok(None);
+        };
+        let Operation::Rewrite { groups, .. } = &transaction.operation else {
+            return Ok(None);
+        };
+        let written = groups
+            .iter()
+            .flat_map(|group| group.new_fragments.iter())
+            .map(|fragment| fragment.id as u32)
+            .collect::<HashSet<_>>();
+        Ok(produced
+            .into_iter()
+            .all(|fragment| written.contains(&fragment))
+            .then_some(committed))
+    }
+}
+
+/// The overlays on `fragment` over `indexed` fields, as (version, base, path).
+fn indexed_overlays<'a>(
+    fragment: &'a Fragment,
+    indexed: &HashSet<i32>,
+    schema: &LanceSchema,
+) -> HashSet<(u64, Option<u32>, &'a str)> {
+    let indexed = indexed.iter().copied().collect::<Vec<_>>();
+    fragment
+        .overlays
+        .iter()
+        .filter(|overlay| {
+            overlay
+                .data_file
+                .fields
+                .iter()
+                .any(|field_id| field_affects_index(*field_id, &indexed, schema))
+        })
+        .map(|overlay| {
+            (
+                overlay.committed_version,
+                overlay.data_file.base_id,
+                overlay.data_file.path.as_str(),
+            )
+        })
+        .collect()
+}
+
+/// Whether a row deleted in `before` is live again in `after` (only a restore
+/// does this; an index built in between never saw the row).
+async fn revives_rows(
+    before: &Snapshot,
+    after: &Snapshot,
+    then: &Fragment,
+    now: &Fragment,
+) -> Result<bool> {
+    let Some(deleted_then) = &then.deletion_file else {
+        return Ok(false);
+    };
+    let Some(deleted_now) = &now.deletion_file else {
+        return Ok(true);
+    };
+    if deleted_now.id == deleted_then.id && deleted_now.read_version == deleted_then.read_version {
+        return Ok(false);
+    }
+    let rows_then = read_dataset_deletion_file(&before.dataset, then.id, deleted_then).await?;
+    let rows_now = read_dataset_deletion_file(&after.dataset, now.id, deleted_now).await?;
+    Ok(rows_then.iter().any(|row| !rows_now.contains(row)))
+}
+
+/// Whether `fragment`'s indexed data differs between `before` and `after`: a
+/// different file or overlay set for the indexed fields, or a revived row.
+async fn indexed_data_differs(
+    before: &Snapshot,
+    after: &Snapshot,
+    fragment: u32,
+    indexed: &HashSet<i32>,
+) -> Result<bool> {
+    let (Some(then), Some(now)) = (before.fragment(fragment), after.fragment(fragment)) else {
+        return Ok(true);
+    };
+    let files_then = fragment_field_files(&before.dataset, then, indexed);
+    if files_then.is_none()
+        || files_then != fragment_field_files(&after.dataset, now, indexed)
+        || indexed_overlays(then, indexed, after.dataset.schema())
+            != indexed_overlays(now, indexed, after.dataset.schema())
+    {
+        return Ok(true);
+    }
+    revives_rows(before, after, then, now).await
+}
+
+/// The fragments of a segment's build snapshot that the recorded rewrites
+/// chained into `fragment`, which compaction produced after the build at
+/// `version`: each source the snapshot does not hold is followed back to the
+/// group, recorded at or after `version`, that produced it. `None` when a link
+/// is missing, a source neither the snapshot holds nor a recorded group
+/// produced, so the segment's rows there cannot be traced to the build.
+///
+/// A group that produced several fragments gives them the same sources, so
+/// repeated compactions reach a fragment along many paths: each fragment is
+/// followed once, which keeps the work within the fragments the history names.
+fn sources_at_build(
+    versions: &[FragReuseVersion],
+    version: u64,
+    fragment: u32,
+    is_built: impl Fn(u32) -> bool,
+) -> Option<Vec<u32>> {
+    let mut sources = Vec::new();
+    let mut visited = RoaringBitmap::new();
+    let mut pending = vec![fragment];
+    while let Some(fragment) = pending.pop() {
+        if !visited.insert(fragment) {
+            continue;
+        }
+        if is_built(fragment) {
+            sources.push(fragment);
+            continue;
+        }
+        let group = versions
+            .iter()
+            .filter(|reuse| reuse.dataset_version >= version)
+            .flat_map(|reuse| reuse.groups.iter())
+            .find(|group| {
+                group
+                    .new_frags
+                    .iter()
+                    .any(|produced| produced.id as u32 == fragment)
+            })?;
+        pending.extend(group.old_frags.iter().map(|source| source.id as u32));
+    }
+    Some(sources)
+}
+
+/// The version each covered fragment's index entries describe: its segment's
+/// version, or for a fragment compactions produced after the build, the
+/// fragments of the segment's version that they rewrote into it, through every
+/// recorded rewrite in between ([`sources_at_build`]). `None` for a fragment
+/// whose segment's version has been cleaned up, or whose chain of rewrites is
+/// not fully recorded.
+async fn build_provenance(
+    history: &mut History<'_>,
+    frag_reuse_index: &CompactFragReuseIndex,
+    segments: &[IndexMetadata],
+) -> Result<HashMap<u32, Option<u64>>> {
+    let mut by_version = segments.iter().collect::<Vec<_>>();
+    // Oldest first: a fragment reached through two segments is checked
+    // against the older one.
+    by_version.sort_by_key(|segment| segment.dataset_version);
+
+    let mut provenance = HashMap::new();
+    for segment in by_version {
+        let version = segment.dataset_version;
+        let built_at = history.at(version).await?;
+        for fragment in segment.fragment_bitmap.iter().flatten() {
+            let Some(built_at) = &built_at else {
+                provenance.entry(fragment).or_insert(None);
+                continue;
+            };
+            let sources = sources_at_build(
+                &frag_reuse_index.details.versions,
+                version,
+                fragment,
+                |id| built_at.fragment(id).is_some(),
+            );
+            match sources {
+                Some(sources) => {
+                    for source in sources {
+                        provenance.entry(source).or_insert(Some(version));
+                    }
+                }
+                None => {
+                    provenance.entry(fragment).or_insert(None);
+                }
+            }
+        }
+    }
+    Ok(provenance)
+}
+
+/// The current fragments holding rows the segments indexed whose indexed data
+/// is shown unchanged since, following each covered fragment through the
+/// compactions that rewrote it. A compaction's inputs and the final fragments
+/// must each match the version their entries describe
+/// ([`indexed_data_differs`]). A changed input, or a manifest the comparison
+/// needs that was cleaned up, leaves out every fragment its group produced.
+async fn fresh_fragments(
+    dataset: &Dataset,
+    frag_reuse_index: &CompactFragReuseIndex,
+    segments: &[IndexMetadata],
+) -> Result<RoaringBitmap> {
+    let mut indexed = HashSet::new();
+    for segment in segments {
+        indexed.extend(indexed_field_ids(dataset, &segment.fields)?);
+    }
+    let mut history = History::new(dataset).await?;
+    // Each followed fragment's version, or `None` once it cannot be shown fresh.
+    let mut following = build_provenance(&mut history, frag_reuse_index, segments).await?;
+
+    let mut versions = frag_reuse_index.details.versions.iter().collect::<Vec<_>>();
+    versions.sort_by_key(|version| version.dataset_version);
+
+    for version in versions {
+        let ours = version
+            .groups
+            .iter()
+            .filter(|group| {
+                group
+                    .old_frags
+                    .iter()
+                    .any(|fragment| following.contains_key(&(fragment.id as u32)))
+            })
+            .collect::<Vec<_>>();
+        if ours.is_empty() {
+            continue;
+        }
+        let before_commit = history.at(version.dataset_version).await?;
+        let produced = ours
+            .iter()
+            .flat_map(|group| group.new_frags.iter())
+            .map(|fragment| fragment.id as u32);
+        let committed = match before_commit {
+            Some(_) => {
+                history
+                    .rewrite_commit(version.dataset_version, produced)
+                    .await?
+            }
+            None => None,
+        };
+        for group in ours {
+            let mut stale = committed.is_none();
+            for old in &group.old_frags {
+                let old = old.id as u32;
+                let (Some(recorded), Some(before_commit)) =
+                    (following.remove(&old), &before_commit)
+                else {
+                    continue;
+                };
+                stale |= match recorded {
+                    None => true,
+                    Some(recorded) => match history.at(recorded).await? {
+                        None => true,
+                        Some(against) => {
+                            indexed_data_differs(&against, before_commit, old, &indexed).await?
+                        }
+                    },
+                };
+            }
+            for new in &group.new_frags {
+                let new = new.id as u32;
+                // A covered fragment whose entries could not be dated stays
+                // out, though another covered fragment's sources lead to the
+                // group that produced it: those vouch for none of the group's
+                // other inputs.
+                if following.get(&new) != Some(&None) {
+                    following.insert(new, committed.filter(|_| !stale));
+                }
+            }
+        }
+    }
+
+    let current = history.current();
+    let mut fresh = RoaringBitmap::new();
+    for (fragment, recorded) in following {
+        // A fragment no longer in the manifest is dropped from coverage anyway.
+        if current.fragment(fragment).is_none() {
+            continue;
+        }
+        let differs = match recorded {
+            None => true,
+            Some(recorded) => match history.at(recorded).await? {
+                None => true,
+                Some(against) => {
+                    indexed_data_differs(&against, &current, fragment, &indexed).await?
+                }
+            },
+        };
+        if !differs {
+            fresh.insert(fragment);
+        }
+    }
+    Ok(fresh)
 }
 
 /// Resolve the field ids a segment's staleness check must consider: the subtree of
@@ -369,9 +785,9 @@ fn fragment_field_files<'a>(
 /// segment's carried columns can go stale independently of its keyed column, so
 /// checking only the keyed subtree would leave a fragment covered after a carried
 /// column was rewritten, and the segment would answer with the obsolete value.
-fn segment_indexed_field_ids(dataset: &Dataset, segment: &IndexSegment) -> Result<HashSet<i32>> {
+fn indexed_field_ids(dataset: &Dataset, fields: &[i32]) -> Result<HashSet<i32>> {
     let mut indexed_field_ids = HashSet::new();
-    for field_id in segment.fields() {
+    for field_id in fields {
         let field = dataset.schema().field_by_id(*field_id).ok_or_else(|| {
             Error::invalid_input(format!(
                 "CreateIndex: field id {field_id} does not exist in the current schema"
@@ -382,10 +798,15 @@ fn segment_indexed_field_ids(dataset: &Dataset, segment: &IndexSegment) -> Resul
     Ok(indexed_field_ids)
 }
 
+/// Drops from each segment's coverage the fragments whose indexed data changed
+/// since it was built. `historically_missing_exempt` names fragments compaction
+/// created after the segments were built, whose absence from a segment's
+/// history is expected rather than stale.
 async fn prune_stale_segment_coverage(
     dataset: &Dataset,
     segments: &mut [IndexSegment],
     prune_historically_missing: bool,
+    historically_missing_exempt: &RoaringBitmap,
     prune_newer_overlays: bool,
 ) -> Result<()> {
     let current_fragments = dataset
@@ -412,11 +833,26 @@ async fn prune_stale_segment_coverage(
         .collect::<HashSet<_>>();
 
     for version in historical_versions {
-        let historical = dataset.checkout_version(version).await.map_err(|error| {
-            Error::invalid_input(format!(
-                "CreateIndex: cannot validate segment coverage built at dataset version {version}: {error}"
-            ))
-        })?;
+        let historical = match dataset.checkout_version(version).await {
+            Ok(historical) => historical,
+            // Cleaned up: nothing the segments built there cover can be shown
+            // unchanged, so they cover nothing and those rows are scanned.
+            Err(Error::DatasetNotFound { .. } | Error::NotFound { .. }) => {
+                for segment in segments
+                    .iter_mut()
+                    .filter(|segment| segment.dataset_version() == version)
+                {
+                    segment.fragment_bitmap_mut().clear();
+                }
+                continue;
+            }
+            Err(error) => {
+                return Err(Error::invalid_input(format!(
+                    "CreateIndex: cannot validate segment coverage built at dataset version \
+                     {version}: {error}"
+                )));
+            }
+        };
         let historical_fragments = historical
             .fragments()
             .iter()
@@ -427,34 +863,41 @@ async fn prune_stale_segment_coverage(
             .iter_mut()
             .filter(|segment| segment.dataset_version() == version)
         {
-            let indexed_field_ids = segment_indexed_field_ids(dataset, segment)?;
+            let indexed_field_ids = indexed_field_ids(dataset, segment.fields())?;
             let stale_fragments = segment
                 .fragment_bitmap()
                 .iter()
                 .filter(|fragment_id| {
-                    let Some(historical_fragment) = historical_fragments.get(fragment_id) else {
+                    let historical_fragment = historical_fragments.get(fragment_id);
+                    if historical_fragment.is_none()
+                        && !historically_missing_exempt.contains(*fragment_id)
+                    {
                         return prune_historically_missing;
-                    };
+                    }
                     let Some(current_fragment) = current_fragments.get(fragment_id) else {
                         return !lineage
                             .as_ref()
                             .is_some_and(|lineage| lineage.contains(*fragment_id));
                     };
-                    let historical_files =
-                        fragment_field_files(&historical, historical_fragment, &indexed_field_ids);
-                    let current_files =
-                        fragment_field_files(dataset, current_fragment, &indexed_field_ids);
-                    let changed_files =
-                        historical_files.is_none() || historical_files != current_files;
+                    // A fragment the remap added may have no counterpart at
+                    // this version to compare; the overlay check still applies.
+                    let changed_files = historical_fragment.is_some_and(|historical_fragment| {
+                        let historical_files = fragment_field_files(
+                            &historical,
+                            historical_fragment,
+                            &indexed_field_ids,
+                        );
+                        let current_files =
+                            fragment_field_files(dataset, current_fragment, &indexed_field_ids);
+                        historical_files.is_none() || historical_files != current_files
+                    });
                     let changed_overlays = prune_newer_overlays
-                        && current_fragment.overlays.iter().any(|overlay| {
-                            overlay.committed_version > version
-                                && overlay
-                                    .data_file
-                                    .fields
-                                    .iter()
-                                    .any(|field_id| indexed_field_ids.contains(field_id))
-                        });
+                        && has_overlay_newer_than(
+                            current_fragment,
+                            version,
+                            &indexed_field_ids,
+                            dataset.schema(),
+                        );
                     changed_files || changed_overlays
                 })
                 .collect::<Vec<_>>();
@@ -681,7 +1124,8 @@ pub(crate) async fn build_index_metadata_from_segments(
         covered_fragments |= segment.fragment_bitmap().clone();
     }
 
-    prune_stale_segment_coverage(dataset, &mut segments, false, false).await?;
+    prune_stale_segment_coverage(dataset, &mut segments, false, &RoaringBitmap::new(), false)
+        .await?;
 
     let new_indices = futures::stream::iter(segments.into_iter().map(|segment| async move {
         let (
@@ -738,7 +1182,7 @@ pub(crate) async fn build_index_metadata_from_segments(
 }
 
 fn retain_committed_inverted_files(files: &mut Vec<IndexFile>) {
-    files.retain(|file| !file.path.starts_with("staging/"));
+    files.retain(|file| !lance_index::scalar::inverted::builder::is_staged_path(&file.path));
 }
 
 async fn prewarm_opened_index(
@@ -1154,6 +1598,18 @@ fn validate_segment_index_details(index_name: &str, segments: &[IndexMetadata]) 
     }
 
     Ok(())
+}
+
+/// Whether optimize can fold several segments of this kind into one without
+/// rescanning the table: the kinds the single-process optimize merges rather
+/// than rebuilds, vector, BTree, Bitmap and NGram (`merge_scalar_indices`) and
+/// Inverted (`InvertedIndex::merge_segments`).
+pub(crate) fn segment_has_merge_primitive(segment: &IndexMetadata) -> bool {
+    segment_has_vector_details(segment)
+        || segment_has_btree_details(segment)
+        || segment_has_bitmap_details(segment)
+        || segment_has_ngram_details(segment)
+        || segment_has_inverted_details(segment)
 }
 
 /// Detect vector segments while preserving the legacy pre-details fallback.
@@ -1676,10 +2132,13 @@ pub(crate) async fn remap_index(
             .await?;
 
             CreatedIndex {
-                index_details: prost_types::Any::from_msg(
-                    &lance_index::pb::VectorIndexDetails::default(),
-                )
-                .unwrap(),
+                // A remap keeps the IVF model, quantizer and sub-index; only row
+                // addresses change, so the details carry over.
+                index_details: matched
+                    .index_details
+                    .as_deref()
+                    .cloned()
+                    .unwrap_or_else(vector_index_details_default),
                 index_version,
                 files: table_files_to_index(files),
             }
@@ -2283,7 +2742,7 @@ impl DatasetIndexExt for Dataset {
                     // call. The raw ledger and mapping readers are already cached
                     // by frag_reuse_reader; this caches its derived output.
                     let derived_key = DerivedIndexListingKey {
-                        version: self.version().version,
+                        version: self.manifest.version,
                         store_identity: &self.object_store.store_prefix,
                         e_tag: self.manifest_location.e_tag.as_deref(),
                     };
@@ -2400,6 +2859,14 @@ impl DatasetIndexExt for Dataset {
 
         validate_segment_params_compatible(&[], &source_segments)?;
 
+        // Before the coverage work below, which would be wasted without `geo`.
+        #[cfg(not(feature = "geo"))]
+        if all_rtree {
+            return Err(Error::not_supported(
+                "RTree segment merge requires the `geo` feature".to_string(),
+            ));
+        }
+
         // Coverage may only move with the row addresses. A scalar merge loads its
         // sources through the reuse index as a row-address remapper, so those
         // addresses land in the current fragment space and the coverage has to
@@ -2409,10 +2876,6 @@ impl DatasetIndexExt for Dataset {
         // to the distributed file merger with an object store and a directory,
         // reaching no dataset and so no reuse index.
         //
-        // RTree is exempt for a narrower reason: it does load through the
-        // remapper, but the `all_rtree` branch below writes the same coverage
-        // field from its own staleness pruning, so a value set here would not
-        // survive. Placing it under the remap means settling how the two compose.
         // Staged segments are unknown to the snapshot plan: on a tagged table
         // they are planned here as one group and every open below uses that
         // plan (see `frag_reuse::plan_staged_segments`).
@@ -2421,36 +2884,41 @@ impl DatasetIndexExt for Dataset {
         } else {
             frag_reuse::plan_staged_segments(self, &source_segments).await?
         };
-        let has_remapped_source_coverage = if !all_vector && !all_rtree {
+        // Before the staleness pass, which drops the retired fragments this remaps.
+        let staged_coverage: Vec<Option<RoaringBitmap>> = source_segments
+            .iter()
+            .map(|segment| segment.fragment_bitmap.clone())
+            .collect();
+        let remapped_fragments = if !all_vector {
             let index_name = source_segments[0].name.clone();
             remap_merged_segment_coverage(self, &index_name, &mut source_segments, staged.as_ref())
                 .await?
         } else {
-            false
+            None
         };
+        let has_remapped_source_coverage = remapped_fragments.is_some();
+        // A tagged history reports its remap even when every plan is the
+        // identity, so whether row addresses moved is read off the coverage.
+        let source_coverage_moved = source_segments
+            .iter()
+            .zip(&staged_coverage)
+            .any(|(segment, staged)| &segment.fragment_bitmap != staged);
 
-        // Refused before the pruning below, which checks out historical dataset
-        // versions: a build without `geo` cannot merge these segments at all, so
-        // that work would be discarded.
-        #[cfg(not(feature = "geo"))]
         if all_rtree {
-            return Err(Error::not_supported(
-                "RTree segment merge requires the `geo` feature".to_string(),
-            ));
-        }
-
-        let merged_dataset_version = if all_rtree {
             let mut source_coverage = source_segments
                 .iter()
                 .cloned()
                 .map(IntoIndexSegment::into_index_segment)
                 .collect::<Result<Vec<_>>>()?;
-            prune_stale_segment_coverage(self, &mut source_coverage, true, true).await?;
+            // Only fragments the remap added are exempt.
+            let exempt = remapped_fragments.unwrap_or_default();
+            prune_stale_segment_coverage(self, &mut source_coverage, true, &exempt, true).await?;
             for (source, coverage) in source_segments.iter_mut().zip(source_coverage) {
                 source.fragment_bitmap = Some(coverage.fragment_bitmap().clone());
             }
-            self.manifest.version
-        } else if has_remapped_source_coverage {
+        }
+
+        let merged_dataset_version = if all_rtree || has_remapped_source_coverage {
             self.manifest.version
         } else {
             source_dataset_version
@@ -2460,7 +2928,13 @@ impl DatasetIndexExt for Dataset {
         let mut merged_segment = if all_vector {
             crate::index::vector::ivf::merge_segments(self, source_segments).await?
         } else if all_inverted {
-            crate::index::scalar::inverted::merge_segments(self, source_segments, staged).await?
+            crate::index::scalar::inverted::merge_segments(
+                self,
+                source_segments,
+                staged,
+                source_coverage_moved,
+            )
+            .await?
         } else if all_fmindex {
             crate::index::scalar::fmindex::merge_segments(
                 self,
@@ -2826,182 +3300,6 @@ impl DatasetIndexExt for Dataset {
         return Ok(None);
     }
 
-    #[instrument(skip_all)]
-
-    async fn optimize_indices(&mut self, options: &OptimizeOptions) -> Result<()> {
-        let dataset = Arc::new(self.clone());
-        // Grouped from the complete list so a name's segments are all accounted
-        // for. A segment this build cannot read is still coverage, and merging
-        // against a group whose coverage is only partly visible would commit a
-        // new segment claiming fragments an existing one already holds.
-        let indices = load_all_indices(self).await?;
-
-        // Under a history this build cannot interpret the reader lists no
-        // user segment, so every fragment looks unindexed and each optimize
-        // would rebuild the whole table only to have the result excluded
-        // again. Trim, superseded pruning and remap refuse such a history;
-        // optimize leaves the table alone the same way.
-        if let Some(entry) = indices
-            .iter()
-            .find(|idx| lance_table::system_index::frag_reuse::metadata::is_tagged(idx))
-            && frag_reuse::decode_frag_reuse_ledger(self, entry)
-                .await?
-                .has_unsupported_transitions()
-        {
-            log::warn!(
-                "Skipping index optimization: the tagged fragment reuse history carries \
-                 transitions this build cannot interpret; upgrade to a newer version of Lance"
-            );
-            return Ok(());
-        }
-
-        let indices_to_optimize = options
-            .index_names
-            .as_ref()
-            .map(|names| names.iter().collect::<HashSet<_>>());
-        let name_to_indices = indices
-            .iter()
-            .filter(|idx| {
-                indices_to_optimize
-                    .as_ref()
-                    .is_none_or(|names| names.contains(&idx.name))
-                    && !is_system_index(idx)
-            })
-            .map(|idx| (idx.name.clone(), idx))
-            .into_group_map();
-
-        let mut new_indices = vec![];
-        let mut removed_indices = vec![];
-        for (name, deltas) in name_to_indices.iter() {
-            if let Some(index) = deltas.iter().find(|idx| !index_type_is_known(idx)) {
-                let type_url = index
-                    .index_details
-                    .as_ref()
-                    .map(|details| details.type_url.as_str())
-                    .unwrap_or("<legacy>");
-                log::warn!(
-                    "Skipping optimization of index '{}' because this build does not recognize index type '{}'",
-                    index.name,
-                    type_url
-                );
-                continue;
-            }
-
-            // Optimizing a covered index would republish its declaration on a
-            // segment rebuilt without the carried values: `scan_vector_fragments`
-            // projects the keyed field and `_rowid` only, and the scalar merges
-            // reconstruct value plus row id.
-            //
-            // What decides is the caller's intent, not whether this group is
-            // stale. An unfiltered `optimize_indices()` is a table-wide
-            // maintenance request, and erroring aborts the loop before the
-            // replacements accumulated for the other groups are committed -- so
-            // one index this build cannot rebuild would leave every other index
-            // on the table stale. Skip it with a warning instead.
-            //
-            // A caller that listed this index in `index_names` asked for it
-            // specifically, so refuse out loud. The loop is already filtered by
-            // that list, so reaching here with it set means this group was named.
-            if let Some(covered) = deltas
-                .iter()
-                .find(|index| !index.covering_fields.is_empty())
-            {
-                if options.index_names.is_none() {
-                    log::warn!(
-                        "Skipping index '{}': it declares covering fields {:?}, \
-                         which no index builder writes or preserves yet.",
-                        covered.name,
-                        covered.covering_fields,
-                    );
-                    continue;
-                }
-                return Err(Error::index(format!(
-                    "Optimizing index '{}' is not supported: it declares \
-                     covering fields {:?}, which no index builder writes or \
-                     preserves yet",
-                    covered.name, covered.covering_fields,
-                )));
-            }
-
-            // Optimizing a name means replacing its segments with one that
-            // covers their union, which this build cannot compute when it
-            // cannot read one of them: the merged segment would overlap the
-            // segment left behind, and `Dataset::validate` calls that
-            // corruption. Leave the whole name to a build that can read it.
-            if let Some(max_supported_version) =
-                deltas.iter().find_map(|idx| unsupported_index_version(idx))
-            {
-                log::warn!(
-                    "Index {} has a segment newer than version {}, which this build cannot read; \
-                     skipping its optimization",
-                    name,
-                    max_supported_version,
-                );
-                continue;
-            }
-            // Scalar indices have no rebalance concept, so skip them entirely
-            // when every fragment is already covered and the caller hasn't
-            // asked for retrain or an explicit delta merge. Vector indices
-            // fall through and use a rebalance-aware no-op check inside
-            // merge_indices_with_unindexed_frags.
-            if !options.retrain
-                && options.num_indices_to_merge.is_none_or(|n| n == 0)
-                && index_group_is_scalar(self, deltas)
-                && index_group_has_no_unindexed(self, deltas)
-            {
-                continue;
-            }
-
-            let Some(res) = merge_indices(dataset.clone(), deltas.as_slice(), options).await?
-            else {
-                continue;
-            };
-
-            let last_idx = deltas.last().expect("Delta indices should not be empty");
-            let new_idx = IndexMetadata {
-                uuid: res.new_uuid,
-                name: last_idx.name.clone(), // Keep the same name
-                fields: last_idx.fields.clone(),
-                covering_fields: last_idx.covering_fields.clone(),
-                dataset_version: res.new_dataset_version,
-                fragment_bitmap: Some(res.new_fragment_bitmap),
-                index_details: Some(Arc::new(res.new_index_details)),
-                index_version: res.new_index_version,
-                created_at: Some(chrono::Utc::now()),
-                base_id: None, // New merged index file locates in the cloned dataset.
-                files: Some(res.files),
-            };
-            removed_indices.extend(res.removed_indices.iter().map(|&idx| idx.clone()));
-            new_indices.push(new_idx);
-        }
-
-        // A no-work optimize still has to commit on a table that requires
-        // catch-up. Coverage is derived at commit time, so an index that
-        // already spans the table records its position only if there is a
-        // commit to record it on -- and that is the ordinary case after a
-        // remap or a compaction that advanced a generation without changing
-        // fragments. Returning early there leaves the position missing forever
-        // and the repair rescheduling itself.
-        if new_indices.is_empty() && !self.mem_wal_catch_up_would_advance(&indices)? {
-            return Ok(());
-        }
-
-        let transaction = TransactionBuilder::new(
-            self.manifest.version,
-            Operation::CreateIndex {
-                new_indices,
-                removed_indices,
-            },
-        )
-        .transaction_properties(options.transaction_properties.clone())
-        .build();
-
-        self.apply_commit(transaction, &Default::default(), &Default::default())
-            .await?;
-
-        Ok(())
-    }
-
     async fn index_statistics(&self, index_name: &str) -> Result<String> {
         let metadatas = self.load_indices_by_name(index_name).await?;
         if metadatas.is_empty() {
@@ -3041,6 +3339,155 @@ impl DatasetIndexExt for Dataset {
             .read_partition(partition_id, with_vector)
             .await
     }
+
+    #[instrument(skip_all)]
+
+    async fn optimize_indices(&mut self, options: &OptimizeOptions) -> Result<()> {
+        // Grouped from the complete list so a name's segments are all accounted
+        // for. A segment this build cannot read is still coverage, and merging
+        // against a group whose coverage is only partly visible would commit a
+        // new segment claiming fragments an existing one already holds.
+        let indices = load_all_indices(self).await?;
+
+        // The stages a distributed optimize runs across workers, run here in
+        // turn: without row bounds every index is one task that does the
+        // whole single-process optimize, and every merge passes it through.
+        let Some(plan) = optimize::plan_optimize_indices_or_skip(self, &indices, options).await?
+        else {
+            return Ok(());
+        };
+        let mut built = Vec::with_capacity(plan.tasks.len());
+        for task in &plan.tasks {
+            built.extend(
+                task.execute_with_progress(self, options.progress.clone())
+                    .await?,
+            );
+        }
+        let mut merged = Vec::with_capacity(plan.merges.len());
+        for merge in &plan.merges {
+            merged.extend(
+                merge
+                    .execute_with_progress(self, &built, options.progress.clone())
+                    .await?,
+            );
+        }
+
+        // Without results this still commits when MemWAL catch-up needs it.
+        optimize::commit_optimize_indices(self, merged, options).await
+    }
+}
+
+/// The indices an optimize pass may rewrite: each entry is one index name
+/// with all of its segments, in name order.
+///
+/// An index this build cannot rewrite is skipped with a warning: an index type
+/// it does not recognize, a segment newer than it reads, a covered index, or a
+/// scalar index with nothing to do. A covered index the caller named in
+/// `index_names` is refused instead.
+pub(crate) fn optimizable_indices<'a>(
+    dataset: &Dataset,
+    indices: &'a [IndexMetadata],
+    options: &OptimizeOptions,
+) -> Result<Vec<(String, Vec<&'a IndexMetadata>)>> {
+    let indices_to_optimize = options
+        .index_names
+        .as_ref()
+        .map(|names| names.iter().collect::<HashSet<_>>());
+    let name_to_indices = indices
+        .iter()
+        .filter(|idx| {
+            indices_to_optimize
+                .as_ref()
+                .is_none_or(|names| names.contains(&idx.name))
+                && !is_system_index(idx)
+        })
+        .map(|idx| (idx.name.clone(), idx))
+        .into_group_map();
+
+    let mut optimizable = Vec::with_capacity(name_to_indices.len());
+    for (name, deltas) in name_to_indices {
+        if let Some(index) = deltas.iter().find(|idx| !index_type_is_known(idx)) {
+            let type_url = index
+                .index_details
+                .as_ref()
+                .map(|details| details.type_url.as_str())
+                .unwrap_or("<legacy>");
+            log::warn!(
+                "Skipping optimization of index '{}' because this build does not recognize index type '{}'",
+                index.name,
+                type_url
+            );
+            continue;
+        }
+
+        // Optimizing a covered index would republish its declaration on a
+        // segment rebuilt without the carried values: `scan_vector_fragments`
+        // projects the keyed field and `_rowid` only, and the scalar merges
+        // reconstruct value plus row id.
+        //
+        // What decides is the caller's intent, not whether this group is
+        // stale. An unfiltered `optimize_indices()` is a table-wide
+        // maintenance request, and erroring aborts the loop before the
+        // replacements accumulated for the other groups are committed -- so
+        // one index this build cannot rebuild would leave every other index
+        // on the table stale. Skip it with a warning instead.
+        //
+        // A caller that listed this index in `index_names` asked for it
+        // specifically, so refuse out loud. The loop is already filtered by
+        // that list, so reaching here with it set means this group was named.
+        if let Some(covered) = deltas
+            .iter()
+            .find(|index| !index.covering_fields.is_empty())
+        {
+            if options.index_names.is_none() {
+                log::warn!(
+                    "Skipping index '{}': it declares covering fields {:?}, \
+                     which no index builder writes or preserves yet.",
+                    covered.name,
+                    covered.covering_fields,
+                );
+                continue;
+            }
+            return Err(Error::index(format!(
+                "Optimizing index '{}' is not supported: it declares \
+                 covering fields {:?}, which no index builder writes or \
+                 preserves yet",
+                covered.name, covered.covering_fields,
+            )));
+        }
+
+        // Optimizing a name means replacing its segments with one that
+        // covers their union, which this build cannot compute when it
+        // cannot read one of them: the merged segment would overlap the
+        // segment left behind, and `Dataset::validate` calls that
+        // corruption. Leave the whole name to a build that can read it.
+        if let Some(max_supported_version) =
+            deltas.iter().find_map(|idx| unsupported_index_version(idx))
+        {
+            log::warn!(
+                "Index {} has a segment newer than version {}, which this build cannot read; \
+                 skipping its optimization",
+                name,
+                max_supported_version,
+            );
+            continue;
+        }
+        // Scalar indices have no rebalance concept, so skip them entirely
+        // when every fragment is already covered and the caller hasn't
+        // asked for retrain or an explicit delta merge. Vector indices
+        // fall through and use a rebalance-aware no-op check inside
+        // merge_indices_with_unindexed_frags.
+        if !options.retrain
+            && options.num_indices_to_merge.is_none_or(|n| n == 0)
+            && index_group_is_scalar(dataset, &deltas)
+            && index_group_has_no_unindexed(dataset, &deltas)
+        {
+            continue;
+        }
+        optimizable.push((name, deltas));
+    }
+    optimizable.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(optimizable)
 }
 
 fn index_group_is_scalar(dataset: &Dataset, deltas: &[&IndexMetadata]) -> bool {
@@ -3377,7 +3824,7 @@ pub(crate) fn warn_about_unsupported_indices(indices: &[IndexMetadata]) {
 /// second question too: a name it cannot see is a name it will hand out twice.
 pub(crate) async fn load_all_indices(dataset: &Dataset) -> Result<Arc<Vec<IndexMetadata>>> {
     let metadata_key = IndexMetadataKey {
-        version: dataset.version().version,
+        version: dataset.manifest.version,
         store_identity: &dataset.object_store.store_prefix,
         e_tag: dataset.manifest_location.e_tag.as_deref(),
     };
@@ -4686,7 +5133,9 @@ mod tests {
     use crate::dataset::{WriteMode, WriteParams};
     use crate::index::vector::VectorIndexParams;
     use crate::session::Session;
-    use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount, copy_test_data_to_tmp};
+    use crate::utils::test::{
+        DatagenExt, FragmentCount, FragmentRowCount, compact_into_two, copy_test_data_to_tmp,
+    };
     use arrow::array::AsArray;
     use arrow::datatypes::{Float32Type, Int32Type, Int64Type};
     use arrow_array::Int32Array;
@@ -5459,6 +5908,89 @@ mod tests {
         );
     }
 
+    /// A compaction's commit is the version after its reuse record, and only if
+    /// that commit is the rewrite that produced the fragments.
+    #[tokio::test]
+    async fn test_a_compaction_is_dated_by_its_own_commit_record() {
+        let test_dir = TempStrDir::default();
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch = |values: std::ops::Range<i32>| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int32Array::from_iter_values(values))],
+            )
+            .unwrap()
+        };
+        let params = WriteParams {
+            max_rows_per_file: 2,
+            ..Default::default()
+        };
+        let reader = RecordBatchIterator::new(vec![Ok(batch(0..4))], schema.clone());
+        let mut dataset = Dataset::write(reader, &test_dir, Some(params))
+            .await
+            .unwrap();
+        // An index, so the deferred compaction writes a reuse record.
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::BTree,
+                None,
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        let sources = all_fragment_ids(&dataset);
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 1_000,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        let committed = dataset.manifest.version;
+        let recorded = dataset
+            .open_frag_reuse_index(&NoOpMetricsCollector)
+            .await
+            .unwrap()
+            .expect("a deferred compaction records itself")
+            .details
+            .versions[0]
+            .dataset_version;
+        let produced = all_fragment_ids(&dataset);
+        let reader = RecordBatchIterator::new(vec![Ok(batch(4..6))], schema);
+        dataset.append(reader, None).await.unwrap();
+
+        let history = History::new(&dataset).await.unwrap();
+        assert_eq!(
+            history
+                .rewrite_commit(recorded, produced.iter().copied())
+                .await
+                .unwrap(),
+            Some(committed)
+        );
+        assert_eq!(
+            history
+                .rewrite_commit(recorded, sources.iter().copied())
+                .await
+                .unwrap(),
+            None,
+            "the commit is a rewrite, but not the one that produced these fragments"
+        );
+        assert_eq!(
+            history
+                .rewrite_commit(committed, produced.iter().copied())
+                .await
+                .unwrap(),
+            None,
+            "the commit after this version is an append, not a rewrite"
+        );
+    }
+
     fn all_fragment_ids(dataset: &Dataset) -> Vec<u32> {
         dataset
             .get_fragments()
@@ -5608,41 +6140,10 @@ mod tests {
     #[cfg(feature = "geo")]
     #[tokio::test]
     async fn test_merge_existing_index_segments_preserves_covering_rtree() {
-        use geo_types::line_string;
-        use geoarrow_array::GeoArrowArray;
-        use geoarrow_array::builder::LineStringBuilder;
-        use geoarrow_schema::{Dimension, LineStringType};
-
         const ROWS_PER_FRAGMENT: i32 = 20;
-        let line_string_type = LineStringType::new(Dimension::XY, Default::default());
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int32, false),
-            line_string_type.clone().to_field("geometry", true),
-        ]));
+        const FRAGMENTS: i32 = 2;
 
-        let batches = (0..2)
-            .map(|fragment: i32| {
-                let mut builder = LineStringBuilder::new(line_string_type.clone());
-                for row in 0..ROWS_PER_FRAGMENT {
-                    let x = (fragment * ROWS_PER_FRAGMENT + row) as f64;
-                    builder
-                        .push_line_string(Some(&line_string![
-                            (x: x, y: x),
-                            (x: x + 1.0, y: x + 1.0)
-                        ]))
-                        .unwrap();
-                }
-                let ids = Int32Array::from_iter_values(
-                    fragment * ROWS_PER_FRAGMENT..(fragment + 1) * ROWS_PER_FRAGMENT,
-                );
-                RecordBatch::try_new(
-                    schema.clone(),
-                    vec![Arc::new(ids), builder.finish().to_array_ref()],
-                )
-            })
-            .collect::<std::result::Result<Vec<_>, arrow_schema::ArrowError>>()
-            .unwrap();
-
+        let (schema, batches) = crate::utils::test::geo::batches(ROWS_PER_FRAGMENT, FRAGMENTS);
         let test_dir = TempStrDir::default();
         let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
         let mut dataset = Dataset::write(
@@ -5670,6 +6171,94 @@ mod tests {
             id_field_id,
         )
         .await;
+    }
+
+    #[cfg(feature = "geo")]
+    async fn compact_into_one_fragment(
+        dataset: &mut Dataset,
+        rows_per_fragment: i32,
+        fragments: i32,
+    ) {
+        compact_files(
+            dataset,
+            crate::utils::test::geo::deferred_compaction(rows_per_fragment, fragments),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            dataset.get_fragments().len(),
+            1,
+            "the fragments must become one rewrite group"
+        );
+    }
+
+    /// Rows the merged index holds.
+    #[cfg(feature = "geo")]
+    async fn merged_rtree_item_count(dataset: &Dataset, merged: &IndexMetadata) -> u64 {
+        let index = crate::index::scalar::open_scalar_index(
+            dataset,
+            "geometry",
+            merged,
+            &NoOpMetricsCollector,
+        )
+        .await
+        .unwrap();
+        index.statistics().unwrap()["num_items"].as_u64().unwrap()
+    }
+
+    /// RTree segments staged before a deferred compaction: merged coverage moves
+    /// to the compacted fragment only if the segments cover the whole group.
+    #[cfg(feature = "geo")]
+    #[rstest]
+    #[case::whole_group(true)]
+    #[case::part_of_the_group(false)]
+    #[tokio::test]
+    async fn test_rtree_merge_coverage_across_a_deferred_compaction(#[case] whole_group: bool) {
+        const ROWS_PER_FRAGMENT: i32 = 10;
+        const FRAGMENTS: i32 = 3;
+
+        let test_dir = TempStrDir::default();
+        let (mut dataset, params) = crate::utils::test::geo::dataset_with_committed_rtree_index(
+            test_dir.as_str(),
+            ROWS_PER_FRAGMENT,
+            FRAGMENTS,
+        )
+        .await;
+        let mut covered = all_fragment_ids(&dataset);
+        if !whole_group {
+            covered.pop();
+        }
+        let staged =
+            crate::utils::test::geo::stage_rtree_segments(&mut dataset, &params, covered).await;
+        compact_into_one_fragment(&mut dataset, ROWS_PER_FRAGMENT, FRAGMENTS).await;
+        let surviving = all_fragment_ids(&dataset);
+
+        let merged = dataset.merge_existing_index_segments(staged).await.unwrap();
+        let coverage = merged
+            .fragment_bitmap
+            .as_ref()
+            .expect("a merged segment records what it covers");
+
+        if !whole_group {
+            assert!(
+                coverage.is_empty(),
+                "a straddling merge claimed {coverage:?}; the rewritten fragment holds \
+                 unindexed rows, which would then be dropped from results instead of scanned"
+            );
+            return;
+        }
+        assert_eq!(
+            coverage.iter().collect::<Vec<_>>(),
+            surviving,
+            "coverage must name the fragment the rewrite produced"
+        );
+        // The claim is only correct if the index holds every row of the fragment.
+        assert_eq!(
+            merged_rtree_item_count(&dataset, &merged).await,
+            (ROWS_PER_FRAGMENT * FRAGMENTS) as u64,
+            "the merged index must hold every row of the fragment it claims"
+        );
     }
 
     #[tokio::test]
@@ -10980,6 +11569,161 @@ mod tests {
         );
     }
 
+    #[rstest::rstest]
+    #[case::retained_row_ids(false)]
+    #[case::retained_row_addresses(true)]
+    #[tokio::test]
+    async fn test_staged_btree_row_domains_reject_partial_migration(
+        #[case] retain_row_addresses: bool,
+    ) {
+        let dir = copy_test_data_to_tmp("v14.0.0-beta.15/stable_row_id_btree.lance").unwrap();
+        let mut dataset = Dataset::open(&dir.path_str()).await.unwrap();
+        assert!(dataset.manifest.uses_stable_row_ids());
+        let legacy = dataset.load_indices_by_name("value_idx").await.unwrap();
+        assert_eq!(legacy.len(), 2);
+        assert!(
+            legacy
+                .iter()
+                .all(|segment| !segment.results_are_row_addrs())
+        );
+        let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::BTree);
+        let mut current = Vec::with_capacity(2);
+        for fragment_id in [0, 1] {
+            current.push(
+                dataset
+                    .create_index_builder(&["value"], IndexType::BTree, &params)
+                    .name("value_idx".into())
+                    .replace(true)
+                    .fragments(vec![fragment_id])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+            );
+        }
+        assert!(
+            current
+                .iter()
+                .all(|segment| segment.results_are_row_addrs())
+        );
+        if retain_row_addresses {
+            dataset
+                .commit_existing_index_segments("value_idx", "value", current.clone())
+                .await
+                .unwrap();
+        }
+        dataset = Dataset::open(&dir.path_str()).await.unwrap();
+        let before_version = dataset.version_id();
+        let before = dataset.load_indices_by_name("value_idx").await.unwrap();
+        let incoming = if retain_row_addresses {
+            legacy[0].clone()
+        } else {
+            current[0].clone()
+        };
+        let error = dataset
+            .commit_existing_index_segments("value_idx", "value", vec![incoming])
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(error.to_string().contains("mixes row-ID and row-address"));
+        let mut dataset = Dataset::open(&dir.path_str()).await.unwrap();
+        assert_eq!(dataset.version_id(), before_version);
+        assert_eq!(
+            dataset.load_indices_by_name("value_idx").await.unwrap(),
+            before
+        );
+        for (filter, expected) in [("value = 1", 1), ("value = 9", 1), ("value IS NULL", 2)] {
+            for indexed in [false, true] {
+                let mut scan = dataset.scan();
+                scan.filter(filter).unwrap().use_scalar_index(indexed);
+                assert_eq!(scan.try_into_batch().await.unwrap().num_rows(), expected);
+            }
+        }
+        // A complete migration remains valid: no legacy sibling survives it.
+        dataset
+            .commit_existing_index_segments("value_idx", "value", current)
+            .await
+            .unwrap();
+        assert!(
+            dataset
+                .load_indices_by_name("value_idx")
+                .await
+                .unwrap()
+                .iter()
+                .all(|segment| segment.results_are_row_addrs())
+        );
+        assert_eq!(
+            dataset.count_rows(Some("value = 9".into())).await.unwrap(),
+            1
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::legacy_first(false, false)]
+    #[case::address_first(true, false)]
+    #[case::transaction_boundary(false, true)]
+    #[tokio::test]
+    async fn test_staged_btree_row_domains_reject_mixed_incoming(
+        #[case] reverse: bool,
+        #[case] direct_transaction: bool,
+    ) {
+        let dir = copy_test_data_to_tmp("v14.0.0-beta.15/stable_row_id_btree.lance").unwrap();
+        let mut dataset = Dataset::open(&dir.path_str()).await.unwrap();
+        let legacy = dataset.load_indices_by_name("value_idx").await.unwrap();
+        let first = legacy
+            .iter()
+            .find(|segment| segment.fragment_bitmap.as_ref().unwrap().contains(0))
+            .unwrap()
+            .clone();
+        let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::BTree);
+        let current = dataset
+            .create_index_builder(&["value"], IndexType::BTree, &params)
+            .name("value_idx".into())
+            .replace(true)
+            .fragments(vec![1])
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        let mut incoming = vec![first, current];
+        if reverse {
+            incoming.reverse();
+        }
+        let version = dataset.version_id();
+        let error = if direct_transaction {
+            dataset
+                .apply_commit(
+                    Transaction::new(
+                        version,
+                        Operation::CreateIndex {
+                            new_indices: incoming,
+                            removed_indices: legacy.clone(),
+                        },
+                        None,
+                    ),
+                    &Default::default(),
+                    &Default::default(),
+                )
+                .await
+                .unwrap_err()
+        } else {
+            dataset
+                .commit_existing_index_segments("value_idx", "value", incoming)
+                .await
+                .unwrap_err()
+        };
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(error.to_string().contains("mixes row-ID and row-address"));
+        let dataset = Dataset::open(&dir.path_str()).await.unwrap();
+        assert_eq!(dataset.version_id(), version);
+        assert_eq!(
+            dataset.load_indices_by_name("value_idx").await.unwrap(),
+            legacy
+        );
+        assert_eq!(
+            dataset.count_rows(Some("value = 9".into())).await.unwrap(),
+            1
+        );
+    }
+
     #[tokio::test]
     async fn test_commit_existing_index_segments_commits_multiple_segments() {
         use lance_datagen::{BatchCount, RowCount, array};
@@ -13293,7 +14037,18 @@ mod tests {
         let mut unreadable = current.clone();
         match kind {
             UnreadableIndexKind::NewerVersion => {
-                unreadable[0].index_version = current[0].index_version + 1;
+                // Derive the unsupported version from what this build's
+                // plugin actually reports as its max supported version,
+                // rather than from the freshly created index's own version:
+                // BTree now varies that baseline by whether the dataset uses
+                // stable row ids (see BTREE_ROW_ID_DOMAIN_VERSION), so
+                // `current + 1` no longer reliably lands past what this
+                // build can read.
+                let max_supported =
+                    crate::index::scalar::IndexDetails(current[0].index_details.clone().unwrap())
+                        .index_version()
+                        .unwrap();
+                unreadable[0].index_version = (max_supported + 1) as i32;
             }
             UnreadableIndexKind::UnknownType => {
                 unreadable[0].index_details = Some(Arc::new(prost_types::Any {
@@ -13341,9 +14096,23 @@ mod tests {
         index_name: &str,
         kind: UnreadableIndexKind,
     ) -> Dataset {
-        let mut dataset = Dataset::write(two_column_reader(), uri, None)
-            .await
-            .unwrap();
+        // Stable row ids so the BTree indices this fixture creates are
+        // address-domain (index_version 1): `hide_index_as`'s NewerVersion
+        // kind computes an unsupported version as `current + 1`, which only
+        // exceeds what this build supports starting from that baseline. On a
+        // dataset without stable row ids, BTree is created at index_version 0
+        // instead (see BTREE_ROW_ID_DOMAIN_VERSION), and 0 + 1 is this
+        // build's own max supported version, not an unsupported one.
+        let mut dataset = Dataset::write(
+            two_column_reader(),
+            uri,
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
 
         let btree_params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
         dataset
@@ -14089,9 +14858,12 @@ mod tests {
             .unwrap();
         assert_eq!(dataset.get_fragments().len(), 2);
 
-        let btree_params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
+        // Row-id-domain: its coverage is recalculated (not dropped) across a
+        // rewrite under stable row ids, which is exactly the property this test
+        // checks. BTree moved to row-address domain and no longer exercises it.
+        let bitmap_params = ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap);
         dataset
-            .create_index_builder(&["id"], IndexType::BTree, &btree_params)
+            .create_index_builder(&["id"], IndexType::Bitmap, &bitmap_params)
             .name("id_idx".to_string())
             .train(false)
             .await
@@ -14592,5 +15364,137 @@ mod tests {
             distance > 1_000.0,
             "nearest distance {distance} should reflect the rewritten vectors, not stale postings"
         );
+    }
+
+    /// `fragments` fragments of 10 rows of `i`, with a BTree index on it so
+    /// that deferred compactions record their groups. Returns the table and
+    /// the fragments the index was built over.
+    async fn recording_btree_table(uri: &str, fragments: u32) -> (Dataset, RoaringBitmap) {
+        let mut dataset = gen_batch()
+            .col("i", array::step::<Int32Type>())
+            .into_dataset_with_params(
+                uri,
+                FragmentCount::from(fragments),
+                FragmentRowCount::from(10),
+                Some(WriteParams {
+                    max_rows_per_file: 10,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["i"],
+                IndexType::BTree,
+                Some("i_idx".into()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        let built = dataset
+            .manifest
+            .fragments
+            .iter()
+            .map(|fragment| fragment.id as u32)
+            .collect();
+        (dataset, built)
+    }
+
+    /// Twelve compactions each rewrite both fragments into two, so both
+    /// outputs come from both inputs and a current fragment reaches every
+    /// earlier one along many paths. Traced back to the index's build, each
+    /// fragment is followed once: the work stays within the fragments the
+    /// history names, and the build's two fragments come back once each.
+    #[tokio::test]
+    async fn test_sources_at_build_follows_each_shared_ancestor_once() {
+        let dir = TempStrDir::default();
+        let (mut dataset, built) = recording_btree_table(dir.as_str(), 2).await;
+        let version = dataset.manifest.version;
+        for _ in 0..12 {
+            let current = dataset
+                .manifest
+                .fragments
+                .iter()
+                .map(|fragment| fragment.id)
+                .collect::<Vec<_>>();
+            compact_into_two(&mut dataset, &current).await;
+        }
+        let history = dataset.frag_reuse_index().await.unwrap().unwrap();
+        let versions = &history.details.versions;
+        let named = versions
+            .iter()
+            .flat_map(|reuse| reuse.old_frag_ids().into_iter().chain(reuse.new_frag_ids()))
+            .map(|id| id as u32)
+            .collect::<RoaringBitmap>();
+        assert_eq!((versions.len(), named.len()), (12, 26));
+
+        for fragment in dataset.manifest.fragments.iter() {
+            let visits = std::cell::Cell::new(0);
+            let mut sources = sources_at_build(versions, version, fragment.id as u32, |id| {
+                visits.set(visits.get() + 1);
+                built.contains(id)
+            })
+            .unwrap();
+            assert!(
+                visits.get() <= named.len(),
+                "tracing fragment {} took {} visits and returned {} sources",
+                fragment.id,
+                visits.get(),
+                sources.len()
+            );
+            sources.sort_unstable();
+            assert_eq!(sources, [0, 1]);
+        }
+    }
+
+    /// Compactions rewrite fragments 0 and 1 into 4 and 5, 2 and 3 into 6 and
+    /// 7, then 5 and 6 into 8 and 9. The index is caught up past the first
+    /// one, so a cleanup trims its record: 4 and 5 no longer trace to the
+    /// build, and neither do 8 and 9, though their other source, 6, does, as 7
+    /// still does.
+    #[tokio::test]
+    async fn test_sources_at_build_fails_on_a_missing_link_beside_a_traced_one() {
+        let dir = TempStrDir::default();
+        let (mut dataset, built) = recording_btree_table(dir.as_str(), 4).await;
+        let version = dataset.manifest.version;
+        let first = compact_into_two(&mut dataset, &[0, 1]).await;
+        crate::dataset::optimize::remapping::remap_column_index(
+            &mut dataset,
+            &["i"],
+            Some("i_idx".into()),
+        )
+        .await
+        .unwrap();
+        let second = compact_into_two(&mut dataset, &[2, 3]).await;
+        let third = compact_into_two(&mut dataset, &[first[1], second[0]]).await;
+        let trace = |versions: &[FragReuseVersion], fragment: u64| {
+            sources_at_build(versions, version, fragment as u32, |id| built.contains(id)).map(
+                |mut sources| {
+                    sources.sort_unstable();
+                    sources
+                },
+            )
+        };
+        let recorded = dataset.frag_reuse_index().await.unwrap().unwrap();
+        assert_eq!(
+            trace(&recorded.details.versions, third[0]),
+            Some(vec![0, 1, 2, 3])
+        );
+
+        crate::dataset::index::frag_reuse::cleanup_frag_reuse_index(&mut dataset)
+            .await
+            .unwrap();
+        let kept = dataset.frag_reuse_index().await.unwrap().unwrap();
+        assert_eq!(kept.details.versions.len(), 2);
+        for fragment in [first[0], third[0], third[1]] {
+            assert_eq!(
+                trace(&kept.details.versions, fragment),
+                None,
+                "fragment {fragment}"
+            );
+        }
+        assert_eq!(trace(&kept.details.versions, second[1]), Some(vec![2, 3]));
     }
 }
