@@ -180,3 +180,35 @@ tensor_images.to_encoded()
 # [...
 # b'\x89PNG\r\n\x1a...'
 ```
+
+## Compressing integer tensors (Lance 2.3)
+
+The unstable 2.3 writer can compress each fixed-size-list row independently with
+`lance-encoding:compression=lz4` or `zstd`. It automatically considers AxisDelta
+for signed or unsigned 8-, 16-, 32-, and 64-bit integer tensors in per-value pages.
+AxisDelta stores differences between adjacent values along one tensor axis,
+without losing precision or sharing prediction state across rows.
+
+The default tries the longest physical dimension, breaking ties in favor of the
+innermost dimension. Shape comes from Arrow fixed-shape tensor metadata, including
+its optional permutation, or from fixed-size-list nesting. A flat list without
+extension metadata is one-dimensional. The writer samples up to four complete
+non-null tensors, at most 4 MiB per page, and requires at least a 5% estimated
+reduction in compressed payload and descriptor size. Both candidates use the
+configured codec and level. Sampling adds write work even when prediction loses;
+it does not guarantee a smaller complete page or faster reads.
+
+Field metadata `lance-encoding:axis-delta` accepts `auto` (the default),
+`auto:<axis>`, `on:<axis>`, and `off`. An explicit axis is a zero-based logical
+axis inside the tensor, excluding the dataset row dimension. For HWC images,
+`auto:1` tests horizontal prediction independently within each channel.
+`on:<axis>` forces prediction and rejects unsupported types or inner nulls.
+`off` skips prediction and sampling while retaining the configured general codec.
+
+Automatic prediction skips floating-point data, inner nulls, unsupported layouts,
+length-one axes, and tensors larger than the sample budget. Missing or `none`
+general compression keeps the existing encoding. Invalid extension metadata is
+ignored by implicit Auto; explicitly requested prediction validates it and
+reports an error. Existing structural and dictionary selection happens first.
+Random reads still address individual tensors, but decoding one tensor requires
+its entire compressed frame. Stable 2.1 and 2.2 writers are unchanged.

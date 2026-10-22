@@ -16,6 +16,8 @@
 //! Fullzip compression is a per-value approach where we require that values are transparently
 //! compressed so that we can locate them later.
 
+use crate::encodings::physical::axis_delta::AxisDeltaDecompressor;
+pub use crate::encodings::physical::axis_delta::try_axis_delta_per_value;
 #[cfg(feature = "bitpacking")]
 use crate::encodings::physical::bitpacking::{InlineBitpacking, OutOfLineBitpacking};
 use crate::{
@@ -50,7 +52,8 @@ use crate::{
                 FsstPerValueEncoder,
             },
             general::{
-                FixedWidthGeneralBlockDecompressor, GeneralBlockCompressor,
+                FixedWidthGeneralBlockDecompressor, FixedWidthGeneralPerValueCompressor,
+                FixedWidthGeneralPerValueDecompressor, GeneralBlockCompressor,
                 GeneralMiniBlockCompressor, GeneralMiniBlockDecompressor,
             },
             packed::{
@@ -577,6 +580,7 @@ fn try_general_compression(
 }
 
 /// Parse field-level compression metadata without applying format-specific constraints.
+/// AxisDelta metadata is validated separately when selecting a per-value compressor.
 pub fn field_metadata_params(field: &Field) -> CompressionFieldParams {
     let mut params = CompressionFieldParams::default();
 
@@ -793,6 +797,26 @@ pub fn try_raw_fixed_size_list_miniblock(data: &DataBlock) -> Option<Box<dyn Min
 pub fn try_raw_per_value(data: &DataBlock) -> Option<Box<dyn PerValueCompressor>> {
     matches!(data, DataBlock::FixedWidth(_) | DataBlock::FixedSizeList(_))
         .then(|| Box::new(ValueEncoder::default()) as _)
+}
+
+/// Apply configured LZ4 or Zstd compression independently to fixed-size-list rows.
+/// Each row retains its own frame and remains independently addressable.
+pub fn try_fixed_size_list_per_value(
+    data: &DataBlock,
+    params: &CompressionFieldParams,
+) -> Option<Box<dyn PerValueCompressor>> {
+    if !matches!(data, DataBlock::FixedSizeList(_)) {
+        return None;
+    }
+    let scheme = match params.compression.as_deref() {
+        Some("zstd") => CompressionScheme::Zstd,
+        Some("lz4") => CompressionScheme::Lz4,
+        _ => return None,
+    };
+    Some(Box::new(FixedWidthGeneralPerValueCompressor::new(
+        Box::new(ValueEncoder::default()),
+        CompressionConfig::new(scheme, params.compression_level),
+    )))
 }
 
 fn validate_packed_struct(field: &Field, data: &DataBlock) -> Result<Option<bool>> {
@@ -1260,6 +1284,7 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
             ))),
             Compression::Flat(flat) => Ok(Box::new(ValueDecompressor::from_flat(flat))),
             Compression::FixedSizeList(fsl) => Ok(Box::new(ValueDecompressor::from_fsl(fsl)?)),
+            Compression::AxisDelta(delta) => Ok(Box::new(AxisDeltaDecompressor::try_new(delta)?)),
             Compression::PackedStruct(description) => Ok(Box::new(
                 PackedStructFixedPerValueDecompressor::new(description)?,
             )),
@@ -1307,9 +1332,23 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
                 LanceBuffer::from_bytes(fsst.symbol_table.clone(), 1),
                 Box::new(VariableDecoder::default()),
             ))),
-            Compression::General(general) => Ok(Box::new(CompressedBufferEncoder::from_scheme(
-                general.compression.as_ref().expect_ok()?.scheme(),
-            )?)),
+            Compression::General(general) => {
+                let compression = general.compression.as_ref().expect_ok()?;
+                if let Some(inner) = general.values.as_deref()
+                    && matches!(
+                        inner.compression,
+                        Some(Compression::FixedSizeList(_) | Compression::AxisDelta(_))
+                    )
+                {
+                    return Ok(Box::new(FixedWidthGeneralPerValueDecompressor::new(
+                        self.create_fixed_per_value_decompressor(inner)?,
+                        CompressionConfig::new(compression.scheme().try_into()?, compression.level),
+                    )));
+                }
+                Ok(Box::new(CompressedBufferEncoder::from_scheme(
+                    compression.scheme(),
+                )?))
+            }
             Compression::VariablePackedStruct(description) => {
                 let mut fields = Vec::with_capacity(description.fields.len());
                 for field in &description.fields {
@@ -1998,7 +2037,7 @@ fn compression_name(compression: &Compression) -> &'static str {
         Compression::Constant(_) => "constant",
         Compression::Dictionary(_) => "dictionary",
         Compression::ByteStreamSplit(_) => "byte stream split",
-        Compression::AxisDelta(_) => "axis delta",
+        Compression::AxisDelta(_) => "axis_delta",
         Compression::PackedStruct(_) => "packed struct",
         Compression::FixedSizeList(_) => "fixed-size list",
         Compression::VariablePackedStruct(_) => "variable packed struct",
@@ -2300,6 +2339,7 @@ mod tests {
                 compression: Some("lz4".to_string()),
                 compression_level: None,
                 bss: Some(BssMode::Off), // Explicitly disable BSS to test RLE
+                axis_delta: None,
                 minichunk_size: None,
             },
         );
@@ -2332,6 +2372,7 @@ mod tests {
                 compression: Some("zstd".to_string()),
                 compression_level: Some(3),
                 bss: Some(BssMode::Off), // Disable BSS to test RLE
+                axis_delta: None,
                 minichunk_size: None,
             },
         );
@@ -2764,6 +2805,7 @@ mod tests {
                 compression: Some("zstd".to_string()),
                 compression_level: Some(6),
                 bss: None,
+                axis_delta: None,
                 minichunk_size: None,
             },
         );
@@ -3166,6 +3208,7 @@ mod tests {
                 compression: Some("lz4".to_string()),
                 compression_level: None,
                 bss: None,
+                axis_delta: None,
                 minichunk_size: None,
             },
         );
