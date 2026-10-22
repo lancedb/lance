@@ -866,6 +866,8 @@ async fn test_tensor_per_value_compression(
     let metadata = HashMap::from([
         (COMPRESSION_META_KEY.to_string(), compression.to_string()),
         (COMPRESSION_LEVEL_META_KEY.to_string(), "3".to_string()),
+        // Exercise the configured codec independently of automatic selection.
+        ("lance-encoding:axis-delta".to_string(), "off".to_string()),
     ]);
     let field = arrow_schema::Field::new("tensor", array.data_type().clone(), true)
         .with_metadata(metadata.clone());
