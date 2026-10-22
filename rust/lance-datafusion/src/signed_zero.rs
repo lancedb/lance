@@ -135,7 +135,7 @@ pub fn normalize_zero_comparisons(
 /// Both encodings of a floating point zero, negative first.
 ///
 /// Returns `None` for anything else, including NULL, NaN, and integer zero.
-fn zero_encodings(value: &ScalarValue) -> Option<(ScalarValue, ScalarValue)> {
+pub fn zero_encodings(value: &ScalarValue) -> Option<(ScalarValue, ScalarValue)> {
     match value {
         Float16(Some(v)) if *v == f16::ZERO => {
             Some((Float16(Some(f16::NEG_ZERO)), Float16(Some(f16::ZERO))))

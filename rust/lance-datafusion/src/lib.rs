@@ -22,7 +22,8 @@ pub mod pb {
     #![allow(clippy::use_self)]
     include!(concat!(env!("OUT_DIR"), "/lance.datafusion.rs"));
 }
-mod signed_zero;
+#[doc(hidden)]
+pub mod signed_zero;
 pub mod spill;
 pub mod sql;
 #[cfg(feature = "substrait")]

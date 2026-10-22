@@ -91,6 +91,7 @@ use arrow_select::take::take_record_batch;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{Column as DFColumn, NullEquality, TableReference};
 use datafusion::error::DataFusionError;
+use datafusion::physical_plan::replace_children_if_necessary;
 use datafusion::{
     catalog::{TableProvider, streaming::StreamingTable},
     datasource::MemTable,
@@ -1870,7 +1871,7 @@ impl MergeInsertJob {
                                 as Arc<dyn ExecutionPlan>
                         })
                         .collect();
-                    let new_node = node.with_new_children(new_children)?;
+                    let new_node = replace_children_if_necessary(node, new_children)?;
                     Ok(Transformed::yes(new_node))
                 } else {
                     Ok(Transformed::no(node))
@@ -4148,6 +4149,10 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
     use arrow_select::concat::concat_batches;
     use datafusion::common::Column;
+    use datafusion::physical_plan::ChildrenPropertiesMode;
+    use datafusion::physical_plan::ReplaceChildrenOptions;
+    use datafusion::physical_plan::StatisticsArgs;
+    use datafusion::physical_plan::StatisticsContext;
     use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
     use futures::{FutureExt, StreamExt, TryStreamExt, future::try_join_all};
     use lance_arrow::FixedSizeListArrayExt;
@@ -5815,13 +5820,10 @@ mod tests {
         assert_eq!(actual_payload, expected_payload);
     }
 
-    /// merge_insert matches keys by bit pattern, in the indexed probe and in the
-    /// hash join behind it alike, so a source key of `+0.0` updates only the
-    /// `+0.0` row. Filters answer zero comparisons per IEEE 754 now, and this
-    /// pins that the two are still allowed to disagree: making key matching agree
-    /// needs the unindexed join fixed too, and DataFusion 54 hashes join keys by
-    /// raw bits. Both settings of `use_index` are exercised; which one the planner
-    /// picks for a one-row source is not asserted.
+    /// merge_insert matches float keys per IEEE 754, like filters do, so a source
+    /// key of `+0.0` matches both the `-0.0` and the `+0.0` row. Both settings of
+    /// `use_index` are exercised; which one the planner picks for a one-row source
+    /// is not asserted.
     #[rstest::rstest]
     #[tokio::test]
     async fn test_merge_insert_on_float_zero_key(#[values(true, false)] use_index: bool) {
@@ -5864,10 +5866,86 @@ mod tests {
             .await
             .unwrap();
 
-        // Only the +0.0 row is updated. Checking both sides pins which row was
-        // replaced, not just how many; `value = 20` is the -0.0 row.
+        // Both zero rows are updated; `value = 20` was the -0.0 row and
+        // `value = 30` the +0.0 row.
         assert_eq!(ds.count_rows(None).await.unwrap(), 4);
-        for (filter, expected) in [("value = 99", 1), ("value = 30", 0), ("value = 20", 1)] {
+        for (filter, expected) in [("value = 99", 2), ("value = 30", 0), ("value = 20", 0)] {
+            assert_eq!(
+                ds.count_rows(Some(filter.to_string())).await.unwrap(),
+                expected,
+                "{filter}"
+            );
+        }
+    }
+
+    /// `-0.0` and `+0.0` are one key, so a source holding both has a duplicate
+    /// key: each zero target row is matched twice. The default `Fail` rejects
+    /// that as ambiguous; `FirstSeen` updates each zero row once, with either
+    /// source row's value depending on join order.
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn test_merge_insert_source_with_both_float_zeros(
+        #[values(true, false)] use_index: bool,
+        #[values(SourceDedupeBehavior::Fail, SourceDedupeBehavior::FirstSeen)]
+        behavior: SourceDedupeBehavior,
+    ) {
+        let target = record_batch!(
+            (
+                "key",
+                Float64,
+                [Some(-1.0), Some(-0.0), Some(0.0), Some(1.0)]
+            ),
+            ("value", Int32, [10, 20, 30, 40])
+        )
+        .unwrap();
+        let schema = target.schema();
+        let reader = RecordBatchIterator::new(vec![Ok(target)], schema.clone());
+        let mut ds = Dataset::write(reader, "memory://", None).await.unwrap();
+        ds.create_index(
+            &["key"],
+            IndexType::Scalar,
+            None,
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+
+        let source = record_batch!(
+            ("key", Float64, [Some(-0.0), Some(0.0)]),
+            ("value", Int32, [98, 99])
+        )
+        .unwrap();
+        let result = MergeInsertBuilder::try_new(Arc::new(ds), vec!["key".to_string()])
+            .unwrap()
+            .when_not_matched(WhenNotMatched::DoNothing)
+            .when_matched(WhenMatched::UpdateAll)
+            .use_index(use_index)
+            .source_dedupe_behavior(behavior)
+            .try_build()
+            .unwrap()
+            .execute_reader(Box::new(RecordBatchIterator::new(
+                vec![Ok(source)],
+                schema.clone(),
+            )))
+            .await;
+
+        if behavior == SourceDedupeBehavior::Fail {
+            let err = result.unwrap_err().to_string();
+            assert!(
+                err.contains("Ambiguous merge inserts"),
+                "Fail must reject a source holding both zeros, got: {err}"
+            );
+            return;
+        }
+
+        let (ds, _) = result.unwrap();
+        assert_eq!(ds.count_rows(None).await.unwrap(), 4);
+        for (filter, expected) in [
+            ("value = 98 OR value = 99", 2),
+            ("value = 20", 0),
+            ("value = 30", 0),
+        ] {
             assert_eq!(
                 ds.count_rows(Some(filter.to_string())).await.unwrap(),
                 expected,
@@ -7304,8 +7382,11 @@ mod tests {
         );
 
         let rebuilt = plan
-            .with_new_children(vec![dummy_input.clone()])
-            .expect("with_new_children must accept exactly one child");
+            .replace_children(
+                vec![dummy_input.clone()],
+                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+            )
+            .expect("replace_children must accept exactly one child");
         let rebuilt_rendered = format!("{}", displayable(rebuilt.as_ref()).indent(false));
         assert!(
             rebuilt_rendered.contains("IndexedLookup [a, b]"),
@@ -16868,7 +16949,7 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
     }
 
     fn collect_exact_row_counts(plan: &Arc<dyn ExecutionPlan>, out: &mut Vec<usize>) {
-        if let Ok(stats) = plan.partition_statistics(None)
+        if let Ok(stats) = StatisticsContext::new().compute(plan.as_ref(), &StatisticsArgs::new())
             && let datafusion::common::stats::Precision::Exact(n) = stats.num_rows
         {
             out.push(n);
