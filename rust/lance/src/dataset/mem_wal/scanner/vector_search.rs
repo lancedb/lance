@@ -149,8 +149,8 @@ fn sstable_distance_scale(distance_type: lance_linalg::distance::DistanceType) -
 
 /// Whether `dataset` holds an index the scanner would answer a `distance_type`
 /// search on `column` with. Mirrors the scanner's own choice: keyed on the
-/// column, a known type, and a compatible metric. A generation without one
-/// must be searched flat, since `fast_search` over it returns nothing.
+/// column, a known type, and a compatible metric. A generation without one is
+/// searched flat, which reports exact rather than index-scaled distances.
 async fn has_usable_vector_index(
     dataset: &Dataset,
     column: &str,
@@ -695,7 +695,7 @@ impl LsmVectorSearchPlanner {
                 };
                 scanner.nearest(&vector_column, query_arr.as_ref(), k)?;
                 // A generation flushed while the column was not maintained has
-                // no index on it: search it flat, which reports exact distances.
+                // no index on it, so the scanner searches it flat.
                 let indexed =
                     has_usable_vector_index(&dataset, &vector_column, self.distance_type).await?;
                 let native_scale = if indexed {
@@ -718,11 +718,8 @@ impl LsmVectorSearchPlanner {
                 if let Some(ef) = self.ef {
                     scanner.ef(ef);
                 }
-                if indexed {
-                    scanner.fast_search();
-                    if let Some(refine_factor) = refine_factor {
-                        scanner.refine(refine_factor);
-                    }
+                if indexed && let Some(refine_factor) = refine_factor {
+                    scanner.refine(refine_factor);
                 }
                 // Boxed for the reason the scan planner's arm gives: a
                 // generation resolves its own schema before scanning, and
