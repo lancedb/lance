@@ -10,13 +10,16 @@ use std::{
 };
 
 use arrow_array::{RecordBatchIterator, record_batch};
-use arrow_schema::Field;
+use arrow_schema::{DataType, Field};
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use futures::TryStreamExt;
 use lance::{
     Dataset,
-    dataset::WriteParams,
+    dataset::{
+        ColumnAlteration, WriteParams,
+        optimize::{CompactionOptions, compact_files},
+    },
     index::{DatasetIndexExt, DatasetIndexInternalExt, register_scalar_index_plugin},
 };
 use lance_core::{
@@ -25,6 +28,7 @@ use lance_core::{
 use lance_index::{
     Index, IndexType,
     metrics::{MetricsCollector, NoOpMetricsCollector},
+    optimize::OptimizeOptions,
     progress::IndexBuildProgress,
     scalar::{
         AnyQuery, CreatedIndex, IndexStore, OldIndexDataFilter, RowIdRemapper, ScalarIndex,
@@ -36,7 +40,7 @@ use lance_index::{
 use prost::Name;
 use roaring::RoaringBitmap;
 use rstest::rstest;
-use tempfile::tempdir;
+use tempfile::{TempDir, tempdir};
 
 #[derive(Clone, PartialEq, prost::Message)]
 struct ExampleIndexDetails {}
@@ -138,6 +142,9 @@ impl ScalarIndexPlugin for ExampleIndexPlugin {
         "Example"
     }
     fn provides_exact_answer(&self) -> bool {
+        false
+    }
+    fn supports_optimization(&self) -> bool {
         false
     }
     fn version(&self) -> u32 {
@@ -416,4 +423,239 @@ async fn reopen_in_another_process() {
         .output()
         .unwrap();
     assert!(output.status.success(), "child process failed: {output:?}");
+}
+
+async fn dataset_with_example_index(stable_row_ids: bool) -> (TempDir, Dataset) {
+    LazyLock::force(&REGISTRATION);
+    let directory = tempdir().unwrap();
+    let batch = record_batch!(
+        ("value", Int64, [Some(1), None, Some(3), Some(4)]),
+        ("other", Int64, [1, 2, 3, 4]),
+        ("keep", Int64, [1, 2, 3, 4])
+    )
+    .unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+        directory.path().to_str().unwrap(),
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            enable_stable_row_ids: stable_row_ids,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.fragments().len(), 2);
+    let mut segment = dataset
+        .create_index_builder(
+            &["value"],
+            IndexType::Scalar,
+            &ScalarIndexParams::new("example".into()),
+        )
+        .name("profile".into())
+        .execute_uncommitted()
+        .await
+        .unwrap();
+    segment.fragment_bitmap = Some(RoaringBitmap::new());
+    dataset
+        .commit_existing_index_segments("profile", "value", vec![segment])
+        .await
+        .unwrap();
+    // Compare persisted metadata across maintenance operations: serialization
+    // stores creation timestamps at millisecond precision.
+    let reopened = Dataset::open(dataset.uri()).await.unwrap();
+    (directory, reopened)
+}
+
+#[rstest]
+#[case::default(OptimizeOptions::default())]
+#[case::append(OptimizeOptions::append())]
+#[case::merge(OptimizeOptions::merge(1))]
+#[case::retrain(OptimizeOptions::retrain())]
+#[case::bounded(OptimizeOptions::default().max_rows_per_task(Some(2)))]
+#[tokio::test]
+async fn externally_maintained_index_is_skipped(#[case] options: OptimizeOptions) {
+    let (_directory, mut dataset) = dataset_with_example_index(false).await;
+    let before = dataset.load_indices().await.unwrap();
+    let version = dataset.version().version;
+    let plan = lance::index::optimize::plan_optimize_indices(&dataset, &options)
+        .await
+        .unwrap();
+    assert!(plan.tasks.is_empty());
+    assert!(plan.merges.is_empty());
+    dataset.optimize_indices(&options).await.unwrap();
+    assert_eq!(dataset.version().version, version);
+    assert_eq!(dataset.load_indices().await.unwrap(), before);
+
+    let error = dataset
+        .optimize_indices(&options.index_names(vec!["profile".into()]))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::NotSupported { .. }));
+    assert!(error.to_string().contains("profile"));
+    assert!(error.to_string().contains("maintained externally"));
+}
+
+#[tokio::test]
+async fn externally_maintained_index_does_not_block_builtin_optimization() {
+    let (_directory, mut dataset) = dataset_with_example_index(false).await;
+    let profile = dataset.load_indices().await.unwrap()[0].clone();
+    dataset
+        .create_index(
+            &["other"],
+            IndexType::BTree,
+            Some("lookup".into()),
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+    let batch = record_batch!(
+        ("value", Int64, [5, 6]),
+        ("other", Int64, [5, 6]),
+        ("keep", Int64, [5, 6])
+    )
+    .unwrap();
+    dataset
+        .append(
+            RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+            None,
+        )
+        .await
+        .unwrap();
+    dataset
+        .optimize_indices(&OptimizeOptions::default())
+        .await
+        .unwrap();
+    let indices = dataset.load_indices().await.unwrap();
+    assert_eq!(indices.len(), 2);
+    assert!(indices.iter().any(|index| index == &profile));
+    let lookup = indices.iter().find(|index| index.name == "lookup").unwrap();
+    assert_eq!(lookup.fragment_bitmap.as_ref().unwrap().len(), 3);
+    assert_eq!(
+        dataset
+            .scan()
+            .filter("other >= 5")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap()
+            .num_rows(),
+        2
+    );
+}
+
+#[rstest]
+#[case::row_addresses(false)]
+#[case::stable_row_ids(true)]
+#[tokio::test]
+async fn empty_coverage_survives_compaction(#[case] stable_row_ids: bool) {
+    let (_directory, mut dataset) = dataset_with_example_index(stable_row_ids).await;
+    let before = dataset.load_indices().await.unwrap();
+    compact_files(&mut dataset, CompactionOptions::default(), None)
+        .await
+        .unwrap();
+    assert_eq!(dataset.fragments().len(), 1);
+    assert_eq!(dataset.count_rows(None).await.unwrap(), 4);
+    assert_eq!(dataset.load_indices().await.unwrap(), before);
+    let reopened = Dataset::open(dataset.uri()).await.unwrap();
+    let index = reopened
+        .open_scalar_index("value", &before[0].uuid, &NoOpMetricsCollector)
+        .await
+        .unwrap();
+    assert!(!index.can_remap());
+    assert_eq!(index.statistics().unwrap()["rows"], 4);
+}
+
+#[tokio::test]
+async fn registered_plugin_type_is_visible() {
+    let (_directory, dataset) = dataset_with_example_index(false).await;
+    let descriptions = dataset.describe_indices(None).await.unwrap();
+    assert_eq!(descriptions.len(), 1);
+    assert_eq!(descriptions[0].name(), "profile");
+    assert_eq!(descriptions[0].index_type(), "Example");
+    let statistics: serde_json::Value =
+        serde_json::from_str(&dataset.index_statistics("profile").await.unwrap()).unwrap();
+    assert_eq!(statistics["index_type"], "Example");
+    assert_eq!(statistics["indices"][0]["rows"], 4);
+}
+
+#[tokio::test]
+async fn unregistered_plugin_does_not_block_maintenance() {
+    const DATASET_ENV: &str = "LANCE_UNREGISTERED_PLUGIN_TEST_DATASET";
+    if let Some(uri) = std::env::var_os(DATASET_ENV) {
+        let mut dataset = Dataset::open(uri.to_str().unwrap()).await.unwrap();
+        assert!(dataset.load_indices().await.unwrap().is_empty());
+        assert!(dataset.describe_indices(None).await.unwrap().is_empty());
+        dataset
+            .optimize_indices(&OptimizeOptions::default())
+            .await
+            .unwrap();
+        compact_files(&mut dataset, CompactionOptions::default(), None)
+            .await
+            .unwrap();
+        assert_eq!(dataset.fragments().len(), 1);
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 4);
+        return;
+    }
+
+    for stable_row_ids in [false, true] {
+        let (_directory, dataset) = dataset_with_example_index(stable_row_ids).await;
+        let before = Dataset::open(dataset.uri())
+            .await
+            .unwrap()
+            .load_indices()
+            .await
+            .unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "unregistered_plugin_does_not_block_maintenance",
+                "--nocapture",
+            ])
+            .env(DATASET_ENV, dataset.uri())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "child process failed: {output:?}");
+        let reopened = Dataset::open(dataset.uri()).await.unwrap();
+        assert_eq!(reopened.load_indices().await.unwrap(), before);
+        assert_external_index(&reopened, 4, RoaringBitmap::new()).await;
+    }
+}
+
+#[tokio::test]
+async fn schema_changes_and_drop_index_respect_plugin_fields() {
+    let (_directory, mut dataset) = dataset_with_example_index(false).await;
+    let before = dataset.load_indices().await.unwrap();
+    let version = dataset.version().version;
+    let error = dataset
+        .alter_columns(&[ColumnAlteration::new("value".into()).cast_to(DataType::Int32)])
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::InvalidInput { .. }));
+    assert!(error.to_string().contains("profile"));
+    assert!(error.to_string().contains("drop_index()"));
+    assert_eq!(dataset.version().version, version);
+    assert_eq!(dataset.load_indices().await.unwrap(), before);
+
+    dataset.drop_index("profile").await.unwrap();
+    assert!(dataset.load_indices().await.unwrap().is_empty());
+    dataset
+        .alter_columns(&[ColumnAlteration::new("value".into()).cast_to(DataType::Int32)])
+        .await
+        .unwrap();
+    assert_eq!(
+        dataset.schema().field("value").unwrap().data_type(),
+        DataType::Int32
+    );
+}
+
+#[tokio::test]
+async fn dropping_plugin_field_removes_index() {
+    let (_directory, mut dataset) = dataset_with_example_index(false).await;
+    dataset.drop_columns(&["other"]).await.unwrap();
+    assert_eq!(dataset.load_indices().await.unwrap().len(), 1);
+    dataset.drop_columns(&["value"]).await.unwrap();
+    assert!(dataset.load_indices().await.unwrap().is_empty());
+    assert_eq!(dataset.count_rows(None).await.unwrap(), 4);
 }

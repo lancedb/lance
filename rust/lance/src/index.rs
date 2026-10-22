@@ -1930,7 +1930,13 @@ fn legacy_type_name(index_uri: &str, index_type_hint: Option<&str>) -> String {
         "Json" => IndexType::Scalar.to_string(),
         "Flat" | "Vector" => IndexType::Vector.to_string(),
         other if other.contains("Vector") => IndexType::Vector.to_string(),
-        _ => "N/A".to_string(),
+        _ => scalar::SCALAR_INDEX_PLUGIN_REGISTRY
+            .get_plugin_by_details(&prost_types::Any {
+                type_url: index_uri.to_string(),
+                value: Vec::new(),
+            })
+            .map(|plugin| plugin.name().to_string())
+            .unwrap_or_else(|_| "N/A".to_string()),
     }
 }
 
@@ -3383,9 +3389,9 @@ impl DatasetIndexExt for Dataset {
 /// with all of its segments, in name order.
 ///
 /// An index this build cannot rewrite is skipped with a warning: an index type
-/// it does not recognize, a segment newer than it reads, a covered index, or a
-/// scalar index with nothing to do. A covered index the caller named in
-/// `index_names` is refused instead.
+/// it does not recognize, a segment newer than it reads, a covered index, an
+/// externally maintained index, or a scalar index with nothing to do. A covered
+/// or externally maintained index named in `index_names` is refused instead.
 pub(crate) fn optimizable_indices<'a>(
     dataset: &Dataset,
     indices: &'a [IndexMetadata],
@@ -3419,6 +3425,22 @@ pub(crate) fn optimizable_indices<'a>(
                 index.name,
                 type_url
             );
+            continue;
+        }
+
+        if let Some(index) = deltas.iter().find(|index| {
+            index.index_details.as_ref().is_some_and(|details| {
+                scalar::SCALAR_INDEX_PLUGIN_REGISTRY
+                    .get_plugin_by_details(details)
+                    .is_ok_and(|plugin| !plugin.supports_optimization())
+            })
+        }) {
+            if options.index_names.is_some() {
+                return Err(Error::not_supported(format!(
+                    "Index '{}' is maintained externally and does not support optimize_indices",
+                    index.name
+                )));
+            }
             continue;
         }
 
@@ -3668,13 +3690,19 @@ async fn collect_regular_indices_statistics(
     let mut index_uri: Option<String> = None;
 
     for meta in metadatas.iter() {
-        // An index that covers no fragments has no file to load statistics
-        // from: it carries its definition and nothing else until there is
-        // enough data to train it.
-        if meta
-            .fragment_bitmap
-            .as_ref()
-            .is_some_and(roaring::RoaringBitmap::is_empty)
+        // Externally maintained indices can keep coverage in their own payload
+        // and deliberately declare an empty bitmap. Other empty indices carry
+        // only a definition until there is enough data to train them.
+        let is_externally_maintained = meta.index_details.as_ref().is_some_and(|details| {
+            scalar::SCALAR_INDEX_PLUGIN_REGISTRY
+                .get_plugin_by_details(details)
+                .is_ok_and(|plugin| !plugin.supports_optimization())
+        });
+        if !is_externally_maintained
+            && meta
+                .fragment_bitmap
+                .as_ref()
+                .is_some_and(roaring::RoaringBitmap::is_empty)
         {
             indices_stats.push(serde_json::json!({}));
             continue;
