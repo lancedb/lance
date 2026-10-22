@@ -68,6 +68,7 @@ impl DirectoryNamespace {
             "IVF_HNSW_FLAT" => Ok(IndexType::IvfHnswFlat),
             "IVF_HNSW_SQ" => Ok(IndexType::IvfHnswSq),
             "IVF_HNSW_PQ" => Ok(IndexType::IvfHnswPq),
+            "IVF_HNSW_RQ" => Ok(IndexType::IvfHnswRq),
             other => Err(NamespaceError::InvalidInput {
                 message: format!("Unsupported index_type '{}'", other),
             }
@@ -228,6 +229,15 @@ impl DirectoryNamespace {
                     IvfBuildParams::default(),
                     HnswBuildParams::default(),
                     PQBuildParams::default(),
+                ),
+            },
+            IndexType::IvfHnswRq => DirectoryIndexParams::Vector {
+                index_type,
+                params: VectorIndexParams::with_ivf_hnsw_rq_params(
+                    Self::parse_metric_type(request.distance_type.as_deref())?,
+                    IvfBuildParams::default(),
+                    HnswBuildParams::default(),
+                    RQBuildParams::new(5),
                 ),
             },
             other => {

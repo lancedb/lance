@@ -456,3 +456,28 @@ fn test_manifest_version_from_filename() {
         None
     );
 }
+
+#[test]
+fn test_build_index_params_ivf_hnsw_rq_default_num_bits() {
+    // SymRaBitQ reranks the 1-bit warmup with the ex-code, so IVF_HNSW_RQ
+    // defaults to the same 5-bit width as the other entry points.
+    let request = CreateTableIndexRequest::new("vector".to_string(), "IVF_HNSW_RQ".to_string());
+
+    let DirectoryIndexParams::Vector {
+        index_type: IndexType::IvfHnswRq,
+        params,
+    } = DirectoryNamespace::build_index_params(&request).unwrap()
+    else {
+        panic!("expected IVF_HNSW_RQ vector index params");
+    };
+    match params.stages.as_slice() {
+        [
+            StageParams::Ivf(_),
+            StageParams::Hnsw(_),
+            StageParams::RQ(rq),
+        ] => {
+            assert_eq!(rq.num_bits, 5)
+        }
+        stages => panic!("expected IVF, HNSW and RQ stages, got {stages:?}"),
+    }
+}
