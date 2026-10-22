@@ -4,6 +4,7 @@
 mod data_file_part;
 #[cfg(feature = "substrait")]
 mod dataset_aggregate;
+mod dataset_blob;
 mod dataset_common;
 mod dataset_concurrency_store;
 mod dataset_fts_combined_fields;
@@ -22,3 +23,5 @@ mod dataset_zone_map_seeds;
 mod fragment_validate_tombstones;
 mod fragment_write_columns;
 mod merge_coverage;
+mod seed_commit_io;
+mod seed_versions;

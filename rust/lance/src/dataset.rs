@@ -144,7 +144,7 @@ use crate::utils::temporal::{SystemTime, timestamp_to_nanos, utc_now};
 use crate::{Error, Result};
 pub use blob::{
     BlobFile, BlobRangeRequest, BlobReadRange, ReadBlob, ReadBlobRange, ReadBlobRangesBuilder,
-    ReadBlobRangesStream, ReadBlobsBuilder, ReadBlobsStream,
+    ReadBlobRangesStream, ReadBlobsBuilder, ReadBlobsStream, preserve_managed_descriptors,
 };
 use hash_joiner::HashJoiner;
 pub use lance_core::ROW_ID;
@@ -1638,6 +1638,14 @@ impl Dataset {
     /// Some validation can be performed using the function
     /// [crate::dataset::transaction::validate_operation].
     ///
+    /// That responsibility includes the files' format requirements: a caller publishing
+    /// externally produced fragments must make sure their contents comply with the
+    /// destination's format and with the feature flags the destination carries. The commit
+    /// does not discover every capability from arbitrary file contents. For example, data
+    /// files that embed version 1 zone write seeds (such as files copied from another table
+    /// whose manifest carries `FLAG_ZONE_WRITE_SEEDS`) may only be committed into a
+    /// destination that already carries that flag.
+    ///
     /// If this commit is a change to an existing dataset then it will often need to be based on an
     /// existing version of the dataset.  For example, if this change is a `delete` operation then
     /// the caller will have read in the existing data (at some version) to determine which fragments
@@ -1761,12 +1769,32 @@ impl Dataset {
     }
 
     pub(crate) async fn count_all_rows(&self) -> Result<usize> {
-        let cnts = stream::iter(self.get_fragments())
+        // Sum the counts already in the manifest. A fragment goes through
+        // `FileFragment::count_rows` (which may open its files) only when a
+        // count is missing, the manifest predates `writer_version` (see
+        // `FileFragment::physical_rows`), or it has no data files (an error).
+        // Those are checked before `num_rows`, since an untrusted physical row
+        // count can be smaller than the deletion count.
+        let trust_metadata = self.manifest.writer_version.is_some();
+        let dataset = Arc::new(self.clone());
+        let mut num_rows = 0;
+        let mut need_io = Vec::new();
+        for fragment in self.manifest.fragments.iter() {
+            if trust_metadata
+                && !fragment.files.is_empty()
+                && let Some(rows) = fragment.num_rows()
+            {
+                num_rows += rows;
+            } else {
+                need_io.push(FileFragment::new(dataset.clone(), fragment.clone()));
+            }
+        }
+        let cnts = stream::iter(need_io)
             .map(|f| async move { f.count_rows(None).await })
             .buffer_unordered(16)
             .try_collect::<Vec<_>>()
             .await?;
-        Ok(cnts.iter().sum())
+        Ok(num_rows + cnts.iter().sum::<usize>())
     }
 
     /// Take rows by indices.

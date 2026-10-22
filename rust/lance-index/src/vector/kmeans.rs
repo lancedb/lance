@@ -32,7 +32,7 @@ use lance_linalg::distance::dot_f16::{
     PackedCentroidsF16, amx_fp16_available, amx_fp16_supported, dot_f16_batch_16,
 };
 use lance_linalg::distance::hamming::{hamming, hamming_distance_batch};
-use lance_linalg::distance::{DistanceType, Normalize, dot_distance_batch};
+use lance_linalg::distance::{DistanceType, Normalize, dot_distance_batch_into};
 use lance_linalg::kernels::{
     Normalizable, argmin_value_float, argmin_value_float_with_bias, normalize,
 };
@@ -44,7 +44,7 @@ use rayon::prelude::*;
 use {
     lance_linalg::distance::{
         Dot,
-        l2::{L2, l2_distance_batch},
+        l2::{L2, L2Prepared, l2_distance_batch_into},
     },
     lance_linalg::kernels::argmin_value,
 };
@@ -430,6 +430,111 @@ impl MaybeF16 for Float16Type {
 impl MaybeF16 for Float32Type {}
 impl MaybeF16 for Float64Type {}
 
+/// The `f32` counterpart of [`MaybeF16`], for the pre-transposed L2 path below.
+pub(crate) trait MaybeF32: ArrowNumericType {
+    fn as_f32_slice(_values: &[Self::Native]) -> Option<&[f32]> {
+        None
+    }
+}
+
+impl MaybeF32 for Float32Type {
+    fn as_f32_slice(values: &[f32]) -> Option<&[f32]> {
+        Some(values)
+    }
+}
+impl MaybeF32 for Float16Type {}
+impl MaybeF32 for Float64Type {}
+
+/// [`L2Prepared`] (SoA, all centroids of a vector in one pass) is used only for
+/// PQ sub-vectors: at most 16 dimensions, where the per-centroid kernels are
+/// dominated by call overhead (a 16 × 512 IVF node ran 4× slower through SoA),
+/// and a table that fits the L1 data cache.
+const L2_PREPARED_MAX_DIMENSION: usize = 16;
+const L2_PREPARED_MAX_BYTES: usize = 32 * 1024;
+
+/// Centroid tables up to this size are summed with one partial table per data
+/// chunk ([`sum_members_single_pass`]); larger tables keep the centroid-split
+/// update, whose redundant passes over the data cost less than replicating the
+/// table per chunk.
+const SINGLE_PASS_SUMS_MAX_BYTES: usize = 1024 * 1024;
+/// Chunks, hence partial tables and workers, of a single-pass update. Fixed
+/// rather than derived from the CPU count so the summation order, and with it
+/// the trained centroids, is the same on every host.
+const SINGLE_PASS_MAX_CHUNKS: usize = 64;
+
+/// Sums the members of each centroid with one partial table per chunk of
+/// `rows_per_chunk` rows, merged in chunk order. Memberships outside `0..k`
+/// are skipped, as the centroid-split update skips them.
+fn sum_members_single_pass<N: Float + AddAssign + Send + Sync>(
+    data: &[N],
+    dimension: usize,
+    k: usize,
+    membership: &[Option<u32>],
+    rows_per_chunk: usize,
+) -> Vec<N> {
+    let partial_sums = data
+        .par_chunks(rows_per_chunk * dimension)
+        .zip(membership.par_chunks(rows_per_chunk))
+        .map(|(vectors, members)| {
+            let mut sums = vec![N::zero(); k * dimension];
+            for (vector, cluster_id) in vectors.chunks(dimension).zip(members) {
+                if let Some(cluster_id) = cluster_id.filter(|&id| (id as usize) < k) {
+                    let centroid = &mut sums[cluster_id as usize * dimension..][..dimension];
+                    centroid.iter_mut().zip(vector).for_each(|(c, v)| *c += *v);
+                }
+            }
+            sums
+        })
+        .collect::<Vec<_>>();
+    partial_sums
+        .into_iter()
+        .reduce(|mut total, sums| {
+            total.iter_mut().zip(sums).for_each(|(t, s)| *t += s);
+            total
+        })
+        .unwrap_or_else(|| vec![N::zero(); k * dimension])
+}
+
+/// Sums the members of each centroid with the centroids split across workers,
+/// each scanning all of `data` for its own slice of the table.
+fn sum_members_centroid_split<N: Float + AddAssign + Send + Sync>(
+    data: &[N],
+    dimension: usize,
+    k: usize,
+    membership: &[Option<u32>],
+) -> Vec<N> {
+    let mut centroids = vec![N::zero(); k * dimension];
+
+    let mut num_cpus = get_num_compute_intensive_cpus();
+    if k < num_cpus || k < 16 {
+        num_cpus = 1;
+    }
+    let chunk_size = k / num_cpus;
+
+    centroids
+        .par_chunks_mut(dimension * chunk_size)
+        .enumerate()
+        .with_max_len(1)
+        .for_each(|(i, centroids)| {
+            let start = i * chunk_size;
+            let end = ((i + 1) * chunk_size).min(k);
+            data.chunks(dimension)
+                .zip(membership.iter())
+                .filter_map(|(vector, cluster_id)| {
+                    cluster_id.map(|cluster_id| (vector, cluster_id as usize))
+                })
+                .for_each(|(vector, cluster_id)| {
+                    if start <= cluster_id && cluster_id < end {
+                        let local_id = cluster_id - start;
+                        let centroid =
+                            &mut centroids[local_id * dimension..(local_id + 1) * dimension];
+                        centroid.iter_mut().zip(vector).for_each(|(c, v)| *c += *v);
+                    }
+                });
+        });
+    centroids
+}
+
 /// Per-thread score-buffer budget for [`dot_membership_amx_f16`], in f32
 /// values: 256 KB, sized to stay within a typical private L2 alongside the
 /// vectors and packed centroids a block streams past.
@@ -482,8 +587,8 @@ fn dot_membership_amx_f16(
     Some(
         data.par_chunks(block_rows * dimension)
             .map_init(
-                || vec![0f32; block_rows * n_padded],
-                |scores, block| {
+                || (vec![0f32; block_rows * n_padded], vec![0f32; k]),
+                |(scores, distances), block| {
                     let rows = block.len() / dimension;
                     let tiled = rows - rows % 32;
                     let mut assignments = Vec::with_capacity(rows);
@@ -502,8 +607,9 @@ fn dot_membership_amx_f16(
                     }
                     // Rows past the last whole tile pass keep the per-vector path.
                     for vector in block[tiled * dimension..].chunks(dimension) {
+                        dot_distance_batch_into(vector, centroids, dimension, distances);
                         assignments.push(argmin_value_float_with_bias(
-                            dot_distance_batch(vector, centroids, dimension),
+                            distances.iter().copied(),
                             biases(),
                         ));
                     }
@@ -522,7 +628,7 @@ where
     phantom_data: std::marker::PhantomData<T>,
 }
 
-impl<T: ArrowNumericType + MaybeF16> KMeansAlgo<T::Native> for KMeansAlgoFloat<T>
+impl<T: ArrowNumericType + MaybeF16 + MaybeF32> KMeansAlgo<T::Native> for KMeansAlgoFloat<T>
 where
     T::Native: Float + Dot + L2 + MulAssign + DivAssign + AddAssign + FromPrimitive + Sync,
     PrimitiveArray<T>: From<Vec<T::Native>>,
@@ -536,6 +642,8 @@ where
         cluster_sizes: Option<&[usize]>,
         index: Option<&SimpleIndex>,
     ) -> (Vec<Option<u32>>, Vec<Option<f32>>) {
+        let biases =
+            || cluster_sizes.map(|size| size.iter().map(|size| balance_factor * *size as f32));
         let cluster_and_dists = match index {
             Some(index) => data
                 .par_chunks(dimension)
@@ -549,16 +657,38 @@ where
                 })
                 .collect::<Vec<_>>(),
             None => match distance_type {
-                DistanceType::L2 => data
-                    .par_chunks(dimension)
-                    .map(|vec| {
-                        argmin_value_float_with_bias(
-                            l2_distance_batch(vec, centroids, dimension),
-                            cluster_sizes
-                                .map(|size| size.iter().map(|size| balance_factor * *size as f32)),
+                DistanceType::L2 => match T::as_f32_slice(centroids)
+                    .zip(T::as_f32_slice(data))
+                    .filter(|_| {
+                        dimension <= L2_PREPARED_MAX_DIMENSION
+                            && centroids.len() * size_of::<f32>() <= L2_PREPARED_MAX_BYTES
+                    }) {
+                    // PQ sub-vector codebooks: one SoA pass per vector instead of one
+                    // kernel call per centroid, whose call and dispatch overhead
+                    // dominates at these dimensions.
+                    Some((centroids, data)) => {
+                        let prepared = L2Prepared::new(centroids, dimension);
+                        data.par_chunks(dimension)
+                            .map_init(
+                                || vec![0f32; prepared.num_targets()],
+                                |dists, vec| {
+                                    prepared.distances_into(vec, dists);
+                                    argmin_value_float_with_bias(dists.iter().copied(), biases())
+                                },
+                            )
+                            .collect::<Vec<_>>()
+                    }
+                    None => data
+                        .par_chunks(dimension)
+                        .map_init(
+                            || vec![0.0; centroids.len() / dimension],
+                            |distances, vec| {
+                                l2_distance_batch_into(vec, centroids, dimension, distances);
+                                argmin_value_float_with_bias(distances.iter().copied(), biases())
+                            },
                         )
-                    })
-                    .collect::<Vec<_>>(),
+                        .collect::<Vec<_>>(),
+                },
                 DistanceType::Dot => T::as_f16_slice(centroids)
                     .zip(T::as_f16_slice(data))
                     // The kill switch is enforced here rather than inside the
@@ -577,14 +707,18 @@ where
                     })
                     .unwrap_or_else(|| {
                         data.par_chunks(dimension)
-                            .map(|vec| {
-                                argmin_value_float_with_bias(
-                                    dot_distance_batch(vec, centroids, dimension),
-                                    cluster_sizes.map(|size| {
-                                        size.iter().map(|size| balance_factor * *size as f32)
-                                    }),
-                                )
-                            })
+                            .map_init(
+                                || vec![0.0; centroids.len() / dimension],
+                                |distances, vec| {
+                                    dot_distance_batch_into(vec, centroids, dimension, distances);
+                                    argmin_value_float_with_bias(
+                                        distances.iter().copied(),
+                                        cluster_sizes.map(|size| {
+                                            size.iter().map(|size| balance_factor * *size as f32)
+                                        }),
+                                    )
+                                },
+                            )
                             .collect::<Vec<_>>()
                     }),
                 _ => {
@@ -608,35 +742,13 @@ where
         distance_type: DistanceType,
         loss: f64,
     ) -> KMeans {
-        let mut centroids = vec![T::Native::zero(); k * dimension];
-
-        let mut num_cpus = get_num_compute_intensive_cpus();
-        if k < num_cpus || k < 16 {
-            num_cpus = 1;
-        }
-        let chunk_size = k / num_cpus;
-
-        centroids
-            .par_chunks_mut(dimension * chunk_size)
-            .enumerate()
-            .with_max_len(1)
-            .for_each(|(i, centroids)| {
-                let start = i * chunk_size;
-                let end = ((i + 1) * chunk_size).min(k);
-                data.chunks(dimension)
-                    .zip(membership.iter())
-                    .filter_map(|(vector, cluster_id)| {
-                        cluster_id.map(|cluster_id| (vector, cluster_id as usize))
-                    })
-                    .for_each(|(vector, cluster_id)| {
-                        if start <= cluster_id && cluster_id < end {
-                            let local_id = cluster_id - start;
-                            let centroid =
-                                &mut centroids[local_id * dimension..(local_id + 1) * dimension];
-                            centroid.iter_mut().zip(vector).for_each(|(c, v)| *c += *v);
-                        }
-                    });
-            });
+        let mut centroids = if k * dimension * size_of::<T::Native>() <= SINGLE_PASS_SUMS_MAX_BYTES
+        {
+            let rows_per_chunk = membership.len().div_ceil(SINGLE_PASS_MAX_CHUNKS).max(1);
+            sum_members_single_pass(data, dimension, k, membership, rows_per_chunk)
+        } else {
+            sum_members_centroid_split(data, dimension, k, membership)
+        };
 
         centroids
             .par_chunks_mut(dimension)
@@ -1772,7 +1884,7 @@ fn dot_f16_partitions_amx(centroids: &[f16], query: &[f16]) -> Option<Vec<f32>> 
             *slot = row(base + i);
         }
         // The kernel returns raw dot products; `Dot` distance is `1 - dot`, the
-        // same convention `dot_distance_batch` applies.
+        // same convention `dot_distance_batch_into` applies.
         let dots = dot_f16_batch_16(query, &group, out.len());
         for (d, dot) in out.iter_mut().zip(dots.iter()) {
             *d = 1.0 - *dot;
@@ -1795,16 +1907,17 @@ pub fn kmeans_find_partitions<T: Float + L2 + Dot>(
     nprobes: usize,
     distance_type: DistanceType,
 ) -> arrow::error::Result<(UInt32Array, Float32Array)> {
-    let dists: Vec<f32> = match distance_type {
-        DistanceType::L2 => l2_distance_batch(query, centroids, query.len()).collect(),
-        DistanceType::Dot => dot_distance_batch(query, centroids, query.len()).collect(),
+    let mut dists = vec![0.0; centroids.len() / query.len()];
+    match distance_type {
+        DistanceType::L2 => l2_distance_batch_into(query, centroids, query.len(), &mut dists),
+        DistanceType::Dot => dot_distance_batch_into(query, centroids, query.len(), &mut dists),
         _ => {
             panic!(
                 "KMeans::find_partitions: {} is not supported",
                 distance_type
             );
         }
-    };
+    }
 
     smallest_nprobes(dists, nprobes)
 }
@@ -1998,19 +2111,20 @@ where
     Ok(model)
 }
 
+/// Returns the centroid nearest to `vector`.
+///
+/// `distances` is scratch space with one slot per centroid, so that callers
+/// assigning many vectors can reuse it.
 #[inline]
 pub fn compute_partition<T: Float + L2 + Dot>(
     centroids: &[T],
     vector: &[T],
     distance_type: DistanceType,
+    distances: &mut [f32],
 ) -> Option<u32> {
     match distance_type {
-        DistanceType::L2 => {
-            argmin_value_float(l2_distance_batch(vector, centroids, vector.len())).map(|(c, _)| c)
-        }
-        DistanceType::Dot => {
-            argmin_value_float(dot_distance_batch(vector, centroids, vector.len())).map(|(c, _)| c)
-        }
+        DistanceType::L2 => l2_distance_batch_into(vector, centroids, vector.len(), distances),
+        DistanceType::Dot => dot_distance_batch_into(vector, centroids, vector.len(), distances),
         _ => {
             panic!(
                 "KMeans::compute_partition: distance type {} is not supported",
@@ -2018,6 +2132,7 @@ pub fn compute_partition<T: Float + L2 + Dot>(
             );
         }
     }
+    argmin_value_float(distances.iter().copied()).map(|(c, _)| c)
 }
 
 #[cfg(test)]
@@ -2029,6 +2144,7 @@ mod tests {
     use half::f16;
     use lance_arrow::*;
     use lance_testing::datagen::{generate_random_array, generate_random_array_with_seed};
+    use rstest::rstest;
 
     use super::*;
     use lance_linalg::distance::dot_f16::amx_fp16_supported;
@@ -2057,7 +2173,8 @@ mod tests {
 
             let amx = dot_f16_partitions_amx(&centroids, &query)
                 .expect("the AMX path declined a shape it should accept");
-            let scalar: Vec<f32> = dot_distance_batch(&query[..], &centroids[..], dim).collect();
+            let mut scalar = vec![0.0; k];
+            dot_distance_batch_into(&query[..], &centroids[..], dim, &mut scalar);
             assert_eq!(amx.len(), scalar.len(), "dim={dim} k={k}");
 
             for nprobes in [1usize, 8, 32] {
@@ -2243,6 +2360,137 @@ mod tests {
             DistanceType::L2,
         );
         assert_eq!(expected, actual);
+    }
+
+    /// The SoA path and the per-centroid fallback must pick the centroids the
+    /// per-centroid f64 path picks, up to rounding on exact ties.
+    #[rstest]
+    #[case::pq_table(8, 256, 0.0, true)]
+    #[case::pq_table_with_bias(8, 256, 0.5, true)]
+    #[case::wide_table_falls_back(32, 256, 0.0, false)]
+    #[case::large_table_falls_back(16, 4096, 0.0, false)]
+    fn test_l2_assignment_matches_per_centroid_path(
+        #[case] dim: usize,
+        #[case] k: usize,
+        #[case] balance_factor: f32,
+        #[case] expect_soa: bool,
+    ) {
+        assert_eq!(
+            expect_soa,
+            dim <= L2_PREPARED_MAX_DIMENSION && k * dim * size_of::<f32>() <= L2_PREPARED_MAX_BYTES,
+            "the case must exercise the path its name claims"
+        );
+        let centroids = generate_random_array_with_seed::<Float32Type>(dim * k, [7; 32]);
+        let data = generate_random_array_with_seed::<Float32Type>(dim * 1000, [8; 32]);
+        let cluster_sizes = (balance_factor != 0.0)
+            .then(|| (0..k).map(|cluster| cluster * 3).collect::<Vec<usize>>());
+        let (prepared, prepared_dists) =
+            KMeansAlgoFloat::<Float32Type>::compute_membership_and_dist(
+                centroids.values(),
+                data.values(),
+                dim,
+                DistanceType::L2,
+                balance_factor,
+                cluster_sizes.as_deref(),
+                None,
+            );
+        let widen = |array: &Float32Array| arrow::compute::cast(array, &DataType::Float64).unwrap();
+        let (reference, reference_dists) =
+            KMeansAlgoFloat::<Float64Type>::compute_membership_and_dist(
+                widen(&centroids).as_primitive::<Float64Type>().values(),
+                widen(&data).as_primitive::<Float64Type>().values(),
+                dim,
+                DistanceType::L2,
+                balance_factor,
+                cluster_sizes.as_deref(),
+                None,
+            );
+        assert_eq!(prepared, reference);
+        for (dist, expected) in prepared_dists.iter().zip(&reference_dists) {
+            let (dist, expected) = (dist.unwrap(), expected.unwrap());
+            assert!(
+                (dist - expected).abs() <= 1e-4 * expected.max(1.0),
+                "{dist} vs {expected}"
+            );
+        }
+    }
+
+    /// Sums every row into its centroid one row at a time, in input order.
+    fn sum_members_sequential(
+        data: &[f32],
+        dimension: usize,
+        k: usize,
+        membership: &[Option<u32>],
+    ) -> Vec<f32> {
+        let mut sums = vec![0f32; k * dimension];
+        for (vector, cluster_id) in data.chunks(dimension).zip(membership) {
+            if let Some(cluster_id) = cluster_id.filter(|&id| (id as usize) < k) {
+                let centroid = &mut sums[cluster_id as usize * dimension..][..dimension];
+                centroid.iter_mut().zip(vector).for_each(|(c, v)| *c += *v);
+            }
+        }
+        sums
+    }
+
+    /// Both update strategies must agree with the sequential sums, including
+    /// when the single pass merges several partial tables and when a membership
+    /// points outside the table.
+    #[test]
+    fn test_member_sums_match_sequential_reference() {
+        let (k, dim, rows) = (3, 2, 50);
+        let data = generate_random_array_with_seed::<Float32Type>(rows * dim, [9; 32]);
+        let mut membership: Vec<Option<u32>> = (0..rows)
+            .map(|row| (row % 4 != 3).then_some((row % k) as u32))
+            .collect();
+        membership[5] = Some(k as u32);
+        let expected = sum_members_sequential(data.values(), dim, k, &membership);
+        // 50 rows in chunks of 4: 13 partial tables to merge.
+        let single_pass = sum_members_single_pass(data.values(), dim, k, &membership, 4);
+        let split = sum_members_centroid_split(data.values(), dim, k, &membership);
+        for (actual, name) in [(&single_pass, "single pass"), (&split, "centroid split")] {
+            for (value, reference) in actual.iter().zip(&expected) {
+                assert!(
+                    (value - reference).abs() <= 1e-4,
+                    "{name}: {value} vs {reference}"
+                );
+            }
+        }
+    }
+
+    /// Both update strategies must return the member means: a table under
+    /// `SINGLE_PASS_SUMS_MAX_BYTES` takes the single pass, a larger one the
+    /// centroid split.
+    #[rstest]
+    #[case::single_pass(3, 2)]
+    #[case::centroid_split(256, 1025)]
+    fn test_to_kmeans_centroids_are_member_means(#[case] k: usize, #[case] dim: usize) {
+        assert_eq!(
+            k == 3,
+            k * dim * size_of::<f32>() <= SINGLE_PASS_SUMS_MAX_BYTES,
+            "the case must exercise the update its name claims"
+        );
+        let rows = 2 * k;
+        let data: Vec<f32> = (0..rows).flat_map(|row| vec![row as f32; dim]).collect();
+        let membership: Vec<Option<u32>> = (0..rows).map(|row| Some((row % k) as u32)).collect();
+        let mut cluster_sizes = vec![2; k];
+        let model = KMeansAlgoFloat::<Float32Type>::to_kmeans(
+            &data,
+            dim,
+            k,
+            &membership,
+            &mut cluster_sizes,
+            DistanceType::L2,
+            0.0,
+        );
+        let centroids = model.centroids.as_primitive::<Float32Type>().values();
+        for (cluster, centroid) in centroids.chunks(dim).enumerate() {
+            // Rows `cluster` and `cluster + k` are its members.
+            let mean = cluster as f32 + k as f32 / 2.0;
+            assert!(
+                centroid.iter().all(|&v| (v - mean).abs() < 1e-3),
+                "cluster {cluster}: expected {mean}, got {centroid:?}"
+            );
+        }
     }
 
     #[test]
@@ -2516,8 +2764,9 @@ mod tests {
                 panic!("{ctx}: the AMX path declined this shape, so agreeing proves nothing")
             });
 
+        let mut row = vec![0.0; centroids.len() / dimension];
         for (i, vector) in data.chunks(dimension).enumerate() {
-            let row = dot_distance_batch(vector, centroids, dimension).collect::<Vec<_>>();
+            dot_distance_batch_into(vector, centroids, dimension, &mut row);
             let want = argmin_value_float_with_bias(
                 row.iter().copied(),
                 cluster_sizes.map(|sizes| sizes.iter().map(|size| balance_factor * *size as f32)),
@@ -2618,9 +2867,11 @@ mod tests {
             .map(|v| f16::from_f32(v.to_f32().abs() + 0.1))
             .collect::<Vec<_>>();
 
+        let mut distances = vec![0.0; centroids.len() / DIM];
         for vector in data.chunks(DIM) {
+            dot_distance_batch_into(vector, &centroids, DIM, &mut distances);
             assert!(
-                dot_distance_batch(vector, &centroids, DIM).all(|dist| dist > 1.0),
+                distances.iter().all(|&dist| dist > 1.0),
                 "premise broken: a real centroid is nearer than the zero padding"
             );
         }
