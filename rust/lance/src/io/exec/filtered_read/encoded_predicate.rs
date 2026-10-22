@@ -692,12 +692,11 @@ mod tests {
             options = options.with_deleted_rows().unwrap();
         }
         let read = FilteredReadExec::try_new(dataset.clone(), options.clone(), None).unwrap();
-        let plan = read
-            .get_or_create_plan(Arc::new(TaskContext::default()))
+        read.get_or_create_plan(Arc::new(TaskContext::default()))
             .await
             .unwrap();
         let scoped = FilteredReadStream::plan_to_scoped_fragments(
-            &plan,
+            read.plan.get().unwrap(),
             dataset.fragments(),
             &dataset,
             &options,
