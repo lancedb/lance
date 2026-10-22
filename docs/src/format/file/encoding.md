@@ -993,4 +993,3 @@ This descriptor is valid only in per-value positions, including inside General
 compression. General compression retains one frame per tensor. Selecting and
 reading a tensor does not require other tensors; selecting an individual element
 still requires decoding that tensor's frame.
-
