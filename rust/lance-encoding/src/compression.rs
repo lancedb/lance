@@ -799,9 +799,10 @@ pub fn try_raw_per_value(data: &DataBlock) -> Option<Box<dyn PerValueCompressor>
         .then(|| Box::new(ValueEncoder::default()) as _)
 }
 
-/// Apply configured LZ4 or Zstd compression independently to fixed-size-list rows.
+/// Apply configured LZ4 or Zstd compression independently to integer tensor rows.
 /// Each row retains its own frame and remains independently addressable.
-pub fn try_fixed_size_list_per_value(
+pub fn try_integer_tensor_per_value(
+    field: &Field,
     data: &DataBlock,
     params: &CompressionFieldParams,
 ) -> Option<Box<dyn PerValueCompressor>> {
@@ -813,6 +814,17 @@ pub fn try_fixed_size_list_per_value(
         Some("lz4") => CompressionScheme::Lz4,
         _ => return None,
     };
+    // Per-value compression was previously not applied to fixed-size lists.
+    // Keep this new path scoped to integer tensors rather than changing the
+    // storage and read cost of existing floating-point vectors or other types.
+    let data_type = field.data_type();
+    let mut leaf = &data_type;
+    while let DataType::FixedSizeList(child, _) = leaf {
+        leaf = child.data_type();
+    }
+    if !leaf.is_integer() {
+        return None;
+    }
     Some(Box::new(FixedWidthGeneralPerValueCompressor::new(
         Box::new(ValueEncoder::default()),
         CompressionConfig::new(scheme, params.compression_level),

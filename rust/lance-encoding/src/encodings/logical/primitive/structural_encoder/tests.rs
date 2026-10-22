@@ -2250,6 +2250,10 @@ async fn test_default_axis_delta_preserves_other_encodings(
     let field = arrow_schema::Field::new("value", array.data_type().clone(), false)
         .with_metadata(metadata.clone());
     let automatic = encode_first_page(field, array.clone(), version).await;
+    if kind == "float" {
+        // A general codec must not newly change floating-vector storage.
+        metadata.remove(COMPRESSION_META_KEY);
+    }
     metadata.insert("lance-encoding:axis-delta".into(), "off".into());
     let field =
         arrow_schema::Field::new("value", array.data_type().clone(), false).with_metadata(metadata);

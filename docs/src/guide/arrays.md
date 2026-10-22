@@ -183,7 +183,7 @@ tensor_images.to_encoded()
 
 ## Compressing integer tensors (Lance 2.3)
 
-The unstable 2.3 writer can compress each fixed-size-list row independently with
+The unstable 2.3 writer can compress each integer tensor row independently with
 `lance-encoding:compression=lz4` or `zstd`. It automatically considers AxisDelta
 for signed or unsigned 8-, 16-, 32-, and 64-bit integer tensors in per-value pages.
 AxisDelta stores differences between adjacent values along one tensor axis,
@@ -205,7 +205,9 @@ axis inside the tensor, excluding the dataset row dimension. For HWC images,
 `on:<axis>` forces prediction and rejects unsupported types or inner nulls.
 `off` skips prediction and sampling while retaining the configured general codec.
 
-Automatic prediction skips floating-point data, inner nulls, unsupported layouts,
+Floating-point vectors and other non-integer list types retain their existing
+encoding, including when a general codec is configured. Automatic prediction
+skips inner nulls, unsupported layouts,
 length-one axes, and tensors larger than the sample budget. Missing or `none`
 general compression keeps the existing encoding. Invalid extension metadata is
 ignored by implicit Auto; explicitly requested prediction validates it and

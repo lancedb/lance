@@ -179,7 +179,7 @@ impl CompressionStrategy for TestCompressionStrategy {
         }
         if self.encoding == TestEncoding::StructuralSparse
             && let Some(compressor) =
-                crate::compression::try_fixed_size_list_per_value(data, &params)
+                crate::compression::try_integer_tensor_per_value(field, data, &params)
         {
             return Ok(compressor);
         }

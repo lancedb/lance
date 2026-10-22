@@ -2753,6 +2753,20 @@ mod tests {
                 STRUCTURAL_ENCODING_META_KEY.to_string(),
                 STRUCTURAL_ENCODING_SPARSE.to_string(),
             )]);
+            if kind == "tensor_zstd" {
+                vectors = Arc::new(FixedSizeListArray::new(
+                    Arc::new(Field::new("item", DataType::Int32, true)),
+                    64,
+                    Arc::new(arrow_array::Int32Array::from(
+                        (0..rows * 64)
+                            .map(|i| (i % 7 != 0).then_some(i % (17 * 64)))
+                            .collect::<Vec<_>>(),
+                    )),
+                    Some(NullBuffer::from(
+                        (0..rows).map(|i| i % 8 != 0).collect::<Vec<_>>(),
+                    )),
+                ));
+            }
             if kind.starts_with("tensor_") {
                 metadata.insert(
                     "lance-encoding:compression".to_string(),

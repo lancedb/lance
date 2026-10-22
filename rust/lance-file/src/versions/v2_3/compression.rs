@@ -11,9 +11,9 @@ use lance_encoding::{
         BlockCompressor, CompressionStrategy, field_metadata_params, finalize_miniblock_compressor,
         try_bitpacking_block, try_bitpacking_miniblock, try_byte_stream_split_miniblock,
         try_child_rle_miniblock, try_fixed_packed_struct_miniblock, try_fixed_size_list_block,
-        try_fixed_size_list_per_value, try_fixed_u8_rle_miniblock, try_general_block,
-        try_raw_block, try_raw_fixed_size_list_miniblock, try_raw_fixed_width_miniblock,
-        try_raw_per_value, try_uncompressed_fixed_width_miniblock, try_variable_rle_block,
+        try_fixed_u8_rle_miniblock, try_general_block, try_integer_tensor_per_value, try_raw_block,
+        try_raw_fixed_size_list_miniblock, try_raw_fixed_width_miniblock, try_raw_per_value,
+        try_uncompressed_fixed_width_miniblock, try_variable_rle_block,
         try_variable_width_miniblock_with_generic_offsets, try_variable_width_per_value,
     },
     compression_config::{CompressionFieldParams, CompressionParams},
@@ -106,7 +106,7 @@ impl CompressionStrategy for Strategy {
         {
             return Ok(compressor);
         }
-        if let Some(compressor) = try_fixed_size_list_per_value(data, &params) {
+        if let Some(compressor) = try_integer_tensor_per_value(field, data, &params) {
             return Ok(compressor);
         }
         if let Some(compressor) = try_raw_per_value(data) {
