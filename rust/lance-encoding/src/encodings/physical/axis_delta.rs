@@ -845,6 +845,26 @@ mod tests {
         assert!(error.to_string().contains("shape"));
     }
 
+    #[rstest::rstest]
+    #[case::outer_longest([5, 2, 3], (5, 6))]
+    #[case::inner_longest([2, 3, 5], (5, 1))]
+    #[case::innermost_tie([3, 3, 2], (3, 2))]
+    fn default_axis_uses_longest_physical_dimension(
+        #[case] dimensions: [usize; 3],
+        #[case] expected: (usize, usize),
+    ) {
+        let (mut field, _) = fixture(1, dimensions.iter().product(), false);
+        field.metadata.insert(
+            "ARROW:extension:name".into(),
+            "arrow.fixed_shape_tensor".into(),
+        );
+        field.metadata.insert(
+            "ARROW:extension:metadata".into(),
+            serde_json::json!({"shape": dimensions, "permutation": [2, 0, 1]}).to_string(),
+        );
+        assert_eq!(shape(&field, None).unwrap(), expected);
+    }
+
     #[test]
     fn nested_tensor_and_unsupported_inputs() {
         let (field, data) = fixture(6, 30, false);
