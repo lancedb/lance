@@ -1049,13 +1049,9 @@ pub(crate) async fn build_index_metadata_from_segments(
 
     let mut seen_segment_ids = HashSet::with_capacity(segments.len());
     let mut covered_fragments = RoaringBitmap::new();
-    // One logical index needs one declaration. The per-segment rules below only
-    // pin the *keyed* field and its count, so segments that disagree on the
-    // carried columns -- `fields = [k, a]` beside `fields = [k]`, say -- each pass
-    // individually. Committing that pair produces an index whose own description
-    // path refuses it: `IndexDescriptionImpl::try_new` requires `fields` to be
-    // identical across segments, so `describe_indices` would error on metadata
-    // this function just wrote. Same rule, and same reason, as
+    // Per-segment validation does not establish one ordered declaration for
+    // the logical index: both carried columns and plugin dependencies can
+    // differ. Keep the same invariant as `IndexDescriptionImpl::try_new` and
     // `merge_existing_index_segments`.
     let expected_fields = segments[0].fields().to_vec();
     let expected_covering_fields = segments[0].covering_fields().to_vec();
@@ -1068,7 +1064,17 @@ pub(crate) async fn build_index_metadata_from_segments(
                 dataset.manifest.version
             )));
         }
-        if segment.keyed_field() != Some(field_id) {
+        // Multi-field statistics are built and maintained by the plugin. Empty
+        // coverage keeps them out of the single-column query and remap paths.
+        let is_multi_field_plugin = segment.fields().len() > 1
+            && segment.covering_fields().is_empty()
+            && segment.fragment_bitmap().is_empty()
+            && scalar::SCALAR_INDEX_PLUGIN_REGISTRY
+                .get_plugin_by_details(segment.index_details())
+                .is_ok_and(|plugin| !plugin.supports_optimization());
+        if segment.keyed_field() != Some(field_id)
+            && !(is_multi_field_plugin && segment.fields().first() == Some(&field_id))
+        {
             return Err(Error::invalid_input(format!(
                 "CreateIndex: segment {} was built for fields {:?} (carried {:?}), \
                  expected keyed field [{}]",
@@ -1077,6 +1083,27 @@ pub(crate) async fn build_index_metadata_from_segments(
                 segment.covering_fields(),
                 field_id
             )));
+        }
+        if is_multi_field_plugin {
+            let mut seen_fields = HashSet::with_capacity(segment.fields().len());
+            for id in segment.fields() {
+                if dataset.schema().field_by_id(*id).is_none() {
+                    return Err(Error::invalid_input(format!(
+                        "CreateIndex: segment {} references field id {} absent from dataset version {}",
+                        segment.uuid(),
+                        id,
+                        dataset.manifest.version
+                    )));
+                }
+                if !seen_fields.insert(*id) {
+                    return Err(Error::invalid_input(format!(
+                        "CreateIndex: segment {} repeats field id {} in {:?}",
+                        segment.uuid(),
+                        id,
+                        segment.fields()
+                    )));
+                }
+            }
         }
         // Cardinality alone does not prove `covering_fields` is really the
         // trailing slice of `fields`; delegate that to the same rule a
@@ -3053,18 +3080,6 @@ impl DatasetIndexExt for Dataset {
             .map(|details| details.type_url.clone());
         let mut incoming_fragments = RoaringBitmap::new();
         for segment in &new_indices {
-            // Mirrors `build_index_metadata_from_segments`'s guard, which
-            // already validated these exact segments. Kept in the same shape
-            // so this second look does not silently re-reject what that guard
-            // just accepted.
-            if segment.keyed_field() != Some(field.id) {
-                return Err(Error::invalid_input(format!(
-                    "CreateIndex: segment {} was built for fields {:?} (carried {:?}), \
-                     expected keyed field [{}]",
-                    segment.uuid, segment.fields, segment.covering_fields, field.id
-                )));
-            }
-            segment.validate_covering_fields()?;
             if let Some(fragment_bitmap) = &segment.fragment_bitmap {
                 incoming_fragments |= fragment_bitmap.clone();
             }
@@ -3072,9 +3087,9 @@ impl DatasetIndexExt for Dataset {
 
         let existing_named_indices = load_all_indices_by_name(self, index_name).await?;
         if existing_named_indices.iter().any(|idx| {
-            // Same name-collision rule as `CreateIndexBuilder`'s default-name
-            // loop in create.rs.
-            idx.keyed_field() != Some(field.id)
+            // Field order is part of a plugin scope's identity. Covered
+            // single-column indices still compare only their keyed prefix.
+            idx.keyed_fields() != new_indices[0].keyed_fields()
         }) {
             return Err(Error::index(format!(
                 "Index name '{index_name}' already exists with different fields, \
@@ -11934,10 +11949,8 @@ mod tests {
 
     /// A segment may carry extra columns; `build_index_metadata_from_segments`
     /// must still commit it, keyed on the field the index is being built for.
-    /// Calls the guarded function directly (not through
-    /// `commit_existing_index_segments`) so this test's outcome depends only
-    /// on this guard, not on the independent duplicate a few lines into
-    /// `commit_existing_index_segments`.
+    /// Calls the metadata builder directly to isolate field validation from
+    /// commit conflict resolution and manifest writing.
     #[tokio::test]
     async fn test_build_index_metadata_from_segments_accepts_carried_fields() {
         use lance_datagen::{BatchCount, RowCount, array};
@@ -12311,12 +12324,6 @@ mod tests {
             )
             .await
             .unwrap_err();
-        // This end-to-end path is guarded twice (`build_index_metadata_from_segments`
-        // and a duplicate check in `commit_existing_index_segments` itself), so
-        // this assertion alone does not prove which one fired -- see
-        // `test_build_index_metadata_from_segments_rejects_wrong_field_provenance`
-        // for that. It still proves the public `commit_existing_index_segments`
-        // entry point rejects this input end-to-end.
         assert!(error.to_string().contains("expected keyed field"));
     }
 

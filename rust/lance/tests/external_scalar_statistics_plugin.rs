@@ -33,7 +33,7 @@ use lance_index::{
     scalar::{
         AnyQuery, CreatedIndex, IndexStore, OldIndexDataFilter, RowIdRemapper, ScalarIndex,
         ScalarIndexParams, SearchResult, TrainingCriteria, TrainingOrdering, UpdateCriteria,
-        expression::ScalarQueryParser,
+        expression::{IndexInformationProvider, ScalarQueryParser},
         registry::{BasicTrainer, ScalarIndexPlugin, TrainingRequest},
     },
 };
@@ -425,7 +425,7 @@ async fn reopen_in_another_process() {
     assert!(output.status.success(), "child process failed: {output:?}");
 }
 
-async fn dataset_with_example_index(stable_row_ids: bool) -> (TempDir, Dataset) {
+async fn dataset_with_example_index(stable_row_ids: bool, columns: &[&str]) -> (TempDir, Dataset) {
     LazyLock::force(&REGISTRATION);
     let directory = tempdir().unwrap();
     let batch = record_batch!(
@@ -448,7 +448,7 @@ async fn dataset_with_example_index(stable_row_ids: bool) -> (TempDir, Dataset) 
     assert_eq!(dataset.fragments().len(), 2);
     let mut segment = dataset
         .create_index_builder(
-            &["value"],
+            &columns[..1],
             IndexType::Scalar,
             &ScalarIndexParams::new("example".into()),
         )
@@ -457,8 +457,12 @@ async fn dataset_with_example_index(stable_row_ids: bool) -> (TempDir, Dataset) 
         .await
         .unwrap();
     segment.fragment_bitmap = Some(RoaringBitmap::new());
+    segment.fields = columns
+        .iter()
+        .map(|column| dataset.schema().field(column).unwrap().id)
+        .collect();
     dataset
-        .commit_existing_index_segments("profile", "value", vec![segment])
+        .commit_existing_index_segments("profile", columns[0], vec![segment])
         .await
         .unwrap();
     // Compare persisted metadata across maintenance operations: serialization
@@ -474,8 +478,11 @@ async fn dataset_with_example_index(stable_row_ids: bool) -> (TempDir, Dataset) 
 #[case::retrain(OptimizeOptions::retrain())]
 #[case::bounded(OptimizeOptions::default().max_rows_per_task(Some(2)))]
 #[tokio::test]
-async fn externally_maintained_index_is_skipped(#[case] options: OptimizeOptions) {
-    let (_directory, mut dataset) = dataset_with_example_index(false).await;
+async fn externally_maintained_index_is_skipped(
+    #[case] options: OptimizeOptions,
+    #[values(&["value"][..], &["other", "value"][..])] columns: &[&str],
+) {
+    let (_directory, mut dataset) = dataset_with_example_index(false, columns).await;
     let before = dataset.load_indices().await.unwrap();
     let version = dataset.version().version;
     let plan = lance::index::optimize::plan_optimize_indices(&dataset, &options)
@@ -498,7 +505,7 @@ async fn externally_maintained_index_is_skipped(#[case] options: OptimizeOptions
 
 #[tokio::test]
 async fn externally_maintained_index_does_not_block_builtin_optimization() {
-    let (_directory, mut dataset) = dataset_with_example_index(false).await;
+    let (_directory, mut dataset) = dataset_with_example_index(false, &["value"]).await;
     let profile = dataset.load_indices().await.unwrap()[0].clone();
     dataset
         .create_index(
@@ -549,8 +556,11 @@ async fn externally_maintained_index_does_not_block_builtin_optimization() {
 #[case::row_addresses(false)]
 #[case::stable_row_ids(true)]
 #[tokio::test]
-async fn empty_coverage_survives_compaction(#[case] stable_row_ids: bool) {
-    let (_directory, mut dataset) = dataset_with_example_index(stable_row_ids).await;
+async fn empty_coverage_survives_compaction(
+    #[case] stable_row_ids: bool,
+    #[values(&["value"][..], &["other", "value"][..])] columns: &[&str],
+) {
+    let (_directory, mut dataset) = dataset_with_example_index(stable_row_ids, columns).await;
     let before = dataset.load_indices().await.unwrap();
     compact_files(&mut dataset, CompactionOptions::default(), None)
         .await
@@ -560,7 +570,7 @@ async fn empty_coverage_survives_compaction(#[case] stable_row_ids: bool) {
     assert_eq!(dataset.load_indices().await.unwrap(), before);
     let reopened = Dataset::open(dataset.uri()).await.unwrap();
     let index = reopened
-        .open_scalar_index("value", &before[0].uuid, &NoOpMetricsCollector)
+        .open_scalar_index(columns[0], &before[0].uuid, &NoOpMetricsCollector)
         .await
         .unwrap();
     assert!(!index.can_remap());
@@ -569,7 +579,7 @@ async fn empty_coverage_survives_compaction(#[case] stable_row_ids: bool) {
 
 #[tokio::test]
 async fn registered_plugin_type_is_visible() {
-    let (_directory, dataset) = dataset_with_example_index(false).await;
+    let (_directory, dataset) = dataset_with_example_index(false, &["value"]).await;
     let descriptions = dataset.describe_indices(None).await.unwrap();
     assert_eq!(descriptions.len(), 1);
     assert_eq!(descriptions[0].name(), "profile");
@@ -600,7 +610,7 @@ async fn unregistered_plugin_does_not_block_maintenance() {
     }
 
     for stable_row_ids in [false, true] {
-        let (_directory, dataset) = dataset_with_example_index(stable_row_ids).await;
+        let (_directory, dataset) = dataset_with_example_index(stable_row_ids, &["value"]).await;
         let before = Dataset::open(dataset.uri())
             .await
             .unwrap()
@@ -625,7 +635,7 @@ async fn unregistered_plugin_does_not_block_maintenance() {
 
 #[tokio::test]
 async fn schema_changes_and_drop_index_respect_plugin_fields() {
-    let (_directory, mut dataset) = dataset_with_example_index(false).await;
+    let (_directory, mut dataset) = dataset_with_example_index(false, &["value"]).await;
     let before = dataset.load_indices().await.unwrap();
     let version = dataset.version().version;
     let error = dataset
@@ -652,10 +662,206 @@ async fn schema_changes_and_drop_index_respect_plugin_fields() {
 
 #[tokio::test]
 async fn dropping_plugin_field_removes_index() {
-    let (_directory, mut dataset) = dataset_with_example_index(false).await;
+    let (_directory, mut dataset) = dataset_with_example_index(false, &["value"]).await;
     dataset.drop_columns(&["other"]).await.unwrap();
     assert_eq!(dataset.load_indices().await.unwrap().len(), 1);
     dataset.drop_columns(&["value"]).await.unwrap();
     assert!(dataset.load_indices().await.unwrap().is_empty());
     assert_eq!(dataset.count_rows(None).await.unwrap(), 4);
+}
+
+#[tokio::test]
+async fn multi_field_scope_preserves_order_on_reopen_rename_and_replace() {
+    // Deliberately reverse schema order: field order belongs to the plugin.
+    let (_directory, mut dataset) = dataset_with_example_index(false, &["other", "value"]).await;
+    let before = dataset.load_indices().await.unwrap();
+    let fields = vec![
+        dataset.schema().field("other").unwrap().id,
+        dataset.schema().field("value").unwrap().id,
+    ];
+    assert_eq!(before[0].fields, fields);
+    let descriptions = dataset.describe_indices(None).await.unwrap();
+    assert_eq!(
+        descriptions[0].field_ids(),
+        fields.iter().map(|id| *id as u32).collect::<Vec<_>>()
+    );
+    assert_eq!(descriptions[0].index_type(), "Example");
+    let statistics: serde_json::Value =
+        serde_json::from_str(&dataset.index_statistics("profile").await.unwrap()).unwrap();
+    assert_eq!(statistics["indices"][0]["rows"], 4);
+    assert_eq!(statistics["num_indexed_rows"], 0);
+    let info = dataset.scalar_index_info().await.unwrap();
+    assert!(info.get_index("other").is_none());
+    assert!(info.get_index("value").is_none());
+
+    dataset
+        .alter_columns(&[
+            ColumnAlteration::new("other".into()).rename("group".into()),
+            ColumnAlteration::new("value".into()).rename("input".into()),
+        ])
+        .await
+        .unwrap();
+    let mut reopened = Dataset::open(dataset.uri()).await.unwrap();
+    assert_eq!(reopened.load_indices().await.unwrap(), before);
+    let index = reopened
+        .open_scalar_index("group", &before[0].uuid, &NoOpMetricsCollector)
+        .await
+        .unwrap();
+    assert_eq!(index.statistics().unwrap()["rows"], 4);
+    reopened
+        .commit_existing_index_segments("profile", "group", vec![before[0].clone()])
+        .await
+        .unwrap();
+    assert_eq!(reopened.load_indices().await.unwrap()[0].fields, fields);
+
+    let mut reversed = before[0].clone();
+    reversed.fields.reverse();
+    let version = reopened.version().version;
+    let error = reopened
+        .commit_existing_index_segments("profile", "input", vec![reversed])
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::Index { .. }));
+    assert!(error.to_string().contains("different fields"));
+    assert_eq!(reopened.version().version, version);
+}
+
+#[rstest]
+#[case::first("other")]
+#[case::second("value")]
+#[tokio::test]
+async fn multi_field_scope_protects_every_dependency(#[case] column: &str) {
+    let (_directory, mut dataset) = dataset_with_example_index(false, &["other", "value"]).await;
+    let before = dataset.load_indices().await.unwrap();
+    let version = dataset.version().version;
+    let error = dataset
+        .alter_columns(&[ColumnAlteration::new(column.into()).cast_to(DataType::Int32)])
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::InvalidInput { .. }));
+    assert!(error.to_string().contains("profile"));
+    assert!(error.to_string().contains("drop_index()"));
+    assert_eq!(dataset.version().version, version);
+    assert_eq!(dataset.load_indices().await.unwrap(), before);
+
+    dataset.drop_columns(&["keep"]).await.unwrap();
+    assert_eq!(dataset.load_indices().await.unwrap(), before);
+    dataset.drop_columns(&[column]).await.unwrap();
+    let reopened = Dataset::open(dataset.uri()).await.unwrap();
+    assert!(reopened.load_indices().await.unwrap().is_empty());
+    assert_eq!(reopened.count_rows(None).await.unwrap(), 4);
+}
+
+#[rstest]
+#[case::missing_field(vec![0, 99], false, "absent from dataset")]
+#[case::duplicate_field(vec![0, 0], false, "repeats field id")]
+#[case::wrong_first_field(vec![1, 0], false, "expected keyed field")]
+#[case::filtering_coverage(vec![0, 1], true, "expected keyed field")]
+#[tokio::test]
+async fn multi_field_scope_rejects_invalid_declarations(
+    #[case] fields: Vec<i32>,
+    #[case] has_coverage: bool,
+    #[case] message: &str,
+) {
+    let (_directory, mut dataset) = dataset_with_example_index(false, &["value"]).await;
+    let before = dataset.load_indices().await.unwrap();
+    let mut segment = before[0].clone();
+    segment.fields = fields;
+    if has_coverage {
+        segment.fragment_bitmap = Some([0].into_iter().collect());
+    }
+    let version = dataset.version().version;
+    let error = dataset
+        .commit_existing_index_segments("multi", "value", vec![segment])
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::InvalidInput { .. }));
+    assert!(error.to_string().contains(message), "{error}");
+    assert_eq!(dataset.version().version, version);
+    assert_eq!(dataset.load_indices().await.unwrap(), before);
+}
+
+#[tokio::test]
+async fn multi_field_scope_rejects_mixed_segment_order() {
+    let (_directory, mut dataset) =
+        dataset_with_example_index(false, &["value", "other", "keep"]).await;
+    let before = dataset.load_indices().await.unwrap();
+    let mut second = before[0].clone();
+    second.uuid = uuid::Uuid::new_v4();
+    second.fields.swap(1, 2);
+    let error = dataset
+        .commit_existing_index_segments("multi", "value", vec![before[0].clone(), second.clone()])
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::InvalidInput { .. }));
+    assert!(error.to_string().contains("must declare the same columns"));
+    assert_eq!(dataset.load_indices().await.unwrap(), before);
+
+    // Keeping the first field does not permit changing the rest of the scope.
+    second.uuid = before[0].uuid;
+    let error = dataset
+        .commit_existing_index_segments("profile", "value", vec![second])
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::Index { .. }));
+    assert!(error.to_string().contains("different fields"));
+    assert_eq!(dataset.load_indices().await.unwrap(), before);
+}
+
+#[rstest]
+#[case::drop(false)]
+#[case::cast(true)]
+#[tokio::test]
+async fn staged_multi_field_scope_rejects_removed_dependency(#[case] cast: bool) {
+    let (_directory, mut dataset) = dataset_with_example_index(false, &["value", "other"]).await;
+    let segments = dataset.load_indices().await.unwrap().as_ref().clone();
+    dataset.drop_index("profile").await.unwrap();
+    if cast {
+        dataset
+            .alter_columns(&[ColumnAlteration::new("other".into()).cast_to(DataType::Int32)])
+            .await
+            .unwrap();
+    } else {
+        dataset.drop_columns(&["other"]).await.unwrap();
+    }
+    let version = dataset.version().version;
+    let error = dataset
+        .commit_existing_index_segments("profile", "value", segments)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::InvalidInput { .. }));
+    assert!(error.to_string().contains("absent from dataset"), "{error}");
+    assert_eq!(dataset.version().version, version);
+    assert!(dataset.load_indices().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn builtin_segments_and_builders_still_require_one_keyed_field() {
+    let (_directory, mut dataset) = dataset_with_example_index(false, &["value"]).await;
+    for params in [
+        ScalarIndexParams::default(),
+        ScalarIndexParams::new("example".into()),
+    ] {
+        let error = dataset
+            .create_index_builder(&["value", "other"], IndexType::Scalar, &params)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::Index { .. }));
+        assert!(error.to_string().contains("1 column"), "{error}");
+    }
+    let mut segment = dataset
+        .create_index_builder(&["value"], IndexType::BTree, &ScalarIndexParams::default())
+        .execute_uncommitted()
+        .await
+        .unwrap();
+    segment
+        .fields
+        .push(dataset.schema().field("other").unwrap().id);
+    segment.fragment_bitmap = Some(RoaringBitmap::new());
+    let error = dataset
+        .commit_existing_index_segments("builtin", "value", vec![segment])
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::InvalidInput { .. }));
+    assert!(error.to_string().contains("expected keyed field"));
 }
