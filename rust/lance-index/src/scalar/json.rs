@@ -1869,10 +1869,15 @@ mod tests {
     /// dataset, and address and id coincide without one), so the loaded
     /// target must always report the pre-migration, row-id-domain floor
     /// version instead.
+    ///
+    /// LabelList shares the same floor-version handling in `load_index` but
+    /// has no case here: JSON path extraction rejects array/object values
+    /// outright (see `test_json_index_rejects_non_scalar_path`), so a
+    /// LabelList target -- which requires a List/LargeList column -- can
+    /// never actually be trained through this wrapper to exercise it.
     #[rstest]
     #[case::btree("btree")]
     #[case::bitmap("bitmap")]
-    #[case::label_list("label_list")]
     #[tokio::test]
     #[serial_test::serial(LANCE_DF_SPILL_POOL)]
     async fn test_json_wrapped_target_loads_as_row_id_domain(#[case] target_index_type: &str) {

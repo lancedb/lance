@@ -187,10 +187,9 @@ impl IndexMetadata {
             ("lance.table" | "lance.index.pb", "btreeindexdetails") => self.index_version < 1,
             ("lance.table" | "lance.index.pb", "bitmapindexdetails") => self.index_version < 1,
             ("lance.table" | "lance.index.pb", "labellistindexdetails") => self.index_version < 2,
-            (
-                "lance.table" | "lance.index.pb",
-                "ngramindexdetails" | "invertedindexdetails",
-            ) => true,
+            ("lance.table" | "lance.index.pb", "ngramindexdetails" | "invertedindexdetails") => {
+                true
+            }
             (
                 "lance.index.pb",
                 "vectorindexdetails"
