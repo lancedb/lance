@@ -50,6 +50,8 @@ const REFRESH_MANIFEST_CONCURRENCY: usize = 4;
 impl CleanupOperation<'_> {
     /// Plan a cleanup whose listing and deletion can be split across processes.
     ///
+    /// This is an experimental API. It may change at any time.
+    ///
     /// The plan removes the expired manifests. Run every task from
     /// [`CleanupPlan::tasks`], in any order and on any machine with access to the
     /// dataset, then pass all of their results to [`CleanupPlan::finish`]. Tasks are

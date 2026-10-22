@@ -3573,6 +3573,8 @@ class LanceDataset(pa.dataset.Dataset):
         ``delete_unverified=True``, nothing may write to the dataset from the plan
         until the last task has run. Cleaning referenced branches is not supported.
 
+        **Experimental API**
+
         Parameters
         ----------
         older_than, retain_versions, delete_unverified, error_if_tagged_old_versions,
