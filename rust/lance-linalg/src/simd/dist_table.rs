@@ -184,12 +184,11 @@ lance_core::target_kernel! {
     }
 }
 
-// The object is built with `-march=sapphirerapids`, so it requires
-// `avx512fp16`, which stands in for that CPU's features as for the
-// half-precision C kernels.
+// The C object adds only `-mavx512f -mavx512bw` to the build's baseline
+// target (see build.rs).
 #[cfg(all(target_arch = "x86_64", kernel_support = "avx512_dist_table"))]
 lance_core::target_kernel! {
-    #[target_features("avx512fp16")]
+    #[target_features("avx512f", "avx512bw")]
     #[candidate(SUM_U16_AVX512: SumU16Fn)]
     fn sum_u16_avx512(
         codes: &[u8],
