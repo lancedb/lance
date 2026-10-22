@@ -3567,34 +3567,29 @@ impl FragmentReader {
         let (unique_indices, restore_order) = if is_sorted_and_unique {
             (Cow::Borrowed(indices), None)
         } else {
-            let survives_deletion = |index| {
-                self.make_deletions_null
-                    || self
-                        .deletion_vec
-                        .as_ref()
-                        .is_none_or(|deletion_vec| !deletion_vec.contains(index))
-            };
-            let mut sorted_positions = (0..indices.len())
-                .filter(|position| survives_deletion(indices[*position]))
+            let mut sorted_positions = indices
+                .iter()
+                .copied()
+                .filter(|&index| {
+                    self.make_deletions_null
+                        || self
+                            .deletion_vec
+                            .as_ref()
+                            .is_none_or(|deletion_vec| !deletion_vec.contains(index))
+                })
+                // Restoration positions only count surviving requests.
+                .enumerate()
                 .collect::<Vec<_>>();
-            sorted_positions.sort_unstable_by_key(|position| indices[*position]);
+            sorted_positions.sort_unstable_by_key(|&(_, index)| index);
 
-            let mut unique: Vec<u32> = Vec::with_capacity(indices.len());
-            let mut restore_indices = vec![0_u32; indices.len()];
-            for position in sorted_positions {
-                let idx = indices[position];
+            let mut unique: Vec<u32> = Vec::with_capacity(sorted_positions.len());
+            let mut restore_indices = vec![0_u32; sorted_positions.len()];
+            for (position, idx) in sorted_positions {
                 if unique.last() != Some(&idx) {
                     unique.push(idx);
                 }
                 restore_indices[position] = (unique.len() - 1) as u32;
             }
-            let restore_indices = restore_indices
-                .into_iter()
-                .zip(indices)
-                .filter_map(|(restore_index, &index)| {
-                    survives_deletion(index).then_some(restore_index)
-                })
-                .collect::<Vec<_>>();
             (Cow::Owned(unique), Some(UInt32Array::from(restore_indices)))
         };
 
@@ -6156,10 +6151,15 @@ mod tests {
     }
 
     #[rstest]
+    #[case::unordered(&[8, 2, 5, 4, 1], &[128, 125, 121])]
+    #[case::duplicates_and_deletions(&[2, 8, 2, 5, 4, 1, 8, 4], &[128, 125, 121, 128])]
+    #[case::all_deleted(&[4, 2, 4], &[])]
     #[tokio::test]
     async fn test_fragment_take_rows(
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
         data_storage_version: LanceFileVersion,
+        #[case] unordered_indices: &[u32],
+        #[case] expected_values: &[i32],
     ) {
         let test_dir = TempStrDir::default();
         let test_uri = &test_dir;
@@ -6216,7 +6216,7 @@ mod tests {
         // Unordered deleted rows are omitted while surviving rows retain request order.
         let batch = fragment
             .take_rows(
-                &[8, 2, 5, 4, 1],
+                unordered_indices,
                 dataset.schema(),
                 false,
                 false,
@@ -6227,7 +6227,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             batch.column_by_name("i").unwrap().as_ref(),
-            &Int32Array::from(vec![128, 125, 121])
+            &Int32Array::from(expected_values.to_vec())
         );
 
         // Readers configured to materialize deletions retain their requested positions.
