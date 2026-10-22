@@ -461,7 +461,10 @@ async fn dataset_with_example_index(stable_row_ids: bool) -> (TempDir, Dataset) 
         .commit_existing_index_segments("profile", "value", vec![segment])
         .await
         .unwrap();
-    (directory, dataset)
+    // Compare persisted metadata across maintenance operations: serialization
+    // stores creation timestamps at millisecond precision.
+    let reopened = Dataset::open(dataset.uri()).await.unwrap();
+    (directory, reopened)
 }
 
 #[rstest]
