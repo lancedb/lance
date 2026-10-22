@@ -11,7 +11,10 @@ use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use lance::{
     Dataset,
-    dataset::WriteParams,
+    dataset::{
+        UpdateBuilder, WriteParams,
+        optimize::{CompactionOptions, compact_files},
+    },
     index::{DatasetIndexExt, DatasetIndexInternalExt, register_scalar_index_plugin},
 };
 use lance_core::{Error, Result, cache::LanceCache};
@@ -22,7 +25,7 @@ use lance_index::{
     progress::IndexBuildProgress,
     scalar::{
         CreatedIndex, IndexStore, RowIdRemapper, ScalarIndex, ScalarIndexParams,
-        expression::ScalarQueryParser,
+        expression::{SargableQueryParser, ScalarQueryParser},
         registry::{BasicTrainer, ScalarIndexPlugin, TrainingRequest},
         seed::{IndexSeedWriter, SEED_META_KEY_PREFIX},
         zonemap::{ZoneMapIndexPlugin, ZoneMapSeedWriter},
@@ -100,10 +103,14 @@ impl ScalarIndexPlugin for ExampleIndexPlugin {
 
     fn new_query_parser(
         &self,
-        _index_name: String,
+        index_name: String,
         _index_details: &prost_types::Any,
     ) -> Option<Box<dyn ScalarQueryParser>> {
-        None
+        Some(Box::new(SargableQueryParser::new(
+            index_name,
+            self.name().to_string(),
+            true,
+        )))
     }
 
     async fn load_index(
@@ -138,6 +145,100 @@ impl ScalarIndexPlugin for ExampleIndexPlugin {
             data_type.clone(),
         )?)))
     }
+}
+
+#[rstest]
+#[case::compaction(true)]
+#[case::row_rewrite(false)]
+#[tokio::test]
+async fn external_address_index_keeps_rewritten_rows_visible(#[case] compact: bool) {
+    LazyLock::force(&REGISTRATION);
+    let directory = tempdir().unwrap();
+    let batch = record_batch!(
+        ("value", Int64, [1, 2, 3, 4]),
+        ("other", Int64, [10, 20, 30, 40])
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        directory.path().to_str().unwrap(),
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            enable_stable_row_ids: true,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(
+            &["value"],
+            IndexType::Scalar,
+            Some("example_index".to_string()),
+            &ScalarIndexParams::new("example".to_string()),
+            false,
+        )
+        .await
+        .unwrap();
+    let mut before = dataset.scan();
+    before.filter("value = 3").unwrap();
+    assert!(
+        before
+            .explain_plan(false)
+            .await
+            .unwrap()
+            .contains("ScalarIndex")
+    );
+    assert_eq!(before.try_into_batch().await.unwrap().num_rows(), 1);
+
+    if compact {
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 4,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.fragments().len(), 1);
+    } else {
+        let result = UpdateBuilder::new(Arc::new(dataset))
+            .update_where("value = 3")
+            .unwrap()
+            .set("other", "99")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(result.rows_updated, 1);
+        dataset = result.new_dataset.as_ref().clone();
+    }
+
+    let reopened = Dataset::open(dataset.uri()).await.unwrap();
+    let indices = reopened.load_indices().await.unwrap();
+    let coverage = indices[0].fragment_bitmap.as_ref().unwrap();
+    assert!(coverage.iter().all(|fragment| fragment < 2));
+    if compact {
+        assert!(coverage.is_empty());
+    } else {
+        assert_eq!(coverage.iter().collect::<Vec<_>>(), [0, 1]);
+    }
+    let mut full_scan = reopened.scan();
+    full_scan
+        .filter("value = 3")
+        .unwrap()
+        .use_scalar_index(false);
+    let expected = full_scan.try_into_batch().await.unwrap();
+    assert_eq!(expected.num_rows(), 1);
+    let mut indexed_scan = reopened.scan();
+    indexed_scan.filter("value = 3").unwrap();
+    let actual = indexed_scan.try_into_batch().await.unwrap();
+    assert_eq!(actual, expected, "rewritten rows must remain visible");
 }
 
 #[tokio::test]

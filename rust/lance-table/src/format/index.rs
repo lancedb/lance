@@ -147,6 +147,7 @@ impl IndexMetadata {
     /// Currently this is a rather short list.  We will soon be migrating the remaining
     /// row-id-domain indexes to use row addresses.  At that point this list will grow and
     /// likely turn from an allow-list into a block-list.
+    /// A false result does not prove that an unrecognized plugin stores stable row IDs.
     pub fn results_are_row_addrs(&self) -> bool {
         self.index_details.as_ref().is_some_and(|details| {
             let is_fm = details
@@ -160,6 +161,46 @@ impl IndexMetadata {
                 || is_fm
                 || Self::is_btree_addr_domain(details, self.index_version)
         })
+    }
+
+    /// Whether the metadata proves that stored identifiers survive a physical
+    /// row rewrite without remapping. Unknown plugin types must lose coverage
+    /// of rewritten rows instead of being assumed to store stable row IDs.
+    /// Missing details retain the historical native-index behavior.
+    pub(crate) fn can_follow_stable_row_ids(&self) -> bool {
+        if self.results_are_row_addrs() {
+            return false;
+        }
+        let Some(details) = &self.index_details else {
+            return true;
+        };
+        let type_url = details.type_url.to_ascii_lowercase();
+        let Some((package, name)) = type_url
+            .rsplit_once('/')
+            .and_then(|(_, name)| name.rsplit_once('.'))
+        else {
+            return false;
+        };
+        match (package, name) {
+            ("lance.table" | "lance.index.pb", "btreeindexdetails") => self.index_version < 1,
+            (
+                "lance.table" | "lance.index.pb",
+                "bitmapindexdetails"
+                | "labellistindexdetails"
+                | "ngramindexdetails"
+                | "invertedindexdetails",
+            ) => true,
+            (
+                "lance.index.pb",
+                "vectorindexdetails"
+                | "jsonindexdetails"
+                | "rtreeindexdetails"
+                | "minhashlshindexdetails",
+            ) => true,
+            // MemWAL flush briefly emitted this native vector identity.
+            ("lance.index", "vectorindexdetails") => true,
+            _ => false,
+        }
     }
 
     // A BTree segment stores row addresses only from format version 1
@@ -743,13 +784,37 @@ mod tests {
     }
 
     #[rstest]
-    #[case::zone_map("type.googleapis.com/lance.table.ZoneMapIndexDetails", true)]
-    #[case::bloom_filter("type.googleapis.com/lance.index.pb.BloomFilterIndexDetails", true)]
-    #[case::fm("type.googleapis.com/lance.index.pb.FMIndexDetails", true)]
-    #[case::fm_case_insensitive("type.googleapis.com/LANCE.INDEX.PB.FMINDEXDETAILS", true)]
-    #[case::foreign_fm_terminal_name("type.googleapis.com/example.FMIndexDetails", false)]
-    #[case::btree_legacy("type.googleapis.com/lance.table.BTreeIndexDetails", false)]
-    fn test_results_are_row_addrs(#[case] type_url: &str, #[case] expected: bool) {
+    #[case::zone_map("type.googleapis.com/lance.table.ZoneMapIndexDetails", true, false)]
+    #[case::bloom_filter(
+        "type.googleapis.com/lance.index.pb.BloomFilterIndexDetails",
+        true,
+        false
+    )]
+    #[case::fm("type.googleapis.com/lance.index.pb.FMIndexDetails", true, false)]
+    #[case::fm_case_insensitive("type.googleapis.com/LANCE.INDEX.PB.FMINDEXDETAILS", true, false)]
+    #[case::foreign_fm_terminal_name("type.googleapis.com/example.FMIndexDetails", false, false)]
+    #[case::custom("type.googleapis.com/example.ExampleIndexDetails", false, false)]
+    #[case::foreign_bitmap("type.googleapis.com/example.BitmapIndexDetails", false, false)]
+    #[case::btree_legacy("type.googleapis.com/lance.table.BTreeIndexDetails", false, true)]
+    #[case::bitmap("type.googleapis.com/lance.table.BitmapIndexDetails", false, true)]
+    #[case::bitmap_alias("type.googleapis.com/LANCE.INDEX.PB.BITMAPINDEXDETAILS", false, true)]
+    #[case::label_list("type.googleapis.com/lance.table.LabelListIndexDetails", false, true)]
+    #[case::ngram("type.googleapis.com/lance.table.NGramIndexDetails", false, true)]
+    #[case::inverted("type.googleapis.com/lance.table.InvertedIndexDetails", false, true)]
+    #[case::vector("type.googleapis.com/lance.index.pb.VectorIndexDetails", false, true)]
+    #[case::vector_legacy("type.googleapis.com/lance.index.VectorIndexDetails", false, true)]
+    #[case::json("type.googleapis.com/lance.index.pb.JsonIndexDetails", false, true)]
+    #[case::rtree("type.googleapis.com/lance.index.pb.RTreeIndexDetails", false, true)]
+    #[case::minhash_lsh(
+        "type.googleapis.com/lance.index.pb.MinHashLshIndexDetails",
+        false,
+        true
+    )]
+    fn test_results_are_row_addrs(
+        #[case] type_url: &str,
+        #[case] expected: bool,
+        #[case] can_follow_stable_row_ids: bool,
+    ) {
         let mut metadata = index_metadata_with(vec![0], vec![]);
         metadata.index_details = Some(Arc::new(prost_types::Any {
             type_url: type_url.to_string(),
@@ -758,11 +823,16 @@ mod tests {
         metadata.index_version = 0;
 
         assert_eq!(metadata.results_are_row_addrs(), expected);
+        assert_eq!(
+            metadata.can_follow_stable_row_ids(),
+            can_follow_stable_row_ids
+        );
     }
 
     #[test]
     fn test_results_are_row_addrs_btree_is_version_gated() {
         let mut metadata = index_metadata_with(vec![0], vec![]);
+        assert!(metadata.can_follow_stable_row_ids());
         metadata.index_details = Some(Arc::new(prost_types::Any {
             type_url: "type.googleapis.com/lance.table.BTreeIndexDetails".to_string(),
             value: Vec::new(),
@@ -773,12 +843,14 @@ mod tests {
             !metadata.results_are_row_addrs(),
             "a legacy BTree segment stores row ids directly"
         );
+        assert!(metadata.can_follow_stable_row_ids());
 
         metadata.index_version = 1;
         assert!(
             metadata.results_are_row_addrs(),
             "a BTree segment built with address-domain support stores row addresses"
         );
+        assert!(!metadata.can_follow_stable_row_ids());
     }
 
     #[rstest]
