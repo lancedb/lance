@@ -44,10 +44,10 @@ use lance_index::vector::ivf::storage::IvfModel;
 use object_store::path::Path;
 
 use lance_arrow::FixedSizeListArrayExt;
+use lance_index::vector::pca::PcaParams;
 use lance_index::vector::pq::ProductQuantizer;
 use lance_index::vector::quantizer::QuantizationType;
 use lance_index::vector::v3::shuffler::{Shuffler, create_ivf_shuffler};
-use lance_index::vector::pca::PcaParams;
 use lance_index::vector::v3::subindex::SubIndexType;
 use lance_index::vector::{
     VectorIndex,
@@ -521,10 +521,9 @@ impl VectorIndexParams {
 
     /// Returns the configured PCA pre-transform parameters, if present.
     pub fn pca_params(&self) -> Option<&PcaParams> {
-        match self.pre_transform.as_ref() {
-            Some(PreTransformParams::Pca(params)) => Some(params),
-            None => None,
-        }
+        self.pre_transform
+            .as_ref()
+            .map(|PreTransformParams::Pca(params)| params)
     }
 
     /// Returns the manifest compatibility version required by these parameters.

@@ -97,6 +97,7 @@ enum CompressionDetailsJson {
     },
 }
 
+#[allow(dead_code)] // The build path calls this once PCA indexes are created.
 fn pca_parameters(
     params: Option<&PcaParams>,
     model_fingerprint: Option<[u8; 32]>,
@@ -224,6 +225,7 @@ pub fn vector_index_details(params: &VectorIndexParams) -> prost_types::Any {
 }
 
 /// Same as [`vector_index_details`], attaching the trained PCA model fingerprint.
+#[allow(dead_code)] // The build path calls this once PCA indexes are created.
 pub fn vector_index_details_with_pca(
     params: &VectorIndexParams,
     model_fingerprint: Option<[u8; 32]>,
@@ -293,6 +295,7 @@ pub fn pca_params_from_details(
 
 /// Whether persisted details describe a pre-transform that cannot be appended,
 /// optimized, or merged in place.
+#[allow(dead_code)] // The build path calls this once PCA indexes are created.
 pub fn pre_transform_blocks_maintenance(details: &prost_types::Any) -> Result<bool> {
     Ok(pca_params_from_details(details)?.is_some())
 }

@@ -250,20 +250,22 @@ message VectorIndexDetails {
  * way.
  */
 message PcaParameters {
-  // Number of dimensions produced by PCA. A present PCA configuration must
-  // have a non-zero dimension.
+  /* Number of dimensions produced by PCA. A present PCA configuration must
+   * have a non-zero dimension.
+   */
   uint32 dimension = 1;
   // Target number of valid rows used for training.
   uint32 sample_size = 2;
   // Seed used by dataset-aware sampling.
   uint64 sampling_seed = 3;
-  // BLAKE3 fingerprint of the exact trained model applied by the index.
-  // This must contain exactly 32 raw bytes and is required whenever this
-  // message is present.
-  //
-  // This message does not store whitening, an epsilon, a random rotation, a
-  // rotation seed, or a training memory budget. A reader must not infer any of
-  // those from a missing field number.
+  /* BLAKE3 fingerprint of the exact trained model applied by the index.
+   * This must contain exactly 32 raw bytes and is required whenever this
+   * message is present.
+   *
+   * This message does not store whitening, an epsilon, a random rotation, a
+   * rotation seed, or a training memory budget. A reader must not infer any of
+   * those from a missing field number.
+   */
   bytes model_fingerprint = 4;
 }
 
