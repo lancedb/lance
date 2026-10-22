@@ -130,6 +130,9 @@ pub struct OptimizeIndexTask {
     /// How many of `old_segments` to fold in, as
     /// [`OptimizeOptions::num_indices_to_merge`] counts them.
     pub num_indices_to_merge: Option<usize>,
+    /// Allow IVF partition splitting and joining within the task's merge window.
+    /// Split builds keep this disabled so their results share the reference model.
+    pub enable_partition_rebalancing: bool,
     /// Rebuild the index from a freshly trained model.
     pub retrain: bool,
 }
@@ -314,6 +317,24 @@ fn skip_unless_named(name: &str, named: bool, reason: &str) -> Result<Option<Spl
     Ok(None)
 }
 
+fn validate_partition_rebalancing_options(options: &OptimizeOptions) -> Result<()> {
+    if !options.enable_partition_rebalancing {
+        return Ok(());
+    }
+    if options.num_indices_to_merge == Some(0) {
+        return Err(Error::invalid_input(
+            "enable_partition_rebalancing requires num_indices_to_merge to be positive or unset, got Some(0)",
+        ));
+    }
+    if options.max_rows_per_task.is_some() || options.max_rows_per_segment.is_some() {
+        return Err(Error::invalid_input(format!(
+            "enable_partition_rebalancing cannot be combined with max_rows_per_task={:?} or max_rows_per_segment={:?}; partition rebalancing requires an unbounded merge task",
+            options.max_rows_per_task, options.max_rows_per_segment,
+        )));
+    }
+    Ok(())
+}
+
 /// Plan the optimization of the dataset's indices.
 ///
 /// See the module documentation for what the plan contains and which indices
@@ -361,6 +382,7 @@ pub(crate) async fn plan_optimize_indices_or_skip(
     indices: &[IndexMetadata],
     options: &OptimizeOptions,
 ) -> Result<Option<OptimizeIndicesPlan>> {
+    validate_partition_rebalancing_options(options)?;
     if has_unsupported_frag_reuse_history(dataset, indices).await? {
         log::warn!(
             "Skipping index optimization: the tagged fragment reuse history carries \
@@ -466,6 +488,7 @@ async fn plan_unsplit_index(
         reference: last.clone(),
         old_segments: segments.iter().map(|segment| (*segment).clone()).collect(),
         num_indices_to_merge: options.num_indices_to_merge,
+        enable_partition_rebalancing: options.enable_partition_rebalancing,
         retrain: options.retrain,
     });
     plan.merges.push(OptimizeIndexMerge {
@@ -881,6 +904,7 @@ async fn pack_split_index(
                 fragments,
                 reference: reference.clone(),
                 num_indices_to_merge: Some(absorbed_by_task.len()),
+                enable_partition_rebalancing: false,
                 old_segments: absorbed_by_task.clone(),
                 retrain: false,
             });
@@ -910,15 +934,17 @@ impl OptimizeIndexTask {
         dataset: &Dataset,
         progress: Arc<dyn IndexBuildProgress>,
     ) -> Result<Option<IndexSegmentResult>> {
+        let mut options = OptimizeOptions::default().progress(progress);
+        options.num_indices_to_merge = self.num_indices_to_merge;
+        options.enable_partition_rebalancing = self.enable_partition_rebalancing;
+        options.retrain = self.retrain;
+        validate_partition_rebalancing_options(&options)?;
         let dataset = Arc::new(dataset_at_version(dataset, self.read_version).await?);
         let fragments = dataset
             .get_fragments_from_ids(&self.fragments)?
             .into_iter()
             .map(|fragment| fragment.metadata().clone())
             .collect::<Vec<_>>();
-        let mut options = OptimizeOptions::default().progress(progress);
-        options.num_indices_to_merge = self.num_indices_to_merge;
-        options.retrain = self.retrain;
         let results = if self.old_segments.is_empty() && segment_has_vector_details(&self.reference)
         {
             let field = keyed_field(&dataset, &self.reference)?;
