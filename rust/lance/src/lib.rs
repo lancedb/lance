@@ -97,7 +97,7 @@ pub mod utils;
 
 pub mod pb {
     #![allow(clippy::use_self)]
-    include!(concat!(env!("OUT_DIR"), "/lance.pb.rs"));
+    include!("pb/lance.pb.rs");
 }
 
 pub use blob::{
