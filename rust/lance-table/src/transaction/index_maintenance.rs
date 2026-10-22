@@ -42,9 +42,9 @@ impl Transaction {
             .collect::<HashSet<_>>();
 
         for index in indices.iter_mut() {
-            // Physical row addresses cannot follow moved rows into a new fragment.
-            // Leave that fragment uncovered so the scanner reads it directly.
-            if index.results_are_row_addrs() {
+            // Only known stable row IDs can follow moved rows into a new
+            // fragment. Unknown plugin domains must leave it for the scanner.
+            if !index.can_follow_stable_row_ids() {
                 continue;
             }
             let index_covers_modified_field = index.fields.iter().any(|field_id| {
