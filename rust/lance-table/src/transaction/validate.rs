@@ -659,61 +659,72 @@ fn schema_fragments_valid(
 }
 
 pub fn schema_fragments_modern_valid(schema: &Schema, fragments: &[Fragment]) -> Result<()> {
-    // A field must be physically present in every fragment only when it, and all
-    // of its ancestors, are non-nullable: such a field can never be null, so a
-    // fragment that omits it (which reads back as all-null) would violate the
+    // A field is "required" when it, and all of its ancestors, are non-nullable:
+    // it can never be null, so a fragment that carries no data for it violates the
     // schema. Nullable fields -- and anything under a nullable ancestor -- may be
-    // legally omitted and are filled with nulls on read; that is the
-    // subschema-insert contract (#3016 / #3041). Only leaves carry data-file
-    // entries, so only leaves are collected, matching the reader's notion of a
-    // "missing field".
-    fn collect_required_leaf_ids(fields: &[Field], required_path: bool, out: &mut Vec<i32>) {
+    // omitted and are filled with nulls on read (#3016 / #3041).
+    //
+    // Coverage must follow physical encoding, not just leaf ids:
+    //   - a packed struct stores only the parent column, so a present *ancestor*
+    //     id covers every (possibly non-nullable) descendant;
+    //   - a split struct stores only child columns, so a present *descendant* id
+    //     covers the (non-nullable) container.
+    // A required node is therefore violated only when the fragment carries no id
+    // from its ancestors, itself, or its subtree.
+    fn subtree_has_present(field: &Field, present: &HashSet<i32>) -> bool {
+        (field.id >= 0 && present.contains(&field.id))
+            || field
+                .children
+                .iter()
+                .any(|c| subtree_has_present(c, present))
+    }
+    fn missing(field: &Field, fragment: &Fragment) -> Error {
+        Error::invalid_input(format!(
+            "Fragment {} does not contain non-nullable field \"{}\" (id {}); \
+             appending data that omits a non-nullable column is not allowed",
+            fragment.id, field.name, field.id
+        ))
+    }
+    fn check(
+        fields: &[Field],
+        required_path: bool,
+        ancestor_present: bool,
+        present: &HashSet<i32>,
+        fragment: &Fragment,
+    ) -> Result<()> {
         for field in fields {
             let required = required_path && !field.nullable;
+            // Covered by this column itself or by a present (packed) ancestor.
+            let covered = ancestor_present || (field.id >= 0 && present.contains(&field.id));
             if field.children.is_empty() {
-                if required && field.id >= 0 {
-                    out.push(field.id);
+                if required && field.id >= 0 && !covered {
+                    return Err(missing(field, fragment));
                 }
             } else {
-                collect_required_leaf_ids(&field.children, required, out);
+                // A required container is satisfied if it is covered from above or
+                // any descendant column (split children) is present.
+                if required && !covered && !subtree_has_present(field, present) {
+                    return Err(missing(field, fragment));
+                }
+                check(&field.children, required, covered, present, fragment)?;
             }
         }
+        Ok(())
     }
-    let mut required_ids = Vec::new();
-    collect_required_leaf_ids(&schema.fields, true, &mut required_ids);
 
     for fragment in fragments {
-        // validate that each data file at least contains one field.
+        let mut present: HashSet<i32> = HashSet::new();
         for data_file in &fragment.files {
+            // validate that each data file at least contains one field.
             if data_file.fields.is_empty() {
                 return Err(Error::invalid_input(format!(
                     "Datafile {} does not contain any fields",
                     data_file.path
                 )));
             }
+            present.extend(data_file.fields.iter().copied());
         }
-
-        if required_ids.is_empty() {
-            continue;
-        }
-        let present: HashSet<i32> = fragment
-            .files
-            .iter()
-            .flat_map(|f| f.fields.iter().copied())
-            .collect();
-        for id in &required_ids {
-            if !present.contains(id) {
-                let name = schema
-                    .field_by_id(*id)
-                    .map(|f| f.name.clone())
-                    .unwrap_or_else(|| format!("<field id {id}>"));
-                return Err(Error::invalid_input(format!(
-                    "Fragment {} does not contain non-nullable field \"{}\" (id {}); \
-                     appending data that omits a non-nullable column is not allowed",
-                    fragment.id, name, id
-                )));
-            }
-        }
+        check(&schema.fields, true, false, &present, fragment)?;
     }
     Ok(())
 }
@@ -1239,6 +1250,69 @@ mod tests {
         // Omitting a nullable column is the subschema-insert contract (#3041).
         let frags = vec![fragment_with_file_fields(0, "f.lance", vec![0])];
         schema_fragments_modern_valid(&schema, &frags).unwrap();
+    }
+
+    #[test]
+    fn test_modern_valid_struct_covered_by_packed_or_split() {
+        use arrow_schema::Fields;
+        // struct p { x: int32 NOT NULL } NOT NULL
+        let schema = LanceSchema::try_from(&ArrowSchema::new(vec![ArrowField::new(
+            "p",
+            DataType::Struct(Fields::from(vec![ArrowField::new(
+                "x",
+                DataType::Int32,
+                false,
+            )])),
+            false,
+        )]))
+        .unwrap();
+        let p_id = schema.fields[0].id;
+        let x_id = schema.fields[0].children[0].id;
+
+        // Packed: only the parent column is stored on disk; the non-nullable child
+        // is carried inside it, so this must NOT be rejected.
+        let packed = vec![fragment_with_file_fields(0, "p.lance", vec![p_id])];
+        schema_fragments_modern_valid(&schema, &packed).unwrap();
+
+        // Split: only the child column is stored; the non-nullable container is
+        // represented by its child, so this must NOT be rejected either.
+        let split = vec![fragment_with_file_fields(0, "p.lance", vec![x_id])];
+        schema_fragments_modern_valid(&schema, &split).unwrap();
+    }
+
+    #[test]
+    fn test_modern_valid_rejects_omitted_required_container() {
+        use arrow_schema::Fields;
+        // id: int32 NOT NULL, s: struct { a: int32 NULL } NOT NULL
+        let schema = LanceSchema::try_from(&ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new(
+                "s",
+                DataType::Struct(Fields::from(vec![ArrowField::new(
+                    "a",
+                    DataType::Int32,
+                    true,
+                )])),
+                false,
+            ),
+        ]))
+        .unwrap();
+        let id_id = schema.fields[0].id;
+        let s_child = schema.fields[1].children[0].id;
+
+        // A non-nullable container omitted entirely must be rejected even though
+        // its only child is nullable.
+        let frags = vec![fragment_with_file_fields(0, "f.lance", vec![id_id])];
+        let err = schema_fragments_modern_valid(&schema, &frags).unwrap_err();
+        assert!(err.to_string().contains("\"s\""), "unexpected error: {err}");
+
+        // Carrying the container (via its child column) is accepted.
+        let ok = vec![fragment_with_file_fields(
+            0,
+            "f.lance",
+            vec![id_id, s_child],
+        )];
+        schema_fragments_modern_valid(&schema, &ok).unwrap();
     }
 
     fn activated_manifest() -> Manifest {
