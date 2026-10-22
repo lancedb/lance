@@ -640,6 +640,7 @@ impl PlanarSparseScheduler {
                     decompressors,
                 )?;
                 scheduler.enable_cache = true;
+                scheduler.chunk_oversized_pages = false;
                 ValueStorage::Zipped {
                     scheduler,
                     num_values: v.num_items,

@@ -160,6 +160,11 @@ pub struct FullZipScheduler {
     /// Pages larger than this are read in row chunks; see
     /// [`MAX_PAGE_LOAD_BYTES`].
     max_page_load_bytes: u64,
+    /// Whether a whole-page read of an oversized page is split into row chunks.
+    /// Off for callers that gather every load task of a page before decoding:
+    /// chunks free nothing early for them, and a chunk queued at a later row
+    /// priority can wait on I/O buffer held by a read they have not drained.
+    pub(super) chunk_oversized_pages: bool,
 }
 
 impl FullZipScheduler {
@@ -243,6 +248,7 @@ impl FullZipScheduler {
             cached_state: None,
             enable_cache: false,
             max_page_load_bytes: MAX_PAGE_LOAD_BYTES,
+            chunk_oversized_pages: true,
         })
     }
 
@@ -617,7 +623,8 @@ impl StructuralPageScheduler for FullZipScheduler {
         ranges: &[Range<u64>],
         io: &Arc<dyn EncodingsIo>,
     ) -> Result<Vec<PageLoadTask>> {
-        if self.data_buf_size > self.max_page_load_bytes
+        if self.chunk_oversized_pages
+            && self.data_buf_size > self.max_page_load_bytes
             && self.rows_in_page > 1
             && Self::covers_entire_page(ranges, self.rows_in_page)
         {
@@ -1711,6 +1718,7 @@ mod tests {
             cached_state: None,
             enable_cache: false,
             max_page_load_bytes: super::MAX_PAGE_LOAD_BYTES,
+            chunk_oversized_pages: true,
         }
     }
 

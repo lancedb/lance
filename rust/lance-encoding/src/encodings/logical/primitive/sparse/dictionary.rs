@@ -187,6 +187,7 @@ impl IndexedScheduler {
             decompressors,
         )?;
         items.enable_cache = true;
+        items.chunk_oversized_pages = false;
         Ok(Self {
             indices: Arc::from(create_fixed_width_block_decompressor(index_encoding, 32)?),
             index_range: checked_buffer_range(buffers[0].0, buffers[0].1, "dictionary indices")?,
