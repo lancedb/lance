@@ -809,10 +809,11 @@ async fn test_v10_0_0_dictionary_merged_past_key_type() {
     // One batch of the whole page references 192 distinct values, more than Int8
     // keys can address.
     let error = dataset.scan().try_into_batch().await.unwrap_err();
+    assert!(matches!(error, Error::NotSupported { .. }), "{error}");
     assert!(
         error
             .to_string()
-            .contains("read the column in batches of at most 128 rows"),
+            .contains("more than the 128 distinct values that Int8 keys can address"),
         "unexpected error: {error}"
     );
 

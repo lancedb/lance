@@ -1139,14 +1139,15 @@ impl DictionaryDataBlock {
         Ok(builder.build()?)
     }
 
-    /// Converts a page whose stored indices are 32 bits wide although the field
+    /// Converts a decoded chunk whose indices are 32 bits wide although the field
     /// declares a narrower key type.
     ///
-    /// Writers before #8220 stored such pages when the 2.0 writer appended a null
-    /// slot past the last key the declared type can address, or when the
-    /// dictionaries of the chunks buffered into one page did not fit that type
-    /// together.  The indices still point at the right values, so the batch is
-    /// re-encoded with only the values it references.
+    /// Before #8220 the 2.0 writer stored such pages when it appended a null slot
+    /// past the last key the declared type can address, or when the dictionaries of
+    /// the chunks buffered into one page did not fit that type together.  The 2.1
+    /// writer still stores them in the second case.  The indices still point at the
+    /// right values, so the chunk keeps only the entries it references, re-interned
+    /// when they do not fit the key type.
     fn narrow_widened_indices(
         self,
         key_type: Box<DataType>,
@@ -1171,17 +1172,23 @@ impl DictionaryDataBlock {
                 ),
             )
         })?;
-        // Keep only the referenced values, then cast them to the declared dictionary
-        // type.  The cast interns them exactly and turns a null stored as a
-        // dictionary value into a null key.
         let dictionary = garbage_collect_dictionary(&dictionary)?;
+        let max_keys = max_index_val(&key_type) + 1;
         let declared_type = DataType::Dictionary(key_type.clone(), value_type);
+        if dictionary.values().len() as u64 <= max_keys {
+            // The referenced entries fit the declared key type, so only the keys are
+            // narrowed.  A null stored as a dictionary value stays a value, as it does
+            // on a page whose indices match the key type.
+            return Ok(arrow_cast::cast(&dictionary, &declared_type)?.to_data());
+        }
+        // The referenced entries can repeat a value or include the null slot, so intern
+        // them exactly.  This turns a null dictionary value into a null key.
         let interned = match arrow_cast::cast(dictionary.values(), &declared_type) {
             Ok(interned) => interned,
             Err(arrow_schema::ArrowError::DictionaryKeyOverflowError) => {
-                let max_keys = max_index_val(&key_type) + 1;
                 return Err(lance_core::Error::not_supported(format!(
-                    "this batch references more than {max_keys} distinct dictionary values, which a {key_type} key cannot address; read the column in batches of at most {max_keys} rows"
+                    "this batch references {} dictionary entries, more than the {max_keys} distinct values that {key_type} keys can address; read fewer rows per batch",
+                    dictionary.values().len()
                 )));
             }
             Err(err) => return Err(err.into()),
@@ -2559,9 +2566,21 @@ mod tests {
         // We want to normalize this by pushing nulls into the dictionary, but we cannot because
         // the dictionary is too large for the index type
         let dict = DictionaryArray::new(indices, Arc::new(items));
-        let data = DataBlock::from_array(dict);
+        let data = DataBlock::from_array(dict.clone());
 
         assert_eq!(data.num_values(), 257);
+
+        // The reader narrows the widened indices back to the declared UInt8 keys.
+        let read = make_array(
+            data.clone()
+                .into_arrow(dict.data_type().clone(), false)
+                .unwrap(),
+        );
+        assert_eq!(read.data_type(), dict.data_type());
+        assert_eq!(
+            arrow_cast::cast(&read, &DataType::Utf8).unwrap().as_ref(),
+            arrow_cast::cast(&dict, &DataType::Utf8).unwrap().as_ref()
+        );
 
         let dict = data.as_dictionary().unwrap();
 
@@ -2623,6 +2642,17 @@ mod tests {
         let dict2 = DictionaryArray::new(indices, Arc::new(other_items));
         let data = DataBlock::from_arrays(&[Arc::new(dict1), Arc::new(dict2)], 512);
         assert_eq!(data.num_values(), 512);
+
+        // 512 distinct values cannot be read back under the declared UInt8 keys.
+        let declared = DataType::Dictionary(Box::new(DataType::UInt8), Box::new(DataType::Utf8));
+        let error = data.clone().into_arrow(declared, false).unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("the 256 distinct values that UInt8 keys can address"),
+            "unexpected error: {error}"
+        );
 
         let dict = data.as_dictionary().unwrap();
 
@@ -2962,8 +2992,9 @@ mod tests {
         assert!(matches!(error, Error::CorruptFile { .. }));
         assert!(
             error.to_string().contains(
-                "dictionary indices use 32 bits but the declared Int8 key type uses 8 bits"
-            )
+                "dictionary indices use 32 bits but the declared Int8 key type uses 8 bits, and they do not address the dictionary"
+            ),
+            "unexpected error: {error}"
         );
     }
 
@@ -3015,8 +3046,29 @@ mod tests {
             ]
         );
         let dictionary = array.as_dictionary::<Int8Type>();
-        assert_eq!(dictionary.values().len(), 3);
-        assert_eq!(dictionary.values().null_count(), 0);
+        // Only the four referenced entries remain, and the null slot stays a value.
+        assert_eq!(dictionary.values().len(), 4);
+        assert_eq!(dictionary.values().null_count(), 1);
+    }
+
+    #[test]
+    fn dictionary_narrows_indices_widened_at_key_capacity() {
+        // 127 values plus the null slot are exactly the 128 entries Int8 keys address.
+        let values = (0..128)
+            .map(|i| Some(format!("v{i}")))
+            .chain([None])
+            .collect();
+        let indices = (1..128).chain([128]).collect::<Vec<u32>>();
+        let array = widened_int8_dictionary(indices, values);
+
+        let expected = (1..128)
+            .map(|i| Some(format!("v{i}")))
+            .chain([None])
+            .collect::<Vec<_>>();
+        assert_eq!(decode_strings(&array), expected);
+        let dictionary = array.as_dictionary::<Int8Type>();
+        assert_eq!(dictionary.values().len(), 128);
+        assert_eq!(dictionary.values().null_count(), 1);
     }
 
     #[test]
@@ -3032,6 +3084,23 @@ mod tests {
                 .to_vec()
         );
         assert_eq!(array.as_dictionary::<Int8Type>().values().len(), 3);
+    }
+
+    #[test]
+    fn dictionary_narrows_indices_widened_with_repeated_entries() {
+        // Merging chunks that share 90 values could repeat them in the merged
+        // dictionary.  180 referenced entries do not fit Int8, but 90 distinct values do.
+        let values = (0..180).map(|i| Some(format!("v{}", i % 90))).collect();
+        let array = widened_int8_dictionary((0..180).rev().collect(), values);
+
+        assert_eq!(
+            decode_strings(&array),
+            (0..180)
+                .rev()
+                .map(|i| Some(format!("v{}", i % 90)))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(array.as_dictionary::<Int8Type>().values().len(), 90);
     }
 
     #[test]
@@ -3056,9 +3125,9 @@ mod tests {
 
         assert!(matches!(error, Error::NotSupported { .. }));
         assert!(
-            error
-                .to_string()
-                .contains("read the column in batches of at most 128 rows"),
+            error.to_string().contains(
+                "this batch references 200 dictionary entries, more than the 128 distinct values that Int8 keys can address"
+            ),
             "unexpected error: {error}"
         );
     }

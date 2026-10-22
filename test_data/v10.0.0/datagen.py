@@ -59,9 +59,6 @@ for name, table, version in [
     shutil.rmtree(path, ignore_errors=True)
     lance.write_dataset(table, path, data_storage_version=version)
     # Confirm the generator still captures the defect: Lance 10.0.0 reads these
-    # pages back with wrong values or an error.
-    try:
-        actual = lance.dataset(path).to_table().column("d").to_pylist()
-    except pa.ArrowInvalid:
-        continue
+    # pages back without an error but with the wrong values.
+    actual = lance.dataset(path).to_table().column("d").to_pylist()
     assert actual != table.column("d").to_pylist()
