@@ -381,27 +381,12 @@ impl TryFrom<pb::Transaction> for Transaction {
                     .collect::<Result<Vec<_>>>()?,
             },
             Some(pb::transaction::Operation::UpdateMemWalState(
-                pb::transaction::UpdateMemWalState {
-                    compacted_sstables,
-                    require_index_catchup,
-                },
+                pb::transaction::UpdateMemWalState { compacted_sstables },
             )) => Operation::UpdateMemWalState {
                 compacted_sstables: compacted_sstables
                     .into_iter()
                     .map(CompactedSsTable::try_from)
                     .collect::<Result<_>>()?,
-                // Absent is an ordinary progress update. Explicit `false` is
-                // refused rather than read as absent, so a caller cannot express
-                // "deactivate" -- the migration is one-way.
-                require_index_catchup: match require_index_catchup {
-                    Some(false) => {
-                        return Err(Error::invalid_input(
-                            "require_index_catchup cannot be false: MemWAL index catch-up \
-                             cannot stop being required once it is",
-                        ));
-                    }
-                    other => other.unwrap_or(false),
-                },
             },
             Some(pb::transaction::Operation::UpdateBases(pb::transaction::UpdateBases {
                 new_bases,
@@ -416,11 +401,9 @@ impl TryFrom<pb::Transaction> for Transaction {
                     .map(DataOverlayGroup::try_from)
                     .collect::<Result<Vec<_>>>()?,
             },
-            None => {
-                return Err(Error::internal(
-                    "Transaction message did not contain an operation".to_string(),
-                ));
-            }
+            // prost drops unrecognized oneof fields, so an operation from a
+            // newer writer is indistinguishable from a missing one.
+            None => Operation::Unknown {},
         };
         Ok(Self {
             read_version: message.read_version,
@@ -504,8 +487,10 @@ impl TryFrom<pb::transaction::rewrite::RewriteGroup> for RewriteGroup {
     }
 }
 
-impl From<&Transaction> for pb::Transaction {
-    fn from(value: &Transaction) -> Self {
+impl TryFrom<&Transaction> for pb::Transaction {
+    type Error = Error;
+
+    fn try_from(value: &Transaction) -> Result<Self> {
         let operation = match &value.operation {
             Operation::Append { fragments } => {
                 pb::transaction::Operation::Append(pb::transaction::Append {
@@ -704,18 +689,12 @@ impl From<&Transaction> for pb::Transaction {
                         .collect(),
                 })
             }
-            Operation::UpdateMemWalState {
-                compacted_sstables,
-                require_index_catchup,
-            } => {
+            Operation::UpdateMemWalState { compacted_sstables } => {
                 pb::transaction::Operation::UpdateMemWalState(pb::transaction::UpdateMemWalState {
                     compacted_sstables: compacted_sstables
                         .iter()
                         .map(pb::CompactedSsTable::from)
                         .collect::<Vec<_>>(),
-                    // Written only when requesting activation, so an ordinary
-                    // progress update stays byte-identical to before.
-                    require_index_catchup: require_index_catchup.then_some(true),
                 })
             }
             Operation::UpdateBases { new_bases } => {
@@ -727,6 +706,13 @@ impl From<&Transaction> for pb::Transaction {
                         .collect::<Vec<pb::BasePath>>(),
                 })
             }
+            Operation::Unknown { .. } => {
+                return Err(Error::not_supported(format!(
+                    "Transaction {} has an operation written by a newer version of Lance \
+                     and cannot be re-encoded by this version",
+                    value.uuid
+                )));
+            }
         };
 
         let transaction_properties = value
@@ -734,13 +720,13 @@ impl From<&Transaction> for pb::Transaction {
             .as_ref()
             .map(|arc| arc.as_ref().clone())
             .unwrap_or_default();
-        Self {
+        Ok(Self {
             read_version: value.read_version,
             uuid: value.uuid.clone(),
             operation: Some(operation),
             tag: value.tag.clone().unwrap_or("".to_string()),
             transaction_properties,
-        }
+        })
     }
 }
 
@@ -817,12 +803,13 @@ impl From<&pb::transaction::UpdateMap> for UpdateMap {
     }
 }
 
-impl From<&Transaction> for crate::format::Transaction {
-    fn from(value: &Transaction) -> Self {
-        let pb_transaction: pb::Transaction = value.into();
-        Self {
-            inner: pb_transaction,
-        }
+impl TryFrom<&Transaction> for crate::format::Transaction {
+    type Error = Error;
+
+    fn try_from(value: &Transaction) -> Result<Self> {
+        Ok(Self {
+            inner: pb::Transaction::try_from(value)?,
+        })
     }
 }
 
@@ -831,6 +818,35 @@ mod tests {
     use super::*;
     use crate::format::DataFile;
     use crate::format::overlay::OverlayCoverage;
+
+    #[test]
+    fn test_rewrite_frag_reuse_update_stays_in_memory() {
+        // The fragment reuse update never enters the transaction file:
+        // other writers' conflict decisions only need the fragment sets in
+        // `groups`.
+        let entry = crate::transaction::test_support::sample_index_metadata(
+            crate::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME,
+        );
+        let transaction = Transaction::new(
+            1,
+            Operation::Rewrite {
+                groups: vec![],
+                rewritten_indices: vec![],
+                frag_reuse_index: Some(entry),
+            },
+            None,
+        );
+        let decoded =
+            Transaction::try_from(pb::Transaction::try_from(&transaction).unwrap()).unwrap();
+        match decoded.operation {
+            Operation::Rewrite {
+                frag_reuse_index, ..
+            } => {
+                assert!(frag_reuse_index.is_none());
+            }
+            other => panic!("expected Rewrite, got {other:?}"),
+        }
+    }
 
     #[test]
     fn test_data_overlay_operation_roundtrips() {

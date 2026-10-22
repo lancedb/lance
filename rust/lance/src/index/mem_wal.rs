@@ -90,7 +90,6 @@ mod tests {
             dataset.manifest.version,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(Uuid::new_v4(), 1)],
-                require_index_catchup: false,
             },
             None,
         );
@@ -123,7 +122,6 @@ mod tests {
             dataset.manifest.version,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
-                require_index_catchup: false,
             },
             None,
         );
@@ -138,7 +136,6 @@ mod tests {
             dataset.manifest.version - 1, // Based on old version
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 5)],
-                require_index_catchup: false,
             },
             None,
         );
@@ -162,7 +159,6 @@ mod tests {
             dataset.manifest.version,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
-                require_index_catchup: false,
             },
             None,
         );
@@ -176,7 +172,6 @@ mod tests {
             dataset.manifest.version - 1, // Based on old version
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
-                require_index_catchup: false,
             },
             None,
         );
@@ -201,7 +196,6 @@ mod tests {
             dataset.manifest.version,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 5)],
-                require_index_catchup: false,
             },
             None,
         );
@@ -216,7 +210,6 @@ mod tests {
             dataset.manifest.version - 1, // Based on old version
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
-                require_index_catchup: false,
             },
             None,
         );
@@ -241,7 +234,6 @@ mod tests {
             dataset.manifest.version,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard1, 10)],
-                require_index_catchup: false,
             },
             None,
         );
@@ -256,7 +248,6 @@ mod tests {
             dataset.manifest.version - 1, // Based on old version
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard2, 5)],
-                require_index_catchup: false,
             },
             None,
         );
@@ -294,7 +285,6 @@ mod tests {
             dataset.manifest.version,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
-                require_index_catchup: false,
             },
             None,
         );
@@ -375,7 +365,6 @@ mod tests {
             dataset.manifest.version - 1, // Based on old version
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 5)],
-                require_index_catchup: false,
             },
             None,
         );
@@ -388,120 +377,13 @@ mod tests {
         );
     }
 
-    /// The bit must survive being written and read back, not just
-    /// `build_manifest`. `apply_feature_flags` runs a second time inside
-    /// `write_manifest_file`, so a version of this that stops at the in-memory
-    /// manifest passes while the stored table stays legacy.
-    #[tokio::test]
-    async fn required_catch_up_survives_a_persisted_round_trip() {
-        use crate::dataset::mem_wal::DatasetMemWalExt;
-        use lance_table::feature_flags::FLAG_MEM_WAL_INDEX_CATCHUP;
-
-        // A real directory, not `memory://`: reopening by URI builds a fresh
-        // store registry, and the point of this test is to read back what was
-        // actually written.
-        let dir = tempfile::tempdir().unwrap();
-        let uri = dir.path().to_str().unwrap();
-        let write_params = WriteParams {
-            max_rows_per_file: 10,
-            ..Default::default()
-        };
-        let data = RecordBatch::try_new(
-            Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)])),
-            vec![Arc::new(Int32Array::from_iter_values(0..10_i32))],
-        )
-        .unwrap();
-        let dataset = InsertBuilder::new(uri)
-            .with_params(&write_params)
-            .execute(vec![data])
-            .await
-            .unwrap();
-
-        // Install the system index, then require catch-up.
-        let mem_wal_index =
-            new_mem_wal_index_meta(dataset.manifest.version, MemWalIndexDetails::default())
-                .unwrap();
-        let txn = Transaction::new(
-            dataset.manifest.version,
-            Operation::CreateIndex {
-                new_indices: vec![mem_wal_index],
-                removed_indices: vec![],
-            },
-            None,
-        );
-        let mut dataset = CommitBuilder::new(Arc::new(dataset))
-            .execute(txn)
-            .await
-            .unwrap();
-        dataset.require_mem_wal_index_catchup().await.unwrap();
-
-        let reopened = crate::dataset::builder::DatasetBuilder::from_uri(uri)
-            .load()
-            .await
-            .unwrap();
-        assert_ne!(
-            reopened.manifest.reader_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP,
-            0,
-            "activation did not reach storage"
-        );
-        assert_ne!(
-            reopened.manifest.writer_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP,
-            0,
-            "activation did not reach storage"
-        );
-
-        // An ordinary commit must not walk it back.
-        let txn = Transaction::new(
-            reopened.manifest.version,
-            Operation::UpdateConfig {
-                config_updates: Some(crate::dataset::transaction::UpdateMap {
-                    update_entries: vec![crate::dataset::transaction::UpdateMapEntry {
-                        key: "k".to_string(),
-                        value: Some("v".to_string()),
-                    }],
-                    replace: false,
-                }),
-                table_metadata_updates: None,
-                schema_metadata_updates: None,
-                field_metadata_updates: HashMap::new(),
-            },
-            None,
-        );
-        CommitBuilder::new(Arc::new(reopened))
-            .execute(txn)
-            .await
-            .unwrap();
-
-        let reopened = crate::dataset::builder::DatasetBuilder::from_uri(uri)
-            .load()
-            .await
-            .unwrap();
-        assert_ne!(
-            reopened.manifest.reader_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP,
-            0,
-            "an ordinary commit downgraded the stored table"
-        );
-        assert_ne!(
-            reopened.manifest.writer_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP,
-            0,
-            "an ordinary commit downgraded the stored table"
-        );
-    }
-
-    /// A table on the catch-up protocol with `generation` folded into base.
-    ///
-    /// Activation must precede any compaction progress: it refuses a table that
-    /// already has some, since nothing can prove which indexes hold it.
-    async fn activated_dataset(shard: Uuid, generation: u64) -> crate::Dataset {
-        use crate::dataset::mem_wal::DatasetMemWalExt;
-
-        let mut dataset = test_dataset_with_mem_wal().await;
-        dataset.require_mem_wal_index_catchup().await.unwrap();
+    /// A table with `generation` folded into base.
+    async fn compacted_dataset(shard: Uuid, generation: u64) -> crate::Dataset {
+        let dataset = test_dataset_with_mem_wal().await;
         let txn = Transaction::new(
             dataset.manifest.version,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, generation)],
-                require_index_catchup: false,
             },
             None,
         );
@@ -517,6 +399,7 @@ mod tests {
             uuid: Uuid::new_v4(),
             name: name.to_string(),
             fields: vec![0],
+            covering_fields: vec![],
             dataset_version: 1,
             fragment_bitmap: Some(roaring::RoaringBitmap::from_iter(fragments.iter().copied())),
             index_details: None,
@@ -545,12 +428,11 @@ mod tests {
     }
 
     /// The commit path, not the derivation in isolation: `commit_transaction`
-    /// has to load the read version's indices and hand them down, and it only
-    /// does so for tables carrying the feature bit.
+    /// has to load the read version's indices and hand them down.
     #[tokio::test]
     async fn an_index_covering_the_table_earns_catch_up_on_commit() {
         let shard = Uuid::new_v4();
-        let dataset = activated_dataset(shard, 5).await;
+        let dataset = compacted_dataset(shard, 5).await;
 
         let txn = Transaction::new(
             dataset.manifest.version,
@@ -582,7 +464,7 @@ mod tests {
         use lance_index::optimize::OptimizeOptions;
 
         let shard = Uuid::new_v4();
-        let dataset = activated_dataset(shard, 7).await;
+        let dataset = compacted_dataset(shard, 7).await;
         // Already spans the table, so the optimize below has nothing to build.
         let txn = Transaction::new(
             dataset.manifest.version,
@@ -603,7 +485,6 @@ mod tests {
             dataset.manifest.version,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 9)],
-                require_index_catchup: false,
             },
             None,
         );
@@ -633,7 +514,7 @@ mod tests {
     /// no-op: the early return is what keeps ordinary tables from committing an
     /// empty version on every maintenance pass.
     #[tokio::test]
-    async fn a_no_work_optimize_off_protocol_commits_nothing() {
+    async fn a_no_work_optimize_with_nothing_compacted_commits_nothing() {
         use lance_index::optimize::OptimizeOptions;
 
         let dataset = test_dataset_with_mem_wal().await;
@@ -659,18 +540,17 @@ mod tests {
         assert_eq!(dataset.manifest.version, before);
     }
 
-    /// A legacy table reads a missing entry as "fully caught up". Writing one
-    /// there would be the first step toward a trim it never agreed to, so the
-    /// commit path must not even look.
+    /// A table carrying compaction progress but no catch-up entry earns one
+    /// from an ordinary commit. This is how a table written before catch-up was
+    /// maintained heals itself: nothing has to be run against it.
     #[tokio::test]
-    async fn a_legacy_table_earns_nothing_on_commit() {
+    async fn a_table_with_no_catchup_entry_earns_one() {
         let dataset = test_dataset_with_mem_wal().await;
         let shard = Uuid::new_v4();
         let txn = Transaction::new(
             dataset.manifest.version,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 5)],
-                require_index_catchup: false,
             },
             None,
         );
@@ -692,7 +572,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(catch_up_generation(&dataset, "idx").await, None);
+        assert_eq!(catch_up_generation(&dataset, "idx").await, Some(5));
     }
 
     /// What a commit earns is fixed by the version it read, and a rebase does
@@ -703,7 +583,7 @@ mod tests {
     #[tokio::test]
     async fn credit_is_anchored_to_the_read_version_across_a_rebase() {
         let shard = Uuid::new_v4();
-        let dataset = activated_dataset(shard, 5).await;
+        let dataset = compacted_dataset(shard, 5).await;
         let read_version = dataset.manifest.version;
 
         let data = RecordBatch::try_new(
@@ -753,14 +633,13 @@ mod tests {
     #[tokio::test]
     async fn a_user_index_build_cannot_rebase_past_a_compaction_commit() {
         let shard = Uuid::new_v4();
-        let dataset = activated_dataset(shard, 5).await;
+        let dataset = compacted_dataset(shard, 5).await;
         let read_version = dataset.manifest.version;
 
         let txn = Transaction::new(
             dataset.manifest.version,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 9)],
-                require_index_catchup: false,
             },
             None,
         );
@@ -1003,7 +882,6 @@ mod tests {
                 version,
                 Operation::UpdateMemWalState {
                     compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
-                    require_index_catchup: false,
                 },
                 None,
             ))
@@ -1117,7 +995,6 @@ mod tests {
             dataset.manifest.version,
             Operation::UpdateMemWalState {
                 compacted_sstables: vec![CompactedSsTable::new(shard, 1)],
-                require_index_catchup: false,
             },
             None,
         );

@@ -5,7 +5,6 @@
 
 use arrow_buffer::BooleanBufferBuilder;
 use lance_core::{Error, Result};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::{
     buffer::LanceBuffer,
@@ -80,40 +79,6 @@ pub struct PrimitivePredicatePlan {
     pub outcome: PrimitivePredicateOutcome,
 }
 
-static DIRECT_VALUES: AtomicU64 = AtomicU64::new(0);
-static FALLBACK_VALUES: AtomicU64 = AtomicU64::new(0);
-static OUTPUT_BYTES: AtomicU64 = AtomicU64::new(0);
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-/// Process-wide counters for primitive encoded predicate evaluation.
-pub struct PrimitivePredicateStats {
-    /// Values evaluated by an encoding-specific kernel.
-    pub direct_values: u64,
-    /// Values evaluated after falling back to a decoded `DataBlock`.
-    pub fallback_values: u64,
-    /// Bytes emitted for Boolean predicate bitmaps.
-    pub output_bytes: u64,
-}
-
-/// Returns a snapshot of process-wide primitive predicate counters.
-pub fn primitive_predicate_stats() -> PrimitivePredicateStats {
-    PrimitivePredicateStats {
-        direct_values: DIRECT_VALUES.load(Ordering::Relaxed),
-        fallback_values: FALLBACK_VALUES.load(Ordering::Relaxed),
-        output_bytes: OUTPUT_BYTES.load(Ordering::Relaxed),
-    }
-}
-
-pub(crate) fn record_direct_values(num_values: u64) {
-    DIRECT_VALUES.fetch_add(num_values, Ordering::Relaxed);
-    OUTPUT_BYTES.fetch_add(num_values.div_ceil(8), Ordering::Relaxed);
-}
-
-pub(crate) fn record_fallback_values(num_values: u64) {
-    FALLBACK_VALUES.fetch_add(num_values, Ordering::Relaxed);
-    OUTPUT_BYTES.fetch_add(num_values.div_ceil(8), Ordering::Relaxed);
-}
-
 impl PrimitivePredicate {
     /// Evaluates this predicate against a decoded fixed-width block.
     pub fn evaluate_block(&self, data: &DataBlock) -> Result<DataBlock> {
@@ -175,6 +140,8 @@ impl PrimitivePredicate {
                 ));
             }
             let remaining = expected.saturating_sub(matches.len());
+            // Older miniblock writers let the final run cross the chunk checkpoint;
+            // match the value decoder's truncation of those excess values.
             matches.append_n(length.min(remaining), self.matches_u32(value));
             if matches.len() == expected {
                 break;

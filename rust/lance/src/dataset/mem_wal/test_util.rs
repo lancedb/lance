@@ -35,10 +35,18 @@ pub struct FailControls {
     simulate_lost_ack: AtomicBool,
     /// WAL-entry `put_opts` attempts observed, for assertions.
     wal_put_attempts: AtomicUsize,
+    /// Remaining Blob sidecar `put_opts` calls to fail.
+    blob_put_failures: AtomicUsize,
+    /// Block Blob sidecar PUTs forever so cancellation can drop the caller.
+    block_blob_puts: AtomicBool,
+    /// Blob sidecar `put_opts` attempts observed, for assertions.
+    blob_put_attempts: AtomicUsize,
     /// Every location written through this store.
     put_paths: StdMutex<Vec<String>>,
     /// Every location read through this store.
     get_paths: StdMutex<Vec<String>>,
+    /// Fail every write whose path contains this substring.
+    fail_writes_under: StdMutex<Option<String>>,
 }
 
 impl FailControls {
@@ -51,8 +59,33 @@ impl FailControls {
     pub fn set_lost_ack(&self, v: bool) {
         self.simulate_lost_ack.store(v, Ordering::SeqCst);
     }
+    /// Fail every write whose path contains `needle`, until cleared.
+    pub fn fail_writes_under(&self, needle: &str) {
+        *self.fail_writes_under.lock().unwrap() = Some(needle.to_string());
+    }
+    /// Stop failing the writes [`Self::fail_writes_under`] targets.
+    pub fn clear_write_failures(&self) {
+        *self.fail_writes_under.lock().unwrap() = None;
+    }
+    /// Whether a write to `location` should fail.
+    fn fails_write(&self, location: &Path) -> bool {
+        self.fail_writes_under
+            .lock()
+            .unwrap()
+            .as_deref()
+            .is_some_and(|needle| location.as_ref().contains(needle))
+    }
     pub fn attempts(&self) -> usize {
         self.wal_put_attempts.load(Ordering::SeqCst)
+    }
+    pub fn fail_blob_puts(&self, n: usize) {
+        self.blob_put_failures.store(n, Ordering::SeqCst);
+    }
+    pub fn set_block_blob_puts(&self, value: bool) {
+        self.block_blob_puts.store(value, Ordering::SeqCst);
+    }
+    pub fn blob_attempts(&self) -> usize {
+        self.blob_put_attempts.load(Ordering::SeqCst)
     }
 
     /// Did any write land on a path containing `needle`? An open that resolved
@@ -88,6 +121,15 @@ impl WrappingObjectStore for FailingWrapper {
             inner: original,
             controls: self.controls.clone(),
         })
+    }
+
+    // Injects behaviour into every request, so a listing must not go around it.
+    fn wrap_paginated(
+        &self,
+        _store_prefix: &str,
+        _original: Arc<dyn object_store::list::PaginatedListStore>,
+    ) -> Option<Arc<dyn object_store::list::PaginatedListStore>> {
+        None
     }
 }
 
@@ -132,6 +174,23 @@ impl OSObjectStore for FailingObjectStore {
             .lock()
             .unwrap()
             .push(location.to_string());
+        if self.controls.fails_write(location) {
+            return Err(Self::injected_error());
+        }
+        if location.as_ref().ends_with(".blob") {
+            self.controls
+                .blob_put_attempts
+                .fetch_add(1, Ordering::SeqCst);
+            if self.controls.block_blob_puts.load(Ordering::SeqCst) {
+                std::future::pending::<()>().await;
+            }
+            if self.controls.blob_put_failures.load(Ordering::SeqCst) > 0 {
+                self.controls
+                    .blob_put_failures
+                    .fetch_sub(1, Ordering::SeqCst);
+                return Err(Self::injected_error());
+            }
+        }
         if Self::is_wal_entry(location) {
             self.controls
                 .wal_put_attempts
@@ -161,6 +220,9 @@ impl OSObjectStore for FailingObjectStore {
             .lock()
             .unwrap()
             .push(location.to_string());
+        if self.controls.fails_write(location) {
+            return Err(Self::injected_error());
+        }
         self.inner.put_multipart_opts(location, opts).await
     }
 

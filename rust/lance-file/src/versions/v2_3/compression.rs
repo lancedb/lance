@@ -9,15 +9,15 @@ use lance_encoding::{
     compression::{
         BlockCompressor, CompressionStrategy, field_metadata_params, finalize_miniblock_compressor,
         try_bitpacking_block, try_bitpacking_miniblock, try_byte_stream_split_miniblock,
-        try_child_rle_miniblock, try_fixed_packed_struct_miniblock, try_general_block,
-        try_raw_block, try_raw_fixed_size_list_miniblock, try_raw_fixed_width_miniblock,
-        try_raw_per_value, try_uncompressed_fixed_width_miniblock, try_variable_rle_block,
-        try_variable_width_miniblock, try_variable_width_per_value,
+        try_child_rle_miniblock, try_fixed_packed_struct_miniblock, try_fixed_size_list_block,
+        try_fixed_u8_rle_miniblock, try_general_block, try_raw_block,
+        try_raw_fixed_size_list_miniblock, try_raw_fixed_width_miniblock, try_raw_per_value,
+        try_uncompressed_fixed_width_miniblock, try_variable_rle_block,
+        try_variable_width_miniblock_with_generic_offsets, try_variable_width_per_value,
     },
     compression_config::{CompressionFieldParams, CompressionParams},
     data::DataBlock,
     encodings::logical::primitive::{fullzip::PerValueCompressor, miniblock::MiniBlockCompressor},
-    format::pb21::CompressiveEncoding,
 };
 
 #[derive(Debug, Clone)]
@@ -40,6 +40,23 @@ impl Strategy {
 }
 
 impl CompressionStrategy for Strategy {
+    fn create_dictionary_index_compressor(
+        &self,
+        field: &Field,
+        data: &DataBlock,
+    ) -> Result<Box<dyn MiniBlockCompressor>> {
+        let params = self.field_params(field);
+        // Dictionary lookup already adds an indirection. Keep index decoding
+        // simple instead of stacking child decompression and run expansion.
+        let compressor = try_uncompressed_fixed_width_miniblock(data, &params)
+            .or_else(|| try_byte_stream_split_miniblock(data, &params))
+            .or_else(|| try_fixed_u8_rle_miniblock(data, &params))
+            .or_else(|| try_bitpacking_miniblock(data))
+            .or_else(|| try_raw_fixed_width_miniblock(data))
+            .ok_or_else(|| Error::internal("Dictionary indices must be fixed-width values"))?;
+        finalize_miniblock_compressor(data, compressor, &params)
+    }
+
     fn create_miniblock_compressor(
         &self,
         field: &Field,
@@ -57,7 +74,9 @@ impl CompressionStrategy for Strategy {
                 compressor
             } else if let Some(compressor) = try_raw_fixed_width_miniblock(data) {
                 compressor
-            } else if let Some(compressor) = try_variable_width_miniblock(field, data, &params)? {
+            } else if let Some(compressor) =
+                try_variable_width_miniblock_with_generic_offsets(field, data, &params)?
+            {
                 compressor
             } else if let Some(compressor) = try_fixed_packed_struct_miniblock(data)? {
                 compressor
@@ -104,8 +123,11 @@ impl CompressionStrategy for Strategy {
         &self,
         field: &Field,
         data: &DataBlock,
-    ) -> Result<(Box<dyn BlockCompressor>, CompressiveEncoding)> {
+    ) -> Result<Box<dyn BlockCompressor>> {
         let params = self.field_params(field);
+        if let Some(compressor) = try_fixed_size_list_block(data, &params)? {
+            return Ok(compressor);
+        }
         if let Some(compressor) = try_variable_rle_block(data, &params)? {
             return Ok(compressor);
         }

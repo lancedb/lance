@@ -62,6 +62,7 @@ use std::ffi::CString;
 use std::ptr::NonNull;
 
 pub(crate) mod arrow;
+pub(crate) mod bitmap;
 pub(crate) mod blob;
 #[cfg(feature = "datagen")]
 pub(crate) mod datagen;
@@ -75,6 +76,7 @@ pub(crate) mod fts;
 pub(crate) mod indices;
 pub(crate) mod mem_wal;
 pub(crate) mod namespace;
+pub(crate) mod object_store;
 pub(crate) mod otel;
 pub(crate) mod reader;
 pub(crate) mod rowids;
@@ -94,6 +96,7 @@ pub use crate::tracing::{TraceGuard, trace_to_chrome};
 use crate::utils::Hnsw;
 use crate::utils::KMeans;
 pub use dataset::Dataset;
+pub use dataset::serialize_row_addrs;
 pub use dataset::write_dataset;
 use fragment::{FileFragment, PyDeletionFile, PyRowDatasetVersionMeta, PyRowIdMeta};
 pub use indices::register_indices;
@@ -102,7 +105,8 @@ use rowids::{PyRowIdSequence, PyRowIdSequenceIterator};
 pub use scanner::Scanner;
 
 use crate::blob::{
-    PyBlobDescriptor, PyBlobDescriptorArrayBuilder, PyDedicatedBlobWriter, PyPackedBlobWriter,
+    PyBlobDescriptor, PyBlobDescriptorArrayBuilder, PyDedicatedBlobWriter, PyManagedBlobWriter,
+    PyPackedBlobWriter,
 };
 use crate::executor::BackgroundExecutor;
 
@@ -273,6 +277,7 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyBlobDescriptor>()?;
     m.add_class::<PyBlobDescriptorArrayBuilder>()?;
     m.add_class::<PyPackedBlobWriter>()?;
+    m.add_class::<PyManagedBlobWriter>()?;
     m.add_class::<PyDedicatedBlobWriter>()?;
     m.add_class::<LanceFileReader>()?;
     m.add_class::<LanceFileWriter>()?;
@@ -298,10 +303,14 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyCompactionMetrics>()?;
     m.add_class::<ScanStatistics>()?;
     m.add_class::<Session>()?;
+    m.add_class::<object_store::PyObjectStoreProvider>()?;
+    m.add_class::<object_store::PyObjectStoreRegistry>()?;
     m.add_class::<PyTraceEvent>()?;
     m.add_class::<TraceGuard>()?;
     m.add_class::<fts::FtsToken>()?;
     m.add_class::<schema::LanceSchema>()?;
+    m.add_class::<bitmap::PyBitmap>()?;
+    m.add_class::<bitmap::PyBitmapIter>()?;
     m.add_class::<PyFullTextQuery>()?;
     m.add_class::<PySearchFilter>()?;
     m.add_class::<namespace::PyDirectoryNamespace>()?;
@@ -320,6 +329,7 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_wrapped(wrap_pyfunction!(mem_wal::py_write_pk_sidecar))?;
     m.add_wrapped(wrap_pyfunction!(bfloat16_array))?;
     m.add_wrapped(wrap_pyfunction!(write_dataset))?;
+    m.add_wrapped(wrap_pyfunction!(serialize_row_addrs))?;
     m.add_wrapped(wrap_pyfunction!(write_fragments))?;
     m.add_wrapped(wrap_pyfunction!(write_fragments_transaction))?;
     m.add_wrapped(wrap_pyfunction!(schema_to_json))?;
