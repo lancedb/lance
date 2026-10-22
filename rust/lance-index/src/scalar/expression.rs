@@ -535,8 +535,8 @@ fn extract_like_leading_prefix(pattern: &str, escape_char: Option<char>) -> Opti
     // DataFusion's starts_with simplification escapes special characters with backslash
     // but doesn't set escape_char, so backslash is the default escape. It is also the
     // only escape the executor defines: DataFusion's physical planner rejects any other
-    // ESCAPE character, so decline here rather than answer with backslash semantics
-    // (an index query would replace the predicate and skip that rejection).
+    // ESCAPE character, so decline here rather than answer a query the executor
+    // refuses (an index query would replace the predicate and skip that rejection).
     // Pattern: starts_with(col, 'test_ns$') -> col LIKE 'test\_ns$%' (escape_char: None)
     let esc = match escape_char {
         None | Some('\\') => '\\',
@@ -3716,7 +3716,7 @@ mod tests {
 
         // A non-backslash ESCAPE is accepted by the SQL layer but rejected by
         // DataFusion's physical planner; the index must decline rather than answer
-        // with backslash semantics (it would otherwise replace the predicate
+        // a query the executor refuses (it would otherwise replace the predicate
         // entirely and skip the planner's rejection).
         let expr = state
             .create_logical_expr("color LIKE 'a!b%' ESCAPE '!'", &df_schema)

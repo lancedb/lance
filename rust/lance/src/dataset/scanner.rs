@@ -16250,6 +16250,79 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         );
     }
 
+    /// A LIKE whose escape consumes an ordinary character (`a\b%` means "starts
+    /// with ab") or that runs escapes together (`\\\%` is the literal `\%`) must
+    /// return the same rows through an index as without one. The BTree answer
+    /// has no recheck, and a multi-fragment zone map prunes before its recheck.
+    #[rstest]
+    #[case::btree(IndexType::BTree, ScalarIndexParams::default())]
+    #[case::zonemap(
+        IndexType::Scalar,
+        ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::ZoneMap)
+    )]
+    #[tokio::test]
+    async fn test_like_prefix_escapes_match_unindexed_scan(
+        #[case] index_type: IndexType,
+        #[case] params: ScalarIndexParams,
+    ) {
+        // Two rows per fragment: the first holds only the "ab" rows, so a zone map
+        // pruning on the wrong prefix skips it before its recheck can see them.
+        let names = ["ab1", "ab2", r"a\b1", r"\%", r"\%x", "zz"];
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "name",
+            DataType::Utf8,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(names.to_vec()))],
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            "memory://test_like_prefix_escapes",
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 3);
+        dataset
+            .create_index(&["name"], index_type, None, &params, true)
+            .await
+            .unwrap();
+
+        let matched = async |filter: &str, use_index: bool| -> BTreeSet<String> {
+            let batch = dataset
+                .scan()
+                .use_scalar_index(use_index)
+                .filter(filter)
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+            batch["name"]
+                .as_string::<i32>()
+                .iter()
+                .map(|name| name.unwrap().to_string())
+                .collect()
+        };
+        for (filter, expected) in [
+            (r"name LIKE 'a\b%'", vec!["ab1", "ab2"]),
+            (r"name LIKE '\\\%'", vec![r"\%"]),
+        ] {
+            let expected: BTreeSet<String> = expected.into_iter().map(String::from).collect();
+            assert_eq!(
+                matched(filter, false).await,
+                expected,
+                "{filter} without index"
+            );
+            assert_eq!(matched(filter, true).await, expected, "{filter} with index");
+        }
+    }
+
     #[tokio::test]
     async fn test_like_prefix_with_zone_map() {
         use lance_index::scalar::BuiltinIndexType;
