@@ -10,16 +10,13 @@
 //! - Inferring details from index files on disk (fallback for legacy indices)
 
 use std::collections::HashMap;
-use std::fmt::Write;
 use std::str::FromStr;
 use std::sync::Arc;
 
 use lance_file::reader::FileReaderOptions;
 use lance_index::pb::index::Implementation;
-use lance_index::pb::vector_index_details::{
-    Compression, FlatCompression, PreTransform, rabit_quantization,
-};
-use lance_index::pb::{PcaParameters, VectorIndexDetails, VectorMetricType};
+use lance_index::pb::vector_index_details::{Compression, FlatCompression, rabit_quantization};
+use lance_index::pb::{VectorIndexDetails, VectorMetricType};
 use lance_index::{INDEX_FILE_NAME, INDEX_METADATA_SCHEMA_KEY, pb};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::traits::Reader;
@@ -31,7 +28,6 @@ use serde::Serialize;
 use lance_index::vector::bq::{RQBuildParams, RQRotationType};
 use lance_index::vector::hnsw::builder::HnswBuildParams;
 use lance_index::vector::ivf::IvfBuildParams;
-use lance_index::vector::pca::PcaParams;
 use lance_index::vector::pq::PQBuildParams;
 use lance_index::vector::sq::builder::SQBuildParams;
 
@@ -48,8 +44,6 @@ use crate::{Error, Result};
 struct VectorDetailsJson {
     metric_type: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pre_transform: Option<PcaDetailsJson>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     target_partition_size: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     hnsw: Option<HnswDetailsJson>,
@@ -57,16 +51,6 @@ struct VectorDetailsJson {
     compression: Option<CompressionDetailsJson>,
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     runtime_hints: HashMap<String, String>,
-}
-
-#[derive(Serialize)]
-struct PcaDetailsJson {
-    #[serde(rename = "type")]
-    transform_type: &'static str,
-    dimension: u32,
-    sample_size: u32,
-    sampling_seed: u64,
-    model_fingerprint: String,
 }
 
 #[derive(Serialize)]
@@ -95,45 +79,6 @@ enum CompressionDetailsJson {
         num_bits: u32,
         rotation_type: &'static str,
     },
-}
-
-#[allow(dead_code)] // The build path calls this once PCA indexes are created.
-fn pca_parameters(
-    params: Option<&PcaParams>,
-    model_fingerprint: Option<[u8; 32]>,
-) -> Result<Option<PcaParameters>> {
-    match (params, model_fingerprint) {
-        (Some(params), Some(model_fingerprint)) => {
-            if params.dimension == 0 {
-                return Err(Error::invalid_input(
-                    "pca.dimension=0 must be greater than 0".to_string(),
-                ));
-            }
-            Ok(Some(PcaParameters {
-                dimension: u32::try_from(params.dimension).map_err(|_| {
-                    Error::invalid_input(format!(
-                        "pca.dimension={} does not fit in u32",
-                        params.dimension
-                    ))
-                })?,
-                sample_size: u32::try_from(params.sample_size).map_err(|_| {
-                    Error::invalid_input(format!(
-                        "pca.sample_size={} does not fit in u32",
-                        params.sample_size
-                    ))
-                })?,
-                sampling_seed: params.sampling_seed,
-                model_fingerprint: model_fingerprint.to_vec(),
-            }))
-        }
-        (Some(_), None) => Err(Error::invalid_input(
-            "PCA parameters require a trained model fingerprint".to_string(),
-        )),
-        (None, Some(_)) => Err(Error::invalid_input(
-            "a PCA model fingerprint requires PCA parameters".to_string(),
-        )),
-        (None, None) => Ok(None),
-    }
 }
 
 fn vector_index_details_proto(params: &VectorIndexParams) -> VectorIndexDetails {
@@ -224,80 +169,9 @@ pub fn vector_index_details(params: &VectorIndexParams) -> prost_types::Any {
     prost_types::Any::from_msg(&vector_index_details_proto(params)).unwrap()
 }
 
-/// Same as [`vector_index_details`], attaching the trained PCA model fingerprint.
-#[allow(dead_code)] // The build path calls this once PCA indexes are created.
-pub fn vector_index_details_with_pca(
-    params: &VectorIndexParams,
-    model_fingerprint: Option<[u8; 32]>,
-) -> Result<prost_types::Any> {
-    let mut details = vector_index_details_proto(params);
-    details.pre_transform =
-        pca_parameters(params.pca_params(), model_fingerprint)?.map(PreTransform::Pca);
-    prost_types::Any::from_msg(&details)
-        .map_err(|e| Error::index(format!("Failed to serialize VectorIndexDetails: {e}")))
-}
-
 pub fn vector_index_details_default() -> prost_types::Any {
     let details = lance_index::pb::VectorIndexDetails::default();
     prost_types::Any::from_msg(&details).unwrap()
-}
-
-/// Strictly extracts PCA parameters and their trained-model fingerprint.
-///
-/// This helper validates persisted manifest data only. Query matrices must be
-/// loaded from the persisted PCA model and never reconstructed from parameters.
-pub fn pca_params_from_details(
-    details: &prost_types::Any,
-) -> Result<Option<(PcaParams, [u8; 32])>> {
-    let details = details.to_msg::<VectorIndexDetails>().map_err(|error| {
-        Error::corrupt_file_named(
-            "VectorIndexDetails",
-            format!("failed to decode VectorIndexDetails: {error}"),
-        )
-    })?;
-    let Some(PreTransform::Pca(pca)) = details.pre_transform else {
-        return Ok(None);
-    };
-    if pca.dimension == 0 {
-        return Err(Error::corrupt_file_named(
-            "VectorIndexDetails",
-            "pca.dimension=0 must be greater than 0",
-        ));
-    }
-    let fingerprint_length = pca.model_fingerprint.len();
-    let model_fingerprint: [u8; 32] = pca.model_fingerprint.try_into().map_err(|_| {
-        Error::corrupt_file_named(
-            "VectorIndexDetails",
-            format!("pca.model_fingerprint length={fingerprint_length}, expected 32 bytes"),
-        )
-    })?;
-    let dimension = usize::try_from(pca.dimension).map_err(|_| {
-        Error::corrupt_file_named(
-            "VectorIndexDetails",
-            format!("pca.dimension={} does not fit in usize", pca.dimension),
-        )
-    })?;
-    let sample_size = usize::try_from(pca.sample_size).map_err(|_| {
-        Error::corrupt_file_named(
-            "VectorIndexDetails",
-            format!("pca.sample_size={} does not fit in usize", pca.sample_size),
-        )
-    })?;
-    Ok(Some((
-        PcaParams {
-            dimension,
-            sample_size,
-            sampling_seed: pca.sampling_seed,
-        },
-        model_fingerprint,
-    )))
-}
-
-/// Whether persisted details describe a pre-transform that cannot be appended,
-/// optimized, or merged in place.
-#[allow(dead_code)] // The build path calls this once PCA indexes are created.
-pub fn pre_transform_blocks_maintenance(details: &prost_types::Any) -> Result<bool> {
-    Ok(pca_params_from_details(details)?.is_some())
 }
 
 /// Apply stored runtime hints from `VectorIndexDetails` back into build params.
@@ -450,10 +324,6 @@ pub fn vector_params_from_details(details: &prost_types::Any) -> Option<VectorIn
     };
 
     apply_runtime_hints(&d.runtime_hints, &mut params);
-    if d.pre_transform.is_some() {
-        let (pca, _) = pca_params_from_details(details).ok()??;
-        params = params.with_pca(pca);
-    }
     Some(params)
 }
 
@@ -578,34 +448,6 @@ pub fn vector_details_as_json(details: &prost_types::Any) -> Result<String> {
         return Ok("{}".to_string());
     }
 
-    let pre_transform = pca_params_from_details(details)?
-        .map(|(params, model_fingerprint)| -> Result<PcaDetailsJson> {
-            let mut fingerprint = String::with_capacity(7 + model_fingerprint.len() * 2);
-            fingerprint.push_str("blake3:");
-            for byte in model_fingerprint {
-                write!(&mut fingerprint, "{byte:02x}")
-                    .map_err(|e| Error::index(format!("Failed to format PCA fingerprint: {e}")))?;
-            }
-            Ok(PcaDetailsJson {
-                transform_type: "pca",
-                dimension: u32::try_from(params.dimension).map_err(|_| {
-                    Error::index(format!(
-                        "pca.dimension={} does not fit in u32",
-                        params.dimension
-                    ))
-                })?,
-                sample_size: u32::try_from(params.sample_size).map_err(|_| {
-                    Error::index(format!(
-                        "pca.sample_size={} does not fit in u32",
-                        params.sample_size
-                    ))
-                })?,
-                sampling_seed: params.sampling_seed,
-                model_fingerprint: fingerprint,
-            })
-        })
-        .transpose()?;
-
     let d = details
         .to_msg::<VectorIndexDetails>()
         .map_err(|e| Error::index(format!("Failed to deserialize VectorIndexDetails: {}", e)))?;
@@ -647,7 +489,6 @@ pub fn vector_details_as_json(details: &prost_types::Any) -> Result<String> {
 
     let json = VectorDetailsJson {
         metric_type,
-        pre_transform,
         target_partition_size: if d.target_partition_size > 0 {
             Some(d.target_partition_size)
         } else {
@@ -1080,110 +921,6 @@ mod tests {
     fn test_json_empty_details() {
         let details = vector_index_details_default();
         assert_eq!(vector_details_as_json(&details).unwrap(), "{}");
-    }
-
-    fn pca_params() -> PcaParams {
-        PcaParams::new(16)
-            .with_sample_size(2048)
-            .with_sampling_seed(7)
-    }
-
-    fn pca_details(dimension: u32, fingerprint: Vec<u8>) -> prost_types::Any {
-        let details = VectorIndexDetails {
-            metric_type: VectorMetricType::L2.into(),
-            target_partition_size: 0,
-            hnsw_index_config: None,
-            compression: None,
-            runtime_hints: Default::default(),
-            pre_transform: Some(PreTransform::Pca(PcaParameters {
-                dimension,
-                sample_size: 2048,
-                sampling_seed: 7,
-                model_fingerprint: fingerprint,
-            })),
-        };
-        prost_types::Any::from_msg(&details).unwrap()
-    }
-
-    #[test]
-    fn test_pca_details_roundtrip() {
-        let expected_params = pca_params();
-        let fingerprint = [0xab; 32];
-        let params = VectorIndexParams::with_ivf_rq_params(
-            DistanceType::L2,
-            IvfBuildParams::default(),
-            RQBuildParams::default(),
-        )
-        .with_pca(expected_params.clone());
-
-        let details = vector_index_details_with_pca(&params, Some(fingerprint)).unwrap();
-        let (actual_params, actual_fingerprint) =
-            pca_params_from_details(&details).unwrap().unwrap();
-        assert_eq!(actual_params, expected_params);
-        assert_eq!(actual_fingerprint, fingerprint);
-
-        let restored = vector_params_from_details(&details).unwrap();
-        assert_eq!(restored.pca_params(), Some(&expected_params));
-    }
-
-    #[test]
-    fn test_pca_details_requires_matching_fingerprint_presence() {
-        let params =
-            VectorIndexParams::with_ivf_flat_params(DistanceType::L2, IvfBuildParams::default())
-                .with_pca(pca_params());
-        let error = vector_index_details_with_pca(&params, None).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("require a trained model fingerprint")
-        );
-
-        let params =
-            VectorIndexParams::with_ivf_flat_params(DistanceType::L2, IvfBuildParams::default());
-        let error = vector_index_details_with_pca(&params, Some([0; 32])).unwrap_err();
-        assert!(error.to_string().contains("requires PCA parameters"));
-    }
-
-    #[rstest::rstest]
-    #[case::zero_dimension(pca_details(0, vec![0; 32]), "pca.dimension=0")]
-    #[case::missing_fingerprint(pca_details(16, Vec::new()), "pca.model_fingerprint length=0")]
-    #[case::bad_fingerprint_length(
-        pca_details(16, vec![0; 31]),
-        "pca.model_fingerprint length=31"
-    )]
-    fn test_invalid_pca_manifest_details(
-        #[case] details: prost_types::Any,
-        #[case] expected_message: &str,
-    ) {
-        let error = pca_params_from_details(&details).unwrap_err();
-        assert!(matches!(error, Error::CorruptFile { .. }));
-        assert!(error.to_string().contains(expected_message), "{error}");
-        assert!(vector_params_from_details(&details).is_none());
-    }
-
-    #[test]
-    fn test_json_with_pca_pre_transform() {
-        let details = pca_details(16, (0_u8..32).collect());
-        let json = vector_details_as_json(&details).unwrap();
-        let expected = serde_json::json!({
-            "metric_type": "L2",
-            "pre_transform": {
-                "type": "pca",
-                "dimension": 16,
-                "sample_size": 2048,
-                "sampling_seed": 7,
-                "model_fingerprint":
-                    "blake3:000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
-            }
-        });
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&json).unwrap(),
-            expected
-        );
-        assert_eq!(
-            json,
-            r#"{"metric_type":"L2","pre_transform":{"type":"pca","dimension":16,"sample_size":2048,"sampling_seed":7,"model_fingerprint":"blake3:000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"}}"#
-        );
     }
 
     #[test]

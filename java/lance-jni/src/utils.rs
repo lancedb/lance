@@ -544,7 +544,6 @@ pub fn get_vector_index_params(
             Ok(VectorIndexParams {
                 metric_type: distance_type,
                 stages,
-                pre_transform: None,
                 version: IndexFileVersion::V3,
                 skip_transpose: false,
                 runtime_hints: Default::default(),

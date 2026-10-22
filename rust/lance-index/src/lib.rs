@@ -105,11 +105,8 @@ mod tests {
 
     #[test]
     fn test_max_vector_version_tracks_highest_supported() {
+        assert_eq!(IndexType::max_vector_version(), IVF_RQ_INDEX_VERSION);
         const { assert!(VECTOR_PRE_TRANSFORM_INDEX_VERSION > IVF_RQ_INDEX_VERSION) };
-        assert_eq!(
-            IndexType::max_vector_version(),
-            VECTOR_PRE_TRANSFORM_INDEX_VERSION
-        );
     }
 
     #[test]
