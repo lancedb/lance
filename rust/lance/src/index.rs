@@ -3389,9 +3389,9 @@ impl DatasetIndexExt for Dataset {
 /// with all of its segments, in name order.
 ///
 /// An index this build cannot rewrite is skipped with a warning: an index type
-/// it does not recognize, a segment newer than it reads, a covered index, or a
-/// scalar index with nothing to do. A covered index the caller named in
-/// `index_names` is refused instead.
+/// it does not recognize, a segment newer than it reads, a covered index, an
+/// externally maintained index, or a scalar index with nothing to do. A covered
+/// or externally maintained index named in `index_names` is refused instead.
 pub(crate) fn optimizable_indices<'a>(
     dataset: &Dataset,
     indices: &'a [IndexMetadata],
@@ -3690,13 +3690,19 @@ async fn collect_regular_indices_statistics(
     let mut index_uri: Option<String> = None;
 
     for meta in metadatas.iter() {
-        // An index that covers no fragments has no file to load statistics
-        // from: it carries its definition and nothing else until there is
-        // enough data to train it.
-        if meta
-            .fragment_bitmap
-            .as_ref()
-            .is_some_and(roaring::RoaringBitmap::is_empty)
+        // Externally maintained indices can keep coverage in their own payload
+        // and deliberately declare an empty bitmap. Other empty indices carry
+        // only a definition until there is enough data to train them.
+        let is_externally_maintained = meta.index_details.as_ref().is_some_and(|details| {
+            scalar::SCALAR_INDEX_PLUGIN_REGISTRY
+                .get_plugin_by_details(details)
+                .is_ok_and(|plugin| !plugin.supports_optimization())
+        });
+        if !is_externally_maintained
+            && meta
+                .fragment_bitmap
+                .as_ref()
+                .is_some_and(roaring::RoaringBitmap::is_empty)
         {
             indices_stats.push(serde_json::json!({}));
             continue;
