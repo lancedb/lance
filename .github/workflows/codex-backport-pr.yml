@@ -35,7 +35,7 @@ permissions:
 
 jobs:
   backport:
-    runs-on: ubuntu-24.04-4x
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
       CC: clang
