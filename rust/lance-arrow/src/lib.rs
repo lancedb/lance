@@ -2507,8 +2507,8 @@ mod tests {
         assert!(!x_of(payload.as_ref(), 1));
     }
 
-    /// A batch whose parent rows are all null still supplies its own list when
-    /// merged with an all-null placeholder whose item struct holds more fields.
+    /// A batch whose parent rows are all null merges with an all-null
+    /// placeholder whose item struct holds more fields.
     #[test]
     fn test_merge_list_struct_under_null_parents_with_a_placeholder() {
         for large in [false, true] {
