@@ -19,6 +19,7 @@ import org.lance.Fragment;
 import org.lance.FragmentMetadata;
 import org.lance.ReadOptions;
 import org.lance.Ref;
+import org.lance.Session;
 import org.lance.Transaction;
 import org.lance.WriteParams;
 import org.lance.namespace.errors.ErrorCode;
@@ -216,6 +217,85 @@ public class DirectoryNamespaceTest {
     assertTrue(
         versionRejectingNamespace.getDescribeTableCallCount() > 0,
         "Expected describeTable to be called when opening through namespace");
+  }
+
+  @Test
+  void testRepeatedOpensShareReadOptionsSession() throws Exception {
+    List<String> tableId = Arrays.asList("shared_session");
+    namespaceClient.createTable(new CreateTableRequest().id(tableId), createTestTableData());
+    namespaceClient.insertIntoTable(
+        new InsertIntoTableRequest().id(tableId).mode("append"), createTestTableData());
+    // Keep an older, multi-fragment version pinned while the latest version advances.
+    namespaceClient.insertIntoTable(
+        new InsertIntoTableRequest().id(tableId).mode("append"), createTestTableData());
+
+    try (Session session = Session.builder().build()) {
+      ReadOptions options = new ReadOptions.Builder().setSession(session).setVersion(2L).build();
+      long previousHits = 0;
+      for (int i = 0; i < 3; i++) {
+        try (Dataset dataset =
+            Dataset.open()
+                .allocator(allocator)
+                .namespaceClient(namespaceClient)
+                .tableId(tableId)
+                .readOptions(options)
+                .build()) {
+          assertTrue(dataset.session().isSameAs(session));
+          assertEquals(2, dataset.version());
+          assertEquals(6, dataset.countRows());
+          assertEquals(2, dataset.getFragments().size());
+        }
+        assertFalse(session.isClosed());
+        long hits = session.metadataCacheStats().getHits();
+        if (i > 0) {
+          assertTrue(hits > previousHits, "Repeated opens should reuse the metadata cache");
+        }
+        previousHits = hits;
+      }
+    }
+  }
+
+  @Test
+  void testExplicitSessionOverridesReadOptionsSession() throws Exception {
+    List<String> tableId = Arrays.asList("explicit_session");
+    namespaceClient.createTable(new CreateTableRequest().id(tableId), createTestTableData());
+
+    try (Session optionsSession = Session.builder().build();
+        Session builderSession = Session.builder().build()) {
+      try (Dataset dataset =
+          Dataset.open()
+              .allocator(allocator)
+              .namespaceClient(namespaceClient)
+              .tableId(tableId)
+              .readOptions(new ReadOptions.Builder().setSession(optionsSession).build())
+              .session(builderSession)
+              .build()) {
+        assertTrue(dataset.session().isSameAs(builderSession));
+        assertFalse(dataset.session().isSameAs(optionsSession));
+        assertEquals(3, dataset.countRows());
+      }
+      assertFalse(optionsSession.isClosed());
+      assertFalse(builderSession.isClosed());
+    }
+  }
+
+  @Test
+  void testNamespaceDatasetOwnsInternalSession() throws Exception {
+    List<String> tableId = Arrays.asList("internal_session");
+    namespaceClient.createTable(new CreateTableRequest().id(tableId), createTestTableData());
+
+    Session internalSession;
+    try (Dataset dataset =
+        Dataset.open()
+            .allocator(allocator)
+            .namespaceClient(namespaceClient)
+            .tableId(tableId)
+            .build()) {
+      internalSession = dataset.session();
+      assertFalse(internalSession.isClosed());
+      assertEquals(3, dataset.countRows());
+    }
+    assertTrue(internalSession.isClosed());
   }
 
   @Test
