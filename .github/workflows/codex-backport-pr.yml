@@ -1,179 +1,219 @@
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-name: Codex Backport PR
+name: Validate v14 RC2 backport
 
 on:
   workflow_dispatch:
     inputs:
       pr_urls:
-        description: "Comma-separated PR URLs to backport in order (e.g., https://github.com/lancedb/lance/pull/1234,https://github.com/lancedb/lance/pull/5678)"
         required: true
         type: string
+        default: https://github.com/lance-format/lance/pull/10149
       release_branch:
-        description: "Release branch to backport to (e.g., release/v2.0)"
         required: true
         type: string
+        default: release/v14.0
       guidelines:
-        description: "Additional guidelines for the backport (optional)"
         required: false
         type: string
 
 permissions:
-  contents: write
-  pull-requests: write
-  actions: read
+  contents: read
+
+env:
+  CC: clang
+  CXX: clang++
+  CARGO_TERM_COLOR: always
 
 jobs:
-  backport:
+  prepare:
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    env:
-      CC: clang
-      CXX: clang++
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    outputs:
+      candidate: ${{ steps.prepare.outputs.candidate }}
     steps:
-      - name: Show inputs
-        run: |
-          echo "pr_urls = ${{ inputs.pr_urls }}"
-          echo "release_branch = ${{ inputs.release_branch }}"
-          echo "guidelines = ${{ inputs.guidelines }}"
-
-      - name: Checkout Repo
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
+          ref: release/v14.0
           fetch-depth: 0
-          persist-credentials: true
-
-      - name: Set up Node.js
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: 20
-
-      - name: Install Codex CLI
-        run: npm install -g @openai/codex
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
-        with:
-          toolchain: stable
-          components: clippy, rustfmt
-
-      - uses: rui314/setup-mold@725a8794d15fc7563f59595bd9556495c0564878 # v1
-
-      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
-
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libssl-dev
-
-      - name: Set up Python
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
-        with:
-          python-version: '3.11'
-
-      - name: Install Python dependencies
-        run: |
-          pip install maturin ruff pytest pyarrow pandas polars
-
-      - name: Set up Java
-        uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9 # v4
-        with:
-          distribution: temurin
-          java-version: '11'
-          cache: maven
-
-      - name: Configure git user
-        run: |
-          git config user.name "lance-community"
-          git config user.email "community@lance.org"
-
-      - name: Run Codex to backport PRs
+          token: ${{ secrets.LANCE_RELEASE_TOKEN }}
+      - name: Prepare exact backport candidate
+        id: prepare
         env:
+          GH_TOKEN: ${{ secrets.LANCE_RELEASE_TOKEN }}
           PR_URLS: ${{ inputs.pr_urls }}
           RELEASE_BRANCH: ${{ inputs.release_branch }}
-          GUIDELINES: ${{ inputs.guidelines }}
-          GITHUB_TOKEN: ${{ secrets.LANCE_RELEASE_TOKEN }}
-          GH_TOKEN: ${{ secrets.LANCE_RELEASE_TOKEN }}
-          OPENAI_API_KEY: ${{ secrets.CODEX_TOKEN }}
+        shell: bash
         run: |
           set -euo pipefail
+          test "$PR_URLS" = https://github.com/lance-format/lance/pull/10149
+          test "$RELEASE_BRANCH" = release/v14.0
+          test "$(git rev-parse HEAD)" = f86d8c1ffcb6b4e077b906389a39befa2a57d71c
+          test "$(gh pr view 10149 --repo lance-format/lance --json state --jq .state)" = MERGED
+          test "$(gh pr view 10149 --repo lance-format/lance --json mergeCommit --jq .mergeCommit.oid)" = 356164431913a6a0f35f9b8aff364c095a844c22
+          git config user.name lance-community
+          git config user.email community@lance.org
+          git fetch origin main
+          branch=backport/pr-10149-to-release-v14.0
+          if git ls-remote --exit-code --heads origin "$branch"; then
+            git fetch origin "$branch"
+            git checkout --detach FETCH_HEAD
+          else
+            git checkout -b "$branch"
+            git cherry-pick -x 356164431913a6a0f35f9b8aff364c095a844c22
+          fi
+          expected=$(git show 356164431913a6a0f35f9b8aff364c095a844c22 --pretty=format: | git patch-id --stable | cut -d' ' -f1)
+          actual=$(git diff f86d8c1ffcb6b4e077b906389a39befa2a57d71c HEAD | git patch-id --stable | cut -d' ' -f1)
+          test "$expected" = "$actual"
+          git diff --check f86d8c1ffcb6b4e077b906389a39befa2a57d71c HEAD
+          git diff --stat f86d8c1ffcb6b4e077b906389a39befa2a57d71c HEAD
+          git push origin "HEAD:refs/heads/$branch"
+          echo "candidate=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
-          cat <<EOF >/tmp/codex-prompt.txt
-          You are running inside the lance repository on a GitHub Actions runner. Your task is to backport one or more merged PRs to a release branch.
+  rust-lint:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ needs.prepare.outputs.candidate }}
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7
+        with:
+          toolchain: 1.98.1
+          components: clippy,rustfmt
+      - uses: rui314/setup-mold@725a8794d15fc7563f59595bd9556495c0564878
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5
+        with:
+          save-if: false
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libssl-dev
+      - name: Rust formatting and strict workspace Clippy
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt --all -- --check
+          cargo clippy --all --tests --benches -- -D warnings
+          git diff --exit-code
 
-          Input parameters:
-          - PR URLs (comma-separated, apply in order): ${PR_URLS}
-          - Release branch: ${RELEASE_BRANCH}
-          - Additional guidelines: ${GUIDELINES:-"None provided"}
+  rust-tests:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ needs.prepare.outputs.candidate }}
+          fetch-depth: 0
+          lfs: true
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7
+        with:
+          toolchain: 1.98.1
+          components: clippy,rustfmt
+      - uses: rui314/setup-mold@725a8794d15fc7563f59595bd9556495c0564878
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5
+        with:
+          save-if: false
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libssl-dev ripgrep
+      - name: Schema, Arrow nulls, encoding and dataset Blob regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_tests() {
+            label=$1
+            shift
+            cargo test --profile ci "$@" 2>&1 | tee "/tmp/rc2-$label.log"
+            rg -q 'test result:.*[1-9][0-9]* passed;.*0 failed' "/tmp/rc2-$label.log"
+          }
+          run_tests schema -p lance-core --lib test_blob_v2_descriptor_subfield_projection
+          run_tests arrow -p lance-arrow --lib
+          run_tests encoding -p lance-encoding --lib
+          run_tests blob -p lance --lib dataset_blob
+          git diff --exit-code
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: rc2-rust-regressions
+          path: /tmp/rc2-*.log
 
-          Follow these steps exactly:
+  python:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ needs.prepare.outputs.candidate }}
+          fetch-depth: 0
+          lfs: true
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.13'
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7
+        with:
+          toolchain: 1.98.1
+          components: clippy,rustfmt
+      - uses: rui314/setup-mold@725a8794d15fc7563f59595bd9556495c0564878
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5
+        with:
+          workspaces: python
+          save-if: false
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libssl-dev ripgrep
+      - name: Set up repository Python environment and rebuild extension
+        working-directory: python
+        run: |
+          make install PYTHON=3.13
+          make build PYTHON=3.13
+      - name: Full Blob Python regression suite and lint
+        working-directory: python
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv run --python 3.13 python -c "import lance; print(lance.__version__); print(lance.__file__)"
+          uv run --python 3.13 pytest python/tests/test_blob.py -ra --color=yes 2>&1 | tee /tmp/rc2-python.log
+          rg -q '[1-9][0-9]* passed' /tmp/rc2-python.log
+          uv run --python 3.13 make lint
+          git diff --exit-code
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: rc2-python-regressions
+          path: /tmp/rc2-python.log
 
-          1. Parse the comma-separated PR URLs into a list. Trim any whitespace around each URL. The URL format is https://github.com/lancedb/lance/pull/<number>.
+  publish-pr:
+    needs: [prepare, rust-lint, rust-tests, python]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ needs.prepare.outputs.candidate }}
+          fetch-depth: 0
+      - name: Open validated backport PR
+        env:
+          GH_TOKEN: ${{ secrets.LANCE_RELEASE_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          branch=backport/pr-10149-to-release-v14.0
+          existing=$(gh pr list --repo lance-format/lance --base release/v14.0 --head "$branch" --state open --json number --jq 'length')
+          if [ "$existing" -ne 0 ]; then
+            gh pr list --repo lance-format/lance --base release/v14.0 --head "$branch" --state open --json number,url
+            exit 0
+          fi
+          cat > /tmp/pr-body.md <<'BODY'
+          Backport #10149 onto release/v14.0 for v14.0.0-rc.2. Resolve Blob v2 descriptor subfields in projections and filters, and propagate packed-struct parent nulls to descriptor children. The candidate patch matches the original merged PR exactly; the stored format is unchanged.
 
-          2. For each PR URL in order, extract the PR number and use "gh pr view <number> --json state,mergeCommit,title,number" to verify the PR is merged. If any PR is not merged (state != "MERGED"), exit with an error message explaining that only merged PRs can be backported.
+          Pre-cut validation runs strict Rust workspace Clippy and formatting, schema projection regressions, the lance-arrow and lance-encoding library suites, dataset Blob tests including the Lance 11 historical fixture, the complete Python test_blob.py suite, and Python lint using the rebuilt local extension. Every test command asserts a positive passing test count.
 
-          3. Store all PR numbers, titles, and merge commit SHAs for later use.
-
-          4. Verify the release branch exists with "git ls-remote --heads origin ${RELEASE_BRANCH}". If it doesn't exist, exit with an error.
-
-          5. Checkout the release branch: "git checkout ${RELEASE_BRANCH}" and pull latest: "git pull origin ${RELEASE_BRANCH}".
-
-          6. Create a new branch for the backport. If there's only one PR, use "backport/pr-<number>-to-${RELEASE_BRANCH//\//-}". If there are multiple PRs, use "backport/pr-<first_number>-and-more-to-${RELEASE_BRANCH//\//-}".
-
-          7. For each PR in order, cherry-pick its merge commit: "git cherry-pick -m 1 <merge_commit_sha>".
-             - If there are conflicts, try to resolve them. Inspect conflicting files with "git status" and "git diff".
-             - For simple conflicts, fix them and continue with "git add -A && git cherry-pick --continue".
-             - If conflicts are too complex to resolve automatically, abort and exit with a clear error message indicating which PR caused the conflict.
-
-          8. Run "cargo fmt --all" to ensure formatting is correct.
-
-          9. Run "cargo clippy --workspace --tests --benches -- -D warnings" to check for issues. Fix any warnings and rerun until clean.
-
-          10. Run ONLY the tests related to the changes in these PRs:
-              - Use "git diff --name-only ${RELEASE_BRANCH}...HEAD" to see all files changed across all cherry-picked commits.
-              - For Rust changes: Run tests for the affected crates only (e.g., "cargo test -p lance-core" if lance-core files changed).
-              - For Python changes (python/** files): Build with "cd python && make build" then run "uv run pytest" on the specific test files that were modified, or related test files.
-              - For Java changes (java/** files): Run "cd java && mvn test" for the affected modules.
-              - If test files themselves were modified, run those specific tests.
-              - Do NOT run the full test suite - only run tests related to the changed files.
-
-          11. If additional guidelines are provided, follow them as well when making decisions or resolving issues.
-
-          12. Stage any additional changes with "git add -A" and amend the last commit if needed: "git commit --amend --no-edit".
-
-          13. Push the branch: "git push origin <branch_name>". If the remote branch exists, delete it first with "gh api -X DELETE repos/lancedb/lance/git/refs/heads/<branch_name>" then push. Do NOT use "git push --force" or "git push -f".
-
-          14. Create a pull request targeting "${RELEASE_BRANCH}":
-              - If single PR: Title should be the same as the original PR title.
-              - If multiple PRs: Title should be "Backport multiple PRs to ${RELEASE_BRANCH}" or similar descriptive title.
-              - First, write the PR body to /tmp/pr-body.md using a heredoc (cat <<'PREOF' > /tmp/pr-body.md). The body should list all backported PRs:
-                "Backport of the following PRs:
-                - <PR_URL_1>
-                - <PR_URL_2>
-                ...
-
-                This PR backports the changes from the original PRs to the ${RELEASE_BRANCH} branch."
-              - Then run "gh pr create --base ${RELEASE_BRANCH} --title '<title>' --body-file /tmp/pr-body.md".
-
-          15. Display the new PR URL, "git status --short", and a summary of what was done including which PRs were backported.
-
-          Constraints:
-          - Use bash commands for all operations.
-          - Do not merge the PR.
-          - Do not modify GitHub workflow files.
-          - If any command fails, diagnose and attempt to fix the issue instead of aborting immediately.
-          - env "GH_TOKEN" is available, use "gh" tools for GitHub-related operations.
-          EOF
-
-          printenv OPENAI_API_KEY | codex login --with-api-key
-          codex --config shell_environment_policy.ignore_default_excludes=true exec --dangerously-bypass-approvals-and-sandbox "$(cat /tmp/codex-prompt.txt)"
+          This PR contains only the four files from https://github.com/lance-format/lance/pull/10149. The temporary validation workflow is outside the release branch.
+          BODY
+          printf '\nValidation run: https://github.com/%s/actions/runs/%s\nCandidate: %s\n' "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" "$(git rev-parse HEAD)" >> /tmp/pr-body.md
+          gh pr create --repo lance-format/lance --base release/v14.0 --head "$branch" --title 'fix(blob): backport descriptor subfield queries to v14' --body-file /tmp/pr-body.md
