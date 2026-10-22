@@ -4895,8 +4895,7 @@ fn bisect_weighted_cluster<T: StreamingKMeansArrowType>(
         .indices
         .iter()
         .partition(|&&idx| squared_l2(row(idx), row(first)) <= squared_l2(row(idx), row(second)));
-    let mut halves = Vec::with_capacity(2);
-    for indices in [near_first, near_second] {
+    let mut make_half = |indices: Vec<usize>| -> Result<WeightedCluster<T>> {
         let weight = indices.iter().map(|&idx| weights[idx]).sum::<f64>();
         let mut centroid = vec![T::Native::default(); dimension];
         for &idx in &indices {
@@ -4927,17 +4926,17 @@ fn bisect_weighted_cluster<T: StreamingKMeansArrowType>(
         );
         let id = *next_cluster_id;
         *next_cluster_id += 1;
-        halves.push(WeightedCluster {
+        Ok(WeightedCluster {
             id,
             indices,
             centroid,
             weight,
             split_priority,
             finalized: true,
-        });
-    }
-    let second = halves.pop().expect("two halves");
-    let first = halves.pop().expect("two halves");
+        })
+    };
+    let first = make_half(near_first)?;
+    let second = make_half(near_second)?;
     Ok(Some([first, second]))
 }
 
@@ -7172,10 +7171,11 @@ mod tests {
         assert_eq!(values.len(), target_k, "centroids: {values:?}");
     }
 
-    #[test]
-    fn test_weighted_hierarchical_bisects_clusters_kmeans_cannot_split() {
-        bisects_clusters_kmeans_cannot_split::<Float32Type>();
-        bisects_clusters_kmeans_cannot_split::<Float64Type>();
+    #[rstest::rstest]
+    #[case::f32(bisects_clusters_kmeans_cannot_split::<Float32Type> as fn())]
+    #[case::f64(bisects_clusters_kmeans_cannot_split::<Float64Type> as fn())]
+    fn test_weighted_hierarchical_bisects_clusters_kmeans_cannot_split(#[case] check: fn()) {
+        check();
     }
 
     #[tokio::test]
