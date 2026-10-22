@@ -10,6 +10,7 @@
 //! key below `_indices/{uuid}/` or `_fri/{map_id}/` by that uuid or map id. A
 //! reference goes to every range holding a key it can decide.
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 
 use lance_core::{Error, Result};
@@ -18,8 +19,8 @@ use serde::{Deserialize, Serialize};
 
 use super::{CleanupSubtree, ReferencedFiles};
 
-/// Known keys per task below which a subtree is not split further: a task that
-/// lists less is not worth scheduling on its own.
+/// A subtree gets at most one range per this many known keys, rounded up: a task
+/// that lists much less is not worth scheduling on its own.
 pub(super) const KEYS_PER_TASK: usize = 10_000;
 
 /// The keys `k` with `start_after < k <= end_inclusive`. A `None` bound is open.
@@ -48,13 +49,15 @@ enum ReferenceKind {
 }
 
 /// The keys whose cleanup decision can consult one reference.
-struct Probe {
+struct Probe<'a> {
     subtree: CleanupSubtree,
     /// Every such key is in `first..=last`.
-    first: String,
-    last: String,
-    /// Where a range boundary splits no group of keys sharing this reference.
-    boundary: String,
+    first: Cow<'a, str>,
+    last: Cow<'a, str>,
+    /// A place a range may end without splitting the keys this reference decides.
+    /// It can fall inside another reference's `first..=last`, which is why a
+    /// reference goes to every range its span overlaps.
+    boundary: Cow<'a, str>,
 }
 
 const SUBTREES: [CleanupSubtree; 7] = [
@@ -75,17 +78,7 @@ fn subtree_of(key: &str) -> Option<CleanupSubtree> {
 }
 
 /// `None` for a reference no listed key can consult.
-fn probe(kind: ReferenceKind, entry: &str) -> Option<Probe> {
-    let grouped = |subtree: CleanupSubtree, first: String, id: &str| {
-        let dir = subtree.relative_dir();
-        Probe {
-            subtree,
-            first,
-            // `0` follows `/`, so this bounds every key below `{dir}/{id}/`.
-            last: format!("{dir}/{id}0"),
-            boundary: format!("{dir}/{id}"),
-        }
-    };
+fn probe(kind: ReferenceKind, entry: &str) -> Option<Probe<'_>> {
     match kind {
         ReferenceKind::IndexUuid | ReferenceKind::FragReuseMapId => {
             let subtree = if kind == ReferenceKind::IndexUuid {
@@ -93,16 +86,29 @@ fn probe(kind: ReferenceKind, entry: &str) -> Option<Probe> {
             } else {
                 CleanupSubtree::FragReuse
             };
-            let first = format!("{}/{entry}", subtree.relative_dir());
-            Some(grouped(subtree, first, entry))
+            let group = format!("{}/{entry}", subtree.relative_dir());
+            Some(Probe {
+                subtree,
+                // `0` follows `/`, so this bounds every key below `{dir}/{id}/`.
+                last: Cow::Owned(format!("{group}0")),
+                boundary: Cow::Owned(group.clone()),
+                first: Cow::Owned(group),
+            })
         }
         ReferenceKind::DataPath => match entry
             .strip_prefix("data/")
             .and_then(|name| name.strip_suffix(".lance"))
         {
-            // `.` sorts before `/`, so the data file is the first key of its group.
             Some(stem) if !stem.contains('/') => {
-                Some(grouped(CleanupSubtree::Data, entry.to_string(), stem))
+                let group = &entry[..entry.len() - ".lance".len()];
+                Some(Probe {
+                    subtree: CleanupSubtree::Data,
+                    // `.` sorts before `/`, so the data file is the first key of its
+                    // group, and `0` follows `/`.
+                    first: Cow::Borrowed(entry),
+                    last: Cow::Owned(format!("{group}0")),
+                    boundary: Cow::Borrowed(group),
+                })
             }
             _ => exact(entry),
         },
@@ -112,26 +118,29 @@ fn probe(kind: ReferenceKind, entry: &str) -> Option<Probe> {
     }
 }
 
-fn exact(key: &str) -> Option<Probe> {
+fn exact(key: &str) -> Option<Probe<'_>> {
     let subtree = subtree_of(key)?;
     // Keep a data file's sidecar directory with it: `data/{stem}` sorts before both
     // `data/{stem}.lance` and `data/{stem}/...`.
-    let boundary = match (subtree, key.split('/').nth(1)) {
-        (CleanupSubtree::Data, Some(name)) => {
-            format!("data/{}", name.strip_suffix(".lance").unwrap_or(name))
+    let boundary = match key.strip_prefix("data/") {
+        Some(rest) if subtree == CleanupSubtree::Data => {
+            let name = rest.split('/').next().unwrap_or(rest);
+            let stem = name.strip_suffix(".lance").unwrap_or(name);
+            &key[.."data/".len() + stem.len()]
         }
-        _ => key.to_string(),
+        _ => key,
     };
     Some(Probe {
         subtree,
-        first: key.to_string(),
-        last: key.to_string(),
-        boundary,
+        first: Cow::Borrowed(key),
+        last: Cow::Borrowed(key),
+        boundary: Cow::Borrowed(boundary),
     })
 }
 
-/// The reference sets of [`ReferencedFiles`], as sorted dataset-relative paths;
-/// index uuids and row-map ids are bare.
+/// The reference sets of [`ReferencedFiles`], as dataset-relative paths; index
+/// uuids and row-map ids are bare. [`Self::from_files`] sorts them, so the tasks of a
+/// plan are deterministic.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct ReferenceSlice {
     data_paths: Vec<String>,
@@ -156,27 +165,96 @@ impl ReferenceSlice {
         }
     }
 
-    pub(super) fn to_files(&self) -> Result<ReferencedFiles> {
-        let paths = |entries: &[String]| {
+    /// The references in `files` that cleanup consults for keys of `subtree` in
+    /// `range`, copying only those.
+    pub(super) fn restricted_from(
+        files: &ReferencedFiles,
+        subtree: CleanupSubtree,
+        range: &KeyRange,
+    ) -> Self {
+        fn keep<'a>(
+            kind: ReferenceKind,
+            entries: impl Iterator<Item = &'a str>,
+            subtree: CleanupSubtree,
+            range: &KeyRange,
+        ) -> Vec<String> {
             entries
-                .iter()
-                .map(|entry| {
-                    Path::parse(entry).map_err(|error| {
-                        Error::invalid_input(format!(
-                            "invalid path {entry:?} in a cleanup sweep task: {error}"
-                        ))
+                .filter(|entry| {
+                    probe(kind, entry).is_some_and(|probe| {
+                        probe.subtree == subtree && range.overlaps(&probe.first, &probe.last)
                     })
                 })
-                .collect::<Result<HashSet<_>>>()
+                .map(str::to_string)
+                .collect()
+        }
+        Self {
+            data_paths: keep(
+                ReferenceKind::DataPath,
+                files.data_paths.iter().map(AsRef::<str>::as_ref),
+                subtree,
+                range,
+            ),
+            managed_blob_paths: keep(
+                ReferenceKind::ManagedBlob,
+                files.managed_blob_paths.iter().map(AsRef::<str>::as_ref),
+                subtree,
+                range,
+            ),
+            delete_paths: keep(
+                ReferenceKind::Deletion,
+                files.delete_paths.iter().map(AsRef::<str>::as_ref),
+                subtree,
+                range,
+            ),
+            tx_paths: keep(
+                ReferenceKind::Transaction,
+                files.tx_paths.iter().map(AsRef::<str>::as_ref),
+                subtree,
+                range,
+            ),
+            index_uuids: keep(
+                ReferenceKind::IndexUuid,
+                files.index_uuids.iter().map(String::as_str),
+                subtree,
+                range,
+            ),
+            frag_reuse_map_ids: keep(
+                ReferenceKind::FragReuseMapId,
+                files.frag_reuse_map_ids.iter().map(String::as_str),
+                subtree,
+                range,
+            ),
+        }
+    }
+
+    pub(super) fn to_files(&self) -> Result<ReferencedFiles> {
+        let mut files = ReferencedFiles::default();
+        self.add_to(&mut files)?;
+        Ok(files)
+    }
+
+    /// Adds these references to `files`.
+    pub(super) fn add_to(&self, files: &mut ReferencedFiles) -> Result<()> {
+        let add_paths = |entries: &[String], set: &mut HashSet<Path>| {
+            for entry in entries {
+                let path = Path::parse(entry).map_err(|error| {
+                    Error::invalid_input(format!(
+                        "invalid path {entry:?} in a cleanup sweep task: {error}"
+                    ))
+                })?;
+                set.insert(path);
+            }
+            Ok::<_, Error>(())
         };
-        Ok(ReferencedFiles {
-            data_paths: paths(&self.data_paths)?,
-            managed_blob_paths: paths(&self.managed_blob_paths)?,
-            delete_paths: paths(&self.delete_paths)?,
-            tx_paths: paths(&self.tx_paths)?,
-            index_uuids: self.index_uuids.iter().cloned().collect(),
-            frag_reuse_map_ids: self.frag_reuse_map_ids.iter().cloned().collect(),
-        })
+        add_paths(&self.data_paths, &mut files.data_paths)?;
+        add_paths(&self.managed_blob_paths, &mut files.managed_blob_paths)?;
+        add_paths(&self.delete_paths, &mut files.delete_paths)?;
+        add_paths(&self.tx_paths, &mut files.tx_paths)?;
+        files.index_uuids.extend(self.index_uuids.iter().cloned());
+        files
+            .frag_reuse_map_ids
+            .extend(self.frag_reuse_map_ids.iter().cloned());
+        Ok(())
     }
 
     pub(super) fn index_uuids(&self) -> &[String] {
@@ -198,17 +276,6 @@ impl ReferenceSlice {
         self.tx_paths.extend(tx_paths);
         self.index_uuids.extend(index_uuids);
         self.frag_reuse_map_ids.extend(frag_reuse_map_ids);
-    }
-
-    /// The references that cleanup consults for keys of `subtree` in `range`.
-    pub(super) fn restrict(&self, subtree: CleanupSubtree, range: &KeyRange) -> Self {
-        let mut restricted = Self::default();
-        for (kind, entry, probe) in self.probes(subtree) {
-            if range.overlaps(&probe.first, &probe.last) {
-                restricted.kind_mut(kind).push(entry.clone());
-            }
-        }
-        restricted
     }
 
     fn kinds(&self) -> [(ReferenceKind, &[String]); 6] {
@@ -237,7 +304,7 @@ impl ReferenceSlice {
     fn probes(
         &self,
         subtree: CleanupSubtree,
-    ) -> impl Iterator<Item = (ReferenceKind, &String, Probe)> {
+    ) -> impl Iterator<Item = (ReferenceKind, &String, Probe<'_>)> {
         self.kinds().into_iter().flat_map(move |(kind, entries)| {
             entries.iter().filter_map(move |entry| {
                 probe(kind, entry)
@@ -263,9 +330,8 @@ pub(super) struct Shard {
     pub(super) verified: ReferenceSlice,
 }
 
-/// The sorted, distinct places where `subtree` can be split without separating
-/// keys that consult the same reference. Their number is a proxy for the size of
-/// the subtree.
+/// The sorted, distinct places where `subtree` can be split, from
+/// [`Probe::boundary`]. Their number is a proxy for the size of the subtree.
 pub(super) fn boundary_candidates(
     subtree: CleanupSubtree,
     referenced: &ReferenceSlice,
@@ -274,7 +340,11 @@ pub(super) fn boundary_candidates(
     let mut candidates = [referenced, verified]
         .into_iter()
         .flat_map(|slice| slice.probes(subtree))
-        .map(|(_, _, probe)| probe.boundary)
+        // A task parses its bounds as paths; a stem like `.` would not parse back.
+        .filter(|(_, _, probe)| {
+            Path::parse(&*probe.boundary).is_ok_and(|path| path.as_ref() == probe.boundary)
+        })
+        .map(|(_, _, probe)| probe.boundary.into_owned())
         .collect::<Vec<_>>();
     candidates.sort_unstable();
     candidates.dedup();
@@ -282,8 +352,8 @@ pub(super) fn boundary_candidates(
 }
 
 /// Splits each subtree into ranges, giving every subtree at least one and the
-/// rest of `max_tasks` to the subtree with the most known keys per range, as long
-/// as each range keeps at least `keys_per_task` of them.
+/// rest of `max_tasks` to the subtree with the most known keys per range, up to one
+/// range per `keys_per_task` known keys, rounded up.
 pub(super) fn allocate(known_keys: &[usize], max_tasks: usize, keys_per_task: usize) -> Vec<usize> {
     let caps = known_keys
         .iter()
@@ -569,17 +639,63 @@ mod tests {
             }
         }
 
-        // `split` and `restrict` agree on which references a range needs.
+        // `split` and `restricted_from`, which a task cuts its refreshed references
+        // with, agree on which references a range needs.
         for shard in &shards {
             assert_eq!(
                 shard.referenced,
-                referenced_slice.restrict(subtree, &shard.range)
+                restricted(&referenced, subtree, &shard.range)
             );
-            assert_eq!(
-                shard.verified,
-                verified_slice.restrict(subtree, &shard.range)
-            );
+            assert_eq!(shard.verified, restricted(&verified, subtree, &shard.range));
         }
+    }
+
+    fn restricted(
+        files: &ReferencedFiles,
+        subtree: CleanupSubtree,
+        range: &KeyRange,
+    ) -> ReferenceSlice {
+        let mut slice = ReferenceSlice::restricted_from(files, subtree, range);
+        for (kind, _) in ReferenceSlice::default().kinds() {
+            slice.kind_mut(kind).sort_unstable();
+        }
+        slice
+    }
+
+    #[test]
+    fn a_boundary_inside_another_data_group_keeps_its_reference() {
+        // `data/s.v2` sorts between `data/s.lance` and `data/s/x.blob`.
+        let referenced = ReferencedFiles {
+            data_paths: HashSet::from([Path::from("data/s.lance"), Path::from("data/s.v2.lance")]),
+            ..Default::default()
+        };
+        let slice = ReferenceSlice::from_files(&referenced);
+        let empty = ReferenceSlice::default();
+        let candidates = boundary_candidates(CleanupSubtree::Data, &slice, &empty);
+        assert_eq!(candidates, ["data/s", "data/s.v2"]);
+        let shards = split(CleanupSubtree::Data, &slice, &empty, &candidates, 2);
+        assert_eq!(shards[0].range.end_inclusive.as_deref(), Some("data/s.v2"));
+        let sidecar = "data/s/x.blob";
+        assert!(shards[1].range.overlaps(sidecar, sidecar));
+        let files = shards[1].referenced.to_files().unwrap();
+        assert!(files.data_paths.contains(&Path::from("data/s.lance")));
+        assert_eq!(classify(sidecar, &files, &files, false), None);
+    }
+
+    #[test]
+    fn unparsable_boundaries_are_never_chosen() {
+        let referenced = ReferencedFiles {
+            data_paths: HashSet::from([
+                Path::from("data/a.lance"),
+                Path::from_iter(["data", "..lance"]),
+                Path::from_iter(["data", "...lance"]),
+            ]),
+            ..Default::default()
+        };
+        let slice = ReferenceSlice::from_files(&referenced);
+        let candidates =
+            boundary_candidates(CleanupSubtree::Data, &slice, &ReferenceSlice::default());
+        assert_eq!(candidates, ["data/a"]);
     }
 
     #[test]
@@ -595,7 +711,7 @@ mod tests {
         let slice = ReferenceSlice::from_files(&files);
         assert_eq!(slice.to_files().unwrap().data_paths, files.data_paths);
         for subtree in SUBTREES {
-            let restricted = slice.restrict(subtree, &KeyRange::default());
+            let restricted = restricted(&files, subtree, &KeyRange::default());
             let count = restricted
                 .kinds()
                 .iter()

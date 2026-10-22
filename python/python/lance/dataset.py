@@ -3586,7 +3586,8 @@ class LanceDataset(pa.dataset.Dataset):
         explain: bool, default False
             Plan an explanation instead: nothing is removed, and
             :meth:`CleanupPlan.finish_explain` returns what
-            :meth:`explain_cleanup_old_versions` would.
+            ``explain_cleanup_old_versions(include_files=True, max_files=max_files)``
+            would.
 
         max_files: int, default 1000
             Maximum number of candidate files included in the explanation.

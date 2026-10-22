@@ -34,7 +34,7 @@
 //! happening at the same time)
 
 use super::refs::TagContents;
-use crate::dataset::TRANSACTIONS_DIR;
+use crate::dataset::{FileFragment, TRANSACTIONS_DIR};
 use crate::{Dataset, utils::temporal::utc_now};
 use chrono::{DateTime, TimeDelta, Utc};
 use dashmap::DashSet;
@@ -408,6 +408,7 @@ impl CleanupInspection {
 /// A Lance-managed directory that cleanup lists for unreferenced files.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum CleanupSubtree {
     /// `_versions/`: leftover temporary manifests.
     Versions,
@@ -776,44 +777,10 @@ impl<'a> CleanupTask<'a> {
         retained: bool,
         inspection: &Mutex<CleanupInspection>,
     ) -> Result<bool> {
-        let names = dataset
-            .schema()
-            .fields
-            .iter()
-            .filter(|field| super::blob::field_contains_blob(field))
-            .map(|field| field.name.as_str())
-            .collect::<Vec<_>>();
-        if names.is_empty() {
-            return Ok(false);
-        }
-        let projection = dataset.schema().project(&names)?;
-        let fields = projection
-            .fields
-            .iter()
-            .map(arrow_schema::Field::from)
-            .collect::<Vec<_>>();
-        let field_ids = projection.field_ids();
-        let mut bases = dataset
-            .manifest
-            .base_paths
-            .iter()
-            .map(|(id, base)| (*id, base.path.clone(), base.is_dataset_root))
-            .collect::<Vec<_>>();
-        bases.sort_unstable();
         let mut found = false;
         // Manifests are already read concurrently. Scan their fragments in order
         // to avoid multiplying concurrent descriptor buffers and path sets.
-        for fragment in dataset.get_fragments() {
-            let key = ManagedScanKey {
-                store_prefix: dataset.object_store.store_prefix.clone(),
-                data_dir: dataset.data_dir(),
-                bases: bases.clone(),
-                fragment: lance_table::format::pb::DataFragment::from(&fragment.metadata)
-                    .encode_to_vec(),
-                fields: fields.clone(),
-                field_ids: field_ids.clone(),
-                retained,
-            };
+        for (key, fragment) in managed_scan_keys(dataset, retained)? {
             let cell = inspection
                 .lock()
                 .unwrap()
@@ -2159,6 +2126,55 @@ impl<'a> CleanupTask<'a> {
     }
 }
 
+/// The managed-blob scan key of every fragment of `dataset`, with the fragment;
+/// empty when the schema has no blob column.
+fn managed_scan_keys(
+    dataset: &Dataset,
+    retained: bool,
+) -> Result<Vec<(ManagedScanKey, FileFragment)>> {
+    let names = dataset
+        .schema()
+        .fields
+        .iter()
+        .filter(|field| super::blob::field_contains_blob(field))
+        .map(|field| field.name.as_str())
+        .collect::<Vec<_>>();
+    if names.is_empty() {
+        return Ok(Vec::new());
+    }
+    let projection = dataset.schema().project(&names)?;
+    let fields = projection
+        .fields
+        .iter()
+        .map(arrow_schema::Field::from)
+        .collect::<Vec<_>>();
+    let field_ids = projection.field_ids();
+    let mut bases = dataset
+        .manifest
+        .base_paths
+        .iter()
+        .map(|(id, base)| (*id, base.path.clone(), base.is_dataset_root))
+        .collect::<Vec<_>>();
+    bases.sort_unstable();
+    Ok(dataset
+        .get_fragments()
+        .into_iter()
+        .map(|fragment| {
+            let key = ManagedScanKey {
+                store_prefix: dataset.object_store.store_prefix.clone(),
+                data_dir: dataset.data_dir(),
+                bases: bases.clone(),
+                fragment: lance_table::format::pb::DataFragment::from(&fragment.metadata)
+                    .encode_to_vec(),
+                fields: fields.clone(),
+                field_ids: field_ids.clone(),
+                retained,
+            };
+            (key, fragment)
+        })
+        .collect())
+}
+
 /// Size of an expired manifest, for `bytes_removed`.
 ///
 /// `known` is what the listing reported. The HEAD fallback only runs when the listing did
@@ -3125,7 +3141,7 @@ mod tests {
             Ok(file_count)
         }
 
-        async fn count_blob_files(&self) -> Result<usize> {
+        pub(super) async fn count_blob_files(&self) -> Result<usize> {
             let registry = Arc::new(ObjectStoreRegistry::default());
             let (os, path) =
                 ObjectStore::from_uri_and_params(registry, &self.dataset_path, &self.os_params())

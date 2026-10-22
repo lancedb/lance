@@ -16,21 +16,22 @@
 //! that runs later is only more conservative.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
-use futures::TryStreamExt;
+use futures::{TryStreamExt, stream};
 use lance_core::{Error, Result};
 use object_store::path::Path;
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tokio::sync::OnceCell;
+use tracing::{debug, info};
 use uuid::Uuid;
 
 use super::shard::{self, KeyRange, ReferenceSlice};
 use super::{
     CleanupAction, CleanupCandidateFile, CleanupExplanation, CleanupInspection, CleanupOperation,
     CleanupPolicy, CleanupReferencedBranch, CleanupRunResult, CleanupSubtree, CleanupTask,
-    DEFAULT_EXPLANATION_MAX_CANDIDATE_FILES, ReferencedFiles, RemovalStats, SweepEvidence,
+    DEFAULT_EXPLANATION_MAX_CANDIDATE_FILES, RemovalStats, SweepEvidence, managed_scan_keys,
     tag_is_on_branch, validate_delete_concurrency, validate_delete_rate_limit,
 };
 use crate::Dataset;
@@ -41,6 +42,10 @@ const SWEEP_FORMAT: u32 = 1;
 /// Tasks only run on the Lance version that planned them, so the rules a task
 /// applies are always the rules its plan was built for.
 const LANCE_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Most manifests a task reads at once when refreshing. Each one's data, deletion,
+/// transaction and index references are held in full until cut to the task's
+/// range; managed blob paths are gathered across manifests and cut at the end.
+const REFRESH_MANIFEST_CONCURRENCY: usize = 4;
 
 impl CleanupOperation<'_> {
     /// Plan a cleanup whose listing and deletion can be split across processes.
@@ -54,8 +59,8 @@ impl CleanupOperation<'_> {
     /// from the plan until the last task has run.
     ///
     /// Returns [`Error::NotSupported`] when the policy cleans referenced branches, and
-    /// [`Error::Cleanup`] without creating a plan when an expired manifest cannot be
-    /// removed.
+    /// [`Error::Cleanup`] when an expired version is tagged or branched from, or when
+    /// an expired manifest cannot be removed; no plan is created then.
     ///
     /// ```
     /// # use lance::{Dataset, Result};
@@ -132,8 +137,8 @@ pub struct CleanupPlan {
     /// The expired manifests the plan removed, or would remove when explaining.
     manifests: CleanupRunResult,
     referenced_branches: Vec<(String, u64)>,
-    /// False when a ranged listing would list the whole subtree again, so each
-    /// subtree gets a single task.
+    /// False when the store does not list in lexical order, so a ranged listing
+    /// would read the whole subtree again and each subtree gets a single task.
     is_shardable: bool,
 }
 impl CleanupPlan {
@@ -180,9 +185,7 @@ impl CleanupPlan {
             verified: ReferenceSlice::from_files(&inspection.verified_files),
             manifests,
             referenced_branches,
-            // A local filesystem lists the whole directory for every range, but
-            // that is cheap there.
-            is_shardable: store.list_is_lexically_ordered || task.removes_empty_dirs(),
+            is_shardable: store.list_is_lexically_ordered,
         };
         info!(
             plan_id = %plan.id,
@@ -206,16 +209,19 @@ impl CleanupPlan {
     /// Split the sweep into tasks.
     ///
     /// Every listed directory gets at least one task, so there can be more than
-    /// `max_tasks` of them. The split is deterministic. Returns an invalid-input
-    /// error if `max_tasks` is zero.
+    /// `max_tasks` of them. A directory is split only on a store that lists in lexical
+    /// order (not a local filesystem or S3 Express), and into at most one task per
+    /// 10,000 files the plan knows of there. The split is deterministic. Returns an
+    /// invalid-input error if `max_tasks` is zero.
     pub fn tasks(&self, max_tasks: usize) -> Result<Vec<CleanupSweepTask>> {
-        self.tasks_with_min_keys(max_tasks, shard::KEYS_PER_TASK)
+        self.split_tasks(max_tasks, shard::KEYS_PER_TASK, self.is_shardable)
     }
 
-    fn tasks_with_min_keys(
+    fn split_tasks(
         &self,
         max_tasks: usize,
         keys_per_task: usize,
+        is_shardable: bool,
     ) -> Result<Vec<CleanupSweepTask>> {
         if max_tasks == 0 {
             return Err(Error::invalid_input("max_tasks must be greater than 0"));
@@ -227,7 +233,7 @@ impl CleanupPlan {
                 shard::boundary_candidates(*subtree, &self.referenced, &self.verified)
             })
             .collect::<Vec<_>>();
-        let ranges = if self.is_shardable {
+        let ranges = if is_shardable {
             let known_keys = candidates.iter().map(Vec::len).collect::<Vec<_>>();
             shard::allocate(&known_keys, max_tasks, keys_per_task)
         } else {
@@ -538,7 +544,7 @@ impl CleanupSweepTask {
         )?;
         // The manifests after the plan's version are the ones to refresh.
         task.read_version = self.read_version;
-        info!(
+        debug!(
             plan_id = %self.plan_id,
             task = self.index,
             subtree = %self.subtree,
@@ -548,15 +554,7 @@ impl CleanupSweepTask {
         );
         let (refresh, refreshed_versions) = self.refresh(&task).await?;
         let result = match refresh {
-            Some(refresh) => {
-                let refresh = ReferenceSlice::from_files(&refresh);
-                self.sweep(
-                    &task,
-                    refresh.restrict(self.subtree, &self.range),
-                    refreshed_versions,
-                )
-                .await?
-            }
+            Some(refreshed) => self.sweep(&task, &refreshed, refreshed_versions).await?,
             None => {
                 let mut result = self.result(refreshed_versions);
                 result.warnings.push(format!(
@@ -605,15 +603,15 @@ impl CleanupSweepTask {
     async fn sweep(
         &self,
         task: &CleanupTask<'_>,
-        refreshed: ReferenceSlice,
+        refreshed: &ReferenceSlice,
         refreshed_versions: u64,
     ) -> Result<CleanupSweepResult> {
         let base = &task.dataset.base;
-        let mut referenced = self.referenced.clone();
-        referenced.extend(refreshed);
+        let mut referenced_files = self.referenced.to_files()?;
+        refreshed.add_to(&mut referenced_files)?;
         let evidence = SweepEvidence {
             inspection: CleanupInspection {
-                referenced_files: referenced.to_files()?,
+                referenced_files,
                 verified_files: self.verified.to_files()?,
                 ..Default::default()
             },
@@ -645,44 +643,122 @@ impl CleanupSweepTask {
         Ok(result)
     }
 
-    /// Reads the manifests committed after the plan, returning the files they
-    /// reference and how many there were. `None` when one of them carries a fragment
-    /// reuse index this client cannot interpret and this task lists `_fri/`.
-    async fn refresh(&self, task: &CleanupTask<'_>) -> Result<(Option<ReferencedFiles>, u64)> {
+    /// Reads the manifests committed after the plan, returning the references the
+    /// keys of this task's range consult and how many manifests there were. `None`
+    /// when one of them carries a fragment reuse index this client cannot interpret
+    /// and this task lists `_fri/`.
+    async fn refresh(&self, task: &CleanupTask<'_>) -> Result<(Option<ReferenceSlice>, u64)> {
         let dataset = task.dataset;
-        let inspection = Mutex::new(CleanupInspection::default());
-        let scans_managed_blobs =
-            matches!(self.subtree, CleanupSubtree::Data | CleanupSubtree::Blobs);
         let locations = dataset
             .commit_handler
             .list_manifest_locations_since(&dataset.base, &dataset.object_store, self.read_version)
             .try_collect::<Vec<_>>()
             .await?;
-        for location in &locations {
-            let Some((manifest, indexes)) = task
-                .load_manifest_for_cleanup(location, &inspection)
-                .await?
-            else {
-                continue;
-            };
-            if scans_managed_blobs && manifest.has_managed_blobs() {
-                let snapshot = dataset
-                    .checkout_version((manifest.branch.as_deref(), Some(manifest.version)))
-                    .await?;
-                task.inspect_managed_blobs(&snapshot, true, &inspection)
-                    .await?;
-            }
-            let mut guard = inspection.lock().unwrap();
-            task.process_manifest(&manifest, &indexes, true, &mut guard)?;
-        }
-        let mut inspection = inspection.into_inner().unwrap();
         let refreshed_versions = locations.len() as u64;
+        // The rules consult no reference for `_versions/` keys.
+        if self.subtree == CleanupSubtree::Versions || locations.is_empty() {
+            return Ok((Some(ReferenceSlice::default()), refreshed_versions));
+        }
+        let scans_managed_blobs =
+            matches!(self.subtree, CleanupSubtree::Data | CleanupSubtree::Blobs);
+        let inspection = Mutex::new(CleanupInspection::default());
+        if scans_managed_blobs {
+            self.skip_planned_managed_scans(dataset, &inspection)
+                .await?;
+        }
+        let refreshed = Mutex::new(ReferenceSlice::default());
+        let (inspection_ref, refreshed_ref) = (&inspection, &refreshed);
+        stream::iter(locations.iter().map(Ok::<_, Error>))
+            .try_for_each_concurrent(
+                REFRESH_MANIFEST_CONCURRENCY.min(dataset.object_store.io_parallelism()),
+                |location| async move {
+                    let Some((manifest, indexes)) = task
+                        .load_manifest_for_cleanup(location, inspection_ref)
+                        .await?
+                    else {
+                        return Ok(());
+                    };
+                    if scans_managed_blobs && manifest.has_managed_blobs() {
+                        let snapshot = dataset
+                            .checkout_version((manifest.branch.as_deref(), Some(manifest.version)))
+                            .await?;
+                        task.inspect_managed_blobs(&snapshot, true, inspection_ref)
+                            .await?;
+                    }
+                    // Cut to this task's range manifest by manifest: only the manifests
+                    // being read hold their references in full.
+                    let manifest_inspection = Mutex::new(CleanupInspection::default());
+                    let mut guard = manifest_inspection
+                        .lock()
+                        .expect("a lock taken only here cannot be poisoned");
+                    task.process_manifest(&manifest, &indexes, true, &mut guard)?;
+                    let slice = ReferenceSlice::restricted_from(
+                        &guard.referenced_files,
+                        self.subtree,
+                        &self.range,
+                    );
+                    let frag_reuse_entries = std::mem::take(&mut guard.frag_reuse_entries);
+                    drop(guard);
+                    refreshed_ref
+                        .lock()
+                        .expect("no holder of this lock panics")
+                        .extend(slice);
+                    inspection_ref
+                        .lock()
+                        .expect("no holder of this lock panics")
+                        .frag_reuse_entries
+                        .extend(frag_reuse_entries);
+                    Ok(())
+                },
+            )
+            .await?;
+        let mut inspection = inspection
+            .into_inner()
+            .expect("no holder of this lock panics");
         if self.subtree == CleanupSubtree::FragReuse
             && !task.resolve_frag_reuse_map_ids(&mut inspection).await
         {
             return Ok((None, refreshed_versions));
         }
-        Ok((Some(inspection.referenced_files), refreshed_versions))
+        let mut refreshed = refreshed
+            .into_inner()
+            .expect("no holder of this lock panics");
+        // Managed blob paths and row-map ids are collected across manifests.
+        refreshed.extend(ReferenceSlice::restricted_from(
+            &inspection.referenced_files,
+            self.subtree,
+            &self.range,
+        ));
+        Ok((Some(refreshed), refreshed_versions))
+    }
+
+    /// Marks the fragments of the planned version as already scanned for managed
+    /// blobs. The plan holds their paths, so only fragments changed since are read.
+    async fn skip_planned_managed_scans(
+        &self,
+        dataset: &Dataset,
+        inspection: &Mutex<CleanupInspection>,
+    ) -> Result<()> {
+        let planned = match dataset
+            .checkout_version((self.branch.as_deref(), Some(self.read_version)))
+            .await
+        {
+            // The plan scanned only manifests with managed blobs.
+            Ok(planned) if planned.manifest.has_managed_blobs() => planned,
+            Ok(_) => return Ok(()),
+            // A later cleanup removed it; then every fragment is scanned.
+            Err(error) if error.is_not_found() => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        let keys = managed_scan_keys(&planned, true)?;
+        let mut inspection = inspection.lock().expect("no holder of this lock panics");
+        for (key, _) in keys {
+            // Whether the scan found paths is not read by a refresh.
+            inspection
+                .managed_scans
+                .insert(key, Arc::new(OnceCell::new_with(Some(false))));
+        }
+        Ok(())
     }
 }
 
@@ -870,17 +946,20 @@ mod tests {
     use super::*;
     use crate::dataset::cleanup::CleanupPolicyBuilder;
     use crate::dataset::cleanup::tests::{
-        MockDatasetFixture, blob_v2_batch, managed_blob_batch, write_dummy_index_artifact,
+        IdentifiedStore, MockDatasetFixture, MockObjectStore, blob_v2_batch, managed_blob_batch,
+        write_dummy_index_artifact,
     };
-    use crate::dataset::{WriteMode, WriteParams};
+    use crate::dataset::{InsertBuilder, WriteDestination, WriteMode, WriteParams};
     use crate::index::DatasetIndexExt;
     use crate::index::vector::VectorIndexParams;
     use crate::utils::temporal::utc_now;
     use arrow_array::RecordBatchIterator;
     use chrono::TimeDelta;
     use lance_index::IndexType;
+    use lance_io::object_store::ObjectStoreParams;
     use lance_linalg::distance::MetricType;
-    use lance_table::io::commit::RenameCommitHandler;
+    use lance_table::io::commit::external_manifest::ExternalManifestCommitHandler;
+    use lance_table::io::commit::{CommitHandler, RenameCommitHandler};
     use mock_instant::thread_local::MockClock;
     use rstest::rstest;
     use serde::de::DeserializeOwned;
@@ -902,7 +981,8 @@ mod tests {
         max_tasks: usize,
     ) -> Result<Vec<CleanupSweepResult>> {
         let mut results = Vec::new();
-        for task in plan.tasks_with_min_keys(max_tasks, 1)?.iter().rev() {
+        // Split even on the local filesystem the fixtures use.
+        for task in plan.split_tasks(max_tasks, 1, true)?.iter().rev() {
             let result = round_trip(task)
                 .execute(dataset, &SweepOptions::default())
                 .await?;
@@ -1155,7 +1235,7 @@ mod tests {
                 cleanup_task(dataset, action, task.delete_unverified, None, None).unwrap();
             cleanup.read_version = task.read_version;
             let result = task
-                .sweep(&cleanup, ReferenceSlice::default(), 0)
+                .sweep(&cleanup, &ReferenceSlice::default(), 0)
                 .await
                 .unwrap();
             removed += result.stats.data_files_removed;
@@ -1186,6 +1266,84 @@ mod tests {
         let latest = fixture.open().await.unwrap();
         assert_eq!(latest.version_id(), plan.read_version() + 1);
         assert_eq!(latest.count_rows(None).await.unwrap(), 1024);
+    }
+
+    /// Managed blobs committed after the plan are kept, and a task reads the blob
+    /// descriptors of only the fragments the plan has not seen.
+    #[tokio::test]
+    async fn sweep_keeps_managed_blobs_committed_after_the_plan() {
+        MockClock::set_system_time(std::time::Duration::ZERO);
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        let params = || WriteParams {
+            store_params: Some(fixture.os_params()),
+            data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
+            ..Default::default()
+        };
+        let batch = managed_blob_batch();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+            &fixture.dataset_path,
+            Some(params()),
+        )
+        .await
+        .unwrap();
+        dataset.update_config([("v", "2")]).await.unwrap();
+        let planned_file = dataset.manifest.fragments[0].files[0].path.clone();
+        MockClock::set_system_time(days(10));
+        let policy = CleanupPolicyBuilder::default()
+            .before_timestamp(utc_now())
+            .delete_unverified(true)
+            .build();
+        let plan = dataset.cleanup(policy).plan().await.unwrap();
+
+        dataset
+            .append(
+                RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+                Some(WriteParams {
+                    mode: WriteMode::Append,
+                    ..params()
+                }),
+            )
+            .await
+            .unwrap();
+        let blobs = fixture.count_blob_files().await.unwrap();
+        assert_eq!(blobs, 4);
+        let planned_reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = planned_reads.clone();
+        fixture.mock_store.policy.lock().unwrap().set_before_policy(
+            "count_planned_reads",
+            Arc::new(move |op, path| {
+                if op.starts_with("get") && path.filename() == Some(planned_file.as_str()) {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                Ok(())
+            }),
+        );
+        let results = run_tasks(&dataset, &plan, 1).await.unwrap();
+        assert_eq!(
+            planned_reads.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the planned fragment's descriptors are read again"
+        );
+        let stats = plan.finish(&dataset, &results).await.unwrap();
+        assert_eq!(stats.data_files_removed, 0);
+        assert_eq!(fixture.count_blob_files().await.unwrap(), blobs);
+        let latest = fixture.open().await.unwrap();
+        let values = Arc::new(*latest)
+            .take_blobs_by_indices(&[0, 1, 2, 3], "blob")
+            .await
+            .unwrap();
+        for (value, expected) in values.iter().zip([
+            b"first".as_slice(),
+            b"second".as_slice(),
+            b"first".as_slice(),
+            b"second".as_slice(),
+        ]) {
+            assert_eq!(
+                value.as_ref().unwrap().read().await.unwrap().as_ref(),
+                expected
+            );
+        }
     }
 
     #[tokio::test]
@@ -1378,12 +1536,6 @@ mod tests {
     }
     #[tokio::test]
     async fn plan_fails_when_an_expired_manifest_cannot_be_removed() {
-        use crate::dataset::cleanup::tests::{IdentifiedStore, MockObjectStore};
-        use crate::dataset::{InsertBuilder, WriteDestination};
-        use lance_io::object_store::ObjectStoreParams;
-        use lance_table::io::commit::CommitHandler;
-        use lance_table::io::commit::external_manifest::ExternalManifestCommitHandler;
-
         MockClock::set_system_time(std::time::Duration::ZERO);
         let store = Arc::new(IdentifiedStore::default());
         let handler: Arc<dyn CommitHandler> = Arc::new(ExternalManifestCommitHandler {

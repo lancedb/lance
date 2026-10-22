@@ -1691,11 +1691,14 @@ impl ObjectStore {
     /// Read the files under `dir_path` whose paths sort after `start_after` and not after
     /// `end_inclusive`, comparing path strings byte by byte. A `None` bound is open.
     ///
-    /// Both bounds are checked on every listed file, so the result does not depend on
-    /// the store. `start_after` is also passed to the store, which skips the earlier
-    /// files on the server where it supports a start offset, and a store that lists in
-    /// lexical order stops listing at the first path past `end_inclusive`. As with
-    /// [`Self::read_dir_all`], a failed listing is not retried.
+    /// Both bounds are checked on every listed file, so no file outside the range is
+    /// returned. `start_after` is also passed to the store, which skips the earlier
+    /// files on the server where it supports a start offset. A store that lists in
+    /// lexical order stops listing at the first path past `end_inclusive`; that
+    /// assumes the server lists in the byte order of the `Path` strings, and where it
+    /// does not (OpenDAL stores with keys that `Path` percent-encodes), files in the
+    /// range can be missed. As with [`Self::read_dir_all`], a failed listing is not
+    /// retried.
     ///
     /// ```
     /// # use futures::TryStreamExt;
@@ -2721,6 +2724,113 @@ mod tests {
             .await
             .unwrap();
         assert!(modified.is_empty());
+    }
+
+    /// How a store's `list_with_offset` treats the offset.
+    #[derive(Debug, Clone, Copy)]
+    enum OffsetHandling {
+        Ignored,
+        Inclusive,
+    }
+
+    /// Forwards to `InMemory`, except that `list_with_offset` misreads the offset.
+    #[derive(Debug)]
+    struct OffsetMisreadingStore {
+        inner: InMemory,
+        handling: OffsetHandling,
+    }
+
+    impl Display for OffsetMisreadingStore {
+        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+            write!(f, "OffsetMisreadingStore")
+        }
+    }
+
+    #[async_trait]
+    impl OSObjectStore for OffsetMisreadingStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            bytes: PutPayload,
+            opts: PutOptions,
+        ) -> OSResult<PutResult> {
+            self.inner.put_opts(location, bytes, opts).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: PutMultipartOptions,
+        ) -> OSResult<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+        async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+        async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> OSResult<Vec<Bytes>> {
+            self.inner.get_ranges(location, ranges).await
+        }
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, OSResult<Path>>,
+        ) -> BoxStream<'static, OSResult<Path>> {
+            self.inner.delete_stream(locations)
+        }
+        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+        fn list_with_offset(
+            &self,
+            prefix: Option<&Path>,
+            offset: &Path,
+        ) -> BoxStream<'static, OSResult<ObjectMeta>> {
+            let listed = self.inner.list(prefix);
+            match self.handling {
+                OffsetHandling::Ignored => listed,
+                OffsetHandling::Inclusive => {
+                    let offset = offset.clone();
+                    listed
+                        .try_filter(move |meta| future::ready(meta.location >= offset))
+                        .boxed()
+                }
+            }
+        }
+        async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OSResult<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+        async fn copy_opts(&self, from: &Path, to: &Path, opts: CopyOptions) -> OSResult<()> {
+            self.inner.copy_opts(from, to, opts).await
+        }
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_list_range_checks_the_offset_itself(
+        #[values(OffsetHandling::Ignored, OffsetHandling::Inclusive)] handling: OffsetHandling,
+        #[values(false, true)] is_lexically_ordered: bool,
+    ) {
+        let mut store = ObjectStore::memory();
+        store.inner = Arc::new(OffsetMisreadingStore {
+            inner: InMemory::new(),
+            handling,
+        });
+        store.list_is_lexically_ordered = is_lexically_ordered;
+        let dir = Path::from("base/dir");
+        for name in ["a", "b", "b0", "c", "d"] {
+            store.put(&dir.clone().join(name), b"x").await.unwrap();
+        }
+        let mut names = store
+            .list_range(
+                &dir,
+                Some(&dir.clone().join("b")),
+                Some(&dir.clone().join("c")),
+                None,
+            )
+            .map_ok(|meta| meta.location.filename().unwrap().to_string())
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        names.sort();
+        assert_eq!(names, ["b0", "c"]);
     }
 
     #[rstest]
