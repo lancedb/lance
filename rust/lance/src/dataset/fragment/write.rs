@@ -169,7 +169,7 @@ impl<'a> FragmentCreateBuilder<'a> {
 
         progress.begin(&fragment).await?;
 
-        let mut writer = V2WriterAdapter::new(writer, Some(data_file), None);
+        let mut writer = V2WriterAdapter::new(writer, Some(data_file), None, None);
         let break_limit = (128 * 1024).min(params.max_rows_per_file);
 
         let mut broken_stream = break_stream(stream, break_limit);
@@ -239,7 +239,8 @@ impl<'a> FragmentCreateBuilder<'a> {
             stream,
             params,
             target_bases_info,
-            Vec::new(),
+            crate::dataset::write::seeds::SeedCollector::disabled(),
+            None,
             None,
         )
         .await

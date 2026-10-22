@@ -219,6 +219,23 @@ class PackedBlobWriter:
     def finish(self) -> List[BlobDescriptor]: ...
     def finish_array(self, field_name: str) -> pa.StructArray: ...
 
+class ManagedBlobWriter:
+    @property
+    def path(self) -> str: ...
+    def write_blob(self, data: bytes) -> None: ...
+    def write_blobs(
+        self,
+        payloads: Union[
+            pa.BinaryArray,
+            pa.LargeBinaryArray,
+            pa.BinaryViewArray,
+            pa.FixedSizeBinaryArray,
+            pa.ChunkedArray,
+        ],
+    ) -> None: ...
+    def finish(self) -> List[BlobDescriptor]: ...
+    def finish_column(self, field_name: str) -> tuple[pa.Field, pa.StructArray]: ...
+
 class DedicatedBlobWriter:
     @property
     def blob_id(self) -> int: ...
@@ -235,6 +252,9 @@ class BlobDescriptorArrayBuilder:
         self, blob_id: int, offsets: List[int], sizes: List[int]
     ) -> None: ...
     def append_dedicated(self, blob_id: int, size: int) -> None: ...
+    def append_managed(
+        self, uri: str, offset: int, size: int, *, base_id: Optional[int] = None
+    ) -> None: ...
     def append(self, value: BlobDescriptor) -> None: ...
     def extend(self, values: List[BlobDescriptor]) -> None: ...
     def append_inline(self, data: bytes) -> None: ...
@@ -261,6 +281,9 @@ class LanceFileSession:
         keep_original_array: Optional[bool] = None,
         max_page_bytes: Optional[int] = None,
     ) -> LanceFileWriter: ...
+    def open_managed_blob_writer(
+        self, *, base_id: Optional[int] = None
+    ) -> ManagedBlobWriter: ...
     def open_packed_blob_writer(self, path: str, blob_id: int) -> PackedBlobWriter: ...
     def open_dedicated_blob_writer(
         self, path: str, blob_id: int
@@ -424,6 +447,9 @@ class _Dataset:
         order_by: Optional[List[Any]] = None,
         disable_scoring_autoprojection: Optional[bool] = None,
         substrait_aggregate: Optional[bytes] = None,
+        row_addr_allowlist: Optional[bytes] = None,
+        row_addr_blocklist: Optional[bytes] = None,
+        minhash_query: Optional[Dict[str, str]] = None,
     ) -> _Scanner: ...
     def count_rows(self, filter: Optional[str] = None) -> int: ...
     def take(
@@ -490,11 +516,11 @@ class _Dataset:
     ) -> pa.RecordBatchReader: ...
     def alter_columns(self, alterations: List[AlterColumn]): ...
     def merge(self, reader: pa.RecordBatchReader, left_on: str, right_on: str): ...
-    def delete(self, predicate: str): ...
+    def delete(self, predicate: str | bytes): ...
     def update(
         self,
         updates: Dict[str, str],
-        predicate: Optional[str] = None,
+        predicate: Optional[str | bytes] = None,
         conflict_retries: Optional[int] = None,
         retry_timeout: Optional[timedelta] = None,
         data_storage_version: Optional[str] = None,
@@ -503,6 +529,7 @@ class _Dataset:
     def versions(self) -> List[Version]: ...
     def version_refs(self) -> List[VersionRef]: ...
     def version(self) -> int: ...
+    def current_version(self) -> Version: ...
     def latest_version(self) -> int: ...
     def checkout_version(
         self, version: int | str | Tuple[Optional[str], Optional[int]]
@@ -522,6 +549,8 @@ class _Dataset:
         delete_unverified: Optional[bool] = None,
         error_if_tagged_old_versions: Optional[bool] = None,
         delete_rate_limit: Optional[int] = None,
+        versions: Optional[List[int]] = None,
+        delete_concurrency: Optional[int] = None,
     ) -> CleanupStats: ...
     def explain_cleanup_old_versions(
         self,
@@ -530,6 +559,7 @@ class _Dataset:
         delete_unverified: Optional[bool] = None,
         error_if_tagged_old_versions: Optional[bool] = None,
         delete_rate_limit: Optional[int] = None,
+        versions: Optional[List[int]] = None,
         include_files: bool = False,
         max_files: int = 1000,
     ) -> CleanupExplanation: ...
@@ -599,6 +629,7 @@ class _Dataset:
         self, index_name: str, column: str, segments: List[Union[IndexSegment, Index]]
     ) -> None: ...
     def count_fragments(self) -> int: ...
+    def fragment_ids(self) -> Bitmap: ...
     def num_small_files(self, max_rows_per_group: int) -> int: ...
     def get_fragments(self) -> List[_Fragment]: ...
     def get_fragment(self, fragment_id: int) -> Optional[_Fragment]: ...
@@ -653,6 +684,24 @@ class _Dataset:
     def get_transactions(
         self, recent_transactions=10
     ) -> List[Optional[Transaction]]: ...
+    def find_duplicate_pairs(
+        self,
+        column: str,
+        distance_threshold: float,
+        *,
+        memory_limit: Optional[int] = None,
+        max_concurrency: Optional[int] = None,
+    ) -> pa.RecordBatchReader: ...
+    def find_duplicate_pairs_in_partition(
+        self,
+        column: str,
+        segment_id: str,
+        partition_id: int,
+        distance_threshold: float,
+        *,
+        memory_limit: Optional[int] = None,
+        max_concurrency: Optional[int] = None,
+    ) -> pa.RecordBatchReader: ...
     def hamming_clustering_for_ivf_partition(
         self,
         index_name: str,
@@ -750,6 +799,7 @@ class _Fragment:
         include_deleted_rows: Optional[bool] = None,
         batch_size_bytes: Optional[int] = None,
         strict_batch_size: Optional[bool] = None,
+        substrait_filter: Optional[bytes] = None,
     ) -> _Scanner: ...
     def add_columns_from_reader(
         self,
@@ -970,6 +1020,13 @@ class PyFullTextQuery:
         boosts: Optional[List[float]] = None,
         operator: str = "OR",
     ) -> PyFullTextQuery: ...
+    @staticmethod
+    def combined_fields_query(
+        query: str,
+        columns: List[str],
+        boosts: Optional[List[float]] = None,
+        operator: str = "OR",
+    ) -> PyFullTextQuery: ...
 
 class ScanStatistics:
     """Statistics about a scan operation."""
@@ -1008,6 +1065,11 @@ class ScanStatistics:
     all_counts: Dict[
         str, int
     ]  # Additional metrics for debugging purposes. Subject to change.
+    all_times: Dict[str, int]
+    """Additional debugging timings in nanoseconds. Keys are subject to change.
+
+    Nested and concurrent stages overlap; summing these values does not
+    reconstruct query wall time."""
 
 class DatasetBasePath:
     def __init__(
