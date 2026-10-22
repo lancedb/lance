@@ -1094,7 +1094,7 @@ impl InvertedIndex {
                                     params.as_ref(),
                                     operator,
                                     metrics.as_ref(),
-                                    PostingLoadOptions::read_ahead(false),
+                                    PostingLoadOptions::cache_aware_exact(false),
                                     partition_term_ids,
                                 )
                                 .await?
