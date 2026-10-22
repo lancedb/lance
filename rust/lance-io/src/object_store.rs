@@ -818,6 +818,15 @@ impl ObjectStore {
         self.block_size
     }
 
+    /// Bytes one multipart upload of `total_bytes` to this store can hold in
+    /// memory at once. See [`crate::object_writer::upload_memory_bound_bytes`].
+    pub fn upload_memory_bound_bytes(&self, total_bytes: u64) -> u64 {
+        crate::object_writer::upload_memory_bound_bytes(
+            total_bytes,
+            self.use_constant_size_upload_parts,
+        )
+    }
+
     pub fn max_iop_size(&self) -> u64 {
         self.max_iop_size
     }
@@ -1654,11 +1663,18 @@ impl ObjectStore {
         Ok(self.inner.list_with_delimiter(prefix).await?)
     }
 
+    /// List objects recursively. On unordered stores, a retryable failure after
+    /// the first entry is returned to the caller because resuming by lexical
+    /// offset could silently omit entries.
     pub fn list(
         &self,
         path: Option<Path>,
     ) -> Pin<Box<dyn Stream<Item = Result<ObjectMeta>> + Send>> {
-        Box::pin(ListRetryStream::new(self.inner.clone(), path, 5).map(|m| m.map_err(|e| e.into())))
+        Box::pin(
+            ListRetryStream::new(self.inner.clone(), path, 5)
+                .with_lexical_ordering(self.list_is_lexically_ordered)
+                .map(|m| m.map_err(|e| e.into())),
+        )
     }
 
     /// Read all files (start from base directory) recursively
