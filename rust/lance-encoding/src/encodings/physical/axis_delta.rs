@@ -826,6 +826,11 @@ mod tests {
                 .unwrap();
             let (encoded, description) = compressor.compress(data.clone()).unwrap();
             assert_eq!(has_delta(&description), expected);
+            assert_eq!(
+                matches!(encoded, PerValueDataBlock::Fixed(_)),
+                noise && matches!(mode, AxisDeltaMode::Auto { .. }),
+                "Auto must bypass general compression when both sampled candidates lose"
+            );
             let strategy = DefaultDecompressionStrategy::default();
             let decoded = match encoded {
                 PerValueDataBlock::Fixed(encoded) => {
