@@ -98,6 +98,14 @@ static PLUGIN_REGISTRATIONS: Mutex<PluginRegistrations> = Mutex::new(PluginRegis
 /// so another process can select the registered reader. This registers Rust
 /// implementations linked into the application, not dynamic libraries.
 ///
+/// This is an unstable Rust extension interface: plugins must use the same
+/// Lance version as the application. Each process must register its plugins;
+/// registration is not persisted in the dataset. Parallel tests sharing a
+/// process should use a shared `std::sync::LazyLock` to register all plugins
+/// once, before any test constructs a default registry or uses a dataset.
+/// Racing registry construction either includes the registration or rejects it
+/// as late; it never silently omits a successful registration.
+///
 /// ```
 /// # use lance_core::Result;
 /// # use lance_index::scalar::registry::ScalarIndexPlugin;
