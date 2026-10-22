@@ -33,6 +33,10 @@ use crate::index::scalar::zonemap::stored_null_bitmap_policy;
 use crate::index::scalar::{IndexDetails, fetch_index_details};
 use crate::index::{index_is_usable, load_all_indices};
 
+/// The unresolved same-column conflict is a configuration fact, so it is
+/// reported once per process and at debug level afterwards.
+static SEED_CONFLICT_WARNED: std::sync::Once = std::sync::Once::new();
+
 /// Collects write seeds for the columns of one data file.
 #[derive(Debug, Default)]
 pub struct SeedCollector {
@@ -170,7 +174,21 @@ async fn seed_writers_for(
             let Some(rows_per_zone) = zone_map.rows_per_zone else {
                 continue;
             };
-            let positions = stored_null_bitmap_policy(dataset, index).await?;
+            // The policy is optional metadata: a segment that cannot be read
+            // right now costs this file its seed for that index, never the
+            // write itself.
+            let positions = match stored_null_bitmap_policy(dataset, index).await {
+                Ok(positions) => positions,
+                Err(err) => {
+                    log::warn!(
+                        "column {}: zone map {} could not be read ({err}); no zone map seed is \
+                         written for it in this file",
+                        field.name,
+                        index.name
+                    );
+                    continue;
+                }
+            };
             zone_map_columns.entry(field_id).or_default().push((
                 index.name.clone(),
                 rows_per_zone,
@@ -198,10 +216,15 @@ async fn seed_writers_for(
             // One seed key per column; a zone map and another plugin's
             // seed cannot both be served. Left unresolved rather than
             // guessing: the zone maps scan their new fragments.
-            log::warn!(
+            let message = format!(
                 "column {} has a zone map and another seeded index: no zone map seed is written for it",
                 field.name
             );
+            if SEED_CONFLICT_WARNED.is_completed() {
+                log::debug!("{message}");
+            } else {
+                SEED_CONFLICT_WARNED.call_once(|| log::warn!("{message}"));
+            }
             continue;
         }
         // Several zone maps on one column share one seed: the finest zone

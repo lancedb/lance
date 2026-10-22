@@ -57,12 +57,17 @@ fn without_fragments(
     rows: &RowAddrTreeMap,
     fragments: impl IntoIterator<Item = u64>,
 ) -> RowAddrTreeMap {
+    let removed: HashSet<u32> = fragments
+        .into_iter()
+        .filter_map(|fragment| u32::try_from(fragment).ok())
+        .collect();
     let mut rows = rows.clone();
-    for fragment in fragments {
-        if let Ok(fragment) = u32::try_from(fragment) {
-            rows.insert_bitmap(fragment, RoaringBitmap::new());
-        }
-    }
+    let kept: Vec<u32> = rows
+        .iter()
+        .map(|(fragment, _)| *fragment)
+        .filter(|fragment| !removed.contains(fragment))
+        .collect();
+    rows.retain_fragments(kept);
     rows
 }
 pub const ROWS_PER_ZONE_DEFAULT: u64 = 8192; // 1 zone every two batches
@@ -1111,16 +1116,12 @@ impl ScalarIndex for ZoneMapIndex {
             .with_null_tracking(self.null_rows.is_some());
         let (new_zones, new_null_rows) = trainer.train(new_data).await?;
 
-        // A fragment in the new data is re-summarized: its previous zones and
-        // null positions (from values a column replacement has since
-        // retired) are superseded, not kept beside the new ones.
-        let refreshed: HashSet<u64> = new_zones.iter().map(|z| z.bound.fragment_id).collect();
-        let mut updated_zones: Vec<ZoneMapStatistics> = self
-            .zones
-            .iter()
-            .filter(|zone| !refreshed.contains(&zone.bound.fragment_id))
-            .cloned()
-            .collect();
+        // Additive: the stream is "the new data", with no claim about the
+        // rest of its fragments, so every existing zone stays. Superseding a
+        // re-summarized fragment is the dataset builder's job
+        // (`build_zonemap_segment`), which knows the refreshed fragment set
+        // and the physical row counts.
+        let mut updated_zones = self.zones.clone();
         updated_zones.extend(new_zones);
         updated_zones.sort_by_key(|z| (z.bound.fragment_id, z.bound.start));
 
@@ -1129,7 +1130,7 @@ impl ScalarIndex for ZoneMapIndex {
         // recover the missing information, and claiming the result has zero nulls would
         // be a false negative.  Only a full retrain produces a fresh, complete bitmap.
         let merged_null_rows = self.null_rows.as_ref().map(|existing| {
-            let mut merged = without_fragments(existing, refreshed.iter().copied());
+            let mut merged = existing.clone();
             merged |= &new_null_rows;
             merged
         });
@@ -2149,17 +2150,19 @@ impl ScalarIndexPlugin for ZoneMapIndexPlugin {
         index_details: &prost_types::Any,
         dest_store: &dyn IndexStore,
     ) -> Result<Option<CreatedIndex>> {
-        let Some(rows_per_zone) = index_details
+        // Only an index that records its zone size can take seeds.
+        if index_details
             .to_msg::<pbold::ZoneMapIndexDetails>()
             .ok()
             .and_then(|d| d.rows_per_zone)
-        else {
+            .is_none()
+        {
             return Ok(None);
-        };
+        }
 
-        // Seeds of any record size up to the zone size are packed; a seed
-        // that cannot be used makes the whole update fall back to a scan.
-        let _ = rows_per_zone;
+        // A seed record is reused only when it fits whole inside one target
+        // zone; rows without a reusable record are scanned (see
+        // `ReusedZones::reuse`).
         let Some(zone_map) = reference_index.as_any().downcast_ref::<ZoneMapIndex>() else {
             return Ok(None);
         };
@@ -2723,7 +2726,6 @@ impl ReusedZones {
         let Some(validated) = validate_seed(
             &harvested.seed,
             Some(harvested.physical_rows),
-            rows_per_zone,
             data_type,
             self.with_null_positions,
         )?
@@ -3200,11 +3202,9 @@ struct ValidatedSeed {
 fn validate_seed(
     seed: &crate::scalar::seed::FragmentSeed,
     expected_rows: Option<u64>,
-    rows_per_zone: u64,
     data_type: &DataType,
     need_null_positions: bool,
 ) -> Result<Option<ValidatedSeed>> {
-    let _ = rows_per_zone;
     let fragment_id = seed.fragment_id;
     let reject = |reason: String| {
         log::debug!("not reusing the zone map seed of fragment {fragment_id}: {reason}");
@@ -3213,9 +3213,12 @@ fn validate_seed(
     if u32::try_from(fragment_id).is_err() {
         return reject("fragment id exceeds u32".into());
     }
-    let Some(record_rows) = seed_rows_per_zone(seed) else {
+    // The locator's record size is the writer's configuration, not a cap on
+    // carried records (a binary copy keeps older, larger records under a
+    // newer locator); a record's fit is decided against the target zones.
+    if seed_rows_per_zone(seed).is_none() {
         return reject("locator carries no record size".into());
-    };
+    }
     let (records, null_positions) =
         match ZoneMapSeedWriter::decode_seed(fragment_id, &seed.bytes, need_null_positions) {
             Ok(decoded) => decoded,
@@ -3233,10 +3236,8 @@ fn validate_seed(
     let mut total_nulls: u64 = 0;
     for (i, record) in records.iter().enumerate() {
         let rows = record.bound.length as u64;
-        if rows == 0 || rows > record_rows {
-            return reject(format!(
-                "record {i} has {rows} rows for a {record_rows}-row layout"
-            ));
+        if rows == 0 {
+            return reject(format!("record {i} is empty"));
         }
         if record.bound.start != covered {
             return reject(format!(
@@ -9430,6 +9431,104 @@ mod tests {
         assert_eq!(updated.zones.len(), 2);
         assert_eq!(updated.zones[1].max, ScalarValue::Float64(Some(7.0)));
         assert_eq!(updated.zones[1].negative_nan_count, Some(1));
+    }
+
+    /// The low-level update adds the stream's zones beside the existing
+    /// ones: partial input for a fragment never erases that fragment's other
+    /// rows or null positions (whole-fragment supersession is the dataset
+    /// builder's, which knows the refreshed fragments).
+    #[tokio::test]
+    async fn test_update_is_additive_for_a_partially_fed_fragment() {
+        use arrow::datatypes::Int32Type;
+
+        let index = train_and_load::<Int32Type>(vec![vec![None, Some(2), Some(3), Some(4)]]).await;
+        assert_eq!(index.zones.len(), 2);
+        assert!(index.null_rows.as_ref().unwrap().contains(0));
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(VALUE_COLUMN_NAME, DataType::Int32, true),
+            Field::new(lance_core::ROW_ADDR, DataType::UInt64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![Some(9), None, Some(11), Some(12)])),
+                Arc::new(UInt64Array::from(vec![4u64, 5, 6, 7])),
+            ],
+        )
+        .unwrap();
+        let new_data: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream::once(std::future::ready(Ok(batch))),
+        ));
+        let dest_tmpdir = TempObjDir::default();
+        let dest_store = local_store(&dest_tmpdir);
+        index
+            .update(new_data, dest_store.as_ref(), None)
+            .await
+            .unwrap();
+        let updated = ZoneMapIndex::load(
+            dest_store,
+            None,
+            &LanceCache::no_cache(),
+            false,
+            ZoneMapIndexVersion::V1,
+        )
+        .await
+        .unwrap();
+
+        let layout: Vec<(u64, u64, usize)> = updated
+            .zones
+            .iter()
+            .map(|z| (z.bound.fragment_id, z.bound.start, z.bound.length))
+            .collect();
+        assert_eq!(layout, vec![(0, 0, 2), (0, 2, 2), (0, 4, 2), (0, 6, 2)]);
+        let nulls = updated.null_rows.as_ref().unwrap();
+        assert!(
+            nulls.contains(0) && nulls.contains(5),
+            "old and new null positions"
+        );
+        assert!(!nulls.contains(1) && !nulls.contains(4));
+        for (value, row) in [(2, 1), (4, 3), (9, 4), (12, 7)] {
+            let found = updated
+                .search(
+                    &SargableQuery::Equals(ScalarValue::Int32(Some(value))),
+                    &NoOpMetricsCollector,
+                )
+                .await
+                .unwrap();
+            assert!(
+                found.row_addrs().selected_rows().contains(row),
+                "{value} at row {row}"
+            );
+        }
+        let nulls_found = updated
+            .search(&SargableQuery::IsNull(), &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert!(
+            nulls_found.row_addrs().selected_rows().contains(0)
+                && nulls_found.row_addrs().selected_rows().contains(5)
+        );
+    }
+
+    /// Dropping fragments from a bitmap removes their entries; an empty
+    /// entry would make an otherwise equal map compare unequal.
+    #[test]
+    fn test_without_fragments_drops_entries() {
+        let mut rows = RowAddrTreeMap::new();
+        rows.insert_range((1u64 << 32) | 3..(1u64 << 32) | 4);
+        rows.insert_range((2u64 << 32) | 1..(2u64 << 32) | 2);
+        let mut expected = RowAddrTreeMap::new();
+        expected.insert_range((2u64 << 32) | 1..(2u64 << 32) | 2);
+        let kept = super::without_fragments(&rows, [1]);
+        assert_eq!(kept, expected);
+        assert!(kept.get_fragment_bitmap(1).is_none());
+        assert_eq!(
+            super::without_fragments(&rows, [1, 2]),
+            RowAddrTreeMap::new()
+        );
+        assert_eq!(super::without_fragments(&rows, [7]), rows);
     }
 
     /// Seed admission into a version 1 file: a version 0 reference is never

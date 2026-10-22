@@ -1421,6 +1421,77 @@ async fn test_binary_copy_merges_ragged_seeds_and_feeds_index_update() {
     }
 }
 
+/// A binary copy carries seed records unchanged under a locator that
+/// declares the column's current zone size, which can be smaller than those
+/// records; a later index whose zones fit the records still reuses them
+/// instead of scanning.
+#[tokio::test]
+async fn test_binary_copy_keeps_large_carried_records_reusable_after_config_change() {
+    use crate::index::scalar::zonemap::SEED_REUSE_REPORTS;
+
+    fn params(rows_per_zone: u64) -> ScalarIndexParams {
+        ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap)
+            .with_params(&serde_json::json!({"rows_per_zone": rows_per_zone, "use_seeds": true}))
+    }
+    async fn locator_rows_per_zone(dataset: &Dataset, fragment: &Fragment) -> u64 {
+        let file = serving_file(fragment, field_id(dataset, "val"));
+        let reader = open_data_file(dataset, &file.path).await;
+        let value = reader
+            .metadata()
+            .file_schema
+            .metadata
+            .get(&format!("{SEED_META_KEY_PREFIX}val"))
+            .unwrap()
+            .clone();
+        value.split_once(':').unwrap().1.parse().unwrap()
+    }
+
+    let dir = TempStrDir::default();
+    // Three 8-row fragments with 4-row seed records.
+    let mut dataset = all_seeded_dataset(dir.as_str(), 3, 8).await;
+    // The column's index now wants 2-row records: the copy's output
+    // declares that locator while carrying the 4-row records verbatim.
+    dataset
+        .create_index(&["val"], IndexType::ZoneMap, None, &params(2), true)
+        .await
+        .unwrap();
+    let metrics = force_binary_copy(&mut dataset, 1_000_000).await;
+    assert_eq!(metrics.fragments_added, 1);
+    let output = dataset.fragments()[0].clone();
+    assert_eq!(output.physical_rows, Some(24));
+    assert_eq!(locator_rows_per_zone(&dataset, &output).await, 2);
+
+    // Eight-row zones fit every carried 4-row record: reuse, no scan.
+    let reports = SEED_REUSE_REPORTS
+        .scope(std::sync::Mutex::new(Vec::new()), async {
+            dataset
+                .create_index(&["val"], IndexType::ZoneMap, None, &params(8), true)
+                .await
+                .unwrap();
+            SEED_REUSE_REPORTS.with(|reports| reports.lock().unwrap().clone())
+        })
+        .await;
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].reused_fragments, vec![output.id]);
+    assert_eq!(reports[0].reused_records, 6);
+    assert_eq!(reports[0].scanned_rows, 0);
+
+    for filter in ["val >= 10 AND val < 15", "val IS NULL", "val = 23"] {
+        let mut indexed = dataset.scan();
+        indexed.filter(filter).unwrap().project(&["id"]).unwrap();
+        let indexed = indexed.try_into_batch().await.unwrap();
+        let mut unindexed = dataset.scan();
+        unindexed
+            .use_scalar_index(false)
+            .filter(filter)
+            .unwrap()
+            .project(&["id"])
+            .unwrap();
+        let expected = unindexed.try_into_batch().await.unwrap();
+        assert_eq!(indexed, expected, "filter {filter}");
+    }
+}
+
 /// Seed locators keep their `<buffer_index>:<rows_per_zone>` encoding: a
 /// normal write declares the index's granularity, and a binary-copy output
 /// declares the column's current index granularity.

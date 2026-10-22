@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::{HashMap, hash_map::Entry};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use futures::{FutureExt, TryStreamExt};
@@ -487,7 +487,8 @@ fn block_stale_rows(
 pub struct SeedHarvester<'a> {
     dataset: &'a Dataset,
     field: &'a lance_core::datatypes::Field,
-    schedulers: HashMap<Option<u32>, Arc<ScanScheduler>>,
+    /// One scheduler per base store, shared by concurrent harvests.
+    schedulers: std::sync::Mutex<HashMap<Option<u32>, Arc<ScanScheduler>>>,
 }
 
 impl<'a> SeedHarvester<'a> {
@@ -500,7 +501,7 @@ impl<'a> SeedHarvester<'a> {
         Some(Self {
             dataset,
             field,
-            schedulers: HashMap::new(),
+            schedulers: std::sync::Mutex::new(HashMap::new()),
         })
     }
 
@@ -510,8 +511,26 @@ impl<'a> SeedHarvester<'a> {
         Some(Self {
             dataset,
             field,
-            schedulers: HashMap::new(),
+            schedulers: std::sync::Mutex::new(HashMap::new()),
         })
+    }
+
+    /// The scan scheduler for `base_id`, created on first use. A concurrent
+    /// first use may build one twice; the first one cached wins.
+    async fn scheduler(&self, base_id: Option<u32>) -> Result<Arc<ScanScheduler>> {
+        if let Some(scheduler) = self.schedulers.lock().unwrap().get(&base_id) {
+            return Ok(scheduler.clone());
+        }
+        let store = self.dataset.object_store(base_id).await?;
+        let config = SchedulerConfig::max_bandwidth(&store);
+        let scheduler = ScanScheduler::new(store, config);
+        Ok(self
+            .schedulers
+            .lock()
+            .unwrap()
+            .entry(base_id)
+            .or_insert(scheduler)
+            .clone())
     }
 
     /// The seed `fragment`'s current data file stores for the column.
@@ -520,7 +539,7 @@ impl<'a> SeedHarvester<'a> {
     /// or the seed's field identity cannot be verified. Index-type-specific
     /// validation (e.g. `rows_per_zone` checks) is left to the caller via
     /// [`FragmentSeed::metadata_value`].
-    pub async fn harvest(&mut self, fragment: &Fragment) -> Result<Option<FragmentSeed>> {
+    pub async fn harvest(&self, fragment: &Fragment) -> Result<Option<FragmentSeed>> {
         let dataset = self.dataset;
         let field = self.field;
         // An overlay on the column (or a field it contains or is nested in)
@@ -550,14 +569,7 @@ impl<'a> SeedHarvester<'a> {
         let path = dataset
             .data_file_dir(data_file)?
             .join(data_file.path.as_str());
-        let scheduler = match self.schedulers.entry(data_file.base_id) {
-            Entry::Occupied(entry) => entry.into_mut(),
-            Entry::Vacant(entry) => {
-                let store = dataset.object_store(data_file.base_id).await?;
-                let config = SchedulerConfig::max_bandwidth(&store);
-                entry.insert(ScanScheduler::new(store, config))
-            }
-        };
+        let scheduler = self.scheduler(data_file.base_id).await?;
         let Ok(file_scheduler) = scheduler.open_file(&path, &CachedFileSize::unknown()).await
         else {
             return Ok(None);
@@ -653,7 +665,7 @@ async fn try_harvest_seeds(
     let Some(field_id) = index.keyed_field() else {
         return Ok(None);
     };
-    let Some(mut harvester) = SeedHarvester::for_field_id(dataset, field_id) else {
+    let Some(harvester) = SeedHarvester::for_field_id(dataset, field_id) else {
         return Ok(None);
     };
     let mut seeds = Vec::with_capacity(fragments.len());

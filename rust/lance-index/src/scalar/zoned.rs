@@ -284,15 +284,43 @@ where
         }
         let bound = match aligned {
             Some((zone_index, capacity, physical_rows)) => {
-                let start = zone_index * capacity;
+                let zone_start = zone_index.checked_mul(capacity).ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "fragment {fragment_id}: zone {zone_index} of {capacity} rows overflows"
+                    ))
+                })?;
                 let end = match physical_rows.get(&fragment_id) {
-                    Some(rows) => (start + capacity).min(*rows),
+                    Some(rows) => {
+                        // The supplied row count is authoritative for the
+                        // zone's length, so every observed offset must lie
+                        // inside it (and inside this zone); otherwise the
+                        // zone would summarize rows it does not cover.
+                        if start < zone_start || inferred_end >= *rows {
+                            return Err(Error::invalid_input(format!(
+                                "fragment {fragment_id}: zone {zone_index} (rows {zone_start}..) \
+                                 saw offsets {start}..={inferred_end}, outside its physical row \
+                                 count {rows}"
+                            )));
+                        }
+                        zone_start
+                            .checked_add(capacity)
+                            .map_or(*rows, |zone_end| zone_end.min(*rows))
+                    }
                     None => inferred_end + 1,
                 };
+                let length = end
+                    .checked_sub(zone_start)
+                    .filter(|length| *length > 0)
+                    .ok_or_else(|| {
+                        Error::invalid_input(format!(
+                            "fragment {fragment_id}: zone {zone_index} ends at {end} before its \
+                             start {zone_start}"
+                        ))
+                    })?;
                 ZoneBound {
                     fragment_id,
-                    start,
-                    length: (end - start) as usize,
+                    start: zone_start,
+                    length: length as usize,
                 }
             }
             None => ZoneBound {
@@ -501,6 +529,51 @@ mod tests {
             format!("{}", err).contains("zone row offsets are out of order"),
             "unexpected error: {err:?}"
         );
+    }
+
+    /// Aligned zones take their length from the supplied physical row count,
+    /// so every observed offset must lie inside it; a count below an observed
+    /// offset would hide a row the zone already summarized.
+    #[tokio::test]
+    async fn aligned_zone_rejects_offsets_outside_physical_rows() {
+        async fn train(offsets: Vec<u64>, physical_rows: u64) -> Result<Vec<MockStats>> {
+            let batch = batch(vec![1; offsets.len()], vec![0; offsets.len()], offsets);
+            let stream = Box::pin(RecordBatchStreamAdapter::new(
+                batch.schema(),
+                stream::once(async { Ok(batch) }),
+            ));
+            let trainer = ZoneTrainer::new(MockProcessor::new(), 10)
+                .unwrap()
+                .aligned_to(HashMap::from([(0, physical_rows)]));
+            trainer.train(stream).await.map(|(zones, _)| zones)
+        }
+
+        // The last zone ends at the physical row count even when its
+        // trailing rows are deleted.
+        let zones = train(vec![0, 1, 2, 3], 8).await.unwrap();
+        assert_eq!(zones.len(), 1);
+        assert_eq!(zones[0].bound.start, 0);
+        assert_eq!(zones[0].bound.length, 8);
+
+        for (offsets, physical_rows) in [
+            // The count lies inside the zone but below an observed offset.
+            (vec![0, 1, 2, 7], 5),
+            // The count equals the zone's start.
+            (vec![10, 11, 12], 10),
+            // The count lies below the zone's start.
+            (vec![10, 11, 12], 5),
+        ] {
+            let message = train(offsets.clone(), physical_rows)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                message.contains("fragment 0")
+                    && message.contains(&format!("physical row count {physical_rows}"))
+                    && message.contains(&format!("..={}", offsets.last().unwrap())),
+                "{offsets:?} in {physical_rows} rows: {message}"
+            );
+        }
     }
 
     #[tokio::test]

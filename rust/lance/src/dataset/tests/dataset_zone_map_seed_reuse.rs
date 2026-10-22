@@ -8,7 +8,9 @@
 //! scan by row identity.
 
 use std::collections::{BTreeSet, HashMap};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use arrow_array::{
     Array, Float64Array, Int32Array, Int64Array, RecordBatch, RecordBatchIterator, StringArray,
@@ -32,7 +34,8 @@ use roaring::RoaringBitmap;
 
 use crate::Dataset;
 use crate::dataset::WriteParams;
-use crate::index::scalar::zonemap::{SEED_REUSE_REPORTS, SeedReuseReport};
+use crate::dataset::optimize::{CompactionMode, CompactionOptions, compact_files};
+use crate::index::scalar::zonemap::{SEED_REUSE_REPORTS, SeedReuseReport, harvest_concurrency};
 use crate::index::{CreateIndexBuilder, DatasetIndexExt, DatasetIndexInternalExt};
 
 const ROWS_PER_FILE: usize = 20000;
@@ -494,7 +497,17 @@ async fn test_create_index_keeps_configured_boundaries(
         assert_eq!(report.scanned_fragments, vec![0, 1, 2, 3, 4, 5]);
     }
     assert!(report.masked);
-    assert!(report.max_live_seed_bytes * 4 <= report.total_seed_bytes);
+    // Seeds are read through a bounded window and dropped once folded: the
+    // raw bytes held at once never exceed that many seeds, and the window
+    // is never wider than the configured harvest concurrency.
+    let seeds_in_window = report.harvest_concurrency.min(5);
+    assert!(
+        report.max_live_seed_bytes <= seeds_in_window * report.total_seed_bytes.div_ceil(5),
+        "{} live seed bytes, {} total over 5 seeds, window {seeds_in_window}",
+        report.max_live_seed_bytes,
+        report.total_seed_bytes
+    );
+    assert!(report.max_concurrent_harvests <= report.harvest_concurrency);
 
     // Column pages: the unseeded fragment reads its pages; a fully reused
     // fragment reads none (below the file-open tail prefetch); a partially
@@ -1390,4 +1403,415 @@ async fn test_seed_collector_policy_lookup_cost() {
     );
     let (writers, warm) = writers_and_requests(&dataset).await;
     assert_eq!((writers, warm), (1, 0));
+}
+
+/// A segment whose index file cannot be read costs the write only that
+/// index's seed, never the write itself; a healthy index on another column
+/// keeps its seed in the same file.
+#[tokio::test]
+async fn test_unreadable_policy_skips_the_seed_not_the_write() {
+    let dir = TempStrDir::default();
+    let mut dataset = write(dir.as_str(), 0..N).await;
+    create_index(
+        &mut dataset,
+        "val",
+        &zone_map_params(1000, true, true),
+        None,
+    )
+    .await;
+    create_index(
+        &mut dataset,
+        "name",
+        &zone_map_params(1000, true, true),
+        None,
+    )
+    .await;
+    let segment = index_metadata(&dataset, "val").await.remove(0);
+    std::fs::remove_file(format!(
+        "{}/_indices/{}/zonemap.lance",
+        dir.as_str(),
+        segment.uuid
+    ))
+    .unwrap();
+
+    // A fresh handle: nothing about the removed file is cached.
+    let mut dataset = Dataset::open(dir.as_str()).await.unwrap();
+    append(&mut dataset, N..2 * N).await;
+    let fragment = dataset.fragments().last().unwrap().id;
+    assert!(
+        seed_locator(&dataset, fragment, "val").await.is_none(),
+        "the unreadable index gets no seed"
+    );
+    assert!(
+        seed_locator(&dataset, fragment, "name").await.is_some(),
+        "the healthy index on another column keeps its seed"
+    );
+
+    // A second, healthy zone map on the same column still gets its seed:
+    // only the failed consumer is skipped, not the column.
+    CreateIndexBuilder::new(
+        &mut dataset,
+        &["val"],
+        IndexType::ZoneMap,
+        &zone_map_params(500, true, true),
+    )
+    .name("val_fine".to_string())
+    .await
+    .unwrap();
+    let dataset_fresh = Dataset::open(dir.as_str()).await.unwrap();
+    let mut dataset = dataset_fresh;
+    append(&mut dataset, 2 * N..3 * N).await;
+    let fragment = dataset.fragments().last().unwrap().id;
+    let locator = seed_locator(&dataset, fragment, "val").await;
+    assert_eq!(
+        locator
+            .as_deref()
+            .and_then(|locator| locator.split_once(':'))
+            .map(|(_, rows)| rows),
+        Some("500"),
+        "the healthy same-column index drives the seed: {locator:?}"
+    );
+}
+
+/// Counts overlapping reads and slows each one down enough for the overlap
+/// to show.
+#[derive(Debug, Default)]
+struct ReadWatch {
+    in_flight: AtomicUsize,
+    max_in_flight: AtomicUsize,
+}
+
+impl ReadWatch {
+    async fn enter(&self) -> ReadGuard<'_> {
+        let live = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max_in_flight.fetch_max(live, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        ReadGuard(self)
+    }
+}
+
+struct ReadGuard<'a>(&'a ReadWatch);
+
+impl Drop for ReadGuard<'_> {
+    fn drop(&mut self) {
+        self.0.in_flight.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+#[derive(Debug)]
+struct SlowReads {
+    target: Arc<dyn object_store::ObjectStore>,
+    watch: Arc<ReadWatch>,
+}
+
+impl std::fmt::Display for SlowReads {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SlowReads({})", self.target)
+    }
+}
+
+#[async_trait::async_trait]
+impl object_store::ObjectStore for SlowReads {
+    async fn put_opts(
+        &self,
+        location: &object_store::path::Path,
+        bytes: object_store::PutPayload,
+        opts: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        self.target.put_opts(location, bytes, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &object_store::path::Path,
+        opts: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.target.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &object_store::path::Path,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        let _read = self.watch.enter().await;
+        self.target.get_opts(location, options).await
+    }
+
+    async fn get_ranges(
+        &self,
+        location: &object_store::path::Path,
+        ranges: &[std::ops::Range<u64>],
+    ) -> object_store::Result<Vec<bytes::Bytes>> {
+        let _read = self.watch.enter().await;
+        self.target.get_ranges(location, ranges).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: futures::stream::BoxStream<
+            'static,
+            object_store::Result<object_store::path::Path>,
+        >,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>> {
+        self.target.delete_stream(locations)
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        self.target.list(prefix)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.target.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &object_store::path::Path,
+        to: &object_store::path::Path,
+        opts: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.target.copy_opts(from, to, opts).await
+    }
+
+    async fn rename_opts(
+        &self,
+        from: &object_store::path::Path,
+        to: &object_store::path::Path,
+        opts: object_store::RenameOptions,
+    ) -> object_store::Result<()> {
+        self.target.rename_opts(from, to, opts).await
+    }
+}
+
+#[derive(Debug)]
+struct SlowReadsWrapper(Arc<ReadWatch>);
+
+impl lance_io::object_store::WrappingObjectStore for SlowReadsWrapper {
+    fn wrap(
+        &self,
+        _store_prefix: &str,
+        target: Arc<dyn object_store::ObjectStore>,
+    ) -> Arc<dyn object_store::ObjectStore> {
+        Arc::new(SlowReads {
+            target,
+            watch: self.0.clone(),
+        })
+    }
+
+    fn wrap_paginated(
+        &self,
+        _store_prefix: &str,
+        original: Arc<dyn object_store::list::PaginatedListStore>,
+    ) -> Option<Arc<dyn object_store::list::PaginatedListStore>> {
+        Some(original)
+    }
+}
+
+/// Seeds are harvested a bounded number of fragments at a time: the footer
+/// reads overlap, never beyond the harvest concurrency, and the raw seed
+/// buffers held at once stay within that window.
+#[tokio::test]
+#[allow(clippy::print_stderr)]
+async fn test_harvest_reads_are_bounded_and_concurrent() {
+    let watch = Arc::new(ReadWatch::default());
+    let params = WriteParams {
+        max_rows_per_file: ROWS_PER_FILE,
+        store_params: Some(lance_io::object_store::ObjectStoreParams {
+            object_store_wrapper: Some(Arc::new(SlowReadsWrapper(watch.clone()))),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let dir = TempStrDir::default();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(rows(0..1000))], schema()),
+        dir.as_str(),
+        Some(params),
+    )
+    .await
+    .unwrap();
+    create_index(
+        &mut dataset,
+        "val",
+        &zone_map_params(1000, true, true),
+        None,
+    )
+    .await;
+    let fragments = 3 * harvest_concurrency(&dataset) as i32;
+    for k in 1..=fragments {
+        append(&mut dataset, k * 1000..(k + 1) * 1000).await;
+    }
+    let seeded: Vec<u32> = (1..=fragments as u32).collect();
+
+    watch.max_in_flight.store(0, Ordering::SeqCst);
+    let (_, reports) = with_reports(create_index(
+        &mut dataset,
+        "val",
+        &zone_map_params(1000, true, true),
+        Some(seeded.clone()),
+    ))
+    .await;
+    assert_eq!(reports.len(), 1);
+    let report = &reports[0];
+    // The task bound: harvests in flight never exceed the configured
+    // concurrency, and the window is actually used.
+    let concurrency = harvest_concurrency(&dataset);
+    assert_eq!(report.harvest_concurrency, concurrency);
+    assert!(
+        (2..=concurrency).contains(&report.max_concurrent_harvests),
+        "{} concurrent harvests for a concurrency of {concurrency}",
+        report.max_concurrent_harvests
+    );
+    // Storage-level concurrency is reported separately: one harvest can
+    // issue several reads, so only the overlap itself is asserted.
+    let max_reads_in_flight = watch.max_in_flight.load(Ordering::SeqCst);
+    assert!(
+        max_reads_in_flight >= 2,
+        "{max_reads_in_flight} overlapping storage reads"
+    );
+    // Visible with `--nocapture`: the measured bounds for the checkpoint.
+    eprintln!(
+        "harvest concurrency {concurrency}: {} concurrent harvests, {max_reads_in_flight} \
+         concurrent storage reads, {} live seed bytes over {} total",
+        report.max_concurrent_harvests, report.max_live_seed_bytes, report.total_seed_bytes
+    );
+    assert_eq!(
+        report.reused_fragments,
+        seeded.iter().map(|id| u64::from(*id)).collect::<Vec<_>>(),
+        "every fragment is folded from its seed, so no scan read is counted"
+    );
+    assert_eq!(report.scanned_rows, 0);
+    let per_seed = report.total_seed_bytes / seeded.len();
+    assert!(
+        report.max_live_seed_bytes > per_seed
+            && report.max_live_seed_bytes <= concurrency * per_seed,
+        "{} live seed bytes, {per_seed} per seed, window {concurrency}",
+        report.max_live_seed_bytes
+    );
+    assert_index_matches_scan(&dataset, &["val = 23", "val IS NULL", "val > 500000"]).await;
+}
+
+/// Null positions survive a binary copy only when every input carried them;
+/// counts always survive. A bitmap-keeping index built over an output
+/// without positions scans it, a count-only index ignores carried positions
+/// and keeps no bitmap, and enabling collection later cannot recover
+/// positions the inputs never had.
+#[rstest::rstest]
+#[case::positions_on_on(true, true, None)]
+#[case::positions_on_off(true, false, None)]
+#[case::positions_off_off(false, false, None)]
+#[case::positions_off_on(false, true, None)]
+#[case::count_only_after_copy(true, true, Some(false))]
+#[case::bitmap_enabled_after_copy(false, false, Some(true))]
+#[tokio::test]
+async fn test_binary_copy_bitmap_provenance(
+    #[case] first: bool,
+    #[case] second: bool,
+    #[case] after_copy: Option<bool>,
+) {
+    let dir = TempStrDir::default();
+    let mut dataset = write(dir.as_str(), 0..N).await;
+    create_index(
+        &mut dataset,
+        "val",
+        &zone_map_params(1000, true, first),
+        None,
+    )
+    .await;
+    append(&mut dataset, N..2 * N).await;
+    // The replacement keeps covering only the pre-index fragment, so both
+    // appended fragments stay uncovered and the planner bins them together.
+    create_index(
+        &mut dataset,
+        "val",
+        &zone_map_params(1000, true, second),
+        Some(vec![0]),
+    )
+    .await;
+    append(&mut dataset, 2 * N..3 * N).await;
+    assert_eq!(seed_positions(&dataset, 1, "val").await.is_some(), first);
+    assert_eq!(seed_positions(&dataset, 2, "val").await.is_some(), second);
+
+    // Only the two seeded inputs go into the copy.
+    dataset.delete(&format!("id < {N}")).await.unwrap();
+    let metrics = compact_files(
+        &mut dataset,
+        CompactionOptions {
+            target_rows_per_fragment: 10 * ROWS_PER_FILE,
+            compaction_mode: Some(CompactionMode::ForceBinaryCopy),
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(metrics.fragments_added, 1);
+    let output = dataset.fragments().iter().map(|f| f.id).max().unwrap();
+    assert!(seed_locator(&dataset, output, "val").await.is_some());
+    let positions = seed_positions(&dataset, output, "val").await;
+    assert_eq!(positions.is_some(), first && second);
+    if let Some(positions) = &positions {
+        let expected: Vec<u32> = (N..3 * N)
+            .filter(|i| val(*i).is_none())
+            .map(|i| (i - N) as u32)
+            .collect();
+        assert_eq!(positions, &expected);
+    }
+
+    let policy = after_copy.unwrap_or(second);
+    let (_, reports) = with_reports(create_index(
+        &mut dataset,
+        "val",
+        &zone_map_params(1000, true, policy),
+        None,
+    ))
+    .await;
+    assert_eq!(reports.len(), 1);
+    if policy && positions.is_none() {
+        assert_eq!(
+            reports[0].scanned_fragments,
+            vec![output],
+            "no positions to reuse"
+        );
+        assert!(reports[0].reused_fragments.is_empty());
+    } else {
+        assert_eq!(reports[0].reused_fragments, vec![output]);
+        assert_eq!(reports[0].scanned_rows, 0);
+    }
+    let segment = index_metadata(&dataset, "val").await.remove(0);
+    assert_eq!(details(&segment).has_null_bitmap, Some(policy));
+    assert_index_matches_scan_with(
+        &dataset,
+        &["val IS NULL", "val IS NOT NULL", "val = 23"],
+        policy,
+    )
+    .await;
+
+    // The next seeded append and update follow the index's policy.
+    append(&mut dataset, 3 * N..4 * N).await;
+    let appended = dataset.fragments().last().unwrap().id;
+    assert_eq!(
+        seed_positions(&dataset, appended, "val").await.is_some(),
+        policy
+    );
+    dataset
+        .optimize_indices(&OptimizeOptions::new().num_indices_to_merge(Some(0)))
+        .await
+        .unwrap();
+    for segment in index_metadata(&dataset, "val").await {
+        assert_eq!(details(&segment).has_null_bitmap, Some(policy));
+    }
+    assert_index_matches_scan_with(
+        &dataset,
+        &["val IS NULL", "val IS NOT NULL", "val = 23"],
+        policy,
+    )
+    .await;
 }
