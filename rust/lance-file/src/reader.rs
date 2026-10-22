@@ -2507,9 +2507,13 @@ mod tests {
     use futures::{StreamExt, prelude::stream::TryStreamExt};
     use lance_arrow::{BLOB_META_KEY, RecordBatchExt};
     use lance_core::{ArrowResult, datatypes::Schema};
-    use lance_datagen::{ArrayGeneratorExt, BatchCount, ByteCount, RowCount, array, gen_batch};
+    use lance_datagen::{
+        ArrayGeneratorExt, BatchCount, ByteCount, RowCount, array, gen_array, gen_batch,
+    };
     use lance_encoding::{
-        constants::{STRUCTURAL_ENCODING_META_KEY, STRUCTURAL_ENCODING_SPARSE},
+        constants::{
+            DICT_MAX_SIZE_META_KEY, STRUCTURAL_ENCODING_META_KEY, STRUCTURAL_ENCODING_SPARSE,
+        },
         decoder::{
             DecodeBatchScheduler, DecoderPlugins, EncodedBatchLayout, FilterExpression,
             PageEncoding, ReadBatchTask, decode_batch,
@@ -2517,7 +2521,11 @@ mod tests {
         encoder::{EncodedBatch, EncodingOptions, encode_batch},
         format::metadata,
     };
-    use lance_io::{scheduler::IoStats, stream::RecordBatchStream, utils::CachedFileSize};
+    use lance_io::{
+        scheduler::{IoStats, ScanScheduler, SchedulerConfig},
+        stream::RecordBatchStream,
+        utils::CachedFileSize,
+    };
     use log::debug;
     use rstest::rstest;
     use tokio::sync::mpsc;
@@ -2525,7 +2533,7 @@ mod tests {
     use crate::reader::{
         EncodedBatchReaderExt, FileReader, FileReaderOptions, ProjectedFileReader, ReaderProjection,
     };
-    use crate::testing::{FsFixture, WrittenFile, test_cache, write_lance_file};
+    use crate::testing::{FsFixture, WrittenFile, read_lance_file, test_cache, write_lance_file};
     use crate::version::{ConcreteFileVersion, LanceFileVersion};
     use crate::versions;
     use crate::writer::{FileWriterOptions, PAGE_BUFFER_ALIGNMENT};
@@ -5340,5 +5348,88 @@ mod tests {
             9
         );
         assert_eq!(validate(empty_struct, true, &[0], vec![9]).unwrap(), 9);
+    }
+
+    /// A full read of an oversized full-zip page completes under an I/O buffer
+    /// smaller than one page while another column's read holds that buffer:
+    /// plain pages, and the sparse values and dictionary items the reader
+    /// gathers whole before decoding.
+    #[rstest]
+    #[tokio::test]
+    async fn test_oversized_pages_read_under_small_io_buffer(
+        #[values(false, true)] lite_scheduler: bool,
+    ) {
+        const VALUE_BYTES: u64 = 1024 * 1024;
+        const IO_BUFFER_BYTES: u64 = 32 * VALUE_BYTES;
+        // About two buffers of non-null values per column.
+        const NUM_ROWS: u64 = 4 * IO_BUFFER_BYTES / VALUE_BYTES;
+        let random_values = |rows: u64, null_probability: f64| {
+            gen_array(
+                array::rand_varbin(ByteCount::from(VALUE_BYTES), ByteCount::from(VALUE_BYTES))
+                    .with_random_nulls(null_probability),
+            )
+            .into_array_rows(RowCount::from(rows))
+            .unwrap()
+        };
+        let sparse = HashMap::from([(
+            STRUCTURAL_ENCODING_META_KEY.to_string(),
+            STRUCTURAL_ENCODING_SPARSE.to_string(),
+        )]);
+        // Distinct values worth more than the buffer, each repeated, under
+        // dictionary limits that admit them all.
+        let distinct = random_values(IO_BUFFER_BYTES / VALUE_BYTES + 8, 0.0);
+        // Every other row null, as for the other columns.
+        let rows = (0..NUM_ROWS as u32)
+            .map(|row| (row % 2 == 0).then_some(row / 2 % distinct.len() as u32));
+        let repeated =
+            arrow_select::take::take(&distinct, &UInt32Array::from_iter(rows), None).unwrap();
+        let mut dictionary = sparse.clone();
+        dictionary.insert(
+            DICT_MAX_SIZE_META_KEY.to_string(),
+            (2 * IO_BUFFER_BYTES).to_string(),
+        );
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("plain", DataType::Binary, true),
+            Field::new("sparse", DataType::Binary, true).with_metadata(sparse),
+            Field::new("dictionary", DataType::Binary, true).with_metadata(dictionary),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                random_values(NUM_ROWS, 0.5),
+                random_values(NUM_ROWS, 0.5),
+                repeated,
+            ],
+        )
+        .unwrap();
+
+        let mut fs = FsFixture::default();
+        fs.scheduler = ScanScheduler::new(
+            fs.object_store.clone(),
+            SchedulerConfig {
+                io_buffer_size_bytes: IO_BUFFER_BYTES,
+                use_lite_scheduler: Some(lite_scheduler),
+                ..SchedulerConfig::default_for_testing()
+            },
+        );
+        write_lance_file(
+            RecordBatchIterator::new(vec![Ok(batch.clone())], schema),
+            &fs,
+            ConcreteFileVersion::V2_3,
+            FileWriterOptions::default(),
+        )
+        .await;
+
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            read_lance_file(
+                &fs,
+                Arc::<DecoderPlugins>::default(),
+                FilterExpression::no_filter(),
+            ),
+        )
+        .await
+        .expect("the read must not stall on the I/O buffer");
+        assert_eq!(concat_batches(&read[0].schema(), &read).unwrap(), batch);
     }
 }
