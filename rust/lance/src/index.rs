@@ -1930,7 +1930,13 @@ fn legacy_type_name(index_uri: &str, index_type_hint: Option<&str>) -> String {
         "Json" => IndexType::Scalar.to_string(),
         "Flat" | "Vector" => IndexType::Vector.to_string(),
         other if other.contains("Vector") => IndexType::Vector.to_string(),
-        _ => "N/A".to_string(),
+        _ => scalar::SCALAR_INDEX_PLUGIN_REGISTRY
+            .get_plugin_by_details(&prost_types::Any {
+                type_url: index_uri.to_string(),
+                value: Vec::new(),
+            })
+            .map(|plugin| plugin.name().to_string())
+            .unwrap_or_else(|_| "N/A".to_string()),
     }
 }
 
@@ -3419,6 +3425,22 @@ pub(crate) fn optimizable_indices<'a>(
                 index.name,
                 type_url
             );
+            continue;
+        }
+
+        if let Some(index) = deltas.iter().find(|index| {
+            index.index_details.as_ref().is_some_and(|details| {
+                scalar::SCALAR_INDEX_PLUGIN_REGISTRY
+                    .get_plugin_by_details(details)
+                    .is_ok_and(|plugin| !plugin.supports_optimization())
+            })
+        }) {
+            if options.index_names.is_some() {
+                return Err(Error::not_supported(format!(
+                    "Index '{}' is maintained externally and does not support optimize_indices",
+                    index.name
+                )));
+            }
             continue;
         }
 
