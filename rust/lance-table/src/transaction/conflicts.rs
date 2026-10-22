@@ -999,6 +999,7 @@ mod tests {
     use super::*;
     use crate::transaction::test_support::overlay_with_field;
     use crate::transaction::{DataOverlayGroup, UpdateMapEntry};
+    use rstest::rstest;
     use std::collections::HashMap;
 
     fn table_metadata_update(entries: Vec<(&str, Option<&str>)>, replace: bool) -> Operation {
@@ -1051,6 +1052,45 @@ mod tests {
         assert!(left.modifies_same_metadata(&same_key));
         assert!(!left.modifies_same_metadata(&different_key));
         assert!(left.modifies_same_metadata(&replace));
+    }
+
+    #[rstest]
+    #[case::table_metadata(false)]
+    #[case::schema_metadata(true)]
+    fn test_metadata_conflicts_on_same_key(#[case] is_schema_metadata: bool) {
+        let metadata_update = |entries: Vec<(&str, Option<&str>)>, replace| {
+            let update = UpdateMap {
+                update_entries: entries.into_iter().map(UpdateMapEntry::from).collect(),
+                replace,
+            };
+            Operation::UpdateConfig {
+                config_updates: None,
+                table_metadata_updates: (!is_schema_metadata).then_some(update.clone()),
+                schema_metadata_updates: is_schema_metadata.then_some(update),
+                field_metadata_updates: HashMap::new(),
+            }
+        };
+        let left = metadata_update(vec![("key", Some("1"))], false);
+        let no_metadata = Operation::UpdateConfig {
+            config_updates: None,
+            table_metadata_updates: None,
+            schema_metadata_updates: None,
+            field_metadata_updates: HashMap::new(),
+        };
+
+        for (other, expected_conflict) in [
+            (metadata_update(vec![("key", Some("2"))], false), true),
+            (metadata_update(vec![("key", None)], false), true),
+            (metadata_update(vec![("other", Some("2"))], false), false),
+            (metadata_update(vec![("other", None)], false), false),
+            (metadata_update(vec![("other", Some("2"))], true), true),
+            (metadata_update(vec![], true), true),
+            (metadata_update(vec![], false), false),
+            (no_metadata, false),
+        ] {
+            assert_eq!(left.modifies_same_metadata(&other), expected_conflict);
+            assert_eq!(other.modifies_same_metadata(&left), expected_conflict);
+        }
     }
 
     #[test]
