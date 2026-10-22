@@ -1872,6 +1872,7 @@ mod tests {
     #[rstest]
     #[case::btree("btree")]
     #[case::bitmap("bitmap")]
+    #[case::label_list("label_list")]
     #[tokio::test]
     #[serial_test::serial(LANCE_DF_SPILL_POOL)]
     async fn test_json_wrapped_target_loads_as_row_id_domain(#[case] target_index_type: &str) {
