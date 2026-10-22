@@ -660,17 +660,20 @@ fn schema_fragments_valid(
 
 pub fn schema_fragments_modern_valid(schema: &Schema, fragments: &[Fragment]) -> Result<()> {
     // A field is "required" when it, and all of its ancestors, are non-nullable:
-    // it can never be null, so a fragment that carries no data for it violates the
+    // it can never be null, so a fragment that stores no data for it violates the
     // schema. Nullable fields -- and anything under a nullable ancestor -- may be
     // omitted and are filled with nulls on read (#3016 / #3041).
     //
-    // Coverage must follow physical encoding, not just leaf ids:
-    //   - a packed struct stores only the parent column, so a present *ancestor*
-    //     id covers every (possibly non-nullable) descendant;
-    //   - a split struct stores only child columns, so a present *descendant* id
-    //     covers the (non-nullable) container.
-    // A required node is therefore violated only when the fragment carries no id
-    // from its ancestors, itself, or its subtree.
+    // Coverage is taken from each data file's *physical* schema
+    // (`DataFile::schema`), not from the raw `fields` list, because a field id in
+    // `fields` does not by itself mean the field's data is present:
+    //   - a packed struct maps one physical column that carries its whole subtree,
+    //     so `DataFile::schema` reports every descendant as present;
+    //   - an ordinary struct reports only the child columns actually stored, never
+    //     a bare structural header (a V2.0 header, or a V2.1 id with
+    //     column_index = -1), and obsolete/retained ids are dropped.
+    // A required leaf must therefore have its own id physically present, and a
+    // required container must have some id from its subtree present.
     fn subtree_has_present(field: &Field, present: &HashSet<i32>) -> bool {
         (field.id >= 0 && present.contains(&field.id))
             || field
@@ -688,25 +691,23 @@ pub fn schema_fragments_modern_valid(schema: &Schema, fragments: &[Fragment]) ->
     fn check(
         fields: &[Field],
         required_path: bool,
-        ancestor_present: bool,
         present: &HashSet<i32>,
         fragment: &Fragment,
     ) -> Result<()> {
         for field in fields {
             let required = required_path && !field.nullable;
-            // Covered by this column itself or by a present (packed) ancestor.
-            let covered = ancestor_present || (field.id >= 0 && present.contains(&field.id));
             if field.children.is_empty() {
-                if required && field.id >= 0 && !covered {
+                if required && field.id >= 0 && !present.contains(&field.id) {
                     return Err(missing(field, fragment));
                 }
             } else {
-                // A required container is satisfied if it is covered from above or
-                // any descendant column (split children) is present.
-                if required && !covered && !subtree_has_present(field, present) {
+                // The container (struct/list) is present iff some id in its subtree
+                // is physically stored; a bare structural header does not qualify
+                // because `DataFile::schema` already excludes it from `present`.
+                if required && !subtree_has_present(field, present) {
                     return Err(missing(field, fragment));
                 }
-                check(&field.children, required, covered, present, fragment)?;
+                check(&field.children, required, present, fragment)?;
             }
         }
         Ok(())
@@ -722,9 +723,9 @@ pub fn schema_fragments_modern_valid(schema: &Schema, fragments: &[Fragment]) ->
                     data_file.path
                 )));
             }
-            present.extend(data_file.fields.iter().copied());
+            present.extend(data_file.schema(schema).fields_pre_order().map(|f| f.id));
         }
-        check(&schema.fields, true, false, &present, fragment)?;
+        check(&schema.fields, true, &present, fragment)?;
     }
     Ok(())
 }
@@ -1223,19 +1224,37 @@ mod tests {
         ]))
         .unwrap();
 
-        // A fragment whose data file omits the non-nullable field 1 ("c") would
-        // read back all-null, violating the schema -> commit must be rejected.
-        let missing = vec![fragment_with_file_fields(0, "f.lance", vec![0])];
-        let err = schema_fragments_modern_valid(&schema, &missing).unwrap_err();
+        // A V2 file that physically stores only "id" (column 0) omits the
+        // non-nullable "c" -> commit must be rejected.
+        let missing = DataFile::new(
+            "f.lance",
+            vec![0],
+            vec![0],
+            ConcreteFileVersion::V2_0,
+            None,
+            None,
+        );
+        let mut frag = Fragment::new(0);
+        frag.files.push(missing);
+        let err = schema_fragments_modern_valid(&schema, std::slice::from_ref(&frag)).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("non-nullable field") && msg.contains("\"c\""),
             "unexpected error: {msg}"
         );
 
-        // Covering both non-nullable fields is accepted.
-        let full = vec![fragment_with_file_fields(0, "f.lance", vec![0, 1])];
-        schema_fragments_modern_valid(&schema, &full).unwrap();
+        // Storing both columns is accepted.
+        let full = DataFile::new(
+            "f.lance",
+            vec![0, 1],
+            vec![0, 1],
+            ConcreteFileVersion::V2_0,
+            None,
+            None,
+        );
+        let mut ok = Fragment::new(0);
+        ok.files.push(full);
+        schema_fragments_modern_valid(&schema, &[ok]).unwrap();
     }
 
     #[test]
@@ -1248,71 +1267,125 @@ mod tests {
         .unwrap();
 
         // Omitting a nullable column is the subschema-insert contract (#3041).
-        let frags = vec![fragment_with_file_fields(0, "f.lance", vec![0])];
-        schema_fragments_modern_valid(&schema, &frags).unwrap();
+        let file = DataFile::new(
+            "f.lance",
+            vec![0],
+            vec![0],
+            ConcreteFileVersion::V2_0,
+            None,
+            None,
+        );
+        let mut frag = Fragment::new(0);
+        frag.files.push(file);
+        schema_fragments_modern_valid(&schema, &[frag]).unwrap();
     }
 
     #[test]
-    fn test_modern_valid_struct_covered_by_packed_or_split() {
-        use arrow_schema::Fields;
-        // struct p { x: int32 NOT NULL } NOT NULL
-        let schema = LanceSchema::try_from(&ArrowSchema::new(vec![ArrowField::new(
-            "p",
-            DataType::Struct(Fields::from(vec![ArrowField::new(
-                "x",
-                DataType::Int32,
+    fn test_modern_valid_packed_struct() {
+        // A packed struct maps to a single physical column that carries its whole
+        // subtree, so storing only the parent column must NOT reject the
+        // non-nullable child.
+        let schema = LanceSchema::try_from(&ArrowSchema::new(vec![
+            ArrowField::new(
+                "p",
+                DataType::Struct(vec![ArrowField::new("x", DataType::Int32, false)].into()),
                 false,
-            )])),
-            false,
-        )]))
+            )
+            .with_metadata(HashMap::from([("packed".to_string(), "true".to_string())])),
+        ]))
         .unwrap();
+        assert!(schema.fields[0].is_packed_struct());
         let p_id = schema.fields[0].id;
-        let x_id = schema.fields[0].children[0].id;
 
-        // Packed: only the parent column is stored on disk; the non-nullable child
-        // is carried inside it, so this must NOT be rejected.
-        let packed = vec![fragment_with_file_fields(0, "p.lance", vec![p_id])];
-        schema_fragments_modern_valid(&schema, &packed).unwrap();
-
-        // Split: only the child column is stored; the non-nullable container is
-        // represented by its child, so this must NOT be rejected either.
-        let split = vec![fragment_with_file_fields(0, "p.lance", vec![x_id])];
-        schema_fragments_modern_valid(&schema, &split).unwrap();
+        let file = DataFile::new(
+            "packed.lance",
+            vec![p_id],
+            vec![0],
+            ConcreteFileVersion::V2_1,
+            None,
+            None,
+        );
+        let mut fragment = Fragment::new(0);
+        fragment.files.push(file);
+        schema_fragments_modern_valid(&schema, &[fragment]).unwrap();
     }
 
-    #[test]
-    fn test_modern_valid_rejects_omitted_required_container() {
-        use arrow_schema::Fields;
-        // id: int32 NOT NULL, s: struct { a: int32 NULL } NOT NULL
+    #[rstest::rstest]
+    #[case::v2_0(ConcreteFileVersion::V2_0, vec![0, 1, 2])]
+    #[case::v2_1(ConcreteFileVersion::V2_1, vec![0, -1, 1])]
+    fn test_modern_rejects_structural_header_without_child(
+        #[case] version: ConcreteFileVersion,
+        #[case] columns: Vec<i32>,
+    ) {
+        // id(0), p(1){ x(2) NOT NULL, y(3) NULL } NOT NULL
         let schema = LanceSchema::try_from(&ArrowSchema::new(vec![
             ArrowField::new("id", DataType::Int32, false),
             ArrowField::new(
-                "s",
-                DataType::Struct(Fields::from(vec![ArrowField::new(
-                    "a",
-                    DataType::Int32,
-                    true,
-                )])),
+                "p",
+                DataType::Struct(
+                    vec![
+                        ArrowField::new("x", DataType::Int32, false),
+                        ArrowField::new("y", DataType::Int32, true),
+                    ]
+                    .into(),
+                ),
                 false,
             ),
         ]))
         .unwrap();
-        let id_id = schema.fields[0].id;
-        let s_child = schema.fields[1].children[0].id;
+        // The file stores id, the struct header, and p.y -- but NOT required p.x.
+        // A bare structural header (V2.0) or retained id (V2.1 column_index=-1)
+        // must not count as coverage of its children.
+        let file = DataFile::new("partial.lance", vec![0, 1, 3], columns, version, None, None);
+        assert!(!schema.fields[1].is_packed_struct());
+        assert!(file.schema(&schema).field_by_id(2).is_none());
+        let mut fragment = Fragment::new(0);
+        fragment.physical_rows = Some(1);
+        fragment.files.push(file);
+        let manifest = Manifest::new(
+            schema,
+            Arc::new(vec![]),
+            DataStorageFormat::new(version),
+            HashMap::new(),
+        );
+        let operation = Operation::Append {
+            fragments: vec![fragment],
+        };
+        let err = validate_operation(Some(&manifest), &operation).unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
+        assert!(err.to_string().contains("\"x\""), "{err}");
+    }
 
-        // A non-nullable container omitted entirely must be rejected even though
-        // its only child is nullable.
-        let frags = vec![fragment_with_file_fields(0, "f.lance", vec![id_id])];
-        let err = schema_fragments_modern_valid(&schema, &frags).unwrap_err();
-        assert!(err.to_string().contains("\"s\""), "unexpected error: {err}");
-
-        // Carrying the container (via its child column) is accepted.
-        let ok = vec![fragment_with_file_fields(
-            0,
-            "f.lance",
-            vec![id_id, s_child],
-        )];
-        schema_fragments_modern_valid(&schema, &ok).unwrap();
+    #[test]
+    fn test_modern_rejects_placeholder_container() {
+        // id(0), p(1){ optional(2) NULL } NOT NULL
+        let schema = LanceSchema::try_from(&ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new(
+                "p",
+                DataType::Struct(vec![ArrowField::new("optional", DataType::Int32, true)].into()),
+                false,
+            ),
+        ]))
+        .unwrap();
+        // p(1) is retained only as a placeholder (column_index=-1) and 99 is an
+        // obsolete id; DataFile::schema omits p, so the NOT NULL container has no
+        // physical data and must be rejected.
+        let file = DataFile::new(
+            "retained.lance",
+            vec![0, 1, 99],
+            vec![0, -1, 1],
+            ConcreteFileVersion::V2_1,
+            None,
+            None,
+        );
+        assert!(file.schema(&schema).field_by_id(1).is_none());
+        let mut fragment = Fragment::new(0);
+        fragment.physical_rows = Some(1);
+        fragment.files.push(file);
+        let err = schema_fragments_modern_valid(&schema, &[fragment]).unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
+        assert!(err.to_string().contains("\"p\""), "{err}");
     }
 
     fn activated_manifest() -> Manifest {
