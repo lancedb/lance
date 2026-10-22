@@ -14529,7 +14529,9 @@ mod test {
 
             assert_eq!(
                 dataset.index_cache_entry_count().await,
-                5 + dataset.versions().await.unwrap().len()
+                // the index, its partitions and the segment ownership mask, plus
+                // the index metadata of every version
+                6 + dataset.versions().await.unwrap().len()
             );
             assert_eq!(results.len(), 1);
             let batch = &results[0];
@@ -15542,6 +15544,107 @@ mod test {
         );
     }
 
+    /// Zone map pruning over NaN-bearing float zones returns exactly what the
+    /// unindexed scan returns, for every filter shape, while really going
+    /// through the index.
+    #[tokio::test]
+    async fn test_zonemap_nan_scan_matches_unindexed_scan() {
+        use arrow_array::Float32Array;
+
+        let pos_nan = f32::from_bits(0x7FC0_0000);
+        let pos_nan_payload = f32::from_bits(0x7FFF_FFFF);
+        let neg_nan = f32::from_bits(0xFFC0_0000);
+        let neg_nan_payload = f32::from_bits(0xFFFF_FFFF);
+
+        // One fragment (= one zone) per value class: all positive NaNs, all
+        // negative NaNs, NaN plus null, finite plus NaN, finite only.
+        let values: Vec<Option<f32>> = vec![
+            Some(pos_nan),
+            Some(pos_nan_payload),
+            Some(neg_nan),
+            Some(neg_nan_payload),
+            Some(neg_nan),
+            None,
+            Some(1.0),
+            Some(pos_nan),
+            Some(-5.0),
+            Some(7.0),
+        ];
+        let ids: Vec<i32> = (0..values.len() as i32).collect();
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("id", DataType::Int32, false),
+                ArrowField::new("val", DataType::Float32, true),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(ids)),
+                Arc::new(Float32Array::from(values)),
+            ],
+        )
+        .unwrap();
+        let schema = batch.schema();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let mut dataset = Dataset::write(
+            reader,
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 5);
+        dataset
+            .create_index(
+                &["val"],
+                IndexType::ZoneMap,
+                None,
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap),
+                false,
+            )
+            .await
+            .unwrap();
+
+        for filter in [
+            "val < 0.0",
+            "val > 0.0",
+            "val >= 0.0 AND val <= 5.0",
+            "val <= -1.0",
+            "val > 100.0",
+            "val = 7.0",
+            "val IS NULL",
+        ] {
+            let mut full_scan = dataset.scan();
+            full_scan
+                .use_scalar_index(false)
+                .filter(filter)
+                .unwrap()
+                .project(&["id"])
+                .unwrap();
+            let full = full_scan.try_into_batch().await.unwrap();
+            let full_ids: Vec<i32> = full["id"].as_primitive::<Int32Type>().values().to_vec();
+
+            let mut indexed_scan = dataset.scan();
+            indexed_scan
+                .filter(filter)
+                .unwrap()
+                .project(&["id"])
+                .unwrap();
+            let plan = indexed_scan.explain_plan(false).await.unwrap();
+            assert!(
+                plan.contains("ScalarIndexQuery") && plan.contains("ZoneMap"),
+                "filter {filter} must go through the zone map index: {plan}"
+            );
+            let indexed = indexed_scan.try_into_batch().await.unwrap();
+            let indexed_ids: Vec<i32> = indexed["id"].as_primitive::<Int32Type>().values().to_vec();
+            assert_eq!(
+                indexed_ids, full_ids,
+                "indexed and unindexed scans disagree for filter {filter}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_fm_index_with_stable_row_ids() {
         let batch = arrow_array::record_batch!(
@@ -15860,32 +15963,53 @@ mod test {
         assert_eq!(count(&dataset, "regexp_like(text, 'a.b')").await, 20);
     }
 
+    #[rstest]
+    #[case::short_unicode("éé", vec![0, 1], false)]
+    #[case::tokenizable_unicode("ééb", vec![0], true)]
+    #[case::punctuation("_k7", vec![5, 6, 7, 8], true)]
+    #[case::all_windows_filtered("_k7_", vec![8], true)]
+    #[case::partly_tokenizable("_k77", vec![6], true)]
+    #[case::only_punctuation("!!!", vec![9], true)]
+    #[case::no_matches("_x7", vec![], true)]
     #[tokio::test]
-    async fn test_ngram_contains_untokenizable_needle() {
-        // A needle the tokenizer cannot turn into a trigram must fall back to a
-        // full recheck rather than silently matching nothing.  Byte length is
-        // not a usable proxy for this: "éé" is two characters but four bytes.
-        let unit = ["ééb", "aéé", "abc", "dog", "éab"];
-        let values: Vec<&str> = unit.iter().copied().cycle().take(60).collect();
-        let array = StringArray::from_iter_values(values);
-        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "text",
-            DataType::Utf8,
-            false,
-        )]));
-        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(array)]).unwrap();
-        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    async fn test_ngram_contains_untokenizable_needle(
+        #[case] needle: &str,
+        #[case] expected_ids: Vec<u32>,
+        #[case] is_index_used: bool,
+        #[values(false, true)] has_stable_row_ids: bool,
+    ) {
+        let batch = arrow_array::record_batch!(
+            ("id", UInt32, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]),
+            (
+                "text",
+                Utf8,
+                vec![
+                    Some("ééb"),
+                    Some("aéé"),
+                    Some("abc"),
+                    Some("dog"),
+                    Some("éab"),
+                    Some("user_k7"),
+                    Some("user_k77"),
+                    Some("_k7"),
+                    Some("_k7_"),
+                    Some("!!!"),
+                    Some(""),
+                    None,
+                ]
+            )
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
         let write_params = WriteParams {
-            max_rows_per_file: 20, // 60 rows -> 3 fragments
+            max_rows_per_file: 4,
+            enable_stable_row_ids: has_stable_row_ids,
             ..Default::default()
         };
-        let mut dataset = Dataset::write(
-            reader,
-            "memory://test_ngram_contains_utf8",
-            Some(write_params),
-        )
-        .await
-        .unwrap();
+        let mut dataset = Dataset::write(reader, "memory://", Some(write_params))
+            .await
+            .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 3);
         dataset
             .create_index(
                 &["text"],
@@ -15897,46 +16021,29 @@ mod test {
             .await
             .unwrap();
 
-        async fn count(dataset: &Dataset, filter: &str) -> usize {
-            let mut scan = dataset.scan();
-            scan.filter(filter).unwrap();
-            let batches = scan
-                .try_into_stream()
-                .await
-                .unwrap()
-                .try_collect::<Vec<_>>()
-                .await
-                .unwrap();
-            batches.iter().map(|b| b.num_rows()).sum()
+        let filter = format!("contains(text, '{needle}')");
+        let mut indexed_scan = dataset.scan();
+        indexed_scan.filter(&filter).unwrap();
+        let plan = indexed_scan.explain_plan(false).await.unwrap();
+        assert_eq!(plan.contains("ScalarIndexQuery"), is_index_used, "{plan}");
+        if is_index_used {
+            assert!(plan.contains("NGram"), "{plan}");
         }
 
-        async fn plan_of(dataset: &Dataset, filter: &str) -> String {
-            let mut scan = dataset.scan();
-            scan.filter(filter).unwrap();
-            let plan = scan.create_plan().await.unwrap();
-            format!(
-                "{}",
-                datafusion::physical_plan::displayable(plan.as_ref()).indent(true)
-            )
-        }
-
-        // Each unit value appears 12 times in the 60 rows.
-        // Two characters (four bytes): shorter than a trigram, so the index is
-        // bypassed and "ééb" / "aéé" are still found.
-        assert_eq!(count(&dataset, "contains(text, 'éé')").await, 24);
-        let plan_str = plan_of(&dataset, "contains(text, 'éé')").await;
-        assert!(
-            !plan_str.contains("ScalarIndexQuery"),
-            "expected NO ngram index usage for a two character needle, got plan:\n{plan_str}"
+        let indexed = indexed_scan.try_into_batch().await.unwrap();
+        let unindexed = dataset
+            .scan()
+            .use_scalar_index(false)
+            .filter(&filter)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(
+            unindexed["id"].as_primitive::<UInt32Type>().values(),
+            &expected_ids,
         );
-
-        // Three characters: long enough to tokenize, so the index is used.
-        assert_eq!(count(&dataset, "contains(text, 'ééb')").await, 12);
-        let plan_str = plan_of(&dataset, "contains(text, 'ééb')").await;
-        assert!(
-            plan_str.contains("ScalarIndexQuery") && plan_str.contains("NGram"),
-            "expected ngram index usage for a three character needle, got plan:\n{plan_str}"
-        );
+        assert_eq!(indexed, unindexed);
     }
 
     #[tokio::test]

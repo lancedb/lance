@@ -828,11 +828,20 @@ pub struct FragReadConfig {
     /// The scan sets this so every base file it opens shares one scheduler per
     /// base. When absent, a base file falls back to building its own scheduler.
     pub base_schedulers: Option<BaseSchedulers>,
+    /// Read rows as if the fragment had no deletions: the deletion file is not
+    /// loaded and deleted rows come back with their stored values. Only for a
+    /// caller that knows the rows it asks for are live.
+    pub ignore_deletions: bool,
 }
 
 impl FragReadConfig {
     pub fn with_row_id(mut self, value: bool) -> Self {
         self.with_row_id = value;
+        self
+    }
+
+    pub fn with_ignore_deletions(mut self, value: bool) -> Self {
+        self.ignore_deletions = value;
         self
     }
 
@@ -1164,7 +1173,11 @@ impl FileFragment {
         read_config: FragReadConfig,
     ) -> Result<FragmentReader> {
         let open_files = self.open_readers(projection, &read_config);
-        let deletion_vec_load = self.get_deletion_vector();
+        let deletion_vec_load = if read_config.ignore_deletions {
+            futures::future::Either::Left(futures::future::ready(Ok(None)))
+        } else {
+            futures::future::Either::Right(self.get_deletion_vector())
+        };
 
         // Preserve the legacy reader's eager initialization. Current readers
         // can defer the sequence until a read actually requests stable row IDs.
@@ -1423,7 +1436,7 @@ impl FileFragment {
         let data_file_schema = Arc::new(data_file.schema(full_schema));
         let projection = projection.unwrap_or(full_schema);
         let schema_per_file =
-            Arc::new(projection.intersection_ignore_types(data_file_schema.as_ref())?);
+            Arc::new(data_file_projection(projection, data_file_schema.as_ref())?);
         if schema_per_file.fields.is_empty() {
             return Ok(None);
         }
@@ -1569,6 +1582,14 @@ impl FileFragment {
             .await
     }
 
+    /// The id of `field` and of every field under it.
+    fn collect_field_ids(field: &lance_core::datatypes::Field, out: &mut HashSet<i32>) {
+        out.insert(field.id);
+        for child in &field.children {
+            Self::collect_field_ids(child, out);
+        }
+    }
+
     async fn open_readers_with_full_metadata(
         &self,
         projection: &Schema,
@@ -1585,26 +1606,47 @@ impl FileFragment {
         metadata_mode: MetadataMode,
     ) -> BoxFuture<'a, Result<Vec<Box<dyn GenericFileReader>>>> {
         async move {
+            // A fragment written through several `add_columns` holds one file
+            // per column group. Projecting the full schema through every file
+            // only to learn that it holds none of the requested fields costs
+            // more CPU than the read itself on a wide table, so test the ids
+            // first. A projected struct or list takes its validity and offsets
+            // from whichever of its leaves a file holds, so every leaf under a
+            // projected parent counts as wanted even when it is not projected.
+            let mut wanted_ids: HashSet<i32> = projection.field_ids().into_iter().collect();
+            for parent in projection
+                .fields_pre_order()
+                .filter(|field| !field.children.is_empty())
+            {
+                if let Some(full) = self.dataset.schema().field_by_id(parent.id) {
+                    Self::collect_field_ids(full, &mut wanted_ids);
+                }
+            }
             // Each open is at least one object-store round trip for the file's
             // metadata; a fragment with several data files (one per
             // `add_columns` / merge) would otherwise pay them back to back.
             // `try_join_all` keeps the readers in data-file order.
-            let opens = self.metadata.files.iter().map(|data_file| async move {
-                match metadata_mode {
-                    MetadataMode::LazyAllowed => {
-                        self.open_reader(data_file, Some(projection), read_config)
+            let opens = self
+                .metadata
+                .files
+                .iter()
+                .filter(|data_file| data_file.fields.iter().any(|id| wanted_ids.contains(id)))
+                .map(|data_file| async move {
+                    match metadata_mode {
+                        MetadataMode::LazyAllowed => {
+                            self.open_reader(data_file, Some(projection), read_config)
+                                .await
+                        }
+                        MetadataMode::Full => {
+                            self.open_reader_with_full_metadata(
+                                data_file,
+                                Some(projection),
+                                read_config,
+                            )
                             .await
+                        }
                     }
-                    MetadataMode::Full => {
-                        self.open_reader_with_full_metadata(
-                            data_file,
-                            Some(projection),
-                            read_config,
-                        )
-                        .await
-                    }
-                }
-            });
+                });
             let mut opened_files: Vec<Box<dyn GenericFileReader>> =
                 try_join_all(opens).await?.into_iter().flatten().collect();
 
@@ -1722,21 +1764,40 @@ impl FileFragment {
         Ok(num_physical_rows - num_deleted_rows)
     }
 
-    /// Get the number of physical rows in the fragment. This includes deleted rows.
+    /// Get the number of physical rows in this [`FileFragment`].
     ///
-    /// If there are no deleted rows, this is equal to the number of rows in the
-    /// fragment.
+    /// Physical rows include deleted rows. If there are no deleted rows, this is
+    /// equal to the number of logical rows in the fragment.
+    ///
+    /// When the dataset manifest contains writer-version metadata, this method
+    /// trusts [`Fragment::physical_rows`] when it is present. This includes
+    /// file-less fragments, which can represent rows whose columns are all null.
+    /// Use [`Self::metadata`] to inspect the persisted [`Fragment`] metadata.
+    ///
+    /// Legacy manifests without writer-version metadata may contain an incorrect
+    /// cached count, so this method ignores it and reads the count from a data
+    /// file. If such a fragment has no data files, this method returns
+    /// [`Error::NotFound`]. See [`Self::validate`] for the corresponding metadata
+    /// checks.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # async fn example(dataset: &Dataset) -> Result<()> {
+    /// for fragment in dataset.get_fragments() {
+    ///     let physical_rows = fragment.physical_rows().await?;
+    ///     if fragment.num_data_files() == 0 {
+    ///         assert_eq!(fragment.metadata().physical_rows, Some(physical_rows));
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn physical_rows(&self) -> Result<usize> {
-        if self.metadata.files.is_empty() {
-            return Err(Error::not_found(format!(
-                "Fragment {} does not contain any data",
-                self.id()
-            )));
-        };
-
         // Early versions that did not write the writer version also could write
-        // incorrect `physical_row` values. So if we don't have a writer version,
-        // we should not used the cached value. On write, we update the values
+        // incorrect `physical_rows` values. So if we don't have a writer version,
+        // we should not use the cached value. On write, we update the values
         // in the manifest, fixing the issue for future reads.
         // See: https://github.com/lance-format/lance/issues/1531
         if self.dataset.manifest.writer_version.is_some()
@@ -1744,6 +1805,14 @@ impl FileFragment {
         {
             return Ok(physical_rows);
         }
+
+        // Without a trustworthy cached count, a data file must supply the length.
+        if self.metadata.files.is_empty() {
+            return Err(Error::not_found(format!(
+                "Fragment {} does not contain any data",
+                self.id()
+            )));
+        };
 
         // Just open any file. All of them should have same size.
         let some_file = &self.metadata.files[0];
@@ -1760,19 +1829,41 @@ impl FileFragment {
         Ok(reader.len() as usize)
     }
 
-    /// Validate the fragment
+    /// Validate this [`FileFragment`] and its persisted [`Fragment`] metadata.
     ///
     /// Verifies:
-    /// * All field ids in the fragment are distinct
-    /// * Within each data file, field ids are in increasing order
+    /// * All field ids in the fragment are distinct.
+    /// * Within each data file, field ids are in increasing order.
     /// * All data files holding user data exist and have the same length. A
     ///   file kept only for the spilled row lineage it carries is not opened;
-    ///   [`Dataset::validate`] reads that lineage back, which checks its
-    ///   length.
+    ///   [`Dataset::validate`] reads that lineage back, which checks its length.
     /// * Field ids are distinct between data files.
-    /// * Deletion file exists and has rowids in the correct range
-    /// * `Fragment.physical_rows` matches length of file
-    /// * `DeletionFile.num_deleted_rows` matches length of deletion vector
+    /// * The deletion file exists and has row offsets in the correct range.
+    /// * [`Fragment::physical_rows`], when present, matches the data-file length.
+    /// * [`DeletionFile::num_deleted_rows`], when present, matches the deletion-vector length.
+    ///
+    /// When no file holds user data, the fragment is accepted if the manifest contains
+    /// writer-version metadata, [`Fragment::physical_rows`] is present, and the
+    /// remaining metadata is valid. The cached count supplies the expected length
+    /// for deletion metadata validation. A missing count returns
+    /// [`Error::CorruptFile`].
+    ///
+    /// For legacy manifests without writer-version metadata, a file-less fragment
+    /// returns [`Error::CorruptFile`] even when [`Fragment::physical_rows`] is
+    /// present, because the cached count cannot be trusted. See
+    /// [`Self::physical_rows`] for the corresponding row-count lookup behavior.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # async fn example(dataset: &Dataset) -> Result<()> {
+    /// for fragment in dataset.get_fragments() {
+    ///     fragment.validate().await?;
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn validate(&self) -> Result<()> {
         let mut seen_fields = HashSet::new();
         for data_file in &self.metadata.files {
@@ -1877,35 +1968,59 @@ impl FileFragment {
         let (get_lengths, deletion_vector) = join!(get_lengths, deletion_vector);
 
         let get_lengths = get_lengths?;
-        let expected_length = get_lengths.first().unwrap_or(&0);
-        for (length, data_file) in get_lengths.iter().zip(user_data_files) {
-            if length != expected_length {
-                let path = self
-                    .dataset
-                    .data_file_dir(data_file)?
-                    .join(data_file.path.as_str());
+        let expected_length = if let Some(first_length) = get_lengths.first() {
+            for (length, data_file) in get_lengths.iter().zip(user_data_files) {
+                if length != first_length {
+                    let path = self
+                        .dataset
+                        .data_file_dir(data_file)?
+                        .join(data_file.path.as_str());
+                    return Err(Error::corrupt_file(
+                        path,
+                        format!(
+                            "data file has incorrect length. Expected: {} Got: {}",
+                            first_length, length
+                        ),
+                    ));
+                }
+            }
+            if let Some(physical_rows) = self.metadata.physical_rows
+                && physical_rows != *first_length
+            {
                 return Err(Error::corrupt_file(
-                    path,
+                    self.dataset.base.clone(),
                     format!(
-                        "data file has incorrect length. Expected: {} Got: {}",
-                        expected_length, length
+                        "Fragment metadata has incorrect physical_rows. Fragment: {} Actual: {} Metadata: {}",
+                        self.id(),
+                        first_length,
+                        physical_rows
                     ),
                 ));
             }
-        }
-        if let Some(physical_rows) = self.metadata.physical_rows
-            && physical_rows != *expected_length
-        {
-            return Err(Error::corrupt_file(
-                self.dataset
-                    .data_file_dir(&self.metadata.files[0])?
-                    .join(self.metadata.files[0].path.as_str()),
-                format!(
-                    "Fragment metadata has incorrect physical_rows. Actual: {} Metadata: {}",
-                    expected_length, physical_rows
-                ),
-            ));
-        }
+            *first_length
+        } else {
+            // No user data file supplied a length, so validation must use a
+            // trustworthy persisted count, including when only lineage remains.
+            if self.dataset.manifest.writer_version.is_none() {
+                return Err(Error::corrupt_file(
+                    self.dataset.base.clone(),
+                    format!(
+                        "Fragment {} has no user data files; physical_rows={:?} cannot be trusted because manifest.writer_version is missing",
+                        self.id(),
+                        self.metadata.physical_rows
+                    ),
+                ));
+            }
+            self.metadata.physical_rows.ok_or_else(|| {
+                Error::corrupt_file(
+                    self.dataset.base.clone(),
+                    format!(
+                        "Fragment {} has no user data files and is missing physical_rows",
+                        self.id()
+                    ),
+                )
+            })?
+        };
 
         if let Some(deletion_vector) = deletion_vector? {
             if let Some(num_deletions) = self
@@ -1931,7 +2046,7 @@ impl FileFragment {
             }
 
             for offset in deletion_vector.iter() {
-                if offset >= *expected_length as u32 {
+                if offset as usize >= expected_length {
                     let deletion_file_meta = self.metadata.deletion_file.as_ref().unwrap();
                     return Err(Error::corrupt_file(
                         deletion_file_path(
@@ -1987,7 +2102,7 @@ impl FileFragment {
 
         // Then call take rows
         let batch = self
-            .take_rows(&row_ids, projection, false, false, false, false)
+            .take_rows(&row_ids, projection, FragReadConfig::default())
             .await?;
 
         // Convert Lance JSON columns (LargeBinary/JSONB) back to Arrow JSON (Utf8)
@@ -2176,21 +2291,9 @@ impl FileFragment {
         &self,
         row_offsets: &[u32],
         projection: &Schema,
-        with_row_id: bool,
-        with_row_address: bool,
-        with_row_created_at_version: bool,
-        with_row_last_updated_at_version: bool,
+        read_config: FragReadConfig,
     ) -> Result<RecordBatch> {
-        let reader = self
-            .open(
-                projection,
-                FragReadConfig::default()
-                    .with_row_id(with_row_id)
-                    .with_row_address(with_row_address)
-                    .with_row_created_at_version(with_row_created_at_version)
-                    .with_row_last_updated_at_version(with_row_last_updated_at_version),
-            )
-            .await?;
+        let reader = self.open(projection, read_config).await?;
 
         if row_offsets.len() > 1 && Self::row_ids_contiguous(row_offsets) {
             let range =
@@ -3453,6 +3556,51 @@ impl std::fmt::Display for FragmentReader {
     }
 }
 
+/// `projection` intersected with a data file's schema. A nested field none of
+/// whose projected children are in the file keeps one file leaf, which still
+/// carries its validity and offsets; the final projection drops it.
+fn data_file_projection(projection: &Schema, file_schema: &Schema) -> Result<Schema> {
+    fn keep_a_leaf(field: &mut lance_core::datatypes::Field, file_schema: &Schema) -> Result<()> {
+        if field.is_blob() || field.is_packed_struct() {
+            return Ok(());
+        }
+        if !field.children.is_empty() {
+            return field
+                .children
+                .iter_mut()
+                .try_for_each(|child| keep_a_leaf(child, file_schema));
+        }
+        let Some(file_field) = file_schema.field_by_id(field.id) else {
+            return Ok(());
+        };
+        if file_field.children.is_empty() {
+            return Ok(());
+        }
+        let path =
+            crate::io::exec::filtered_read::validity_leaf_path(file_field).unwrap_or_else(|| {
+                // No fixed-width leaf: any leaf carries the validity.
+                let mut path = vec![];
+                let mut node = file_field;
+                while !(node.is_blob()
+                    || node.is_packed_struct()
+                    || matches!(node.data_type(), DataType::Map(..)))
+                    && let Some(child) = node.children.first()
+                {
+                    path.push(child.name.as_str());
+                    node = child;
+                }
+                path
+            });
+        *field = file_field.project(&path)?;
+        Ok(())
+    }
+    let mut schema = projection.intersection_ignore_types(file_schema)?;
+    for field in &mut schema.fields {
+        keep_a_leaf(field, file_schema)?;
+    }
+    Ok(schema)
+}
+
 fn merge_batches(batches: &[RecordBatch]) -> Result<RecordBatch> {
     if batches.is_empty() {
         return Err(Error::invalid_input(
@@ -4106,6 +4254,13 @@ mod tests {
             .unwrap();
 
         Dataset::open(test_uri).await.unwrap()
+    }
+
+    fn assert_error_contains(err: Error, expected: &str) {
+        assert!(
+            err.to_string().contains(expected),
+            "expected error to contain {expected:?}, got {err:?}"
+        );
     }
 
     async fn create_dataset_v2(test_uri: &str) -> Dataset {
@@ -5968,6 +6123,113 @@ mod tests {
             .unwrap();
     }
 
+    /// A fragment with one data file per column group reads only the files
+    /// that hold a requested field: the others are not even opened.
+    #[tokio::test]
+    async fn test_take_opens_only_files_with_projected_fields() {
+        let test_dir = TempStrDir::default();
+        let mut dataset = create_dataset_v2(&test_dir).await;
+        dataset
+            .add_columns(
+                NewColumnTransform::SqlExpressions(vec![("col1".into(), "i * 2".into())]),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let fragment = dataset.get_fragment(0).unwrap();
+        assert_eq!(fragment.metadata().files.len(), 2);
+        let added_file = fragment.metadata().files[1].path.clone();
+
+        let projection = dataset.schema().project(&["col1"]).unwrap();
+        dataset.object_store.io_stats_incremental();
+        let reader = fragment
+            .open(&projection, FragReadConfig::default())
+            .await
+            .unwrap();
+        let rows = reader.take_as_batch(&[1, 5], None).await.unwrap();
+        assert_eq!(rows.num_rows(), 2);
+        let data_files_read: HashSet<String> = dataset
+            .object_store
+            .io_stats_incremental()
+            .requests
+            .iter()
+            .filter(|request| request.path.as_ref().contains("/data/"))
+            .map(|request| request.path.filename().unwrap().to_string())
+            .collect();
+        assert_eq!(data_files_read, HashSet::from([added_file]));
+    }
+
+    /// Projecting only a child that lives in a later file must still open the
+    /// file holding the parent's other leaves: a list takes its offsets and a
+    /// struct its validity from whichever leaf a file has.
+    #[rstest]
+    #[case::take(false)]
+    #[case::scan(true)]
+    #[tokio::test]
+    async fn test_projected_missing_list_child_keeps_offsets(#[case] use_scan: bool) {
+        use arrow_array::{ListArray, StructArray};
+        use arrow_buffer::OffsetBuffer;
+
+        let old_values = StructArray::new(
+            vec![ArrowField::new("a", DataType::Int32, true)].into(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+            None,
+        );
+        let list = ListArray::new(
+            Arc::new(ArrowField::new(
+                "item",
+                old_values.data_type().clone(),
+                true,
+            )),
+            OffsetBuffer::new(vec![0i32, 2, 2, 3].into()),
+            Arc::new(old_values),
+            None,
+        );
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "c",
+            list.data_type().clone(),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(list)]).unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let added = ArrowSchema::new(vec![ArrowField::new(
+            "c",
+            DataType::List(Arc::new(ArrowField::new(
+                "item",
+                DataType::Struct(vec![ArrowField::new("b", DataType::Int32, true)].into()),
+                true,
+            ))),
+            true,
+        )]);
+        dataset
+            .add_columns(NewColumnTransform::AllNulls(Arc::new(added)), None, None)
+            .await
+            .unwrap();
+
+        let projection = dataset.schema().project(&["c.item.b"]).unwrap();
+        let result = if use_scan {
+            let mut scan = dataset.scan();
+            scan.project_with_schema(&projection).unwrap();
+            scan.try_into_batch().await.unwrap()
+        } else {
+            dataset.take(&[0, 1, 2], projection).await.unwrap()
+        };
+        let list = result["c"].as_any().downcast_ref::<ListArray>().unwrap();
+        assert_eq!(list.value_offsets(), &[0, 2, 2, 3][..]);
+        assert_eq!(list.null_count(), 0);
+    }
+
     #[tokio::test]
     async fn test_fragment_update() {
         let test_dir = TempStrDir::default();
@@ -6667,10 +6929,7 @@ mod tests {
             .take_rows(
                 &[1, 2, 4, 5, 5, 8],
                 dataset.schema(),
-                false,
-                false,
-                false,
-                false,
+                FragReadConfig::default().with_row_address(false),
             )
             .await
             .unwrap();
@@ -6693,10 +6952,7 @@ mod tests {
             .take_rows(
                 &[1, 2, 4, 5, 8],
                 dataset.schema(),
-                false,
-                false,
-                false,
-                false,
+                FragReadConfig::default().with_row_address(false),
             )
             .await
             .unwrap();
@@ -6707,7 +6963,7 @@ mod tests {
 
         // Empty indices gives empty result
         let batch = fragment
-            .take_rows(&[], dataset.schema(), false, false, false, false)
+            .take_rows(&[], dataset.schema(), FragReadConfig::default())
             .await
             .unwrap();
         assert_eq!(
@@ -6720,10 +6976,7 @@ mod tests {
             .take_rows(
                 &[1, 2, 4, 5, 8],
                 dataset.schema(),
-                false,
-                true,
-                false,
-                false,
+                FragReadConfig::default().with_row_address(true),
             )
             .await
             .unwrap();
@@ -6823,6 +7076,144 @@ mod tests {
         assert_eq!(
             fragment.metadata.deletion_file.unwrap().num_deleted_rows,
             Some(13)
+        );
+    }
+
+    #[rstest]
+    #[case::empty(0)]
+    #[case::non_empty(7)]
+    #[tokio::test]
+    async fn test_file_less_fragment_physical_rows_uses_cached_value(#[case] physical_rows: usize) {
+        let test_dir = TempStrDir::default();
+        let mut dataset = create_dataset(&test_dir, LanceFileVersion::Stable).await;
+        assert!(dataset.manifest.writer_version.is_some());
+
+        let fragment = FileFragment::new(
+            Arc::new(dataset.clone()),
+            Fragment::new(99).with_physical_rows(physical_rows),
+        );
+        assert_eq!(fragment.physical_rows().await.unwrap(), physical_rows);
+        fragment.validate().await.unwrap();
+
+        Arc::make_mut(&mut dataset.manifest).writer_version = None;
+        let fragment = FileFragment::new(
+            Arc::new(dataset),
+            Fragment::new(99).with_physical_rows(physical_rows),
+        );
+        let err = fragment.physical_rows().await.unwrap_err();
+        assert!(matches!(err, Error::NotFound { .. }));
+        assert_error_contains(err, "Fragment 99 does not contain any data");
+
+        let err = fragment.validate().await.unwrap_err();
+        assert!(matches!(err, Error::CorruptFile { .. }));
+        assert_error_contains(
+            err,
+            &format!(
+                "physical_rows=Some({physical_rows}) cannot be trusted because manifest.writer_version is missing"
+            ),
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fragment_validate_checks_physical_rows_against_data_file() {
+        let test_dir = TempStrDir::default();
+        let dataset = create_dataset(&test_dir, LanceFileVersion::Stable).await;
+        let mut metadata = dataset.manifest.fragments[0].clone();
+        let actual_rows = metadata.physical_rows.unwrap();
+        metadata.physical_rows = Some(actual_rows + 1);
+        let fragment = FileFragment::new(Arc::new(dataset), metadata);
+        assert_eq!(fragment.physical_rows().await.unwrap(), actual_rows + 1);
+
+        let err = fragment.validate().await.unwrap_err();
+        assert!(matches!(err, Error::CorruptFile { .. }));
+        assert_error_contains(err, "Fragment metadata has incorrect physical_rows");
+    }
+
+    #[tokio::test]
+    async fn test_file_less_fragment_validate_requires_physical_rows() {
+        let test_dir = TempStrDir::default();
+        let dataset = Arc::new(create_dataset(&test_dir, LanceFileVersion::Stable).await);
+        let fragment = FileFragment::new(dataset, Fragment::new(99));
+
+        let err = fragment.physical_rows().await.unwrap_err();
+        assert!(matches!(err, Error::NotFound { .. }));
+        assert_error_contains(err, "Fragment 99 does not contain any data");
+
+        let err = fragment.validate().await.unwrap_err();
+        assert!(matches!(err, Error::CorruptFile { .. }));
+        assert_error_contains(
+            err,
+            "Fragment 99 has no user data files and is missing physical_rows",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_file_less_fragment_validate_checks_deletion_metadata() {
+        let test_dir = TempStrDir::default();
+        let dataset = Arc::new(create_dataset(&test_dir, LanceFileVersion::Stable).await);
+
+        let deletion_vector = DeletionVector::from_iter([2, 9]);
+        let deletion_file = write_deletion_file(
+            &dataset.base,
+            99,
+            dataset.version().version,
+            &deletion_vector,
+            &dataset.object_store,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let mut metadata = Fragment::new(99).with_physical_rows(10);
+        metadata.deletion_file = Some(deletion_file.clone());
+        FileFragment::new(dataset.clone(), metadata)
+            .validate()
+            .await
+            .unwrap();
+
+        let mut metadata = Fragment::new(99).with_physical_rows(10);
+        metadata.deletion_file = Some(DeletionFile {
+            num_deleted_rows: Some(3),
+            ..deletion_file
+        });
+        let err = FileFragment::new(dataset, metadata)
+            .validate()
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::CorruptFile { .. }));
+        assert_error_contains(
+            err,
+            "deletion vector length does not match metadata. Metadata: 3 Deletion vector: 2",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_file_less_fragment_validate_rejects_out_of_range_deletions() {
+        let test_dir = TempStrDir::default();
+        let dataset = Arc::new(create_dataset(&test_dir, LanceFileVersion::Stable).await);
+
+        let deletion_vector = DeletionVector::from_iter([2, 10]);
+        let deletion_file = write_deletion_file(
+            &dataset.base,
+            99,
+            dataset.version().version,
+            &deletion_vector,
+            &dataset.object_store,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let mut metadata = Fragment::new(99).with_physical_rows(10);
+        metadata.deletion_file = Some(deletion_file);
+        let err = FileFragment::new(dataset, metadata)
+            .validate()
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::CorruptFile { .. }));
+        assert_error_contains(
+            err,
+            "deletion vector contains an offset that is out of range. Offset: 10 Fragment length: 10",
         );
     }
 

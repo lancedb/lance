@@ -5268,6 +5268,21 @@ def test_scan_with_row_ids(tmp_path: Path):
     assert tbl2["a"] == tbl["a"]
 
 
+def test_take_rows_ignore_deletions(tmp_path: Path):
+    data = pa.table({"a": range(8)})
+    ds = lance.write_dataset(data, tmp_path, enable_stable_row_ids=True)
+    ds.delete("a in (1, 7)")
+
+    assert ds._take_rows([0, 1, 7, 4])["a"].to_pylist() == [0, 4]
+    # Deleted rows come back with their stored values; no deletion file is read.
+    assert ds._take_rows([0, 1, 7, 4], ignore_deletions=True)["a"].to_pylist() == [
+        0,
+        1,
+        7,
+        4,
+    ]
+
+
 @pytest.mark.cuda
 def test_random_dataset_recall_accelerated(tmp_path: Path):
     dims = 32

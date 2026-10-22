@@ -729,7 +729,7 @@ impl PyLsmPointLookupPlanner {
             None => get_pk_columns(&ds)?,
         };
         let base_schema = Arc::new(ArrowSchema::from(ds.schema()));
-        // A sealed generation stores the names it was written with, so the
+        // A flushed generation stores the names it was written with, so the
         // planner resolves its columns by id; `base_schema` carries none.
         let identity_schema = Arc::new(arrow_schema_with_field_ids(ds.schema()));
         let collector = LsmDataSourceCollector::new(ds.clone(), snapshots);

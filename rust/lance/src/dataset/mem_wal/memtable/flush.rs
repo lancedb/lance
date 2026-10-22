@@ -88,7 +88,7 @@ pub struct MemTableFlusher {
 ///
 /// Read off the memtable being flushed, which is frozen. That matters: an
 /// appending store bumps these counters before it publishes the batch, so only
-/// a sealed one agrees with what a scan of it will see.
+/// a frozen one agrees with what a scan of it will see.
 #[derive(Clone, Copy)]
 struct FlushedSize {
     in_memory_bytes: Option<u64>,
@@ -1037,7 +1037,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Nothing is durable yet, so the L0 flush must refuse.
+        // Nothing is durable yet, so the SSTable flush must refuse.
         let durable = 0;
         assert!(!memtable.all_flushed_to_wal(durable));
 
