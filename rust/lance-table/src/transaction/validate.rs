@@ -1311,6 +1311,79 @@ mod tests {
     }
 
     #[rstest::rstest]
+    #[case::all_fields(vec![vec![0, 2, 3]], true, None)]
+    #[case::missing_required_column(vec![vec![2, 3]], true, Some("id"))]
+    #[case::missing_required_child(vec![vec![0, 3]], false, Some("required"))]
+    #[case::missing_nullable_child(vec![vec![0, 2]], true, None)]
+    #[case::missing_nullable_parent(vec![vec![0]], true, None)]
+    #[case::missing_required_parent(vec![vec![0]], false, Some("value"))]
+    #[case::split_files(vec![vec![0, 2], vec![3]], true, None)]
+    #[case::empty_fragment(vec![], true, Some("id"))]
+    fn test_modern_append_field_coverage(
+        #[case] file_fields: Vec<Vec<i32>>,
+        #[case] parent_nullable: bool,
+        #[case] missing_field: Option<&str>,
+        #[values(
+            ConcreteFileVersion::V2_0,
+            ConcreteFileVersion::V2_1,
+            ConcreteFileVersion::V2_2,
+            ConcreteFileVersion::V2_3
+        )]
+        version: ConcreteFileVersion,
+    ) {
+        // A struct child is required only when it and all of its ancestors are
+        // non-nullable, so coverage comes from the files' physical schema.
+        let schema = LanceSchema::try_from(&ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new(
+                "value",
+                DataType::Struct(
+                    vec![
+                        ArrowField::new("required", DataType::Int32, false),
+                        ArrowField::new("optional", DataType::Int32, true),
+                    ]
+                    .into(),
+                ),
+                parent_nullable,
+            ),
+        ]))
+        .unwrap();
+        let make_file = |file_schema: &LanceSchema| {
+            let (fields, column_indices) =
+                lance_file::versions::data_file_columns(version, file_schema);
+            DataFile::new("data.lance", fields, column_indices, version, None, None)
+        };
+        let mut complete = Fragment::new(1);
+        complete.files.push(make_file(&schema));
+        let mut partial = Fragment::new(2);
+        partial.files = file_fields
+            .iter()
+            .map(|fields| make_file(&schema.project_by_ids(fields, false)))
+            .collect();
+        let manifest = Manifest::new(
+            schema,
+            Arc::new(vec![]),
+            DataStorageFormat::new(version),
+            HashMap::new(),
+        );
+        let result = validate_operation(
+            Some(&manifest),
+            &Operation::Append {
+                fragments: vec![complete, partial],
+            },
+        );
+        if let Some(missing_field) = missing_field {
+            let error = result.unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }));
+            let message = error.to_string();
+            assert!(message.contains("Fragment 2"), "{message}");
+            assert!(message.contains(missing_field), "{message}");
+        } else {
+            result.unwrap();
+        }
+    }
+
+    #[rstest::rstest]
     #[case::v2_0(ConcreteFileVersion::V2_0, vec![0, 1, 2])]
     #[case::v2_1(ConcreteFileVersion::V2_1, vec![0, -1, 1])]
     fn test_modern_rejects_structural_header_without_child(
