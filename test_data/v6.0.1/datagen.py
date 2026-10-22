@@ -7,7 +7,7 @@ from pathlib import Path
 import lance
 import numpy as np
 import pyarrow as pa
-from lance.file import LanceFileWriter
+from lance.file import LanceFileReader, LanceFileWriter
 
 EXPECTED_LANCE_VERSION = "6.0.1"
 NUM_DENSE_ROWS = 513
@@ -66,9 +66,15 @@ table = pa.table(
         ]
     ),
 )
-with LanceFileWriter(
-    str(Path(__file__).with_name("wrapped_bitpacked_levels.lance")),
-    table.schema,
-    version="2.1",
-) as writer:
+file_path = str(Path(__file__).with_name("wrapped_bitpacked_levels.lance"))
+with LanceFileWriter(file_path, table.schema, version="2.1") as writer:
     writer.write_batch(table)
+
+# The v6.0.1 reader trusts the wrapped u16 level count and drops levels. Confirm
+# this generator still captures the defect.
+try:
+    LanceFileReader(file_path).read_all(batch_size=1024).to_table()
+except pa.ArrowInvalid as error:
+    assert 'StructArray field "vector", expected 1024 got 432' in str(error)
+else:
+    raise AssertionError("expected the v6.0.1 wrapped bitpacked level count")
