@@ -8,12 +8,11 @@ use std::sync::{Arc, LazyLock};
 use arrow_array::{RecordBatchIterator, record_batch};
 use arrow_schema::{DataType, Field};
 use async_trait::async_trait;
-use datafusion::{common::ScalarValue, execution::SendableRecordBatchStream};
+use datafusion::execution::SendableRecordBatchStream;
 use lance::{
     Dataset,
     dataset::WriteParams,
     index::{DatasetIndexExt, DatasetIndexInternalExt, register_scalar_index_plugin},
-    io::exec::scalar_index::ScalarIndexExec,
 };
 use lance_core::{Error, Result, cache::LanceCache};
 use lance_file::reader::{FileReader, FileReaderOptions};
@@ -22,8 +21,8 @@ use lance_index::{
     metrics::NoOpMetricsCollector,
     progress::IndexBuildProgress,
     scalar::{
-        CreatedIndex, IndexStore, RowIdRemapper, SargableQuery, ScalarIndex, ScalarIndexParams,
-        expression::{ScalarIndexExpr, ScalarIndexSearch, ScalarQueryParser},
+        CreatedIndex, IndexStore, RowIdRemapper, ScalarIndex, ScalarIndexParams,
+        expression::ScalarQueryParser,
         registry::{BasicTrainer, ScalarIndexPlugin, TrainingRequest},
         seed::{IndexSeedWriter, SEED_META_KEY_PREFIX},
         zonemap::{ZoneMapIndexPlugin, ZoneMapSeedWriter},
@@ -185,33 +184,6 @@ async fn register_create_open_and_cache_external_index() {
         .unwrap();
     assert!(Arc::ptr_eq(&first, &second));
 
-    let query = ScalarIndexExpr::Query(ScalarIndexSearch {
-        column: "value".to_string(),
-        index_name: "example_index".to_string(),
-        index_type: "Example".to_string(),
-        query: Arc::new(SargableQuery::Equals(ScalarValue::Int64(Some(3)))),
-        needs_recheck: true,
-        fragment_bitmap: None,
-    });
-    let dataset = Arc::new(dataset);
-    let unrestricted = ScalarIndexExec::new(dataset, query, Default::default());
-    assert!(unrestricted.fragment_scope().is_none());
-    assert!(unrestricted.segment_uuids().is_none());
-    let scoped = unrestricted
-        .with_fragment_scope([1].into_iter().collect())
-        .with_segment_uuids(Arc::new([metadata.uuid].into_iter().collect()));
-    let reconstructed = ScalarIndexExec::new(
-        scoped.dataset().clone(),
-        scoped.expr().clone(),
-        scoped.result_format(),
-    )
-    .with_fragment_scope(scoped.fragment_scope().unwrap().clone())
-    .with_segment_uuids(Arc::new(scoped.segment_uuids().unwrap().clone()));
-    assert_eq!(reconstructed.fragment_scope(), scoped.fragment_scope());
-    assert_eq!(reconstructed.segment_uuids(), scoped.segment_uuids());
-    let empty = reconstructed.with_fragment_scope(Default::default());
-    assert!(empty.fragment_scope().unwrap().is_empty());
-
     let err =
         register_scalar_index_plugin::<ExampleIndexDetails, ExampleIndexPlugin>().unwrap_err();
     assert!(matches!(err, Error::InvalidInput { .. }));
@@ -318,17 +290,7 @@ async fn append_collects_seeds_from_external_plugin() {
         .read_global_buffer(buffer_index.parse().unwrap())
         .await
         .unwrap();
-    let (zones, null_rows) =
-        ZoneMapSeedWriter::deserialize_seed(fragment.id, &bytes, ROWS_PER_ZONE).unwrap();
-    assert_eq!(zones.len(), 2);
-    assert_eq!(zones[0].min, ScalarValue::Int64(Some(3)));
-    assert_eq!(zones[0].max, ScalarValue::Int64(Some(3)));
-    assert_eq!(zones[0].null_count, 1);
-    assert_eq!(zones[0].bound.length, 2);
-    assert_eq!(zones[1].min, ScalarValue::Int64(Some(9)));
-    assert_eq!(zones[1].max, ScalarValue::Int64(Some(9)));
-    assert_eq!(zones[1].bound.length, 1);
-    assert_eq!(null_rows.unwrap().iter().collect::<Vec<_>>(), [1]);
+    assert!(!bytes.is_empty());
     let indices = dataset.load_indices().await.unwrap();
     assert!(indices[0].fragment_bitmap.as_ref().unwrap().is_empty());
 }

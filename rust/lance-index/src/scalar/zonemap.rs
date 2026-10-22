@@ -29,7 +29,6 @@ use lance_index_core::remapping::RowAddrTranslator;
 use lance_index_core::remapping::{BatchRowIdRemapper, remap_row_addrs_tree_map_async};
 use serde::{Deserialize, Serialize};
 use std::any::Any;
-use std::ops::Bound;
 use std::sync::LazyLock;
 
 use arrow_array::{
@@ -59,20 +58,17 @@ const NULL_BITMAP_META_KEY: &str = "null_bitmap";
 const SEED_NULL_BITMAP_META_KEY: &str = "seed_null_bitmap";
 const ZONEMAP_INDEX_VERSION: u32 = 0;
 
-/// Value bounds and counts for one zone in a fragment.
+/// Basic stats about zonemap index
 #[derive(Debug, PartialEq, Clone)]
-pub struct ZoneMapStatistics {
-    /// The stored lower bound, or a typed null when unavailable.
-    pub min: ScalarValue,
-    /// The stored upper bound, including legacy NaN markers when present.
-    pub max: ScalarValue,
-    /// Number of null values summarized.
-    pub null_count: u32,
-    /// Number of NaN values summarized; zero for non-floating-point types.
-    pub nan_count: u32,
+pub(crate) struct ZoneMapStatistics {
+    min: ScalarValue,
+    max: ScalarValue,
+    null_count: u32,
+    // only apply to float type
+    nan_count: u32,
     // Bound of this zone within the fragment. Persisted as three separate columns
     // (fragment_id, zone_start, zone_length) in the index file.
-    pub bound: ZoneBound,
+    bound: ZoneBound,
 }
 
 impl DeepSizeOf for ZoneMapStatistics {
@@ -248,30 +244,10 @@ impl ZoneMapIndex {
         zone: &ZoneMapStatistics,
         query: &SargableQuery,
     ) -> Result<bool> {
-        zone.may_match(&self.data_type, query)
-    }
-}
-
-impl ZoneMapStatistics {
-    /// Test whether this summary may contain a value matching `query`.
-    ///
-    /// Uses the same predicate evaluation as the ZoneMap index. A `true`
-    /// result is only a candidate and still needs data-level rechecking.
-    /// Callers must first verify that the summary applies to the current data.
-    ///
-    /// ```
-    /// # use arrow_schema::DataType;
-    /// # use lance_core::Result;
-    /// # use lance_index::scalar::{SargableQuery, zonemap::ZoneMapStatistics};
-    /// # fn evaluate(stats: &ZoneMapStatistics, query: &SargableQuery) -> Result<bool> {
-    /// stats.may_match(&DataType::Int64, query)
-    /// # }
-    /// ```
-    pub fn may_match(&self, data_type: &DataType, query: &SargableQuery) -> Result<bool> {
-        let zone = self;
+        use std::ops::Bound;
 
         // For nested types we only track null_count; prune only when certain.
-        if data_type.is_nested() {
+        if self.data_type.is_nested() {
             let all_null = zone.null_count as usize == zone.bound.length;
             return match query {
                 SargableQuery::IsNull() => Ok(zone.null_count > 0),
@@ -317,8 +293,8 @@ impl ZoneMapStatistics {
                     return Ok(zone.nan_count > 0);
                 }
 
-                if ZoneMapIndex::zone_has_missing_extrema(zone) {
-                    return Ok(ZoneMapIndex::zone_has_comparable_values(zone));
+                if Self::zone_has_missing_extrema(zone) {
+                    return Ok(Self::zone_has_comparable_values(zone));
                 }
 
                 Ok(target >= &zone.min && target <= &zone.max)
@@ -326,8 +302,8 @@ impl ZoneMapStatistics {
             SargableQuery::Range(start, end) => {
                 // Zone overlaps with query range if there's any intersection between
                 // the zone's [min, max] and the query's range
-                if ZoneMapIndex::zone_has_missing_extrema(zone) {
-                    return Ok(ZoneMapIndex::zone_has_comparable_values(zone));
+                if Self::zone_has_missing_extrema(zone) {
+                    return Ok(Self::zone_has_comparable_values(zone));
                 }
 
                 let zone_min = &zone.min;
@@ -443,9 +419,9 @@ impl ZoneMapStatistics {
                             ScalarValue::Float16(Some(f)) => {
                                 if f.is_nan() {
                                     zone.nan_count > 0
-                                } else if ZoneMapIndex::zone_has_missing_extrema(zone) {
-                                    ZoneMapIndex::zone_has_comparable_values(zone)
-                                } else if !ZoneMapIndex::zone_has_finite_min(zone) {
+                                } else if Self::zone_has_missing_extrema(zone) {
+                                    Self::zone_has_comparable_values(zone)
+                                } else if !Self::zone_has_finite_min(zone) {
                                     false
                                 } else {
                                     value >= &zone.min && value <= &zone.max
@@ -454,9 +430,9 @@ impl ZoneMapStatistics {
                             ScalarValue::Float32(Some(f)) => {
                                 if f.is_nan() {
                                     zone.nan_count > 0
-                                } else if ZoneMapIndex::zone_has_missing_extrema(zone) {
-                                    ZoneMapIndex::zone_has_comparable_values(zone)
-                                } else if !ZoneMapIndex::zone_has_finite_min(zone) {
+                                } else if Self::zone_has_missing_extrema(zone) {
+                                    Self::zone_has_comparable_values(zone)
+                                } else if !Self::zone_has_finite_min(zone) {
                                     false
                                 } else {
                                     value >= &zone.min && value <= &zone.max
@@ -465,19 +441,19 @@ impl ZoneMapStatistics {
                             ScalarValue::Float64(Some(f)) => {
                                 if f.is_nan() {
                                     zone.nan_count > 0
-                                } else if ZoneMapIndex::zone_has_missing_extrema(zone) {
-                                    ZoneMapIndex::zone_has_comparable_values(zone)
-                                } else if !ZoneMapIndex::zone_has_finite_min(zone) {
+                                } else if Self::zone_has_missing_extrema(zone) {
+                                    Self::zone_has_comparable_values(zone)
+                                } else if !Self::zone_has_finite_min(zone) {
                                     false
                                 } else {
                                     value >= &zone.min && value <= &zone.max
                                 }
                             }
                             _ => {
-                                if ZoneMapIndex::zone_has_missing_extrema(zone) {
-                                    ZoneMapIndex::zone_has_comparable_values(zone)
+                                if Self::zone_has_missing_extrema(zone) {
+                                    Self::zone_has_comparable_values(zone)
                                 } else {
-                                    ZoneMapIndex::zone_has_finite_extrema(zone)
+                                    Self::zone_has_finite_extrema(zone)
                                         && value >= &zone.min
                                         && value <= &zone.max
                                 }
@@ -538,9 +514,7 @@ impl ZoneMapStatistics {
             }
         }
     }
-}
 
-impl ZoneMapIndex {
     /// Additive sibling of [`Self::load`] for mappings that require
     /// asynchronous batch row-ID translation.
     async fn load_with_remapping(
@@ -1334,26 +1308,13 @@ enum ZoneStatsAccumulator {
 /// parent-level null_count without inspecting child values; min and max are
 /// stored as typed null values.
 #[derive(Debug)]
-pub struct ZoneMapProcessor {
+struct ZoneMapProcessor {
     data_type: DataType,
     statistics: ZoneStatsAccumulator,
 }
 
 impl ZoneMapProcessor {
-    /// Create an accumulator for values of `data_type`.
-    ///
-    /// Feed values through [`ZoneProcessor::process_chunk`] and obtain a
-    /// summary through [`ZoneProcessor::finish_zone`].
-    ///
-    /// ```
-    /// # use arrow_schema::DataType;
-    /// # use lance_core::Result;
-    /// # fn processor() -> Result<()> {
-    /// let processor = lance_index::scalar::zonemap::ZoneMapProcessor::new(DataType::Int64)?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn new(data_type: DataType) -> Result<Self> {
+    fn new(data_type: DataType) -> Result<Self> {
         let statistics = if data_type.is_nested() {
             ZoneStatsAccumulator::NullOnly { null_count: 0 }
         } else {
@@ -1822,7 +1783,7 @@ impl ZoneMapSeedWriter {
     /// Returns zone statistics (bounds reconstructed from sequential fragment layout) and an
     /// optional `RoaringBitmap` of null row offsets within the fragment. The bitmap is absent
     /// for seeds written by older code that did not track null positions.
-    pub fn deserialize_seed(
+    pub(crate) fn deserialize_seed(
         fragment_id: u64,
         bytes: &bytes::Bytes,
         rows_per_zone: u64,
