@@ -634,15 +634,15 @@ impl CompactionOptions {
 
 /// Determine if page-level binary copy can safely merge the provided fragments.
 ///
-/// Preconditions checked in order:
+/// Preconditions:
 /// - Compaction mode is not `Reencode`
 /// - Dataset storage format is non-legacy
-/// - Fragment list is non-empty
+/// - Fragment list is non-empty and every fragment has at least one data file
 /// - All data files share identical Lance file versions
 /// - No fragment has a deletion file
-///   TODO: Need to support schema evolution case like add column and drop column
+/// - No fragment has data overlays
 /// - All data files use an identical schema mapping (`fields`, `column_indices`) in dataset schema
-///   order
+///   order, with the current schema's expected physical-column count
 /// - Input data files must not contain extra global buffers (beyond schema / file descriptor)
 async fn can_use_binary_copy(
     dataset: &Dataset,
@@ -700,10 +700,10 @@ pub(super) async fn can_use_binary_copy_current(
         return Ok(false);
     }
 
-    if fragments[0].files.is_empty() {
+    if let Some(fragment) = fragments.iter().find(|fragment| fragment.files.is_empty()) {
         log::debug!(
             "Binary copy disabled: fragment {} has no data files",
-            fragments[0].id
+            fragment.id
         );
         return Ok(false);
     }
@@ -720,6 +720,12 @@ pub(super) async fn can_use_binary_copy_current(
         );
         return Ok(false);
     }
+    let expected_column_count: usize = dataset
+        .schema()
+        .fields
+        .iter()
+        .map(|field| lance_file::versions::physical_column_count(version, field))
+        .sum();
     for fragment in fragments {
         // Binary copy only reads base files; overlays must be materialized by the scanner.
         if !fragment.overlays.is_empty() {
@@ -759,6 +765,16 @@ pub(super) async fn can_use_binary_copy_current(
                 .open_file_with_priority(&full_path, 0, &data_file.file_size_bytes)
                 .await?;
             let file_meta = LFReader::read_all_metadata(&file_scheduler).await?;
+            if file_meta.column_infos.len() != expected_column_count {
+                log::debug!(
+                    "Binary copy disabled: data file '{}' in fragment {} has {} physical columns, expected {} for the current schema",
+                    data_file.path,
+                    fragment.id,
+                    file_meta.column_infos.len(),
+                    expected_column_count
+                );
+                return Ok(false);
+            }
             // Binary copy only preserves page and column-buffer bytes; the
             // output footer (including global buffers) is re-generated. Extra
             // global buffers are allowed only when every one of them is a
@@ -4906,6 +4922,93 @@ mod tests {
         assert_eq!(ds.count_rows(None).await.unwrap(), num_rows);
     }
 
+    /// Compaction is a read->write roundtrip and the decoder materializes the
+    /// children of null structs as nulls. A dataset containing null structs
+    /// with non-nullable children (e.g. GeoArrow point columns, where the
+    /// children must be non-nullable and validity is carried by the struct)
+    /// must therefore stay compactable.
+    ///
+    /// Reproduces <https://github.com/lance-format/lance/issues/7826>
+    ///
+    /// 2.1+ only: the 2.0 encoding does not store struct validity, so masked
+    /// child nulls stay rejected at write time there.
+    #[tokio::test]
+    async fn test_compact_null_structs_with_non_nullable_children() {
+        let data_storage_version = LanceFileVersion::V2_1;
+        use arrow_array::{Float64Array, StructArray, cast::AsArray};
+        use arrow_buffer::NullBuffer;
+        use arrow_schema::Fields;
+
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
+
+        let child_fields = Fields::from(vec![
+            Field::new("x", DataType::Float64, false),
+            Field::new("y", DataType::Float64, false),
+        ]);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("position", DataType::Struct(child_fields.clone()), true),
+        ]));
+
+        // Every third row is a null struct; the children physically hold 0.0
+        // fillers at those slots ("validity-first" layout).
+        let num_rows = 100_usize;
+        let ids = Int64Array::from_iter_values(0..num_rows as i64);
+        let is_valid = |i: usize| !i.is_multiple_of(3);
+        let xs = Float64Array::from_iter_values(
+            (0..num_rows).map(|i| if is_valid(i) { i as f64 } else { 0.0 }),
+        );
+        let ys = Float64Array::from_iter_values(
+            (0..num_rows).map(|i| if is_valid(i) { i as f64 * 10.0 } else { 0.0 }),
+        );
+        let position = StructArray::try_new(
+            child_fields,
+            vec![Arc::new(xs) as ArrayRef, Arc::new(ys) as ArrayRef],
+            Some(NullBuffer::from_iter((0..num_rows).map(is_valid))),
+        )
+        .unwrap();
+        let data = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(ids) as ArrayRef, Arc::new(position) as ArrayRef],
+        )
+        .unwrap();
+
+        let reader = RecordBatchIterator::new(vec![Ok(data)], schema.clone());
+        let write_params = WriteParams {
+            max_rows_per_file: 25,
+            data_storage_version: Some(data_storage_version),
+            ..Default::default()
+        };
+        let mut dataset = Dataset::write(reader, test_uri, Some(write_params))
+            .await
+            .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 4);
+
+        let metrics = compact_files(&mut dataset, CompactionOptions::default(), None)
+            .await
+            .unwrap();
+        assert_eq!(metrics.fragments_removed, 4);
+        assert_eq!(metrics.fragments_added, 1);
+
+        // The rewritten data is intact: null structs stay null and valid rows
+        // keep their values.
+        let batch = dataset.scan().try_into_batch().await.unwrap();
+        assert_eq!(batch.num_rows(), num_rows);
+        let ids = batch.column_by_name("id").unwrap();
+        let ids = ids.as_primitive::<Int64Type>();
+        let position = batch.column_by_name("position").unwrap().as_struct();
+        let xs = position.column(0).as_primitive::<Float64Type>();
+        let ys = position.column(1).as_primitive::<Float64Type>();
+        for row in 0..num_rows {
+            let i = ids.value(row) as usize;
+            assert_eq!(position.is_valid(row), is_valid(i));
+            if is_valid(i) {
+                assert_eq!((xs.value(row), ys.value(row)), (i as f64, i as f64 * 10.0));
+            }
+        }
+    }
+
     #[tokio::test]
     async fn test_compact_blob_columns() {
         let test_dir = TempStrDir::default();
@@ -7403,6 +7506,135 @@ mod tests {
             panic!("scalar index must be available");
         };
         assert_eq!(current_scalar_index.uuid, original_scalar_uuid);
+    }
+
+    /// A merge translates its sources through the fragment-reuse index, so the merged segment
+    /// is caught up with the manifest it read and must be stamped with it. Stamped with the
+    /// oldest source instead, the trim keeps every reuse version that source predates, forever.
+    #[tokio::test]
+    async fn test_segment_merge_is_stamped_with_the_version_it_was_built_from() {
+        use lance_index::optimize::OptimizeOptions;
+
+        let test_dir = TempStrDir::default();
+        let uri = test_dir.as_str().to_string();
+        let mut data_gen =
+            BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("id".to_owned())));
+        let mut dataset = Dataset::write(
+            data_gen.batch(4_000),
+            &uri,
+            Some(WriteParams {
+                max_rows_per_file: 1_000,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::BTree,
+                Some("id_idx".into()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        // A deferred-remap compaction leaves a reuse version that the base segment predates.
+        dataset.delete("id % 10 == 0").await.unwrap();
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 2_000,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        let reuse_meta = dataset
+            .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+            .await
+            .unwrap()
+            .expect("a deferred-remap compaction leaves a reuse index");
+        let reuse_details = load_frag_reuse_index_details(&dataset, &reuse_meta)
+            .await
+            .unwrap();
+        assert_eq!(reuse_details.versions.len(), 1);
+        let base_version = dataset.load_indices_by_name("id_idx").await.unwrap()[0].dataset_version;
+        assert!(
+            base_version < reuse_details.versions[0].dataset_version,
+            "the base segment must predate the reuse version for the stamp to matter"
+        );
+
+        // New rows for the merge to fold into the base segment.
+        Dataset::write(
+            data_gen.batch(1_000),
+            WriteDestination::Dataset(Arc::new(dataset.clone())),
+            Some(WriteParams {
+                max_rows_per_file: 1_000,
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset.checkout_latest().await.unwrap();
+        let filter = "id >= 1500 and id < 4500".to_owned();
+        let mut oracle = dataset.scan();
+        oracle.filter(&filter).unwrap();
+        oracle.use_scalar_index(false);
+        let expected = oracle.count_rows().await.unwrap();
+
+        let built_from = dataset.manifest.version;
+        dataset
+            .optimize_indices(&OptimizeOptions::default())
+            .await
+            .unwrap();
+        let merged = dataset.load_indices_by_name("id_idx").await.unwrap();
+        assert_eq!(
+            merged.len(),
+            1,
+            "the new rows must merge into the base segment"
+        );
+        assert_eq!(
+            merged[0].dataset_version, built_from,
+            "a merged segment is caught up with the manifest it was built from"
+        );
+
+        cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+        dataset.checkout_latest().await.unwrap();
+        let reuse_meta = dataset
+            .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+            .await
+            .unwrap()
+            .expect("the reuse index survives cleanup, trimmed to zero versions");
+        let details = load_frag_reuse_index_details(&dataset, &reuse_meta)
+            .await
+            .unwrap();
+        assert_eq!(
+            details.versions.len(),
+            0,
+            "the trim must drop the reuse version the merged segment is past"
+        );
+
+        // Nothing translates addresses any more, so only a correct merge answers right, and the
+        // plan must show the merged index answering for every fragment rather than a scan.
+        let fresh = Dataset::open(&uri).await.unwrap();
+        let mut scanner = fresh.scan();
+        scanner.filter(&filter).unwrap();
+        scanner.project::<String>(&[]).unwrap().with_row_id();
+        let plan = scanner.explain_plan(false).await.unwrap();
+        assert!(
+            plan.contains("ScalarIndexQuery"),
+            "the merged index must answer the query: {plan}"
+        );
+        assert!(
+            !plan.contains("LanceScan"),
+            "no fragment may fall back to a scan: {plan}"
+        );
+        assert_eq!(scanner.count_rows().await.unwrap(), expected);
     }
 
     #[tokio::test]
