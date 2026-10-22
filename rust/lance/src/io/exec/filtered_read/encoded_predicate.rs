@@ -297,8 +297,8 @@ impl FilteredReadStream {
         if predicate.column.contains('.') {
             return Ok(None);
         }
-        // Predicate range reads bypass deletion handling. Deleted rows must instead
-        // pass through the ordinary filter, where their predicate values become null.
+        // Predicate range reads bypass deletion handling. Preserve the ordinary
+        // fragment reader's tombstone semantics whenever deleted rows are requested.
         if fragment_read_task.with_deleted_rows
             && fragment_read_task
                 .fragment
@@ -343,8 +343,7 @@ impl FilteredReadStream {
                         selected_rows: 0,
                     }));
                 }
-                // Deleted rows become null in the predicate projection and therefore do not
-                // match, even when every stored value does.
+                // Keep the ordinary read/filter path when tombstones are requested.
                 PrimitivePredicateOutcome::AlwaysTrue if !fragment_read_task.with_deleted_rows => {
                     let selected_rows = total_range_rows(&fragment_read_task.ranges);
                     global_metrics.encoded_predicate_applied.add(1);
@@ -515,7 +514,8 @@ mod tests {
     use crate::dataset::WriteParams;
     use arrow_array::cast::AsArray;
     use arrow_array::{
-        Int32Array, RecordBatch, RecordBatchIterator, UInt32Array, UInt64Array, types::UInt64Type,
+        Array, Int32Array, RecordBatch, RecordBatchIterator, UInt32Array, UInt64Array,
+        types::UInt64Type,
     };
     use arrow_schema::Schema as ArrowSchema;
     use arrow_select::concat::concat_batches;
@@ -676,10 +676,13 @@ mod tests {
         with_deleted_rows: bool,
         expected_encoding: PrimitivePredicateEncoding,
     ) -> (Vec<u64>, Arc<FilteredReadGlobalMetrics>) {
-        let projection = dataset
+        let mut projection = dataset
             .empty_projection()
             .union_column("payload", OnMissing::Error)
             .unwrap();
+        if with_deleted_rows {
+            projection = projection.with_row_id();
+        }
         let planner = Planner::new(Arc::new(ArrowSchema::from(dataset.schema())));
         let filter = planner
             .optimize_expr(planner.parse_filter(filter).unwrap())
@@ -710,6 +713,17 @@ mod tests {
         ));
         let mut payload = Vec::new();
         for fragment in scoped {
+            if with_deleted_rows {
+                assert!(
+                    !fragment
+                        .fragment
+                        .get_deletion_vector()
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .is_empty()
+                );
+            }
             // Prove the real file uses the requested direct encoding; a fallback-only
             // scan would not exercise Boolean results together with rep/def levels.
             let predicate = fragment.encoded_predicate.as_ref().unwrap();
@@ -739,11 +753,15 @@ mod tests {
             .unwrap();
             while let Some(task) = stream.next().await {
                 for batch in task.unwrap().await.unwrap() {
-                    payload.extend_from_slice(
-                        batch.batch()["payload"]
-                            .as_primitive::<UInt64Type>()
-                            .values(),
-                    );
+                    let values = batch.batch()["payload"].as_primitive::<UInt64Type>();
+                    if with_deleted_rows {
+                        let row_ids =
+                            batch.batch()[lance_core::ROW_ID].as_primitive::<UInt64Type>();
+                        for (index, value) in values.values().iter().enumerate() {
+                            assert_eq!(row_ids.is_null(index), value % 3 == 0);
+                        }
+                    }
+                    payload.extend_from_slice(values.values());
                 }
             }
         }
@@ -859,7 +877,8 @@ mod tests {
         let (actual, metrics) = execute_mode_scan(dataset, filter, mode, true, encoding).await;
         assert_eq!(actual, expected);
         assert!(!actual.is_empty());
-        assert!(actual.iter().all(|row| row % 3 != 0));
+        assert!(actual.iter().any(|row| row % 3 == 0));
+        assert_eq!(metrics.encoded_predicate_attempts.value(), 0);
         assert_eq!(metrics.encoded_predicate_applied.value(), 0);
     }
 
@@ -968,12 +987,11 @@ mod tests {
         let (output_rows, metrics) =
             execute_encoded_predicate_test_scan(dataset.clone(), "constant = 7").await;
         assert_eq!(output_rows, num_rows as usize);
-        assert_eq!(metric_value(&metrics, "encoded_predicate_applied"), 0);
-        assert_eq!(metric_value(&metrics, "encoded_predicate_rejected"), 4);
-        assert_eq!(
-            metric_value(&metrics, "encoded_predicate_sample_rows"),
-            4 * ENCODED_PREDICATE_AUTO_SAMPLE_ROWS as usize
-        );
+        // The current default format writes structural constant layouts, whose
+        // non-null all-match outcome can be proven without sampling.
+        assert_eq!(metric_value(&metrics, "encoded_predicate_applied"), 4);
+        assert_eq!(metric_value(&metrics, "encoded_predicate_rejected"), 0);
+        assert_eq!(metric_value(&metrics, "encoded_predicate_sample_rows"), 0);
 
         let (output_rows, metrics) =
             execute_encoded_predicate_test_scan(dataset.clone(), "rle = 1").await;
