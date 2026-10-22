@@ -34,6 +34,49 @@ impl FixedWidthGeneralPerValueCompressor {
     pub(crate) fn new(child: Box<dyn PerValueCompressor>, compression: CompressionConfig) -> Self {
         Self { child, compression }
     }
+
+    /// Frame already encoded fixed-width rows without running their child codec again.
+    pub(crate) fn compress_encoded(
+        data: FixedWidthDataBlock,
+        encoding: CompressiveEncoding,
+        compression: CompressionConfig,
+    ) -> Result<(PerValueDataBlock, CompressiveEncoding)> {
+        let width = usize::try_from(data.bits_per_value / 8)
+            .map_err(|_| Error::invalid_input("Per-row byte width exceeds usize"))?;
+        let rows = usize::try_from(data.num_values)
+            .map_err(|_| Error::invalid_input("Per-row value count exceeds usize"))?;
+        if !data.bits_per_value.is_multiple_of(8)
+            || rows.checked_mul(width) != Some(data.data.len())
+        {
+            return Err(Error::invalid_input(format!(
+                "Invalid fixed-width rows: {} values, {} bits per value, {} bytes",
+                data.num_values,
+                data.bits_per_value,
+                data.data.len()
+            )));
+        }
+        let compressor = GeneralBufferCompressor::get_compressor(compression)?;
+        let mut compressed = Vec::with_capacity(data.data.len());
+        let num_offsets = rows
+            .checked_add(1)
+            .ok_or_else(|| Error::invalid_input("Per-row offset count exceeds usize"))?;
+        let mut offsets = Vec::with_capacity(num_offsets);
+        offsets.push(0_u64);
+        for row in 0..rows {
+            compressor.compress(&data.data[row * width..(row + 1) * width], &mut compressed)?;
+            offsets.push(compressed.len() as u64);
+        }
+        Ok((
+            PerValueDataBlock::Variable(VariableWidthBlock {
+                data: LanceBuffer::from(compressed),
+                offsets: LanceBuffer::reinterpret_vec(offsets),
+                bits_per_offset: 64,
+                num_values: data.num_values,
+                block_info: BlockInfo::new(),
+            }),
+            EncodingUtils::wrapped(compression, encoding)?,
+        ))
+    }
 }
 
 impl PerValueCompressor for FixedWidthGeneralPerValueCompressor {
@@ -56,41 +99,7 @@ impl PerValueCompressor for FixedWidthGeneralPerValueCompressor {
                 "Per-row general compression requires fixed-width rows",
             ));
         };
-        let width = usize::try_from(data.bits_per_value / 8)
-            .map_err(|_| Error::invalid_input("Per-row byte width exceeds usize"))?;
-        let rows = usize::try_from(data.num_values)
-            .map_err(|_| Error::invalid_input("Per-row value count exceeds usize"))?;
-        if !data.bits_per_value.is_multiple_of(8)
-            || rows.checked_mul(width) != Some(data.data.len())
-        {
-            return Err(Error::invalid_input(format!(
-                "Invalid fixed-width rows: {} values, {} bits per value, {} bytes",
-                data.num_values,
-                data.bits_per_value,
-                data.data.len()
-            )));
-        }
-        let compressor = GeneralBufferCompressor::get_compressor(self.compression)?;
-        let mut compressed = Vec::with_capacity(data.data.len());
-        let num_offsets = rows
-            .checked_add(1)
-            .ok_or_else(|| Error::invalid_input("Per-row offset count exceeds usize"))?;
-        let mut offsets = Vec::with_capacity(num_offsets);
-        offsets.push(0_u64);
-        for row in 0..rows {
-            compressor.compress(&data.data[row * width..(row + 1) * width], &mut compressed)?;
-            offsets.push(compressed.len() as u64);
-        }
-        Ok((
-            PerValueDataBlock::Variable(VariableWidthBlock {
-                data: LanceBuffer::from(compressed),
-                offsets: LanceBuffer::reinterpret_vec(offsets),
-                bits_per_offset: 64,
-                num_values: data.num_values,
-                block_info: BlockInfo::new(),
-            }),
-            EncodingUtils::wrapped(self.compression, encoding)?,
-        ))
+        Self::compress_encoded(data, encoding, self.compression)
     }
 }
 

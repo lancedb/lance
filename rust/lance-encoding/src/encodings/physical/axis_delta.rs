@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Integer prediction along a logical tensor axis, with bounded per-page selection.
+//! First-order differential coding along a tensor axis, with bounded per-page selection.
 
 #[cfg(target_arch = "x86_64")]
 mod x86_64;
@@ -20,7 +20,7 @@ use super::{
 };
 use crate::{
     buffer::LanceBuffer,
-    compression::FixedPerValueDecompressor,
+    compression::{FixedPerValueDecompressor, try_raw_per_value},
     compression_config::{AxisDeltaMode, CompressionFieldParams},
     data::{DataBlock, FixedWidthDataBlock},
     encodings::logical::primitive::fullzip::{PerValueCompressor, PerValueDataBlock},
@@ -34,7 +34,7 @@ const META_KEY: &str = "lance-encoding:axis-delta";
 // Whole frames preserve predictor resets and the downstream codec's dictionary scope.
 const MAX_SAMPLE_ROWS: usize = 4;
 const MAX_SAMPLE_BYTES: usize = 4 * 1024 * 1024;
-// Prediction adds decoding work; marginal sample savings do not justify that cost.
+// Compression and prediction add decoding work; marginal savings do not justify it.
 const MIN_SAVING_PERCENT: u128 = 5;
 
 #[derive(Debug, Clone, Copy)]
@@ -357,13 +357,16 @@ pub fn try_axis_delta_per_value(
     if implicit && compression.is_none() {
         return Ok(None);
     }
+    if auto && !matches!(data, DataBlock::FixedSizeList(_)) {
+        return Ok(None);
+    }
     let (axis_length, inner_stride) = match shape(field, axis) {
-        Err(_) if implicit => return Ok(None),
-        Err(Error::NotSupported { .. }) if auto => return Ok(None),
+        Err(_) if implicit => return Ok(try_raw_per_value(data)),
+        Err(Error::NotSupported { .. }) if auto => return Ok(try_raw_per_value(data)),
         result => result?,
     };
     if auto && (compression.is_none() || axis_length == 1) {
-        return Ok(None);
+        return Ok(try_raw_per_value(data));
     }
     // ValueEncoder owns nested FSL shape and validity. A predictor cannot operate
     // on its packed validity bytes, so reject such children before flattening.
@@ -373,7 +376,7 @@ pub fn try_axis_delta_per_value(
     }
     if !matches!(child, DataBlock::FixedWidth(_)) {
         if auto {
-            return Ok(None);
+            return Ok(try_raw_per_value(data));
         }
         return Err(Error::not_supported(
             "AxisDelta requires tensor elements without nulls",
@@ -385,7 +388,11 @@ pub fn try_axis_delta_per_value(
         auto,
         compression,
     });
-    Ok(Some(if let Some(compression) = compression {
+    Ok(Some(if auto {
+        // Auto owns the raw candidate as well as both compressed candidates.
+        // Wrapping it unconditionally would compress even a rejected page.
+        predictor
+    } else if let Some(compression) = compression {
         Box::new(FixedWidthGeneralPerValueCompressor::new(
             predictor,
             compression,
@@ -403,6 +410,13 @@ struct AxisDeltaCompressor {
     compression: Option<CompressionConfig>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Selection {
+    Raw,
+    Compressed,
+    Delta,
+}
+
 impl AxisDeltaCompressor {
     fn select(
         &self,
@@ -411,7 +425,7 @@ impl AxisDeltaCompressor {
         baseline: &CompressiveEncoding,
         predicted: &CompressiveEncoding,
         validity: Option<&BooleanBuffer>,
-    ) -> Result<bool> {
+    ) -> Result<Selection> {
         let start = log::log_enabled!(target: "lance_encoding::axis_delta", log::Level::Debug)
             .then(Instant::now);
         let rows = usize::try_from(data.num_values)
@@ -426,7 +440,7 @@ impl AxisDeltaCompressor {
             .min(MAX_SAMPLE_BYTES / layout.row_bytes())
             .min(valid_rows);
         if count == 0 {
-            return Ok(false);
+            return Ok(Selection::Raw);
         }
         let config = self
             .compression
@@ -470,24 +484,42 @@ impl AxisDeltaCompressor {
                 .saturating_mul(valid_rows as u64)
                 .div_ceil(count as u64)
         };
-        // Offsets and structural control words are identical for these two
-        // generally compressed candidates, so their common cost cancels out.
+        let raw_wire = wire_bytes(
+            baseline,
+            true,
+            &[(valid_rows as u64).saturating_mul(layout.row_bytes() as u64)],
+            BlockCost::default(),
+        );
+        // General per-value frames use a 64-bit length for each visible value.
+        // Raw fixed-width values need no length. Structural control words are
+        // common to the candidates and are excluded from this estimate.
+        let addressing_bytes = (valid_rows as u64).saturating_mul(8);
         let baseline_wire = wire_bytes(
             &EncodingUtils::wrapped(config, baseline.clone())?,
             true,
-            &[projected(baseline_bytes)],
+            &[projected(baseline_bytes).saturating_add(addressing_bytes)],
             BlockCost::default(),
         );
         let delta_wire = wire_bytes(
             &EncodingUtils::wrapped(config, predicted.clone())?,
             true,
-            &[projected(delta_bytes)],
+            &[projected(delta_bytes).saturating_add(addressing_bytes)],
             BlockCost::default(),
         );
-        let selected =
-            (delta_wire as u128) * 100 <= (baseline_wire as u128) * (100 - MIN_SAVING_PERCENT);
+        let saves_enough = |candidate: u64, baseline: u64| {
+            (candidate as u128) * 100 <= (baseline as u128) * (100 - MIN_SAVING_PERCENT)
+        };
+        let mut selected = Selection::Raw;
+        let mut best_wire = raw_wire;
+        if saves_enough(baseline_wire, best_wire) {
+            selected = Selection::Compressed;
+            best_wire = baseline_wire;
+        }
+        if saves_enough(delta_wire, best_wire) {
+            selected = Selection::Delta;
+        }
         if let Some(start) = start {
-            log::debug!(target: "lance_encoding::axis_delta", "rows={} bytes={} baseline={} delta={} selected={} nanos={}", count, count * layout.row_bytes(), baseline_wire, delta_wire, selected, start.elapsed().as_nanos());
+            log::debug!(target: "lance_encoding::axis_delta", "rows={} bytes={} raw={} baseline={} delta={} selected={} encoding={:?} nanos={}", count, count * layout.row_bytes(), raw_wire, baseline_wire, delta_wire, selected == Selection::Delta, selected, start.elapsed().as_nanos());
         }
         Ok(selected)
     }
@@ -520,8 +552,25 @@ impl PerValueCompressor for AxisDeltaCompressor {
         let predicted = CompressiveEncoding {
             compression: Some(Compression::AxisDelta(Box::new(description))),
         };
-        if self.auto && !self.select(&data, layout, &original, &predicted, validity)? {
-            return Ok((PerValueDataBlock::Fixed(data), original));
+        if self.auto {
+            let selected = self.select(&data, layout, &original, &predicted, validity)?;
+            if selected == Selection::Raw {
+                return Ok((PerValueDataBlock::Fixed(data), original));
+            }
+            let description = if selected == Selection::Delta {
+                layout.transform(&mut data, false)?;
+                predicted
+            } else {
+                original
+            };
+            let compression = self.compression.ok_or_else(|| {
+                Error::internal("Automatic AxisDelta requires general compression")
+            })?;
+            return FixedWidthGeneralPerValueCompressor::compress_encoded(
+                data,
+                description,
+                compression,
+            );
         }
         layout.transform(&mut data, false)?;
         Ok((PerValueDataBlock::Fixed(data), predicted))
@@ -704,6 +753,58 @@ mod tests {
         }
     }
 
+    fn assert_raw(
+        data: &DataBlock,
+        description: &CompressiveEncoding,
+        encoded: &FixedWidthDataBlock,
+    ) {
+        let (raw, expected) = ValueEncoder::default().compress(data.clone()).unwrap();
+        let PerValueDataBlock::Fixed(raw) = raw else {
+            panic!("expected raw rows")
+        };
+        assert_eq!(*description, expected);
+        assert_eq!(encoded.data.as_ref(), raw.data.as_ref());
+        assert_eq!(encoded.bits_per_value, raw.bits_per_value);
+        assert_eq!(encoded.num_values, raw.num_values);
+    }
+
+    #[rstest::rstest]
+    fn direct_compression_wins(#[values("lz4", "zstd")] codec: &str) {
+        let (field, mut data) = fixture(9, 4096, true);
+        let DataBlock::FixedSizeList(list) = &mut data else {
+            panic!()
+        };
+        let DataBlock::FixedWidth(values) = list.child.as_mut() else {
+            panic!()
+        };
+        // A short random pattern repeats within each row. Direct compression
+        // already captures that repetition; prediction adds no useful savings.
+        let pattern = values.data.as_ref()[..128].to_vec();
+        values.data = LanceBuffer::from(pattern.repeat(values.data.len() / pattern.len()));
+        let params = CompressionFieldParams {
+            compression: Some(codec.into()),
+            ..Default::default()
+        };
+        let (encoded, description) = try_axis_delta_per_value(&field, &data, &params)
+            .unwrap()
+            .unwrap()
+            .compress(data.clone())
+            .unwrap();
+        assert!(!has_delta(&description));
+        let PerValueDataBlock::Variable(encoded) = encoded else {
+            panic!("expected compression")
+        };
+        let decoded = DefaultDecompressionStrategy::default()
+            .create_variable_per_value_decompressor(&description)
+            .unwrap()
+            .decompress(encoded)
+            .unwrap();
+        assert_eq!(
+            decoded.into_arrow(field.data_type(), true).unwrap(),
+            data.into_arrow(field.data_type(), true).unwrap()
+        );
+    }
+
     #[rstest::rstest]
     fn automatic_selection(
         #[values("lz4", "zstd")] codec: &str,
@@ -725,14 +826,23 @@ mod tests {
                 .unwrap();
             let (encoded, description) = compressor.compress(data.clone()).unwrap();
             assert_eq!(has_delta(&description), expected);
-            let PerValueDataBlock::Variable(encoded) = encoded else {
-                panic!("expected general compression");
+            let strategy = DefaultDecompressionStrategy::default();
+            let decoded = match encoded {
+                PerValueDataBlock::Fixed(encoded) => {
+                    assert!(noise && matches!(mode, AxisDeltaMode::Auto { .. }));
+                    assert_raw(&data, &description, &encoded);
+                    strategy
+                        .create_fixed_per_value_decompressor(&description)
+                        .unwrap()
+                        .decompress(encoded, 9)
+                        .unwrap()
+                }
+                PerValueDataBlock::Variable(encoded) => strategy
+                    .create_variable_per_value_decompressor(&description)
+                    .unwrap()
+                    .decompress(encoded)
+                    .unwrap(),
             };
-            let decoded = DefaultDecompressionStrategy::default()
-                .create_variable_per_value_decompressor(&description)
-                .unwrap()
-                .decompress(encoded)
-                .unwrap();
             assert_eq!(
                 decoded.into_arrow(field.data_type(), true).unwrap(),
                 data.clone().into_arrow(field.data_type(), true).unwrap()
@@ -778,10 +888,15 @@ mod tests {
             "hidden smooth rows would bias this sample"
         );
         let validity = BooleanBuffer::from_iter((0..9).map(|i| ![0, 2, 5, 8].contains(&i)));
-        let (_, description) = compressor
-            .compress_with_validity(data, Some(&validity))
-            .unwrap();
-        assert!(!has_delta(&description));
+        for validity in [validity, BooleanBuffer::new_unset(9)] {
+            let (encoded, description) = compressor
+                .compress_with_validity(data.clone(), Some(&validity))
+                .unwrap();
+            let PerValueDataBlock::Fixed(encoded) = encoded else {
+                panic!("expected raw rows")
+            };
+            assert_raw(&data, &description, &encoded);
+        }
     }
 
     #[test]
@@ -793,12 +908,15 @@ mod tests {
                 compression: Some("zstd".into()),
                 ..Default::default()
             };
-            let (_, description) = try_axis_delta_per_value(&field, &data, &params)
+            let (encoded, description) = try_axis_delta_per_value(&field, &data, &params)
                 .unwrap()
                 .unwrap()
-                .compress(data)
+                .compress(data.clone())
                 .unwrap();
-            assert!(!has_delta(&description));
+            let PerValueDataBlock::Fixed(encoded) = encoded else {
+                panic!("expected raw rows")
+            };
+            assert_raw(&data, &description, &encoded);
         }
     }
 
@@ -947,11 +1065,15 @@ mod tests {
                 axis_delta: Some(AxisDeltaMode::Auto { axis: Some(0) }),
                 ..params.clone()
             };
-            assert!(
-                try_axis_delta_per_value(&field, &data, &auto)
-                    .unwrap()
-                    .is_none()
-            );
+            let (encoded, description) = try_axis_delta_per_value(&field, &data, &auto)
+                .unwrap()
+                .unwrap()
+                .compress(data.clone())
+                .unwrap();
+            let PerValueDataBlock::Fixed(encoded) = encoded else {
+                panic!("expected raw rows")
+            };
+            assert_raw(&data, &description, &encoded);
             let error = try_axis_delta_per_value(&field, &data, &params).unwrap_err();
             assert!(matches!(error, Error::NotSupported { .. }));
             assert!(error.to_string().contains("AxisDelta"));

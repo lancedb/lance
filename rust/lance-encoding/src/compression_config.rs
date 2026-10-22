@@ -59,7 +59,8 @@ impl BssMode {
 pub enum AxisDeltaMode {
     /// Keep the existing tensor encoding without prediction.
     Off,
-    /// Sample complete tensors and use prediction only when compressed size improves.
+    /// Sample complete tensors to choose raw, direct compression, or prediction plus compression.
+    /// Keep raw encoding when neither compressed candidate saves enough space.
     /// `None` tries the longest physical dimension, choosing the innermost on ties.
     /// `Some(axis)` selects a zero-based logical axis instead.
     Auto { axis: Option<usize> },

@@ -2623,6 +2623,8 @@ mod tests {
     #[case("tensor_axis-auto_zstd")]
     #[case("tensor_axis-off_zstd")]
     #[case("tensor_axis-auto_dense_lz4")]
+    #[case("tensor_axis-auto_noise_zstd")]
+    #[case("tensor_axis-auto_noise_dense_lz4")]
     #[tokio::test]
     async fn sparse_file_writer_reader_scan_range_and_take_roundtrip(#[case] kind: &str) {
         let fs = FsFixture::default();
@@ -2803,12 +2805,22 @@ mod tests {
                 if kind.contains("dense") {
                     metadata.insert(STRUCTURAL_ENCODING_META_KEY.into(), "fullzip".into());
                 }
+                let mut noise = 137_u32;
                 vectors = Arc::new(FixedSizeListArray::new(
                     Arc::new(Field::new("item", DataType::Int32, true)),
                     768,
                     Arc::new(arrow_array::Int32Array::from(
                         (0..rows * 768)
-                            .map(|i| (i * 131) - 100_000)
+                            .map(|i| {
+                                if kind.contains("noise") {
+                                    noise ^= noise << 13;
+                                    noise ^= noise >> 17;
+                                    noise ^= noise << 5;
+                                    noise as i32
+                                } else {
+                                    (i * 131) - 100_000
+                                }
+                            })
                             .collect::<Vec<_>>(),
                     )),
                     Some(NullBuffer::from(
