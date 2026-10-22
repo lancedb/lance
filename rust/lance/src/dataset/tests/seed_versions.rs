@@ -15,7 +15,6 @@ use arrow_ipc::reader::FileReader as IpcReader;
 use arrow_ipc::writer::FileWriter as IpcWriter;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use bytes::Bytes;
-use lance_core::Error;
 use lance_core::utils::tempfile::TempStrDir;
 use lance_file::reader::{FileReader, FileReaderOptions};
 use lance_file::versions as file_versions;
@@ -427,11 +426,15 @@ async fn test_index_update_scans_invalid_version_0_seed() {
     }
 }
 
-/// An index update that harvests a future-version seed fails before
-/// publishing anything; it never covers the fragment with statistics it
-/// could not read.
+/// An index update that harvests a future-version seed treats it as
+/// unavailable and scans that fragment's column, while a valid version 1
+/// seed beside it is reused; the published segment is version 1 and its
+/// answers equal a scan. The decoder itself still refuses the unknown
+/// version (see `test_parse_seed_rejects_corrupt_and_unknown`).
 #[tokio::test]
-async fn test_index_update_refuses_unsupported_seed_version() {
+async fn test_index_update_scans_unsupported_seed_version() {
+    use crate::index::scalar::zonemap::SEED_REUSE_REPORTS;
+
     let dir = TempStrDir::default();
     let dataset = seeded_dataset(dir.as_str(), &["val"]).await;
     let crafted = rows(TRAINING_ROWS, ROWS_PER_FILE);
@@ -440,28 +443,40 @@ async fn test_index_update_refuses_unsupported_seed_version() {
         relabel_version(&seed_bytes("val", crafted.column(0)), "2"),
     )];
     let mut dataset = commit_crafted_fragment(dataset, crafted, &seeds).await;
-    let version_before = dataset.manifest.version;
-    let before = dataset.load_indices().await.unwrap();
+    let unreadable = dataset.fragments().last().unwrap().id;
+    append(&mut dataset, TRAINING_ROWS + ROWS_PER_FILE).await;
+    let seeded = dataset.fragments().last().unwrap().id;
+    assert_ne!(unreadable, seeded);
 
-    let error = dataset
-        .optimize_indices(&OptimizeOptions::default())
-        .await
-        .unwrap_err();
-    assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+    let reports = SEED_REUSE_REPORTS
+        .scope(std::sync::Mutex::new(Vec::new()), async {
+            dataset
+                .optimize_indices(&OptimizeOptions::default())
+                .await
+                .unwrap();
+            SEED_REUSE_REPORTS.with(|reports| reports.lock().unwrap().clone())
+        })
+        .await;
+    assert_eq!(reports.len(), 1, "{reports:?}");
+    assert_eq!(reports[0].scanned_fragments, vec![unreadable]);
+    assert_eq!(reports[0].reused_fragments, vec![seeded]);
 
     let reopened = Dataset::open(dir.as_str()).await.unwrap();
-    assert_eq!(reopened.manifest.version, version_before);
-    let after = reopened.load_indices().await.unwrap();
-    assert_eq!(before.len(), after.len());
-    for (before, after) in before.iter().zip(after.iter()) {
-        assert_eq!(before.uuid, after.uuid);
-        assert_eq!(before.fragment_bitmap, after.fragment_bitmap);
-    }
-    // The uncovered fragment is still scanned by indexed queries.
+    let indices = reopened.load_indices().await.unwrap();
+    assert_eq!(indices.len(), 1, "{indices:?}");
+    assert_eq!(indices[0].index_version, 1);
     assert_eq!(
-        count(&reopened, "val > 20", true).await,
-        count(&reopened, "val > 20", false).await
+        indices[0].fragment_bitmap.as_ref().unwrap(),
+        reopened.fragment_bitmap.as_ref(),
+        "every fragment is covered after the update"
     );
+    for filter in ["val > 20", "val = 70", "val < 100 AND val > 30"] {
+        assert_eq!(
+            count(&reopened, filter, true).await,
+            count(&reopened, filter, false).await,
+            "{filter}"
+        );
+    }
 }
 
 /// A file carrying a future-version seed is never read by a later write:

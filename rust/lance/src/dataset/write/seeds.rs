@@ -16,15 +16,20 @@
 //! ([`apply_seed_feature_flags`]), so no manifest references a seed its flags
 //! do not announce.
 
+use std::collections::{HashMap, HashSet};
+
 use arrow_array::RecordBatch;
 use lance_core::Result;
 use lance_core::datatypes::Schema;
 use lance_file::version::ConcreteFileVersion;
+use lance_index::pbold;
 use lance_index::scalar::seed::IndexSeedWriter;
+use lance_index::scalar::zonemap::ZoneMapSeedWriter;
 use lance_table::format::{IndexMetadata, Manifest};
 
 use super::GenericWriter;
 use crate::Dataset;
+use crate::index::scalar::zonemap::stored_null_bitmap_policy;
 use crate::index::scalar::{IndexDetails, fetch_index_details};
 use crate::index::{index_is_usable, load_all_indices};
 
@@ -135,6 +140,10 @@ async fn seed_writers_for(
     schema: &Schema,
 ) -> Result<Vec<Box<dyn IndexSeedWriter>>> {
     let mut writers: Vec<Box<dyn IndexSeedWriter>> = Vec::new();
+    // Zone map requirements per column: every ZoneMap index on the column
+    // that collects seeds, as (index name, rows_per_zone, null positions).
+    let mut zone_map_columns: HashMap<i32, Vec<(String, u64, bool)>> = HashMap::new();
+    let mut other_columns: HashSet<i32> = HashSet::new();
     for index in indices.iter().filter(|index| index_is_usable(index)) {
         // A covered index lists its carried columns in `fields` too; the
         // seed writer keys on the single keyed column. System indices
@@ -151,6 +160,24 @@ async fn seed_writers_for(
         let Ok(index_details) = fetch_index_details(dataset, &field.name, index).await else {
             continue;
         };
+        if let Ok(zone_map) = index_details.to_msg::<pbold::ZoneMapIndexDetails>() {
+            // Seeds follow the index's configuration: its zone size from
+            // the details and its null-position policy from the index
+            // file (one cached footer read; see `stored_null_bitmap_policy`).
+            if !zone_map.use_seeds.unwrap_or(false) {
+                continue;
+            }
+            let Some(rows_per_zone) = zone_map.rows_per_zone else {
+                continue;
+            };
+            let positions = stored_null_bitmap_policy(dataset, index).await?;
+            zone_map_columns.entry(field_id).or_default().push((
+                index.name.clone(),
+                rows_per_zone,
+                positions,
+            ));
+            continue;
+        }
         let details = IndexDetails(index_details.clone());
         let Ok(plugin) = details.get_plugin() else {
             continue;
@@ -159,8 +186,51 @@ async fn seed_writers_for(
             .create_seed_writer(&field.name, &field.data_type(), &index_details)
             .await?
         {
+            other_columns.insert(field_id);
             writers.push(writer);
         }
+    }
+    for (field_id, consumers) in zone_map_columns {
+        let Some(field) = schema.fields.iter().find(|f| f.id == field_id) else {
+            continue;
+        };
+        if other_columns.contains(&field_id) {
+            // One seed key per column; a zone map and another plugin's
+            // seed cannot both be served. Left unresolved rather than
+            // guessing: the zone maps scan their new fragments.
+            log::warn!(
+                "column {} has a zone map and another seeded index: no zone map seed is written for it",
+                field.name
+            );
+            continue;
+        }
+        // Several zone maps on one column share one seed: the finest zone
+        // size serves every coarser index through whole-record reuse, and
+        // positions are collected if any of them keeps a bitmap. Each
+        // index still cuts its own zones by its own configuration.
+        let Some(rows_per_zone) = consumers.iter().map(|c| c.1).min() else {
+            continue;
+        };
+        let positions = consumers.iter().any(|c| c.2);
+        if consumers
+            .iter()
+            .any(|c| c.1 != rows_per_zone || c.2 != positions)
+        {
+            log::info!(
+                "column {}: zone maps {:?} share one seed of {rows_per_zone} rows per record{}",
+                field.name,
+                consumers.iter().map(|c| c.0.as_str()).collect::<Vec<_>>(),
+                if positions {
+                    " with null positions"
+                } else {
+                    ""
+                }
+            );
+        }
+        writers.push(Box::new(
+            ZoneMapSeedWriter::new(&field.name, rows_per_zone, field.data_type())?
+                .with_null_positions(positions),
+        ));
     }
     Ok(writers)
 }
