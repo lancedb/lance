@@ -2756,6 +2756,7 @@ mod tests {
                 STRUCTURAL_ENCODING_SPARSE.to_string(),
             )]);
             if kind == "tensor_zstd" {
+                metadata.insert("lance-encoding:axis-delta".into(), "off".into());
                 vectors = Arc::new(FixedSizeListArray::new(
                     Arc::new(Field::new("item", DataType::Int32, true)),
                     64,
@@ -2883,6 +2884,19 @@ mod tests {
                     else {
                         panic!("expected zipped tensors")
                     };
+                    if kind.contains("noise") {
+                        assert!(matches!(
+                            values.compression.as_ref().unwrap().compression,
+                            Some(metadata::compressive_encoding::Compression::FixedSizeList(
+                                _
+                            ))
+                        ));
+                        assert!(matches!(
+                            values.addressing,
+                            Some(lance_encoding::format::pb23::zipped_values::Addressing::BitsPerValue(_))
+                        ));
+                        continue;
+                    }
                     let Some(metadata::compressive_encoding::Compression::General(general)) =
                         &values.compression.as_ref().unwrap().compression
                     else {
