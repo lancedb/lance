@@ -21,36 +21,29 @@ The **data file** stores the five-child descriptor schema, regardless of the
 logical shape. The logical `data`, `uri`, `position`, and `size` children are not
 separate stored columns.
 
+In the schemas below, `string` denotes UTF-8, and `u8`, `u32`, and `u64` denote
+unsigned integers of the indicated bit width.
+
 ### Table Schema
 
-```python
-import pyarrow as pa
+The minimal schema is:
 
-minimal_input_schema = pa.schema([
-    pa.field(
-        "blob",
-        pa.struct([
-            pa.field("data", pa.large_binary(), nullable=True),
-            pa.field("uri", pa.utf8(), nullable=True),
-        ]),
-        nullable=True,
-        metadata={"ARROW:extension:name": "lance.blob.v2"},
-    ),
-])
+```text
+blob: struct (nullable)
+    <metadata>: {"ARROW:extension:name": "lance.blob.v2"}
+    data: large_binary (nullable)
+    uri:        string (nullable)
+```
 
-complete_input_schema = pa.schema([
-    pa.field(
-        "blob",
-        pa.struct([
-            pa.field("data", pa.large_binary(), nullable=True),
-            pa.field("uri", pa.utf8(), nullable=True),
-            pa.field("position", pa.uint64(), nullable=True),
-            pa.field("size", pa.uint64(), nullable=True),
-        ]),
-        nullable=True,
-        metadata={"ARROW:extension:name": "lance.blob.v2"},
-    ),
-])
+The complete schema is:
+
+```text
+blob: struct (nullable)
+    <metadata>: {"ARROW:extension:name": "lance.blob.v2"}
+    data:     large_binary (nullable)
+    uri:            string (nullable)
+    position:          u64 (nullable)
+    size:              u64 (nullable)
 ```
 
 A logical blob field:
@@ -71,26 +64,17 @@ that structure. A null list, empty list, null blob, and empty blob remain distin
 
 ### Data File Schema
 
-```python
-import pyarrow as pa
-
-descriptor_schema = pa.schema([
-    pa.field(
-        "blob",
-        pa.struct([
-            pa.field("kind", pa.uint8(), nullable=False),
-            pa.field("position", pa.uint64(), nullable=False),
-            pa.field("size", pa.uint64(), nullable=False),
-            pa.field("blob_id", pa.uint32(), nullable=False),
-            pa.field("blob_uri", pa.utf8(), nullable=False),
-        ]),
-        nullable=True,
-        metadata={
-            "lance-encoding:blob": "true",
-            "lance-encoding:packed": "true",
-        },
-    ),
-])
+```text
+blob: struct (nullable)
+    <metadata>: {
+        "lance-encoding:blob": "true",
+        "lance-encoding:packed": "true"
+    }
+    kind:         u8 (non-nullable)
+    position:    u64 (non-nullable)
+    size:        u64 (non-nullable)
+    blob_id:     u32 (non-nullable)
+    blob_uri: string (non-nullable)
 ```
 
 The outer name and nullability follow the blob field. It maps to one physical
