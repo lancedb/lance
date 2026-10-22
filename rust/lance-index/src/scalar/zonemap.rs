@@ -1091,7 +1091,7 @@ impl ZoneMapIndex {
         for seed in seeds {
             let (mut zones, seed_null_bitmap) =
                 ZoneMapSeedWriter::deserialize_seed(seed.fragment_id, &seed.bytes)?;
-            if !admit_seed_zones_for_v1(&mut zones) {
+            if !admit_seed_zones_for_v1(&mut zones, &self.data_type) {
                 return Ok(None);
             }
             // The statistics stand in for a scan of the fragment, so they
@@ -1105,10 +1105,13 @@ impl ZoneMapIndex {
                     Error::invalid_input("seed zone lengths overflow u64".to_string())
                 })?;
             if covered != seed.physical_rows {
-                return Err(Error::invalid_input(format!(
-                    "seed for fragment {} covers {} rows but the fragment holds {}",
-                    seed.fragment_id, covered, seed.physical_rows
-                )));
+                log::debug!(
+                    "not reusing the zone map seed of fragment {}: it covers {covered} rows but \
+                     the fragment holds {}",
+                    seed.fragment_id,
+                    seed.physical_rows
+                );
+                return Ok(None);
             }
             new_zones.append(&mut zones);
 
@@ -1156,31 +1159,59 @@ impl ZoneMapIndex {
     }
 }
 
-/// Admit decoded seed zones into a version 1 file. A version 0 record has
-/// no sign split: without NaNs the split is provably zero and the record is
-/// admitted; with NaNs its ordinary maximum is hidden behind the marker and
-/// the split is unknown, so `false` tells the caller to scan.
-fn admit_seed_zones_for_v1(zones: &mut [ZoneMapStatistics]) -> bool {
+/// Admit decoded seed zones into a version 1 file; `false` tells the caller
+/// to scan instead. A version 0 record has no sign split: without NaNs the
+/// split is provably zero and the record is admitted; with NaNs its
+/// ordinary maximum is hidden behind the marker and the split is unknown.
+/// Every admitted record must also satisfy the version 1 zone invariants,
+/// which the strict decoder only checks for version 1 seeds.
+fn admit_seed_zones_for_v1(zones: &mut [ZoneMapStatistics], data_type: &DataType) -> bool {
     for zone in zones.iter_mut() {
-        if zone.negative_nan_count.is_none() {
-            if zone.nan_count != 0 {
-                return false;
-            }
-            zone.negative_nan_count = Some(0);
+        let negative = match zone.negative_nan_count {
+            Some(negative) => negative,
+            None if zone.nan_count == 0 => 0,
+            None => return false,
+        };
+        if let Some(violation) = v1_zone_violation(
+            &zone.min,
+            &zone.max,
+            zone.null_count,
+            zone.nan_count,
+            negative,
+            zone.bound.length as u64,
+            data_type.is_nested(),
+        ) {
+            log::debug!(
+                "not reusing the zone map seed of fragment {}: record at {} has {violation}",
+                zone.bound.fragment_id,
+                zone.bound.start
+            );
+            return false;
         }
+        zone.negative_nan_count = Some(negative);
     }
     true
 }
 
+/// The destination runs of `zone` under `remapper`. With `fragment_filter`,
+/// rows that land outside those fragments are dropped before the runs are
+/// built, so a run the caller would not keep can neither fail here nor be
+/// checked later.
 fn remap_zone(
     zone: &ZoneMapStatistics,
     remapper: &dyn RowIdRemapper,
     remapped_null_rows: Option<&RowAddrTreeMap>,
     is_nested: bool,
+    fragment_filter: Option<&RoaringBitmap>,
 ) -> Result<Vec<ZoneMapStatistics>> {
     let zone_start = (zone.bound.fragment_id << 32).saturating_add(zone.bound.start);
     let mut remapped = (0..zone.bound.length as u64)
         .filter_map(|offset| remapper.remap_row_id(zone_start.saturating_add(offset)))
+        .filter(|row_id| {
+            fragment_filter.is_none_or(|filter| {
+                u32::try_from(row_id >> 32).is_ok_and(|fragment| filter.contains(fragment))
+            })
+        })
         .collect::<Vec<_>>();
     remapped.sort_unstable();
     remapped.dedup();
@@ -1337,18 +1368,21 @@ pub async fn merge_zonemap_indices(
                         remapper,
                         remapped_null_rows.as_ref(),
                         source.data_type.is_nested(),
+                        Some(fragment_filter),
                     )
                 },
             )?;
-            if version == ZoneMapIndexVersion::V1 {
-                for remapped in &source_zones {
-                    reject_inexact_remapped_zone(zone, remapped, remapped_null_rows.is_some())?;
-                }
-            }
-            zones.extend(source_zones.into_iter().filter(|zone| {
+            // Only the runs that are kept are held to the version 1 contract.
+            let retained = source_zones.into_iter().filter(|zone| {
                 u32::try_from(zone.bound.fragment_id)
                     .is_ok_and(|fragment_id| fragment_filter.contains(fragment_id))
-            }));
+            });
+            for remapped in retained {
+                if version == ZoneMapIndexVersion::V1 {
+                    reject_inexact_remapped_zone(zone, &remapped, remapped_null_rows.is_some())?;
+                }
+                zones.push(remapped);
+            }
         }
         match remapped_null_rows {
             Some(mut filtered) => {
@@ -3065,7 +3099,7 @@ mod tests {
         remapped_null_rows.insert(new_start + 1);
 
         assert_eq!(
-            remap_zone(&zone, &remapper, Some(&remapped_null_rows), false).unwrap(),
+            remap_zone(&zone, &remapper, Some(&remapped_null_rows), false, None).unwrap(),
             vec![first_run, second_run]
         );
     }
@@ -3088,8 +3122,14 @@ mod tests {
         let new_start = 3_u64 << 32;
         let remapper = TestRemapper::new([(2, new_start), (3, new_start + 1)]);
         let remapped_null_rows = RowAddrTreeMap::new();
-        let zones =
-            remap_zone(&mixed_null_zone, &remapper, Some(&remapped_null_rows), true).unwrap();
+        let zones = remap_zone(
+            &mixed_null_zone,
+            &remapper,
+            Some(&remapped_null_rows),
+            true,
+            None,
+        )
+        .unwrap();
 
         assert_eq!(zones.len(), 1);
         assert_eq!(zones[0].bound.length, 2);
@@ -3121,7 +3161,7 @@ mod tests {
         };
         let remapper = TestRemapper::new([(2, 0)]);
 
-        let error = remap_zone(&zone, &remapper, None, true).unwrap_err();
+        let error = remap_zone(&zone, &remapper, None, true, None).unwrap_err();
         assert!(matches!(error, lance_core::Error::NotSupported { .. }));
         assert!(
             error
@@ -3203,6 +3243,7 @@ mod tests {
             source.fri.as_deref().unwrap(),
             None,
             false,
+            None,
         )
         .unwrap();
         assert_eq!(remapped.len(), 1);
@@ -3281,6 +3322,7 @@ mod tests {
             source.fri.as_deref().unwrap(),
             None,
             false,
+            None,
         )
         .unwrap();
         assert_eq!(remapped.len(), 1);
@@ -7975,6 +8017,158 @@ mod tests {
         assert_eq!(merged.zones[0].bound.length, 3);
         assert_eq!(merged.zones[0].nan_count, 2);
         assert_eq!(merged.zones[0].negative_nan_count, Some(1));
+    }
+
+    /// Destination runs outside the output's fragments are dropped before
+    /// they are built or checked: a narrowed NaN-bearing run and a mixed-null
+    /// singleton without a bitmap, both excluded, do not block the merge of
+    /// the retained exact run, and the output holds only that coverage.
+    #[tokio::test]
+    async fn test_merge_ignores_inexact_runs_outside_the_fragment_filter() {
+        let new_row = |fragment: u64, offset: u64| (fragment << 32) + offset;
+        // Zones of three: [+NaN, +NaN, 5.0], [null, 7.0, 8.0], [1.0, 2.0, 3.0].
+        let tmpdir = TempObjDir::default();
+        let mut source = train_float_index_in(
+            local_store(&tmpdir),
+            3,
+            vec![
+                Some(f64::NAN),
+                Some(f64::NAN),
+                Some(5.0),
+                None,
+                Some(7.0),
+                Some(8.0),
+                Some(1.0),
+                Some(2.0),
+                Some(3.0),
+            ],
+        )
+        .await;
+        let source_mut = Arc::get_mut(&mut source).unwrap();
+        source_mut.null_rows = None;
+        // Offset 2 alone to fragment 3 (narrowed, NaNs lost), offset 4 alone
+        // to fragment 5 (mixed-null singleton without positions), and the
+        // whole third zone to fragment 4.
+        source_mut.fri = Some(Arc::new(TestRemapper::new([
+            (2, new_row(3, 0)),
+            (4, new_row(5, 0)),
+            (6, new_row(4, 0)),
+            (7, new_row(4, 1)),
+            (8, new_row(4, 2)),
+        ])));
+        let dest_tmpdir = TempObjDir::default();
+        let dest_store = local_store(&dest_tmpdir);
+        let created = merge_zonemap_indices(
+            &[source.as_ref()],
+            dest_store.as_ref(),
+            &RoaringBitmap::from_iter([4u32]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(created.index_version, 1);
+        let merged = ZoneMapIndex::load(
+            dest_store.clone(),
+            None,
+            &LanceCache::no_cache(),
+            false,
+            ZoneMapIndexVersion::V1,
+        )
+        .await
+        .unwrap();
+        assert_eq!(merged.zones.len(), 1);
+        assert_eq!(merged.zones[0].bound.fragment_id, 4);
+        assert_eq!(merged.zones[0].bound.length, 3);
+        assert_eq!(merged.zones[0].min, ScalarValue::Float64(Some(1.0)));
+        assert_eq!(merged.zones[0].max, ScalarValue::Float64(Some(3.0)));
+        assert_eq!(merged.zones[0].negative_nan_count, Some(0));
+        // The same excluded runs still refuse the merge once they are kept.
+        let dest_tmpdir = TempObjDir::default();
+        let dest_store = local_store(&dest_tmpdir);
+        let err = merge_zonemap_indices(
+            &[source.as_ref()],
+            dest_store.as_ref(),
+            &RoaringBitmap::from_iter([3u32, 4]),
+        )
+        .await
+        .err()
+        .expect("a retained narrowed NaN run must be refused");
+        assert!(matches!(err, Error::NotSupported { .. }), "{err}");
+    }
+
+    /// Optional version 0 statistics are checked before they are admitted:
+    /// a record whose counts do not fit its length, or a seed that does not
+    /// cover its fragment, makes the plugin entry fall back to a scan
+    /// instead of failing at the version 1 writer.
+    #[tokio::test]
+    async fn test_update_with_seeds_scans_invalid_version_0_records() {
+        use crate::scalar::seed::FragmentSeed;
+        use arrow_ipc::writer::FileWriter;
+        /// `(min, max, null_count, nan_count, zone_length)` of a version 0 record.
+        type V0SeedRecord = (Option<f64>, Option<f64>, u32, u32, u64);
+        fn v0_seed(fragment_id: u64, physical_rows: u64, records: &[V0SeedRecord]) -> FragmentSeed {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("min", DataType::Float64, true),
+                Field::new("max", DataType::Float64, true),
+                Field::new("null_count", DataType::UInt32, false),
+                Field::new("nan_count", DataType::UInt32, false),
+                Field::new("zone_length", DataType::UInt64, false),
+            ]));
+            let batch = RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(Float64Array::from(
+                        records.iter().map(|r| r.0).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Float64Array::from(
+                        records.iter().map(|r| r.1).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(UInt32Array::from_iter_values(records.iter().map(|r| r.2))),
+                    Arc::new(UInt32Array::from_iter_values(records.iter().map(|r| r.3))),
+                    Arc::new(UInt64Array::from_iter_values(records.iter().map(|r| r.4))),
+                ],
+            )
+            .unwrap();
+            let mut buf = std::io::Cursor::new(Vec::new());
+            {
+                let mut w = FileWriter::try_new(&mut buf, batch.schema_ref()).unwrap();
+                w.write(&batch).unwrap();
+                w.finish().unwrap();
+            }
+            FragmentSeed {
+                fragment_id,
+                physical_rows,
+                bytes: bytes::Bytes::from(buf.into_inner()),
+                metadata_value: "0:2".to_string(),
+            }
+        }
+        let mut v1 = train_and_load::<Float64Type>(vec![vec![Some(1.0), Some(2.0)]]).await;
+        Arc::get_mut(&mut v1).unwrap().null_rows = None;
+        let dest_tmpdir = TempObjDir::default();
+        let dest_store = local_store(&dest_tmpdir);
+        // null_count 2 in a record of length 1.
+        let bad_counts = v0_seed(1, 1, &[(None, None, 2, 0, 1)]);
+        assert!(
+            v1.try_update_with_seeds(&[bad_counts], dest_store.as_ref())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // Records covering 2 rows for a fragment of 3.
+        let bad_coverage = v0_seed(1, 3, &[(Some(5.0), Some(6.0), 0, 0, 2)]);
+        assert!(
+            v1.try_update_with_seeds(&[bad_coverage], dest_store.as_ref())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // The valid sibling is still admitted.
+        let good = v0_seed(1, 2, &[(Some(5.0), Some(6.0), 0, 0, 2)]);
+        let created = v1
+            .try_update_with_seeds(&[good], dest_store.as_ref())
+            .await
+            .unwrap()
+            .expect("a valid version 0 record is admitted");
+        assert_eq!(created.index_version, 1);
     }
 
     /// The low-level update keeps the segment's file version: a version 0
