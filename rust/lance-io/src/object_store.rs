@@ -1688,6 +1688,73 @@ impl ObjectStore {
         self.inner.read_dir_all(dir_path, unmodified_since)
     }
 
+    /// Read the files under `dir_path` whose paths sort after `start_after` and not after
+    /// `end_inclusive`, comparing path strings byte by byte. A `None` bound is open.
+    ///
+    /// Both bounds are checked on every listed file, so no file outside the range is
+    /// returned. `start_after` is also passed to the store, which skips the earlier
+    /// files on the server where it supports a start offset. A store that lists in
+    /// lexical order stops listing at the first path past `end_inclusive`; that
+    /// assumes the server lists in the byte order of the `Path` strings, and where it
+    /// does not (OpenDAL stores with keys that `Path` percent-encodes), files in the
+    /// range can be missed. As with [`Self::read_dir_all`], a failed listing is not
+    /// retried.
+    ///
+    /// ```
+    /// # use futures::TryStreamExt;
+    /// # use lance_core::Result;
+    /// # use lance_io::object_store::ObjectStore;
+    /// # use object_store::path::Path;
+    /// # async fn list_middle(store: &ObjectStore) -> Result<()> {
+    /// let files = store
+    ///     .list_range(
+    ///         &Path::from("dataset/data"),
+    ///         Some(&Path::from("dataset/data/a")),
+    ///         Some(&Path::from("dataset/data/m")),
+    ///         None,
+    ///     )
+    ///     .try_collect::<Vec<_>>()
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn list_range(
+        &self,
+        dir_path: &Path,
+        start_after: Option<&Path>,
+        end_inclusive: Option<&Path>,
+        unmodified_since: Option<DateTime<Utc>>,
+    ) -> BoxStream<'static, Result<ObjectMeta>> {
+        let listed = match start_after {
+            Some(offset) => self.inner.list_with_offset(Some(dir_path), offset),
+            None => self.inner.list(Some(dir_path)),
+        };
+        let start_after = start_after.cloned();
+        // Some stores treat the offset as inclusive, and others ignore it.
+        let listed = listed.map_err(Error::from).try_filter(move |meta| {
+            future::ready(
+                start_after
+                    .as_ref()
+                    .is_none_or(|start| meta.location > *start),
+            )
+        });
+        let bounded = match end_inclusive.cloned() {
+            Some(end) if self.list_is_lexically_ordered => listed
+                .try_take_while(move |meta| future::ready(Ok(meta.location <= end)))
+                .boxed(),
+            Some(end) => listed
+                .try_filter(move |meta| future::ready(meta.location <= end))
+                .boxed(),
+            None => listed.boxed(),
+        };
+        match unmodified_since {
+            Some(cutoff) => bounded
+                .try_filter(move |meta| future::ready(meta.last_modified <= cutoff))
+                .boxed(),
+            None => bounded,
+        }
+    }
+
     /// Remove a directory recursively.
     pub async fn remove_dir_all(&self, dir_path: impl Into<Path>) -> Result<()> {
         let path = dir_path.into();
@@ -2152,6 +2219,7 @@ mod tests {
     use async_trait::async_trait;
     use bytes::Bytes;
     use lance_core::utils::tempfile::{TempStdDir, TempStdFile, TempStrDir};
+    use lance_core::utils::testing::{ProxyObjectStore, ProxyObjectStorePolicy};
     use object_store::memory::InMemory;
     use object_store::{
         CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, PutMultipartOptions,
@@ -2164,6 +2232,7 @@ mod tests {
     use std::fs::{create_dir_all, write};
     use std::ops::Range;
     use std::path::Path as StdPath;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
@@ -2580,6 +2649,188 @@ mod tests {
             .unwrap();
 
         assert!(!path.join("foo").exists());
+    }
+
+    #[rstest]
+    #[case::lexically_ordered("memory", true)]
+    #[case::unordered("memory", false)]
+    #[case::local("file", false)]
+    #[tokio::test]
+    async fn test_list_range(#[case] scheme: &str, #[case] is_lexically_ordered: bool) {
+        let tmp = TempStdDir::default();
+        let (mut store, base) = if scheme == "file" {
+            let (store, base) = ObjectStore::from_uri(tmp.to_str().unwrap()).await.unwrap();
+            (Arc::unwrap_or_clone(store), base)
+        } else {
+            (ObjectStore::memory(), Path::from("base"))
+        };
+        let pulled = Arc::new(AtomicUsize::new(0));
+        let counter = pulled.clone();
+        let mut policy = ProxyObjectStorePolicy::new();
+        policy.set_obj_meta_policy(
+            "count",
+            Arc::new(move |_, meta| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Ok(meta)
+            }),
+        );
+        store.inner = Arc::new(ProxyObjectStore::new(
+            store.inner.clone(),
+            Arc::new(Mutex::new(policy)),
+        ));
+        store.list_is_lexically_ordered = is_lexically_ordered;
+        let dir = base.clone().join("dir");
+        for name in ["a", "b", "b0", "c", "d"] {
+            store.put(&dir.clone().join(name), b"x").await.unwrap();
+        }
+        // Shares the string prefix `dir` but is outside the directory.
+        store.put(&base.clone().join("dirx"), b"x").await.unwrap();
+
+        let key = |name: &str| dir.clone().join(name);
+        let list = async |start: Option<&str>, end: Option<&str>| {
+            let mut names = store
+                .list_range(&dir, start.map(key).as_ref(), end.map(key).as_ref(), None)
+                .map_ok(|meta| meta.location.filename().unwrap().to_string())
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            names.sort();
+            names
+        };
+        assert_eq!(list(None, None).await, ["a", "b", "b0", "c", "d"]);
+        assert_eq!(list(Some("b"), Some("c")).await, ["b0", "c"]);
+        assert_eq!(list(Some("b"), None).await, ["b0", "c", "d"]);
+        assert_eq!(list(None, Some("b")).await, ["a", "b"]);
+        // A bound between two keys, and an empty range.
+        assert_eq!(list(Some("a0"), Some("b00")).await, ["b", "b0"]);
+        assert!(list(Some("c"), Some("c")).await.is_empty());
+
+        pulled.store(0, Ordering::SeqCst);
+        assert_eq!(list(None, Some("a")).await, ["a"]);
+        // Stops at the first key past the end, rather than listing the rest.
+        let expected_pulled = if is_lexically_ordered { 2 } else { 5 };
+        assert_eq!(pulled.load(Ordering::SeqCst), expected_pulled);
+
+        let cutoff = Utc::now() + chrono::TimeDelta::try_days(1).unwrap();
+        let unmodified = store
+            .list_range(&dir, None, None, Some(cutoff))
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(unmodified.len(), 5);
+        let modified = store
+            .list_range(&dir, None, None, Some(DateTime::<Utc>::UNIX_EPOCH))
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert!(modified.is_empty());
+    }
+
+    /// How a store's `list_with_offset` treats the offset.
+    #[derive(Debug, Clone, Copy)]
+    enum OffsetHandling {
+        Ignored,
+        Inclusive,
+    }
+
+    /// Forwards to `InMemory`, except that `list_with_offset` misreads the offset.
+    #[derive(Debug)]
+    struct OffsetMisreadingStore {
+        inner: InMemory,
+        handling: OffsetHandling,
+    }
+
+    impl Display for OffsetMisreadingStore {
+        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+            write!(f, "OffsetMisreadingStore")
+        }
+    }
+
+    #[async_trait]
+    impl OSObjectStore for OffsetMisreadingStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            bytes: PutPayload,
+            opts: PutOptions,
+        ) -> OSResult<PutResult> {
+            self.inner.put_opts(location, bytes, opts).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: PutMultipartOptions,
+        ) -> OSResult<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+        async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+        async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> OSResult<Vec<Bytes>> {
+            self.inner.get_ranges(location, ranges).await
+        }
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, OSResult<Path>>,
+        ) -> BoxStream<'static, OSResult<Path>> {
+            self.inner.delete_stream(locations)
+        }
+        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+        fn list_with_offset(
+            &self,
+            prefix: Option<&Path>,
+            offset: &Path,
+        ) -> BoxStream<'static, OSResult<ObjectMeta>> {
+            let listed = self.inner.list(prefix);
+            match self.handling {
+                OffsetHandling::Ignored => listed,
+                OffsetHandling::Inclusive => {
+                    let offset = offset.clone();
+                    listed
+                        .try_filter(move |meta| future::ready(meta.location >= offset))
+                        .boxed()
+                }
+            }
+        }
+        async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OSResult<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+        async fn copy_opts(&self, from: &Path, to: &Path, opts: CopyOptions) -> OSResult<()> {
+            self.inner.copy_opts(from, to, opts).await
+        }
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_list_range_checks_the_offset_itself(
+        #[values(OffsetHandling::Ignored, OffsetHandling::Inclusive)] handling: OffsetHandling,
+        #[values(false, true)] is_lexically_ordered: bool,
+    ) {
+        let mut store = ObjectStore::memory();
+        store.inner = Arc::new(OffsetMisreadingStore {
+            inner: InMemory::new(),
+            handling,
+        });
+        store.list_is_lexically_ordered = is_lexically_ordered;
+        let dir = Path::from("base/dir");
+        for name in ["a", "b", "b0", "c", "d"] {
+            store.put(&dir.clone().join(name), b"x").await.unwrap();
+        }
+        let mut names = store
+            .list_range(
+                &dir,
+                Some(&dir.clone().join("b")),
+                Some(&dir.clone().join("c")),
+                None,
+            )
+            .map_ok(|meta| meta.location.filename().unwrap().to_string())
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        names.sort();
+        assert_eq!(names, ["b0", "c"]);
     }
 
     #[rstest]

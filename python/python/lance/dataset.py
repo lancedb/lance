@@ -58,6 +58,7 @@ from .fragment import DataFile, FragmentMetadata, LanceFragment
 from .indices import IndexConfig, IndexSegment, SupportedDistributedIndices
 from .lance import (
     CleanupExplanation,
+    CleanupPlan,
     CleanupStats,
     Compaction,
     CompactionMetrics,
@@ -3559,6 +3560,82 @@ class LanceDataset(pa.dataset.Dataset):
             delete_rate_limit,
             versions,
             include_files,
+            max_files,
+        )
+
+    def plan_cleanup_old_versions(
+        self,
+        older_than: Optional[timedelta] = None,
+        retain_versions: Optional[int] = None,
+        *,
+        delete_unverified: bool = False,
+        error_if_tagged_old_versions: bool = True,
+        delete_rate_limit: Optional[int] = None,
+        versions: Optional[List[int]] = None,
+        delete_concurrency: Optional[int] = None,
+        explain: bool = False,
+        max_files: int = 1000,
+    ) -> CleanupPlan:
+        """
+        Plan a :meth:`cleanup_old_versions` whose listing and deletion can be split
+        across processes.
+
+        The plan removes the expired manifests, so those versions are gone once it
+        returns. Run every task from :meth:`CleanupPlan.tasks`, in any order and on
+        any worker that can open this dataset, then pass all of their results to
+        :meth:`CleanupPlan.finish`. Tasks are pickle-able and can be retried. Files
+        are removed with the same rules as :meth:`cleanup_old_versions`, and each
+        task first reads the versions committed after the plan so their files are
+        kept. If the tasks are abandoned, no version references the files they
+        left, so later cleanups only remove them as unverified files. With
+        ``delete_unverified=True``, nothing may write to the dataset from the plan
+        until the last task has run. Cleaning referenced branches is not supported.
+
+        **Experimental API**
+
+        Parameters
+        ----------
+        older_than, retain_versions, delete_unverified, error_if_tagged_old_versions,
+        versions
+            As for :meth:`cleanup_old_versions`.
+
+        delete_concurrency, delete_rate_limit: int, optional
+            Limits for removing the expired manifests while planning. Each task
+            takes its own limits in :meth:`CleanupSweepTask.execute`.
+
+        explain: bool, default False
+            Plan an explanation instead: nothing is removed, and
+            :meth:`CleanupPlan.finish_explain` returns what
+            ``explain_cleanup_old_versions(include_files=True, max_files=max_files)``
+            would.
+
+        max_files: int, default 1000
+            Maximum number of candidate files included in the explanation.
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> dataset = lance.write_dataset(pa.table({"a": [1]}), "memory://")
+        >>> plan = dataset.plan_cleanup_old_versions()
+        >>> results = [task.execute(dataset) for task in plan.tasks(16)]
+        >>> plan.finish(dataset, results).old_versions
+        0
+        """
+        if older_than is None and retain_versions is None and versions is None:
+            older_than = timedelta(days=14)
+        if max_files <= 0:
+            raise ValueError("max_files must be positive")
+
+        return self._ds.plan_cleanup_old_versions(
+            td_to_micros(older_than) if older_than else None,
+            retain_versions,
+            delete_unverified,
+            error_if_tagged_old_versions,
+            delete_rate_limit,
+            versions,
+            delete_concurrency,
+            explain,
             max_files,
         )
 

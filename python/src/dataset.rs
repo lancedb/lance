@@ -113,7 +113,7 @@ use crate::{LanceReader, Scanner};
 use lance::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
 
 use self::cleanup::{
-    CleanupCandidateFile, CleanupExplanation, CleanupReferencedBranch, CleanupStats,
+    CleanupCandidateFile, CleanupExplanation, CleanupReferencedBranch, CleanupStats, PyCleanupPlan,
 };
 use self::commit::PyCommitLock;
 use self::io_stats::IoStats;
@@ -2371,6 +2371,52 @@ impl Dataset {
             explanation.warnings.clear();
         }
         Ok(explanation)
+    }
+
+    /// Plan a cleanup whose listing and deletion can be split across processes
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (older_than_micros = None, retain_versions = None, delete_unverified = None, error_if_tagged_old_versions = None, delete_rate_limit = None, versions = None, delete_concurrency = None, explain = false, max_files = 1000))]
+    fn plan_cleanup_old_versions(
+        &self,
+        py: Python<'_>,
+        older_than_micros: Option<i64>,
+        retain_versions: Option<usize>,
+        delete_unverified: Option<bool>,
+        error_if_tagged_old_versions: Option<bool>,
+        delete_rate_limit: Option<u64>,
+        versions: Option<Vec<u64>>,
+        delete_concurrency: Option<usize>,
+        explain: bool,
+        max_files: usize,
+    ) -> PyResult<PyCleanupPlan> {
+        let plan = rt()
+            .block_on(Some(py), async {
+                let mut operation = self
+                    .cleanup_operation(
+                        older_than_micros,
+                        retain_versions,
+                        delete_unverified,
+                        error_if_tagged_old_versions,
+                        versions,
+                    )
+                    .await?;
+                if let Some(value) = delete_concurrency {
+                    operation = operation.with_delete_concurrency(value)?;
+                }
+                if let Some(value) = delete_rate_limit {
+                    operation = operation.with_delete_rate_limit(value)?;
+                }
+                if explain {
+                    operation
+                        .with_max_candidate_files(max_files)
+                        .plan_explain()
+                        .await
+                } else {
+                    operation.plan().await
+                }
+            })?
+            .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
+        Ok(PyCleanupPlan(plan))
     }
 
     fn tags_ordered(self_: PyRef<'_, Self>, order: Option<String>) -> PyResult<Py<PyAny>> {

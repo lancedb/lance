@@ -39,7 +39,8 @@ use datafusion_ffi::table_provider::FFI_TableProvider;
 use datagen::register_datagen;
 use dataset::blob::LanceBlobFile;
 use dataset::cleanup::{
-    CleanupCandidateFile, CleanupExplanation, CleanupReferencedBranch, CleanupStats,
+    CleanupCandidateFile, CleanupExplanation, CleanupReferencedBranch, CleanupStats, PyCleanupPlan,
+    PyCleanupSweepResult, PyCleanupSweepTask,
 };
 use dataset::io_stats::IoStats;
 use dataset::optimize::{
@@ -293,6 +294,9 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<CleanupCandidateFile>()?;
     m.add_class::<CleanupReferencedBranch>()?;
     m.add_class::<CleanupExplanation>()?;
+    m.add_class::<PyCleanupPlan>()?;
+    m.add_class::<PyCleanupSweepTask>()?;
+    m.add_class::<PyCleanupSweepResult>()?;
     m.add_class::<IoStats>()?;
     m.add_class::<KMeans>()?;
     m.add_class::<Hnsw>()?;

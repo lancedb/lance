@@ -1731,6 +1731,60 @@ def test_explain_cleanup_old_versions(tmp_path):
     assert stats.old_versions == explanation.stats.old_versions
 
 
+def test_plan_cleanup_old_versions(tmp_path):
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    base_dir = tmp_path / "test"
+    lance.write_dataset(table, base_dir)
+    time.sleep(0.1)
+    moment = datetime.now()
+    lance.write_dataset(table, base_dir, mode="overwrite")
+    dataset = lance.dataset(base_dir)
+    older_than = datetime.now() - moment
+    expected = dataset.explain_cleanup_old_versions(
+        older_than=older_than, include_files=True
+    )
+
+    plan = dataset.plan_cleanup_old_versions(older_than=older_than, explain=True)
+    results = [task.execute(dataset) for task in plan.tasks(8)]
+    explanation = plan.finish_explain(dataset, results)
+    assert sorted(f.path for f in explanation.candidate_files) == sorted(
+        f.path for f in expected.candidate_files
+    )
+    assert explanation.stats.bytes_removed == expected.stats.bytes_removed
+    assert len(dataset.versions()) == 2
+
+    plan = dataset.plan_cleanup_old_versions(older_than=older_than)
+    assert plan.read_version == dataset.version
+    assert plan.num_old_versions == 1
+    # The expired manifest is gone before any task runs.
+    assert len(lance.dataset(base_dir).versions()) == 1
+    tasks = [pickle.loads(pickle.dumps(task)) for task in plan.tasks(8)]
+    assert len({task.subtree for task in tasks}) == len(tasks)
+    results = [
+        pickle.loads(pickle.dumps(task.execute(dataset, delete_concurrency=2)))
+        for task in tasks
+    ]
+    assert sorted(result.index for result in results) == list(range(len(tasks)))
+
+    with pytest.raises(OSError, match="results for"):
+        plan.finish(dataset, results[1:])
+    with pytest.raises(OSError, match="call finish_explain"):
+        dataset.plan_cleanup_old_versions(older_than=older_than, explain=True).finish(
+            dataset, results
+        )
+
+    stats = plan.finish(dataset, results)
+    assert stats.old_versions == 1
+    assert stats.bytes_removed == expected.stats.bytes_removed
+    assert stats.data_files_removed == expected.stats.data_files_removed
+    assert lance.dataset(base_dir).to_table() == table
+
+    with pytest.raises(ValueError, match="max_tasks"):
+        plan.tasks(0)
+    with pytest.raises(ValueError, match="delete_concurrency"):
+        tasks[0].execute(dataset, delete_concurrency=0)
+
+
 def test_cleanup_error_when_tagged_old_versions(tmp_path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"

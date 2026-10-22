@@ -39,6 +39,7 @@ from ..dataset import (
     Branch,
     ExecuteResult,
     Index,
+    LanceDataset,
     LanceOperation,
     Tag,
     Transaction,
@@ -170,6 +171,42 @@ class CleanupExplanation:
     candidate_file_limit: int
     referenced_branches: List[CleanupReferencedBranch]
     warnings: List[str]
+
+class CleanupPlan:
+    read_version: int
+    num_old_versions: int
+    def tasks(self, max_tasks: int) -> List[CleanupSweepTask]: ...
+    def finish(
+        self, dataset: LanceDataset, results: List[CleanupSweepResult]
+    ) -> CleanupStats: ...
+    def finish_explain(
+        self, dataset: LanceDataset, results: List[CleanupSweepResult]
+    ) -> CleanupExplanation: ...
+
+class CleanupSweepTask:
+    index: int
+    subtree: str
+    start_after: Optional[str]
+    end_inclusive: Optional[str]
+    def execute(
+        self,
+        dataset: LanceDataset,
+        *,
+        delete_concurrency: Optional[int] = None,
+        delete_rate_limit: Optional[int] = None,
+    ) -> CleanupSweepResult: ...
+    def json(self) -> str: ...
+    @staticmethod
+    def from_json(json: str) -> CleanupSweepTask: ...
+
+class CleanupSweepResult:
+    index: int
+    stats: CleanupStats
+    refreshed_versions: int
+    warnings: List[str]
+    def json(self) -> str: ...
+    @staticmethod
+    def from_json(json: str) -> CleanupSweepResult: ...
 
 class LanceFileWriteSummary:
     num_rows: int
@@ -563,6 +600,18 @@ class _Dataset:
         include_files: bool = False,
         max_files: int = 1000,
     ) -> CleanupExplanation: ...
+    def plan_cleanup_old_versions(
+        self,
+        older_than_micros: Optional[int] = None,
+        retain_versions: Optional[int] = None,
+        delete_unverified: Optional[bool] = None,
+        error_if_tagged_old_versions: Optional[bool] = None,
+        delete_rate_limit: Optional[int] = None,
+        versions: Optional[List[int]] = None,
+        delete_concurrency: Optional[int] = None,
+        explain: bool = False,
+        max_files: int = 1000,
+    ) -> CleanupPlan: ...
     def get_version(self, tag: str) -> int: ...
     # Tag operations
     def tags(self) -> Dict[str, Tag]: ...
