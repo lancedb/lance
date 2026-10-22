@@ -9,11 +9,13 @@ use super::*;
 use crate::dataset::WriteParams;
 use crate::index::create::CreateIndexBuilder;
 use crate::index::frag_reuse_remapping::vector_supports_batch_remapping;
+use crate::index::vector::dedup::find_duplicate_pairs;
 use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
 use crate::session::index_caches::IndexMetadataKey;
 use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
 use arrow_array::types::Int32Type;
 use arrow_array::{RecordBatch, RecordBatchIterator, cast::AsArray};
+use futures::TryStreamExt as _;
 #[cfg(feature = "geo")]
 use geo_types::line_string;
 #[cfg(feature = "geo")]
@@ -33,6 +35,149 @@ use lance_table::system_index::frag_reuse::ledger::Mapping;
 use prost::Message;
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
+
+#[tokio::test]
+async fn tagged_remapping_translates_pairwise_staged_ids() {
+    // Segmented vector index under a tagged FRI history: opens resolve
+    // V1Translate, so every read path translates pre-compaction row ids.
+    // Pairwise staging must do the same, or find_duplicate_pairs reports
+    // addresses that no longer exist in the current snapshot.
+    let dim = 4_usize;
+    let distinct: Vec<Vec<f32>> = (0..4)
+        .map(|i| (0..dim).map(|j| (i * dim + j) as f32 + 1.0).collect())
+        .collect();
+    let schema = std::sync::Arc::new(arrow_schema::Schema::new(vec![
+        arrow_schema::Field::new("i", arrow_schema::DataType::Int32, false),
+        arrow_schema::Field::new("id", arrow_schema::DataType::UInt64, false),
+        arrow_schema::Field::new(
+            "vector",
+            arrow_schema::DataType::FixedSizeList(
+                std::sync::Arc::new(arrow_schema::Field::new(
+                    "item",
+                    arrow_schema::DataType::Float32,
+                    true,
+                )),
+                dim as i32,
+            ),
+            true,
+        ),
+    ]));
+    let make_batch = |ids: &[u64], vectors: &[usize]| {
+        let values = vectors
+            .iter()
+            .flat_map(|&i| distinct[i].clone())
+            .collect::<Vec<_>>();
+        arrow_array::RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                std::sync::Arc::new(arrow_array::Int32Array::from(
+                    ids.iter().map(|v| *v as i32).collect::<Vec<_>>(),
+                )),
+                std::sync::Arc::new(arrow_array::UInt64Array::from(ids.to_vec())),
+                std::sync::Arc::new(
+                    arrow_array::FixedSizeListArray::try_new(
+                        std::sync::Arc::new(arrow_schema::Field::new(
+                            "item",
+                            arrow_schema::DataType::Float32,
+                            true,
+                        )),
+                        dim as i32,
+                        std::sync::Arc::new(arrow_array::Float32Array::from(values)),
+                        None,
+                    )
+                    .unwrap(),
+                ),
+            ],
+        )
+        .unwrap()
+    };
+    // Duplicate vectors within each fragment, so each segment's pairwise
+    // scorer reports one pair.
+    let frag0 = make_batch(&[0, 1], &[0, 0]);
+    let frag1 = make_batch(&[2, 3], &[1, 1]);
+    let mut dataset = crate::Dataset::write(
+        arrow_array::RecordBatchIterator::new(vec![Ok(frag0)], schema.clone()),
+        "memory://",
+        None,
+    )
+    .await
+    .unwrap();
+    dataset
+        .append(
+            arrow_array::RecordBatchIterator::new(vec![Ok(frag1)], schema.clone()),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let params = crate::index::vector::VectorIndexParams::ivf_flat(
+        1,
+        lance_linalg::distance::DistanceType::L2,
+    );
+    let fragments: Vec<_> = dataset
+        .fragments()
+        .iter()
+        .map(|fragment| fragment.id as u32)
+        .collect();
+    let mut segments = Vec::new();
+    for fragment in &fragments {
+        segments.push(
+            CreateIndexBuilder::new(&mut dataset, &["vector"], IndexType::Vector, &params)
+                .name("vector_idx".into())
+                .fragments(vec![*fragment])
+                .execute_uncommitted()
+                .await
+                .unwrap(),
+        );
+    }
+    dataset
+        .commit_existing_index_segments("vector_idx", "vector", segments)
+        .await
+        .unwrap();
+
+    let (transition, destinations) = prepare(&dataset).await;
+    let content = InlineContent {
+        legacy_versions: vec![],
+        transitions: vec![transition],
+    }
+    .encode_to_vec();
+    install(&mut dataset, content, destinations, false).await;
+
+    let live_row_ids: std::collections::HashSet<u64> =
+        dataset.scan().with_row_id().try_into_batch().await.unwrap()[crate::dataset::ROW_ID]
+            .as_primitive::<arrow::array::types::UInt64Type>()
+            .values()
+            .iter()
+            .copied()
+            .collect();
+    assert_eq!(live_row_ids.len(), 4);
+
+    let pairs = find_duplicate_pairs(std::sync::Arc::new(dataset.clone()), "vector", 1e-3)
+        .await
+        .unwrap();
+    let pairs = futures::TryStreamExt::try_collect::<Vec<_>>(pairs)
+        .await
+        .unwrap();
+    assert_eq!(
+        pairs.iter().map(|b| b.num_rows()).sum::<usize>(),
+        2,
+        "expected one duplicate pair per segment"
+    );
+    for batch in &pairs {
+        let ids_a = batch["row_id_a"].as_primitive::<arrow::array::types::UInt64Type>();
+        let ids_b = batch["row_id_b"].as_primitive::<arrow::array::types::UInt64Type>();
+        for (a, b) in ids_a.values().iter().zip(ids_b.values().iter()) {
+            assert!(
+                live_row_ids.contains(a),
+                "row_id_a {a} is not a live row id of the current snapshot"
+            );
+            assert!(
+                live_row_ids.contains(b),
+                "row_id_b {b} is not a live row id of the current snapshot"
+            );
+        }
+    }
+}
 
 #[rstest::rstest]
 #[case::default_search("default")]
