@@ -522,7 +522,8 @@ impl ScalarQueryParser for SargableQueryParser {
 /// - `prefix` is the leading literal portion before any wildcards
 /// - `needs_refine` is true if the pattern has wildcards beyond a simple trailing `%`
 ///
-/// Returns `None` if the pattern starts with a wildcard (no leading literal).
+/// Returns `None` if the pattern starts with a wildcard (no leading literal), has
+/// no unescaped wildcard, or uses an escape character other than backslash.
 ///
 /// Examples:
 /// - "foo%" -> Some(("foo", false)) - pure prefix, no recheck needed
@@ -531,6 +532,7 @@ impl ScalarQueryParser for SargableQueryParser {
 /// - "foo\%bar%" with escape '\' -> Some(("foo%bar", false)) - escaped %, pure prefix
 /// - "%foo" -> None - starts with wildcard, cannot prune
 /// - "foo" -> None - no wildcard at all, use equality instead
+/// - "a\b%" -> Some(("ab", false)) - an escape consumes any character
 fn extract_like_leading_prefix(pattern: &str, escape_char: Option<char>) -> Option<(String, bool)> {
     // DataFusion's starts_with simplification escapes special characters with backslash
     // but doesn't set escape_char, so backslash is the default escape. It is also the
