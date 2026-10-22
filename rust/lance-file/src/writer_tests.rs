@@ -1701,8 +1701,6 @@ mod tests {
                 compression: None,        // Will use default compression if any
                 compression_level: None,
                 bss: Some(lance_encoding::compression_config::BssMode::Off), // Explicitly disable BSS to ensure RLE is used
-                bitshuffle: None,
-                pixel_transform: None,
                 axis_delta: None,
                 minichunk_size: None,
             },
