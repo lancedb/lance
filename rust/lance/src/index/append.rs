@@ -762,11 +762,9 @@ async fn merge_scalar_indices<'a>(
             .iter()
             .any(|segment| !segment.results_are_row_addrs());
 
-    // A ZoneMap segment persisted in an older file version cannot be updated
-    // or merged into the current version: its missing statistics (the NaN
-    // sign split, the ordinary maximum hidden by the legacy NaN marker) can
-    // only be recovered by scanning the column, so it is rebuilt from
-    // source data. Untouched older segments stay readable as they are.
+    // An older ZoneMap file version lacks statistics the current version
+    // stores (the NaN sign split, the maximum hidden by the NaN marker);
+    // only a scan recovers them, so such a segment is rebuilt, not merged.
     let zonemap_requires_rebuild = index_type == IndexType::ZoneMap
         && selected_old_indices
             .iter()

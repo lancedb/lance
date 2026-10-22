@@ -61,15 +61,15 @@ const SEED_NULL_BITMAP_META_KEY: &str = "seed_null_bitmap";
 const SEED_VERSION_META_KEY: &str = "version";
 /// The seed format version this writer emits.
 const SEED_FORMAT_VERSION: &str = "1";
-/// The ZoneMap index file versions this build writes and reads
-/// (`IndexMetadata.index_version`, see `docs/src/format/index/scalar/zonemap.md`).
+/// The ZoneMap index file versions this build reads and writes
+/// (`IndexMetadata.index_version`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ZoneMapIndexVersion {
-    /// Seven columns; `max` may carry the legacy `+NaN` marker and the NaN
-    /// sign split is unknown. Read only; never written for a new segment.
+    /// Seven columns. `max` may hold the `+NaN` marker for a zone with NaNs
+    /// and the NaN sign split is not stored. Never written for a new segment.
     V0 = 0,
-    /// Adds a non-null `negative_nan_count` column; `min`/`max` are ordinary
-    /// bounds that exclude NaNs of either sign.
+    /// Adds the non-null `negative_nan_count` column; `min`/`max` are
+    /// ordinary bounds that exclude NaNs.
     V1 = 1,
 }
 
@@ -77,9 +77,8 @@ impl ZoneMapIndexVersion {
     /// The version new segments are written with.
     pub const CURRENT: Self = Self::V1;
 
-    /// The version a segment's metadata declares, or `NotSupported` for a
-    /// version this build does not know, which must not be interpreted
-    /// under an older contract.
+    /// The version a segment's metadata declares; `NotSupported` for one
+    /// this build does not know.
     pub fn from_metadata(index_version: u32) -> Result<Self> {
         match index_version {
             0 => Ok(Self::V0),
@@ -96,6 +95,35 @@ impl ZoneMapIndexVersion {
 }
 
 const ZONEMAP_INDEX_VERSION: u32 = ZoneMapIndexVersion::CURRENT as u32;
+
+/// The invariants a version 1 zone must satisfy, checked when a file is
+/// read and before one is written: the sign split fits the NaN count, the
+/// counts fit the zone, and no bound is a NaN (nested types store
+/// placeholder bounds that are never consulted). Returns the violation.
+fn v1_zone_violation(
+    min: &ScalarValue,
+    max: &ScalarValue,
+    null_count: u32,
+    nan_count: u32,
+    negative_nan_count: u32,
+    length: u64,
+    nested: bool,
+) -> Option<String> {
+    if negative_nan_count > nan_count {
+        return Some(format!(
+            "negative_nan_count {negative_nan_count} above nan_count {nan_count}"
+        ));
+    }
+    if u64::from(null_count) + u64::from(nan_count) > length {
+        return Some(format!(
+            "null_count {null_count} plus nan_count {nan_count} above its length {length}"
+        ));
+    }
+    if !nested && (ZoneMapIndex::scalar_is_nan(min) || ZoneMapIndex::scalar_is_nan(max)) {
+        return Some("a NaN bound".to_string());
+    }
+    None
+}
 
 /// Basic stats about zonemap index
 #[derive(Debug, PartialEq, Clone)]
@@ -158,10 +186,8 @@ pub struct ZoneMapIndex {
     // The maximum rows per zone provided by user
     rows_per_zone: u64,
     use_seeds: bool,
-    /// The file version this segment was loaded from. Governs what
-    /// `negative_nan_count` means (`V0`: unknown unless provably zero) and
-    /// what maintenance may do with the zones (a `V0` segment is never
-    /// copied into a `V1` file; it is rebuilt from source data).
+    /// The file version this segment was loaded from. A `V0` segment's
+    /// zones are never written into a `V1` file.
     version: ZoneMapIndexVersion,
     store: Arc<dyn IndexStore>,
     /// Legacy synchronous remapper (index_version 0). Mutually exclusive with
@@ -751,22 +777,14 @@ impl ZoneMapIndex {
                 Error::invalid_input("ZoneMapIndex: 'zone_start' column is not UInt64")
             })?;
 
-        // Version 1 persists the NaN sign split; version 0 has no such column.
+        // Only version 1 stores the NaN sign split.
         let negative_nan_count_col = match version {
             ZoneMapIndexVersion::V1 => Some(
                 data.column_by_name("negative_nan_count")
                     .ok_or_else(|| {
                         Error::corrupt_file_named(
                             ZONEMAP_FILENAME,
-                            format!(
-                                "ZoneMapIndex: version 1 file is missing the 'negative_nan_count' \
-                             column (columns: {:?})",
-                                data.schema()
-                                    .fields()
-                                    .iter()
-                                    .map(|f| f.name().clone())
-                                    .collect::<Vec<_>>()
-                            ),
+                            "ZoneMapIndex: version 1 file has no 'negative_nan_count' column",
                         )
                     })?
                     .as_any()
@@ -819,36 +837,24 @@ impl ZoneMapIndex {
             let negative_nan_count = match negative_nan_count_col {
                 Some(col) => {
                     let negative = col.value(i);
-                    if negative > nan_count {
+                    if let Some(violation) = v1_zone_violation(
+                        &min,
+                        &max,
+                        null_count,
+                        nan_count,
+                        negative,
+                        length,
+                        data_type.is_nested(),
+                    ) {
                         return Err(Error::corrupt_file_named(
                             ZONEMAP_FILENAME,
-                            format!(
-                                "ZoneMapIndex: zone {i} has negative_nan_count {negative} above \
-                             nan_count {nan_count}"
-                            ),
-                        ));
-                    }
-                    if u64::from(null_count) + u64::from(nan_count) > length {
-                        return Err(Error::corrupt_file_named(
-                            ZONEMAP_FILENAME,
-                            format!(
-                                "ZoneMapIndex: zone {i} counts null_count {null_count} plus \
-                             nan_count {nan_count} above its length {length}"
-                            ),
-                        ));
-                    }
-                    if !data_type.is_nested()
-                        && (Self::scalar_is_nan(&min) || Self::scalar_is_nan(&max))
-                    {
-                        return Err(Error::corrupt_file_named(
-                            ZONEMAP_FILENAME,
-                            format!("ZoneMapIndex: version 1 zone {i} carries a NaN bound"),
+                            format!("ZoneMapIndex: version 1 zone {i} has {violation}"),
                         ));
                     }
                     Some(negative)
                 }
-                // Version 0 files have no sign split. It is unknown, except
-                // that a zone without NaNs provably has none of either sign.
+                // Version 0 stores no split: unknown, unless the zone has no
+                // NaNs at all.
                 None if nan_count == 0 => Some(0),
                 None => None,
             };
@@ -1021,11 +1027,8 @@ impl ScalarIndex for ZoneMapIndex {
             merged
         });
 
-        // Serialize the combined zones back into the index file. This entry
-        // has no fragment metadata or source data, so it keeps the segment's
-        // file version: a version 0 segment stays version 0 (its unknown
-        // NaN sign splits stay unknown) and a version 1 segment stays
-        // version 1. Migrating a segment is a rebuild from source data.
+        // This entry has no source data to recover version 1 statistics
+        // from, so the file keeps the segment's version.
         let mut builder = ZoneMapIndexBuilder::try_new(options, self.data_type.clone())?
             .with_version(self.version);
         builder.options.rows_per_zone = self.rows_per_zone;
@@ -1076,9 +1079,8 @@ impl ZoneMapIndex {
         seeds: &[crate::scalar::seed::FragmentSeed],
         dest_store: &dyn IndexStore,
     ) -> Result<Option<CreatedIndex>> {
-        // A version 0 segment's zones cannot be copied into a version 1
-        // file (their NaN sign split is unknown); the caller rebuilds it
-        // from source data instead.
+        // Version 0 zones cannot be copied into the version 1 output; the
+        // caller rebuilds the segment from source data.
         if self.version != ZoneMapIndexVersion::V1 {
             return Ok(None);
         }
@@ -1089,9 +1091,6 @@ impl ZoneMapIndex {
         for seed in seeds {
             let (mut zones, seed_null_bitmap) =
                 ZoneMapSeedWriter::deserialize_seed(seed.fragment_id, &seed.bytes)?;
-            // A version 0 seed record with NaNs has an unknown sign split
-            // and a NaN-marker max: it cannot become a version 1 zone, so
-            // the caller scans. Without NaNs the split is provably zero.
             if !admit_seed_zones_for_v1(&mut zones) {
                 return Ok(None);
             }
@@ -1157,10 +1156,10 @@ impl ZoneMapIndex {
     }
 }
 
-/// Make decoded seed zones eligible for a version 1 file: a record whose
-/// sign split is unknown (a version 0 seed) is admitted only when it holds
-/// no NaNs, in which case the split is provably zero. Returns `false` when
-/// some record cannot be admitted; the caller must scan instead.
+/// Admit decoded seed zones into a version 1 file. A version 0 record has
+/// no sign split: without NaNs the split is provably zero and the record is
+/// admitted; with NaNs its ordinary maximum is hidden behind the marker and
+/// the split is unknown, so `false` tells the caller to scan.
 fn admit_seed_zones_for_v1(zones: &mut [ZoneMapStatistics]) -> bool {
     for zone in zones.iter_mut() {
         if zone.negative_nan_count.is_none() {
@@ -1284,11 +1283,9 @@ pub async fn merge_zonemap_indices(
     let rows_per_zone = first.rows_per_zone;
     let use_seeds = first.use_seeds;
     let data_type = first.data_type.clone();
-    // The output keeps the sources' file version: version 0 sources merge
-    // into a version 0 file under its own contract, version 1 sources into
-    // a version 1 file. Mixed inputs are refused before anything is written;
-    // this entry neither reads source data nor upgrades or downgrades a
-    // segment (`optimize_indices` rebuilds a selected older segment).
+    // The output keeps the sources' version; this entry has no source data
+    // to upgrade a version 0 segment with, so mixed inputs are refused
+    // before anything is written.
     let version = first.version;
     if let Some(other) = source_indices
         .iter()
@@ -1380,12 +1377,11 @@ pub async fn merge_zonemap_indices(
     })
 }
 
-/// A version 1 file holds exact counts, but `remap_zone` copies a source
-/// zone's counts into every destination run, which is only exact when the
-/// run keeps all of the zone's rows. A narrower run keeps exact counts only
-/// when the zone has no NaNs (none can remain) and its null count was
-/// recomputed from an exact bitmap (or there were no nulls). Anything else
-/// is refused before the file is written; the segment has to be rebuilt.
+/// `remap_zone` copies a zone's counts into each destination run, which is
+/// exact only when the run keeps every row of the zone. A version 1 file
+/// must hold exact counts, so a narrower run is accepted only when the zone
+/// has no NaNs and its null count is exact (recomputed from a bitmap, or
+/// zero); otherwise the merge is refused before writing.
 fn reject_inexact_remapped_zone(
     source: &ZoneMapStatistics,
     remapped: &ZoneMapStatistics,
@@ -1466,8 +1462,7 @@ impl ZoneMapIndexBuilderParams {
 // A builder for zonemap index
 pub struct ZoneMapIndexBuilder {
     options: ZoneMapIndexBuilderParams,
-    /// The file version to write. New segments use the current version; the
-    /// low-level update entry keeps its segment's existing version.
+    /// The file version to write; see [`Self::with_version`].
     version: ZoneMapIndexVersion,
 
     items_type: DataType,
@@ -1489,9 +1484,9 @@ impl ZoneMapIndexBuilder {
         })
     }
 
-    /// Write the file in `version` instead of the current version. This
-    /// exists only for the low-level update of an existing segment, which
-    /// keeps that segment's version; new segments never set it.
+    /// Write the file in `version` instead of the current one. Only the
+    /// low-level update of an existing segment uses this, to keep that
+    /// segment's version.
     #[doc(hidden)]
     pub fn with_version(mut self, version: ZoneMapIndexVersion) -> Self {
         self.version = version;
@@ -1524,9 +1519,8 @@ impl ZoneMapIndexBuilder {
                 ScalarValue::iter_to_array(std::iter::repeat_n(placeholder, self.maps.len()))?;
             (bounds.clone(), bounds)
         } else if self.version == ZoneMapIndexVersion::V0 {
-            // Version 0 has no column for the NaN sign split, and its readers
-            // take a NaN max as the marker that the zone holds NaNs. Keep
-            // writing that marker so version 0 readers stay conservative.
+            // Version 0 readers take a NaN max as the marker that the zone
+            // holds NaNs.
             let legacy_max = |stat: &ZoneMapStatistics| {
                 if stat.nan_count > 0
                     && let Some(nan) = nan_scalar(&self.items_type)
@@ -1552,10 +1546,9 @@ impl ZoneMapIndexBuilder {
 
         let nan_counts = UInt32Array::from_iter_values(self.maps.iter().map(|stat| stat.nan_count));
 
-        // Version 1 persists the sign split, so every zone must know it, and
-        // its loader rejects counts above the zone length or NaN bounds; the
-        // same invariants are checked here so a bad zone fails the write
-        // rather than producing a file its own reader refuses.
+        // A version 1 zone must know its sign split and satisfy the loader's
+        // invariants; a bad zone fails the write instead of producing a file
+        // its own reader refuses.
         let negative_nan_counts = match self.version {
             ZoneMapIndexVersion::V1 => Some(UInt32Array::from_iter_values(
                 self.maps
@@ -1568,26 +1561,17 @@ impl ZoneMapIndexBuilder {
                                 stat.bound.fragment_id, stat.bound.start
                             ))
                         })?;
-                        if negative > stat.nan_count
-                            || u64::from(stat.null_count) + u64::from(stat.nan_count)
-                                > stat.bound.length as u64
-                        {
+                        if let Some(violation) = v1_zone_violation(
+                            &stat.min,
+                            &stat.max,
+                            stat.null_count,
+                            stat.nan_count,
+                            negative,
+                            stat.bound.length as u64,
+                            self.items_type.is_nested(),
+                        ) {
                             return Err(Error::invalid_input(format!(
-                                "cannot write a version 1 ZoneMap zone with inconsistent \
-                                 counts (fragment {}, start {}, length {}, null_count {}, \
-                                 nan_count {}, negative_nan_count {negative})",
-                                stat.bound.fragment_id,
-                                stat.bound.start,
-                                stat.bound.length,
-                                stat.null_count,
-                                stat.nan_count
-                            )));
-                        }
-                        if ZoneMapIndex::scalar_is_nan(&stat.min)
-                            || ZoneMapIndex::scalar_is_nan(&stat.max)
-                        {
-                            return Err(Error::invalid_input(format!(
-                                "cannot write a version 1 ZoneMap zone with a NaN bound \
+                                "cannot write a version 1 ZoneMap zone with {violation} \
                                  (fragment {}, start {})",
                                 stat.bound.fragment_id, stat.bound.start
                             )));
