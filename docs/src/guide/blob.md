@@ -3,6 +3,10 @@
 Lance can store large binary objects (images, videos, audio, model artifacts) in blob columns, where they are treated like any other column payload in the dataset.
 Blob columns support both planned full-payload reads and lazy file-like access.
 
+For moving lazy values between processes, see the Rust
+[portable blob reference execution contract](blob_references.md). This transport
+contract is separate from stored Blob v2 descriptors and payload readers.
+
 !!! tip "Choosing between `read_blobs` and `take_blobs`"
     - For data loaders and batch processing that need complete byte payloads, use `read_blobs`.
     - Use `take_blobs` when you need a `BlobFile` handle for streaming, seeking, or partial reads.
