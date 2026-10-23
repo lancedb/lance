@@ -3881,7 +3881,7 @@ mod tests {
                 &counting,
             )
             .unwrap();
-        assert_eq!(results.0.len(), 10);
+        assert_eq!(results.len(), 10);
         assert_eq!(
             counting.prefetch_calls.load(Ordering::Relaxed) > 0,
             expect_prefetch
