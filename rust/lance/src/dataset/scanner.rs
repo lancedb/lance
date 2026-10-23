@@ -22,6 +22,7 @@ use datafusion::common::{DFSchema, JoinType, NullEquality, exec_datafusion_err};
 use datafusion::functions_aggregate;
 use datafusion::logical_expr::{Expr, ScalarUDF, col, lit};
 use datafusion::physical_expr::PhysicalSortExpr;
+use datafusion::physical_optimizer::output_requirements::OutputRequirementExec;
 #[allow(deprecated)]
 use datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
@@ -42,7 +43,9 @@ use datafusion_expr::execution_props::ExecutionProps;
 use datafusion_functions::core::getfield::GetFieldFunc;
 use datafusion_physical_expr::aggregate::LoweredAggregateBuilder;
 use datafusion_physical_expr::expressions::{Column, Literal};
-use datafusion_physical_expr::{LexOrdering, Partitioning, PhysicalExpr, create_physical_expr};
+use datafusion_physical_expr::{
+    Distribution, LexOrdering, Partitioning, PhysicalExpr, create_physical_expr,
+};
 use datafusion_physical_plan::joins::PartitionMode;
 use datafusion_physical_plan::projection::ProjectionExec;
 use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
@@ -2226,6 +2229,10 @@ impl Scanner {
     /// Overrides the default (`get_num_compute_intensive_cpus()`). Used by
     /// `EnforceDistribution` and similar rules to decide how many parallel
     /// partitions to use. Set to 1 in tests that assert specific plan shapes.
+    ///
+    /// A scan that reads in order (see [`Self::scan_in_order`]) and has no sort
+    /// does not split its filters and projections across partitions, because
+    /// merging the partitions would lose the order.
     pub fn target_parallelism(&mut self, n: usize) -> &mut Self {
         self.target_parallelism = Some(n);
         self
@@ -2992,6 +2999,31 @@ impl Scanner {
         }
 
         Ok(output_expr)
+    }
+
+    /// The `order_by` keys as columns of the final projection's output, or `None`
+    /// when a key does not pass through the projection unchanged.
+    fn ordering_in_output(
+        ordering: &[ColumnOrdering],
+        projection: &[(Arc<dyn PhysicalExpr>, String)],
+    ) -> Option<LexOrdering> {
+        let sort_exprs = ordering
+            .iter()
+            .map(|col| {
+                let index = projection.iter().position(|(expr, _)| {
+                    expr.downcast_ref::<Column>()
+                        .is_some_and(|column| column.name() == col.column_name)
+                })?;
+                Some(PhysicalSortExpr {
+                    expr: Arc::new(Column::new(&projection[index].1, index)),
+                    options: SortOptions {
+                        descending: !col.ascending,
+                        nulls_first: col.nulls_first,
+                    },
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        LexOrdering::new(sort_exprs)
     }
 
     /// Create a stream from the Scanner.
@@ -3894,6 +3926,10 @@ impl Scanner {
 
         // Final projection
         let final_projection = self.calculate_final_projection(plan.schema().as_ref())?;
+        let output_sort = self
+            .ordering
+            .as_ref()
+            .and_then(|ordering| Self::ordering_in_output(ordering, &final_projection));
 
         plan = Arc::new(DFProjectionExec::try_new(final_projection, plan)?);
 
@@ -3907,6 +3943,39 @@ impl Scanner {
         options.execution.target_partitions = self
             .target_parallelism
             .unwrap_or_else(get_num_compute_intensive_cpus);
+        // Rows must come back in plan order unless the caller opted out and
+        // nothing ranks them.
+        let order_matters = self.ordered
+            || self.ordering.is_some()
+            || self.nearest.is_some()
+            || self.full_text_query.is_some()
+            || self.minhash_query.is_some();
+        // The order the output declares. With `order_by` it must cover every sort
+        // key, which it cannot if the projection drops or changes one.
+        let properties = plan.properties();
+        let visible_order = match (&self.ordering, output_sort) {
+            (None, _) => properties.output_ordering().cloned(),
+            (Some(_), Some(output_sort)) => properties
+                .equivalence_properties()
+                .ordering_satisfy(output_sort.clone())?
+                .then_some(output_sort),
+            (Some(_), None) => None,
+        };
+        // Round-robin partitions are merged back in order only by an ordering the
+        // output declares; otherwise they arrive in whichever order they finish.
+        options.optimizer.enable_round_robin_repartition =
+            !order_matters || visible_order.is_some();
+        if let Some(order) = visible_order {
+            // `EnforceDistribution` then merges any partitions back in this order
+            plan = Arc::new(OutputRequirementExec::new(
+                plan,
+                Some(order.into()),
+                Distribution::SinglePartition,
+                None,
+            ));
+            // Otherwise the merge is replaced by a coalesce and a full re-sort
+            options.optimizer.prefer_existing_sort = true;
+        }
         for rule in optimizer.rules {
             plan = rule.optimize(plan, &options)?;
         }
@@ -4065,6 +4134,37 @@ impl Scanner {
         }
     }
 
+    // Read options carrying the scanner's batch size, readahead and I/O settings.
+    fn read_options(&self, projection: Projection) -> Result<FilteredReadOptions> {
+        // Bound the decode fan-out by `batch_readahead`.
+        let mut read_options = FilteredReadOptions::new(projection).with_threading_mode(
+            FilteredReadThreadingMode::OnePartitionMultipleThreads(self.batch_readahead),
+        );
+
+        if let Some(batch_size) = self.batch_size {
+            read_options = read_options.with_batch_size(validate_batch_size(batch_size)?);
+        }
+
+        if let Some(file_reader_options) = self.resolved_file_reader_options() {
+            read_options = read_options.with_file_reader_options(file_reader_options);
+        }
+
+        if let Some(fragment_readahead) = self.fragment_readahead {
+            read_options = read_options.with_fragment_readahead(fragment_readahead);
+        }
+
+        if let Some(io_buffer_size_bytes) = self.io_buffer_size {
+            read_options = read_options.with_io_buffer_size(io_buffer_size_bytes);
+        }
+
+        if let Some(materialization_readahead_bytes) = self.materialization_readahead_bytes {
+            read_options =
+                read_options.with_materialization_readahead_bytes(materialization_readahead_bytes);
+        }
+
+        Ok(read_options)
+    }
+
     // Helper function for filtered_read
     //
     // Do not call this directly, use filtered_read instead
@@ -4082,9 +4182,9 @@ impl Scanner {
         let use_external_mask = self.use_external_mask();
         let effective_filter = self.effective_filter_plan(filter_plan);
 
-        let mut read_options = FilteredReadOptions::basic_full_read(&self.dataset)
-            .with_filter_plan(effective_filter)
-            .with_projection(projection);
+        let mut read_options = self
+            .read_options(projection)?
+            .with_filter_plan(effective_filter);
 
         if let Some(rows) = &self.physical_row_addr_prefilter {
             read_options = read_options.with_physical_row_addr_prefilter(rows.clone());
@@ -4098,34 +4198,8 @@ impl Scanner {
             read_options = read_options.with_scan_range_before_filter(scan_range)?;
         }
 
-        if let Some(batch_size) = self.batch_size {
-            read_options = read_options.with_batch_size(validate_batch_size(batch_size)?);
-        }
-
-        // Bound the decode fan-out by `batch_readahead`.
-        read_options = read_options.with_threading_mode(
-            FilteredReadThreadingMode::OnePartitionMultipleThreads(self.batch_readahead),
-        );
-
-        if let Some(file_reader_options) = self.resolved_file_reader_options() {
-            read_options = read_options.with_file_reader_options(file_reader_options);
-        }
-
-        if let Some(fragment_readahead) = self.fragment_readahead {
-            read_options = read_options.with_fragment_readahead(fragment_readahead);
-        }
-
         if make_deletions_null {
             read_options = read_options.with_deleted_rows()?;
-        }
-
-        if let Some(io_buffer_size_bytes) = self.io_buffer_size {
-            read_options = read_options.with_io_buffer_size(io_buffer_size_bytes);
-        }
-
-        if let Some(materialization_readahead_bytes) = self.materialization_readahead_bytes {
-            read_options =
-                read_options.with_materialization_readahead_bytes(materialization_readahead_bytes);
         }
 
         if self.fast_search && filter_plan.has_index_query() {
@@ -4311,10 +4385,31 @@ impl Scanner {
         self.row_ids_as_take_input(RowAddrTreeMap::from_iter(row_ids.into_iter().flatten()))
     }
 
+    // The columns the source read must produce. If we have an aggregate, we only need the
+    // columns referenced by the aggregate, not all the columns from the projection plan.
+    fn source_projection(&self) -> Result<Projection> {
+        let Some(agg) = &self.aggregate else {
+            return Ok(self.projection_plan.physical_projection.clone());
+        };
+        let required_columns = agg.required_columns();
+        if required_columns.is_empty() {
+            // COUNT(*) or similar - no columns needed
+            Ok(self.dataset.empty_projection())
+        } else {
+            // Aggregate needs specific columns
+            self.dataset
+                .empty_projection()
+                .union_columns(&required_columns, OnMissing::Error)
+        }
+    }
+
     async fn take_source(&self, take_op: TakeOperation) -> Result<Arc<dyn ExecutionPlan>> {
         // We generally assume that late materialization does not make sense for take operations
-        // so we can just use the physical projection
-        let projection = self.projection_plan.physical_projection.clone();
+        // so we can just use the source projection
+        let mut projection = self.source_projection()?;
+        // Later stages take filter, aggregate and ordering columns by row address, and
+        // an empty projection still needs an output column. The address is synthesized.
+        projection.with_row_addr = true;
 
         let input = match take_op {
             TakeOperation::RowIds(ids) => {
@@ -4329,7 +4424,7 @@ impl Scanner {
             }
         }?;
 
-        let mut filtered_read_options = FilteredReadOptions::new(projection);
+        let mut filtered_read_options = self.read_options(projection)?;
         if let Some(fragment) = self.fragments.as_ref() {
             filtered_read_options =
                 filtered_read_options.with_fragments(Arc::new(fragment.clone()));
@@ -4353,23 +4448,7 @@ impl Scanner {
     ) -> Result<PlannedFilteredScan> {
         log::trace!("source is a filtered read");
 
-        // Compute the effective projection based on what's actually needed.
-        // If we have an aggregate, we only need the columns referenced by the aggregate,
-        // not all the columns from the projection plan.
-        let effective_projection = if let Some(agg) = &self.aggregate {
-            let required_columns = agg.required_columns();
-            if required_columns.is_empty() {
-                // COUNT(*) or similar - no columns needed
-                self.dataset.empty_projection()
-            } else {
-                // Aggregate needs specific columns
-                self.dataset
-                    .empty_projection()
-                    .union_columns(&required_columns, OnMissing::Error)?
-            }
-        } else {
-            self.projection_plan.physical_projection.clone()
-        };
+        let effective_projection = self.source_projection()?;
 
         // Plan against the effective filter: with an external mask the SQL filter
         // becomes a refine, so its columns must be retained even when the original
@@ -8421,33 +8500,14 @@ impl Scanner {
             let mut projection = output_projection;
             projection.with_row_id |= has_row_id;
             projection.with_row_addr |= has_row_addr;
-            let mut read_options = FilteredReadOptions::new(projection);
+            let mut read_options = self.read_options(projection)?;
             if self.include_deleted_rows {
                 // Forwarded so the row-stream read rejects it: deleted rows
                 // carry a null row id, which the take would silently drop
                 read_options = read_options.with_deleted_rows()?;
             }
-            if let Some(batch_size) = self.batch_size {
-                read_options = read_options.with_batch_size(validate_batch_size(batch_size)?);
-            }
             if let Some(fragments) = &self.fragments {
                 read_options = read_options.with_fragments(Arc::new(fragments.clone()));
-            }
-            read_options = read_options.with_threading_mode(
-                FilteredReadThreadingMode::OnePartitionMultipleThreads(self.batch_readahead),
-            );
-            if let Some(file_reader_options) = self.resolved_file_reader_options() {
-                read_options = read_options.with_file_reader_options(file_reader_options);
-            }
-            if let Some(fragment_readahead) = self.fragment_readahead {
-                read_options = read_options.with_fragment_readahead(fragment_readahead);
-            }
-            if let Some(io_buffer_size_bytes) = self.io_buffer_size {
-                read_options = read_options.with_io_buffer_size(io_buffer_size_bytes);
-            }
-            if let Some(materialization_readahead_bytes) = self.materialization_readahead_bytes {
-                read_options = read_options
-                    .with_materialization_readahead_bytes(materialization_readahead_bytes);
             }
             return Ok(Arc::new(FilteredReadExec::try_new(
                 self.dataset.clone(),
@@ -13361,6 +13421,103 @@ mod test {
         );
     }
 
+    // More rows than one batch, so the row count alone does not keep the
+    // optimizer from splitting the read across partitions.
+    async fn scan_order_dataset() -> Dataset {
+        gen_batch()
+            .col("idx", array::step::<Int32Type>())
+            .col(
+                "grp",
+                array::cycle::<Int32Type>((0..12_288).map(|idx| idx / 1_000).collect()),
+            )
+            .into_ram_dataset(FragmentCount::from(3), FragmentRowCount::from(4_096))
+            .await
+            .unwrap()
+    }
+
+    #[rstest]
+    #[case::computed_column(None, &[], &[], false)]
+    // Row 1 of fragments 2, 1 and 0
+    #[case::take_with_filter(
+        Some("_rowid IN (8589934593, 4294967297, 1) AND idx >= 0"),
+        &[],
+        &[],
+        false
+    )]
+    #[case::sort_column_projected_away(None, &["idx"], &[], false)]
+    // The sorted partitions are merged back in order, so they may run in parallel.
+    #[case::sort_column_kept(None, &["idx"], &[("idx", "idx")], true)]
+    #[case::sort_key_partly_projected(None, &["grp", "idx"], &[("grp", "grp")], false)]
+    // `idx > 0` keeps an ordering on its second column, but a weaker one than `idx`.
+    #[case::sort_key_weakened(
+        None,
+        &["grp", "idx"],
+        &[("grp", "grp"), ("flag", "idx > 0")],
+        false
+    )]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_scan_order_survives_parallelism(
+        #[case] filter: Option<&str>,
+        #[case] descending_by: &[&str],
+        #[case] extra_columns: &[(&str, &str)],
+        #[case] round_robin: bool,
+    ) {
+        let dataset = scan_order_dataset().await;
+        let mut scan = dataset.scan();
+        scan.target_parallelism(8);
+        let mut columns = vec![("foo", "idx * 2")];
+        columns.extend_from_slice(extra_columns);
+        scan.project_with_transform(&columns).unwrap();
+        if let Some(filter) = filter {
+            scan.filter(filter).unwrap();
+        }
+        if !descending_by.is_empty() {
+            let ordering = descending_by
+                .iter()
+                .map(|column| ColumnOrdering::desc_nulls_first(column.to_string()))
+                .collect();
+            scan.order_by(Some(ordering)).unwrap();
+        }
+
+        let plan = scan.explain_plan(false).await.unwrap();
+        assert_eq!(plan.contains("RoundRobinBatch"), round_robin, "{plan}");
+        // The plan merges its own partitions back in order.
+        assert_eq!(
+            plan.contains("SortPreservingMergeExec"),
+            round_robin,
+            "{plan}"
+        );
+        let mut expected = match filter {
+            Some(_) => vec![1, 4_097, 8_193],
+            None => (0..12_288).collect::<Vec<i32>>(),
+        };
+        if !descending_by.is_empty() {
+            expected.reverse();
+        }
+        let expected = expected.iter().map(|idx| idx * 2).collect::<Vec<_>>();
+        let batch = scan.try_into_batch().await.unwrap();
+        assert_eq!(
+            batch["foo"].as_primitive::<Int32Type>().values(),
+            expected.as_slice()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unordered_scan_keeps_parallelism() {
+        let dataset = scan_order_dataset().await;
+        let mut scan = dataset.scan();
+        scan.target_parallelism(8);
+        scan.scan_in_order(false);
+        scan.project_with_transform(&[("foo", "idx * 2")]).unwrap();
+
+        let plan = scan.explain_plan(false).await.unwrap();
+        assert!(plan.contains("RoundRobinBatch"), "{plan}");
+        let batch = scan.try_into_batch().await.unwrap();
+        let mut values = batch["foo"].as_primitive::<Int32Type>().values().to_vec();
+        values.sort_unstable();
+        assert_eq!(values, (0..12_288).map(|idx| idx * 2).collect::<Vec<_>>());
+    }
+
     #[rstest]
     #[tokio::test]
     async fn test_refine_factor(
@@ -14372,7 +14529,9 @@ mod test {
 
             assert_eq!(
                 dataset.index_cache_entry_count().await,
-                5 + dataset.versions().await.unwrap().len()
+                // the index, its partitions and the segment ownership mask, plus
+                // the index metadata of every version
+                6 + dataset.versions().await.unwrap().len()
             );
             assert_eq!(results.len(), 1);
             let batch = &results[0];
@@ -15385,6 +15544,107 @@ mod test {
         );
     }
 
+    /// Zone map pruning over NaN-bearing float zones returns exactly what the
+    /// unindexed scan returns, for every filter shape, while really going
+    /// through the index.
+    #[tokio::test]
+    async fn test_zonemap_nan_scan_matches_unindexed_scan() {
+        use arrow_array::Float32Array;
+
+        let pos_nan = f32::from_bits(0x7FC0_0000);
+        let pos_nan_payload = f32::from_bits(0x7FFF_FFFF);
+        let neg_nan = f32::from_bits(0xFFC0_0000);
+        let neg_nan_payload = f32::from_bits(0xFFFF_FFFF);
+
+        // One fragment (= one zone) per value class: all positive NaNs, all
+        // negative NaNs, NaN plus null, finite plus NaN, finite only.
+        let values: Vec<Option<f32>> = vec![
+            Some(pos_nan),
+            Some(pos_nan_payload),
+            Some(neg_nan),
+            Some(neg_nan_payload),
+            Some(neg_nan),
+            None,
+            Some(1.0),
+            Some(pos_nan),
+            Some(-5.0),
+            Some(7.0),
+        ];
+        let ids: Vec<i32> = (0..values.len() as i32).collect();
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("id", DataType::Int32, false),
+                ArrowField::new("val", DataType::Float32, true),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(ids)),
+                Arc::new(Float32Array::from(values)),
+            ],
+        )
+        .unwrap();
+        let schema = batch.schema();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let mut dataset = Dataset::write(
+            reader,
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 5);
+        dataset
+            .create_index(
+                &["val"],
+                IndexType::ZoneMap,
+                None,
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap),
+                false,
+            )
+            .await
+            .unwrap();
+
+        for filter in [
+            "val < 0.0",
+            "val > 0.0",
+            "val >= 0.0 AND val <= 5.0",
+            "val <= -1.0",
+            "val > 100.0",
+            "val = 7.0",
+            "val IS NULL",
+        ] {
+            let mut full_scan = dataset.scan();
+            full_scan
+                .use_scalar_index(false)
+                .filter(filter)
+                .unwrap()
+                .project(&["id"])
+                .unwrap();
+            let full = full_scan.try_into_batch().await.unwrap();
+            let full_ids: Vec<i32> = full["id"].as_primitive::<Int32Type>().values().to_vec();
+
+            let mut indexed_scan = dataset.scan();
+            indexed_scan
+                .filter(filter)
+                .unwrap()
+                .project(&["id"])
+                .unwrap();
+            let plan = indexed_scan.explain_plan(false).await.unwrap();
+            assert!(
+                plan.contains("ScalarIndexQuery") && plan.contains("ZoneMap"),
+                "filter {filter} must go through the zone map index: {plan}"
+            );
+            let indexed = indexed_scan.try_into_batch().await.unwrap();
+            let indexed_ids: Vec<i32> = indexed["id"].as_primitive::<Int32Type>().values().to_vec();
+            assert_eq!(
+                indexed_ids, full_ids,
+                "indexed and unindexed scans disagree for filter {filter}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_fm_index_with_stable_row_ids() {
         let batch = arrow_array::record_batch!(
@@ -15703,32 +15963,53 @@ mod test {
         assert_eq!(count(&dataset, "regexp_like(text, 'a.b')").await, 20);
     }
 
+    #[rstest]
+    #[case::short_unicode("éé", vec![0, 1], false)]
+    #[case::tokenizable_unicode("ééb", vec![0], true)]
+    #[case::punctuation("_k7", vec![5, 6, 7, 8], true)]
+    #[case::all_windows_filtered("_k7_", vec![8], true)]
+    #[case::partly_tokenizable("_k77", vec![6], true)]
+    #[case::only_punctuation("!!!", vec![9], true)]
+    #[case::no_matches("_x7", vec![], true)]
     #[tokio::test]
-    async fn test_ngram_contains_untokenizable_needle() {
-        // A needle the tokenizer cannot turn into a trigram must fall back to a
-        // full recheck rather than silently matching nothing.  Byte length is
-        // not a usable proxy for this: "éé" is two characters but four bytes.
-        let unit = ["ééb", "aéé", "abc", "dog", "éab"];
-        let values: Vec<&str> = unit.iter().copied().cycle().take(60).collect();
-        let array = StringArray::from_iter_values(values);
-        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "text",
-            DataType::Utf8,
-            false,
-        )]));
-        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(array)]).unwrap();
-        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    async fn test_ngram_contains_untokenizable_needle(
+        #[case] needle: &str,
+        #[case] expected_ids: Vec<u32>,
+        #[case] is_index_used: bool,
+        #[values(false, true)] has_stable_row_ids: bool,
+    ) {
+        let batch = arrow_array::record_batch!(
+            ("id", UInt32, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]),
+            (
+                "text",
+                Utf8,
+                vec![
+                    Some("ééb"),
+                    Some("aéé"),
+                    Some("abc"),
+                    Some("dog"),
+                    Some("éab"),
+                    Some("user_k7"),
+                    Some("user_k77"),
+                    Some("_k7"),
+                    Some("_k7_"),
+                    Some("!!!"),
+                    Some(""),
+                    None,
+                ]
+            )
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
         let write_params = WriteParams {
-            max_rows_per_file: 20, // 60 rows -> 3 fragments
+            max_rows_per_file: 4,
+            enable_stable_row_ids: has_stable_row_ids,
             ..Default::default()
         };
-        let mut dataset = Dataset::write(
-            reader,
-            "memory://test_ngram_contains_utf8",
-            Some(write_params),
-        )
-        .await
-        .unwrap();
+        let mut dataset = Dataset::write(reader, "memory://", Some(write_params))
+            .await
+            .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 3);
         dataset
             .create_index(
                 &["text"],
@@ -15740,46 +16021,29 @@ mod test {
             .await
             .unwrap();
 
-        async fn count(dataset: &Dataset, filter: &str) -> usize {
-            let mut scan = dataset.scan();
-            scan.filter(filter).unwrap();
-            let batches = scan
-                .try_into_stream()
-                .await
-                .unwrap()
-                .try_collect::<Vec<_>>()
-                .await
-                .unwrap();
-            batches.iter().map(|b| b.num_rows()).sum()
+        let filter = format!("contains(text, '{needle}')");
+        let mut indexed_scan = dataset.scan();
+        indexed_scan.filter(&filter).unwrap();
+        let plan = indexed_scan.explain_plan(false).await.unwrap();
+        assert_eq!(plan.contains("ScalarIndexQuery"), is_index_used, "{plan}");
+        if is_index_used {
+            assert!(plan.contains("NGram"), "{plan}");
         }
 
-        async fn plan_of(dataset: &Dataset, filter: &str) -> String {
-            let mut scan = dataset.scan();
-            scan.filter(filter).unwrap();
-            let plan = scan.create_plan().await.unwrap();
-            format!(
-                "{}",
-                datafusion::physical_plan::displayable(plan.as_ref()).indent(true)
-            )
-        }
-
-        // Each unit value appears 12 times in the 60 rows.
-        // Two characters (four bytes): shorter than a trigram, so the index is
-        // bypassed and "ééb" / "aéé" are still found.
-        assert_eq!(count(&dataset, "contains(text, 'éé')").await, 24);
-        let plan_str = plan_of(&dataset, "contains(text, 'éé')").await;
-        assert!(
-            !plan_str.contains("ScalarIndexQuery"),
-            "expected NO ngram index usage for a two character needle, got plan:\n{plan_str}"
+        let indexed = indexed_scan.try_into_batch().await.unwrap();
+        let unindexed = dataset
+            .scan()
+            .use_scalar_index(false)
+            .filter(&filter)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(
+            unindexed["id"].as_primitive::<UInt32Type>().values(),
+            &expected_ids,
         );
-
-        // Three characters: long enough to tokenize, so the index is used.
-        assert_eq!(count(&dataset, "contains(text, 'ééb')").await, 12);
-        let plan_str = plan_of(&dataset, "contains(text, 'ééb')").await;
-        assert!(
-            plan_str.contains("ScalarIndexQuery") && plan_str.contains("NGram"),
-            "expected ngram index usage for a three character needle, got plan:\n{plan_str}"
-        );
+        assert_eq!(indexed, unindexed);
     }
 
     #[tokio::test]
@@ -19850,6 +20114,100 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         .await;
     }
 
+    #[rstest]
+    #[case::address_offset_only(false, false)]
+    #[case::address_with_id(false, true)]
+    #[case::stable_offset_only(true, false)]
+    #[case::stable_with_id(true, true)]
+    #[tokio::test]
+    async fn test_ann_row_offset_projection(
+        #[case] has_stable_row_ids: bool,
+        #[case] has_id_projection: bool,
+    ) {
+        let mut dataset = gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .col(
+                "vec",
+                array::cycle_vec(array::step::<Float32Type>(), Dimension::from(2)),
+            )
+            .into_ram_dataset_with_params(
+                FragmentCount::from(3),
+                FragmentRowCount::from(4),
+                Some(WriteParams {
+                    max_rows_per_file: 4,
+                    enable_stable_row_ids: has_stable_row_ids,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        let centroids = Arc::new(
+            FixedSizeListArray::try_new_from_values(Float32Array::from(vec![0.0, 1.0]), 2).unwrap(),
+        );
+        let params = VectorIndexParams::with_ivf_flat_params(
+            MetricType::L2,
+            IvfBuildParams::try_with_centroids(1, centroids).unwrap(),
+        );
+        dataset
+            .create_index(&["vec"], IndexType::Vector, None, &params, true)
+            .await
+            .unwrap();
+        dataset.delete("id IN (1, 5)").await.unwrap();
+        assert_eq!(dataset.get_fragments().len(), 3);
+
+        let mut scanner = dataset.scan();
+        scanner
+            .nearest("vec", &Float32Array::from(vec![14.5, 15.5]), 4)
+            .unwrap()
+            .minimum_nprobes(1)
+            .maximum_nprobes(1);
+        let projection = if has_id_projection {
+            vec!["id", ROW_OFFSET]
+        } else {
+            vec![ROW_OFFSET]
+        };
+        scanner.project(&projection).unwrap();
+        // Keep the default distance projection and ordering: they cause the
+        // physical optimizer to request statistics above AddRowOffsetExec.
+        let plan = scanner.explain_plan(false).await.unwrap();
+        assert!(plan.contains("ANNSubIndex"), "{plan}");
+        assert!(plan.contains("AddRowOffsetExec"), "{plan}");
+        let batch = scanner.try_into_batch().await.unwrap();
+        let mut expected_columns = projection;
+        expected_columns.push(DIST_COL);
+        assert_eq!(
+            batch
+                .schema()
+                .fields()
+                .iter()
+                .map(|field| field.name().as_str())
+                .collect::<Vec<_>>(),
+            expected_columns
+        );
+
+        // Vectors are [2 * id, 2 * id + 1]. The exact neighbors are 7, 8, 6, 9;
+        // deleting 1 and 5 shifts their logical offsets by two.
+        let expected_offsets = [5, 6, 4, 7];
+        let offsets = batch[ROW_OFFSET].as_primitive::<UInt64Type>().values();
+        let recall = offsets
+            .iter()
+            .filter(|offset| expected_offsets.contains(offset))
+            .count() as f64
+            / expected_offsets.len() as f64;
+        assert_eq!(recall, 1.0);
+        assert_eq!(offsets.as_ref(), expected_offsets);
+        assert_eq!(
+            batch[DIST_COL].as_primitive::<Float32Type>().values(),
+            &[0.5, 4.5, 12.5, 24.5]
+        );
+        if has_id_projection {
+            assert_eq!(
+                batch["id"].as_primitive::<Int32Type>().values(),
+                &[7, 8, 6, 9]
+            );
+        }
+    }
+
     // Unit-level companion to the NOT IN case in
     // test_filter_to_take_with_stable_row_ids: exercises the lowering directly,
     // independent of the expression simplifier's InList expansion threshold
@@ -20026,6 +20384,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
     async fn test_filter_to_take() {
         let mut ds = lance_datagen::gen_batch()
             .col("idx", array::step::<Int32Type>())
+            .col("other", array::step_custom::<Int32Type>(1000, 1))
             .into_ram_dataset(FragmentCount::from(3), FragmentRowCount::from(100))
             .await
             .unwrap();
@@ -20162,6 +20521,26 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         check_no_opt("_rowid = 50 AND _rowid = 51", &[]).await;
         check_no_opt("(_rowid = 50 AND idx < 100) OR _rowid = 51", &[50, 51]).await;
 
+        // The take's row count is inexact, so the plan must keep the remainder
+        // filter from splitting the take's batches across partitions
+        let mut scanner = ds.scan();
+        scanner
+            .target_parallelism(4)
+            .filter(&format!(
+                "_rowid IN ({}, {}, {}) AND idx >= 0",
+                row_ids.value(250),
+                row_ids.value(101),
+                row_ids.value(1)
+            ))
+            .unwrap();
+        let plan = scanner.explain_plan(false).await.unwrap();
+        assert!(!plan.contains("RepartitionExec"), "{plan}");
+        let batch = scanner.try_into_batch().await.unwrap();
+        assert_eq!(
+            batch["idx"].as_primitive::<Int32Type>().values(),
+            &[1, 101, 250]
+        );
+
         // Dynamic projection
         let mut scanner = ds.scan();
         scanner.filter("_rowoffset = 77").unwrap();
@@ -20173,6 +20552,41 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         assert_eq!(batches[0].schema().field(0).name(), "foo");
         let val = batches[0].column(0).as_primitive::<Int32Type>().values()[0];
         assert_eq!(val, 154);
+
+        // The remainder filter reads `idx`, which the projection leaves out
+        let mut scanner = ds.scan();
+        scanner
+            .project(&["other"])
+            .unwrap()
+            .filter("_rowid IN (5, 10, 15) AND idx > 10")
+            .unwrap();
+        let batch = scanner.try_into_batch().await.unwrap();
+        assert_eq!(batch.schema().fields().len(), 1, "{:?}", batch.schema());
+        assert_eq!(batch["other"].as_primitive::<Int32Type>().values(), &[1015]);
+
+        // A count reads no data columns, and the take keeps the scanner's batch size
+        let mut scanner = ds.scan();
+        scanner
+            .batch_size(1)
+            .filter("_rowid IN (5, 10, 15)")
+            .unwrap();
+        let plan = scanner.analyze_count_plan().await.unwrap();
+        assert!(plan.contains("projection=[], "), "{plan}");
+        assert_eq!(scanner.count_rows().await.unwrap(), 3);
+        let batches = scanner
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(
+            batches
+                .iter()
+                .map(|batch| batch.num_rows())
+                .collect::<Vec<_>>(),
+            vec![1, 1, 1]
+        );
     }
 
     #[tokio::test]
