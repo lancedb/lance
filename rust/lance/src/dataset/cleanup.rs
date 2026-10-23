@@ -644,7 +644,9 @@ impl<'a> CleanupTask<'a> {
             .map(|tag_content| tag_content.version)
             .collect();
 
-        let mut inspection = self.process_manifests(&tagged_versions).await?;
+        let mut inspection = self
+            .process_manifests(&tagged_versions, &referenced_branches)
+            .await?;
 
         if self.policy.error_if_tagged_old_versions && !inspection.tagged_old_versions.is_empty() {
             return Err(tagged_old_versions_cleanup_error(
@@ -675,14 +677,19 @@ impl<'a> CleanupTask<'a> {
     async fn process_manifests(
         &'a self,
         tagged_versions: &HashSet<u64>,
+        referenced_branches: &[(String, u64)],
     ) -> Result<CleanupInspection> {
         let inspection = Mutex::new(CleanupInspection::default());
+        let branch_versions: HashSet<u64> = referenced_branches
+            .iter()
+            .map(|(_, version)| *version)
+            .collect();
         self.dataset
             .commit_handler
             .list_manifest_locations(&self.dataset.base, &self.dataset.object_store, false)
             .try_filter(|location| future::ready(!self.ignored_manifests.contains(&location.path)))
             .try_for_each_concurrent(self.dataset.object_store.io_parallelism(), |location| {
-                self.process_manifest_file(location, &inspection, tagged_versions)
+                self.process_manifest_file(location, &inspection, tagged_versions, &branch_versions)
             })
             .await?;
         Ok(inspection.into_inner().unwrap())
@@ -782,6 +789,7 @@ impl<'a> CleanupTask<'a> {
         location: ManifestLocation,
         inspection: &Mutex<CleanupInspection>,
         tagged_versions: &HashSet<u64>,
+        branch_versions: &HashSet<u64>,
     ) -> Result<()> {
         // Reading an expired manifest only ever produced `verified_files`, the evidence
         // that a file came from a version we are deleting. `delete_unverified` says that
@@ -789,10 +797,11 @@ impl<'a> CleanupTask<'a> {
         // path, version, size and store identity all come from the listing.
         //
         // This is the whole cost on a table that has accumulated versions faster than it
-        // cleaned them, where almost every manifest is expired. The retained ones are
-        // still read, because the live set is what keeps cleanup from deleting live data.
+        // cleaned them, where almost every manifest is expired. Branch roots must also
+        // be read: lineage retention can rescue them and their own FRI row maps later.
         if self.policy.delete_unverified
             && !tagged_versions.contains(&location.version)
+            && !branch_versions.contains(&location.version)
             && location.version < self.read_version
             && self.policy.proven_expired(location.version)
         {
@@ -4756,7 +4765,7 @@ mod tests {
             CleanupAction::Execute,
         )
         .unwrap();
-        let inspection = task.process_manifests(&HashSet::new()).await.unwrap();
+        let inspection = task.process_manifests(&HashSet::new(), &[]).await.unwrap();
         // Queue the branch root for removal on both sides; rescuing the
         // manifest must rescue its store record with it.
         let inspection = Mutex::new(inspection);
@@ -4857,7 +4866,7 @@ mod tests {
             CleanupAction::Execute,
         )
         .unwrap();
-        let inspection = task.process_manifests(&HashSet::new()).await.unwrap();
+        let inspection = task.process_manifests(&HashSet::new(), &[]).await.unwrap();
         let kept: HashSet<&Path> = inspection
             .referenced_files
             .data_paths
@@ -7859,6 +7868,58 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(fixture.list_fri_map_dirs().await, vec![map_id]);
+        }
+
+        #[tokio::test]
+        #[serial_test::serial(frag_reuse_maintenance)]
+        async fn version_cleanup_keeps_maps_of_rescued_branch_roots() {
+            let fixture = MockDatasetFixture::try_new().unwrap();
+            let (mut dataset, map_id) = make_tagged(&fixture).await;
+            let root_version = dataset.version().version;
+            let mut branch = fixture
+                .create_branch_and_load(&mut dataset, "child", (None, None))
+                .await
+                .unwrap();
+            branch
+                .create_index(
+                    &["i"],
+                    IndexType::Scalar,
+                    Some("i_idx".into()),
+                    &ScalarIndexParams::default(),
+                    true,
+                )
+                .await
+                .unwrap();
+            cleanup_frag_reuse_index(&mut branch).await.unwrap();
+            assert!(
+                branch
+                    .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            branch
+                .cleanup(expire_below(branch.version().version, true))
+                .execute()
+                .await
+                .unwrap();
+            fixture.overwrite_some_data().await.unwrap();
+            let latest = fixture.open().await.unwrap().version().version;
+
+            fixture
+                .run_cleanup_with_policy(expire_below(latest, true))
+                .await
+                .unwrap();
+
+            assert_eq!(fixture.list_fri_map_dirs().await, vec![map_id]);
+            fixture
+                .open()
+                .await
+                .unwrap()
+                .checkout_version(root_version)
+                .await
+                .unwrap();
+            assert_eq!(branch.count_rows(None).await.unwrap(), 8);
         }
 
         /// D2: a map referenced only by expiring manifests goes away in the
