@@ -1450,7 +1450,7 @@ mod tests {
 
         graph.insert_batch(ids, &snapshot).unwrap();
         assert_eq!(graph.len(), rows);
-        for node in &graph.nodes {
+        for node in (0..graph.nodes.allocated()).map(|id| graph.node(id as u32)) {
             assert!(node.levels[0].published.is_none());
             assert!(
                 node.levels[1..]
