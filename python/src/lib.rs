@@ -105,7 +105,8 @@ use rowids::{PyRowIdSequence, PyRowIdSequenceIterator};
 pub use scanner::Scanner;
 
 use crate::blob::{
-    PyBlobDescriptor, PyBlobDescriptorArrayBuilder, PyDedicatedBlobWriter, PyPackedBlobWriter,
+    PyBlobDescriptor, PyBlobDescriptorArrayBuilder, PyDedicatedBlobWriter, PyManagedBlobWriter,
+    PyPackedBlobWriter,
 };
 use crate::executor::BackgroundExecutor;
 
@@ -276,6 +277,7 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyBlobDescriptor>()?;
     m.add_class::<PyBlobDescriptorArrayBuilder>()?;
     m.add_class::<PyPackedBlobWriter>()?;
+    m.add_class::<PyManagedBlobWriter>()?;
     m.add_class::<PyDedicatedBlobWriter>()?;
     m.add_class::<LanceFileReader>()?;
     m.add_class::<LanceFileWriter>()?;
