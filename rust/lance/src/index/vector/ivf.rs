@@ -1117,6 +1117,7 @@ async fn optimize_ivf_pq_indices(
         IndexFile {
             path: INDEX_FILE_NAME.to_string(),
             size_bytes,
+            file_metadata_size_bytes: None,
         },
     ))
 }
@@ -1276,10 +1277,12 @@ async fn optimize_ivf_hnsw_indices<Q: Quantization>(
             IndexFile {
                 path: INDEX_FILE_NAME.to_string(),
                 size_bytes: index_size,
+                file_metadata_size_bytes: None,
             },
             IndexFile {
                 path: INDEX_AUXILIARY_FILE_NAME.to_string(),
                 size_bytes: aux_size,
+                file_metadata_size_bytes: None,
             },
         ],
     ))
@@ -2425,6 +2428,7 @@ pub(crate) async fn remap_index_file(
     Ok(IndexFile {
         path: INDEX_FILE_NAME.to_string(),
         size_bytes,
+        file_metadata_size_bytes: None,
     })
 }
 
@@ -2493,6 +2497,7 @@ async fn write_ivf_pq_file(
     Ok(IndexFile {
         path: INDEX_FILE_NAME.to_string(),
         size_bytes,
+        file_metadata_size_bytes: None,
     })
 }
 
@@ -3042,6 +3047,7 @@ async fn write_root_vector_index_from_auxiliary(
     Ok(IndexFile {
         path: INDEX_FILE_NAME.to_string(),
         size_bytes: summary.size_bytes,
+        file_metadata_size_bytes: None,
     })
 }
 
@@ -5059,10 +5065,16 @@ fn train_weighted_hierarchical_kmeans<T: StreamingKMeansArrowType>(
         let mut cluster = heap
             .pop()
             .ok_or_else(|| Error::index("No weighted cluster can be further split"))?;
-        if cluster.finalized || cluster.indices.len() <= 1 {
-            cluster.finalized = true;
+        if cluster.finalized {
             heap.push(cluster);
             break;
+        }
+        if cluster.indices.len() <= 1 {
+            // A singleton can retain a large coreset loss while other clusters
+            // still have multiple summaries to split.
+            cluster.finalized = true;
+            heap.push(cluster);
+            continue;
         }
 
         let remaining_k = target_k - heap.len();
@@ -8270,16 +8282,26 @@ mod tests {
         assert!(error.to_string().contains("input lengths do not match"));
     }
 
-    #[test]
-    fn test_weighted_hierarchical_splits_until_target_k() {
+    #[rstest]
+    #[case::zero_loss(17, 0.0)]
+    #[case::lossy_coreset(32, 1_000.0)]
+    #[case::exhausted_splits(33, 1_000.0)]
+    fn test_weighted_hierarchical_splits_until_target_k(
+        #[case] target_k: usize,
+        #[case] base_loss: f64,
+    ) {
         let values = (0..16)
             .flat_map(|value| [value as f32, value as f32 + 0.1])
             .collect::<Vec<_>>();
         let data = streaming_kmeans_fsl_from_values::<Float32Type>(values, 1).unwrap();
+        // A singleton summary can retain a large loss from the raw vectors it
+        // represents, even though that summary cannot be split any further.
+        let mut losses = vec![0.0; data.len()];
+        losses[0] = base_loss;
         let progress = Arc::new(|_: u32, _: u32| {});
         let params = WeightedHierarchicalKMeansParams {
             dimension: 1,
-            target_k: 17,
+            target_k,
             metric_policy: &L2_METRIC_POLICY,
             max_iters: 3,
             on_progress: progress,
@@ -8287,21 +8309,19 @@ mod tests {
         let result = train_weighted_hierarchical_kmeans::<Float32Type>(
             &data,
             &vec![1.0; 32],
-            &vec![0.0; 32],
+            &losses,
             &params,
         )
         .unwrap();
-        assert_eq!(result.len(), 17);
+        assert_eq!(result.len(), target_k);
         let values = result.values().as_primitive::<Float32Type>().values();
         let mut sorted = values.to_vec();
         sorted.sort_by(|left, right| left.total_cmp(right));
-        assert!(
-            sorted
-                .windows(2)
-                .filter(|pair| (pair[0] - pair[1]).abs() > 0.001)
-                .count()
-                >= 16
-        );
+        let distinct_centroids = 1 + sorted
+            .windows(2)
+            .filter(|pair| (pair[0] - pair[1]).abs() > 0.001)
+            .count();
+        assert_eq!(distinct_centroids, target_k.min(data.len()));
     }
 
     #[test]
