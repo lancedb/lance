@@ -166,8 +166,8 @@ mod exec;
 mod logical_plan;
 
 /// Whether a partial source's field can be written to `target`: the same type,
-/// or blob input in any layout to a Blob v2 column (as `check_source_schema`
-/// allows), at any depth.
+/// or blob input to a Blob v2 column, whose layout the writer checks, at any
+/// depth.
 fn partial_source_field_fits(
     target: &lance_core::datatypes::Field,
     source: &lance_core::datatypes::Field,
