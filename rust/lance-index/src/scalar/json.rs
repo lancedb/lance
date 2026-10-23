@@ -1192,10 +1192,17 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scalar::bitmap::{BitmapIndex, BitmapIndexPlugin};
+    use crate::scalar::lance_format::LanceIndexStore;
+    use crate::scalar::lookup_test_util::lookup_pairs;
     use crate::scalar::{SargableQuery, TextQuery};
-    use arrow_array::{ArrayRef, RecordBatch};
+    use arrow_array::{ArrayRef, Int64Array, RecordBatch, record_batch};
     use arrow_schema::{DataType, Field, Schema};
+    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+    use lance_core::cache::LanceCache;
+    use lance_core::utils::tempfile::TempObjDir;
     use lance_core::{ROW_ADDR, ROW_ID, utils::address::RowAddress};
+    use lance_io::object_store::ObjectStore;
     use rstest::rstest;
     use std::ops::Bound;
     use std::sync::Arc;
@@ -1209,6 +1216,35 @@ mod tests {
     #[case::accessor_array_index("0", false)]
     fn test_path_matches_typed_accessor(#[case] path: &str, #[case] expected: bool) {
         assert_eq!(JsonQueryParser::path_matches_typed_accessor(path), expected);
+    }
+
+    /// Lookup keys are values of the indexed path, in the target index's
+    /// type, and are answered by the target index.
+    #[tokio::test]
+    async fn test_json_lookup_forwards_to_target() {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let batch =
+            record_batch!(("value", Int64, [1, 1, 2]), (ROW_ID, UInt64, [0, 2, 1])).unwrap();
+        let schema = batch.schema();
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            futures::stream::once(async move { Ok(batch) }),
+        ));
+        BitmapIndexPlugin::train_bitmap_index(stream, store.as_ref())
+            .await
+            .unwrap();
+        let target = BitmapIndex::load(store, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+        let index = JsonIndex::new(target, "x".to_string());
+
+        let keys: ArrayRef = Arc::new(Int64Array::from(vec![1, 3]));
+        assert_eq!(lookup_pairs(&index, keys).await, vec![(0, 0), (0, 2)]);
     }
 
     #[test]

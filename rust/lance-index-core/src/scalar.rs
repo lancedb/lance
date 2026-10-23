@@ -720,9 +720,10 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
     /// Streams one row per match in batches with [`lookup_schema`]: the
     /// key's position in `keys` and the matched row. A key matching several
     /// rows yields one match per row, a key matching nothing yields none, and
-    /// matches come in no particular order. Matching is exact equality: a null
-    /// key never matches, not even a null indexed value. `keys` must have the
-    /// index's value type.
+    /// matches come in no particular order. A key matches exactly the rows
+    /// `search` returns for an equality query on it, so for floats `-0.0`
+    /// and `0.0` are distinct and NaN matches NaN. A null key never matches,
+    /// not even a null indexed value. `keys` must have the index's value type.
     ///
     /// Like [`Self::search`], the rows are not filtered by deletions, and any
     /// fragment-reuse remapping the index was loaded with is already applied.
