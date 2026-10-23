@@ -805,7 +805,11 @@ def _with_options(request_cls):
     return type(
         f"{request_cls.__name__}WithOptions",
         (request_cls,),
-        {"model_config": ConfigDict(**{**dict(request_cls.model_config), "extra": "allow"})},
+        {
+            "model_config": ConfigDict(
+                **{**dict(request_cls.model_config), "extra": "allow"}
+            )
+        },
     )
 
 
@@ -835,7 +839,9 @@ class TestBackfillAndRefreshExtraOptions:
         )
         assert request.model_extra == {"use_cpu_only_pool": True}
 
-        client = connect("rest", {"uri": f"http://127.0.0.1:{capturing_server.server_port}"})
+        client = connect(
+            "rest", {"uri": f"http://127.0.0.1:{capturing_server.server_port}"}
+        )
         client.alter_table_backfill_columns(request)
 
         assert len(capturing_server.captured_bodies) == 1
@@ -858,7 +864,9 @@ class TestBackfillAndRefreshExtraOptions:
         )
         assert request.model_extra == {"a_future_refresh_knob": 1000}
 
-        client = connect("rest", {"uri": f"http://127.0.0.1:{capturing_server.server_port}"})
+        client = connect(
+            "rest", {"uri": f"http://127.0.0.1:{capturing_server.server_port}"}
+        )
         client.refresh_materialized_view(request)
 
         assert len(capturing_server.captured_bodies) == 1
@@ -879,7 +887,9 @@ class TestBackfillAndRefreshExtraOptions:
         captured bodies (not just checking one field's absence) is what
         would have caught that.
         """
-        client = connect("rest", {"uri": f"http://127.0.0.1:{capturing_server.server_port}"})
+        client = connect(
+            "rest", {"uri": f"http://127.0.0.1:{capturing_server.server_port}"}
+        )
 
         client.alter_table_backfill_columns(
             AlterTableBackfillColumnsRequest(id=["db", "table"], column="embedding")
@@ -897,9 +907,13 @@ class TestBackfillAndRefreshExtraOptions:
     def test_refresh_no_extras_matches_plain_request_body(self, capturing_server):
         """See test_backfill_no_extras_matches_plain_request_body -- same
         guard, for refresh_materialized_view."""
-        client = connect("rest", {"uri": f"http://127.0.0.1:{capturing_server.server_port}"})
+        client = connect(
+            "rest", {"uri": f"http://127.0.0.1:{capturing_server.server_port}"}
+        )
 
-        client.refresh_materialized_view(RefreshMaterializedViewRequest(id=["db", "view"]))
+        client.refresh_materialized_view(
+            RefreshMaterializedViewRequest(id=["db", "view"])
+        )
         plain_body = capturing_server.captured_bodies[-1]
 
         extras_capable_request_cls = _with_options(RefreshMaterializedViewRequest)
