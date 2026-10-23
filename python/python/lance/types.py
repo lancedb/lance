@@ -18,9 +18,6 @@ from .dependencies import (
 )
 from .dependencies import pandas as pd
 
-# Must match lance_encoding::constants::ALP_META_KEY.
-_ALP_FIELD_METADATA_KEY = b"lance-encoding:alp"
-
 if TYPE_CHECKING:
     ReaderLike = Union[
         pd.Timestamp,
@@ -183,31 +180,3 @@ def _coerce_reader(
             "https://lance.org/guide/read_and_write/ "
             "to see supported types."
         )
-
-
-def _set_alp_field_metadata(
-    reader: pa.RecordBatchReader, alp: str
-) -> pa.RecordBatchReader:
-    """Record the ALP mode on floating-point fields of a reader's schema.
-
-    ALP uses the same Arrow field metadata channel as the other encoding
-    options (``lance-encoding:*``), so the v2.3 encoder picks the mode up
-    without a writer-level compression API. Only float32/float64 fields carry
-    the metadata because those are the types ALP compresses.
-    """
-    schema = reader.schema
-    fields = []
-    changed = False
-    for field in schema:
-        if field.type in (pa.float32(), pa.float64()):
-            metadata = dict(field.metadata or {})
-            if metadata.get(_ALP_FIELD_METADATA_KEY) != alp.encode():
-                metadata[_ALP_FIELD_METADATA_KEY] = alp.encode()
-                field = field.with_metadata(metadata)
-                changed = True
-        fields.append(field)
-    if not changed:
-        return reader
-    return pa.RecordBatchReader.from_batches(
-        pa.schema(fields, metadata=schema.metadata), reader
-    )

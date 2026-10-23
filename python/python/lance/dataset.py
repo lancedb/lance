@@ -78,7 +78,7 @@ from .lance import (
 from .lance import __version__ as __version__
 from .lance import _Session as Session
 from .query import DocumentGranularity, FullTextQuery, MinHashQuery
-from .types import _coerce_reader, _is_materialized, _set_alp_field_metadata
+from .types import _coerce_reader, _is_materialized
 from .udf import BatchUDF, normalize_transform
 from .udf import BatchUDFCheckpoint as BatchUDFCheckpoint
 from .udf import batch_udf as batch_udf
@@ -8151,7 +8151,6 @@ def write_dataset(
     max_bytes_per_file: int = 90 * 1024 * 1024 * 1024,
     data_cache_bytes: Optional[int] = None,
     max_page_bytes: Optional[int] = None,
-    alp: Optional[Literal["auto", "on", "off"]] = None,
     commit_lock: Optional[CommitLock] = None,
     progress: Optional[FragmentWriteProgress] = None,
     storage_options: Optional[Dict[str, str]] = None,
@@ -8212,14 +8211,6 @@ def write_dataset(
     max_page_bytes : int, optional
         Best-effort maximum page size in bytes. If not set, the current file
         writer uses its configured default. Ignored for legacy V1 files.
-    alp : Literal["auto", "on", "off"], optional
-        ALP (Adaptive Lossless floating-Point) compression mode for floating
-        point columns. ``"auto"`` enables ALP only when the data benefits from
-        it, ``"on"`` forces ALP, and ``"off"`` disables it. If not set, the
-        current file writer uses its configured default (``"auto"`` for the
-        current format). The mode is recorded on float32/float64 columns via
-        the standard ``lance-encoding:alp`` field metadata, so it persists in
-        the written schema; v2.0-v2.2 and legacy V1 writers ignore it.
     commit_lock : CommitLock, optional
         A custom commit lock.  Only needed if your object store does not support
         atomic commits.  See the user guide for more details.
@@ -8421,11 +8412,7 @@ def write_dataset(
         else:
             data_storage_version = "stable"
 
-    if alp is not None and alp not in ("auto", "on", "off"):
-        raise ValueError(f"Invalid `alp` value: {alp}. Expected one of: auto, on, off")
     reader = _coerce_reader(data_obj, schema)
-    if alp is not None:
-        reader = _set_alp_field_metadata(reader, alp)
     _validate_schema(reader.schema)
     # TODO add support for passing in LanceDataset and LanceScanner here
     base_store_params = LanceDataset._inherit_base_store_params(uri, base_store_params)
