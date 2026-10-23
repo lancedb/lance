@@ -31,6 +31,12 @@ from .lance import (
     DeletionFile as DeletionFile,
 )
 from .lance import (
+    FragmentAddColumnsCleanup,
+    _Fragment,
+    _write_fragments,
+    _write_fragments_transaction,
+)
+from .lance import (
     RowDatasetVersionMeta as RowDatasetVersionMeta,
 )
 from .lance import (
@@ -39,13 +45,14 @@ from .lance import (
 from .lance import (
     RowIdSequence as RowIdSequence,
 )
-from .lance import _Fragment, _write_fragments, _write_fragments_transaction
 from .lance import _Session as Session
 from .progress import FragmentWriteProgress, NoopFragmentWriteProgress
 from .types import _coerce_reader
 from .udf import BatchUDF, normalize_transform
 
 if TYPE_CHECKING:
+    from pyarrow._compute import Expression
+
     from .dataset import (
         ColumnOrdering,
         DatasetBasePath,
@@ -247,6 +254,8 @@ class DataFile:
         The minor version of the data storage format.
     file_size_bytes : Optional[int]
         The size of the data file in bytes, if available.
+    file_metadata_size_bytes : Optional[int]
+        The size of the data file's metadata suffix in bytes, if available.
     """
 
     _path: str
@@ -256,6 +265,7 @@ class DataFile:
     file_minor_version: int = 0
     file_size_bytes: Optional[int] = None
     base_id: Optional[int] = None
+    file_metadata_size_bytes: Optional[int] = None
 
     def __init__(
         self,
@@ -266,6 +276,7 @@ class DataFile:
         file_minor_version: int = 0,
         file_size_bytes: Optional[int] = None,
         base_id: Optional[int] = None,
+        file_metadata_size_bytes: Optional[int] = None,
     ):
         # TODO: only we eliminate the path method, we can remove this
         self._path = path
@@ -275,6 +286,7 @@ class DataFile:
         self.file_minor_version = file_minor_version
         self.file_size_bytes = file_size_bytes
         self.base_id = base_id
+        self.file_metadata_size_bytes = file_metadata_size_bytes
 
     def __repr__(self):
         # pretend we have a 'path' attribute
@@ -516,9 +528,7 @@ class LanceFragment(pa.dataset.Fragment):
     def fragment_id(self):
         return self._fragment.id()
 
-    def count_rows(
-        self, filter: Optional[Union[pa.compute.Expression, str]] = None
-    ) -> int:
+    def count_rows(self, filter: Optional[Union[Expression, str]] = None) -> int:
         if isinstance(filter, pa.compute.Expression):
             return self.scanner(
                 with_row_id=True, columns=[], filter=filter
@@ -568,7 +578,7 @@ class LanceFragment(pa.dataset.Fragment):
         *,
         columns: Optional[Union[List[str], Dict[str, str]]] = None,
         batch_size: Optional[int] = None,
-        filter: Optional[Union[str, pa.compute.Expression]] = None,
+        filter: Optional[Union[str, Expression]] = None,
         limit: Optional[int] = None,
         offset: Optional[int] = None,
         with_row_id: bool = False,
@@ -586,7 +596,14 @@ class LanceFragment(pa.dataset.Fragment):
         strict_batch_size: Optional[bool] = None,
     ) -> "LanceScanner":
         """See Dataset::scanner for details"""
-        filter_str = str(filter) if filter is not None else None
+        from .dataset import LanceScanner, _serialize_expression
+
+        if isinstance(filter, pa.compute.Expression):
+            filter_str = None
+            substrait_filter = _serialize_expression(filter, self._ds._ds.schema)
+        else:
+            filter_str = str(filter) if filter is not None else None
+            substrait_filter = None
 
         columns_arg = {}
         if isinstance(columns, dict):
@@ -598,6 +615,7 @@ class LanceFragment(pa.dataset.Fragment):
         s = self._fragment.scanner(
             batch_size=batch_size,
             filter=filter_str,
+            substrait_filter=substrait_filter,
             limit=limit,
             offset=offset,
             with_row_id=with_row_id,
@@ -613,13 +631,11 @@ class LanceFragment(pa.dataset.Fragment):
             strict_batch_size=strict_batch_size,
             **columns_arg,
         )
-        from .dataset import LanceScanner
-
         snapshot = {
             "_limit": limit,
             "_filter": filter_str,
             "_search_filter": None,
-            "_substrait_filter": None,
+            "_substrait_filter": substrait_filter,
             "_prefilter": False,
             "_late_materialization": late_materialization,
             "_blob_handling": blob_handling,
@@ -687,7 +703,7 @@ class LanceFragment(pa.dataset.Fragment):
         *,
         columns: Optional[Union[List[str], Dict[str, str]]] = None,
         batch_size: Optional[int] = None,
-        filter: Optional[Union[str, pa.compute.Expression]] = None,
+        filter: Optional[Union[str, Expression]] = None,
         limit: Optional[int] = None,
         offset: Optional[int] = None,
         with_row_id: bool = False,
@@ -726,7 +742,7 @@ class LanceFragment(pa.dataset.Fragment):
     def to_table(
         self,
         columns: Optional[Union[List[str], Dict[str, str]]] = None,
-        filter: Optional[Union[str, pa.compute.Expression]] = None,
+        filter: Optional[Union[str, Expression]] = None,
         limit: Optional[int] = None,
         offset: Optional[int] = None,
         with_row_id: bool = False,
@@ -762,7 +778,7 @@ class LanceFragment(pa.dataset.Fragment):
     def to_pandas(
         self,
         columns: Optional[Union[List[str], Dict[str, str]]] = None,
-        filter: Optional[Union[str, pa.compute.Expression]] = None,
+        filter: Optional[Union[str, Expression]] = None,
         limit: Optional[int] = None,
         offset: Optional[int] = None,
         batch_size: Optional[int] = None,
@@ -870,8 +886,7 @@ class LanceFragment(pa.dataset.Fragment):
             right_on = left_on
 
         reader = _coerce_reader(data_obj, schema)
-        max_field_id = self._ds.max_field_id
-        metadata, schema = self._fragment.merge(reader, left_on, right_on, max_field_id)
+        metadata, schema = self._fragment.merge(reader, left_on, right_on)
         return metadata, schema
 
     @overload
@@ -1026,7 +1041,11 @@ class LanceFragment(pa.dataset.Fragment):
         columns: Optional[list[str]] = None,
         batch_size: Optional[int] = None,
         reader_schema: Optional[pa.Schema] = None,
-    ) -> Tuple[FragmentMetadata, LanceSchema]:
+        return_cleanup: bool = False,
+    ) -> (
+        Tuple[FragmentMetadata, LanceSchema]
+        | Tuple[FragmentMetadata, LanceSchema, FragmentAddColumnsCleanup]
+    ):
         """Add columns to this Fragment.
 
         .. warning::
@@ -1040,6 +1059,12 @@ class LanceFragment(pa.dataset.Fragment):
         fragment is created.  The new schema of the fragment is returned as well.
         These can be used in a later operation to commit the changes to the dataset.
 
+        Set ``return_cleanup=True`` to also return a cleanup token that owns only
+        the files staged by this operation. Retain the token until the outer merge
+        commits. If the commit definitively fails, call ``cleanup.cleanup()``.
+        Dropping the token does not remove files because a failed commit response
+        can have an ambiguous outcome.
+
         See Also
         --------
         lance.dataset.LanceOperation.Merge :
@@ -1048,8 +1073,10 @@ class LanceFragment(pa.dataset.Fragment):
 
         Returns
         -------
-        Tuple[FragmentMetadata, LanceSchema]
-            A new fragment with the added column(s) and the final schema.
+        Tuple[FragmentMetadata, LanceSchema] or
+        Tuple[FragmentMetadata, LanceSchema, FragmentAddColumnsCleanup]
+            A new fragment with the added column(s), the final schema, and, when
+            requested, an explicit cleanup token for the staged files.
         """
         transforms = normalize_transform(value_func, self, columns, reader_schema)
 
@@ -1062,15 +1089,17 @@ class LanceFragment(pa.dataset.Fragment):
                 )
 
         if isinstance(transforms, pa.RecordBatchReader):
-            metadata, schema = self._fragment.add_columns_from_reader(
-                transforms, batch_size
-            )
+            if return_cleanup:
+                return self._fragment.add_columns_from_reader_with_cleanup(
+                    transforms, batch_size
+                )
+            return self._fragment.add_columns_from_reader(transforms, batch_size)
         else:
-            metadata, schema = self._fragment.add_columns(
-                transforms, columns, batch_size
-            )
-
-        return metadata, schema
+            if return_cleanup:
+                return self._fragment.add_columns_with_cleanup(
+                    transforms, columns, batch_size
+                )
+            return self._fragment.add_columns(transforms, columns, batch_size)
 
     def delete(self, predicate: str) -> FragmentMetadata | None:
         """Delete rows from this Fragment.
@@ -1173,6 +1202,8 @@ if TYPE_CHECKING:
         max_rows_per_file: int = 1024 * 1024,
         max_rows_per_group: Optional[int] = 1024,
         max_bytes_per_file: int = DEFAULT_MAX_BYTES_PER_FILE,
+        data_cache_bytes: Optional[int] = None,
+        max_page_bytes: Optional[int] = None,
         progress: Optional[FragmentWriteProgress] = None,
         data_storage_version: Optional[str] = None,
         use_legacy_format: Optional[bool] = None,
@@ -1200,6 +1231,8 @@ if TYPE_CHECKING:
         max_rows_per_file: int = 1024 * 1024,
         max_rows_per_group: Optional[int] = 1024,
         max_bytes_per_file: int = DEFAULT_MAX_BYTES_PER_FILE,
+        data_cache_bytes: Optional[int] = None,
+        max_page_bytes: Optional[int] = None,
         progress: Optional[FragmentWriteProgress] = None,
         data_storage_version: Optional[str] = None,
         use_legacy_format: Optional[bool] = None,
@@ -1227,6 +1260,8 @@ def write_fragments(
     max_rows_per_file: int = 1024 * 1024,
     max_rows_per_group: Optional[int] = 1024,
     max_bytes_per_file: int = DEFAULT_MAX_BYTES_PER_FILE,
+    data_cache_bytes: Optional[int] = None,
+    max_page_bytes: Optional[int] = None,
     progress: Optional[FragmentWriteProgress] = None,
     data_storage_version: Optional[str] = None,
     use_legacy_format: Optional[bool] = None,
@@ -1276,6 +1311,13 @@ def write_fragments(
         means larger groups may cause this to be overshot meaningfully. This
         defaults to 90 GB, since we have a hard limit of 100 GB per file on
         object stores.
+    data_cache_bytes : int, optional
+        Total bytes to buffer for column data before writing pages. The budget
+        is divided evenly across top-level columns. If not set, the current
+        file writer uses 8 MiB per column. Ignored for legacy V1 files.
+    max_page_bytes : int, optional
+        Best-effort maximum page size in bytes. If not set, the current file
+        writer uses its configured default. Ignored for legacy V1 files.
     progress : FragmentWriteProgress, optional
         *Experimental API*. Progress tracking for writing the fragment. Pass
         a custom class that defines hooks to be called when each fragment is
@@ -1291,10 +1333,12 @@ def write_fragments(
         Extra options that make sense for a particular storage connection. This is
         used to store connection parameters like credentials, endpoint, etc.
     enable_stable_row_ids: bool
-        Experimental: if set to true, the writer will use stable row ids.
-        These row ids are stable after compaction operations, but not after updates.
-        This makes compaction more efficient, since with stable row ids no
-        secondary indices need to be updated to point to new row ids.
+        Has no effect. Row ids are not assigned by this function; they are
+        assigned when the fragments are committed to a dataset (e.g. via
+        :class:`lance.LanceOperation.Append`, or
+        :class:`lance.LanceOperation.Merge` when merging staged fragments
+        with existing ones, together with :meth:`lance.LanceDataset.commit`),
+        based on whether the target dataset uses stable row ids.
     target_bases : list of str, optional
         References to base paths where data should be written. Can be
         specified in all modes.
@@ -1418,6 +1462,8 @@ def write_fragments(
         max_rows_per_file=max_rows_per_file,
         max_rows_per_group=max_rows_per_group,
         max_bytes_per_file=max_bytes_per_file,
+        data_cache_bytes=data_cache_bytes,
+        max_page_bytes=max_page_bytes,
         progress=progress,
         data_storage_version=data_storage_version,
         storage_options=storage_options,
