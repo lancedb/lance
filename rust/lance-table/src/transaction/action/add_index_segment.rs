@@ -7,7 +7,7 @@ use super::apply::ApplyState;
 use super::footprint::IndexIdentity;
 use super::proto::{data_change_from_wire, data_change_to_wire, non_empty, required};
 use super::query_contract::QueryContract;
-use super::{Footprint, Ref};
+use super::{FieldRef, Footprint, Ref};
 use crate::format::{IndexFile, IndexMetadata, pb, pb_actions};
 use crate::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
 use crate::system_index::mem_wal::MEM_WAL_INDEX_NAME;
@@ -42,7 +42,7 @@ pub struct AddIndexSegment {
     /// Keys only, unlike [`IndexMetadata::fields`] under the legacy contract,
     /// where it means keyed columns followed by carried ones. `apply` derives
     /// that representation.
-    pub fields: Vec<Ref>,
+    pub fields: Vec<FieldRef>,
     /// The fields whose values the segment carries but is not necessarily
     /// keyed on, independent of [`Self::fields`] rather than a subset of it.
     /// Empty for a segment that carries no extra column.
@@ -50,7 +50,7 @@ pub struct AddIndexSegment {
     /// A field in both lists is one the segment is keyed on *and* carries.
     /// That needs `FLAG_INDEPENDENT_COVERING_FIELDS`, which no release
     /// implements, so `apply` rejects it for now.
-    pub covering_fields: Vec<Ref>,
+    pub covering_fields: Vec<FieldRef>,
     /// Index-type-specific metadata, opaque to the transaction layer.
     pub index_details: Option<Arc<prost_types::Any>>,
     /// The version of the index type's on-disk format the segment was written
@@ -94,7 +94,7 @@ impl AddIndexSegment {
         let fields = self
             .fields
             .iter()
-            .map(|field| state.resolve_field(*field))
+            .map(|field| state.resolve_schema_field(*field, "AddIndexSegment"))
             .collect::<Result<Vec<_>>>()?;
         let is_system_index = self.name == MEM_WAL_INDEX_NAME || self.name == FRAG_REUSE_INDEX_NAME;
         if self.covered_fragments.is_none() && !is_system_index {
@@ -115,7 +115,7 @@ impl AddIndexSegment {
         let covering_fields = self
             .covering_fields
             .iter()
-            .map(|field| state.resolve_field(*field))
+            .map(|field| state.resolve_schema_field(*field, "AddIndexSegment"))
             .collect::<Result<Vec<_>>>()?;
         let (fields, covering_fields) = Self::lower_covering(&self.name, fields, covering_fields)?;
 
@@ -276,7 +276,7 @@ impl AddIndexSegment {
         // Keyed and carried columns alike: a carried column can be rewritten
         // while the keyed one is untouched, and the segment would then answer
         // from an obsolete carried value.
-        let dependencies: Vec<Ref> = self
+        let dependencies: Vec<FieldRef> = self
             .fields
             .iter()
             .chain(self.covering_fields.iter())
@@ -382,12 +382,12 @@ impl TryFrom<pb_actions::AddIndexSegment> for AddIndexSegment {
             fields: message
                 .fields
                 .into_iter()
-                .map(Ref::try_from)
+                .map(FieldRef::try_from)
                 .collect::<Result<Vec<_>>>()?,
             covering_fields: message
                 .covering_fields
                 .into_iter()
-                .map(Ref::try_from)
+                .map(FieldRef::try_from)
                 .collect::<Result<Vec<_>>>()?,
             index_details: message.index_details.map(Arc::new),
             index_version: message.index_version.unwrap_or_default(),
@@ -435,7 +435,7 @@ mod tests {
     use lance_file::version::ConcreteFileVersion;
     use rstest::rstest;
 
-    fn segment(name: &str, fields: Vec<Ref>) -> AddIndexSegment {
+    fn segment(name: &str, fields: Vec<FieldRef>) -> AddIndexSegment {
         AddIndexSegment {
             uuid: Uuid::new_v4(),
             name: name.into(),
@@ -460,7 +460,7 @@ mod tests {
                 path: "index.idx".into(),
                 size_bytes: 1024,
             }],
-            ..segment("by_a", vec![Ref::Committed(0)])
+            ..segment("by_a", vec![FieldRef::Committed(0)])
         };
 
         let (next, indices) = apply_with_indices(
@@ -501,7 +501,7 @@ mod tests {
                 "step",
                 vec![Action::AddIndexSegment(segment(
                     "by_a",
-                    vec![Ref::Committed(0)],
+                    vec![FieldRef::Committed(0)],
                 ))],
             )])),
             None,
@@ -533,7 +533,7 @@ mod tests {
                 "step",
                 vec![Action::AddIndexSegment(AddIndexSegment {
                     dataset_version: Some(read_version + 1),
-                    ..segment("by_a", vec![Ref::Committed(0)])
+                    ..segment("by_a", vec![FieldRef::Committed(0)])
                 })],
             )])),
             None,
@@ -561,7 +561,7 @@ mod tests {
             &manifest,
             vec![Action::AddIndexSegment(AddIndexSegment {
                 dataset_version: Some(manifest.version - 1),
-                ..segment("by_a", vec![Ref::Committed(0)])
+                ..segment("by_a", vec![FieldRef::Committed(0)])
             })],
             Vec::new(),
         )
@@ -581,7 +581,7 @@ mod tests {
             &manifest,
             vec![Action::AddIndexSegment(AddIndexSegment {
                 dataset_version: Some(manifest.version),
-                ..segment("by_a", vec![Ref::Committed(0)])
+                ..segment("by_a", vec![FieldRef::Committed(0)])
             })],
             Vec::new(),
         )
@@ -597,7 +597,7 @@ mod tests {
             &manifest,
             vec![Action::AddIndexSegment(AddIndexSegment {
                 dataset_version: Some(manifest.version + 1),
-                ..segment("by_a", vec![Ref::Committed(0)])
+                ..segment("by_a", vec![FieldRef::Committed(0)])
             })],
             Vec::new(),
         )
@@ -625,8 +625,8 @@ mod tests {
                     def: added_field("carried"),
                 }),
                 Action::AddIndexSegment(AddIndexSegment {
-                    covering_fields: vec![Ref::Local(0)],
-                    ..segment("by_a", vec![Ref::Committed(0)])
+                    covering_fields: vec![FieldRef::Local(0)],
+                    ..segment("by_a", vec![FieldRef::Committed(0)])
                 }),
             ],
             Vec::new(),
@@ -647,8 +647,8 @@ mod tests {
         let error = apply_with_indices(
             &backed_manifest(),
             vec![Action::AddIndexSegment(AddIndexSegment {
-                covering_fields: vec![Ref::Committed(0)],
-                ..segment("by_a", vec![Ref::Committed(0)])
+                covering_fields: vec![FieldRef::Committed(0)],
+                ..segment("by_a", vec![FieldRef::Committed(0)])
             })],
             Vec::new(),
         )
@@ -669,7 +669,7 @@ mod tests {
         let existing = sample_index_metadata("by_a");
         let added = AddIndexSegment {
             covered_fragments: Some(vec![Ref::Committed(1)]),
-            ..segment("by_a", vec![Ref::Committed(0)])
+            ..segment("by_a", vec![FieldRef::Committed(0)])
         };
 
         let (_, indices) = apply_with_indices(
@@ -721,11 +721,11 @@ mod tests {
     /// on what the index is and not describe a fragment twice.
     #[rstest]
     #[case::different_keyed_field(
-        |added: &mut AddIndexSegment| added.fields = vec![Ref::Committed(1)],
+        |added: &mut AddIndexSegment| added.fields = vec![FieldRef::Committed(1)],
         Some("fields")
     )]
     #[case::different_carried_field(
-        |added: &mut AddIndexSegment| added.covering_fields = vec![Ref::Committed(1)],
+        |added: &mut AddIndexSegment| added.covering_fields = vec![FieldRef::Committed(1)],
         Some("fields")
     )]
     #[case::different_index_type(
@@ -758,7 +758,7 @@ mod tests {
         let mut added = AddIndexSegment {
             index_details: type_url("btree.Details"),
             covered_fragments: Some(vec![Ref::Committed(1)]),
-            ..segment("shared", vec![Ref::Committed(0)])
+            ..segment("shared", vec![FieldRef::Committed(0)])
         };
         change(&mut added);
 
@@ -804,12 +804,12 @@ mod tests {
     ) {
         let first = AddIndexSegment {
             index_details: vector(L2, false, "flat", 1024),
-            ..segment("shared", vec![Ref::Committed(0)])
+            ..segment("shared", vec![FieldRef::Committed(0)])
         };
         let second = AddIndexSegment {
             index_details: details,
             covered_fragments: Some(vec![Ref::Committed(1)]),
-            ..segment("shared", vec![Ref::Committed(0)])
+            ..segment("shared", vec![FieldRef::Committed(0)])
         };
         let first_uuid = first.uuid;
         let second_uuid = second.uuid;
@@ -864,12 +864,12 @@ mod tests {
     ) {
         let first = AddIndexSegment {
             index_details: type_url("btree.Details"),
-            ..segment("shared", vec![Ref::Committed(0)])
+            ..segment("shared", vec![FieldRef::Committed(0)])
         };
         let mut second = AddIndexSegment {
             index_details: type_url("btree.Details"),
             covered_fragments: Some(vec![Ref::Committed(1)]),
-            ..segment("shared", vec![Ref::Committed(0)])
+            ..segment("shared", vec![FieldRef::Committed(0)])
         };
         change(&mut second);
 
@@ -913,7 +913,7 @@ mod tests {
         let (_, indices) = apply_with_indices(
             &manifest,
             vec![
-                Action::AddIndexSegment(segment("other", vec![Ref::Committed(0)])),
+                Action::AddIndexSegment(segment("other", vec![FieldRef::Committed(0)])),
                 Action::RemoveIndexSegment(RemoveIndexSegment {
                     uuid: removed,
                     name: "mixed".into(),
@@ -947,7 +947,7 @@ mod tests {
         let (next, indices) = apply_with_indices(
             &backed_manifest(),
             vec![
-                Action::AddIndexSegment(segment("early", vec![Ref::Committed(0)])),
+                Action::AddIndexSegment(segment("early", vec![FieldRef::Committed(0)])),
                 Action::ResetTable(ResetTable),
                 Action::AddField(AddField {
                     local: 0,
@@ -965,12 +965,13 @@ mod tests {
                 Action::AddDataFile(AddDataFile {
                     fragment: Ref::Local(0),
                     file: DataFile::new_unstarted("data/fresh.lance", ConcreteFileVersion::V2_0),
-                    field_ids: vec![Ref::Local(0)],
+                    field_ids: vec![FieldRef::Local(0)],
                     data_change: true,
+                    base: None,
                 }),
                 Action::AddIndexSegment(AddIndexSegment {
                     covered_fragments: Some(vec![Ref::Local(0)]),
-                    ..segment("fresh", vec![Ref::Local(0)])
+                    ..segment("fresh", vec![FieldRef::Local(0)])
                 }),
             ],
             vec![sample_index_metadata("old")],
@@ -995,7 +996,7 @@ mod tests {
             &backed_manifest(),
             vec![Action::AddIndexSegment(AddIndexSegment {
                 covered_fragments: Some(vec![Ref::Committed(beyond)]),
-                ..segment("by_a", vec![Ref::Committed(0)])
+                ..segment("by_a", vec![FieldRef::Committed(0)])
             })],
             Vec::new(),
         )
@@ -1011,7 +1012,7 @@ mod tests {
     fn test_an_unrepresentable_created_at_is_rejected(#[case] millis: u64) {
         let message = pb_actions::AddIndexSegment {
             created_at: Some(millis),
-            ..pb_actions::AddIndexSegment::from(&segment("by_a", vec![Ref::Committed(0)]))
+            ..pb_actions::AddIndexSegment::from(&segment("by_a", vec![FieldRef::Committed(0)]))
         };
 
         let error = AddIndexSegment::try_from(message).unwrap_err();
@@ -1036,7 +1037,7 @@ mod tests {
                 }),
                 Action::AddIndexSegment(AddIndexSegment {
                     covered_fragments: Some(vec![Ref::Committed(fragment)]),
-                    ..segment("shared", vec![Ref::Local(0)])
+                    ..segment("shared", vec![FieldRef::Local(0)])
                 }),
             ]
         };
@@ -1073,11 +1074,11 @@ mod tests {
                 }),
                 Action::AddIndexSegment(AddIndexSegment {
                     base: Some(Ref::Committed(3)),
-                    ..segment("committed", vec![Ref::Committed(0)])
+                    ..segment("committed", vec![FieldRef::Committed(0)])
                 }),
                 Action::AddIndexSegment(AddIndexSegment {
                     base: Some(Ref::Local(0)),
-                    ..segment("minted", vec![Ref::Committed(0)])
+                    ..segment("minted", vec![FieldRef::Committed(0)])
                 }),
             ],
             Vec::new(),
@@ -1109,7 +1110,7 @@ mod tests {
             &backed_manifest(),
             vec![Action::AddIndexSegment(AddIndexSegment {
                 base: Some(base),
-                ..segment("by_a", vec![Ref::Committed(0)])
+                ..segment("by_a", vec![FieldRef::Committed(0)])
             })],
             Vec::new(),
         )
@@ -1126,7 +1127,7 @@ mod tests {
             &backed_manifest(),
             vec![Action::AddIndexSegment(AddIndexSegment {
                 uuid: existing.uuid,
-                ..segment("by_a", vec![Ref::Committed(0)])
+                ..segment("by_a", vec![FieldRef::Committed(0)])
             })],
             vec![existing],
         )
@@ -1181,7 +1182,7 @@ mod tests {
             &backed_manifest(),
             vec![Action::AddIndexSegment(AddIndexSegment {
                 covered_fragments: None,
-                ..segment("by_a", vec![Ref::Committed(0)])
+                ..segment("by_a", vec![FieldRef::Committed(0)])
             })],
             Vec::new(),
         )
@@ -1210,7 +1211,7 @@ mod tests {
                 }),
                 Action::AddIndexSegment(AddIndexSegment {
                     covered_fragments: Some(vec![Ref::Committed(0), Ref::Local(0)]),
-                    ..segment("by_a", vec![Ref::Committed(0)])
+                    ..segment("by_a", vec![FieldRef::Committed(0)])
                 }),
             ],
             Vec::new(),
@@ -1233,7 +1234,7 @@ mod tests {
                     parent: None,
                     def: added_field("added"),
                 }),
-                Action::AddIndexSegment(segment("by_added", vec![Ref::Local(0)])),
+                Action::AddIndexSegment(segment("by_added", vec![FieldRef::Local(0)])),
             ],
             Vec::new(),
         )
@@ -1256,17 +1257,18 @@ mod tests {
         let rewrite = vec![
             Action::TombstoneFieldData(TombstoneFieldData {
                 fragment: Ref::Committed(0),
-                field_ids: vec![Ref::Committed(0)],
+                field_ids: vec![FieldRef::Committed(0)],
                 data_change: true,
             }),
             Action::AddDataFile(AddDataFile {
                 fragment: Ref::Committed(0),
                 file: DataFile::new_unstarted("data/new.lance", ConcreteFileVersion::V2_0),
-                field_ids: vec![Ref::Committed(0)],
+                field_ids: vec![FieldRef::Committed(0)],
                 data_change: true,
+                base: None,
             }),
         ];
-        let build = Action::AddIndexSegment(segment("by_a", vec![Ref::Committed(0)]));
+        let build = Action::AddIndexSegment(segment("by_a", vec![FieldRef::Committed(0)]));
         let actions = if segment_after_rewrite {
             rewrite.into_iter().chain([build]).collect()
         } else {
@@ -1286,9 +1288,9 @@ mod tests {
             &backed_manifest(),
             vec![
                 Action::DropField(DropField {
-                    field: Ref::Committed(0),
+                    field: FieldRef::Committed(0),
                 }),
-                Action::AddIndexSegment(segment("by_a", vec![Ref::Committed(0)])),
+                Action::AddIndexSegment(segment("by_a", vec![FieldRef::Committed(0)])),
             ],
             Vec::new(),
         )
@@ -1320,7 +1322,7 @@ mod tests {
         let build = index_footprint(covering("by_a", Some(vec![0])));
         let rewrite = footprint(vec![Action::TombstoneFieldData(TombstoneFieldData {
             fragment: Ref::Committed(0),
-            field_ids: vec![Ref::Committed(0)],
+            field_ids: vec![FieldRef::Committed(0)],
             data_change: true,
         })]);
 
@@ -1341,12 +1343,12 @@ mod tests {
     #[test]
     fn test_a_build_requires_the_columns_it_carries_too() {
         let mut segment = covering("by_a", Some(vec![0]));
-        segment.covering_fields = vec![Ref::Committed(1)];
+        segment.covering_fields = vec![FieldRef::Committed(1)];
         let build = index_footprint(segment);
 
         let rewrite = footprint(vec![Action::TombstoneFieldData(TombstoneFieldData {
             fragment: Ref::Committed(0),
-            field_ids: vec![Ref::Committed(1)],
+            field_ids: vec![FieldRef::Committed(1)],
             data_change: true,
         })]);
 
@@ -1361,7 +1363,7 @@ mod tests {
     fn test_a_build_loses_to_a_committed_drop_but_not_the_reverse() {
         let build = index_footprint(covering("by_a", Some(vec![0])));
         let drop = footprint(vec![Action::DropField(DropField {
-            field: Ref::Committed(0),
+            field: FieldRef::Committed(0),
         })]);
 
         assert!(build.conflicts_with(&drop));
@@ -1399,7 +1401,7 @@ mod tests {
         AddIndexSegment {
             covered_fragments: fragments
                 .map(|ids| ids.into_iter().map(Ref::Committed).collect::<Vec<_>>()),
-            ..segment(name, vec![Ref::Committed(0)])
+            ..segment(name, vec![FieldRef::Committed(0)])
         }
     }
 
@@ -1426,7 +1428,7 @@ mod tests {
     )]
     #[case::two_segments_of_unstated_coverage(covering("by_a", None), covering("by_a", None), true)]
     #[case::disagreeing_about_which_fields_the_index_is_over(
-        AddIndexSegment { fields: vec![Ref::Committed(1)], ..covering("by_a", Some(vec![0])) },
+        AddIndexSegment { fields: vec![FieldRef::Committed(1)], ..covering("by_a", Some(vec![0])) },
         covering("by_a", Some(vec![2])),
         true,
     )]
@@ -1481,7 +1483,7 @@ mod tests {
         // name get distinct ids once both commits are ordered.
         let local = AddIndexSegment {
             covered_fragments: Some(vec![Ref::Local(0)]),
-            ..segment("by_a", vec![Ref::Committed(0)])
+            ..segment("by_a", vec![FieldRef::Committed(0)])
         };
 
         let ours = index_footprint(local.clone());
