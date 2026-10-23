@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
+use arrow_array::builder::{ListBuilder, StringBuilder};
 use arrow_array::types::Int32Type;
 use arrow_array::{
     Array, ArrayRef, DictionaryArray, FixedSizeListArray, Float32Array, Float64Array, Int8Array,
@@ -147,6 +148,32 @@ fn test_fullzip_fixed_rejects_non_byte_aligned_values() {
         err.to_string().contains("byte aligned"),
         "unexpected error: {err}"
     );
+}
+
+// https://github.com/lance-format/lance/issues/8558
+#[tokio::test]
+async fn test_take_multichunk_string_lists() {
+    let mut list_builder = ListBuilder::new(StringBuilder::new());
+    for row in 0..3 {
+        for item in 0..512 {
+            list_builder
+                .values()
+                .append_value(format!("r{row:03}i{item:06}xaaaa"));
+        }
+        list_builder.append(true);
+    }
+    let list_array: ArrayRef = Arc::new(list_builder.finish());
+
+    let mut metadata = HashMap::new();
+    metadata.insert(
+        STRUCTURAL_ENCODING_META_KEY.to_string(),
+        STRUCTURAL_ENCODING_MINIBLOCK.to_string(),
+    );
+    let test_cases = TestCases::default()
+        .with_encoding(TestEncoding::StructuralU16)
+        .with_indices(vec![0, 2]);
+
+    check_round_trip_encoding_of_data(vec![list_array], &test_cases, metadata).await;
 }
 
 async fn test_minichunk_size_helper(
