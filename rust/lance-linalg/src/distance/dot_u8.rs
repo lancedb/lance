@@ -142,13 +142,15 @@ mod x86 {
                 };
                 let b_biased = _mm512_xor_si512(bv, sign_flip);
                 acc_dot = _mm512_dpbusd_epi32(acc_dot, av, b_biased);
-                acc_suma = _mm512_add_epi64(acc_suma, _mm512_sad_epu8(av, zeros));
+                acc_suma = _mm512_add_epi32(acc_suma, _mm512_sad_epu8(av, zeros));
                 i += 64;
             }
 
-            let biased_dot = _mm512_reduce_add_epi32(acc_dot);
-            let sum_a = _mm512_reduce_add_epi64(acc_suma);
-            let mut result = (biased_dot as i64 + 128 * sum_a) as u32;
+            // VPSADBW leaves the high 32 bits of each u64 lane zero, so Σa
+            // can be summed in 32-bit lanes and folded into `acc_dot` for a
+            // single reduction; the result is only kept mod 2^32 anyway.
+            let acc = _mm512_add_epi32(acc_dot, _mm512_slli_epi32(acc_suma, 7));
+            let mut result = _mm512_reduce_add_epi32(acc) as u32;
 
             while i < n {
                 result = result.wrapping_add(a[i] as u32 * b[i] as u32);
