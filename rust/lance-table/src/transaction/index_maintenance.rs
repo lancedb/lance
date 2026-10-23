@@ -42,9 +42,9 @@ impl Transaction {
             .collect::<HashSet<_>>();
 
         for index in indices.iter_mut() {
-            // Physical row addresses cannot follow moved rows into a new fragment.
-            // Leave that fragment uncovered so the scanner reads it directly.
-            if index.results_are_row_addrs() {
+            // Only known stable row IDs can follow moved rows into a new
+            // fragment. Unknown plugin domains must leave it for the scanner.
+            if !index.can_follow_stable_row_ids() {
                 continue;
             }
             let index_covers_modified_field = index.fields.iter().any(|field_id| {
@@ -486,9 +486,13 @@ impl Transaction {
     /// into the new fragment's base data. An index built *before* one of those
     /// overlays (`overlay.committed_version > index.dataset_version`) indexed the
     /// stale pre-overlay values -- and unlike a live overlay, the compacted
-    /// fragment no longer signals that staleness to the query path. Drop each
-    /// rewritten (new) fragment from the coverage of any index covering a field
-    /// such an overlay supplied, so those rows fall back to a flat scan.
+    /// fragment no longer signals that staleness to the query path. Drop the
+    /// group's fragments from the coverage of any index covering a field such
+    /// an overlay supplied, so those rows fall back to a flat scan.
+    ///
+    /// Both the old and the new ids are dropped: an eager remap has already
+    /// moved the bitmap to the new ids, while a deferred remap leaves the old
+    /// ids for the fragment reuse index to translate at load time.
     pub(super) fn prune_overlay_stale_fields_from_indices(
         indices: &mut [IndexMetadata],
         groups: &[RewriteGroup],
@@ -512,9 +516,10 @@ impl Transaction {
                 continue;
             }
 
-            let new_fragment_ids = group
-                .new_fragments
+            let fragment_ids = group
+                .old_fragments
                 .iter()
+                .chain(group.new_fragments.iter())
                 .map(|f| f.id as u32)
                 .collect::<Vec<_>>();
             for index in indices.iter_mut() {
@@ -524,8 +529,8 @@ impl Transaction {
                         .is_some_and(|&overlay_version| overlay_version > index.dataset_version)
                 });
                 if is_stale && let Some(fragment_bitmap) = &mut index.fragment_bitmap {
-                    for new_id in &new_fragment_ids {
-                        fragment_bitmap.remove(*new_id);
+                    for id in &fragment_ids {
+                        fragment_bitmap.remove(*id);
                     }
                 }
             }
@@ -607,7 +612,7 @@ impl Transaction {
                     });
 
                 if non_empty_indices.is_empty() {
-                    // All indices are empty -- keep only the oldest definition.
+                    // All indices are empty -- keep only the earliest-created definition.
                     //
                     // An empty index definition is still correct: the scanner
                     // falls back to scanning unindexed fragments, and normal
@@ -616,8 +621,20 @@ impl Transaction {
                     // index whenever an operation replaces every fragment it
                     // covered (e.g. a full table rewrite), leaving the dataset
                     // without its declared index.
+                    //
+                    // `dataset_version` is a watermark, not a creation time:
+                    // merges take the minimum of their sources and remaps raise
+                    // it. Order by `created_at` instead, with segments that lack
+                    // one after those that have one, and break ties on the
+                    // lowest `dataset_version`.
                     let mut sorted_indices = empty_indices;
-                    sorted_indices.sort_by_key(|index: &&IndexMetadata| index.dataset_version);
+                    sorted_indices.sort_by_key(|index: &&IndexMetadata| {
+                        (
+                            index.created_at.is_none(),
+                            index.created_at,
+                            index.dataset_version,
+                        )
+                    });
 
                     if let Some(oldest) = sorted_indices.first() {
                         uuids_to_keep.insert(oldest.uuid);
@@ -857,6 +874,7 @@ impl Transaction {
 mod tests {
     use super::*;
     use crate::transaction::test_support::overlay_with_field;
+    use chrono::{TimeZone, Utc};
     use uuid::Uuid;
 
     #[test]
@@ -1247,6 +1265,46 @@ mod tests {
     }
 
     #[test]
+    fn test_retain_multiple_empty_indices_keeps_earliest_created() {
+        let schema = create_test_schema(&[1]);
+        let fragments = vec![Fragment::new(1)];
+        let at = |secs| Some(Utc.timestamp_opt(secs, 0).unwrap());
+
+        // The lowest `dataset_version` is not the earliest-created segment
+        // (e.g. a merged segment that took the minimum version of its sources).
+        let mut indices = vec![
+            create_test_index("idx", 1, 1, Some(RoaringBitmap::new()), false),
+            create_test_index("idx", 1, 2, Some(RoaringBitmap::new()), false),
+            create_test_index("idx", 1, 3, Some(RoaringBitmap::new()), false),
+        ];
+        indices[0].created_at = at(300);
+        indices[1].created_at = None;
+        indices[2].created_at = at(100);
+
+        Transaction::retain_relevant_indices(&mut indices, &schema, &fragments);
+
+        assert_eq!(indices.len(), 1);
+        assert_eq!(indices[0].dataset_version, 3);
+        assert_eq!(indices[0].created_at, at(100));
+
+        // Segments without `created_at` sort after those with one, and ties
+        // go to the lowest `dataset_version`.
+        let mut indices = vec![
+            create_test_index("idx", 1, 1, Some(RoaringBitmap::new()), false),
+            create_test_index("idx", 1, 5, Some(RoaringBitmap::new()), false),
+            create_test_index("idx", 1, 4, Some(RoaringBitmap::new()), false),
+        ];
+        indices[0].created_at = None;
+        indices[1].created_at = at(200);
+        indices[2].created_at = at(200);
+
+        Transaction::retain_relevant_indices(&mut indices, &schema, &fragments);
+
+        assert_eq!(indices.len(), 1);
+        assert_eq!(indices[0].dataset_version, 4);
+    }
+
+    #[test]
     fn test_retain_mixed_empty_nonempty_keeps_nonempty() {
         let schema = create_test_schema(&[1]);
         let fragments = vec![Fragment::new(1)];
@@ -1498,6 +1556,14 @@ mod tests {
             create_test_index("fresh", 1, 5, covering(), false),
             // Unrelated: covers field 2, which the overlay never touched.
             create_test_index("unrelated", 2, 2, covering(), false),
+            // Stale, after a deferred remap: still covers the old fragment (0).
+            create_test_index(
+                "deferred",
+                1,
+                2,
+                Some(RoaringBitmap::from_iter([0u32])),
+                false,
+            ),
         ];
 
         Transaction::prune_overlay_stale_fields_from_indices(&mut indices, &groups);
@@ -1513,6 +1579,10 @@ mod tests {
         assert!(
             indices[2].fragment_bitmap.as_ref().unwrap().contains(7),
             "an index on an un-overlaid field is unaffected"
+        );
+        assert!(
+            indices[3].fragment_bitmap.as_ref().unwrap().is_empty(),
+            "stale index must drop the old fragment when the remap is deferred"
         );
     }
 
