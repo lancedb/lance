@@ -2531,6 +2531,21 @@ mod tests {
             .unwrap();
     }
 
+    /// `i_idx` on `i`: a zone map, which an eager compaction cannot remap, or a
+    /// BTree, which it remaps.
+    async fn create_address_index(dataset: &mut Dataset, index_type: IndexType) {
+        let builtin = match index_type {
+            IndexType::ZoneMap => BuiltinIndexType::ZoneMap,
+            IndexType::BTree => BuiltinIndexType::BTree,
+            _ => unreachable!("{index_type:?}"),
+        };
+        dataset
+            .create_index_builder(&["i"], index_type, &ScalarIndexParams::for_builtin(builtin))
+            .name("i_idx".into())
+            .await
+            .unwrap();
+    }
+
     /// Maintenance other than the fragment reuse cleanup never trims or alters
     /// the history, with or without indices, even once every index has caught
     /// up.
@@ -2583,27 +2598,33 @@ mod tests {
     #[derive(Clone, Copy, Debug)]
     enum Indexing {
         None,
-        /// A zone map built after the compaction, from the addresses it wrote.
-        CaughtUp,
+        /// An index built after the compaction, from the addresses it wrote.
+        CaughtUp(IndexType),
     }
 
     /// Trimming every version keeps the empty entry. Current handles see the
     /// trim; the previous snapshot retains its history. Only a deferred
     /// compaction records into the empty history: without `defer_index_remap`
-    /// it stays empty, and a caught-up zone map stops covering the rewritten
-    /// fragments instead of following their rows.
+    /// it stays empty, a caught-up zone map stops covering the rewritten
+    /// fragments instead of following their rows, and a BTree is remapped onto
+    /// them.
     #[rstest]
     #[tokio::test]
     async fn test_cleanup_trims_the_history_no_index_needs(
-        #[values(Indexing::None, Indexing::CaughtUp)] indexing: Indexing,
+        #[values(
+            Indexing::None,
+            Indexing::CaughtUp(IndexType::ZoneMap),
+            Indexing::CaughtUp(IndexType::BTree)
+        )]
+        indexing: Indexing,
         #[values(Storage::Inline, Storage::External)] storage: Storage,
         #[values(false, true)] defer_index_remap: bool,
     ) {
         let dir = TempStrDir::default();
         let uri = dir.as_str();
         let (mut dataset, _) = recording_table(uri, storage).await;
-        if matches!(indexing, Indexing::CaughtUp) {
-            create_zone_map(&mut dataset).await;
+        if let Indexing::CaughtUp(index_type) = indexing {
+            create_address_index(&mut dataset, index_type).await;
         }
         let recorded = history(&dataset).await;
         let untrimmed = dataset.manifest.version;
@@ -2638,20 +2659,28 @@ mod tests {
         } else {
             assert!(history(&latest).await.is_empty());
         }
-        if matches!(indexing, Indexing::CaughtUp) {
+        if let Indexing::CaughtUp(index_type) = indexing {
             let coverage = coverage_of(&load_all_indices(&latest).await.unwrap(), "i_idx");
             assert!(
                 !coverage.contains(6) && !coverage.contains(7),
                 "{coverage:?}"
             );
-            assert_eq!(coverage.contains(output), defer_index_remap, "{coverage:?}");
+            assert_eq!(
+                coverage.contains(output),
+                defer_index_remap || index_type == IndexType::BTree,
+                "{coverage:?}"
+            );
             assert_answers_through(&latest, "i_idx", "i >= 55").await;
         }
     }
 
-    /// A recording table as [`recording_table`] makes it, with a zone map built
-    /// before its compaction, which therefore still needs the version.
-    async fn indexed_recording_table(uri: &str) -> (Dataset, HashMap<u64, (u64, i32)>) {
+    /// A recording table as [`recording_table`] makes it, with an index of
+    /// `index_type` built before its compaction, which therefore still needs the
+    /// version.
+    async fn indexed_recording_table(
+        uri: &str,
+        index_type: IndexType,
+    ) -> (Dataset, HashMap<u64, (u64, i32)>) {
         let mut dataset = gen_batch()
             .col("i", array::step::<Int32Type>())
             .into_dataset_with_params(
@@ -2667,7 +2696,7 @@ mod tests {
             .await
             .unwrap();
         dataset.delete("i IN (1, 2, 5, 61)").await.unwrap();
-        create_zone_map(&mut dataset).await;
+        create_address_index(&mut dataset, index_type).await;
         let before = rows_by_addr(&dataset).await;
         let options = compaction_of(&dataset, &[0, 1, 3, 4]);
         compact_files(&mut dataset, options, None).await.unwrap();
@@ -2676,11 +2705,14 @@ mod tests {
 
     /// Catching up an index makes only the oldest prefix trimmable.
     /// Retained moves must still translate correctly and serve indexed queries.
+    #[rstest]
     #[tokio::test]
-    async fn test_cleanup_keeps_the_versions_an_index_needs() {
+    async fn test_cleanup_keeps_the_versions_an_index_needs(
+        #[values(IndexType::ZoneMap, IndexType::BTree)] index_type: IndexType,
+    ) {
         let dir = TempStrDir::default();
         let uri = dir.as_str();
-        let (mut dataset, before) = indexed_recording_table(uri).await;
+        let (mut dataset, before) = indexed_recording_table(uri, index_type).await;
         let first = history(&dataset).await;
         let untrimmed = dataset.manifest.version;
         cleanup_frag_reuse_index(&mut dataset).await.unwrap();
@@ -2882,7 +2914,7 @@ mod tests {
         let dir = TempStrDir::default();
         let uri = dir.as_str();
         let (mut dataset, before) = match trim {
-            Trim::Needed => indexed_recording_table(uri).await,
+            Trim::Needed => indexed_recording_table(uri, IndexType::ZoneMap).await,
             Trim::WithAnIndex | Trim::Resurrected => recording_table(uri, Storage::Inline).await,
         };
         let recorded = history(&dataset).await;

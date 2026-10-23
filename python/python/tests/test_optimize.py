@@ -808,22 +808,31 @@ def test_public_compaction_records_only_when_deferred_with_stable_row_ids(
     before = start_recording(base_dir, srid_recording_enabled, index_type)
     if before is None:
         return
-    # Without defer_index_remap it records nothing, also over the recorded
-    # output, and the index stops covering what it rewrote.
     dataset = lance.dataset(base_dir)
     history = frag_reuse_uuid(dataset)
-    metrics = dataset.optimize.compact_files(
-        target_rows_per_fragment=4_000, num_threads=1
-    )
-    assert metrics.fragments_removed == 3
-    dataset = lance.dataset(base_dir)
-    assert frag_reuse_uuid(dataset) == history
-    assert not index_coverage(dataset) & {
-        fragment.fragment_id for fragment in dataset.get_fragments()
-    }
-    assert_rows_keep_their_ids(before, dataset)
-    for value in [10, 1_999, 2_700, 3_999]:
-        assert dataset.to_table(filter=f"i = {value}")["i"].to_pylist() == [value]
+    if index_type == "BTREE":
+        # Without defer_index_remap a BTree is remapped eagerly, which is
+        # refused while the history holds versions.
+        with pytest.raises(OSError, match="run optimize_indices first"):
+            dataset.optimize.compact_files(
+                target_rows_per_fragment=4_000, num_threads=1
+            )
+        assert frag_reuse_uuid(lance.dataset(base_dir)) == history
+    else:
+        # Without defer_index_remap it records nothing, also over the recorded
+        # output, and the index stops covering what it rewrote.
+        metrics = dataset.optimize.compact_files(
+            target_rows_per_fragment=4_000, num_threads=1
+        )
+        assert metrics.fragments_removed == 3
+        dataset = lance.dataset(base_dir)
+        assert frag_reuse_uuid(dataset) == history
+        assert not index_coverage(dataset) & {
+            fragment.fragment_id for fragment in dataset.get_fragments()
+        }
+        assert_rows_keep_their_ids(before, dataset)
+        for value in [10, 1_999, 2_700, 3_999]:
+            assert dataset.to_table(filter=f"i = {value}")["i"].to_pylist() == [value]
 
     # Asked to defer, it records again.
     lance.write_dataset(pa.table({"i": range(4_000, 4_010)}), base_dir, mode="append")
