@@ -13,8 +13,9 @@ use datafusion_substrait::logical_plan::consumer::{
 use datafusion_substrait::substrait::proto::{
     AggregateRel, Expression, ExpressionReference, ExtendedExpression, NamedStruct, Plan, Type,
     expression::{
-        RexType,
+        Literal, RexType,
         field_reference::{ReferenceType, RootType},
+        literal::{LiteralType, PrecisionTimestamp},
         reference_segment,
     },
     expression_reference::ExprType,
@@ -33,11 +34,70 @@ use std::sync::Arc;
 fn is_substrait_compatible(data_type: &DataType) -> bool {
     match data_type {
         DataType::FixedSizeList(_, _) => false,
-        DataType::List(inner) => is_substrait_compatible(inner.data_type()),
+        DataType::List(inner) | DataType::LargeList(inner) => {
+            is_substrait_compatible(inner.data_type())
+        }
+        DataType::Map(entries, _) => is_substrait_compatible(entries.data_type()),
         DataType::Struct(fields) => fields
             .iter()
             .all(|f| is_substrait_compatible(f.data_type())),
         _ => true,
+    }
+}
+
+/// Validates that every input field referenced by an expression can be
+/// represented by DataFusion's Substrait producer.
+///
+/// This is a preflight check for callers that prune unsupported fields before
+/// calling [`encode_substrait`]. It distinguishes an unsupported transport from
+/// an expression that references a field missing from the input schema. The
+/// producer may still reject unsupported expression operators during encoding.
+///
+/// # Example
+///
+/// ```
+/// use std::sync::Arc;
+///
+/// use arrow_schema::{DataType, Field, Schema};
+/// use datafusion::prelude::col;
+/// use lance_core::Error;
+/// use lance_datafusion::substrait::validate_substrait_expr;
+///
+/// let schema = Schema::new(vec![Field::new(
+///     "vector",
+///     DataType::FixedSizeList(
+///         Arc::new(Field::new("item", DataType::Float32, true)),
+///         4,
+///     ),
+///     true,
+/// )]);
+/// let error = validate_substrait_expr(&col("vector").is_null(), &schema).unwrap_err();
+/// assert!(matches!(error, Error::NotSupported { .. }));
+/// ```
+pub fn validate_substrait_expr(expr: &Expr, schema: &ArrowSchema) -> Result<()> {
+    let mut columns = expr.column_refs().into_iter().collect::<Vec<_>>();
+    columns.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+
+    let mut unsupported_columns = Vec::new();
+    for column in columns {
+        let field = schema.field_with_name(&column.name).map_err(|_| {
+            Error::schema(format!(
+                "Substrait expression references column '{}' which is missing from the input schema",
+                column.name
+            ))
+        })?;
+        if !is_substrait_compatible(field.data_type()) {
+            unsupported_columns.push(format!("'{}' ({})", column.name, field.data_type()));
+        }
+    }
+
+    if unsupported_columns.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::not_supported(format!(
+            "Substrait expression transport cannot encode predicates referencing unsupported columns: {}",
+            unsupported_columns.join(", ")
+        )))
     }
 }
 
@@ -280,14 +340,47 @@ fn missing_field(what: &str) -> Error {
     ))
 }
 
-fn remap_expr_references(expr: &mut Expression, mapping: &HashMap<usize, usize>) -> Result<()> {
+/// Substrait's deprecated `timestamp`/`timestamp_tz` literals are always microseconds, but
+/// DataFusion takes their unit from `type_variation_reference` and reads the default 0 as
+/// seconds. PyArrow emits exactly that, so filters silently matched the wrong rows.
+///
+/// Rewrite them into the `precision_timestamp` forms, which state the unit.
+#[allow(deprecated)]
+fn normalize_deprecated_timestamp_literal(lit: &mut Literal) {
+    let precision = match lit.type_variation_reference {
+        // 0 is Substrait's default reference (microseconds); 1..=3 are DataFusion's ms/us/ns.
+        0 | 2 => 6,
+        1 => 3,
+        3 => 9,
+        _ => return,
+    };
+    let replacement = match lit.literal_type {
+        Some(LiteralType::Timestamp(value)) => {
+            LiteralType::PrecisionTimestamp(PrecisionTimestamp { precision, value })
+        }
+        Some(LiteralType::TimestampTz(value)) => {
+            LiteralType::PrecisionTimestampTz(PrecisionTimestamp { precision, value })
+        }
+        _ => return,
+    };
+    lit.literal_type = Some(replacement);
+    lit.type_variation_reference = 0;
+}
+
+/// Reject operators we cannot push down, normalize ambiguous literals, and remap field
+/// references onto the schema `remove_extension_types` left behind.
+fn normalize_expr(expr: &mut Expression, mapping: &HashMap<usize, usize>) -> Result<()> {
     match expr
         .rex_type
         .as_mut()
         .ok_or_else(|| missing_field("expression"))?
     {
+        RexType::Literal(lit) => {
+            normalize_deprecated_timestamp_literal(lit);
+            Ok(())
+        }
         // Simple, no field references possible
-        RexType::Literal(_) | RexType::Nested(_) | RexType::DynamicParameter(_) => Ok(()),
+        RexType::Nested(_) | RexType::DynamicParameter(_) => Ok(()),
         // Enum literals are deprecated in Substrait and should only appear in older plans.
         #[allow(deprecated)]
         RexType::Enum(_) => Ok(()),
@@ -302,7 +395,7 @@ fn remap_expr_references(expr: &mut Expression, mapping: &HashMap<usize, usize>)
         RexType::ScalarFunction(func) => {
             #[allow(deprecated)]
             for arg in &mut func.args {
-                remap_expr_references(arg, mapping)?;
+                normalize_expr(arg, mapping)?;
             }
             for arg in &mut func.arguments {
                 match arg
@@ -310,7 +403,7 @@ fn remap_expr_references(expr: &mut Expression, mapping: &HashMap<usize, usize>)
                     .as_mut()
                     .ok_or_else(|| missing_field("function argument"))?
                 {
-                    ArgType::Value(expr) => remap_expr_references(expr, mapping)?,
+                    ArgType::Value(expr) => normalize_expr(expr, mapping)?,
                     ArgType::Enum(_) | ArgType::Type(_) => {}
                 }
             }
@@ -318,7 +411,7 @@ fn remap_expr_references(expr: &mut Expression, mapping: &HashMap<usize, usize>)
         }
         RexType::IfThen(ifthen) => {
             for (i, clause) in ifthen.ifs.iter_mut().enumerate() {
-                remap_expr_references(
+                normalize_expr(
                     clause
                         .r#if
                         .as_mut()
@@ -326,7 +419,7 @@ fn remap_expr_references(expr: &mut Expression, mapping: &HashMap<usize, usize>)
                     mapping,
                 )?;
                 match clause.then.as_mut() {
-                    Some(then) => remap_expr_references(then, mapping)?,
+                    Some(then) => normalize_expr(then, mapping)?,
                     // Only the leading clause may omit `then`, in which case its condition is
                     // the case expression being matched against.
                     None if i == 0 => {}
@@ -334,26 +427,26 @@ fn remap_expr_references(expr: &mut Expression, mapping: &HashMap<usize, usize>)
                 }
             }
             if let Some(otherwise) = ifthen.r#else.as_mut() {
-                remap_expr_references(otherwise, mapping)?;
+                normalize_expr(otherwise, mapping)?;
             }
             Ok(())
         }
         RexType::SwitchExpression(switch) => {
             for clause in switch.ifs.iter_mut() {
                 if let Some(then) = clause.then.as_mut() {
-                    remap_expr_references(then, mapping)?;
+                    normalize_expr(then, mapping)?;
                 }
             }
             if let Some(otherwise) = switch.r#else.as_mut() {
-                remap_expr_references(otherwise, mapping)?;
+                normalize_expr(otherwise, mapping)?;
             }
             Ok(())
         }
         RexType::SingularOrList(orlist) => {
             for opt in orlist.options.iter_mut() {
-                remap_expr_references(opt, mapping)?;
+                normalize_expr(opt, mapping)?;
             }
-            remap_expr_references(
+            normalize_expr(
                 orlist
                     .value
                     .as_mut()
@@ -365,16 +458,16 @@ fn remap_expr_references(expr: &mut Expression, mapping: &HashMap<usize, usize>)
         RexType::MultiOrList(orlist) => {
             for opt in orlist.options.iter_mut() {
                 for field in opt.fields.iter_mut() {
-                    remap_expr_references(field, mapping)?;
+                    normalize_expr(field, mapping)?;
                 }
             }
             for val in orlist.value.iter_mut() {
-                remap_expr_references(val, mapping)?;
+                normalize_expr(val, mapping)?;
             }
             Ok(())
         }
         RexType::Cast(cast) => {
-            remap_expr_references(
+            normalize_expr(
                 cast.input
                     .as_mut()
                     .ok_or_else(|| missing_field("cast input"))?,
@@ -473,9 +566,10 @@ pub async fn parse_substrait(
         let (substrait_schema, _, index_mapping) =
             remove_extension_types(envelope.base_schema.as_ref().unwrap(), input_schema.clone())?;
 
-        // Always walk the expression: this also rejects operators we cannot push down. When no
-        // fields were removed the mapping is the identity, so the remap itself is a no-op.
-        remap_expr_references(&mut expr, &index_mapping)?;
+        // Always walk the expression: this also rejects operators we cannot push down and
+        // normalizes literals. When no fields were removed the mapping is the identity, so the
+        // remap itself is a no-op.
+        normalize_expr(&mut expr, &index_mapping)?;
 
         substrait_schema
     } else {
@@ -698,11 +792,11 @@ async fn parse_measures(
 mod tests {
     use std::sync::Arc;
 
-    use arrow_schema::{DataType, Field, Schema};
+    use arrow_schema::{DataType, Field, Fields, Schema, TimeUnit};
     use datafusion::{
         execution::SessionState,
         logical_expr::{BinaryExpr, Case, Operator},
-        prelude::{Expr, SessionContext},
+        prelude::{Expr, SessionContext, col, lit},
     };
     use datafusion_common::{Column, ScalarValue};
     use datafusion_substrait::substrait::proto::{
@@ -724,8 +818,9 @@ mod tests {
         r#type::{Boolean, I32, Kind, Nullability, Struct},
     };
     use prost::Message;
+    use rstest::rstest;
 
-    use crate::substrait::{encode_substrait, parse_substrait};
+    use crate::substrait::{encode_substrait, parse_substrait, validate_substrait_expr};
 
     fn session_state() -> SessionState {
         let ctx = SessionContext::new();
@@ -905,6 +1000,62 @@ mod tests {
         .unwrap();
 
         assert_eq!(expr, Expr::Column(Column::new_unqualified("x")));
+    }
+
+    /// The deprecated literal is always microseconds, but DataFusion reads the default
+    /// variation reference as seconds.
+    #[rstest]
+    #[case::default_reference(0, TimeUnit::Microsecond)]
+    #[case::milli_reference(1, TimeUnit::Millisecond)]
+    #[case::micro_reference(2, TimeUnit::Microsecond)]
+    #[case::nano_reference(3, TimeUnit::Nanosecond)]
+    #[tokio::test]
+    async fn test_deprecated_timestamp_literal_units(
+        #[case] type_variation_reference: u32,
+        #[case] expected_unit: TimeUnit,
+    ) {
+        const MICROS: i64 = 1_704_247_200_000_000;
+
+        #[allow(deprecated)]
+        let expr = parse_unpruned_expr(RexType::Literal(Literal {
+            nullable: false,
+            type_variation_reference,
+            literal_type: Some(LiteralType::Timestamp(MICROS)),
+        }))
+        .await
+        .unwrap();
+
+        let expected = match expected_unit {
+            TimeUnit::Millisecond => ScalarValue::TimestampMillisecond(Some(MICROS), None),
+            TimeUnit::Microsecond => ScalarValue::TimestampMicrosecond(Some(MICROS), None),
+            TimeUnit::Nanosecond => ScalarValue::TimestampNanosecond(Some(MICROS), None),
+            other => panic!("unexpected time unit {other:?}"),
+        };
+        assert_eq!(expr, Expr::Literal(expected, None));
+    }
+
+    /// DataFusion has no consumer branch for the deprecated `timestamp_tz`, so it failed the
+    /// filter outright rather than answering wrongly.
+    #[tokio::test]
+    async fn test_deprecated_timestamp_tz_literal() {
+        const MICROS: i64 = 1_704_247_200_000_000;
+
+        #[allow(deprecated)]
+        let expr = parse_unpruned_expr(RexType::Literal(Literal {
+            nullable: false,
+            type_variation_reference: 0,
+            literal_type: Some(LiteralType::TimestampTz(MICROS)),
+        }))
+        .await
+        .unwrap();
+
+        assert_eq!(
+            expr,
+            Expr::Literal(
+                ScalarValue::TimestampMicrosecond(Some(MICROS), Some("UTC".into())),
+                None
+            )
+        );
     }
 
     /// Optional message fields that a producer may legitimately omit must not panic the walker.
@@ -1238,9 +1389,88 @@ mod tests {
             Field::new("name", DataType::Utf8, true),
         ]);
 
-        // Encoding with the full schema would fail, but pruning removes the FSL column
+        let supported_expr = col("id").is_not_null().and(col("name").is_not_null());
+        validate_substrait_expr(&supported_expr, &schema).unwrap();
+
+        // Encoding with the full schema would fail, but pruning removes the FSL column.
+        // The compound filter verifies references on both sides retain their mappings.
         let pruned = prune_schema_for_substrait(&schema);
         assert_eq!(pruned.fields().len(), 2); // id and name only
+        assert_substrait_roundtrip(pruned, supported_expr).await;
+    }
+
+    #[rstest]
+    #[case::is_null(col("vector").is_null())]
+    #[case::is_not_null(col("vector").is_not_null())]
+    #[case::compound(
+        col("before")
+            .gt(lit(0_i64))
+            .and(col("vector").is_null())
+            .and(col("after").lt(lit(10_i64)))
+    )]
+    fn test_validate_substrait_expr_rejects_fixed_size_list(#[case] expr: Expr) {
+        let schema = Schema::new(vec![
+            Field::new("before", DataType::Int64, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 4),
+                true,
+            ),
+            Field::new("after", DataType::Int64, true),
+        ]);
+
+        let error = validate_substrait_expr(&expr, &schema)
+            .expect_err("FixedSizeList predicates are not supported by Substrait transport");
+        assert!(matches!(error, lance_core::Error::NotSupported { .. }));
+        assert!(
+            error.to_string().contains("'vector' (FixedSizeList"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_prune_schema_for_substrait_nested_list_types() {
+        // The producer recurses into LargeList and Map children, so an FSL
+        // nested under them must still be pruned.
+        use crate::substrait::prune_schema_for_substrait;
+
+        let fsl = |width: i32| {
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), width)
+        };
+        let map_of = |value: DataType| {
+            DataType::Map(
+                Arc::new(Field::new(
+                    "entries",
+                    DataType::Struct(Fields::from(vec![
+                        Field::new("key", DataType::Utf8, false),
+                        Field::new("value", value, true),
+                    ])),
+                    false,
+                )),
+                false,
+            )
+        };
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("map_ok", map_of(DataType::Int32), true),
+            Field::new(
+                "ll_ok",
+                DataType::LargeList(Arc::new(Field::new("item", DataType::Int32, true))),
+                true,
+            ),
+            Field::new(
+                "ll_fsl",
+                DataType::LargeList(Arc::new(Field::new("item", fsl(16), true))),
+                true,
+            ),
+            Field::new("map_fsl", map_of(fsl(8)), true),
+        ]);
+
+        let pruned = prune_schema_for_substrait(&schema);
+        let names: Vec<&str> = pruned.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(names, vec!["id", "map_ok", "ll_ok"]);
+        // The encoder writes the whole schema, so a filter on another column
+        // only encodes once those columns are gone.
         assert_substrait_roundtrip(pruned, id_filter("test-id")).await;
     }
 

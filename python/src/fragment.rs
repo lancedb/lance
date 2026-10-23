@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::fmt::Write as _;
+use std::num::NonZero;
 use std::sync::Arc;
 
 use arrow::ffi_stream::ArrowArrayStreamReader;
@@ -42,6 +43,8 @@ use crate::error::PythonErrorExt;
 use crate::schema::{LanceSchema, logical_schema_from_lance};
 use crate::utils::{PyLance, export_vec, extract_vec};
 use crate::{Dataset, Scanner, rt};
+
+type UpdateColumnsResult = (PyLance<Fragment>, Vec<u32>, Option<Vec<u8>>);
 
 #[pyclass(name = "_Fragment", module = "_lib", from_py_object)]
 #[derive(Clone)]
@@ -211,7 +214,7 @@ impl FileFragment {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature=(columns=None, columns_with_transform=None, batch_size=None, filter=None, limit=None, offset=None, with_row_id=None, with_row_address=None, batch_readahead=None, blob_handling=None, order_by=None, use_scalar_index=None, io_buffer_size=None, late_materialization=None, include_deleted_rows=None, batch_size_bytes=None, strict_batch_size=None))]
+    #[pyo3(signature=(columns=None, columns_with_transform=None, batch_size=None, filter=None, limit=None, offset=None, with_row_id=None, with_row_address=None, batch_readahead=None, blob_handling=None, order_by=None, use_scalar_index=None, io_buffer_size=None, late_materialization=None, include_deleted_rows=None, batch_size_bytes=None, strict_batch_size=None, substrait_filter=None))]
     fn scanner(
         self_: PyRef<'_, Self>,
         columns: Option<Vec<String>>,
@@ -231,6 +234,7 @@ impl FileFragment {
         include_deleted_rows: Option<bool>,
         batch_size_bytes: Option<u64>,
         strict_batch_size: Option<bool>,
+        substrait_filter: Option<Vec<u8>>,
     ) -> PyResult<Scanner> {
         let mut scanner = self_.fragment.scan();
 
@@ -257,9 +261,17 @@ impl FileFragment {
             scanner.batch_size(batch_size);
         }
         if let Some(f) = filter {
+            if substrait_filter.is_some() {
+                return Err(PyValueError::new_err(
+                    "cannot specify both a string filter and a substrait filter",
+                ));
+            }
             scanner
                 .filter(&f)
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        }
+        if let Some(f) = substrait_filter {
+            scanner.filter_substrait(&f).infer_error()?;
         }
 
         scanner
@@ -383,14 +395,11 @@ impl FileFragment {
         reader: PyArrowType<ArrowArrayStreamReader>,
         left_on: String,
         right_on: String,
-        max_field_id: i32,
     ) -> PyResult<(PyLance<Fragment>, LanceSchema)> {
         let mut fragment = self.fragment.clone();
         let (fragment, schema) = rt()
             .spawn(None, async move {
-                fragment
-                    .merge_columns(reader.0, &left_on, &right_on, max_field_id)
-                    .await
+                fragment.merge_columns(reader.0, &left_on, &right_on).await
             })?
             .infer_error()?;
 
@@ -402,15 +411,34 @@ impl FileFragment {
         reader: PyArrowType<ArrowArrayStreamReader>,
         left_on: String,
         right_on: String,
-    ) -> PyResult<(PyLance<Fragment>, Vec<u32>)> {
+        with_offsets: bool,
+    ) -> PyResult<UpdateColumnsResult> {
         let mut fragment = self.fragment.clone();
-        let (updated_fragment, fields_modified) = rt()
+        let result = rt()
             .spawn(None, async move {
-                fragment.update_columns(reader.0, &left_on, &right_on).await
+                fragment
+                    .update_columns_with_offsets(reader.0, &left_on, &right_on)
+                    .await
             })?
             .infer_error()?;
 
-        Ok((PyLance(updated_fragment), fields_modified))
+        let matched_offsets = if with_offsets {
+            let mut buf = Vec::with_capacity(result.matched_offsets.serialized_size());
+            result
+                .matched_offsets
+                .serialize_into(&mut buf)
+                .map_err(|err| {
+                    PyIOError::new_err(format!("Failed to serialize matched row offsets: {err}"))
+                })?;
+            Some(buf)
+        } else {
+            None
+        };
+        Ok((
+            PyLance(result.fragment),
+            result.fields_modified,
+            matched_offsets,
+        ))
     }
 
     fn delete(&self, predicate: &str) -> PyResult<Option<Self>> {
@@ -936,6 +964,8 @@ impl FromPyObject<'_, '_> for PyLance<DataFile> {
     fn extract(ob: Borrowed<'_, '_, PyAny>) -> PyResult<Self> {
         let file_size_bytes: Option<u64> = ob.getattr("file_size_bytes")?.extract()?;
         let file_size_bytes = CachedFileSize::new(file_size_bytes.unwrap_or(0));
+        let file_metadata_size_bytes: Option<u64> =
+            ob.getattr("file_metadata_size_bytes")?.extract()?;
         let fields: Vec<i32> = ob.getattr("fields")?.extract()?;
         let column_indices: Vec<i32> = ob.getattr("column_indices")?.extract()?;
         Ok(Self(DataFile {
@@ -945,6 +975,7 @@ impl FromPyObject<'_, '_> for PyLance<DataFile> {
             file_major_version: ob.getattr("file_major_version")?.extract()?,
             file_minor_version: ob.getattr("file_minor_version")?.extract()?,
             file_size_bytes,
+            file_metadata_size_bytes: file_metadata_size_bytes.and_then(NonZero::new),
             base_id: ob.getattr("base_id")?.extract()?,
         }))
     }
@@ -970,6 +1001,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&DataFile> {
             self.0.file_minor_version,
             file_size_bytes,
             self.0.base_id,
+            self.0.file_metadata_size_bytes.map(NonZero::get),
         ))
     }
 }
