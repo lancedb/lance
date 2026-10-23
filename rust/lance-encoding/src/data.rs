@@ -1763,16 +1763,23 @@ fn concat_dict_arrays(arrays: &[ArrayRef]) -> ArrayRef {
 ///
 /// Arrow merges dictionaries with a lossy interner, so a batch that spans pages
 /// whose dictionaries fit the key type together can still report an overflow.
-/// On overflow the dictionaries are merged exactly instead.
+/// On overflow the dictionaries are merged exactly instead.  A null stored as a
+/// dictionary value (the 2.0 layout) becomes a null key in the merged array.
 pub(crate) fn concat_decoded_arrays(arrays: &[&dyn Array]) -> Result<ArrayRef> {
     match arrow_select::concat::concat(arrays) {
-        Err(arrow_schema::ArrowError::DictionaryKeyOverflowError)
-            if arrays[0].data_type().is_dictionary() =>
-        {
+        Err(arrow_schema::ArrowError::DictionaryKeyOverflowError) => {
+            let DataType::Dictionary(key_type, _) = arrays[0].data_type() else {
+                return Err(arrow_schema::ArrowError::DictionaryKeyOverflowError.into());
+            };
             reencode_dict_arrays(arrays).ok_or_else(|| {
+                let entries = arrays
+                    .iter()
+                    .map(|array| array.as_any_dictionary().values().len())
+                    .sum::<usize>();
                 Error::not_supported(format!(
-                    "this batch spans pages whose dictionaries hold more distinct values than {} keys can address; read fewer rows per batch",
-                    arrays[0].data_type()
+                    "could not merge the dictionaries of the {} pages in this batch ({entries} entries) into {key_type} keys, which address at most {} distinct values; read fewer rows per batch",
+                    arrays.len(),
+                    max_index_val(key_type) + 1
                 ))
             })
         }
@@ -2768,10 +2775,13 @@ mod tests {
         // merge overflows Int8, the exact merge fits.
         let a = Arc::new(all_int8_dictionary()) as ArrayRef;
         let b = Arc::new(all_int8_dictionary()) as ArrayRef;
-        assert!(matches!(
-            arrow_select::concat::concat(&[a.as_ref(), b.as_ref()]),
-            Err(arrow_schema::ArrowError::DictionaryKeyOverflowError)
-        ));
+        assert!(
+            matches!(
+                arrow_select::concat::concat(&[a.as_ref(), b.as_ref()]),
+                Err(arrow_schema::ArrowError::DictionaryKeyOverflowError)
+            ),
+            "Arrow no longer overflows here, so the exact merge is not exercised"
+        );
 
         let merged = concat_decoded_arrays(&[a.as_ref(), b.as_ref()]).unwrap();
 
@@ -2790,7 +2800,9 @@ mod tests {
 
         assert!(matches!(error, Error::NotSupported { .. }), "{error}");
         assert!(
-            error.to_string().contains("read fewer rows per batch"),
+            error.to_string().contains(
+                "could not merge the dictionaries of the 2 pages in this batch (200 entries) into Int8 keys, which address at most 128 distinct values"
+            ),
             "unexpected error: {error}"
         );
     }
