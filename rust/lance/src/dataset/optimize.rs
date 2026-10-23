@@ -3512,7 +3512,10 @@ pub async fn commit_compaction(
 
     // Confirm there is a remapper before materializing the potentially very large row address map.
     let index_remapper = if needs_remapping {
-        remap_options.create_remapper(dataset).await?
+        remap_options
+            .create_remapper(dataset)
+            .await?
+            .filter(|remapper| remapper.needs_row_address_map(&completed_tasks))
     } else {
         None
     };
@@ -6001,10 +6004,16 @@ mod tests {
     }
 
     #[rstest]
-    #[case::without_index(false)]
-    #[case::with_index(true)]
+    #[case::without_index(&[])]
+    #[case::zonemap(&[BuiltinIndexType::ZoneMap])]
+    #[case::bloom_filter(&[BuiltinIndexType::BloomFilter])]
+    #[case::btree(&[BuiltinIndexType::BTree])]
+    #[case::mixed(&[BuiltinIndexType::ZoneMap, BuiltinIndexType::BTree])]
     #[tokio::test]
-    async fn test_row_addrs_only_used_with_remappable_index(#[case] has_index: bool) {
+    async fn test_row_addrs_only_used_with_remappable_index(
+        #[case] index_types: &[BuiltinIndexType],
+        #[values(IndexRemapMode::Direct, IndexRemapMode::Compact)] index_remap_mode: IndexRemapMode,
+    ) {
         let data = sample_data();
         let reader = RecordBatchIterator::new(vec![Ok(data.slice(0, 9_000))], data.schema());
         let mut dataset = Dataset::write(
@@ -6012,34 +6021,40 @@ mod tests {
             "memory://",
             Some(WriteParams {
                 max_rows_per_file: 3_000,
-                data_storage_version: Some(LanceFileVersion::Legacy),
                 ..Default::default()
             }),
         )
         .await
         .unwrap();
 
-        if has_index {
-            create_scalar_index(&mut dataset, "a", false).await;
+        for builtin in index_types {
+            dataset
+                .create_index(
+                    &["a"],
+                    IndexType::Scalar,
+                    Some(builtin.as_str().to_string()),
+                    &ScalarIndexParams::for_builtin(builtin.clone()),
+                    false,
+                )
+                .await
+                .unwrap();
         }
 
         let options = CompactionOptions {
             target_rows_per_fragment: 9_000,
+            index_remap_mode,
             ..Default::default()
         };
+        let original_indices = dataset.load_indices().await.unwrap();
         let plan = plan_compaction(&dataset, &options).await.unwrap();
         assert_eq!(plan.tasks().len(), 1);
 
         let mut result = rewrite_files(Cow::Borrowed(&dataset), plan.tasks()[0].clone(), &options)
             .await
             .unwrap();
-        assert_eq!(result.row_addrs.is_some(), has_index);
+        assert_eq!(result.row_addrs.is_some(), !index_types.is_empty());
 
-        if has_index {
-            let row_addrs_bytes = result
-                .row_addrs
-                .as_ref()
-                .expect("indexed compaction should capture row addresses");
+        if let Some(row_addrs_bytes) = &result.row_addrs {
             let row_addrs =
                 RoaringTreemap::deserialize_from(&mut Cursor::new(row_addrs_bytes)).unwrap();
             assert_eq!(row_addrs.len(), 9_000);
@@ -6055,21 +6070,42 @@ mod tests {
                 row_addrs_bytes.len(),
                 row_addrs.len()
             );
-        } else {
-            // Simulate a stale worker result that captured row addresses before the
-            // dataset no longer needed a remapper. Invalid bytes ensure the commit
-            // does not attempt to deserialize or materialize the unused map.
-            result.row_addrs = Some(b"not a roaring treemap".to_vec());
-            commit_compaction(
-                &mut dataset,
-                vec![result],
-                Arc::new(DatasetIndexRemapperOptions::default()),
-                &options,
-            )
-            .await
-            .unwrap();
-            assert_eq!(dataset.get_fragments().len(), 1);
         }
+        if !index_types.contains(&BuiltinIndexType::BTree) {
+            // Invalid bytes prove commit skips decoding and building the map
+            // when no index supports remapping, even if the worker captured it.
+            result.row_addrs = Some(b"not a roaring treemap".to_vec());
+        }
+        commit_compaction(
+            &mut dataset,
+            vec![result],
+            Arc::new(DatasetIndexRemapperOptions::default()),
+            &options,
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 1);
+        let current_indices = dataset.load_indices().await.unwrap();
+        for original in original_indices.iter() {
+            let current = current_indices
+                .iter()
+                .find(|index| index.name == original.name)
+                .unwrap();
+            if original.name == BuiltinIndexType::BTree.as_str() {
+                assert_ne!(current.uuid, original.uuid);
+            } else {
+                assert_eq!(current.uuid, original.uuid);
+                assert!(
+                    current
+                        .effective_fragment_bitmap(dataset.fragment_bitmap.as_ref())
+                        .unwrap()
+                        .is_empty()
+                );
+            }
+        }
+        let mut scanner = dataset.scan();
+        scanner.filter("a = 4500").unwrap();
+        assert_eq!(scanner.try_into_batch().await.unwrap().num_rows(), 1);
     }
 
     #[derive(Debug, Clone, Copy)]

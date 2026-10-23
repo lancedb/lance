@@ -30,6 +30,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
 
+use super::RewriteResult;
+
 /// The result of remapping an index
 #[derive(Debug, Clone, PartialEq)]
 pub enum RemapResult {
@@ -58,6 +60,24 @@ pub struct RemappedIndex {
 /// for inversion of control.
 #[async_trait]
 pub trait IndexRemapper: Send + Sync {
+    /// Whether compaction must construct the address map and invoke
+    /// [`Self::remap_indices`] for these completed rewrite tasks.
+    ///
+    /// Returning false must be equivalent to producing no rewritten indices,
+    /// including any coverage updates normally produced by keeping an index.
+    /// This check must not decode captured addresses or read index files.
+    /// The default preserves the existing path for custom remappers.
+    ///
+    /// ```
+    /// # use lance::dataset::optimize::{IndexRemapper, RewriteResult};
+    /// fn needs_mapping(remapper: &dyn IndexRemapper, tasks: &[RewriteResult]) -> bool {
+    ///     remapper.needs_row_address_map(tasks)
+    /// }
+    /// ```
+    fn needs_row_address_map(&self, _tasks: &[RewriteResult]) -> bool {
+        true
+    }
+
     async fn remap_indices(
         &self,
         index_map: RowAddrRemap,
@@ -71,10 +91,11 @@ pub trait IndexRemapper: Send + Sync {
 /// want to keep a placeholder
 #[async_trait]
 pub trait IndexRemapperOptions: Send + Sync {
-    /// Creates a remapper when the dataset has indices that need row address remapping.
+    /// Creates a remapper from the dataset's index metadata.
     ///
-    /// Returns `None` when no remappable indices exist, allowing compaction to avoid
-    /// materializing an unused row address map.
+    /// Returning `None` skips address-map construction and index maintenance.
+    /// A returned remapper can further opt out for the completed rewrite tasks
+    /// through [`IndexRemapper::needs_row_address_map`].
     async fn create_remapper(&self, dataset: &Dataset) -> Result<Option<Box<dyn IndexRemapper>>>;
 }
 

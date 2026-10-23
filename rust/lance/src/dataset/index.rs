@@ -13,7 +13,7 @@ use crate::dataset::optimize::RemappedIndex;
 use crate::dataset::optimize::remapping::RemapResult;
 use crate::index::DatasetIndexExt;
 use crate::index::remap_index;
-use crate::index::scalar::infer_scalar_index_details;
+use crate::index::scalar::{IndexDetails, infer_scalar_index_details};
 use arrow_schema::DataType;
 use async_trait::async_trait;
 use lance_core::{Error, Result};
@@ -22,10 +22,11 @@ use lance_index::is_system_index;
 use lance_index::pb::VectorIndexDetails;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_table::format::IndexMetadata;
+use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::optimize::{IndexRemapper, IndexRemapperOptions};
+use super::optimize::{IndexRemapper, IndexRemapperOptions, RewriteResult};
 use super::versions;
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -62,6 +63,95 @@ impl IndexRemapperOptions for DatasetIndexRemapperOptions {
     }
 }
 
+/// Whether an affected index needs the normal remap path. Inspect metadata only,
+/// before compaction decodes the captured addresses or opens any index.
+fn needs_index_remap(
+    dataset: &Dataset,
+    indices: &[IndexMetadata],
+    tasks: &[RewriteResult],
+) -> bool {
+    let affected_fragments: RoaringBitmap = tasks
+        .iter()
+        .flat_map(|task| &task.original_fragments)
+        .filter_map(|fragment| u32::try_from(fragment.id).ok())
+        .collect();
+
+    indices.iter().any(|index| {
+        if is_system_index(index) {
+            return false;
+        }
+        if let Some(indexed_fragments) = &index.fragment_bitmap
+            && indexed_fragments.is_disjoint(&affected_fragments)
+        {
+            return false;
+        }
+
+        // Preserve remap_index's handling of multi-field or invalid declarations.
+        let [field_id] = index.fields.as_slice() else {
+            return true;
+        };
+        if !index.covering_fields.is_empty() || dataset.schema().field_by_id(*field_id).is_none() {
+            return true;
+        }
+        // Legacy details require file inspection. Vectors and failed plugin
+        // lookups also retain the existing path and its error handling.
+        let Some(details) = &index.index_details else {
+            return true;
+        };
+        let capability = IndexDetails(details.clone())
+            .get_plugin()
+            .and_then(|plugin| plugin.can_remap(details.as_ref()));
+        if !matches!(capability, Ok(false)) {
+            return true;
+        }
+
+        let Some(indexed_fragments) = &index.fragment_bitmap else {
+            // remap_index only considers Keep when a fragment bitmap exists.
+            return false;
+        };
+
+        // Even an unsupported index can return Keep when all its rows are
+        // deleted, which updates its coverage at commit. A nonempty output
+        // from a fully indexed task proves Keep cannot occur. Partial coverage
+        // cannot prove this: only unindexed rows might have survived.
+        let has_surviving_indexed_rows = tasks.iter().any(|task| {
+            if task.row_addrs.is_none() || task.original_fragments.is_empty() {
+                return false;
+            }
+            let has_indexed_sources = task.original_fragments.iter().all(|fragment| {
+                let Ok(fragment_id) = u32::try_from(fragment.id) else {
+                    return false;
+                };
+                let Some(rows) = fragment.physical_rows else {
+                    return false;
+                };
+                // Keep checks addresses in the current snapshot. Incomplete or
+                // changed source counts cannot establish the same row domain.
+                indexed_fragments.contains(fragment_id)
+                    && u32::try_from(rows).is_ok()
+                    && dataset
+                        .get_fragment(fragment_id as usize)
+                        .is_some_and(|current| current.metadata().physical_rows == Some(rows))
+            });
+            if !has_indexed_sources {
+                return false;
+            }
+            let mut has_output_rows = false;
+            for fragment in &task.new_fragments {
+                let Some(rows) = fragment
+                    .physical_rows
+                    .and_then(|rows| u32::try_from(rows).ok())
+                else {
+                    return false;
+                };
+                has_output_rows |= rows > 0;
+            }
+            has_output_rows
+        });
+        !has_surviving_indexed_rows
+    })
+}
+
 struct DatasetIndexRemapper {
     dataset: Arc<Dataset>,
     indices: Arc<Vec<IndexMetadata>>,
@@ -79,6 +169,10 @@ impl DatasetIndexRemapper {
 
 #[async_trait]
 impl IndexRemapper for DatasetIndexRemapper {
+    fn needs_row_address_map(&self, tasks: &[RewriteResult]) -> bool {
+        needs_index_remap(&self.dataset, &self.indices, tasks)
+    }
+
     async fn remap_indices(
         &self,
         mapping: RowAddrRemap,
@@ -228,8 +322,89 @@ mod tests {
     use lance_index::frag_reuse::{FRAG_REUSE_INDEX_NAME, FragReuseIndexDetails};
     use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
     use lance_linalg::distance::MetricType;
+    use rstest::rstest;
     use std::collections::HashMap;
     use uuid::Uuid;
+
+    #[rstest]
+    #[case::zonemap("ZoneMap", |_: &mut IndexMetadata, _: &mut RewriteResult| {}, false)]
+    #[case::bloom_filter("BloomFilter", |_: &mut IndexMetadata, _: &mut RewriteResult| {}, false)]
+    #[case::btree("BTree", |_: &mut IndexMetadata, _: &mut RewriteResult| {}, true)]
+    #[case::vector("Vector", |_: &mut IndexMetadata, _: &mut RewriteResult| {}, true)]
+    #[case::unknown_plugin("Unknown", |_: &mut IndexMetadata, _: &mut RewriteResult| {}, true)]
+    #[case::invalid_json_details("Json", |_: &mut IndexMetadata, _: &mut RewriteResult| {}, true)]
+    #[case::missing_details("ZoneMap", |index: &mut IndexMetadata, _: &mut RewriteResult| index.index_details = None, true)]
+    #[case::no_bitmap("ZoneMap", |index: &mut IndexMetadata, _: &mut RewriteResult| index.fragment_bitmap = None, false)]
+    #[case::unaffected("BTree", |index: &mut IndexMetadata, _: &mut RewriteResult| index.fragment_bitmap = Some(RoaringBitmap::new()), false)]
+    #[case::all_deleted("ZoneMap", |_: &mut IndexMetadata, task: &mut RewriteResult| task.new_fragments.clear(), true)]
+    #[case::partial_coverage("ZoneMap", |index: &mut IndexMetadata, task: &mut RewriteResult| {
+        index.fragment_bitmap.as_mut().unwrap().remove(task.original_fragments[1].id as u32);
+    }, true)]
+    #[case::missing_addresses("ZoneMap", |_: &mut IndexMetadata, task: &mut RewriteResult| task.row_addrs = None, true)]
+    #[case::missing_source_rows("ZoneMap", |_: &mut IndexMetadata, task: &mut RewriteResult| task.original_fragments[0].physical_rows = None, true)]
+    #[case::changed_source_rows("ZoneMap", |_: &mut IndexMetadata, task: &mut RewriteResult| task.original_fragments[0].physical_rows = Some(2), true)]
+    #[case::missing_output_rows("ZoneMap", |_: &mut IndexMetadata, task: &mut RewriteResult| task.new_fragments[0].physical_rows = None, true)]
+    #[case::invalid_output_rows("ZoneMap", |_: &mut IndexMetadata, task: &mut RewriteResult| task.new_fragments[0].physical_rows = Some(u32::MAX as usize + 1), true)]
+    #[case::covering("ZoneMap", |index: &mut IndexMetadata, _: &mut RewriteResult| {
+        index.fields.push(1);
+        index.covering_fields.push(1);
+    }, true)]
+    #[case::malformed_covering("ZoneMap", |index: &mut IndexMetadata, _: &mut RewriteResult| index.covering_fields.push(99), true)]
+    #[case::composite("ZoneMap", |index: &mut IndexMetadata, _: &mut RewriteResult| index.fields.push(1), true)]
+    #[case::missing_field("ZoneMap", |index: &mut IndexMetadata, _: &mut RewriteResult| index.fields[0] = -1, true)]
+    #[tokio::test]
+    async fn test_remapper_checks_metadata_without_index_files(
+        #[case] index_type: &str,
+        #[case] change: fn(&mut IndexMetadata, &mut RewriteResult),
+        #[case] needs_mapping: bool,
+    ) {
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<arrow_array::types::Int32Type>())
+            .into_reader_rows(RowCount::from(1), BatchCount::from(2));
+        let dataset = Dataset::write(
+            reader,
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 1,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        // No index files exist, and the addresses cannot be decoded. Both the
+        // capability query and the Keep exclusion must use metadata alone.
+        let mut index = IndexMetadata {
+            uuid: Uuid::new_v4(),
+            fields: vec![dataset.schema().field("id").unwrap().id],
+            covering_fields: Vec::new(),
+            name: "id_idx".to_string(),
+            dataset_version: dataset.version().version,
+            fragment_bitmap: Some(dataset.fragment_bitmap.as_ref().clone()),
+            index_details: Some(Arc::new(prost_types::Any {
+                type_url: format!("type.googleapis.com/lance.table.{index_type}IndexDetails"),
+                value: Vec::new(),
+            })),
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+            files: None,
+        };
+        let mut output = dataset.manifest.fragments[0].clone();
+        output.physical_rows = Some(2);
+        let mut task = RewriteResult {
+            metrics: Default::default(),
+            original_fragments: dataset.manifest.fragments.as_ref().clone(),
+            new_fragments: vec![output],
+            read_version: dataset.manifest.version,
+            row_addrs: Some(b"not a roaring treemap".to_vec()),
+        };
+        change(&mut index, &mut task);
+        let remapper = DatasetIndexRemapper {
+            dataset: Arc::new(dataset),
+            indices: Arc::new(vec![index]),
+        };
+        assert_eq!(remapper.needs_row_address_map(&[task]), needs_mapping);
+    }
 
     #[tokio::test]
     async fn test_remapper_not_created_without_remappable_indices() {
@@ -513,23 +688,17 @@ mod tests {
         let _ = index_uuid;
     }
 
-    /// The same migration path must reject -- cleanly, not with a panic -- a
-    /// malformed `covering_fields` longer than `fields`.
-    ///
-    /// Note this is a genuinely synthetic scenario, not one a real commit can
-    /// produce: `crate::index::remap_index`'s own `keyed > 1` guard (a sibling
-    /// fix in this same phase) already rejects every organically-committable
-    /// composite index *before* this migration path ever runs, since it is
-    /// only reached from that function's `RemapResult::Keep` arm. And
-    /// `validate_covering_fields` rejects a fully-consumed `covering_fields`
-    /// (`keyed == 0` with non-empty `fields`) at `Operation::CreateIndex`
-    /// commit time, and `TryFrom<pb::IndexMetadata>` rejects it again when a
-    /// manifest is decoded. The only way left to reach this branch's rejection
-    /// is metadata that passed through neither, which is how this test reaches
-    /// it: seeding the index cache directly rather than committing through a
-    /// `Transaction`.
+    // Seed the cache directly: normal commits and manifest decoding already
+    // reject malformed covering fields. Even an unremappable index must reach
+    // the existing validation instead of being silently skipped.
+    #[rstest]
+    #[case::legacy_btree(BuiltinIndexType::BTree, false)]
+    #[case::zonemap(BuiltinIndexType::ZoneMap, true)]
     #[tokio::test]
-    async fn test_remapper_migration_path_rejects_malformed_covering_fields() {
+    async fn test_remapper_rejects_malformed_covering_fields(
+        #[case] index_type: BuiltinIndexType,
+        #[case] has_details: bool,
+    ) {
         let reader = lance_datagen::gen_batch()
             .col("a", array::step::<arrow_array::types::Int32Type>())
             .into_reader_rows(RowCount::from(20), BatchCount::from(1));
@@ -537,9 +706,9 @@ mod tests {
         dataset
             .create_index(
                 &["a"],
-                IndexType::BTree,
+                IndexType::Scalar,
                 None,
-                &ScalarIndexParams::for_builtin(BuiltinIndexType::BTree),
+                &ScalarIndexParams::for_builtin(index_type),
                 false,
             )
             .await
@@ -549,15 +718,12 @@ mod tests {
         let mut indices = dataset.load_indices().await.unwrap().as_ref().clone();
         for idx in &mut indices {
             if idx.uuid == index_uuid {
-                // Force the legacy migration path, and malform `covering_fields`
-                // to be longer than `fields` -- more carried fields than fields
-                // at all. No normal commit can produce this.
-                idx.index_details = None;
-                // A real `index_details: None` entry predates every version bump
-                // too, so `index_version` must go back to 0 along with it --
-                // otherwise `unsupported_index_version` hides it as a too-new
-                // version of an unrecognized type before this path is even reached.
-                idx.index_version = 0;
+                if !has_details {
+                    // Missing details predate versioned indices; preserve that
+                    // legacy case alongside the current ZoneMap case.
+                    idx.index_details = None;
+                    idx.index_version = 0;
+                }
                 idx.covering_fields = idx
                     .fields
                     .iter()

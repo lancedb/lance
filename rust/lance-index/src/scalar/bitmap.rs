@@ -1114,10 +1114,6 @@ impl ScalarIndex for BitmapIndex {
         Ok(SearchResult::Exact(selection))
     }
 
-    fn can_remap(&self) -> bool {
-        true
-    }
-
     /// Remap the row ids, creating a new remapped version of this index in `dest_store`
     async fn remap(
         &self,
@@ -2481,6 +2477,10 @@ impl BasicTrainer for BitmapIndexPlugin {
 
 #[async_trait]
 impl ScalarIndexPlugin for BitmapIndexPlugin {
+    fn can_remap(&self, _details: &prost_types::Any) -> Result<bool> {
+        Ok(true)
+    }
+
     fn basic_trainer(&self) -> Option<&dyn BasicTrainer> {
         Some(self)
     }
