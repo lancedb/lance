@@ -446,7 +446,6 @@ impl ExternalManifestStore for DynamoDBExternalManifestStore {
             // authoritative object store when it validates the final path.
             e_tag: None,
             identity: None,
-            last_modified: None,
         })
     }
 
@@ -516,7 +515,6 @@ impl ExternalManifestStore for DynamoDBExternalManifestStore {
                             // version identity, and are intentionally ignored.
                             e_tag: None,
                             identity: None,
-                            last_modified: None,
                         };
                         Ok(Some(location))
                     }

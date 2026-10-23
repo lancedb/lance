@@ -57,7 +57,6 @@ pub async fn finalize_staged<S: ExternalManifestStore + ?Sized>(
         naming_scheme,
         e_tag: final_e_tag,
         identity: None,
-        last_modified: None,
     };
 
     // Step 3: Update the external index to the final path.
@@ -180,7 +179,6 @@ pub trait ExternalManifestStore: std::fmt::Debug + Send + Sync {
             naming_scheme,
             e_tag: None,
             identity: None,
-            last_modified: None,
         })
     }
 
@@ -209,7 +207,6 @@ pub trait ExternalManifestStore: std::fmt::Debug + Send + Sync {
                     naming_scheme,
                     e_tag: None,
                     identity: None,
-                    last_modified: None,
                 })
             })
             .transpose()
@@ -583,7 +580,6 @@ impl ExternalManifestCommitHandler {
                     naming_scheme,
                     e_tag: _,
                     identity,
-                    ..
                 } = location;
 
                 let size = match expected_size {
@@ -613,7 +609,6 @@ impl ExternalManifestCommitHandler {
                     naming_scheme,
                     e_tag,
                     identity,
-                    last_modified: None,
                 })
             }
             Err(ObjectStoreError::NotFound { .. }) => {
@@ -661,7 +656,6 @@ impl ExternalManifestCommitHandler {
             naming_scheme,
             e_tag: final_e_tag,
             identity: None,
-            last_modified: None,
         };
 
         // Step 2: point the external index at the final location without an
@@ -787,7 +781,6 @@ impl CommitHandler for ExternalManifestCommitHandler {
                     naming_scheme,
                     e_tag: _,
                     identity,
-                    ..
                 } = location;
 
                 let size = if let Some(size) = size {
@@ -872,7 +865,6 @@ impl CommitHandler for ExternalManifestCommitHandler {
                             naming_scheme,
                             e_tag,
                             identity: None,
-                            last_modified: None,
                         });
                     }
                     Err(ObjectStoreError::NotFound { .. }) => {
@@ -1112,7 +1104,6 @@ impl CommitHandler for ExternalManifestCommitHandler {
                     naming_scheme,
                     e_tag: write_res.e_tag,
                     identity: Some(identity),
-                    last_modified: None,
                 })
             }
             Ok(Reservation::PredecessorChanged) => {
@@ -1296,7 +1287,6 @@ mod tests {
                 size: Some(stored.size),
                 e_tag: stored.e_tag,
                 identity: None,
-                last_modified: None,
             })
         }
 
@@ -2142,7 +2132,6 @@ mod tests {
                 size: Some(row.1),
                 e_tag: None,
                 identity: Some(row.2),
-                last_modified: None,
             })
         }
 

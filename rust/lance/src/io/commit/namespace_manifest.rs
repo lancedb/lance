@@ -178,8 +178,6 @@ impl ExternalManifestStore for LanceNamespaceExternalManifestStore {
             naming_scheme,
             e_tag: version_info.e_tag,
             identity: None,
-            // The namespace response carries no object write time.
-            last_modified: None,
         })
     }
 

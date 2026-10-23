@@ -794,7 +794,7 @@ impl<'a> CleanupTask<'a> {
         if self.policy.delete_unverified
             && !tagged_versions.contains(&location.version)
             && location.version < self.read_version
-            && self.policy.proven_expired(&location)
+            && self.policy.proven_expired(location.version)
         {
             let mut inspection = inspection.lock().unwrap();
             inspection.old_manifests.insert(
@@ -2186,36 +2186,22 @@ pub struct CleanupPolicy {
 impl CleanupPolicy {
     /// True only when the listing alone proves this manifest is expired.
     ///
-    /// `should_clean` needs a `Manifest`, which costs a read. This answers the same
-    /// question from `ManifestLocation` where it can, and refuses to guess where it
-    /// cannot: a `false` here means "not proven", never "retained". Misclassifying a
-    /// retained manifest as expired would delete live data, so every condition must be
-    /// decidable *and* satisfied.
-    ///
-    /// `before_timestamp` compares against the object's write time rather than the commit
-    /// time inside the manifest. A manifest is written after its commit time is set, so
-    /// `last_modified < cutoff` implies `timestamp < cutoff`; the reverse does not hold,
-    /// which is why a write time at or after the cutoff falls back to reading.
-    fn proven_expired(&self, location: &ManifestLocation) -> bool {
-        if self.before_timestamp.is_none()
-            && self.before_version.is_none()
-            && self.versions.is_none()
+    /// Timestamp policies require reading the logical commit time: storage clocks and
+    /// timestamp precision do not guarantee that object write time is an upper bound.
+    /// All version conditions must be satisfied, and at least one must be specified.
+    fn proven_expired(&self, version: u64) -> bool {
+        if self.before_timestamp.is_some()
+            || (self.before_version.is_none() && self.versions.is_none())
         {
             return false;
         }
-        if let Some(before_timestamp) = self.before_timestamp {
-            match location.last_modified {
-                Some(last_modified) if last_modified < before_timestamp => {}
-                _ => return false,
-            }
-        }
         if let Some(before_version) = self.before_version
-            && location.version >= before_version
+            && version >= before_version
         {
             return false;
         }
         if let Some(versions) = self.versions.as_ref()
-            && !versions.contains(&location.version)
+            && !versions.contains(&version)
         {
             return false;
         }
@@ -7092,65 +7078,96 @@ mod tests {
         );
     }
 
-    fn location_at(version: u64, last_modified: Option<DateTime<Utc>>) -> ManifestLocation {
-        ManifestLocation {
-            version,
-            path: ManifestNamingScheme::V2.manifest_path(&Path::from("base"), version),
-            size: Some(1),
-            naming_scheme: ManifestNamingScheme::V2,
-            e_tag: None,
-            identity: None,
-            last_modified,
-        }
-    }
-
     #[test]
     fn proven_expired_refuses_to_guess() {
-        let t = |secs: i64| DateTime::from_timestamp(secs, 0).unwrap();
-        let policy = |f: &dyn Fn(CleanupPolicy) -> CleanupPolicy| f(CleanupPolicy::default());
-
-        // No condition at all proves nothing. A policy that expires everything must say so.
-        assert!(!CleanupPolicy::default().proven_expired(&location_at(1, Some(t(0)))));
-
-        // before_version is exact: the version is in the filename.
-        let by_version = policy(&|p| CleanupPolicy {
+        assert!(!CleanupPolicy::default().proven_expired(1));
+        let by_version = CleanupPolicy {
             before_version: Some(10),
-            ..p
-        });
-        assert!(by_version.proven_expired(&location_at(9, None)));
-        assert!(!by_version.proven_expired(&location_at(10, None)));
-        assert!(!by_version.proven_expired(&location_at(11, None)));
+            ..Default::default()
+        };
+        assert!(by_version.proven_expired(9));
+        assert!(!by_version.proven_expired(10));
+        assert!(!by_version.proven_expired(11));
 
-        // before_timestamp needs a write time. A manifest is written after its commit time
-        // is set, so a write time before the cutoff proves the commit was too.
-        let by_time = policy(&|p| CleanupPolicy {
-            before_timestamp: Some(t(100)),
-            ..p
-        });
-        assert!(by_time.proven_expired(&location_at(1, Some(t(99)))));
-        // At or after the cutoff proves nothing: the commit time could be either side.
-        assert!(!by_time.proven_expired(&location_at(1, Some(t(100)))));
-        assert!(!by_time.proven_expired(&location_at(1, Some(t(101)))));
-        // No write time reported at all: read it rather than assume.
-        assert!(!by_time.proven_expired(&location_at(1, None)));
-
-        // Conditions combine, so one undecidable condition forces a read.
-        let both = policy(&|p| CleanupPolicy {
-            before_version: Some(10),
-            before_timestamp: Some(t(100)),
-            ..p
-        });
-        assert!(both.proven_expired(&location_at(9, Some(t(99)))));
-        assert!(!both.proven_expired(&location_at(9, Some(t(101)))));
-        assert!(!both.proven_expired(&location_at(11, Some(t(99)))));
-
-        // An explicit kill-list only proves the versions it names.
-        let listed = policy(&|p| CleanupPolicy {
+        let listed = CleanupPolicy {
             versions: Some(HashSet::from([3, 4])),
-            ..p
-        });
-        assert!(listed.proven_expired(&location_at(3, None)));
-        assert!(!listed.proven_expired(&location_at(5, None)));
+            ..Default::default()
+        };
+        assert!(listed.proven_expired(3));
+        assert!(!listed.proven_expired(5));
+        let combined = CleanupPolicy {
+            before_version: Some(4),
+            ..listed
+        };
+        assert!(combined.proven_expired(3));
+        assert!(!combined.proven_expired(4));
+        assert!(!combined.proven_expired(2));
+
+        let by_time = CleanupPolicy {
+            before_timestamp: Some(DateTime::from_timestamp(100, 0).unwrap()),
+            ..Default::default()
+        };
+        assert!(!by_time.proven_expired(1));
+        let combined = CleanupPolicy {
+            before_timestamp: by_time.before_timestamp,
+            ..combined
+        };
+        assert!(!combined.proven_expired(3));
+    }
+
+    #[rstest]
+    #[case::verifying_precision(false, 100)]
+    #[case::skipping_precision(true, 100)]
+    #[case::verifying_clock_skew(false, 90)]
+    #[case::skipping_clock_skew(true, 90)]
+    #[tokio::test]
+    async fn timestamp_cleanup_preserves_retained_versions_with_older_store_time(
+        #[case] delete_unverified: bool,
+        #[case] store_seconds: i64,
+        #[values(None, Some(2))] before_version: Option<u64>,
+    ) {
+        MockClock::set_system_time(Duration::from_millis(100_900));
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        let first = fixture.open().await.unwrap();
+        let cutoff = DateTime::from_timestamp(100, 500_000_000).unwrap();
+        assert!(first.manifest.timestamp() > cutoff);
+        MockClock::set_system_time(Duration::from_millis(101_900));
+        fixture.overwrite_some_data().await.unwrap();
+        fixture
+            .mock_store
+            .policy
+            .lock()
+            .unwrap()
+            .set_obj_meta_policy(
+                "add_recorded_file_time",
+                Arc::new(move |_, mut meta| {
+                    if meta.location.extension() == Some("manifest") {
+                        meta.last_modified = DateTime::from_timestamp(store_seconds, 0).unwrap();
+                    }
+                    Ok(meta)
+                }),
+            );
+        let removed = fixture
+            .run_cleanup_with_policy(CleanupPolicy {
+                before_timestamp: Some(cutoff),
+                before_version,
+                delete_unverified,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(removed.old_versions, 0);
+        assert_eq!(removed.data_files_removed, 0);
+        assert_eq!(removed.transaction_files_removed, 0);
+        let retained = fixture
+            .open()
+            .await
+            .unwrap()
+            .checkout_version(1)
+            .await
+            .unwrap();
+        assert!(retained.count_rows(None).await.unwrap() > 0);
     }
 
     #[test]
