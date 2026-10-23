@@ -254,16 +254,13 @@ impl DatasetPreFilter {
             }
         };
 
-        // The metadata cache is namespaced by dataset URI only, and a dataset
-        // dropped and recreated at the same URI restarts its version history
-        // at 1, so the mask key must carry the manifest e-tag to keep
-        // generations apart. Without one the entry must not be shared at all,
-        // mirroring how `get_row_id_index` treats `RowIdIndexKey`.
+        // The mask is cached only under a manifest e-tag, as `get_row_id_index`
+        // does for `RowIdIndexKey`; without one it is rebuilt.
         if let Some(e_tag) = dataset.manifest_location.e_tag.as_deref() {
             let key = crate::session::caches::RowAddrMaskKey {
                 version: dataset.manifest().version,
                 restrict_hash,
-                e_tag: Some(e_tag),
+                e_tag,
             };
             dataset
                 .metadata_cache
@@ -720,16 +717,6 @@ mod test {
         assert_eq!(mask.allow_list().and_then(|x| x.len()), Some(0));
     }
 
-    // Regression test: `RowAddrMaskKey` is scoped by `{version, restrict_hash}`
-    // alone, but the metadata cache it lives in is namespaced by dataset URI
-    // only. A dataset dropped and recreated at the same URI restarts its
-    // version history at 1, so the new incarnation reaches the old
-    // incarnation's cached key and is served the previous generation's
-    // allow-list. Stable row ids restart near 0 in both generations, so rows
-    // beyond the old generation's id range silently vanish from every indexed
-    // query. `RowIdIndexKey` guards the row-id index against exactly this with
-    // the manifest e-tag; the mask must not share entries across generations
-    // either.
     #[tokio::test]
     async fn test_deletion_mask_stale_after_dataset_recreated_at_same_uri() {
         use lance_core::utils::tempfile::TempStrDir;

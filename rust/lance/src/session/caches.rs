@@ -170,26 +170,22 @@ pub struct RowAddrMaskKey<'a> {
     /// when it covers all fragments in the dataset. Two consumers that ask
     /// for different subsets must not poison each other's cache entry.
     pub restrict_hash: Option<u64>,
-    /// A dataset dropped and recreated at the same URI restarts its version
-    /// history at 1, so a long-lived session's cache can otherwise serve the
-    /// previous incarnation's mask for a version the new incarnation also
-    /// holds. The e-tag disambiguates generations the same way
-    /// [`ManifestKey::e_tag`] does. Callers without one must not share the
-    /// cached mask at all (see `do_create_deletion_mask_row_id`).
-    pub e_tag: Option<&'a str>,
+    /// The manifest e-tag. Version numbers restart when a dataset is recreated
+    /// at the same URI, so the e-tag tells the generations apart. A manifest
+    /// without one is not cached.
+    pub e_tag: &'a str,
 }
 
 impl CacheKey for RowAddrMaskKey<'_> {
     type ValueType = RowAddrMask;
     // Only the legacy display form. Identity comes from `write_key` below.
     fn key(&self) -> Cow<'_, str> {
-        match (self.restrict_hash, self.e_tag) {
-            (None, None) => Cow::Owned(format!("row_addr_mask/{}/", self.version)),
-            (Some(h), None) => Cow::Owned(format!("row_addr_mask/{}/{:x}", self.version, h)),
-            (None, Some(e)) => Cow::Owned(format!("row_addr_mask/{}/{}", self.version, e)),
-            (Some(h), Some(e)) => {
-                Cow::Owned(format!("row_addr_mask/{}/{:x}/{}", self.version, h, e))
-            }
+        match self.restrict_hash {
+            None => Cow::Owned(format!("row_addr_mask/{}/{}", self.version, self.e_tag)),
+            Some(h) => Cow::Owned(format!(
+                "row_addr_mask/{}/{:x}/{}",
+                self.version, h, self.e_tag
+            )),
         }
     }
     fn type_name() -> &'static str {
@@ -208,12 +204,7 @@ impl CacheKey for RowAddrMaskKey<'_> {
         } else {
             builder.write_none();
         }
-        if let Some(e_tag) = self.e_tag {
-            builder.write_some();
-            builder.write_str(e_tag);
-        } else {
-            builder.write_none();
-        }
+        builder.write_str(self.e_tag);
     }
 }
 
@@ -475,7 +466,7 @@ mod tests {
         let key = RowAddrMaskKey {
             version: 5,
             restrict_hash: None,
-            e_tag: Some("first-etag"),
+            e_tag: "first-etag",
         };
         cache.insert_with_key(&key, mask()).await;
         assert!(cache.get_with_key(&key).await.is_some());
@@ -486,7 +477,7 @@ mod tests {
                 .get_with_key(&RowAddrMaskKey {
                     version: 5,
                     restrict_hash: None,
-                    e_tag: Some("second-etag"),
+                    e_tag: "second-etag",
                 })
                 .await
                 .is_none()
@@ -498,7 +489,7 @@ mod tests {
                 .get_with_key(&RowAddrMaskKey {
                     version: 5,
                     restrict_hash: Some(0xa),
-                    e_tag: Some("first-etag"),
+                    e_tag: "first-etag",
                 })
                 .await
                 .is_none()
