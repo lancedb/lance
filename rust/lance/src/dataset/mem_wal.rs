@@ -282,7 +282,8 @@ pub fn schema_with_tombstone(base: &ArrowSchema) -> Arc<ArrowSchema> {
 /// with `false`; a column the target does not declare is dropped; a missing
 /// primary key is an error.
 ///
-/// A blob v2 field the batches hold writer-prepared stays prepared, at any depth.
+/// A blob v2 field the batches hold writer-prepared stays prepared, at any depth;
+/// one held as descriptors is an error.
 ///
 /// `batches` must be in `source_schema` order. The result is in `target_schema`
 /// order, without field ids.
@@ -526,7 +527,7 @@ mod tests {
         fields: Vec<ArrowField>,
         columns: Vec<arrow_array::ArrayRef>,
         target: &Arc<ArrowSchema>,
-    ) -> RecordBatch {
+    ) -> Result<RecordBatch> {
         let mut source = vec![id];
         source.extend(fields);
         let mut arrays: Vec<arrow_array::ArrayRef> =
@@ -536,8 +537,7 @@ mod tests {
         let batch = RecordBatch::try_new(Arc::new(source.clone()), arrays)
             .expect("a batch under the source schema");
         reconcile_batches(&source, target, &["id".to_string()], vec![batch])
-            .expect("reconcile")
-            .remove(0)
+            .map(|mut out| out.remove(0))
     }
 
     /// A blob held writer-prepared, as the MemTable stores it, keeps its
@@ -641,7 +641,8 @@ mod tests {
                 )),
             ],
             &target,
-        );
+        )
+        .expect("reconcile");
 
         assert_managed(out["blob"].as_struct(), 3);
         let logical = out["logical"].as_struct();
@@ -667,8 +668,32 @@ mod tests {
         ]);
         let (blob_field, blob) = managed_blob("blob", None, 3);
         let id = ArrowField::new("id", DataType::Int64, false);
-        let out = reconcile_one(id, vec![blob_field], vec![blob], &target);
+        let out = reconcile_one(id, vec![blob_field], vec![blob], &target).expect("reconcile");
         assert_managed(out["blob"].as_struct(), 3);
+    }
+
+    /// A blob held as descriptors is refused, not resolved to an empty one.
+    #[test]
+    fn a_blob_held_as_descriptors_is_refused() {
+        let target = table_schema(vec![
+            ArrowField::new("id", DataType::Int64, false),
+            crate::blob::blob_field("blob", true),
+        ]);
+        let (blob_field, blob) = managed_blob("blob", None, 3);
+        let prepared =
+            RecordBatch::try_new(Arc::new(ArrowSchema::new(vec![blob_field])), vec![blob])
+                .expect("a prepared batch");
+        let described = crate::dataset::blob::prepared_blob_batch_to_descriptors(&prepared)
+            .expect("descriptors");
+        let id = ArrowField::new("id", DataType::Int64, false);
+        let err = reconcile_one(
+            id,
+            vec![described.schema().field(0).clone()],
+            vec![described.column(0).clone()],
+            &target,
+        )
+        .expect_err("descriptors are refused");
+        assert!(err.to_string().contains("held as descriptors"), "{err}");
     }
 
     /// A plain struct shaped like a blob is not one: its children still resolve
@@ -681,42 +706,32 @@ mod tests {
                 stamped("uri", DataType::Utf8, uri_id),
             ]))
         };
-        let source = ArrowSchema::new(vec![
-            stamped("id", DataType::Int64, 0),
-            stamped("asset", asset(3), 1),
-        ]);
+        use arrow_array::cast::AsArray;
+
         let target = Arc::new(ArrowSchema::new(vec![
             stamped("id", DataType::Int64, 0),
             stamped("asset", asset(4), 1),
         ]));
-        let DataType::Struct(children) = source.field(1).data_type().clone() else {
+        let held = stamped("asset", asset(3), 1);
+        let DataType::Struct(children) = held.data_type().clone() else {
             unreachable!("asset is a struct");
         };
-        let batch = RecordBatch::try_new(
-            Arc::new(source.clone()),
+        let values = arrow_array::StructArray::new(
+            children,
             vec![
-                Arc::new(arrow_array::Int64Array::from(vec![1])),
-                Arc::new(arrow_array::StructArray::new(
-                    children,
-                    vec![
-                        Arc::new(arrow_array::LargeBinaryArray::from(vec![None::<&[u8]>]))
-                            as arrow_array::ArrayRef,
-                        Arc::new(arrow_array::StringArray::from(vec!["retired"])),
-                    ],
-                    None,
-                )),
+                Arc::new(arrow_array::LargeBinaryArray::from(vec![None::<&[u8]>])),
+                Arc::new(arrow_array::StringArray::from(vec!["retired"])),
             ],
+            None,
+        );
+        let out = reconcile_one(
+            stamped("id", DataType::Int64, 0),
+            vec![held],
+            vec![Arc::new(values)],
+            &target,
         )
-        .expect("a batch under the source schema");
-
-        let out = reconcile_batches(&source, &target, &["id".to_string()], vec![batch])
-            .expect("reconcile");
-        let asset = out[0]
-            .column(1)
-            .as_any()
-            .downcast_ref::<arrow_array::StructArray>()
-            .expect("asset is a struct");
-        assert!(asset.column_by_name("uri").expect("uri").is_null(0));
+        .expect("reconcile");
+        assert!(out["asset"].as_struct()["uri"].is_null(0));
     }
 
     #[test]
