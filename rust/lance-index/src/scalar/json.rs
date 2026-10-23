@@ -8,7 +8,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use arrow_array::{Array, LargeBinaryArray, RecordBatch, StructArray, UInt8Array};
+use arrow_array::{Array, ArrayRef, LargeBinaryArray, RecordBatch, StructArray, UInt8Array};
 use arrow_schema::{DataType, Field, Schema, SortOptions};
 use async_trait::async_trait;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -22,7 +22,7 @@ use datafusion_physical_expr::{
     PhysicalExpr, PhysicalSortExpr, ScalarFunctionExpr,
     expressions::{Column, Literal},
 };
-use futures::StreamExt;
+use futures::{StreamExt, stream::BoxStream};
 use lance_arrow::json::{JsonEncoding, JsonValues, json_field};
 use lance_core::deepsize::DeepSizeOf;
 use lance_datafusion::exec::{
@@ -40,8 +40,8 @@ use crate::{
     metrics::MetricsCollector,
     registry::IndexPluginRegistry,
     scalar::{
-        AnyQuery, CreatedIndex, IndexStore, LookupMatches, RowIdRemapper, ScalarIndex,
-        SearchOptions, SearchResult, UpdateCriteria,
+        AnyQuery, CreatedIndex, IndexStore, RowIdRemapper, ScalarIndex, SearchOptions,
+        SearchResult, UpdateCriteria,
         expression::{IndexedExpression, ScalarIndexExpr, ScalarIndexSearch, ScalarQueryParser},
         registry::{
             BasicTrainer, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
@@ -142,12 +142,12 @@ impl ScalarIndex for JsonIndex {
             .await
     }
 
-    async fn lookup(
-        &self,
-        keys: &dyn Array,
-        metrics: &dyn MetricsCollector,
-    ) -> Result<LookupMatches> {
-        self.target_index.lookup(keys, metrics).await
+    fn lookup<'a>(
+        &'a self,
+        keys: ArrayRef,
+        metrics: &'a dyn MetricsCollector,
+    ) -> Result<BoxStream<'a, Result<RecordBatch>>> {
+        self.target_index.lookup(keys, metrics)
     }
 
     fn can_remap(&self) -> bool {

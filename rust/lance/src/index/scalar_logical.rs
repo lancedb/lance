@@ -9,14 +9,16 @@ use std::any::Any;
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use arrow_array::Array;
+use arrow_array::{ArrayRef, RecordBatch};
 use async_trait::async_trait;
+use futures::StreamExt;
 use futures::future::try_join_all;
+use futures::stream::{self, BoxStream};
 use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_core::{Error, Result};
 use lance_index::metrics::MetricsCollector;
 use lance_index::scalar::{
-    AnyQuery, CreatedIndex, LookupMatches, ScalarIndex, SearchOptions, SearchResult, UpdateCriteria,
+    AnyQuery, CreatedIndex, ScalarIndex, SearchOptions, SearchResult, UpdateCriteria,
 };
 use lance_index::{Index, IndexType};
 use lance_select::{NullableRowAddrSet, RowSetOps};
@@ -260,18 +262,17 @@ impl ScalarIndex for LogicalScalarIndex {
         combine_search_results(results)
     }
 
-    async fn lookup(
-        &self,
-        keys: &dyn Array,
-        metrics: &dyn MetricsCollector,
-    ) -> Result<LookupMatches> {
-        let matches = try_join_all(
-            self.segments
-                .iter()
-                .map(|segment| segment.lookup(keys, metrics)),
-        )
-        .await?;
-        Ok(LookupMatches::concat(matches))
+    fn lookup<'a>(
+        &'a self,
+        keys: ArrayRef,
+        metrics: &'a dyn MetricsCollector,
+    ) -> Result<BoxStream<'a, Result<RecordBatch>>> {
+        let segments = self
+            .segments
+            .iter()
+            .map(|segment| segment.lookup(keys.clone(), metrics))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(stream::select_all(segments).boxed())
     }
 
     fn results_are_row_addresses(&self) -> bool {
@@ -522,8 +523,10 @@ mod tests {
     use std::collections::BTreeSet;
     use std::ops::Bound;
 
-    use arrow::datatypes::Int32Type;
+    use arrow::array::AsArray;
+    use arrow::datatypes::{Int32Type, UInt32Type, UInt64Type};
     use datafusion::scalar::ScalarValue;
+    use futures::TryStreamExt;
     use lance_core::utils::address::RowAddress;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::{ArrayGeneratorExt, array};
@@ -531,6 +534,7 @@ mod tests {
     use lance_index::metrics::NoOpMetricsCollector;
     use lance_index::optimize::OptimizeOptions;
     use lance_index::scalar::bitmap::BITMAP_LOOKUP_NAME;
+    use lance_index::scalar::lookup_schema;
     use lance_index::scalar::{
         BuiltinIndexType, SargableQuery, ScalarIndexParams, SearchOptions, SearchResult,
     };
@@ -854,15 +858,36 @@ mod tests {
         );
 
         // Keys resolve in whichever segment covers them; one absent.
-        let keys = arrow_array::Int32Array::from(vec![20, 43, 99, 20, 0]);
-        let matches = logical.lookup(&keys, &NoOpMetricsCollector).await.unwrap();
-        let mut pairs = matches
-            .key_indices
-            .values()
-            .iter()
-            .copied()
-            .zip(matches.row_ids.values().iter().copied())
-            .collect::<Vec<_>>();
+        let keys = Arc::new(arrow_array::Int32Array::from(vec![20, 43, 99, 20, 0]));
+        let batches: Vec<RecordBatch> = logical
+            .lookup(keys, &NoOpMetricsCollector)
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let mut pairs = Vec::new();
+        for batch in &batches {
+            assert_eq!(
+                batch.schema(),
+                lookup_schema(logical.results_are_row_addresses())
+            );
+            pairs.extend(
+                batch
+                    .column(0)
+                    .as_primitive::<UInt32Type>()
+                    .values()
+                    .iter()
+                    .copied()
+                    .zip(
+                        batch
+                            .column(1)
+                            .as_primitive::<UInt64Type>()
+                            .values()
+                            .iter()
+                            .copied(),
+                    ),
+            );
+        }
         pairs.sort_unstable();
         let addr = |value: u32| u64::from(RowAddress::new_from_parts(value / 16, value % 16));
         assert_eq!(

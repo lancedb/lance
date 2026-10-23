@@ -17,14 +17,14 @@ use std::{
 };
 
 use arrow::array::BinaryBuilder;
-use arrow_array::{Array, BinaryArray, RecordBatch, UInt64Array, new_null_array};
+use arrow_array::{Array, ArrayRef, BinaryArray, RecordBatch, UInt64Array, new_null_array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use bytes::Bytes;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_common::ScalarValue;
-use futures::{StreamExt, TryStreamExt, stream};
+use futures::{StreamExt, TryStreamExt, stream, stream::BoxStream};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{
     Error, ROW_ID, Result,
@@ -43,7 +43,7 @@ use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 use tracing::{instrument, warn};
 
-use super::{AnyQuery, IndexFile, IndexStore, LookupMatches, ScalarIndex, SearchOptions};
+use super::{AnyQuery, IndexFile, IndexStore, ScalarIndex, SearchOptions, lookup_batch};
 use super::{
     BuiltinIndexType, SargableQuery, ScalarIndexParams, SearchResult,
     btree::{OrderableScalarValue, filter_keeps_nothing},
@@ -67,6 +67,10 @@ pub const BITMAP_LOOKUP_NAME: &str = "bitmap_page_lookup.lance";
 pub const INDEX_STATS_METADATA_KEY: &str = "lance:index_stats";
 const BITMAP_PART_LOOKUP_PREFIX: &str = "part_";
 const BITMAP_PART_LOOKUP_SUFFIX: &str = "_bitmap_page_lookup.lance";
+
+/// The most matches one [`BitmapIndex`] key lookup batch holds.
+const LOOKUP_BATCH_SIZE: usize = 8192;
+
 const EXPLICIT_SHARD_ID_TAG: u64 = 0;
 const IMPLICIT_FRAGMENT_ID_TAG: u64 = 1;
 
@@ -1114,11 +1118,11 @@ impl ScalarIndex for BitmapIndex {
         Ok(SearchResult::Exact(selection))
     }
 
-    async fn lookup(
-        &self,
-        keys: &dyn Array,
-        metrics: &dyn MetricsCollector,
-    ) -> Result<LookupMatches> {
+    fn lookup<'a>(
+        &'a self,
+        keys: ArrayRef,
+        metrics: &'a dyn MetricsCollector,
+    ) -> Result<BoxStream<'a, Result<RecordBatch>>> {
         if keys.data_type() != &self.value_type {
             return Err(Error::invalid_input(format!(
                 "bitmap lookup keys have type {} but the index has type {}",
@@ -1138,36 +1142,46 @@ impl ScalarIndex for BitmapIndex {
         // Group repeated keys so each bitmap is loaded once.
         let mut key_positions: BTreeMap<OrderableScalarValue, Vec<u32>> = BTreeMap::new();
         for idx in (0..keys.len()).filter(|idx| keys.is_valid(*idx)) {
-            let key = OrderableScalarValue(ScalarValue::try_from_array(keys, idx)?);
+            let key = OrderableScalarValue(ScalarValue::try_from_array(&keys, idx)?);
             if self.index_map.contains_key(&key) {
                 key_positions.entry(key).or_default().push(idx as u32);
             }
         }
 
-        let matches: Vec<LookupMatches> = stream::iter(key_positions.into_iter().map(
-            |(key, positions)| async move {
+        let results_are_row_addresses = self.results_are_row_addresses();
+        Ok(stream::iter(key_positions)
+            .map(move |(key, positions)| async move {
                 let bitmap = self.load_bitmap(&key, Some(metrics)).await?;
-                let row_ids = bitmap
-                    .row_addrs()
-                    .ok_or_else(|| {
-                        Error::internal(format!(
-                            "bitmap for value {key} covers whole fragments, so its row ids cannot be listed"
-                        ))
-                    })?
-                    .map(u64::from)
-                    .collect::<Vec<_>>();
-                let key_indices = positions
-                    .iter()
-                    .flat_map(|&position| std::iter::repeat_n(position, row_ids.len()))
-                    .collect::<Vec<_>>();
-                let row_ids = row_ids.repeat(positions.len());
-                LookupMatches::new(key_indices.into(), row_ids.into())
-            },
-        ))
-        .buffer_unordered(get_num_compute_intensive_cpus())
-        .try_collect()
-        .await?;
-        Ok(LookupMatches::concat(matches))
+                if bitmap.row_addrs().is_none() {
+                    return Err(Error::internal(format!(
+                        "bitmap for value {key} covers whole fragments, so its rows cannot be listed"
+                    )));
+                }
+                Ok((bitmap, positions))
+            })
+            .buffer_unordered(get_num_compute_intensive_cpus())
+            .map_ok(move |(bitmap, positions)| {
+                // A value can match many rows, so its matches are cut into
+                // bounded batches instead of expanded all at once.
+                let rows_per_batch = (LOOKUP_BATCH_SIZE / positions.len()).max(1);
+                let mut rows = Arc::unwrap_or_clone(bitmap).into_addr_iter();
+                stream::iter(std::iter::from_fn(move || {
+                    let chunk = rows.by_ref().take(rows_per_batch).collect::<Vec<_>>();
+                    (!chunk.is_empty()).then(|| {
+                        let key_indices = positions
+                            .iter()
+                            .flat_map(|&position| std::iter::repeat_n(position, chunk.len()))
+                            .collect();
+                        lookup_batch(
+                            results_are_row_addresses,
+                            key_indices,
+                            chunk.repeat(positions.len()),
+                        )
+                    })
+                }))
+            })
+            .try_flatten()
+            .boxed())
     }
 
     fn can_remap(&self) -> bool {
@@ -2739,7 +2753,12 @@ mod tests {
     use crate::metrics::{LocalMetricsCollector, NoOpMetricsCollector};
     use crate::scalar::OldIndexDataFilter;
     use crate::scalar::lance_format::LanceIndexStore;
-    use arrow_array::{BooleanArray, RecordBatch, StringArray, UInt64Array, record_batch};
+    use crate::scalar::lookup_schema;
+    use arrow_array::cast::AsArray;
+    use arrow_array::types::{UInt32Type, UInt64Type};
+    use arrow_array::{
+        BooleanArray, Int32Array, RecordBatch, StringArray, UInt64Array, record_batch,
+    };
     use arrow_schema::{DataType, Field, Schema};
 
     /// Sort a (value, row_id) RecordBatch by the value column so that unit tests
@@ -3888,26 +3907,101 @@ mod tests {
 
         // Repeated, null (never matches the null row), and absent keys.
         let keys = StringArray::from(vec![Some("a"), None, Some("c"), Some("z"), Some("a")]);
-        let matches = index.lookup(&keys, &NoOpMetricsCollector).await.unwrap();
-        let mut pairs = matches
-            .key_indices
-            .values()
-            .iter()
-            .copied()
-            .zip(matches.row_ids.values().iter().copied())
-            .collect::<Vec<_>>();
-        pairs.sort_unstable();
-        assert_eq!(pairs, vec![(0, 0), (0, 3), (2, 2), (4, 0), (4, 3)]);
+        let batches = lookup_batches(&index, Arc::new(keys)).await;
+        assert_eq!(
+            sorted_lookup_pairs(&batches),
+            vec![(0, 0), (0, 3), (2, 2), (4, 0), (4, 3)]
+        );
 
         let err = index
-            .lookup(&UInt64Array::from(vec![1]), &NoOpMetricsCollector)
-            .await
-            .unwrap_err();
+            .lookup(Arc::new(UInt64Array::from(vec![1])), &NoOpMetricsCollector)
+            .err()
+            .unwrap();
         assert!(
             err.to_string()
                 .contains("bitmap lookup keys have type UInt64 but the index has type Utf8"),
             "{err}"
         );
+    }
+
+    async fn lookup_batches(index: &BitmapIndex, keys: ArrayRef) -> Vec<RecordBatch> {
+        index
+            .lookup(keys, &NoOpMetricsCollector)
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap()
+    }
+
+    fn sorted_lookup_pairs(batches: &[RecordBatch]) -> Vec<(u32, u64)> {
+        let mut pairs = Vec::new();
+        for batch in batches {
+            assert_eq!(batch.schema(), lookup_schema(false));
+            pairs.extend(
+                batch
+                    .column(0)
+                    .as_primitive::<UInt32Type>()
+                    .values()
+                    .iter()
+                    .copied()
+                    .zip(
+                        batch
+                            .column(1)
+                            .as_primitive::<UInt64Type>()
+                            .values()
+                            .iter()
+                            .copied(),
+                    ),
+            );
+        }
+        pairs.sort_unstable();
+        pairs
+    }
+
+    #[tokio::test]
+    async fn test_bitmap_lookup_bounds_batches() {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        // One value on more rows than fit in a lookup batch.
+        let num_rows = 2 * LOOKUP_BATCH_SIZE as u64 + 100;
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("value", DataType::Int32, false),
+                Field::new("_rowid", DataType::UInt64, false),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![7; num_rows as usize])),
+                Arc::new(UInt64Array::from_iter_values(0..num_rows)),
+            ],
+        )
+        .unwrap();
+        let schema = batch.schema();
+        let stream = stream::once(async move { Ok(batch) });
+        let stream = Box::pin(RecordBatchStreamAdapter::new(schema, stream));
+        BitmapIndexPlugin::train_bitmap_index(stream, store.as_ref())
+            .await
+            .unwrap();
+        let index = BitmapIndex::load(store, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+
+        // The key repeats, so every row is matched twice.
+        let batches = lookup_batches(&index, Arc::new(Int32Array::from(vec![7, 7]))).await;
+        assert!(batches.len() > 1);
+        assert!(
+            batches
+                .iter()
+                .all(|batch| batch.num_rows() <= LOOKUP_BATCH_SIZE)
+        );
+        let expected = [0_u32, 1]
+            .into_iter()
+            .flat_map(|key| (0..num_rows).map(move |row| (key, row)))
+            .collect::<Vec<_>>();
+        assert_eq!(sorted_lookup_pairs(&batches), expected);
     }
 
     #[tokio::test]
