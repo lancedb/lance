@@ -5,10 +5,10 @@
 //! through the fragment reuse history after a deferred compaction. A
 //! publication must keep every recorded version exactly. A rewrite that carries
 //! the history appends the one version recording its own moves; a rewrite that
-//! does not leaves it unchanged, and its address indices stop covering the
-//! fragments it rewrites. Only a cleanup, a commit that replaces nothing but
-//! the fragment reuse index, may remove versions: the oldest ones, and only
-//! those no index of the published manifest still needs.
+//! does not leaves it unchanged, and either remaps an address index eagerly or
+//! stops it covering the fragments it rewrites. Only a cleanup, a commit that
+//! replaces nothing but the fragment reuse index, may remove versions: the
+//! oldest ones, and only those no index of the published manifest still needs.
 
 use std::io::Cursor;
 use std::sync::Arc;
@@ -147,8 +147,8 @@ pub async fn validate_frag_reuse_history(
             operation.name(),
             versions.len()
         ))),
-        // Unrecorded: the manifest build drops the rewritten fragments from the
-        // coverage of indices that store row addresses.
+        // Unrecorded: the rewrite remaps the address indices it can, and the
+        // manifest build drops the rewritten fragments from the others.
         (Some((_, false)), []) => Ok(()),
         (Some((_, true)), []) => Err(Error::invalid_input(
             "Cannot commit a rewrite that carries a fragment reuse index without appending the \
@@ -2714,8 +2714,8 @@ mod tests {
         assert_answers_through(&latest, "i_idx", "i >= 55 AND i < 75").await;
     }
 
-    /// Every index type that stores row addresses lives with the history the
-    /// same way: zone maps, bloom filters and BTrees from format version 1. A
+    /// Every index type that stores row addresses an eager compaction cannot
+    /// remap lives with the history the same way: zone maps and bloom filters. A
     /// deferred compaction records its moves, which the index answers through.
     /// A compaction without `defer_index_remap` records nothing, also across the
     /// output of a recorded one: the index stops covering what it rewrote, which
@@ -2725,12 +2725,12 @@ mod tests {
     /// without giving the index coverage it never had, and neither does merging
     /// the index's segments. Caught up, the index needs no version: cleanup
     /// empties the history, keeps the entry, and the next deferred compaction
-    /// records into it.
+    /// records into it. A BTree is remapped eagerly instead, which is refused
+    /// while the history holds versions.
     #[rstest]
     #[tokio::test]
     async fn test_address_index_lives_with_the_history(
-        #[values(IndexType::ZoneMap, IndexType::BloomFilter, IndexType::BTree)]
-        index_type: IndexType,
+        #[values(IndexType::ZoneMap, IndexType::BloomFilter)] index_type: IndexType,
     ) {
         let dir = TempStrDir::default();
         let uri = dir.as_str();
@@ -2751,8 +2751,7 @@ mod tests {
         dataset.delete("i IN (1, 2, 5, 61)").await.unwrap();
         let params = match index_type {
             IndexType::ZoneMap => ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap),
-            IndexType::BloomFilter => ScalarIndexParams::for_builtin(BuiltinIndexType::BloomFilter),
-            _ => ScalarIndexParams::default(),
+            _ => ScalarIndexParams::for_builtin(BuiltinIndexType::BloomFilter),
         };
         dataset
             .create_index_builder(&["i"], index_type, &params)
@@ -2761,9 +2760,6 @@ mod tests {
             .unwrap();
         let index = dataset.load_index_by_name("i_idx").await.unwrap().unwrap();
         assert!(index.results_are_row_addrs());
-        if index_type == IndexType::BTree {
-            assert_eq!(index.index_version, 1);
-        }
         // Rows of fragments 0, 1 and 7 end up behind the unrecorded compaction;
         // the others stay where they are or move only through recorded ones.
         // A bloom filter answers only equality.

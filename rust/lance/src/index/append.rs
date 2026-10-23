@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::HashMap;
+use std::collections::{HashMap, hash_map::Entry};
 use std::sync::Arc;
 
 use futures::{FutureExt, TryStreamExt};
+use lance_core::utils::address::RowAddress;
 use lance_core::{Error, Result};
 use lance_file::reader::FileReaderOptions;
+use lance_file::versions::data_file_columns;
 use lance_index::{
     INDEX_FILE_NAME, IndexType,
     frag_reuse::CompactFragReuseIndex,
@@ -38,9 +40,11 @@ use super::vector::{LogicalVectorIndex, VectorIndexParams, details, fresh_vector
 use super::{CreateIndexBuilder, DatasetIndexExt, DatasetIndexInternalExt};
 use crate::dataset::Dataset;
 use crate::dataset::index::LanceIndexStoreExt;
-use crate::dataset::rowids::load_row_id_sequences;
+use crate::dataset::overlay::{collect_overlay_stale_rows_for_segment, overlaid_fragments};
+use crate::dataset::rowids::{load_row_id_sequences, translate_addr_treemap_to_row_ids};
 use crate::index::scalar::{
-    IndexDetails, fetch_index_details, load_fts_training_data, load_training_data,
+    IndexDetails, TrainingRows, fetch_index_details, load_fts_training_data, load_training_data,
+    scan_training_data,
 };
 use crate::index::vector_index_details_default;
 
@@ -54,6 +58,26 @@ pub struct IndexMergeResults<'a> {
     pub new_index_details: prost_types::Any,
     /// List of files and their sizes for the merged index
     pub files: Vec<lance_table::format::IndexFile>,
+}
+
+impl IndexMergeResults<'_> {
+    /// The new segment as manifest metadata, named and keyed like `template`
+    /// (the segment it replaces or extends).
+    pub fn into_metadata(self, template: &IndexMetadata) -> IndexMetadata {
+        IndexMetadata {
+            uuid: self.new_uuid,
+            name: template.name.clone(),
+            fields: template.fields.clone(),
+            covering_fields: template.covering_fields.clone(),
+            dataset_version: self.new_dataset_version,
+            fragment_bitmap: Some(self.new_fragment_bitmap),
+            index_details: Some(Arc::new(self.new_index_details)),
+            index_version: self.new_index_version,
+            created_at: Some(chrono::Utc::now()),
+            base_id: None,
+            files: Some(self.files),
+        }
+    }
 }
 
 async fn build_stable_row_id_filter(
@@ -363,39 +387,149 @@ pub async fn build_per_segment_filters(
     Ok((effective_union, filters))
 }
 
-/// Attempt to read seed buffers for `column_name` from `fragments`' data files.
+/// What a remapping merge re-reads. Returns the stale rows, those an overlay replaced after
+/// the source segment covering them was built, which are dropped from each source's
+/// carried-over entries, and the scan selection: those rows and every row of the unindexed
+/// fragments, as one selection so the scan sorts them together.
 ///
-/// Returns `Some(vec)` only if every fragment has a seed entry; returns `None`
-/// if any fragment is missing a seed or its data file cannot be opened.
+/// The two are keyed differently. The stale rows are keyed like the old-data filter they are
+/// subtracted from, so they follow `address_domain` exactly as [`build_old_data_filter`] does:
+/// addresses for an address-domain index, row ids only when the dataset uses stable row ids
+/// and the index does not. The selection is keyed by what the scanner takes, which is always
+/// the `_rowid` domain (see [`Scanner::with_row_id_prefilter`]), whatever the index stores.
+///
+/// [`Scanner::with_row_id_prefilter`]: crate::dataset::scanner::Scanner::with_row_id_prefilter
+async fn overlay_rescan(
+    dataset: &Dataset,
+    selected_old_indices: &[&IndexMetadata],
+    effective_old_frags: &RoaringBitmap,
+    unindexed: &[Fragment],
+    address_domain: bool,
+) -> Result<(RowAddrTreeMap, TrainingRows)> {
+    // The same per-row, field-aware, version-gated check the scanner masks by.
+    let overlaid = overlaid_fragments(&dataset.manifest.fragments);
+    let mut stale_offsets: HashMap<u32, RoaringBitmap> = HashMap::new();
+    for segment in selected_old_indices {
+        collect_overlay_stale_rows_for_segment(
+            segment,
+            &overlaid,
+            &mut stale_offsets,
+            dataset.schema(),
+        )?;
+    }
+    let mut stale_rows = RowAddrTreeMap::new();
+    for (fragment_id, offsets) in stale_offsets {
+        if effective_old_frags.contains(fragment_id) {
+            stale_rows.insert_bitmap(fragment_id, offsets);
+        }
+    }
+    if stale_rows.is_empty() {
+        return Ok((stale_rows, TrainingRows::Fragments(unindexed.to_vec())));
+    }
+    let mut selection = stale_rows.clone();
+    for fragment in unindexed {
+        selection.insert_fragment(fragment.id as u32);
+    }
+    if dataset.manifest.uses_stable_row_ids() {
+        selection = translate_addr_treemap_to_row_ids(dataset, &selection).await?;
+        if !address_domain {
+            stale_rows = translate_addr_treemap_to_row_ids(dataset, &stale_rows).await?;
+        }
+    }
+    Ok((stale_rows, TrainingRows::Rows(selection)))
+}
+
+/// Remove `stale_rows` from a segment's old-data filter ([`OldIndexDataFilter`]): the rows
+/// an overlay replaced after the segment was built, keyed like the filter (see
+/// [`overlay_rescan`]). The merge re-reads them.
+fn block_stale_rows(
+    dataset: &Dataset,
+    filter: Option<OldIndexDataFilter>,
+    stale_rows: &RowAddrTreeMap,
+) -> Option<OldIndexDataFilter> {
+    match filter {
+        // `to_remove` is bookkeeping no scalar merge reads.
+        Some(OldIndexDataFilter::Fragments {
+            to_keep,
+            to_remove: _,
+        }) if stale_rows
+            .iter()
+            .any(|(fragment_id, _)| to_keep.contains(*fragment_id)) =>
+        {
+            // Every row of the kept fragments, one run each, minus the stale ones.
+            let mut allow = RowAddrTreeMap::new();
+            for fragment_id in to_keep.iter() {
+                let physical_rows = dataset
+                    .get_fragment(fragment_id as usize)
+                    .and_then(|fragment| fragment.metadata().physical_rows);
+                match physical_rows {
+                    Some(physical_rows) => {
+                        let start = u64::from(RowAddress::new_from_parts(fragment_id, 0));
+                        allow.insert_range(start..start + physical_rows as u64);
+                    }
+                    None => allow.insert_fragment(fragment_id),
+                }
+            }
+            allow -= stale_rows;
+            Some(OldIndexDataFilter::RowIds(allow))
+        }
+        Some(OldIndexDataFilter::RowIds(valid)) => {
+            Some(OldIndexDataFilter::RowIds(valid - stale_rows))
+        }
+        other => other,
+    }
+}
+
+/// Attempt to read seed buffers for `index` from `fragments`' data files.
+///
+/// Returns `Some(vec)` only if every fragment has a seed entry whose field
+/// identity can be verified; returns `None` if a seed is missing, its file
+/// cannot be opened, or its physical column mapping cannot be verified.
 /// Index-type-specific validation (e.g. `rows_per_zone` checks) is left to the
 /// caller via [`FragmentSeed::metadata_value`].
 async fn try_harvest_seeds(
     dataset: &Dataset,
     fragments: &[Fragment],
-    column_name: &str,
+    index: &IndexMetadata,
 ) -> Result<Option<Vec<FragmentSeed>>> {
     if fragments.is_empty() {
         return Ok(Some(Vec::new()));
     }
 
-    let meta_key = format!("{}{}", SEED_META_KEY_PREFIX, column_name);
+    // SeedCollector writes seeds only for top-level keyed fields. A nested
+    // leaf can share its name with a different, seeded top-level column.
+    let Some(field_id) = index.keyed_field() else {
+        return Ok(None);
+    };
+    let Some(field) = dataset.schema().fields.iter().find(|f| f.id == field_id) else {
+        return Ok(None);
+    };
     let mut seeds = Vec::with_capacity(fragments.len());
-
-    let scheduler = ScanScheduler::new(
-        dataset.object_store.clone(),
-        SchedulerConfig::max_bandwidth(&dataset.object_store),
-    );
+    let mut schedulers = HashMap::new();
 
     for fragment in fragments {
-        let Some(data_file) = fragment.files.first() else {
+        // A column replacement can retain an older file for other columns.
+        // Its seed still describes the old values, even after the manifest
+        // stops mapping this column to that file.
+        let Some(data_file) = fragment.files.iter().rev().find(|file| {
+            file.schema(dataset.schema())
+                .field_by_id(field.id)
+                .is_some()
+        }) else {
             return Ok(None);
         };
 
         let path = dataset
-            .base
-            .clone()
-            .join(crate::dataset::DATA_DIR)
+            .data_file_dir(data_file)?
             .join(data_file.path.as_str());
+        let scheduler = match schedulers.entry(data_file.base_id) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => {
+                let store = dataset.object_store(data_file.base_id).await?;
+                let config = SchedulerConfig::max_bandwidth(&store);
+                entry.insert(ScanScheduler::new(store, config))
+            }
+        };
         let Ok(file_scheduler) = scheduler.open_file(&path, &CachedFileSize::unknown()).await
         else {
             return Ok(None);
@@ -413,13 +547,41 @@ async fn try_harvest_seeds(
             return Ok(None);
         };
 
-        let Some(meta_value) = reader
-            .metadata()
-            .file_schema
-            .metadata
-            .get(&meta_key)
-            .cloned()
+        // Renames preserve the manifest's field IDs, but seed keys retain
+        // the names used when writing the file. Resolve the stored field
+        // through its physical column, since field IDs can also be remapped.
+        let Some((_, column_index)) = data_file
+            .fields
+            .iter()
+            .zip(data_file.column_indices.iter())
+            .find(|(id, column_index)| **id == field.id && **column_index >= 0)
         else {
+            return Ok(None);
+        };
+        let metadata = reader.metadata();
+        let file_schema = &metadata.file_schema;
+        let (stored_ids, stored_columns) = data_file_columns(metadata.version, file_schema);
+        // Blob footers can retain descriptor fields without physical columns.
+        // Their inferred positions must not select another column's seed.
+        if stored_columns.len() != metadata.column_metadatas.len() {
+            return Ok(None);
+        }
+        let Some((stored_id, _)) = stored_ids
+            .iter()
+            .zip(&stored_columns)
+            .find(|(_, stored_column)| *stored_column == column_index)
+        else {
+            return Ok(None);
+        };
+        let Some(stored_field) = file_schema
+            .fields
+            .iter()
+            .find(|stored| stored.id == *stored_id && stored.data_type() == field.data_type())
+        else {
+            return Ok(None);
+        };
+        let meta_key = format!("{}{}", SEED_META_KEY_PREFIX, stored_field.name);
+        let Some(meta_value) = file_schema.metadata.get(&meta_key).cloned() else {
             return Ok(None);
         };
 
@@ -435,8 +597,12 @@ async fn try_harvest_seeds(
             return Ok(None);
         };
 
+        let Some(physical_rows) = fragment.physical_rows else {
+            return Ok(None);
+        };
         seeds.push(FragmentSeed {
             fragment_id: fragment.id,
+            physical_rows: physical_rows as u64,
             bytes,
             metadata_value: meta_value,
         });
@@ -449,20 +615,18 @@ async fn load_unindexed_training_data(
     dataset: &Dataset,
     field_path: &str,
     update_criteria: &lance_index::scalar::UpdateCriteria,
-    unindexed: &[Fragment],
+    unindexed: TrainingRows,
 ) -> Result<datafusion::execution::SendableRecordBatchStream> {
-    let fragments = if update_criteria.requires_old_data {
+    let selection = if update_criteria.requires_old_data {
         None
     } else {
-        Some(unindexed.to_vec())
+        Some(unindexed)
     };
-    load_training_data(
+    scan_training_data(
         dataset,
         field_path,
         &update_criteria.data_criteria,
-        fragments,
-        true,
-        None,
+        selection,
     )
     .await
 }
@@ -514,7 +678,7 @@ async fn rebuild_scalar_segment(
 /// The deletion check is conservative (any current deletion vector on a covered
 /// fragment), so a segment built after those deletions may be rewritten as a
 /// harmless no-op; it never leaves a stale segment behind (PR #7359).
-fn select_segments_to_merge<'a>(
+pub fn select_segments_to_merge<'a>(
     dataset: &Dataset,
     old_indices: &[&'a IndexMetadata],
     options: &OptimizeOptions,
@@ -661,6 +825,28 @@ async fn merge_scalar_indices<'a>(
         None => split_segment_coverage(dataset.as_ref(), selected_old_indices.iter().copied()),
     };
 
+    // A remapping merge is stamped with the manifest it read (below): its sources were
+    // translated through the fragment-reuse index, so the trim may retire the versions they
+    // predate, and overlay masking will trust it for every overlay up to that manifest.
+    // Entries carried over from a source never incorporate overlays committed after it was
+    // built, so those rows are dropped from the carried-over data and re-read instead.
+    let (stale_rows, scan_selection) = if reference_index.can_remap() {
+        overlay_rescan(
+            dataset.as_ref(),
+            &selected_old_indices,
+            &effective_old_frags,
+            unindexed,
+            // The domain each `build_per_segment_filters` call below asks for.
+            index_type == IndexType::BTree,
+        )
+        .await?
+    } else {
+        (
+            RowAddrTreeMap::new(),
+            TrainingRows::Fragments(unindexed.to_vec()),
+        )
+    };
+
     // The fragments a from-scratch rebuild must scan: everything the merged
     // segment will answer for, all of it live.
     let mut rebuild_frags = base_unindexed_bitmap.clone();
@@ -754,9 +940,11 @@ async fn merge_scalar_indices<'a>(
         let details = IndexDetails(index_details.clone());
         let plugin = details.get_plugin()?;
         // Only open data files looking for seeds when the plugin confirms this
-        // index type and configuration can actually produce them.
-        let maybe_created = if plugin.might_use_seeds(&index_details) {
-            if let Some(seeds) = try_harvest_seeds(dataset.as_ref(), unindexed, column_name).await?
+        // index type and configuration can actually produce them, and never when
+        // overlaid rows must be read: a seed predates any overlay.
+        let maybe_created = if plugin.might_use_seeds(&index_details) && stale_rows.is_empty() {
+            if let Some(seeds) =
+                try_harvest_seeds(dataset.as_ref(), unindexed, reference_idx).await?
             {
                 plugin
                     .update_from_seeds(seeds, reference_index.clone(), &index_details, &new_store)
@@ -775,9 +963,15 @@ async fn merge_scalar_indices<'a>(
                 dataset.as_ref(),
                 field_path,
                 &update_criteria,
-                unindexed,
+                scan_selection,
             )
             .await?;
+            let per_segment_filters = |filters: Vec<Option<OldIndexDataFilter>>| {
+                filters
+                    .into_iter()
+                    .map(|filter| block_stale_rows(dataset.as_ref(), filter, &stale_rows))
+                    .collect::<Vec<_>>()
+            };
 
             match index_type {
                 IndexType::BTree => {
@@ -788,6 +982,7 @@ async fn merge_scalar_indices<'a>(
                         true,
                     )
                     .await?;
+                    let old_data_filters = per_segment_filters(old_data_filters);
                     crate::index::scalar::btree::open_and_merge_segments(
                         dataset.as_ref(),
                         field_path,
@@ -807,6 +1002,7 @@ async fn merge_scalar_indices<'a>(
                         false,
                     )
                     .await?;
+                    let old_data_filters = per_segment_filters(old_data_filters);
                     crate::index::scalar::bitmap::open_and_merge_segments(
                         dataset.as_ref(),
                         field_path,
@@ -826,6 +1022,7 @@ async fn merge_scalar_indices<'a>(
                         false,
                     )
                     .await?;
+                    let old_data_filters = per_segment_filters(old_data_filters);
                     crate::index::scalar::ngram::open_and_merge_segments(
                         dataset.as_ref(),
                         &selected_old_indices,
@@ -844,18 +1041,24 @@ async fn merge_scalar_indices<'a>(
                         false,
                     )
                     .await?;
+                    let old_data_filter =
+                        block_stale_rows(dataset.as_ref(), old_data_filter, &stale_rows);
                     reference_index
                         .update(new_data_stream, &new_store, old_data_filter)
                         .await?
                 }
             }
         };
-        let source_dataset_version = selected_old_indices
-            .iter()
-            .map(|index| index.dataset_version)
-            .min()
-            .unwrap_or(dataset.manifest.version);
-        (created_index, source_dataset_version)
+        let new_dataset_version = if reference_index.can_remap() {
+            dataset.manifest.version
+        } else {
+            selected_old_indices
+                .iter()
+                .map(|index| index.dataset_version)
+                .min()
+                .unwrap_or(dataset.manifest.version)
+        };
+        (created_index, new_dataset_version)
     };
 
     Ok(Some((
@@ -887,40 +1090,9 @@ async fn metadata_is_vector_index(dataset: &Dataset, index: &IndexMetadata) -> R
     object_store.exists(&index_file).await
 }
 
-/// Merge in-inflight unindexed data, with a specific number of previous indices
-/// into a new index, to improve the query performance.
-///
-/// The merge behavior is controlled by [`OptimizeOptions::num_indices_to_merge].
-///
-/// Returns
-/// -------
-/// - the UUID of the new index
-/// - merged indices,
-/// - Bitmap of the fragments that covered in the newly created index.
-pub async fn merge_indices<'a>(
-    dataset: Arc<Dataset>,
-    old_indices: &[&'a IndexMetadata],
-    options: &OptimizeOptions,
-) -> Result<Option<IndexMergeResults<'a>>> {
-    if old_indices.is_empty() {
-        return Err(Error::index(
-            "Append index: no previous index found".to_string(),
-        ));
-    };
-
-    let unindexed = dataset.unindexed_fragments(&old_indices[0].name).await?;
-    Box::pin(merge_indices_with_unindexed_frags(
-        dataset,
-        old_indices,
-        &unindexed,
-        options,
-    ))
-    .await
-}
-
 /// Whether a rebuild of `params` should expect the definition alone, because
 /// the column does not hold the vectors its quantizer needs.
-async fn expects_definition_only(
+pub async fn expects_definition_only(
     dataset: &Dataset,
     field_path: &str,
     params: &VectorIndexParams,
@@ -955,7 +1127,7 @@ async fn rebuild_vector_segment(
 ///
 /// Happens when an index is created against an empty table, or one without
 /// enough rows to justify training it.
-fn is_definition_only_segment(metadata: &IndexMetadata) -> bool {
+pub fn is_definition_only_segment(metadata: &IndexMetadata) -> bool {
     let no_files_recorded = metadata.files.as_ref().is_none_or(|files| files.is_empty());
     let covers_nothing = metadata
         .fragment_bitmap
@@ -1085,6 +1257,149 @@ fn fresh_vector_segment_result<'a>(
     })
 }
 
+/// The column path an index is maintained under: the keyed field's path, or
+/// for a full-text index the canonical path its document granularity resolves
+/// to (returned alongside, for the inverted merge).
+pub async fn index_field_path(
+    dataset: &Dataset,
+    metadata: &IndexMetadata,
+) -> Result<(
+    String,
+    Option<crate::index::scalar::inverted::ResolvedFtsField>,
+)> {
+    let field_id = *metadata.fields.first().ok_or_else(|| {
+        Error::index(format!(
+            "Append index: segment {} is missing field ids",
+            metadata.uuid
+        ))
+    })?;
+    let raw_field_path = dataset.schema().field_path(field_id)?;
+    let details = super::scalar::fetch_index_details(dataset, &raw_field_path, metadata).await?;
+    let resolved_fts = if details.type_url.ends_with("InvertedIndexDetails") {
+        let details = lance_index::pbold::InvertedIndexDetails::decode(details.value.as_slice())
+            .map_err(|error| {
+                Error::io(format!(
+                    "failed to decode InvertedIndexDetails payload: {error}"
+                ))
+            })?;
+        let granularity = lance_index::scalar::inverted::DocumentGranularity::try_from(
+            details.document_granularity,
+        )?;
+        Some(crate::index::scalar::inverted::resolve_fts_field_by_id(
+            dataset.schema(),
+            field_id,
+            granularity,
+        )?)
+    } else {
+        None
+    };
+    let field_path = resolved_fts
+        .as_ref()
+        .map(|resolved| resolved.canonical_path.clone())
+        .unwrap_or(raw_field_path);
+    Ok((field_path, resolved_fts))
+}
+
+/// Build one new vector segment over `fragments`, encoded against the model
+/// (IVF centroids and quantizer) of `reference`, without touching any existing
+/// segment. The reference is opened by the caller, so it need not be in the
+/// manifest.
+pub async fn append_vector_segment<'a>(
+    dataset: &Dataset,
+    field_path: &str,
+    column_nullable: bool,
+    reference_metadata: &IndexMetadata,
+    reference_index: &Arc<dyn lance_index::vector::VectorIndex>,
+    fragments: &[Fragment],
+    options: &OptimizeOptions,
+) -> Result<IndexMergeResults<'a>> {
+    let reference_logical_index = LogicalVectorIndex::try_new(
+        reference_metadata.name.clone(),
+        field_path.to_string(),
+        vec![(reference_metadata.clone(), reference_index.clone())],
+    )?;
+    let reference_ivf_view = reference_logical_index.as_ivf()?;
+    let new_data_stream =
+        scan_vector_fragments(dataset, field_path, column_nullable, fragments).await?;
+    let mut append_options = options.clone();
+    append_options.num_indices_to_merge = Some(0);
+    append_options.enable_partition_rebalancing = false;
+    append_options.retrain = false;
+    let (new_uuid, indices_merged, files) = optimize_vector_indices(
+        dataset.clone(),
+        Some(new_data_stream),
+        field_path,
+        &reference_ivf_view,
+        &append_options,
+    )
+    .boxed()
+    .await?;
+    if indices_merged != 0 {
+        return Err(Error::index(format!(
+            "Optimize vector index append unexpectedly merged {indices_merged} existing segments"
+        )));
+    }
+    Ok(IndexMergeResults {
+        new_uuid,
+        removed_indices: Vec::new(),
+        new_fragment_bitmap: fragments.iter().map(|frag| frag.id as u32).collect(),
+        new_dataset_version: dataset.manifest.version,
+        new_index_version: index_type_for_segmented_optimize(reference_index.as_ref())?.version(),
+        new_index_details: reference_metadata
+            .index_details
+            .as_deref()
+            .cloned()
+            .unwrap_or_else(vector_index_details_default),
+        files,
+    })
+}
+
+/// Split vector segments into the live ones and the dormant ones.
+///
+/// Segments with stored rows (raw coverage) but no live coverage (e.g. a
+/// definition retained through a full rewrite) are dormant. With stable row
+/// ids their stored postings still share ids with live rows, so merging them
+/// would resurrect stale vectors; they may only be replaced. A born-empty
+/// segment (deferred build) has no stored rows and stays mergeable.
+///
+/// Under a tagged history an empty bitmap does not mean empty pages: an
+/// in-place rewrite withdraws a segment's whole coverage and leaves its files.
+/// Such a segment is dormant too, rebuilt from the live fragments; only a
+/// definition without files (the deferred build) stays mergeable there.
+/// Elsewhere an index initialized on an empty table has files and no rows and
+/// keeps merging as before.
+///
+/// On a tagged table a segment's stored bitmap is provenance: its rows
+/// translate to the coverage the tagged reader derives for it, so THAT is its
+/// live coverage. A segment the reader excludes (derived coverage empty) is
+/// the dormant one.
+///
+/// `tagged_coverage` is [`tagged_segment_coverage`] of `segments`.
+pub fn partition_dormant_vector_segments<'a>(
+    dataset: &Dataset,
+    segments: &[&'a IndexMetadata],
+    tagged_coverage: Option<&HashMap<Uuid, RoaringBitmap>>,
+) -> (Vec<&'a IndexMetadata>, Vec<&'a IndexMetadata>) {
+    segments.iter().copied().partition(|idx| {
+        let has_stored_rows = match tagged_coverage {
+            Some(_) => !is_definition_only_segment(idx),
+            None => idx
+                .fragment_bitmap
+                .as_ref()
+                .is_some_and(|bitmap| !bitmap.is_empty()),
+        };
+        let has_live_coverage = match tagged_coverage {
+            Some(coverage) => coverage
+                .get(&idx.uuid)
+                .is_some_and(|bitmap| !bitmap.is_empty()),
+            None => idx
+                .effective_fragment_bitmap(&dataset.fragment_bitmap)
+                .is_none_or(|bitmap| !bitmap.is_empty()),
+        };
+        !has_stored_rows || has_live_coverage
+    })
+}
+
 /// Merge a list of provided unindexed data, with a specific number of previous indices
 /// into a new index, to improve the query performance.
 pub async fn merge_indices_with_unindexed_frags<'a>(
@@ -1107,33 +1422,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
             old_indices[0].fields[0]
         )))?;
 
-    let raw_field_path = dataset.schema().field_path(old_indices[0].fields[0])?;
-    let first_details =
-        super::scalar::fetch_index_details(dataset.as_ref(), &raw_field_path, old_indices[0])
-            .await?;
-    let resolved_fts = if first_details.type_url.ends_with("InvertedIndexDetails") {
-        let details =
-            lance_index::pbold::InvertedIndexDetails::decode(first_details.value.as_slice())
-                .map_err(|error| {
-                    Error::io(format!(
-                        "failed to decode InvertedIndexDetails payload: {error}"
-                    ))
-                })?;
-        let granularity = lance_index::scalar::inverted::DocumentGranularity::try_from(
-            details.document_granularity,
-        )?;
-        Some(crate::index::scalar::inverted::resolve_fts_field_by_id(
-            dataset.schema(),
-            old_indices[0].fields[0],
-            granularity,
-        )?)
-    } else {
-        None
-    };
-    let field_path = resolved_fts
-        .as_ref()
-        .map(|resolved| resolved.canonical_path.clone())
-        .unwrap_or(raw_field_path);
+    let (field_path, resolved_fts) = index_field_path(dataset.as_ref(), old_indices[0]).await?;
     let first_is_vector_index = metadata_is_vector_index(dataset.as_ref(), old_indices[0]).await?;
     for idx in old_indices.iter().skip(1) {
         let is_vector_index = metadata_is_vector_index(dataset.as_ref(), idx).await?;
@@ -1152,44 +1441,13 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
 
     let (new_uuid, removed_indices, new_fragment_bitmap, created_index, new_dataset_version) =
         if first_is_vector_index {
-            // Segments with stored rows (raw coverage) but no live coverage
-            // (e.g. a definition retained through a full rewrite) are dormant.
-            // With stable row ids their stored postings still share ids with
-            // live rows, so merging them would resurrect stale vectors; they
-            // may only be replaced. A born-empty segment (deferred build) has
-            // no stored rows and stays mergeable.
-            // Under a tagged history an empty bitmap does not mean empty
-            // pages: an in-place rewrite withdraws a segment's whole coverage
-            // and leaves its files. Such a segment is dormant too, rebuilt
-            // from the live fragments; only a definition without files (the
-            // deferred build) stays mergeable there. Elsewhere an index
-            // initialized on an empty table has files and no rows and keeps
-            // merging as before.
-            // On a tagged table a segment's stored bitmap is provenance: its
-            // rows translate to the coverage the tagged reader derives for
-            // it, so THAT is its live coverage. A segment the reader excludes
-            // (derived coverage empty) is the dormant one.
             let tagged_coverage =
                 tagged_segment_coverage(dataset.as_ref(), old_indices, None).await?;
-            let (live_segments, dormant_segments): (Vec<&IndexMetadata>, Vec<&IndexMetadata>) =
-                old_indices.iter().copied().partition(|idx| {
-                    let has_stored_rows = match &tagged_coverage {
-                        Some(_) => !is_definition_only_segment(idx),
-                        None => idx
-                            .fragment_bitmap
-                            .as_ref()
-                            .is_some_and(|bitmap| !bitmap.is_empty()),
-                    };
-                    let has_live_coverage = match &tagged_coverage {
-                        Some(coverage) => coverage
-                            .get(&idx.uuid)
-                            .is_some_and(|bitmap| !bitmap.is_empty()),
-                        None => idx
-                            .effective_fragment_bitmap(&dataset.fragment_bitmap)
-                            .is_none_or(|bitmap| !bitmap.is_empty()),
-                    };
-                    !has_stored_rows || has_live_coverage
-                });
+            let (live_segments, dormant_segments) = partition_dormant_vector_segments(
+                dataset.as_ref(),
+                old_indices,
+                tagged_coverage.as_ref(),
+            );
             if !dormant_segments.is_empty() && !live_segments.is_empty() && !options.retrain {
                 // Optimize the live segments as usual; the dormant segments
                 // are superseded by whatever that produces.
@@ -1311,50 +1569,17 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                             logical_index.name()
                         ))
                     })?;
-                let reference_logical_index = LogicalVectorIndex::try_new(
-                    logical_index.name().to_string(),
-                    field_path.clone(),
-                    vec![(reference_metadata.clone(), reference_index.clone())],
-                )?;
-                let reference_ivf_view = reference_logical_index.as_ivf()?;
-                let new_data_stream = scan_vector_fragments(
+                return append_vector_segment(
                     dataset.as_ref(),
                     &field_path,
                     column.nullable,
+                    reference_metadata,
+                    reference_index,
                     unindexed,
+                    options,
                 )
-                .await?;
-                let mut append_options = options.clone();
-                append_options.num_indices_to_merge = Some(0);
-                append_options.retrain = false;
-                let (new_uuid, indices_merged, files) = optimize_vector_indices(
-                    dataset.as_ref().clone(),
-                    Some(new_data_stream),
-                    &field_path,
-                    &reference_ivf_view,
-                    &append_options,
-                )
-                .boxed()
-                .await?;
-                if indices_merged != 0 {
-                    return Err(Error::index(format!(
-                        "Optimize vector index append unexpectedly merged {indices_merged} existing segments"
-                    )));
-                }
-                return Ok(Some(IndexMergeResults {
-                    new_uuid,
-                    removed_indices: Vec::new(),
-                    new_fragment_bitmap: base_unindexed_bitmap,
-                    new_dataset_version: dataset.manifest.version,
-                    new_index_version: index_type_for_segmented_optimize(reference_index.as_ref())?
-                        .version(),
-                    new_index_details: reference_metadata
-                        .index_details
-                        .as_deref()
-                        .cloned()
-                        .unwrap_or_else(vector_index_details_default),
-                    files,
-                }));
+                .await
+                .map(Some);
             }
 
             // Append is a steady-state no-op when every fragment is already
@@ -1806,6 +2031,9 @@ mod tests {
 
     use crate::index::DatasetIndexExt;
     use crate::index::DatasetIndexInternalExt;
+    use crate::index::optimize::{
+        OptimizeIndicesPlan, commit_optimize_indices, plan_optimize_indices,
+    };
     use arrow::datatypes::{Float32Type, UInt32Type};
     use arrow_array::cast::AsArray;
     use arrow_array::{
@@ -1839,7 +2067,7 @@ mod tests {
     use crate::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched, WriteMode, WriteParams};
     use crate::index::CreateIndexBuilder;
     use crate::index::vector::VectorIndexParams;
-    use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+    use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount, copy_test_data_to_tmp};
 
     #[test]
     fn test_fragment_reuse_at_source_version_affects_segment() {
@@ -1961,7 +2189,163 @@ mod tests {
     }
 
     #[rstest]
+    #[case::append(OptimizeOptions::append().with_partition_rebalancing(), "num_indices_to_merge", "Some(0)")]
+    #[case::task_bound(OptimizeOptions::merge(1).with_partition_rebalancing().max_rows_per_task(Some(64)), "max_rows_per_task", "Some(64)")]
+    #[case::segment_bound(OptimizeOptions::merge(1).with_partition_rebalancing().max_rows_per_segment(Some(64)), "max_rows_per_segment", "Some(64)")]
+    #[tokio::test]
+    async fn test_partition_rebalancing_rejects_incompatible_options(
+        #[case] options: OptimizeOptions,
+        #[case] parameter: &str,
+        #[case] value: &str,
+    ) {
+        let mut dataset = lance_datagen::gen_batch()
+            .col("id", array::step::<UInt32Type>())
+            .into_dataset("memory://", FragmentCount(1), FragmentRowCount(1))
+            .await
+            .unwrap();
+        let error = dataset.optimize_indices(&options).await.unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains(parameter));
+        assert!(error.to_string().contains(value));
+    }
+
+    #[rstest]
+    #[case::unchanged(1, 128, std::cmp::Ordering::Equal)]
+    #[case::split(1, 8, std::cmp::Ordering::Greater)]
+    #[case::join(8, 64, std::cmp::Ordering::Less)]
+    #[tokio::test]
+    async fn test_merge_latest_segment_with_partition_rebalancing(
+        #[case] num_partitions: usize,
+        #[case] target_partition_size: usize,
+        #[case] expected_partition_change: std::cmp::Ordering,
+        #[values(false, true)] enable_stable_row_ids: bool,
+        #[values(false, true)] distributed: bool,
+    ) {
+        let test_dir = TempStrDir::default();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 2),
+                false,
+            ),
+        ]));
+        let (first, first_vectors) = clustered_vector_batch(schema.clone(), 0, 64, 2, 0.0);
+        let (last, last_vectors) = clustered_vector_batch(schema.clone(), 64, 64, 2, 100.0);
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(first), Ok(last)], schema.clone()),
+            test_dir.as_str(),
+            Some(WriteParams {
+                max_rows_per_file: 64,
+                enable_stable_row_ids,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let params = VectorIndexParams::with_ivf_flat_params(
+            MetricType::L2,
+            IvfBuildParams {
+                num_partitions: Some(num_partitions),
+                target_partition_size: Some(target_partition_size),
+                max_iters: 2,
+                sample_rate: 2,
+                ..Default::default()
+            },
+        );
+        let mut segments = Vec::with_capacity(2);
+        for fragment in dataset.get_fragments() {
+            segments.push(
+                CreateIndexBuilder::new(&mut dataset, &["vector"], IndexType::Vector, &params)
+                    .name("vector_idx".to_string())
+                    .fragments(vec![fragment.id() as u32])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+            );
+        }
+        let first_uuid = segments[0].uuid;
+        dataset
+            .commit_existing_index_segments("vector_idx", "vector", segments)
+            .await
+            .unwrap();
+
+        for round in 0..3 {
+            let (batch, vectors) = clustered_vector_batch(
+                schema.clone(),
+                128 + round * 16,
+                16,
+                2,
+                101.0 + round as f32,
+            );
+            dataset
+                .append(
+                    RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+                    None,
+                )
+                .await
+                .unwrap();
+            let options = OptimizeOptions::merge(1).with_partition_rebalancing();
+            if distributed {
+                let plan = plan_optimize_indices(&dataset, &options).await.unwrap();
+                let plan: OptimizeIndicesPlan =
+                    serde_json::from_str(&serde_json::to_string(&plan).unwrap()).unwrap();
+                assert_eq!(plan.tasks.len(), 1);
+                assert!(plan.tasks[0].enable_partition_rebalancing);
+                let mut built = Vec::new();
+                for task in &plan.tasks {
+                    built.extend(task.execute(&dataset).await.unwrap());
+                }
+                let mut merged = Vec::new();
+                for merge in &plan.merges {
+                    merged.extend(merge.execute(&dataset, &built).await.unwrap());
+                }
+                commit_optimize_indices(&mut dataset, merged, &options)
+                    .await
+                    .unwrap();
+            } else {
+                dataset.optimize_indices(&options).await.unwrap();
+            }
+            let segments = dataset.load_indices_by_name("vector_idx").await.unwrap();
+            assert_eq!(segments.len(), 2, "each append must replace only the tail");
+            assert_eq!(
+                segments[0].uuid, first_uuid,
+                "earlier segments must not change"
+            );
+            assert!(
+                dataset
+                    .unindexed_fragments("vector_idx")
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            let logical = dataset
+                .open_logical_vector_index("vector", "vector_idx")
+                .await
+                .unwrap();
+            let partitions = logical.as_ivf().unwrap().num_partitions_per_segment();
+            assert_eq!(partitions[0].1, num_partitions);
+            assert_eq!(
+                partitions[1].1.cmp(&num_partitions),
+                expected_partition_change
+            );
+            let nprobes = partitions.iter().map(|(_, count)| *count).max().unwrap();
+            for (expected, query) in [
+                (0, first_vectors.value(0)),
+                (64, last_vectors.value(0)),
+                (128 + round * 16, vectors.value(0)),
+            ] {
+                assert_eq!(
+                    nearest_id(&dataset, query.as_primitive::<Float32Type>(), nprobes).await,
+                    expected
+                );
+            }
+        }
+    }
+
+    #[rstest]
     #[case::append(OptimizeOptions::append(), false)]
+    #[case::default_with_rebalancing(OptimizeOptions::new().with_partition_rebalancing(), false)]
     #[case::default_with_stable_row_ids_and_delete(OptimizeOptions::default(), true)]
     #[tokio::test]
     async fn test_vector_append_is_segment_set_native_with_distinct_models(
@@ -4025,130 +4409,60 @@ mod tests {
         }
     }
 
-    /// The same invariant as the append-mode case above, but for
-    /// `num_indices_to_merge: Some(N)` with `N` small enough that the legacy
-    /// segment sits outside the trailing window `select_segments_to_merge`
-    /// picks. A fix scoped to "nothing was selected" (`num_indices_to_merge:
-    /// Some(0)`) would miss this: the legacy segment is just as stray here,
-    /// left beside whatever the merge of the trailing segments produces.
+    /// A trailing merge window must also rebuild legacy segments outside it.
+    /// Use a real pre-migration index: committing a mixture of row domains is
+    /// rejected before optimization can run.
     #[tokio::test]
     async fn test_optimize_btree_merge_rebuilds_legacy_segment_outside_merge_window() {
-        async fn query_id_count(dataset: &Dataset, id: &str) -> usize {
-            dataset
-                .scan()
-                .filter(&format!("id = '{}'", id))
-                .unwrap()
-                .project(&["id"])
-                .unwrap()
-                .try_into_batch()
-                .await
-                .unwrap()
-                .num_rows()
-        }
+        let dir = copy_test_data_to_tmp("v14.0.0-beta.15/stable_row_id_btree.lance").unwrap();
+        let uri = dir.path_str();
+        let mut dataset = Dataset::open(&uri).await.unwrap();
+        assert!(dataset.manifest.uses_stable_row_ids());
+        let legacy = dataset.load_indices_by_name("value_idx").await.unwrap();
+        assert_eq!(legacy.len(), 2);
+        assert!(legacy.iter().all(|index| !index.results_are_row_addrs()));
 
-        let test_dir = TempStrDir::default();
-        let test_uri = test_dir.as_str();
-
-        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)]));
-        let make_batch = |start: i32, end: i32| {
-            let ids = StringArray::from_iter_values((start..end).map(|i| format!("song-{i}")));
-            RecordBatch::try_new(schema.clone(), vec![Arc::new(ids)]).unwrap()
-        };
-
-        // Three fragments, three BTree segments, under stable row ids.
-        let reader = RecordBatchIterator::new(
-            vec![
-                Ok(make_batch(0, 64)),
-                Ok(make_batch(64, 128)),
-                Ok(make_batch(128, 192)),
-            ],
-            schema.clone(),
-        );
-        let mut dataset = Dataset::write(
-            reader,
-            test_uri,
-            Some(WriteParams {
-                max_rows_per_file: 64,
-                enable_stable_row_ids: true,
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
-
-        let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::BTree);
-        let fragments = dataset.get_fragments();
-        assert_eq!(fragments.len(), 3);
-
-        let mut staged_segments = Vec::new();
-        for fragment in &fragments {
-            staged_segments.push(
-                crate::index::create::CreateIndexBuilder::new(
-                    &mut dataset,
-                    &["id"],
-                    IndexType::BTree,
-                    &params,
-                )
-                .name("id_idx".into())
-                .fragments(vec![fragment.id() as u32])
-                .execute_uncommitted()
-                .await
-                .unwrap(),
-            );
-        }
-        // Relabel only the oldest (first) segment as pre-migration row-id
-        // domain -- the one `num_indices_to_merge: Some(2)` below will leave
-        // outside its trailing window.
-        staged_segments[0] = IndexMetadata {
-            index_version: 0,
-            ..staged_segments[0].clone()
-        };
+        let batch = arrow_array::record_batch!(("value", Int32, [Some(20), None])).unwrap();
+        let schema = batch.schema();
         dataset
-            .commit_existing_index_segments("id_idx", "id", staged_segments)
+            .append(RecordBatchIterator::new([Ok(batch)], schema), None)
             .await
             .unwrap();
-        assert_eq!(
-            dataset.load_indices_by_name("id_idx").await.unwrap().len(),
-            3
-        );
+        assert_eq!(dataset.get_fragments().len(), 3);
 
-        let appended = RecordBatchIterator::new(vec![Ok(make_batch(192, 256))], schema.clone());
-        let mut dataset = Dataset::write(
-            appended,
-            test_uri,
-            Some(WriteParams {
-                max_rows_per_file: 64,
-                mode: WriteMode::Append,
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
-
-        // Merge only the trailing 2 old segments with the new data; the
-        // legacy segment (index 0 of 3) is outside this window.
+        // One of the two legacy segments is outside this trailing window.
+        // Both must join the rebuild before its address-domain result commits.
         dataset
-            .optimize_indices(&OptimizeOptions::merge(2))
+            .optimize_indices(&OptimizeOptions::merge(1))
             .await
             .unwrap();
 
-        let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
-        let committed = dataset.load_indices_by_name("id_idx").await.unwrap();
+        let dataset = Dataset::open(&uri).await.unwrap();
+        let committed = dataset.load_indices_by_name("value_idx").await.unwrap();
         assert_eq!(
             committed.len(),
             1,
-            "the legacy segment outside the merge window must still be folded \
-             into the rebuild, not left standing alone: {committed:?}"
+            "the legacy segment outside the merge window must join the rebuild: {committed:?}"
         );
-        assert!(
-            committed[0].results_are_row_addrs(),
-            "the rebuilt segment must be address-domain"
-        );
+        assert!(committed[0].results_are_row_addrs());
+        assert_eq!(committed[0].fragment_bitmap.as_ref().unwrap().len(), 3);
 
-        // In particular, rows the legacy segment alone covers must still be
-        // findable once it is no longer the only segment of its domain.
-        for id in ["song-10", "song-100", "song-200"] {
-            assert_eq!(query_id_count(&dataset, id).await, 1, "missing row {id}");
+        // Check both original fragments and the appended rows, including NULLs.
+        for (filter, expected) in [
+            ("value = 1", 1),
+            ("value = 9", 1),
+            ("value = 20", 1),
+            ("value IS NULL", 3),
+        ] {
+            for indexed in [false, true] {
+                let mut scan = dataset.scan();
+                scan.use_scalar_index(indexed).filter(filter).unwrap();
+                assert_eq!(
+                    scan.try_into_batch().await.unwrap().num_rows(),
+                    expected,
+                    "{filter}, indexed={indexed}"
+                );
+            }
         }
     }
 
@@ -4531,16 +4845,21 @@ mod tests {
     }
 
     /// BTree stores row addresses (`BTREE_ROW_ADDR_DOMAIN_VERSION`), so a plain
-    /// eager compaction on a stable-row-id dataset invalidates it exactly like a
-    /// zone map: with nothing to repair the addresses it stores, the rewritten
-    /// fragment drops out of its coverage (still correct -- the scanner falls
-    /// back to a full scan for it -- just uncovered). `defer_index_remap` is
-    /// what keeps the guarantee this test used to make about eager compaction:
-    /// the FRI it writes lets the btree follow its data to the new fragment, and
-    /// draining that FRI via `optimize_indices` (a segment merge, not a rescan)
-    /// must not change any answer either.
+    /// eager compaction on a stable-row-id dataset needs explicit repair, unlike
+    /// a row-id-domain index whose ids survive the rewrite for free. An eager
+    /// commit remaps the btree in place -- the same way it would on a
+    /// non-stable-row-id table -- and writes no fragment reuse index.
+    /// `defer_index_remap` instead leaves the btree untouched and writes an FRI
+    /// that lets it follow its data to the new fragment at read time; draining
+    /// that FRI via `optimize_indices` (a segment merge, not a rescan) must not
+    /// change any answer either.
+    #[rstest]
+    #[case::eager(false)]
+    #[case::deferred(true)]
     #[tokio::test]
-    async fn test_optimize_btree_keeps_rows_with_stable_row_ids_after_compaction() {
+    async fn test_optimize_btree_keeps_rows_with_stable_row_ids_after_compaction(
+        #[case] defer_index_remap: bool,
+    ) {
         async fn query_id_count(dataset: &Dataset, id: &str) -> usize {
             dataset
                 .scan()
@@ -4590,7 +4909,7 @@ mod tests {
             &mut dataset,
             crate::dataset::optimize::CompactionOptions {
                 target_rows_per_fragment: 512,
-                defer_index_remap: true,
+                defer_index_remap,
                 ..Default::default()
             },
             None,
@@ -4598,13 +4917,15 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(
-            dataset
-                .load_index_by_name(lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME)
-                .await
-                .unwrap()
-                .is_some(),
-            "a deferred compaction over an address-domain index must write an FRI"
+        let has_fri = dataset
+            .load_index_by_name(lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME)
+            .await
+            .unwrap()
+            .is_some();
+        assert_eq!(
+            has_fri, defer_index_remap,
+            "only a deferred compaction over an address-domain index writes an FRI; an \
+             eager one remaps the btree in place instead"
         );
 
         let frags = dataset.get_fragments();
@@ -4616,12 +4937,13 @@ mod tests {
                 .await
                 .unwrap()
                 .is_empty(),
-            "the FRI must let the btree follow its data to the rewritten fragment"
+            "the btree must cover the rewritten fragment, either because the FRI lets it \
+             follow its data (deferred) or because the eager commit remapped it in place"
         );
         assert_eq!(query_id_count(&dataset, "song-42").await, 1);
 
-        // Draining the FRI into the index (a segment merge, not a rescan) must
-        // not change any answer.
+        // Draining the FRI into the index (a segment merge, not a rescan), or
+        // simply reopening an eagerly-remapped index, must not change any answer.
         dataset
             .optimize_indices(&OptimizeOptions::default())
             .await
@@ -5704,43 +6026,73 @@ mod tests {
             .unwrap();
     }
 
-    /// The oldest `dataset_version` across an index's segments, which is what a
-    /// segment merge carries over to the segment it produces. Checked here to
-    /// predate the current manifest, since otherwise it could not tell a merge
-    /// from a rebuild.
-    async fn oldest_segment_version(dataset: &Dataset, index_name: &str) -> u64 {
-        let oldest = dataset
+    /// Helper to determine whether `optimize_indices` merged the segments rather
+    /// than rebuilding the index from scratch. Call it right before the optimize
+    /// and pass the result to [`assert_merged_not_rebuilt`] after.
+    ///
+    /// Returns the base data files of every fragment the index's segments
+    /// already cover. A rebuild re-reads them to index every row; a merge copies
+    /// the segment entries and reads none of them. Also resets the object
+    /// store's IO counters so the assertion sees only the optimize's reads.
+    async fn indexed_data_files(dataset: &Dataset, index_name: &str) -> Vec<String> {
+        let covered = dataset
             .load_indices_by_name(index_name)
             .await
             .unwrap()
             .iter()
-            .map(|segment| segment.dataset_version)
-            .min()
-            .expect("the index must have at least one segment");
+            .filter_map(|segment| segment.fragment_bitmap.clone())
+            .fold(RoaringBitmap::new(), |covered, bitmap| covered | bitmap);
+        let files = dataset
+            .get_fragments()
+            .iter()
+            .filter(|fragment| covered.contains(fragment.id() as u32))
+            .flat_map(|fragment| {
+                fragment
+                    .metadata()
+                    .files
+                    .iter()
+                    .map(|file| file.path.clone())
+            })
+            .collect::<Vec<_>>();
         assert!(
-            oldest < dataset.manifest.version,
-            "the source segments must predate the manifest, or their version \
-             cannot distinguish a merge from a rebuild"
+            !files.is_empty(),
+            "the index must cover at least one fragment with data"
         );
-        oldest
+        dataset.object_store.as_ref().io_stats_incremental(); // Reset
+        files
     }
 
-    /// Pins that `optimize_indices` took the segment-merge path. A full rebuild
-    /// produces the same rows, so the row counts these tests check cannot tell
-    /// the two apart; the stamped `dataset_version` can, because the merge keeps
-    /// the oldest source segment's version while a rebuild stamps the manifest
-    /// version current at the time of the optimize.
-    async fn assert_merged_not_rebuilt(dataset: &Dataset, index_name: &str, oldest_source: u64) {
+    /// Pins that `optimize_indices` merged rather than rebuilt. Both produce the
+    /// same rows and stamp; only a rebuild reads the already-indexed data files.
+    /// `dataset` must be the handle that ran the optimize: the IO counters
+    /// belong to its object store.
+    async fn assert_merged_not_rebuilt(
+        dataset: &Dataset,
+        index_name: &str,
+        indexed_files: &[String],
+    ) {
+        let rescanned = dataset
+            .object_store
+            .as_ref()
+            .io_stats_incremental()
+            .requests
+            .into_iter()
+            .filter(|request| {
+                indexed_files
+                    .iter()
+                    .any(|file| request.path.as_ref().ends_with(file.as_str()))
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            rescanned.is_empty(),
+            "the optimize rebuilt the index instead of merging the segments: it read \
+             already-indexed data files {rescanned:?}"
+        );
         let segments = dataset.load_indices_by_name(index_name).await.unwrap();
         assert_eq!(
             segments.len(),
             1,
             "the optimize must consolidate every bitmap segment, got {segments:?}"
-        );
-        assert_eq!(
-            segments[0].dataset_version, oldest_source,
-            "the optimize rebuilt the index instead of merging the segments: a \
-             merged segment carries the oldest source segment's dataset version"
         );
     }
 
@@ -5838,14 +6190,14 @@ mod tests {
             .await
             .unwrap();
 
-        let oldest_source = oldest_segment_version(&dataset, "cat_idx").await;
+        let indexed_files = indexed_data_files(&dataset, "cat_idx").await;
         dataset
             .optimize_indices(&OptimizeOptions::merge(200))
             .await
             .unwrap();
+        assert_merged_not_rebuilt(&dataset, "cat_idx", &indexed_files).await;
 
         let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
-        assert_merged_not_rebuilt(&dataset, "cat_idx", oldest_source).await;
 
         // 48 rows cycling A/B/C/NULL: 12 of each.
         for cat in ["A", "B", "C"] {
@@ -5911,14 +6263,14 @@ mod tests {
             .await
             .unwrap();
 
-        let oldest_source = oldest_segment_version(&dataset, "cat_idx").await;
+        let indexed_files = indexed_data_files(&dataset, "cat_idx").await;
         dataset
             .optimize_indices(&OptimizeOptions::merge(200))
             .await
             .unwrap();
+        assert_merged_not_rebuilt(&dataset, "cat_idx", &indexed_files).await;
 
         let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
-        assert_merged_not_rebuilt(&dataset, "cat_idx", oldest_source).await;
         let segments = dataset.load_indices_by_name("cat_idx").await.unwrap();
         let expected_coverage = dataset
             .get_fragments()
@@ -5978,14 +6330,14 @@ mod tests {
             num_segments as usize
         );
 
-        let oldest_source = oldest_segment_version(&dataset, "cat_idx").await;
+        let indexed_files = indexed_data_files(&dataset, "cat_idx").await;
         dataset
             .optimize_indices(&OptimizeOptions::merge(num_segments as usize))
             .await
             .unwrap();
+        assert_merged_not_rebuilt(&dataset, "cat_idx", &indexed_files).await;
 
         let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
-        assert_merged_not_rebuilt(&dataset, "cat_idx", oldest_source).await;
         let segments = dataset.load_indices_by_name("cat_idx").await.unwrap();
         let expected_coverage = dataset
             .get_fragments()
@@ -6084,14 +6436,14 @@ mod tests {
             .await
             .unwrap();
 
-        let oldest_source = oldest_segment_version(&dataset, "cat_idx").await;
+        let indexed_files = indexed_data_files(&dataset, "cat_idx").await;
         dataset
             .optimize_indices(&OptimizeOptions::merge(200))
             .await
             .unwrap();
+        assert_merged_not_rebuilt(&dataset, "cat_idx", &indexed_files).await;
 
         let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
-        assert_merged_not_rebuilt(&dataset, "cat_idx", oldest_source).await;
         // 240 rows: A/B/C/NULL evenly when nullable, A/B/C otherwise.
         let (expected_per_cat, expected_nulls) = if nullable {
             ([60, 60, 60], 60)
@@ -6165,16 +6517,16 @@ mod tests {
             .unwrap();
         let mut dataset = res.new_dataset.as_ref().clone();
 
-        let oldest_source = oldest_segment_version(&dataset, "cat_idx").await;
+        let indexed_files = indexed_data_files(&dataset, "cat_idx").await;
         dataset
             .optimize_indices(&OptimizeOptions::default())
             .await
             .unwrap();
-
-        let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
         // Two segments went in, so this exercised the K-way path rather than the
         // single-segment `update` this change does not touch.
-        assert_merged_not_rebuilt(&dataset, "cat_idx", oldest_source).await;
+        assert_merged_not_rebuilt(&dataset, "cat_idx", &indexed_files).await;
+
+        let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
         // ids 0..25 are now 'Z'; the remaining A/B/C counts come from ids 25..100.
         assert_eq!(count_cat(&dataset, "Z").await, 25, "updated rows missing");
         for (cat, expected) in [("A", 25), ("B", 25), ("C", 25)] {
