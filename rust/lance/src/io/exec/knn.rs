@@ -49,7 +49,9 @@ use lance_datafusion::utils::{
 };
 use lance_index::metrics::{IndexTimer, IndexTiming, MetricsCollector};
 use lance_index::prefilter::PreFilter;
+use lance_index::scalar::minhash_lsh::{MinHashHit, TopHits};
 use lance_index::vector::DIST_Q_C_COLUMN;
+use lance_index::vector::graph::OrderedFloat;
 use lance_index::vector::{
     DIST_COL, INDEX_UUID_COLUMN, PART_ID_COLUMN, PartitionSearchControl, Query, VectorIndex,
     flat::compute_distance,
@@ -2538,47 +2540,6 @@ pub struct ANNIvfBatchExec {
     metrics: ExecutionPlanMetricsSet,
 }
 
-#[derive(Debug)]
-struct AnnBatchCandidate {
-    distance: f32,
-    row_id: u64,
-}
-
-impl Ord for AnnBatchCandidate {
-    fn cmp(&self, other: &Self) -> CmpOrdering {
-        self.distance
-            .total_cmp(&other.distance)
-            .then_with(|| self.row_id.cmp(&other.row_id))
-    }
-}
-
-impl PartialOrd for AnnBatchCandidate {
-    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl PartialEq for AnnBatchCandidate {
-    fn eq(&self, other: &Self) -> bool {
-        self.cmp(other) == CmpOrdering::Equal
-    }
-}
-
-impl Eq for AnnBatchCandidate {}
-
-fn push_ann_batch_candidate(
-    heap: &mut BinaryHeap<AnnBatchCandidate>,
-    candidate: AnnBatchCandidate,
-    k: usize,
-) {
-    if heap.len() < k {
-        heap.push(candidate);
-    } else if heap.peek().is_some_and(|worst| candidate < *worst) {
-        heap.pop();
-        heap.push(candidate);
-    }
-}
-
 impl ANNIvfBatchExec {
     pub fn try_new(
         dataset: Arc<Dataset>,
@@ -2762,7 +2723,7 @@ impl ExecutionPlan for ANNIvfBatchExec {
             let dim = query.key.len() / query_count;
             // Each max-heap retains only the best k candidates across deltas.
             let mut candidates = (0..query_count)
-                .map(|_| BinaryHeap::<AnnBatchCandidate>::with_capacity(query.k))
+                .map(|_| TopHits::new(query.k))
                 .collect::<Vec<_>>();
 
             for index_meta in &indices {
@@ -2870,11 +2831,10 @@ impl ExecutionPlan for ANNIvfBatchExec {
                         .copied()
                         .zip(row_ids.values().iter().copied())
                     {
-                        push_ann_batch_candidate(
-                            &mut candidates[query_index],
-                            AnnBatchCandidate { distance, row_id },
-                            query.k,
-                        );
+                        candidates[query_index].push(MinHashHit {
+                            distance: OrderedFloat(distance),
+                            row_id,
+                        });
                     }
                 }
             }
@@ -2883,10 +2843,10 @@ impl ExecutionPlan for ANNIvfBatchExec {
             let mut query_index_builder = Int32Builder::new();
             let mut distance_builder = Float32Builder::new();
             let mut row_id_builder = UInt64Builder::new();
-            for (query_index, heap) in candidates.into_iter().enumerate() {
-                for AnnBatchCandidate { distance, row_id } in heap.into_sorted_vec() {
+            for (query_index, hits) in candidates.into_iter().enumerate() {
+                for MinHashHit { distance, row_id } in hits.into_sorted() {
                     query_index_builder.append_value(query_index as i32);
-                    distance_builder.append_value(distance);
+                    distance_builder.append_value(distance.0);
                     row_id_builder.append_value(row_id);
                 }
             }
@@ -3176,7 +3136,9 @@ mod tests {
     #[case::fewer_than_k(4, vec![vec![(2.0, 2)], vec![(1.0, 1)]])]
     #[case::zero_k(0, vec![vec![(1.0, 1)]])]
     #[case::ties_and_duplicates(3, vec![vec![(1.0, 7), (1.0, 3)], vec![(1.0, 3), (1.0, 5)]])]
-    #[case::float_total_order(3, vec![vec![(f32::NAN, 1), (-0.0, 2)], vec![(0.0, 3), (f32::NEG_INFINITY, 4)]])]
+    #[case::worse_after_full(1, vec![vec![(1.0, 1)], vec![(2.0, 2)]])]
+    #[case::float_total_order(3, vec![vec![(f32::NAN, 1), (-0.0, 3)], vec![(0.0, 2), (f32::NEG_INFINITY, 4)]])]
+    #[case::signed_zero_at_capacity(1, vec![vec![(0.0, 2)], vec![(-0.0, 3)]])]
     fn test_ann_batch_candidate_merge_matches_sort(
         #[case] k: usize,
         #[case] segments: Vec<Vec<(f32, u64)>>,
@@ -3185,17 +3147,22 @@ mod tests {
         expected.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
         expected.truncate(k);
 
-        let mut heap = BinaryHeap::with_capacity(k);
+        let mut hits = TopHits::new(k);
+        let mut candidates_seen = 0;
         for segment in segments {
             for (distance, row_id) in segment {
-                push_ann_batch_candidate(&mut heap, AnnBatchCandidate { distance, row_id }, k);
-                assert!(heap.len() <= k);
+                hits.push(MinHashHit {
+                    distance: OrderedFloat(distance),
+                    row_id,
+                });
+                candidates_seen += 1;
+                assert_eq!(hits.missing(), k.saturating_sub(candidates_seen));
             }
         }
-        let actual = heap.into_sorted_vec();
+        let actual = hits.into_sorted();
         assert_eq!(actual.len(), expected.len());
         for (candidate, (distance, row_id)) in actual.iter().zip(expected) {
-            assert_eq!(candidate.distance.to_bits(), distance.to_bits());
+            assert_eq!(candidate.distance.0.to_bits(), distance.to_bits());
             assert_eq!(candidate.row_id, row_id);
         }
     }
