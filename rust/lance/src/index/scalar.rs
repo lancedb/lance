@@ -60,6 +60,7 @@ use lance_index::scalar::registry::{
     ScalarIndexCacheKey, ScalarIndexLoad, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering,
     VALUE_COLUMN_NAME,
 };
+use lance_index::scalar::zonemap::ZoneMapIndexBuilderParams;
 use lance_index::scalar::{BuiltinIndexType, CreatedIndex, InvertedIndexParams};
 use lance_index::scalar::{
     ScalarIndex, ScalarIndexParams, bitmap::BITMAP_LOOKUP_NAME, inverted::INVERT_LIST_FILE,
@@ -162,6 +163,7 @@ pub(crate) async fn scan_training_data(
     column: &str,
     criteria: &TrainingCriteria,
     selection: Option<TrainingRows>,
+    physical_rows: Option<RowAddrTreeMap>,
 ) -> Result<SendableRecordBatchStream> {
     let num_rows = dataset.count_all_rows().await?;
 
@@ -199,6 +201,11 @@ pub(crate) async fn scan_training_data(
             scan.with_row_id_prefilter(RowAddrMask::from_allowed(rows));
         }
         None => {}
+    }
+    // A physical selection restricts the scan to these rows of the selected
+    // fragments (the two intersect); the caller includes every row it wants.
+    if let Some(physical_rows) = physical_rows {
+        scan.with_physical_row_addr_prefilter(physical_rows);
     }
 
     let batches = scan
@@ -239,6 +246,7 @@ pub(crate) async fn load_training_data(
     fragments: Option<Vec<Fragment>>,
     train: bool,
     fragment_ids: Option<Vec<u32>>,
+    physical_rows: Option<RowAddrTreeMap>,
 ) -> Result<SendableRecordBatchStream> {
     // Create training request with fragment_ids if provided
     let training_request = Box::new(match fragment_ids.clone() {
@@ -273,10 +281,10 @@ pub(crate) async fn load_training_data(
                 })
                 .collect();
             let selection = Some(TrainingRows::Fragments(frags?));
-            scan_training_data(dataset, column, criteria, selection).await
+            scan_training_data(dataset, column, criteria, selection, physical_rows).await
         } else {
             let selection = fragments.map(TrainingRows::Fragments);
-            scan_training_data(dataset, column, criteria, selection).await
+            scan_training_data(dataset, column, criteria, selection, physical_rows).await
         }
     } else {
         TrainingRequest::create_empty_stream(dataset, column, criteria).await
@@ -303,6 +311,7 @@ pub(crate) async fn load_fts_training_data(
         fragments,
         train,
         fragment_ids,
+        None,
     )
     .await?;
     if resolved.has_lists() {
@@ -459,6 +468,33 @@ pub(super) async fn build_scalar_index(
     let training_request =
         trainer.new_training_request(params.params.as_deref().unwrap_or("{}"), &field)?;
 
+    // A zone map trained from the table reuses the write seeds its fragments
+    // already carry and scans only the fragments without one. A caller that
+    // supplies the rows itself has already chosen what to train from.
+    if train
+        && preprocessed_data.is_none()
+        && params
+            .index_type
+            .eq_ignore_ascii_case(BuiltinIndexType::ZoneMap.as_str())
+    {
+        let zone_map_params = serde_json::from_str::<ZoneMapIndexBuilderParams>(
+            params.params.as_deref().unwrap_or("{}"),
+        )?;
+        progress.stage_start("load_data", None, "rows").await?;
+        let created = zonemap::build_segment_with_seeds(
+            dataset,
+            column,
+            zone_map_params,
+            field.data_type(),
+            fragment_ids,
+            training_request.criteria(),
+            &index_store,
+        )
+        .await?;
+        progress.stage_complete("load_data").await?;
+        return Ok(created);
+    }
+
     progress.stage_start("load_data", None, "rows").await?;
     let training_data = match (preprocessed_data, resolved_fts_field.as_ref()) {
         (Some((preprocessed_data, declared)), _) => {
@@ -491,6 +527,7 @@ pub(super) async fn build_scalar_index(
                 None,
                 train,
                 fragment_ids.clone(),
+                None,
             )
             .await?
         }
@@ -562,8 +599,16 @@ pub(super) async fn build_bitmap_index_segment(
     let criteria = training_request.criteria();
 
     progress.stage_start("load_data", None, "rows").await?;
-    let training_data =
-        load_training_data(dataset, column, criteria, None, true, Some(fragment_ids)).await?;
+    let training_data = load_training_data(
+        dataset,
+        column,
+        criteria,
+        None,
+        true,
+        Some(fragment_ids),
+        None,
+    )
+    .await?;
     progress.stage_complete("load_data").await?;
 
     let index_store = LanceIndexStore::from_dataset_for_new(dataset, &uuid)?;
@@ -1548,6 +1593,7 @@ mod tests {
             &TrainingCriteria::new(TrainingOrdering::Addresses).with_row_addr(),
             None,
             true,
+            None,
             None,
         )
         .await
