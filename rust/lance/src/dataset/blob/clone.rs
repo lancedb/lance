@@ -20,9 +20,8 @@ use lance_table::format::{Fragment, Manifest};
 use object_store::path::Path;
 use uuid::Uuid;
 
-use super::{
-    BlobV2DescriptorColumns, field_contains_blob, join_base_and_relative_path, managed_references,
-};
+use super::locate::{BlobV2DescriptorColumns, join_base_and_relative_path};
+use super::managed::{field_contains_blob, managed_references};
 use crate::dataset::Dataset;
 use crate::dataset::optimize::BlobV2BatchRewritePlan;
 

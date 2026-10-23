@@ -51,6 +51,11 @@ references. It then records the largest ID assigned after activation. When a man
 
 </details>
 
+The manifest also has a `config` map for table-level configuration. Keys prefixed with
+`lance.` are reserved for the Lance library; conforming readers and writers are expected
+to recognize and honor them. See the [Table Config Specification](table_config.md) for
+the full list of known `lance.` configuration keys and their meanings.
+
 ## Schema & Fields
 
 The schema of the table is written as a series of fields, plus a schema metadata map.
@@ -144,6 +149,19 @@ fragment's row lineage sequences when they are not stored in the manifest; see
 fragment's `files`, next to user columns or in a file holding nothing else, and at
 most one file of a fragment may carry each of these ids.
 
+### Fragment Metadata
+
+Like `Manifest.table_metadata`, `DataFragment.metadata` is a `map<string, string>`
+for arbitrary metadata associated with the fragment. It may be empty. Use namespaced
+keys and small values. Any metadata stored here must remain valid regardless of
+operations on the same fragment, including column replacement, overlays, and deletions.
+
+- Changes to the same fragment preserve all entries, including unknown ones.
+- New fragments do not automatically inherit metadata from their inputs.
+
+A nonempty map requires `FLAG_OBJECT_METADATA` (`1 << 17`) in
+`writer_feature_flags`. Readers may ignore it.
+
 ## Data Files
 
 Data files store column data for a fragment using the Lance file format.
@@ -217,6 +235,12 @@ versioning, index integration, compaction, and a worked example — see the
 
 
 ## Related Specifications
+
+### Table Config
+
+Standard `lance.`-prefixed table configuration keys and their meanings.
+
+See [Table Config Specification](table_config.md)
 
 ### Storage Layout
 

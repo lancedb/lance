@@ -73,12 +73,19 @@ pub const FLAG_FRAGMENT_REUSE_INDEX: u64 = 1 << 10;
 /// every fragment has them; a writer without it would carry the fragment
 /// forward and drop the sequence. Both must refuse the table.
 ///
-/// Every earlier build has its unknown boundary at or below this bit, so each
-/// already refuses such a dataset without a change of its own. Spilled row
-/// lineage is not yet a released feature: this build understands the bit only
-/// in debug builds or when [`ENABLE_UNSTABLE_SPILLED_ROW_LINEAGE_ENV`] is set,
-/// mirroring [`FLAG_UNSTABLE_DATA_OVERLAY_FILES`].
-pub const FLAG_UNSTABLE_SPILLED_ROW_LINEAGE: u64 = 1 << 11;
+/// Supported in every build. Table configuration controls whether a writer
+/// spills sequences; readers must understand existing spilled sequences even
+/// when spilling is disabled for subsequent writes.
+///
+/// ```
+/// use lance_table::feature_flags::{FLAG_SPILLED_ROW_LINEAGE, can_read_dataset};
+///
+/// assert!(can_read_dataset(FLAG_SPILLED_ROW_LINEAGE));
+/// ```
+pub const FLAG_SPILLED_ROW_LINEAGE: u64 = 1 << 11;
+/// Deprecated name for [`FLAG_SPILLED_ROW_LINEAGE`].
+#[deprecated(since = "14.0.0", note = "use FLAG_SPILLED_ROW_LINEAGE instead")]
+pub const FLAG_UNSTABLE_SPILLED_ROW_LINEAGE: u64 = FLAG_SPILLED_ROW_LINEAGE;
 /// Reserved for fragment trees. Readers and writers reject it until implemented.
 ///
 /// Bit 11 is spilled row lineage, so this takes the next free bit.
@@ -109,8 +116,17 @@ pub const MANAGED_BLOBS_META_KEY: &str = "lance.blob.managed";
 /// Writers must understand this allocation contract. It does not change how
 /// readers interpret the schema or data files.
 pub const FLAG_NON_REUSABLE_FIELD_IDS: u64 = 1 << 15;
+/// Required for data files containing version 1 zone-level statistics seeds.
+/// Their min/max exclude NaNs, which are counted separately by sign. Set in
+/// both reader and writer feature flags and preserve across commits.
+pub const FLAG_ZONE_WRITE_SEEDS: u64 = 1 << 16;
+/// Writer-only protection for clustering definitions, ID allocation, references,
+/// and generic fragment/index segment metadata maintenance.
+/// Reserved and unsupported until writers implement its maintenance rules.
+/// Ordinary readers can ignore this metadata; all covered features share this one bit.
+pub const FLAG_OBJECT_METADATA: u64 = 1 << 17;
 /// The first bit that is unknown as a feature flag
-pub const FLAG_UNKNOWN: u64 = 1 << 16;
+pub const FLAG_UNKNOWN: u64 = 1 << 18;
 
 const _: () = assert!(FLAG_COVERED_INDEX_METADATA < FLAG_UNKNOWN);
 // The fence needs a bit the current released build already refuses, which means
@@ -122,26 +138,24 @@ const _: () = assert!(FLAG_NON_REUSABLE_FIELD_IDS < FLAG_UNKNOWN);
 const _: () = assert!(FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS >= 1 << 9);
 const _: () = assert!(FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS < FLAG_UNKNOWN);
 const _: () = assert!(FLAG_FRAGMENT_REUSE_INDEX < FLAG_UNKNOWN);
-const _: () = assert!(FLAG_UNSTABLE_SPILLED_ROW_LINEAGE < FLAG_UNKNOWN);
+const _: () = assert!(FLAG_SPILLED_ROW_LINEAGE < FLAG_UNKNOWN);
 const _: () = assert!(FLAG_FRAGMENT_TREE < FLAG_UNKNOWN);
 const _: () = assert!(FLAG_INDEPENDENT_COVERING_FIELDS < FLAG_UNKNOWN);
 
 const _: () = assert!(FLAG_MANAGED_BLOBS < FLAG_UNKNOWN);
+const _: () = assert!(FLAG_ZONE_WRITE_SEEDS < FLAG_UNKNOWN);
+const _: () = assert!(FLAG_OBJECT_METADATA < FLAG_UNKNOWN);
 
-pub(crate) const STICKY_PAIRED_FLAGS: u64 =
-    FLAG_MIXED_DATA_FILE_VERSIONS | FLAG_FRAGMENT_REUSE_INDEX | FLAG_MANAGED_BLOBS;
+pub(crate) const STICKY_PAIRED_FLAGS: u64 = FLAG_MIXED_DATA_FILE_VERSIONS
+    | FLAG_FRAGMENT_REUSE_INDEX
+    | FLAG_MANAGED_BLOBS
+    | FLAG_ZONE_WRITE_SEEDS;
 pub(crate) const STICKY_READER_FLAGS: u64 = STICKY_PAIRED_FLAGS;
 pub(crate) const STICKY_WRITER_FLAGS: u64 = STICKY_PAIRED_FLAGS | FLAG_NON_REUSABLE_FIELD_IDS;
 
 /// Environment variable that opts a release build into reading and writing data
 /// overlay files before the feature is generally released.
 pub const ENABLE_UNSTABLE_DATA_OVERLAY_FILES_ENV: &str = "LANCE_ENABLE_UNSTABLE_DATA_OVERLAY_FILES";
-
-/// Environment variable that opts a release build into reading and writing row
-/// lineage sequences spilled to hidden data file columns before the feature is
-/// generally released.
-pub const ENABLE_UNSTABLE_SPILLED_ROW_LINEAGE_ENV: &str =
-    "LANCE_ENABLE_UNSTABLE_SPILLED_ROW_LINEAGE";
 
 /// Set the reader and writer feature flags in the manifest based on the contents of the manifest.
 pub fn apply_feature_flags(
@@ -222,8 +236,8 @@ pub fn apply_feature_flags(
         .iter()
         .any(|frag| frag.has_spilled_row_lineage());
     if has_spilled_row_lineage {
-        manifest.reader_feature_flags |= FLAG_UNSTABLE_SPILLED_ROW_LINEAGE;
-        manifest.writer_feature_flags |= FLAG_UNSTABLE_SPILLED_ROW_LINEAGE;
+        manifest.reader_feature_flags |= FLAG_SPILLED_ROW_LINEAGE;
+        manifest.writer_feature_flags |= FLAG_SPILLED_ROW_LINEAGE;
     }
 
     if disable_transaction_file {
@@ -291,13 +305,6 @@ fn data_overlay_files_enabled() -> bool {
     cfg!(debug_assertions) || std::env::var_os(ENABLE_UNSTABLE_DATA_OVERLAY_FILES_ENV).is_some()
 }
 
-/// Whether this build understands row lineage sequences spilled to data file
-/// columns: always in debug builds, and in release builds only when
-/// [`ENABLE_UNSTABLE_SPILLED_ROW_LINEAGE_ENV`] is set, like data overlay files.
-pub fn spilled_row_lineage_enabled() -> bool {
-    cfg!(debug_assertions) || std::env::var_os(ENABLE_UNSTABLE_SPILLED_ROW_LINEAGE_ENV).is_some()
-}
-
 /// Debug builds only, with no environment override, until continuous recording
 /// and retention land. Hidden because it is removed then.
 #[doc(hidden)]
@@ -319,7 +326,6 @@ fn mark_supported(flags: &mut u64, flag: u64, feature_enabled: bool) {
 /// without toggling the build profile or environment.
 fn supported_flags_when(
     overlay_enabled: bool,
-    spilled_row_lineage_enabled: bool,
     frag_reuse_with_stable_row_ids_enabled: bool,
 ) -> u64 {
     let mut supported = FLAG_UNKNOWN - 1;
@@ -333,21 +339,17 @@ fn supported_flags_when(
         FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS,
         frag_reuse_with_stable_row_ids_enabled,
     );
-    mark_supported(
-        &mut supported,
-        FLAG_UNSTABLE_SPILLED_ROW_LINEAGE,
-        spilled_row_lineage_enabled,
-    );
     // Reserved, not implemented: see the flag's doc comment.
     mark_supported(&mut supported, FLAG_FRAGMENT_TREE, false);
     mark_supported(&mut supported, FLAG_INDEPENDENT_COVERING_FIELDS, false);
+    mark_supported(&mut supported, FLAG_ZONE_WRITE_SEEDS, true);
+    mark_supported(&mut supported, FLAG_OBJECT_METADATA, false);
     supported
 }
 
 fn supported_flags() -> u64 {
     supported_flags_when(
         data_overlay_files_enabled(),
-        spilled_row_lineage_enabled(),
         frag_reuse_with_stable_row_ids_enabled(),
     )
 }
@@ -419,6 +421,7 @@ pub fn validate_paired_feature_flags(manifest: &Manifest) -> Result<()> {
     for (flag, name) in [
         (FLAG_MIXED_DATA_FILE_VERSIONS, "mixed data-file-version"),
         (FLAG_MANAGED_BLOBS, "Managed Blob"),
+        (FLAG_ZONE_WRITE_SEEDS, "zone write seed"),
     ] {
         let reader = manifest.reader_feature_flags & flag != 0;
         let writer = manifest.writer_feature_flags & flag != 0;
@@ -532,6 +535,61 @@ mod tests {
     use crate::format::BasePath;
 
     #[test]
+    fn test_object_metadata_flag_fences_writes_without_blocking_reads() {
+        let mut manifest = empty_manifest();
+        manifest.writer_feature_flags = FLAG_OBJECT_METADATA;
+        ensure_can_read_manifest(&manifest).unwrap();
+        let error = ensure_can_write_manifest(&manifest).unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }));
+        assert!(error.to_string().contains("cannot be written"));
+        assert!(!can_read_dataset(FLAG_OBJECT_METADATA));
+        assert!(!can_write_dataset(FLAG_OBJECT_METADATA));
+        assert_eq!(FLAG_OBJECT_METADATA, 1 << 17);
+        // The zone seed bit below it is supported; bits above remain unknown.
+        assert!(can_read_dataset(FLAG_ZONE_WRITE_SEEDS));
+        assert!(can_write_dataset(FLAG_ZONE_WRITE_SEEDS));
+        assert_eq!(FLAG_UNKNOWN, 1 << 18);
+        assert!(!can_read_dataset(FLAG_UNKNOWN));
+        assert!(!can_write_dataset(FLAG_UNKNOWN));
+    }
+
+    #[test]
+    fn test_zone_write_seed_flag_is_supported_and_sticky() {
+        assert_eq!(FLAG_ZONE_WRITE_SEEDS, 1 << 16);
+        // This build implements version 1 seeds: flagged datasets stay
+        // readable and writable here, while pre-flag builds refuse them.
+        assert!(can_read_dataset(FLAG_ZONE_WRITE_SEEDS));
+        assert!(can_write_dataset(FLAG_ZONE_WRITE_SEEDS));
+
+        let mut manifest = empty_manifest();
+        manifest.reader_feature_flags = FLAG_ZONE_WRITE_SEEDS;
+        manifest.writer_feature_flags = FLAG_ZONE_WRITE_SEEDS;
+        apply_feature_flags(&mut manifest, false, false).unwrap();
+        assert_eq!(manifest.reader_feature_flags, FLAG_ZONE_WRITE_SEEDS);
+        assert_eq!(manifest.writer_feature_flags, FLAG_ZONE_WRITE_SEEDS);
+
+        ensure_can_read_manifest(&manifest).unwrap();
+        ensure_can_write_manifest(&manifest).unwrap();
+
+        let mut destination = empty_manifest();
+        inherit_sticky_feature_flags(&mut destination, &manifest).unwrap();
+        assert_eq!(destination.reader_feature_flags, FLAG_ZONE_WRITE_SEEDS);
+        assert_eq!(destination.writer_feature_flags, FLAG_ZONE_WRITE_SEEDS);
+    }
+
+    #[test]
+    fn test_zone_write_seeds_require_both_feature_bits() {
+        for (reader, writer) in [(true, false), (false, true)] {
+            let mut manifest = empty_manifest();
+            manifest.reader_feature_flags = if reader { FLAG_ZONE_WRITE_SEEDS } else { 0 };
+            manifest.writer_feature_flags = if writer { FLAG_ZONE_WRITE_SEEDS } else { 0 };
+            let error = validate_paired_feature_flags(&manifest).unwrap_err();
+            assert!(matches!(error, Error::CorruptFile { .. }));
+            assert!(error.to_string().contains("zone write seed"));
+        }
+    }
+
+    #[test]
     fn test_fragment_tree_flag_is_reserved_not_supported() {
         assert_eq!(FLAG_FRAGMENT_TREE, 4096);
         assert_eq!(
@@ -546,14 +604,13 @@ mod tests {
     fn test_frag_reuse_with_stable_row_ids_flag_release_gating() {
         // v12.0.0's unknown boundary, so every released client refuses it.
         assert_eq!(FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS, 512);
-        let without_support = supported_flags_when(true, true, false);
+        let without_support = supported_flags_when(true, false);
         assert_ne!(FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS & !without_support, 0);
         assert_eq!(FLAG_STABLE_ROW_IDS & !without_support, 0);
-        let enabled = supported_flags_when(false, false, true);
+        let enabled = supported_flags_when(false, true);
         assert_eq!(FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS & !enabled, 0);
         for unrelated in [
             FLAG_UNSTABLE_DATA_OVERLAY_FILES,
-            FLAG_UNSTABLE_SPILLED_ROW_LINEAGE,
             FLAG_FRAGMENT_TREE,
             FLAG_UNKNOWN,
         ] {
@@ -607,29 +664,32 @@ mod tests {
     fn test_data_overlay_flag_release_gating() {
         // Release default (overlays disabled): the overlay flag is treated as
         // unknown so the dataset is refused, while other known flags still pass.
-        let supported = supported_flags_when(false, false, false);
+        let supported = supported_flags_when(false, false);
         assert_eq!(supported & FLAG_UNSTABLE_DATA_OVERLAY_FILES, 0);
         assert_eq!(FLAG_DELETION_FILES & !supported, 0);
         assert_ne!(FLAG_UNSTABLE_DATA_OVERLAY_FILES & !supported, 0);
         // Enabled (debug or env opt-in): the overlay flag is understood.
-        let supported = supported_flags_when(true, false, false);
+        let supported = supported_flags_when(true, false);
         assert_eq!(FLAG_UNSTABLE_DATA_OVERLAY_FILES & !supported, 0);
     }
 
     #[test]
-    fn test_spilled_row_lineage_flag_release_gating() {
-        // Every earlier build has its unknown boundary at or below this bit
-        // (256 for v11, 512 for the v12 and v13 pre-releases, 2048 on main
-        // before this flag), so each refuses the dataset without a change of
-        // its own.
-        assert_eq!(FLAG_UNSTABLE_SPILLED_ROW_LINEAGE, 2048);
-        // A build that has not opted in refuses the dataset; one that has
-        // understands it, and either way the other known flags still pass.
-        let supported = supported_flags_when(true, false, false);
-        assert_ne!(FLAG_UNSTABLE_SPILLED_ROW_LINEAGE & !supported, 0);
-        assert_eq!(FLAG_MIXED_DATA_FILE_VERSIONS & !supported, 0);
-        let supported = supported_flags_when(true, true, false);
-        assert_eq!(FLAG_UNSTABLE_SPILLED_ROW_LINEAGE & !supported, 0);
+    fn test_spilled_row_lineage_flag_is_stable() {
+        assert_eq!(FLAG_SPILLED_ROW_LINEAGE, 2048);
+        // Support must not depend on enabling unrelated experimental formats.
+        let supported = supported_flags_when(false, false);
+        let flags = FLAG_STABLE_ROW_IDS | FLAG_SPILLED_ROW_LINEAGE;
+        assert_eq!(flags & !supported, 0);
+        assert!(can_read_dataset(flags));
+        assert!(can_write_dataset(flags));
+        for unsupported in [
+            FLAG_UNSTABLE_DATA_OVERLAY_FILES,
+            FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS,
+            FLAG_FRAGMENT_TREE,
+            FLAG_UNKNOWN,
+        ] {
+            assert_ne!(unsupported & !supported, 0);
+        }
     }
 
     #[test]
@@ -711,14 +771,8 @@ mod tests {
                 HashMap::new(),
             );
             apply_feature_flags(&mut manifest, true, false).unwrap();
-            assert_ne!(
-                manifest.reader_feature_flags & FLAG_UNSTABLE_SPILLED_ROW_LINEAGE,
-                0
-            );
-            assert_ne!(
-                manifest.writer_feature_flags & FLAG_UNSTABLE_SPILLED_ROW_LINEAGE,
-                0
-            );
+            assert_ne!(manifest.reader_feature_flags & FLAG_SPILLED_ROW_LINEAGE, 0);
+            assert_ne!(manifest.writer_feature_flags & FLAG_SPILLED_ROW_LINEAGE, 0);
         }
 
         // An inline sequence does not, so a table whose sequences all fit in
@@ -732,10 +786,7 @@ mod tests {
             HashMap::new(),
         );
         apply_feature_flags(&mut manifest, true, false).unwrap();
-        assert_eq!(
-            manifest.reader_feature_flags & FLAG_UNSTABLE_SPILLED_ROW_LINEAGE,
-            0
-        );
+        assert_eq!(manifest.reader_feature_flags & FLAG_SPILLED_ROW_LINEAGE, 0);
     }
 
     #[test]
