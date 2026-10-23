@@ -6,6 +6,7 @@
 
 use lance_core::utils::address::RowAddress;
 use lance_index::scalar::RowAddrTranslator;
+use lance_index::vector::storage::ResidentColumns;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
@@ -33,6 +34,7 @@ use lance_index::mem_wal::{MEM_WAL_INDEX_NAME, MemWalIndex, MemWalIndexHandle};
 use lance_index::optimize::OptimizeOptions;
 use lance_index::pb::index::Implementation;
 pub use lance_index::progress::{IndexBuildProgress, NoopIndexBuildProgress};
+pub use lance_index::registry::register_scalar_index_plugin;
 use lance_index::scalar::expression::{IndexInformationProvider, MultiQueryParser};
 use lance_index::scalar::inverted::{InvertedIndex, InvertedIndexPlugin};
 use lance_index::scalar::lance_format::LanceIndexStore;
@@ -75,7 +77,7 @@ use vector::details::{
     vector_details_as_json,
 };
 pub(crate) use vector::details::{vector_index_details, vector_index_details_default};
-use vector::ivf::v2::{IVFIndex, IvfStateEntryBox};
+use vector::ivf::v2::{IVFIndex, IvfOpenContext, IvfStateEntryBox, aux_file_key};
 use vector::utils::get_vector_type;
 
 mod api;
@@ -1047,13 +1049,9 @@ pub(crate) async fn build_index_metadata_from_segments(
 
     let mut seen_segment_ids = HashSet::with_capacity(segments.len());
     let mut covered_fragments = RoaringBitmap::new();
-    // One logical index needs one declaration. The per-segment rules below only
-    // pin the *keyed* field and its count, so segments that disagree on the
-    // carried columns -- `fields = [k, a]` beside `fields = [k]`, say -- each pass
-    // individually. Committing that pair produces an index whose own description
-    // path refuses it: `IndexDescriptionImpl::try_new` requires `fields` to be
-    // identical across segments, so `describe_indices` would error on metadata
-    // this function just wrote. Same rule, and same reason, as
+    // Per-segment validation does not establish one ordered declaration for
+    // the logical index: both carried columns and plugin dependencies can
+    // differ. Keep the same invariant as `IndexDescriptionImpl::try_new` and
     // `merge_existing_index_segments`.
     let expected_fields = segments[0].fields().to_vec();
     let expected_covering_fields = segments[0].covering_fields().to_vec();
@@ -1066,7 +1064,17 @@ pub(crate) async fn build_index_metadata_from_segments(
                 dataset.manifest.version
             )));
         }
-        if segment.keyed_field() != Some(field_id) {
+        // Multi-field statistics are built and maintained by the plugin. Empty
+        // coverage keeps them out of the single-column query and remap paths.
+        let is_multi_field_plugin = segment.fields().len() > 1
+            && segment.covering_fields().is_empty()
+            && segment.fragment_bitmap().is_empty()
+            && scalar::SCALAR_INDEX_PLUGIN_REGISTRY
+                .get_plugin_by_details(segment.index_details())
+                .is_ok_and(|plugin| !plugin.supports_optimization());
+        if segment.keyed_field() != Some(field_id)
+            && !(is_multi_field_plugin && segment.fields().first() == Some(&field_id))
+        {
             return Err(Error::invalid_input(format!(
                 "CreateIndex: segment {} was built for fields {:?} (carried {:?}), \
                  expected keyed field [{}]",
@@ -1075,6 +1083,27 @@ pub(crate) async fn build_index_metadata_from_segments(
                 segment.covering_fields(),
                 field_id
             )));
+        }
+        if is_multi_field_plugin {
+            let mut seen_fields = HashSet::with_capacity(segment.fields().len());
+            for id in segment.fields() {
+                if dataset.schema().field_by_id(*id).is_none() {
+                    return Err(Error::invalid_input(format!(
+                        "CreateIndex: segment {} references field id {} absent from dataset version {}",
+                        segment.uuid(),
+                        id,
+                        dataset.manifest.version
+                    )));
+                }
+                if !seen_fields.insert(*id) {
+                    return Err(Error::invalid_input(format!(
+                        "CreateIndex: segment {} repeats field id {} in {:?}",
+                        segment.uuid(),
+                        id,
+                        segment.fields()
+                    )));
+                }
+            }
         }
         // Cardinality alone does not prove `covering_fields` is really the
         // trailing slice of `fields`; delegate that to the same rule a
@@ -1928,7 +1957,13 @@ fn legacy_type_name(index_uri: &str, index_type_hint: Option<&str>) -> String {
         "Json" => IndexType::Scalar.to_string(),
         "Flat" | "Vector" => IndexType::Vector.to_string(),
         other if other.contains("Vector") => IndexType::Vector.to_string(),
-        _ => "N/A".to_string(),
+        _ => scalar::SCALAR_INDEX_PLUGIN_REGISTRY
+            .get_plugin_by_details(&prost_types::Any {
+                type_url: index_uri.to_string(),
+                value: Vec::new(),
+            })
+            .map(|plugin| plugin.name().to_string())
+            .unwrap_or_else(|_| "N/A".to_string()),
     }
 }
 
@@ -3045,18 +3080,6 @@ impl DatasetIndexExt for Dataset {
             .map(|details| details.type_url.clone());
         let mut incoming_fragments = RoaringBitmap::new();
         for segment in &new_indices {
-            // Mirrors `build_index_metadata_from_segments`'s guard, which
-            // already validated these exact segments. Kept in the same shape
-            // so this second look does not silently re-reject what that guard
-            // just accepted.
-            if segment.keyed_field() != Some(field.id) {
-                return Err(Error::invalid_input(format!(
-                    "CreateIndex: segment {} was built for fields {:?} (carried {:?}), \
-                     expected keyed field [{}]",
-                    segment.uuid, segment.fields, segment.covering_fields, field.id
-                )));
-            }
-            segment.validate_covering_fields()?;
             if let Some(fragment_bitmap) = &segment.fragment_bitmap {
                 incoming_fragments |= fragment_bitmap.clone();
             }
@@ -3064,9 +3087,9 @@ impl DatasetIndexExt for Dataset {
 
         let existing_named_indices = load_all_indices_by_name(self, index_name).await?;
         if existing_named_indices.iter().any(|idx| {
-            // Same name-collision rule as `CreateIndexBuilder`'s default-name
-            // loop in create.rs.
-            idx.keyed_field() != Some(field.id)
+            // Field order is part of a plugin scope's identity. Covered
+            // single-column indices still compare only their keyed prefix.
+            idx.keyed_fields() != new_indices[0].keyed_fields()
         }) {
             return Err(Error::index(format!(
                 "Index name '{index_name}' already exists with different fields, \
@@ -3381,9 +3404,9 @@ impl DatasetIndexExt for Dataset {
 /// with all of its segments, in name order.
 ///
 /// An index this build cannot rewrite is skipped with a warning: an index type
-/// it does not recognize, a segment newer than it reads, a covered index, or a
-/// scalar index with nothing to do. A covered index the caller named in
-/// `index_names` is refused instead.
+/// it does not recognize, a segment newer than it reads, a covered index, an
+/// externally maintained index, or a scalar index with nothing to do. A covered
+/// or externally maintained index named in `index_names` is refused instead.
 pub(crate) fn optimizable_indices<'a>(
     dataset: &Dataset,
     indices: &'a [IndexMetadata],
@@ -3417,6 +3440,22 @@ pub(crate) fn optimizable_indices<'a>(
                 index.name,
                 type_url
             );
+            continue;
+        }
+
+        if let Some(index) = deltas.iter().find(|index| {
+            index.index_details.as_ref().is_some_and(|details| {
+                scalar::SCALAR_INDEX_PLUGIN_REGISTRY
+                    .get_plugin_by_details(details)
+                    .is_ok_and(|plugin| !plugin.supports_optimization())
+            })
+        }) {
+            if options.index_names.is_some() {
+                return Err(Error::not_supported(format!(
+                    "Index '{}' is maintained externally and does not support optimize_indices",
+                    index.name
+                )));
+            }
             continue;
         }
 
@@ -3666,13 +3705,19 @@ async fn collect_regular_indices_statistics(
     let mut index_uri: Option<String> = None;
 
     for meta in metadatas.iter() {
-        // An index that covers no fragments has no file to load statistics
-        // from: it carries its definition and nothing else until there is
-        // enough data to train it.
-        if meta
-            .fragment_bitmap
-            .as_ref()
-            .is_some_and(roaring::RoaringBitmap::is_empty)
+        // Externally maintained indices can keep coverage in their own payload
+        // and deliberately declare an empty bitmap. Other empty indices carry
+        // only a definition until there is enough data to train them.
+        let is_externally_maintained = meta.index_details.as_ref().is_some_and(|details| {
+            scalar::SCALAR_INDEX_PLUGIN_REGISTRY
+                .get_plugin_by_details(details)
+                .is_ok_and(|plugin| !plugin.supports_optimization())
+        });
+        if !is_externally_maintained
+            && meta
+                .fragment_bitmap
+                .as_ref()
+                .is_some_and(roaring::RoaringBitmap::is_empty)
         {
             indices_stats.push(serde_json::json!({}));
             continue;
@@ -4214,6 +4259,26 @@ impl Dataset {
     ) -> Result<Arc<dyn VectorIndex>> {
         let uuid = &index_meta.uuid;
         let object_store = self.object_store_for_index(index_meta).await?;
+        let index_dir = self.indice_files_dir(index_meta)?;
+        // Hold the shared allocation before cache accesses can evict it.
+        // The handle is dropped if this index does not use resident columns.
+        let file_cache = self.index_cache.for_index(uuid, None);
+        let resident_columns_handle = Some(ResidentColumns::shared(&aux_file_key(
+            &object_store,
+            &index_dir,
+            uuid,
+        )));
+        // What the session declares about the index, for whichever IVF open
+        // or reconstruction below runs, and where a reconstruction adds the
+        // I/O of a resident store load.
+        let open_context = IvfOpenContext {
+            rabit_scan_factory: self.session.rabit_scan_factory.clone(),
+            origin_latency_hint: self.session.index_origin_latency(),
+            resident_columns: self.session.index_resident_columns(),
+            file_cache: Some(file_cache),
+            resident_columns_handle,
+            io_stats: metrics.io_stats(),
+        };
         let resolved =
             frag_reuse::open_row_id_remapping_with_plan(self, index_meta, staged, purpose, metrics)
                 .await?;
@@ -4238,6 +4303,7 @@ impl Dataset {
                     self.metadata_cache.as_ref(),
                     partition_cache,
                     remapping,
+                    open_context,
                 )
                 .await;
         }
@@ -4259,7 +4325,6 @@ impl Dataset {
         } else {
             self.open_frag_reuse_index(metrics).await?
         };
-        let index_dir = self.indice_files_dir(index_meta)?;
         let index_file = index_dir
             .clone()
             .join(uuid.to_string())
@@ -4380,6 +4445,7 @@ impl Dataset {
                                 self.metadata_cache.as_ref(),
                                 index_cache,
                                 file_sizes,
+                                open_context,
                             )
                             .await?;
                             Ok(wrap_ivf(ivf))
@@ -4393,6 +4459,7 @@ impl Dataset {
                                 self.metadata_cache.as_ref(),
                                 index_cache,
                                 file_sizes,
+                                open_context,
                             )
                             .await?;
                             Ok(wrap_ivf(ivf))
@@ -4412,6 +4479,7 @@ impl Dataset {
                             self.metadata_cache.as_ref(),
                             index_cache,
                             file_sizes,
+                            open_context,
                         )
                         .await?;
                         Ok(wrap_ivf(ivf))
@@ -4426,6 +4494,7 @@ impl Dataset {
                             self.metadata_cache.as_ref(),
                             index_cache,
                             file_sizes,
+                            open_context,
                         )
                         .await?;
                         Ok(wrap_ivf(ivf))
@@ -4440,6 +4509,7 @@ impl Dataset {
                             self.metadata_cache.as_ref(),
                             index_cache,
                             file_sizes,
+                            open_context,
                         )
                         .await?;
                         Ok(wrap_ivf(ivf))
@@ -4455,6 +4525,7 @@ impl Dataset {
                                 self.metadata_cache.as_ref(),
                                 index_cache,
                                 file_sizes,
+                                open_context,
                             )
                             .await?;
                             Ok(wrap_ivf(ivf))
@@ -4468,6 +4539,7 @@ impl Dataset {
                                 self.metadata_cache.as_ref(),
                                 index_cache,
                                 file_sizes,
+                                open_context,
                             )
                             .await?;
                             Ok(wrap_ivf(ivf))
@@ -4483,6 +4555,7 @@ impl Dataset {
                             self.metadata_cache.as_ref(),
                             index_cache,
                             file_sizes,
+                            open_context,
                         )
                         .await?;
                         Ok(wrap_ivf(ivf))
@@ -4497,6 +4570,7 @@ impl Dataset {
                             self.metadata_cache.as_ref(),
                             index_cache,
                             file_sizes,
+                            open_context,
                         )
                         .await?;
                         Ok(wrap_ivf(ivf))
@@ -11875,10 +11949,8 @@ mod tests {
 
     /// A segment may carry extra columns; `build_index_metadata_from_segments`
     /// must still commit it, keyed on the field the index is being built for.
-    /// Calls the guarded function directly (not through
-    /// `commit_existing_index_segments`) so this test's outcome depends only
-    /// on this guard, not on the independent duplicate a few lines into
-    /// `commit_existing_index_segments`.
+    /// Calls the metadata builder directly to isolate field validation from
+    /// commit conflict resolution and manifest writing.
     #[tokio::test]
     async fn test_build_index_metadata_from_segments_accepts_carried_fields() {
         use lance_datagen::{BatchCount, RowCount, array};
@@ -12252,12 +12324,6 @@ mod tests {
             )
             .await
             .unwrap_err();
-        // This end-to-end path is guarded twice (`build_index_metadata_from_segments`
-        // and a duplicate check in `commit_existing_index_segments` itself), so
-        // this assertion alone does not prove which one fired -- see
-        // `test_build_index_metadata_from_segments_rejects_wrong_field_provenance`
-        // for that. It still proves the public `commit_existing_index_segments`
-        // entry point rejects this input end-to-end.
         assert!(error.to_string().contains("expected keyed field"));
     }
 
