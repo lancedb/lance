@@ -71,6 +71,9 @@ const DEFAULT_DEMAND_PAGE_TARGET_BYTES: usize = 512 * 1024;
 const DEFAULT_PREWARM_CHUNK_TARGET_BYTES: usize = 8 * 1024 * 1024;
 const FMINDEX_PARTITION_FINGERPRINT_KEY: &str = "partition_fingerprint";
 const SENTINEL_BYTE: u8 = 0xFF;
+/// Stored in place of NUL, which terminates the indexed text. Like
+/// [`SENTINEL_BYTE`], it never occurs in valid UTF-8.
+const NUL_SUBSTITUTE_BYTE: u8 = 0xFE;
 
 /// SA sampling rate. Store every D-th SA entry. Locate walks at most D LF steps.
 const SA_SAMPLE_RATE: usize = 32;
@@ -1641,7 +1644,8 @@ impl ScalarIndex for FMIndexScalarIndex {
             .ok_or_else(|| Error::invalid_input("Fm only supports TextQuery"))?;
         match tq {
             TextQuery::StringContains(pattern) => {
-                self.search_string_contains(pattern.as_bytes()).await
+                self.search_string_contains(&sanitize_text_bytes(pattern.as_bytes()))
+                    .await
             }
             // Regex queries are routed only to the ngram index (the FM-index's
             // query parser advertises `supports_regex = false`), so this is
@@ -1990,15 +1994,17 @@ async fn fmindex_partition_matches(
         .is_some_and(|fingerprint| fingerprint == expected_fingerprint))
 }
 
+/// Rewrites the bytes the index reserves for itself. Search patterns go through
+/// the same mapping as the indexed text. For valid UTF-8 the mapping is one to
+/// one, so a pattern matches exactly the strings that contain it. Binary values
+/// can contain 0xFE and 0xFF, so for them it is not.
 fn sanitize_text_bytes(bytes: &[u8]) -> Vec<u8> {
     bytes
         .iter()
-        .map(|&b| {
-            if b == SENTINEL_BYTE || b == 0x00 {
-                b' '
-            } else {
-                b
-            }
+        .map(|&b| match b {
+            0x00 => NUL_SUBSTITUTE_BYTE,
+            SENTINEL_BYTE => b' ',
+            b => b,
         })
         .collect()
 }
@@ -2881,6 +2887,94 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn test_contains_with_nul_bytes() {
+        // NUL terminates the indexed text, so the index stores a substitute for
+        // it. Patterns are mapped the same way: a NUL in a pattern still finds
+        // the row, and a space in a pattern does not match a NUL.
+        let docs = vec!["hello\0again", "hello again", "plain"];
+        let row_addrs: Vec<u64> = vec![0, 1, 2];
+        let schema = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new(
+                crate::scalar::registry::VALUE_COLUMN_NAME,
+                DataType::Utf8,
+                false,
+            ),
+            arrow_schema::Field::new(ROW_ADDR, DataType::UInt64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(docs)),
+                Arc::new(UInt64Array::from(row_addrs)),
+            ],
+        )
+        .unwrap();
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let index_dir = Path::from_filesystem_path(tempdir.path()).unwrap();
+        let store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            index_dir,
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let stream = RecordBatchStreamAdapter::new(batch.schema(), stream::iter(vec![Ok(batch)]));
+        let req = FMIndexPlugin
+            .new_training_request("", &arrow_schema::Field::new("val", DataType::Utf8, false))
+            .unwrap();
+        let created = FMIndexPlugin
+            .train_index(
+                Box::pin(stream),
+                store.as_ref(),
+                req,
+                None,
+                Arc::new(crate::progress::NoopIndexBuildProgress),
+            )
+            .await
+            .unwrap();
+        let index = FMIndexPlugin
+            .load_index(
+                store,
+                &created.index_details,
+                0,
+                None,
+                &LanceCache::no_cache(),
+            )
+            .await
+            .unwrap();
+
+        // Once prewarmed, the index searches synchronously instead of loading
+        // blocks on demand; check both paths.
+        for prewarmed in [false, true] {
+            if prewarmed {
+                index.prewarm().await.unwrap();
+            }
+            for (pattern, expected) in [
+                ("\0", vec![0]),
+                ("o\0a", vec![0]),
+                (" ", vec![1]),
+                ("o a", vec![1]),
+                ("hello", vec![0, 1]),
+            ] {
+                let r = index
+                    .search(
+                        &TextQuery::StringContains(pattern.to_string()),
+                        &crate::metrics::NoOpMetricsCollector,
+                    )
+                    .await
+                    .unwrap();
+                let SearchResult::Exact(set) = r else {
+                    panic!("expected exact result");
+                };
+                let rows = (0..3)
+                    .filter(|&row| set.selected(row))
+                    .collect::<Vec<u64>>();
+                assert_eq!(rows, expected, "pattern {pattern:?}, prewarmed {prewarmed}");
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_stream_train_splits_partition_by_bytes() {
         let docs = vec!["abcd", "efgh", "ijkl"];
         let row_addrs: Vec<u64> = vec![0, 1, 2];
@@ -3345,7 +3439,7 @@ mod tests {
         let binary_with_sentinels = BinaryArray::from(vec![b"a\xFFb\0c" as &[u8]]);
         assert_eq!(
             extract_sanitized_text_bytes(&binary_with_sentinels, 0).unwrap(),
-            Some(b"a b c".to_vec())
+            Some(b"a b\xFEc".to_vec())
         );
 
         let large_binary = LargeBinaryArray::from(vec![b"large" as &[u8]]);
