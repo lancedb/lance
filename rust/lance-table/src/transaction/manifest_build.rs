@@ -1088,8 +1088,23 @@ impl Transaction {
                 )?;
 
                 if next_row_id.is_some() {
-                    // We can re-use indices, but need to rewrite the fragment bitmaps
-                    debug_assert!(rewritten_indices.is_empty());
+                    // We can re-use indices, but need to rewrite the fragment bitmaps.
+                    //
+                    // An address-domain index the commit path remapped eagerly (no FRI,
+                    // no deferral) is already fully migrated here: its uuid, files and
+                    // bitmap were rewritten in place by `handle_rewrite_indices`, below,
+                    // exactly as a non-stable-row-id rewrite migrates one. The per-index
+                    // loop that follows must not touch those again, so it skips any index
+                    // whose uuid is one `handle_rewrite_indices` just produced.
+                    let remapped_new_ids: HashSet<Uuid> =
+                        rewritten_indices.iter().map(|idx| idx.new_id).collect();
+                    if !rewritten_indices.is_empty() {
+                        Self::handle_rewrite_indices(
+                            &mut final_indices,
+                            rewritten_indices,
+                            &ordered_groups,
+                        )?;
+                    }
                     // If there is an FRI and the index uses addresses then we can
                     // migrate fragment support.
                     //
@@ -1099,20 +1114,27 @@ impl Transaction {
                     for index in final_indices.iter_mut() {
                         // Its bitmap is lineage, not coverage, and a straddling
                         // group would fail the recalculation.
-                        if is_frag_reuse_index_entry(index) {
+                        if is_frag_reuse_index_entry(index)
+                            || remapped_new_ids.contains(&index.uuid)
+                        {
                             continue;
                         }
                         let results_are_row_addrs = index.results_are_row_addrs();
+                        let can_follow_stable_row_ids = index.can_follow_stable_row_ids();
                         if let Some(fragment_bitmap) = &mut index.fragment_bitmap {
-                            *fragment_bitmap = if results_are_row_addrs && !deferred_remap {
+                            *fragment_bitmap = if !(can_follow_stable_row_ids
+                                || (results_are_row_addrs && deferred_remap))
+                            {
                                 // Stable row ids survive a rewrite, so a row-id-domain index
                                 // can simply follow its data to the new fragments. An
-                                // address-domain index cannot: its stored addresses point into
-                                // the fragments the rewrite dropped. Claiming coverage of the
-                                // new fragments would make it answer queries with addresses
-                                // that no longer resolve, so drop the rewritten fragments from
-                                // its coverage instead and let the scanner fall back to a full
-                                // scan for them.
+                                // address-domain index this commit did not remap above
+                                // cannot. Neither can a plugin whose identifier domain is
+                                // unknown: its stored addresses may point into fragments the
+                                // rewrite dropped. Claiming coverage of the new fragments
+                                // would make it answer queries with addresses that no longer
+                                // resolve, so drop the rewritten fragments from its coverage
+                                // instead and let the scanner fall back to a full scan for
+                                // them.
                                 Self::drop_rewritten_fragments(fragment_bitmap, &ordered_groups)
                             } else {
                                 Self::recalculate_fragment_bitmap(fragment_bitmap, &ordered_groups)?
@@ -1201,6 +1223,35 @@ impl Transaction {
                     new_index.validate_covering_fields()?;
                 }
                 final_indices.extend(new_indices.clone());
+
+                // Check the final set, including retained siblings, on every
+                // commit attempt. A format migration may change the result
+                // domain without changing the index type.
+                let changed_names = new_indices
+                    .iter()
+                    .map(|index| index.name.as_str())
+                    .collect::<HashSet<_>>();
+                let mut first_segments: HashMap<&str, &IndexMetadata> = HashMap::new();
+                for index in &final_indices {
+                    if !changed_names.contains(index.name.as_str()) {
+                        continue;
+                    }
+                    if let Some(first) = first_segments.get(index.name.as_str()) {
+                        if first.results_are_row_addrs() != index.results_are_row_addrs() {
+                            return Err(Error::invalid_input(format!(
+                                "Index '{}' mixes row-ID and row-address segments {} (version {}) \
+                                 and {} (version {}); rebuild every segment in one commit",
+                                index.name,
+                                first.uuid,
+                                first.index_version,
+                                index.uuid,
+                                index.index_version,
+                            )));
+                        }
+                    } else {
+                        first_segments.insert(index.name.as_str(), index);
+                    }
+                }
             }
             Operation::ReserveFragments { .. } | Operation::UpdateConfig { .. } => {
                 final_fragments.extend(maybe_existing_fragments?.clone());
@@ -3753,6 +3804,7 @@ mod tests {
             file_major_version: 2,
             file_minor_version: 0,
             file_size_bytes: CachedFileSize::new(1000),
+            file_metadata_size_bytes: None,
             base_id: None,
         });
 
@@ -3764,6 +3816,7 @@ mod tests {
             file_major_version: 2,
             file_minor_version: 0,
             file_size_bytes: CachedFileSize::new(500),
+            file_metadata_size_bytes: None,
             base_id: None,
         });
 
@@ -3775,6 +3828,7 @@ mod tests {
             file_major_version: 2,
             file_minor_version: 0,
             file_size_bytes: CachedFileSize::new(750),
+            file_metadata_size_bytes: None,
             base_id: None,
         });
 
@@ -3786,6 +3840,7 @@ mod tests {
             file_major_version: 2,
             file_minor_version: 0,
             file_size_bytes: CachedFileSize::new(250),
+            file_metadata_size_bytes: None,
             base_id: None,
         });
 
