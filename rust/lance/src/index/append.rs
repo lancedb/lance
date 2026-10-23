@@ -848,7 +848,16 @@ async fn merge_scalar_indices<'a>(
             &effective_old_frags,
             unindexed,
             // The domain each `build_per_segment_filters` call below asks for.
-            index_type == IndexType::BTree,
+            // `legacy_domain_mismatch` above already forces a rebuild instead of
+            // reaching here for a row-id-domain BTree/Bitmap/LabelList segment
+            // under stable row ids, so every segment of these three types that
+            // can still be merged here is address-domain (or the dataset lacks
+            // stable row ids and the two domains coincide). NGram has no such
+            // domain and always asks for row ids.
+            matches!(
+                index_type,
+                IndexType::BTree | IndexType::Bitmap | IndexType::LabelList
+            ),
         )
         .await?
     } else {
@@ -1065,6 +1074,8 @@ async fn merge_scalar_indices<'a>(
                         reference_index.results_are_row_addresses(),
                     )
                     .await?;
+                    let old_data_filter =
+                        block_stale_rows(dataset.as_ref(), old_data_filter, &stale_rows);
                     reference_index
                         .update(new_data_stream, &new_store, old_data_filter)
                         .await?
