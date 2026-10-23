@@ -371,6 +371,7 @@ mod tests {
             path: "x".to_string(),
             target_details: target,
             target_data_type: pb::JsonTargetDataType::Unspecified as i32,
+            target_index_version: None,
         })
     }
 
