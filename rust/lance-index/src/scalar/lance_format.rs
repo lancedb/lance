@@ -748,8 +748,8 @@ mod tests {
     use arrow_schema::Schema as ArrowSchema;
     use arrow_schema::{DataType, Field, TimeUnit};
     use arrow_select::take::TakeOptions;
-    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use datafusion_common::ScalarValue;
+    use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
     use futures::FutureExt;
     use lance_core::utils::row_addr_remap::RowAddrRemap;
     use lance_core::utils::tempfile::TempDir;
@@ -996,7 +996,7 @@ mod tests {
         };
         let params = serde_json::to_string(&params).unwrap();
         let btree_plugin = BTreeIndexPlugin;
-        let data = lance_datafusion::utils::reader_to_stream(Box::new(data));
+        let data = lance_datafusion_exec::utils::reader_to_stream(Box::new(data));
         let request = btree_plugin
             .new_training_request(
                 &params,
@@ -1144,7 +1144,7 @@ mod tests {
         let updated_index_store = test_store(&updated_index_dir);
         index
             .update(
-                lance_datafusion::utils::reader_to_stream(Box::new(data)),
+                lance_datafusion_exec::utils::reader_to_stream(Box::new(data)),
                 updated_index_store.as_ref(),
                 None,
             )
@@ -1532,7 +1532,7 @@ mod tests {
             Field::new(ROW_ADDR, DataType::UInt64, false),
         ]));
         let data = RecordBatchIterator::new(batches, schema);
-        let data = lance_datafusion::utils::reader_to_stream(Box::new(data));
+        let data = lance_datafusion_exec::utils::reader_to_stream(Box::new(data));
 
         train_btree_index(
             data,
@@ -1997,7 +1997,7 @@ mod tests {
         let updated_index_store = test_store(&updated_index_dir);
         index
             .update(
-                lance_datafusion::utils::reader_to_stream(Box::new(data)),
+                lance_datafusion_exec::utils::reader_to_stream(Box::new(data)),
                 updated_index_store.as_ref(),
                 None,
             )
@@ -2099,7 +2099,7 @@ mod tests {
         index_store: &Arc<dyn IndexStore>,
         data: impl RecordBatchReader + Send + Sync + 'static,
     ) {
-        let data = lance_datafusion::utils::reader_to_stream(Box::new(data));
+        let data = lance_datafusion_exec::utils::reader_to_stream(Box::new(data));
         let request = LabelListIndexPlugin
             .new_training_request(
                 "{}",
@@ -2319,7 +2319,7 @@ mod tests {
             .unwrap();
 
         BitmapIndexPlugin::train_bitmap_index(
-            lance_datafusion::utils::reader_to_stream(Box::new(RecordBatchIterator::new(
+            lance_datafusion_exec::utils::reader_to_stream(Box::new(RecordBatchIterator::new(
                 vec![Ok(batch)],
                 schema,
             ))),
