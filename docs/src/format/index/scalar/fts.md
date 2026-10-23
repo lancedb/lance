@@ -34,6 +34,15 @@ An FTS index may contain multiple partitions. Each partition has its own set of 
 | `_rowid`      | UInt64 | false    | Document row ID                  |
 | `_num_tokens` | UInt32 | false    | Number of tokens in the document |
 
+Partitioned `docs.lance` files may include the optional schema metadata key
+`total_tokens`. Its decimal `UInt64` value is the sum of `_num_tokens` in that
+file. `_num_tokens` remains the canonical per-document data. Readers use the
+metadata value to construct exact corpus statistics without scanning the column;
+when the key is absent, they compute the sum from `_num_tokens`. Writers produce
+the key from the same document table in the same file commit. A present value
+that cannot be parsed, or that differs when `_num_tokens` is subsequently
+loaded, is file corruption.
+
 ### FTS List File Schema
 
 | Column                 | Type                    | Nullable | Description                                                      |

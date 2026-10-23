@@ -34,7 +34,8 @@ from .lance import (
 from .types import _coerce_reader
 
 if TYPE_CHECKING:
-    import lance
+    from .dataset import LanceDataset
+    from .schema import LanceSchema
 
 __all__ = [
     "ShardingField",
@@ -94,7 +95,7 @@ class ShardingSpec:
 def evaluate_sharding_spec(
     batch: pa.RecordBatch,
     spec: Union[ShardingSpec, Mapping[str, object]],
-    schema: "lance.schema.LanceSchema",
+    schema: "LanceSchema",
 ) -> pa.RecordBatch:
     """Evaluate a MemWAL sharding spec against one PyArrow RecordBatch.
 
@@ -283,7 +284,7 @@ class ShardWriter:
         -------
         dict
             Keys: ``row_count``, ``batch_count``, ``estimated_size_bytes``,
-            ``generation``.
+            ``generation``, ``frozen_count``, ``frozen_bytes``.
         """
         return self._raw.memtable_stats()
 
@@ -341,7 +342,7 @@ class LsmScanner:
 
     @staticmethod
     def from_snapshots(
-        dataset: "lance.LanceDataset",
+        dataset: "LanceDataset",
         shard_snapshots: List[ShardSnapshot],
     ) -> "LsmScanner":
         """Create a scanner from dataset and shard snapshots.
@@ -469,7 +470,7 @@ class LsmPointLookupPlanner:
 
     def __init__(
         self,
-        dataset: "lance.LanceDataset",
+        dataset: "LanceDataset",
         shard_snapshots: List[ShardSnapshot],
         pk_columns: Optional[List[str]] = None,
     ) -> None:
@@ -538,7 +539,7 @@ class LsmVectorSearchPlanner:
 
     def __init__(
         self,
-        dataset: "lance.LanceDataset",
+        dataset: "LanceDataset",
         shard_snapshots: List[ShardSnapshot],
         vector_column: str,
         pk_columns: Optional[List[str]] = None,
@@ -582,10 +583,9 @@ class LsmVectorSearchPlanner:
             Columns to project.  Returns all columns + ``_distance`` if
             omitted.
         refine_base_table : bool, optional
-            When true, the base-table arm re-ranks its candidates with exact
-            distances.  Useful when the base index is approximate (e.g.
-            IVF-PQ).  Memtable arms use exact HNSW and are unaffected.
-            Auto-enabled whenever stale filtering is on (see ``overfetch_factor``).
+            When true, the base-table and SSTable arms re-rank their candidates
+            with exact distances. Auto-enabled when a newer generation blocks
+            the base table.
         overfetch_factor : float, optional
             Over-fetch multiple for sources with rows superseded by newer
             generations. Must be at least ``1.0``. At ``1.0`` each affected

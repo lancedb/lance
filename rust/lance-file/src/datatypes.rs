@@ -1,14 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use arrow_schema::DataType;
-use async_recursion::async_recursion;
 use lance_arrow::ARROW_EXT_NAME_KEY;
-use lance_arrow::DataTypeExt;
 use lance_core::datatypes::{Dictionary, Encoding, Field, LogicalType, Schema};
 use lance_core::{Error, Result};
-use lance_io::traits::Reader;
-use lance_io::utils::{read_binary_array, read_fixed_stride_array};
 use std::collections::HashMap;
 
 use crate::format::pb;
@@ -346,66 +341,6 @@ impl From<Encoding> for pb::Encoding {
             Encoding::RLE => Self::Rle,
         }
     }
-}
-
-#[async_recursion]
-async fn load_field_dictionary<'a>(field: &mut Field, reader: &dyn Reader) -> Result<()> {
-    if let DataType::Dictionary(_, value_type) = field.data_type() {
-        assert!(field.dictionary.is_some());
-        if let Some(dict_info) = field.dictionary.as_mut() {
-            use DataType::*;
-            match value_type.as_ref() {
-                _ if value_type.is_binary_like() => {
-                    dict_info.values = Some(
-                        read_binary_array(
-                            reader,
-                            value_type.as_ref(),
-                            true, // Empty values are null
-                            dict_info.offset,
-                            dict_info.length,
-                            ..,
-                        )
-                        .await?,
-                    );
-                }
-                Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 | UInt64 => {
-                    dict_info.values = Some(
-                        read_fixed_stride_array(
-                            reader,
-                            value_type.as_ref(),
-                            dict_info.offset,
-                            dict_info.length,
-                            ..,
-                        )
-                        .await?,
-                    );
-                }
-                _ => {
-                    return Err(Error::schema(format!(
-                        "Does not support {} as dictionary value type",
-                        value_type
-                    )));
-                }
-            }
-        } else {
-            panic!("Should not reach here: dictionary field does not load dictionary info")
-        }
-        Ok(())
-    } else {
-        for child in field.children.as_mut_slice() {
-            load_field_dictionary(child, reader).await?;
-        }
-        Ok(())
-    }
-}
-
-/// Load dictionary value array from manifest files.
-// TODO: pub(crate)
-pub async fn populate_schema_dictionary(schema: &mut Schema, reader: &dyn Reader) -> Result<()> {
-    for field in schema.fields.as_mut_slice() {
-        load_field_dictionary(field, reader).await?;
-    }
-    Ok(())
 }
 
 #[cfg(test)]
