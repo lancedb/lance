@@ -170,13 +170,8 @@ static FLAT_ALL_TOKENS_FIELD: LazyLock<Arc<Field>> =
     LazyLock::new(|| Arc::new(Field::new(FLAT_ALL_TOKENS_COL, DataType::UInt64, false)));
 static FLAT_QUERY_TOKEN_COUNTS_ITEM_FIELD: LazyLock<Arc<Field>> =
     LazyLock::new(|| Arc::new(Field::new("item", DataType::UInt64, true)));
-static FLAT_PHRASE_MATCH_FIELD: LazyLock<Arc<Field>> = LazyLock::new(|| {
-    Arc::new(Field::new(
-        FLAT_PHRASE_MATCH_COL,
-        DataType::Boolean,
-        false,
-    ))
-});
+static FLAT_PHRASE_MATCH_FIELD: LazyLock<Arc<Field>> =
+    LazyLock::new(|| Arc::new(Field::new(FLAT_PHRASE_MATCH_COL, DataType::Boolean, false)));
 
 pub(super) fn phrase_matches_positions(
     query_tokens: &Tokens,
@@ -252,15 +247,13 @@ pub(super) async fn tokenize_and_count(
     phrase_slop: Option<u32>,
 ) -> DataFusionResult<RecordBatch> {
     let mut output_fields: Vec<Arc<Field>> = vec![ROW_ID_SCHEMA.fields()[0].clone()];
-    output_fields.extend(
-        (0..coordinate_rank).map(|rank| {
-            Arc::new(Field::new(
-                doc_index_storage_column(rank),
-                DataType::UInt32,
-                false,
-            ))
-        }),
-    );
+    output_fields.extend((0..coordinate_rank).map(|rank| {
+        Arc::new(Field::new(
+            doc_index_storage_column(rank),
+            DataType::UInt32,
+            false,
+        ))
+    }));
     output_fields.extend([
         FLAT_ALL_TOKENS_FIELD.clone(),
         Arc::new(Field::new(
