@@ -35,7 +35,6 @@ use lance_index::vector::v3::subindex::IvfSubIndex;
 use crate::dataset::{InsertBuilder, UpdateBuilder, WriteMode, WriteParams};
 use crate::index::DatasetIndexExt;
 use crate::index::DatasetIndexInternalExt;
-use crate::index::vector::dedup::find_duplicate_pairs;
 use crate::index::vector::ivf::v2::{
     IVFPartitionKey, IvfFlatIndex, IvfHnswSqIndex, IvfPq, IvfStateEntryBox, PartitionEntry,
 };
@@ -6737,128 +6736,6 @@ async fn test_shallow_clone_ivf_rq_uses_resolved_index_directory() {
         .collect::<HashSet<_>>();
     let recall = row_ids.intersection(&ground_truth).count() as f32 / 20.0;
     assert_ge!(recall, 0.5);
-}
-
-#[tokio::test]
-async fn test_pairwise_partition_ids_are_current_after_compaction() {
-    // Compaction rewrites data fragments but leaves vector index files holding
-    // pre-compaction row ids; every index read path translates them except
-    // pairwise staging, which leaked stale ids into find_duplicate_pairs
-    // results. deferred index remap (defer_index_remap) keeps the index files,
-    // so the translation path is exercised on open.
-    let dim = 4_usize;
-    // Four distinct vectors, each duplicated, written across two fragments.
-    let distinct: Vec<Vec<f32>> = (0..4)
-        .map(|i| (0..dim).map(|j| (i * dim + j) as f32 + 1.0).collect())
-        .collect();
-    let schema_ref = SchemaRef::new(Schema::new(vec![
-        Field::new("id", DataType::UInt64, false),
-        Field::new(
-            "vector",
-            DataType::FixedSizeList(
-                Arc::new(Field::new("item", DataType::Float32, true)),
-                dim as i32,
-            ),
-            true,
-        ),
-    ]));
-    let make_batch = |ids: &[u64], vectors: &[usize]| {
-        let values = vectors
-            .iter()
-            .flat_map(|&i| distinct[i].clone())
-            .collect::<Vec<_>>();
-        let vectors =
-            FixedSizeListArray::try_new_from_values(Float32Array::from(values), dim as i32)
-                .unwrap();
-        RecordBatch::try_new(
-            schema_ref.clone(),
-            vec![Arc::new(UInt64Array::from(ids.to_vec())), Arc::new(vectors)],
-        )
-        .unwrap()
-    };
-    let frag0 = make_batch(&[0, 1], &[0, 0]);
-    let frag1 = make_batch(&[2, 3, 4, 5], &[1, 1, 2, 2]);
-
-    let mut dataset = Dataset::write(
-        RecordBatchIterator::new(vec![Ok(frag0)], schema_ref.clone()),
-        "memory://",
-        None,
-    )
-    .await
-    .unwrap();
-    dataset
-        .append(
-            RecordBatchIterator::new(vec![Ok(frag1)], schema_ref.clone()),
-            None,
-        )
-        .await
-        .unwrap();
-    // Delete a row of the SECOND fragment's pair so a surviving duplicate
-    // pair lives in a rewritten fragment: its row ids change under
-    // compaction, which is what makes stale staged ids detectable.
-    dataset.delete("id = 5").await.unwrap();
-
-    let mut ivf = IvfBuildParams::new(1);
-    ivf.centroids = Some(Arc::new(
-        FixedSizeListArray::try_new_from_values(Float32Array::from(vec![0.0; dim]), dim as i32)
-            .unwrap(),
-    ));
-    let params = VectorIndexParams::with_ivf_flat_params(DistanceType::L2, ivf);
-    dataset
-        .create_index(
-            &["vector"],
-            IndexType::Vector,
-            Some("pairs".into()),
-            &params,
-            true,
-        )
-        .await
-        .unwrap();
-
-    // With defer_index_remap the index files are not rewritten; reads must
-    // translate the surviving pre-compaction row ids on open.
-    compact_files(
-        &mut dataset,
-        CompactionOptions {
-            defer_index_remap: true,
-            ..Default::default()
-        },
-        None,
-    )
-    .await
-    .unwrap();
-
-    let live_row_ids: HashSet<u64> = dataset.scan().with_row_id().try_into_batch().await.unwrap()
-        [ROW_ID]
-        .as_primitive::<UInt64Type>()
-        .values()
-        .iter()
-        .copied()
-        .collect();
-    assert!(live_row_ids.len() >= 5);
-
-    let pairs = find_duplicate_pairs(Arc::new(dataset.clone()), "vector", 1e-3)
-        .await
-        .unwrap();
-    let pairs = pairs.try_collect::<Vec<_>>().await.unwrap();
-    assert!(
-        pairs.iter().map(|b| b.num_rows()).sum::<usize>() >= 2,
-        "expected the surviving duplicate pairs to be reported"
-    );
-    for batch in &pairs {
-        let ids_a = batch["row_id_a"].as_primitive::<UInt64Type>();
-        let ids_b = batch["row_id_b"].as_primitive::<UInt64Type>();
-        for (a, b) in ids_a.values().iter().zip(ids_b.values().iter()) {
-            assert!(
-                live_row_ids.contains(a),
-                "row_id_a {a} is not a live row id of the current snapshot"
-            );
-            assert!(
-                live_row_ids.contains(b),
-                "row_id_b {b} is not a live row id of the current snapshot"
-            );
-        }
-    }
 }
 
 mod native_resident_tests;
