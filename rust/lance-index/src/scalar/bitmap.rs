@@ -2869,7 +2869,7 @@ mod tests {
         BitmapIndexPlugin::train_bitmap_index(stream, store.as_ref())
             .await
             .unwrap();
-        let index = BitmapIndex::load(store, None, &LanceCache::no_cache())
+        let index = BitmapIndex::load(store, None, &LanceCache::no_cache(), true)
             .await
             .unwrap();
 
@@ -4801,7 +4801,7 @@ mod tests {
             BitmapIndexPlugin::train_bitmap_index(stream, store.as_ref())
                 .await
                 .unwrap();
-            let index = BitmapIndex::load(store, None, &LanceCache::no_cache())
+            let index = BitmapIndex::load(store, None, &LanceCache::no_cache(), true)
                 .await
                 .unwrap();
             (tmpdir, index)
@@ -4865,7 +4865,7 @@ mod tests {
                 .unwrap();
         }
         writer.finish().await.unwrap();
-        let unsorted = BitmapIndex::load(unsorted_store, None, &LanceCache::no_cache())
+        let unsorted = BitmapIndex::load(unsorted_store, None, &LanceCache::no_cache(), true)
             .await
             .unwrap();
         assert!(!unsorted.rows_follow_key_order());
@@ -4877,7 +4877,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let sorted = BitmapIndex::load(sorted_store, None, &LanceCache::no_cache())
+        let sorted = BitmapIndex::load(sorted_store, None, &LanceCache::no_cache(), true)
             .await
             .unwrap();
         assert!(sorted.rows_follow_key_order());
