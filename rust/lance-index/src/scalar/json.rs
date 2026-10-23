@@ -392,13 +392,13 @@ impl JsonQueryParser {
         if path.parse::<usize>().is_ok() {
             return false;
         }
-        let Ok(json_path) = jsonb::jsonpath::parse_json_path(path.as_bytes()) else {
+        let Ok(json_path) = lance_jsonb::jsonpath::parse_json_path(path.as_bytes()) else {
             return false;
         };
 
         matches!(
             json_path.paths.as_slice(),
-            [jsonb::jsonpath::Path::DotField(field)] if field.as_ref() == path
+            [lance_jsonb::jsonpath::Path::DotField(field)] if field.as_ref() == path
         )
     }
 }

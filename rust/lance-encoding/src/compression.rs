@@ -1067,6 +1067,21 @@ pub trait BlockDecompressor: std::fmt::Debug + Send + Sync {
     fn infer_num_values(&self, _data: &LanceBuffer) -> Result<Option<u64>> {
         Ok(None)
     }
+
+    /// Recover a legacy structural level count whose u16 header wrapped modulo 65536.
+    ///
+    /// Unlike [`Self::infer_num_values`], the payload alone does not identify the count;
+    /// the declared residue selects among the layouts the payload size allows. Returns an
+    /// exact count only when the codec can prove a unique one without decoding or
+    /// allocating. Unsupported codecs return `None`; inconsistent supported layouts return
+    /// an error. Only called for mini-block structural levels.
+    fn infer_u16_wrapped_count(
+        &self,
+        _data: &LanceBuffer,
+        _declared_count: u16,
+    ) -> Result<Option<u64>> {
+        Ok(None)
+    }
 }
 
 pub(crate) fn require_block_payload(data: Option<LanceBuffer>, codec: &str) -> Result<LanceBuffer> {
@@ -2016,7 +2031,7 @@ fn compression_name(compression: &Compression) -> &'static str {
         Compression::Constant(_) => "constant",
         Compression::Dictionary(_) => "dictionary",
         Compression::ByteStreamSplit(_) => "byte stream split",
-        Compression::AxisDelta(_) => "axis_delta",
+        Compression::AxisDelta(_) => "axis delta",
         Compression::PackedStruct(_) => "packed struct",
         Compression::FixedSizeList(_) => "fixed-size list",
         Compression::VariablePackedStruct(_) => "variable packed struct",
@@ -2739,9 +2754,9 @@ mod tests {
             panic!("Expected general per-value compression");
         };
         let expected_scheme = if test_encoding == TestEncoding::StructuralSparse {
-            crate::format::pb21::CompressionScheme::CompressionAlgorithmLz4
+            crate::format::pb23::CompressionScheme::CompressionAlgorithmLz4
         } else {
-            crate::format::pb21::CompressionScheme::CompressionAlgorithmZstd
+            crate::format::pb23::CompressionScheme::CompressionAlgorithmZstd
         };
         assert_eq!(
             general.compression.as_ref().unwrap().scheme(),

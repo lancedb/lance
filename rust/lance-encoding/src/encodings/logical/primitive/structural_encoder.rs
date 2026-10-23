@@ -2175,6 +2175,22 @@ impl PrimitiveStructuralEncoder {
         }
 
         if let DataBlock::Dictionary(dict) = data_block {
+            // Merging the buffered chunks can widen dictionary indices beyond
+            // the declared key type (see `concat_dict_arrays`).  The physical
+            // index width must match the schema, so reject the mismatch instead
+            // of persisting a file the reader would later reject as corrupt.
+            if let DataType::Dictionary(key_type, _) = field.data_type() {
+                let declared_key_bits = key_type.byte_width() as u64 * 8;
+                if dict.indices.bits_per_value != declared_key_bits {
+                    return Err(Error::invalid_input(format!(
+                        "Field '{}' is declared as {} but the merged dictionary needs {} bits per index and the declared key type addresses only {} bits; widen the dictionary key type to hold the merged values",
+                        field.name,
+                        field.data_type(),
+                        dict.indices.bits_per_value,
+                        declared_key_bits,
+                    )));
+                }
+            }
             log::debug!(
                 "Encoding column {} with {} items using dictionary encoding (already dictionary encoded)",
                 column_idx,

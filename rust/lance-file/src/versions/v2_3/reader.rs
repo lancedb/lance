@@ -155,9 +155,6 @@ fn validate_compressive_encoding(
             )
             .into(),
         )),
-        Some(Compression::AxisDelta(_)) => Err(Error::not_supported(
-            "AxisDelta decoding is not implemented",
-        )),
         None => Err(Error::invalid_input_source(
             "Lance v2.3 compressive encoding is missing its compression variant".into(),
         )),
