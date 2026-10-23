@@ -21,6 +21,7 @@ on:
       - clippy.toml
       - deny.toml
       - ci/check_dependency_age.py
+      - ci/check_advisory_ignores.py
       - ci/arrow_upgrade.py
 
 permissions:
@@ -117,6 +118,12 @@ jobs:
       # fetched. The script falls back to the network when that misses.
       - name: Check dependency age
         run: python3 ci/check_dependency_age.py
+      # Fails if an ignore in deny.toml has no `expires` or `no fix` marker, or
+      # its expires date has passed. It runs even if a step above failed, so
+      # one CI run reports every problem.
+      - name: Check advisory ignores
+        if: ${{ !cancelled() }}
+        run: python3 ci/check_advisory_ignores.py
 
   arrow-ordering-detect:
     # Lance inherits its comparison semantics from Arrow, DataFusion and `half`.
