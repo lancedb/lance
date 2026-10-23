@@ -77,6 +77,20 @@ impl PostingListBatchBuilder {
         self.len == 0
     }
 
+    /// Encoded v3 payload bytes, excluding array offsets and allocation slack.
+    pub fn payload_bytes(&self) -> usize {
+        let positions = match &self.positions {
+            BatchPositionsBuilder::Shared { bytes, .. } => bytes.values_slice().len(),
+            _ => 0,
+        };
+        self.postings.values_ref().values_slice().len()
+            + self
+                .impacts
+                .as_ref()
+                .map_or(0, |impacts| impacts.values_ref().values_slice().len())
+            + positions
+    }
+
     pub(super) fn append(
         &mut self,
         compressed: LargeBinaryArray,
