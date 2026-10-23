@@ -489,6 +489,17 @@ message ByteStreamSplit {
   CompressiveEncoding values = 1;
 }
 
+/* ALP: Adaptive Lossless floating-Point encoding
+ *
+ * Unstable 2.3 mirror of the stable 2.1/2.2 ALP compression message. Each
+ * mini-block chunk is self-describing (mode, exponents, bit width, base
+ * values), so only the input width is declared here.
+ */
+message Alp {
+  // 32 for f32 and 64 for f64
+  uint32 bits_per_value = 1;
+}
+
 /* Length-preserving modular integer differences within each fixed-size tensor.
  * The child is one or more fixed-size-list layers ending in plain 8/16/32/64-bit
  * elements, without child validity. For each tensor, divide its elements into
@@ -526,5 +537,6 @@ message CompressiveEncoding {
         Range range = 14;
         Delta delta = 15;
         AxisDelta axis_delta = 16;
+        Alp alp = 17;
     }
 }

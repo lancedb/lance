@@ -6,6 +6,7 @@ use lance_core::{Error, Result};
 
 use crate::data::FixedWidthDataBlock;
 
+pub mod alp;
 pub(crate) mod axis_delta;
 pub mod binary;
 #[cfg(feature = "bitpacking")]

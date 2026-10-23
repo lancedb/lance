@@ -425,6 +425,18 @@ fn bitpack_out_of_line<T: ArrowNativeType + BitPackingUninit>(
     data: FixedWidthDataBlock,
     compressed_bits_per_value: usize,
 ) -> LanceBuffer {
+    LanceBuffer::reinterpret_vec(bitpack_out_of_line_vec::<T>(
+        data,
+        compressed_bits_per_value,
+    ))
+}
+
+/// Bitpacks a FixedWidthDataBlock with a given bit width and returns the raw
+/// word vector. See [`bitpack_out_of_line`] for layout details.
+pub(crate) fn bitpack_out_of_line_vec<T: ArrowNativeType + BitPackingUninit>(
+    data: FixedWidthDataBlock,
+    compressed_bits_per_value: usize,
+) -> Vec<T> {
     let data_buffer = data.data.borrow_to_typed_slice::<T>();
     let data_buffer = data_buffer.as_ref();
 
@@ -457,7 +469,7 @@ fn bitpack_out_of_line<T: ArrowNativeType + BitPackingUninit>(
     }
 
     if !last_chunk_is_runt {
-        return LanceBuffer::reinterpret_vec(output);
+        return output;
     }
 
     let last_chunk_start = num_whole_chunks * ELEMS_PER_CHUNK as usize;
@@ -489,7 +501,7 @@ fn bitpack_out_of_line<T: ArrowNativeType + BitPackingUninit>(
         output.extend_from_slice(&data_buffer[last_chunk_start..]);
     }
 
-    LanceBuffer::reinterpret_vec(output)
+    output
 }
 
 /// Unpacks a FixedWidthDataBlock that has been bitpacked with a constant bit width.
@@ -497,7 +509,7 @@ fn bitpack_out_of_line<T: ArrowNativeType + BitPackingUninit>(
 /// The compressed bit width is provided while the uncompressed width comes from `T`.
 /// Depending on the encoding decision the final chunk may be fully packed (with padding)
 /// or stored as raw tail values. We infer the layout from the buffer length.
-fn unpack_out_of_line<T: ArrowNativeType + BitPackingUninit>(
+pub(crate) fn unpack_out_of_line<T: ArrowNativeType + BitPackingUninit>(
     data: FixedWidthDataBlock,
     num_values: usize,
     compressed_bits_per_value: usize,

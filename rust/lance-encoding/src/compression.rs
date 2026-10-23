@@ -22,9 +22,10 @@ pub use crate::encodings::physical::axis_delta::try_tensor_per_value;
 use crate::encodings::physical::bitpacking::{InlineBitpacking, OutOfLineBitpacking};
 use crate::{
     buffer::LanceBuffer,
-    compression_config::{BssMode, CompressionFieldParams},
+    compression_config::{AlpMode, BssMode, CompressionFieldParams},
     constants::{
-        BSS_META_KEY, COMPRESSION_LEVEL_META_KEY, COMPRESSION_META_KEY, RLE_THRESHOLD_META_KEY,
+        ALP_META_KEY, BSS_META_KEY, COMPRESSION_LEVEL_META_KEY, COMPRESSION_META_KEY,
+        RLE_THRESHOLD_META_KEY,
     },
     data::{DataBlock, FixedWidthDataBlock, VariableWidthBlock},
     encodings::{
@@ -33,6 +34,7 @@ use crate::{
             miniblock::{MAX_MINIBLOCK_VALUES, MiniBlockCompressor},
         },
         physical::{
+            alp::{AlpMiniBlockDecompressor, AlpMiniBlockEncoder, should_use_alp},
             binary::{
                 BinaryBlockDecompressor, BinaryMiniBlockDecompressor, BinaryMiniBlockEncoder,
                 VariableDecoder, VariableEncoder,
@@ -189,6 +191,25 @@ fn try_bss_for_mini_block(
         )));
     }
     None
+}
+
+fn try_alp_for_mini_block(
+    field: &Field,
+    data: &FixedWidthDataBlock,
+    params: &CompressionFieldParams,
+) -> Option<Box<dyn MiniBlockCompressor>> {
+    // Auto is the default: the entropy pre-gate rejects incompressible pages
+    // before the candidate scan, and the page-level fallback already guarantees
+    // ALP never enlarges data. Only v2.3 writers call this path.
+    let mode = params.alp.unwrap_or(AlpMode::Auto);
+    if !should_use_alp(data, mode) {
+        return None;
+    }
+    match (field.data_type(), data.bits_per_value) {
+        (DataType::Float32, 32) => Some(Box::new(AlpMiniBlockEncoder::new(32))),
+        (DataType::Float64, 64) => Some(Box::new(AlpMiniBlockEncoder::new(64))),
+        _ => None,
+    }
 }
 
 fn rle_is_applicable(data: &FixedWidthDataBlock, params: &CompressionFieldParams) -> Option<u128> {
@@ -598,6 +619,12 @@ pub fn field_metadata_params(field: &Field) -> CompressionFieldParams {
             None => log::warn!("Invalid BSS mode '{}', using default", bss_str),
         }
     }
+    if let Some(alp_str) = field.metadata.get(ALP_META_KEY) {
+        match AlpMode::parse(alp_str) {
+            Some(mode) => params.alp = Some(mode),
+            None => log::warn!("Invalid ALP mode '{}', using default", alp_str),
+        }
+    }
     if let Some(minichunk_size_str) = field
         .metadata
         .get(super::constants::MINICHUNK_SIZE_META_KEY)
@@ -643,6 +670,18 @@ pub fn try_byte_stream_split_miniblock(
         return None;
     };
     try_bss_for_mini_block(data, params)
+}
+
+/// Select modern ALP compression for an applicable floating-point miniblock.
+pub fn try_alp_miniblock(
+    field: &Field,
+    data: &DataBlock,
+    params: &CompressionFieldParams,
+) -> Option<Box<dyn MiniBlockCompressor>> {
+    let DataBlock::FixedWidth(data) = data else {
+        return None;
+    };
+    try_alp_for_mini_block(field, data, params)
 }
 
 /// Select the original fixed-u8 RLE miniblock grammar.
@@ -1220,6 +1259,9 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
                     values.bits_per_value as usize,
                 )))
             }
+            Compression::Alp(description) => Ok(Box::new(
+                AlpMiniBlockDecompressor::from_description(description)?,
+            )),
             Compression::General(general) => {
                 // Create inner decompressor
                 let inner_decompressor = self.create_miniblock_decompressor(
@@ -2038,6 +2080,7 @@ fn compression_name(compression: &Compression) -> &'static str {
         Compression::Rle(_) => "rle",
         Compression::Range(_) => "range",
         Compression::Delta(_) => "delta",
+        Compression::Alp(_) => "alp",
     }
 }
 
@@ -2333,6 +2376,7 @@ mod tests {
                 compression: Some("lz4".to_string()),
                 compression_level: None,
                 bss: Some(BssMode::Off), // Explicitly disable BSS to test RLE
+                alp: None,
                 axis_delta: None,
                 minichunk_size: None,
             },
@@ -2366,6 +2410,7 @@ mod tests {
                 compression: Some("zstd".to_string()),
                 compression_level: Some(3),
                 bss: Some(BssMode::Off), // Disable BSS to test RLE
+                alp: None,
                 axis_delta: None,
                 minichunk_size: None,
             },
@@ -2799,6 +2844,7 @@ mod tests {
                 compression: Some("zstd".to_string()),
                 compression_level: Some(6),
                 bss: None,
+                alp: None,
                 axis_delta: None,
                 minichunk_size: None,
             },
@@ -3202,6 +3248,7 @@ mod tests {
                 compression: Some("lz4".to_string()),
                 compression_level: None,
                 bss: None,
+                alp: None,
                 axis_delta: None,
                 minichunk_size: None,
             },
