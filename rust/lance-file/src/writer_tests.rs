@@ -90,7 +90,7 @@ mod tests {
         let n = 65536usize;
         use rand::rngs::SmallRng;
         use rand::{Rng, SeedableRng};
-        let mut rng = SmallRng::seed_from_u64(0x5eed_a1b_2026_1023);
+        let mut rng = SmallRng::seed_from_u64(0x05ee_da1b_2026_1023);
         let mut gauss = || {
             let u1: f64 = rng.random_range(1e-12..1.0);
             let u2: f64 = rng.random();
@@ -2093,7 +2093,7 @@ mod tests {
         // Reuse a fixed LCG so the test is deterministic across platforms. The
         // [-1e12, 1e12) range matches the high-entropy fixture used by the
         // `should_use_alp` unit test: near-uniform bytes in every position.
-        let mut state = 0x5eed_a1b_2026_1023u64;
+        let mut state = 0x05ee_da1b_2026_1023_u64;
         let random = arrow_array::Float64Array::from_iter_values((0..n).map(|_| {
             state = state
                 .wrapping_mul(6364136223846793005)

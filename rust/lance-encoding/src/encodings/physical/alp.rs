@@ -30,7 +30,7 @@
 //!
 //! - **Buffer 0 (payload):** bitpacked offsets, `enc - min` for FOR mode or
 //!   `delta - min_delta` for Delta mode, using the same layout as
-//!   [`bitpack_out_of_line_vec`](crate::encodings::physical::bitpacking::bitpack_out_of_line_vec).
+//!   `bitpack_out_of_line_vec`.
 //! - **Buffer 1 (header):** per-chunk header:
 //!   - `mode`: bit 0 = Delta, bit 1 = `use_div`
 //!   - `e` / `f`: base-10 exponents (f is ignored when `use_div`)
@@ -1886,7 +1886,7 @@ mod tests {
         // one-entry RD dictionary (all values share their high bits), so every
         // chunk's index stream is empty (index_bits == 0). The decoder must
         // accept that instead of demanding one packed index per value.
-        let mut rng = rand::rngs::SmallRng::seed_from_u64(0x5eed_a1b_2026_1023);
+        let mut rng = rand::rngs::SmallRng::seed_from_u64(0x05ee_da1b_2026_1023);
         let gauss = |rng: &mut rand::rngs::SmallRng| {
             let u1: f64 = rng.random_range(1e-12..1.0);
             let u2: f64 = rng.random();
