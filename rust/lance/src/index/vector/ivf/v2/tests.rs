@@ -6021,13 +6021,16 @@ async fn test_prewarm_vector_index(#[case] params: VectorIndexParams) {
         "prewarm should have read from disk, but read_iops was 0"
     );
     let after_prewarm = dataset.session().cache_diagnostics();
-    assert!(after_prewarm.index.activity.warm.attempts > before_prewarm.index.activity.warm.attempts);
+    assert!(
+        after_prewarm.index.activity.warm.attempts > before_prewarm.index.activity.warm.attempts
+    );
     assert!(
         after_prewarm.index.activity.warm.loads_succeeded
             > before_prewarm.index.activity.warm.loads_succeeded
     );
     assert!(
-        after_prewarm.index.activity.warm.load_bytes > before_prewarm.index.activity.warm.load_bytes
+        after_prewarm.index.activity.warm.load_bytes
+            > before_prewarm.index.activity.warm.load_bytes
     );
 
     // Query should not perform IO after prewarming all deltas.

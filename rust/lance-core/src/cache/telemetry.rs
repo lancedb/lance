@@ -13,9 +13,9 @@ use metrics::{Key, Label};
 #[cfg(feature = "metrics")]
 use std::sync::OnceLock;
 
-/// Cache lookup outcomes, labelled by `cache`, `backend`, and `outcome`.
+/// Cache lookup outcomes, labelled by `cache`, `backend`, `type`, and `outcome`.
 pub const METRIC_LOOKUPS: &str = "lance_cache_lookups_total";
-/// Cache lookup failures, labelled by `cache`, `backend`, and `reason`.
+/// Cache lookup failures, labelled by `cache`, `backend`, `type`, and `reason`.
 pub const METRIC_LOOKUP_ERRORS: &str = "lance_cache_lookup_errors_total";
 /// Physical backend write submissions, labelled by `backend`.
 pub const METRIC_WRITE_ATTEMPTS: &str = "lance_cache_write_attempts_total";
@@ -32,7 +32,7 @@ pub const METRIC_BYPASSES: &str = "lance_cache_bypasses_total";
 /// Reserved for backends that can positively identify shared-load results.
 /// The built-in backends currently do not export samples for this metric.
 pub const METRIC_COALESCED_LOADS: &str = "lance_cache_coalesced_loads_total";
-/// Explicit prewarm cache calls, labelled by `cache` and `backend`.
+/// Explicit prewarm cache calls, labelled by `cache`, `backend`, and `type`.
 pub const METRIC_WARM_ATTEMPTS: &str = "lance_cache_warm_attempts_total";
 /// Explicit prewarm calls served without a new materialization.
 pub const METRIC_WARM_HITS: &str = "lance_cache_warm_hits_total";
@@ -42,11 +42,11 @@ pub const METRIC_WARM_LOADS: &str = "lance_cache_warm_loads_total";
 pub const METRIC_WARM_LOAD_BYTES: &str = "lance_cache_warm_load_bytes_total";
 /// Failed explicit prewarm cache calls.
 pub const METRIC_WARM_ERRORS: &str = "lance_cache_warm_errors_total";
-/// Executed loader outcomes, labelled by `cache`, `backend`, and `outcome`.
+/// Executed loader outcomes, labelled by `cache`, `backend`, `type`, and `outcome`.
 pub const METRIC_LOADS: &str = "lance_cache_loads_total";
-/// Executing loader futures, labelled by `cache` and `backend`.
+/// Executing loader futures, labelled by `cache`, `backend`, and `type`.
 pub const METRIC_LOADS_IN_FLIGHT: &str = "lance_cache_loads_in_flight";
-/// Executed loader duration in seconds, labelled by `cache`, `backend`, and `outcome`.
+/// Executed loader duration in seconds, labelled by `cache`, `backend`, `type`, and `outcome`.
 pub const METRIC_LOAD_DURATION: &str = "lance_cache_load_duration_seconds";
 /// Accounted submitted entry size in bytes, labelled by `backend`.
 pub const METRIC_ENTRY_SIZE: &str = "lance_cache_entry_size_bytes";
@@ -213,16 +213,146 @@ pub(crate) fn register_backend(_backend: &std::sync::Arc<dyn CacheBackend>) {}
 
 #[cfg(feature = "metrics")]
 mod enabled {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use std::sync::atomic::{AtomicU16, Ordering};
     use std::sync::{Arc, LazyLock, Mutex, Weak};
 
+    use super::super::{CacheActivity, CacheState};
     use super::*;
 
     static BACKENDS: LazyLock<Mutex<Vec<Weak<dyn CacheBackend>>>> =
         LazyLock::new(|| Mutex::new(Vec::new()));
     static TYPE_LABELS: LazyLock<Mutex<Vec<&'static str>>> =
         LazyLock::new(|| Mutex::new(Vec::new()));
+    type ActivityLabels = (&'static str, &'static str, &'static str);
+
+    #[derive(Default)]
+    struct ActivityExport {
+        live: Vec<Weak<CacheState>>,
+        // Retain only bounded label totals, never cache instances. Counters must
+        // remain cumulative after a cache is dropped, including between scrapes.
+        retired: HashMap<ActivityLabels, CacheActivity>,
+        retired_overflow: HashMap<(&'static str, &'static str), u64>,
+    }
+
+    static ACTIVITY: LazyLock<Mutex<ActivityExport>> =
+        LazyLock::new(|| Mutex::new(ActivityExport::default()));
+
+    pub(super) fn register_activity(state: &Arc<CacheState>) {
+        let mut export = ACTIVITY.lock().unwrap_or_else(|e| e.into_inner());
+        export.live.retain(|state| state.strong_count() > 0);
+        export.live.push(Arc::downgrade(state));
+    }
+
+    fn collect_activity(
+        state: &CacheState,
+        totals: &mut HashMap<ActivityLabels, CacheActivity>,
+        overflow: &mut HashMap<(&'static str, &'static str), u64>,
+    ) {
+        let cache = state.cache_kind.as_str();
+        let backend = state.backend_kind.as_str();
+        let (rows, overflow_events) = state.type_activity.export_snapshot();
+        for (type_name, activity) in rows {
+            totals
+                .entry((cache, backend, type_name))
+                .or_default()
+                .saturating_add_assign(&activity);
+        }
+        let total = overflow.entry((cache, backend)).or_default();
+        *total = total.saturating_add(overflow_events);
+    }
+
+    pub(super) fn retire_activity(state: &CacheState) {
+        let mut export = ACTIVITY.lock().unwrap_or_else(|e| e.into_inner());
+        let ActivityExport {
+            retired,
+            retired_overflow,
+            ..
+        } = &mut *export;
+        collect_activity(state, retired, retired_overflow);
+    }
+
+    fn refresh_activity() {
+        let (live, mut totals, mut overflow) = {
+            let mut export = ACTIVITY.lock().unwrap_or_else(|e| e.into_inner());
+            let live: Vec<_> = export.live.iter().filter_map(Weak::upgrade).collect();
+            export.live.retain(|state| state.strong_count() > 0);
+            (
+                live,
+                export.retired.clone(),
+                export.retired_overflow.clone(),
+            )
+        };
+        for state in live {
+            collect_activity(&state, &mut totals, &mut overflow);
+        }
+        for ((cache, backend, type_name), activity) in totals {
+            publish_activity(cache, backend, type_name, &activity);
+        }
+        for ((cache, backend), value) in overflow {
+            metrics::counter!(METRIC_TYPE_OVERFLOW, "cache" => cache, "backend" => backend)
+                .absolute(value);
+        }
+    }
+
+    fn publish_activity(
+        cache: &'static str,
+        backend: &'static str,
+        type_name: &'static str,
+        activity: &CacheActivity,
+    ) {
+        let labels = [
+            Label::new("cache", cache),
+            Label::new("backend", backend),
+            Label::new("type", type_name),
+        ];
+        let counter = |name: &'static str, value| {
+            metrics::counter!(name, labels.to_vec()).absolute(value);
+        };
+        let outcome = |name: &'static str, label: &'static str, value| {
+            let mut labels = labels.to_vec();
+            labels.push(Label::new("outcome", label));
+            metrics::counter!(name, labels).absolute(value);
+        };
+        outcome(METRIC_LOOKUPS, "hit", activity.hits);
+        outcome(METRIC_LOOKUPS, "miss", activity.misses);
+        for (reason, value) in [
+            (
+                "load",
+                activity
+                    .lookup_errors
+                    .saturating_sub(activity.type_mismatches),
+            ),
+            ("type_mismatch", activity.type_mismatches),
+        ] {
+            let mut labels = labels.to_vec();
+            labels.push(Label::new("reason", reason));
+            metrics::counter!(METRIC_LOOKUP_ERRORS, labels).absolute(value);
+        }
+        for (label, loads, warm_loads) in [
+            (
+                "success",
+                activity.loads_succeeded,
+                activity.warm.loads_succeeded,
+            ),
+            ("error", activity.loads_failed, activity.warm.loads_failed),
+            (
+                "cancelled",
+                activity.loads_cancelled,
+                activity.warm.loads_cancelled,
+            ),
+        ] {
+            outcome(METRIC_LOADS, label, loads);
+            outcome(METRIC_WARM_LOADS, label, warm_loads);
+        }
+        counter(METRIC_WARM_ATTEMPTS, activity.warm.attempts);
+        counter(METRIC_WARM_HITS, activity.warm.hits);
+        counter(METRIC_WARM_LOAD_BYTES, activity.warm.load_bytes);
+        counter(METRIC_WARM_ERRORS, activity.warm.errors);
+        metrics::gauge!(METRIC_LOADS_IN_FLIGHT, labels.to_vec())
+            .set(activity.loads_in_flight as f64);
+    }
+
     // Three metrics for each of three backend kinds.
     static SEEN_GAUGES: AtomicU16 = AtomicU16::new(0);
 
@@ -292,6 +422,7 @@ mod enabled {
     }
 
     pub(super) fn refresh_metrics() {
+        refresh_activity();
         let live = {
             let mut backends = BACKENDS
                 .lock()
@@ -350,37 +481,21 @@ pub(super) fn register_type_label(type_name: &'static str) -> (&'static str, boo
 }
 
 #[cfg(feature = "metrics")]
-#[inline]
-pub(crate) fn type_overflow(cache: CacheMetricsKind, backend: CacheBackendKind) {
-    static KEYS: [OnceLock<Key>; 9] = [const { OnceLock::new() }; 9];
-    static METADATA: metrics::Metadata<'static> =
-        metrics::Metadata::new(module_path!(), metrics::Level::INFO, Some(module_path!()));
-    let cache_index = match cache {
-        CacheMetricsKind::Index => 0,
-        CacheMetricsKind::Metadata => 1,
-        CacheMetricsKind::Other => 2,
-    };
-    let backend_index = match backend {
-        CacheBackendKind::Quick => 0,
-        CacheBackendKind::Moka => 1,
-        CacheBackendKind::Custom => 2,
-    };
-    let key = KEYS[cache_index * 3 + backend_index].get_or_init(|| {
-        Key::from_parts(
-            METRIC_TYPE_OVERFLOW,
-            vec![
-                Label::new("cache", cache.as_str()),
-                Label::new("backend", backend.as_str()),
-            ],
-        )
-    });
-    metrics::with_recorder(|recorder| recorder.register_counter(key, &METADATA).increment(1));
+pub(super) fn register_activity(state: &std::sync::Arc<super::CacheState>) {
+    enabled::register_activity(state);
 }
 
-/// Refresh aggregate occupancy gauges from distinct live physical backends.
+#[cfg(feature = "metrics")]
+pub(super) fn retire_activity(state: &super::CacheState) {
+    enabled::retire_activity(state);
+}
+
+/// Publish cumulative native activity counters and aggregate live pool occupancy.
 ///
 /// This performs only cheap approximate accounting. It removes expired weak
 /// registrations, does not keep caches alive, and does not scan cache entries.
+/// Activity always carries a bounded `type` label; sum over it for cache totals.
+/// Dropped caches retain their final counts. Call periodically or before scraping.
 #[cfg(feature = "metrics")]
 pub fn refresh_metrics() {
     enabled::refresh_metrics();
@@ -388,85 +503,8 @@ pub fn refresh_metrics() {
 
 #[cfg(feature = "metrics")]
 #[derive(Debug)]
-pub(super) struct LookupMetricKeys {
-    hit: Key,
-    miss: Key,
-}
-
-#[cfg(feature = "metrics")]
-impl LookupMetricKeys {
-    pub(super) fn aggregate(cache: CacheMetricsKind, backend: CacheBackendKind) -> Self {
-        Self::new(cache, backend, None)
-    }
-
-    pub(super) fn by_type(
-        cache: CacheMetricsKind,
-        backend: CacheBackendKind,
-        type_name: &'static str,
-    ) -> Self {
-        Self::new(cache, backend, Some(type_name))
-    }
-
-    fn new(
-        cache: CacheMetricsKind,
-        backend: CacheBackendKind,
-        type_name: Option<&'static str>,
-    ) -> Self {
-        Self {
-            hit: lookup_key(cache, backend, type_name, "hit"),
-            miss: lookup_key(cache, backend, type_name, "miss"),
-        }
-    }
-
-    pub(super) fn get(&self, is_hit: bool) -> &Key {
-        if is_hit { &self.hit } else { &self.miss }
-    }
-}
-
-#[cfg(feature = "metrics")]
-fn lookup_key(
-    cache: CacheMetricsKind,
-    backend: CacheBackendKind,
-    type_name: Option<&'static str>,
-    outcome: &'static str,
-) -> Key {
-    let mut labels = Vec::with_capacity(if type_name.is_some() { 4 } else { 3 });
-    labels.push(Label::new("cache", cache.as_str()));
-    labels.push(Label::new("backend", backend.as_str()));
-    if let Some(type_name) = type_name {
-        labels.push(Label::new("type", type_name));
-    }
-    labels.push(Label::new("outcome", outcome));
-    Key::from_parts(METRIC_LOOKUPS, labels)
-}
-
-#[cfg(feature = "metrics")]
-#[derive(Debug)]
 pub(super) struct EventMetricKeys {
-    cache: CacheMetricsKind,
-    backend: CacheBackendKind,
-    type_name: Option<&'static str>,
-    lookup_errors: OnceLock<[Key; 2]>,
-    load: OnceLock<LoadMetricKeys>,
-    warm: OnceLock<WarmMetricKeys>,
-}
-
-#[cfg(feature = "metrics")]
-#[derive(Debug)]
-struct LoadMetricKeys {
-    in_flight: Key,
-    loads: [Key; 3],
     durations: [Key; 3],
-}
-
-#[cfg(feature = "metrics")]
-#[derive(Debug)]
-struct WarmMetricKeys {
-    warm_attempts: Key,
-    warm_hits: Key,
-    warm_loads: [Key; 3],
-    warm_bytes: Key,
-    warm_errors: Key,
 }
 
 #[cfg(feature = "metrics")]
@@ -474,96 +512,26 @@ impl EventMetricKeys {
     pub(super) fn new(
         cache: CacheMetricsKind,
         backend: CacheBackendKind,
-        type_name: Option<&'static str>,
+        type_name: &'static str,
     ) -> Self {
         Self {
-            cache,
-            backend,
-            type_name,
-            lookup_errors: OnceLock::new(),
-            load: OnceLock::new(),
-            warm: OnceLock::new(),
+            durations: ["success", "error", "cancelled"].map(|outcome| {
+                Key::from_parts(
+                    METRIC_LOAD_DURATION,
+                    vec![
+                        Label::new("cache", cache.as_str()),
+                        Label::new("backend", backend.as_str()),
+                        Label::new("type", type_name),
+                        Label::new("outcome", outcome),
+                    ],
+                )
+            }),
         }
     }
-
-    fn lookup_errors(&self) -> &[Key; 2] {
-        self.lookup_errors.get_or_init(|| {
-            ["load", "type_mismatch"]
-                .map(|reason| lookup_error_key(self.cache, self.backend, self.type_name, reason))
-        })
-    }
-
-    fn load(&self) -> &LoadMetricKeys {
-        self.load.get_or_init(|| {
-            const OUTCOMES: [&str; 3] = ["success", "error", "cancelled"];
-            let key =
-                |name, outcome| event_key(name, self.cache, self.backend, self.type_name, outcome);
-            LoadMetricKeys {
-                in_flight: key(METRIC_LOADS_IN_FLIGHT, None),
-                loads: OUTCOMES.map(|outcome| key(METRIC_LOADS, Some(outcome))),
-                durations: OUTCOMES.map(|outcome| key(METRIC_LOAD_DURATION, Some(outcome))),
-            }
-        })
-    }
-
-    fn warm(&self) -> &WarmMetricKeys {
-        self.warm.get_or_init(|| {
-            const OUTCOMES: [&str; 3] = ["success", "error", "cancelled"];
-            let key =
-                |name, outcome| event_key(name, self.cache, self.backend, self.type_name, outcome);
-            WarmMetricKeys {
-                warm_attempts: key(METRIC_WARM_ATTEMPTS, None),
-                warm_hits: key(METRIC_WARM_HITS, None),
-                warm_loads: OUTCOMES.map(|outcome| key(METRIC_WARM_LOADS, Some(outcome))),
-                warm_bytes: key(METRIC_WARM_LOAD_BYTES, None),
-                warm_errors: key(METRIC_WARM_ERRORS, None),
-            }
-        })
-    }
-}
-
-#[cfg(feature = "metrics")]
-fn event_key(
-    name: &'static str,
-    cache: CacheMetricsKind,
-    backend: CacheBackendKind,
-    type_name: Option<&'static str>,
-    outcome: Option<&'static str>,
-) -> Key {
-    let mut labels =
-        Vec::with_capacity(2 + usize::from(type_name.is_some()) + usize::from(outcome.is_some()));
-    labels.push(Label::new("cache", cache.as_str()));
-    labels.push(Label::new("backend", backend.as_str()));
-    if let Some(type_name) = type_name {
-        labels.push(Label::new("type", type_name));
-    }
-    if let Some(outcome) = outcome {
-        labels.push(Label::new("outcome", outcome));
-    }
-    Key::from_parts(name, labels)
-}
-
-#[cfg(feature = "metrics")]
-fn lookup_error_key(
-    cache: CacheMetricsKind,
-    backend: CacheBackendKind,
-    type_name: Option<&'static str>,
-    reason: &'static str,
-) -> Key {
-    let mut labels = Vec::with_capacity(if type_name.is_some() { 4 } else { 3 });
-    labels.push(Label::new("cache", cache.as_str()));
-    labels.push(Label::new("backend", backend.as_str()));
-    if let Some(type_name) = type_name {
-        labels.push(Label::new("type", type_name));
-    }
-    labels.push(Label::new("reason", reason));
-    Key::from_parts(METRIC_LOOKUP_ERRORS, labels)
 }
 
 #[derive(Clone, Copy)]
 pub(super) struct CacheMetricKeys<'a> {
-    #[cfg(feature = "metrics")]
-    aggregate: &'a EventMetricKeys,
     #[cfg(feature = "metrics")]
     by_type: &'a EventMetricKeys,
     #[cfg(not(feature = "metrics"))]
@@ -572,8 +540,8 @@ pub(super) struct CacheMetricKeys<'a> {
 
 impl<'a> CacheMetricKeys<'a> {
     #[cfg(feature = "metrics")]
-    pub(super) fn new(aggregate: &'a EventMetricKeys, by_type: &'a EventMetricKeys) -> Self {
-        Self { aggregate, by_type }
+    pub(super) fn new(by_type: &'a EventMetricKeys) -> Self {
+        Self { by_type }
     }
 
     #[cfg(not(feature = "metrics"))]
@@ -583,49 +551,10 @@ impl<'a> CacheMetricKeys<'a> {
         }
     }
 
-    #[cfg(feature = "metrics")]
-    #[inline]
-    pub(super) fn lookup_error(self, reason: &'static str) {
-        let index = match reason {
-            "load" => 0,
-            "type_mismatch" => 1,
-            _ => unreachable!("cache lookup error reason"),
-        };
-        self.increment_pair(
-            &self.aggregate.lookup_errors()[index],
-            &self.by_type.lookup_errors()[index],
-            1,
-        );
-    }
-
-    #[inline]
-    pub(super) fn load_started(self) {
-        #[cfg(feature = "metrics")]
-        {
-            let aggregate = self.aggregate.load();
-            let by_type = self.by_type.load();
-            metrics::with_recorder(|recorder| {
-                static METADATA: metrics::Metadata<'static> = metrics::Metadata::new(
-                    module_path!(),
-                    metrics::Level::INFO,
-                    Some(module_path!()),
-                );
-                recorder
-                    .register_gauge(&aggregate.in_flight, &METADATA)
-                    .increment(1.0);
-                recorder
-                    .register_gauge(&by_type.in_flight, &METADATA)
-                    .increment(1.0);
-            });
-        }
-    }
-
     #[inline]
     pub(super) fn load_finished(self, outcome: &'static str, duration_ns: u64) {
         #[cfg(feature = "metrics")]
         {
-            let aggregate = self.aggregate.load();
-            let by_type = self.by_type.load();
             static METADATA: metrics::Metadata<'static> =
                 metrics::Metadata::new(module_path!(), metrics::Level::INFO, Some(module_path!()));
             let index = match outcome {
@@ -634,121 +563,15 @@ impl<'a> CacheMetricKeys<'a> {
                 "cancelled" => 2,
                 _ => unreachable!("cache load outcome"),
             };
-            let duration = duration_ns as f64 / 1_000_000_000.0;
             metrics::with_recorder(|recorder| {
                 recorder
-                    .register_gauge(&aggregate.in_flight, &METADATA)
-                    .decrement(1.0);
-                recorder
-                    .register_gauge(&by_type.in_flight, &METADATA)
-                    .decrement(1.0);
-                recorder
-                    .register_counter(&aggregate.loads[index], &METADATA)
-                    .increment(1);
-                recorder
-                    .register_counter(&by_type.loads[index], &METADATA)
-                    .increment(1);
-                recorder
-                    .register_histogram(&aggregate.durations[index], &METADATA)
-                    .record(duration);
-                recorder
-                    .register_histogram(&by_type.durations[index], &METADATA)
-                    .record(duration);
+                    .register_histogram(&self.by_type.durations[index], &METADATA)
+                    .record(duration_ns as f64 / 1_000_000_000.0);
             });
         }
         #[cfg(not(feature = "metrics"))]
         let _ = (outcome, duration_ns);
     }
-
-    #[inline]
-    pub(super) fn warm_attempt(self) {
-        #[cfg(feature = "metrics")]
-        self.increment_pair(
-            &self.aggregate.warm().warm_attempts,
-            &self.by_type.warm().warm_attempts,
-            1,
-        );
-    }
-
-    #[inline]
-    pub(super) fn warm_hit(self) {
-        #[cfg(feature = "metrics")]
-        self.increment_pair(
-            &self.aggregate.warm().warm_hits,
-            &self.by_type.warm().warm_hits,
-            1,
-        );
-    }
-
-    #[inline]
-    pub(super) fn warm_load(self, outcome: &'static str) {
-        #[cfg(feature = "metrics")]
-        {
-            let index = match outcome {
-                "success" => 0,
-                "error" => 1,
-                "cancelled" => 2,
-                _ => unreachable!("cache warm load outcome"),
-            };
-            self.increment_pair(
-                &self.aggregate.warm().warm_loads[index],
-                &self.by_type.warm().warm_loads[index],
-                1,
-            );
-        }
-        #[cfg(not(feature = "metrics"))]
-        let _ = outcome;
-    }
-
-    #[inline]
-    pub(super) fn warm_load_bytes(self, bytes: u64) {
-        #[cfg(feature = "metrics")]
-        self.increment_pair(
-            &self.aggregate.warm().warm_bytes,
-            &self.by_type.warm().warm_bytes,
-            bytes,
-        );
-        #[cfg(not(feature = "metrics"))]
-        let _ = bytes;
-    }
-
-    #[inline]
-    pub(super) fn warm_error(self) {
-        #[cfg(feature = "metrics")]
-        self.increment_pair(
-            &self.aggregate.warm().warm_errors,
-            &self.by_type.warm().warm_errors,
-            1,
-        );
-    }
-
-    #[cfg(feature = "metrics")]
-    #[inline]
-    fn increment_pair(self, aggregate: &Key, by_type: &Key, value: u64) {
-        static METADATA: metrics::Metadata<'static> =
-            metrics::Metadata::new(module_path!(), metrics::Level::INFO, Some(module_path!()));
-        metrics::with_recorder(|recorder| {
-            recorder
-                .register_counter(aggregate, &METADATA)
-                .increment(value);
-            recorder
-                .register_counter(by_type, &METADATA)
-                .increment(value);
-        });
-    }
-}
-
-#[cfg(feature = "metrics")]
-#[inline]
-pub(crate) fn lookup(aggregate_key: &Key, type_key: &Key) {
-    static METADATA: metrics::Metadata<'static> =
-        metrics::Metadata::new(module_path!(), metrics::Level::INFO, Some(module_path!()));
-    metrics::with_recorder(|recorder| {
-        recorder
-            .register_counter(aggregate_key, &METADATA)
-            .increment(1);
-        recorder.register_counter(type_key, &METADATA).increment(1);
-    });
 }
 
 #[cfg(feature = "metrics")]
@@ -892,6 +715,7 @@ pub(crate) fn bypass(_kind: CacheBackendKind, _reason: &'static str) {}
 mod tests {
     use std::borrow::Cow;
     use std::pin::Pin;
+    use std::process::Command;
     use std::sync::Arc;
 
     use async_trait::async_trait;
@@ -904,6 +728,26 @@ mod tests {
         CacheBackendDiagnostics, CacheCodec, CacheEntry, CacheKey, CacheLoadOrigin,
         CacheSnapshotMode, InternalCacheKey, LanceCache, MokaCacheBackend, QuickCacheBackend,
     };
+
+    // The label budget and native export totals are process-wide. Each recorder
+    // test runs alone so parallel tests cannot consume its labels or add counts.
+    fn isolated(name: &str) -> bool {
+        if std::env::var("LANCE_CACHE_TELEMETRY_TEST").as_deref() == Ok(name) {
+            return false;
+        }
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture"])
+            .env("LANCE_CACHE_TELEMETRY_TEST", name)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        true
+    }
 
     #[derive(Debug)]
     struct GaugeBackend;
@@ -1004,7 +848,7 @@ mod tests {
                 key.labels()
                     .any(|label| label.key() == *expected_key && label.value() == *expected_value)
             });
-            if key.name() == name && has_labels {
+            if key.name() == name && key.labels().count() == labels.len() && has_labels {
                 if let DebugValue::Counter(value) = value {
                     return Some(*value);
                 }
@@ -1015,6 +859,9 @@ mod tests {
 
     #[test]
     fn cache_operations_emit_activity_and_backend_events() {
+        if isolated("cache::telemetry::tests::cache_operations_emit_activity_and_backend_events") {
+            return;
+        }
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
         let cache = LanceCache::with_backend_and_metrics_kind(
@@ -1037,6 +884,7 @@ mod tests {
                 );
                 assert_eq!(*cache.get_with_key(&TestKey).await.unwrap(), 42);
             });
+            refresh_metrics();
         });
 
         let metrics = snapshotter
@@ -1052,10 +900,10 @@ mod tests {
                 &[
                     ("cache", "index"),
                     ("backend", "quick"),
-                    ("outcome", "miss"),
-                ],
+                    ("outcome", "miss")
+                ]
             ),
-            Some(2)
+            None
         );
         assert_eq!(
             counter(
@@ -1074,7 +922,12 @@ mod tests {
             counter(
                 &metrics,
                 METRIC_LOOKUPS,
-                &[("cache", "index"), ("backend", "quick"), ("outcome", "hit"),],
+                &[
+                    ("cache", "index"),
+                    ("backend", "quick"),
+                    ("type", "TelemetryTest"),
+                    ("outcome", "hit"),
+                ],
             ),
             Some(1)
         );
@@ -1085,6 +938,7 @@ mod tests {
                 &[
                     ("cache", "index"),
                     ("backend", "quick"),
+                    ("type", "TelemetryTest"),
                     ("outcome", "success"),
                 ],
             ),
@@ -1100,6 +954,9 @@ mod tests {
 
     #[test]
     fn cached_keys_use_the_current_local_recorder() {
+        if isolated("cache::telemetry::tests::cached_keys_use_the_current_local_recorder") {
+            return;
+        }
         let first_recorder = DebuggingRecorder::new();
         let first_snapshotter = first_recorder.snapshotter();
         let second_recorder = DebuggingRecorder::new();
@@ -1128,15 +985,20 @@ mod tests {
             runtime
                 .block_on(load_cache.get_or_insert_with_key(TestKey, || async { Ok(42) }))
                 .unwrap();
+            refresh_metrics();
         });
         metrics::with_local_recorder(&second_recorder, || {
             assert!(runtime.block_on(cache.get_with_key(&TestKey)).is_some());
             runtime
                 .block_on(load_cache.get_or_insert_with_key(TestKey, || async { Ok(42) }))
                 .unwrap();
+            refresh_metrics();
         });
 
-        for snapshotter in [&first_snapshotter, &second_snapshotter] {
+        for (index, snapshotter) in [&first_snapshotter, &second_snapshotter]
+            .into_iter()
+            .enumerate()
+        {
             let metrics = snapshotter
                 .snapshot()
                 .into_vec()
@@ -1147,9 +1009,14 @@ mod tests {
                 counter(
                     &metrics,
                     METRIC_LOOKUPS,
-                    &[("cache", "index"), ("backend", "quick"), ("outcome", "hit"),],
+                    &[
+                        ("cache", "index"),
+                        ("backend", "quick"),
+                        ("type", "TelemetryTest"),
+                        ("outcome", "hit"),
+                    ],
                 ),
-                Some(1)
+                Some(index as u64 + 1)
             );
             assert_eq!(
                 counter(
@@ -1162,7 +1029,7 @@ mod tests {
                         ("outcome", "hit"),
                     ],
                 ),
-                Some(1)
+                Some(index as u64 + 1)
             );
             for name in [METRIC_LOADS, METRIC_WARM_LOADS] {
                 assert_eq!(
@@ -1176,7 +1043,7 @@ mod tests {
                             ("outcome", "success"),
                         ],
                     ),
-                    Some(1)
+                    Some(index as u64 + 2)
                 );
             }
         }
@@ -1184,6 +1051,9 @@ mod tests {
 
     #[test]
     fn moka_exports_size_removals_only_when_enabled() {
+        if isolated("cache::telemetry::tests::moka_exports_size_removals_only_when_enabled") {
+            return;
+        }
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
         metrics::with_local_recorder(&recorder, || {
@@ -1215,6 +1085,7 @@ mod tests {
                     .diagnostics_with_mode(CacheSnapshotMode::Refreshed)
                     .await;
             });
+            refresh_metrics();
         });
         let metrics = snapshotter
             .snapshot()
@@ -1238,12 +1109,16 @@ mod tests {
 
     #[test]
     fn occupancy_gauges_deduplicate_and_clear_expired_pools() {
+        if isolated("cache::telemetry::tests::occupancy_gauges_deduplicate_and_clear_expired_pools")
+        {
+            return;
+        }
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
         metrics::with_local_recorder(&recorder, || {
             let backend: Arc<dyn CacheBackend> = Arc::new(GaugeBackend);
             let first = LanceCache::with_backend(backend.clone());
-            let second = LanceCache::with_backend(backend.clone());
+            let second = LanceCache::with_backend(Arc::new(GaugeBackend));
 
             refresh_metrics();
             assert_eq!(gauge(&snapshotter, METRIC_CAPACITY, "custom"), Some(321.0));
@@ -1262,6 +1137,9 @@ mod tests {
 
     #[test]
     fn warm_origin_emits_aggregate_and_typed_events() {
+        if isolated("cache::telemetry::tests::warm_origin_emits_aggregate_and_typed_events") {
+            return;
+        }
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
         let cache = LanceCache::with_backend_and_metrics_kind(
@@ -1279,6 +1157,7 @@ mod tests {
                     .unwrap();
                 assert_eq!(*warm.get_with_key(&TestKey).await.unwrap(), 42);
             });
+            refresh_metrics();
         });
         let metrics = snapshotter
             .snapshot()
@@ -1317,6 +1196,7 @@ mod tests {
                 &[
                     ("cache", "index"),
                     ("backend", "quick"),
+                    ("type", "TelemetryTest"),
                     ("outcome", "success")
                 ],
             ),
@@ -1326,11 +1206,198 @@ mod tests {
             counter(
                 &metrics,
                 METRIC_WARM_LOAD_BYTES,
-                &[("type", "TelemetryTest")]
+                &[
+                    ("cache", "index"),
+                    ("backend", "quick"),
+                    ("type", "TelemetryTest")
+                ]
             )
             .unwrap()
                 > 0
         );
         assert_eq!(cache.diagnostics().activity.warm.attempts, 2);
+    }
+    #[test]
+    fn process_type_budget_exports_other_and_retains_dropped_activity() {
+        const NAME: &str = "cache::telemetry::tests::process_type_budget_exports_other_and_retains_dropped_activity";
+        if isolated(NAME) {
+            return;
+        }
+        for index in 0..MAX_CACHE_TYPE_SERIES {
+            let name = Box::leak(format!("export-budget-{index}").into_boxed_str());
+            assert_eq!(register_type_label(name), (name as &str, false));
+        }
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        {
+            let first = LanceCache::with_backend_and_metrics_kind(
+                Arc::new(QuickCacheBackend::with_capacity(4096)),
+                CacheMetricsKind::Index,
+            );
+            let second = LanceCache::with_backend_and_metrics_kind(
+                Arc::new(QuickCacheBackend::with_capacity(4096)),
+                CacheMetricsKind::Index,
+            );
+            runtime.block_on(async {
+                assert!(first.get_with_key(&TestKey).await.is_none());
+                assert!(second.get_with_key(&TestKey).await.is_none());
+            });
+            // Drop before the first refresh: native lifetime counts must survive.
+        }
+        metrics::with_local_recorder(&recorder, || {
+            refresh_metrics();
+            refresh_metrics();
+        });
+        let metrics = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .map(|(key, _, _, value)| (key.key().clone(), value))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            counter(
+                &metrics,
+                METRIC_LOOKUPS,
+                &[
+                    ("cache", "index"),
+                    ("backend", "quick"),
+                    ("type", "other"),
+                    ("outcome", "miss")
+                ]
+            ),
+            Some(2)
+        );
+        assert_eq!(
+            counter(
+                &metrics,
+                METRIC_LOOKUPS,
+                &[
+                    ("cache", "index"),
+                    ("backend", "quick"),
+                    ("outcome", "miss")
+                ]
+            ),
+            None
+        );
+        assert_eq!(
+            counter(
+                &metrics,
+                METRIC_TYPE_OVERFLOW,
+                &[("cache", "index"), ("backend", "quick")]
+            ),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn refresh_tracks_errors_cancelled_loads_and_in_flight_gauge() {
+        const NAME: &str =
+            "cache::telemetry::tests::refresh_tracks_errors_cancelled_loads_and_in_flight_gauge";
+        if isolated(NAME) {
+            return;
+        }
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let backend = Arc::new(QuickCacheBackend::with_capacity(4096));
+                let cache = LanceCache::with_backend_and_metrics_kind(
+                    backend.clone(),
+                    CacheMetricsKind::Index,
+                )
+                .with_load_origin(CacheLoadOrigin::Warm);
+                backend
+                    .insert(&cache.sized_key(&TestKey), Arc::new(1_u32), 4, None)
+                    .await;
+                assert!(cache.get_with_key(&TestKey).await.is_none());
+                cache.clear().await;
+                let error = cache
+                    .get_or_insert_with_key(TestKey, || async {
+                        Err::<u64, _>(crate::Error::timeout("exported loader failure"))
+                    })
+                    .await
+                    .unwrap_err();
+                assert!(matches!(error.find_root(), crate::Error::Timeout { .. }));
+                let mut pending = Box::pin(
+                    cache.get_or_insert_with_key(TestKey, std::future::pending::<Result<u64>>),
+                );
+                assert!(futures::poll!(&mut pending).is_pending());
+                refresh_metrics();
+                assert!(
+                    snapshotter
+                        .snapshot()
+                        .into_vec()
+                        .iter()
+                        .any(|(key, _, _, value)| {
+                            key.key().name() == METRIC_LOADS_IN_FLIGHT
+                                && matches!(value, DebugValue::Gauge(value) if value.0 == 1.0)
+                        })
+                );
+                drop(pending);
+                refresh_metrics();
+            });
+        });
+        let metrics = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .map(|(key, _, _, value)| (key.key().clone(), value))
+            .collect::<Vec<_>>();
+        for reason in ["load", "type_mismatch"] {
+            assert_eq!(
+                counter(
+                    &metrics,
+                    METRIC_LOOKUP_ERRORS,
+                    &[
+                        ("cache", "index"),
+                        ("backend", "quick"),
+                        ("type", "TelemetryTest"),
+                        ("reason", reason)
+                    ]
+                ),
+                Some(1)
+            );
+        }
+        for name in [METRIC_LOADS, METRIC_WARM_LOADS] {
+            for outcome in ["error", "cancelled"] {
+                assert_eq!(
+                    counter(
+                        &metrics,
+                        name,
+                        &[
+                            ("cache", "index"),
+                            ("backend", "quick"),
+                            ("type", "TelemetryTest"),
+                            ("outcome", outcome)
+                        ]
+                    ),
+                    Some(1)
+                );
+            }
+        }
+        assert_eq!(
+            counter(
+                &metrics,
+                METRIC_WARM_ERRORS,
+                &[
+                    ("cache", "index"),
+                    ("backend", "quick"),
+                    ("type", "TelemetryTest")
+                ]
+            ),
+            Some(2)
+        );
+        assert!(
+            metrics
+                .iter()
+                .any(|(key, value)| key.name() == METRIC_LOADS_IN_FLIGHT
+                    && matches!(value, DebugValue::Gauge(value) if value.0 == 0.0))
+        );
     }
 }

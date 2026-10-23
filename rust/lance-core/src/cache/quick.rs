@@ -93,6 +93,8 @@ impl quick_cache::Lifecycle<InternalCacheKey, QuickEntry> for EntryLifecycle {
 }
 
 pub struct QuickCacheBackend {
+    #[cfg(test)]
+    priority_snapshot_pause: Option<(std::sync::Barrier, std::sync::Barrier)>,
     cache: quick_cache::sync::Cache<
         InternalCacheKey,
         QuickEntry,
@@ -214,6 +216,8 @@ impl QuickCacheBackend {
             EntryLifecycle(metrics.clone()),
         );
         Self {
+            #[cfg(test)]
+            priority_snapshot_pause: None,
             cache,
             capacity,
             metrics,
@@ -241,8 +245,21 @@ impl QuickCacheBackend {
                 // Metadata and existing entries compete with signs, ahead of ex planes.
                 // Reserving the whole budget for planes would otherwise evict the IVF model.
                 let existing: Vec<_> = self.cache.iter().collect();
+                #[cfg(test)]
+                if let Some((snapshotted, resume)) = &self.priority_snapshot_pause {
+                    snapshotted.wait();
+                    resume.wait();
+                }
                 for (key, value) in existing {
-                    self.cache.remove(&key);
+                    // A concurrent eviction and reload may have replaced this
+                    // snapshot with a new value or single-flight placeholder.
+                    if self
+                        .cache
+                        .remove_if(&key, |current| current.submission_id == value.submission_id)
+                        .is_none()
+                    {
+                        continue;
+                    }
                     let size = key_footprint(&key).saturating_add(value.size_bytes);
                     dropped.extend(entries.insert(key, value, size, 3, self.capacity));
                 }
@@ -450,6 +467,15 @@ impl CacheBackend for QuickCacheBackend {
     }
 
     async fn get(&self, key: &InternalCacheKey, codec: Option<CacheCodec>) -> Option<CacheEntry> {
+        self.get_entry(key, codec)
+    }
+
+    async fn get_with_context(
+        &self,
+        key: &InternalCacheKey,
+        codec: Option<CacheCodec>,
+        _context: CacheOperationContext,
+    ) -> Option<CacheEntry> {
         self.get_entry(key, codec)
     }
 
@@ -1252,6 +1278,52 @@ mod tests {
         assert_eq!(snapshot.write_attempts, Some(2));
         assert_eq!(snapshot.lost_placeholder_rejections, Some(1));
         assert_eq!(snapshot.size_removals, Some(0));
+    }
+
+    #[rstest::rstest]
+    #[case::placeholder(true)]
+    #[case::replacement(false)]
+    #[test]
+    fn priority_transition_preserves_entries_reopened_after_snapshot(#[case] is_loading: bool) {
+        let mut backend = QuickCacheBackend::with_capacity(4096);
+        backend.priority_snapshot_pause =
+            Some((std::sync::Barrier::new(2), std::sync::Barrier::new(2)));
+        let key = InternalCacheKey::from_bytes([1; 16]);
+        let entry = |submission_id| QuickEntry {
+            entry: Arc::new(submission_id),
+            size_bytes: 8,
+            submission_id,
+            type_name: None,
+        };
+        backend.cache.insert(key, entry(1));
+
+        std::thread::scope(|scope| {
+            let transition = scope.spawn(|| {
+                backend.admit_priority(InternalCacheKey::from_bytes([2; 16]), entry(2), 3, 0);
+            });
+            let (snapshotted, resume) = backend.priority_snapshot_pause.as_ref().unwrap();
+            snapshotted.wait();
+            backend.cache.remove(&key);
+            let guard = if is_loading {
+                Some(
+                    futures::executor::block_on(backend.cache.get_value_or_guard_async(&key))
+                        .err()
+                        .unwrap(),
+                )
+            } else {
+                backend.cache.insert(key, entry(3));
+                None
+            };
+            resume.wait();
+            transition.join().unwrap();
+            assert!(!backend.priority.lock().unwrap().contains(&key));
+            if let Some(guard) = guard {
+                assert!(
+                    guard.insert(entry(3)).is_ok(),
+                    "priority transition removed a new loader's placeholder"
+                );
+            }
+        });
     }
 
     #[cfg(target_pointer_width = "64")]

@@ -2336,10 +2336,12 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         Q::Metadata: 'static,
         Q::Storage: 'static,
     {
-        if self.caches_partition_codes() {
-            return self.prewarm_partition_codes_window(partitions).await;
-        }
         let index_cache = self.index_cache.with_load_origin(CacheLoadOrigin::Warm);
+        if self.caches_partition_codes() {
+            return self
+                .prewarm_partition_codes_window(partitions, &index_cache)
+                .await;
+        }
         let index_schema = Arc::new(match &self.read_projection {
             Some(projection) => projection.schema.as_ref().into(),
             None => self.reader.schema().as_ref().into(),
@@ -2463,14 +2465,18 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
     /// columns, cut into the entries of its partitions. The flat sub-index
     /// holds nothing to warm, and the index loaded the resident store when
     /// it opened.
-    async fn prewarm_partition_codes_window(&self, partitions: Range<usize>) -> Result<()> {
+    async fn prewarm_partition_codes_window(
+        &self,
+        partitions: Range<usize>,
+        index_cache: &WeakLanceCache,
+    ) -> Result<()> {
         let projection = self.storage.partition_codes_projection()?;
         let schema: arrow_schema::SchemaRef = Arc::new(projection.schema.as_ref().into());
         let mut partition_id = partitions.start;
         while partition_id < partitions.end {
             let cached = |partition| async move {
                 let key = PartitionCodesKey { partition };
-                self.index_cache.get_with_key(&key).await.is_some()
+                index_cache.get_with_key(&key).await.is_some()
             };
             if cached(partition_id).await {
                 partition_id += 1;
@@ -2503,7 +2509,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
                     !shares_resident_store(&codes.0),
                     "prewarmed codes of partition {partition} hold memory of a resident store"
                 );
-                self.index_cache
+                index_cache
                     .get_or_insert_with_key(
                         PartitionCodesKey { partition },
                         || async move { Ok(codes) },
@@ -2626,7 +2632,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<S, 
             self.uuid
         );
         if self.uses_rabit_plane_cache() {
-            self.storage.prewarm_planes(&self.index_cache).await?;
+            let index_cache = self.index_cache.with_load_origin(CacheLoadOrigin::Warm);
+            self.storage.prewarm_planes(&index_cache).await?;
         } else {
             self.prewarm_partitions().await?;
         }

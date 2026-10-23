@@ -270,10 +270,7 @@ impl CacheState {
         self.type_activity.record_hit(by_type);
         #[cfg(feature = "metrics")]
         {
-            self.type_activity
-                .note_event(by_type, self.cache_kind, self.backend_kind);
-            let (aggregate_key, type_key) = self.type_activity.lookup_metric_keys(by_type, true);
-            telemetry::lookup(aggregate_key, type_key);
+            self.type_activity.note_event(by_type);
         }
     }
 
@@ -283,10 +280,7 @@ impl CacheState {
         self.type_activity.record_miss(by_type);
         #[cfg(feature = "metrics")]
         {
-            self.type_activity
-                .note_event(by_type, self.cache_kind, self.backend_kind);
-            let (aggregate_key, type_key) = self.type_activity.lookup_metric_keys(by_type, false);
-            telemetry::lookup(aggregate_key, type_key);
+            self.type_activity.note_event(by_type);
         }
     }
 
@@ -294,27 +288,18 @@ impl CacheState {
     fn record_lookup_error(
         &self,
         by_type: diagnostics::TypeActivityHandle,
-        reason: &'static str,
         origin: CacheLoadOrigin,
     ) {
         self.activity.lookup_errors.fetch_add(1, Ordering::Relaxed);
         self.type_activity.record_lookup_error(by_type);
         if origin == CacheLoadOrigin::Warm {
-            self.activity.record_warm_error(
-                self.type_activity.activity(by_type),
-                self.type_activity.event_metric_keys(by_type),
-            );
+            self.activity
+                .record_warm_error(self.type_activity.activity(by_type));
         }
         #[cfg(feature = "metrics")]
         {
-            self.type_activity
-                .note_event(by_type, self.cache_kind, self.backend_kind);
-            self.type_activity
-                .event_metric_keys(by_type)
-                .lookup_error(reason);
+            self.type_activity.note_event(by_type);
         }
-        #[cfg(not(feature = "metrics"))]
-        let _ = reason;
     }
 
     #[inline]
@@ -327,7 +312,7 @@ impl CacheState {
             .type_mismatches
             .fetch_add(1, Ordering::Relaxed);
         self.type_activity.record_type_mismatch(by_type);
-        self.record_lookup_error(by_type, "type_mismatch", origin);
+        self.record_lookup_error(by_type, origin);
     }
 
     fn record_warm_attempt(
@@ -339,20 +324,15 @@ impl CacheState {
             return;
         }
         #[cfg(feature = "metrics")]
-        self.type_activity
-            .note_event(by_type, self.cache_kind, self.backend_kind);
-        self.activity.record_warm_attempt(
-            self.type_activity.activity(by_type),
-            self.type_activity.event_metric_keys(by_type),
-        );
+        self.type_activity.note_event(by_type);
+        self.activity
+            .record_warm_attempt(self.type_activity.activity(by_type));
     }
 
     fn record_warm_hit(&self, by_type: diagnostics::TypeActivityHandle, origin: CacheLoadOrigin) {
         if origin == CacheLoadOrigin::Warm {
-            self.activity.record_warm_hit(
-                self.type_activity.activity(by_type),
-                self.type_activity.event_metric_keys(by_type),
-            );
+            self.activity
+                .record_warm_hit(self.type_activity.activity(by_type));
         }
     }
 
@@ -365,7 +345,6 @@ impl CacheState {
         if origin == CacheLoadOrigin::Warm {
             self.activity.record_warm_insert(
                 self.type_activity.activity(by_type),
-                self.type_activity.event_metric_keys(by_type),
                 size_bytes.try_into().unwrap_or(u64::MAX),
             );
         }
@@ -396,6 +375,13 @@ impl CacheState {
                 .or_insert(cache_entry_size_with_context::<T>);
         }
         cache_entry_size(value)
+    }
+}
+
+#[cfg(feature = "metrics")]
+impl Drop for CacheState {
+    fn drop(&mut self) {
+        telemetry::retire_activity(self);
     }
 }
 
@@ -465,8 +451,11 @@ impl LanceCache {
         backend: Arc<dyn CacheBackend>,
         cache_kind: CacheMetricsKind,
     ) -> Self {
+        let state = Arc::new(CacheState::new(backend, cache_kind));
+        #[cfg(feature = "metrics")]
+        telemetry::register_activity(&state);
         Self {
-            state: Arc::new(CacheState::new(backend, cache_kind)),
+            state,
             namespace: key::CacheNamespace::root(),
             origin: CacheLoadOrigin::Demand,
         }
@@ -609,7 +598,7 @@ impl LanceCache {
     pub async fn diagnostics_by_type(&self, mode: CacheSnapshotMode) -> CacheDiagnostics {
         let (backend, occupancy) = self.state.backend.diagnostics_with_types(mode).await;
         let aggregate = self.activity_snapshot();
-        let (activity, type_label_overflow_events) = self.state.type_activity.snapshot(&aggregate);
+        let (activity, type_label_overflow_events) = self.state.type_activity.snapshot();
         CacheDiagnostics::with_by_type(
             aggregate,
             backend,
@@ -665,13 +654,11 @@ impl LanceCache {
         K: CacheKey,
         K::ValueType: DeepSizeOf + Send + Sync + 'static,
     {
+        let by_type = self.state.type_activity.get(K::stable_type_id());
+        self.state.record_warm_attempt(by_type, self.origin);
         let key = self.sized_key(cache_key);
-        self.state
-            .backend
-            .get_resident(&key)
-            .await?
-            .downcast::<K::ValueType>()
-            .ok()
+        let entry = self.state.backend.get_resident(&key).await;
+        self.lookup_result(entry, by_type, K::stable_type_id())
     }
 
     /// Report whether an entry is resident without counting as an access.
@@ -701,13 +688,15 @@ impl LanceCache {
         K: CacheKey,
         K::ValueType: DeepSizeOf + Send + Sync + 'static,
     {
+        let by_type = self.state.type_activity.get(K::stable_type_id());
+        self.state.record_warm_attempt(by_type, self.origin);
         let key = self.sized_key(cache_key);
-        self.state
+        let entry = self
+            .state
             .backend
             .get_without_promotion(&key, cache_key.codec_for_key())
-            .await?
-            .downcast::<K::ValueType>()
-            .ok()
+            .await;
+        self.lookup_result(entry, by_type, K::stable_type_id())
     }
 
     /// Read selected rows from a persistent entry without memory admission.
@@ -720,12 +709,14 @@ impl LanceCache {
         K: CacheKey,
         K::ValueType: DeepSizeOf + Send + Sync + 'static,
     {
-        self.state
+        let by_type = self.state.type_activity.get(K::stable_type_id());
+        self.state.record_warm_attempt(by_type, self.origin);
+        let entry = self
+            .state
             .backend
             .get_rows(&self.sized_key(cache_key), rows, cache_key.codec_for_key())
-            .await?
-            .downcast::<K::ValueType>()
-            .ok()
+            .await;
+        self.lookup_result(entry, by_type, K::stable_type_id())
     }
 
     pub async fn get_with_key<K>(&self, cache_key: &K) -> Option<Arc<K::ValueType>>
@@ -736,16 +727,29 @@ impl LanceCache {
         let by_type = self.state.type_activity.get(K::stable_type_id());
         self.state.record_warm_attempt(by_type, self.origin);
         let key = self.sized_key(cache_key);
-        let Some(entry) = self
+        let entry = self
             .state
             .backend
-            .get(&key, cache_key.codec_for_key())
-            .await
-        else {
+            .get_with_context(
+                &key,
+                cache_key.codec_for_key(),
+                CacheOperationContext::new(K::stable_type_id(), self.origin),
+            )
+            .await;
+        self.lookup_result(entry, by_type, K::stable_type_id())
+    }
+
+    fn lookup_result<T: Send + Sync + 'static>(
+        &self,
+        entry: Option<CacheEntry>,
+        by_type: diagnostics::TypeActivityHandle,
+        type_name: &'static str,
+    ) -> Option<Arc<T>> {
+        let Some(entry) = entry else {
             self.state.record_miss(by_type);
             return None;
         };
-        match entry.downcast::<K::ValueType>() {
+        match entry.downcast::<T>() {
             Ok(value) => {
                 self.state.record_hit(by_type);
                 self.state.record_warm_hit(by_type, self.origin);
@@ -757,7 +761,7 @@ impl LanceCache {
                 // intermediate state). Treat as a miss.
                 log::warn!(
                     "cache backend returned a value with the wrong concrete type for key type {:?}",
-                    K::stable_type_id()
+                    type_name
                 );
                 self.state.record_miss(by_type);
                 self.state.record_type_mismatch(by_type, self.origin);
@@ -807,9 +811,7 @@ impl LanceCache {
         let origin = self.origin;
         let typed_loader = Box::pin(async move {
             #[cfg(feature = "metrics")]
-            state
-                .type_activity
-                .note_event(by_type, state.cache_kind, state.backend_kind);
+            state.type_activity.note_event(by_type);
             let guard = state.activity.start_load(
                 state.type_activity.activity(by_type),
                 state.type_activity.event_metric_keys(by_type),
@@ -822,7 +824,6 @@ impl LanceCache {
             if origin == CacheLoadOrigin::Warm {
                 state.activity.record_warm_load_bytes(
                     state.type_activity.activity(by_type),
-                    state.type_activity.event_metric_keys(by_type),
                     size.try_into().unwrap_or(u64::MAX),
                 );
             }
@@ -840,7 +841,7 @@ impl LanceCache {
             )
             .await
             .inspect_err(|_| {
-                self.state.record_lookup_error(by_type, "load", self.origin);
+                self.state.record_lookup_error(by_type, self.origin);
             })?;
         let entry = entry.downcast::<K::ValueType>().map_err(|_| {
             self.state.record_miss(by_type);
@@ -954,9 +955,7 @@ impl LanceCache {
         let origin = self.origin;
         let typed_loader = Box::pin(async move {
             #[cfg(feature = "metrics")]
-            state
-                .type_activity
-                .note_event(by_type, state.cache_kind, state.backend_kind);
+            state.type_activity.note_event(by_type);
             let guard = state.activity.start_load(
                 state.type_activity.activity(by_type),
                 state.type_activity.event_metric_keys(by_type),
@@ -969,7 +968,6 @@ impl LanceCache {
             if origin == CacheLoadOrigin::Warm {
                 state.activity.record_warm_load_bytes(
                     state.type_activity.activity(by_type),
-                    state.type_activity.event_metric_keys(by_type),
                     size.try_into().unwrap_or(u64::MAX),
                 );
             }
@@ -987,7 +985,7 @@ impl LanceCache {
             )
             .await
             .inspect_err(|_| {
-                self.state.record_lookup_error(by_type, "load", self.origin);
+                self.state.record_lookup_error(by_type, self.origin);
             })?;
         let entry = entry.downcast::<Arc<K::ValueType>>().map_err(|_| {
             self.state.record_miss(by_type);
@@ -1014,7 +1012,16 @@ impl LanceCache {
         let by_type = self.state.type_activity.get(K::stable_type_id());
         self.state.record_warm_attempt(by_type, self.origin);
         let key = self.unsized_key(cache_key);
-        let Some(entry) = self.state.backend.get(&key, None).await else {
+        let Some(entry) = self
+            .state
+            .backend
+            .get_with_context(
+                &key,
+                None,
+                CacheOperationContext::new(K::stable_type_id(), self.origin),
+            )
+            .await
+        else {
             self.state.record_miss(by_type);
             return None;
         };
@@ -1556,10 +1563,34 @@ mod tests {
     #[derive(Debug, Default)]
     struct HashMapBackend {
         entries: tokio::sync::Mutex<HashMap<InternalCacheKey, (CacheEntry, usize)>>,
+        lookup_contexts: tokio::sync::Mutex<Vec<CacheOperationContext>>,
     }
 
     #[async_trait::async_trait]
     impl CacheBackend for HashMapBackend {
+        async fn get_with_context(
+            &self,
+            key: &InternalCacheKey,
+            codec: Option<CacheCodec>,
+            context: CacheOperationContext,
+        ) -> Option<CacheEntry> {
+            self.lookup_contexts.lock().await.push(context);
+            self.get(key, codec).await
+        }
+
+        async fn get_rows(
+            &self,
+            key: &InternalCacheKey,
+            _rows: &[u32],
+            codec: Option<CacheCodec>,
+        ) -> Option<CacheEntry> {
+            self.get(key, codec).await
+        }
+
+        async fn get_resident(&self, key: &InternalCacheKey) -> Option<CacheEntry> {
+            self.get(key, None).await
+        }
+
         async fn get(
             &self,
             key: &InternalCacheKey,
@@ -1919,6 +1950,57 @@ mod tests {
         cache.clear().await;
         assert!(backend.entries.lock().await.is_empty());
         assert_eq!(child.stats().await.hits, 0);
+    }
+
+    #[tokio::test]
+    async fn typed_lookups_forward_context_and_specialized_reads_record_activity() {
+        let backend = Arc::new(HashMapBackend::default());
+        let cache = LanceCache::with_backend(backend.clone());
+        let warm = cache.with_load_origin(CacheLoadOrigin::Warm);
+        assert!(cache.get_with_key(&TestKey::new(1)).await.is_none());
+        assert!(
+            warm.get_unsized_with_key(&LegacyUnsizedBridgeKey("missing"))
+                .await
+                .is_none()
+        );
+        let contexts = backend.lookup_contexts.lock().await;
+        assert_eq!(contexts.len(), 2);
+        assert_eq!(contexts[0].type_name(), Some(TestKey::stable_type_id()));
+        assert_eq!(contexts[0].origin(), CacheLoadOrigin::Demand);
+        assert_eq!(
+            contexts[1].type_name(),
+            Some(LegacyUnsizedBridgeKey::stable_type_id())
+        );
+        assert_eq!(contexts[1].origin(), CacheLoadOrigin::Warm);
+        drop(contexts);
+
+        cache
+            .insert_with_key(&TestKey::new(1), Arc::new(vec![1]))
+            .await;
+        for id in [1, 2] {
+            assert_eq!(
+                warm.get_resident_with_key(&TestKey::new(id))
+                    .await
+                    .is_some(),
+                id == 1
+            );
+            assert_eq!(
+                warm.get_without_promotion_with_key(&TestKey::new(id))
+                    .await
+                    .is_some(),
+                id == 1
+            );
+            assert_eq!(
+                warm.get_rows_with_key(&TestKey::new(id), &[0])
+                    .await
+                    .is_some(),
+                id == 1
+            );
+        }
+        let activity = cache.diagnostics().activity;
+        assert_eq!((activity.hits, activity.misses), (3, 5));
+        assert_eq!((activity.warm.attempts, activity.warm.hits), (7, 3));
+        assert_eq!(activity.loads_started, 0);
     }
 
     #[tokio::test]
@@ -2322,6 +2404,17 @@ mod tests {
         assert_eq!(warm_activity.errors, 1);
         assert!(warm_activity.load_bytes > 0);
         let by_type = snapshot.by_type.unwrap();
+        let second = &by_type
+            .activity
+            .iter()
+            .find(|row| row.type_name == SecondTypedKey::stable_type_id())
+            .unwrap()
+            .activity
+            .warm;
+        assert_eq!(second.attempts, 1);
+        assert_eq!(second.loads_started, 1);
+        assert_eq!(second.loads_succeeded, 1);
+        assert_eq!(second.load_bytes, cache_entry_size(&vec![3_u32]) as u64);
         assert_eq!(
             by_type
                 .activity
