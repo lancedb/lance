@@ -4510,6 +4510,125 @@ mod tests {
         }
     }
 
+    /// A pre-migration Bitmap segment stores row ids directly (version 0); this
+    /// test relabels a freshly built segment's version to simulate one, the
+    /// same trick `test_optimize_btree_merge_rebuilds_legacy_segment_outside_merge_window`
+    /// used before a checked-in legacy fixture replaced it -- there is no such
+    /// fixture for Bitmap. A segment built afterward for an untouched fragment
+    /// is genuinely address-domain. Publishing just the new segment keeps the
+    /// relabeled one covering the original fragments, exercising the same
+    /// staged-commit path as the BTree case above, but for Bitmap: the
+    /// manifest build's row-domain check must reject the mixed result rather
+    /// than let the named index silently combine the two domains.
+    #[tokio::test]
+    async fn test_staged_bitmap_row_domains_reject_mixed_commit() {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int32,
+            false,
+        )]));
+        let make_batch = |values: std::ops::Range<i32>| -> RecordBatch {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int32Array::from_iter_values(values))],
+            )
+            .unwrap()
+        };
+
+        let reader = RecordBatchIterator::new(
+            vec![Ok(make_batch(0..2)), Ok(make_batch(2..4))],
+            schema.clone(),
+        );
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::Bitmap);
+        let legacy_segment = crate::index::create::CreateIndexBuilder::new(
+            &mut dataset,
+            &["value"],
+            IndexType::Bitmap,
+            &params,
+        )
+        .name("value_idx".into())
+        .execute_uncommitted()
+        .await
+        .unwrap();
+        assert!(legacy_segment.results_are_row_addrs());
+        // Relabel as pre-migration row-id domain, simulating a segment built
+        // before stable row ids were enabled for this dataset.
+        let legacy_segment = IndexMetadata {
+            index_version: 0,
+            ..legacy_segment
+        };
+        dataset
+            .commit_existing_index_segments("value_idx", "value", vec![legacy_segment])
+            .await
+            .unwrap();
+        let legacy = dataset.load_indices_by_name("value_idx").await.unwrap();
+        assert_eq!(legacy.len(), 1);
+        assert!(!legacy[0].results_are_row_addrs());
+
+        let appended = RecordBatchIterator::new(vec![Ok(make_batch(4..6))], schema.clone());
+        let mut dataset = Dataset::write(
+            appended,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let new_fragment_id = dataset.get_fragments().last().unwrap().id() as u32;
+        let new_segment = crate::index::create::CreateIndexBuilder::new(
+            &mut dataset,
+            &["value"],
+            IndexType::Bitmap,
+            &params,
+        )
+        .name("value_idx".into())
+        .replace(true)
+        .fragments(vec![new_fragment_id])
+        .execute_uncommitted()
+        .await
+        .unwrap();
+        assert!(new_segment.results_are_row_addrs());
+
+        let error = dataset
+            .commit_existing_index_segments("value_idx", "value", vec![new_segment])
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(
+            error.to_string().contains("mixes row-ID and row-address"),
+            "{error}"
+        );
+        // The rejected commit must not have landed: the named index is left
+        // exactly as it was before the attempt.
+        assert_eq!(
+            dataset
+                .load_indices_by_name("value_idx")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
     fn json_btree_schema_and_batch(ids: std::ops::Range<i32>) -> (Arc<Schema>, RecordBatch) {
         // A plain Utf8 field tagged with the `arrow.json` extension is read as
         // JSON text (`JsonEncoding::of_field`) -- simpler to construct by hand

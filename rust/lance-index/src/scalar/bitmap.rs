@@ -2846,20 +2846,20 @@ mod tests {
             Arc::new(LanceCache::no_cache()),
         ));
         let values = vec![Some(1u32), Some(2u32), None];
-        let row_ids: Vec<u64> = vec![
+        let row_addrs: Vec<u64> = vec![
             RowAddress::new_from_parts(1, 0).into(),
             RowAddress::new_from_parts(2, 0).into(),
             RowAddress::new_from_parts(3, 0).into(),
         ];
         let schema = Arc::new(Schema::new(vec![
             Field::new("value", DataType::UInt32, true),
-            Field::new("_rowid", DataType::UInt64, false),
+            Field::new(ROW_ADDR, DataType::UInt64, false),
         ]));
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
                 Arc::new(UInt32Array::from(values)),
-                Arc::new(UInt64Array::from(row_ids)),
+                Arc::new(UInt64Array::from(row_addrs)),
             ],
         )
         .unwrap();
