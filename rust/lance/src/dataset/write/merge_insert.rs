@@ -3268,6 +3268,12 @@ impl MergeInsertJob {
                         .iter()
                         .map(|f| f.physical_rows.unwrap() as u64);
 
+                    // `Merger` captures IDs only for updated rows, while padding below
+                    // assigns fresh IDs at each fragment's tail. The indexed full outer
+                    // hash join must therefore emit every matched update before its
+                    // unmatched build-side inserts. Keep
+                    // `test_multi_batch_upsert_preserves_stable_row_ids` covering this
+                    // DataFusion ordering contract.
                     let sequences = lance_table::rowids::rechunk_sequences(
                         [row_id_sequence.clone()],
                         fragment_sizes,
@@ -5384,10 +5390,10 @@ mod tests {
     }
 
     #[rstest::rstest]
+    #[case::indexed_slow_path(true)]
+    #[case::full_scan_fast_path(false)]
     #[tokio::test]
-    async fn test_multi_batch_upsert_preserves_stable_row_ids(
-        #[values(true, false)] use_index: bool,
-    ) {
+    async fn test_multi_batch_upsert_preserves_stable_row_ids(#[case] use_index: bool) {
         let mut dataset = (*create_test_dataset(
             "memory://test_multi_batch_upsert_row_ids",
             LanceFileVersion::default(),
@@ -5414,26 +5420,36 @@ mod tests {
             .iter()
             .copied()
             .collect::<HashSet<_>>();
-        let updated_keys = [2, 4];
+        let updated_keys = [2];
         let updated_row_ids_before = get_row_ids_for_keys(&dataset, &updated_keys).await;
 
-        // Put inserts in the first source batch and updates in the second. Stable
-        // row-id assignment still relies on the join emitting all updates first.
-        let insert_batch = record_batch!(
-            ("key", UInt32, [7, 8]),
-            ("value", UInt32, [70, 80]),
-            ("filterme", Utf8, ["inserted", "inserted"])
+        // Surround an update with inserts in separate source batches. Stable row-id
+        // assignment still relies on the join emitting the update before both inserts.
+        let first_insert_batch = record_batch!(
+            ("key", UInt32, [7]),
+            ("value", UInt32, [70]),
+            ("filterme", Utf8, ["inserted before"])
         )
         .unwrap();
         let update_batch = record_batch!(
-            ("key", UInt32, [2, 4]),
-            ("value", UInt32, [20, 40]),
-            ("filterme", Utf8, ["updated", "updated"])
+            ("key", UInt32, [2]),
+            ("value", UInt32, [20]),
+            ("filterme", Utf8, ["updated"])
         )
         .unwrap();
-        let source_schema = insert_batch.schema();
+        let second_insert_batch = record_batch!(
+            ("key", UInt32, [8]),
+            ("value", UInt32, [80]),
+            ("filterme", Utf8, ["inserted after"])
+        )
+        .unwrap();
+        let source_schema = first_insert_batch.schema();
         let source = Box::new(RecordBatchIterator::new(
-            [Ok(insert_batch), Ok(update_batch)],
+            [
+                Ok(first_insert_batch),
+                Ok(update_batch),
+                Ok(second_insert_batch),
+            ],
             source_schema,
         ));
 
@@ -5448,7 +5464,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(stats.num_updated_rows, 2);
+        assert_eq!(stats.num_updated_rows, 1);
         assert_eq!(stats.num_inserted_rows, 2);
         let updated_row_ids_after = get_row_ids_for_keys(&dataset, &updated_keys).await;
         assert_eq!(updated_row_ids_after, updated_row_ids_before);
@@ -9929,16 +9945,11 @@ mod tests {
                 .await
                 .unwrap();
             // Compaction physically rewrites fragments, and on a
-            // stable-row-id dataset the "id" BTree index now stores row
-            // addresses, which the rewrite invalidates for the affected
-            // fragment (`test_addr_domain_index_does_not_cover_rewritten_update_fragment`).
-            // The in-place patch that would otherwise write zero files falls
-            // back to a real rewrite there to keep the index's coverage
-            // consistent, matching ZoneMap/BloomFilter/FM's existing
-            // address-domain behavior.
-            let expect_rewrite =
-                stable_row_ids && matches!(concurrent_write, ConcurrentWrite::Compaction);
-
+            // stable-row-id dataset the "id" BTree index stores row
+            // addresses. Unlike ZoneMap/BloomFilter/FM, BTree supports remap,
+            // so an eager compaction remaps it in place instead of dropping
+            // its coverage of the rewritten fragment -- the in-place patch
+            // below still finds the fragment covered and writes zero files.
             let commit = CommitBuilder::new(Arc::new(other.clone()))
                 .with_max_retries(0)
                 .execute(prepared.transaction)
@@ -9957,25 +9968,17 @@ mod tests {
                 let (merged, stats) = job.execute_batches(vec![source]).await.unwrap();
                 assert_eq!(stats.num_attempts, 2);
                 assert_eq!(stats.num_updated_rows, 2);
-                assert_eq!(stats.num_files_written, if expect_rewrite { 1 } else { 0 });
+                assert_eq!(stats.num_files_written, 0);
                 merged.as_ref().clone()
             };
-            if expect_rewrite {
-                // The address-domain "id" index can no longer cover the
-                // fragment the rewrite touched, so the patched rows land in
-                // a brand new fragment alongside `other`'s single compacted
-                // one instead of overwriting it in place.
-                assert_eq!(merged.fragments().len(), other.fragments().len() + 1);
-            } else {
-                assert_eq!(merged.fragments().len(), other.fragments().len());
-                for (merged_fragment, current) in
-                    merged.fragments().iter().zip(other.fragments().iter())
-                {
-                    assert_eq!(merged_fragment.id, current.id);
-                    assert_eq!(merged_fragment.files, current.files);
-                    if !stable_row_ids {
-                        assert_eq!(merged_fragment, current);
-                    }
+            assert_eq!(merged.fragments().len(), other.fragments().len());
+            for (merged_fragment, current) in
+                merged.fragments().iter().zip(other.fragments().iter())
+            {
+                assert_eq!(merged_fragment.id, current.id);
+                assert_eq!(merged_fragment.files, current.files);
+                if !stable_row_ids {
+                    assert_eq!(merged_fragment, current);
                 }
             }
             let after = merged
@@ -9986,33 +9989,19 @@ mod tests {
                 .try_into_batch()
                 .await
                 .unwrap();
-            // `before`'s row order is always original-id order (it was
-            // captured before any rewrite). `after`'s is too, except when
-            // `expect_rewrite` relocates the patched rows (ids 0 and 4) to a
-            // new trailing fragment -- so look rows up by id rather than
-            // assuming position, which degrades to position for every other
-            // case since id and position coincide here.
+            // `before`'s and `after`'s row order are both original-id order:
+            // the patch is always in-place, so no row ever relocates. Looking
+            // rows up by id (rather than assuming position) degrades to
+            // position here, but stays correct if a case is added later where
+            // the patch does relocate rows.
             let after_row_for_id = |id: u32| -> usize {
                 let ids = after["id"].as_primitive::<UInt32Type>();
                 (0..ids.len()).find(|&i| ids.value(i) == id).unwrap()
             };
-            if expect_rewrite {
-                for id in 0u32..6 {
-                    assert_eq!(
-                        before.project(&[0, 1, 2]).unwrap().slice(id as usize, 1),
-                        after
-                            .project(&[0, 1, 2])
-                            .unwrap()
-                            .slice(after_row_for_id(id), 1),
-                        "row id {id} mismatched"
-                    );
-                }
-            } else {
-                assert_eq!(
-                    before.project(&[0, 1, 2]).unwrap(),
-                    after.project(&[0, 1, 2]).unwrap()
-                );
-            }
+            assert_eq!(
+                before.project(&[0, 1, 2]).unwrap(),
+                after.project(&[0, 1, 2]).unwrap()
+            );
             if stable_row_ids {
                 for id in 0u32..6 {
                     assert_eq!(
@@ -10040,22 +10029,16 @@ mod tests {
             } else {
                 vec!["id_idx"]
             };
-            // The address-domain "id" index cannot cover the new fragment a
-            // rewrite creates -- its stored addresses describe the fragment
-            // it was built against, not whatever replaced part of it (see
+            // Address-domain indices usually cannot cover a fragment a rewrite
+            // replaces -- their stored addresses describe the fragment they
+            // were built against, not whatever replaced it (see
             // `test_addr_domain_index_does_not_cover_rewritten_update_fragment`).
-            // Nor does it keep partial credit for the untouched remainder of
-            // the rewritten fragment: the whole fragment drops out of its
-            // coverage, leaving it empty here (only one fragment existed).
-            let empty_bitmap = RoaringBitmap::new();
+            // "id" is a BTree, though, which supports remap: any rewrite that
+            // touched it (the concurrent compaction) remapped it in place, so
+            // it still covers every live fragment here.
             for name in expected_indices {
                 let index = indices.iter().find(|index| index.name == name).unwrap();
-                let expected_bitmap = if expect_rewrite && name == "id_idx" {
-                    &empty_bitmap
-                } else {
-                    &live_fragments
-                };
-                assert_eq!(index.fragment_bitmap.as_ref(), Some(expected_bitmap));
+                assert_eq!(index.fragment_bitmap.as_ref(), Some(&live_fragments));
             }
             merged.validate().await.unwrap();
         }
@@ -15227,6 +15210,129 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
             .to_vec();
         remaining_keys.sort();
         assert_eq!(remaining_keys, vec![1, 2, 3, 4, 5, 6]);
+    }
+
+    /// Test WhenMatched::Delete combined with deleting rows not matched by source,
+    /// when the source carries dataset columns besides the key. This is not
+    /// delete-only, so the general write exec runs and needs those columns.
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn test_when_matched_delete_with_delete_not_matched_by_source(
+        #[values(true, false)] full_source: bool,
+        #[values(true, false)] delete_if: bool,
+    ) {
+        let test_uri = "memory://test_delete_with_delete_by_source.lance";
+
+        // Create dataset with keys 1-6 (full schema: key, value, filterme)
+        let ds = create_test_dataset(test_uri, LanceFileVersion::V2_0, false).await;
+        // Keys 4, 5, 6 match and are deleted; 1, 2, 3 are only in the target
+        let full_batch = create_new_batch(create_test_schema());
+        let new_batch = if full_source {
+            full_batch
+        } else {
+            full_batch.project(&[0, 1]).unwrap()
+        };
+
+        let when_not_matched_by_source = if delete_if {
+            WhenNotMatchedBySource::delete_if(&ds, "key < 3").unwrap()
+        } else {
+            WhenNotMatchedBySource::Delete
+        };
+        let job = MergeInsertBuilder::try_new(ds.clone(), vec!["key".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::Delete)
+            .when_not_matched(WhenNotMatched::DoNothing)
+            .when_not_matched_by_source(when_not_matched_by_source)
+            .try_build()
+            .unwrap();
+
+        let new_schema = new_batch.schema();
+        let new_reader = Box::new(RecordBatchIterator::new([Ok(new_batch)], new_schema));
+        let (merged_dataset, merge_stats) =
+            job.execute(reader_to_stream(new_reader)).await.unwrap();
+
+        let expected_keys: Vec<u32> = if delete_if { vec![3] } else { vec![] };
+        assert_eq!(merge_stats.num_deleted_rows, 6 - expected_keys.len() as u64);
+        assert_eq!(merge_stats.num_inserted_rows, 0);
+        assert_eq!(merge_stats.num_updated_rows, 0);
+
+        let batches = merged_dataset
+            .scan()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let merged = concat_batches(&create_test_schema(), &batches).unwrap();
+        let mut remaining_keys: Vec<u32> = merged
+            .column(0)
+            .as_primitive::<UInt32Type>()
+            .values()
+            .to_vec();
+        remaining_keys.sort();
+        assert_eq!(remaining_keys, expected_keys);
+    }
+
+    /// A source column the dataset lacks is never written, so it is not carried
+    /// through the join even when the merge is not delete-only.
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn test_delete_by_source_drops_source_columns_not_in_dataset(
+        #[values(WhenMatched::Delete, WhenMatched::DoNothing)] when_matched: WhenMatched,
+        #[values(true, false)] delete_if: bool,
+    ) {
+        let ds = create_test_dataset(
+            "memory://test_delete_by_source_drops_columns.lance",
+            LanceFileVersion::V2_0,
+            false,
+        )
+        .await;
+        // Keys 4, 5, 6 match; 1, 2, 3 are only in the target
+        let source_schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::UInt32, true),
+            Field::new("extra", DataType::Utf8, true),
+        ]));
+        let new_batch = RecordBatch::try_new(
+            source_schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![4, 5, 6, 7, 8, 9])),
+                Arc::new(StringArray::from(vec!["x"; 6])),
+            ],
+        )
+        .unwrap();
+
+        let when_not_matched_by_source = if delete_if {
+            WhenNotMatchedBySource::delete_if(&ds, "key < 3").unwrap()
+        } else {
+            WhenNotMatchedBySource::Delete
+        };
+        let job = MergeInsertBuilder::try_new(ds.clone(), vec!["key".to_string()])
+            .unwrap()
+            .when_matched(when_matched.clone())
+            .when_not_matched(WhenNotMatched::DoNothing)
+            .when_not_matched_by_source(when_not_matched_by_source)
+            .try_build()
+            .unwrap();
+
+        let plan = job
+            .explain_plan(Some(source_schema.as_ref()), false)
+            .await
+            .unwrap();
+        assert!(!plan.contains("extra"), "{plan}");
+
+        let new_reader = Box::new(RecordBatchIterator::new([Ok(new_batch)], source_schema));
+        let (_, merge_stats) = job.execute(reader_to_stream(new_reader)).await.unwrap();
+        let matched_deleted = if when_matched == WhenMatched::Delete {
+            3
+        } else {
+            0
+        };
+        let unmatched_deleted = if delete_if { 2 } else { 3 };
+        assert_eq!(
+            merge_stats.num_deleted_rows,
+            matched_deleted + unmatched_deleted
+        );
     }
 
     /// Test that MergeInsertPlanner::is_delete_only correctly identifies delete-only operations.
