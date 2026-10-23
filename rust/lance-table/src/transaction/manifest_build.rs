@@ -1120,12 +1120,16 @@ impl Transaction {
                             continue;
                         }
                         let results_are_row_addrs = index.results_are_row_addrs();
+                        let can_follow_stable_row_ids = index.can_follow_stable_row_ids();
                         if let Some(fragment_bitmap) = &mut index.fragment_bitmap {
-                            *fragment_bitmap = if results_are_row_addrs && !deferred_remap {
+                            *fragment_bitmap = if !(can_follow_stable_row_ids
+                                || (results_are_row_addrs && deferred_remap))
+                            {
                                 // Stable row ids survive a rewrite, so a row-id-domain index
                                 // can simply follow its data to the new fragments. An
                                 // address-domain index this commit did not remap above
-                                // cannot: its stored addresses point into the fragments the
+                                // cannot. Neither can a plugin whose identifier domain is
+                                // unknown: its stored addresses may point into fragments the
                                 // rewrite dropped. Claiming coverage of the new fragments
                                 // would make it answer queries with addresses that no longer
                                 // resolve, so drop the rewritten fragments from its coverage
@@ -3800,6 +3804,7 @@ mod tests {
             file_major_version: 2,
             file_minor_version: 0,
             file_size_bytes: CachedFileSize::new(1000),
+            file_metadata_size_bytes: None,
             base_id: None,
         });
 
@@ -3811,6 +3816,7 @@ mod tests {
             file_major_version: 2,
             file_minor_version: 0,
             file_size_bytes: CachedFileSize::new(500),
+            file_metadata_size_bytes: None,
             base_id: None,
         });
 
@@ -3822,6 +3828,7 @@ mod tests {
             file_major_version: 2,
             file_minor_version: 0,
             file_size_bytes: CachedFileSize::new(750),
+            file_metadata_size_bytes: None,
             base_id: None,
         });
 
@@ -3833,6 +3840,7 @@ mod tests {
             file_major_version: 2,
             file_minor_version: 0,
             file_size_bytes: CachedFileSize::new(250),
+            file_metadata_size_bytes: None,
             base_id: None,
         });
 
