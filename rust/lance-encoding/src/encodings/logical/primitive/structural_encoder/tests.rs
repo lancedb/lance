@@ -2039,6 +2039,43 @@ async fn test_dictionary_merge_keeps_declared_key_type_round_trip() {
     .await;
 }
 
+#[tokio::test]
+async fn test_dictionary_batch_spanning_pages_keeps_declared_key_type() {
+    // Same two chunks as above, but a tiny page budget writes each chunk as its
+    // own page, so the reader concatenates two decoded dictionaries for a batch
+    // that spans both pages.
+    let a = int8_dictionary_with_all_values();
+    let b = int8_dictionary_with_all_values();
+    let values: Vec<u16> = (0..127u16).collect();
+    let permutation: Vec<i8> = (0..127)
+        .map(|i| ((i as u64).wrapping_mul(2_654_435_761) % 127) as i8)
+        .collect();
+    let mut keys = permutation.clone();
+    keys.extend_from_slice(&permutation);
+    let expected: ArrayRef = Arc::new(
+        DictionaryArray::<Int8Type>::try_new(
+            Int8Array::from(keys),
+            Arc::new(UInt16Array::from(values)),
+        )
+        .unwrap(),
+    );
+    let test_cases = TestCases::default()
+        .with_encodings([
+            TestEncoding::Array,
+            TestEncoding::StructuralU16,
+            TestEncoding::StructuralU32,
+        ])
+        .with_page_sizes(vec![64])
+        .with_batch_size(1000);
+    check_round_trip_encoding_of_data_with_expected(
+        vec![a, b],
+        Some(expected),
+        &test_cases,
+        HashMap::new(),
+    )
+    .await;
+}
+
 fn disjoint_int8_dictionary(offset: u16) -> ArrayRef {
     let values: Vec<u16> = (0..100u16).map(|value| value + offset).collect();
     let keys: Vec<i8> = (0..100).map(|i| i as i8).collect();
