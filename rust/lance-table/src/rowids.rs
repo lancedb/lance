@@ -329,11 +329,16 @@ impl RowIdSequence {
     /// has holes, keeps the cheapest of plain `Range` segments, a hole array,
     /// a bitmap or a sorted array; hole-free stretches become one `Range`.
     ///
-    /// A sequence that is not sorted comes back as one `Range` per run, which
-    /// may be larger than it was, so callers keep whichever encoding is
-    /// smaller. Readers without the compact in-memory `Ranges` form are slow
-    /// on many `Range` segments, which is why only tables that opted in get
-    /// this (see [`crate::transaction::RANGE_SEGMENTS_CONFIG_KEY`]).
+    /// Unsorted `Array` segments are kept as they are; the other kinds are
+    /// sorted, so the result is never much larger than the input: at most the
+    /// piece breakers below. Readers without the compact in-memory `Ranges`
+    /// form are slow on many `Range` segments, which is why only tables that
+    /// opted in get this (see [`crate::transaction::RANGE_SEGMENTS_CONFIG_KEY`]).
+    ///
+    /// Every piece (a stretch more than 64K ids past the previous one) opens
+    /// with a one-id `RangeWithHoles`, so no reader folds `Range` runs across
+    /// the gap into one `Ranges` covering every piece in between; the rest of
+    /// the stretch stays a plain `Range`, which the row id index keeps compact.
     pub fn reencode(&self) -> Self {
         // `Range` cannot hold an exclusive end past u64::MAX.
         if self
@@ -343,8 +348,16 @@ impl RowIdSequence {
             return self.clone();
         }
         let mut encoder = ChunkEncoder::default();
-        for run in self.0.iter().flat_map(U64Segment::runs) {
-            encoder.push_run(run);
+        for segment in &self.0 {
+            // Unsorted ids have no runs to speak of: a `Range` per id would
+            // be larger, and an array breaks a fold by itself.
+            if matches!(segment, U64Segment::Array(_)) {
+                encoder.push_verbatim(segment.clone());
+                continue;
+            }
+            for run in segment.runs() {
+                encoder.push_run(run);
+            }
         }
         Self(encoder.finish())
     }
@@ -999,9 +1012,19 @@ struct ChunkEncoder {
     /// `Range`. Readers fold consecutive `Range` wire segments into one
     /// `Ranges` across any gap below 2^32 ids, and the row id index then sees
     /// one interval covering every piece in between: on a compacted table
-    /// that put the merged map at 278 GB. A `RangeWithHoles` with no holes
-    /// costs 4 more bytes and stops the fold at the piece boundary.
+    /// that put the merged map at 278 GB. A one-id `RangeWithHoles` ahead of
+    /// the plain `Range` stops the fold for about 24 bytes, and leaves the
+    /// `Range` compact for the index, which expands every other kind row by
+    /// row when it merges.
     new_piece: bool,
+}
+
+/// A one-id breaker segment at `start` (see `ChunkEncoder::new_piece`).
+fn piece_breaker(start: u64) -> U64Segment {
+    U64Segment::RangeWithHoles {
+        range: start..start + 1,
+        holes: Vec::new().into(),
+    }
 }
 
 impl ChunkEncoder {
@@ -1013,6 +1036,16 @@ impl ChunkEncoder {
             self.push_clipped(start..end);
             start = end;
         }
+    }
+
+    /// Write out what is gathered, then `segment` as it is. The next run
+    /// cannot fold across it, so it does not open a piece.
+    fn push_verbatim(&mut self, segment: U64Segment) {
+        self.flush_chunk();
+        self.flush_pending();
+        self.segments.push(segment);
+        self.last_end = None;
+        self.new_piece = false;
     }
 
     /// Add a run that lies within one chunk.
@@ -1052,11 +1085,10 @@ impl ChunkEncoder {
         let holes = || runs.windows(2).flat_map(|pair| pair[0].end..pair[1].start);
         // Wire bytes: ~16 per `Range` segment; otherwise 24 of framing plus
         // two per packed u16 offset, or one per eight bitmap slots.
-        // A chunk that opens a piece writes its first run as a hole-free
-        // `RangeWithHoles` so no reader folds `Range` runs across the gap
-        // before it (see `new_piece`); that costs 4 bytes more.
+        // A chunk that opens a piece leads with a one-id breaker (see
+        // `new_piece`), about 24 bytes more.
         let opens_piece = std::mem::take(&mut self.new_piece);
-        let range_bytes = 16 * runs.len() as u64 + if opens_piece { 4 } else { 0 };
+        let range_bytes = 16 * runs.len() as u64 + if opens_piece { 24 } else { 0 };
         let holes_bytes = 24 + 2 * (span - count);
         let bitmap_bytes = 24 + span.div_ceil(8);
         let array_bytes = 24 + 2 * count;
@@ -1078,13 +1110,15 @@ impl ChunkEncoder {
             U64Segment::RangeWithBitmap { range, bitmap }
         } else if smallest == range_bytes {
             if opens_piece {
-                self.segments.push(U64Segment::RangeWithHoles {
-                    range: first.clone(),
-                    holes: Vec::new().into(),
-                });
-                match &runs[1..] {
+                self.segments.push(piece_breaker(first.start));
+                let mut rest = runs.clone();
+                rest[0].start += 1;
+                if rest[0].is_empty() {
+                    rest.remove(0);
+                }
+                match rest.as_slice() {
                     [only] => U64Segment::Range(only.clone()),
-                    rest => U64Segment::from_sorted_ranges(rest)
+                    _ => U64Segment::from_sorted_ranges(&rest)
                         .expect("two or more disjoint ranges within one 64K chunk"),
                 }
             } else {
@@ -1108,15 +1142,14 @@ impl ChunkEncoder {
     }
 
     fn flush_pending(&mut self) {
-        if let Some((range, opens_piece)) = self.pending.take() {
-            self.segments.push(if opens_piece {
-                U64Segment::RangeWithHoles {
-                    range,
-                    holes: Vec::new().into(),
-                }
-            } else {
-                U64Segment::Range(range)
-            });
+        if let Some((mut range, opens_piece)) = self.pending.take() {
+            if opens_piece {
+                self.segments.push(piece_breaker(range.start));
+                range.start += 1;
+            }
+            if !range.is_empty() {
+                self.segments.push(U64Segment::Range(range));
+            }
         }
     }
 
@@ -2466,7 +2499,7 @@ mod test {
     // reader folds the two `Range` runs across the gap.
     #[case::u32_offsets(
         vec![sorted_array((0..100).chain(1_000_000..1_000_100))],
-        vec!["range", "holes"], true)]
+        vec!["range", "holes", "range"], true)]
     // Hole-free stretches across segments and chunks merge into one `Range`.
     #[case::adjacent(
         vec![U64Segment::Range(0..10), U64Segment::Range(10..70_000), sorted_array(70_000..70_003)],
@@ -2475,8 +2508,12 @@ mod test {
     #[case::backwards(
         vec![U64Segment::Range(1000..2000), U64Segment::Range(0..500)],
         vec!["range", "range"], true)]
-    // An unsorted array splits at each step back; callers keep the smaller encoding.
-    #[case::unsorted(vec![U64Segment::Array(vec![5, 3, 9].into())], vec!["range", "bitmap"], false)]
+    // An unsorted array is kept as it is.
+    #[case::unsorted(vec![U64Segment::Array(vec![5, 3, 9].into())], vec!["array"], true)]
+    // An array between two far-apart ranges breaks the fold by itself: no breaker.
+    #[case::array_between_pieces(
+        vec![U64Segment::Range(0..100), U64Segment::Array(vec![7, 5, 3].into()), U64Segment::Range(1_000_000..1_000_100)],
+        vec!["range", "array", "range"], true)]
     // `Range` cannot hold an exclusive end past u64::MAX: left as is.
     #[case::max_id(vec![sorted_array([5, u64::MAX])], vec!["sorted_array"], true)]
     // A bitmap whose length is not a multiple of 8, with a run at each end;
@@ -2513,21 +2550,26 @@ mod test {
 
     #[test]
     fn test_reencode_breaks_the_range_fold_between_pieces() {
-        // Two hole-free pieces 1M ids apart: on the wire a `Range` and a
-        // `RangeWithHoles` without holes, which `read_row_ids` keeps as two
-        // segments instead of one `Ranges` spanning the gap.
+        // Two hole-free pieces 1M ids apart: on the wire a `Range`, then a
+        // one-id `RangeWithHoles` and the rest of the second piece as a
+        // `Range`, which `read_row_ids` keeps apart instead of folding into
+        // one `Ranges` spanning the gap.
         let sequence = RowIdSequence(vec![sorted_array((0..100).chain(1_000_000..1_000_100))]);
         let decoded = read_row_ids(&write_row_ids(&sequence.reencode())).unwrap();
         assert!(matches!(
             decoded.segments(),
-            [U64Segment::Range(_), U64Segment::RangeWithHoles { .. }]
+            [
+                U64Segment::Range(_),
+                U64Segment::RangeWithHoles { range, .. },
+                U64Segment::Range(rest)
+            ] if range.end - range.start == 1 && rest.start == 1_000_001
         ));
         assert_eq!(
             decoded.iter().collect::<Vec<_>>(),
             sequence.iter().collect::<Vec<_>>()
         );
-        // A chunk of `Range` runs that opens a piece writes its first run as
-        // a hole-free `RangeWithHoles` and keeps the rest as runs.
+        // A chunk of `Range` runs that opens a piece leads with the one-id
+        // breaker and keeps the rest as runs.
         let sequence = RowIdSequence(vec![sorted_array(
             (0..100)
                 .chain(1_048_576..1_048_676)
@@ -2540,7 +2582,7 @@ mod test {
                 [
                     U64Segment::Range(_),
                     U64Segment::RangeWithHoles { .. },
-                    U64Segment::Range(_)
+                    U64Segment::Ranges { .. }
                 ]
             ),
             "{:?}",

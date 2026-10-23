@@ -3903,7 +3903,10 @@ mod tests {
             after.len(),
             before.len()
         );
-        assert_eq!(wire_kinds(&after), ["range", "holes", "holes"]);
+        assert_eq!(
+            wire_kinds(&after),
+            ["range", "holes", "range", "holes", "range"]
+        );
         assert_eq!(
             read_row_ids(&after).unwrap().iter().collect::<Vec<_>>(),
             row_ids.iter().collect::<Vec<_>>()
@@ -3914,6 +3917,35 @@ mod tests {
         again.config = manifest.config.clone();
         apply_range_segments(&mut again, None).unwrap();
         assert_eq!(inline_bytes(&again), after);
+
+        // Repairing a gap leaves an unrelated unsorted array as it is: the
+        // bytes grow by the breaker alone, not by a `Range` per id.
+        let mut row_ids = RowIdSequence::from(0u64..100);
+        row_ids.extend(RowIdSequence::from(1_000_000u64..1_000_100));
+        let descending: Vec<u64> = (2_000_000..2_020_000u64).rev().collect();
+        row_ids.extend(RowIdSequence::from(descending.as_slice()));
+        let mut fragment = Fragment::new(0);
+        fragment.row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&row_ids).into()));
+        fragment.physical_rows = Some(20_200);
+        let mut manifest = make_stable_row_id_manifest(vec![fragment]);
+        manifest
+            .config
+            .insert(RANGE_SEGMENTS_CONFIG_KEY.to_string(), "true".to_string());
+        let before = inline_bytes(&manifest);
+        apply_range_segments(&mut manifest, None).unwrap();
+        let after = inline_bytes(&manifest);
+        assert_eq!(wire_kinds(&after), ["range", "holes", "range", "other"]);
+        assert!(
+            after.len() <= before.len() + 64,
+            "repairing one gap expanded unrelated data: {} -> {} bytes",
+            before.len(),
+            after.len()
+        );
+        assert!(!read_row_ids(&after).unwrap().range_runs_span_a_gap());
+        assert_eq!(
+            read_row_ids(&after).unwrap().iter().collect::<Vec<_>>(),
+            row_ids.iter().collect::<Vec<_>>()
+        );
     }
 
     /// When a fragment has no existing last_updated_at_version_meta (None), a
