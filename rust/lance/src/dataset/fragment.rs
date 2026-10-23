@@ -2670,9 +2670,12 @@ impl FileFragment {
         updated_fragment
             .files
             .retain(|data_file| data_file.fields.iter().any(|&field| field != -2));
-        let updated_fields = updated_fields
-            .iter()
-            .filter_map(|&i| u32::try_from(i).ok())
+        // An index can target a logical parent (such as a geometry or list) that
+        // is absent from the physical file's field IDs. Report the full write
+        // schema so commit conflict resolution invalidates those indices too.
+        let updated_fields = write_schema
+            .fields_pre_order()
+            .filter_map(|field| u32::try_from(field.id).ok())
             .collect();
         Ok(FragmentUpdateColumnsResult {
             fragment: updated_fragment,
