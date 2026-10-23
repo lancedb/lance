@@ -976,15 +976,26 @@ async fn test_default_posting_read_keeps_read_ahead_group() {
     assert_eq!(counter.impact_rows_read(), 4);
 }
 
+#[rstest::rstest]
+#[case::dense_alternatives(4, [0, 0], 1, 4, 1)]
+#[case::sparse_alternatives(8, [0, 0], 1, 8, 1)]
+#[case::dense_terms(4, [0, 1], 1, 4, 2)]
+#[case::sparse_terms(8, [0, 1], 2, 2, 2)]
 #[tokio::test]
-async fn test_cache_aware_same_group_expansions_share_one_read_ahead_group() {
+async fn test_cache_aware_same_group_expansions_bound_read_amplification(
+    #[case] group_size: u32,
+    #[case] positions: [u32; 2],
+    #[case] expected_reads: usize,
+    #[case] expected_rows: usize,
+    #[case] expected_postings: usize,
+) {
     let cache = LanceCache::with_capacity(1024 * 1024);
     let (mut index, counter, _tmpdir) = load_counted_v2_index(8, cache.clone()).await;
-    set_test_posting_group_size(&mut index, 4);
+    set_test_posting_group_size(&mut index, group_size);
     let partition = index.partitions[0].clone();
     let tokens = Tokens::with_positions(
         vec!["t0".to_owned(), "t1".to_owned()],
-        vec![0, 0],
+        positions.to_vec(),
         DocType::Text,
     );
     let scorer = MemBM25Scorer::new(
@@ -1006,15 +1017,15 @@ async fn test_cache_aware_same_group_expansions_share_one_read_ahead_group() {
         .await
         .unwrap();
 
-    assert_eq!(loaded.postings.len(), 1);
-    assert_eq!(counter.read_range_calls(), 1);
-    assert_eq!(counter.rows_read(), 4);
-    assert_eq!(counter.metadata_rows_read(), 4);
-    assert_eq!(counter.posting_rows_read(), 4);
-    assert_eq!(counter.impact_rows_read(), 4);
-    assert_eq!(metrics.index_cache_misses(), 1);
-    assert_eq!(metrics.index_cache_hits(), 1);
-    assert_eq!(metrics.parts_loaded.load(Ordering::Relaxed), 1);
+    assert_eq!(loaded.postings.len(), expected_postings);
+    assert_eq!(counter.read_range_calls(), expected_reads);
+    assert_eq!(counter.rows_read(), expected_rows);
+    assert_eq!(counter.metadata_rows_read(), expected_rows);
+    assert_eq!(counter.posting_rows_read(), expected_rows);
+    assert_eq!(counter.impact_rows_read(), expected_rows);
+    assert_eq!(metrics.index_cache_misses(), expected_reads);
+    assert_eq!(metrics.index_cache_hits(), 2 - expected_reads);
+    assert_eq!(metrics.parts_loaded.load(Ordering::Relaxed), expected_reads);
 }
 
 #[tokio::test]
