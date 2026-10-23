@@ -197,7 +197,7 @@ impl AimdThrottleConfig {
     /// |----------------------|----------------------------------|----------------------------------|---------|
     /// | Initial rate         | `lance_aimd_initial_rate`        | `LANCE_AIMD_INITIAL_RATE`        | 2000    |
     /// | Min rate             | `lance_aimd_min_rate`            | `LANCE_AIMD_MIN_RATE`            | 1       |
-    /// | Max rate             | `lance_aimd_max_rate`            | `LANCE_AIMD_MAX_RATE`            | 5000    |
+    /// | Max rate             | `lance_aimd_max_rate`            | `LANCE_AIMD_MAX_RATE`            | 10000   |
     /// | Decrease factor      | `lance_aimd_decrease_factor`     | `LANCE_AIMD_DECREASE_FACTOR`     | 0.5     |
     /// | Additive increment   | `lance_aimd_additive_increment`  | `LANCE_AIMD_ADDITIVE_INCREMENT`  | 300     |
     /// | Burst capacity       | `lance_aimd_burst_capacity`      | `LANCE_AIMD_BURST_CAPACITY`      | 100     |
@@ -301,7 +301,11 @@ impl AimdThrottleConfig {
 
         let initial_rate = resolve_f64("lance_aimd_initial_rate", storage_options, 2000.0)?;
         let min_rate = resolve_f64("lance_aimd_min_rate", storage_options, 1.0)?;
-        let max_rate = resolve_f64("lance_aimd_max_rate", storage_options, 5000.0)?;
+        let max_rate = resolve_f64(
+            "lance_aimd_max_rate",
+            storage_options,
+            AimdConfig::default().max_rate,
+        )?;
         let decrease_factor = resolve_f64("lance_aimd_decrease_factor", storage_options, 0.5)?;
         let additive_increment =
             resolve_f64("lance_aimd_additive_increment", storage_options, 300.0)?;
@@ -528,6 +532,16 @@ pub(crate) struct AimdThrottleState {
 
 impl AimdThrottleState {
     pub(crate) fn new(config: AimdThrottleConfig) -> lance_core::Result<Self> {
+        // A retry draws its backoff from `min..=max`, and sampling an empty
+        // range panics, so a range that cannot be sampled is rejected while
+        // the store is being built rather than on the first throttled request.
+        if config.min_backoff_ms > config.max_backoff_ms {
+            return Err(lance_core::Error::invalid_input(format!(
+                "lance_aimd_min_backoff_ms ({}) must not exceed lance_aimd_max_backoff_ms \
+                 ({}): the retry backoff is drawn from that range",
+                config.min_backoff_ms, config.max_backoff_ms
+            )));
+        }
         let burst_capacity = config.burst_capacity as f64;
         let max_retries = config.max_retries;
         let min_backoff_ms = config.min_backoff_ms;
@@ -1404,6 +1418,7 @@ mod tests {
                 .is_none()
         );
     }
+
     use object_store::memory::InMemory;
     use rstest::rstest;
     use std::collections::VecDeque;
@@ -1416,6 +1431,70 @@ mod tests {
             store: "test",
             source: msg.into(),
         }
+    }
+
+    fn params_with(options: &[(&str, &str)]) -> ObjectStoreParams {
+        ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                options
+                    .iter()
+                    .map(|(key, value)| (key.to_string(), value.to_string()))
+                    .collect(),
+            ))),
+            ..Default::default()
+        }
+    }
+
+    /// A backoff range that cannot be sampled is rejected while the store is
+    /// being built. Reaching the sampler with one panics, and raising only the
+    /// minimum above the default maximum is enough to get there.
+    #[rstest]
+    #[case::min_above_explicit_max(
+        &[("lance_aimd_min_backoff_ms", "500"), ("lance_aimd_max_backoff_ms", "100")]
+    )]
+    #[case::min_above_default_max(&[("lance_aimd_min_backoff_ms", "500")])]
+    fn test_shared_throttle_state_rejects_an_unsamplable_backoff_range(
+        #[case] options: &[(&str, &str)],
+    ) {
+        let Err(err) = shared_throttle_state("s3$backoff-bucket", &params_with(options)) else {
+            panic!("an unsamplable backoff range must be rejected");
+        };
+        assert!(
+            matches!(err, lance_core::Error::InvalidInput { .. }),
+            "got: {err:?}"
+        );
+        let message = err.to_string();
+        assert!(message.contains("lance_aimd_min_backoff_ms"), "{message}");
+        assert!(message.contains("lance_aimd_max_backoff_ms"), "{message}");
+    }
+
+    /// Equal bounds are a one-value range, which samples fine.
+    #[test]
+    fn test_shared_throttle_state_accepts_equal_backoff_bounds() {
+        let params = params_with(&[
+            ("lance_aimd_min_backoff_ms", "250"),
+            ("lance_aimd_max_backoff_ms", "250"),
+        ]);
+        assert!(
+            shared_throttle_state("s3$equal-bounds-bucket", &params)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// With retries off nothing samples the range, and a store that opens
+    /// today has to keep opening.
+    #[test]
+    fn test_shared_throttle_state_ignores_the_backoff_range_when_disabled() {
+        let params = params_with(&[
+            ("lance_aimd_max_retries", "0"),
+            ("lance_aimd_min_backoff_ms", "500"),
+        ]);
+        assert!(
+            shared_throttle_state("s3$disabled-bucket", &params)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[rstest]
