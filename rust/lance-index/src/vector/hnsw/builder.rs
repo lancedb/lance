@@ -3826,7 +3826,7 @@ mod tests {
             inner: storage,
             prefetch_calls: Arc::new(AtomicUsize::new(0)),
         };
-        let results = hnsw
+        let (results, _) = hnsw
             .search_basic(
                 fsl.value(0),
                 10,
@@ -3880,6 +3880,7 @@ mod tests {
                 None,
             )
             .unwrap()
+            .0
             .iter()
             .map(|node| (node.id, node.dist.0))
             .collect();
@@ -3896,6 +3897,7 @@ mod tests {
                     prefetch_distance,
                 )
                 .unwrap()
+                .0
                 .iter()
                 .map(|node| (node.id, node.dist.0))
                 .collect();
