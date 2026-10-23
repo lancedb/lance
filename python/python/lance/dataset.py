@@ -2334,6 +2334,8 @@ class LanceDataset(pa.dataset.Dataset):
         self,
         row_ids: Union[List[int], pa.Array],
         columns: Optional[Union[List[str], Dict[str, str]]] = None,
+        *,
+        ignore_deletions: bool = False,
         **kargs,
     ) -> pa.Table:
         """Select rows by row_ids.
@@ -2348,6 +2350,15 @@ class LanceDataset(pa.dataset.Dataset):
             List of column names to be fetched.
             Or a dictionary of column names to SQL expressions.
             All columns are fetched if None or unspecified.
+        ignore_deletions: bool, default False
+            Take the rows as if the dataset had no deletions. Deletion files
+            are read only where a row id could name more than one physical
+            copy (fragments whose id spans overlap, as after an update), which
+            on a table with many fragments saves one request per fragment. A
+            deleted row may come back with its stored values or be dropped, so
+            the result is only complete for live ids: use it only for ids known
+            to be live, for example ids read from an index built after the
+            last deletion.
         **kwargs : dict, optional
             See scanner() method for full parameter description.
 
@@ -2360,7 +2371,14 @@ class LanceDataset(pa.dataset.Dataset):
             columns_with_transform = list(columns.items())
             columns = None
         return pa.Table.from_batches(
-            [self._ds.take_rows(row_ids, columns, columns_with_transform)]
+            [
+                self._ds.take_rows(
+                    row_ids,
+                    columns,
+                    columns_with_transform,
+                    ignore_deletions=ignore_deletions,
+                )
+            ]
         )
 
     def take_blobs(
@@ -4222,7 +4240,6 @@ class LanceDataset(pa.dataset.Dataset):
                 fs, path = FileSystem.from_uri(ivf_centroids_file)
                 with fs.open_input_file(path) as f:
                     ivf_centroids = np.load(f)
-                num_partitions = ivf_centroids.shape[0]
 
             if isinstance(num_partitions, float):
                 warnings.warn("num_partitions is float, converting to int")
@@ -4288,8 +4305,7 @@ class LanceDataset(pa.dataset.Dataset):
                             f"got {ivf_centroids.shape}"
                         )
                     if ivf_centroids.shape[0] == 0:
-                        # num_partitions was derived from shape[0] above, and
-                        # zero partitions panics in the Rust residual step.
+                        # Zero partitions panics in the Rust residual step.
                         raise ValueError(
                             "Ivf centroids must have at least one cluster, "
                             f"got {ivf_centroids.shape}"
@@ -4457,6 +4473,11 @@ class LanceDataset(pa.dataset.Dataset):
             A ``num_clusters x dimension`` array of existing K-mean centroids
             for IVF clustering. The row count determines the number of IVF
             partitions. If not provided, a new KMeans model will be trained.
+        ivf_centroids_file : str, optional
+            Path to a ``.npy`` file holding the same array as ``ivf_centroids``.
+            Mutually exclusive with it. The file's row count sets the number of
+            IVF partitions, so passing a ``num_partitions`` that disagrees with
+            it is an error.
         pq_codebook : optional,
             It can be :py:class:`np.ndarray`, :py:class:`pyarrow.FixedSizeListArray`,
             or :py:class:`pyarrow.FixedShapeTensorArray`.
@@ -5545,18 +5566,16 @@ class LanceDataset(pa.dataset.Dataset):
             # Or using explicit version range
             delta = ds_append.delta(begin_version=1, end_version=2)
         """
-        has_compared_against = compared_against is not None
-
         builder = _DatasetDeltaBuilder(self._ds.delta())
 
-        if has_compared_against:
+        # Forward every argument as given: the Rust builder rejects conflicting
+        # or half-set selections, which filtering here would hide.
+        if compared_against is not None:
             builder = builder.compared_against_version(compared_against)
-        else:
-            if begin_version is not None:
-                builder = builder.with_begin_version(begin_version)
-
-            if end_version is not None:
-                builder = builder.with_end_version(end_version)
+        if begin_version is not None:
+            builder = builder.with_begin_version(begin_version)
+        if end_version is not None:
+            builder = builder.with_end_version(end_version)
 
         return builder.build()
 

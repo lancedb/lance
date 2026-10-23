@@ -8,23 +8,33 @@ Independently addressed Managed objects can survive data-file rewrites without
 copying their bytes.
 
 Writers accept bytes or a URI. A URI can be recorded as an External reference or
-ingested into Lance-owned storage. Lance retains its payloads according to
-snapshot lifetime; external owners must preserve their objects. Blob v2 requires
-file format 2.2 or later. API examples and configuration belong in the
+ingested into Lance-owned storage. Lance retains its payloads while any
+protected snapshot (a table version retained by the cleanup policy) references
+them; see [Snapshot Lifetime](#snapshot-lifetime). External owners must preserve
+their objects. Blob v2 requires file format 2.2 or later. API examples and
+configuration belong in the
 [Blob Columns guide](../../guide/blob.md).
 
 ## Schema
 
-The **table manifest** retains the logical shape supplied by the writer: either
-the minimal or complete schema below, including child metadata and nullability.
+The **table manifest** retains the logical struct shape supplied when the column
+is created: either the minimal or complete schema below, including child metadata
+and nullability. Legacy blob-marked binary inputs are converted to a Blob v2
+logical struct by dataset writers targeting file format 2.2 or later; see
+[Version Compatibility](../../guide/blob.md#version-compatibility).
 The **data file** stores the five-child descriptor schema, regardless of the
-logical shape. The logical `data`, `uri`, `position`, and `size` children are not
-separate stored columns.
-
-In the schemas below, `string` denotes UTF-8, and `u8`, `u32`, and `u64` denote
-unsigned integers of the indicated bit width.
+logical shape. Writers convert logical `data`, `uri`, `position`, and `size`
+values into that descriptor; those input children are not stored alongside it.
+The descriptor itself is a packed struct occupying one physical column.
 
 ### Table Schema
+
+Both shapes are logical input schemas. Use the minimal shape for bytes or
+whole-object URIs; use the complete shape to supply byte ranges within external
+objects. Writers may append either shape to an existing Blob v2 column, retaining
+the table's existing logical shape. Supplying a complete input to a column created
+with the minimal shape does not require rewriting existing payloads or changing
+the manifest schema.
 
 The minimal schema is:
 
@@ -52,14 +62,14 @@ A logical blob field:
   including when nested.
 - Must have exactly the children, types, and order of one of these schemas.
   `data` and `uri` must be nullable. Child metadata does not affect recognition.
-- May declare both `position` and `size`, or neither; either range child may
+- May declare both `position` and `size`, or neither; either field may
   be nullable or non-nullable.
 - May have any outer name and be nullable or non-nullable.
 - May appear beneath `Struct`, `List`, and `LargeList`, including combinations.
 
 Other child types, extra children, and reordered children are invalid.
 Container validity, list boundaries, and element order keep their Arrow
-meanings. Materialization replaces the blob leaf with `LargeBinary`, preserving
+meanings. Materialization replaces the blob field with `LargeBinary`, preserving
 that structure. A null list, empty list, null blob, and empty blob remain distinct.
 
 ### Data File Schema
@@ -107,7 +117,10 @@ errors identifying the field and offending input.
 
 Positions and sizes count bytes from the beginning of the selected object.
 The exclusive end is `position + size`; arithmetic must not overflow.
-Partial reads use offsets relative to the blob and add its object position.
+
+Packed and Dedicated remain the default out-of-line storage kinds without the
+[Managed opt-in](#capability-and-compatibility). They are not deprecated by this
+specification.
 
 | Kind | Object | `position` | `size` | `blob_id` | `blob_uri` |
 |---|---|---|---|---|---|
@@ -124,8 +137,10 @@ An Inline descriptor with `size = 0`, including an all-zero descriptor, is empty
 
 ### External Resolution
 
-With `blob_id = 0`, interpret `blob_uri` as an absolute URI using its object
-store. Otherwise, look up that **ID**, not an array index, in
+With `blob_id = 0`, resolve `blob_uri` as an absolute URI through the reader's
+object-store registry, using the dataset's runtime storage options and credential
+configuration. Anonymous access is not assumed; credentials are not stored in
+the descriptor. Otherwise, look up that **ID**, not an array index, in
 `manifest.base_paths`, use its object store and credentials, and append
 `blob_uri` directly. Do not add `data/`.
 
