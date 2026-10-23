@@ -1389,8 +1389,11 @@ class LanceDataset(pa.dataset.Dataset):
             appended unindexed fragments.
 
             The list must be nonempty. With index use enabled, UUIDs must identify
-            existing segments of one logical index on the query's vector column,
-            with a compatible query metric. Only supported for vector search.
+            existing segments of one logical index on the query's vector column.
+            Query metric compatibility is checked when selected segments overlap
+            the fragment scope. With no overlap, ordinary search uses flat KNN with
+            the query metric, while fast search returns no rows.
+            Only supported for vector search.
             With ``nearest["use_index"]=False``, a flat scan uses the fragment scope
             rather than segment selection.
         prefilter: bool, default False
@@ -7311,8 +7314,11 @@ class ScannerBuilder:
         """Select vector index segments, or restore automatic selection with None.
 
         With index use enabled, UUIDs must identify existing segments of one logical
-        index on the query's vector column, with a compatible metric. An empty iterable
-        is invalid, and segment selection is only supported for vector search.
+        index on the query's vector column. Metric compatibility is checked when
+        selected segments overlap the fragment scope. With no overlap, ordinary
+        search uses flat KNN with the query metric, while fast search returns no rows.
+        An empty iterable is invalid, and segment selection is only supported for
+        vector search.
         With explicit fragments, uncovered fragments use flat KNN unless fast search
         is enabled. Without fragments, indexed search searches only these segments.
         This controls index use rather than flat scans with ``use_index=False``.
