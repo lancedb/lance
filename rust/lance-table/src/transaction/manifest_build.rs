@@ -116,8 +116,13 @@ fn apply_range_segments(
         if unchanged.get(&fragment.id) == Some(&data.as_ptr()) {
             continue;
         }
-        let encoded = write_row_ids(&read_row_ids(&data[..])?.reencode());
-        if encoded.len() < data.len() {
+        let sequence = read_row_ids(&data[..])?;
+        let encoded = write_row_ids(&sequence.reencode());
+        // Smaller wins. So does breaking `Range` runs that a reader would fold
+        // across a gap: the row id index then sees one interval covering every
+        // piece in between, which cost one table 278 GB of merged map; on that
+        // table the fragments concerned grew by 4 MB in all.
+        if encoded.len() < data.len() || sequence.range_runs_span_a_gap() {
             fragment.row_id_meta = Some(RowIdMeta::Inline(encoded.into()));
         }
     }
