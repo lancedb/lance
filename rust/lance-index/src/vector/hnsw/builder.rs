@@ -3866,7 +3866,7 @@ mod tests {
             inner: storage,
             prefetch_calls: Arc::new(AtomicUsize::new(0)),
         };
-        let results = hnsw
+        let (results, _) = hnsw
             .search_basic(
                 fsl.value(0),
                 10,

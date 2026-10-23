@@ -404,7 +404,7 @@ fn bench_hnsw_prefetch(c: &mut Criterion) {
                 b.iter(|| {
                     let query = queries[next_query % NUM_QUERIES].clone();
                     next_query += 1;
-                    let result = hnsw
+                    let (result, _) = hnsw
                         .search_inner(
                             query,
                             K,
