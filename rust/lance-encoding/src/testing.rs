@@ -24,6 +24,7 @@ use tokio::sync::mpsc::{self, UnboundedSender};
 use lance_core::{Error, Result, datatypes::Field as LanceField, utils::bit::pad_bytes};
 use lance_datagen::{ArrayGenerator, RowCount, Seed, array, gen_batch};
 
+use crate::compression::PerValueGeneralCompression;
 use crate::compression::try_packed_struct_per_value;
 use crate::{
     EncodingsIo,
@@ -184,7 +185,14 @@ impl CompressionStrategy for TestCompressionStrategy {
         if let Some(compressor) = packed {
             return Ok(compressor);
         }
-        if let Some(compressor) = try_variable_width_per_value(field, data, &params)? {
+        let general_compression = if self.encoding == TestEncoding::StructuralSparse {
+            PerValueGeneralCompression::Any
+        } else {
+            PerValueGeneralCompression::ZstdOnly
+        };
+        if let Some(compressor) =
+            try_variable_width_per_value(field, data, &params, general_compression)?
+        {
             return Ok(compressor);
         }
         Err(lance_core::Error::not_supported_source(
@@ -1358,7 +1366,10 @@ async fn check_round_trip_encoding_inner(
     let scheduler = Arc::new(SimulatedScheduler::new(encoded_data)) as Arc<dyn EncodingsIo>;
 
     let num_rows = data.iter().map(|arr| arr.len() as u64).sum::<u64>();
-    let concat_data = if test_cases.skip_validation {
+    // The caller can supply the expected array; in that case skip deriving it,
+    // because building it here may itself fail (e.g. `concat` on dictionaries
+    // that Arrow's lossy merge cannot combine).
+    let concat_data = if test_cases.skip_validation || expected_override.is_some() {
         None
     } else if let Some(DataType::Struct(_)) = data.first().map(|datum| datum.data_type()) {
         // TODO(tsaucer) When arrow upgrades to 56, remove this if statement

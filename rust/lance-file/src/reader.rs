@@ -795,7 +795,8 @@ impl FileReader {
         let magic_bytes = footer_bytes.slice(len - 4..);
         if magic_bytes.as_ref() != MAGIC {
             return Err(Error::invalid_input(format!(
-                "file does not appear to be a Lance file (invalid magic: {:?})",
+                "file does not appear to be a Lance file (invalid magic: {:?}, expected {:?})",
+                magic_bytes.as_ref(),
                 MAGIC
             )));
         }
@@ -3429,6 +3430,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_read_legacy_wrapped_bitpacked_levels() {
+        use arrow_array::{Array, Float16Array, Int64Array, LargeListArray};
+
+        let fs = FsFixture::default();
+        fs.object_store
+            .put(
+                &fs.tmp_path,
+                include_bytes!("../../../test_data/v6.0.1/wrapped_bitpacked_levels.lance"),
+            )
+            .await
+            .unwrap();
+        let file = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let reader = FileReader::try_open(
+            file,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &test_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+        for batch_size in [128, 2048, 8192] {
+            for range in [0..70065, 60..72, 65530..65550, 70060..70065] {
+                let batches = reader
+                    .read_stream(
+                        lance_io::ReadBatchParams::Range(range.clone()),
+                        batch_size,
+                        1,
+                        FilterExpression::no_filter(),
+                    )
+                    .await
+                    .unwrap()
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .unwrap();
+                let mut row = range.start;
+                for batch in batches {
+                    let ids = batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap();
+                    let vectors = batch
+                        .column(1)
+                        .as_any()
+                        .downcast_ref::<LargeListArray>()
+                        .unwrap();
+                    for i in 0..batch.num_rows() {
+                        assert_eq!(ids.value(i), row as i64);
+                        assert_eq!(vectors.is_null(i), (64..70064).contains(&row));
+                        if vectors.is_valid(i) {
+                            let value = vectors.value(i);
+                            let value = value.as_any().downcast_ref::<Float16Array>().unwrap();
+                            assert_eq!(value.len(), 2048);
+                            for (j, scalar) in value.values().iter().enumerate() {
+                                assert_eq!(scalar.to_f32(), j as f32);
+                            }
+                        }
+                        row += 1;
+                    }
+                }
+                assert_eq!(row, range.end);
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn test_round_trip() {
         let fs = FsFixture::default();
 
@@ -5015,6 +5087,29 @@ mod tests {
         assert_eq!(buf_index, 1);
 
         file_writer.finish().await.unwrap();
+    }
+
+    #[test]
+    fn test_decode_footer_reports_actual_magic_bytes_on_mismatch() {
+        // decode_footer only reads the trailing FOOTER_LEN bytes, so a buffer of
+        // zeros with a bad 4-byte magic at the end is enough to trigger the check.
+        let mut footer_bytes = vec![0u8; super::FOOTER_LEN];
+        let bad_magic = b"BAD!";
+        let len = footer_bytes.len();
+        footer_bytes[len - 4..].copy_from_slice(bad_magic);
+
+        let error = FileReader::decode_footer(&Bytes::from(footer_bytes))
+            .expect_err("footer with wrong magic must fail to decode");
+
+        let message = error.to_string();
+        assert!(
+            message.contains(&format!("{:?}", bad_magic.as_slice())),
+            "error should report the bytes actually read, got: {message}"
+        );
+        assert!(
+            message.contains(&format!("{:?}", super::MAGIC)),
+            "error should still report the expected magic, got: {message}"
+        );
     }
 
     #[derive(Clone, Copy, Debug)]
