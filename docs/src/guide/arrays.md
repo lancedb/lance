@@ -183,39 +183,25 @@ tensor_images.to_encoded()
 
 ## Compressing integer tensors (Lance 2.3)
 
-The unstable 2.3 writer can compress each integer tensor row independently with
-`lance-encoding:compression=lz4` or `zstd`. It automatically considers AxisDelta
-for signed or unsigned 8-, 16-, 32-, and 64-bit integer tensors in per-value pages.
-AxisDelta applies first-order differential coding (also called delta coding)
-along one tensor axis. It stores differences between adjacent integer values,
-without losing precision or sharing prediction state across rows.
+Integer tensors with similar neighboring values, such as images or sensor arrays,
+can benefit from lossless compression. With the unstable 2.3 writer, set the field
+metadata `lance-encoding:compression` to `lz4` or `zstd`. Lance automatically samples
+supported integer tensors and chooses raw storage, direct compression, or AxisDelta
+followed by compression. AxisDelta stores differences along a tensor axis; when
+sampling finds no worthwhile compression, Lance keeps raw storage.
 
-The default tries the longest physical dimension, breaking ties in favor of the
-innermost dimension. Shape comes from Arrow fixed-shape tensor metadata, including
-its optional permutation, or from fixed-size-list nesting. A flat list without
-extension metadata is one-dimensional. The writer samples up to four complete
-non-null tensors, at most 4 MiB per page. It compares raw encoding, direct
-compression, and differential coding followed by compression, using the configured
-codec and level. Estimated cost includes payload, descriptor, and per-row frame
-lengths. Each additional step must save at least 5% over the current best candidate;
-otherwise Auto retains that candidate. If neither compressed candidate qualifies,
-or no complete non-null tensor fits the sample budget, Auto stores raw rows without
-compression frames. Sampling adds write work even when compression loses; it does
-not guarantee a smaller complete page or faster reads.
+Compression can save space at the cost of additional write and decode work.
+Random reads still fetch individual tensors, but must decode each selected tensor
+in full. Smaller files do not guarantee faster reads. Leave general compression
+unset to avoid both compression and sampling.
 
-Field metadata `lance-encoding:axis-delta` accepts `auto` (the default),
-`auto:<axis>`, `on:<axis>`, and `off`. An explicit axis is a zero-based logical
-axis inside the tensor, excluding the dataset row dimension. For HWC images,
-`auto:1` tests horizontal prediction independently within each channel.
-`on:<axis>` forces prediction and rejects unsupported types or inner nulls.
-`off` skips prediction and sampling while retaining the configured general codec.
+The default requires no AxisDelta configuration. To override it, set field metadata
+`lance-encoding:axis-delta` to:
 
-Floating-point vectors and other non-integer list types retain their existing
-encoding, including when a general codec is configured. Automatic prediction
-skips inner nulls, unsupported layouts,
-length-one axes, and tensors larger than the sample budget. Missing or `none`
-general compression keeps the existing encoding. Invalid extension metadata is
-ignored by implicit Auto; explicitly requested prediction validates it and
-reports an error. Existing structural and dictionary selection happens first.
-Random reads still address individual tensors, but decoding one tensor requires
-its entire compressed frame. Stable 2.1 and 2.2 writers are unchanged.
+- `auto:<axis>` to sample a specific axis instead of choosing one automatically.
+- `on:<axis>` to force differential coding on that axis.
+- `off` to disable differential coding and sampling, **keeping the configured codec**.
+
+Axes are zero-based and exclude the dataset row dimension. For HWC images,
+`auto:1` tests horizontal differences within each channel. Floating-point vectors
+and stable 2.1/2.2 writers keep their existing behavior.
