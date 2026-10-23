@@ -637,7 +637,6 @@ async fn rebuild_scalar_segment(
     dataset: &Dataset,
     reference_index: &Arc<dyn ScalarIndex>,
     field_path: &str,
-    column_name: &str,
     uuid: Uuid,
     fragment_ids: Vec<u32>,
 ) -> Result<CreatedIndex> {
@@ -654,7 +653,7 @@ async fn rebuild_scalar_segment(
     .await?;
     super::scalar::build_scalar_index(
         dataset,
-        column_name,
+        field_path,
         uuid,
         &params,
         true,
@@ -725,7 +724,6 @@ async fn merge_scalar_indices<'a>(
     options: &OptimizeOptions,
     index_type: IndexType,
     field_path: &str,
-    column_name: &str,
     base_unindexed_bitmap: RoaringBitmap,
 ) -> Result<
     Option<(
@@ -913,7 +911,6 @@ async fn merge_scalar_indices<'a>(
                 dataset.as_ref(),
                 &reference_index,
                 field_path,
-                column_name,
                 new_uuid,
                 rebuild_frags.iter().collect(),
             )
@@ -1884,8 +1881,13 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     .await?;
 
                     let mut frag_bitmap = base_unindexed_bitmap;
-                    let mut effective_old_frags = RoaringBitmap::new();
                     let mut selected_indices = Vec::with_capacity(selected_old_indices.len());
+                    // Each segment keeps only its old rows still stored in the
+                    // fragments it covers. Under stable row ids a rewritten row
+                    // keeps its row id while it moves into a fragment a sibling
+                    // covers, so a filter over the union of all coverage would
+                    // keep the old segment's stale posting for it.
+                    let mut old_data_filters = Vec::with_capacity(selected_old_indices.len());
                     // On a tagged table a selected segment's old data is the
                     // coverage the reader derives for it (translated, live)
                     // and the merged segment keeps the stored provenance,
@@ -1895,24 +1897,30 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                         tagged_segment_coverage(dataset.as_ref(), &selected_old_indices, None)
                             .await?;
                     for idx in &selected_old_indices {
-                        match &tagged_coverage {
+                        let effective_old_frags = match &tagged_coverage {
                             Some(coverage) => {
-                                if let Some(derived) = coverage.get(&idx.uuid) {
-                                    effective_old_frags |= derived;
-                                }
                                 if let Some(stored) = &idx.fragment_bitmap {
                                     frag_bitmap |= stored;
                                 }
+                                coverage.get(&idx.uuid).cloned().unwrap_or_default()
                             }
                             None => {
-                                if let Some(effective) =
-                                    idx.effective_fragment_bitmap(&dataset.fragment_bitmap)
-                                {
-                                    frag_bitmap |= &effective;
-                                    effective_old_frags |= &effective;
-                                }
+                                let effective = idx
+                                    .effective_fragment_bitmap(&dataset.fragment_bitmap)
+                                    .unwrap_or_default();
+                                frag_bitmap |= &effective;
+                                effective
                             }
-                        }
+                        };
+                        old_data_filters.push(
+                            build_old_data_filter(
+                                dataset.as_ref(),
+                                &effective_old_frags,
+                                &RoaringBitmap::new(),
+                                false,
+                            )
+                            .await?,
+                        );
                         let scalar_index = dataset
                             .open_scalar_index_for_maintenance(
                                 &field_path,
@@ -1932,20 +1940,6 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                             })?;
                         selected_indices.push(Arc::new(inverted_index.clone()));
                     }
-
-                    let old_data_filter = if selected_indices.is_empty() {
-                        None
-                    } else if dataset.manifest.uses_stable_row_ids() {
-                        let valid_old_row_ids =
-                            build_stable_row_id_filter(dataset.as_ref(), &effective_old_frags)
-                                .await?;
-                        Some(OldIndexDataFilter::RowIds(valid_old_row_ids))
-                    } else {
-                        Some(OldIndexDataFilter::Fragments {
-                            to_keep: effective_old_frags,
-                            to_remove: RoaringBitmap::new(),
-                        })
-                    };
 
                     let new_uuid = Uuid::new_v4();
                     let new_store = LanceIndexStore::from_dataset_for_new(&dataset, &new_uuid)?;
@@ -1970,7 +1964,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                                 &selected_indices,
                                 new_data_stream,
                                 &new_store,
-                                old_data_filter,
+                                &old_data_filters,
                                 options.progress.clone(),
                             )
                             .await?,
@@ -1998,7 +1992,6 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                         options,
                         it,
                         &field_path,
-                        column.name.as_str(),
                         base_unindexed_bitmap,
                     )
                     .await?
@@ -5793,6 +5786,68 @@ mod tests {
         let after_default = dataset.load_indices_by_name("id_idx").await.unwrap();
         assert_eq!(after_default[0].uuid, original_uuid);
         assert_eq!(dataset.manifest.version, original_version);
+    }
+
+    #[tokio::test]
+    async fn test_optimize_empty_nested_scalar_index() {
+        let test_dir = TempStrDir::default();
+        let child_field = Arc::new(Field::new("child", DataType::Int32, false));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "st",
+            DataType::Struct(vec![child_field.clone()].into()),
+            false,
+        )]));
+        let empty_batch = RecordBatch::new_empty(schema.clone());
+        let reader = RecordBatchIterator::new(vec![Ok(empty_batch)], schema.clone());
+        let mut dataset = Dataset::write(reader, test_dir.as_str(), None)
+            .await
+            .unwrap();
+
+        dataset
+            .create_index(
+                &["st.child"],
+                IndexType::BTree,
+                Some("child_idx".to_string()),
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+
+        let child_values = Arc::new(Int32Array::from(vec![0, 1, 2, 3]));
+        let st_values = StructArray::from(vec![(
+            child_field,
+            child_values as Arc<dyn arrow_array::Array>,
+        )]);
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(st_values)]).unwrap();
+        dataset
+            .append(
+                RecordBatchIterator::new(vec![Ok(batch)], schema),
+                Some(WriteParams {
+                    max_rows_per_file: 2,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 2);
+
+        dataset
+            .optimize_indices(&OptimizeOptions::default())
+            .await
+            .unwrap();
+
+        let stats = dataset.index_statistics("child_idx").await.unwrap();
+        let stats: serde_json::Value = serde_json::from_str(&stats).unwrap();
+        assert_eq!(stats["num_unindexed_rows"], 0);
+        let result = dataset
+            .scan()
+            .filter("st.child = 3")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(result.num_rows(), 1);
     }
 
     #[rstest]
