@@ -164,20 +164,28 @@ impl CacheKey for DeletionFileKey<'_> {
 }
 
 #[derive(Debug)]
-pub struct RowAddrMaskKey {
+pub struct RowAddrMaskKey<'a> {
     pub version: u64,
     /// `Some(hash)` when the mask is restricted to a fragment subset; `None`
     /// when it covers all fragments in the dataset. Two consumers that ask
     /// for different subsets must not poison each other's cache entry.
     pub restrict_hash: Option<u64>,
+    /// The manifest e-tag. Version numbers restart when a dataset is recreated
+    /// at the same URI, so the e-tag tells the generations apart. A manifest
+    /// without one is not cached.
+    pub e_tag: &'a str,
 }
 
-impl CacheKey for RowAddrMaskKey {
+impl CacheKey for RowAddrMaskKey<'_> {
     type ValueType = RowAddrMask;
+    // Only the legacy display form. Identity comes from `write_key` below.
     fn key(&self) -> Cow<'_, str> {
         match self.restrict_hash {
-            None => Cow::Owned(format!("row_addr_mask/{}", self.version)),
-            Some(h) => Cow::Owned(format!("row_addr_mask/{}/{:x}", self.version, h)),
+            None => Cow::Owned(format!("row_addr_mask/{}/{}", self.version, self.e_tag)),
+            Some(h) => Cow::Owned(format!(
+                "row_addr_mask/{}/{:x}/{}",
+                self.version, h, self.e_tag
+            )),
         }
     }
     fn type_name() -> &'static str {
@@ -185,7 +193,7 @@ impl CacheKey for RowAddrMaskKey {
     }
 
     fn schema() -> CacheKeySchema {
-        CacheKeySchema::new("lance.dataset.row-address-mask-key", 1)
+        CacheKeySchema::new("lance.dataset.row-address-mask-key", 2)
     }
 
     fn write_key(&self, builder: &mut KeyBuilder) {
@@ -196,6 +204,7 @@ impl CacheKey for RowAddrMaskKey {
         } else {
             builder.write_none();
         }
+        builder.write_str(self.e_tag);
     }
 }
 
@@ -447,6 +456,47 @@ mod tests {
                     version: 5,
                     with_deletions: true,
                     e_tag: Some("second-etag"),
+                })
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn row_addr_mask_key_separates_manifest_generations() {
+        let cache = LanceCache::with_capacity(4096);
+        let mask = || {
+            Arc::new(RowAddrMask::from_allowed(
+                lance_select::RowAddrTreeMap::new(),
+            ))
+        };
+        let key = RowAddrMaskKey {
+            version: 5,
+            restrict_hash: None,
+            e_tag: "first-etag",
+        };
+        cache.insert_with_key(&key, mask()).await;
+        assert!(cache.get_with_key(&key).await.is_some());
+
+        // Same version and restriction, different dataset generation.
+        assert!(
+            cache
+                .get_with_key(&RowAddrMaskKey {
+                    version: 5,
+                    restrict_hash: None,
+                    e_tag: "second-etag",
+                })
+                .await
+                .is_none()
+        );
+        // A different fragment restriction must not alias the unrestricted
+        // entry either, even within one generation.
+        assert!(
+            cache
+                .get_with_key(&RowAddrMaskKey {
+                    version: 5,
+                    restrict_hash: Some(0xa),
+                    e_tag: "first-etag",
                 })
                 .await
                 .is_none()
