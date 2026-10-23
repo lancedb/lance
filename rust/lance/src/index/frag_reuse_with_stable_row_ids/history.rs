@@ -5,10 +5,10 @@
 //! through the fragment reuse history after a deferred compaction. A
 //! publication must keep every recorded version exactly. A rewrite that carries
 //! the history appends the one version recording its own moves; a rewrite that
-//! does not leaves it unchanged, and its address indices stop covering the
-//! fragments it rewrites. Only a cleanup, a commit that replaces nothing but
-//! the fragment reuse index, may remove versions: the oldest ones, and only
-//! those no index of the published manifest still needs.
+//! does not leaves it unchanged, and either remaps an address index eagerly or
+//! stops it covering the fragments it rewrites. Only a cleanup, a commit that
+//! replaces the fragment reuse index, may remove versions: the oldest ones, and
+//! only those no index of the published manifest still needs.
 
 use std::io::Cursor;
 use std::sync::Arc;
@@ -39,8 +39,9 @@ pub enum ReadSnapshot<'a> {
     Version { base: &'a Dataset, version: u64 },
 }
 
-/// The single v0 entry. `Err` when the list holds several entries or a tagged
-/// one, which the publication check refuses on its own.
+/// The single fragment reuse entry with `index_version = 0` (the format that
+/// stores compaction records). `Err` for multiple entries or a tagged entry,
+/// which the publication check refuses separately.
 fn sole_v0_entry(indices: &[IndexMetadata]) -> std::result::Result<Option<&IndexMetadata>, ()> {
     let mut entries = indices
         .iter()
@@ -52,17 +53,31 @@ fn sole_v0_entry(indices: &[IndexMetadata]) -> std::result::Result<Option<&Index
     Ok(entry)
 }
 
-/// Refuse a commit that would lose or alter recorded history on a stable-row-id
-/// table, or append a version that does not record its rewrite or whose stamp
-/// misplaces it. A rewrite that does not carry the history records nothing. A
-/// cleanup may trim the oldest versions no index needs ([`validate_trim`]).
+/// Validate fragment reuse history stored as compaction records
+/// (`index_version = 0`) when committing a stable-row-id table:
+///
+/// 1. Keep the existing entry and its recorded versions unchanged and in order,
+///    except for cleanup, restore and overwrite below. A rewrite without FRI
+///    may leave the history unchanged.
+/// 2. Only a rewrite may append a version. A rewrite carrying FRI must append
+///    exactly one, matching its source fragments, live source rows and published
+///    destinations. Its stamp must be at least the preceding stamp and the
+///    version of every index that may cover its source fragments.
+/// 3. Cleanup is a `CreateIndex` that replaces the FRI entry, and it may add or
+///    remove other indices too. It may remove an oldest prefix the writer read,
+///    retaining the entry and every later version unchanged. No index in the
+///    proposed manifest, including one the commit adds, may still need a removed
+///    version ([`validate_trim`]).
+/// 4. Overwrite may replace history. Restore republishes the selected history,
+///    but refuses history or index versions ahead of the new main-chain version
+///    ([`validate_restore`]).
+///
 /// `base` is the manifest the commit replaces (for a detached commit, the one it
 /// builds on).
 ///
 /// A refusal is retryable when the history or index it misses was published
 /// after the writer's `read` snapshot, and `InvalidInput` when the writer saw
-/// it. Restore and overwrite replace the history by design
-/// ([`validate_restore`]).
+/// it or the commit supplies it.
 pub async fn validate_frag_reuse_history(
     operation: &Operation,
     base: &Dataset,
@@ -75,6 +90,10 @@ pub async fn validate_frag_reuse_history(
             return validate_restore(base, *version, proposed_manifest, proposed_indices).await;
         }
         Operation::Overwrite { .. } => return Ok(()),
+        // Non-stable-row-id tables can need the same history protection.
+        // Extending these checks must also allow existing operations such as
+        // migration to stable row ids, which drops unused history once no
+        // other index remains.
         _ if !base.manifest.uses_stable_row_ids() => return Ok(()),
         _ => {}
     }
@@ -114,11 +133,22 @@ pub async fn validate_frag_reuse_history(
         (Some(replaced), Some(proposed)) => {
             let recorded = load_frag_reuse_index_details(base, replaced).await?;
             let published = load_proposed_history(base, proposed_manifest, proposed).await?;
-            if let Some(trimmed) =
-                trimmed_versions(operation, &recorded.versions, &published.versions)?
+            if let Operation::CreateIndex {
+                new_indices,
+                removed_indices,
+            } = operation
+                && replaces_frag_reuse_entry(new_indices, removed_indices)
+                && let Some(trimmed) = trimmed_versions(&recorded.versions, &published.versions)?
             {
-                return validate_trim(&recorded.versions, trimmed, proposed_indices, &read, base)
-                    .await;
+                return validate_trim(
+                    &recorded.versions,
+                    trimmed,
+                    new_indices,
+                    proposed_indices,
+                    &read,
+                    base,
+                )
+                .await;
             }
             for (position, version) in recorded.versions.iter().enumerate() {
                 let kept = match published.versions.get(position) {
@@ -147,8 +177,8 @@ pub async fn validate_frag_reuse_history(
             operation.name(),
             versions.len()
         ))),
-        // Unrecorded: the manifest build drops the rewritten fragments from the
-        // coverage of indices that store row addresses.
+        // Unrecorded: the rewrite remaps the address indices it can, and the
+        // manifest build drops the rewritten fragments from the others.
         (Some((_, false)), []) => Ok(()),
         (Some((_, true)), []) => Err(Error::invalid_input(
             "Cannot commit a rewrite that carries a fragment reuse index without appending the \
@@ -233,28 +263,30 @@ async fn load_proposed_history(
         })
 }
 
+/// Whether a `CreateIndex` replaces the fragment reuse entry, removing one entry
+/// and publishing one in its place, whatever other indices it adds or removes.
+fn replaces_frag_reuse_entry(
+    new_indices: &[IndexMetadata],
+    removed_indices: &[IndexMetadata],
+) -> bool {
+    let entries = |indices: &[IndexMetadata]| {
+        indices
+            .iter()
+            .filter(|index| is_frag_reuse_index_entry(index))
+            .count()
+    };
+    entries(new_indices) == 1 && entries(removed_indices) == 1
+}
+
 /// How many versions a cleanup removes from the front of the history: `Some`
-/// only for a commit that replaces nothing but the fragment reuse index and
-/// publishes every later version exactly. Anything else is held to keeping
-/// every recorded version.
+/// only when it publishes every later version exactly. Anything else is held
+/// to keeping every recorded version.
 fn trimmed_versions(
-    operation: &Operation,
     recorded: &[FragReuseVersion],
     published: &[FragReuseVersion],
 ) -> Result<Option<usize>> {
-    let Operation::CreateIndex {
-        new_indices,
-        removed_indices,
-    } = operation
-    else {
-        return Ok(None);
-    };
-    let replaces_only_the_history = matches!(
-        (new_indices.as_slice(), removed_indices.as_slice()),
-        ([new], [removed]) if is_frag_reuse_index_entry(new) && is_frag_reuse_index_entry(removed)
-    );
     let trimmed = recorded.len().saturating_sub(published.len());
-    if !replaces_only_the_history || trimmed == 0 {
+    if trimmed == 0 {
         return Ok(None);
     }
     for (kept, candidate) in recorded[trimmed..].iter().zip(published) {
@@ -301,13 +333,14 @@ fn contains_version(versions: &[FragReuseVersion], version: &FragReuseVersion) -
 }
 
 /// A cleanup removes the oldest `trimmed` recorded versions. Each must be one
-/// the writer read, and no index the commit publishes may still need it. The
-/// writer chose from the history and indices it read, so a version recorded or
-/// an index committed since makes the refusal retryable: run again on the
-/// latest version, the cleanup keeps them.
+/// the writer read, and no index the commit publishes may still need it. An
+/// index the writer read or supplies makes a refusal `InvalidInput`. A version
+/// recorded or an index committed since the writer read makes it retryable: run
+/// again on the latest version, the cleanup keeps them.
 async fn validate_trim(
     recorded: &[FragReuseVersion],
     trimmed: usize,
+    supplied_indices: &[IndexMetadata],
     proposed_indices: &[IndexMetadata],
     read: &ReadSnapshot<'_>,
     base: &Dataset,
@@ -342,11 +375,16 @@ async fn validate_trim(
         let Some(index) = index_needing(version, proposed_indices, &chain) else {
             continue;
         };
+        // Judged as the writer saw it: against the history it read, through the
+        // metadata it read or supplies.
         let needed_when_read = seen
             .indices
             .iter()
-            .filter(|read| read.uuid == index.uuid)
-            .any(|read| index_needing(version, std::slice::from_ref(read), &read_chain).is_some());
+            .chain(supplied_indices)
+            .filter(|known| known.uuid == index.uuid)
+            .any(|known| {
+                index_needing(version, std::slice::from_ref(known), &read_chain).is_some()
+            });
         if needed_when_read {
             return Err(Error::invalid_input(format!(
                 "Cannot remove the fragment reuse version stamped {stamp} on a table with stable \
@@ -404,9 +442,9 @@ impl ReadSnapshot<'_> {
                 Loss::Version(lost) => format!(
                     "Cannot drop or alter the fragment reuse version stamped {} on a table with \
                      stable row ids: it was recorded at version {read_version}, the version this \
-                     commit read. Only a cleanup, replacing nothing but the fragment reuse index, \
-                     may remove versions, the oldest ones no index needs, and every other version \
-                     must be kept exactly",
+                     commit read. Only a cleanup, a commit replacing the fragment reuse index, may \
+                     remove versions, the oldest ones no index needs, and every other version must \
+                     be kept exactly",
                     lost.dataset_version
                 ),
             });
@@ -1003,8 +1041,9 @@ mod tests {
 
     /// No publication may drop the history or a version it keeps, or change a
     /// recorded version's stamp or moves, or record moves no rewrite made: a
-    /// cleanup removes only the oldest versions and adds none. A republished
-    /// history that records the same moves is the same history.
+    /// cleanup removes only the oldest versions and adds none. Dropping an index
+    /// in the same commit changes none of this. A republished history that
+    /// records the same moves is the same history.
     #[rstest]
     #[tokio::test]
     async fn test_recorded_history_is_kept(
@@ -1020,15 +1059,19 @@ mod tests {
         change: Change,
         #[values(Storage::Inline, Storage::External)] storage: Storage,
         #[values(false, true)] detached: bool,
+        #[values(false, true)] drops_an_index: bool,
     ) {
         let dir = TempStrDir::default();
         let (mut dataset, before) = recording_table(dir.as_str(), storage).await;
         // A second version, so the newest can go while an older one stays.
         let options = compaction_of(&dataset, &[6, 7]);
         compact_files(&mut dataset, options, None).await.unwrap();
+        if drops_an_index {
+            create_zone_map(&mut dataset).await;
+        }
         let recorded = history(&dataset).await;
         let mut versions = recorded.clone();
-        let operation = match change {
+        let mut operation = match change {
             Change::Dropped => Operation::CreateIndex {
                 new_indices: vec![],
                 removed_indices: vec![frag_reuse_entry(&dataset).await],
@@ -1064,6 +1107,15 @@ mod tests {
                 replacement(&dataset, versions).await
             }
         };
+        if drops_an_index {
+            let Operation::CreateIndex {
+                removed_indices, ..
+            } = &mut operation
+            else {
+                unreachable!()
+            };
+            removed_indices.push(zone_map_entry(&dataset).await);
+        }
         let result = commit(&dataset, dataset.manifest.version, operation, detached).await;
 
         match change {
@@ -1075,7 +1127,17 @@ mod tests {
                 assert_refused(result, "Cannot drop or alter the fragment reuse version")
             }
             Change::Fabricated => assert_refused(result, "may only be appended by the rewrite"),
-            Change::Republished => assert_same_history(&history(&result.unwrap()).await, &recorded),
+            Change::Republished => {
+                let published = result.unwrap();
+                assert_same_history(&history(&published).await, &recorded);
+                // The zone map, when there is one, goes with the same commit.
+                let indexed = load_all_indices(&published)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|index| index.name == "i_idx");
+                assert!(!indexed);
+            }
         }
         let latest = Dataset::open(dir.as_str()).await.unwrap();
         let published = matches!(change, Change::Republished) && !detached;
@@ -2262,14 +2324,24 @@ mod tests {
         RawTrim,
         /// A raw republish of the history the cleaner read, nothing trimmed.
         RawRepublish,
+        /// A raw trim of every version that also builds a zone map.
+        RawTrimBuildingAnIndex,
     }
 
     /// A rewrite rebases onto a trimmed history without resurrecting versions.
     /// A stale trim or republish must retry rather than erase a new recording.
+    /// A rewrite is not rebased across a trim that also builds an index: it is
+    /// refused as incompatible, and runs again from the latest version.
     #[rstest]
     #[tokio::test]
     async fn test_cleanup_and_a_recorded_rewrite_race_in_either_order(
-        #[values(Pruning::Cleanup, Pruning::RawTrim, Pruning::RawRepublish)] pruning: Pruning,
+        #[values(
+            Pruning::Cleanup,
+            Pruning::RawTrim,
+            Pruning::RawRepublish,
+            Pruning::RawTrimBuildingAnIndex
+        )]
+        pruning: Pruning,
         #[values(false, true)] rewrite_first: bool,
     ) {
         let dir = TempStrDir::default();
@@ -2282,7 +2354,22 @@ mod tests {
             Pruning::Cleanup => None,
             Pruning::RawTrim => Some(replacement(&cleaner, vec![]).await),
             Pruning::RawRepublish => Some(replacement(&cleaner, recorded.clone()).await),
+            Pruning::RawTrimBuildingAnIndex => {
+                let Operation::CreateIndex {
+                    mut new_indices,
+                    removed_indices,
+                } = replacement(&cleaner, vec![]).await
+                else {
+                    unreachable!()
+                };
+                new_indices.push(stage_zone_map(&mut cleaner, "i", "i_idx").await);
+                Some(Operation::CreateIndex {
+                    new_indices,
+                    removed_indices,
+                })
+            }
         };
+        let builds_an_index = matches!(pruning, Pruning::RawTrimBuildingAnIndex);
         let compaction = compaction_of(&compactor, &[6, 7]);
 
         if rewrite_first {
@@ -2297,15 +2384,28 @@ mod tests {
                 .map(|_| ()),
         };
         if !rewrite_first {
-            compact_files(&mut compactor, compaction, None)
-                .await
-                .unwrap();
+            let compacted = compact_files(&mut compactor, compaction, None).await;
+            if builds_an_index {
+                let error = compacted.expect_err("the rewrite must not rebase across the trim");
+                assert!(
+                    matches!(error, Error::IncompatibleTransaction { .. }),
+                    "{error}"
+                );
+                let mut compactor = Dataset::open(dir.as_str()).await.unwrap();
+                let compaction = compaction_of(&compactor, &[6, 7]);
+                compact_files(&mut compactor, compaction, None)
+                    .await
+                    .unwrap();
+            } else {
+                compacted.unwrap();
+            }
         }
 
         let latest = Dataset::open(dir.as_str()).await.unwrap();
         let kept = history(&latest).await;
         if rewrite_first {
-            // The rebase sees the entry it replaces changed first.
+            // The rebase sees the entry it replaces changed first, or the
+            // index it builds over the rewritten fragments.
             let error = trimmed.expect_err("a stale replacement must be refused");
             assert!(
                 matches!(error, Error::RetryableCommitConflict { .. }),
@@ -2328,7 +2428,7 @@ mod tests {
                 assert_same_history(&kept[..recorded.len()], &recorded);
                 assert_translations_hold(&before, dir.as_str()).await;
             }
-            Pruning::Cleanup | Pruning::RawTrim => {
+            Pruning::Cleanup | Pruning::RawTrim | Pruning::RawTrimBuildingAnIndex => {
                 assert_eq!(kept.len(), 1);
                 assert!(!same_version(&kept[0], &recorded[0]).unwrap());
                 assert_eq!(kept[0].old_frag_ids(), vec![6, 7]);
@@ -2531,6 +2631,21 @@ mod tests {
             .unwrap();
     }
 
+    /// `i_idx` on `i`: a zone map, which an eager compaction cannot remap, or a
+    /// BTree, which it remaps.
+    async fn create_address_index(dataset: &mut Dataset, index_type: IndexType) {
+        let builtin = match index_type {
+            IndexType::ZoneMap => BuiltinIndexType::ZoneMap,
+            IndexType::BTree => BuiltinIndexType::BTree,
+            _ => unreachable!("{index_type:?}"),
+        };
+        dataset
+            .create_index_builder(&["i"], index_type, &ScalarIndexParams::for_builtin(builtin))
+            .name("i_idx".into())
+            .await
+            .unwrap();
+    }
+
     /// Maintenance other than the fragment reuse cleanup never trims or alters
     /// the history, with or without indices, even once every index has caught
     /// up.
@@ -2583,27 +2698,33 @@ mod tests {
     #[derive(Clone, Copy, Debug)]
     enum Indexing {
         None,
-        /// A zone map built after the compaction, from the addresses it wrote.
-        CaughtUp,
+        /// An index built after the compaction, from the addresses it wrote.
+        CaughtUp(IndexType),
     }
 
     /// Trimming every version keeps the empty entry. Current handles see the
     /// trim; the previous snapshot retains its history. Only a deferred
     /// compaction records into the empty history: without `defer_index_remap`
-    /// it stays empty, and a caught-up zone map stops covering the rewritten
-    /// fragments instead of following their rows.
+    /// it stays empty, a caught-up zone map stops covering the rewritten
+    /// fragments instead of following their rows, and a BTree is remapped onto
+    /// them.
     #[rstest]
     #[tokio::test]
     async fn test_cleanup_trims_the_history_no_index_needs(
-        #[values(Indexing::None, Indexing::CaughtUp)] indexing: Indexing,
+        #[values(
+            Indexing::None,
+            Indexing::CaughtUp(IndexType::ZoneMap),
+            Indexing::CaughtUp(IndexType::BTree)
+        )]
+        indexing: Indexing,
         #[values(Storage::Inline, Storage::External)] storage: Storage,
         #[values(false, true)] defer_index_remap: bool,
     ) {
         let dir = TempStrDir::default();
         let uri = dir.as_str();
         let (mut dataset, _) = recording_table(uri, storage).await;
-        if matches!(indexing, Indexing::CaughtUp) {
-            create_zone_map(&mut dataset).await;
+        if let Indexing::CaughtUp(index_type) = indexing {
+            create_address_index(&mut dataset, index_type).await;
         }
         let recorded = history(&dataset).await;
         let untrimmed = dataset.manifest.version;
@@ -2638,20 +2759,28 @@ mod tests {
         } else {
             assert!(history(&latest).await.is_empty());
         }
-        if matches!(indexing, Indexing::CaughtUp) {
+        if let Indexing::CaughtUp(index_type) = indexing {
             let coverage = coverage_of(&load_all_indices(&latest).await.unwrap(), "i_idx");
             assert!(
                 !coverage.contains(6) && !coverage.contains(7),
                 "{coverage:?}"
             );
-            assert_eq!(coverage.contains(output), defer_index_remap, "{coverage:?}");
+            assert_eq!(
+                coverage.contains(output),
+                defer_index_remap || index_type == IndexType::BTree,
+                "{coverage:?}"
+            );
             assert_answers_through(&latest, "i_idx", "i >= 55").await;
         }
     }
 
-    /// A recording table as [`recording_table`] makes it, with a zone map built
-    /// before its compaction, which therefore still needs the version.
-    async fn indexed_recording_table(uri: &str) -> (Dataset, HashMap<u64, (u64, i32)>) {
+    /// A recording table as [`recording_table`] makes it, with an index of
+    /// `index_type` built before its compaction, which therefore still needs the
+    /// version.
+    async fn indexed_recording_table(
+        uri: &str,
+        index_type: IndexType,
+    ) -> (Dataset, HashMap<u64, (u64, i32)>) {
         let mut dataset = gen_batch()
             .col("i", array::step::<Int32Type>())
             .into_dataset_with_params(
@@ -2667,7 +2796,7 @@ mod tests {
             .await
             .unwrap();
         dataset.delete("i IN (1, 2, 5, 61)").await.unwrap();
-        create_zone_map(&mut dataset).await;
+        create_address_index(&mut dataset, index_type).await;
         let before = rows_by_addr(&dataset).await;
         let options = compaction_of(&dataset, &[0, 1, 3, 4]);
         compact_files(&mut dataset, options, None).await.unwrap();
@@ -2676,11 +2805,14 @@ mod tests {
 
     /// Catching up an index makes only the oldest prefix trimmable.
     /// Retained moves must still translate correctly and serve indexed queries.
+    #[rstest]
     #[tokio::test]
-    async fn test_cleanup_keeps_the_versions_an_index_needs() {
+    async fn test_cleanup_keeps_the_versions_an_index_needs(
+        #[values(IndexType::ZoneMap, IndexType::BTree)] index_type: IndexType,
+    ) {
         let dir = TempStrDir::default();
         let uri = dir.as_str();
-        let (mut dataset, before) = indexed_recording_table(uri).await;
+        let (mut dataset, before) = indexed_recording_table(uri, index_type).await;
         let first = history(&dataset).await;
         let untrimmed = dataset.manifest.version;
         cleanup_frag_reuse_index(&mut dataset).await.unwrap();
@@ -2714,8 +2846,8 @@ mod tests {
         assert_answers_through(&latest, "i_idx", "i >= 55 AND i < 75").await;
     }
 
-    /// Every index type that stores row addresses lives with the history the
-    /// same way: zone maps, bloom filters and BTrees from format version 1. A
+    /// Every index type that stores row addresses an eager compaction cannot
+    /// remap lives with the history the same way: zone maps and bloom filters. A
     /// deferred compaction records its moves, which the index answers through.
     /// A compaction without `defer_index_remap` records nothing, also across the
     /// output of a recorded one: the index stops covering what it rewrote, which
@@ -2725,12 +2857,12 @@ mod tests {
     /// without giving the index coverage it never had, and neither does merging
     /// the index's segments. Caught up, the index needs no version: cleanup
     /// empties the history, keeps the entry, and the next deferred compaction
-    /// records into it.
+    /// records into it. A BTree is remapped eagerly instead, which is refused
+    /// while the history holds versions.
     #[rstest]
     #[tokio::test]
     async fn test_address_index_lives_with_the_history(
-        #[values(IndexType::ZoneMap, IndexType::BloomFilter, IndexType::BTree)]
-        index_type: IndexType,
+        #[values(IndexType::ZoneMap, IndexType::BloomFilter)] index_type: IndexType,
     ) {
         let dir = TempStrDir::default();
         let uri = dir.as_str();
@@ -2751,8 +2883,7 @@ mod tests {
         dataset.delete("i IN (1, 2, 5, 61)").await.unwrap();
         let params = match index_type {
             IndexType::ZoneMap => ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap),
-            IndexType::BloomFilter => ScalarIndexParams::for_builtin(BuiltinIndexType::BloomFilter),
-            _ => ScalarIndexParams::default(),
+            _ => ScalarIndexParams::for_builtin(BuiltinIndexType::BloomFilter),
         };
         dataset
             .create_index_builder(&["i"], index_type, &params)
@@ -2761,9 +2892,6 @@ mod tests {
             .unwrap();
         let index = dataset.load_index_by_name("i_idx").await.unwrap().unwrap();
         assert!(index.results_are_row_addrs());
-        if index_type == IndexType::BTree {
-            assert_eq!(index.index_version, 1);
-        }
         // Rows of fragments 0, 1 and 7 end up behind the unrecorded compaction;
         // the others stay where they are or move only through recorded ones.
         // A bloom filter answers only equality.
@@ -2868,26 +2996,24 @@ mod tests {
     enum Trim {
         /// Trims the version a zone map built before it still needs.
         Needed,
-        /// Trims a version no index needs while dropping an index.
-        WithAnIndex,
         /// Republishes, after a cleanup, the version it trimmed.
         Resurrected,
     }
 
-    /// A trim holds to the cleanup rule however it is committed: it replaces
-    /// nothing but the fragment reuse index, removes no version an index may
-    /// still need, and never brings back a trimmed version.
+    /// A trim holds to the cleanup rule however it is committed: it removes no
+    /// version an index may still need, and never brings back a trimmed
+    /// version.
     #[rstest]
     #[tokio::test]
     async fn test_a_trim_holds_to_the_cleanup_rule(
-        #[values(Trim::Needed, Trim::WithAnIndex, Trim::Resurrected)] trim: Trim,
+        #[values(Trim::Needed, Trim::Resurrected)] trim: Trim,
         #[values(false, true)] detached: bool,
     ) {
         let dir = TempStrDir::default();
         let uri = dir.as_str();
         let (mut dataset, before) = match trim {
-            Trim::Needed => indexed_recording_table(uri).await,
-            Trim::WithAnIndex | Trim::Resurrected => recording_table(uri, Storage::Inline).await,
+            Trim::Needed => indexed_recording_table(uri, IndexType::ZoneMap).await,
+            Trim::Resurrected => recording_table(uri, Storage::Inline).await,
         };
         let recorded = history(&dataset).await;
         let (operation, refusal) = match trim {
@@ -2895,22 +3021,6 @@ mod tests {
                 replacement(&dataset, vec![]).await,
                 "may still hold row addresses it moved",
             ),
-            Trim::WithAnIndex => {
-                create_zone_map(&mut dataset).await;
-                let Operation::CreateIndex {
-                    new_indices,
-                    mut removed_indices,
-                } = replacement(&dataset, vec![]).await
-                else {
-                    unreachable!()
-                };
-                removed_indices.push(zone_map_entry(&dataset).await);
-                let operation = Operation::CreateIndex {
-                    new_indices,
-                    removed_indices,
-                };
-                (operation, "Cannot drop or alter the fragment reuse version")
-            }
             Trim::Resurrected => {
                 cleanup_frag_reuse_index(&mut dataset).await.unwrap();
                 assert!(history(&dataset).await.is_empty());
@@ -2932,6 +3042,96 @@ mod tests {
         } else {
             assert_same_history(&history(&latest).await, &recorded);
             assert_translations_hold(&before, uri).await;
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Alongside {
+        /// Drops the zone map that needs the trimmed record.
+        DroppingTheIndexThatNeedsIt,
+        /// Replaces that zone map with its segment merged through the history.
+        CatchingUpTheIndexThatNeedsIt,
+        /// Keeps that zone map and builds another index.
+        BuildingAnother,
+    }
+
+    /// A cleanup may change other indices in the same commit, ordinary or
+    /// detached. Dropping or catching up the zone map that needs a record lets
+    /// it trim the record, and queries still answer as a scan does. Every index
+    /// of the resulting manifest still holds the trim to the cleanup rule: a
+    /// commit that keeps the zone map is invalid, as is one that supplies a
+    /// segment still needing the record
+    /// ([`test_saved_segment_published_with_a_change_to_its_history_is_refused`]).
+    #[rstest]
+    #[tokio::test]
+    async fn test_a_trim_alongside_other_index_changes(
+        #[values(
+            Alongside::DroppingTheIndexThatNeedsIt,
+            Alongside::CatchingUpTheIndexThatNeedsIt,
+            Alongside::BuildingAnother
+        )]
+        alongside: Alongside,
+        #[values(false, true)] detached: bool,
+    ) {
+        let dir = TempStrDir::default();
+        let uri = dir.as_str();
+        let mut dataset = zone_mapped_table(uri).await;
+        let segment = stage_zone_map(&mut dataset, "i", "late").await;
+        dataset
+            .commit_existing_index_segments("late", "i", vec![segment])
+            .await
+            .unwrap();
+        let compacted = compact_recorded(&mut dataset, &[0, 1, 2, 3]).await;
+        let saved = dataset.load_indices_by_name("late").await.unwrap();
+        let recorded = history(&dataset).await;
+        let Operation::CreateIndex {
+            mut new_indices,
+            mut removed_indices,
+        } = replacement(&dataset, vec![]).await
+        else {
+            unreachable!()
+        };
+        match alongside {
+            Alongside::DroppingTheIndexThatNeedsIt => removed_indices.extend(saved.clone()),
+            Alongside::CatchingUpTheIndexThatNeedsIt => {
+                let merged = dataset
+                    .merge_existing_index_segments(saved.clone())
+                    .await
+                    .unwrap();
+                removed_indices.extend(saved.clone());
+                new_indices.push(merged);
+            }
+            Alongside::BuildingAnother => {
+                new_indices.push(stage_zone_map(&mut dataset, "j", "other").await);
+            }
+        }
+        let operation = Operation::CreateIndex {
+            new_indices,
+            removed_indices,
+        };
+        let version = dataset.manifest.version;
+        let result = commit(&dataset, version, operation, detached).await;
+
+        let latest = Dataset::open(uri).await.unwrap();
+        match alongside {
+            Alongside::DroppingTheIndexThatNeedsIt | Alongside::CatchingUpTheIndexThatNeedsIt => {
+                let trimmed = result.unwrap();
+                assert!(history(&trimmed).await.is_empty());
+                assert_eq!(latest.manifest.version, version + u64::from(!detached));
+                let coverage = coverage_of(&load_all_indices(&trimmed).await.unwrap(), "late");
+                if matches!(alongside, Alongside::CatchingUpTheIndexThatNeedsIt) {
+                    assert_eq!(coverage, RoaringBitmap::from_iter([compacted]));
+                    assert_answers_through(&trimmed, "late", "i < 150").await;
+                } else {
+                    assert!(coverage.is_empty(), "{coverage:?}");
+                    assert_matches_a_scan(&trimmed, "i < 150").await;
+                }
+            }
+            Alongside::BuildingAnother => {
+                assert_refused(result, "may still hold row addresses it moved");
+                assert_eq!(latest.manifest.version, version);
+                assert_same_history(&history(&latest).await, &recorded);
+            }
         }
     }
 
@@ -3090,12 +3290,15 @@ mod tests {
     }
 
     /// A saved zone map is committed again while a cleanup that read before
-    /// it trims the record it needs. Committed first from a handle that read
-    /// the record, the zone map holds the cleanup back. The opposite order, a
-    /// cleanup committed before the saved segment is published, is deferred
-    /// with #9947.
+    /// it trims the record it needs, alone or while building another index.
+    /// Committed first from a handle that read the record, the zone map holds
+    /// the cleanup back, which may retry. The opposite order, a cleanup
+    /// committed before the saved segment is published, is deferred with #9947.
+    #[rstest]
     #[tokio::test]
-    async fn test_republished_zone_map_racing_a_cleanup_keeps_what_it_covers() {
+    async fn test_republished_zone_map_racing_a_cleanup_keeps_what_it_covers(
+        #[values(false, true)] builds_another_index: bool,
+    ) {
         let dir = TempStrDir::default();
         let uri = dir.as_str();
         let mut dataset = zone_mapped_table(uri).await;
@@ -3110,14 +3313,34 @@ mod tests {
         let recorded = history(&dataset).await;
         let mut publisher = Dataset::open(uri).await.unwrap();
         let mut cleaner = Dataset::open(uri).await.unwrap();
+        let cleanup = if builds_another_index {
+            let Operation::CreateIndex {
+                mut new_indices,
+                removed_indices,
+            } = replacement(&cleaner, vec![]).await
+            else {
+                unreachable!()
+            };
+            new_indices.push(stage_zone_map(&mut cleaner, "j", "other").await);
+            Some(Operation::CreateIndex {
+                new_indices,
+                removed_indices,
+            })
+        } else {
+            None
+        };
 
         publisher
             .commit_existing_index_segments("late", "i", saved)
             .await
             .unwrap();
-        let error = cleanup_frag_reuse_index(&mut cleaner)
-            .await
-            .expect_err("the zone map still needs the record");
+        let error = match cleanup {
+            Some(operation) => commit(&cleaner, cleaner.manifest.version, operation, false)
+                .await
+                .map(|_| ()),
+            None => cleanup_frag_reuse_index(&mut cleaner).await,
+        }
+        .expect_err("the zone map still needs the record");
         assert_retryable(&error, "may still hold row addresses it moved");
         let latest = Dataset::open(uri).await.unwrap();
         assert_same_history(&history(&latest).await, &recorded);
@@ -3450,7 +3673,15 @@ mod tests {
         }
         let error =
             result.expect_err("the history the saved coverage needs would not be published");
+        // An emptied history is checked as a cleanup, and the segment the
+        // commit supplies still needs the record it trims.
+        let refusal = if emptied {
+            "may still hold row addresses it moved"
+        } else {
+            "Cannot remove the fragment reuse index"
+        };
         assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(error.to_string().contains(refusal), "{error}");
         let latest = Dataset::open(dir.as_str()).await.unwrap();
         assert_eq!(latest.manifest.version, dataset.manifest.version);
         assert_same_history(&history(&latest).await, &recorded);
