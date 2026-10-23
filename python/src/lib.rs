@@ -62,6 +62,7 @@ use std::ffi::CString;
 use std::ptr::NonNull;
 
 pub(crate) mod arrow;
+pub(crate) mod bitmap;
 pub(crate) mod blob;
 #[cfg(feature = "datagen")]
 pub(crate) mod datagen;
@@ -104,7 +105,8 @@ use rowids::{PyRowIdSequence, PyRowIdSequenceIterator};
 pub use scanner::Scanner;
 
 use crate::blob::{
-    PyBlobDescriptor, PyBlobDescriptorArrayBuilder, PyDedicatedBlobWriter, PyPackedBlobWriter,
+    PyBlobDescriptor, PyBlobDescriptorArrayBuilder, PyDedicatedBlobWriter, PyManagedBlobWriter,
+    PyPackedBlobWriter,
 };
 use crate::executor::BackgroundExecutor;
 
@@ -275,6 +277,7 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyBlobDescriptor>()?;
     m.add_class::<PyBlobDescriptorArrayBuilder>()?;
     m.add_class::<PyPackedBlobWriter>()?;
+    m.add_class::<PyManagedBlobWriter>()?;
     m.add_class::<PyDedicatedBlobWriter>()?;
     m.add_class::<LanceFileReader>()?;
     m.add_class::<LanceFileWriter>()?;
@@ -306,6 +309,8 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<TraceGuard>()?;
     m.add_class::<fts::FtsToken>()?;
     m.add_class::<schema::LanceSchema>()?;
+    m.add_class::<bitmap::PyBitmap>()?;
+    m.add_class::<bitmap::PyBitmapIter>()?;
     m.add_class::<PyFullTextQuery>()?;
     m.add_class::<PySearchFilter>()?;
     m.add_class::<namespace::PyDirectoryNamespace>()?;
