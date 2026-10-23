@@ -1000,7 +1000,7 @@ struct ChunkEncoder {
     /// `Ranges` across any gap below 2^32 ids, and the row id index then sees
     /// one interval covering every piece in between: on a compacted table
     /// that put the merged map at 278 GB. A `RangeWithHoles` with no holes
-    /// costs 8 more bytes and stops the fold at the piece boundary.
+    /// costs 4 more bytes and stops the fold at the piece boundary.
     new_piece: bool,
 }
 
@@ -1054,9 +1054,9 @@ impl ChunkEncoder {
         // two per packed u16 offset, or one per eight bitmap slots.
         // A chunk that opens a piece writes its first run as a hole-free
         // `RangeWithHoles` so no reader folds `Range` runs across the gap
-        // before it (see `new_piece`); that costs 8 bytes more.
+        // before it (see `new_piece`); that costs 4 bytes more.
         let opens_piece = std::mem::take(&mut self.new_piece);
-        let range_bytes = 16 * runs.len() as u64 + if opens_piece { 8 } else { 0 };
+        let range_bytes = 16 * runs.len() as u64 + if opens_piece { 4 } else { 0 };
         let holes_bytes = 24 + 2 * (span - count);
         let bitmap_bytes = 24 + span.div_ceil(8);
         let array_bytes = 24 + 2 * count;

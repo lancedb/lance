@@ -3857,6 +3857,65 @@ mod tests {
         assert_eq!(fragments[0].files[1].path, "mixed.lance");
     }
 
+    /// The hook takes a re-encoding that is larger when the old bytes hold
+    /// `Range` runs a reader folds across a gap: three short runs 1M apart are
+    /// 48 bytes of `Range` segments that fold into one `Ranges` spanning 2M
+    /// ids, and come back as a `Range` and two hole-free `RangeWithHoles`.
+    #[test]
+    fn test_range_segments_hook_breaks_wide_folds_even_when_larger() {
+        fn inline_bytes(manifest: &Manifest) -> Vec<u8> {
+            match &manifest.fragments[0].row_id_meta {
+                Some(RowIdMeta::Inline(data)) => data.to_vec(),
+                other => panic!("expected inline row ids, got {other:?}"),
+            }
+        }
+        fn wire_kinds(bytes: &[u8]) -> Vec<&'static str> {
+            use prost::Message;
+            pb::RowIdSequence::decode(bytes)
+                .unwrap()
+                .segments
+                .iter()
+                .map(|segment| match segment.segment {
+                    Some(pb::u64_segment::Segment::Range(_)) => "range",
+                    Some(pb::u64_segment::Segment::RangeWithHoles(_)) => "holes",
+                    _ => "other",
+                })
+                .collect()
+        }
+        let mut row_ids = RowIdSequence::from(0u64..100);
+        row_ids.extend(RowIdSequence::from(1_000_000u64..1_000_100));
+        row_ids.extend(RowIdSequence::from(2_000_000u64..2_000_100));
+        let mut fragment = Fragment::new(0);
+        fragment.row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&row_ids).into()));
+        fragment.physical_rows = Some(300);
+        let mut manifest = make_stable_row_id_manifest(vec![fragment]);
+        manifest
+            .config
+            .insert(RANGE_SEGMENTS_CONFIG_KEY.to_string(), "true".to_string());
+        let before = inline_bytes(&manifest);
+        assert_eq!(wire_kinds(&before), ["range", "range", "range"]);
+
+        apply_range_segments(&mut manifest, None).unwrap();
+        let after = inline_bytes(&manifest);
+        assert!(
+            after.len() > before.len(),
+            "{} <= {}",
+            after.len(),
+            before.len()
+        );
+        assert_eq!(wire_kinds(&after), ["range", "holes", "holes"]);
+        assert_eq!(
+            read_row_ids(&after).unwrap().iter().collect::<Vec<_>>(),
+            row_ids.iter().collect::<Vec<_>>()
+        );
+
+        // Decoded afresh, the result has nothing left to break and is kept.
+        let mut again = make_stable_row_id_manifest(vec![manifest.fragments[0].clone()]);
+        again.config = manifest.config.clone();
+        apply_range_segments(&mut again, None).unwrap();
+        assert_eq!(inline_bytes(&again), after);
+    }
+
     /// When a fragment has no existing last_updated_at_version_meta (None), a
     /// partial RewriteColumns refresh must leave it as None rather than fabricating
     /// prev_version for unmatched rows.
