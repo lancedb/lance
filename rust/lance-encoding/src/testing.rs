@@ -173,13 +173,7 @@ impl CompressionStrategy for TestCompressionStrategy {
         let params = self.field_params(field);
         if self.encoding == TestEncoding::StructuralSparse
             && let Some(compressor) =
-                crate::compression::try_axis_delta_per_value(field, data, &params)?
-        {
-            return Ok(compressor);
-        }
-        if self.encoding == TestEncoding::StructuralSparse
-            && let Some(compressor) =
-                crate::compression::try_integer_tensor_per_value(field, data, &params)
+                crate::compression::try_tensor_per_value(field, data, &params)?
         {
             return Ok(compressor);
         }

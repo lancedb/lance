@@ -17,7 +17,7 @@
 //! compressed so that we can locate them later.
 
 use crate::encodings::physical::axis_delta::AxisDeltaDecompressor;
-pub use crate::encodings::physical::axis_delta::try_axis_delta_per_value;
+pub use crate::encodings::physical::axis_delta::try_tensor_per_value;
 #[cfg(feature = "bitpacking")]
 use crate::encodings::physical::bitpacking::{InlineBitpacking, OutOfLineBitpacking};
 use crate::{
@@ -52,9 +52,8 @@ use crate::{
                 FsstPerValueEncoder,
             },
             general::{
-                FixedWidthGeneralBlockDecompressor, FixedWidthGeneralPerValueCompressor,
-                FixedWidthGeneralPerValueDecompressor, GeneralBlockCompressor,
-                GeneralMiniBlockCompressor, GeneralMiniBlockDecompressor,
+                FixedWidthGeneralBlockDecompressor, FixedWidthGeneralPerValueDecompressor,
+                GeneralBlockCompressor, GeneralMiniBlockCompressor, GeneralMiniBlockDecompressor,
             },
             packed::{
                 PackedStructFixedPerValueDecompressor, PackedStructFixedPerValueEncoder,
@@ -797,38 +796,6 @@ pub fn try_raw_fixed_size_list_miniblock(data: &DataBlock) -> Option<Box<dyn Min
 pub fn try_raw_per_value(data: &DataBlock) -> Option<Box<dyn PerValueCompressor>> {
     matches!(data, DataBlock::FixedWidth(_) | DataBlock::FixedSizeList(_))
         .then(|| Box::new(ValueEncoder::default()) as _)
-}
-
-/// Apply configured LZ4 or Zstd compression independently to integer tensor rows.
-/// Each row retains its own frame and remains independently addressable.
-pub fn try_integer_tensor_per_value(
-    field: &Field,
-    data: &DataBlock,
-    params: &CompressionFieldParams,
-) -> Option<Box<dyn PerValueCompressor>> {
-    if !matches!(data, DataBlock::FixedSizeList(_)) {
-        return None;
-    }
-    let scheme = match params.compression.as_deref() {
-        Some("zstd") => CompressionScheme::Zstd,
-        Some("lz4") => CompressionScheme::Lz4,
-        _ => return None,
-    };
-    // Per-value compression was previously not applied to fixed-size lists.
-    // Keep this new path scoped to integer tensors rather than changing the
-    // storage and read cost of existing floating-point vectors or other types.
-    let data_type = field.data_type();
-    let mut leaf = &data_type;
-    while let DataType::FixedSizeList(child, _) = leaf {
-        leaf = child.data_type();
-    }
-    if !leaf.is_integer() {
-        return None;
-    }
-    Some(Box::new(FixedWidthGeneralPerValueCompressor::new(
-        Box::new(ValueEncoder::default()),
-        CompressionConfig::new(scheme, params.compression_level),
-    )))
 }
 
 fn validate_packed_struct(field: &Field, data: &DataBlock) -> Result<Option<bool>> {

@@ -16,23 +16,25 @@ use crate::{
         logical::primitive::miniblock::{
             MiniBlockCompressed, MiniBlockCompressionContext, MiniBlockCompressor,
         },
-        physical::block::{CompressionConfig, GeneralBufferCompressor},
+        physical::{
+            block::{CompressionConfig, GeneralBufferCompressor},
+            value::ValueEncoder,
+        },
     },
     format::{EncodingUtils, metadata::CompressiveEncoding},
 };
-use arrow_buffer::{ArrowNativeType, BooleanBuffer};
+use arrow_buffer::ArrowNativeType;
 use lance_core::Error;
 
-/// Compress fixed-width encoded rows independently, retaining the child's type description.
+/// Compress fixed-width rows independently, retaining their logical type description.
 #[derive(Debug)]
 pub(crate) struct FixedWidthGeneralPerValueCompressor {
-    child: Box<dyn PerValueCompressor>,
     compression: CompressionConfig,
 }
 
 impl FixedWidthGeneralPerValueCompressor {
-    pub(crate) fn new(child: Box<dyn PerValueCompressor>, compression: CompressionConfig) -> Self {
-        Self { child, compression }
+    pub(crate) fn new(compression: CompressionConfig) -> Self {
+        Self { compression }
     }
 
     /// Frame already encoded fixed-width rows without running their child codec again.
@@ -81,19 +83,7 @@ impl FixedWidthGeneralPerValueCompressor {
 
 impl PerValueCompressor for FixedWidthGeneralPerValueCompressor {
     fn compress(&self, data: DataBlock) -> Result<(PerValueDataBlock, CompressiveEncoding)> {
-        self.compress_with_validity(data, None)
-    }
-
-    fn needs_row_validity(&self) -> bool {
-        self.child.needs_row_validity()
-    }
-
-    fn compress_with_validity(
-        &self,
-        data: DataBlock,
-        validity: Option<&BooleanBuffer>,
-    ) -> Result<(PerValueDataBlock, CompressiveEncoding)> {
-        let (data, encoding) = self.child.compress_with_validity(data, validity)?;
+        let (data, encoding) = PerValueCompressor::compress(&ValueEncoder::default(), data)?;
         let PerValueDataBlock::Fixed(data) = data else {
             return Err(Error::invalid_input(
                 "Per-row general compression requires fixed-width rows",
@@ -425,10 +415,10 @@ mod tests {
             Arc::new(Int32Array::from(vec![7; 128])),
             None,
         );
-        let compressor = FixedWidthGeneralPerValueCompressor::new(
-            Box::new(ValueEncoder::default()),
-            CompressionConfig::new(CompressionScheme::Zstd, Some(3)),
-        );
+        let compressor = FixedWidthGeneralPerValueCompressor::new(CompressionConfig::new(
+            CompressionScheme::Zstd,
+            Some(3),
+        ));
         let (encoded, description) = compressor.compress(DataBlock::from_array(array)).unwrap();
         let PerValueDataBlock::Variable(mut encoded) = encoded else {
             panic!("expected variable frames")

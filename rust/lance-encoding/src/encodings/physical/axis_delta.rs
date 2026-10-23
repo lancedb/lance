@@ -321,22 +321,17 @@ fn shape(field: &Field, axis: Option<usize>) -> Result<(usize, usize)> {
     Ok((length, product(&shape[physical_axis + 1..])?))
 }
 
-/// Select an integer axis predictor for the unstable 2.3 per-value writer.
+/// Select raw, compressed, or axis-predicted integer tensors for the 2.3 per-value writer.
 /// The default samples the longest physical axis when LZ4 or Zstd is configured.
 /// Unsupported implicit inputs retain their existing encoding.
 /// Metadata `lance-encoding:axis-delta` overrides the typed column/type setting.
-pub fn try_axis_delta_per_value(
+pub fn try_tensor_per_value(
     field: &Field,
     data: &DataBlock,
     params: &CompressionFieldParams,
 ) -> Result<Option<Box<dyn PerValueCompressor>>> {
     let implicit = params.axis_delta.is_none() && !field.metadata.contains_key(META_KEY);
     let mode = request(field, params)?;
-    let (axis, auto) = match mode {
-        AxisDeltaMode::Off => return Ok(None),
-        AxisDeltaMode::Auto { axis } => (axis, true),
-        AxisDeltaMode::On { axis } => (Some(axis), false),
-    };
     let compression = match params.compression.as_deref() {
         Some("lz4") => Some(CompressionConfig::new(
             CompressionScheme::Lz4,
@@ -347,12 +342,32 @@ pub fn try_axis_delta_per_value(
             params.compression_level,
         )),
         None | Some("none") => None,
-        Some(_) if auto => return Ok(None),
+        Some(_) if !matches!(mode, AxisDeltaMode::On { .. }) => return Ok(None),
         Some(name) => {
             return Err(Error::invalid_input(format!(
                 "Unsupported AxisDelta compression {name:?}"
             )));
         }
+    };
+    let (axis, auto) = match mode {
+        AxisDeltaMode::Off => {
+            // Off still honors an explicitly configured codec for integer tensors.
+            if !matches!(data, DataBlock::FixedSizeList(_)) {
+                return Ok(None);
+            }
+            let data_type = field.data_type();
+            let mut leaf = &data_type;
+            while let DataType::FixedSizeList(child, _) = leaf {
+                leaf = child.data_type();
+            }
+            return Ok(compression
+                .filter(|_| leaf.is_integer())
+                .map(|compression| {
+                    Box::new(FixedWidthGeneralPerValueCompressor::new(compression)) as _
+                }));
+        }
+        AxisDeltaMode::Auto { axis } => (axis, true),
+        AxisDeltaMode::On { axis } => (Some(axis), false),
     };
     if implicit && compression.is_none() {
         return Ok(None);
@@ -382,24 +397,12 @@ pub fn try_axis_delta_per_value(
             "AxisDelta requires tensor elements without nulls",
         ));
     }
-    let predictor: Box<dyn PerValueCompressor> = Box::new(AxisDeltaCompressor {
+    Ok(Some(Box::new(AxisDeltaCompressor {
         axis_length,
         inner_stride,
         auto,
         compression,
-    });
-    Ok(Some(if auto {
-        // Auto owns the raw candidate as well as both compressed candidates.
-        // Wrapping it unconditionally would compress even a rejected page.
-        predictor
-    } else if let Some(compression) = compression {
-        Box::new(FixedWidthGeneralPerValueCompressor::new(
-            predictor,
-            compression,
-        ))
-    } else {
-        predictor
-    }))
+    })))
 }
 
 #[derive(Debug)]
@@ -552,28 +555,24 @@ impl PerValueCompressor for AxisDeltaCompressor {
         let predicted = CompressiveEncoding {
             compression: Some(Compression::AxisDelta(Box::new(description))),
         };
-        if self.auto {
-            let selected = self.select(&data, layout, &original, &predicted, validity)?;
-            if selected == Selection::Raw {
-                return Ok((PerValueDataBlock::Fixed(data), original));
-            }
-            let description = if selected == Selection::Delta {
+        let selected = if self.auto {
+            self.select(&data, layout, &original, &predicted, validity)?
+        } else {
+            Selection::Delta
+        };
+        let description = match selected {
+            Selection::Raw => return Ok((PerValueDataBlock::Fixed(data), original)),
+            Selection::Compressed => original,
+            Selection::Delta => {
                 layout.transform(&mut data, false)?;
                 predicted
-            } else {
-                original
-            };
-            let compression = self.compression.ok_or_else(|| {
-                Error::internal("Automatic AxisDelta requires general compression")
-            })?;
-            return FixedWidthGeneralPerValueCompressor::compress_encoded(
-                data,
-                description,
-                compression,
-            );
+            }
+        };
+        if let Some(compression) = self.compression {
+            FixedWidthGeneralPerValueCompressor::compress_encoded(data, description, compression)
+        } else {
+            Ok((PerValueDataBlock::Fixed(data), description))
         }
-        layout.transform(&mut data, false)?;
-        Ok((PerValueDataBlock::Fixed(data), predicted))
     }
 }
 
@@ -785,7 +784,7 @@ mod tests {
             compression: Some(codec.into()),
             ..Default::default()
         };
-        let (encoded, description) = try_axis_delta_per_value(&field, &data, &params)
+        let (encoded, description) = try_tensor_per_value(&field, &data, &params)
             .unwrap()
             .unwrap()
             .compress(data.clone())
@@ -815,13 +814,14 @@ mod tests {
             (AxisDeltaMode::Auto { axis: Some(0) }, !noise),
             (AxisDeltaMode::Auto { axis: None }, !noise),
             (AxisDeltaMode::On { axis: 0 }, true),
+            (AxisDeltaMode::Off, false),
         ] {
             let params = CompressionFieldParams {
                 axis_delta: Some(mode),
                 compression: Some(codec.into()),
                 ..Default::default()
             };
-            let compressor = try_axis_delta_per_value(&field, &data, &params)
+            let compressor = try_tensor_per_value(&field, &data, &params)
                 .unwrap()
                 .unwrap();
             let (encoded, description) = compressor.compress(data.clone()).unwrap();
@@ -884,7 +884,7 @@ mod tests {
         values.data = LanceBuffer::from(bytes);
         list.child = Box::new(DataBlock::FixedWidth(values));
         let data = DataBlock::FixedSizeList(list);
-        let compressor = try_axis_delta_per_value(&field, &data, &params)
+        let compressor = try_tensor_per_value(&field, &data, &params)
             .unwrap()
             .unwrap();
         let (_, unmasked) = compressor.compress(data.clone()).unwrap();
@@ -913,7 +913,7 @@ mod tests {
                 compression: Some("zstd".into()),
                 ..Default::default()
             };
-            let (encoded, description) = try_axis_delta_per_value(&field, &data, &params)
+            let (encoded, description) = try_tensor_per_value(&field, &data, &params)
                 .unwrap()
                 .unwrap()
                 .compress(data.clone())
@@ -948,13 +948,13 @@ mod tests {
         };
         field.metadata.insert(META_KEY.into(), "off".into());
         assert!(
-            try_axis_delta_per_value(&field, &data, &params)
+            try_tensor_per_value(&field, &data, &params)
                 .unwrap()
                 .is_none()
         );
         for value in ["invalid", "auto:-1", "on:99", "auto:99"] {
             field.metadata.insert(META_KEY.into(), value.into());
-            let error = try_axis_delta_per_value(&field, &data, &params).unwrap_err();
+            let error = try_tensor_per_value(&field, &data, &params).unwrap_err();
             assert!(matches!(error, Error::InvalidInput { .. }));
             assert!(error.to_string().contains("Axis") || error.to_string().contains(META_KEY));
         }
@@ -963,7 +963,7 @@ mod tests {
             "ARROW:extension:metadata".into(),
             r#"{"shape":[2,3,6]}"#.into(),
         );
-        let error = try_axis_delta_per_value(&field, &data, &params).unwrap_err();
+        let error = try_tensor_per_value(&field, &data, &params).unwrap_err();
         assert!(matches!(error, Error::InvalidInput { .. }));
         assert!(error.to_string().contains("shape"));
     }
@@ -1021,7 +1021,7 @@ mod tests {
             compression: Some("lz4".into()),
             ..Default::default()
         };
-        let (encoded, desc) = try_axis_delta_per_value(&field, &data, &params)
+        let (encoded, desc) = try_tensor_per_value(&field, &data, &params)
             .unwrap()
             .unwrap()
             .compress(data)
@@ -1070,7 +1070,7 @@ mod tests {
                 axis_delta: Some(AxisDeltaMode::Auto { axis: Some(0) }),
                 ..params.clone()
             };
-            let (encoded, description) = try_axis_delta_per_value(&field, &data, &auto)
+            let (encoded, description) = try_tensor_per_value(&field, &data, &auto)
                 .unwrap()
                 .unwrap()
                 .compress(data.clone())
@@ -1079,7 +1079,7 @@ mod tests {
                 panic!("expected raw rows")
             };
             assert_raw(&data, &description, &encoded);
-            let error = try_axis_delta_per_value(&field, &data, &params).unwrap_err();
+            let error = try_tensor_per_value(&field, &data, &params).unwrap_err();
             assert!(matches!(error, Error::NotSupported { .. }));
             assert!(error.to_string().contains("AxisDelta"));
         }
