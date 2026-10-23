@@ -1153,7 +1153,7 @@ impl Transaction {
                 // base data. Any index older than one of those overlays was built on
                 // the pre-overlay values, so drop the rewritten fragment from its
                 // coverage to keep it from serving stale values.
-                Self::prune_overlay_stale_fields_from_indices(&mut final_indices, groups);
+                Self::prune_overlay_stale_fields_from_indices(&mut final_indices, groups, &schema);
 
                 match (frag_reuse_index, assembly) {
                     // Tagged history: splice the entry the commit path
@@ -3804,6 +3804,7 @@ mod tests {
             file_major_version: 2,
             file_minor_version: 0,
             file_size_bytes: CachedFileSize::new(1000),
+            file_metadata_size_bytes: None,
             base_id: None,
         });
 
@@ -3815,6 +3816,7 @@ mod tests {
             file_major_version: 2,
             file_minor_version: 0,
             file_size_bytes: CachedFileSize::new(500),
+            file_metadata_size_bytes: None,
             base_id: None,
         });
 
@@ -3826,6 +3828,7 @@ mod tests {
             file_major_version: 2,
             file_minor_version: 0,
             file_size_bytes: CachedFileSize::new(750),
+            file_metadata_size_bytes: None,
             base_id: None,
         });
 
@@ -3837,6 +3840,7 @@ mod tests {
             file_major_version: 2,
             file_minor_version: 0,
             file_size_bytes: CachedFileSize::new(250),
+            file_metadata_size_bytes: None,
             base_id: None,
         });
 
