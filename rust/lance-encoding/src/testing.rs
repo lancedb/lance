@@ -171,6 +171,12 @@ impl CompressionStrategy for TestCompressionStrategy {
         data: &DataBlock,
     ) -> Result<Box<dyn PerValueCompressor>> {
         let params = self.field_params(field);
+        if self.encoding == TestEncoding::StructuralSparse
+            && let Some(compressor) =
+                crate::compression::try_tensor_per_value(field, data, &params)?
+        {
+            return Ok(compressor);
+        }
         if let Some(compressor) = try_raw_per_value(data) {
             return Ok(compressor);
         }

@@ -101,6 +101,11 @@ impl CompressionStrategy for Strategy {
         data: &DataBlock,
     ) -> Result<Box<dyn PerValueCompressor>> {
         let params = self.field_params(field);
+        if let Some(compressor) =
+            lance_encoding::compression::try_tensor_per_value(field, data, &params)?
+        {
+            return Ok(compressor);
+        }
         if let Some(compressor) = try_raw_per_value(data) {
             return Ok(compressor);
         }
