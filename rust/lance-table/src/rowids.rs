@@ -318,23 +318,35 @@ impl RowIdSequence {
         self.0.extend(other.0);
     }
 
-    /// Re-encode every segment that is smaller as a run of `Range` segments
-    /// than as it is stored now (see [`U64Segment::as_ranges`]). Returns
-    /// whether anything changed.
+    /// The same ids, in sequence order, in the smallest wire encoding every
+    /// reader understands.
     ///
-    /// The result is written as plain `Range` segments, which every reader
-    /// understands, but a reader without the compact in-memory form handles
-    /// thousands of segments per fragment slowly, so this is only called for
-    /// tables that opted in.
-    pub fn use_range_segments(&mut self) -> bool {
-        let mut changed = false;
-        for segment in &mut self.0 {
-            if let Some(ranges) = segment.as_ranges() {
-                *segment = ranges;
-                changed = true;
-            }
+    /// Compaction and update encode each segment on its own and never split
+    /// one, so a segment whose ids came from far-apart source fragments spans
+    /// billions of slots: a bitmap is infeasible, a hole array huge, and it
+    /// falls back to a sorted array at four bytes per id. This cuts the
+    /// sequence into runs of consecutive ids and, per chunk of 64K ids that
+    /// has holes, keeps the cheapest of plain `Range` segments, a hole array,
+    /// a bitmap or a sorted array; hole-free stretches become one `Range`.
+    ///
+    /// A sequence that is not sorted comes back as one `Range` per run, which
+    /// may be larger than it was, so callers keep whichever encoding is
+    /// smaller. Readers without the compact in-memory `Ranges` form are slow
+    /// on many `Range` segments, which is why only tables that opted in get
+    /// this (see [`crate::transaction::RANGE_SEGMENTS_CONFIG_KEY`]).
+    pub fn reencode(&self) -> Self {
+        // `Range` cannot hold an exclusive end past u64::MAX.
+        if self
+            .row_id_range()
+            .is_some_and(|range| *range.end() == u64::MAX)
+        {
+            return self.clone();
         }
-        changed
+        let mut encoder = ChunkEncoder::default();
+        for run in self.0.iter().flat_map(U64Segment::runs) {
+            encoder.push_run(run);
+        }
+        Self(encoder.finish())
     }
 
     /// Remove a set of row ids from the sequence.
@@ -943,6 +955,113 @@ impl RowIdSeqSlice<'_> {
     }
 }
 
+/// Ids per chunk [`RowIdSequence::reencode`] picks a wire kind for. Offsets
+/// within a chunk fit `u16`, the narrowest packed array width.
+const REENCODE_CHUNK_IDS: u64 = 1 << 16;
+
+/// Builds the segments of [`RowIdSequence::reencode`] from runs of
+/// consecutive ids fed in sequence order.
+#[derive(Default)]
+struct ChunkEncoder {
+    segments: Vec<U64Segment>,
+    /// Hole-free ids not yet written, extended by the next adjacent run.
+    pending: Option<Range<u64>>,
+    /// Runs of the chunk being gathered: sorted, disjoint, not adjacent.
+    chunk: Vec<Range<u64>>,
+}
+
+impl ChunkEncoder {
+    fn push_run(&mut self, run: Range<u64>) {
+        let mut start = run.start;
+        while start < run.end {
+            let chunk_end = (start | (REENCODE_CHUNK_IDS - 1)).saturating_add(1);
+            let end = run.end.min(chunk_end);
+            self.push_clipped(start..end);
+            start = end;
+        }
+    }
+
+    /// Add a run that lies within one chunk.
+    fn push_clipped(&mut self, run: Range<u64>) {
+        if let (Some(first), Some(last)) = (self.chunk.first(), self.chunk.last()) {
+            let same_chunk = first.start / REENCODE_CHUNK_IDS == run.start / REENCODE_CHUNK_IDS;
+            if !same_chunk || run.start < last.end {
+                self.flush_chunk();
+            }
+        }
+        match self.chunk.last_mut() {
+            Some(last) if last.end == run.start => last.end = run.end,
+            _ => self.chunk.push(run),
+        }
+    }
+
+    fn flush_chunk(&mut self) {
+        let runs = std::mem::take(&mut self.chunk);
+        let [first, .., last] = runs.as_slice() else {
+            if let [only] = runs.as_slice() {
+                self.push_range(only.clone());
+            }
+            return;
+        };
+        self.flush_pending();
+        let range = first.start..last.end;
+        let span = last.end - first.start;
+        let count: u64 = runs.iter().map(|run| run.end - run.start).sum();
+        let holes = || runs.windows(2).flat_map(|pair| pair[0].end..pair[1].start);
+        // Wire bytes: ~16 per `Range` segment; otherwise 24 of framing plus
+        // two per packed u16 offset, or one per eight bitmap slots.
+        let range_bytes = 16 * runs.len() as u64;
+        let holes_bytes = 24 + 2 * (span - count);
+        let bitmap_bytes = 24 + span.div_ceil(8);
+        let array_bytes = 24 + 2 * count;
+        let smallest = range_bytes
+            .min(holes_bytes)
+            .min(bitmap_bytes)
+            .min(array_bytes);
+        let segment = if smallest == holes_bytes {
+            U64Segment::RangeWithHoles {
+                range,
+                holes: holes().collect::<Vec<_>>().into(),
+            }
+        } else if smallest == bitmap_bytes {
+            let mut bitmap = bitmap::Bitmap::new_full(span as usize);
+            for pair in runs.windows(2) {
+                let offset = |id: u64| (id - first.start) as usize;
+                bitmap.clear_range(offset(pair[0].end)..offset(pair[1].start));
+            }
+            U64Segment::RangeWithBitmap { range, bitmap }
+        } else if smallest == range_bytes {
+            U64Segment::from_sorted_ranges(&runs)
+                .expect("two or more disjoint ranges within one 64K chunk")
+        } else {
+            U64Segment::SortedArray(runs.iter().cloned().flatten().collect::<Vec<_>>().into())
+        };
+        self.segments.push(segment);
+    }
+
+    fn push_range(&mut self, run: Range<u64>) {
+        match &mut self.pending {
+            Some(pending) if pending.end == run.start => pending.end = run.end,
+            _ => {
+                self.flush_pending();
+                self.pending = Some(run);
+            }
+        }
+    }
+
+    fn flush_pending(&mut self) {
+        if let Some(pending) = self.pending.take() {
+            self.segments.push(U64Segment::Range(pending));
+        }
+    }
+
+    fn finish(mut self) -> Vec<U64Segment> {
+        self.flush_chunk();
+        self.flush_pending();
+        self.segments
+    }
+}
+
 /// Re-chunk a sequences of row ids into chunks of a given size.
 ///
 /// The sequences may less than chunk sizes, because the sequences only
@@ -1132,6 +1251,7 @@ mod test {
     use super::*;
 
     use pretty_assertions::assert_eq;
+    use rstest::rstest;
     use test::bitmap::Bitmap;
 
     #[test]
@@ -2248,6 +2368,82 @@ mod test {
         assert_eq!(*r.end(), 104);
     }
 
+    fn segment_kind(segment: &U64Segment) -> &'static str {
+        match segment {
+            U64Segment::Range(_) => "range",
+            U64Segment::Ranges { .. } => "ranges",
+            U64Segment::RangeWithHoles { .. } => "holes",
+            U64Segment::RangeWithBitmap { .. } => "bitmap",
+            U64Segment::SortedArray(_) => "sorted_array",
+            U64Segment::Array(_) => "array",
+        }
+    }
+
+    fn sorted_array(values: impl IntoIterator<Item = u64>) -> U64Segment {
+        U64Segment::SortedArray(values.into_iter().collect::<Vec<_>>().into())
+    }
+
+    #[rstest]
+    // Two far-apart source ranges in one sorted array: a hole array per chunk.
+    #[case::far_apart_pieces(
+        vec![sorted_array((0..1000).chain(5_000_000_000..5_000_001_000).filter(|v| v % 250 != 7))],
+        vec!["holes", "holes"], true)]
+    // Every third id missing: a bitmap.
+    #[case::dense_holes(vec![sorted_array((0..60_000).filter(|v| v % 3 != 0))], vec!["bitmap"], true)]
+    // A bitmap whose holes span many bytes as well as single bits.
+    #[case::bitmap_long_hole(
+        vec![sorted_array((0..60_000).filter(|v| v % 3 != 0 && !(1_001..20_006).contains(v)))],
+        vec!["bitmap"], true)]
+    // One wide hole: two `Range` segments, folded into `Ranges` in memory.
+    #[case::wide_hole(vec![sorted_array((0..100).chain(50_000..65_536))], vec!["ranges"], true)]
+    // A span above u16 packs offsets as u32; the gap empties the chunks between.
+    #[case::u32_offsets(
+        vec![sorted_array((0..100).chain(1_000_000..1_000_100))],
+        vec!["range", "range"], true)]
+    // Hole-free stretches across segments and chunks merge into one `Range`.
+    #[case::adjacent(
+        vec![U64Segment::Range(0..10), U64Segment::Range(10..70_000), sorted_array(70_000..70_003)],
+        vec!["range"], true)]
+    // Sequence order is kept when the ids go backwards.
+    #[case::backwards(
+        vec![U64Segment::Range(1000..2000), U64Segment::Range(0..500)],
+        vec!["range", "range"], true)]
+    // An unsorted array splits at each step back; callers keep the smaller encoding.
+    #[case::unsorted(vec![U64Segment::Array(vec![5, 3, 9].into())], vec!["range", "bitmap"], false)]
+    // `Range` cannot hold an exclusive end past u64::MAX: left as is.
+    #[case::max_id(vec![sorted_array([5, u64::MAX])], vec!["sorted_array"], true)]
+    // A bitmap whose length is not a multiple of 8, with a run at each end;
+    // two bytes of bitmap beat two u16 holes, so it stays a bitmap.
+    #[case::bitmap_input(
+        vec![U64Segment::RangeWithBitmap { range: 0..13, bitmap: {
+            let mut bitmap = Bitmap::new_full(13);
+            bitmap.clear(5);
+            bitmap.clear(6);
+            bitmap
+        } }],
+        vec!["bitmap"], true)]
+    #[case::empty(vec![], vec![], true)]
+    fn test_reencode(
+        #[case] segments: Vec<U64Segment>,
+        #[case] kinds: Vec<&str>,
+        #[case] shrinks: bool,
+    ) {
+        let sequence = RowIdSequence(segments);
+        let reencoded = sequence.reencode();
+        assert_eq!(
+            reencoded.0.iter().map(segment_kind).collect::<Vec<_>>(),
+            kinds
+        );
+        let values = sequence.iter().collect::<Vec<_>>();
+        assert_eq!(reencoded.iter().collect::<Vec<_>>(), values);
+        let wire = write_row_ids(&reencoded);
+        assert_eq!(
+            read_row_ids(&wire).unwrap().iter().collect::<Vec<_>>(),
+            values
+        );
+        assert_eq!(wire.len() <= write_row_ids(&sequence).len(), shrinks);
+    }
+
     #[test]
     fn test_range_segments_sequence_matches_bitmap_sequence() {
         let live: Vec<u64> = (0..600u64)
@@ -2258,16 +2454,13 @@ mod test {
             bitmap_sequence.0.as_slice(),
             [U64Segment::RangeWithBitmap { .. }]
         ));
-        let mut runs_sequence = bitmap_sequence.clone();
-        assert!(runs_sequence.use_range_segments());
+        let runs_sequence = bitmap_sequence.reencode();
         assert!(matches!(
             runs_sequence.0.as_slice(),
             [U64Segment::Ranges { .. }]
         ));
-        // Idempotent: a second pass has nothing left to convert.
-        let again = runs_sequence.clone();
-        assert!(!runs_sequence.use_range_segments());
-        assert_eq!(runs_sequence, again);
+        // Idempotent: a second pass changes nothing.
+        assert_eq!(runs_sequence.reencode(), runs_sequence);
 
         assert_eq!(runs_sequence.iter().collect::<Vec<_>>(), live);
         assert_eq!(runs_sequence.len(), bitmap_sequence.len());

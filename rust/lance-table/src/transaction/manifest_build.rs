@@ -57,12 +57,13 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use uuid::Uuid;
 
-/// Table config key that opts a table into writing clustered deletions as
-/// `Range` segments (`U64Segment::Ranges`). Set it to `true` with
-/// `update_config`.
+/// Table config key that opts a table into re-encoding its inline row id
+/// sequences in the smallest wire form (`RowIdSequence::reencode`), clustered
+/// deletions included as `Range` segments (`U64Segment::Ranges`). Set it to
+/// `true` with `update_config`.
 ///
-/// Manifests written afterwards re-encode bitmap row id segments as runs of
-/// `Range` segments where that is smaller. That is the
+/// Manifests written afterwards re-encode the row ids of every fragment a
+/// commit changes where that is smaller. That is the
 /// existing wire format, so any version reads the result, but a reader without
 /// the compact in-memory form handles thousands of segments per fragment
 /// slowly. That is why it is opt-in rather than the default.
@@ -80,7 +81,7 @@ fn range_segments_enabled(manifest: &Manifest) -> bool {
         .is_some_and(|value| str_is_truthy(value))
 }
 
-/// Re-encode inline row id sequences as runs of `Range` segments when the
+/// Re-encode inline row id sequences in their smallest wire form when the
 /// table has opted in.
 ///
 /// Fragments that the previous manifest already re-encoded are left alone
@@ -115,9 +116,9 @@ fn apply_range_segments(
         if unchanged.get(&fragment.id) == Some(&data.as_ptr()) {
             continue;
         }
-        let mut sequence = read_row_ids(&data[..])?;
-        if sequence.use_range_segments() {
-            fragment.row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&sequence).into()));
+        let encoded = write_row_ids(&read_row_ids(&data[..])?.reencode());
+        if encoded.len() < data.len() {
+            fragment.row_id_meta = Some(RowIdMeta::Inline(encoded.into()));
         }
     }
     Ok(())
