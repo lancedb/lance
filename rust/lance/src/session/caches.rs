@@ -19,7 +19,9 @@ use lance_core::{
 };
 use lance_select::RowAddrMask;
 use lance_table::{
-    format::{DataFile, DeletionFile, DeletionFileType, Manifest, RowIdMeta},
+    format::{
+        DataFile, DeletionFile, DeletionFileType, Manifest, RowDatasetVersionSequence, RowIdMeta,
+    },
     rowids::{RowIdIndex, RowIdSequence},
 };
 use object_store::path::Path;
@@ -162,20 +164,29 @@ impl CacheKey for DeletionFileKey<'_> {
 }
 
 #[derive(Debug)]
-pub struct RowAddrMaskKey {
+pub struct RowAddrMaskKey<'a> {
     pub version: u64,
+    /// A dataset dropped and recreated at the same URI restarts its version
+    /// history at 1, so the manifest e-tag distinguishes mask entries from
+    /// different dataset generations. Callers without one must not share a
+    /// cached mask.
+    pub e_tag: Option<&'a str>,
     /// `Some(hash)` when the mask is restricted to a fragment subset; `None`
     /// when it covers all fragments in the dataset. Two consumers that ask
     /// for different subsets must not poison each other's cache entry.
     pub restrict_hash: Option<u64>,
 }
 
-impl CacheKey for RowAddrMaskKey {
+impl CacheKey for RowAddrMaskKey<'_> {
     type ValueType = RowAddrMask;
     fn key(&self) -> Cow<'_, str> {
-        match self.restrict_hash {
-            None => Cow::Owned(format!("row_addr_mask/{}", self.version)),
-            Some(h) => Cow::Owned(format!("row_addr_mask/{}/{:x}", self.version, h)),
+        match (self.e_tag, self.restrict_hash) {
+            (None, None) => Cow::Owned(format!("row_addr_mask/{}", self.version)),
+            (None, Some(hash)) => Cow::Owned(format!("row_addr_mask/{}/{hash:x}", self.version)),
+            (Some(e_tag), None) => Cow::Owned(format!("row_addr_mask/{}/{e_tag}", self.version)),
+            (Some(e_tag), Some(hash)) => {
+                Cow::Owned(format!("row_addr_mask/{}/{e_tag}/{hash:x}", self.version))
+            }
         }
     }
     fn type_name() -> &'static str {
@@ -183,11 +194,17 @@ impl CacheKey for RowAddrMaskKey {
     }
 
     fn schema() -> CacheKeySchema {
-        CacheKeySchema::new("lance.dataset.row-address-mask-key", 1)
+        CacheKeySchema::new("lance.dataset.row-address-mask-key", 2)
     }
 
     fn write_key(&self, builder: &mut KeyBuilder) {
         builder.write_u64(self.version);
+        if let Some(e_tag) = self.e_tag {
+            builder.write_some();
+            builder.write_str(e_tag);
+        } else {
+            builder.write_none();
+        }
         if let Some(restrict_hash) = self.restrict_hash {
             builder.write_some();
             builder.write_u64(restrict_hash);
@@ -200,6 +217,9 @@ impl CacheKey for RowAddrMaskKey {
 #[derive(Debug)]
 pub struct RowIdIndexKey<'a> {
     pub version: u64,
+    /// Whether the index knows the deleted rows (it then maps them to `None`).
+    /// An index built without deletion vectors reads no deletion file.
+    pub with_deletions: bool,
     /// A dataset dropped and recreated at the same URI restarts its version
     /// history at 1, so a long-lived session's cache can otherwise return the
     /// previous incarnation's index for a version number the new incarnation
@@ -213,8 +233,9 @@ impl CacheKey for RowIdIndexKey<'_> {
     type ValueType = RowIdIndex;
     fn key(&self) -> Cow<'_, str> {
         Cow::Owned(format!(
-            "row_id_index/{}/{}",
+            "row_id_index/{}/{}/{}",
             self.version,
+            self.with_deletions,
             self.e_tag.unwrap_or("")
         ))
     }
@@ -228,6 +249,7 @@ impl CacheKey for RowIdIndexKey<'_> {
 
     fn write_key(&self, builder: &mut KeyBuilder) {
         builder.write_u64(self.version);
+        builder.write_u64(self.with_deletions as u64);
         match self.e_tag {
             Some(e_tag) => {
                 builder.write_some();
@@ -299,6 +321,45 @@ impl CacheKey for RowIdSequenceKey<'_> {
                 }
             }
         }
+    }
+}
+
+/// Cache key for one of a fragment's per-row version sequences that is spilled
+/// to a data file column.
+///
+/// Inline sequences are not cached: they decode straight from the manifest
+/// bytes the fragment already holds.
+#[derive(Debug)]
+pub struct RowVersionSequenceKey<'a> {
+    pub fragment_id: u64,
+    /// Which sequence this is, by the reserved field id of its column.
+    pub field_id: i32,
+    /// The data file carrying the column, named freshly per rewrite, so its
+    /// path identifies the contents the way an inline sequence's digest does.
+    pub data_file: &'a DataFile,
+}
+
+impl CacheKey for RowVersionSequenceKey<'_> {
+    type ValueType = RowDatasetVersionSequence;
+    fn key(&self) -> Cow<'_, str> {
+        Cow::Owned(format!(
+            "row_version_sequence/{}/{}",
+            self.fragment_id, self.field_id
+        ))
+    }
+    fn type_name() -> &'static str {
+        "RowDatasetVersionSequence"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.dataset.row-version-sequence-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_u64(self.fragment_id);
+        builder.write_u64(self.field_id as u64);
+        builder.write_str(&self.data_file.path);
+        builder.write_u64(self.data_file.base_id.map_or(u64::MAX, u64::from));
     }
 }
 
@@ -387,6 +448,7 @@ mod tests {
         let cache = LanceCache::with_capacity(4096);
         let key = RowIdIndexKey {
             version: 5,
+            with_deletions: true,
             e_tag: Some("first-etag"),
         };
         cache
@@ -398,6 +460,7 @@ mod tests {
             cache
                 .get_with_key(&RowIdIndexKey {
                     version: 5,
+                    with_deletions: true,
                     e_tag: Some("second-etag"),
                 })
                 .await

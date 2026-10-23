@@ -120,7 +120,6 @@ impl PendingReadBatch {
 struct MergeStream {
     streams: Vec<ReadBatchTaskStream>,
     pending: Vec<Option<PendingReadBatch>>,
-    index: usize,
 }
 
 impl MergeStream {
@@ -171,22 +170,40 @@ impl Stream for MergeStream {
                 return std::task::Poll::Ready(Some(self.emit()));
             }
 
-            let index = self.index;
-            if self.pending[index].is_some() {
-                self.index = (index + 1) % self.streams.len();
-                continue;
+            // Poll every stream that doesn't have a batch ready yet, instead
+            // of stopping at the first one that isn't. All files in a
+            // fragment share a base read priority (only row offset tells
+            // their reads apart), so stopping early can leave a later
+            // sibling's already-completed read unpolled. That read's
+            // response would then never be consumed, permanently pinning
+            // the I/O scheduler's byte budget at that priority and
+            // deadlocking the scan. See
+            // https://github.com/lance-format/lance/pull/9576#issuecomment-6265846131.
+            //
+            // Each stream here is paced by the caller's own batch size (see
+            // `next_batch_task`), so none of them can race arbitrarily far
+            // ahead of the others while parked in `pending`: a stream only
+            // ever holds rows it has already fully loaded, never a dangling
+            // claim on bytes it hasn't consumed yet.
+            let this = &mut *self;
+            let mut progressed = false;
+            for (index, stream) in this.streams.iter_mut().enumerate() {
+                if this.pending[index].is_some() {
+                    continue;
+                }
+                match stream.poll_next_unpin(cx) {
+                    std::task::Poll::Ready(Some(batch_task)) => {
+                        this.pending[index] = Some(PendingReadBatch::new(batch_task));
+                        progressed = true;
+                    }
+                    std::task::Poll::Ready(None) => {
+                        return std::task::Poll::Ready(None);
+                    }
+                    std::task::Poll::Pending => {}
+                }
             }
-            match self.streams[index].poll_next_unpin(cx) {
-                std::task::Poll::Ready(Some(batch_task)) => {
-                    self.pending[index] = Some(PendingReadBatch::new(batch_task));
-                    self.index = (index + 1) % self.streams.len();
-                }
-                std::task::Poll::Ready(None) => {
-                    return std::task::Poll::Ready(None);
-                }
-                std::task::Poll::Pending => {
-                    return std::task::Poll::Pending;
-                }
+            if !progressed {
+                return std::task::Poll::Pending;
             }
         }
     }
@@ -207,12 +224,7 @@ pub fn merge_streams(streams: Vec<ReadBatchTaskStream>) -> ReadBatchTaskStream {
         return futures::stream::empty().boxed();
     }
     let pending = (0..streams.len()).map(|_| None).collect();
-    MergeStream {
-        streams,
-        pending,
-        index: 0,
-    }
-    .boxed()
+    MergeStream { streams, pending }.boxed()
 }
 
 /// Apply a mask to the batch, where rows are "deleted" by the _rowid column null.

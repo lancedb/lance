@@ -270,13 +270,58 @@ impl IndexReader for V1IndexReader {
 /// Newtype wrapper to allow implementing IndexReader for CurrentFileReader (a foreign type)
 struct CurrentIndexReader(CurrentFileReader);
 
+impl CurrentIndexReader {
+    /// Row range covered by batch `offset`, clamped to the end of the file.
+    fn batch_bounds(&self, offset: u64, batch_size: u64) -> (usize, usize) {
+        let num_rows = self.0.num_rows();
+        let start = (offset * batch_size).min(num_rows);
+        let end = (start + batch_size).min(num_rows);
+        (start as usize, end as usize)
+    }
+}
+
 #[async_trait]
 impl IndexReader for CurrentIndexReader {
     async fn read_record_batch(&self, offset: u64, batch_size: u64) -> Result<RecordBatch> {
-        let start = offset * batch_size;
-        let end = start + batch_size;
-        let end = end.min(self.0.num_rows());
-        self.read_range(start as usize..end as usize, None).await
+        let (start, end) = self.batch_bounds(offset, batch_size);
+        self.read_range(start..end, None).await
+    }
+
+    /// Fold every requested batch into one [`Self::read_ranges`] call.
+    ///
+    /// Batch N occupies rows `[N * batch_size, (N + 1) * batch_size)`, so a set
+    /// of batch numbers maps directly onto a set of row ranges, and `read_ranges`
+    /// already merges adjacent and nearby ranges into shared requests.  A range
+    /// query that touches thousands of consecutive batches therefore becomes a
+    /// handful of large reads rather than one request per batch.
+    async fn read_record_batches(
+        &self,
+        batch_numbers: &[u64],
+        batch_size: u64,
+    ) -> Result<Vec<RecordBatch>> {
+        if batch_numbers.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ranges = batch_numbers
+            .iter()
+            .map(|n| {
+                let (start, end) = self.batch_bounds(*n, batch_size);
+                start..end
+            })
+            .collect::<Vec<_>>();
+        let merged = self.read_ranges(&ranges, None).await?;
+        // `read_ranges` returns the rows in the order the ranges were given, so
+        // the batches come back out as consecutive slices of the merged batch.
+        let mut offset = 0;
+        Ok(ranges
+            .iter()
+            .map(|range| {
+                let len = range.end - range.start;
+                let batch = merged.slice(offset, len);
+                offset += len;
+                batch
+            })
+            .collect())
     }
 
     async fn read_global_buffer(&self, n: u32) -> Result<Bytes> {
@@ -527,6 +572,21 @@ impl IndexStore for LanceIndexStore {
         })
     }
 
+    fn with_io_buffer_size(&self, bytes: u64) -> Arc<dyn IndexStore> {
+        // Unlike `with_io_priority`, this cannot share `scheduler`: the budget belongs to the
+        // scheduler. The object store underneath is still shared.
+        Arc::new(Self {
+            scheduler: ScanScheduler::new(
+                self.object_store.clone(),
+                SchedulerConfig {
+                    io_buffer_size_bytes: bytes,
+                    ..SchedulerConfig::max_bandwidth(&self.object_store)
+                },
+            ),
+            ..self.clone()
+        })
+    }
+
     async fn open_index_file(&self, name: &str) -> Result<Arc<dyn IndexReader>> {
         let path = self.index_file_path(name)?;
         // Use cached file size if available, otherwise unknown (requires HEAD call)
@@ -691,7 +751,7 @@ mod tests {
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use datafusion_common::ScalarValue;
     use futures::FutureExt;
-    use lance_core::ROW_ID;
+    use lance_core::ROW_ADDR;
     use lance_core::utils::row_addr_remap::RowAddrRemap;
     use lance_core::utils::tempfile::TempDir;
     use lance_datagen::{ArrayGeneratorExt, BatchCount, ByteCount, RowCount, array, gen_batch};
@@ -992,13 +1052,14 @@ mod tests {
         let index_store = test_store(&tempdir);
         let data = gen_batch()
             .col(VALUE_COLUMN_NAME, array::step::<Int32Type>())
-            .col(ROW_ID, array::step::<UInt64Type>())
+            .col(ROW_ADDR, array::step::<UInt64Type>())
             .into_reader_rows(RowCount::from(4096), BatchCount::from(100));
         train_index(&index_store, data, None).await;
         let index = BTreeIndexPlugin
             .load_index(
                 index_store,
                 &default_details::<pbold::BTreeIndexDetails>(),
+                crate::scalar::btree::BTREE_INDEX_VERSION,
                 None,
                 &LanceCache::no_cache(),
             )
@@ -1057,13 +1118,14 @@ mod tests {
         let index_store = test_store(&index_dir);
         let data = gen_batch()
             .col(VALUE_COLUMN_NAME, array::step::<Int32Type>())
-            .col(ROW_ID, array::step::<UInt64Type>())
+            .col(ROW_ADDR, array::step::<UInt64Type>())
             .into_reader_rows(RowCount::from(4096), BatchCount::from(100));
         train_index(&index_store, data, None).await;
         let index = BTreeIndexPlugin
             .load_index(
                 index_store,
                 &default_details::<pbold::BTreeIndexDetails>(),
+                crate::scalar::btree::BTREE_INDEX_VERSION,
                 None,
                 &LanceCache::no_cache(),
             )
@@ -1075,7 +1137,7 @@ mod tests {
                 VALUE_COLUMN_NAME,
                 array::step_custom::<Int32Type>(4096 * 100, 1),
             )
-            .col(ROW_ID, array::step_custom::<UInt64Type>(4096 * 100, 1))
+            .col(ROW_ADDR, array::step_custom::<UInt64Type>(4096 * 100, 1))
             .into_reader_rows(RowCount::from(4096), BatchCount::from(100));
 
         let updated_index_dir = TempDir::default();
@@ -1092,6 +1154,7 @@ mod tests {
             .load_index(
                 updated_index_store,
                 &default_details::<pbold::BTreeIndexDetails>(),
+                crate::scalar::btree::BTREE_INDEX_VERSION,
                 None,
                 &LanceCache::no_cache(),
             )
@@ -1143,21 +1206,24 @@ mod tests {
                 VALUE_COLUMN_NAME,
                 array::cycle::<Int32Type>(vec![0, 1, 4, 5]),
             )
-            .col(ROW_ID, array::cycle::<UInt64Type>(vec![0, 1, 2, 3]))
+            .col(ROW_ADDR, array::cycle::<UInt64Type>(vec![0, 1, 2, 3]))
             .into_batch_rows(RowCount::from(4));
         let batch_two = gen_batch()
             .col(
                 VALUE_COLUMN_NAME,
                 array::cycle::<Int32Type>(vec![10, 11, 11, 15]),
             )
-            .col(ROW_ID, array::cycle::<UInt64Type>(vec![40, 50, 60, 70]))
+            .col(ROW_ADDR, array::cycle::<UInt64Type>(vec![40, 50, 60, 70]))
             .into_batch_rows(RowCount::from(4));
         let batch_three = gen_batch()
             .col(
                 VALUE_COLUMN_NAME,
                 array::cycle::<Int32Type>(vec![15, 15, 15, 15]),
             )
-            .col(ROW_ID, array::cycle::<UInt64Type>(vec![400, 500, 600, 700]))
+            .col(
+                ROW_ADDR,
+                array::cycle::<UInt64Type>(vec![400, 500, 600, 700]),
+            )
             .into_batch_rows(RowCount::from(4));
         let batch_four = gen_batch()
             .col(
@@ -1165,14 +1231,14 @@ mod tests {
                 array::cycle::<Int32Type>(vec![15, 16, 20, 20]),
             )
             .col(
-                ROW_ID,
+                ROW_ADDR,
                 array::cycle::<UInt64Type>(vec![4000, 5000, 6000, 7000]),
             )
             .into_batch_rows(RowCount::from(4));
         let batches = vec![batch_one, batch_two, batch_three, batch_four];
         let schema = Arc::new(Schema::new(vec![
             Field::new(VALUE_COLUMN_NAME, DataType::Int32, false),
-            Field::new(ROW_ID, DataType::UInt64, false),
+            Field::new(ROW_ADDR, DataType::UInt64, false),
         ]));
         let data = RecordBatchIterator::new(batches, schema);
         train_index(&index_store, data, Some(4)).await;
@@ -1180,6 +1246,7 @@ mod tests {
             .load_index(
                 index_store,
                 &default_details::<pbold::BTreeIndexDetails>(),
+                crate::scalar::btree::BTREE_INDEX_VERSION,
                 None,
                 &LanceCache::no_cache(),
             )
@@ -1382,7 +1449,7 @@ mod tests {
         let index_store = test_store(&tempdir);
         let data: RecordBatch = gen_batch()
             .col(VALUE_COLUMN_NAME, array::rand_type(&data_type))
-            .col(ROW_ID, array::step::<UInt64Type>())
+            .col(ROW_ADDR, array::step::<UInt64Type>())
             .into_batch_rows(RowCount::from(4096 * 3))
             .unwrap();
 
@@ -1422,6 +1489,7 @@ mod tests {
             .load_index(
                 index_store,
                 &default_details::<pbold::BTreeIndexDetails>(),
+                crate::scalar::btree::BTREE_INDEX_VERSION,
                 None,
                 &LanceCache::no_cache(),
             )
@@ -1452,7 +1520,7 @@ mod tests {
                 VALUE_COLUMN_NAME,
                 array::rand_utf8(ByteCount::from(0), false).with_nulls(&[true]),
             )
-            .col(ROW_ID, array::step::<UInt64Type>())
+            .col(ROW_ADDR, array::step::<UInt64Type>())
             .into_batch_rows(RowCount::from(4096));
         assert_eq!(
             batch.as_ref().unwrap()[VALUE_COLUMN_NAME].null_count(),
@@ -1461,7 +1529,7 @@ mod tests {
         let batches = vec![batch];
         let schema = Arc::new(Schema::new(vec![
             Field::new(VALUE_COLUMN_NAME, DataType::Utf8, true),
-            Field::new(ROW_ID, DataType::UInt64, false),
+            Field::new(ROW_ADDR, DataType::UInt64, false),
         ]));
         let data = RecordBatchIterator::new(batches, schema);
         let data = lance_datafusion::utils::reader_to_stream(Box::new(data));
@@ -1480,6 +1548,7 @@ mod tests {
             .load_index(
                 index_store,
                 &default_details::<pbold::BTreeIndexDetails>(),
+                crate::scalar::btree::BTREE_INDEX_VERSION,
                 None,
                 &LanceCache::no_cache(),
             )
@@ -1559,7 +1628,7 @@ mod tests {
 
         let schema = Arc::new(ArrowSchema::new(vec![
             Field::new(VALUE_COLUMN_NAME, DataType::Utf8, true),
-            Field::new(ROW_ID, DataType::UInt64, false),
+            Field::new(ROW_ADDR, DataType::UInt64, false),
         ]));
 
         let batch1 = RecordBatch::try_new(
@@ -1588,7 +1657,7 @@ mod tests {
         let data = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
         train_bitmap(&index_store, data).await;
 
-        let index = BitmapIndex::load(index_store, None, &LanceCache::no_cache())
+        let index = BitmapIndex::load(index_store, None, &LanceCache::no_cache(), true)
             .await
             .unwrap();
 
@@ -1627,10 +1696,10 @@ mod tests {
         let index_store = test_store(&tempdir);
         let data = gen_batch()
             .col(VALUE_COLUMN_NAME, array::step::<Int32Type>())
-            .col(ROW_ID, array::step::<UInt64Type>())
+            .col(ROW_ADDR, array::step::<UInt64Type>())
             .into_reader_rows(RowCount::from(4096), BatchCount::from(100));
         train_bitmap(&index_store, data).await;
-        let index = BitmapIndex::load(index_store, None, &LanceCache::no_cache())
+        let index = BitmapIndex::load(index_store, None, &LanceCache::no_cache(), true)
             .await
             .unwrap();
 
@@ -1694,21 +1763,24 @@ mod tests {
                 VALUE_COLUMN_NAME,
                 array::cycle::<Int32Type>(vec![0, 1, 4, 5]),
             )
-            .col(ROW_ID, array::cycle::<UInt64Type>(vec![0, 1, 2, 3]))
+            .col(ROW_ADDR, array::cycle::<UInt64Type>(vec![0, 1, 2, 3]))
             .into_batch_rows(RowCount::from(4));
         let batch_two = gen_batch()
             .col(
                 VALUE_COLUMN_NAME,
                 array::cycle::<Int32Type>(vec![10, 11, 11, 15]),
             )
-            .col(ROW_ID, array::cycle::<UInt64Type>(vec![40, 50, 60, 70]))
+            .col(ROW_ADDR, array::cycle::<UInt64Type>(vec![40, 50, 60, 70]))
             .into_batch_rows(RowCount::from(4));
         let batch_three = gen_batch()
             .col(
                 VALUE_COLUMN_NAME,
                 array::cycle::<Int32Type>(vec![15, 15, 15, 15]),
             )
-            .col(ROW_ID, array::cycle::<UInt64Type>(vec![400, 500, 600, 700]))
+            .col(
+                ROW_ADDR,
+                array::cycle::<UInt64Type>(vec![400, 500, 600, 700]),
+            )
             .into_batch_rows(RowCount::from(4));
         let batch_four = gen_batch()
             .col(
@@ -1716,18 +1788,18 @@ mod tests {
                 array::cycle::<Int32Type>(vec![15, 16, 20, 20]),
             )
             .col(
-                ROW_ID,
+                ROW_ADDR,
                 array::cycle::<UInt64Type>(vec![4000, 5000, 6000, 7000]),
             )
             .into_batch_rows(RowCount::from(4));
         let batches = vec![batch_one, batch_two, batch_three, batch_four];
         let schema = Arc::new(Schema::new(vec![
             Field::new(VALUE_COLUMN_NAME, DataType::Int32, false),
-            Field::new(ROW_ID, DataType::UInt64, false),
+            Field::new(ROW_ADDR, DataType::UInt64, false),
         ]));
         let data = RecordBatchIterator::new(batches, schema);
         train_bitmap(&index_store, data).await;
-        let index = BitmapIndex::load(index_store, None, &LanceCache::no_cache())
+        let index = BitmapIndex::load(index_store, None, &LanceCache::no_cache(), true)
             .await
             .unwrap();
 
@@ -1912,16 +1984,16 @@ mod tests {
         let index_store = test_store(&index_dir);
         let data = gen_batch()
             .col(VALUE_COLUMN_NAME, array::step::<Int32Type>())
-            .col(ROW_ID, array::step::<UInt64Type>())
+            .col(ROW_ADDR, array::step::<UInt64Type>())
             .into_reader_rows(RowCount::from(4096), BatchCount::from(1));
         train_bitmap(&index_store, data).await;
-        let index = BitmapIndex::load(index_store, None, &LanceCache::no_cache())
+        let index = BitmapIndex::load(index_store, None, &LanceCache::no_cache(), true)
             .await
             .unwrap();
 
         let data = gen_batch()
             .col(VALUE_COLUMN_NAME, array::step_custom::<Int32Type>(4096, 1))
-            .col(ROW_ID, array::step_custom::<UInt64Type>(4096, 1))
+            .col(ROW_ADDR, array::step_custom::<UInt64Type>(4096, 1))
             .into_reader_rows(RowCount::from(4096), BatchCount::from(1));
 
         let updated_index_dir = TempDir::default();
@@ -1934,9 +2006,10 @@ mod tests {
             )
             .await
             .unwrap();
-        let updated_index = BitmapIndex::load(updated_index_store, None, &LanceCache::no_cache())
-            .await
-            .unwrap();
+        let updated_index =
+            BitmapIndex::load(updated_index_store, None, &LanceCache::no_cache(), true)
+                .await
+                .unwrap();
 
         let result = updated_index
             .search(
@@ -1958,10 +2031,10 @@ mod tests {
         let index_store = test_store(&index_dir);
         let data = gen_batch()
             .col(VALUE_COLUMN_NAME, array::step::<Int32Type>())
-            .col(ROW_ID, array::step::<UInt64Type>())
+            .col(ROW_ADDR, array::step::<UInt64Type>())
             .into_reader_rows(RowCount::from(50), BatchCount::from(1));
         train_bitmap(&index_store, data).await;
-        let index = BitmapIndex::load(index_store, None, &LanceCache::no_cache())
+        let index = BitmapIndex::load(index_store, None, &LanceCache::no_cache(), true)
             .await
             .unwrap();
 
@@ -1984,7 +2057,7 @@ mod tests {
             .remap(&RowAddrRemap::direct(mapping), remapped_store.as_ref())
             .await
             .unwrap();
-        let remapped_index = BitmapIndex::load(remapped_store, None, &LanceCache::no_cache())
+        let remapped_index = BitmapIndex::load(remapped_store, None, &LanceCache::no_cache(), true)
             .await
             .unwrap();
 
@@ -2066,7 +2139,7 @@ mod tests {
                     false,
                 )))),
             )
-            .col(ROW_ID, array::step::<UInt64Type>())
+            .col(ROW_ADDR, array::step::<UInt64Type>())
             .into_batch_rows(RowCount::from(40960))
             .unwrap();
 
@@ -2087,6 +2160,7 @@ mod tests {
                     .load_index(
                         index_store,
                         &default_details::<pbold::LabelListIndexDetails>(),
+                        0,
                         None,
                         &LanceCache::no_cache(),
                     )
@@ -2181,7 +2255,7 @@ mod tests {
                 DataType::List(Arc::new(Field::new("item", DataType::UInt8, true))),
                 true,
             ),
-            Field::new(ROW_ID, DataType::UInt64, false),
+            Field::new(ROW_ADDR, DataType::UInt64, false),
         ]));
         let batch = RecordBatch::try_new(
             schema.clone(),
@@ -2196,6 +2270,7 @@ mod tests {
             .load_index(
                 index_store,
                 &default_details::<pbold::LabelListIndexDetails>(),
+                0,
                 None,
                 &LanceCache::no_cache(),
             )
@@ -2242,7 +2317,7 @@ mod tests {
         let row_ids = UInt64Array::from(vec![0, 2]);
         let schema = Arc::new(Schema::new(vec![
             Field::new(VALUE_COLUMN_NAME, DataType::UInt8, true),
-            Field::new(ROW_ID, DataType::UInt64, false),
+            Field::new(ROW_ADDR, DataType::UInt64, false),
         ]));
         let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(values), Arc::new(row_ids)])
             .unwrap();
@@ -2261,6 +2336,7 @@ mod tests {
             .load_index(
                 index_store,
                 &default_details::<pbold::LabelListIndexDetails>(),
+                0,
                 None,
                 &LanceCache::no_cache(),
             )
