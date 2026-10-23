@@ -39,8 +39,9 @@ pub enum ReadSnapshot<'a> {
     Version { base: &'a Dataset, version: u64 },
 }
 
-/// The single v0 entry. `Err` when the list holds several entries or a tagged
-/// one, which the publication check refuses on its own.
+/// The single fragment reuse entry with `index_version = 0` (the format that
+/// stores compaction records). `Err` for multiple entries or a tagged entry,
+/// which the publication check refuses separately.
 fn sole_v0_entry(indices: &[IndexMetadata]) -> std::result::Result<Option<&IndexMetadata>, ()> {
     let mut entries = indices
         .iter()
@@ -52,7 +53,8 @@ fn sole_v0_entry(indices: &[IndexMetadata]) -> std::result::Result<Option<&Index
     Ok(entry)
 }
 
-/// Validate v0 fragment reuse history when committing a stable-row-id table:
+/// Validate fragment reuse history stored as compaction records
+/// (`index_version = 0`) when committing a stable-row-id table:
 ///
 /// 1. Keep the existing entry and its recorded versions unchanged and in order,
 ///    except for cleanup, restore and overwrite below. A rewrite without FRI
@@ -88,12 +90,10 @@ pub async fn validate_frag_reuse_history(
             return validate_restore(base, *version, proposed_manifest, proposed_indices).await;
         }
         Operation::Overwrite { .. } => return Ok(()),
-        // Without stable row ids, indices store row addresses too and can need
-        // the history, but these checks would change behavior there: the
-        // migration to stable row ids drops the history once no other index
-        // remains, the v0 cleanup keeps or removes each version on its own
-        // rather than only an oldest prefix, and a tagged history has its own
-        // validation and cleanup.
+        // Non-stable-row-id tables can need the same history protection.
+        // Extending these checks must also allow existing operations such as
+        // migration to stable row ids, which drops unused history once no
+        // other index remains.
         _ if !base.manifest.uses_stable_row_ids() => return Ok(()),
         _ => {}
     }

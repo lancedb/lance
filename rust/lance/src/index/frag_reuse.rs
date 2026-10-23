@@ -64,11 +64,12 @@ impl std::fmt::Debug for ResolvedRemapping {
     }
 }
 
-/// Cache key for a v0 history and the mappings decoded from it.
+/// Cache key for fragment reuse history with `index_version = 0` and the
+/// mappings decoded from it.
 ///
-/// The entry's UUID alone is insufficient: a writer can reuse it for different
-/// moves. Include the encoded history details and the external storage base as
-/// well. Published files are immutable, so the same key identifies the same moves.
+/// A writer can change the history without changing its UUID. Include the
+/// history contents and storage location in the key so we don't reuse an old
+/// mapping. Referenced files are immutable once published.
 pub(crate) fn v0_cache_identity(dataset: &Dataset, entry: &IndexMetadata) -> Uuid {
     fn update_sized(hasher: &mut blake3::Hasher, bytes: &[u8]) {
         hasher.update(&(bytes.len() as u64).to_le_bytes());
@@ -503,7 +504,8 @@ pub(crate) async fn plan_staged_segments(
 }
 
 /// Resolve the FRI remapper shared by scalar and vector index loading, with
-/// its cache identity: [`v0_cache_identity`] for v0, the UUID for tagged.
+/// its cache identity: [`v0_cache_identity`] for `index_version = 0`, or the
+/// entry UUID for tagged history.
 pub(super) async fn open_row_id_remapping(
     dataset: &Dataset,
     index: &IndexMetadata,

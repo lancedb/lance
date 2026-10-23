@@ -4096,8 +4096,8 @@ async fn v0_frag_reuse_cache_id(dataset: &Dataset) -> Option<Uuid> {
 }
 
 /// The FRI part of a cache key for content read alongside the dataset's
-/// history: a v0 history's [`frag_reuse::v0_cache_identity`], a tagged one's
-/// UUID, which every change to a tagged history replaces.
+/// history: [`frag_reuse::v0_cache_identity`] for `index_version = 0`, or the
+/// entry UUID for tagged history, which every change to that history replaces.
 pub(crate) async fn frag_reuse_cache_scope(dataset: &Dataset) -> Option<Uuid> {
     load_all_indices(dataset)
         .await

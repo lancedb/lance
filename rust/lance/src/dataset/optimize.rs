@@ -270,8 +270,7 @@ pub struct CompactionOptions {
     /// the behavior depends on the index.  Some legacy indexes store row ids.  These
     /// indexes remain valid and their fragment bitmaps are updated.  Modern indexes
     /// store row addresses and these indexes need to be remapped as if we were not using
-    /// stable row ids. Such a compaction records nothing, even on a table that already
-    /// has a fragment reuse index.
+    /// stable row ids. An existing fragment reuse index does not by itself enable recording.
     pub defer_index_remap: bool,
     /// How the old-to-new row-address mapping used to remap indices is built.
     /// Defaults to [`IndexRemapMode::Direct`].
@@ -13008,8 +13007,9 @@ mod tests {
         ids
     }
 
-    /// Decoded vector partitions embed v0 remapping, so changing history under
-    /// the same UUID must invalidate them. Cover both vector index load paths.
+    /// Decoded vector partitions embed the address mappings for history with
+    /// `index_version = 0`, so changing that history under the same UUID must
+    /// invalidate them. Cover both vector index load paths.
     #[rstest]
     #[case::ivf_flat(false)]
     #[case::legacy_ivf_pq(true)]
