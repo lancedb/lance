@@ -14,6 +14,8 @@ use lance_core::FenceReason;
 use lance_io::object_store::ObjectStore;
 use uuid::Uuid;
 
+mod future_depth;
+
 fn durable_writer_config(shard_id: Uuid) -> ShardWriterConfig {
     ShardWriterConfig {
         shard_id,
@@ -88,7 +90,7 @@ async fn durable_put_does_not_alias_across_memtable_generations() {
     // Write and fully flush generation N, then rotate to generation N+1.
     writer_a.put(vec![first_batch]).await.unwrap();
     let first_generation = writer_a.memtable_stats().await.unwrap().generation;
-    writer_a.force_seal_active().await.unwrap();
+    writer_a.force_freeze_active().await.unwrap();
     writer_a.wait_for_flush_drain().await.unwrap();
     let current_generation = writer_a.memtable_stats().await.unwrap().generation;
     assert_eq!(
