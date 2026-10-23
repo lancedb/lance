@@ -961,6 +961,7 @@ async fn test_datafile_partial_replacement() {
         file_major_version: major,
         file_minor_version: minor,
         file_size_bytes: CachedFileSize::unknown(),
+        file_metadata_size_bytes: None,
         base_id: None,
     };
 
@@ -1022,6 +1023,7 @@ async fn test_datafile_partial_replacement() {
         file_major_version: major,
         file_minor_version: minor,
         file_size_bytes: CachedFileSize::unknown(),
+        file_metadata_size_bytes: None,
         base_id: None,
     };
 
@@ -1122,6 +1124,7 @@ async fn test_datafile_replacement_error() {
         file_major_version: 2,
         file_minor_version: 0,
         file_size_bytes: CachedFileSize::unknown(),
+        file_metadata_size_bytes: None,
         base_id: None,
     };
 
@@ -3344,6 +3347,7 @@ async fn test_cross_column_fast_search_blocks_column_local_stale_postings() {
         file_major_version,
         file_minor_version,
         file_size_bytes: CachedFileSize::unknown(),
+        file_metadata_size_bytes: None,
         base_id: None,
     };
     let read_version = dataset.version().version;
