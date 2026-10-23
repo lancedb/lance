@@ -6,7 +6,6 @@ use std::sync::Arc;
 use arrow_array::{ArrayRef, RecordBatch};
 use bytes::Bytes;
 use lance_core::{Error, Result, datatypes::Schema};
-use lance_encoding::compression_config::CompressionParams;
 use lance_encoding::decoder::{ColumnInfo, PageEncoding};
 use lance_io::object_store::ObjectStore;
 use object_store::path::Path;
@@ -52,14 +51,6 @@ pub struct FileWriterOptions {
     /// Do not enable this for arrays arriving through the Arrow C data
     /// interface because a small child array can keep an entire batch alive.
     pub keep_original_array: Option<bool>,
-
-    /// Compression tuning for the current-format writer.
-    ///
-    /// Only the v2.3 writer consumes this today (ALP mode and other v2.3
-    /// compression codecs); v2.0-v2.2 writers ignore it. When the explicit
-    /// [`crate::versions::v2_3::create_writer_with_compression`] argument is
-    /// also provided, the explicit argument wins.
-    pub compression: Option<CompressionParams>,
 }
 
 impl FileWriterOptions {

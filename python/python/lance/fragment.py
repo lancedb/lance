@@ -42,7 +42,7 @@ from .lance import (
 from .lance import _Fragment, _write_fragments, _write_fragments_transaction
 from .lance import _Session as Session
 from .progress import FragmentWriteProgress, NoopFragmentWriteProgress
-from .types import _coerce_reader
+from .types import _coerce_reader, _set_alp_field_metadata
 from .udf import BatchUDF, normalize_transform
 
 if TYPE_CHECKING:
@@ -1305,8 +1305,9 @@ def write_fragments(
         point columns. ``"auto"`` enables ALP only when the data benefits from
         it, ``"on"`` forces ALP, and ``"off"`` disables it. If not set, the
         current file writer uses its configured default (``"auto"`` for the
-        current format). Only the current v2.3 file writer consumes this
-        option; v2.0-v2.2 and legacy V1 writers ignore it.
+        current format). The mode is recorded on float32/float64 columns via
+        the standard ``lance-encoding:alp`` field metadata, so it persists in
+        the written schema; v2.0-v2.2 and legacy V1 writers ignore it.
     progress : FragmentWriteProgress, optional
         *Experimental API*. Progress tracking for writing the fragment. Pass
         a custom class that defines hooks to be called when each fragment is
@@ -1413,7 +1414,11 @@ def write_fragments(
             "Both 'namespace_client' and 'table_id' must be provided together."
         )
 
+    if alp is not None and alp not in ("auto", "on", "off"):
+        raise ValueError(f"Invalid `alp` value: {alp}. Expected one of: auto, on, off")
     reader = _coerce_reader(data, schema)
+    if alp is not None:
+        reader = _set_alp_field_metadata(reader, alp)
 
     if isinstance(dataset_uri, Path):
         dataset_uri = str(dataset_uri)
@@ -1453,7 +1458,6 @@ def write_fragments(
         max_bytes_per_file=max_bytes_per_file,
         data_cache_bytes=data_cache_bytes,
         max_page_bytes=max_page_bytes,
-        alp=alp,
         progress=progress,
         data_storage_version=data_storage_version,
         storage_options=storage_options,
