@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use lance_index::scalar::index_files_to_table;
 use lance_table::format::IndexMetadata;
 use roaring::RoaringBitmap;
 use std::sync::Arc;
@@ -19,10 +20,14 @@ use crate::{Dataset, Error, Result};
 /// fully live is returned as-is: rebuilding it would produce equivalent content
 /// over the same fragments, which makes distributed builds (one uncommitted
 /// segment per worker, merged 1:1 into final segments) pay for every segment
-/// twice.
+/// twice. `is_rebuild_required` disables that passthrough when the caller has
+/// moved coverage into the current fragment space and the stored row addresses
+/// must be rebuilt to match it.
 pub(in crate::index) async fn merge_segments(
     dataset: &Dataset,
     segments: Vec<IndexMetadata>,
+    is_rebuild_required: bool,
+    staged: Option<&crate::index::frag_reuse::StagedRemappingPlans>,
 ) -> Result<IndexMetadata> {
     if segments.is_empty() {
         return Err(Error::index("No segment metadata was provided".to_string()));
@@ -47,8 +52,19 @@ pub(in crate::index) async fn merge_segments(
     }
 
     // Intersect with the dataset's current live fragments to drop retired/compacted
-    // fragments, mirroring the btree merge behavior.
-    fragment_bitmap &= dataset.fragment_bitmap.as_ref();
+    // fragments, mirroring the btree merge behavior. Under a tagged history the
+    // segments' stored bitmaps are provenance; the FM merge rebuilds from the
+    // dataset, so it rebuilds over the live coverage the tagged reader derives
+    // for them instead.
+    let segment_refs: Vec<&IndexMetadata> = segments.iter().collect();
+    match crate::index::append::tagged_segment_coverage(dataset, &segment_refs, staged).await? {
+        Some(coverage) => {
+            fragment_bitmap = coverage
+                .values()
+                .fold(RoaringBitmap::new(), |acc, bitmap| acc | bitmap);
+        }
+        None => fragment_bitmap &= dataset.fragment_bitmap.as_ref(),
+    }
 
     if fragment_bitmap.is_empty() {
         // All covered fragments have been retired; produce an empty index.
@@ -69,19 +85,21 @@ pub(in crate::index) async fn merge_segments(
 
         return Ok(IndexMetadata {
             uuid: new_uuid,
-            fields: vec![field_id],
             dataset_version: dataset.manifest.version,
             fragment_bitmap: Some(fragment_bitmap),
             index_details: Some(Arc::new(created_index.index_details)),
             index_version: created_index.index_version as i32,
             created_at: Some(chrono::Utc::now()),
             base_id: None,
-            files: Some(created_index.files),
+            files: Some(index_files_to_table(created_index.files)),
             ..segments[0].clone()
         });
     }
 
-    if segments.len() == 1 && segments[0].fragment_bitmap.as_ref() == Some(&fragment_bitmap) {
+    if !is_rebuild_required
+        && segments.len() == 1
+        && segments[0].fragment_bitmap.as_ref() == Some(&fragment_bitmap)
+    {
         return Ok(segments.into_iter().next().unwrap());
     }
 
@@ -104,14 +122,13 @@ pub(in crate::index) async fn merge_segments(
 
     Ok(IndexMetadata {
         uuid: new_uuid,
-        fields: vec![field_id],
         dataset_version: dataset.manifest.version,
         fragment_bitmap: Some(fragment_bitmap),
         index_details: Some(Arc::new(created_index.index_details)),
         index_version: created_index.index_version as i32,
         created_at: Some(chrono::Utc::now()),
         base_id: None,
-        files: Some(created_index.files),
+        files: Some(index_files_to_table(created_index.files)),
         ..segments[0].clone()
     })
 }

@@ -3,6 +3,7 @@
 
 use bytes::Bytes;
 use futures::channel::oneshot;
+use futures::future::Either;
 use futures::{FutureExt, TryFutureExt};
 use object_store::path::Path;
 use std::collections::BinaryHeap;
@@ -377,7 +378,8 @@ struct MutableBatch<F: FnOnce(Response) + Send> {
     num_bytes: u64,
     priority: u128,
     num_reqs: usize,
-    err: Option<Box<dyn std::error::Error + Send + Sync + 'static>>,
+    num_delivered: usize,
+    err: Option<Error>,
     // When true, report 0 bytes consumed so the backpressure budget is unaffected
     bypass_backpressure: bool,
     // Queue the batch's backpressure reservation is refunded to once its response
@@ -400,6 +402,7 @@ impl<F: FnOnce(Response) + Send> MutableBatch<F> {
             num_bytes: 0,
             priority,
             num_reqs,
+            num_delivered: 0,
             err: None,
             bypass_backpressure,
             io_queue,
@@ -413,9 +416,16 @@ impl<F: FnOnce(Response) + Send> MutableBatch<F> {
 // data.
 impl<F: FnOnce(Response) + Send> Drop for MutableBatch<F> {
     fn drop(&mut self) {
-        // If we have an error, return that.  Otherwise return the data
-        let result = if self.err.is_some() {
-            Err(Error::wrapped(self.err.take().unwrap()))
+        // If we have an error, return that. Otherwise return the data, as long as the I/O requests have been processed.
+        let result = if let Some(err) = self.err.take() {
+            Err(err)
+        } else if self.num_delivered < self.data_buffers.len() {
+            // This usually happens on tokio runtime shutdown
+            Err(Error::io(format!(
+                "I/O request was dropped before completion ({} of {} reads delivered)",
+                self.num_delivered,
+                self.data_buffers.len()
+            )))
         } else {
             let mut data = Vec::new();
             std::mem::swap(&mut data, &mut self.data_buffers);
@@ -453,13 +463,14 @@ impl<F: FnOnce(Response) + Send> DataSink for MutableBatch<F> {
     // Called by worker tasks to add data to the MutableBatch
     fn deliver_data(&mut self, data: DataChunk) {
         self.num_bytes += data.num_bytes;
+        self.num_delivered += 1;
         match data.data {
             Ok(data_bytes) => {
                 self.data_buffers[data.task_idx] = data_bytes;
             }
             Err(err) => {
                 // This keeps the original error, if present
-                self.err.get_or_insert(Box::new(err));
+                self.err.get_or_insert(err);
             }
         }
     }
@@ -471,6 +482,23 @@ struct IoTask {
     when_done: Box<dyn FnOnce(Result<Bytes>) + Send>,
     priority: u128,
     bypass_backpressure: bool,
+}
+
+fn validate_read_length(
+    file_path: &Path,
+    requested_range: &Range<u64>,
+    bytes: Bytes,
+) -> Result<Bytes> {
+    let expected_len = requested_range.end - requested_range.start;
+    if bytes.len() as u64 != expected_len {
+        return Err(Error::io(format!(
+            "I/O request for file {file_path} and range {}..{} returned {} bytes, expected {expected_len} bytes",
+            requested_range.start,
+            requested_range.end,
+            bytes.len()
+        )));
+    }
+    Ok(bytes)
 }
 
 impl Eq for IoTask {}
@@ -524,6 +552,7 @@ impl IoTask {
                 })
                 .await
                 .map_err(Error::from)
+                .and_then(|bytes| validate_read_length(self.reader.path(), &self.to_read, bytes))
         };
         // Emit per-file I/O trace event only when tracing is enabled
         tracing::trace!(
@@ -804,6 +833,10 @@ impl Drop for Response {
     }
 }
 
+/// Bytes [`SchedulerConfig::max_bandwidth`] allows per I/O thread, sized to hold one
+/// storage page of the largest size we write.
+const MAX_BANDWIDTH_BYTES_PER_IO_THREAD: u64 = 32 * 1024 * 1024;
+
 #[derive(Debug, Clone, Copy)]
 pub struct SchedulerConfig {
     /// the # of bytes that can be buffered but not yet requested.
@@ -839,7 +872,14 @@ impl SchedulerConfig {
     /// Configuration that should generally maximize bandwidth (not trying to save RAM
     /// at all).  We assume a max page size of 32MiB and then allow 32MiB per I/O thread
     pub fn max_bandwidth(store: &ObjectStore) -> Self {
-        Self::new(32 * 1024 * 1024 * store.io_parallelism() as u64)
+        Self::new(Self::max_bandwidth_bytes(store.io_parallelism()))
+    }
+
+    /// The byte budget [`Self::max_bandwidth`] would give a store with this I/O parallelism,
+    /// for callers that must reason about it without holding the store — to divide it between
+    /// several schedulers, say.
+    pub fn max_bandwidth_bytes(io_parallelism: usize) -> u64 {
+        MAX_BANDWIDTH_BYTES_PER_IO_THREAD * io_parallelism.max(1) as u64
     }
 
     pub fn with_lite_scheduler(self) -> Self {
@@ -1046,11 +1086,30 @@ impl ScanScheduler {
             .map(|task| {
                 let reader = reader.clone();
                 let queue = io_queue.clone();
+                let requested_range = task.clone();
                 let run_fn = Box::new(move || {
-                    reader
-                        .get_range(task.start as usize..task.end as usize)
-                        .map_err(Error::from)
-                        .boxed()
+                    // An empty range asks for no bytes, which IoTask::run
+                    // answers without a request. Reaching a cloud store with
+                    // one is an InvalidGetRange error there.
+                    if requested_range.start == requested_range.end {
+                        return async { Ok(Bytes::new()) }.boxed();
+                    }
+                    // IoTask::run publishes the counters behind
+                    // iops_counter()/bytes_read_counter(), so this path has to
+                    // publish the same pair the same way: the requested
+                    // length, on the error arm as well.
+                    let num_bytes = requested_range.end - requested_range.start;
+                    IOPS_COUNTER.fetch_add(1, Ordering::Release);
+                    let bytes_fut = reader
+                        .get_range(requested_range.start as usize..requested_range.end as usize)
+                        .inspect(move |_| {
+                            BYTES_READ_COUNTER.fetch_add(num_bytes, Ordering::Release);
+                        });
+                    async move {
+                        let bytes = bytes_fut.await.map_err(Error::from)?;
+                        validate_read_length(reader.path(), &requested_range, bytes)
+                    }
+                    .boxed()
                 });
                 queue.submit(task, priority, run_fn, bypass_backpressure)
             })
@@ -1138,7 +1197,8 @@ pub struct FileScheduler {
 
 fn is_close_together(range1: &Range<u64>, range2: &Range<u64>, block_size: u64) -> bool {
     // Note that range1.end <= range2.start is possible (e.g. when decoding string arrays)
-    range2.start <= (range1.end + block_size)
+    // A gap from `FileScheduler::with_block_size` may be as large as `u64::MAX`.
+    range2.start <= range1.end.saturating_add(block_size)
 }
 
 fn is_overlapping(range1: &Range<u64>, range2: &Range<u64>) -> bool {
@@ -1158,6 +1218,8 @@ impl FileScheduler {
     /// Each request has a backpressure ID which controls which backpressure throttle
     /// is applied to the request.  Requests made to the same backpressure throttle
     /// will be throttled together.
+    ///
+    /// Ranges must be sorted by their start offset.
     pub fn submit_request(
         &self,
         request: Vec<Range<u64>>,
@@ -1165,6 +1227,19 @@ impl FileScheduler {
     ) -> impl Future<Output = Result<Vec<Bytes>>> + Send + use<> {
         // The final priority is a combination of the row offset and the file number
         let priority = ((self.base_priority as u128) << 64) + priority as u128;
+
+        if let Some((range_index, ranges)) = request
+            .windows(2)
+            .enumerate()
+            .find(|(_, ranges)| ranges[0].start > ranges[1].start)
+        {
+            return Either::Left(std::future::ready(Err(Error::invalid_input(format!(
+                "I/O request ranges must be sorted by start offset: range at index {range_index} is {:?}, but range at index {} is {:?}",
+                ranges[0],
+                range_index + 1,
+                ranges[1]
+            )))));
+        }
 
         let mut merged_requests = Vec::with_capacity(request.len());
 
@@ -1218,7 +1293,7 @@ impl FileScheduler {
         let mut updated_index = 0;
         let mut final_bytes = Vec::with_capacity(request.len());
 
-        async move {
+        Either::Right(async move {
             let bytes_vec = bytes_vec_fut.await?;
 
             let mut orig_index = 0;
@@ -1242,13 +1317,16 @@ impl FileScheduler {
                         let mut merged_bytes = Vec::with_capacity(orig_size as usize);
                         merged_bytes.extend_from_slice(&bytes_vec[updated_index].slice(start..));
                         let mut copy_offset = merged_bytes.len() as u64;
+                        // Later ranges may overlap this one, so keep their search
+                        // cursor at this range's first chunk while copying its tail.
+                        let mut copy_index = updated_index;
                         while copy_offset < orig_size {
-                            updated_index += 1;
-                            let next_range = &updated_requests[updated_index];
+                            copy_index += 1;
+                            let next_range = &updated_requests[copy_index];
                             let bytes_to_take =
                                 (orig_size - copy_offset).min(next_range.end - next_range.start);
                             merged_bytes.extend_from_slice(
-                                &bytes_vec[updated_index].slice(0..bytes_to_take as usize),
+                                &bytes_vec[copy_index].slice(0..bytes_to_take as usize),
                             );
                             copy_offset += bytes_to_take;
                         }
@@ -1261,7 +1339,7 @@ impl FileScheduler {
             }
 
             Ok(final_bytes)
-        }
+        })
     }
 
     pub fn with_priority(&self, priority: u64) -> Self {
@@ -1288,6 +1366,21 @@ impl FileScheduler {
     pub fn with_io_stats(&self, stats: Arc<dyn IoStatsRecorder>) -> Self {
         Self {
             extra_stats: Some(stats),
+            ..self.clone()
+        }
+    }
+
+    /// Returns a copy of this scheduler that merges the ranges of a request
+    /// that are at most `block_size` bytes apart into one I/O, instead of
+    /// using the object store's block size.
+    ///
+    /// Each requested range is still cut back out of the merged read, so the
+    /// bytes returned are the same for every gap; only the number and size of
+    /// the I/Os change. A wider gap trades extra bytes for fewer requests,
+    /// which pays off where every request is a round trip to remote storage.
+    pub fn with_block_size(&self, block_size: u64) -> Self {
+        Self {
+            block_size,
             ..self.clone()
         }
     }
@@ -1335,6 +1428,7 @@ mod tests {
     use futures::poll;
     use lance_core::utils::tempfile::TempObjFile;
     use rand::RngCore;
+    use rstest::rstest;
 
     use object_store::{GetRange, ObjectStore as OSObjectStore, ObjectStoreExt, memory::InMemory};
     use tokio::{runtime::Handle, time::timeout};
@@ -1418,6 +1512,29 @@ mod tests {
         assert_eq!(order, vec![(5, true), (20, true), (1, false), (10, false)]);
     }
 
+    #[test]
+    fn test_batch_with_undelivered_slot_is_error() {
+        let response = Arc::new(Mutex::new(None));
+        let response_clone = response.clone();
+        let io_queue = Arc::new(IoQueue::new(1, 1024, IoStats::new()));
+        let batch = MutableBatch::new(
+            move |rsp| *response_clone.lock().unwrap() = Some(rsp),
+            2, // num_data_buffers
+            0, // priority
+            2, // num_reqs
+            false,
+            io_queue,
+        );
+        drop(batch);
+
+        let mut rsp = response.lock().unwrap().take().unwrap();
+        let data = rsp.data.take().unwrap();
+        assert!(
+            data.is_err(),
+            "undelivered slot must yield an error, got {data:?}",
+        );
+    }
+
     #[tokio::test]
     async fn test_full_seq_read() {
         let tmp_file = TempObjFile::default();
@@ -1488,6 +1605,75 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(bytes[0], some_data);
+    }
+
+    #[derive(Debug)]
+    struct ShortReader {
+        path: Path,
+    }
+
+    impl lance_core::deepsize::DeepSizeOf for ShortReader {
+        fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
+            0
+        }
+    }
+
+    impl Reader for ShortReader {
+        fn path(&self) -> &Path {
+            &self.path
+        }
+
+        fn block_size(&self) -> usize {
+            4096
+        }
+
+        fn io_parallelism(&self) -> usize {
+            1
+        }
+
+        fn size(&self) -> futures::future::BoxFuture<'_, object_store::Result<usize>> {
+            Box::pin(async { Ok(0) })
+        }
+
+        fn get_range(
+            &self,
+            _range: Range<usize>,
+        ) -> futures::future::BoxFuture<'static, object_store::Result<Bytes>> {
+            Box::pin(async { Ok(Bytes::new()) })
+        }
+
+        fn get_all(&self) -> futures::future::BoxFuture<'_, object_store::Result<Bytes>> {
+            Box::pin(async { Ok(Bytes::new()) })
+        }
+    }
+
+    #[rstest]
+    #[case::standard(false)]
+    #[case::lite(true)]
+    #[tokio::test]
+    async fn test_short_read_returns_io_error(#[case] use_lite_scheduler: bool) {
+        let config = SchedulerConfig {
+            use_lite_scheduler: Some(use_lite_scheduler),
+            ..SchedulerConfig::default_for_testing()
+        };
+        let scheduler = ScanScheduler::new(Arc::new(ObjectStore::memory()), config);
+        let reader = Arc::new(ShortReader {
+            path: Path::parse("short-file").unwrap(),
+        });
+        let file_scheduler = scheduler.open_reader(reader);
+
+        let error = file_scheduler
+            .submit_request(vec![0..8], 0)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, Error::IO { .. }), "{error:?}");
+        assert!(
+            error.to_string().contains(
+                "I/O request for file short-file and range 0..8 returned 0 bytes, expected 8 bytes"
+            ),
+            "{error}"
+        );
     }
 
     #[tokio::test]
@@ -1572,6 +1758,116 @@ mod tests {
             );
         }
         assert_eq!(11, scheduler.stats().iops);
+
+        // A gap set on the file scheduler replaces the store's 4KiB block
+        // size: gap 0 merges only touching ranges, a wider gap merges every
+        // range it reaches, and `u64::MAX` merges them all. Each range still
+        // gets exactly its own bytes.
+        let reads = vec![
+            50_000..51_000,
+            52_000..53_000,
+            150_000..151_000,
+            151_000..152_000,
+        ];
+        for (gap, expected_iops) in [(0, 3), (4 * 1024, 2), (100_000, 1), (u64::MAX, 1)] {
+            let iops_before = scheduler.stats().iops;
+            let bytes = file_scheduler
+                .with_block_size(gap)
+                .submit_request(reads.clone(), 0)
+                .await
+                .unwrap();
+            assert_eq!(bytes.len(), reads.len(), "gap={gap}");
+            for (range, bytes) in reads.iter().zip(&bytes) {
+                let expected = &some_data[range.start as usize..range.end as usize];
+                assert_eq!(bytes, expected, "gap={gap} range={range:?}");
+            }
+            assert_eq!(
+                scheduler.stats().iops - iops_before,
+                expected_iops,
+                "gap={gap}"
+            );
+        }
+        // The scheduler the gap was set on keeps the store's block size.
+        let iops_before = scheduler.stats().iops;
+        file_scheduler.submit_request(reads, 0).await.unwrap();
+        assert_eq!(scheduler.stats().iops - iops_before, 2);
+    }
+
+    #[rstest]
+    #[case::nested(vec![0..15, 5..6, 24..25])]
+    #[case::overlapping(vec![0..15, 5..20, 24..25])]
+    #[case::duplicate(vec![0..15, 0..15, 24..25])]
+    #[case::spanning(vec![0..31, 5..7, 20..25, 40..41])]
+    #[case::disjoint(vec![0..15, 24..25])]
+    #[tokio::test]
+    async fn test_coalesce_overlapping_ranges(
+        #[case] ranges: Vec<Range<u64>>,
+        #[values(0, 4, 256 * 1024, u64::MAX)] gap: u64,
+        #[values(false, true)] use_lite_scheduler: bool,
+    ) {
+        let path = Path::parse("overlapping-ranges").unwrap();
+        let source = (0_u8..64).collect::<Vec<_>>();
+        let object_store = Arc::new(ObjectStore::memory());
+        object_store.put(&path, &source).await.unwrap();
+        let scheduler = ScanScheduler::new(
+            object_store,
+            SchedulerConfig {
+                use_lite_scheduler: Some(use_lite_scheduler),
+                ..SchedulerConfig::default_for_testing()
+            },
+        );
+        let mut file_scheduler = scheduler
+            .open_file(&path, &CachedFileSize::unknown())
+            .await
+            .unwrap()
+            .with_block_size(gap);
+        // Preserve the production split/reassembly boundary with a tiny fixture.
+        file_scheduler.max_iop_size = 16;
+
+        let bytes = file_scheduler
+            .submit_request(ranges.clone(), 0)
+            .await
+            .unwrap();
+
+        assert_eq!(bytes.len(), ranges.len());
+        for (bytes, range) in bytes.iter().zip(&ranges) {
+            assert_eq!(
+                bytes.as_ref(),
+                &source[range.start as usize..range.end as usize]
+            );
+        }
+    }
+
+    #[rstest]
+    #[case::standard(false)]
+    #[case::lite(true)]
+    #[tokio::test]
+    async fn test_unordered_ranges_are_rejected(#[case] use_lite_scheduler: bool) {
+        let path = Path::parse("unordered-ranges").unwrap();
+        let source = (0_u8..64).collect::<Vec<_>>();
+        let object_store = Arc::new(ObjectStore::memory());
+        object_store.put(&path, &source).await.unwrap();
+
+        let config = SchedulerConfig {
+            use_lite_scheduler: Some(use_lite_scheduler),
+            ..SchedulerConfig::default_for_testing()
+        };
+        let scheduler = ScanScheduler::new(object_store, config);
+        let file_scheduler = scheduler
+            .open_file(&path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+
+        let ranges = vec![9..26, 0..49];
+        let error = file_scheduler.submit_request(ranges, 0).await.unwrap_err();
+
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(
+            error.to_string().contains(
+                "I/O request ranges must be sorted by start offset: range at index 0 is 9..26, but range at index 1 is 0..49"
+            ),
+            "{error}"
+        );
     }
 
     #[tokio::test]

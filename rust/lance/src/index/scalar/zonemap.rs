@@ -4,6 +4,7 @@
 use std::sync::Arc;
 
 use lance_index::metrics::NoOpMetricsCollector;
+use lance_index::scalar::index_files_to_table;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::zonemap::ZoneMapIndex;
 use lance_table::format::IndexMetadata;
@@ -16,6 +17,7 @@ use crate::{Dataset, Error, Result, dataset::index::LanceIndexStoreExt};
 pub(in crate::index) async fn merge_segments(
     dataset: &Dataset,
     segments: Vec<IndexMetadata>,
+    staged: Option<&crate::index::frag_reuse::StagedRemappingPlans>,
 ) -> Result<IndexMetadata> {
     if segments.is_empty() {
         return Err(Error::index("No segment metadata was provided".to_string()));
@@ -42,8 +44,15 @@ pub(in crate::index) async fn merge_segments(
                 ))
             })?;
         fragment_bitmap |= effective;
-        let scalar_index =
-            super::open_scalar_index(dataset, &field_path, segment, &NoOpMetricsCollector).await?;
+        let scalar_index = super::open_scalar_index_with_plan(
+            dataset,
+            &field_path,
+            segment,
+            staged.and_then(|plans| plans.get(&segment.uuid)),
+            crate::index::frag_reuse::OpenPurpose::Maintenance,
+            &NoOpMetricsCollector,
+        )
+        .await?;
         scalar_indices.push((segment.uuid, scalar_index));
     }
 
@@ -73,14 +82,13 @@ pub(in crate::index) async fn merge_segments(
 
     Ok(IndexMetadata {
         uuid: new_uuid,
-        fields: vec![field_id],
         dataset_version: dataset.manifest.version,
         fragment_bitmap: Some(fragment_bitmap),
         index_details: Some(Arc::new(created_index.index_details)),
         index_version: created_index.index_version as i32,
         created_at: Some(chrono::Utc::now()),
         base_id: None,
-        files: Some(created_index.files),
+        files: Some(index_files_to_table(created_index.files)),
         ..segments[0].clone()
     })
 }

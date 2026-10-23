@@ -3,6 +3,7 @@
 
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::scalar::IndexStore;
+use lance_index::scalar::index_files_to_table;
 use lance_index::scalar::label_list::{
     BITMAP_LOOKUP_NAME, LABEL_LIST_NULLS_METADATA_KEY, LABEL_LIST_NULLS_MIN_VERSION, LabelListIndex,
 };
@@ -62,6 +63,7 @@ async fn validate_nullable_segment_for_merge(
 pub(in crate::index) async fn merge_segments(
     dataset: &Dataset,
     segments: Vec<IndexMetadata>,
+    staged: Option<&crate::index::frag_reuse::StagedRemappingPlans>,
 ) -> Result<IndexMetadata> {
     if segments.is_empty() {
         return Err(Error::index("No segment metadata was provided".to_string()));
@@ -101,6 +103,7 @@ pub(in crate::index) async fn merge_segments(
             dataset,
             &effective_old_frags,
             &deleted_old_frags,
+            false,
         )
         .await?
     };
@@ -108,8 +111,15 @@ pub(in crate::index) async fn merge_segments(
     let mut source_indices = Vec::with_capacity(segments.len());
     for segment in &segments {
         validate_nullable_segment_for_merge(dataset, field_id, segment).await?;
-        let scalar_index =
-            super::open_scalar_index(dataset, &field_path, segment, &NoOpMetricsCollector).await?;
+        let scalar_index = super::open_scalar_index_with_plan(
+            dataset,
+            &field_path,
+            segment,
+            staged.and_then(|plans| plans.get(&segment.uuid)),
+            crate::index::frag_reuse::OpenPurpose::Maintenance,
+            &NoOpMetricsCollector,
+        )
+        .await?;
         let label_list_index = scalar_index
             .as_any()
             .downcast_ref::<LabelListIndex>()
@@ -135,14 +145,13 @@ pub(in crate::index) async fn merge_segments(
 
     Ok(IndexMetadata {
         uuid: new_uuid,
-        fields: vec![field_id],
         dataset_version: dataset.manifest.version,
         fragment_bitmap: Some(fragment_bitmap),
         index_details: Some(Arc::new(created_index.index_details)),
         index_version: created_index.index_version as i32,
         created_at: Some(chrono::Utc::now()),
         base_id: None,
-        files: Some(created_index.files),
+        files: Some(index_files_to_table(created_index.files)),
         ..segments[0].clone()
     })
 }

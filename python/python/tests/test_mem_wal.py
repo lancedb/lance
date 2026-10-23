@@ -9,6 +9,7 @@ import lance
 import pyarrow as pa
 import pytest
 from lance.mem_wal import (
+    CompactedSsTable,
     LsmPointLookupPlanner,
     LsmScanner,
     LsmVectorSearchPlanner,
@@ -56,15 +57,15 @@ def _append_only_table(ids, prefix: str) -> pa.Table:
     )
 
 
-def _write_flushed_gen(base_path: str, shard_id: str, gen_folder: str, data: pa.Table):
-    """Write a flushed-generation Lance dataset at the expected sub-path.
+def _write_sstable(base_path: str, shard_id: str, gen_folder: str, data: pa.Table):
+    """Write an SSTable Lance dataset at the expected sub-path.
 
-    The collector resolves flushed generation paths as:
+    The collector resolves SSTable paths as:
         {base_dataset_path}/_mem_wal/{shard_id}/{gen_folder}
 
     Production flush also writes a primary-key dedup sidecar (`_pk_index/`) that
     the LSM scanner opens to dedup across generations; stage it here too so the
-    flushed generation faithfully matches what flush produces.
+    SSTable faithfully matches what flush produces.
     """
     from lance.lance import _write_pk_sidecar
 
@@ -73,17 +74,36 @@ def _write_flushed_gen(base_path: str, shard_id: str, gen_folder: str, data: pa.
     _write_pk_sidecar(gen_path, data, ["id"])
 
 
+def test_mark_sstables_as_compacted(tmp_path):
+    ds_path = str(tmp_path / "base")
+    shard_id = str(uuid.uuid4())
+    dataset = lance.write_dataset(
+        _lookup_table([1, 2, 3], "base"), ds_path, schema=_LOOKUP_SCHEMA
+    )
+    dataset.initialize_mem_wal()
+
+    (
+        dataset.merge_insert("id")
+        .when_matched_update_all()
+        .when_not_matched_insert_all()
+        .mark_sstables_as_compacted([CompactedSsTable(shard_id, 1)])
+        .execute(_lookup_table([2, 4], "compacted"))
+    )
+
+    assert dataset.count_rows() == 4
+
+
 def test_point_lookup_with_memtables(tmp_path):
     """
-    Lookup against a base table that has one flushed generation containing an
-    update.  The flushed version must win over the base table version.
+    Lookup against a base table that has one SSTable containing an
+    update.  The SSTable version must win over the base table version.
 
     Setup
     -----
     base   : ids [1, 2, 3]  names ["base_1",  "base_2",  "base_3"]
     gen_1  : ids [2]        names ["gen1_2"]          ← update to id=2
 
-    ShardSnapshot: flushed_generation(gen=1, path="gen_1"), current_generation=2
+    ShardSnapshot: sstable(gen=1, path="gen_1"), current_generation=2
     """
     ds_path = str(tmp_path / "base")
     shard_id = str(uuid.uuid4())
@@ -94,28 +114,25 @@ def test_point_lookup_with_memtables(tmp_path):
     )
     base_ds.initialize_mem_wal()
 
-    # --- Flushed generation: overwrites id=2 ---
-    _write_flushed_gen(ds_path, shard_id, "gen_1", _lookup_table([2], "gen1"))
+    # --- SSTable: overwrites id=2 ---
+    _write_sstable(ds_path, shard_id, "gen_1", _lookup_table([2], "gen1"))
 
-    # --- ShardSnapshot describing the flushed state ---
-    snap = (
-        ShardSnapshot(shard_id)
-        .with_flushed_generation(1, "gen_1")
-        .with_current_generation(2)
-    )
+    # --- ShardSnapshot describing the SSTable state ---
+    snap = ShardSnapshot(shard_id).with_sstable(1, "gen_1").with_current_generation(2)
 
     planner = LsmPointLookupPlanner(base_ds, [snap])
     assert not hasattr(planner, "lookup")
 
-    # id=2 must return the flushed version
+    # id=2 must return the SSTable version
     plan = planner.plan_lookup(pa.array([2], type=pa.int64()))
     assert plan.schema.names == ["id", "name"]
     assert plan.dataset_schema.names == ["id", "name"]
-    assert "Take" in plan.explain() or "Scan" in plan.explain()
+    explained = plan.explain()
+    assert "Take" in explained or "Scan" in explained or "LanceRead" in explained
     result = plan.to_table()
     assert len(result) == 1, "Expected exactly one row for id=2"
     assert result.column("name")[0].as_py() == "gen1_2", (
-        "Flushed generation must win over base table"
+        "SSTable must win over base table"
     )
 
     # id=1 is only in the base table
@@ -146,13 +163,9 @@ def test_lsm_scanner_with_memtables(tmp_path):
     )
     base_ds.initialize_mem_wal()
 
-    _write_flushed_gen(ds_path, shard_id, "gen_1", _lookup_table([2], "gen1"))
+    _write_sstable(ds_path, shard_id, "gen_1", _lookup_table([2], "gen1"))
 
-    snap = (
-        ShardSnapshot(shard_id)
-        .with_flushed_generation(1, "gen_1")
-        .with_current_generation(2)
-    )
+    snap = ShardSnapshot(shard_id).with_sstable(1, "gen_1").with_current_generation(2)
 
     scanner = LsmScanner.from_snapshots(base_ds, [snap])
     table = scanner.to_table()
@@ -161,7 +174,7 @@ def test_lsm_scanner_with_memtables(tmp_path):
     name_by_id = {row["id"]: row["name"] for row in table.to_pylist()}
 
     assert name_by_id[1] == "base_1"
-    assert name_by_id[2] == "gen1_2", "Flushed gen must overwrite base for id=2"
+    assert name_by_id[2] == "gen1_2", "SSTable gen must overwrite base for id=2"
     assert name_by_id[3] == "base_3"
 
     offset_table = (
@@ -170,7 +183,33 @@ def test_lsm_scanner_with_memtables(tmp_path):
     assert len(offset_table) == 2, "Offset-only LSM scan should not require a limit"
 
 
-def test_shard_writer_lsm_scanner_includes_own_flushed_generations(tmp_path):
+def test_lsm_scanner_json_column(tmp_path):
+    """Every LsmScanner read method returns a JSON column as Arrow JSON, the
+    same as Dataset.to_table, not as Lance's stored JSONB bytes."""
+    schema = pa.schema(
+        [
+            pa.field("id", pa.int64(), nullable=False, metadata=_PK_META),
+            pa.field("doc", pa.json_(pa.utf8())),
+        ]
+    )
+    docs = pa.array(['{"a": 1}', '{"b": 2}'], pa.json_(pa.utf8()))
+    data = pa.table({"id": pa.array([1, 2], pa.int64()), "doc": docs}, schema=schema)
+    base_ds = lance.write_dataset(data, str(tmp_path / "base"), schema=schema)
+    base_ds.initialize_mem_wal()
+    snap = ShardSnapshot(str(uuid.uuid4())).with_current_generation(1)
+
+    expected = base_ds.to_table().sort_by("id")
+    assert expected.schema.field("doc").type == pa.json_(pa.utf8())
+
+    def scanner():
+        return LsmScanner.from_snapshots(base_ds, [snap])
+
+    assert scanner().to_table().sort_by("id") == expected
+    assert pa.Table.from_batches(scanner().to_batches()).sort_by("id") == expected
+    assert scanner().count_rows() == 2
+
+
+def test_shard_writer_lsm_scanner_includes_own_sstables(tmp_path):
     ds_path = str(tmp_path / "base")
     shard_id = str(uuid.uuid4())
     ds = lance.write_dataset(_lookup_table([0], "base"), ds_path, schema=_LOOKUP_SCHEMA)
@@ -192,7 +231,7 @@ def test_shard_writer_lsm_scanner_includes_own_flushed_generations(tmp_path):
             if name_by_id.get(1) == "writer_1" and name_by_id.get(2) == "writer_2":
                 break
             if time.time() >= deadline:
-                assert False, "writer.lsm_scanner() did not include flushed writer rows"
+                assert False, "writer.lsm_scanner() did not include SSTable writer rows"
             time.sleep(0.05)
 
 
@@ -209,7 +248,6 @@ def test_shard_writer_delete_binding_masks_base_row(tmp_path):
     with ds.mem_wal_writer(
         shard_id,
         durable_write=True,
-        sync_indexed_write=True,
         max_wal_buffer_size=1,
         max_wal_flush_interval_ms=10,
     ) as writer:
@@ -333,7 +371,7 @@ def test_shard_writer_e2e_correctness(tmp_path):
     End-to-end correctness test for ShardWriter covering:
     - Multi-round writes that trigger WAL and MemTable flushes
     - File-system layout verification (_mem_wal/<shard_id>/wal/ and manifest/)
-    - Flushed generation data readable via LsmScanner
+    - SSTable data readable via LsmScanner
     - New writer created after close can write and scan correctly
 
     Mirrors Rust test: shard_writer_tests::test_shard_writer_e2e_correctness
@@ -355,7 +393,6 @@ def test_shard_writer_e2e_correctness(tmp_path):
     writer = ds.mem_wal_writer(
         shard_id,
         durable_write=True,
-        sync_indexed_write=True,
         max_wal_buffer_size=10 * 1024,  # 10 KB
         max_wal_flush_interval_ms=50,
         max_memtable_size=80,  # flush after ~80 rows
@@ -381,6 +418,9 @@ def test_shard_writer_e2e_correctness(tmp_path):
     assert closed_memtable_stats["row_count"] == 0
     assert closed_memtable_stats["batch_count"] == 0
     assert closed_memtable_stats["generation"] >= 1
+    assert "frozen_count" in closed_memtable_stats
+    # close() flushes every frozen memtable, so nothing is still owed to flush.
+    assert closed_memtable_stats["frozen_bytes"] == 0
 
     # === File-system layout ===
     mem_wal_dir = os.path.join(ds_path, "_mem_wal", shard_id)
@@ -405,9 +445,7 @@ def test_shard_writer_e2e_correctness(tmp_path):
     # === New writer: write and read back via active MemTable scanner ===
     ds2 = lance.dataset(ds_path)
     shard_id2 = str(uuid.uuid4())
-    with ds2.mem_wal_writer(
-        shard_id2, durable_write=False, sync_indexed_write=True
-    ) as writer2:
+    with ds2.mem_wal_writer(shard_id2, durable_write=False) as writer2:
         verify_batch = _e2e_batch(schema, start_id=10000, num_rows=10)
         writer2.put(pa.Table.from_batches([verify_batch]))
         result = writer2.lsm_scanner().to_table()
@@ -438,6 +476,7 @@ def test_initialize_mem_wal_manual(tmp_path):
     assert details["num_shards"] == 0
     assert details["sharding_specs"] == []
     assert details["maintained_indexes"] == []
+    assert details["maintain_all_indexes"] is True
     assert details["writer_config_defaults"] == {}
 
 
@@ -505,7 +544,29 @@ def test_initialize_mem_wal_maintained_indexes(tmp_path):
     ds.create_scalar_index("id", "BTREE", name="id_btree")
     ds.initialize_mem_wal(maintained_indexes=["id_btree"])
 
-    assert ds.mem_wal_index_details()["maintained_indexes"] == ["id_btree"]
+    details = ds.mem_wal_index_details()
+    assert details["maintained_indexes"] == ["id_btree"]
+    assert details["maintain_all_indexes"] is False
+
+
+def test_initialize_mem_wal_maintains_none_and_all_differently(tmp_path):
+    # Both leave maintained_indexes empty, so the flag is the only thing
+    # separating "every index the table has" from "no index at all".
+    ds = _mem_wal_dataset(tmp_path)
+    ds.create_scalar_index("id", "BTREE", name="id_btree")
+    ds.initialize_mem_wal(maintained_indexes=[])
+
+    details = ds.mem_wal_index_details()
+    assert details["maintained_indexes"] == []
+    assert details["maintain_all_indexes"] is False
+
+    all_ds = _mem_wal_dataset(tmp_path, "all")
+    all_ds.create_scalar_index("id", "BTREE", name="id_btree")
+    all_ds.initialize_mem_wal()
+
+    all_details = all_ds.mem_wal_index_details()
+    assert all_details["maintained_indexes"] == []
+    assert all_details["maintain_all_indexes"] is True
 
 
 def test_initialize_mem_wal_writer_config_defaults(tmp_path):
@@ -522,7 +583,6 @@ def test_initialize_mem_wal_writer_config_defaults(tmp_path):
     # Duration knobs are recorded in milliseconds with a `_ms` suffix.
     assert defaults["max_wal_flush_interval_ms"] == "250"
     # Every ShardWriterConfig tunable is recorded once any default is set.
-    assert "sync_indexed_write" in defaults
     assert "enable_memtable" in defaults
 
 
