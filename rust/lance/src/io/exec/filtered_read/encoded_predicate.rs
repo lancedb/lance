@@ -297,6 +297,21 @@ impl FilteredReadStream {
         if predicate.column.contains('.') {
             return Ok(None);
         }
+        // Avoid metadata and sampling I/O when even one matching range cannot fit
+        // the most generous non-constant encoding budget. Tiny reads are cheaper
+        // through the ordinary reader, which can coalesce the projected columns.
+        let candidate_rows = total_range_rows(&fragment_read_task.ranges);
+        if mode == EncodedPredicateMode::Auto
+            && (candidate_rows == 0
+                || !encoded_predicate_auto_accepts(
+                    PrimitivePredicateEncoding::Rle,
+                    candidate_rows,
+                    1,
+                    1,
+                ))
+        {
+            return Ok(None);
+        }
         // Predicate range reads bypass deletion handling. Preserve the ordinary
         // fragment reader's tombstone semantics whenever deleted rows are requested.
         if fragment_read_task.with_deleted_rows
@@ -512,10 +527,11 @@ mod tests {
     use super::*;
     use crate::Dataset;
     use crate::dataset::WriteParams;
+    use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
     use arrow_array::cast::AsArray;
     use arrow_array::{
         Array, Int32Array, RecordBatch, RecordBatchIterator, UInt32Array, UInt64Array,
-        types::UInt64Type,
+        types::{UInt32Type, UInt64Type},
     };
     use arrow_schema::Schema as ArrowSchema;
     use arrow_select::concat::concat_batches;
@@ -525,6 +541,7 @@ mod tests {
     use futures::TryStreamExt;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datafusion::planner::Planner;
+    use lance_datagen::{array, gen_batch};
     use rstest::rstest;
     #[rstest]
     #[case::eq(Operator::Eq, ComparisonOperator::Equal)]
@@ -880,6 +897,44 @@ mod tests {
         assert!(actual.iter().any(|row| row % 3 == 0));
         assert_eq!(metrics.encoded_predicate_attempts.value(), 0);
         assert_eq!(metrics.encoded_predicate_applied.value(), 0);
+    }
+
+    #[rstest]
+    #[case::one_row(1, 0)]
+    #[case::update_sized(10, 0)]
+    #[case::below_minimum_budget(1_281, 0)]
+    #[case::minimum_budget(1_282, 2)]
+    #[tokio::test]
+    async fn test_encoded_predicate_auto_skips_unaffordable_probes(
+        #[case] rows_per_fragment: u32,
+        #[case] expected_attempts: usize,
+    ) {
+        let dataset = Arc::new(
+            gen_batch()
+                .col("predicate", array::step::<UInt32Type>())
+                .col("payload", array::step::<UInt64Type>())
+                .into_dataset_with_params(
+                    "memory://",
+                    FragmentCount::from(2),
+                    FragmentRowCount::from(rows_per_fragment),
+                    Some(WriteParams {
+                        max_rows_per_file: rows_per_fragment as usize,
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .unwrap(),
+        );
+        let (rows, metrics) = execute_encoded_predicate_test_scan(dataset, "predicate = 0").await;
+        assert_eq!(rows, 1);
+        assert_eq!(
+            metric_value(&metrics, "encoded_predicate_attempts"),
+            expected_attempts
+        );
+        if expected_attempts == 0 {
+            assert_eq!(metric_value(&metrics, "encoded_predicate_sample_rows"), 0);
+            assert_eq!(metric_value(&metrics, "encoded_predicate_rows_scanned"), 0);
+        }
     }
 
     #[tokio::test]
