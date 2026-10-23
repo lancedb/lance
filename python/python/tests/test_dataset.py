@@ -3063,7 +3063,10 @@ def test_merge_insert_subcols_preserves_nested_blob(tmp_path: Path, container: s
     "base_version,patch_version",
     [("2.0", "2.2"), ("2.2", "2.0"), ("2.1", "2.3"), ("2.3", "2.1")],
 )
-def test_merge_insert_subcols_in_place(tmp_path: Path, base_version, patch_version):
+@pytest.mark.parametrize("has_row_id_index", [False, True])
+def test_merge_insert_subcols_in_place(
+    tmp_path: Path, base_version, patch_version, has_row_id_index
+):
     """`write_mode("rewrite_columns")` patches the source columns into the
     fragments that already hold the matched rows.
 
@@ -3084,7 +3087,11 @@ def test_merge_insert_subcols_in_place(tmp_path: Path, base_version, patch_versi
         tmp_path / "dataset",
         max_rows_per_file=5,
         data_storage_version=base_version,
+        enable_stable_row_ids=has_row_id_index,
     )
+    if has_row_id_index:
+        dataset.create_scalar_index("_rowid", "BTREE", name="row_ids")
+    original = lance.dataset(dataset.uri, version=dataset.version)
     fragments_before = [f.fragment_id for f in dataset.get_fragments()]
 
     new_values = pa.table(
@@ -3122,6 +3129,10 @@ def test_merge_insert_subcols_in_place(tmp_path: Path, base_version, patch_versi
         expected.filter(pc.greater_equal(expected["b"], 20)).select(["c", "b", "a"])
     )
     assert dataset.take([9, 3, 0, 4, 3]) == expected.take([9, 3, 0, 4, 3])
+    assert original.to_table() == initial_data
+    if has_row_id_index:
+        assert dataset._take_rows([9, 3, 0, 4, 3]) == expected.take([9, 3, 0, 4, 3])
+        assert original._take_rows([3, 4]) == initial_data.take([3, 4])
 
     # Patching columns cannot add rows, so asking for it explicitly on a merge
     # that also inserts is rejected rather than quietly rewriting whole rows.

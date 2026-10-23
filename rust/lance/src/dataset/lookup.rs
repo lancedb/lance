@@ -3,6 +3,7 @@
 
 //! Ordered, deletion-aware lookup of unique keys through ordinary scalar indices.
 
+mod capture;
 mod uint64;
 
 use std::collections::{BTreeMap, HashMap};
@@ -220,6 +221,45 @@ impl PreparedLookup {
         }
         matches
     }
+
+    /// Resolve just the indexed and inline fragments. Bulk captures call this
+    /// with bounded batches and scan the disjoint uncovered fragments once.
+    async fn lookup_indexed(
+        &self,
+        dataset: &Dataset,
+        column: &str,
+        keys: &dyn Array,
+    ) -> Result<Vec<Option<RowAddress>>> {
+        let mut addresses = vec![None; keys.len()];
+        dataset
+            .assign_lookup_matches(&mut addresses, self.lookup_ranges(keys), column)
+            .await?;
+        for segment in &self.segments {
+            let index = segment
+                .index
+                .get_or_try_init(|| {
+                    open_scalar_index(dataset, column, &segment.metadata, &NoOpMetricsCollector)
+                })
+                .await?;
+            let matches = index.lookup(keys, &NoOpMetricsCollector).await?;
+            let mut live = Vec::with_capacity(matches.key_indices.len());
+            for (key, address) in matches.key_indices.iter().zip(matches.row_ids.iter()) {
+                let (Some(key), Some(address)) = (key, address) else {
+                    return Err(Error::index(
+                        "Scalar lookup returned a null key position or address",
+                    ));
+                };
+                let address = RowAddress::from(address);
+                if segment.coverage.contains(address.fragment_id()) {
+                    live.push((key as usize, address));
+                }
+            }
+            dataset
+                .assign_lookup_matches(&mut addresses, live, column)
+                .await?;
+        }
+        Ok(addresses)
+    }
 }
 
 /// Only decode a bounded amount of inline metadata. Large arrays, sparse
@@ -287,39 +327,14 @@ impl Dataset {
                 keys.len()
             )));
         }
-        let mut addresses = vec![None; keys.len()];
         if keys.len() == keys.null_count() {
-            return Ok(addresses);
+            return Ok(vec![None; keys.len()]);
         }
         let cell = self.lookup_cache.plan(self, column)?;
         let plan = cell
             .get_or_try_init(|| PreparedLookup::new(self, column, field_id))
             .await?;
-        self.assign_lookup_matches(&mut addresses, plan.lookup_ranges(keys), column)
-            .await?;
-        for segment in &plan.segments {
-            let index = segment
-                .index
-                .get_or_try_init(|| {
-                    open_scalar_index(self, column, &segment.metadata, &NoOpMetricsCollector)
-                })
-                .await?;
-            let matches = index.lookup(keys, &NoOpMetricsCollector).await?;
-            let mut live = Vec::with_capacity(matches.key_indices.len());
-            for (key, address) in matches.key_indices.iter().zip(matches.row_ids.iter()) {
-                let (Some(key), Some(address)) = (key, address) else {
-                    return Err(Error::index(
-                        "Scalar lookup returned a null key position or address",
-                    ));
-                };
-                let address = RowAddress::from(address);
-                if segment.coverage.contains(address.fragment_id()) {
-                    live.push((key as usize, address));
-                }
-            }
-            self.assign_lookup_matches(&mut addresses, live, column)
-                .await?;
-        }
+        let mut addresses = plan.lookup_indexed(self, column, keys).await?;
         if plan.uncovered.is_empty() {
             return Ok(addresses);
         }

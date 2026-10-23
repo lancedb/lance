@@ -503,7 +503,19 @@ fn block_stale_rows(
         Some(OldIndexDataFilter::RowIds(valid)) => {
             Some(OldIndexDataFilter::RowIds(valid - stale_rows))
         }
-        other => other,
+        Some(OldIndexDataFilter::RowAddresses {
+            to_keep,
+            to_remove,
+            mut deleted_rows,
+        }) => {
+            deleted_rows |= stale_rows;
+            Some(OldIndexDataFilter::RowAddresses {
+                to_keep,
+                to_remove,
+                deleted_rows,
+            })
+        }
+        other @ (None | Some(OldIndexDataFilter::Fragments { .. })) => other,
     }
 }
 

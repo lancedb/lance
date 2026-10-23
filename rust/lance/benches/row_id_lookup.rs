@@ -17,6 +17,12 @@
 //! already been read. Each result is checked against the other implementation.
 //! The report also includes BTree bytes/row and the reverse index's retained
 //! deep size; these are different resources, not a memory savings comparison.
+//!
+//! `ROW_ID_LOOKUP_CAPTURE_ROWS` instead benchmarks preparing a predicate delete
+//! of this many rows from a real dataset twice that size. Input is streamed in
+//! fixed batches. Timing includes scanning, capture resolution and deletion-file
+//! writing, but excludes dataset creation and transaction publication. Run each
+//! revision in a fresh process to compare whole-process peak RSS externally.
 
 #![allow(clippy::print_stdout)]
 
@@ -32,12 +38,13 @@ use lance::dataset::rowids::{
     INLINE_ROW_LINEAGE_MAX_BYTES_CONFIG_KEY, SPILL_ROW_LINEAGE_CONFIG_KEY, get_row_id_index,
     row_ids_to_row_addrs,
 };
-use lance::dataset::{CommitBuilder, InsertBuilder, WriteMode, WriteParams};
+use lance::dataset::{CommitBuilder, DeleteBuilder, InsertBuilder, WriteMode, WriteParams};
 use lance::index::DatasetIndexExt;
 use lance_core::ROW_ID;
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::tempfile::TempStrDir;
 use lance_index::{IndexType, scalar::ScalarIndexParams};
+use lance_select::RowSetOps;
 use lance_table::format::{ROW_ID_FIELD_ID, RowIdMeta};
 use lance_table::rowids::{RowIdSequence, write_row_ids};
 use lance_table::transaction::{Operation, RewriteGroup, TransactionBuilder};
@@ -271,7 +278,75 @@ async fn build_table(uri: &str, total_rows: usize, shuffled: bool, scenario: Sce
     dataset
 }
 
+fn bench_capture(criterion: &mut Criterion, rows: u64) {
+    assert!(
+        rows > 0 && rows <= u32::MAX as u64 / 2,
+        "capture rows must be in 1..=u32::MAX/2, got {rows}"
+    );
+    let runtime = Runtime::new().unwrap();
+    let directory = TempStrDir::default();
+    let total_rows = rows * 2;
+    let schema = record_batch!(("i", UInt64, [0])).unwrap().schema();
+    let batches = (0..total_rows).step_by(8192).map(move |start| {
+        record_batch!((
+            "i",
+            UInt64,
+            (start..(start + 8192).min(total_rows)).collect::<Vec<_>>()
+        ))
+    });
+    let input = RecordBatchIterator::new(batches, schema);
+    let dataset = Arc::new(
+        runtime
+            .block_on(Dataset::write(
+                input,
+                directory.as_ref(),
+                Some(WriteParams {
+                    enable_stable_row_ids: true,
+                    max_rows_per_file: total_rows as usize,
+                    max_rows_per_group: 8192,
+                    ..Default::default()
+                }),
+            ))
+            .unwrap(),
+    );
+    assert_eq!(dataset.fragments().len(), 1);
+    let deletion = runtime
+        .block_on(DeleteBuilder::new(dataset.clone(), "i % 2 = 0").execute_uncommitted())
+        .unwrap();
+    assert_eq!(deletion.num_deleted_rows, rows);
+    let affected = deletion.affected_rows.as_ref().unwrap();
+    assert_eq!(affected.len(), Some(rows));
+    assert!(affected.contains(0));
+    assert!(affected.contains(total_rows - 2));
+    assert!(!affected.contains(1));
+    drop(deletion);
+    let mut group = criterion.benchmark_group("row_id_capture/delete");
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_secs(1));
+    group.measurement_time(Duration::from_secs(2));
+    group.bench_function(BenchmarkId::from_parameter(rows), |bench| {
+        bench.iter(|| {
+            std::hint::black_box(
+                runtime
+                    .block_on(
+                        DeleteBuilder::new(dataset.clone(), "i % 2 = 0").execute_uncommitted(),
+                    )
+                    .unwrap(),
+            )
+        });
+    });
+    group.finish();
+}
+
 fn bench_row_id_lookup(criterion: &mut Criterion) {
+    if let Ok(rows) = std::env::var("ROW_ID_LOOKUP_CAPTURE_ROWS") {
+        bench_capture(
+            criterion,
+            rows.parse()
+                .expect("ROW_ID_LOOKUP_CAPTURE_ROWS must be an integer"),
+        );
+        return;
+    }
     let rows = std::env::var("ROW_ID_LOOKUP_ROWS").map_or(100_000, |value| {
         value
             .parse::<usize>()
