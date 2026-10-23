@@ -128,10 +128,9 @@ impl LogicalScalarIndex {
                 name, column
             )));
         }
-        if segments
-            .iter()
-            .any(|segment| segment.results_are_row_addresses() != first.results_are_row_addresses())
-        {
+        if segments.iter().any(|(_, segment)| {
+            segment.results_are_row_addresses() != first.results_are_row_addresses()
+        }) {
             return Err(Error::invalid_input(format!(
                 "LogicalScalarIndex '{}' on column '{}' mixes row-ID and row-address segments; \
                  rebuild every segment in one commit",
@@ -575,12 +574,16 @@ mod tests {
             .unwrap();
         assert!(current_index.results_are_row_addresses());
 
-        let mut segments = vec![legacy_index, current_index];
+        let mut segments = vec![
+            (legacy.clone(), legacy_index),
+            (current[1].clone(), current_index),
+        ];
         if reverse {
             segments.reverse();
         }
         let error =
-            LogicalScalarIndex::try_new("value_idx".into(), "value".into(), segments).unwrap_err();
+            LogicalScalarIndex::try_new(&dataset, "value_idx".into(), "value".into(), segments)
+                .unwrap_err();
         assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
         assert!(error.to_string().contains("mixes row-ID and row-address"));
     }
