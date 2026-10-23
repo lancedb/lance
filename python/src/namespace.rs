@@ -33,8 +33,8 @@ use lance_namespace_impls::{
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
 use pythonize::{depythonize, pythonize};
-use serde::de::DeserializeOwned;
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 
 use crate::error::PythonErrorExt;
 use crate::session::Session;
@@ -1471,8 +1471,7 @@ impl PyRestNamespace {
         py: Python<'py>,
         request: &Bound<'_, PyAny>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let (typed, extra): (RefreshMaterializedViewRequest, _) =
-            depythonize_with_extras(request)?;
+        let (typed, extra): (RefreshMaterializedViewRequest, _) = depythonize_with_extras(request)?;
         let response = crate::rt()
             .block_on(
                 Some(py),
