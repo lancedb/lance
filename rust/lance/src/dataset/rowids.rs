@@ -8,6 +8,7 @@ use super::Dataset;
 use crate::io::deletion::read_dataset_deletion_file;
 use crate::session::caches::{RowIdIndexKey, RowIdSequenceKey, RowVersionSequenceKey};
 use crate::{Error, Result};
+use arrow_array::UInt64Array;
 use futures::{Stream, StreamExt, TryFutureExt, TryStreamExt};
 use lance_core::utils::{address::RowAddress, deletion::DeletionVector};
 use lance_select::{RowAddrSelection, RowAddrTreeMap};
@@ -202,6 +203,13 @@ pub fn load_row_id_sequences<'a>(
         .buffer_unordered(dataset.object_store.io_parallelism())
 }
 
+/// Build the legacy in-memory reverse index explicitly.
+///
+/// This API remains available for callers that need the complete mapping.
+/// Normal live-row reads and writes use [`row_ids_to_row_addrs`] instead, which
+/// resolves batches through an ordinary BTree without building this map. Explicit
+/// takes that ignore deletions retain sequence-based resolution for stored rows
+/// that index maintenance may already have removed from the BTree.
 pub async fn get_row_id_index(dataset: &Dataset) -> Result<Option<Arc<RowIdIndex>>> {
     get_row_id_index_with(dataset, true).await
 }
@@ -238,6 +246,35 @@ pub(crate) async fn get_row_id_index_with(
         .get_or_insert_with_key(key, || load_row_id_index(dataset, with_deletions))
         .await?;
     Ok(Some(index))
+}
+
+/// Resolve row IDs to live addresses, preserving order, duplicates, and misses.
+///
+/// Stable IDs use compact inline ranges directly, an ordinary BTree on `_rowid`
+/// for other covered fragments, and a column scan for the remainder. Null,
+/// missing, and deleted stable IDs
+/// yield `None`. Without stable IDs, each non-null ID is already an address
+/// and is returned unchanged; the caller applies physical deletion filtering.
+///
+/// ```
+/// # use arrow_array::UInt64Array;
+/// # use lance::{Dataset, Result, dataset::rowids::row_ids_to_row_addrs};
+/// # async fn example(dataset: &Dataset) -> Result<()> {
+/// let ids = UInt64Array::from(vec![Some(7), None, Some(7)]);
+/// let addresses = row_ids_to_row_addrs(dataset, &ids).await?;
+/// assert_eq!(addresses[0], addresses[2]);
+/// assert_eq!(addresses[1], None);
+/// # Ok(())
+/// # }
+/// ```
+pub async fn row_ids_to_row_addrs(
+    dataset: &Dataset,
+    row_ids: &UInt64Array,
+) -> Result<Vec<Option<RowAddress>>> {
+    if !dataset.manifest.uses_stable_row_ids() {
+        return Ok(row_ids.iter().map(|id| id.map(RowAddress::from)).collect());
+    }
+    Box::pin(dataset.lookup_row_addresses(lance_core::ROW_ID, row_ids)).await
 }
 
 /// Map a set of physical row addresses to their stable row ids
@@ -303,7 +340,7 @@ pub(crate) async fn translate_addr_treemap_to_row_ids(
 
 /// Resolve row addresses to row ids, positionally: `addr = (fragment << 32) | offset`
 /// looks up `offset` in the fragment's [`RowIdSequence`]. The inverse companion of
-/// [`get_row_id_index`].
+/// [`row_ids_to_row_addrs`].
 ///
 /// Returns one entry per input address, in order. Addresses that no longer
 /// resolve — a missing fragment, an out-of-range offset, or a `None` input —
@@ -514,20 +551,29 @@ mod test {
     use super::*;
 
     use crate::dataset::optimize::{CompactionOptions, compact_files};
-    use crate::index::DatasetIndexExt;
+    use crate::index::optimize::{commit_optimize_indices, plan_optimize_indices};
+    use crate::index::{DatasetIndexExt, DatasetIndexInternalExt, scalar::open_scalar_index};
     use crate::session::Session;
-    use crate::utils::test::{DatagenExt, FailingProxyStore, FragmentCount, FragmentRowCount};
+    use crate::utils::test::{
+        DatagenExt, FailingProxyStore, FragmentCount, FragmentRowCount, copy_test_data_to_tmp,
+    };
     use arrow_array::cast::AsArray;
     use arrow_array::types::{Float32Type, Int32Type, UInt64Type};
-    use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, UInt64Array};
+    use arrow_array::{
+        Array, ArrayRef, Int32Array, RecordBatch, RecordBatchIterator, UInt64Array, record_batch,
+    };
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use futures::Future;
     use lance_core::datatypes::Schema;
     use lance_core::{ROW_ADDR, ROW_ID, utils::address::RowAddress};
-    use lance_datagen::Dimension;
-    use lance_index::{IndexType, scalar::ScalarIndexParams};
+    use lance_datagen::{ArrayGeneratorExt, Dimension};
+    use lance_index::{
+        IndexType, metrics::NoOpMetricsCollector, optimize::OptimizeOptions,
+        scalar::ScalarIndexParams,
+    };
     use lance_io::object_store::ObjectStoreParams;
     use lance_table::rowids::segment::U64Segment;
+    use roaring::RoaringBitmap;
     use std::collections::HashMap;
     use std::collections::HashSet;
 
@@ -540,6 +586,985 @@ mod test {
         RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from_iter_values(values))]).unwrap()
     }
 
+    async fn row_id_lookup_dataset() -> Dataset {
+        lance_datagen::gen_batch()
+            .col("i", lance_datagen::array::step::<Int32Type>())
+            .into_ram_dataset_with_params(
+                FragmentCount::from(3),
+                FragmentRowCount::from(4),
+                Some(WriteParams {
+                    enable_stable_row_ids: true,
+                    max_rows_per_file: 4,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn assert_row_id_lookup_matches_scan(dataset: &Dataset) {
+        let rows = dataset
+            .scan()
+            .with_row_id()
+            .with_row_address()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let ids = rows[ROW_ID].as_primitive::<UInt64Type>();
+        let addresses = rows[ROW_ADDR].as_primitive::<UInt64Type>();
+        let expected: HashMap<_, _> = ids
+            .values()
+            .iter()
+            .copied()
+            .zip(addresses.values().iter().copied().map(RowAddress::from))
+            .collect();
+        let mut keys = (0..dataset.manifest.next_row_id + 1)
+            .rev()
+            .map(Some)
+            .collect::<Vec<_>>();
+        keys.extend([Some(0), None, Some(7)]);
+        let actual = row_ids_to_row_addrs(dataset, &UInt64Array::from(keys.clone()))
+            .await
+            .unwrap();
+        let expected = keys
+            .iter()
+            .map(|key| key.and_then(|key| expected.get(&key).copied()))
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+    }
+
+    async fn assert_row_id_btree_entries_match_scan(dataset: &Dataset) {
+        let keys = UInt64Array::from_iter_values(0..dataset.manifest.next_row_id);
+        let mut actual = Vec::new();
+        for segment in dataset.load_indices_by_name("row_ids").await.unwrap() {
+            let index = open_scalar_index(dataset, ROW_ID, &segment, &NoOpMetricsCollector)
+                .await
+                .unwrap();
+            let matches = index.lookup(&keys, &NoOpMetricsCollector).await.unwrap();
+            actual.extend(
+                matches
+                    .key_indices
+                    .values()
+                    .iter()
+                    .map(|position| u64::from(*position))
+                    .zip(matches.row_ids.values().iter().copied()),
+            );
+        }
+        let scan = dataset
+            .scan()
+            .with_row_id()
+            .with_row_address()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let mut expected = scan[ROW_ID]
+            .as_primitive::<UInt64Type>()
+            .values()
+            .iter()
+            .copied()
+            .zip(
+                scan[ROW_ADDR]
+                    .as_primitive::<UInt64Type>()
+                    .values()
+                    .iter()
+                    .copied(),
+            )
+            .collect::<Vec<_>>();
+        actual.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(
+            actual, expected,
+            "index files must contain exactly the live addresses"
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::unindexed(false)]
+    #[case::indexed(true)]
+    #[tokio::test]
+    async fn test_row_id_btree_lookup_contract(#[case] indexed: bool) {
+        let mut dataset = row_id_lookup_dataset().await;
+        if indexed {
+            dataset
+                .create_index(
+                    &[ROW_ID],
+                    IndexType::BTree,
+                    None,
+                    &ScalarIndexParams::default(),
+                    false,
+                )
+                .await
+                .unwrap();
+            let indices = dataset.load_indices().await.unwrap();
+            assert_eq!(indices[0].fields, vec![ROW_ID_FIELD_ID]);
+            assert!(indices[0].results_are_row_addrs());
+            assert_eq!(
+                dataset.describe_indices(None).await.unwrap()[0].index_type(),
+                "BTree"
+            );
+            dataset.index_statistics(&indices[0].name).await.unwrap();
+            dataset.scalar_index_info().await.unwrap();
+        }
+        assert!(dataset.schema().field(ROW_ID).is_none());
+        let keys = UInt64Array::from(vec![Some(9), Some(1), None, Some(9), Some(20)]);
+        let failing = Arc::new(FailingProxyStore::new());
+        failing.fail_when("get_opts", "", "compact ranges must not perform IO");
+        let metadata_only = dataset.with_object_store_wrappers([
+            failing as Arc<dyn lance_io::object_store::WrappingObjectStore>
+        ]);
+        assert_eq!(
+            row_ids_to_row_addrs(&metadata_only, &keys).await.unwrap(),
+            vec![
+                Some(RowAddress::new_from_parts(2, 1)),
+                Some(RowAddress::new_from_parts(0, 1)),
+                None,
+                Some(RowAddress::new_from_parts(2, 1)),
+                None
+            ],
+        );
+        assert_eq!(
+            row_ids_to_row_addrs(&dataset, &keys).await.unwrap(),
+            vec![
+                Some(RowAddress::new_from_parts(2, 1)),
+                Some(RowAddress::new_from_parts(0, 1)),
+                None,
+                Some(RowAddress::new_from_parts(2, 1)),
+                None,
+            ]
+        );
+        assert!(
+            row_ids_to_row_addrs(&dataset, &UInt64Array::from(Vec::<u64>::new()))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            row_ids_to_row_addrs(&dataset, &UInt64Array::from(vec![None, None]))
+                .await
+                .unwrap(),
+            vec![None, None]
+        );
+        let taken = dataset
+            .take_rows(&[9, 1, 9], dataset.schema().clone())
+            .await
+            .unwrap();
+        assert_eq!(taken["i"].as_primitive::<Int32Type>().values(), &[9, 1, 9]);
+
+        let before_delete = dataset.clone();
+        dataset.delete("i = 1").await.unwrap();
+        assert_row_id_lookup_matches_scan(&dataset).await;
+        assert_eq!(
+            row_ids_to_row_addrs(&before_delete, &keys).await.unwrap()[1],
+            Some(RowAddress::new_from_parts(0, 1))
+        );
+        assert_eq!(
+            row_ids_to_row_addrs(&dataset, &keys).await.unwrap()[1],
+            None
+        );
+        assert_eq!(
+            dataset.load_indices().await.unwrap().len(),
+            usize::from(indexed)
+        );
+        assert_eq!(
+            dataset.filter_deleted_ids(&[9, 1, 9, 20]).await.unwrap(),
+            vec![9, 9]
+        );
+        // An index with reserved field ID -3 must not break unrelated filters.
+        assert_eq!(
+            dataset
+                .scan()
+                .filter("i >= 8")
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap()
+                .num_rows(),
+            4
+        );
+    }
+
+    #[tokio::test]
+    async fn test_inline_range_lookup_offsets_and_snapshot_changes() {
+        let mut dataset = row_id_lookup_dataset().await;
+        let keys = UInt64Array::from(vec![Some(0), Some(100), Some(101), Some(2), None]);
+        let original = row_ids_to_row_addrs(&dataset, &keys).await.unwrap();
+        let old_snapshot = dataset.clone();
+        let mut sequence = RowIdSequence::from(100..102);
+        sequence.extend(RowIdSequence::from(0..2));
+        let manifest = Arc::make_mut(&mut dataset.manifest);
+        Arc::make_mut(&mut manifest.fragments)[0].row_id_meta = Some(RowIdMeta::Inline(
+            lance_table::rowids::write_row_ids(&sequence).into(),
+        ));
+        assert_eq!(
+            row_ids_to_row_addrs(&dataset, &keys).await.unwrap(),
+            vec![
+                Some(RowAddress::new_from_parts(0, 2)),
+                Some(RowAddress::new_from_parts(0, 0)),
+                Some(RowAddress::new_from_parts(0, 1)),
+                None,
+                None
+            ],
+        );
+        assert_eq!(
+            row_ids_to_row_addrs(&old_snapshot, &keys).await.unwrap(),
+            original
+        );
+
+        let manifest = Arc::make_mut(&mut dataset.manifest);
+        Arc::make_mut(&mut manifest.fragments)[1].row_id_meta = Some(RowIdMeta::Inline(
+            lance_table::rowids::write_row_ids(&RowIdSequence::from(0..4)).into(),
+        ));
+        let error = row_ids_to_row_addrs(&dataset, &keys).await.unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("not unique for key at position 0")
+        );
+        assert_eq!(
+            row_ids_to_row_addrs(&dataset, &UInt64Array::from(vec![9]))
+                .await
+                .unwrap(),
+            vec![Some(RowAddress::new_from_parts(2, 1))]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_row_id_btree_partial_coverage_and_optimize() {
+        let mut dataset = row_id_lookup_dataset().await;
+        let params = ScalarIndexParams::default();
+        dataset
+            .create_index_builder(&[ROW_ID], IndexType::BTree, &params)
+            .fragments(vec![0, 1])
+            .name("row_ids".into())
+            .await
+            .unwrap();
+        assert_row_id_lookup_matches_scan(&dataset).await;
+        let appended = lance_datagen::gen_batch()
+            .col("i", lance_datagen::array::step_custom::<Int32Type>(12, 1))
+            .into_reader_rows(4.into(), 1.into());
+        dataset.append(appended, None).await.unwrap();
+        assert_row_id_lookup_matches_scan(&dataset).await;
+        dataset.optimize_indices(&Default::default()).await.unwrap();
+        assert_row_id_lookup_matches_scan(&dataset).await;
+        let indices = dataset.load_indices().await.unwrap();
+        let covered: roaring::RoaringBitmap = indices
+            .iter()
+            .flat_map(|index| {
+                index
+                    .fragment_bitmap
+                    .iter()
+                    .flat_map(|bitmap| bitmap.iter())
+            })
+            .collect();
+        assert_eq!(&covered, dataset.fragment_bitmap().as_ref());
+    }
+
+    #[tokio::test]
+    async fn test_row_id_btree_optimize_prunes_deleted_addresses() {
+        let mut dataset = row_id_lookup_dataset().await;
+        dataset
+            .create_index(
+                &[ROW_ID],
+                IndexType::BTree,
+                Some("row_ids".into()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        let before_update = dataset.clone();
+        let update = UpdateBuilder::new(Arc::new(dataset))
+            .update_where("i = 5")
+            .unwrap()
+            .set("i", "100")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+        dataset = Arc::try_unwrap(update.new_dataset).unwrap();
+        dataset.delete("i = 1").await.unwrap();
+        dataset
+            .optimize_indices(&OptimizeOptions::append())
+            .await
+            .unwrap();
+        let segments = dataset.load_indices_by_name("row_ids").await.unwrap();
+        assert_eq!(segments.len(), 2);
+        dataset
+            .optimize_indices(&OptimizeOptions::merge(segments.len()))
+            .await
+            .unwrap();
+
+        let segments = dataset.load_indices_by_name("row_ids").await.unwrap();
+        assert_eq!(segments.len(), 1);
+        assert_row_id_btree_entries_match_scan(&dataset).await;
+        assert_row_id_lookup_matches_scan(&dataset).await;
+        assert_row_id_lookup_matches_scan(&before_update).await;
+    }
+
+    #[tokio::test]
+    async fn test_row_id_btree_distributed_build_and_optimize() {
+        let mut dataset = row_id_lookup_dataset().await;
+        let source = dataset.clone();
+        let params = ScalarIndexParams::default();
+        let mut segments = Vec::new();
+        for fragment_id in 0..3 {
+            let mut worker = source.clone();
+            let segment = worker
+                .create_index_builder(&[ROW_ID], IndexType::BTree, &params)
+                .name("row_ids".into())
+                .fragments(vec![fragment_id])
+                .execute_uncommitted()
+                .await
+                .unwrap();
+            assert_eq!(segment.fields, vec![ROW_ID_FIELD_ID]);
+            assert!(segment.results_are_row_addrs());
+            segments.push(segment);
+        }
+        assert!(source.load_indices().await.unwrap().is_empty());
+
+        // A write after the workers' snapshot must remain outside their coverage.
+        dataset
+            .append(
+                lance_datagen::gen_batch()
+                    .col("i", lance_datagen::array::step_custom::<Int32Type>(12, 1))
+                    .into_reader_rows(4.into(), 1.into()),
+                None,
+            )
+            .await
+            .unwrap();
+        dataset
+            .commit_existing_index_segments("row_ids", ROW_ID, segments)
+            .await
+            .unwrap();
+        let segments = dataset.load_indices_by_name("row_ids").await.unwrap();
+        assert_eq!(segments.len(), 3);
+        let coverage = segments
+            .iter()
+            .flat_map(|segment| segment.fragment_bitmap.as_ref().unwrap().iter())
+            .collect::<RoaringBitmap>();
+        assert_eq!(coverage, RoaringBitmap::from_iter([0, 1, 2]));
+        assert_row_id_lookup_matches_scan(&dataset).await;
+
+        let options = OptimizeOptions::merge(3)
+            .max_rows_per_task(Some(4))
+            .max_rows_per_segment(Some(8));
+        let plan = plan_optimize_indices(&dataset, &options).await.unwrap();
+        assert!(!plan.tasks.is_empty());
+        let mut built = Vec::new();
+        for task in &plan.tasks {
+            built.extend(task.execute(&dataset).await.unwrap());
+        }
+        let mut merged = Vec::new();
+        for merge in &plan.merges {
+            merged.extend(merge.execute(&dataset, &built).await.unwrap());
+        }
+        commit_optimize_indices(&mut dataset, merged, &options)
+            .await
+            .unwrap();
+        assert_row_id_btree_entries_match_scan(&dataset).await;
+        assert_row_id_lookup_matches_scan(&dataset).await;
+        assert_row_id_lookup_matches_scan(&source).await;
+    }
+
+    #[tokio::test]
+    async fn test_row_id_btree_on_released_table() {
+        let directory = copy_test_data_to_tmp("v13.0.0/stable_row_id_btree.lance").unwrap();
+        let mut dataset = Dataset::open(&directory.path_str()).await.unwrap();
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 10);
+        let historical = dataset.clone();
+        let original_schema = dataset.schema().clone();
+        let legacy = dataset
+            .load_indices_by_name("legacy_key_idx")
+            .await
+            .unwrap();
+        assert_eq!(legacy.len(), 1);
+        assert!(!legacy[0].results_are_row_addrs());
+        let legacy_uuid = legacy[0].uuid;
+        assert_row_id_lookup_matches_scan(&dataset).await;
+
+        dataset
+            .create_index(
+                &[ROW_ID],
+                IndexType::BTree,
+                Some("row_ids".into()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        let dataset = Dataset::open(&directory.path_str()).await.unwrap();
+        assert_eq!(dataset.schema(), &original_schema);
+        assert!(dataset.schema().field(ROW_ID).is_none());
+        let retained = dataset
+            .load_indices_by_name("legacy_key_idx")
+            .await
+            .unwrap();
+        assert_eq!(retained[0].uuid, legacy_uuid);
+        assert!(!retained[0].results_are_row_addrs());
+        let indexed = dataset
+            .scan()
+            .filter("key >= 4")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(indexed.num_rows(), 7);
+        assert_row_id_btree_entries_match_scan(&dataset).await;
+        assert_row_id_lookup_matches_scan(&dataset).await;
+        assert_row_id_lookup_matches_scan(&historical).await;
+    }
+
+    #[rstest::rstest]
+    #[case::inline(false, false)]
+    #[case::spilled(true, false)]
+    #[case::inline_remapped(false, true)]
+    #[case::spilled_remapped(true, true)]
+    #[tokio::test]
+    async fn test_row_id_btree_update_and_compact(#[case] spilled: bool, #[case] defer: bool) {
+        let mut dataset = row_id_lookup_dataset().await;
+        if spilled {
+            dataset
+                .update_config([
+                    (SPILL_ROW_LINEAGE_CONFIG_KEY, "true"),
+                    (INLINE_ROW_LINEAGE_MAX_BYTES_CONFIG_KEY, "0"),
+                ])
+                .await
+                .unwrap();
+        }
+        dataset
+            .create_index(
+                &[ROW_ID],
+                IndexType::BTree,
+                Some("row_ids".into()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        let update = UpdateBuilder::new(Arc::new(dataset))
+            .update_where("i = 5")
+            .unwrap()
+            .set("i", "100")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+        dataset = Arc::try_unwrap(update.new_dataset).unwrap();
+        assert_row_id_lookup_matches_scan(&dataset).await;
+        dataset.delete("i = 1").await.unwrap();
+        let before_compaction = dataset.clone();
+        assert_row_id_lookup_matches_scan(&before_compaction).await;
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 20,
+                defer_index_remap: defer,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        if spilled {
+            assert!(
+                dataset
+                    .fragments()
+                    .iter()
+                    .all(|fragment| fragment.row_id_meta == Some(RowIdMeta::Column))
+            );
+        }
+        assert_row_id_lookup_matches_scan(&dataset).await;
+        assert_row_id_lookup_matches_scan(&before_compaction).await;
+        let indices = dataset.load_indices().await.unwrap();
+        let row_ids = indices
+            .iter()
+            .find(|index| index.name == "row_ids")
+            .unwrap();
+        let coverage =
+            row_ids.fragment_bitmap.as_ref().unwrap() & dataset.fragment_bitmap().as_ref();
+        assert!(
+            !coverage.is_empty(),
+            "eager remapping and recorded address translation preserve compacted index coverage"
+        );
+        dataset.optimize_indices(&Default::default()).await.unwrap();
+        assert_row_id_lookup_matches_scan(&dataset).await;
+        let coverage: roaring::RoaringBitmap = dataset
+            .load_indices()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|index| index.name == "row_ids")
+            .flat_map(|index| index.fragment_bitmap.as_ref().unwrap().iter())
+            .collect();
+        assert_eq!(
+            &(coverage & dataset.fragment_bitmap().as_ref()),
+            dataset.fragment_bitmap().as_ref()
+        );
+        let taken = dataset
+            .take_rows(&[5, 9, 5], dataset.schema().clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            taken["i"].as_primitive::<Int32Type>().values(),
+            &[100, 9, 100]
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::signed("i")]
+    #[case::unsigned("u")]
+    #[tokio::test]
+    async fn test_row_id_btree_unique_key_lookup(#[case] column: &str) {
+        let mut dataset = lance_datagen::gen_batch()
+            .col(
+                "i",
+                lance_datagen::array::cycle::<Int32Type>(vec![7, 8, 7, 9])
+                    .with_nulls(&[false, true, false, false]),
+            )
+            .col(
+                "u",
+                lance_datagen::array::cycle::<UInt64Type>(vec![7, 8, 7, 9])
+                    .with_nulls(&[false, true, false, false]),
+            )
+            .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(2))
+            .await
+            .unwrap();
+        let keys: ArrayRef = match column {
+            "i" => Arc::new(Int32Array::from(vec![
+                Some(7),
+                None,
+                Some(9),
+                Some(7),
+                Some(99),
+            ])),
+            "u" => Arc::new(UInt64Array::from(vec![
+                Some(7),
+                None,
+                Some(9),
+                Some(7),
+                Some(99),
+            ])),
+            _ => unreachable!(),
+        };
+        let null_value: ArrayRef = match column {
+            "i" => Arc::new(Int32Array::from(vec![8])),
+            "u" => Arc::new(UInt64Array::from(vec![8])),
+            _ => unreachable!(),
+        };
+        for indexed_fragments in 0..=2 {
+            if indexed_fragments == 1 {
+                let params = ScalarIndexParams::default();
+                let fragment_id = dataset.fragments()[0].id as u32;
+                dataset
+                    .create_index_builder(&[column], IndexType::BTree, &params)
+                    .fragments(vec![fragment_id])
+                    .await
+                    .unwrap();
+            } else if indexed_fragments == 2 {
+                dataset.optimize_indices(&Default::default()).await.unwrap();
+            }
+            assert_eq!(
+                dataset
+                    .lookup_row_addresses(column, null_value.as_ref())
+                    .await
+                    .unwrap(),
+                vec![None],
+                "a null value must not match its underlying buffer value"
+            );
+            let error = dataset
+                .lookup_row_addresses(column, keys.as_ref())
+                .await
+                .unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }));
+            assert!(
+                error
+                    .to_string()
+                    .contains("not unique for key at position 0")
+            );
+        }
+        dataset.delete("_rowaddr = 0").await.unwrap();
+        let resolved = dataset
+            .lookup_row_addresses(column, keys.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(
+            resolved,
+            vec![
+                Some(RowAddress::new_from_parts(1, 0)),
+                None,
+                Some(RowAddress::new_from_parts(1, 1)),
+                Some(RowAddress::new_from_parts(1, 0)),
+                None,
+            ]
+        );
+        let error = dataset
+            .lookup_row_addresses("i", &UInt64Array::from(vec![7]))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("expected Int32"));
+    }
+
+    #[derive(Clone, Copy)]
+    enum U64ScanLayout {
+        Sorted,
+        Descending,
+        InteriorInversion,
+        Nullable,
+        AllNull,
+    }
+
+    #[rstest::rstest]
+    #[case::sorted(U64ScanLayout::Sorted)]
+    #[case::descending(U64ScanLayout::Descending)]
+    #[case::interior_inversion(U64ScanLayout::InteriorInversion)]
+    #[case::nullable(U64ScanLayout::Nullable)]
+    #[case::all_null(U64ScanLayout::AllNull)]
+    #[tokio::test]
+    async fn test_uncovered_u64_lookup_matches_scan(
+        #[case] layout: U64ScanLayout,
+        #[values(false, true)] has_partial_index: bool,
+    ) {
+        let mut values = (0..255)
+            .map(Some)
+            .chain([Some(u64::MAX)])
+            .collect::<Vec<_>>();
+        match layout {
+            U64ScanLayout::Sorted => {}
+            U64ScanLayout::Descending => values.reverse(),
+            U64ScanLayout::InteriorInversion => {
+                // Both fragment endpoints remain ordered despite these inversions.
+                values.swap(32, 33);
+                values.swap(160, 161);
+            }
+            U64ScanLayout::Nullable => values[65] = None,
+            U64ScanLayout::AllNull => values.fill(None),
+        }
+        let batch = record_batch!(("u", UInt64, values)).unwrap();
+        let reader = RecordBatchIterator::new(
+            vec![Ok(batch.slice(0, 128)), Ok(batch.slice(128, 128))],
+            batch.schema(),
+        );
+        let mut dataset = Dataset::write(
+            reader,
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 128,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.fragments().len(), 2);
+        if has_partial_index {
+            let fragment_id = dataset.fragments()[0].id as u32;
+            dataset
+                .create_index_builder(&["u"], IndexType::BTree, &ScalarIndexParams::default())
+                .fragments(vec![fragment_id])
+                .await
+                .unwrap();
+        }
+        let keys = UInt64Array::from(vec![
+            Some(9999),
+            Some(65),
+            None,
+            Some(u64::MAX),
+            Some(0),
+            Some(65),
+            Some(128),
+            Some(255),
+            Some(511),
+            Some(9999),
+        ])
+        .slice(1, 8);
+        let single_key = UInt64Array::from(vec![Some(65), None, Some(65)]);
+        let dense_keys = UInt64Array::from(
+            (0..256)
+                .map(Some)
+                .chain([None, Some(u64::MAX), Some(65)])
+                .collect::<Vec<_>>(),
+        );
+        for is_after_delete in [false, true] {
+            if is_after_delete {
+                dataset.delete("u = 65 OR u = 128").await.unwrap();
+            }
+            let scan = dataset
+                .scan()
+                .with_row_address()
+                .try_into_batch()
+                .await
+                .unwrap();
+            let expected = scan["u"]
+                .as_primitive::<UInt64Type>()
+                .iter()
+                .zip(scan[ROW_ADDR].as_primitive::<UInt64Type>().values())
+                .filter_map(|(value, &address)| {
+                    value.map(|value| (value, RowAddress::from(address)))
+                })
+                .collect::<HashMap<_, _>>();
+            for keys in [&keys, &single_key, &dense_keys] {
+                let actual = dataset.lookup_row_addresses("u", keys).await.unwrap();
+                assert_eq!(
+                    actual,
+                    keys.iter()
+                        .map(|key| key.and_then(|key| expected.get(&key).copied()))
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn test_uncovered_sorted_u64_lookup_rejects_duplicates(
+        #[values(false, true)] has_partial_index: bool,
+    ) {
+        let mut values = (0..256).collect::<Vec<u64>>();
+        values[136] = 135;
+        let batch = record_batch!(("u", UInt64, values)).unwrap();
+        let reader = RecordBatchIterator::new(
+            vec![Ok(batch.slice(0, 128)), Ok(batch.slice(128, 128))],
+            batch.schema(),
+        );
+        let mut dataset = Dataset::write(
+            reader,
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 128,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.fragments().len(), 2);
+        if has_partial_index {
+            let fragment_id = dataset.fragments()[0].id as u32;
+            dataset
+                .create_index_builder(&["u"], IndexType::BTree, &ScalarIndexParams::default())
+                .fragments(vec![fragment_id])
+                .await
+                .unwrap();
+        }
+        let keys = UInt64Array::from(vec![Some(135), None, Some(135), Some(511), Some(0)]);
+        let error = dataset.lookup_row_addresses("u", &keys).await.unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("not unique for key at position 0")
+        );
+
+        let fragment = dataset.fragments()[1].id as u32;
+        let removed = RowAddress::new_from_parts(fragment, 7);
+        dataset
+            .delete(&format!("{ROW_ADDR} = {}", u64::from(removed)))
+            .await
+            .unwrap();
+        assert_eq!(
+            dataset.lookup_row_addresses("u", &keys).await.unwrap(),
+            vec![
+                Some(RowAddress::new_from_parts(fragment, 8)),
+                None,
+                Some(RowAddress::new_from_parts(fragment, 8)),
+                None,
+                Some(RowAddress::new_from_parts(
+                    dataset.fragments()[0].id as u32,
+                    0
+                )),
+            ]
+        );
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum LookupMaintenance {
+        Build,
+        Eager,
+        Defer,
+        Optimize,
+    }
+
+    #[rstest::rstest]
+    #[case::built_after_compaction(LookupMaintenance::Build)]
+    #[case::remapped_eagerly(LookupMaintenance::Eager)]
+    #[case::remapped_by_fri(LookupMaintenance::Defer)]
+    #[case::optimized_after_compaction(LookupMaintenance::Optimize)]
+    #[tokio::test]
+    async fn test_row_id_btree_covered_lookup_does_not_read_lineage(
+        #[case] maintenance: LookupMaintenance,
+    ) {
+        let directory = lance_core::utils::tempfile::TempStrDir::default();
+        let mut dataset = lance_datagen::gen_batch()
+            .col("i", lance_datagen::array::step::<Int32Type>())
+            .into_dataset_with_params(
+                &directory,
+                FragmentCount::from(3),
+                FragmentRowCount::from(4),
+                Some(WriteParams {
+                    enable_stable_row_ids: true,
+                    max_rows_per_file: 4,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        dataset
+            .update_config([
+                (SPILL_ROW_LINEAGE_CONFIG_KEY, "true"),
+                (INLINE_ROW_LINEAGE_MAX_BYTES_CONFIG_KEY, "0"),
+            ])
+            .await
+            .unwrap();
+        if maintenance != LookupMaintenance::Build {
+            dataset
+                .create_index(
+                    &[ROW_ID],
+                    IndexType::BTree,
+                    None,
+                    &ScalarIndexParams::default(),
+                    false,
+                )
+                .await
+                .unwrap();
+        }
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 20,
+                defer_index_remap: maintenance == LookupMaintenance::Defer,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.fragments()[0].row_id_meta, Some(RowIdMeta::Column));
+        if maintenance == LookupMaintenance::Build {
+            dataset
+                .create_index(
+                    &[ROW_ID],
+                    IndexType::BTree,
+                    None,
+                    &ScalarIndexParams::default(),
+                    false,
+                )
+                .await
+                .unwrap();
+        } else if maintenance == LookupMaintenance::Optimize {
+            dataset.optimize_indices(&Default::default()).await.unwrap();
+        }
+        dataset
+            .update_config([(SPILL_ROW_LINEAGE_CONFIG_KEY, "false")])
+            .await
+            .unwrap();
+        dataset
+            .append(
+                lance_datagen::gen_batch()
+                    .col("i", lance_datagen::array::step_custom::<Int32Type>(12, 1))
+                    .into_reader_rows(4.into(), 1.into()),
+                None,
+            )
+            .await
+            .unwrap();
+        let tail_fragment = dataset.fragments().last().unwrap().id as u32;
+        drop(dataset);
+
+        let failing = Arc::new(FailingProxyStore::new());
+        failing.fail_when(
+            "get_opts",
+            "data/",
+            "lookup must not read the row-ID column",
+        );
+        let dataset = DatasetBuilder::from_uri(&directory)
+            .with_read_params(ReadParams {
+                index_cache_size_bytes: 0,
+                store_options: Some(ObjectStoreParams {
+                    object_store_wrapper: Some(failing),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .load()
+            .await
+            .unwrap();
+        let keys = UInt64Array::from(vec![Some(9), Some(1), None, Some(9), Some(99), Some(14)]);
+        assert_eq!(
+            row_ids_to_row_addrs(&dataset, &keys).await.unwrap(),
+            vec![
+                Some(RowAddress::new_from_parts(3, 9)),
+                Some(RowAddress::new_from_parts(3, 1)),
+                None,
+                Some(RowAddress::new_from_parts(3, 9)),
+                None,
+                Some(RowAddress::new_from_parts(tail_fragment, 2)),
+            ]
+        );
+        let rebound = Arc::new(FailingProxyStore::new());
+        rebound.fail_when("get_opts", "_indices/", "lookup must use the rebound store");
+        let rebound = dataset.with_object_store_wrappers([
+            rebound as Arc<dyn lance_io::object_store::WrappingObjectStore>
+        ]);
+        let error = row_ids_to_row_addrs(&rebound, &keys).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("lookup must use the rebound store")
+        );
+        let error = get_row_id_index(&dataset).await.unwrap_err();
+        assert!(matches!(error, Error::IO { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("lookup must not read the row-ID column")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_row_id_btree_shuffled_training() {
+        let dataset = row_id_lookup_dataset().await;
+        let updated = UpdateBuilder::new(Arc::new(dataset))
+            .update_where("i % 2 = 0")
+            .unwrap()
+            .set("i", "i + 100")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+        let mut dataset = Arc::try_unwrap(updated.new_dataset).unwrap();
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 20,
+                defer_index_remap: false,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        let sequence = load_row_id_sequence(&dataset, &dataset.fragments()[0])
+            .await
+            .unwrap();
+        assert!(!sequence.iter().is_sorted());
+        dataset
+            .create_index(
+                &[ROW_ID],
+                IndexType::BTree,
+                None,
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        assert_row_id_lookup_matches_scan(&dataset).await;
+    }
+
     #[tokio::test]
     async fn test_empty_dataset_rowids() {
         let schema = sequence_batch(0..0).schema();
@@ -548,7 +1573,7 @@ mod test {
             enable_stable_row_ids: true,
             ..Default::default()
         };
-        let dataset = Dataset::write(reader, "memory://", Some(write_params))
+        let mut dataset = Dataset::write(reader, "memory://", Some(write_params))
             .await
             .unwrap();
 
@@ -558,6 +1583,22 @@ mod test {
         assert!(index.get(0).unwrap().is_none());
 
         assert_eq!(dataset.manifest().next_row_id, 0);
+        dataset
+            .create_index(
+                &[ROW_ID],
+                IndexType::BTree,
+                None,
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            row_ids_to_row_addrs(&dataset, &UInt64Array::from(vec![Some(0), None]))
+                .await
+                .unwrap(),
+            vec![None, None]
+        );
     }
 
     #[tokio::test]

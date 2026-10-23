@@ -4,7 +4,7 @@
 use std::{collections::BTreeMap, collections::HashMap, ops::Range, pin::Pin, sync::Arc};
 
 use crate::dataset::fragment::FragReadConfig;
-use crate::dataset::rowids::get_row_id_index_with;
+use crate::dataset::rowids::{get_row_id_index_with, row_ids_to_row_addrs};
 use crate::io::exec::AddRowOffsetExec;
 use crate::{Error, Result};
 use arrow::{compute::concat_batches, datatypes::UInt64Type};
@@ -555,10 +555,19 @@ impl TakeBuilder {
                 .row_ids
                 .as_ref()
                 .expect("row_ids must be set if row_addrs is not");
-            let addrs = if let Some(row_id_index) =
-                get_row_id_index_with(&self.dataset, !self.ignore_deletions).await?
-            {
-                let resolved = row_id_index.get_many(row_ids)?;
+            let addrs = if self.dataset.manifest.uses_stable_row_ids() {
+                let resolved = if self.ignore_deletions {
+                    // Scalar index maintenance can remove deleted entries. The
+                    // explicit raw take mode must still resolve those stored rows.
+                    get_row_id_index_with(&self.dataset, false)
+                        .await?
+                        .ok_or_else(|| {
+                            Error::internal("Stable row ID take did not produce a row ID index")
+                        })?
+                        .get_many(row_ids)?
+                } else {
+                    row_ids_to_row_addrs(&self.dataset, &UInt64Array::from(row_ids.clone())).await?
+                };
                 if self.missing_row_policy == MissingRowPolicy::Error
                     && let Some(first_missing_index) =
                         resolved.iter().position(|address| address.is_none())
@@ -632,6 +641,7 @@ mod test {
     use lance_arrow::json::{ARROW_JSON_EXT_NAME, is_arrow_json_field, is_json_field};
     use lance_core::{ROW_ADDR_FIELD, ROW_ID_FIELD};
     use lance_file::version::LanceFileVersion;
+    use lance_index::{IndexType, scalar::ScalarIndexParams};
     use pretty_assertions::assert_eq;
     use rstest::rstest;
     use std::collections::HashMap;
@@ -640,6 +650,7 @@ mod test {
         MergeInsertBuilder, UpdateBuilder, WhenMatched, WhenNotMatched, WriteParams,
         scanner::test_dataset::TestVectorDataset,
     };
+    use crate::index::DatasetIndexExt;
 
     use super::*;
 
@@ -1667,17 +1678,32 @@ mod test {
     /// An update keeps the old copy of a row under a deletion vector and writes
     /// its id again in a new fragment. Ignoring deletions must still resolve
     /// the id to the live copy, which takes that fragment's deletion vector.
+    #[rstest]
+    #[case::unindexed(false)]
+    #[case::btree(true)]
     #[tokio::test]
-    async fn test_take_rows_ignore_deletions_after_update() {
+    async fn test_take_rows_ignore_deletions_after_update(#[case] with_btree: bool) {
         let data = test_batch(0..8);
         let write_params = WriteParams {
             enable_stable_row_ids: true,
             ..Default::default()
         };
         let batches = RecordBatchIterator::new([Ok(data.clone())], data.schema());
-        let dataset = Dataset::write(batches, "memory://", Some(write_params))
+        let mut dataset = Dataset::write(batches, "memory://", Some(write_params))
             .await
             .unwrap();
+        if with_btree {
+            dataset
+                .create_index(
+                    &[lance_core::ROW_ID],
+                    IndexType::BTree,
+                    None,
+                    &ScalarIndexParams::default(),
+                    false,
+                )
+                .await
+                .unwrap();
+        }
         let dataset = UpdateBuilder::new(Arc::new(dataset))
             .update_where("i = 1")
             .unwrap()
@@ -1707,8 +1733,11 @@ mod test {
 
     /// Ignoring deletions resolves and reads the rows without touching a
     /// deletion file, and hands back the deleted rows with their stored values.
+    #[rstest]
+    #[case::unindexed(false)]
+    #[case::btree_after_delete(true)]
     #[tokio::test]
-    async fn test_take_rows_ignore_deletions() {
+    async fn test_take_rows_ignore_deletions(#[case] with_btree: bool) {
         let data = test_batch(0..8);
         let write_params = WriteParams {
             max_rows_per_group: 2,
@@ -1720,6 +1749,20 @@ mod test {
             .await
             .unwrap();
         dataset.delete("i in (1, 7)").await.unwrap();
+        if with_btree {
+            dataset
+                .create_index(
+                    &[lance_core::ROW_ID],
+                    IndexType::BTree,
+                    None,
+                    &ScalarIndexParams::default(),
+                    false,
+                )
+                .await
+                .unwrap();
+        }
+        // Training can populate the deletion cache; measure the take itself.
+        dataset.metadata_cache.clear().await;
         let dataset = Arc::new(dataset);
 
         let reads_deletion_file = |dataset: &Dataset| {

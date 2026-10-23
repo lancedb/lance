@@ -4,7 +4,7 @@
 //! Abstract scalar index traits and types for Lance index plugins
 
 use crate::remapping::{RowAddrTranslator, materialize_remap};
-use arrow_array::{BooleanArray, RecordBatch, UInt64Array};
+use arrow_array::{Array, BooleanArray, RecordBatch, UInt32Array, UInt64Array};
 use arrow_schema::{DataType, Schema};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -13,6 +13,7 @@ use datafusion_common::scalar::ScalarValue;
 use datafusion_expr::Expr;
 use futures::{StreamExt, TryStreamExt};
 use lance_core::deepsize::DeepSizeOf;
+use lance_core::utils::address::RowAddress;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{Error, Result};
@@ -564,6 +565,13 @@ pub enum OldIndexDataFilter {
         to_keep: RoaringBitmap,
         to_remove: RoaringBitmap,
     },
+    /// Keep addresses in retained fragments except for deletion-marked positions.
+    /// The exclusion set stores only deleted offsets, not a mapping for every live row.
+    RowAddresses {
+        to_keep: RoaringBitmap,
+        to_remove: RoaringBitmap,
+        deleted_rows: RowAddrTreeMap,
+    },
     /// Keep old rows whose identifier is in this exact allow-list, used for id-domain
     /// indexes when stable row id is enabled.
     RowIds(RowAddrTreeMap),
@@ -581,6 +589,19 @@ impl OldIndexDataFilter {
                 .iter()
                 .map(|id| id.map(|id| valid_row_ids.contains(id)))
                 .collect(),
+            Self::RowAddresses {
+                to_keep,
+                deleted_rows,
+                ..
+            } => row_ids
+                .iter()
+                .map(|address| {
+                    address.map(|address| {
+                        to_keep.contains(RowAddress::from(address).fragment_id())
+                            && !deleted_rows.contains(address)
+                    })
+                })
+                .collect(),
         }
     }
 
@@ -592,6 +613,14 @@ impl OldIndexDataFilter {
         match self {
             Self::Fragments { to_keep, .. } => rows.retain_fragments(to_keep.iter()),
             Self::RowIds(valid_row_ids) => *rows &= valid_row_ids,
+            Self::RowAddresses {
+                to_keep,
+                deleted_rows,
+                ..
+            } => {
+                rows.retain_fragments(to_keep.iter());
+                *rows -= deleted_rows;
+            }
         }
     }
 }
@@ -642,6 +671,64 @@ impl SearchOptions {
     }
 }
 
+/// The `(key, row id)` pairs produced by [`ScalarIndex::lookup`].
+///
+/// Pair `i` says that the key at position `key_indices[i]` of the looked-up
+/// keys equals the indexed value of row `row_ids[i]`. A key matching several
+/// rows yields one pair per row, and a key matching nothing yields none.
+/// Pairs come in no particular order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LookupMatches {
+    pub key_indices: UInt32Array,
+    pub row_ids: UInt64Array,
+}
+
+impl LookupMatches {
+    pub fn new(key_indices: UInt32Array, row_ids: UInt64Array) -> Result<Self> {
+        if key_indices.len() != row_ids.len() {
+            return Err(Error::internal(format!(
+                "lookup matches have {} key indices but {} row ids",
+                key_indices.len(),
+                row_ids.len()
+            )));
+        }
+        Ok(Self {
+            key_indices,
+            row_ids,
+        })
+    }
+
+    pub fn empty() -> Self {
+        Self {
+            key_indices: UInt32Array::from(Vec::<u32>::new()),
+            row_ids: UInt64Array::from(Vec::<u64>::new()),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.row_ids.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.row_ids.is_empty()
+    }
+
+    /// Concatenate matches produced against the same keys, e.g. by several
+    /// segments of one index.
+    pub fn concat(parts: impl IntoIterator<Item = Self>) -> Self {
+        let mut key_indices = Vec::new();
+        let mut row_ids = Vec::new();
+        for part in parts {
+            key_indices.extend_from_slice(part.key_indices.values());
+            row_ids.extend_from_slice(part.row_ids.values());
+        }
+        Self {
+            key_indices: UInt32Array::from(key_indices),
+            row_ids: UInt64Array::from(row_ids),
+        }
+    }
+}
+
 /// A trait for a scalar index, a structure that can determine row ids that satisfy scalar queries
 #[async_trait]
 pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
@@ -666,6 +753,29 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
         metrics: &dyn MetricsCollector,
     ) -> Result<SearchResult> {
         self.search(query, metrics).await
+    }
+
+    /// Find the rows whose indexed value equals each of `keys`.
+    ///
+    /// Returns one `(key index, row id)` pair per match, where the key index is
+    /// the key's position in `keys`. Matching is exact equality: a null key
+    /// never matches, not even a null indexed value. `keys` must have the
+    /// index's value type.
+    ///
+    /// Like [`Self::search`], the row ids are not filtered by deletions, and any
+    /// fragment-reuse remapping the index was loaded with is already applied.
+    ///
+    /// Indices that cannot answer exact-equality lookups return
+    /// [`Error::NotSupported`], which is the default.
+    async fn lookup(
+        &self,
+        _keys: &dyn Array,
+        _metrics: &dyn MetricsCollector,
+    ) -> Result<LookupMatches> {
+        Err(Error::not_supported(format!(
+            "{} index does not support key lookup",
+            self.index_type()
+        )))
     }
 
     /// Returns true if this index reports matches as physical row addresses
