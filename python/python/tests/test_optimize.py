@@ -545,7 +545,7 @@ def test_index_remapping_multiple_rewrite_tasks(tmp_path: Path):
 
 @pytest.mark.parametrize(
     ("enable_stable_row_ids", "index_type"),
-    [(False, "BTREE"), (True, "ZONEMAP"), (True, None)],
+    [(False, "BTREE"), (True, "ZONEMAP"), (True, "BITMAP"), (True, None)],
 )
 def test_defer_index_remap(
     tmp_path: Path,
@@ -652,7 +652,8 @@ def test_defer_index_remap_with_stable_row_ids_allows_only_address_indices(
     dataset = lance.write_dataset(
         data, base_dir, max_rows_per_file=1_000, enable_stable_row_ids=True
     )
-    dataset.create_scalar_index("category", "BITMAP")
+    # NGram still stores row IDs; new Bitmap indexes now store row addresses.
+    dataset.create_scalar_index("category", "NGRAM")
     options = dict(target_rows_per_fragment=3_000, defer_index_remap=True)
     with pytest.raises(OSError, match="category_idx"):
         dataset.optimize.compact_files(**options)
@@ -661,7 +662,7 @@ def test_defer_index_remap_with_stable_row_ids_allows_only_address_indices(
     dataset.optimize.compact_files(**options)
     assert any(idx.name == "__lance_frag_reuse" for idx in dataset.describe_indices())
     with pytest.raises(ValueError, match="fragment reuse index"):
-        dataset.create_scalar_index("i", "BITMAP")
+        dataset.create_scalar_index("category", "NGRAM")
     # A BTree stores row addresses, which the history translates.
     dataset.create_scalar_index("i", "BTREE")
     assert "i_idx" in dataset.scanner(filter="i = 7").explain_plan()
