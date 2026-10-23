@@ -140,6 +140,24 @@ pub struct LsmVectorSearchPlanner {
 
 /// Multiple of the exact distance a flushed generation's `IVF_HNSW_SQ` index
 /// reports: 2 for cosine (L2 over normalized vectors), otherwise 1.
+/// The caller's `ef`, raised to an arm's candidate count when the caller's own
+/// query accepts it; otherwise unchanged, so it fails as it does on the table.
+fn indexed_arm_ef(
+    ef: Option<usize>,
+    requested_k: usize,
+    arm_k: usize,
+    refine_factor: Option<u32>,
+) -> Option<usize> {
+    let refine = refine_factor.unwrap_or(1) as usize;
+    ef.map(|ef| {
+        if ef >= requested_k.saturating_mul(refine) {
+            ef.max(arm_k.saturating_mul(refine))
+        } else {
+            ef
+        }
+    })
+}
+
 fn sstable_distance_scale(distance_type: lance_linalg::distance::DistanceType) -> f32 {
     match distance_type {
         lance_linalg::distance::DistanceType::Cosine => 2.0,
@@ -224,12 +242,6 @@ impl LsmVectorSearchPlanner {
     pub fn with_distance_scale(mut self, scale: f32) -> Self {
         self.distance_scale = scale;
         self
-    }
-
-    /// The caller's `ef`, widened by the factor the planner widened this arm's `k`.
-    fn indexed_arm_ef(&self, requested_k: usize, arm_k: usize) -> Option<usize> {
-        self.ef
-            .map(|ef| ef.saturating_mul(arm_k).div_ceil(requested_k.max(1)))
     }
 
     /// Factor from an arm's `native` multiple of the exact distance to the
@@ -603,7 +615,7 @@ impl LsmVectorSearchPlanner {
                     scanner.maximum_nprobes(maximum_nprobes);
                 }
                 scanner.distance_metric(self.distance_type);
-                if let Some(ef) = self.indexed_arm_ef(requested_k, k) {
+                if let Some(ef) = indexed_arm_ef(self.ef, requested_k, k, refine_factor) {
                     scanner.ef(ef);
                 }
                 // Memtables cover unindexed rows; only search indexed data here.
@@ -696,7 +708,7 @@ impl LsmVectorSearchPlanner {
                     scanner.maximum_nprobes(maximum_nprobes);
                 }
                 scanner.distance_metric(self.distance_type);
-                if let Some(ef) = self.indexed_arm_ef(requested_k, k) {
+                if let Some(ef) = indexed_arm_ef(self.ef, requested_k, k, refine_factor) {
                     scanner.ef(ef);
                 }
                 scanner.fast_search();
@@ -3685,9 +3697,33 @@ mod tests {
         );
     }
 
-    /// An over-fetched arm widens the caller's `ef`; an `ef` below `k * refine_factor` still fails.
+    #[test]
+    fn indexed_arm_ef_is_the_smallest_valid_beam() {
+        // (ef, requested_k, arm_k, refine_factor) -> arm ef
+        for (ef, requested_k, arm_k, refine, expected) in [
+            (Some(10), 10, 14, None, Some(14)),
+            (Some(100), 10, 14, None, Some(100)),
+            // Every row of a large generation: its candidate count, not `ef * rows / k`.
+            (Some(1_000), 10, 1_000_000, None, Some(1_000_000)),
+            (Some(1_000), 10, 1_000_000, Some(2), Some(2_000_000)),
+            // A generation with fewer rows than `k` keeps the caller's `ef`.
+            (Some(200), 100, 1, Some(2), Some(200)),
+            // Below the caller's own candidate count: unchanged, so it fails.
+            (Some(5), 10, 14, None, Some(5)),
+            (Some(199), 100, 1, Some(2), Some(199)),
+            (None, 10, 14, Some(2), None),
+        ] {
+            assert_eq!(
+                indexed_arm_ef(ef, requested_k, arm_k, refine),
+                expected,
+                "ef={ef:?} k={requested_k} arm_k={arm_k} refine={refine:?}"
+            );
+        }
+    }
+
+    /// An over-fetched arm accepts the caller's `ef`; an `ef` below `k * refine_factor` still fails.
     #[tokio::test]
-    async fn test_vector_search_ef_scales_with_an_arms_overfetch() {
+    async fn test_vector_search_ef_covers_an_arms_overfetch() {
         use crate::dataset::mem_wal::scanner::data_source::ShardSnapshot;
         use datafusion::prelude::SessionContext;
         use futures::TryStreamExt;
