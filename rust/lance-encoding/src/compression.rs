@@ -16,13 +16,16 @@
 //! Fullzip compression is a per-value approach where we require that values are transparently
 //! compressed so that we can locate them later.
 
+use crate::encodings::physical::axis_delta::AxisDeltaDecompressor;
+pub use crate::encodings::physical::axis_delta::try_tensor_per_value;
 #[cfg(feature = "bitpacking")]
 use crate::encodings::physical::bitpacking::{InlineBitpacking, OutOfLineBitpacking};
 use crate::{
     buffer::LanceBuffer,
-    compression_config::{BssMode, CompressionFieldParams},
+    compression_config::{AlpMode, BssMode, CompressionFieldParams},
     constants::{
-        BSS_META_KEY, COMPRESSION_LEVEL_META_KEY, COMPRESSION_META_KEY, RLE_THRESHOLD_META_KEY,
+        ALP_META_KEY, BSS_META_KEY, COMPRESSION_LEVEL_META_KEY, COMPRESSION_META_KEY,
+        RLE_THRESHOLD_META_KEY,
     },
     data::{DataBlock, FixedWidthDataBlock, VariableWidthBlock},
     encodings::{
@@ -31,6 +34,7 @@ use crate::{
             miniblock::{MAX_MINIBLOCK_VALUES, MiniBlockCompressor},
         },
         physical::{
+            alp::{AlpMiniBlockDecompressor, AlpMiniBlockEncoder, should_use_alp},
             binary::{
                 BinaryBlockDecompressor, BinaryMiniBlockDecompressor, BinaryMiniBlockEncoder,
                 VariableDecoder, VariableEncoder,
@@ -50,8 +54,8 @@ use crate::{
                 FsstPerValueEncoder,
             },
             general::{
-                FixedWidthGeneralBlockDecompressor, GeneralBlockCompressor,
-                GeneralMiniBlockCompressor, GeneralMiniBlockDecompressor,
+                FixedWidthGeneralBlockDecompressor, FixedWidthGeneralPerValueDecompressor,
+                GeneralBlockCompressor, GeneralMiniBlockCompressor, GeneralMiniBlockDecompressor,
             },
             packed::{
                 PackedStructFixedPerValueDecompressor, PackedStructFixedPerValueEncoder,
@@ -187,6 +191,25 @@ fn try_bss_for_mini_block(
         )));
     }
     None
+}
+
+fn try_alp_for_mini_block(
+    field: &Field,
+    data: &FixedWidthDataBlock,
+    params: &CompressionFieldParams,
+) -> Option<Box<dyn MiniBlockCompressor>> {
+    // Auto is the default: the entropy pre-gate rejects incompressible pages
+    // before the candidate scan, and the page-level fallback already guarantees
+    // ALP never enlarges data. Only v2.3 writers call this path.
+    let mode = params.alp.unwrap_or(AlpMode::Auto);
+    if !should_use_alp(data, mode) {
+        return None;
+    }
+    match (field.data_type(), data.bits_per_value) {
+        (DataType::Float32, 32) => Some(Box::new(AlpMiniBlockEncoder::new(32))),
+        (DataType::Float64, 64) => Some(Box::new(AlpMiniBlockEncoder::new(64))),
+        _ => None,
+    }
 }
 
 fn rle_is_applicable(data: &FixedWidthDataBlock, params: &CompressionFieldParams) -> Option<u128> {
@@ -577,6 +600,7 @@ fn try_general_compression(
 }
 
 /// Parse field-level compression metadata without applying format-specific constraints.
+/// AxisDelta metadata is validated separately when selecting a per-value compressor.
 pub fn field_metadata_params(field: &Field) -> CompressionFieldParams {
     let mut params = CompressionFieldParams::default();
 
@@ -593,6 +617,12 @@ pub fn field_metadata_params(field: &Field) -> CompressionFieldParams {
         match BssMode::parse(bss_str) {
             Some(mode) => params.bss = Some(mode),
             None => log::warn!("Invalid BSS mode '{}', using default", bss_str),
+        }
+    }
+    if let Some(alp_str) = field.metadata.get(ALP_META_KEY) {
+        match AlpMode::parse(alp_str) {
+            Some(mode) => params.alp = Some(mode),
+            None => log::warn!("Invalid ALP mode '{}', using default", alp_str),
         }
     }
     if let Some(minichunk_size_str) = field
@@ -640,6 +670,18 @@ pub fn try_byte_stream_split_miniblock(
         return None;
     };
     try_bss_for_mini_block(data, params)
+}
+
+/// Select modern ALP compression for an applicable floating-point miniblock.
+pub fn try_alp_miniblock(
+    field: &Field,
+    data: &DataBlock,
+    params: &CompressionFieldParams,
+) -> Option<Box<dyn MiniBlockCompressor>> {
+    let DataBlock::FixedWidth(data) = data else {
+        return None;
+    };
+    try_alp_for_mini_block(field, data, params)
 }
 
 /// Select the original fixed-u8 RLE miniblock grammar.
@@ -1064,6 +1106,21 @@ pub trait BlockDecompressor: std::fmt::Debug + Send + Sync {
     fn infer_num_values(&self, _data: &LanceBuffer) -> Result<Option<u64>> {
         Ok(None)
     }
+
+    /// Recover a legacy structural level count whose u16 header wrapped modulo 65536.
+    ///
+    /// Unlike [`Self::infer_num_values`], the payload alone does not identify the count;
+    /// the declared residue selects among the layouts the payload size allows. Returns an
+    /// exact count only when the codec can prove a unique one without decoding or
+    /// allocating. Unsupported codecs return `None`; inconsistent supported layouts return
+    /// an error. Only called for mini-block structural levels.
+    fn infer_u16_wrapped_count(
+        &self,
+        _data: &LanceBuffer,
+        _declared_count: u16,
+    ) -> Result<Option<u64>> {
+        Ok(None)
+    }
 }
 
 pub(crate) fn require_block_payload(data: Option<LanceBuffer>, codec: &str) -> Result<LanceBuffer> {
@@ -1202,6 +1259,9 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
                     values.bits_per_value as usize,
                 )))
             }
+            Compression::Alp(description) => Ok(Box::new(
+                AlpMiniBlockDecompressor::from_description(description)?,
+            )),
             Compression::General(general) => {
                 // Create inner decompressor
                 let inner_decompressor = self.create_miniblock_decompressor(
@@ -1260,6 +1320,7 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
             ))),
             Compression::Flat(flat) => Ok(Box::new(ValueDecompressor::from_flat(flat))),
             Compression::FixedSizeList(fsl) => Ok(Box::new(ValueDecompressor::from_fsl(fsl)?)),
+            Compression::AxisDelta(delta) => Ok(Box::new(AxisDeltaDecompressor::try_new(delta)?)),
             Compression::PackedStruct(description) => Ok(Box::new(
                 PackedStructFixedPerValueDecompressor::new(description)?,
             )),
@@ -1307,9 +1368,23 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
                 LanceBuffer::from_bytes(fsst.symbol_table.clone(), 1),
                 Box::new(VariableDecoder::default()),
             ))),
-            Compression::General(general) => Ok(Box::new(CompressedBufferEncoder::from_scheme(
-                general.compression.as_ref().expect_ok()?.scheme(),
-            )?)),
+            Compression::General(general) => {
+                let compression = general.compression.as_ref().expect_ok()?;
+                if let Some(inner) = general.values.as_deref()
+                    && matches!(
+                        inner.compression,
+                        Some(Compression::FixedSizeList(_) | Compression::AxisDelta(_))
+                    )
+                {
+                    return Ok(Box::new(FixedWidthGeneralPerValueDecompressor::new(
+                        self.create_fixed_per_value_decompressor(inner)?,
+                        CompressionConfig::new(compression.scheme().try_into()?, compression.level),
+                    )));
+                }
+                Ok(Box::new(CompressedBufferEncoder::from_scheme(
+                    compression.scheme(),
+                )?))
+            }
             Compression::VariablePackedStruct(description) => {
                 let mut fields = Vec::with_capacity(description.fields.len());
                 for field in &description.fields {
@@ -1998,12 +2073,14 @@ fn compression_name(compression: &Compression) -> &'static str {
         Compression::Constant(_) => "constant",
         Compression::Dictionary(_) => "dictionary",
         Compression::ByteStreamSplit(_) => "byte stream split",
+        Compression::AxisDelta(_) => "axis delta",
         Compression::PackedStruct(_) => "packed struct",
         Compression::FixedSizeList(_) => "fixed-size list",
         Compression::VariablePackedStruct(_) => "variable packed struct",
         Compression::Rle(_) => "rle",
         Compression::Range(_) => "range",
         Compression::Delta(_) => "delta",
+        Compression::Alp(_) => "alp",
     }
 }
 
@@ -2299,6 +2376,8 @@ mod tests {
                 compression: Some("lz4".to_string()),
                 compression_level: None,
                 bss: Some(BssMode::Off), // Explicitly disable BSS to test RLE
+                alp: None,
+                axis_delta: None,
                 minichunk_size: None,
             },
         );
@@ -2331,6 +2410,8 @@ mod tests {
                 compression: Some("zstd".to_string()),
                 compression_level: Some(3),
                 bss: Some(BssMode::Off), // Disable BSS to test RLE
+                alp: None,
+                axis_delta: None,
                 minichunk_size: None,
             },
         );
@@ -2718,9 +2799,9 @@ mod tests {
             panic!("Expected general per-value compression");
         };
         let expected_scheme = if test_encoding == TestEncoding::StructuralSparse {
-            crate::format::metadata::CompressionScheme::CompressionAlgorithmLz4
+            crate::format::pb23::CompressionScheme::CompressionAlgorithmLz4
         } else {
-            crate::format::metadata::CompressionScheme::CompressionAlgorithmZstd
+            crate::format::pb23::CompressionScheme::CompressionAlgorithmZstd
         };
         assert_eq!(
             general.compression.as_ref().unwrap().scheme(),
@@ -2763,6 +2844,8 @@ mod tests {
                 compression: Some("zstd".to_string()),
                 compression_level: Some(6),
                 bss: None,
+                alp: None,
+                axis_delta: None,
                 minichunk_size: None,
             },
         );
@@ -3165,6 +3248,8 @@ mod tests {
                 compression: Some("lz4".to_string()),
                 compression_level: None,
                 bss: None,
+                alp: None,
+                axis_delta: None,
                 minichunk_size: None,
             },
         );
