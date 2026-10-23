@@ -7201,6 +7201,21 @@ async fn test_sql_contains_tokens() {
         .await
         .unwrap();
 
+    // A NULL query matches no row, with or without an index.
+    let count_null_query_matches = |dataset: Dataset| async move {
+        execute_sql(
+            "select * from foo where contains_tokens(text, NULL)",
+            "foo".to_string(),
+            Arc::new(dataset),
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|batch| batch.num_rows())
+        .sum::<usize>()
+    };
+    assert_eq!(count_null_query_matches(dataset.clone()).await, 0);
+
     // Test without fts index
     let results = execute_sql(
         "select * from foo where contains_tokens(text, 'cat catch fish')",
@@ -7314,6 +7329,7 @@ async fn test_sql_contains_tokens() {
     .unwrap();
     let plan = format!("{:?}", results);
     assert_contains!(&plan, "ScalarIndexQuery");
+    assert_eq!(count_null_query_matches(dataset.clone()).await, 0);
 }
 
 #[tokio::test]
