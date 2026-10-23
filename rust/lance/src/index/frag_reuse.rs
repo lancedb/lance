@@ -64,12 +64,11 @@ impl std::fmt::Debug for ResolvedRemapping {
     }
 }
 
-/// The key caches hold a v0 history, and everything decoded through it, under.
+/// Cache key for a v0 history and the mappings decoded from it.
 ///
-/// Not the entry's UUID: a writer can publish different moves under a UUID the
-/// table used before. This hashes what the history is read from, the encoded
-/// details and the base an external file resolves through; published files are
-/// never rewritten, so one identity always decodes to the same moves.
+/// The entry's UUID alone is insufficient: a writer can reuse it for different
+/// moves. Include the encoded history details and the external storage base as
+/// well. Published files are immutable, so the same key identifies the same moves.
 pub(crate) fn v0_cache_identity(dataset: &Dataset, entry: &IndexMetadata) -> Uuid {
     fn update_sized(hasher: &mut blake3::Hasher, bytes: &[u8]) {
         hasher.update(&(bytes.len() as u64).to_le_bytes());
