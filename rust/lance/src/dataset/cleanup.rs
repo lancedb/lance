@@ -3592,6 +3592,7 @@ mod tests {
                 old_manifest,
                 &Mutex::new(CleanupInspection::default()),
                 &HashSet::new(),
+                &HashSet::new(),
             )
             .await
             .unwrap();
@@ -7437,7 +7438,6 @@ mod tests {
                 naming_scheme: ManifestNamingScheme::V2,
                 e_tag: None,
                 identity: Some(row.2),
-                last_modified: None,
             })
         }
 
