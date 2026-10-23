@@ -244,8 +244,8 @@ pub struct CompactionOptions {
     /// Setting above 1.0 will never materialize deletions.
     pub materialize_deletions_threshold: f32,
     /// The number of threads to use (how many compaction tasks to run in parallel).
-    /// Defaults to the number of compute-intensive CPUs.  Not used when running
-    /// tasks manually using [`plan_compaction`]
+    /// Must be greater than 0. Defaults to the number of compute-intensive CPUs.
+    /// Not used when running tasks manually using [`plan_compaction`]
     pub num_threads: Option<usize>,
     /// The batch size to use when scanning the input fragments.  If not
     /// specified then the default (see
@@ -1117,6 +1117,16 @@ pub async fn compact_files_with_planner(
     planner: &dyn CompactionPlanner,
 ) -> Result<CompactionMetrics> {
     let compaction_plan: CompactionPlan = planner.plan(dataset).await?;
+
+    // `buffer_unordered(0)` below never pulls a task from the stream and
+    // returns `Pending` with nothing left to wake it, so zero threads would
+    // leave compaction waiting forever. Checked against the plan so plans from
+    // a custom planner are covered too.
+    if compaction_plan.options.num_threads == Some(0) {
+        return Err(Error::invalid_input(
+            "CompactionOptions::num_threads must be greater than 0 (use None for the default)",
+        ));
+    }
 
     // A tagged FRI history is maintained by appending transitions to the
     // tagged entry, which only the deferred-remap commit path does; eager
@@ -12620,6 +12630,41 @@ mod tests {
         assert_eq!(plan.read_version, dataset.manifest.version);
         // make sure options.validate() worked
         assert!(!plan.options.materialize_deletions);
+    }
+
+    /// `num_threads` caps how many rewrite tasks run at once, and a cap of zero
+    /// never starts one, so compaction would wait forever instead of failing.
+    #[tokio::test]
+    async fn test_compact_files_rejects_zero_threads() {
+        let test_dir = TempStrDir::default();
+        let data = sample_data();
+        let reader = RecordBatchIterator::new(vec![Ok(data.clone())], data.schema());
+        let write_params = WriteParams {
+            max_rows_per_file: 2000,
+            ..Default::default()
+        };
+        let mut dataset = Dataset::write(reader, &test_dir, Some(write_params))
+            .await
+            .unwrap();
+
+        let options = CompactionOptions {
+            num_threads: Some(0),
+            ..Default::default()
+        };
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            compact_files(&mut dataset, options, None),
+        )
+        .await
+        .expect("compaction with zero threads must fail instead of hanging")
+        .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("num_threads must be greater than 0"),
+            "{error}"
+        );
     }
 
     #[test]
