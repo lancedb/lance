@@ -1066,7 +1066,8 @@ pub(crate) async fn merge_segments(
     // source's fragment is not carried into the merged segment.
     let segment_refs = segments.iter().collect::<Vec<_>>();
     let (_, old_data_filters) =
-        crate::index::append::build_per_segment_filters(dataset, &segment_refs, staged).await?;
+        crate::index::append::build_per_segment_filters(dataset, &segment_refs, staged, false)
+            .await?;
 
     let new_uuid = Uuid::new_v4();
     let new_store = LanceIndexStore::from_dataset_for_new(dataset, &new_uuid)?;

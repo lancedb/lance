@@ -1920,6 +1920,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                                 dataset.as_ref(),
                                 &effective_old_frags,
                                 &RoaringBitmap::new(),
+                                false,
                             )
                             .await?,
                         );
