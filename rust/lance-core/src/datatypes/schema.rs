@@ -1322,6 +1322,11 @@ impl Projection {
         Self::empty(base).union_schema(&schema)
     }
 
+    /// The schema the projection selects from
+    pub fn base_schema(&self) -> &Schema {
+        self.base.schema()
+    }
+
     pub fn with_row_id(mut self) -> Self {
         self.with_row_id = true;
         self
@@ -1376,7 +1381,28 @@ impl Projection {
             return Ok(self);
         }
 
-        if let Some(fields) = self.base.schema().resolve(column) {
+        let fields = self.base.schema().resolve(column).or_else(|| {
+            let path = parse_field_path(column).ok()?;
+            let (child, parent) = path.split_last()?;
+            let parent =
+                format_field_path_minimal(&parent.iter().map(String::as_str).collect::<Vec<_>>());
+            let fields = self.base.schema().resolve(parent)?;
+            let field = fields.last()?;
+            if field.is_blob_v2()
+                && self.blob_handling.returns_description(field)
+                && super::BLOB_V2_DESC_LANCE_FIELD
+                    .children
+                    .iter()
+                    .any(|descriptor| descriptor.name == *child)
+            {
+                // Descriptor children are synthesized at read time and have no stored field
+                // IDs. Select the physical blob and its ancestors, not a descriptor child.
+                Some(fields)
+            } else {
+                None
+            }
+        });
+        if let Some(fields) = fields {
             self.field_ids.extend(fields.iter().map(|f| f.id));
             if let Some(last_field) = fields.last() {
                 Self::add_field_children(&mut self.field_ids, last_field);
@@ -1841,10 +1867,64 @@ pub fn escape_field_path_for_project(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use crate::datatypes::field::LANCE_FIELD_ID_KEY;
+    use crate::datatypes::{BLOB_V2_LOGICAL_FIELDS, BLOB_V2_LOGICAL_MINIMAL_FIELDS};
     use arrow_schema::{DataType as ArrowDataType, Fields as ArrowFields};
     use std::{collections::HashMap, sync::Arc};
 
     use super::*;
+
+    #[rstest::rstest]
+    fn test_blob_v2_descriptor_subfield_projection(
+        #[values("kind", "position", "size", "blob_id", "blob_uri")] child: &str,
+        #[values(false, true)] complete: bool,
+        #[values(false, true)] nested: bool,
+    ) {
+        let blob = ArrowField::new(
+            if nested { "video.with.dot" } else { "video" },
+            DataType::Struct(if complete {
+                BLOB_V2_LOGICAL_FIELDS.clone()
+            } else {
+                BLOB_V2_LOGICAL_MINIMAL_FIELDS.clone()
+            }),
+            true,
+        )
+        .with_metadata(HashMap::from([(
+            "ARROW:extension:name".to_string(),
+            "lance.blob.v2".to_string(),
+        )]));
+        let (field, path) = if nested {
+            (
+                ArrowField::new("parent", DataType::Struct(vec![blob].into()), true),
+                "parent.`video.with.dot`",
+            )
+        } else {
+            (blob, "video")
+        };
+        let schema = Arc::new(Schema::try_from(&ArrowSchema::new(vec![field])).unwrap());
+        let expected = Projection::empty(schema.clone())
+            .union_column(path, OnMissing::Error)
+            .unwrap();
+        let actual = Projection::empty(schema.clone())
+            .union_column(format!("{path}.{child}"), OnMissing::Error)
+            .unwrap();
+        assert_eq!(actual.to_arrow_schema(), expected.to_arrow_schema());
+        assert!(actual.field_ids.iter().all(|id| *id >= 0));
+
+        for missing in [format!("{path}.missing"), format!("{path}.{child}.missing")] {
+            let error = Projection::empty(schema.clone())
+                .union_column(&missing, OnMissing::Error)
+                .unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }));
+            assert!(error.to_string().contains(&missing));
+            assert!(
+                Projection::empty(schema.clone())
+                    .union_column(&missing, OnMissing::Ignore)
+                    .unwrap()
+                    .field_ids
+                    .is_empty()
+            );
+        }
+    }
 
     #[rstest::rstest]
     #[case::last_id(i32::MAX - 1, 1, true)]
