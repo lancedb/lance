@@ -34,7 +34,7 @@ async fn write_two_column_schema_evolution_dataset(uri: &str) -> Dataset {
 #[tokio::test]
 async fn test_binary_copy_merge_small_files() {
     for version in NON_LEGACY_VERSIONS {
-        do_test_binary_copy_merge_small_files(version).await;
+        Box::pin(do_test_binary_copy_merge_small_files(version)).await;
     }
 }
 
