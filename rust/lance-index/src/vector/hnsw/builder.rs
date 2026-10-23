@@ -1484,6 +1484,9 @@ impl DeepSizeOf for HnswGraph {
     }
 }
 
+/// Lower bound for the search-time `ef` when the caller does not set one.
+pub const DEFAULT_MIN_EF: usize = 256;
+
 #[derive(Debug, Clone, Copy)]
 pub struct HnswQueryParams {
     pub ef: usize,
@@ -1497,7 +1500,7 @@ impl From<&Query> for HnswQueryParams {
     fn from(query: &Query) -> Self {
         let k = query.k * query.refine_factor.unwrap_or(1) as usize;
         Self {
-            ef: query.ef.unwrap_or(k + k / 2),
+            ef: query.ef.unwrap_or_else(|| (k + k / 2).max(DEFAULT_MIN_EF)),
             lower_bound: query.lower_bound,
             upper_bound: query.upper_bound,
             dist_q_c: query.dist_q_c,
@@ -1926,6 +1929,7 @@ mod tests {
     };
     use crate::metrics::{LocalMetricsCollector, NoOpMetricsCollector};
     use crate::prefilter::{NoFilter, PreFilter};
+    use crate::vector::Query;
     use crate::vector::graph::builder::GraphBuilderNode;
     use crate::vector::storage::{DistCalculator, VectorStore};
     use crate::vector::v3::subindex::IvfSubIndex;
@@ -1934,7 +1938,7 @@ mod tests {
         graph::{DISTS_FIELD, NEIGHBORS_FIELD, OrderedNode, VisitedGenerator},
         hnsw::{
             HNSW, HnswMetadata, VECTOR_ID_FIELD,
-            builder::{HnswBuildParams, HnswQueryParams},
+            builder::{DEFAULT_MIN_EF, HnswBuildParams, HnswQueryParams},
         },
     };
 
@@ -2707,7 +2711,7 @@ mod tests {
         }
         assert_eq!(all_results[0], all_results[1]);
 
-        // default ef (k + k/2) and a deletion-style mask (all but a few rows)
+        // the pre-floor default and a deletion-style mask
         let default_ef_params = HnswQueryParams {
             ef: k + k / 2,
             ..params
@@ -3719,6 +3723,42 @@ mod tests {
         );
     }
 
+    fn query_with(k: usize, ef: Option<usize>, refine_factor: Option<u32>) -> Query {
+        Query {
+            column: "vector".to_string(),
+            key: Arc::new(Float32Array::from(vec![0.0; 8])),
+            k,
+            lower_bound: None,
+            upper_bound: None,
+            minimum_nprobes: 1,
+            maximum_nprobes: None,
+            search_effort: 0.5,
+            ef,
+            refine_factor,
+            metric_type: Some(DistanceType::L2),
+            use_index: true,
+            query_parallelism: 0,
+            dist_q_c: 0.0,
+            approx_mode: Default::default(),
+        }
+    }
+
+    #[rstest]
+    #[case::floor_binds_at_search_shaped_k(10, None, None, DEFAULT_MIN_EF)]
+    #[case::floor_stops_binding_by_k(1000, None, None, 1500)]
+    #[case::floor_stops_binding_by_refine(10, None, Some(100), 1500)]
+    #[case::explicit_ef_wins_below_the_floor(10, Some(15), None, 15)]
+    #[case::explicit_ef_wins_above_the_floor(10, Some(4096), None, 4096)]
+    fn default_ef_is_floored_but_never_overrides_the_caller(
+        #[case] k: usize,
+        #[case] ef: Option<usize>,
+        #[case] refine_factor: Option<u32>,
+        #[case] expected: usize,
+    ) {
+        let params = HnswQueryParams::from(&query_with(k, ef, refine_factor));
+        assert_eq!(params.ef, expected);
+    }
+
     /// Wraps [FlatFloatStorage] so tests can observe whether the search path
     /// issued prefetches, which is otherwise invisible in the results.
     #[derive(Clone)]
@@ -3841,7 +3881,7 @@ mod tests {
                 &counting,
             )
             .unwrap();
-        assert_eq!(results.len(), 10);
+        assert_eq!(results.0.len(), 10);
         assert_eq!(
             counting.prefetch_calls.load(Ordering::Relaxed) > 0,
             expect_prefetch
@@ -3880,6 +3920,7 @@ mod tests {
                 None,
             )
             .unwrap()
+            .0
             .iter()
             .map(|node| (node.id, node.dist.0))
             .collect();
@@ -3896,6 +3937,7 @@ mod tests {
                     prefetch_distance,
                 )
                 .unwrap()
+                .0
                 .iter()
                 .map(|node| (node.id, node.dist.0))
                 .collect();
