@@ -246,7 +246,7 @@ async fn build_table(uri: &str, total_rows: usize, shuffled: bool, scenario: Sce
         .map(|fragment| fragment.physical_rows.unwrap())
         .sum::<usize>();
     let expected_indexed_rows = match scenario {
-        Scenario::None | Scenario::Compacted => 0,
+        Scenario::None => 0,
         Scenario::InlineTail | Scenario::Scan90 => total_rows * 9 / 10,
         Scenario::Scan50 => total_rows / 2,
         _ => total_rows,

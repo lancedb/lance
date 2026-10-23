@@ -219,7 +219,10 @@ struct LevelLinks {
     /// it, so the repeated publishes of an incremental build do not accumulate
     /// (the prior manual `AtomicPtr` + retired-`Vec` scheme leaked every old
     /// snapshot until graph drop, growing O(N^2/batch) and OOMing at ~1M rows).
-    published: ArcSwap<Vec<u32>>,
+    ///
+    /// `None` on level 0, which searchers read from the packed level-0
+    /// snapshot; one `ArcSwap` per node makes a large graph slow to drop.
+    published: Option<ArcSwap<Vec<u32>>>,
     /// Empty until the node is inserted or first linked to, then sized to
     /// exactly `max_neighbors` once and reused (see [`size_ranked`]).
     ranked: Mutex<Vec<ScoredPoint>>,
@@ -228,29 +231,34 @@ struct LevelLinks {
 impl LevelLinks {
     /// `empty` is one empty list the whole graph shares until a level first
     /// publishes, so an unfilled slot allocates nothing per level.
-    fn new(empty: &Arc<Vec<u32>>) -> Self {
+    fn new(level: u16, empty: &Arc<Vec<u32>>) -> Self {
         Self {
-            published: ArcSwap::new(Arc::clone(empty)),
+            published: (level > 0).then(|| ArcSwap::new(Arc::clone(empty))),
             ranked: Mutex::new(Vec::new()),
         }
     }
 
     /// Heap bytes a level adds once its node is in the graph: `ranked` at
-    /// exactly `max_neighbors`, and a published list counted at full width
-    /// (a publish may hold fewer) plus its `Arc` block (refcounts and the Vec
-    /// header), rounded to the 16-byte granule allocators hand out for a
-    /// block that small.
-    fn linked_bytes(max_neighbors: usize) -> usize {
+    /// exactly `max_neighbors`, and above level 0 a published list counted at
+    /// full width (a publish may hold fewer) plus its `Arc` block (refcounts
+    /// and the Vec header), rounded to the 16-byte granule allocators hand out
+    /// for a block that small.
+    fn linked_bytes(level: u16, max_neighbors: usize) -> usize {
+        let ranked = max_neighbors * std::mem::size_of::<ScoredPoint>();
+        if level == 0 {
+            return ranked;
+        }
         let published_block = (2 * std::mem::size_of::<usize>() + std::mem::size_of::<Vec<u32>>())
             .next_multiple_of(16);
-        published_block
-            + max_neighbors * (std::mem::size_of::<ScoredPoint>() + std::mem::size_of::<u32>())
+        published_block + ranked + max_neighbors * std::mem::size_of::<u32>()
     }
 
     fn publish_from_ranked(&self, ranked: &[ScoredPoint]) {
-        self.published.store(Arc::new(
-            ranked.iter().map(|point| point.id).collect::<Vec<_>>(),
-        ));
+        if let Some(published) = &self.published {
+            published.store(Arc::new(
+                ranked.iter().map(|point| point.id).collect::<Vec<_>>(),
+            ));
+        }
     }
 }
 
@@ -262,7 +270,9 @@ struct Node {
 
 impl Node {
     fn new(target_level: u16, empty: &Arc<Vec<u32>>) -> Self {
-        let levels = (0..=target_level).map(|_| LevelLinks::new(empty)).collect();
+        let levels = (0..=target_level)
+            .map(|level| LevelLinks::new(level, empty))
+            .collect();
         Self {
             target_level,
             levels,
@@ -279,7 +289,7 @@ impl Node {
     /// Heap bytes a node of `target_level` adds once it is in the graph.
     fn linked_bytes(target_level: u16, m: usize) -> usize {
         (0..=target_level)
-            .map(|level| LevelLinks::linked_bytes(max_neighbors(m, level)))
+            .map(|level| LevelLinks::linked_bytes(level, max_neighbors(m, level)))
             .sum()
     }
 
@@ -1018,7 +1028,10 @@ impl HnswGraph {
                 return;
             }
         }
-        let published = node.levels[level as usize].published.load();
+        let Some(published) = &node.levels[level as usize].published else {
+            return;
+        };
+        let published = published.load();
         if visible_len == usize::MAX {
             for neighbor in published.iter().copied() {
                 visit(neighbor);
@@ -1360,6 +1373,14 @@ mod tests {
 
         graph.insert_batch(ids, &snapshot).unwrap();
         assert_eq!(graph.len(), rows);
+        for node in &graph.nodes {
+            assert!(node.levels[0].published.is_none());
+            assert!(
+                node.levels[1..]
+                    .iter()
+                    .all(|links| links.published.is_some())
+            );
+        }
 
         let query = snapshot.vector(42);
         let result = graph
@@ -1554,6 +1575,13 @@ mod tests {
         let mut exports = 0;
         let mut edges_checked = 0;
         while writing.load(Ordering::Acquire) || exports < 5 {
+            // Read as a search does: every visible node is in the packed level 0.
+            let visible = graph.len() as u32;
+            let packed = graph.packed_level0.load();
+            assert!(
+                (0..visible).all(|id| packed.neighbors(id).is_some()),
+                "a visible node is missing from the packed level-0 snapshot"
+            );
             let batch = graph.to_lance_hnsw_batch(None).unwrap();
             let rows = batch.num_rows();
             let neighbors = batch

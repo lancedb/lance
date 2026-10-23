@@ -30,7 +30,10 @@ use crate::index::DatasetIndexInternalExt;
 use crate::session::index_caches::ProstAny;
 use crate::{
     Dataset,
-    dataset::{index::LanceIndexStoreExt, scanner::ColumnOrdering},
+    dataset::{
+        index::LanceIndexStoreExt,
+        scanner::{ColumnOrdering, RowAddrMask, RowAddrTreeMap},
+    },
 };
 use arrow_schema::DataType;
 use datafusion::physical_plan::SendableRecordBatchStream;
@@ -137,11 +140,28 @@ tokio::task_local! {
     pub(crate) static TEST_TRAINING_IO_BUFFER_SIZE: u64;
 }
 
+/// Which rows [`scan_training_data`] reads.
+pub(crate) enum TrainingRows {
+    /// Every row of these fragments.
+    Fragments(Vec<Fragment>),
+    /// Exactly these rows, keyed like `_rowid`: by address, or by row id under
+    /// stable row ids. The fragments to open follow from the keys. A segment
+    /// merge uses this to re-read the rows an overlay replaced after a source
+    /// segment was built, together with the appended fragments, in one sorted
+    /// scan.
+    Rows(RowAddrTreeMap),
+}
+
+/// Reads the rows a scalar index is built from: `column` projected as the
+/// index's value column, with row ids or addresses as `criteria` asks, sorted
+/// by value when the index type needs it. The scan goes through the regular
+/// reader, so deletions and data overlays are already applied to what it
+/// yields. `selection` restricts the rows read; `None` reads the whole dataset.
 pub(crate) async fn scan_training_data(
     dataset: &Dataset,
     column: &str,
     criteria: &TrainingCriteria,
-    fragments: Option<Vec<Fragment>>,
+    selection: Option<TrainingRows>,
 ) -> Result<SendableRecordBatchStream> {
     let num_rows = dataset.count_all_rows().await?;
 
@@ -156,7 +176,11 @@ pub(crate) async fn scan_training_data(
     // Note: we don't need to sort for TrainingOrdering::Addresses because
     // Lance will return data in the order of the row_address by default.
     let row_ids_are_sorted = column == ROW_ID
-        && row_id_scan_is_sorted(fragments.as_deref().unwrap_or(dataset.fragments()))?;
+        && match &selection {
+            Some(TrainingRows::Fragments(fragments)) => row_id_scan_is_sorted(fragments)?,
+            None => row_id_scan_is_sorted(dataset.fragments())?,
+            Some(TrainingRows::Rows(_)) => false,
+        };
     if TrainingOrdering::Values == criteria.ordering && !row_ids_are_sorted {
         scan.order_by(Some(vec![ColumnOrdering::asc_nulls_first(
             column.to_string(),
@@ -172,8 +196,15 @@ pub(crate) async fn scan_training_data(
 
     scan.project_with_transform(&[(VALUE_COLUMN_NAME, column)])?;
 
-    if let Some(fragments) = fragments {
-        scan.with_fragments(fragments);
+    match selection {
+        Some(TrainingRows::Fragments(fragments)) => {
+            scan.with_fragments(fragments);
+        }
+        // The sort above still applies to what is read.
+        Some(TrainingRows::Rows(rows)) => {
+            scan.with_row_id_prefilter(RowAddrMask::from_allowed(rows));
+        }
+        None => {}
     }
 
     let batches = scan
@@ -271,9 +302,11 @@ pub(crate) async fn load_training_data(
                     Ok(frag.metadata().clone())
                 })
                 .collect();
-            scan_training_data(dataset, column, criteria, Some(frags?)).await
+            let selection = Some(TrainingRows::Fragments(frags?));
+            scan_training_data(dataset, column, criteria, selection).await
         } else {
-            scan_training_data(dataset, column, criteria, fragments).await
+            let selection = fragments.map(TrainingRows::Fragments);
+            scan_training_data(dataset, column, criteria, selection).await
         }
     } else {
         TrainingRequest::create_empty_stream(dataset, column, criteria).await
@@ -309,7 +342,6 @@ pub(crate) async fn load_fts_training_data(
     }
 }
 
-// TODO: Allow users to register their own plugins
 pub(crate) static SCALAR_INDEX_PLUGIN_REGISTRY: LazyLock<Arc<IndexPluginRegistry>> =
     LazyLock::new(IndexPluginRegistry::with_default_plugins);
 

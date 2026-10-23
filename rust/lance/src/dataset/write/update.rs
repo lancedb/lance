@@ -1033,6 +1033,12 @@ mod tests {
             "Should return error if update expression references non-existent column"
         );
 
+        let err = builder.clone().set("id", "coalesce(id), 0").unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidInput { .. }) && err.to_string().contains("not valid"),
+            "Should return error instead of keeping only the first of two expressions, got {err}"
+        );
+
         assert!(
             matches!(builder.build(), Err(Error::InvalidInput { .. })),
             "Should return error if no update expressions are provided"

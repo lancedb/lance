@@ -533,17 +533,18 @@ inline row-ID ranges can be resolved directly, even without an index. Other
 uncovered fragments fall back to scanning their `_rowid` values, so a warmed
 lookup can still be expensive when a large part of the dataset is uncovered.
 
-Compaction preserves stable IDs but changes physical row addresses. With the
-default compaction options, rewritten fragments lose this BTree's coverage.
-After compacting, run index maintenance to restore coverage:
+Compaction preserves stable IDs but changes physical row addresses. The default
+compaction path eagerly remaps this BTree and preserves its existing coverage.
+Index maintenance can then consolidate segments and index previously uncovered
+fragments:
 
 ```python
 dataset.optimize.compact_files(target_rows_per_fragment=1024 * 1024)
 dataset.optimize.optimize_indices()
 ```
 
-Queries remain correct between these operations through direct inline-range
-lookup or scanning. Old dataset versions continue to use their own data and
+Any uncovered fragments remain queryable through direct inline-range lookup or
+scanning. Old dataset versions continue to use their own data and
 index metadata. Keeping coverage through deferred address remapping on a
 stable-row-ID table depends on Fragment Reuse Index support in the deployed
 build; it is not enabled in release builds of this implementation.
@@ -597,14 +598,16 @@ A file is verified when Lance can see that it was referenced by an older version
 and is no longer referenced by any newer version. However, some orphaned files
 cannot be verified this way — for example, files left behind by aborted or failed
 commits that were never recorded in any version. These files are
-indistinguishable from files being written by an in-progress operation.
+indistinguishable from files being written by an in-progress operation, so their
+**age** is the only evidence that no operation still owns them: by default Lance
+removes an unverifiable file only if it is at least **7 days** old.
 
 Cleanup will never delete the current (active) version. This means passing
 `older_than=timedelta(0)` is safe and will delete all versions except the current
 one.
 
 The `delete_unverified` flag enables a more aggressive strategy that will also
-delete these unverified files:
+delete unverified files regardless of their age:
 
 ```python
 dataset.cleanup_old_versions(
@@ -615,15 +618,14 @@ dataset.cleanup_old_versions(
 
 !!! danger
 
-    Only use `delete_unverified=True` when you are confident that no other
-    concurrent operation has been in-progress for longer than the `older_than`
-    duration. Lance uses the file's age to decide whether an unverified file is
-    safe to remove, so any operation that is still running past the `older_than`
-    window risks having its files deleted out from under it.
+    `delete_unverified=True` removes the 7-day age protection entirely: an
+    unverifiable file is deleted whatever its age. Age is the only thing that
+    distinguishes an abandoned file from one an operation is still writing, so with
+    the flag set there is nothing left to make that distinction.
 
-    In particular, combining `delete_unverified=True` with `older_than=timedelta(0)`
-    is **extremely dangerous** — if any other operation is in-progress at all,
-    its data files may be deleted, leading to dataset corruption.
+    Only use it when you can guarantee that **no other process is operating on the
+    dataset at all**. Any concurrent write may have its files deleted out from under
+    it, leaving the dataset corrupted.
 
 Control file deletion throughput with two independent options:
 
@@ -680,7 +682,9 @@ And disabled again:
 ds.optimize.disable_auto_cleanup()
 ```
 
-Auto cleanup parameters can also be set directly via dataset config keys:
+Auto cleanup parameters can also be set directly via dataset config keys. See the
+[Table Config Specification](../format/table/table_config.md) for the full list of
+`lance.auto_cleanup.*` keys:
 
 ```python
 ds.update_config({

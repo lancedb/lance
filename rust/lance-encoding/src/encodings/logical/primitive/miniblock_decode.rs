@@ -23,8 +23,8 @@ use crate::buffer::LanceBuffer;
 use crate::compression::{BlockDecompressor, DecompressionStrategy, MiniBlockDecompressor};
 use crate::data::{DataBlock, DataBlockBuilder, DictionaryDataBlock};
 use crate::decoder::{DecodePageTask, DecodedPage, StructuralPageDecoder};
-use crate::format::pb21::compressive_encoding::Compression;
-use crate::format::{ProtobufUtils21, pb21};
+use crate::format::metadata::compressive_encoding::Compression;
+use crate::format::{EncodingUtils, metadata};
 use crate::repdef::{DefinitionInterpretation, LevelBuffer, RepDefUnraveler, max_visible_level};
 
 use super::chunk_index::{
@@ -311,11 +311,16 @@ impl DecodeMiniBlockTask {
                 }
             };
 
-            // We hit this case when all we needed was the preamble
+            // Empty row ranges can occur when nested scheduling aligns child decode tasks.  Such a
+            // range either requests only the preamble or no values at all.
             if range.start == range.end {
-                debug_assert!(preamble_action == PreambleAction::Take);
                 debug_assert!(items_in_preamble <= total_items);
-                return (0..items_in_preamble, 0..first_row_start);
+                let (item_start, level_start) = if preamble_action == PreambleAction::Take {
+                    (0, 0)
+                } else {
+                    (items_in_preamble, first_row_start)
+                };
+                return (item_start..items_in_preamble, level_start..first_row_start);
             }
             assert!(range.start < range.end);
 
@@ -814,7 +819,7 @@ impl CachedPageData for MiniBlockCacheableState {
 #[derive(Debug)]
 pub struct MiniBlockScheduler {
     // These come from the protobuf
-    buffer_offsets_and_sizes: Vec<(u64, u64)>,
+    pub(super) buffer_offsets_and_sizes: Vec<(u64, u64)>,
     priority: u64,
     items_in_page: u64,
     repetition_index_depth: u16,
@@ -834,7 +839,7 @@ impl MiniBlockScheduler {
         buffer_offsets_and_sizes: &[(u64, u64)],
         priority: u64,
         items_in_page: u64,
-        layout: &pb21::MiniBlockLayout,
+        layout: &metadata::MiniBlockLayout,
         decompressors: &dyn DecompressionStrategy,
     ) -> Result<Self> {
         let rep_decompressor = layout
@@ -858,7 +863,7 @@ impl MiniBlockScheduler {
         let def_meaning = layout
             .layers
             .iter()
-            .map(|l| ProtobufUtils21::repdef_layer_to_def_interp(*l))
+            .map(|l| EncodingUtils::repdef_layer_to_def_interp(*l))
             .collect::<Vec<_>>();
         let value_decompressor = decompressors.create_miniblock_decompressor(
             layout.value_compression.as_ref().unwrap(),
@@ -875,6 +880,12 @@ impl MiniBlockScheduler {
                 Compression::Variable(_) => 4,
                 Compression::Flat(_) => 16,
                 Compression::General(_) => 1,
+                Compression::FixedSizeList(_) => 1,
+                // The RLE frame starts with an 8-byte length prefix and slices its
+                // values/run-length sub-buffers at byte offsets, so no stricter
+                // alignment can be assumed (same reasoning as `General`).  Typed
+                // views taken later re-align (copying) as needed.
+                Compression::Rle(_) => 1,
                 Compression::InlineBitpacking(_) | Compression::OutOfLineBitpacking(_) => {
                     crate::encoder::MIN_PAGE_BUFFER_ALIGNMENT
                 }
@@ -1379,15 +1390,40 @@ fn build_chunk_index(
     // and an invalid count must not reach the final-chunk subtraction.
     let value_counts = analyze_value_counts(words, items_in_page)?;
 
-    // Each chunk stores `(divided_bytes + 1) * MINIBLOCK_ALIGNMENT` bytes, so the
-    // deltas are the chunk sizes and their grand total is the data buffer size.
-    let byte_starts = PrefixSums::from_deltas(
+    // Each chunk stores `(divided_bytes + 1) * MINIBLOCK_ALIGNMENT` bytes.  Validate
+    // that the metadata covers exactly the recorded data buffer before using its
+    // total to select the prefix-sum width.
+    let chunk_sizes = || {
         words
             .iter()
-            .map(|word| ((word >> 4) as u64 + 1) * MINIBLOCK_ALIGNMENT as u64),
-        num_chunks,
-        data_buf_size,
-    );
+            .map(|word| ((word >> 4) as u64 + 1) * MINIBLOCK_ALIGNMENT as u64)
+    };
+    let chunk_data_size = chunk_sizes().enumerate().try_fold(
+        0u64,
+        |accumulated_size, (chunk_index, chunk_size)| {
+            accumulated_size.checked_add(chunk_size).ok_or_else(|| {
+                Error::corrupt_file_named(
+                    "miniblock_metadata",
+                    format!(
+                        "chunk byte sizes overflow at chunk_index={chunk_index}: \
+                         accumulated_size={accumulated_size}, chunk_size={chunk_size}, \
+                         num_chunks={num_chunks}"
+                    ),
+                )
+            })
+        },
+    )?;
+    if chunk_data_size != data_buf_size {
+        return Err(Error::corrupt_file_named(
+            "miniblock_metadata",
+            format!(
+                "chunk byte sizes do not match the data buffer: \
+                 chunk_data_size={chunk_data_size}, data_buf_size={data_buf_size}, \
+                 num_chunks={num_chunks}"
+            ),
+        ));
+    }
+    let byte_starts = PrefixSums::from_deltas(chunk_sizes(), num_chunks, chunk_data_size);
 
     // Nested pages track rows via the repetition index and keep leaf item counts
     // separately; flat pages have row == value index, so value counts are rows.
@@ -1614,7 +1650,7 @@ mod tests {
     use crate::encodings::logical::primitive::{LoadedChunk, MINIBLOCK_ALIGNMENT};
     use crate::encodings::physical::rle::{RleDecompressor, RunLengthWidth};
     use crate::encodings::physical::value::ValueDecompressor;
-    use crate::format::{ProtobufUtils21, pb21};
+    use crate::format::{EncodingUtils, metadata};
 
     use super::{
         ChunkDrainInstructions, ChunkInstructions, DecodeMiniBlockTask, PreambleAction, Words,
@@ -1720,6 +1756,7 @@ mod tests {
             assert_eq!(level_range, expected_level_range);
         };
 
+        check(0..0, 0..0, 0..0);
         check(0..1, 0..3, 0..3);
         check(1..2, 3..5, 3..5);
         check(2..3, 5..5, 5..6);
@@ -1884,6 +1921,7 @@ mod tests {
             assert_eq!(level_range, expected_level_range);
         };
 
+        check(0..0, 1..1, 1..1);
         check(0..1, 1..3, 1..3);
         check(1..2, 3..3, 3..4);
         check(0..2, 1..3, 1..4);
@@ -2427,6 +2465,24 @@ mod tests {
         assert_eq!(total_items, items_in_page);
     }
 
+    #[rstest]
+    #[case::metadata_longer_than_data(8)]
+    #[case::metadata_shorter_than_data(24)]
+    fn test_rejects_mismatched_miniblock_data_size(#[case] data_buf_size: u64) {
+        let (words, _) = words_from(&[(1, 8), (0, 8)]);
+
+        let error = build_chunk_index(&words, 3, 0, data_buf_size, None, 0).unwrap_err();
+
+        assert!(matches!(error, lance_core::Error::CorruptFile { .. }));
+        let message = error.to_string();
+        assert!(message.contains("chunk_data_size=16"), "{message}");
+        assert!(
+            message.contains(&format!("data_buf_size={data_buf_size}")),
+            "{message}"
+        );
+        assert!(message.contains("num_chunks=2"), "{message}");
+    }
+
     #[test]
     fn test_nested_detection_and_axes() {
         // Repetition index (stride 2): three chunks holding 5, 4, 3 rows, no trailers.
@@ -2539,14 +2595,14 @@ mod tests {
         let unique_values = 2_000;
 
         let dictionary_encoding =
-            ProtobufUtils21::out_of_line_bitpacking(64, ProtobufUtils21::flat(11, None));
-        let layout = pb21::MiniBlockLayout {
+            EncodingUtils::out_of_line_bitpacking(64, EncodingUtils::flat(11, None));
+        let layout = metadata::MiniBlockLayout {
             rep_compression: None,
             def_compression: None,
-            value_compression: Some(ProtobufUtils21::flat(64, None)),
+            value_compression: Some(EncodingUtils::flat(64, None)),
             dictionary: Some(dictionary_encoding),
             num_dictionary_items: unique_values,
-            layers: vec![pb21::RepDefLayer::RepdefAllValidItem as i32],
+            layers: vec![metadata::RepDefLayer::RepdefAllValidItem as i32],
             num_buffers: 1,
             repetition_index_depth: 0,
             num_items: rows,
@@ -2572,13 +2628,51 @@ mod tests {
     }
 
     #[test]
+    fn test_miniblock_dictionary_rle_decode() {
+        let rows = 10_000;
+
+        // `create_block_compressor` picks RLE for dictionary values when the
+        // merged values buffer is dominated by runs (e.g. several batches each
+        // contributing the same single dictionary value into one page).  The
+        // reader must accept the same encoding the writer emits.
+        let dictionary_encoding =
+            EncodingUtils::rle(EncodingUtils::flat(64, None), EncodingUtils::flat(8, None));
+        let layout = metadata::MiniBlockLayout {
+            rep_compression: None,
+            def_compression: None,
+            value_compression: Some(EncodingUtils::flat(64, None)),
+            dictionary: Some(dictionary_encoding),
+            num_dictionary_items: 1,
+            layers: vec![metadata::RepDefLayer::RepdefAllValidItem as i32],
+            num_buffers: 1,
+            repetition_index_depth: 0,
+            num_items: rows,
+            has_large_chunk: false,
+        };
+
+        let buffer_offsets_and_sizes = vec![(0, 0), (0, 0), (0, 0)];
+        let scheduler = super::MiniBlockScheduler::try_new(
+            &buffer_offsets_and_sizes,
+            /*priority=*/ 0,
+            /*items_in_page=*/ rows,
+            &layout,
+            &DefaultDecompressionStrategy::default(),
+        )
+        .unwrap();
+
+        let dictionary = scheduler.dictionary.unwrap();
+        assert_eq!(dictionary.num_dictionary_items, 1);
+        assert_eq!(dictionary.dictionary_data_alignment, 1);
+    }
+
+    #[test]
     fn miniblock_levels_use_one_count_for_mixed_codecs() {
         let actual_num_levels = usize::from(u16::MAX) + 8;
         let levels = vec![1_u16; actual_num_levels];
         let rep_frame = encoded_u16_frame(&levels, RunLengthWidth::U8);
         let rep_decompressor = RleDecompressor::new(16);
         let def_frame = LanceBuffer::reinterpret_slice(Arc::from(levels.clone()));
-        let def_decompressor = ValueDecompressor::from_flat(&pb21::Flat {
+        let def_decompressor = ValueDecompressor::from_flat(&metadata::Flat {
             bits_per_value: 16,
             data: None,
         });
