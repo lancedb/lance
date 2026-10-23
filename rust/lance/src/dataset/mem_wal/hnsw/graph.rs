@@ -594,7 +594,8 @@ impl HnswGraph {
             });
         }
 
-        let ef = params.ef.max(params.k);
+        // A beam wider than the graph finds nothing more; cap what it allocates.
+        let ef = params.ef.max(params.k).min(visible_len);
         let limits = BeamLimits {
             ef,
             output_limit: params.k,
@@ -1387,6 +1388,11 @@ mod tests {
             .search(query, SearchParams::new(5, 32), &snapshot)
             .unwrap();
         assert!(result.iter().any(|point| point.id == 42));
+
+        let widest = graph
+            .search(query, SearchParams::new(5, usize::MAX), &snapshot)
+            .unwrap();
+        assert!(widest.iter().any(|point| point.id == 42));
     }
 
     /// Each node's neighbor lists are charged as it is inserted and hold
