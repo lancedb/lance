@@ -6,6 +6,7 @@ use lance_core::{Error, Result};
 
 use crate::data::FixedWidthDataBlock;
 
+pub mod alp;
 pub mod binary;
 #[cfg(feature = "bitpacking")]
 pub mod bitpacking;

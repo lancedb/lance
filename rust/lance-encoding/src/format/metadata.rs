@@ -8,8 +8,8 @@
 use prost::Message;
 
 pub use super::pb23::{
-    BufferCompression, ByteStreamSplit, CompressionScheme, CompressiveEncoding, Constant, Delta,
-    Dictionary, FixedSizeList, Flat, Fsst, General, InlineBitpacking, OutOfLineBitpacking,
+    Alp, BufferCompression, ByteStreamSplit, CompressionScheme, CompressiveEncoding, Constant,
+    Delta, Dictionary, FixedSizeList, Flat, Fsst, General, InlineBitpacking, OutOfLineBitpacking,
     PackedStruct, Range, RepDefLayer, Rle, Variable, VariablePackedStruct, compressive_encoding,
     variable_packed_struct,
 };

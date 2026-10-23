@@ -489,6 +489,17 @@ message ByteStreamSplit {
   CompressiveEncoding values = 1;
 }
 
+/* ALP: Adaptive Lossless floating-Point encoding
+ *
+ * Unstable 2.3 mirror of the stable 2.1/2.2 ALP compression message. Each
+ * mini-block chunk is self-describing (mode, exponents, bit width, base
+ * values), so only the input width is declared here.
+ */
+message Alp {
+  // 32 for f32 and 64 for f64
+  uint32 bits_per_value = 1;
+}
+
 // An encoding that compresses a data block into buffers
 message CompressiveEncoding {
     oneof compression {
@@ -507,5 +518,6 @@ message CompressiveEncoding {
         VariablePackedStruct variable_packed_struct = 13;
         Range range = 14;
         Delta delta = 15;
+        Alp alp = 16;
     }
 }

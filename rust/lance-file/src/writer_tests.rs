@@ -61,6 +61,16 @@ mod tests {
             .map(Into::into)
     }
 
+    fn create_v2_3_writer_with_compression(
+        object_writer: Box<dyn Writer>,
+        schema: LanceSchema,
+        options: FileWriterOptions,
+        compression: CompressionParams,
+    ) -> lance_core::Result<FileWriter> {
+        versions::v2_3::create_writer_with_compression(object_writer, schema, options, compression)
+            .map(Into::into)
+    }
+
     fn reader_projection_from_column_names(
         version: ConcreteFileVersion,
         schema: &LanceSchema,
@@ -1701,6 +1711,7 @@ mod tests {
                 compression: None,        // Will use default compression if any
                 compression_level: None,
                 bss: Some(lance_encoding::compression_config::BssMode::Off), // Explicitly disable BSS to ensure RLE is used
+                alp: None,
                 minichunk_size: None,
             },
         );
@@ -1973,6 +1984,130 @@ mod tests {
             status_encoding.contains("RLE") || status_encoding.contains("Rle"),
             "status column should use RLE encoding due to metadata threshold, but got: {}",
             status_encoding
+        );
+    }
+
+    #[tokio::test]
+    async fn test_field_metadata_alp_round_trip() {
+        use futures::TryStreamExt;
+        use lance_encoding::constants::ALP_META_KEY;
+        use lance_encoding::decoder::FilterExpression;
+        use lance_io::ReadBatchParams;
+
+        let mut metadata = HashMap::new();
+        metadata.insert(ALP_META_KEY.to_string(), "on".to_string());
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("price", DataType::Float32, false).with_metadata(metadata.clone()),
+            ArrowField::new("sensor", DataType::Float64, false).with_metadata(metadata),
+        ]));
+        let lance_schema = LanceSchema::try_from(arrow_schema.as_ref()).unwrap();
+
+        let n = 8192usize;
+        let prices =
+            Float32Array::from_iter_values((0..n).map(|i| ((i * 73) % 10000) as f32 / 100.0));
+        let sensors = arrow_array::Float64Array::from_iter_values(
+            (0..n).map(|i| ((i * 73) % 10000) as f64 / 100.0),
+        );
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(prices), Arc::new(sensors)],
+        )
+        .unwrap();
+
+        let path = TempObjFile::default();
+        let object_store = ObjectStore::local();
+        let mut writer = create_v2_3_writer_with_compression(
+            object_store.create(&path).await.unwrap(),
+            lance_schema.clone(),
+            FileWriterOptions::default(),
+            CompressionParams::new(),
+        )
+        .unwrap();
+        writer.write_batch(&batch).await.unwrap();
+        writer.finish().await.unwrap();
+
+        let fs = FsFixture::default();
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let file_reader = FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &LanceCache::no_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        // Both float columns should have been written with the ALP codec.
+        let column_metadatas = &file_reader.metadata().column_metadatas;
+        for (i, column) in ["price", "sensor"].iter().enumerate() {
+            let encoding = describe_encoding(&column_metadatas[i].pages[0]);
+            assert!(
+                encoding.contains("Alp"),
+                "column {column} should use ALP encoding, got: {encoding}"
+            );
+        }
+
+        // Full pipeline round-trip must be bitwise identical.
+        let projection = reader_projection_from_column_names(
+            ConcreteFileVersion::V2_3,
+            &lance_schema,
+            &["price", "sensor"],
+        )
+        .unwrap();
+        let batches: Vec<RecordBatch> = file_reader
+            .read_stream_projected(
+                ReadBatchParams::RangeFull,
+                1024,
+                16,
+                projection,
+                FilterExpression::no_filter(),
+            )
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let got_prices: Vec<u32> = batches
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<Float32Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .map(|v| v.to_bits())
+            })
+            .collect();
+        let got_sensors: Vec<u64> = batches
+            .iter()
+            .flat_map(|b| {
+                b.column(1)
+                    .as_any()
+                    .downcast_ref::<arrow_array::Float64Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .map(|v| v.to_bits())
+            })
+            .collect();
+        assert_eq!(
+            got_prices,
+            (0..n)
+                .map(|i| (((i * 73) % 10000) as f32 / 100.0).to_bits())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            got_sensors,
+            (0..n)
+                .map(|i| (((i * 73) % 10000) as f64 / 100.0).to_bits())
+                .collect::<Vec<_>>()
         );
     }
 

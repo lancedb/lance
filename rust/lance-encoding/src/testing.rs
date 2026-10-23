@@ -934,6 +934,7 @@ fn tag(e: &Compression) -> &'static str {
         VariablePackedStruct(_) => "variable_packed_struct",
         Range(_) => "range",
         Delta(_) => "delta",
+        Alp(_) => "alp",
     }
 }
 
