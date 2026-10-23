@@ -34,7 +34,10 @@ use std::sync::Arc;
 fn is_substrait_compatible(data_type: &DataType) -> bool {
     match data_type {
         DataType::FixedSizeList(_, _) => false,
-        DataType::List(inner) => is_substrait_compatible(inner.data_type()),
+        DataType::List(inner) | DataType::LargeList(inner) => {
+            is_substrait_compatible(inner.data_type())
+        }
+        DataType::Map(entries, _) => is_substrait_compatible(entries.data_type()),
         DataType::Struct(fields) => fields
             .iter()
             .all(|f| is_substrait_compatible(f.data_type())),
@@ -733,7 +736,7 @@ async fn parse_measures(
 mod tests {
     use std::sync::Arc;
 
-    use arrow_schema::{DataType, Field, Schema, TimeUnit};
+    use arrow_schema::{DataType, Field, Fields, Schema, TimeUnit};
     use datafusion::{
         execution::SessionState,
         logical_expr::{BinaryExpr, Case, Operator},
@@ -1333,6 +1336,52 @@ mod tests {
         // Encoding with the full schema would fail, but pruning removes the FSL column
         let pruned = prune_schema_for_substrait(&schema);
         assert_eq!(pruned.fields().len(), 2); // id and name only
+        assert_substrait_roundtrip(pruned, id_filter("test-id")).await;
+    }
+
+    #[tokio::test]
+    async fn test_prune_schema_for_substrait_nested_list_types() {
+        // The producer recurses into LargeList and Map children, so an FSL
+        // nested under them must still be pruned.
+        use crate::substrait::prune_schema_for_substrait;
+
+        let fsl = |width: i32| {
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), width)
+        };
+        let map_of = |value: DataType| {
+            DataType::Map(
+                Arc::new(Field::new(
+                    "entries",
+                    DataType::Struct(Fields::from(vec![
+                        Field::new("key", DataType::Utf8, false),
+                        Field::new("value", value, true),
+                    ])),
+                    false,
+                )),
+                false,
+            )
+        };
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("map_ok", map_of(DataType::Int32), true),
+            Field::new(
+                "ll_ok",
+                DataType::LargeList(Arc::new(Field::new("item", DataType::Int32, true))),
+                true,
+            ),
+            Field::new(
+                "ll_fsl",
+                DataType::LargeList(Arc::new(Field::new("item", fsl(16), true))),
+                true,
+            ),
+            Field::new("map_fsl", map_of(fsl(8)), true),
+        ]);
+
+        let pruned = prune_schema_for_substrait(&schema);
+        let names: Vec<&str> = pruned.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(names, vec!["id", "map_ok", "ll_ok"]);
+        // The encoder writes the whole schema, so a filter on another column
+        // only encodes once those columns are gone.
         assert_substrait_roundtrip(pruned, id_filter("test-id")).await;
     }
 
