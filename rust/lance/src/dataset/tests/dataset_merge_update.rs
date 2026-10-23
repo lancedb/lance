@@ -10,6 +10,7 @@ use crate::dataset::CommitBuilder;
 use crate::dataset::ROW_ID;
 use crate::dataset::WriteDestination;
 use crate::dataset::builder::DatasetBuilder;
+use crate::dataset::fragment::FileFragment;
 use crate::dataset::optimize::{CompactionOptions, compact_files};
 use crate::dataset::schema_evolution::ColumnAlteration;
 use crate::dataset::transaction::{DataReplacementGroup, Operation};
@@ -440,6 +441,83 @@ async fn test_insert_subschema() {
     // Can scan and get expected data.
     let data = dataset.scan().try_into_batch().await.unwrap();
     assert_eq!(data, expected);
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_commit_append_missing_column(
+    #[values(false, true)] is_nullable: bool,
+    #[values(
+        LanceFileVersion::V2_0,
+        LanceFileVersion::V2_1,
+        LanceFileVersion::V2_2,
+        LanceFileVersion::V2_3
+    )]
+    data_storage_version: LanceFileVersion,
+) {
+    let uri = TempStrDir::default();
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, false),
+        ArrowField::new("value", DataType::Int32, is_nullable),
+    ]));
+    let batch =
+        arrow_array::record_batch!(("id", Int32, [1, 2]), ("value", Int32, [10, 20])).unwrap();
+    let batch = RecordBatch::try_new(schema.clone(), batch.columns().to_vec()).unwrap();
+    let params = WriteParams {
+        max_rows_per_file: 1,
+        data_storage_version: Some(data_storage_version),
+        ..Default::default()
+    };
+    let dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch.clone())], schema),
+        &uri,
+        Some(params.clone()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.fragments().len(), 2);
+
+    // Distributed writers can stage files with a narrower schema independently
+    // of the dataset. The commit must validate them against the current schema.
+    let narrow = batch.project(&[0]).unwrap();
+    let narrow_schema = narrow.schema();
+    let fragments = FileFragment::create_fragments(
+        &uri,
+        RecordBatchIterator::new(vec![Ok(narrow)], narrow_schema),
+        Some(params),
+    )
+    .await
+    .unwrap();
+    assert_eq!(fragments.len(), 2);
+    let result = Dataset::commit(
+        WriteDestination::Dataset(Arc::new(dataset)),
+        Operation::Append { fragments },
+        Some(1),
+        None,
+        None,
+        Arc::new(Default::default()),
+        false,
+    )
+    .await;
+    if is_nullable {
+        let appended = result.unwrap();
+        assert_eq!(appended.fragments().len(), 4);
+        let actual = appended.scan().try_into_batch().await.unwrap();
+        assert_eq!(
+            actual["value"].as_primitive::<Int32Type>(),
+            &Int32Array::from(vec![Some(10), Some(20), None, None])
+        );
+    } else {
+        let error = result.unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("value"), "{error}");
+        let unchanged = Dataset::open(&uri).await.unwrap();
+        assert_eq!(unchanged.version().version, 1);
+        assert_eq!(unchanged.fragments().len(), 2);
+        let actual = unchanged.scan().try_into_batch().await.unwrap();
+        assert_eq!(actual, batch);
+        assert_eq!(actual["value"].null_count(), 0);
+    }
 }
 
 #[tokio::test]
@@ -988,6 +1066,7 @@ async fn test_datafile_partial_replacement() {
         file_major_version: major,
         file_minor_version: minor,
         file_size_bytes: CachedFileSize::unknown(),
+        file_metadata_size_bytes: None,
         base_id: None,
     };
 
@@ -1049,6 +1128,7 @@ async fn test_datafile_partial_replacement() {
         file_major_version: major,
         file_minor_version: minor,
         file_size_bytes: CachedFileSize::unknown(),
+        file_metadata_size_bytes: None,
         base_id: None,
     };
 
@@ -1149,6 +1229,7 @@ async fn test_datafile_replacement_error() {
         file_major_version: 2,
         file_minor_version: 0,
         file_size_bytes: CachedFileSize::unknown(),
+        file_metadata_size_bytes: None,
         base_id: None,
     };
 
@@ -3371,6 +3452,7 @@ async fn test_cross_column_fast_search_blocks_column_local_stale_postings() {
         file_major_version,
         file_minor_version,
         file_size_bytes: CachedFileSize::unknown(),
+        file_metadata_size_bytes: None,
         base_id: None,
     };
     let read_version = dataset.version().version;
