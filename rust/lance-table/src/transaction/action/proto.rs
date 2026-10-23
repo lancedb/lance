@@ -159,6 +159,14 @@ macro_rules! define_action_proto {
                     $(Some(pb_actions::action::Action::$variant(action)) => {
                         Ok(Self::$variant(action.try_into()?))
                     })*
+                    // Specified ahead of its implementation in this stack.
+                    // TODO: implement AssertCellsUnchanged and drop this arm.
+                    Some(pb_actions::action::Action::AssertCellsUnchanged(_)) => {
+                        Err(Error::not_supported(
+                            "the action-based transaction uses AssertCellsUnchanged, which this \
+                             version of Lance does not implement",
+                        ))
+                    }
                     // An action written by a newer Lance decodes to no known
                     // variant, because protobuf drops the field it does not
                     // know. Reject rather than skip: silently dropping an
@@ -313,7 +321,7 @@ mod tests {
                 ],
             }),
             Action::AssertUniqueKeys(AssertUniqueKeys {
-                key_fields: vec![Ref::Committed(1), Ref::Local(3)],
+                key_fields: vec![FieldRef::Committed(1), FieldRef::Local(3)],
                 filter: KeyExistenceFilter {
                     field_ids: Vec::new(),
                     filter: FilterType::ExactSet([7u64, 9].into_iter().collect()),
