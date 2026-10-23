@@ -183,6 +183,32 @@ def test_lsm_scanner_with_memtables(tmp_path):
     assert len(offset_table) == 2, "Offset-only LSM scan should not require a limit"
 
 
+def test_lsm_scanner_json_column(tmp_path):
+    """Every LsmScanner read method returns a JSON column as Arrow JSON, the
+    same as Dataset.to_table, not as Lance's stored JSONB bytes."""
+    schema = pa.schema(
+        [
+            pa.field("id", pa.int64(), nullable=False, metadata=_PK_META),
+            pa.field("doc", pa.json_(pa.utf8())),
+        ]
+    )
+    docs = pa.array(['{"a": 1}', '{"b": 2}'], pa.json_(pa.utf8()))
+    data = pa.table({"id": pa.array([1, 2], pa.int64()), "doc": docs}, schema=schema)
+    base_ds = lance.write_dataset(data, str(tmp_path / "base"), schema=schema)
+    base_ds.initialize_mem_wal()
+    snap = ShardSnapshot(str(uuid.uuid4())).with_current_generation(1)
+
+    expected = base_ds.to_table().sort_by("id")
+    assert expected.schema.field("doc").type == pa.json_(pa.utf8())
+
+    def scanner():
+        return LsmScanner.from_snapshots(base_ds, [snap])
+
+    assert scanner().to_table().sort_by("id") == expected
+    assert pa.Table.from_batches(scanner().to_batches()).sort_by("id") == expected
+    assert scanner().count_rows() == 2
+
+
 def test_shard_writer_lsm_scanner_includes_own_sstables(tmp_path):
     ds_path = str(tmp_path / "base")
     shard_id = str(uuid.uuid4())
@@ -475,6 +501,7 @@ def test_initialize_mem_wal_manual(tmp_path):
     assert details["num_shards"] == 0
     assert details["sharding_specs"] == []
     assert details["maintained_indexes"] == []
+    assert details["maintain_all_indexes"] is True
     assert details["writer_config_defaults"] == {}
 
 
@@ -542,7 +569,29 @@ def test_initialize_mem_wal_maintained_indexes(tmp_path):
     ds.create_scalar_index("id", "BTREE", name="id_btree")
     ds.initialize_mem_wal(maintained_indexes=["id_btree"])
 
-    assert ds.mem_wal_index_details()["maintained_indexes"] == ["id_btree"]
+    details = ds.mem_wal_index_details()
+    assert details["maintained_indexes"] == ["id_btree"]
+    assert details["maintain_all_indexes"] is False
+
+
+def test_initialize_mem_wal_maintains_none_and_all_differently(tmp_path):
+    # Both leave maintained_indexes empty, so the flag is the only thing
+    # separating "every index the table has" from "no index at all".
+    ds = _mem_wal_dataset(tmp_path)
+    ds.create_scalar_index("id", "BTREE", name="id_btree")
+    ds.initialize_mem_wal(maintained_indexes=[])
+
+    details = ds.mem_wal_index_details()
+    assert details["maintained_indexes"] == []
+    assert details["maintain_all_indexes"] is False
+
+    all_ds = _mem_wal_dataset(tmp_path, "all")
+    all_ds.create_scalar_index("id", "BTREE", name="id_btree")
+    all_ds.initialize_mem_wal()
+
+    all_details = all_ds.mem_wal_index_details()
+    assert all_details["maintained_indexes"] == []
+    assert all_details["maintain_all_indexes"] is True
 
 
 def test_initialize_mem_wal_writer_config_defaults(tmp_path):
