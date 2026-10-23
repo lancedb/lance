@@ -311,11 +311,16 @@ impl DecodeMiniBlockTask {
                 }
             };
 
-            // We hit this case when all we needed was the preamble
+            // Empty row ranges can occur when nested scheduling aligns child decode tasks.  Such a
+            // range either requests only the preamble or no values at all.
             if range.start == range.end {
-                debug_assert!(preamble_action == PreambleAction::Take);
                 debug_assert!(items_in_preamble <= total_items);
-                return (0..items_in_preamble, 0..first_row_start);
+                let (item_start, level_start) = if preamble_action == PreambleAction::Take {
+                    (0, 0)
+                } else {
+                    (items_in_preamble, first_row_start)
+                };
+                return (item_start..items_in_preamble, level_start..first_row_start);
             }
             assert!(range.start < range.end);
 
@@ -1751,6 +1756,7 @@ mod tests {
             assert_eq!(level_range, expected_level_range);
         };
 
+        check(0..0, 0..0, 0..0);
         check(0..1, 0..3, 0..3);
         check(1..2, 3..5, 3..5);
         check(2..3, 5..5, 5..6);
@@ -1915,6 +1921,7 @@ mod tests {
             assert_eq!(level_range, expected_level_range);
         };
 
+        check(0..0, 1..1, 1..1);
         check(0..1, 1..3, 1..3);
         check(1..2, 3..3, 3..4);
         check(0..2, 1..3, 1..4);
