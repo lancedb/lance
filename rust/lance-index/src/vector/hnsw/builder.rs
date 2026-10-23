@@ -3881,7 +3881,7 @@ mod tests {
                 &counting,
             )
             .unwrap();
-        assert_eq!(results.len(), 10);
+        assert_eq!(results.0.len(), 10);
         assert_eq!(
             counting.prefetch_calls.load(Ordering::Relaxed) > 0,
             expect_prefetch
@@ -3920,6 +3920,7 @@ mod tests {
                 None,
             )
             .unwrap()
+            .0
             .iter()
             .map(|node| (node.id, node.dist.0))
             .collect();
@@ -3936,6 +3937,7 @@ mod tests {
                     prefetch_distance,
                 )
                 .unwrap()
+                .0
                 .iter()
                 .map(|node| (node.id, node.dist.0))
                 .collect();
