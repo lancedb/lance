@@ -226,19 +226,10 @@ impl LsmVectorSearchPlanner {
         self
     }
 
-    /// The `ef` an index-backed arm searches with when it asks its index for
-    /// `k` rows refined by `refine_factor`.
-    ///
-    /// The index asks its HNSW graph for `k * refine_factor` candidates and
-    /// rejects an `ef` below that. The caller chose `ef` for the `k` it asked
-    /// for, but the `k` an arm is given here may already be widened by this
-    /// planner (over-fetch for a block-listed source, or every row of a
-    /// generation a filter cannot be pushed into), so a caller `ef` that is
-    /// valid for its own query could fail an arm it cannot see. Raise it to the
-    /// candidate count instead, as the memtable graph search already does.
-    fn indexed_arm_ef(&self, k: usize, refine_factor: Option<u32>) -> Option<usize> {
-        let candidates = k.saturating_mul(refine_factor.unwrap_or(1) as usize);
-        self.ef.map(|ef| ef.max(candidates))
+    /// The caller's `ef`, widened by the factor the planner widened this arm's `k`.
+    fn indexed_arm_ef(&self, requested_k: usize, arm_k: usize) -> Option<usize> {
+        self.ef
+            .map(|ef| ef.saturating_mul(arm_k).div_ceil(requested_k.max(1)))
     }
 
     /// Factor from an arm's `native` multiple of the exact distance to the
@@ -447,6 +438,7 @@ impl LsmVectorSearchPlanner {
                     Box::pin(self.build_knn_plan(
                         source,
                         query_vector,
+                        k,
                         *fetch_k,
                         probe_bounds,
                         projection,
@@ -565,10 +557,12 @@ impl LsmVectorSearchPlanner {
 
     /// Build KNN plan for a single data source.
     ///
+    #[allow(clippy::too_many_arguments)]
     async fn build_knn_plan(
         &self,
         source: &LsmDataSource,
         query_vector: &FixedSizeListArray,
+        requested_k: usize,
         k: usize,
         probe_bounds: ProbeBounds,
         projection: Option<&[String]>,
@@ -609,7 +603,7 @@ impl LsmVectorSearchPlanner {
                     scanner.maximum_nprobes(maximum_nprobes);
                 }
                 scanner.distance_metric(self.distance_type);
-                if let Some(ef) = self.indexed_arm_ef(k, refine_factor) {
+                if let Some(ef) = self.indexed_arm_ef(requested_k, k) {
                     scanner.ef(ef);
                 }
                 // Memtables cover unindexed rows; only search indexed data here.
@@ -702,7 +696,7 @@ impl LsmVectorSearchPlanner {
                     scanner.maximum_nprobes(maximum_nprobes);
                 }
                 scanner.distance_metric(self.distance_type);
-                if let Some(ef) = self.indexed_arm_ef(k, refine_factor) {
+                if let Some(ef) = self.indexed_arm_ef(requested_k, k) {
                     scanner.ef(ef);
                 }
                 scanner.fast_search();
@@ -3316,6 +3310,33 @@ mod tests {
 
     /// Build a multi-row (id, vector) batch with explicit vectors, so a test can
     /// place some rows on the query and others nearby.
+    /// Write `rows` as a dataset at `uri` with an IVF_HNSW_SQ index on `vector`.
+    async fn hnsw_sq_generation(
+        uri: &str,
+        rows: &[(i32, [f32; 4])],
+        distance: lance_linalg::distance::DistanceType,
+    ) {
+        use crate::index::DatasetIndexExt;
+        use crate::index::vector::VectorIndexParams;
+        use lance_index::IndexType;
+        use lance_index::vector::hnsw::builder::HnswBuildParams;
+        use lance_index::vector::ivf::IvfBuildParams;
+        use lance_index::vector::sq::builder::SQBuildParams;
+
+        let mut dataset =
+            create_dataset(uri, vec![batch_rows(&create_vector_schema(), rows)]).await;
+        let params = VectorIndexParams::with_ivf_hnsw_sq_params(
+            distance,
+            IvfBuildParams::new(1),
+            HnswBuildParams::default(),
+            SQBuildParams::default(),
+        );
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, true)
+            .await
+            .unwrap();
+    }
+
     fn batch_rows(schema: &ArrowSchema, rows: &[(i32, [f32; 4])]) -> RecordBatch {
         use arrow_array::builder::Float32Builder;
         let mut vb = FixedSizeListBuilder::new(Float32Builder::new(), 4);
@@ -3466,14 +3487,8 @@ mod tests {
         use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
         use crate::dataset::mem_wal::scanner::data_source::ShardSnapshot;
         use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
-        use crate::index::DatasetIndexExt;
-        use crate::index::vector::VectorIndexParams;
         use datafusion::prelude::SessionContext;
         use futures::TryStreamExt;
-        use lance_index::IndexType;
-        use lance_index::vector::hnsw::builder::HnswBuildParams;
-        use lance_index::vector::ivf::IvfBuildParams;
-        use lance_index::vector::sq::builder::SQBuildParams;
         use lance_linalg::distance::DistanceType;
 
         // A vector of norm `norm` whose cosine distance to the query is `cos_distance`.
@@ -3501,16 +3516,7 @@ mod tests {
         let mut sstable_rows = vec![(1, at(0.05, 3.0)), (2, at(0.4, 2.0))];
         sstable_rows.extend((10..20).map(|id| (id, at(1.9, 1.0 + id as f32 * 0.1))));
         let gen1_uri = format!("{}/_mem_wal/{}/gen_1", base_uri, shard_id);
-        let mut gen1 = create_dataset(&gen1_uri, vec![batch_rows(&schema, &sstable_rows)]).await;
-        let hnsw_sq = VectorIndexParams::with_ivf_hnsw_sq_params(
-            DistanceType::Cosine,
-            IvfBuildParams::new(1),
-            HnswBuildParams::default(),
-            SQBuildParams::default(),
-        );
-        gen1.create_index(&["vector"], IndexType::Vector, None, &hnsw_sq, true)
-            .await
-            .unwrap();
+        hnsw_sq_generation(&gen1_uri, &sstable_rows, DistanceType::Cosine).await;
 
         // Active memtable: ids 3 and 4.
         let batch_store = Arc::new(BatchStore::with_capacity(16));
@@ -3679,72 +3685,33 @@ mod tests {
         );
     }
 
-    /// A caller's `ef` that covers the `k` it asked for must not fail the
-    /// search. An HNSW-indexed generation is asked for `k * refine_factor`
-    /// candidates, and for more than `k` when the planner over-fetches a
-    /// block-listed generation; the graph search rejects an `ef` below its
-    /// candidate count, so passing the caller's `ef` through unchanged failed
-    /// the whole query for `ef < k * refine_factor` or `ef < ceil(k * overfetch)`.
+    /// An over-fetched arm widens the caller's `ef`; an `ef` below `k * refine_factor` still fails.
     #[tokio::test]
-    async fn test_vector_search_ef_below_arm_candidates_still_searches() {
+    async fn test_vector_search_ef_scales_with_an_arms_overfetch() {
         use crate::dataset::mem_wal::scanner::data_source::ShardSnapshot;
-        use crate::index::DatasetIndexExt;
-        use crate::index::vector::VectorIndexParams;
         use datafusion::prelude::SessionContext;
         use futures::TryStreamExt;
-        use lance_index::IndexType;
-        use lance_index::vector::hnsw::builder::HnswBuildParams;
-        use lance_index::vector::ivf::IvfBuildParams;
-        use lance_index::vector::sq::builder::SQBuildParams;
         use lance_linalg::distance::DistanceType;
 
         let schema = create_vector_schema();
         let temp_dir = tempfile::tempdir().unwrap();
         let base_uri = format!("{}/base", temp_dir.path().to_str().unwrap());
         let shard_id = uuid::Uuid::new_v4();
-        let hnsw_sq = VectorIndexParams::with_ivf_hnsw_sq_params(
-            DistanceType::L2,
-            IvfBuildParams::new(1),
-            HnswBuildParams::default(),
-            SQBuildParams::default(),
-        );
-        // Row `id` sits `id` steps away from the query.
-        let row = |id: i32| {
-            let d = id as f32 * 0.05;
-            (id, [0.1 + d, 0.2 + d, 0.3 + d, 0.4 + d])
-        };
-
-        // gen 1 (older): ids 1..=20. gen 2 (newer) moves id 1 far away, so
-        // gen 1 is block-listed and over-fetched.
-        let gen1_uri = format!("{}/_mem_wal/{}/gen_1", base_uri, shard_id);
-        let gen1_rows: Vec<_> = (1..=20).map(row).collect();
-        let mut gen1 = create_dataset(&gen1_uri, vec![batch_rows(&schema, &gen1_rows)]).await;
-        gen1.create_index(&["vector"], IndexType::Vector, None, &hnsw_sq, true)
-            .await
-            .unwrap();
-        let gen2_uri = format!("{}/_mem_wal/{}/gen_2", base_uri, shard_id);
-        let gen2_rows: Vec<_> = vec![(1, [9.0, 9.0, 9.0, 9.0])]
-            .into_iter()
-            .chain((30..40).map(row))
-            .collect();
-        let mut gen2 = create_dataset(&gen2_uri, vec![batch_rows(&schema, &gen2_rows)]).await;
-        gen2.create_index(&["vector"], IndexType::Vector, None, &hnsw_sq, true)
-            .await
-            .unwrap();
+        let gen_uri = |g: u64| format!("{}/_mem_wal/{}/gen_{}", base_uri, shard_id, g);
+        // Gen 2 rewrites id 1, so gen 1 is block-listed and over-fetched.
+        let rows: Vec<_> = (1..=20).map(|id| (id, [id as f32 * 0.05; 4])).collect();
+        hnsw_sq_generation(&gen_uri(1), &rows, DistanceType::L2).await;
+        create_dataset(&gen_uri(2), vec![batch_rows(&schema, &[(1, [9.0; 4])])]).await;
 
         let k = 4;
         let query = create_query_vector();
-        // (refine_factor, overfetch_factor): the first widens every indexed
-        // arm's candidate count to `k * 2`, the second widens only gen 1's.
         let search = |ef: Option<usize>, refine: Option<u32>, overfetch: f64| {
             let snapshot = ShardSnapshot::new(shard_id)
                 .with_current_generation(3)
                 .with_sstable(1, "gen_1".to_string())
                 .with_sstable(2, "gen_2".to_string());
-            let collector =
-                LsmDataSourceCollector::without_base_table(base_uri.clone(), vec![snapshot]);
             let planner = LsmVectorSearchPlanner::new(
-                collector,
+                LsmDataSourceCollector::without_base_table(base_uri.clone(), vec![snapshot]),
                 vec!["id".to_string()],
                 schema.clone(),
                 "vector".to_string(),
@@ -3763,28 +3730,24 @@ mod tests {
                     .unwrap()
                     .try_collect()
                     .await
-                    .unwrap_or_else(|e| {
-                        panic!(
-                            "ef={ef:?} refine={refine:?} overfetch={overfetch}: search failed: {e}"
-                        )
-                    });
-                let mut ids: Vec<i32> = collect_id_dist(&batches)
-                    .into_iter()
-                    .map(|(id, _)| id)
-                    .collect();
-                ids.sort_unstable();
-                ids
+                    .map_err(|e| e.to_string())?;
+                Ok::<_, String>(collect_id_dist(&batches))
             }
         };
-        for (refine, overfetch) in [(Some(2), 1.0), (None, 2.0)] {
-            // `ef = k` is valid for the caller's own query. It must answer
-            // what the arm's own default `ef` answers on this small graph.
-            assert_eq!(
-                search(Some(k), refine, overfetch).await,
-                search(None, refine, overfetch).await,
-                "refine={refine:?} overfetch={overfetch}"
-            );
-        }
+
+        assert_eq!(
+            search(Some(k), None, 2.0).await.unwrap(),
+            search(None, None, 2.0).await.unwrap()
+        );
+        assert_eq!(
+            search(Some(2 * k), Some(2), 2.0).await.unwrap(),
+            search(None, Some(2), 2.0).await.unwrap()
+        );
+        let err = search(Some(k), Some(2), 1.0).await.unwrap_err();
+        assert!(
+            err.contains("ef must be greater than or equal to k"),
+            "{err}"
+        );
     }
 
     fn create_multicol_schema() -> Arc<ArrowSchema> {
