@@ -1332,7 +1332,7 @@ async fn test_memwal_flush_keeps_base_ids_past_the_new_table_limit(
         .put(vec![RecordBatch::try_new(schema, columns).unwrap()])
         .await
         .unwrap();
-    let fence = writer.force_seal_active().await.unwrap();
+    let fence = writer.force_freeze_active().await.unwrap();
     let flushed = fence.wait().await;
     writer.abort().await.unwrap();
     flushed.unwrap();
