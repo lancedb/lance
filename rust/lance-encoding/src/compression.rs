@@ -766,6 +766,19 @@ pub fn try_fixed_packed_struct_miniblock(
             "Packed struct mini-block encoding supports only fixed-width children",
         ));
     }
+    // The packing writes `bits_per_value / 8` bytes per child, so a sub-byte
+    // child such as Boolean would write no bytes.
+    if let Some(bits) = data
+        .children
+        .iter()
+        .filter_map(|child| child.as_fixed_width_ref())
+        .map(|fixed| fixed.bits_per_value)
+        .find(|bits| *bits == 0 || !bits.is_multiple_of(8))
+    {
+        return Err(Error::invalid_input(format!(
+            "Packed struct mini-block encoding requires byte-aligned fixed-width children, got a {bits}-bit child"
+        )));
+    }
     Ok(Some(Box::new(
         PackedStructFixedWidthMiniBlockEncoder::default(),
     )))
@@ -2010,6 +2023,33 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, Error::InvalidInput { .. }));
         assert!(error.to_string().contains(message), "{error}");
+    }
+
+    #[test]
+    fn fixed_packed_struct_miniblock_rejects_sub_byte_child() {
+        use arrow_array::{ArrayRef, BooleanArray, Int32Array, StructArray};
+        use arrow_schema::Fields;
+
+        let fields = Fields::from(vec![
+            ArrowField::new("b", DataType::Boolean, false),
+            ArrowField::new("i", DataType::Int32, false),
+        ]);
+        let array = Arc::new(StructArray::new(
+            fields,
+            vec![
+                Arc::new(BooleanArray::from(vec![true, false, true])) as ArrayRef,
+                Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef,
+            ],
+            None,
+        )) as ArrayRef;
+        let block = DataBlock::from_arrays(&[array], 3);
+
+        let error = try_fixed_packed_struct_miniblock(&block).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(
+            error.to_string().contains("byte-aligned") && error.to_string().contains("1-bit child"),
+            "unexpected error: {error}"
+        );
     }
 
     #[rstest::rstest]
