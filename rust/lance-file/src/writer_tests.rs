@@ -71,6 +71,91 @@ mod tests {
             .map(Into::into)
     }
 
+    #[tokio::test]
+    async fn test_v2_3_alp_rd_single_dictionary_default_compression() {
+        // A slow linear drift whose pages collapse to a one-entry ALP-RD
+        // dictionary writes an empty index stream (index_bits == 0). The files
+        // must still read back end-to-end through the default Compress-All path;
+        // this is the integration-level companion to the ALP-RD unit test.
+        use futures::TryStreamExt;
+        use lance_encoding::decoder::FilterExpression;
+        use lance_io::ReadBatchParams;
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "data",
+            DataType::Float64,
+            false,
+        )]));
+        let lance_schema = LanceSchema::try_from(arrow_schema.as_ref()).unwrap();
+        let n = 65536usize;
+        use rand::rngs::SmallRng;
+        use rand::{Rng, SeedableRng};
+        let mut rng = SmallRng::seed_from_u64(0x5eed_a1b_2026_1023);
+        let mut gauss = || {
+            let u1: f64 = rng.random_range(1e-12..1.0);
+            let u2: f64 = rng.random();
+            (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
+        };
+        let vals: Vec<f64> = (0..n)
+            .map(|i| 1_000_000.0 + i as f64 * 0.1 + gauss() * 0.01)
+            .collect();
+        let expected_sum: f64 = vals.iter().sum();
+
+        let path = TempObjFile::default();
+        let object_store = ObjectStore::local();
+        let mut writer = create_v2_3_writer_with_compression(
+            object_store.create(&path).await.unwrap(),
+            lance_schema,
+            FileWriterOptions::default(),
+            CompressionParams::new(),
+        )
+        .unwrap();
+        let arr = Arc::new(arrow_array::Float64Array::from(vals));
+        let batch = RecordBatch::try_new(arrow_schema, vec![arr]).unwrap();
+        writer.write_batch(&batch).await.unwrap();
+        writer.finish().await.unwrap();
+
+        let fs = FsFixture::default();
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let file_reader = FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &LanceCache::no_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+        let stream = file_reader
+            .read_stream(
+                ReadBatchParams::RangeFull,
+                1024,
+                16,
+                FilterExpression::no_filter(),
+            )
+            .await
+            .unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+        let total: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
+        assert_eq!(total, n as u64);
+        let read_sum: f64 = batches
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<arrow_array::Float64Array>()
+                    .unwrap()
+                    .iter()
+                    .flatten()
+            })
+            .sum();
+        assert_eq!(read_sum, expected_sum);
+    }
+
     fn reader_projection_from_column_names(
         version: ConcreteFileVersion,
         schema: &LanceSchema,

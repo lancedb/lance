@@ -1564,11 +1564,18 @@ impl AlpMiniBlockDecompressor {
         let indices = if header.index_bits == 0 {
             Vec::new()
         } else {
-            unpack(index_buffer, n, header.index_bits as usize)?
+            let indices = unpack(index_buffer, n, header.index_bits as usize)?;
+            if indices.len() != n {
+                return Err(Error::invalid_input(format!(
+                    "ALP-RD index stream has wrong length: n={n} d={} index_bits={} dict_len={} packed_indices={}",
+                    header.d,
+                    header.index_bits,
+                    header.dict_len,
+                    indices.len()
+                )));
+            }
+            indices
         };
-        if indices.len() != n {
-            return Err(Error::invalid_input("ALP-RD index stream has wrong length"));
-        }
 
         let dict_words = dict_buffer_entries(&dict_buffer, header.dict_len);
         let mut out = Vec::with_capacity(n);
@@ -1870,6 +1877,52 @@ mod tests {
                 DataBlock::FixedWidth(data),
             )
             .unwrap();
+        check_round_trip(compressed, &encoding, &values, |v| v.to_bits());
+    }
+
+    #[test]
+    fn test_rd_single_dictionary_entry_round_trip() {
+        // A wide drift page that plain ALP cannot transform collapses to a
+        // one-entry RD dictionary (all values share their high bits), so every
+        // chunk's index stream is empty (index_bits == 0). The decoder must
+        // accept that instead of demanding one packed index per value.
+        let mut rng = rand::rngs::SmallRng::seed_from_u64(0x5eed_a1b_2026_1023);
+        let gauss = |rng: &mut rand::rngs::SmallRng| {
+            let u1: f64 = rng.random_range(1e-12..1.0);
+            let u2: f64 = rng.random();
+            (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
+        };
+        let values: Vec<f64> = (0..65536)
+            .map(|i| 1_000_000.0 + i as f64 * 0.1 + gauss(&mut rng) * 0.01)
+            .collect();
+        let bytes = values
+            .iter()
+            .flat_map(|v| v.to_bits().to_le_bytes())
+            .collect::<Vec<_>>();
+        let data = FixedWidthDataBlock {
+            data: LanceBuffer::from(bytes),
+            bits_per_value: 64,
+            num_values: values.len() as u64,
+            block_info: BlockInfo::new(),
+        };
+        let encoder = AlpMiniBlockEncoder::new(64);
+        let (compressed, encoding) = encoder
+            .compress(
+                MiniBlockCompressionContext::new(0, true, true),
+                DataBlock::FixedWidth(data),
+            )
+            .unwrap();
+        // The page must stay RD (not fall back) and carry an empty index stream.
+        let mut header_offset = 0usize;
+        let mut saw_single_dict = false;
+        for chunk in &compressed.chunks {
+            let header =
+                &compressed.data[1][header_offset..header_offset + chunk.buffer_sizes[1] as usize];
+            assert_eq!(header[0], MODE_RD);
+            saw_single_dict |= header[2] == 0; // index_bits == 0
+            header_offset += chunk.buffer_sizes[1] as usize;
+        }
+        assert!(saw_single_dict, "expected an index_bits == 0 RD chunk");
         check_round_trip(compressed, &encoding, &values, |v| v.to_bits());
     }
 
