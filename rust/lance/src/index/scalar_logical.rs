@@ -2279,15 +2279,18 @@ mod tests {
 
     /// An update moves the row with `id = 0` to a new fragment (keeping its row id) and an
     /// append-only optimize gives that fragment its own segment, so the old segment still
-    /// maps `id = 0` to the moved row. That stale posting must not be reported. Zone map
-    /// hits are row addresses, so they must not be restricted by a row-id mask.
+    /// maps `id = 0` to the moved row. That stale posting must not be reported. Bitmap hits
+    /// are row ids, so they need the row-id mask; BTree and zone map hits are row addresses,
+    /// so they must not be restricted by it.
     #[rstest]
-    #[case::btree(IndexType::BTree, BuiltinIndexType::BTree)]
-    #[case::zone_map(IndexType::ZoneMap, BuiltinIndexType::ZoneMap)]
+    #[case::bitmap(IndexType::Bitmap, BuiltinIndexType::Bitmap, false)]
+    #[case::btree(IndexType::BTree, BuiltinIndexType::BTree, true)]
+    #[case::zone_map(IndexType::ZoneMap, BuiltinIndexType::ZoneMap, true)]
     #[tokio::test]
     async fn stale_posting_after_update_with_stable_row_ids(
         #[case] index_type: IndexType,
         #[case] builtin: BuiltinIndexType,
+        #[case] row_addresses: bool,
     ) {
         let dir = TempStrDir::default();
         let batch =
@@ -2311,6 +2314,8 @@ mod tests {
             )
             .await
             .unwrap();
+        let segments = dataset.load_indices_by_name("id_idx").await.unwrap();
+        assert_eq!(segments[0].results_are_row_addrs(), row_addresses);
 
         let mut dataset = UpdateBuilder::new(Arc::new(dataset))
             .update_where("id = 0")
