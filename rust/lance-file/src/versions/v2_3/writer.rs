@@ -42,7 +42,8 @@ impl Writer {
         schema: Schema,
         options: FileWriterOptions,
     ) -> Result<Self> {
-        Self::try_new_with_compression(object_writer, schema, options, Default::default())
+        let compression = options.compression.clone().unwrap_or_default();
+        Self::try_new_with_compression(object_writer, schema, options, compression)
     }
 
     /// Create a v2.3 writer with explicit compression tuning.
@@ -59,7 +60,8 @@ impl Writer {
 
     /// Create a v2.3 writer whose schema is inferred from the first batch.
     pub fn new_lazy(object_writer: Box<dyn ObjectWriter>, options: FileWriterOptions) -> Self {
-        Self::new_lazy_with_compression(object_writer, options, Default::default())
+        let compression = options.compression.clone().unwrap_or_default();
+        Self::new_lazy_with_compression(object_writer, options, compression)
     }
 
     /// Create a lazy v2.3 writer with explicit compression tuning.

@@ -214,6 +214,52 @@ def test_write_page_options_ignored_for_legacy(tmp_path: Path, write_api):
     assert fragment.physical_rows == 3
 
 
+@pytest.mark.parametrize("write_api", ["dataset", "fragments"])
+@pytest.mark.parametrize(
+    "alp,expect_alp",
+    [
+        pytest.param("on", True, id="on"),
+        pytest.param("off", False, id="off"),
+        pytest.param("auto", True, id="auto-compressible"),
+    ],
+)
+def test_write_alp_mode(tmp_path: Path, write_api, alp, expect_alp):
+    schema = pa.schema([pa.field("price", pa.float64())])
+    values = [((i * 73) % 10000) / 100.0 for i in range(8192)]
+    reader = pa.RecordBatchReader.from_batches(
+        schema, [pa.record_batch([pa.array(values, type=pa.float64())], schema=schema)]
+    )
+    kwargs = {"data_storage_version": "2.3", "alp": alp}
+    if write_api == "dataset":
+        dataset = write_dataset(reader, tmp_path, **kwargs)
+        fragment = dataset.get_fragments()[0].metadata
+    else:
+        fragment = write_fragments(reader, tmp_path, **kwargs)[0]
+
+    data_file = tmp_path / "data" / fragment.files[0].path
+    metadata = LanceFileReader(str(data_file)).metadata()
+    assert ("Alp" in metadata.columns[0].pages[0].encoding) == expect_alp
+
+    got = (
+        LanceFileReader(str(data_file))
+        .read_all(batch_size=8192, batch_readahead=4)
+        .to_table()
+    )
+    assert got.column(0).to_pylist() == values
+
+
+@pytest.mark.parametrize("write_api", ["dataset", "fragments"])
+def test_write_rejects_invalid_alp(tmp_path: Path, write_api):
+    with pytest.raises(ValueError, match="Invalid `alp` value: bogus"):
+        _write_single_fragment(
+            write_api,
+            [[1.0, 2.0, 3.0]],
+            tmp_path,
+            data_storage_version="2.3",
+            alp="bogus",
+        )
+
+
 def test_write_fragments_schema_holes(tmp_path: Path):
     # Create table with 3 cols
     data = pa.table({"a": range(3)})

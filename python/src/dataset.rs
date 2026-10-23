@@ -68,6 +68,7 @@ use lance_arrow::as_fixed_size_list_array;
 use lance_core::Error;
 use lance_core::datatypes::BlobHandling;
 use lance_datafusion::utils::reader_to_stream;
+use lance_encoding::compression_config::{AlpMode, CompressionFieldParams, CompressionParams};
 use lance_encoding::decoder::DecoderConfig;
 use lance_file::reader::FileReaderOptions;
 use lance_file::writer::FileWriterOptions;
@@ -5030,10 +5031,27 @@ pub fn get_write_params(
         }
         let data_cache_bytes = get_dict_opt::<u64>(options, "data_cache_bytes")?;
         let max_page_bytes = get_dict_opt::<u64>(options, "max_page_bytes")?;
-        if data_cache_bytes.is_some() || max_page_bytes.is_some() {
+        let alp = get_dict_opt::<String>(options, "alp")?;
+        if data_cache_bytes.is_some() || max_page_bytes.is_some() || alp.is_some() {
+            let mut compression = CompressionParams::default();
+            if let Some(alp) = alp {
+                let alp_mode = AlpMode::parse(&alp).ok_or_else(|| {
+                    PyValueError::new_err(format!(
+                        "Invalid `alp` value: {alp}. Expected one of: auto, on, off",
+                    ))
+                })?;
+                compression.columns.insert(
+                    "*".to_string(),
+                    CompressionFieldParams {
+                        alp: Some(alp_mode),
+                        ..Default::default()
+                    },
+                );
+            }
             p.file_writer_options = Some(FileWriterOptions {
                 data_cache_bytes,
                 max_page_bytes,
+                compression: Some(compression),
                 ..Default::default()
             });
         }

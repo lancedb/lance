@@ -1243,6 +1243,7 @@ def write_fragments(
     max_bytes_per_file: int = DEFAULT_MAX_BYTES_PER_FILE,
     data_cache_bytes: Optional[int] = None,
     max_page_bytes: Optional[int] = None,
+    alp: Optional[Literal["auto", "on", "off"]] = None,
     progress: Optional[FragmentWriteProgress] = None,
     data_storage_version: Optional[str] = None,
     use_legacy_format: Optional[bool] = None,
@@ -1299,6 +1300,13 @@ def write_fragments(
     max_page_bytes : int, optional
         Best-effort maximum page size in bytes. If not set, the current file
         writer uses its configured default. Ignored for legacy V1 files.
+    alp : Literal["auto", "on", "off"], optional
+        ALP (Adaptive Lossless floating-Point) compression mode for floating
+        point columns. ``"auto"`` enables ALP only when the data benefits from
+        it, ``"on"`` forces ALP, and ``"off"`` disables it. If not set, the
+        current file writer uses its configured default (``"auto"`` for the
+        current format). Only the current v2.3 file writer consumes this
+        option; v2.0-v2.2 and legacy V1 writers ignore it.
     progress : FragmentWriteProgress, optional
         *Experimental API*. Progress tracking for writing the fragment. Pass
         a custom class that defines hooks to be called when each fragment is
@@ -1445,6 +1453,7 @@ def write_fragments(
         max_bytes_per_file=max_bytes_per_file,
         data_cache_bytes=data_cache_bytes,
         max_page_bytes=max_page_bytes,
+        alp=alp,
         progress=progress,
         data_storage_version=data_storage_version,
         storage_options=storage_options,

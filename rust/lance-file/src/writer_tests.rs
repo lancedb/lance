@@ -2312,6 +2312,137 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_v2_3_alp_via_file_writer_options() {
+        // FileWriterOptions.compression is the dataset-level knob: the v2.3
+        // writer honors per-column ALP modes without field metadata.
+        use futures::TryStreamExt;
+        use lance_encoding::compression_config::AlpMode;
+        use lance_encoding::decoder::FilterExpression;
+        use lance_io::ReadBatchParams;
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("prices", DataType::Float64, false),
+            ArrowField::new("random", DataType::Float64, false),
+        ]));
+        let lance_schema = LanceSchema::try_from(arrow_schema.as_ref()).unwrap();
+
+        let n = 8192usize;
+        let prices = arrow_array::Float64Array::from_iter_values(
+            (0..n).map(|i| ((i * 73) % 10000) as f64 / 100.0),
+        );
+        let mut state = 0x05ee_da1b_2026_1023_u64;
+        let random = arrow_array::Float64Array::from_iter_values((0..n).map(|_| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 11) as f64 * (2e12 / (1u64 << 53) as f64)) - 1e12
+        }));
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(prices), Arc::new(random)],
+        )
+        .unwrap();
+
+        let mut params = CompressionParams::new();
+        params.columns.insert(
+            "prices".to_string(),
+            CompressionFieldParams {
+                alp: Some(AlpMode::On),
+                ..Default::default()
+            },
+        );
+        params.columns.insert(
+            "random".to_string(),
+            CompressionFieldParams {
+                alp: Some(AlpMode::Off),
+                ..Default::default()
+            },
+        );
+
+        let path = TempObjFile::default();
+        let object_store = ObjectStore::local();
+        let mut writer = create_writer(
+            object_store.create(&path).await.unwrap(),
+            lance_schema.clone(),
+            ConcreteFileVersion::V2_3,
+            FileWriterOptions {
+                compression: Some(params),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        writer.write_batch(&batch).await.unwrap();
+        writer.finish().await.unwrap();
+
+        let fs = FsFixture::default();
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let file_reader = FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &LanceCache::no_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        let column_metadatas = &file_reader.metadata().column_metadatas;
+        let prices_encoding = describe_encoding(&column_metadatas[0].pages[0]);
+        let random_encoding = describe_encoding(&column_metadatas[1].pages[0]);
+        assert!(
+            prices_encoding.contains("Alp"),
+            "prices column should use ALP with alp=on, got: {prices_encoding}"
+        );
+        assert!(
+            !random_encoding.contains("Alp"),
+            "random column should stay flat with alp=off, got: {random_encoding}"
+        );
+
+        // Both columns must round-trip bitwise on read.
+        let projection = reader_projection_from_column_names(
+            ConcreteFileVersion::V2_3,
+            &lance_schema,
+            &["prices", "random"],
+        )
+        .unwrap();
+        let batches: Vec<RecordBatch> = file_reader
+            .read_stream_projected(
+                ReadBatchParams::RangeFull,
+                1024,
+                16,
+                projection,
+                FilterExpression::no_filter(),
+            )
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let got_prices: Vec<u64> = batches
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<arrow_array::Float64Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .map(|v| v.to_bits())
+            })
+            .collect();
+        assert_eq!(
+            got_prices,
+            (0..n)
+                .map(|i| (((i * 73) % 10000) as f64 / 100.0).to_bits())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
     async fn test_large_page_split_on_read() {
         use arrow_array::Array;
         use futures::TryStreamExt;

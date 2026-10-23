@@ -305,6 +305,7 @@ impl LanceFileWriter {
             data_cache_bytes,
             keep_original_array,
             max_page_bytes,
+            ..Default::default()
         };
         let inner = if let Some(schema) = schema {
             let lance_schema = lance_core::datatypes::Schema::try_from(&schema.0).infer_error()?;
