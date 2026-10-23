@@ -65,6 +65,32 @@ impl AlpMode {
     }
 }
 
+/// Lossless integer prediction along one logical axis inside each tensor.
+///
+/// The axis excludes the dataset row dimension. For an HWC tensor, axis 1
+/// predicts each channel from the preceding pixel in the same scanline.
+///
+/// ```
+/// use lance_encoding::compression_config::{AxisDeltaMode, CompressionFieldParams};
+/// let params = CompressionFieldParams {
+///     compression: Some("zstd".into()),
+///     axis_delta: Some(AxisDeltaMode::Auto { axis: Some(1) }),
+///     ..Default::default()
+/// };
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AxisDeltaMode {
+    /// Keep the existing tensor encoding without prediction.
+    Off,
+    /// Sample complete tensors to choose raw, direct compression, or prediction plus compression.
+    /// Keep raw encoding when neither compressed candidate saves enough space.
+    /// `None` tries the longest physical dimension, choosing the innermost on ties.
+    /// `Some(axis)` selects a zero-based logical axis instead.
+    Auto { axis: Option<usize> },
+    /// Require prediction in per-value pages, rejecting unsupported types and layouts.
+    On { axis: usize },
+}
+
 /// Compression parameter configuration
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompressionParams {
@@ -93,6 +119,11 @@ pub struct CompressionFieldParams {
 
     /// ALP mode for floating point data
     pub alp: Option<AlpMode>,
+
+    /// Integer tensor prediction for unstable 2.3 per-value pages. Unset uses
+    /// `AxisDeltaMode::Auto { axis: None }`; `Some(AxisDeltaMode::Off)` disables it.
+    /// General compression and its level are configured independently.
+    pub axis_delta: Option<AxisDeltaMode>,
 
     /// Minichunk size threshold for encoding
     pub minichunk_size: Option<i64>,
@@ -162,6 +193,9 @@ impl CompressionFieldParams {
         }
         if other.alp.is_some() {
             self.alp = other.alp;
+        }
+        if other.axis_delta.is_some() {
+            self.axis_delta = other.axis_delta;
         }
         if other.minichunk_size.is_some() {
             self.minichunk_size = other.minichunk_size;
@@ -234,6 +268,7 @@ mod tests {
             compression_level: None,
             bss: Some(BssMode::On),
             alp: Some(AlpMode::Off),
+            axis_delta: None,
             minichunk_size: None,
         };
 
@@ -250,6 +285,7 @@ mod tests {
             compression_level: Some(3),
             bss: Some(BssMode::Auto),
             alp: Some(AlpMode::On),
+            axis_delta: None,
             minichunk_size: None,
         };
 
@@ -284,6 +320,7 @@ mod tests {
                 compression_level: Some(3),
                 bss: None,
                 alp: None,
+                axis_delta: None,
                 minichunk_size: None,
             },
         );

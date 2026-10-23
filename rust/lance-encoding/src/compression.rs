@@ -16,6 +16,8 @@
 //! Fullzip compression is a per-value approach where we require that values are transparently
 //! compressed so that we can locate them later.
 
+use crate::encodings::physical::axis_delta::AxisDeltaDecompressor;
+pub use crate::encodings::physical::axis_delta::try_tensor_per_value;
 #[cfg(feature = "bitpacking")]
 use crate::encodings::physical::bitpacking::{InlineBitpacking, OutOfLineBitpacking};
 use crate::{
@@ -52,8 +54,8 @@ use crate::{
                 FsstPerValueEncoder,
             },
             general::{
-                FixedWidthGeneralBlockDecompressor, GeneralBlockCompressor,
-                GeneralMiniBlockCompressor, GeneralMiniBlockDecompressor,
+                FixedWidthGeneralBlockDecompressor, FixedWidthGeneralPerValueDecompressor,
+                GeneralBlockCompressor, GeneralMiniBlockCompressor, GeneralMiniBlockDecompressor,
             },
             packed::{
                 PackedStructFixedPerValueDecompressor, PackedStructFixedPerValueEncoder,
@@ -598,6 +600,7 @@ fn try_general_compression(
 }
 
 /// Parse field-level compression metadata without applying format-specific constraints.
+/// AxisDelta metadata is validated separately when selecting a per-value compressor.
 pub fn field_metadata_params(field: &Field) -> CompressionFieldParams {
     let mut params = CompressionFieldParams::default();
 
@@ -1317,6 +1320,7 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
             ))),
             Compression::Flat(flat) => Ok(Box::new(ValueDecompressor::from_flat(flat))),
             Compression::FixedSizeList(fsl) => Ok(Box::new(ValueDecompressor::from_fsl(fsl)?)),
+            Compression::AxisDelta(delta) => Ok(Box::new(AxisDeltaDecompressor::try_new(delta)?)),
             Compression::PackedStruct(description) => Ok(Box::new(
                 PackedStructFixedPerValueDecompressor::new(description)?,
             )),
@@ -1364,9 +1368,23 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
                 LanceBuffer::from_bytes(fsst.symbol_table.clone(), 1),
                 Box::new(VariableDecoder::default()),
             ))),
-            Compression::General(general) => Ok(Box::new(CompressedBufferEncoder::from_scheme(
-                general.compression.as_ref().expect_ok()?.scheme(),
-            )?)),
+            Compression::General(general) => {
+                let compression = general.compression.as_ref().expect_ok()?;
+                if let Some(inner) = general.values.as_deref()
+                    && matches!(
+                        inner.compression,
+                        Some(Compression::FixedSizeList(_) | Compression::AxisDelta(_))
+                    )
+                {
+                    return Ok(Box::new(FixedWidthGeneralPerValueDecompressor::new(
+                        self.create_fixed_per_value_decompressor(inner)?,
+                        CompressionConfig::new(compression.scheme().try_into()?, compression.level),
+                    )));
+                }
+                Ok(Box::new(CompressedBufferEncoder::from_scheme(
+                    compression.scheme(),
+                )?))
+            }
             Compression::VariablePackedStruct(description) => {
                 let mut fields = Vec::with_capacity(description.fields.len());
                 for field in &description.fields {
@@ -2359,6 +2377,7 @@ mod tests {
                 compression_level: None,
                 bss: Some(BssMode::Off), // Explicitly disable BSS to test RLE
                 alp: None,
+                axis_delta: None,
                 minichunk_size: None,
             },
         );
@@ -2392,6 +2411,7 @@ mod tests {
                 compression_level: Some(3),
                 bss: Some(BssMode::Off), // Disable BSS to test RLE
                 alp: None,
+                axis_delta: None,
                 minichunk_size: None,
             },
         );
@@ -2779,9 +2799,9 @@ mod tests {
             panic!("Expected general per-value compression");
         };
         let expected_scheme = if test_encoding == TestEncoding::StructuralSparse {
-            crate::format::metadata::CompressionScheme::CompressionAlgorithmLz4
+            crate::format::pb23::CompressionScheme::CompressionAlgorithmLz4
         } else {
-            crate::format::metadata::CompressionScheme::CompressionAlgorithmZstd
+            crate::format::pb23::CompressionScheme::CompressionAlgorithmZstd
         };
         assert_eq!(
             general.compression.as_ref().unwrap().scheme(),
@@ -2825,6 +2845,7 @@ mod tests {
                 compression_level: Some(6),
                 bss: None,
                 alp: None,
+                axis_delta: None,
                 minichunk_size: None,
             },
         );
@@ -3228,6 +3249,7 @@ mod tests {
                 compression_level: None,
                 bss: None,
                 alp: None,
+                axis_delta: None,
                 minichunk_size: None,
             },
         );

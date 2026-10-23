@@ -1797,6 +1797,7 @@ mod tests {
                 compression_level: None,
                 bss: Some(lance_encoding::compression_config::BssMode::Off), // Explicitly disable BSS to ensure RLE is used
                 alp: None,
+                axis_delta: None,
                 minichunk_size: None,
             },
         );
