@@ -3,6 +3,8 @@
 
 //! Ordered, deletion-aware lookup of unique keys through ordinary scalar indices.
 
+mod uint64;
+
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
 use std::sync::{Arc, Mutex, Weak};
@@ -23,6 +25,7 @@ use object_store::path::Path;
 use roaring::RoaringBitmap;
 use tokio::sync::OnceCell;
 
+use self::uint64::UInt64KeyPositions;
 use super::BaseObjectStores;
 use crate::Dataset;
 use crate::index::{DatasetIndexExt, scalar::open_scalar_index};
@@ -323,15 +326,9 @@ impl Dataset {
         // Retain only the requested keys and consume scan batches incrementally;
         // an uncovered tail never constructs another dataset-wide reverse index.
         let keys = make_array(keys.to_data());
-        let uint64_positions = keys.as_primitive_opt::<UInt64Type>().map(|keys| {
-            let mut positions = HashMap::with_capacity(keys.len() - keys.null_count());
-            for (position, key) in keys.iter().enumerate() {
-                if let Some(key) = key {
-                    positions.entry(key).or_insert_with(Vec::new).push(position);
-                }
-            }
-            positions
-        });
+        let uint64_positions = keys
+            .as_primitive_opt::<UInt64Type>()
+            .map(UInt64KeyPositions::new);
         let converter = RowConverter::new(vec![SortField::new(keys.data_type().clone())])?;
         let key_rows = if uint64_positions.is_none() {
             Some(converter.convert_columns(std::slice::from_ref(&keys))?)
@@ -369,17 +366,12 @@ impl Dataset {
             // Stable IDs need exact integer equality. Avoid encoding and hashing
             // Arrow rows for every scanned value, including nonmatching values.
             if let Some(positions) = &uint64_positions {
-                for (offset, value) in values.as_primitive::<UInt64Type>().iter().enumerate() {
-                    if let Some(value) = value
-                        && row_addresses.is_valid(offset)
-                        && let Some(keys) = positions.get(&value)
-                    {
-                        let address = RowAddress::from(row_addresses.value(offset));
-                        for key in keys {
-                            assign_unique_address(&mut addresses, *key, address, column)?;
-                        }
-                    }
-                }
+                positions.assign_matches(
+                    values.as_primitive::<UInt64Type>(),
+                    row_addresses,
+                    &mut addresses,
+                    column,
+                )?;
                 continue;
             }
             let rows = converter.convert_columns(std::slice::from_ref(values))?;

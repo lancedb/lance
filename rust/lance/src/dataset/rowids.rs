@@ -559,7 +559,9 @@ mod test {
     };
     use arrow_array::cast::AsArray;
     use arrow_array::types::{Float32Type, Int32Type, UInt64Type};
-    use arrow_array::{Array, ArrayRef, Int32Array, RecordBatch, RecordBatchIterator, UInt64Array};
+    use arrow_array::{
+        Array, ArrayRef, Int32Array, RecordBatch, RecordBatchIterator, UInt64Array, record_batch,
+    };
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use futures::Future;
     use lance_core::datatypes::Schema;
@@ -1206,6 +1208,176 @@ mod test {
             .unwrap_err();
         assert!(matches!(error, Error::InvalidInput { .. }));
         assert!(error.to_string().contains("expected Int32"));
+    }
+
+    #[derive(Clone, Copy)]
+    enum U64ScanLayout {
+        Sorted,
+        Descending,
+        InteriorInversion,
+        Nullable,
+        AllNull,
+    }
+
+    #[rstest::rstest]
+    #[case::sorted(U64ScanLayout::Sorted)]
+    #[case::descending(U64ScanLayout::Descending)]
+    #[case::interior_inversion(U64ScanLayout::InteriorInversion)]
+    #[case::nullable(U64ScanLayout::Nullable)]
+    #[case::all_null(U64ScanLayout::AllNull)]
+    #[tokio::test]
+    async fn test_uncovered_u64_lookup_matches_scan(
+        #[case] layout: U64ScanLayout,
+        #[values(false, true)] has_partial_index: bool,
+    ) {
+        let mut values = (0..255)
+            .map(Some)
+            .chain([Some(u64::MAX)])
+            .collect::<Vec<_>>();
+        match layout {
+            U64ScanLayout::Sorted => {}
+            U64ScanLayout::Descending => values.reverse(),
+            U64ScanLayout::InteriorInversion => {
+                // Both fragment endpoints remain ordered despite these inversions.
+                values.swap(32, 33);
+                values.swap(160, 161);
+            }
+            U64ScanLayout::Nullable => values[65] = None,
+            U64ScanLayout::AllNull => values.fill(None),
+        }
+        let batch = record_batch!(("u", UInt64, values)).unwrap();
+        let reader = RecordBatchIterator::new(
+            vec![Ok(batch.slice(0, 128)), Ok(batch.slice(128, 128))],
+            batch.schema(),
+        );
+        let mut dataset = Dataset::write(
+            reader,
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 128,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.fragments().len(), 2);
+        if has_partial_index {
+            let fragment_id = dataset.fragments()[0].id as u32;
+            dataset
+                .create_index_builder(&["u"], IndexType::BTree, &ScalarIndexParams::default())
+                .fragments(vec![fragment_id])
+                .await
+                .unwrap();
+        }
+        let keys = UInt64Array::from(vec![
+            Some(9999),
+            Some(65),
+            None,
+            Some(u64::MAX),
+            Some(0),
+            Some(65),
+            Some(128),
+            Some(255),
+            Some(511),
+            Some(9999),
+        ])
+        .slice(1, 8);
+        let single_key = UInt64Array::from(vec![Some(65), None, Some(65)]);
+        let dense_keys = UInt64Array::from(
+            (0..256)
+                .map(Some)
+                .chain([None, Some(u64::MAX), Some(65)])
+                .collect::<Vec<_>>(),
+        );
+        for is_after_delete in [false, true] {
+            if is_after_delete {
+                dataset.delete("u = 65 OR u = 128").await.unwrap();
+            }
+            let scan = dataset
+                .scan()
+                .with_row_address()
+                .try_into_batch()
+                .await
+                .unwrap();
+            let expected = scan["u"]
+                .as_primitive::<UInt64Type>()
+                .iter()
+                .zip(scan[ROW_ADDR].as_primitive::<UInt64Type>().values())
+                .filter_map(|(value, &address)| {
+                    value.map(|value| (value, RowAddress::from(address)))
+                })
+                .collect::<HashMap<_, _>>();
+            for keys in [&keys, &single_key, &dense_keys] {
+                let actual = dataset.lookup_row_addresses("u", keys).await.unwrap();
+                assert_eq!(
+                    actual,
+                    keys.iter()
+                        .map(|key| key.and_then(|key| expected.get(&key).copied()))
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn test_uncovered_sorted_u64_lookup_rejects_duplicates(
+        #[values(false, true)] has_partial_index: bool,
+    ) {
+        let mut values = (0..256).collect::<Vec<u64>>();
+        values[136] = 135;
+        let batch = record_batch!(("u", UInt64, values)).unwrap();
+        let reader = RecordBatchIterator::new(
+            vec![Ok(batch.slice(0, 128)), Ok(batch.slice(128, 128))],
+            batch.schema(),
+        );
+        let mut dataset = Dataset::write(
+            reader,
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 128,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.fragments().len(), 2);
+        if has_partial_index {
+            let fragment_id = dataset.fragments()[0].id as u32;
+            dataset
+                .create_index_builder(&["u"], IndexType::BTree, &ScalarIndexParams::default())
+                .fragments(vec![fragment_id])
+                .await
+                .unwrap();
+        }
+        let keys = UInt64Array::from(vec![Some(135), None, Some(135), Some(511), Some(0)]);
+        let error = dataset.lookup_row_addresses("u", &keys).await.unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("not unique for key at position 0")
+        );
+
+        let fragment = dataset.fragments()[1].id as u32;
+        let removed = RowAddress::new_from_parts(fragment, 7);
+        dataset
+            .delete(&format!("{ROW_ADDR} = {}", u64::from(removed)))
+            .await
+            .unwrap();
+        assert_eq!(
+            dataset.lookup_row_addresses("u", &keys).await.unwrap(),
+            vec![
+                Some(RowAddress::new_from_parts(fragment, 8)),
+                None,
+                Some(RowAddress::new_from_parts(fragment, 8)),
+                None,
+                Some(RowAddress::new_from_parts(
+                    dataset.fragments()[0].id as u32,
+                    0
+                )),
+            ]
+        );
     }
 
     #[derive(Clone, Copy, PartialEq, Eq)]

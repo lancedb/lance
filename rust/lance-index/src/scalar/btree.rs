@@ -6,6 +6,7 @@ use lance_index_core::remapping::RowAddrTranslator;
 use lance_index_core::remapping::{BatchRowIdRemapper, remap_record_batch_async};
 use std::{
     any::Any,
+    borrow::Cow,
     cmp::Ordering,
     collections::{HashMap, HashSet},
     fmt::{Debug, Display},
@@ -1654,12 +1655,13 @@ impl CacheKey for BTreeIndexStateKey {
     }
 }
 
-/// Input positions sorted by key, shared by every candidate page. Keeping the
-/// ordinals lets repeated keys produce repeated matches without a hash join.
+/// Input positions grouped by page or sorted by value. Keeping the ordinals
+/// lets repeated keys produce repeated matches without a hash join.
 struct LookupKeys {
     keys: ArrayRef,
     order: UInt32Array,
     use_u64_mapping: bool,
+    is_value_sorted: bool,
 }
 
 impl LookupKeys {
@@ -1670,6 +1672,7 @@ impl LookupKeys {
             keys,
             order,
             use_u64_mapping,
+            is_value_sorted: true,
         })
     }
 
@@ -1685,6 +1688,7 @@ impl LookupKeys {
             None => self.order.values().as_ref(),
         };
         if self.use_u64_mapping
+            && (self.is_value_sorted || key_range.is_some())
             && let Some(keys) = self.keys.as_primitive_opt::<UInt64Type>()
             && let Some(lookup) = page.lookup_u64()?
         {
@@ -1711,7 +1715,16 @@ impl LookupKeys {
             metrics.record_comparisons(comparisons.get() + 2 * (end - start));
             return Ok(());
         }
-        let keys = order;
+        // Counting by page leaves a bucket's inputs unsorted. A page with
+        // duplicate or sparse values still needs the general ordered matcher.
+        let keys = if self.is_value_sorted {
+            Cow::Borrowed(order)
+        } else {
+            let mut sorted = order.to_vec();
+            let compare = make_comparator(&self.keys, &self.keys, SortOptions::default())?;
+            sorted.sort_unstable_by(|&a, &b| compare(a as usize, b as usize));
+            Cow::Owned(sorted)
+        };
         let values = page.values();
         let order = page.value_order()?;
         let order = order.values();
@@ -2196,8 +2209,6 @@ impl BTreeIndex {
         metrics: &dyn MetricsCollector,
         mut evaluate: impl FnMut(&FlatIndex, Q) -> Result<T> + Send,
     ) -> Result<Vec<T>> {
-        let lazy_index_reader =
-            LazyIndexReader::new(self.store.clone(), self.ranges_to_files.clone());
         let mut results = Vec::with_capacity(pages.len());
         let mut missing_pages = Vec::new();
         for matches in pages {
@@ -2221,6 +2232,11 @@ impl BTreeIndex {
             results.len() + missing_pages.len(),
             missing_pages.len()
         );
+        if missing_pages.is_empty() {
+            return Ok(results);
+        }
+        let lazy_index_reader =
+            LazyIndexReader::new(self.store.clone(), self.ranges_to_files.clone());
         results.extend(
             self.evaluate_missing_pages(&missing_pages, &lazy_index_reader, metrics, &mut evaluate)
                 .await?,
@@ -3029,32 +3045,52 @@ impl ScalarIndex for BTreeIndex {
             return Ok(LookupMatches::empty());
         }
         let keys = make_array(keys.to_data());
-        let lookup_keys = LookupKeys::try_new(keys, self.results_are_row_addresses)?;
-        let pages = if let Some(directory) = &self.regular_u64_pages
-            && let Some(keys) = lookup_keys.keys.as_primitive_opt::<UInt64Type>()
+        let grouped = if let Some(directory) = &self.regular_u64_pages
+            && let Some(keys) = keys.as_primitive_opt::<UInt64Type>()
         {
-            directory.group_keys(
-                keys,
-                lookup_keys.order.values(),
-                self.page_lookup.page_numbers()?.values(),
+            directory.group_unsorted_keys(keys, self.page_lookup.page_numbers()?.values())
+        } else {
+            None
+        };
+        let (lookup_keys, pages) = if let Some((order, pages)) = grouped {
+            (
+                LookupKeys {
+                    keys,
+                    order,
+                    use_u64_mapping: self.results_are_row_addresses,
+                    is_value_sorted: false,
+                },
+                pages,
             )
         } else {
-            let non_null_keys = if lookup_keys.keys.null_count() > 0 {
-                arrow_select::filter::filter(
-                    &lookup_keys.keys,
-                    &arrow::compute::is_not_null(&lookup_keys.keys)?,
-                )?
+            let lookup_keys = LookupKeys::try_new(keys, self.results_are_row_addresses)?;
+            let pages = if let Some(directory) = &self.regular_u64_pages
+                && let Some(keys) = lookup_keys.keys.as_primitive_opt::<UInt64Type>()
+            {
+                directory.group_keys(
+                    keys,
+                    lookup_keys.order.values(),
+                    self.page_lookup.page_numbers()?.values(),
+                )
             } else {
-                lookup_keys.keys.clone()
+                let non_null_keys = if lookup_keys.keys.null_count() > 0 {
+                    arrow_select::filter::filter(
+                        &lookup_keys.keys,
+                        &arrow::compute::is_not_null(&lookup_keys.keys)?,
+                    )?
+                } else {
+                    lookup_keys.keys.clone()
+                };
+                self.page_lookup
+                    .candidate_pages_for_values(non_null_keys.as_ref())?
+                    .into_iter()
+                    .map(|page_id| LookupPage {
+                        page_id,
+                        key_range: None,
+                    })
+                    .collect()
             };
-            self.page_lookup
-                .candidate_pages_for_values(non_null_keys.as_ref())?
-                .into_iter()
-                .map(|page_id| LookupPage {
-                    page_id,
-                    key_range: None,
-                })
-                .collect()
+            (lookup_keys, pages)
         };
         if pages.is_empty() {
             return Ok(LookupMatches::empty());
@@ -7285,9 +7321,14 @@ mod tests {
     }
 
     #[rstest::rstest]
+    #[case::consecutive_pages(vec![0, 1, 2])]
     #[case::nonconsecutive_pages(vec![9, 2, 7])]
     #[case::repeated_page(vec![9, 2, 9])]
-    fn test_grouped_lookup_preserves_input_positions(#[case] page_ids: Vec<u32>) {
+    fn test_grouped_lookup_preserves_input_positions(
+        #[case] page_ids: Vec<u32>,
+        #[values(false, true)] is_counted: bool,
+        #[values(false, true)] has_duplicate_values: bool,
+    ) {
         let mins = [100_u64, 104, 108];
         let maxs = [103_u64, 107, 110];
         let root = record_batch!(
@@ -7299,6 +7340,7 @@ mod tests {
         .unwrap();
         let directory = super::lookup::RegularU64Pages::try_new(&root, 0).unwrap();
         let queries = UInt64Array::from(vec![
+            Some(101),
             Some(109),
             None,
             Some(100),
@@ -7310,9 +7352,30 @@ mod tests {
             Some(u64::MAX),
             Some(103),
             Some(107),
-        ]);
-        let keys = LookupKeys::try_new(Arc::new(queries.clone()), true).unwrap();
-        let groups = directory.group_keys(&queries, keys.order.values(), &page_ids);
+            Some(102),
+        ])
+        .slice(1, 11);
+        let (keys, groups) = if is_counted {
+            let grouped = directory.group_unsorted_keys(&queries, &page_ids);
+            assert_eq!(grouped.is_some(), page_ids == [0, 1, 2]);
+            let Some((order, groups)) = grouped else {
+                return;
+            };
+            (
+                LookupKeys {
+                    keys: Arc::new(queries.clone()),
+                    order,
+                    use_u64_mapping: true,
+                    is_value_sorted: false,
+                },
+                groups,
+            )
+        } else {
+            let keys = LookupKeys::try_new(Arc::new(queries.clone()), true).unwrap();
+            let groups = directory.group_keys(&queries, keys.order.values(), &page_ids);
+            (keys, groups)
+        };
+        let copies = if has_duplicate_values { 2 } else { 1 };
         let mut matches = LookupBuffers::new(queries.len());
         for group in &groups {
             let values = mins
@@ -7321,10 +7384,12 @@ mod tests {
                 .zip(&page_ids)
                 .filter(|(_, page_id)| **page_id == group.page_id)
                 .flat_map(|((&min, &max), _)| min..=max)
+                .flat_map(|value| std::iter::repeat_n(value, copies))
                 .collect::<Vec<_>>();
             let addresses = values
                 .iter()
-                .map(|value| value - 100 + 500)
+                .enumerate()
+                .map(|(position, value)| value - 100 + 500 + (position % copies) as u64 * 1000)
                 .collect::<Vec<_>>();
             let batch =
                 record_batch!(("values", UInt64, values), ("ids", UInt64, addresses)).unwrap();
@@ -7332,15 +7397,14 @@ mod tests {
             keys.match_page(&page, group.key_range, &mut matches, &NoOpMetricsCollector)
                 .unwrap();
         }
-        let expected = queries
-            .iter()
-            .enumerate()
-            .filter_map(|(position, value)| {
-                value
-                    .filter(|value| (100..=110).contains(value))
-                    .map(|value| (position as u32, value - 100 + 500))
-            })
-            .collect::<Vec<_>>();
+        let mut expected = Vec::new();
+        for (position, value) in queries.iter().enumerate() {
+            if let Some(value) = value.filter(|value| (100..=110).contains(value)) {
+                for copy in 0..copies {
+                    expected.push((position as u32, value - 100 + 500 + copy as u64 * 1000));
+                }
+            }
+        }
         assert_eq!(sorted_pairs(&matches.finish()), expected);
         if page_ids[0] == page_ids[2] {
             assert_eq!(groups.len(), 2);
@@ -7353,6 +7417,54 @@ mod tests {
                     .is_none()
             );
         }
+    }
+
+    #[test]
+    fn test_u64_page_groups_at_maximum_with_null_prefix() {
+        let root = record_batch!(
+            (
+                "min",
+                UInt64,
+                [None, Some(u64::MAX - 7), Some(u64::MAX - 3)]
+            ),
+            ("max", UInt64, [None, Some(u64::MAX - 4), Some(u64::MAX)]),
+            ("null_count", UInt32, [3, 0, 0]),
+            ("page_idx", UInt32, [0, 1, 2])
+        )
+        .unwrap();
+        let lookup = BTreeLookup::try_new(root).unwrap();
+        let directory =
+            super::lookup::RegularU64Pages::try_new(&lookup.batch, lookup.search_start).unwrap();
+        let queries = UInt64Array::from(vec![
+            Some(u64::MAX),
+            None,
+            Some(u64::MAX - 7),
+            Some(u64::MAX - 4),
+            Some(u64::MAX - 8),
+            Some(u64::MAX),
+        ]);
+        let (order, groups) = directory
+            .group_unsorted_keys(&queries, lookup.page_numbers().unwrap().values())
+            .unwrap();
+        let mut actual = groups
+            .iter()
+            .flat_map(|group| {
+                let (start, end) = group.key_range.unwrap();
+                order.values()[start..end]
+                    .iter()
+                    .map(move |&position| (group.page_id, position))
+            })
+            .collect::<Vec<_>>();
+        actual.sort_unstable();
+        assert_eq!(actual, [(1, 2), (1, 3), (2, 0), (2, 5)]);
+        assert!(
+            directory
+                .group_unsorted_keys(
+                    &queries.slice(0, 1),
+                    lookup.page_numbers().unwrap().values()
+                )
+                .is_none()
+        );
     }
 
     fn osv(v: i32) -> OrderableScalarValue {

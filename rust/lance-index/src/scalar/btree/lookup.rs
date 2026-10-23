@@ -128,6 +128,58 @@ impl RegularU64Pages {
         });
         pages
     }
+
+    /// Bucket a large query by page without sorting its values. The scratch
+    /// directory is bounded by the request size, never the dataset size.
+    pub(super) fn group_unsorted_keys(
+        &self,
+        keys: &UInt64Array,
+        page_ids: &[u32],
+    ) -> Option<(UInt32Array, Vec<LookupPage>)> {
+        let page_ids = page_ids.get(self.start..)?;
+        if page_ids.len() > keys.len() - keys.null_count()
+            || !page_ids
+                .windows(2)
+                .all(|pair| pair[0].checked_add(1) == Some(pair[1]))
+        {
+            return None;
+        }
+        let mut offsets = vec![0_usize; page_ids.len()];
+        let mut candidates = Vec::with_capacity(keys.len() - keys.null_count());
+        for (position, key) in keys.iter().enumerate() {
+            if let Some(key) = key
+                && key >= self.first
+                && key <= self.last
+            {
+                let page = ((key - self.first) / self.width) as usize;
+                offsets[page] = offsets[page].checked_add(1)?;
+                candidates.push((page, position as u32));
+            }
+        }
+        let mut end = 0_usize;
+        for offset in &mut offsets {
+            end = end.checked_add(*offset)?;
+            *offset = end;
+        }
+        let mut order = vec![0_u32; candidates.len()];
+        // Consuming each bucket backwards turns cumulative ends into starts.
+        for (page, position) in candidates.into_iter().rev() {
+            offsets[page] -= 1;
+            order[offsets[page]] = position;
+        }
+        let mut pages = Vec::with_capacity(page_ids.len());
+        for (page, &page_id) in page_ids.iter().enumerate() {
+            let start = offsets[page];
+            let end = offsets.get(page + 1).copied().unwrap_or(order.len());
+            if start != end {
+                pages.push(LookupPage {
+                    page_id,
+                    key_range: Some((start, end)),
+                });
+            }
+        }
+        Some((order.into(), pages))
+    }
 }
 
 #[derive(Debug)]
