@@ -172,14 +172,8 @@ async fn load_lookup_index(dataset: &Arc<Dataset>, column: &str) -> Result<Optio
         open_named_scalar_index(dataset, column, &metadata.name, &NoOpMetricsCollector).await?;
     // Exact-equality indices do not all implement lookup, and the trait has no
     // capability flag, so ask with no keys: an unsupported index answers
-    // `NotSupported` without doing any work.
-    match index
-        .lookup(
-            new_empty_array(&field.data_type()).as_ref(),
-            &NoOpMetricsCollector,
-        )
-        .await
-    {
+    // `NotSupported` before any stream is polled.
+    match index.lookup(new_empty_array(&field.data_type()), &NoOpMetricsCollector) {
         Ok(_) => {}
         Err(Error::NotSupported { .. }) => return Ok(None),
         Err(err) => return Err(err),

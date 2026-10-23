@@ -9,8 +9,9 @@ use std::sync::Arc;
 
 use arrow::compute::{filter_record_batch, take};
 use arrow_array::{
-    Array, ArrayRef, BooleanArray, RecordBatch, UInt32Array, UInt64Array, cast::AsArray,
-    types::UInt64Type,
+    Array, ArrayRef, BooleanArray, RecordBatch, UInt32Array, UInt64Array,
+    cast::AsArray,
+    types::{UInt32Type, UInt64Type},
 };
 use arrow_row::{Row, RowConverter, Rows, SortField};
 use arrow_schema::SchemaRef;
@@ -22,22 +23,25 @@ use datafusion::physical_plan::{
     SendableRecordBatchStream,
     execution_plan::{Boundedness, EmissionType},
     metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet},
-    stream::RecordBatchStreamAdapter,
+    stream::{RecordBatchReceiverStream, RecordBatchStreamAdapter},
 };
 use datafusion_physical_expr::EquivalenceProperties;
 use futures::{StreamExt, TryStreamExt};
 use lance_core::{ROW_ADDR, ROW_ID, Result, utils::address::RowAddress};
-use lance_select::{RowAddrMask, RowAddrTreeMap};
+use lance_select::{RowAddrMask, RowAddrTreeMap, RowSetOps};
 use lance_table::format::Fragment;
 use lance_table::rowids::RowIdIndex;
 use roaring::RoaringBitmap;
 use rustc_hash::FxBuildHasher;
 use tokio::sync::OnceCell;
+use tokio::sync::mpsc::Sender;
 
 use super::utils::IndexMetrics;
 use crate::Dataset;
 use crate::datafusion::planning_context::LookupIndex;
-use crate::dataset::rowids::{get_row_id_index, translate_addr_treemap_to_row_ids};
+use crate::dataset::rowids::{
+    get_row_id_index, row_addrs_to_row_ids, translate_addr_treemap_to_row_ids,
+};
 use crate::index::prefilter::DatasetPreFilter;
 
 /// What [`IndexJoinExec`] joins against: a Lance table whose join column has
@@ -199,31 +203,33 @@ impl ExecutionPlan for IndexJoinExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
-        let input = self.input.execute(partition, context)?;
+        let batch_size = context.session_config().batch_size();
+        let mut input = self.input.execute(partition, context)?;
         let joiner = BatchJoiner {
             spec: self.spec.clone(),
             input_key: self.input_key,
             schema: self.schema.clone(),
+            batch_size,
             index_metrics: IndexMetrics::new(&self.metrics, partition),
         };
         let baseline = BaselineMetrics::new(&self.metrics, partition);
         let prepared = self.prepared.clone();
         let spec = self.spec.clone();
-        let stream = futures::stream::once(async move {
+        // The joiner runs in its own task because each lookup stream borrows
+        // the index and metrics the task owns.
+        let mut builder = RecordBatchReceiverStream::builder(self.schema.clone(), 2);
+        let output = builder.tx();
+        builder.spawn(async move {
             let prepared = prepared
                 .get_or_try_init(|| Prepared::load(spec))
                 .await?
                 .clone();
-            let joiner = Arc::new(joiner);
-            Ok::<_, DataFusionError>(input.and_then(move |batch| {
-                let joiner = joiner.clone();
-                let prepared = prepared.clone();
-                async move { Ok(joiner.join(batch, &prepared).await?) }
-            }))
-        })
-        .try_flatten()
-        .map(move |batch| {
-            let _timer = baseline.elapsed_compute().timer();
+            while let Some(batch) = input.try_next().await? {
+                joiner.join(batch, &prepared, &output).await?;
+            }
+            Ok(())
+        });
+        let stream = builder.build().map(move |batch| {
             if let Ok(batch) = &batch {
                 baseline.record_output(batch.num_rows());
             }
@@ -251,11 +257,13 @@ impl ExecutionPlan for IndexJoinExec {
 /// Per-execution state built once and shared by every partition.
 #[derive(Debug)]
 struct Prepared {
-    /// Rows a lookup may report that must not match, in the row-id domain the
-    /// indices report: deleted rows, rows outside [`IndexJoinSpec::coverage`]
-    /// and overlay-stale rows. `None` when nothing is blocked.
+    /// Rows a lookup may report that must not match, in the domain the index
+    /// reports (row ids or row addresses): deleted rows, rows outside
+    /// [`IndexJoinSpec::coverage`] and overlay-stale rows. `None` when nothing
+    /// is blocked.
     lookup_mask: Option<Arc<RowAddrMask>>,
-    /// Translates row ids to addresses under stable row ids.
+    /// Translates the row ids a row-id-domain index reports to addresses
+    /// under stable row ids.
     row_id_index: Option<Arc<RowIdIndex>>,
     uncovered: Option<UncoveredRows>,
 }
@@ -281,34 +289,17 @@ const END_OF_CHAIN: u32 = u32::MAX;
 
 impl Prepared {
     async fn load(spec: Arc<IndexJoinSpec>) -> DFResult<Arc<Self>> {
-        let dataset = spec.dataset.clone();
-        let deletion_mask = match DatasetPreFilter::create_restricted_deletion_mask(
-            dataset.clone(),
-            spec.coverage.clone(),
-        ) {
-            Some(mask) => Some(mask.await?),
-            None => None,
+        let results_are_row_addresses = spec.key.index.results_are_row_addresses();
+        let lookup_mask = if results_are_row_addresses {
+            Self::address_mask(&spec).await?
+        } else {
+            Self::row_id_mask(&spec).await?
         };
-        let stale_block = if spec.stale_rows.is_empty() {
+        let row_id_index = if results_are_row_addresses {
             None
         } else {
-            let mut stale = RowAddrTreeMap::new();
-            for (&fragment_id, offsets) in &spec.stale_rows {
-                stale.insert_bitmap(fragment_id, offsets.clone());
-            }
-            if dataset.manifest.uses_stable_row_ids() {
-                stale = translate_addr_treemap_to_row_ids(&dataset, &stale).await?;
-            }
-            Some(RowAddrMask::from_block(stale))
+            get_row_id_index(&spec.dataset).await?
         };
-        let lookup_mask = match (deletion_mask, stale_block) {
-            (None, None) => None,
-            (Some(mask), None) => Some(mask),
-            (None, Some(block)) => Some(Arc::new(block)),
-            (Some(mask), Some(block)) => Some(Arc::new(mask.as_ref().clone() & block)),
-        };
-
-        let row_id_index = get_row_id_index(&dataset).await?;
         let uncovered = if spec.has_uncovered_rows() {
             Some(UncoveredRows::load(&spec).await?)
         } else {
@@ -320,6 +311,75 @@ impl Prepared {
             uncovered,
         }))
     }
+
+    async fn row_id_mask(spec: &IndexJoinSpec) -> Result<Option<Arc<RowAddrMask>>> {
+        let dataset = spec.dataset.clone();
+        let deletion_mask = match DatasetPreFilter::create_restricted_deletion_mask(
+            dataset.clone(),
+            spec.coverage.clone(),
+        ) {
+            Some(mask) => Some(mask.await?),
+            None => None,
+        };
+        let stale_block = if spec.stale_rows.is_empty() {
+            None
+        } else {
+            let mut stale = stale_row_addrs(spec);
+            if dataset.manifest.uses_stable_row_ids() {
+                stale = translate_addr_treemap_to_row_ids(&dataset, &stale).await?;
+            }
+            Some(RowAddrMask::from_block(stale))
+        };
+        Ok(match (deletion_mask, stale_block) {
+            (None, None) => None,
+            (Some(mask), None) => Some(mask),
+            (None, Some(block)) => Some(Arc::new(block)),
+            (Some(mask), Some(block)) => Some(Arc::new(mask.as_ref().clone() & block)),
+        })
+    }
+
+    async fn address_mask(spec: &IndexJoinSpec) -> Result<Option<Arc<RowAddrMask>>> {
+        let dataset = &spec.dataset;
+        let live = dataset
+            .fragments()
+            .iter()
+            .map(|fragment| fragment.id as u32)
+            .collect::<RoaringBitmap>();
+        let mut blocked = stale_row_addrs(spec);
+        // Indexed fragments since removed, and live fragments the index does
+        // not cover (those are matched through the uncovered map).
+        for fragment_id in (&spec.coverage ^ &live).iter() {
+            blocked.insert_fragment(fragment_id);
+        }
+        let deletions =
+            futures::stream::iter(dataset.get_fragments().into_iter().filter(|fragment| {
+                spec.coverage.contains(fragment.id() as u32)
+                    && fragment.metadata().deletion_file.is_some()
+            }))
+            .map(|fragment| async move {
+                let deletion_vector = fragment.get_deletion_vector().await?;
+                Ok::<_, lance_core::Error>((fragment.id() as u32, deletion_vector))
+            })
+            .buffer_unordered(dataset.object_store.io_parallelism());
+        let deletions = deletions.try_collect::<Vec<_>>().await?;
+        for (fragment_id, deletion_vector) in deletions {
+            if let Some(deletion_vector) = deletion_vector {
+                let mut deleted = RowAddrTreeMap::new();
+                deleted.insert_bitmap(fragment_id, RoaringBitmap::from(deletion_vector.as_ref()));
+                blocked |= deleted;
+            }
+        }
+        Ok((!blocked.is_empty()).then(|| Arc::new(RowAddrMask::from_block(blocked))))
+    }
+}
+
+/// [`IndexJoinSpec::stale_rows`] as row addresses.
+fn stale_row_addrs(spec: &IndexJoinSpec) -> RowAddrTreeMap {
+    let mut stale = RowAddrTreeMap::new();
+    for (&fragment_id, offsets) in &spec.stale_rows {
+        stale.insert_bitmap(fragment_id, offsets.clone());
+    }
+    stale
 }
 
 impl UncoveredRows {
@@ -461,15 +521,54 @@ struct BatchJoiner {
     spec: Arc<IndexJoinSpec>,
     input_key: usize,
     schema: SchemaRef,
+    /// The most matches one output batch holds.
+    batch_size: usize,
     index_metrics: IndexMetrics,
 }
 
 impl BatchJoiner {
-    async fn join(&self, batch: RecordBatch, prepared: &Prepared) -> Result<RecordBatch> {
+    /// Join one input batch, sending the output to `output` as it is built.
+    ///
+    /// Matches arrive from the index in no particular order and are emitted
+    /// in batches of at most [`Self::batch_size`] rows. For a right join, the
+    /// input rows nothing matched follow once every match is known.
+    async fn join(
+        &self,
+        batch: RecordBatch,
+        prepared: &Prepared,
+        output: &Sender<DFResult<RecordBatch>>,
+    ) -> Result<()> {
         let keys = batch.column(self.input_key).clone();
+        let mut matched = vec![false; batch.num_rows()];
 
-        // (input row, target row id, target row address)
-        let mut matches = self.lookup(&keys, prepared).await?;
+        // (input row, row in the index's domain), not yet filtered or resolved
+        let mut input_rows = Vec::new();
+        let mut rows = Vec::new();
+        let mut lookups = self
+            .spec
+            .key
+            .index
+            .lookup(keys.clone(), &self.index_metrics)?;
+        while let Some(found) = lookups.try_next().await? {
+            input_rows.extend_from_slice(found.column(0).as_primitive::<UInt32Type>().values());
+            rows.extend_from_slice(found.column(1).as_primitive::<UInt64Type>().values());
+            while input_rows.len() >= self.batch_size {
+                let rest_input_rows = input_rows.split_off(self.batch_size);
+                let rest_rows = rows.split_off(self.batch_size);
+                let (input_rows, targets) = self
+                    .resolve(
+                        std::mem::replace(&mut input_rows, rest_input_rows),
+                        std::mem::replace(&mut rows, rest_rows),
+                        prepared,
+                    )
+                    .await?;
+                self.send_matches(&batch, &keys, input_rows, targets, &mut matched, output)
+                    .await?;
+            }
+        }
+        drop(lookups);
+        let (mut input_rows, mut targets) = self.resolve(input_rows, rows, prepared).await?;
+
         if let Some(uncovered) = &prepared.uncovered {
             let encoded = uncovered
                 .converter
@@ -478,97 +577,115 @@ impl BatchJoiner {
                 if keys.is_null(row) {
                     continue;
                 }
-                matches.extend(
-                    uncovered
-                        .get(encoded.row(row))
-                        .map(|(row_id, row_addr)| (row as u32, row_id, row_addr)),
-                );
+                for target in uncovered.get(encoded.row(row)) {
+                    input_rows.push(row as u32);
+                    targets.push(target);
+                }
             }
         }
-        // Keep the input's row order, and make the order of several matches
-        // for one input row deterministic.
-        matches.sort_unstable();
+        self.send_matches(&batch, &keys, input_rows, targets, &mut matched, output)
+            .await?;
 
-        self.build_output(&batch, &keys, &matches)
+        if self.spec.join_type == JoinType::Right {
+            let unmatched = (0..batch.num_rows() as u32)
+                .filter(|&row| !matched[row as usize])
+                .collect::<Vec<_>>();
+            if !unmatched.is_empty() {
+                let targets = vec![None; unmatched.len()];
+                send(
+                    output,
+                    self.build_output(&batch, &keys, &unmatched, &targets)?,
+                )
+                .await?;
+            }
+        }
+        Ok(())
     }
 
-    /// The `(input row, row id, row address)` triples the indices report,
-    /// with blocked rows removed.
-    async fn lookup(&self, keys: &ArrayRef, prepared: &Prepared) -> Result<Vec<(u32, u64, u64)>> {
-        let found = self
-            .spec
-            .key
-            .index
-            .lookup(keys.as_ref(), &self.index_metrics)
-            .await?;
-        let pairs = found
-            .key_indices
-            .values()
-            .iter()
-            .copied()
-            .zip(found.row_ids.values().iter().copied())
-            .filter(|(_, row_id)| {
+    /// Drop the matches the lookup mask blocks and give each remaining one
+    /// its `(row id, row address)`.
+    async fn resolve(
+        &self,
+        input_rows: Vec<u32>,
+        rows: Vec<u64>,
+        prepared: &Prepared,
+    ) -> Result<(Vec<u32>, Vec<(u64, u64)>)> {
+        let (input_rows, rows): (Vec<u32>, Vec<u64>) = input_rows
+            .into_iter()
+            .zip(rows)
+            .filter(|(_, row)| {
                 prepared
                     .lookup_mask
                     .as_ref()
-                    .is_none_or(|mask| mask.selected(*row_id))
+                    .is_none_or(|mask| mask.selected(*row))
             })
-            .collect::<Vec<_>>();
+            .unzip();
 
-        Ok(match &prepared.row_id_index {
-            None => pairs
+        let dataset = &self.spec.dataset;
+        if !dataset.manifest.uses_stable_row_ids() {
+            return Ok((input_rows, rows.into_iter().map(|row| (row, row)).collect()));
+        }
+        let targets: Vec<Option<(u64, u64)>> = if let Some(row_id_index) = &prepared.row_id_index {
+            row_id_index
+                .get_many(&rows)?
                 .into_iter()
-                .map(|(row, row_id)| (row, row_id, row_id))
-                .collect(),
-            Some(row_id_index) => {
-                let row_ids = pairs.iter().map(|(_, row_id)| *row_id).collect::<Vec<_>>();
-                let addrs = row_id_index.get_many(&row_ids)?;
-                pairs
-                    .into_iter()
-                    .zip(addrs)
-                    .filter_map(|((row, row_id), addr)| {
-                        addr.map(|addr| (row, row_id, u64::from(addr)))
-                    })
-                    .collect()
-            }
-        })
+                .zip(&rows)
+                .map(|(addr, &row_id)| addr.map(|addr| (row_id, u64::from(addr))))
+                .collect()
+        } else {
+            row_addrs_to_row_ids(dataset, rows.iter().map(|&addr| Some(addr)))
+                .await?
+                .into_iter()
+                .zip(&rows)
+                .map(|(row_id, &addr)| row_id.map(|row_id| (row_id, addr)))
+                .collect()
+        };
+        Ok(input_rows
+            .into_iter()
+            .zip(targets)
+            .filter_map(|(row, target)| target.map(|target| (row, target)))
+            .unzip())
     }
 
+    async fn send_matches(
+        &self,
+        batch: &RecordBatch,
+        keys: &ArrayRef,
+        input_rows: Vec<u32>,
+        targets: Vec<(u64, u64)>,
+        matched: &mut [bool],
+        output: &Sender<DFResult<RecordBatch>>,
+    ) -> Result<()> {
+        for &row in &input_rows {
+            matched[row as usize] = true;
+        }
+        for (input_rows, targets) in input_rows
+            .chunks(self.batch_size)
+            .zip(targets.chunks(self.batch_size))
+        {
+            let targets = targets.iter().copied().map(Some).collect::<Vec<_>>();
+            send(
+                output,
+                self.build_output(batch, keys, input_rows, &targets)?,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Output rows pairing input row `input_rows[i]` with table row
+    /// `targets[i]`, given as `(row id, row address)`, or with nulls.
     fn build_output(
         &self,
         batch: &RecordBatch,
         keys: &ArrayRef,
-        matches: &[(u32, u64, u64)],
+        input_rows: &[u32],
+        targets: &[Option<(u64, u64)>],
     ) -> Result<RecordBatch> {
-        let keep_unmatched = self.spec.join_type == JoinType::Right;
-        let capacity = if keep_unmatched {
-            matches.len() + batch.num_rows()
-        } else {
-            matches.len()
-        };
-        let mut input_rows = Vec::with_capacity(capacity);
-        let mut matched = Vec::with_capacity(capacity);
-        let mut next = matches.iter().peekable();
-        for row in 0..batch.num_rows() as u32 {
-            let mut found = false;
-            while let Some(&&(match_row, row_id, row_addr)) = next.peek()
-                && match_row == row
-            {
-                input_rows.push(row);
-                matched.push(Some((row_id, row_addr)));
-                found = true;
-                next.next();
-            }
-            if !found && keep_unmatched {
-                input_rows.push(row);
-                matched.push(None);
-            }
-        }
-
-        let input_rows = UInt32Array::from(input_rows);
+        let input_rows = UInt32Array::from(input_rows.to_vec());
         let target_rows = input_rows
             .iter()
-            .zip(&matched)
+            .zip(targets)
             .map(|(row, target)| target.as_ref().and(row))
             .collect::<UInt32Array>();
         let mut columns = Vec::with_capacity(self.schema.fields().len());
@@ -576,13 +693,13 @@ impl BatchJoiner {
             columns.push(match column {
                 TargetColumn::Key => take(keys.as_ref(), &target_rows, None)?,
                 TargetColumn::RowId => Arc::new(
-                    matched
+                    targets
                         .iter()
                         .map(|target| target.map(|(row_id, _)| row_id))
                         .collect::<UInt64Array>(),
                 ) as ArrayRef,
                 TargetColumn::RowAddr => Arc::new(
-                    matched
+                    targets
                         .iter()
                         .map(|target| target.map(|(_, row_addr)| row_addr))
                         .collect::<UInt64Array>(),
@@ -594,4 +711,11 @@ impl BatchJoiner {
         }
         Ok(RecordBatch::try_new(self.schema.clone(), columns)?)
     }
+}
+
+async fn send(output: &Sender<DFResult<RecordBatch>>, batch: RecordBatch) -> Result<()> {
+    output
+        .send(Ok(batch))
+        .await
+        .map_err(|_| lance_core::Error::internal("index join output was dropped".to_string()))
 }

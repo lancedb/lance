@@ -314,7 +314,9 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::datasource::MemTable;
     use datafusion::execution::SessionStateBuilder;
-    use datafusion::prelude::SessionContext;
+    use datafusion::physical_plan::{collect, displayable};
+    use datafusion::physical_planner::DefaultPhysicalPlanner;
+    use datafusion::prelude::{SessionConfig, SessionContext};
     use lance_datagen::array;
     use lance_index::IndexType;
     use lance_index::scalar::ScalarIndexParams;
@@ -397,5 +399,86 @@ mod tests {
         let optimized = state.optimize(&plan).unwrap();
         let display = optimized.display_indent().to_string();
         assert_eq!(display.contains("IndexJoin"), index_join, "{display}");
+    }
+
+    /// A key matching many table rows is joined in several output batches
+    /// rather than one holding every match.
+    #[rstest::rstest]
+    #[case::btree(IndexType::BTree)]
+    #[case::bitmap(IndexType::Bitmap)]
+    #[tokio::test]
+    async fn test_many_matches_stream_in_batches(#[case] index_type: IndexType) {
+        let mut dataset = lance_datagen::gen_batch()
+            .col(
+                "bucket",
+                array::cycle::<arrow_array::types::Int64Type>(vec![0, 1]),
+            )
+            .into_ram_dataset(FragmentCount::from(3), FragmentRowCount::from(1000))
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["bucket"],
+                index_type,
+                None,
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let batch_size = 100;
+        let ctx = SessionContext::new_with_config(SessionConfig::new().with_batch_size(batch_size));
+        let target = ctx
+            .read_table(Arc::new(LanceTableProvider::new(
+                Arc::new(dataset),
+                true,
+                true,
+            )))
+            .unwrap()
+            .alias("target")
+            .unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "bucket",
+            DataType::Int64,
+            true,
+        )]));
+        let source_batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![0, 5]))])
+                .unwrap();
+        let source = ctx
+            .read_table(Arc::new(
+                MemTable::try_new(schema, vec![vec![source_batch]]).unwrap(),
+            ))
+            .unwrap()
+            .alias("source")
+            .unwrap();
+        let (state, plan) = target
+            .join(source, JoinType::Right, &["bucket"], &["bucket"], None)
+            .unwrap()
+            .into_parts();
+
+        let context = Arc::new(PlanningContext::collect(&plan).await.unwrap());
+        let state = SessionStateBuilder::new_from_existing(state)
+            .with_optimizer_rule(Arc::new(IndexJoinRule::new(context)))
+            .build();
+        let plan = state.optimize(&plan).unwrap();
+        let plan =
+            DefaultPhysicalPlanner::with_extension_planners(vec![Arc::new(IndexJoinPlanner)])
+                .create_physical_plan(&plan, &state)
+                .await
+                .unwrap();
+        let display = displayable(plan.as_ref()).indent(false).to_string();
+        assert!(display.contains("IndexJoin"), "{display}");
+
+        let batches = collect(plan, state.task_ctx()).await.unwrap();
+        assert!(
+            batches.len() > 2,
+            "expected several batches, got {}",
+            batches.len()
+        );
+        let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        // 1500 rows match key 0, and key 5 is kept unmatched.
+        assert_eq!(rows, 1501);
     }
 }
