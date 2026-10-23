@@ -46,3 +46,7 @@ folder contains a `datagen.py` script that generates one or more lance datasets.
 * `v8.0.0/blobs/v2.0.lance` and `v8.0.0/blobs/v2.1.lance`: Legacy Blob
   columns containing a payload, null, and empty bytes. These fixtures cover
   reading released files alongside newly appended Blob v2 files.
+* `v10.0.0/null_slot_v2_0.lance` and `v10.0.0/disjoint_v2_1.lance`: Int8
+  dictionary columns whose pages store 32-bit indices. Lance 10.0.0 widened
+  them for the null slot it appended past the last Int8 key, and for two
+  chunks whose dictionaries did not fit Int8 together.
