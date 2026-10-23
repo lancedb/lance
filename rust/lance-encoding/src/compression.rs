@@ -2055,6 +2055,7 @@ fn compression_name(compression: &Compression) -> &'static str {
         Compression::Constant(_) => "constant",
         Compression::Dictionary(_) => "dictionary",
         Compression::ByteStreamSplit(_) => "byte stream split",
+        Compression::AxisDelta(_) => "axis delta",
         Compression::PackedStruct(_) => "packed struct",
         Compression::FixedSizeList(_) => "fixed-size list",
         Compression::VariablePackedStruct(_) => "variable packed struct",
