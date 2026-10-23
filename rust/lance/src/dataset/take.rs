@@ -1005,6 +1005,7 @@ mod test {
     #[case::duplicates_unordered(vec![23, 21, 23, 22], vec![31, 29, 31, 30], vec![7], true, true)]
     #[case::multiple_fragments(vec![23, 0, 22, 3], vec![31, 1, 30, 5], vec![0, 1, 7], true, true)]
     #[case::empty(vec![], vec![], vec![], true, true)]
+    #[case::empty_missing_deletion_counts(vec![], vec![], vec![], true, false)]
     #[case::no_deletions(vec![31, 28, 31, 0], vec![31, 28, 31, 0], vec![], false, true)]
     #[case::missing_deletion_counts(vec![23], vec![31], (0..8).collect(), true, false)]
     #[tokio::test]

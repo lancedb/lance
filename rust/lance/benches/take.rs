@@ -3,7 +3,7 @@
 
 use arrow_array::{
     BinaryArray, FixedSizeListArray, Float32Array, Int32Array, RecordBatch, RecordBatchIterator,
-    UInt32Array,
+    UInt32Array, cast::AsArray, types::Int32Type,
 };
 use arrow_schema::{DataType, Field, FieldRef, Schema as ArrowSchema};
 use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
@@ -436,6 +436,11 @@ fn bench_sparse_take_with_deletions(c: &mut Criterion) {
             object_store.io_stats_incremental();
             let batch = take(&dataset);
             assert_eq!(batch.num_rows(), 1);
+            assert_eq!(
+                batch["i"].as_primitive::<Int32Type>().value(0),
+                (num_fragments * 4 - 1) as i32,
+                "{cache} take with {num_fragments} fragments returned the wrong value"
+            );
             let stats = object_store.io_stats_incremental();
             let deletion_reads: Vec<_> = stats
                 .requests
@@ -458,15 +463,28 @@ fn bench_sparse_take_with_deletions(c: &mut Criterion) {
                         })
                 })
                 .sum();
-            // Include the probe's deletion GETs and bytes in Criterion's persisted
-            // benchmark IDs alongside latency, keeping data-file reads separate.
-            let id = BenchmarkId::new(
-                format!(
-                    "{cache}/deletion_gets={}/deletion_bytes={deletion_bytes}",
-                    deletion_reads.len()
-                ),
-                num_fragments,
+            let expected_deletion_reads = usize::from(cache == "cold");
+            assert_eq!(
+                deletion_reads.len(),
+                expected_deletion_reads,
+                "{cache} take with {num_fragments} fragments: {} deletion reads, {deletion_bytes} deletion bytes",
+                deletion_reads.len()
             );
+            if cache == "cold" {
+                assert!(
+                    deletion_bytes > 0,
+                    "{cache} take with {num_fragments} fragments: {} deletion reads, {deletion_bytes} deletion bytes",
+                    deletion_reads.len()
+                );
+            } else {
+                assert_eq!(
+                    deletion_bytes,
+                    0,
+                    "{cache} take with {num_fragments} fragments: {} deletion reads, {deletion_bytes} deletion bytes",
+                    deletion_reads.len()
+                );
+            }
+            let id = BenchmarkId::new(cache, num_fragments);
             group.bench_function(id, |b| {
                 if cache == "cold" {
                     b.iter_batched_ref(
