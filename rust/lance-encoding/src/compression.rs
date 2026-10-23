@@ -196,7 +196,10 @@ fn try_alp_for_mini_block(
     data: &FixedWidthDataBlock,
     params: &CompressionFieldParams,
 ) -> Option<Box<dyn MiniBlockCompressor>> {
-    let mode = params.alp.unwrap_or(AlpMode::Off);
+    // Auto is the default: the entropy pre-gate rejects incompressible pages
+    // before the candidate scan, and the page-level fallback already guarantees
+    // ALP never enlarges data. Only v2.3 writers call this path.
+    let mode = params.alp.unwrap_or(AlpMode::Auto);
     if !should_use_alp(data, mode) {
         return None;
     }

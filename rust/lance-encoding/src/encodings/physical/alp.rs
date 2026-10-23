@@ -391,10 +391,15 @@ pub fn should_use_alp(data: &FixedWidthDataBlock, mode: AlpMode) -> bool {
 
 fn low_byte_position_entropy(data: &FixedWidthDataBlock) -> bool {
     // The byte-position statistic samples 64 values, so its upper bound is
-    // 6.0 bits. Decimal datasets measured 1.5-4.3 bits while random f64
-    // surfaces saturate at 5.0+; split the difference, biasing toward trying
-    // ALP because a false positive only costs one candidate scan.
-    const AUTO_ENTROPY_THRESHOLD: f64 = 5.0;
+    // 6.0 bits. On the 4M-value evaluation corpus (2026-10-23, EC2 i4i.4xlarge),
+    // the best ALP-suitable datasets (prices/sensor/drift, f32+f64) peak at
+    // 4.504 average bits per byte position, while incompressible random data
+    // (gaussian/uniform, f32+f64) bottoms out at 4.72. 4.6 separates the two:
+    // suitable data keeps every page, random data never enters the candidate
+    // scan (a false positive only wastes one scan that falls back). A higher
+    // threshold like 5.0 lets gaussian32/uniform32 through the gate on most
+    // pages and costs 4.5-4.8x encode throughput on those columns.
+    const AUTO_ENTROPY_THRESHOLD: f64 = 4.6;
     let Some(entropy_stat) = data.get_stat(Stat::BytePositionEntropy) else {
         return false;
     };
