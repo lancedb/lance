@@ -2718,9 +2718,9 @@ mod tests {
             panic!("Expected general per-value compression");
         };
         let expected_scheme = if test_encoding == TestEncoding::StructuralSparse {
-            crate::format::pb21::CompressionScheme::CompressionAlgorithmLz4
+            crate::format::metadata::CompressionScheme::CompressionAlgorithmLz4
         } else {
-            crate::format::pb21::CompressionScheme::CompressionAlgorithmZstd
+            crate::format::metadata::CompressionScheme::CompressionAlgorithmZstd
         };
         assert_eq!(
             general.compression.as_ref().unwrap().scheme(),
