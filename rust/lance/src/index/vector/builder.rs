@@ -703,6 +703,15 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         self
     }
 
+    /// Train the IVF model and quantizer but shuffle no rows, so `build()`
+    /// writes an index that carries the model and nothing else.
+    pub fn with_train_only(&mut self, train_only: bool) -> &mut Self {
+        if train_only {
+            self.shuffle_reader = Some(Arc::new(EmptyReader));
+        }
+        self
+    }
+
     /// Control whether codes are transposed when building storage.
     /// This mainly affects intermediate PQ/RQ storage when building distributed indices.
     pub fn with_transpose(&mut self, transpose: bool) -> &mut Self {
@@ -1119,8 +1128,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             ));
         };
 
-        // if no partitions to split, we just create a new delta index,
-        // otherwise, we need to merge all existing indices and split large partitions.
+        // Without partition adjustment, honor the requested merge window. An unset
+        // count appends a delta; an explicit count still merges the selected segments.
         let reader = reader.clone();
         let num_indices_to_merge = self
             .optimize_options
@@ -1144,8 +1153,13 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             (ivf.num_partitions(), Arc::new(indices_to_merge), None)
         };
 
-        let (num_partitions, merge_indices, partition_adjustment) = if num_indices_to_merge
+        let enable_partition_rebalancing = self
+            .optimize_options
+            .as_ref()
+            .is_some_and(|options| options.enable_partition_rebalancing);
+        let (num_partitions, merge_indices, partition_adjustment) = if (num_indices_to_merge
             .is_some()
+            && !enable_partition_rebalancing)
             || self.optimize_options.is_none()
         {
             no_partition_adjustment()
@@ -1962,10 +1976,12 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             IndexFile {
                 path: INDEX_AUXILIARY_FILE_NAME.to_string(),
                 size_bytes: storage_summary.size_bytes,
+                file_metadata_size_bytes: None,
             },
             IndexFile {
                 path: INDEX_FILE_NAME.to_string(),
                 size_bytes: index_summary.size_bytes,
+                file_metadata_size_bytes: None,
             },
         ])
     }
