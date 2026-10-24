@@ -556,6 +556,31 @@ from datetime import timedelta
 dataset.cleanup_old_versions(older_than=timedelta(days=1))
 ```
 
+To retain sparse history, set `keep_one_per` to a positive duration. For example,
+keep every version from the last two days and one version per day before that:
+
+```python
+dataset.cleanup_old_versions(
+    older_than=timedelta(days=2), keep_one_per=timedelta(days=1)
+)
+```
+
+Both durations are configurable. With `keep_one_per` set, `older_than` defaults
+to two days. Each bucket is aligned to the UTC Unix epoch and keeps the newest
+eligible logical commit timestamp, breaking ties by version number. Tags, the
+current version and branch dependencies remain protected, so a bucket can have
+additional protected versions. Other filters, such as `retain_versions` and
+`versions`, still limit which versions can be removed. Cleanup also preserves
+the data and index files needed by these retained snapshots. The same options
+are available on `explain_cleanup_old_versions` for a preview.
+
+In Rust, use `dataset.cleanup(policy).with_keep_one_per(Duration::from_secs(86_400))?`;
+in Java, use `dataset.cleanup(policy).withKeepOnePer(Duration.ofDays(1))`.
+The policy's timestamp cutoff configures the full-history window in both APIs.
+For automatic cleanup, set `lance.auto_cleanup.keep_one_per` to a duration string
+such as `1day`, and `lance.auto_cleanup.older_than` to `2days`. When thinning is
+unset, cleanup retains its existing behavior.
+
 !!! note
 
     Tagged versions are exempt from cleanup. See [Tags and Branches](tags_and_branches.md)

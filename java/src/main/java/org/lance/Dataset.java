@@ -2707,23 +2707,30 @@ public class Dataset implements Closeable {
   }
 
   RemovalStats executeCleanup(
-      CleanupPolicy policy, Optional<Long> deleteConcurrency, Optional<Long> deleteRateLimit) {
+      CleanupPolicy policy,
+      Optional<Long> deleteConcurrency,
+      Optional<Long> deleteRateLimit,
+      Optional<Long> keepOnePerMillis) {
     try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-      return nativeCleanupWithPolicy(policy, deleteConcurrency, deleteRateLimit);
+      return nativeCleanupWithPolicy(policy, deleteConcurrency, deleteRateLimit, keepOnePerMillis);
     }
   }
 
   private native RemovalStats nativeCleanupWithPolicy(
-      CleanupPolicy policy, Optional<Long> deleteConcurrency, Optional<Long> deleteRateLimit);
+      CleanupPolicy policy,
+      Optional<Long> deleteConcurrency,
+      Optional<Long> deleteRateLimit,
+      Optional<Long> keepOnePerMillis);
 
-  CleanupExplanation explainCleanup(CleanupPolicy policy, Optional<Long> maxCandidateFiles) {
+  CleanupExplanation explainCleanup(
+      CleanupPolicy policy, Optional<Long> maxCandidateFiles, Optional<Long> keepOnePerMillis) {
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-      return nativeExplainCleanupWithPolicy(policy, maxCandidateFiles);
+      return nativeExplainCleanupWithPolicy(policy, maxCandidateFiles, keepOnePerMillis);
     }
   }
 
   private native CleanupExplanation nativeExplainCleanupWithPolicy(
-      CleanupPolicy policy, Optional<Long> maxCandidateFiles);
+      CleanupPolicy policy, Optional<Long> maxCandidateFiles, Optional<Long> keepOnePerMillis);
 }

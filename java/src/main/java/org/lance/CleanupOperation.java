@@ -19,6 +19,7 @@ import org.lance.cleanup.RemovalStats;
 
 import org.apache.arrow.util.Preconditions;
 
+import java.time.Duration;
 import java.util.Optional;
 
 /**
@@ -33,10 +34,34 @@ public class CleanupOperation {
   private Optional<Long> deleteConcurrency = Optional.empty();
   private Optional<Long> deleteRateLimit = Optional.empty();
   private Optional<Long> maxCandidateFiles = Optional.empty();
+  private Optional<Long> keepOnePerMillis = Optional.empty();
 
   CleanupOperation(Dataset dataset, CleanupPolicy policy) {
     this.dataset = Preconditions.checkNotNull(dataset, "dataset cannot be null");
     this.policy = Preconditions.checkNotNull(policy, "policy cannot be null");
+  }
+
+  /**
+   * Keep the newest eligible commit per UTC epoch-aligned period, breaking timestamp ties by
+   * version. Tags, current/newer versions and branch dependencies remain protected, so a period may
+   * contain additional protected versions. Defaults to retaining full history for two days; use
+   * {@link CleanupPolicy.Builder#withBeforeTimestampMillis(long)} to configure the cutoff. Without
+   * this option, cleanup removes all eligible versions as before.
+   *
+   * <p>Example: {@code dataset.cleanup(policy).withKeepOnePer(Duration.ofDays(1)).execute()}.
+   *
+   * @param period positive bucket width, with millisecond precision
+   * @return this operation for chaining
+   */
+  public CleanupOperation withKeepOnePer(Duration period) {
+    Preconditions.checkNotNull(period, "period cannot be null");
+    long millis = period.toMillis();
+    Preconditions.checkArgument(
+        millis > 0 && period.equals(Duration.ofMillis(millis)),
+        "keep_one_per must be positive with millisecond precision, got %s",
+        period);
+    this.keepOnePerMillis = Optional.of(millis);
+    return this;
   }
 
   /**
@@ -94,7 +119,7 @@ public class CleanupOperation {
    * @return cleanup explanation
    */
   public CleanupExplanation explain() {
-    return dataset.explainCleanup(policy, maxCandidateFiles);
+    return dataset.explainCleanup(policy, maxCandidateFiles, keepOnePerMillis);
   }
 
   /**
@@ -103,6 +128,6 @@ public class CleanupOperation {
    * @return removal stats
    */
   public RemovalStats execute() {
-    return dataset.executeCleanup(policy, deleteConcurrency, deleteRateLimit);
+    return dataset.executeCleanup(policy, deleteConcurrency, deleteRateLimit, keepOnePerMillis);
   }
 }
