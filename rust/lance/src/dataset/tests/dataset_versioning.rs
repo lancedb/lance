@@ -22,14 +22,15 @@ use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use lance_core::utils::tempfile::{TempDir, TempStdDir, TempStrDir};
 use lance_datagen::{BatchCount, RowCount, array, gen_batch};
 use lance_file::version::LanceFileVersion;
+use lance_table::feature_flags::FLAG_STABLE_ROW_IDS;
 use mock_instant::thread_local::MockClock;
 use tokio::sync::Barrier;
 
-use crate::dataset::refs::branch_contents_path;
+use crate::dataset::refs::{base_branches_contents_path, branch_contents_path};
 use crate::utils::test::copy_test_data_to_tmp;
 use futures::TryStreamExt;
 use lance_core::Error;
-use object_store::path::Path;
+use object_store::{ObjectStoreExt as _, path::Path};
 use rstest::rstest;
 use std::cmp::Ordering;
 
@@ -389,6 +390,99 @@ async fn test_restore_preserves_row_id_high_water_mark() {
         ids.iter().filter(|id| **id >= mark).count(),
         10,
         "appended rows did not all take fresh ids past {mark}: {ids:?}"
+    );
+}
+
+#[derive(Debug, Clone, Copy)]
+enum EmptyTableCopy {
+    ShallowClone,
+    Branch,
+    DeepClone,
+}
+
+/// Once every row is deleted no fragment is left to show that the table uses
+/// stable row ids, so only the flag records it. A copy that lost the flag would
+/// hand out row addresses from the namespace the source has already issued ids
+/// from.
+#[rstest]
+#[case::shallow_clone(EmptyTableCopy::ShallowClone)]
+#[case::branch(EmptyTableCopy::Branch)]
+#[case::deep_clone(EmptyTableCopy::DeepClone)]
+#[tokio::test]
+async fn test_copy_of_emptied_table_keeps_stable_row_ids(#[case] copy: EmptyTableCopy) {
+    let test_dir = TempStrDir::default();
+    let source_uri = format!("{}/source", test_dir.as_str());
+    let copy_uri = format!("{}/copy", test_dir.as_str());
+    let batch = u32_batch(0..20);
+    let mut source = Dataset::write(
+        RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+        &source_uri,
+        Some(WriteParams {
+            max_rows_per_file: 10,
+            enable_stable_row_ids: true,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    source.delete("i >= 0").await.unwrap();
+    assert!(source.manifest.fragments.is_empty());
+    assert!(source.manifest.uses_stable_row_ids());
+    let next_row_id = source.manifest.next_row_id;
+    assert_eq!(next_row_id, 20);
+
+    let version = source.version().version;
+    match copy {
+        EmptyTableCopy::ShallowClone => {
+            source
+                .shallow_clone(&copy_uri, version, None)
+                .await
+                .unwrap();
+        }
+        EmptyTableCopy::Branch => {
+            source.create_branch("copy", version, None).await.unwrap();
+        }
+        EmptyTableCopy::DeepClone => {
+            source.deep_clone(&copy_uri, version, None).await.unwrap();
+        }
+    }
+    let open_copy = async || match copy {
+        EmptyTableCopy::Branch => Dataset::open(&source_uri)
+            .await
+            .unwrap()
+            .checkout_branch("copy")
+            .await
+            .unwrap(),
+        EmptyTableCopy::ShallowClone | EmptyTableCopy::DeepClone => {
+            Dataset::open(&copy_uri).await.unwrap()
+        }
+    };
+    let mut copied = open_copy().await;
+    assert!(copied.manifest.fragments.is_empty());
+    assert!(
+        copied.manifest.uses_stable_row_ids(),
+        "the copy lost stable row ids: reader flags {}",
+        copied.manifest.reader_feature_flags
+    );
+    assert_ne!(
+        copied.manifest.writer_feature_flags & FLAG_STABLE_ROW_IDS,
+        0,
+        "the copy lost stable row ids: writer flags {}",
+        copied.manifest.writer_feature_flags
+    );
+    assert_eq!(copied.manifest.next_row_id, next_row_id);
+
+    let batch = u32_batch(20..25);
+    copied
+        .append(
+            RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        scan_row_ids(&open_copy().await).await,
+        (next_row_id..next_row_id + 5).collect::<Vec<_>>()
     );
 }
 
@@ -1007,6 +1101,54 @@ async fn test_create_branch_and_shallow_clone_from_other_branch() {
 }
 
 #[tokio::test]
+async fn test_main_branch_management() {
+    let tempdir = TempDir::default();
+    let test_uri = tempdir.path_str();
+    let data = gen_batch()
+        .col("id", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+    let mut dataset = Dataset::write(data, &test_uri, None).await.unwrap();
+
+    let main_branch = dataset.checkout_branch("main").await.unwrap();
+    assert_eq!(main_branch.version().version, dataset.version().version);
+    assert_eq!(main_branch.manifest.branch, None);
+
+    let main_ref = dataset.checkout_version(("main", None)).await.unwrap();
+    assert_eq!(main_ref.version().version, dataset.version().version);
+    assert_eq!(main_ref.manifest.branch, None);
+
+    let Err(create_branch_err) = dataset.create_branch("main", ("main", None), None).await else {
+        panic!("creating a branch named main should fail");
+    };
+    assert!(matches!(create_branch_err, Error::InvalidRef { .. }));
+    assert!(
+        create_branch_err
+            .to_string()
+            .contains("\"main\" is reserved"),
+        "{create_branch_err}"
+    );
+
+    assert!(!tempdir.std_path().join("tree").join("main").exists());
+    assert!(dataset.list_branches().await.unwrap().is_empty());
+
+    let get_branch_err = dataset.branches().get("main").await.unwrap_err();
+    assert!(matches!(get_branch_err, Error::InvalidRef { .. }));
+    assert!(
+        get_branch_err.to_string().contains("\"main\" is reserved"),
+        "{get_branch_err}"
+    );
+
+    let delete_branch_err = dataset.delete_branch("main").await.unwrap_err();
+    assert!(matches!(delete_branch_err, Error::InvalidRef { .. }));
+    assert!(
+        delete_branch_err
+            .to_string()
+            .contains("\"main\" is reserved"),
+        "{delete_branch_err}"
+    );
+}
+
+#[tokio::test]
 async fn test_cannot_delete_branch_referenced_by_tag() {
     let tempdir = TempDir::default();
     let test_uri = tempdir.path_str();
@@ -1028,6 +1170,42 @@ async fn test_cannot_delete_branch_referenced_by_tag() {
     assert!(matches!(&error, Error::RefConflict { .. }));
     assert!(error.to_string().contains("keep-dev"));
     dataset.checkout_version("keep-dev").await.unwrap();
+}
+
+#[tokio::test]
+async fn test_list_hierarchical_branches() {
+    let data = gen_batch()
+        .col("id", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(1), BatchCount::from(1));
+    let mut dataset = Dataset::write(data, "memory://", None).await.unwrap();
+
+    dataset.create_branch("release", 1, None).await.unwrap();
+    dataset
+        .create_branch("features/nested", 1, None)
+        .await
+        .unwrap();
+
+    // OpenDAL-backed stores such as OSS may decode the '%2F' path part and
+    // expose the branch metadata as a nested object during listing.
+    let root_path = dataset.refs.root().unwrap().path;
+    let encoded_path = branch_contents_path(&root_path, "features/nested");
+    let nested_path = Path::parse(format!(
+        "{}/features/nested.json",
+        base_branches_contents_path(&root_path)
+    ))
+    .unwrap();
+    dataset
+        .object_store
+        .inner
+        .copy(&encoded_path, &nested_path)
+        .await
+        .unwrap();
+    dataset.object_store.delete(&encoded_path).await.unwrap();
+
+    let branches = dataset.list_branches().await.unwrap();
+    assert_eq!(branches.len(), 2);
+    assert!(branches.contains_key("release"));
+    assert!(branches.contains_key("features/nested"));
 }
 
 #[tokio::test]
@@ -1289,6 +1467,41 @@ async fn test_branch() {
         "branch1"
     );
 
+    // Opening a branch version that main does not have (main only has version 1)
+    // must resolve the version on the branch chain.
+    let branch_version_open = DatasetBuilder::from_uri(&test_uri)
+        .with_branch("feature/nathan/branch3", Some(3))
+        .load()
+        .await
+        .unwrap();
+    assert_eq!(
+        branch_version_open.manifest.branch.as_deref(),
+        Some("feature/nathan/branch3")
+    );
+    assert_eq!(branch_version_open.version().version, 3);
+    assert_eq!(
+        branch_version_open.count_rows(None).await.unwrap(),
+        checkout_branch3_at_version3.count_rows(None).await.unwrap()
+    );
+    // A version the branch does not have is still an error, not its latest version.
+    let err = DatasetBuilder::from_uri(&test_uri)
+        .with_branch("feature/nathan/branch3", Some(99))
+        .load()
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::DatasetNotFound { .. }), "{err}");
+    assert!(err.to_string().contains("feature/nathan/branch3"), "{err}");
+
+    // From the branch's own directory, an older version of that branch is checked out on it.
+    let branch_dir_open = DatasetBuilder::from_uri(branch1_dataset.uri())
+        .with_branch("branch1", Some(1))
+        .load()
+        .await
+        .unwrap();
+    assert_eq!(branch_dir_open.manifest.branch.as_deref(), Some("branch1"));
+    assert_eq!(branch_dir_open.version().version, 1);
+    assert_eq!(branch_dir_open.count_rows(None).await.unwrap(), 50);
+
     // Opening at a branch-pointing tag through the builder must check out the
     // tag's branch chain, not main's chain at the tag's version number.
     let tag_open = DatasetBuilder::from_uri(&test_uri)
@@ -1358,7 +1571,6 @@ async fn test_branch() {
     // error loudly instead of handing back another branch's data: stage main's
     // manifest under a branch path that was never created, so resolution finds
     // a manifest belonging to main.
-    use object_store::ObjectStoreExt as _;
     let staged_manifest = main_dataset.manifest_location().path.clone();
     let staged_copy = Path::parse(format!(
         "{}/tree/ghost/_versions/{}",

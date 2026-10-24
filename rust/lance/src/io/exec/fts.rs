@@ -41,11 +41,14 @@ use lance_table::format::IndexMetadata;
 use rustc_hash::FxHashSet;
 
 use super::PreFilterSource;
-use super::utils::{IndexMetrics, PreFilterMasks, build_prefilter};
+use super::utils::{
+    IndexMetrics, PreFilterMasks, build_prefilter, build_prefilter_restricted_to_fragments,
+};
 use crate::dataset::mem_wal::index::{QueryLocalFtsIndex, QueryLocalFtsStats};
+use crate::index::prefilter::DatasetPreFilter;
 use crate::index::scalar::inverted::{
-    ResolvedFtsField, fts_document_schema, load_segment_details, load_segments,
-    transform_fts_document_stream,
+    ResolvedFtsField, flatten_fts_document_column, fts_document_schema, load_segment_details,
+    load_segments, transform_fts_document_stream,
 };
 use crate::{Dataset, index::DatasetIndexInternalExt};
 use lance_index::metrics::MetricsCollector;
@@ -53,19 +56,22 @@ use lance_index::scalar::inverted::builder::ScoredDoc;
 use lance_index::scalar::inverted::builder::document_input;
 use lance_index::scalar::inverted::document_tokenizer::{DocType, JsonTokenizer, LanceTokenizer};
 use lance_index::scalar::inverted::query::{
-    BoostQuery, FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery, Operator, PhraseQuery, Tokens,
-    collect_query_tokens, has_query_token, uses_fuzzy_expansion,
+    BoostQuery, CombinedFieldsQuery, FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery, Operator,
+    PhraseQuery, Tokens, has_query_token, try_collect_query_tokens, uses_fuzzy_expansion,
 };
 use lance_index::scalar::inverted::tokenizer::document_tokenizer::TextTokenizer;
 use lance_index::scalar::inverted::{
-    DOC_INDEX_COL, DocumentGranularity, FTS_SCHEMA, FlatBm25SearchOptions, InvertedIndex,
-    MemBM25Scorer, PreparedBm25Query, SCORE_COL, Scorer, build_global_bm25_scorer, compound_search,
-    compound_search_prepared_match, compound_search_prepared_match_with_score_floor,
-    compound_search_with_base_scorer, cross_column_compound_search, exclusive_scaled_score_floor,
-    flat_bm25_search_stream_with_options_and_scorer, fts_schema, materialized_compound_top_k,
-    prepare_bm25_query,
+    CombinedCorpusStats, CombinedFieldColumn, CombinedFieldsBM25Scorer, DOC_INDEX_COL,
+    DocumentGranularity, FTS_SCHEMA, FlatBm25SearchOptions, InvertedIndex, MemBM25Scorer,
+    PreparedBm25Query, SCORE_COL, Scorer, build_combined_bm25_scorer, build_global_bm25_scorer,
+    combined_fields_search, compound_search, compound_search_prepared_match,
+    compound_search_prepared_match_with_score_floor, compound_search_with_base_scorer,
+    cross_column_compound_search, exclusive_scaled_score_floor,
+    flat_bm25_search_stream_with_options_and_scorer, flat_combined_fields_search_stream,
+    fts_schema, materialized_compound_top_k, prepare_bm25_query, validate_combined_tokenizers,
 };
 use lance_index::{prefilter::PreFilter, scalar::inverted::query::BooleanQuery};
+use lance_select::{RowAddrTreeMap, RowSetOps};
 use lance_tokenizer::{SimpleTokenizer, TextAnalyzer};
 use tracing::instrument;
 use uuid::Uuid;
@@ -257,41 +263,71 @@ impl ExecutionPlan for FtsDocumentExec {
 }
 
 /// Open one FTS segment as an [`InvertedIndex`].
+///
+/// With `restrict_rows` the segment may only report live rows currently stored in the
+/// fragments it covers (see [`open_fts_segments`]).
 async fn open_fts_segment(
     dataset: &Dataset,
     column: &str,
     segment: &IndexMetadata,
+    restrict_rows: bool,
     metrics: &IndexMetrics,
 ) -> Result<Arc<InvertedIndex>> {
-    let index = dataset
-        .open_scalar_index(column, &segment.uuid, metrics)
-        .await?;
-    let inverted = index
-        .as_any()
-        .downcast_ref::<InvertedIndex>()
-        .ok_or_else(|| {
-            Error::invalid_input(format!(
-                "Index for column {} and segment {} is not an inverted index",
-                column, segment.uuid
-            ))
-        })?;
-    Ok(Arc::new(inverted.clone()))
+    let open = async {
+        let index = dataset
+            .open_scalar_index(column, &segment.uuid, metrics)
+            .await?;
+        index
+            .as_any()
+            .downcast_ref::<InvertedIndex>()
+            .cloned()
+            .ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "Index for column {} and segment {} is not an inverted index",
+                    column, segment.uuid
+                ))
+            })
+    };
+    let allowed_rows = async {
+        let coverage = if restrict_rows {
+            segment.effective_fragment_bitmap(&dataset.fragment_bitmap)
+        } else {
+            None
+        };
+        match coverage.and_then(|coverage| {
+            DatasetPreFilter::create_restricted_deletion_mask(Arc::new(dataset.clone()), coverage)
+        }) {
+            Some(mask) => Ok(Some(mask.await?)),
+            None => Ok(None),
+        }
+    };
+    let (inverted, allowed_rows) = futures::try_join!(open, allowed_rows)?;
+    Ok(Arc::new(match allowed_rows {
+        Some(allowed_rows) => inverted.with_allowed_rows(allowed_rows),
+        None => inverted,
+    }))
 }
 
 /// Open all committed FTS segments for a column.
 ///
 /// Exact multi-segment BM25 still needs every segment's local corpus statistics, so the
 /// current correctness-first path opens each committed segment before scoring.
+///
+/// Under stable row ids a rewritten row keeps its row id while it moves to a fragment
+/// another segment may cover, so the old segment still lists it under its old tokens. The
+/// shared prefilter only knows the union of all segments, so each segment is restricted to
+/// the live rows currently stored in the fragments it covers.
 async fn open_fts_segments(
     dataset: &Dataset,
     column: &str,
     segments: &[IndexMetadata],
     metrics: &IndexMetrics,
 ) -> Result<Vec<Arc<InvertedIndex>>> {
+    let restrict_rows = dataset.manifest.uses_stable_row_ids() && segments.len() > 1;
     try_join_all(
         segments
             .iter()
-            .map(|segment| open_fts_segment(dataset, column, segment, metrics)),
+            .map(|segment| open_fts_segment(dataset, column, segment, restrict_rows, metrics)),
     )
     .await
 }
@@ -581,6 +617,10 @@ fn count_fts_leaves(query: &FtsQuery) -> usize {
             count_fts_leaves(&query.positive) + count_fts_leaves(&query.negative)
         }
         FtsQuery::MultiMatch(query) => query.match_queries.len(),
+        // Unreachable while `supports_compound_scorer` rejects BM25F. Counted as
+        // the per-column posting scans anyway, so the arm stays honest if that
+        // changes.
+        FtsQuery::CombinedFields(query) => query.column_names().count(),
         FtsQuery::Boolean(query) => query
             .should
             .iter()
@@ -628,6 +668,14 @@ fn compound_leaf_columns(query: &FtsQuery) -> Result<Vec<&str>> {
                     visit(query, columns)?;
                 }
             }
+            // Unreachable while `supports_compound_scorer` rejects BM25F: a
+            // combined_fields leaf blends statistics across its columns, so it
+            // cannot name one column per leaf the way this list requires.
+            FtsQuery::CombinedFields(_) => {
+                return Err(Error::invalid_input(
+                    "cross-column compound FTS cannot take a combined_fields leaf".to_string(),
+                ));
+            }
         }
         Ok(())
     }
@@ -640,7 +688,8 @@ fn compound_leaf_columns(query: &FtsQuery) -> Result<Vec<&str>> {
 fn compound_query_uses_fuzzy_expansion(query: &FtsQuery) -> bool {
     match query {
         FtsQuery::Match(query) => uses_fuzzy_expansion(query.fuzziness),
-        FtsQuery::Phrase(_) => false,
+        // combined_fields matches terms exactly; it has no fuzziness setting.
+        FtsQuery::Phrase(_) | FtsQuery::CombinedFields(_) => false,
         FtsQuery::Boost(query) => {
             compound_query_uses_fuzzy_expansion(&query.positive)
                 || compound_query_uses_fuzzy_expansion(&query.negative)
@@ -998,6 +1047,7 @@ pub struct HybridCompoundQueryExec {
     column: String,
     segments: Arc<[IndexMetadata]>,
     residual_input: Arc<dyn ExecutionPlan>,
+    indexed_input: Option<(Arc<dyn ExecutionPlan>, Arc<MemBM25Scorer>)>,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
@@ -1018,6 +1068,7 @@ impl HybridCompoundQueryExec {
             column,
             segments: Arc::from(segments),
             residual_input,
+            indexed_input: None,
             properties: Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(FTS_SCHEMA.clone()),
                 Partitioning::RoundRobinBatch(1),
@@ -1052,6 +1103,56 @@ impl HybridCompoundQueryExec {
         &self.segments
     }
 
+    /// Replace the indexed search with an externally computed bounded top-k.
+    ///
+    /// `input` must search exactly [`Self::segments`] with the complete query
+    /// and the supplied corpus-wide committed-index scorer. It must produce
+    /// at most [`FtsSearchParams::limit`] rows, ordered by score descending and
+    /// row ID ascending. The residual arm extends the same scorer with its
+    /// query-local statistics, preserving the mixed-search scoring contract.
+    ///
+    /// A distributed planner can merge bounded per-worker [`CompoundQueryExec`]
+    /// results before passing that single-partition input to this method.
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use datafusion::physical_plan::ExecutionPlan;
+    /// # use lance::io::exec::fts::HybridCompoundQueryExec;
+    /// # use lance_index::scalar::inverted::MemBM25Scorer;
+    /// # fn replace_indexed_search(
+    /// #     hybrid: &HybridCompoundQueryExec,
+    /// #     merged: Arc<dyn ExecutionPlan>,
+    /// #     scorer: Arc<MemBM25Scorer>,
+    /// # ) -> datafusion::error::Result<HybridCompoundQueryExec> {
+    /// hybrid.with_indexed_input(merged, scorer)
+    /// # }
+    /// ```
+    pub fn with_indexed_input(
+        &self,
+        input: Arc<dyn ExecutionPlan>,
+        committed_scorer: Arc<MemBM25Scorer>,
+    ) -> DataFusionResult<Self> {
+        if input.schema() != self.schema()
+            || input.output_partitioning().partition_count() != 1
+            || self.params.limit.is_none()
+        {
+            return Err(DataFusionError::Plan(
+                "hybrid indexed input requires the FTS schema, one partition, and a bounded limit"
+                    .to_string(),
+            ));
+        }
+        let mut result = Self::new(
+            self.dataset.clone(),
+            self.query.clone(),
+            self.params.clone(),
+            self.column.clone(),
+            self.segments.to_vec(),
+            self.residual_input.clone(),
+        );
+        result.indexed_input = Some((input, committed_scorer));
+        Ok(result)
+    }
+
     /// The scan over the fragments no segment covers.
     pub fn residual_input(&self) -> &Arc<dyn ExecutionPlan> {
         &self.residual_input
@@ -1074,34 +1175,50 @@ impl ExecutionPlan for HybridCompoundQueryExec {
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        vec![&self.residual_input]
+        let mut children = vec![&self.residual_input];
+        if let Some((input, _)) = &self.indexed_input {
+            children.push(input);
+        }
+        children
     }
 
     fn required_input_distribution(&self) -> Vec<Distribution> {
-        vec![Distribution::SinglePartition]
+        vec![Distribution::SinglePartition; self.children().len()]
     }
 
     fn with_new_children(
         self: Arc<Self>,
         mut children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        if children.len() != 1 {
+        if children.len() != self.children().len() {
             return Err(DataFusionError::Internal(format!(
-                "hybrid compound FTS expected one residual child, got {}",
+                "hybrid compound FTS expected {} children, got {}",
+                self.children().len(),
                 children.len()
             )));
         }
+        let indexed_input = if self.indexed_input.is_some() {
+            children.pop()
+        } else {
+            None
+        };
         let residual_input = children.pop().ok_or_else(|| {
             DataFusionError::Internal("hybrid compound FTS lost its residual child".to_string())
         })?;
-        Ok(Arc::new(Self::new(
+        let result = Self::new(
             self.dataset.clone(),
             self.query.clone(),
             self.params.clone(),
             self.column.clone(),
             self.segments.to_vec(),
             residual_input,
-        )))
+        );
+        match (indexed_input, &self.indexed_input) {
+            (Some(input), Some((_, scorer))) => {
+                Ok(Arc::new(result.with_indexed_input(input, scorer.clone())?))
+            }
+            _ => Ok(Arc::new(result)),
+        }
     }
 
     #[instrument(name = "hybrid_compound_fts_exec", level = "debug", skip_all)]
@@ -1116,13 +1233,27 @@ impl ExecutionPlan for HybridCompoundQueryExec {
         let column = self.column.clone();
         let segments = self.segments.clone();
         let residual_input = self.residual_input.clone();
+        let indexed_input = self.indexed_input.clone();
+        let metrics_set = self.metrics.clone();
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
         let schema = self.schema();
 
         let stream = stream::once(async move {
             let _timer = metrics.baseline_metrics.elapsed_compute().timer();
+            // An external indexed arm supplies the committed statistics and
+            // candidates. Only the representative tokenizer is needed here.
+            let segments_to_open = if indexed_input.is_some() {
+                segments.get(..1).ok_or_else(|| {
+                    DataFusionError::Execution(format!(
+                        "hybrid FTS for column {column} requires a committed segment"
+                    ))
+                })?
+            } else {
+                &segments
+            };
             let indices =
-                open_fts_segments(&dataset, &column, &segments, &metrics.index_metrics).await?;
+                open_fts_segments(&dataset, &column, segments_to_open, &metrics.index_metrics)
+                    .await?;
             let first_index = indices.first().ok_or_else(|| {
                 DataFusionError::Execution(format!(
                     "FTS index for column {column} has no committed segments"
@@ -1155,6 +1286,9 @@ impl ExecutionPlan for HybridCompoundQueryExec {
                 index_query_local_residual(residual_input, residual_seed, allowed_terms).await
             };
             let scorer_build = async {
+                if let Some((_, scorer)) = &indexed_input {
+                    return Ok(scorer.clone());
+                }
                 let scorer = build_global_bm25_scorer(
                     &indices,
                     &query_tokens,
@@ -1176,25 +1310,34 @@ impl ExecutionPlan for HybridCompoundQueryExec {
                 )
             })?;
 
-            let prefilter = build_prefilter(
-                context,
-                partition,
-                &PreFilterSource::None,
-                dataset,
-                &segments,
-                PreFilterMasks {
-                    overlay_block: None,
-                    external_mask: None,
-                },
-            )?;
-            let indexed_search = compound_search_with_base_scorer(
-                &indices,
-                &query,
-                &params,
-                prefilter,
-                metrics.clone(),
-                committed_scorer,
-            );
+            let indexed_search = async {
+                if let Some((input, _)) = &indexed_input {
+                    let stream = input.execute(0, context.clone())?;
+                    return collect_bounded_fts_input(stream, limit).await;
+                }
+                let prefilter = build_prefilter(
+                    context,
+                    partition,
+                    &PreFilterSource::None,
+                    dataset,
+                    &segments,
+                    PreFilterMasks {
+                        overlay_block: None,
+                        external_mask: None,
+                    },
+                    &metrics_set,
+                )?;
+                compound_search_with_base_scorer(
+                    &indices,
+                    &query,
+                    &params,
+                    prefilter,
+                    metrics.clone(),
+                    committed_scorer,
+                )
+                .await
+                .map_err(DataFusionError::from)
+            };
             let residual_query = query.clone();
             let residual_search = async move {
                 let residual_leaves = query_local_residual_leaves(
@@ -1207,6 +1350,7 @@ impl ExecutionPlan for HybridCompoundQueryExec {
                     materialized_compound_top_k(&residual_query, residual_leaves, limit)
                 })
                 .await
+                .map_err(DataFusionError::from)
             };
             let ((indexed_row_ids, indexed_scores), (residual_row_ids, residual_scores)) =
                 futures::future::try_join(indexed_search, residual_search).await?;
@@ -1241,6 +1385,41 @@ impl ExecutionPlan for HybridCompoundQueryExec {
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
+}
+
+async fn collect_bounded_fts_input(
+    mut input: SendableRecordBatchStream,
+    limit: usize,
+) -> DataFusionResult<(Vec<u64>, Vec<f32>)> {
+    let mut row_ids = Vec::new();
+    let mut scores = Vec::new();
+    while let Some(batch) = input.try_next().await? {
+        if batch.num_rows() > limit.saturating_sub(row_ids.len()) {
+            return Err(DataFusionError::Execution(format!(
+                "hybrid indexed input exceeded its bounded result limit of {limit} rows"
+            )));
+        }
+        let ids = batch
+            .column_by_name(ROW_ID)
+            .ok_or_else(|| {
+                DataFusionError::Execution("hybrid indexed input is missing row IDs".to_string())
+            })?
+            .as_primitive::<UInt64Type>();
+        let values = batch
+            .column_by_name(SCORE_COL)
+            .ok_or_else(|| {
+                DataFusionError::Execution("hybrid indexed input is missing scores".to_string())
+            })?
+            .as_primitive::<Float32Type>();
+        if ids.null_count() != 0 || values.null_count() != 0 {
+            return Err(DataFusionError::Execution(
+                "hybrid indexed input contains null row IDs or scores".to_string(),
+            ));
+        }
+        row_ids.extend_from_slice(ids.values());
+        scores.extend_from_slice(values.values());
+    }
+    Ok((row_ids, scores))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1410,6 +1589,7 @@ impl ExecutionPlan for CompoundQueryExec {
         let preset_prepared_match = self.prepared_match.clone();
         let segment_selection = self.segment_selection.clone();
         let external_mask = self.external_mask.clone();
+        let metrics_set = self.metrics.clone();
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
 
         let stream = stream::once(async move {
@@ -1452,8 +1632,8 @@ impl ExecutionPlan for CompoundQueryExec {
             let indices =
                 open_fts_segments(&dataset, column, &segments, &metrics.index_metrics).await?;
             if let Some(first_index) = indices.first() {
-                tokenized_query
-                    .get_or_init(|| tokenize_compound_query(&query, first_index.as_ref()));
+                let snapshot = tokenize_compound_query(&query, first_index.as_ref())?;
+                tokenized_query.get_or_init(|| snapshot);
             }
             let mut prefilter = build_prefilter(
                 context,
@@ -1465,6 +1645,7 @@ impl ExecutionPlan for CompoundQueryExec {
                     overlay_block: None,
                     external_mask,
                 },
+                &metrics_set,
             )?;
             let deleted_fragments =
                 indices
@@ -1536,7 +1717,7 @@ impl ExecutionPlan for CompoundQueryExec {
                     })?;
                     let mut tokenizer =
                         tokenizer_for_match_query(first_index.as_ref(), match_query.fuzziness);
-                    let tokens = collect_query_tokens(&match_query.terms, &mut tokenizer);
+                    let tokens = try_collect_query_tokens(&match_query.terms, &mut tokenizer)?;
                     let scorer_start = std::time::Instant::now();
                     let prepared = Arc::new(
                         PreparedMatch::new(
@@ -1962,6 +2143,7 @@ impl ExecutionPlan for CrossColumnCompoundQueryExec {
         let prefilter_source = self.prefilter_source.clone();
         let columns = self.columns.clone();
         let external_mask = self.external_mask.clone();
+        let metrics_set = self.metrics.clone();
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
 
         let stream = stream::once(async move {
@@ -1995,6 +2177,7 @@ impl ExecutionPlan for CrossColumnCompoundQueryExec {
                     overlay_block: None,
                     external_mask,
                 },
+                &metrics_set,
             )?;
             let opened_columns = try_join_all(columns.iter().cloned().map(|selection| {
                 let dataset = dataset.clone();
@@ -2135,12 +2318,19 @@ fn tokenizer_for_match_query(
     }
 }
 
-fn tokenize_compound_query(query: &FtsQuery, index: &InvertedIndex) -> TokenizedCompoundQuery {
-    fn visit(query: &FtsQuery, index: &InvertedIndex, leaves: &mut Vec<TokenizedQueryLeaf>) {
+fn tokenize_compound_query(
+    query: &FtsQuery,
+    index: &InvertedIndex,
+) -> Result<TokenizedCompoundQuery> {
+    fn visit(
+        query: &FtsQuery,
+        index: &InvertedIndex,
+        leaves: &mut Vec<TokenizedQueryLeaf>,
+    ) -> Result<()> {
         match query {
             FtsQuery::Match(query) => {
                 let mut tokenizer = tokenizer_for_match_query(index, query.fuzziness);
-                let tokens = collect_query_tokens(&query.terms, &mut tokenizer);
+                let tokens = try_collect_query_tokens(&query.terms, &mut tokenizer)?;
                 leaves.push(TokenizedQueryLeaf {
                     kind: TokenizedLeafKind::Match,
                     column: query.column.clone(),
@@ -2149,7 +2339,7 @@ fn tokenize_compound_query(query: &FtsQuery, index: &InvertedIndex) -> Tokenized
             }
             FtsQuery::Phrase(query) => {
                 let mut tokenizer = index.tokenizer();
-                let tokens = collect_query_tokens(&query.terms, &mut tokenizer);
+                let tokens = try_collect_query_tokens(&query.terms, &mut tokenizer)?;
                 leaves.push(TokenizedQueryLeaf {
                     kind: TokenizedLeafKind::Phrase,
                     column: query.column.clone(),
@@ -2157,13 +2347,13 @@ fn tokenize_compound_query(query: &FtsQuery, index: &InvertedIndex) -> Tokenized
                 });
             }
             FtsQuery::Boost(query) => {
-                visit(&query.positive, index, leaves);
-                visit(&query.negative, index, leaves);
+                visit(&query.positive, index, leaves)?;
+                visit(&query.negative, index, leaves)?;
             }
             FtsQuery::MultiMatch(query) => {
                 for query in &query.match_queries {
                     let mut tokenizer = tokenizer_for_match_query(index, query.fuzziness);
-                    let tokens = collect_query_tokens(&query.terms, &mut tokenizer);
+                    let tokens = try_collect_query_tokens(&query.terms, &mut tokenizer)?;
                     leaves.push(TokenizedQueryLeaf {
                         kind: TokenizedLeafKind::Match,
                         column: query.column.clone(),
@@ -2171,6 +2361,10 @@ fn tokenize_compound_query(query: &FtsQuery, index: &InvertedIndex) -> Tokenized
                     });
                 }
             }
+            // Unreachable: only `CompoundQueryExec` tokenizes this way, and
+            // `supports_compound_scorer` rejects BM25F at any depth. The
+            // combined_fields execs snapshot their own tokens.
+            FtsQuery::CombinedFields(_) => {}
             FtsQuery::Boolean(query) => {
                 for query in query
                     .should
@@ -2178,15 +2372,16 @@ fn tokenize_compound_query(query: &FtsQuery, index: &InvertedIndex) -> Tokenized
                     .chain(&query.must)
                     .chain(&query.must_not)
                 {
-                    visit(query, index, leaves);
+                    visit(query, index, leaves)?;
                 }
             }
         }
+        Ok(())
     }
 
     let mut leaves = Vec::with_capacity(count_fts_leaves(query));
-    visit(query, index, &mut leaves);
-    TokenizedCompoundQuery(leaves)
+    visit(query, index, &mut leaves)?;
+    Ok(TokenizedCompoundQuery(leaves))
 }
 
 fn tokenize_cross_column_compound_query(
@@ -2220,7 +2415,7 @@ fn tokenize_cross_column_compound_query(
             FtsQuery::Match(query) => {
                 let (index, column) = index_for_leaf(query.column.as_deref(), "Match", indices)?;
                 let mut tokenizer = tokenizer_for_match_query(index, query.fuzziness);
-                let tokens = collect_query_tokens(&query.terms, &mut tokenizer);
+                let tokens = try_collect_query_tokens(&query.terms, &mut tokenizer)?;
                 leaves.push(TokenizedQueryLeaf {
                     kind: TokenizedLeafKind::Match,
                     column: Some(column),
@@ -2230,7 +2425,7 @@ fn tokenize_cross_column_compound_query(
             FtsQuery::Phrase(query) => {
                 let (index, column) = index_for_leaf(query.column.as_deref(), "Phrase", indices)?;
                 let mut tokenizer = index.tokenizer();
-                let tokens = collect_query_tokens(&query.terms, &mut tokenizer);
+                let tokens = try_collect_query_tokens(&query.terms, &mut tokenizer)?;
                 leaves.push(TokenizedQueryLeaf {
                     kind: TokenizedLeafKind::Phrase,
                     column: Some(column),
@@ -2246,7 +2441,7 @@ fn tokenize_cross_column_compound_query(
                     let (index, column) =
                         index_for_leaf(query.column.as_deref(), "MultiMatch", indices)?;
                     let mut tokenizer = tokenizer_for_match_query(index, query.fuzziness);
-                    let tokens = collect_query_tokens(&query.terms, &mut tokenizer);
+                    let tokens = try_collect_query_tokens(&query.terms, &mut tokenizer)?;
                     leaves.push(TokenizedQueryLeaf {
                         kind: TokenizedLeafKind::Match,
                         column: Some(column),
@@ -2264,6 +2459,13 @@ fn tokenize_cross_column_compound_query(
                     visit(query, indices, leaves)?;
                 }
             }
+            // Unreachable while `supports_compound_scorer` rejects BM25F; see
+            // `compound_leaf_columns`.
+            FtsQuery::CombinedFields(_) => {
+                return Err(Error::invalid_input(
+                    "cross-column compound FTS cannot take a combined_fields leaf".to_string(),
+                ));
+            }
         }
         Ok(())
     }
@@ -2273,24 +2475,28 @@ fn tokenize_cross_column_compound_query(
     Ok(TokenizedCompoundQuery(leaves))
 }
 
-type SharedScorerResult = std::result::Result<Arc<MemBM25Scorer>, Arc<str>>;
+type SharedScorerResult<S> = std::result::Result<Arc<S>, Arc<str>>;
 
 /// Coordinates BM25 corpus statistics between the indexed and flat branches
 /// of a mixed search. The flat branch extends the indexed statistics with the
 /// unindexed documents, then publishes the resulting corpus-wide scorer.
+///
+/// Generic over the scorer so the single-column path can share a
+/// [`MemBM25Scorer`] and `combined_fields` a [`CombinedFieldsBM25Scorer`]; the
+/// coordination is the same either way.
 #[derive(Debug)]
-pub(crate) struct SharedFtsScorer {
-    sender: tokio::sync::watch::Sender<Option<SharedScorerResult>>,
+pub(crate) struct SharedFtsScorer<S = MemBM25Scorer> {
+    sender: tokio::sync::watch::Sender<Option<SharedScorerResult<S>>>,
 }
 
-impl SharedFtsScorer {
+impl<S: Send + Sync + 'static> SharedFtsScorer<S> {
     pub(crate) fn new() -> Self {
         let (sender, _) = tokio::sync::watch::channel(None);
         Self { sender }
     }
 
-    fn publish(&self, scorer: MemBM25Scorer) {
-        self.sender.send_replace(Some(Ok(Arc::new(scorer))));
+    fn publish(&self, scorer: Arc<S>) {
+        self.sender.send_replace(Some(Ok(scorer)));
     }
 
     fn publish_error(&self, error: &DataFusionError) {
@@ -2298,7 +2504,7 @@ impl SharedFtsScorer {
             .send_replace(Some(Err(Arc::from(error.to_string()))));
     }
 
-    async fn wait(&self) -> DataFusionResult<Arc<MemBM25Scorer>> {
+    async fn wait(&self) -> DataFusionResult<Arc<S>> {
         let mut receiver = self.sender.subscribe();
         loop {
             let result = receiver.borrow_and_update().clone();
@@ -2315,20 +2521,20 @@ impl SharedFtsScorer {
     }
 }
 
-struct SharedFtsScorerProducer {
-    scorer: Arc<SharedFtsScorer>,
+struct SharedFtsScorerProducer<S: Send + Sync + 'static = MemBM25Scorer> {
+    scorer: Arc<SharedFtsScorer<S>>,
     completed: bool,
 }
 
-impl SharedFtsScorerProducer {
-    fn new(scorer: Arc<SharedFtsScorer>) -> Self {
+impl<S: Send + Sync + 'static> SharedFtsScorerProducer<S> {
+    fn new(scorer: Arc<SharedFtsScorer<S>>) -> Self {
         Self {
             scorer,
             completed: false,
         }
     }
 
-    fn publish(mut self, scorer: MemBM25Scorer) {
+    fn publish(mut self, scorer: Arc<S>) {
         self.scorer.publish(scorer);
         self.completed = true;
     }
@@ -2339,7 +2545,7 @@ impl SharedFtsScorerProducer {
     }
 }
 
-impl Drop for SharedFtsScorerProducer {
+impl<S: Send + Sync + 'static> Drop for SharedFtsScorerProducer<S> {
     fn drop(&mut self) {
         if !self.completed {
             self.scorer.sender.send_replace(Some(Err(Arc::from(
@@ -2947,6 +3153,7 @@ impl ExecutionPlan for MatchQueryExec {
         let overlay_block = self.overlay_block.clone();
         let document_granularity = self.document_granularity;
         let schema = self.schema.clone();
+        let metrics_set = self.metrics.clone();
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
         let column = query.column.ok_or(DataFusionError::Execution(format!(
             "column not set for MatchQuery {}",
@@ -2985,6 +3192,7 @@ impl ExecutionPlan for MatchQueryExec {
                     overlay_block,
                     external_mask,
                 },
+                &metrics_set,
             )?;
             let deleted_fragments =
                 indices
@@ -3006,7 +3214,7 @@ impl ExecutionPlan for MatchQueryExec {
                 column
             )))?;
             let mut tokenizer = tokenizer_for_match_query(first_index, query.fuzziness);
-            let tokens = collect_query_tokens(&query.terms, &mut tokenizer);
+            let tokens = try_collect_query_tokens(&query.terms, &mut tokenizer)?;
             record_tokenized_query(&tokenized_query, &tokens);
             let prepared = if let Some(prepared_query) = preset_prepared_query {
                 Arc::new(PreparedMatch {
@@ -3055,6 +3263,495 @@ impl ExecutionPlan for MatchQueryExec {
             metrics.baseline_metrics.record_output(documents.len());
 
             let batch = scored_documents_batch(schema, documents)?;
+            Ok::<_, DataFusionError>(batch)
+        });
+
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            self.schema(),
+            stream.stream_in_current_span().boxed(),
+        )))
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.properties
+    }
+
+    fn supports_limit_pushdown(&self) -> bool {
+        false
+    }
+}
+
+/// Cross-field BM25F full-text search (`combined_fields`).
+///
+/// Unlike a `MultiMatch` plan (one [`MatchQueryExec`] per column fused by a
+/// `max` aggregate, i.e. `best_fields`), this is a single node: it opens every
+/// target column's segments, blends their corpus statistics, and runs one merged
+/// scan so term statistics are shared across fields. Per-column boosts are baked
+/// into the blended term frequency, so there is no post-scan boost multiplier or
+/// `AggregateExec(max)`. Emits `(ROW_ID, SCORE)` in [`FTS_SCHEMA`].
+#[derive(Debug)]
+pub struct CombinedFieldsQueryExec {
+    dataset: Arc<Dataset>,
+    query: CombinedFieldsQuery,
+    /// Tokens `execute()` actually produced, for `analyze_plan`. One snapshot
+    /// covers every target column because `validate_combined_tokenizers`
+    /// requires them to share a tokenizer, so the scan tokenizes once.
+    tokenized_query: Arc<OnceLock<TokenizedQuery>>,
+    params: FtsSearchParams,
+    prefilter_source: PreFilterSource,
+    /// When set, `execute()` skips `build_combined_bm25_scorer` and threads this
+    /// blended scorer down to the merged scan (distributed corpus-global stats).
+    base_scorer: Option<Arc<CombinedFieldsBM25Scorer>>,
+    /// Waits for the flat sibling's blended scorer; see
+    /// [`Self::with_shared_scorer`].
+    shared_scorer: Option<Arc<SharedFtsScorer<CombinedFieldsBM25Scorer>>>,
+    /// When set, restrict this scan to exactly these fragments: the ones every
+    /// target column's index covers. See [`Self::with_covered_fragments`].
+    covered_fragments: Option<roaring::RoaringBitmap>,
+    /// See [`Self::with_overlay_block`].
+    overlay_block: Option<RowAddrMask>,
+    /// Optional external row-address mask ANDead into the prefilter so only
+    /// masked rows are scored (see [`MatchQueryExec::with_external_mask`]).
+    external_mask: Option<Arc<RowAddrMask>>,
+    properties: Arc<PlanProperties>,
+    metrics: ExecutionPlanMetricsSet,
+}
+
+impl CombinedFieldsQueryExec {
+    pub fn new(
+        dataset: Arc<Dataset>,
+        query: CombinedFieldsQuery,
+        params: FtsSearchParams,
+        prefilter_source: PreFilterSource,
+    ) -> Self {
+        let properties = Arc::new(PlanProperties::new(
+            EquivalenceProperties::new(FTS_SCHEMA.clone()),
+            Partitioning::RoundRobinBatch(1),
+            EmissionType::Final,
+            Boundedness::Bounded,
+        ));
+        Self {
+            dataset,
+            query,
+            tokenized_query: Arc::new(OnceLock::new()),
+            params,
+            prefilter_source,
+            base_scorer: None,
+            shared_scorer: None,
+            covered_fragments: None,
+            overlay_block: None,
+            external_mask: None,
+            properties,
+            metrics: ExecutionPlanMetricsSet::new(),
+        }
+    }
+
+    /// See [`MatchQueryExec::with_external_mask`].
+    pub fn with_external_mask(mut self, mask: Option<Arc<RowAddrMask>>) -> Self {
+        self.external_mask = mask;
+        self
+    }
+
+    /// Restrict this scan to `fragments`, the ones every target column's index
+    /// covers.
+    ///
+    /// A BM25F score is only complete when every target column's index covers the
+    /// row's fragment: `dl'` sums each column's document length, and the per-column
+    /// lookup returns 0 for a row that column's index holds no document for, so a
+    /// fragment indexed for some target columns but not others would score with a
+    /// partial `tf'`/`dl'`. The planner routes those fragments to the flat scan and
+    /// passes the remainder here.
+    ///
+    /// This has to be an allow list rather than a fragment block list: the inverted
+    /// index trains with `_rowid`, which is a logical stable row id when the dataset
+    /// uses stable row ids, so a fragment-address block list would match nothing and
+    /// both sides of the union would emit the same row.
+    pub fn with_covered_fragments(mut self, fragments: roaring::RoaringBitmap) -> Self {
+        self.covered_fragments = Some(fragments);
+        self
+    }
+
+    /// Exclude the rows whose indexed text a newer data overlay superseded in any
+    /// target column. The flat sibling scores them from their current values.
+    pub(crate) fn with_overlay_block(mut self, overlay_block: RowAddrMask) -> Self {
+        self.overlay_block = Some(overlay_block);
+        self
+    }
+
+    /// Override the blended BM25F scorer used by `execute()`. When set, the
+    /// local `build_combined_bm25_scorer` call is skipped. Mirrors
+    /// [`MatchQueryExec::with_base_scorer`] for distributed queries that
+    /// aggregate cross-column corpus statistics out-of-band.
+    pub fn with_base_scorer(mut self, scorer: Arc<CombinedFieldsBM25Scorer>) -> Self {
+        self.base_scorer = Some(scorer);
+        self
+    }
+
+    /// Score against the blended scorer the flat sibling publishes instead of
+    /// building one from this side's index statistics alone.
+    ///
+    /// Only the flat scan sees the rows no index covers, so only it can produce
+    /// the statistics that describe the whole scanned corpus. Without this the two
+    /// children of a mixed plan score against different `docCount'`/`docFreq'`/
+    /// `avgdl'`, which makes their scores incomparable and the union's sort wrong.
+    pub(crate) fn with_shared_scorer(
+        mut self,
+        scorer: Arc<SharedFtsScorer<CombinedFieldsBM25Scorer>>,
+    ) -> Self {
+        self.shared_scorer = Some(scorer);
+        self
+    }
+
+    pub fn query(&self) -> &CombinedFieldsQuery {
+        &self.query
+    }
+
+    pub fn params(&self) -> &FtsSearchParams {
+        &self.params
+    }
+
+    pub fn prefilter_source(&self) -> &PreFilterSource {
+        &self.prefilter_source
+    }
+
+    fn clone_with_prefilter_source(&self, prefilter_source: PreFilterSource) -> Self {
+        Self {
+            dataset: self.dataset.clone(),
+            query: self.query.clone(),
+            tokenized_query: self.tokenized_query.clone(),
+            params: self.params.clone(),
+            prefilter_source,
+            base_scorer: self.base_scorer.clone(),
+            shared_scorer: self.shared_scorer.clone(),
+            covered_fragments: self.covered_fragments.clone(),
+            overlay_block: self.overlay_block.clone(),
+            external_mask: self.external_mask.clone(),
+            properties: self.properties.clone(),
+            metrics: ExecutionPlanMetricsSet::new(),
+        }
+    }
+}
+
+impl DisplayAs for CombinedFieldsQueryExec {
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        fmt_combined_fields(
+            "CombinedFieldsQuery",
+            &self.query,
+            &self.tokenized_query,
+            t,
+            f,
+        )
+    }
+}
+
+/// The plan display every `combined_fields` exec uses: the label, the target
+/// columns and the query text, plus the tokens `execute()` produced once it has
+/// run.
+fn fmt_combined_fields(
+    label: &str,
+    query: &CombinedFieldsQuery,
+    tokenized_query: &OnceLock<TokenizedQuery>,
+    t: DisplayFormatType,
+    f: &mut std::fmt::Formatter,
+) -> std::fmt::Result {
+    let columns = query.column_names().collect::<Vec<_>>().join(", ");
+    // The one-line forms label with `: ` and separate fields with `, `; the tree
+    // render puts every field on its own line.
+    let (after_label, separator) = match t {
+        DisplayFormatType::TreeRender => ("\n", "\n"),
+        DisplayFormatType::Default | DisplayFormatType::Verbose => (": ", ", "),
+    };
+    write!(
+        f,
+        "{label}{after_label}columns=[{columns}]{separator}query={}",
+        query.terms()
+    )?;
+    fmt_tokenized_query(tokenized_query, separator, f)
+}
+
+/// Which target columns of a `combined_fields` scan need an inverted index.
+#[derive(Debug, Clone, Copy)]
+enum CombinedFieldsIndexRequirement {
+    /// Every column, because the indexed side scores each of them from its
+    /// index.
+    EveryColumn,
+    /// At least one column, for the tokenizer. The flat side reads the document
+    /// text from the scan, so a column without an index only misses out on
+    /// contributing corpus statistics.
+    AtLeastOneColumn,
+}
+
+/// What [`open_combined_fields_scan`] hands back to either `combined_fields` exec.
+struct CombinedFieldsScan {
+    columns: Vec<CombinedFieldColumn>,
+    /// Every segment opened across all target columns, for the indexed side's
+    /// prefilter.
+    segments: Vec<IndexMetadata>,
+    tokens: Tokens,
+    tokenizer: Box<dyn LanceTokenizer>,
+}
+
+/// Open every target column's segments, pair each with its boost, and tokenize
+/// the query once.
+///
+/// Always every committed segment at row granularity: BM25F blends the target
+/// columns per row, and query planning rejects a column that only has a
+/// list-element index. The query stores each column together with its weight, so
+/// no column can be dropped here for want of one.
+///
+/// Both sides count the opened segments toward parts searched: the flat side needs
+/// them for the tokenizer and the blended corpus statistics, the indexed side for
+/// scoring.
+///
+/// `stale_rows` is empty, or one entry per target column in query column order.
+/// See [`CombinedFieldColumn::stale_rows`].
+async fn open_combined_fields_scan(
+    dataset: &Dataset,
+    query: &CombinedFieldsQuery,
+    index_requirement: CombinedFieldsIndexRequirement,
+    stale_rows: &[Arc<RowAddrTreeMap>],
+    tokenized_query: &OnceLock<TokenizedQuery>,
+    metrics: &FtsIndexMetrics,
+) -> DataFusionResult<CombinedFieldsScan> {
+    let mut columns = Vec::with_capacity(query.column_names().len());
+    let mut all_segments = Vec::new();
+    for (slot, (column, weight)) in query.weighted_columns().enumerate() {
+        let segments = match index_requirement {
+            CombinedFieldsIndexRequirement::EveryColumn => Some(
+                FtsSegmentSelection::AllCommitted
+                    .resolve(
+                        dataset,
+                        column,
+                        DocumentGranularity::Row,
+                        &metrics.segment_bind_duration,
+                    )
+                    .await?,
+            ),
+            CombinedFieldsIndexRequirement::AtLeastOneColumn => {
+                load_segments(dataset, column, DocumentGranularity::Row)
+                    .await?
+                    .map(Arc::from)
+            }
+        };
+        let indices = match segments {
+            Some(segments) => {
+                let _details = load_segment_details(dataset, column, &segments).await?;
+                let indices =
+                    open_fts_segments(dataset, column, &segments, &metrics.index_metrics).await?;
+                all_segments.extend(segments.iter().cloned());
+                indices
+            }
+            None => Vec::new(),
+        };
+        columns.push(CombinedFieldColumn {
+            column: column.to_string(),
+            weight,
+            indices,
+            stale_rows: stale_rows
+                .get(slot)
+                .filter(|rows| !rows.is_empty())
+                .cloned(),
+        });
+    }
+    validate_combined_tokenizers(&columns)?;
+    metrics.record_parts_searched(
+        columns
+            .iter()
+            .flat_map(|column| &column.indices)
+            .map(|index| index.partition_count())
+            .sum(),
+    );
+
+    // Fields share a tokenizer (validated above), so tokenize once.
+    let first_index = columns
+        .iter()
+        .find_map(|column| column.indices.first())
+        .ok_or_else(|| match index_requirement {
+            // Not a user error: `EveryColumn` resolution already failed for any
+            // column without an index, and `CombinedFieldsQuery::try_new` rejects
+            // an empty column list, so reaching this means one of those two
+            // guarantees broke.
+            CombinedFieldsIndexRequirement::EveryColumn => DataFusionError::Internal(
+                "combined_fields query reached execution with no target columns".to_string(),
+            ),
+            CombinedFieldsIndexRequirement::AtLeastOneColumn => {
+                DataFusionError::Execution(format!(
+                    "combined_fields requires an inverted index on at least one of {:?}",
+                    query.column_names().collect::<Vec<_>>()
+                ))
+            }
+        })?;
+    let mut tokenizer = first_index.tokenizer();
+    let tokens = try_collect_query_tokens(query.terms(), &mut tokenizer)?;
+    record_tokenized_query(tokenized_query, &tokens);
+
+    Ok(CombinedFieldsScan {
+        columns,
+        segments: all_segments,
+        tokens,
+        tokenizer,
+    })
+}
+
+impl ExecutionPlan for CombinedFieldsQueryExec {
+    fn name(&self) -> &str {
+        "CombinedFieldsQueryExec"
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        self.prefilter_source.execution_plan().into_iter().collect()
+    }
+
+    fn required_input_distribution(&self) -> Vec<Distribution> {
+        self.children()
+            .iter()
+            .map(|_| Distribution::SinglePartition)
+            .collect()
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        mut children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        let expected = self.children().len();
+        if children.len() != expected {
+            return Err(DataFusionError::Internal(format!(
+                "CombinedFieldsQueryExec expected {expected} children, got {}",
+                children.len()
+            )));
+        }
+        let prefilter_source = match children.pop() {
+            Some(source) => self.prefilter_source.with_execution_plan(source)?,
+            None => PreFilterSource::None,
+        };
+        Ok(Arc::new(self.clone_with_prefilter_source(prefilter_source)))
+    }
+
+    #[instrument(name = "combined_fields_query_exec", level = "debug", skip_all)]
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<datafusion::execution::TaskContext>,
+    ) -> DataFusionResult<SendableRecordBatchStream> {
+        let query = self.query.clone();
+        let tokenized_query = self.tokenized_query.clone();
+        let params = self.params.clone();
+        let ds = self.dataset.clone();
+        let prefilter_source = self.prefilter_source.clone();
+        let preset_base_scorer = self.base_scorer.clone();
+        let shared_scorer = self.shared_scorer.clone();
+        let covered_fragments = self.covered_fragments.clone();
+        let masks = PreFilterMasks {
+            overlay_block: self.overlay_block.clone(),
+            external_mask: self.external_mask.clone(),
+        };
+        let exec_metrics = self.metrics.clone();
+        let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
+        let stream = stream::once(async move {
+            let _timer = metrics.baseline_metrics.elapsed_compute().timer();
+
+            let CombinedFieldsScan {
+                columns,
+                segments: all_segments,
+                tokens,
+                ..
+            } = open_combined_fields_scan(
+                &ds,
+                &query,
+                CombinedFieldsIndexRequirement::EveryColumn,
+                // Nothing to subtract: this side either scores against index
+                // statistics alone or against the scorer the flat sibling built,
+                // and only that sibling folds a stale row in.
+                &[],
+                &tokenized_query,
+                metrics.as_ref(),
+            )
+            .await?;
+
+            // With mixed coverage the planner supplies the fragments every target
+            // column indexes, and the scan is restricted to exactly those: the
+            // rest go to the flat sibling. Otherwise the prefilter spans the union
+            // of the target columns' segments.
+            let mut pre_filter = match covered_fragments {
+                Some(covered) => build_prefilter_restricted_to_fragments(
+                    context.clone(),
+                    partition,
+                    &prefilter_source,
+                    ds,
+                    covered,
+                    masks,
+                    &exec_metrics,
+                )?,
+                None => build_prefilter(
+                    context.clone(),
+                    partition,
+                    &prefilter_source,
+                    ds,
+                    &all_segments,
+                    masks,
+                    &exec_metrics,
+                )?,
+            };
+            let deleted_fragments = columns.iter().flat_map(|column| &column.indices).fold(
+                roaring::RoaringBitmap::new(),
+                |mut deleted, index| {
+                    deleted |= index.deleted_fragments().clone();
+                    deleted
+                },
+            );
+            if !deleted_fragments.is_empty() {
+                Arc::get_mut(&mut pre_filter)
+                    .expect("prefilter just created")
+                    .set_deleted_fragments(deleted_fragments);
+            }
+            let scorer = match (preset_base_scorer, shared_scorer) {
+                (Some(scorer), _) => scorer,
+                // A mixed plan routes the rows no index covers to a flat sibling,
+                // so folding only this side's index statistics here would score the
+                // two children against different `docCount'`/`docFreq'`/`avgdl'`.
+                // Wait for the blend that describes the whole scanned corpus.
+                (None, Some(shared_scorer)) => shared_scorer.wait().await?,
+                (None, None) => {
+                    let scorer_start = std::time::Instant::now();
+                    let scorer = Arc::new(
+                        build_combined_bm25_scorer(
+                            &columns,
+                            &tokens,
+                            CombinedCorpusStats::IndexOnly,
+                            Some(metrics.as_ref()),
+                        )
+                        .boxed()
+                        .await?,
+                    );
+                    metrics.record_scorer_build(scorer_start.elapsed());
+                    scorer
+                }
+            };
+
+            pre_filter.wait_for_ready().await?;
+            let (doc_ids, scores) = combined_fields_search(
+                &columns,
+                &tokens,
+                &params,
+                query.operator(),
+                scorer.as_ref(),
+                pre_filter,
+                metrics.as_ref(),
+            )
+            .await?;
+            metrics.baseline_metrics.record_output(doc_ids.len());
+
+            let batch = RecordBatch::try_new(
+                FTS_SCHEMA.clone(),
+                vec![
+                    Arc::new(UInt64Array::from(doc_ids)),
+                    Arc::new(Float32Array::from(scores)),
+                ],
+            )?;
             Ok::<_, DataFusionError>(batch)
         });
 
@@ -3176,9 +3873,11 @@ impl FlatMatchFilterExec {
                     column
                 ))
             })?;
-            return Ok(open_fts_segment(dataset, column, index_meta, metrics)
-                .await?
-                .tokenizer());
+            return Ok(
+                open_fts_segment(dataset, column, index_meta, false, metrics)
+                    .await?
+                    .tokenizer(),
+            );
         }
         Ok(default_text_tokenizer())
     }
@@ -3192,9 +3891,11 @@ impl FlatMatchFilterExec {
         let index_meta = segments.first().ok_or_else(|| {
             DataFusionError::Execution(format!("FTS index for column {} has no segments", column))
         })?;
-        Ok(open_fts_segment(dataset, column, index_meta, metrics)
-            .await?
-            .tokenizer())
+        Ok(
+            open_fts_segment(dataset, column, index_meta, false, metrics)
+                .await?
+                .tokenizer(),
+        )
     }
 
     pub fn new(
@@ -3367,7 +4068,7 @@ impl FlatMatchFilterExec {
                 .await?
             }
         };
-        let query_tokens = Arc::new(collect_query_tokens(&query.terms, &mut tokenizer));
+        let query_tokens = Arc::new(try_collect_query_tokens(&query.terms, &mut tokenizer)?);
         record_tokenized_query(&tokenized_query, &query_tokens);
 
         let baseline = BaselineMetrics::new(&metrics_set, partition);
@@ -3775,11 +4476,10 @@ impl ExecutionPlan for FlatMatchQueryExec {
         let document_column = self.document_column.clone();
         let phrase_slop = self.params.phrase_slop;
 
-        // CPU time accumulator passed into `flat_bm25_search_stream_with_metrics`
-        // so it can attribute the spawn_cpu tokenize work and synchronous
-        // scoring back onto this node's `elapsed_compute`. Sharing the same
-        // `Time` handle that's already inside the FtsIndexMetrics avoids
-        // registering a duplicate metric.
+        // Lets `flat_bm25_search_stream_with_metrics` attribute the spawn_cpu
+        // tokenize work and synchronous scoring back onto this node's
+        // `elapsed_compute`. Reusing the handle already inside `FtsIndexMetrics`
+        // avoids registering a duplicate metric.
         let elapsed_compute = metrics.baseline_metrics.elapsed_compute().clone();
 
         let column = query.column.ok_or(DataFusionError::Execution(format!(
@@ -3811,7 +4511,7 @@ impl ExecutionPlan for FlatMatchQueryExec {
                             format!("FTS index for column {} has no segments", column),
                         ))?;
                         let mut tokenizer = first_index.tokenizer();
-                        let query_tokens = collect_query_tokens(&query.terms, &mut tokenizer);
+                        let query_tokens = try_collect_query_tokens(&query.terms, &mut tokenizer)?;
                         record_tokenized_query(&tokenized_query, &query_tokens);
                         let base_scorer = match preset_base_scorer {
                             Some(scorer) => (*scorer).clone(),
@@ -3833,7 +4533,7 @@ impl ExecutionPlan for FlatMatchQueryExec {
                     }
                     None => {
                         let mut tokenizer = default_text_tokenizer();
-                        let query_tokens = collect_query_tokens(&query.terms, &mut tokenizer);
+                        let query_tokens = try_collect_query_tokens(&query.terms, &mut tokenizer)?;
                         record_tokenized_query(&tokenized_query, &query_tokens);
                         (tokenizer, preset_base_scorer.map(|s| (*s).clone()))
                     }
@@ -3861,6 +4561,385 @@ impl ExecutionPlan for FlatMatchQueryExec {
             match result {
                 Ok((stream, scorer)) => {
                     if let Some(producer) = shared_scorer_producer {
+                        producer.publish(Arc::new(scorer));
+                    }
+                    Ok(stream)
+                }
+                Err(error) => {
+                    if let Some(producer) = shared_scorer_producer {
+                        producer.publish_error(&error);
+                    }
+                    Err(error)
+                }
+            }
+        })
+        .try_flatten()
+        .map(move |batch| {
+            // Records output_rows, output_bytes, and output_batches on the shared
+            // BaselineMetrics, as DataFusion's own FilterExec does in its
+            // hand-written poll_next.
+            let poll = metrics_clone
+                .baseline_metrics
+                .record_poll(std::task::Poll::Ready(Some(batch)));
+            match poll {
+                std::task::Poll::Ready(Some(b)) => b,
+                _ => unreachable!("record_poll preserves Ready(Some) input"),
+            }
+        });
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            self.schema(),
+            stream.stream_in_current_span().boxed(),
+        )))
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.properties
+    }
+
+    fn supports_limit_pushdown(&self) -> bool {
+        false
+    }
+}
+
+/// The rows of one target column that a flat `combined_fields` scan folds into
+/// that column's corpus statistics: the ones its index does not already count.
+///
+/// The scan reads every target column of every row it scores, but a scanned
+/// fragment can still be indexed for some of those columns. Folding such a row
+/// into that column's statistics as well would count it twice, inflating
+/// `docCount_f`, `sumTotalTermFreq_f` and `docFreq_f`.
+#[derive(Debug, Clone, Default)]
+pub struct FlatStatsCoverage {
+    /// Fragments this column's index does not cover at all.
+    pub fragments: roaring::RoaringBitmap,
+    /// Rows it does cover, but whose entries a newer overlay made stale, in the id
+    /// domain the scan's `_rowid` uses. Their current values are folded in, and
+    /// their pre-overlay values are subtracted from the index statistics (see
+    /// [`CombinedFieldColumn::stale_rows`]), so each counts once.
+    pub stale_rows: Arc<RowAddrTreeMap>,
+}
+
+/// Which corpus statistics a flat `combined_fields` scan contributes.
+#[derive(Debug, Clone)]
+pub enum FlatStatsScope {
+    /// Per target column, in query order, the rows to fold on top of that
+    /// column's index statistics.
+    PerColumn(Vec<FlatStatsCoverage>),
+    /// The scan reads every target fragment and its statistics replace the index
+    /// statistics; see [`CombinedCorpusStats::FlatOnly`].
+    WholeCorpus,
+}
+
+/// The sibling of [`CombinedFieldsQueryExec`] for the fragments that at least one
+/// target column's index is missing. Those rows cannot be scored from the indexes
+/// (`tf'`/`dl'` would omit the unindexed columns), so they are scored straight
+/// from their column values here. The two plans are unioned and re-sorted by the
+/// planner, exactly as the single-column match path does.
+///
+/// The input must carry `_rowid` plus every target column of the query.
+#[derive(Debug)]
+pub struct FlatCombinedFieldsExec {
+    dataset: Arc<Dataset>,
+    query: CombinedFieldsQuery,
+    /// Tokens `execute()` actually produced, for `analyze_plan`. Single snapshot
+    /// for the same reason as [`CombinedFieldsQueryExec::tokenized_query`].
+    tokenized_query: Arc<OnceLock<TokenizedQuery>>,
+    params: FtsSearchParams,
+    unindexed_input: Arc<dyn ExecutionPlan>,
+    /// The fragments `unindexed_input` reads.
+    scanned_fragments: roaring::RoaringBitmap,
+    /// Per target column, in query order: how `execute` turns the scanned column
+    /// into document text.
+    resolved_fields: Vec<ResolvedFtsField>,
+    stats_scope: FlatStatsScope,
+    /// Picks the emitted rows. The planner reads `unindexed_input` unfiltered, so
+    /// that the filter does not change the corpus statistics.
+    emit_prefilter: PreFilterSource,
+    /// Publishes the blended scorer to an indexed sibling; see
+    /// [`Self::with_shared_scorer`].
+    shared_scorer: Option<Arc<SharedFtsScorer<CombinedFieldsBM25Scorer>>>,
+    properties: Arc<PlanProperties>,
+    metrics: ExecutionPlanMetricsSet,
+}
+
+impl DisplayAs for FlatCombinedFieldsExec {
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        fmt_combined_fields(
+            "FlatCombinedFields",
+            &self.query,
+            &self.tokenized_query,
+            t,
+            f,
+        )
+    }
+}
+
+impl FlatCombinedFieldsExec {
+    /// `resolved_fields` and a [`FlatStatsScope::PerColumn`] scope must hold one
+    /// entry per target column, in query order.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn try_new(
+        dataset: Arc<Dataset>,
+        query: CombinedFieldsQuery,
+        params: FtsSearchParams,
+        unindexed_input: Arc<dyn ExecutionPlan>,
+        scanned_fragments: roaring::RoaringBitmap,
+        resolved_fields: Vec<ResolvedFtsField>,
+        stats_scope: FlatStatsScope,
+        emit_prefilter: PreFilterSource,
+    ) -> Result<Self> {
+        let num_columns = query.column_names().len();
+        let num_coverage = match &stats_scope {
+            FlatStatsScope::PerColumn(coverage) => coverage.len(),
+            FlatStatsScope::WholeCorpus => num_columns,
+        };
+        if resolved_fields.len() != num_columns || num_coverage != num_columns {
+            return Err(Error::internal(format!(
+                "combined_fields flat scan got {} resolved fields and {} statistics coverage \
+                 sets for {} target columns",
+                resolved_fields.len(),
+                num_coverage,
+                num_columns
+            )));
+        }
+        let properties = Arc::new(PlanProperties::new(
+            EquivalenceProperties::new(FTS_SCHEMA.clone()),
+            Partitioning::RoundRobinBatch(1),
+            EmissionType::Incremental,
+            Boundedness::Bounded,
+        ));
+        Ok(Self {
+            dataset,
+            query,
+            tokenized_query: Arc::new(OnceLock::new()),
+            params,
+            unindexed_input,
+            scanned_fragments,
+            resolved_fields,
+            stats_scope,
+            emit_prefilter,
+            shared_scorer: None,
+            properties,
+            metrics: ExecutionPlanMetricsSet::new(),
+        })
+    }
+
+    /// Publish the blended scorer this scan builds to an indexed sibling.
+    ///
+    /// Only this side sees the unindexed rows, so only it can produce the corpus
+    /// statistics both sides must score against.
+    pub(crate) fn with_shared_scorer(
+        mut self,
+        scorer: Arc<SharedFtsScorer<CombinedFieldsBM25Scorer>>,
+    ) -> Self {
+        self.shared_scorer = Some(scorer);
+        self
+    }
+}
+
+impl ExecutionPlan for FlatCombinedFieldsExec {
+    fn name(&self) -> &str {
+        "FlatCombinedFieldsExec"
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        let mut children = vec![&self.unindexed_input];
+        children.extend(self.emit_prefilter.execution_plan());
+        children
+    }
+
+    fn required_input_distribution(&self) -> Vec<Distribution> {
+        // `execute()` reads only `unindexed_input.execute(partition)` for the
+        // single output partition, so the input must be coalesced to one
+        // partition or fragments would be silently dropped. Same reasoning as
+        // `FlatMatchQueryExec`.
+        self.children()
+            .iter()
+            .map(|_| Distribution::SinglePartition)
+            .collect()
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        mut children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        if children.len() != self.children().len() {
+            return Err(DataFusionError::Internal(
+                "Unexpected number of children".to_string(),
+            ));
+        }
+        // Reverse order: the optional prefilter child is last, so pop it first.
+        let emit_prefilter = if self.emit_prefilter.execution_plan().is_some() {
+            self.emit_prefilter
+                .with_execution_plan(children.pop().expect("child count checked above"))?
+        } else {
+            // A prefilter source with no child of its own leaves the input last.
+            self.emit_prefilter.clone()
+        };
+        let Some(unindexed_input) = children.pop() else {
+            return Err(DataFusionError::Internal(
+                "combined_fields flat scan lost its input child".to_string(),
+            ));
+        };
+        Ok(Arc::new(Self {
+            dataset: self.dataset.clone(),
+            query: self.query.clone(),
+            tokenized_query: self.tokenized_query.clone(),
+            params: self.params.clone(),
+            unindexed_input,
+            scanned_fragments: self.scanned_fragments.clone(),
+            resolved_fields: self.resolved_fields.clone(),
+            stats_scope: self.stats_scope.clone(),
+            emit_prefilter,
+            shared_scorer: self.shared_scorer.clone(),
+            properties: self.properties.clone(),
+            metrics: ExecutionPlanMetricsSet::new(),
+        }))
+    }
+
+    #[instrument(name = "flat_combined_fields_exec", level = "debug", skip_all)]
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<datafusion::execution::TaskContext>,
+    ) -> DataFusionResult<SendableRecordBatchStream> {
+        let query = self.query.clone();
+        let tokenized_query = self.tokenized_query.clone();
+        let ds = self.dataset.clone();
+        let stats_scope = self.stats_scope.clone();
+        let stale_rows_per_column: Vec<Arc<RowAddrTreeMap>> = match &stats_scope {
+            FlatStatsScope::PerColumn(coverage) => coverage
+                .iter()
+                .map(|coverage| coverage.stale_rows.clone())
+                .collect(),
+            FlatStatsScope::WholeCorpus => Vec::new(),
+        };
+        let emit_prefilter = self.emit_prefilter.clone();
+        let scanned_fragments = self.scanned_fragments.clone();
+        let prefilter_context = context.clone();
+        let stats_mask_ds = self.dataset.clone();
+        let metrics_set = self.metrics.clone();
+        let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
+        let metrics_clone = metrics.clone();
+        let target_batch_size = context.session_config().batch_size();
+        let elapsed_compute = metrics.baseline_metrics.elapsed_compute().clone();
+
+        let shared_scorer_producer = self.shared_scorer.clone().map(SharedFtsScorerProducer::new);
+
+        let mut input = self.unindexed_input.execute(partition, context)?;
+        for (column, resolved) in query.column_names().zip(&self.resolved_fields) {
+            // A path that continues past a `List` cannot be projected, so the scan
+            // brought its list root instead and the leaf text is derived here.
+            input = if resolved.has_lists() {
+                flatten_fts_document_column(input, resolved.clone())?
+            } else {
+                document_input(input, column)?
+            };
+        }
+
+        let stream = stream::once(async move {
+            let shared_scorer_producer = shared_scorer_producer;
+            let result = async {
+                let CombinedFieldsScan {
+                    columns,
+                    tokens,
+                    tokenizer,
+                    ..
+                } = open_combined_fields_scan(
+                    &ds,
+                    &query,
+                    CombinedFieldsIndexRequirement::AtLeastOneColumn,
+                    &stale_rows_per_column,
+                    &tokenized_query,
+                    metrics.as_ref(),
+                )
+                .await?;
+
+                let input_schema = input.schema();
+                let doc_col_indices = query
+                    .column_names()
+                    .map(|column| input_schema.index_of(column))
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+
+                // One mask per target column over the rows it may fold. Built through
+                // `create_restricted_deletion_mask` so the fragment restriction lands in
+                // the id space the scan's `_rowid` uses; a hand-rolled fragment-address
+                // allow list would match nothing under stable row ids.
+                let fragment_mask = |fragments: roaring::RoaringBitmap| {
+                    let ds = stats_mask_ds.clone();
+                    async move {
+                        match DatasetPreFilter::create_restricted_deletion_mask(ds, fragments) {
+                            Some(mask) => mask.await,
+                            None => Ok(Arc::new(RowAddrMask::all_rows())),
+                        }
+                    }
+                };
+                let stats_masks = match &stats_scope {
+                    FlatStatsScope::PerColumn(coverage) => {
+                        let mut stats_masks = Vec::with_capacity(coverage.len());
+                        for coverage in coverage {
+                            let mask = fragment_mask(coverage.fragments.clone()).await?;
+                            // Stale rows sit in fragments the index does cover, so they
+                            // are allowed by address rather than by fragment.
+                            stats_masks.push(if coverage.stale_rows.is_empty() {
+                                mask
+                            } else {
+                                Arc::new(
+                                    mask.as_ref()
+                                        .clone()
+                                        .also_allow(coverage.stale_rows.as_ref().clone()),
+                                )
+                            });
+                        }
+                        stats_masks
+                    }
+                    FlatStatsScope::WholeCorpus => {
+                        vec![fragment_mask(scanned_fragments.clone()).await?; columns.len()]
+                    }
+                };
+
+                let emit_mask = {
+                    let pre_filter = build_prefilter_restricted_to_fragments(
+                        prefilter_context,
+                        partition,
+                        &emit_prefilter,
+                        stats_mask_ds.clone(),
+                        scanned_fragments,
+                        // The external row-address mask is applied by the
+                        // planner's `RowAddrMaskFilterExec` wrap around this
+                        // node, so it stays out of the corpus statistics.
+                        PreFilterMasks::default(),
+                        &metrics_set,
+                    )?;
+                    pre_filter.wait_for_ready().await?;
+                    pre_filter.mask()
+                };
+
+                flat_combined_fields_search_stream(
+                    input,
+                    &columns,
+                    doc_col_indices,
+                    &stats_masks,
+                    Some(emit_mask),
+                    matches!(stats_scope, FlatStatsScope::WholeCorpus),
+                    &tokens,
+                    tokenizer,
+                    query.operator(),
+                    target_batch_size,
+                    Some(elapsed_compute),
+                    Some(metrics.as_ref()),
+                )
+                .await
+            }
+            .await;
+
+            match result {
+                Ok((stream, scorer)) => {
+                    if let Some(producer) = shared_scorer_producer {
                         producer.publish(scorer);
                     }
                     Ok(stream)
@@ -3875,9 +4954,6 @@ impl ExecutionPlan for FlatMatchQueryExec {
         })
         .try_flatten()
         .map(move |batch| {
-            // record_poll records output_rows, output_bytes, and output_batches
-            // on the shared BaselineMetrics — same pattern DataFusion's own
-            // FilterExec uses inside its hand-written poll_next.
             let poll = metrics_clone
                 .baseline_metrics
                 .record_poll(std::task::Poll::Ready(Some(batch)));
@@ -4256,6 +5332,7 @@ impl ExecutionPlan for PhraseQueryExec {
         let overlay_block = self.overlay_block.clone();
         let document_granularity = self.document_granularity;
         let schema = self.schema.clone();
+        let metrics_set = self.metrics.clone();
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
         let stream = stream::once(async move {
             let _timer = metrics.baseline_metrics.elapsed_compute().timer();
@@ -4284,6 +5361,7 @@ impl ExecutionPlan for PhraseQueryExec {
                     overlay_block,
                     external_mask,
                 },
+                &metrics_set,
             )?;
             let deleted_fragments =
                 indices
@@ -4305,7 +5383,7 @@ impl ExecutionPlan for PhraseQueryExec {
                 column
             )))?;
             let mut tokenizer = first_index.tokenizer();
-            let tokens = collect_query_tokens(&query.terms, &mut tokenizer);
+            let tokens = try_collect_query_tokens(&query.terms, &mut tokenizer)?;
             record_tokenized_query(&tokenized_query, &tokens);
             let base_scorer = match (preset_base_scorer, shared_scorer) {
                 (Some(scorer), _) => scorer,
@@ -4885,9 +5963,10 @@ mod tests {
     use crate::index::DatasetIndexExt;
     use arrow_array::{
         ArrayRef, Float32Array, Int32Array, RecordBatch, RecordBatchIterator, StringArray,
-        UInt64Array,
+        UInt64Array, record_batch,
     };
     use arrow_schema::DataType;
+    use datafusion::datasource::memory::MemorySourceConfig;
     use datafusion::error::{DataFusionError, Result as DataFusionResult};
     use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
     use datafusion::{execution::TaskContext, physical_plan::ExecutionPlan};
@@ -4895,17 +5974,22 @@ mod tests {
     use lance_core::{ROW_ID, utils::address::RowAddress};
     use lance_datafusion::datagen::DatafusionDatagenExt;
     use lance_datafusion::exec::{ExecutionStatsCallback, ExecutionSummaryCounts};
-    use lance_datafusion::utils::PARTITIONS_SEARCHED_METRIC;
+    use lance_datafusion::utils::{
+        INDEX_CACHE_HITS_METRIC, INDEX_CACHE_MISSES_METRIC, PARTITIONS_SEARCHED_METRIC,
+    };
     use lance_datagen::{BatchCount, ByteCount, RowCount};
     use lance_index::metrics::NoOpMetricsCollector;
+    use lance_index::optimize::OptimizeOptions;
     use lance_index::scalar::inverted::builder::ScoredDoc;
     use lance_index::scalar::inverted::query::{
-        BooleanQuery, BoostQuery, FtsQuery, FtsSearchParams, MatchQuery, Occur, Operator,
-        PhraseQuery, collect_query_tokens, has_query_token,
+        BooleanQuery, BoostQuery, CombinedFieldsQuery, FtsQuery, FtsSearchParams, MatchQuery,
+        Occur, Operator, PhraseQuery, collect_query_tokens, has_query_token,
+        try_collect_query_tokens,
     };
     use lance_index::scalar::inverted::{
-        DocumentGranularity, FTS_SCHEMA, InvertedIndex, Language, SCORE_COL,
-        build_global_bm25_scorer, prepare_bm25_query,
+        CombinedCorpusStats, CombinedFieldColumn, DocumentGranularity, FTS_SCHEMA, InvertedIndex,
+        Language, MemBM25Scorer, SCORE_COL, build_combined_bm25_scorer, build_global_bm25_scorer,
+        prepare_bm25_query,
     };
     use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams};
     use lance_index::{IndexCriteria, IndexType};
@@ -4916,23 +6000,27 @@ mod tests {
         Dataset,
         dataset::WriteParams,
         dataset::transaction::{Operation, TransactionBuilder},
+        dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched},
         index::DatasetIndexInternalExt,
         io::exec::PreFilterSource,
         utils::test::{DatagenExt, FragmentCount, FragmentRowCount, NoContextTestFixture},
     };
 
     use super::{
-        BoolSlot, BoostQueryExec, CompoundQueryExec, CrossColumnCompoundQueryExec,
-        FTS_SEGMENT_BIND_DURATION_METRIC, FlatMatchFilterExec, FlatMatchQueryExec, MatchQueryExec,
-        PhraseQueryExec, WAND_TIE_COMPLETION_BUDGET, WandExactnessCertificate,
-        build_boolean_query_children, classify_wand_exactness_certificate, default_text_tokenizer,
-        open_fts_segments, tokenizer_for_match_query,
+        BoolSlot, BoostQueryExec, CombinedFieldsQueryExec, CompoundQueryExec,
+        CrossColumnCompoundQueryExec, FTS_SEGMENT_BIND_DURATION_METRIC, FlatCombinedFieldsExec,
+        FlatMatchFilterExec, FlatMatchQueryExec, FlatStatsCoverage, FlatStatsScope,
+        HybridCompoundQueryExec, MatchQueryExec, PhraseQueryExec, WAND_TIE_COMPLETION_BUDGET,
+        WandExactnessCertificate, build_boolean_query_children,
+        classify_wand_exactness_certificate, default_text_tokenizer, open_fts_segments,
+        tokenizer_for_match_query,
     };
     use crate::io::exec::utils::IndexMetrics;
     use datafusion::physical_plan::empty::EmptyExec;
     use datafusion::physical_plan::repartition::RepartitionExec;
     use datafusion::physical_plan::union::UnionExec;
     use datafusion_physical_plan::joins::HashJoinExec;
+    use lance_datafusion::exec::OneShotExec;
 
     #[derive(Default)]
     struct StatsHolder {
@@ -5090,6 +6178,190 @@ mod tests {
         (Arc::new(dataset), committed, fragment_ids)
     }
 
+    async fn create_hybrid_indexed_input_fixture(
+        term: &str,
+        limit: usize,
+    ) -> (
+        HybridCompoundQueryExec,
+        Arc<MemBM25Scorer>,
+        Arc<dyn ExecutionPlan>,
+    ) {
+        let (dataset, segments, _) = create_segment_selection_fixture().await;
+        let mut dataset = dataset.as_ref().clone();
+        let appended = lance_datagen::gen_batch()
+            .col(
+                "text",
+                lance_datagen::array::cycle_utf8_literals(&["quick fresh", "fresh"]),
+            )
+            .col(
+                "other",
+                lance_datagen::array::cycle_utf8_literals(&["not indexed"]),
+            )
+            .into_reader_rows(RowCount::from(2), BatchCount::from(1));
+        dataset.append(appended, None).await.unwrap();
+        let tail = dataset.fragments().last().unwrap().clone();
+        let dataset = Arc::new(dataset);
+        let mut scanner = dataset.scan();
+        scanner.project(&["text"]).unwrap();
+        scanner.with_row_id().with_fragments(vec![tail]);
+        let residual = scanner.create_plan().await.unwrap();
+        let query = FtsQuery::Match(
+            MatchQuery::new(term.to_string())
+                .with_column(Some("text".to_string()))
+                .with_fuzziness(Some(0)),
+        );
+        let params = FtsSearchParams::default().with_limit(Some(limit));
+        let metrics = IndexMetrics::new(&ExecutionPlanMetricsSet::new(), 0);
+        let indices = open_fts_segments(&dataset, "text", &segments, &metrics)
+            .await
+            .unwrap();
+        let tokens = super::Tokens::new(vec![term.to_string()], indices[0].tokenizer().doc_type());
+        let scorer = Arc::new(
+            build_global_bm25_scorer(&indices, &tokens, &params, None)
+                .await
+                .unwrap(),
+        );
+        let indexed = Arc::new(
+            CompoundQueryExec::new_with_segments(
+                dataset.clone(),
+                query.clone(),
+                params.clone(),
+                PreFilterSource::None,
+                segments.clone(),
+            )
+            .with_base_scorer(scorer.clone()),
+        );
+        (
+            HybridCompoundQueryExec::new(
+                dataset,
+                query,
+                params,
+                "text".to_string(),
+                segments,
+                residual,
+            ),
+            scorer,
+            indexed,
+        )
+    }
+
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn test_hybrid_indexed_input_matches_native(
+        #[values("quick", "fresh")] term: &str,
+        #[values(1, 4)] limit: usize,
+    ) {
+        let (hybrid, scorer, indexed) = create_hybrid_indexed_input_fixture(term, limit).await;
+        let expected = hybrid
+            .execute(0, Arc::new(TaskContext::default()))
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let replaced: Arc<dyn ExecutionPlan> =
+            Arc::new(hybrid.with_indexed_input(indexed, scorer).unwrap());
+        assert_eq!(replaced.children().len(), 2);
+        assert_eq!(replaced.required_input_distribution().len(), 2);
+        // Scanner plans retain execution state, so the comparison needs an
+        // independent residual scan over the same immutable dataset snapshot.
+        let mut scanner = hybrid.dataset().scan();
+        scanner.project(&[hybrid.column()]).unwrap();
+        scanner
+            .with_row_id()
+            .with_fragments(vec![hybrid.dataset().fragments().last().unwrap().clone()]);
+        let mut children = replaced.children().into_iter().cloned().collect::<Vec<_>>();
+        children[0] = scanner.create_plan().await.unwrap();
+        let rewritten = replaced.with_new_children(children).unwrap();
+        let actual = rewritten
+            .execute(0, Arc::new(TaskContext::default()))
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(
+            actual, expected,
+            "indexed replacement must preserve scores and order"
+        );
+        assert!(actual.iter().map(RecordBatch::num_rows).sum::<usize>() > 0);
+    }
+
+    #[tokio::test]
+    async fn test_hybrid_indexed_input_rejects_invalid_plan() {
+        let (hybrid, scorer, indexed) = create_hybrid_indexed_input_fixture("quick", 3).await;
+        let wrong_schema = Arc::new(EmptyExec::new(Arc::new(arrow_schema::Schema::empty())));
+        let error = hybrid
+            .with_indexed_input(wrong_schema, scorer.clone())
+            .unwrap_err();
+        assert!(matches!(error, DataFusionError::Plan(_)));
+        assert!(error.to_string().contains("FTS schema"));
+
+        let multiple_partitions =
+            MemorySourceConfig::try_new_exec(&[vec![], vec![]], FTS_SCHEMA.clone(), None).unwrap();
+        let error = hybrid
+            .with_indexed_input(multiple_partitions, scorer.clone())
+            .unwrap_err();
+        assert!(matches!(error, DataFusionError::Plan(_)));
+        assert!(error.to_string().contains("one partition"));
+
+        let unbounded = HybridCompoundQueryExec::new(
+            hybrid.dataset().clone(),
+            hybrid.query().clone(),
+            hybrid.params().clone().with_limit(None),
+            hybrid.column().to_string(),
+            hybrid.segments().to_vec(),
+            hybrid.residual_input().clone(),
+        );
+        let error = unbounded.with_indexed_input(indexed, scorer).unwrap_err();
+        assert!(matches!(error, DataFusionError::Plan(_)));
+        assert!(error.to_string().contains("bounded limit"));
+
+        let error = Arc::new(hybrid).with_new_children(vec![]).unwrap_err();
+        assert!(matches!(error, DataFusionError::Internal(_)));
+        assert!(error.to_string().contains("expected 1 children"));
+    }
+
+    #[rstest::rstest]
+    #[case::too_many_rows(false, "exceeded its bounded result limit")]
+    #[case::null_score(true, "null row IDs or scores")]
+    #[tokio::test]
+    async fn test_hybrid_indexed_input_rejects_invalid_results(
+        #[case] null_score: bool,
+        #[case] message: &str,
+    ) {
+        let (hybrid, scorer, _) = create_hybrid_indexed_input_fixture("quick", 3).await;
+        let scores = if null_score {
+            vec![None, Some(1.0)]
+        } else {
+            vec![Some(1.0), Some(1.0)]
+        };
+        let batch = RecordBatch::try_new(
+            FTS_SCHEMA.clone(),
+            vec![
+                Arc::new(UInt64Array::from(vec![0, 1])),
+                Arc::new(Float32Array::from(scores)),
+            ],
+        )
+        .unwrap();
+        let input = MemorySourceConfig::try_new_exec(
+            &[vec![batch.clone(), batch]],
+            FTS_SCHEMA.clone(),
+            None,
+        )
+        .unwrap();
+        let replaced: Arc<dyn ExecutionPlan> =
+            Arc::new(hybrid.with_indexed_input(input, scorer).unwrap());
+        let children = replaced.children().into_iter().cloned().collect();
+        let rewritten = replaced.with_new_children(children).unwrap();
+        let error = rewritten
+            .execute(0, Arc::new(TaskContext::default()))
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap_err();
+        assert!(matches!(error, DataFusionError::Execution(_)));
+        assert!(error.to_string().contains(message), "{error}");
+    }
+
     fn tokenized_query_index_params() -> InvertedIndexParams {
         InvertedIndexParams::new("simple".to_string(), Language::English)
             .with_position(true)
@@ -5099,33 +6371,47 @@ mod tests {
             .ascii_folding(false)
     }
 
-    async fn create_tokenized_query_fixture(with_unindexed_append: bool) -> Dataset {
-        let mut dataset = lance_datagen::gen_batch()
-            .col(
-                "text",
-                lance_datagen::array::cycle_utf8_literals(&["first and second"]),
-            )
+    /// Builds a dataset where every column in `columns` holds "first and second"
+    /// and carries its own inverted index. `combined_fields` needs an FTS index
+    /// per target column, so the columns are indexed one at a time rather than
+    /// as a single multi-column index.
+    ///
+    /// With `with_unindexed_append`, extra rows land outside the indices, which
+    /// forces the mixed plan where an indexed exec and its flat sibling both run.
+    async fn create_tokenized_query_fixture(
+        columns: &[&str],
+        with_unindexed_append: bool,
+    ) -> Dataset {
+        let corpus = || {
+            columns
+                .iter()
+                .fold(lance_datagen::gen_batch(), |batch, column| {
+                    batch.col(
+                        *column,
+                        lance_datagen::array::cycle_utf8_literals(&["first and second"]),
+                    )
+                })
+        };
+
+        let mut dataset = corpus()
             .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(2))
             .await
             .unwrap();
-        dataset
-            .create_index(
-                &["text"],
-                IndexType::Inverted,
-                None,
-                &tokenized_query_index_params(),
-                true,
-            )
-            .await
-            .unwrap();
+        for column in columns {
+            dataset
+                .create_index(
+                    &[*column],
+                    IndexType::Inverted,
+                    None,
+                    &tokenized_query_index_params(),
+                    true,
+                )
+                .await
+                .unwrap();
+        }
 
         if with_unindexed_append {
-            let appended = lance_datagen::gen_batch()
-                .col(
-                    "text",
-                    lance_datagen::array::cycle_utf8_literals(&["first and second"]),
-                )
-                .into_reader_rows(RowCount::from(2), BatchCount::from(1));
+            let appended = corpus().into_reader_rows(RowCount::from(2), BatchCount::from(1));
             dataset.append(appended, None).await.unwrap();
         }
         dataset
@@ -5221,7 +6507,7 @@ mod tests {
     #[test]
     fn document_match_filter_respects_document_boundary() {
         let mut tokenizer = default_text_tokenizer();
-        let query_tokens = collect_query_tokens("alpha", &mut tokenizer);
+        let query_tokens = try_collect_query_tokens("alpha", &mut tokenizer).unwrap();
         assert!(super::document_matches_query(
             "alpha beta",
             &mut tokenizer,
@@ -5230,7 +6516,7 @@ mod tests {
         ));
 
         let mut tokenizer = default_text_tokenizer();
-        let query_tokens = collect_query_tokens("alpha beta", &mut tokenizer);
+        let query_tokens = try_collect_query_tokens("alpha beta", &mut tokenizer).unwrap();
         assert!(!super::document_matches_query(
             "alpha",
             &mut tokenizer,
@@ -5247,7 +6533,7 @@ mod tests {
 
     #[tokio::test]
     async fn shared_fts_scorer_reports_cancelled_producer() {
-        let scorer = Arc::new(super::SharedFtsScorer::new());
+        let scorer = Arc::new(super::SharedFtsScorer::<super::MemBM25Scorer>::new());
         let producer = super::SharedFtsScorerProducer::new(scorer.clone());
         drop(producer);
 
@@ -5366,7 +6652,7 @@ mod tests {
         use super::default_text_tokenizer;
 
         let mut tokenizer = default_text_tokenizer();
-        let query_tokens = collect_query_tokens("hello", &mut tokenizer);
+        let query_tokens = try_collect_query_tokens("hello", &mut tokenizer).unwrap();
 
         let text_col =
             LargeStringArray::from(vec!["hello world", "no match here", "say hello there"]);
@@ -5436,7 +6722,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let query_tokens = collect_query_tokens("hello", &mut tokenizer);
+        let query_tokens = try_collect_query_tokens("hello", &mut tokenizer).unwrap();
 
         let mut tokenizer = FlatMatchFilterExec::load_tokenizer(
             &dataset,
@@ -5518,7 +6804,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_analyze_plan_shows_indexed_and_flat_match_tokens() {
-        let dataset = create_tokenized_query_fixture(true).await;
+        let dataset = create_tokenized_query_fixture(&["text"], true).await;
         let query = MatchQuery::new("FIRST and SECOND".to_string())
             .with_column(Some("text".to_string()))
             .with_operator(Operator::And);
@@ -5547,7 +6833,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_analyze_plan_shows_indexed_and_flat_phrase_tokens() {
-        let dataset = create_tokenized_query_fixture(true).await;
+        let dataset = create_tokenized_query_fixture(&["text"], true).await;
         let query =
             PhraseQuery::new("FIRST and SECOND".to_string()).with_column(Some("text".to_string()));
         let mut scanner = dataset.scan();
@@ -5569,7 +6855,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_analyze_plan_shows_compound_leaf_tokens() {
-        let dataset = create_tokenized_query_fixture(false).await;
+        let dataset = create_tokenized_query_fixture(&["text"], false).await;
         let query = BooleanQuery::new([
             (
                 Occur::Should,
@@ -5599,6 +6885,41 @@ mod tests {
         assert!(
             compound.contains(r#"Phrase(column="text", tokens=[("second", 0), ("first", 1)])"#),
             "compound Phrase leaf is missing token positions: {compound}"
+        );
+    }
+
+    /// A `combined_fields` scan is a leaf FTS node, so `analyze_plan` must show
+    /// its tokens the way it does for `match` and `phrase`. Both children of a
+    /// mixed plan report, or a `Boolean{combined_fields, match}` plan would show
+    /// tokens on the `match` sibling only.
+    #[tokio::test]
+    async fn test_analyze_plan_shows_combined_fields_tokens() {
+        let dataset = create_tokenized_query_fixture(&["title", "body"], true).await;
+        let query = CombinedFieldsQuery::try_new(
+            "FIRST and SECOND".to_string(),
+            vec!["title".to_string(), "body".to_string()],
+        )
+        .unwrap();
+        let mut scanner = dataset.scan();
+        scanner
+            .full_text_search(FullTextSearchQuery::new_query(query.into()))
+            .unwrap();
+
+        let explained = scanner.explain_plan(false).await.unwrap();
+        assert!(
+            !explained.contains("tokenized_query="),
+            "explain_plan should not claim runtime tokenization: {explained}"
+        );
+
+        let analysis = scanner.analyze_plan().await.unwrap();
+        let expected = r#"tokenized_query=[("first", 0), ("second", 2)]"#;
+        assert!(
+            find_plan_line(&analysis, "CombinedFieldsQuery:").contains(expected),
+            "indexed combined_fields is missing token positions:\n{analysis}"
+        );
+        assert!(
+            find_plan_line(&analysis, "FlatCombinedFields:").contains(expected),
+            "flat combined_fields is missing token positions:\n{analysis}"
         );
     }
 
@@ -5667,6 +6988,178 @@ mod tests {
         assert!(
             compound_line.contains(&format!("{PARTITIONS_SEARCHED_METRIC}={expected_total}")),
             "compound FTS scorer metrics missing partitions_searched: {compound_line}"
+        );
+    }
+
+    /// The cross-field scorer build reads one posting-metadata row per
+    /// (term, column, partition), and both `combined_fields` execs must report
+    /// those to their query's index-cache counters. Unreported, `EXPLAIN ANALYZE`
+    /// on a cold cross-field query undercounts `index_cache_misses`, so its
+    /// `index_cache_hit_ratio` is not comparable with `match`'s on the same data.
+    #[tokio::test]
+    async fn test_combined_fields_scorer_build_reports_index_cache_metrics() {
+        let mut dataset = lance_datagen::gen_batch()
+            .col(
+                "title",
+                lance_datagen::array::cycle_utf8_literals(&[
+                    "hello world",
+                    "lance search",
+                    "hello lance",
+                ]),
+            )
+            .col(
+                "body",
+                lance_datagen::array::cycle_utf8_literals(&["lance", "hello", "search hello"]),
+            )
+            .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(9))
+            .await
+            .unwrap();
+        for column in ["title", "body"] {
+            dataset
+                .create_index(
+                    &[column],
+                    IndexType::Inverted,
+                    None,
+                    &InvertedIndexParams::default(),
+                    true,
+                )
+                .await
+                .unwrap();
+        }
+        let dataset = Arc::new(dataset);
+
+        let query = CombinedFieldsQuery::try_new(
+            "hello lance".to_string(),
+            vec!["title".to_string(), "body".to_string()],
+        )
+        .unwrap();
+        let params = FtsSearchParams::default().with_limit(Some(10));
+
+        // Open the same segments the execs will, both to size the expected lookup
+        // count and to hand the preset runs a scorer identical to the one they
+        // would have built.
+        let mut columns = Vec::new();
+        for (column, weight) in query.weighted_columns() {
+            let segments = crate::index::scalar::inverted::load_segments(
+                &dataset,
+                column,
+                DocumentGranularity::Row,
+            )
+            .await
+            .unwrap()
+            .expect("FTS index just created");
+            let metrics_set = ExecutionPlanMetricsSet::new();
+            let indices = open_fts_segments(
+                &dataset,
+                column,
+                &segments,
+                &IndexMetrics::new(&metrics_set, 0),
+            )
+            .await
+            .unwrap();
+            columns.push(CombinedFieldColumn {
+                column: column.to_string(),
+                weight,
+                indices,
+                stale_rows: None,
+            });
+        }
+        let mut tokenizer = columns[0].indices[0].tokenizer();
+        let tokens = collect_query_tokens(query.terms(), &mut tokenizer);
+        let mut terms = (0..tokens.len())
+            .map(|index| tokens.get_token(index).to_string())
+            .collect::<Vec<_>>();
+        terms.sort_unstable();
+        terms.dedup();
+        let partitions: usize = columns
+            .iter()
+            .flat_map(|column| &column.indices)
+            .map(|index| index.partition_count())
+            .sum();
+        // One posting-metadata row per (term, column, partition).
+        let expected_lookups = terms.len() * partitions;
+        assert!(expected_lookups > 0);
+        let scorer = Arc::new(
+            build_combined_bm25_scorer(&columns, &tokens, CombinedCorpusStats::IndexOnly, None)
+                .await
+                .unwrap(),
+        );
+
+        // Warm the index cache first: a cold run's counts depend on which entry
+        // each lookup happens to load, while on a warm cache every lookup is a
+        // hit and the two runs below differ only in the scorer build.
+        let warmup = CombinedFieldsQueryExec::new(
+            dataset.clone(),
+            query.clone(),
+            params.clone(),
+            PreFilterSource::None,
+        );
+        let expected = execute_results(&warmup).await.unwrap();
+        assert!(!expected.is_empty());
+
+        let built = CombinedFieldsQueryExec::new(
+            dataset.clone(),
+            query.clone(),
+            params.clone(),
+            PreFilterSource::None,
+        );
+        assert_eq!(execute_results(&built).await.unwrap(), expected);
+        let preset = CombinedFieldsQueryExec::new(
+            dataset.clone(),
+            query.clone(),
+            params.clone(),
+            PreFilterSource::None,
+        )
+        .with_base_scorer(scorer.clone());
+        assert_eq!(
+            execute_results(&preset).await.unwrap(),
+            expected,
+            "the preset scorer must match the one the exec builds",
+        );
+        assert_eq!(
+            metric_value(&built, INDEX_CACHE_HITS_METRIC)
+                - metric_value(&preset, INDEX_CACHE_HITS_METRIC),
+            expected_lookups,
+            "CombinedFieldsQueryExec must report the scorer build's cache lookups",
+        );
+
+        // The flat sibling builds its own scorer from the same per-column index
+        // statistics. An empty input isolates those reads: the scanned rows
+        // contribute none, so the count is absolute rather than a delta.
+        let flat_schema = Arc::new(arrow_schema::Schema::new(vec![
+            lance_core::ROW_ID_FIELD.clone(),
+            arrow_schema::Field::new("title", DataType::Utf8, true),
+            arrow_schema::Field::new("body", DataType::Utf8, true),
+        ]));
+        let resolved_fields = query
+            .column_names()
+            .map(|column| {
+                crate::index::scalar::inverted::resolve_fts_field(
+                    dataset.schema(),
+                    column,
+                    DocumentGranularity::Row,
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let num_columns = resolved_fields.len();
+        let flat = FlatCombinedFieldsExec::try_new(
+            dataset.clone(),
+            query.clone(),
+            params.clone(),
+            Arc::new(EmptyExec::new(flat_schema)),
+            roaring::RoaringBitmap::new(),
+            resolved_fields,
+            FlatStatsScope::PerColumn(vec![FlatStatsCoverage::default(); num_columns]),
+            PreFilterSource::None,
+        )
+        .unwrap();
+        assert!(execute_results(&flat).await.unwrap().is_empty());
+        assert_eq!(
+            metric_value(&flat, INDEX_CACHE_HITS_METRIC)
+                + metric_value(&flat, INDEX_CACHE_MISSES_METRIC),
+            expected_lookups,
+            "FlatCombinedFieldsExec must report the scorer build's cache lookups",
         );
     }
 
@@ -5866,6 +7359,57 @@ mod tests {
         assert_execution_error(
             execute_row_ids(&wrong_column).await.unwrap_err(),
             "no Inverted index found",
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::all_fragments(false)]
+    #[case::restricted_fragments(true)]
+    #[tokio::test]
+    async fn test_combined_fields_exec_opens_all_committed_segments(
+        #[case] restrict_fragments: bool,
+    ) {
+        let (dataset, _segments, fragment_ids) = create_segment_selection_fixture().await;
+        let query = CombinedFieldsQuery::try_new("quick".to_string(), vec!["text".to_string()])
+            .unwrap()
+            .try_with_boosts(vec![2.0])
+            .unwrap();
+        let params = FtsSearchParams::default().with_limit(Some(20));
+
+        // One segment per fragment, so a scan that opens every committed segment
+        // returns every fragment's matching row.
+        let exec = CombinedFieldsQueryExec::new(
+            dataset.clone(),
+            query.clone(),
+            params.clone(),
+            PreFilterSource::None,
+        );
+        assert_eq!(
+            execute_row_ids(&exec).await.unwrap(),
+            expected_row_ids(&fragment_ids)
+        );
+
+        let selected_row_ids = expected_row_ids(&fragment_ids[..2]);
+        let selected_row_count = selected_row_ids.len();
+        let batch = arrow_array::record_batch!(("_rowid", UInt64, selected_row_ids)).unwrap();
+        let source = PreFilterSource::FilteredRowIds(Arc::new(OneShotExec::from_batch(batch)));
+        let mut filtered = CombinedFieldsQueryExec::new(dataset, query, params, source);
+        let expected = if restrict_fragments {
+            filtered = filtered
+                .with_covered_fragments(roaring::RoaringBitmap::from_iter([fragment_ids[1]]));
+            expected_row_ids(&fragment_ids[1..2])
+        } else {
+            expected_row_ids(&fragment_ids[..2])
+        };
+        assert_eq!(execute_row_ids(&filtered).await.unwrap(), expected);
+        assert_eq!(metric_value(&filtered, "prefilter_loads"), 1);
+        assert_eq!(
+            metric_value(&filtered, "prefilter_input_rows"),
+            selected_row_count
+        );
+        assert_eq!(
+            metric_value(&filtered, "prefilter_row_ids"),
+            selected_row_count
         );
     }
 
@@ -6224,7 +7768,7 @@ mod tests {
         );
 
         let mut tokenizer = indices[0].tokenizer();
-        let tokens = collect_query_tokens(&query.terms, &mut tokenizer);
+        let tokens = try_collect_query_tokens(&query.terms, &mut tokenizer).unwrap();
         let global_scorer = Arc::new(
             build_global_bm25_scorer(&indices, &tokens, &search_params, None)
                 .await
@@ -6484,7 +8028,7 @@ mod tests {
         let baseline_results = execute_results(&baseline).await.unwrap();
 
         let mut tokenizer = indices[0].tokenizer();
-        let complete_tokens = collect_query_tokens("quick brown", &mut tokenizer);
+        let complete_tokens = try_collect_query_tokens("quick brown", &mut tokenizer).unwrap();
         let complete_scorer = Arc::new(
             build_global_bm25_scorer(&indices, &complete_tokens, &search_params, None)
                 .await
@@ -6504,7 +8048,7 @@ mod tests {
         );
 
         let mut tokenizer = indices[0].tokenizer();
-        let incomplete_tokens = collect_query_tokens("quick", &mut tokenizer);
+        let incomplete_tokens = try_collect_query_tokens("quick", &mut tokenizer).unwrap();
         let incomplete_scorer = Arc::new(
             build_global_bm25_scorer(&indices, &incomplete_tokens, &search_params, None)
                 .await
@@ -6528,7 +8072,7 @@ mod tests {
         );
 
         let mut tokenizer = indices[0].tokenizer();
-        let brown_tokens = collect_query_tokens("brown", &mut tokenizer);
+        let brown_tokens = try_collect_query_tokens("brown", &mut tokenizer).unwrap();
         let scorer_without_fuzzy_expansion = Arc::new(
             build_global_bm25_scorer(&indices, &brown_tokens, &search_params, None)
                 .await
@@ -6741,5 +8285,146 @@ mod tests {
             .downcast_ref::<UnionExec>()
             .expect("RepartitionExec should wrap a UnionExec");
         assert_eq!(inner.children().len(), 2);
+    }
+
+    /// `(id, score)` of every hit, sorted by id. The limit lets a query over several
+    /// columns use the cross-column scorer, which is skipped without one.
+    async fn fts_hits(dataset: &Dataset, query: FtsQuery) -> Vec<(String, f32)> {
+        let mut scan = dataset.scan();
+        scan.full_text_search(FullTextSearchQuery::new_query(query).limit(Some(10)))
+            .unwrap();
+        scan.project(&["id"]).unwrap();
+        let batch = scan.try_into_batch().await.unwrap();
+        let ids = batch["id"].as_any().downcast_ref::<StringArray>().unwrap();
+        let scores = batch[SCORE_COL]
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap();
+        let mut hits = ids
+            .iter()
+            .zip(scores.values())
+            .map(|(id, score)| (id.unwrap().to_string(), *score))
+            .collect::<Vec<_>>();
+        hits.sort_by(|a, b| a.0.cmp(&b.0));
+        hits
+    }
+
+    /// Every FTS search path reports only current rows: the old segment still lists `a1`
+    /// under "graph engines", but `a1` now lives in a fragment the newer segment covers.
+    async fn assert_no_stale_rows(dataset: &Dataset) {
+        let ids = |hits: Vec<(String, f32)>| hits.into_iter().map(|(id, _)| id).collect::<Vec<_>>();
+        let text = |terms: &str| -> FtsQuery {
+            MatchQuery::new(terms.into())
+                .with_column(Some("text".into()))
+                .into()
+        };
+        assert_eq!(
+            ids(fts_hits(dataset, text("graph")).await),
+            ["a2", "a3", "a5"]
+        );
+        // Listed once, not once per segment.
+        assert_eq!(ids(fts_hits(dataset, text("engines")).await), ["a1", "a4"]);
+        let phrase = PhraseQuery::new("graph engines".into()).with_column(Some("text".into()));
+        assert_eq!(fts_hits(dataset, phrase.into()).await, []);
+        // `tag:zeta` (3 postings, stale `a1` included) is cheaper than `text:graph` (4),
+        // so it generates the candidates and `text:graph` is only loaded for them.
+        let tag_zeta = MatchQuery::new("zeta".into()).with_column(Some("tag".into()));
+        let cross =
+            BooleanQuery::new([(Occur::Must, tag_zeta.into()), (Occur::Must, text("graph"))]);
+        assert_eq!(fts_hits(dataset, FtsQuery::Boolean(cross)).await, []);
+        // `a1` and `a4` hold identical text, so `a1`'s old length must not count.
+        let combined =
+            CombinedFieldsQuery::try_new("zeta".into(), vec!["text".into(), "tag".into()]).unwrap();
+        let hits = fts_hits(dataset, FtsQuery::CombinedFields(combined)).await;
+        assert_eq!(ids(hits.clone()), ["a1", "a4"]);
+        assert_eq!(hits[0].1, hits[1].1);
+    }
+
+    /// https://github.com/lance-format/lance/issues/9817: under stable row ids an
+    /// in-place update moves `a1` to a new fragment with the same row id, and an
+    /// append-only optimize gives that fragment its own segment. Merging the segments
+    /// must drop the stale posting rather than carry it into one segment.
+    #[rstest::rstest]
+    #[case::optimize_indices(true)]
+    #[case::merge_existing_index_segments(false)]
+    #[tokio::test]
+    async fn stale_posting_after_in_place_update_with_stable_row_ids(
+        #[case] merge_by_optimize: bool,
+    ) {
+        let base = record_batch!(
+            ("id", Utf8, ["a1", "a2", "a3", "a4", "a5"]),
+            (
+                "text",
+                Utf8,
+                [
+                    "graph engines",
+                    "graph search",
+                    "graph databases",
+                    "omega engines",
+                    "graph theory"
+                ]
+            ),
+            ("tag", Utf8, ["zeta", "misc", "misc", "zeta", "misc"])
+        )
+        .unwrap();
+        let schema = base.schema();
+        let params = WriteParams {
+            enable_stable_row_ids: true,
+            ..Default::default()
+        };
+        let reader = RecordBatchIterator::new(vec![Ok(base)], schema.clone());
+        let mut dataset = Dataset::write(reader, "memory://", Some(params))
+            .await
+            .unwrap();
+        let index_params = InvertedIndexParams::default().with_position(true);
+        for column in ["text", "tag"] {
+            dataset
+                .create_index(&[column], IndexType::Inverted, None, &index_params, true)
+                .await
+                .unwrap();
+        }
+
+        let update = record_batch!(
+            ("id", Utf8, ["a1"]),
+            ("text", Utf8, ["omega engines"]),
+            ("tag", Utf8, ["zeta"])
+        )
+        .unwrap();
+        let mut merge = MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".into()]).unwrap();
+        merge
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::DoNothing);
+        let reader = RecordBatchIterator::new(vec![Ok(update)], schema);
+        let (dataset, _) = merge
+            .try_build()
+            .unwrap()
+            .execute_reader(reader)
+            .await
+            .unwrap();
+        let mut dataset = dataset.as_ref().clone();
+        dataset
+            .optimize_indices(&OptimizeOptions::append())
+            .await
+            .unwrap();
+        let segments = dataset.load_indices_by_name("text_idx").await.unwrap();
+        assert_eq!(segments.len(), 2);
+        assert_no_stale_rows(&dataset).await;
+
+        if merge_by_optimize {
+            let options = OptimizeOptions::default().num_indices_to_merge(Some(2));
+            dataset.optimize_indices(&options).await.unwrap();
+        } else {
+            let merged = dataset
+                .merge_existing_index_segments(segments)
+                .await
+                .unwrap();
+            dataset
+                .commit_existing_index_segments("text_idx", "text", vec![merged])
+                .await
+                .unwrap();
+        }
+        let segments = dataset.load_indices_by_name("text_idx").await.unwrap();
+        assert_eq!(segments.len(), 1);
+        assert_no_stale_rows(&dataset).await;
     }
 }
