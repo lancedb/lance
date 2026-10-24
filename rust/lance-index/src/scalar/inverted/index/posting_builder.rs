@@ -405,7 +405,7 @@ impl PostingListBuilder {
             let tail_position_block = std::mem::take(&mut overflow.tail_positions).finish();
             full_blocks
                 .encoded_position_blocks
-                .push_encoded_block(tail_position_block);
+                .push_encoded_block(tail_position_block)?;
         }
         self.tail.clear();
         self.tail_len = 0;
@@ -623,7 +623,7 @@ impl PostingListBuilder {
                 encoded_position_blocks.push_encoded_block(
                     tail_position_block
                         .expect("tail position block must exist for postings with positions"),
-                );
+                )?;
             }
         }
 
@@ -683,7 +683,7 @@ impl PostingListBuilder {
                 encoded_position_blocks.push_encoded_block(
                     tail_position_block
                         .expect("tail position block must exist for postings with positions"),
-                );
+                )?;
             }
         }
 

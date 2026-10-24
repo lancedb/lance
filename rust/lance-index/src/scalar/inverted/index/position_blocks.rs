@@ -45,15 +45,27 @@ impl EncodedPositionBlocks {
         }
     }
 
-    pub(super) fn push_encoded_block(&mut self, block: Vec<u8>) -> usize {
+    pub(super) fn push_encoded_block(&mut self, block: Vec<u8>) -> Result<usize> {
         let len = block.len();
+        let offset = u32::try_from(self.byte_len).map_err(|_| {
+            Error::index(format!(
+                "position block offset {} exceeds the u32 format limit",
+                self.byte_len
+            ))
+        })?;
+        let byte_len = self.byte_len.checked_add(len).ok_or_else(|| {
+            Error::index(format!(
+                "position stream length {} + {len} overflows usize",
+                self.byte_len
+            ))
+        })?;
         if !self.tail.is_empty() && len > POSITION_CHUNK_BYTES - self.tail.len() {
             self.chunks.push(PositionChunk {
                 start: self.byte_len - self.tail.len(),
                 bytes: std::mem::take(&mut self.tail).into_boxed_slice(),
             });
         }
-        self.offsets.push(self.byte_len as u32);
+        self.offsets.push(offset);
         if len >= POSITION_CHUNK_BYTES {
             self.chunks.push(PositionChunk {
                 start: self.byte_len,
@@ -68,8 +80,8 @@ impl EncodedPositionBlocks {
             }
             self.tail.extend_from_slice(&block);
         }
-        self.byte_len += len;
-        len
+        self.byte_len = byte_len;
+        Ok(len)
     }
 
     pub(super) fn append_to(
@@ -94,5 +106,29 @@ impl EncodedPositionBlocks {
         let mut offsets = ListBuilder::new(UInt32Builder::with_capacity(self.offsets.len()));
         self.append_to(&mut bytes, &mut offsets)?;
         Ok(vec![Arc::new(bytes.finish()), Arc::new(offsets.finish())])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn position_offsets_reject_overflow_before_mutation() {
+        // Exercise the persisted offset limit without allocating several GiB.
+        let mut blocks = EncodedPositionBlocks {
+            byte_len: u32::MAX as usize + 1,
+            ..Default::default()
+        };
+        let error = blocks.push_encoded_block(vec![1]).unwrap_err();
+        assert!(matches!(error, Error::Index { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("4294967296 exceeds the u32 format limit")
+        );
+        assert!(blocks.offsets.is_empty());
+        assert!(blocks.chunks.is_empty());
+        assert!(blocks.tail.is_empty());
     }
 }

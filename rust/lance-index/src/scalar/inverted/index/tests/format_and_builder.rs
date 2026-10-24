@@ -17,7 +17,7 @@ fn test_position_blocks_keep_small_blocks_compact(
     // overwhelm this payload and its 8 KiB of block offsets.
     let mut blocks = EncodedPositionBlocks::default();
     for len in lengths {
-        blocks.push_encoded_block(vec![0; len]);
+        blocks.push_encoded_block(vec![0; len]).unwrap();
     }
     assert!(
         blocks.size() <= max_bytes,
@@ -42,7 +42,7 @@ fn test_position_blocks_append_without_changing_value_boundaries() {
     for blocks in &inputs {
         let mut encoded = EncodedPositionBlocks::default();
         for block in blocks {
-            encoded.push_encoded_block(block.clone());
+            encoded.push_encoded_block(block.clone()).unwrap();
         }
         for (i, block) in blocks.iter().enumerate() {
             assert_eq!(encoded.block(i), block);
