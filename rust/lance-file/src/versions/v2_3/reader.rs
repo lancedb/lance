@@ -109,6 +109,14 @@ fn validate_compressive_encoding(
             required(split.values.as_deref(), "byte-stream-split values")?,
             position.child(),
         ),
+        Some(Compression::Alp(alp)) => {
+            if !matches!(alp.bits_per_value, 32 | 64) {
+                return Err(Error::invalid_input_source(
+                    "Lance v2.3 ALP requires 32 or 64-bit values".into(),
+                ));
+            }
+            Ok(())
+        }
         Some(Compression::AxisDelta(_)) => {
             if position != EncodingPosition::PerValue {
                 return Err(Error::invalid_input(format!(

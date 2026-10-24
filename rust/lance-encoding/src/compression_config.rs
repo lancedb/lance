@@ -42,6 +42,29 @@ impl BssMode {
     }
 }
 
+/// ALP (Adaptive Lossless floating-Point) encoding mode
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum AlpMode {
+    /// Never use ALP
+    Off,
+    /// Always use ALP for floating point data
+    On,
+    /// Automatically use ALP when it is beneficial
+    Auto,
+}
+
+impl AlpMode {
+    /// Parse from string
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "off" => Some(Self::Off),
+            "on" => Some(Self::On),
+            "auto" => Some(Self::Auto),
+            _ => None,
+        }
+    }
+}
+
 /// Lossless integer prediction along one logical axis inside each tensor.
 ///
 /// The axis excludes the dataset row dimension. For an HWC tensor, axis 1
@@ -93,6 +116,9 @@ pub struct CompressionFieldParams {
 
     /// Byte stream split mode for floating point data
     pub bss: Option<BssMode>,
+
+    /// ALP mode for floating point data
+    pub alp: Option<AlpMode>,
 
     /// Integer tensor prediction for unstable 2.3 per-value pages. Unset uses
     /// `AxisDeltaMode::Auto { axis: None }`; `Some(AxisDeltaMode::Off)` disables it.
@@ -165,6 +191,9 @@ impl CompressionFieldParams {
         if other.bss.is_some() {
             self.bss = other.bss;
         }
+        if other.alp.is_some() {
+            self.alp = other.alp;
+        }
         if other.axis_delta.is_some() {
             self.axis_delta = other.axis_delta;
         }
@@ -231,12 +260,14 @@ mod tests {
         assert_eq!(params.compression, None);
         assert_eq!(params.compression_level, None);
         assert_eq!(params.bss, None);
+        assert_eq!(params.alp, None);
 
         let other = CompressionFieldParams {
             rle_threshold: Some(0.3),
             compression: Some("lz4".to_string()),
             compression_level: None,
             bss: Some(BssMode::On),
+            alp: Some(AlpMode::Off),
             axis_delta: None,
             minichunk_size: None,
         };
@@ -246,12 +277,14 @@ mod tests {
         assert_eq!(params.compression, Some("lz4".to_string()));
         assert_eq!(params.compression_level, None);
         assert_eq!(params.bss, Some(BssMode::On));
+        assert_eq!(params.alp, Some(AlpMode::Off));
 
         let another = CompressionFieldParams {
             rle_threshold: None,
             compression: Some("zstd".to_string()),
             compression_level: Some(3),
             bss: Some(BssMode::Auto),
+            alp: Some(AlpMode::On),
             axis_delta: None,
             minichunk_size: None,
         };
@@ -261,6 +294,7 @@ mod tests {
         assert_eq!(params.compression, Some("zstd".to_string())); // Overridden
         assert_eq!(params.compression_level, Some(3)); // New value
         assert_eq!(params.bss, Some(BssMode::Auto)); // Overridden
+        assert_eq!(params.alp, Some(AlpMode::On)); // Overridden
     }
 
     #[test]
@@ -285,6 +319,7 @@ mod tests {
                 compression: Some("zstd".to_string()),
                 compression_level: Some(3),
                 bss: None,
+                alp: None,
                 axis_delta: None,
                 minichunk_size: None,
             },

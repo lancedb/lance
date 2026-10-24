@@ -15,6 +15,22 @@ their objects. Blob v2 requires file format 2.2 or later. API examples and
 configuration belong in the
 [Blob Columns guide](../../guide/blob.md).
 
+## Logical Input Values
+
+For each non-null blob struct:
+
+- Exactly one of `data` and `uri` must be non-null. Empty `data` is valid.
+- `uri` must be non-empty. Without a range, it denotes the whole external object.
+- `position` and `size` must both be null or both be non-null. When supplied,
+  they require `uri`, must have `size > 0`, and select
+  `[position, position + size)` without overflowing `UInt64`.
+
+Absent range children mean the same as null range children. Input ranges select
+external bytes; they never address Lance-owned storage.
+Nullness comes from outer struct validity, and children beneath a null struct
+are ignored. Writers must reject invalid shapes and value combinations with
+errors identifying the field and offending input.
+
 ## Schema
 
 The **table manifest** retains the logical struct shape supplied when the column
@@ -96,22 +112,6 @@ Names, order, types, and numeric kinds are format contracts.
 [Struct packing](../file/encoding.md#struct-packing) determines child encoding,
 not fixed byte offsets. Packed struct encoding is independent of the `Packed`
 payload kind.
-
-## Logical Input Values
-
-For each non-null blob struct:
-
-- Exactly one of `data` and `uri` must be non-null. Empty `data` is valid.
-- `uri` must be non-empty. Without a range, it denotes the whole external object.
-- `position` and `size` must both be null or both be non-null. When supplied,
-  they require `uri`, must have `size > 0`, and select
-  `[position, position + size)` without overflowing `UInt64`.
-
-Absent range children mean the same as null range children. Input ranges select
-external bytes; they never address Lance-owned storage.
-Nullness comes from outer struct validity, and children beneath a null struct
-are ignored. Writers must reject invalid shapes and value combinations with
-errors identifying the field and offending input.
 
 ## Descriptor Kinds
 

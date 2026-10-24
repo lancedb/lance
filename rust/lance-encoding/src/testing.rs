@@ -941,6 +941,7 @@ fn tag(e: &Compression) -> &'static str {
         Range(_) => "range",
         Delta(_) => "delta",
         AxisDelta(_) => "axis_delta",
+        Alp(_) => "alp",
     }
 }
 
