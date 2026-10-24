@@ -2503,8 +2503,9 @@ async fn cleanup_cascade_branch_run(
 /// Build the eligible automatic cleanup policy from the manifest configuration.
 ///
 /// The returned policy includes the legacy QPS field, but not operation-level
-/// concurrency or time-bucket retention. Use [`auto_cleanup_hook`] to execute
-/// with all configured options.
+/// concurrency. Time-bucket retention cannot be represented by this legacy
+/// policy type and returns an error instead of silently discarding its survivors.
+/// Use [`auto_cleanup_hook`] to execute with all configured options.
 ///
 /// ```
 /// # use lance::{Dataset, Result};
@@ -2518,9 +2519,16 @@ pub async fn build_cleanup_policy(
     dataset: &Dataset,
     manifest: &Manifest,
 ) -> Result<Option<CleanupPolicy>> {
-    Ok(build_cleanup_operation(dataset, manifest, false)
-        .await?
-        .map(|operation| operation.policy))
+    let operation = build_cleanup_operation(dataset, manifest, false).await?;
+    if operation
+        .as_ref()
+        .is_some_and(|operation| operation.keep_one_per.is_some())
+    {
+        return Err(Error::not_supported(
+            "build_cleanup_policy cannot represent keep_one_per retention; use auto_cleanup_hook instead",
+        ));
+    }
+    Ok(operation.map(|operation| operation.policy))
 }
 
 async fn build_cleanup_operation<'a>(
@@ -2841,6 +2849,12 @@ mod tests {
         manifest
             .config
             .insert("lance.auto_cleanup.interval".into(), "1".into());
+        manifest
+            .config
+            .insert("lance.auto_cleanup.keep_one_per".into(), "1day".into());
+        let error = build_cleanup_policy(&dataset, &manifest).await.unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }));
+        assert_contains!(error.to_string(), "keep_one_per");
         for value in ["0s", "invalid"] {
             manifest
                 .config
