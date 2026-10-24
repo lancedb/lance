@@ -21,7 +21,6 @@ use lance_index::vector::{ApproxMode, Query, VectorIndex};
 use lance_linalg::{distance::DistanceType, kernels::normalize_arrow};
 use uuid::Uuid;
 
-use super::dedup::{DuplicatePairsOptions, find_duplicate_pairs_with_options};
 use crate::index::{
     DatasetIndexExt, DatasetIndexInternalExt, prefilter::DatasetPreFilter,
     segment_has_vector_details,
@@ -75,21 +74,33 @@ pub async fn find_similar_pairs_in_partition(
     options: SimilaritySearchOptions,
 ) -> Result<SendableRecordBatchStream> {
     options.validate()?;
-    // Reuse the pair planner's coverage, format, overlay and snapshot checks.
-    drop(
-        find_duplicate_pairs_with_options(
-            dataset.clone(),
-            column,
-            threshold,
-            DuplicatePairsOptions::default(),
-        )
-        .await?,
-    );
+    if !threshold.is_finite() {
+        return Err(Error::invalid_input("distance_threshold must be finite"));
+    }
     let field = dataset.schema().field_id(column)?;
     let metadata = dataset.load_indices().await?;
-    let segments = metadata
+    let names = metadata
         .iter()
         .filter(|m| m.keyed_fields() == [field] && segment_has_vector_details(m))
+        .map(|m| m.name.as_str())
+        .collect::<BTreeSet<_>>();
+    if names.len() != 1 {
+        return Err(Error::invalid_input(
+            "similarity_search requires exactly one vector index",
+        ));
+    }
+    let name = names
+        .into_iter()
+        .next()
+        .ok_or_else(|| Error::internal("missing vector index"))?;
+    if !dataset.unindexed_fragments(name).await?.is_empty() {
+        return Err(Error::invalid_input(
+            "vector index does not cover all fragments; optimize the index first",
+        ));
+    }
+    let segments = metadata
+        .iter()
+        .filter(|m| m.name == name && m.keyed_fields() == [field])
         .collect::<Vec<_>>();
     if !segments.iter().any(|m| m.uuid == segment_id) {
         return Err(Error::invalid_input(
@@ -103,6 +114,26 @@ pub async fn find_similar_pairs_in_partition(
         let index = dataset
             .open_vector_index(column, &meta.uuid, &NoOpMetricsCollector)
             .await?;
+        if !index.supports_pairwise_vectors() {
+            return Err(Error::not_supported(
+                "similarity_search requires a current-format vector index; rebuild the index",
+            ));
+        }
+        for fragment in dataset.fragments().iter() {
+            if meta
+                .fragment_bitmap
+                .as_ref()
+                .is_none_or(|ids| ids.contains(fragment.id as u32))
+                && fragment.overlays.iter().any(|overlay| {
+                    overlay.committed_version > meta.dataset_version
+                        && overlay.data_file.fields.contains(&field)
+                })
+            {
+                return Err(Error::invalid_input(
+                    "vector index has stale values after an overlay update; rebuild the index",
+                ));
+            }
+        }
         if threshold < 0.0 && index.metric_type() != DistanceType::Dot {
             return Err(Error::invalid_input(
                 "negative radius requires dot distance",
