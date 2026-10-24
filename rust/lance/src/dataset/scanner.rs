@@ -16038,6 +16038,44 @@ mod test {
     }
 
     #[tokio::test]
+    async fn test_fm_index_contains_empty_needle() {
+        // Every non-null string contains the empty string, so no text index can
+        // narrow `contains(text, '')` down; it must be left to a full scan.
+        let batch = arrow_array::record_batch!(
+            ("text", Utf8, [Some("alpha"), Some(""), None, Some("beta")]),
+            ("id", Int32, [0, 1, 2, 3])
+        )
+        .unwrap();
+        let schema = batch.schema();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+        let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::Fm);
+        dataset
+            .create_index(&["text"], IndexType::Fm, None, &params, true)
+            .await
+            .unwrap();
+
+        for (filter, uses_index, expected_ids) in [
+            ("contains(text, '')", false, vec![0, 1, 3]),
+            ("NOT contains(text, '')", false, vec![]),
+            // A one-character needle is still answered by the index.
+            ("contains(text, 'a')", true, vec![0, 3]),
+        ] {
+            let mut scan = dataset.scan();
+            scan.filter(filter).unwrap();
+            let plan = scan.explain_plan(false).await.unwrap();
+            let batch = scan.try_into_batch().await.unwrap();
+            let ids = batch["id"].as_primitive::<Int32Type>().values().to_vec();
+            assert_eq!(ids, expected_ids, "wrong rows for {filter}");
+            assert_eq!(
+                plan.contains("ScalarIndexQuery"),
+                uses_index,
+                "unexpected plan for {filter}:\n{plan}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn test_ngram_regex_index_scan() {
         use arrow::array::AsArray;
 
