@@ -2861,7 +2861,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         let use_residual = self.use_query_residual;
         let use_scratch = self.use_residual_scratch;
         let comparisons = partition.storage.len();
-        let batch = spawn_cpu(move || {
+        let batch = spawn_cpu(move || -> Result<RecordBatch> {
             let rotated = rotated_partition_centroid_slice(rq_cache.as_deref(), partition_id);
             let residual = Self::query_context_for_scratch(
                 use_residual,
