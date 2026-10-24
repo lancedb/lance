@@ -145,6 +145,19 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
     /// newer version than this, it cannot be read
     fn version(&self) -> u32;
 
+    /// Whether Lance may maintain this index through `optimize_indices`.
+    ///
+    /// Return `false` when an external service owns refreshing and merging the
+    /// index. Table-wide optimization skips such indices without loading them;
+    /// explicitly naming one in an optimization request returns an error.
+    /// Creation, deletion, and compaction's fragment-coverage rules are unaffected.
+    ///
+    /// For example, a statistics plugin maintained by a separate refresh job can
+    /// override this method with `fn supports_optimization(&self) -> bool { false }`.
+    fn supports_optimization(&self) -> bool {
+        true
+    }
+
     /// Returns a new query parser for the index
     ///
     /// Can return None if this index cannot participate in query optimization
@@ -158,10 +171,19 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
     ///
     /// The index details should match the details that were returned when the index was
     /// originally trained.
+    ///
+    /// `index_version` is this segment's own persisted format version (its
+    /// `IndexMetadata::index_version`), not [`Self::version`] (the plugin's
+    /// current maximum). Most plugins have only ever had one on-disk format and
+    /// can ignore it; a plugin that has changed its on-disk format over time
+    /// (e.g. which domain a stored row identifier is in) uses it to read an
+    /// older segment correctly instead of reinterpreting it under the newest
+    /// format.
     async fn load_index(
         &self,
         index_store: Arc<dyn IndexStore>,
         index_details: &prost_types::Any,
+        index_version: u32,
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>>;
@@ -182,6 +204,7 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
         &self,
         index_store: Arc<dyn IndexStore>,
         index_details: &prost_types::Any,
+        index_version: u32,
         remapping: Option<Arc<dyn BatchRowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
@@ -196,7 +219,7 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
                 self.name()
             )));
         }
-        self.load_index(index_store, index_details, None, cache)
+        self.load_index(index_store, index_details, index_version, None, cache)
             .await
     }
 

@@ -335,7 +335,8 @@ impl PyShardWriter {
     /// Return a snapshot of current write statistics.
     ///
     /// Returns a dict with keys: put_count, put_time_ms, wal_flush_count,
-    /// wal_flush_bytes, memtable_flush_count, memtable_flush_rows.
+    /// wal_flush_bytes, memtable_flush_count, memtable_flush_rows,
+    /// memtable_flush_failures.
     pub fn stats(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let inner = self.inner.clone();
         let closed_state = self.closed_state.clone();
@@ -394,9 +395,11 @@ impl PyShardWriter {
         memtable_stats_to_pydict(py, &stats, bytes.as_ref())
     }
 
-    /// Create an LSM scanner that includes the active MemTable for strong consistency.
+    /// Create an LSM scanner that includes this writer's in-memory MemTables
+    /// for strong consistency.
     ///
-    /// The scanner covers: base table + given SSTables + current active MemTable.
+    /// The scanner covers: base table + given SSTables + the active MemTable
+    /// and every frozen MemTable still awaiting flush.
     #[pyo3(signature = (shard_snapshots=vec![]))]
     pub fn lsm_scanner(
         &self,
@@ -413,18 +416,21 @@ impl PyShardWriter {
         let dataset = self.dataset.clone();
         let shard_id = self.shard_id;
 
-        let (active_ref, writer_snapshot) = rt()
+        let (in_memory_memtables, writer_snapshot) = rt()
             .block_on(Some(py), async move {
                 let guard = inner.lock().await;
                 match guard.as_ref() {
                     Some(w) => {
-                        let active_ref = w.active_memtable_ref().await?;
+                        // Capture the active memtable *and* any frozen-awaiting-flush
+                        // memtables so a concurrent flush rollover cannot hide
+                        // acknowledged writes from this read-your-writes scanner.
+                        let in_memory_memtables = w.in_memory_memtable_refs().await?;
                         let writer_snapshot = w
                             .manifest()
                             .await?
                             .map(shard_snapshot_from_manifest)
                             .unwrap_or_else(|| ShardSnapshot::new(shard_id));
-                        Ok((active_ref, writer_snapshot))
+                        Ok((in_memory_memtables, writer_snapshot))
                     }
                     None => Err(lance_core::Error::invalid_input(
                         "ShardWriter is already closed",
@@ -436,7 +442,7 @@ impl PyShardWriter {
         snapshots.push(writer_snapshot);
 
         let scanner = LsmScanner::new(dataset, snapshots, pk_columns)
-            .with_active_memtable(shard_id, active_ref);
+            .with_in_memory_memtables(shard_id, in_memory_memtables);
 
         Ok(PyLsmScanner {
             inner: Some(scanner),
@@ -749,7 +755,7 @@ impl PyLsmPointLookupPlanner {
             None => get_pk_columns(&ds)?,
         };
         let base_schema = Arc::new(ArrowSchema::from(ds.schema()));
-        // A sealed generation stores the names it was written with, so the
+        // A flushed generation stores the names it was written with, so the
         // planner resolves its columns by id; `base_schema` carries none.
         let identity_schema = Arc::new(arrow_schema_with_field_ids(ds.schema()));
         let collector = LsmDataSourceCollector::new(ds.clone(), snapshots);
@@ -971,6 +977,7 @@ fn write_stats_to_pydict(py: Python<'_>, stats: &WriteStatsSnapshot) -> PyResult
     dict.set_item("wal_flush_time_ms", stats.wal_flush_time.as_millis() as u64)?;
     dict.set_item("memtable_flush_count", stats.memtable_flush_count)?;
     dict.set_item("memtable_flush_rows", stats.memtable_flush_rows)?;
+    dict.set_item("memtable_flush_failures", stats.memtable_flush_failures)?;
     dict.set_item(
         "memtable_flush_time_ms",
         stats.memtable_flush_time.as_millis() as u64,
