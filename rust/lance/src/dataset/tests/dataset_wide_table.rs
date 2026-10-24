@@ -8,8 +8,9 @@
 //! list). These tests pin down the *observable* metadata costs so that future
 //! work (e.g. column-group manifests) can be validated against them:
 //!
-//! 1. [`test_add_column_rewrites_full_manifest`]: a one-column add writes at
-//!    least the previous manifest size of bytes;
+//! 1. [`test_add_column_rewrites_full_manifest`]: a one-column add rewrites the
+//!    whole manifest object, so the new manifest is a full snapshot rather than
+//!    a delta;
 //! 2. [`test_cold_open_reads_full_manifest`]: a cold open reads at least the
 //!    manifest size, even for a narrow query;
 //! 3. [`test_version_refresh_rereads_manifest`]: after another writer commits
@@ -66,13 +67,20 @@ async fn test_add_column_rewrites_full_manifest() {
     let uri = tmpdir.path().to_str().unwrap();
     let mut dataset = create_wide_dataset(uri).await;
 
-    let base_manifest = dataset.manifest().serialized().len() as u64;
+    let base_snapshot = dataset.manifest().serialized().len() as u64;
     assert!(
-        base_manifest > 10_000,
-        "expected a non-trivial manifest for {NUM_COLUMNS} columns, got {base_manifest} bytes"
+        base_snapshot > 10_000,
+        "expected a non-trivial manifest for {NUM_COLUMNS} columns, got {base_snapshot} bytes"
     );
 
-    dataset.object_store.as_ref().io_stats_incremental();
+    // Size of the manifest object that v1 points at, as reported by the writer.
+    // This is the whole manifest: the flat format has no way to express "one
+    // column changed".
+    let base_manifest = dataset
+        .manifest_location
+        .size
+        .expect("the writer should report the size of the manifest it wrote");
+
     dataset
         .add_columns(
             NewColumnTransform::SqlExpressions(vec![(
@@ -84,20 +92,32 @@ async fn test_add_column_rewrites_full_manifest() {
         )
         .await
         .unwrap();
-    let io = dataset.object_store.as_ref().io_stats_incremental();
 
-    // The commit rewrites the entire manifest, so it must write at least the
-    // previous manifest size (plus the transaction file and new data files).
+    // The commit rewrites the entire manifest file, so the object v2 points at
+    // must be a full snapshot no smaller than v1's. That object holds the
+    // serialized manifest plus the inline transaction, which carries the full
+    // fragment list again - it is the real per-commit metadata payload.
+    //
+    // Measuring it directly, rather than the operation's total written bytes, is
+    // what keeps this assertion meaningful: the total is dominated by data and
+    // transaction objects and stays above `base_manifest` even if the manifest
+    // stops being rewritten, which would leave this test silently green. The
+    // manifest object itself collapses to a small delta in that case and fails
+    // here - the signal this test exists to provide.
+    let after_manifest = dataset
+        .manifest_location
+        .size
+        .expect("the writer should report the size of the manifest it wrote");
     assert!(
-        io.written_bytes >= base_manifest,
-        "expected a one-column add to rewrite at least the previous manifest \
-         size ({base_manifest} bytes), but only wrote {} bytes",
-        io.written_bytes
+        after_manifest >= base_manifest,
+        "expected a one-column add to rewrite the whole {base_manifest} byte manifest, \
+         but v{}'s manifest is only {after_manifest} bytes",
+        dataset.manifest_location.version
     );
 
     let grown = dataset.manifest().serialized().len();
     assert!(
-        grown > base_manifest as usize,
+        grown > base_snapshot as usize,
         "manifest should grow after adding a column"
     );
 }
