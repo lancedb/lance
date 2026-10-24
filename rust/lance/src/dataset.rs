@@ -144,7 +144,7 @@ use crate::utils::temporal::{SystemTime, timestamp_to_nanos, utc_now};
 use crate::{Error, Result};
 pub use blob::{
     BlobFile, BlobRangeRequest, BlobReadRange, ReadBlob, ReadBlobRange, ReadBlobRangesBuilder,
-    ReadBlobRangesStream, ReadBlobsBuilder, ReadBlobsStream,
+    ReadBlobRangesStream, ReadBlobsBuilder, ReadBlobsStream, preserve_managed_descriptors,
 };
 use hash_joiner::HashJoiner;
 pub use lance_core::ROW_ID;
@@ -1528,11 +1528,12 @@ impl Dataset {
     /// # Arguments
     ///
     /// * `older_than` - Versions older than this will be deleted.
-    /// * `delete_unverified` - If false (the default) then files will only be deleted if they
-    ///                        are listed in at least one manifest.  Otherwise these files will
-    ///                        be kept since they cannot be distinguished from an in-progress
-    ///                        transaction.  Set to true to delete these files if you are sure
-    ///                        there are no other in-progress dataset operations.
+    /// * `delete_unverified` - If false (the default), files that are not referenced by any
+    ///                        manifest will only be deleted if they are more than 7 days old.
+    ///                        Otherwise these files will be kept since they cannot be
+    ///                        distinguished from an in-progress transaction. Set to true to
+    ///                        delete these files if you are sure there are no other
+    ///                        in-progress dataset operations.
     ///
     /// # Returns
     ///
@@ -1637,6 +1638,14 @@ impl Dataset {
     /// not verify that the provided fragments exist and correct, that is the caller's responsibility.
     /// Some validation can be performed using the function
     /// [crate::dataset::transaction::validate_operation].
+    ///
+    /// That responsibility includes the files' format requirements: a caller publishing
+    /// externally produced fragments must make sure their contents comply with the
+    /// destination's format and with the feature flags the destination carries. The commit
+    /// does not discover every capability from arbitrary file contents. For example, data
+    /// files that embed version 1 zone write seeds (such as files copied from another table
+    /// whose manifest carries `FLAG_ZONE_WRITE_SEEDS`) may only be committed into a
+    /// destination that already carries that flag.
     ///
     /// If this commit is a change to an existing dataset then it will often need to be based on an
     /// existing version of the dataset.  For example, if this change is a `delete` operation then
@@ -4426,8 +4435,8 @@ pub(crate) async fn write_manifest_file(
     }
     // Every manifest write funnels through here, including restore and clone,
     // which rebuild a manifest from a stored one rather than from an Arrow
-    // schema, so this is where the invariant holds for a schema that never
-    // passed through that conversion.
+    // schema. Validate names and primary keys at this boundary so all write
+    // paths enforce them.
     //
     // Only for transactions that can change the schema. Released versions could
     // install a key on a nullable column through the metadata path, and
@@ -4443,6 +4452,10 @@ pub(crate) async fn write_manifest_file(
     // once it spilled -- and a MemWAL table spills routinely, since its
     // transactions carry mem-table state.
     if may_change_schema {
+        manifest
+            .schema
+            .validate_writable()
+            .map_err(CommitError::OtherError)?;
         manifest
             .schema
             .verify_primary_key()
