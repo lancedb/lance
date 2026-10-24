@@ -184,3 +184,45 @@ async fn nested_vector_projection_is_resolved_for_both_endpoints() {
     }
     assert_eq!(rows, 2);
 }
+
+#[tokio::test]
+async fn automatic_probe_budget_is_bounded_and_can_be_raised() {
+    let ds = dataset(vec![-1.0, 1.0, 3.0], vec![-1.0, 1.0, 3.0]).await;
+    let segment = ds.load_indices().await.unwrap()[0].uuid;
+    for (maximum, expect_outer_pair) in [(None, false), (Some(3), true)] {
+        let mut outer_pair = false;
+        for partition in 0..3 {
+            let mut stream = find_similar_pairs_in_partition(
+                ds.clone(),
+                "vector",
+                segment,
+                partition,
+                16.0,
+                SimilaritySearchOptions {
+                    nprobes: None,
+                    max_nprobes: maximum,
+                },
+            )
+            .await
+            .unwrap();
+            while let Some(batch) = stream.try_next().await.unwrap() {
+                let a = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .unwrap();
+                let b = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .unwrap();
+                outer_pair |= a
+                    .values()
+                    .iter()
+                    .zip(b.values())
+                    .any(|(&a, &b)| a == 0 && b == 2);
+            }
+        }
+        assert_eq!(outer_pair, expect_outer_pair);
+    }
+}

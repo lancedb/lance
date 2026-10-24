@@ -30,10 +30,12 @@ use crate::{Dataset, dataset::ProjectionRequest};
 
 const SOURCE_BATCH_ROWS: usize = 128;
 const VERIFY_BATCH_ROWS: usize = 1024;
+const DEFAULT_AUTO_MAX_PROBES: usize = 2;
 
 /// Probe budgets apply independently to each target index segment. Automatic
-/// probing includes centroid cells intersecting the query radius. A cap or fixed
-/// count trades recall for work; quantization can also omit threshold matches.
+/// probing tests centroid boundaries among the nearest two centroids by default.
+/// `max_nprobes` changes that budget; fixed `nprobes` uses its own count. Both
+/// restricted probes and quantization can omit threshold matches.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SimilaritySearchOptions {
     pub nprobes: Option<usize>,
@@ -301,6 +303,7 @@ fn probes(
     query.maximum_nprobes = options
         .nprobes
         .or(options.max_nprobes)
+        .or(Some(DEFAULT_AUTO_MAX_PROBES))
         .map(|n| n.min(index.total_partitions()));
     let (ids, distances) = index.find_partitions(&query)?;
     if options.nprobes.is_some() {
