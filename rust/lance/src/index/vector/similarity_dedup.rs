@@ -311,8 +311,7 @@ pub async fn find_similar_pairs_in_partition_with_sharding(
                                 dataset.clone(),
                                 column.clone(),
                                 targets.clone(),
-                                id,
-                                key,
+                                (id, key),
                                 threshold,
                                 options,
                                 sharding,
@@ -446,12 +445,12 @@ async fn query_stream(
     dataset: Arc<Dataset>,
     column: String,
     targets: Arc<Vec<Target>>,
-    id: u64,
-    raw_key: ArrayRef,
+    source: (u64, ArrayRef),
     threshold: f32,
     options: SimilaritySearchOptions,
     sharding: SimilaritySearchSharding,
 ) -> Result<SendableRecordBatchStream> {
+    let (id, raw_key) = source;
     let schema = super::dedup::pair_schema();
     let output = stream::iter(0..targets.len())
         .then(move |target_id| {
