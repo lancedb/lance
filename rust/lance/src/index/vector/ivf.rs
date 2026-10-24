@@ -8532,8 +8532,23 @@ mod tests {
             &vec![1.0; 32],
             &losses,
             &params,
-        )
-        .unwrap();
+        );
+        if target_k > data.len() {
+            let Err(error) = result else {
+                panic!(
+                    "a coreset of {} rows cannot serve {target_k} partitions",
+                    data.len()
+                );
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains("smaller than the partition count"),
+                "unexpected error: {error}"
+            );
+            return;
+        }
+        let result = result.unwrap();
         assert_eq!(result.len(), target_k);
         let values = result.values().as_primitive::<Float32Type>().values();
         let mut sorted = values.to_vec();
