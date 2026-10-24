@@ -2711,7 +2711,13 @@ impl Dataset {
     /// This constructs a full [Version], including summary metadata derived
     /// from the loaded manifest fragments.
     pub fn version(&self) -> Version {
-        Version::from(self.manifest.as_ref())
+        let mut version = Version::from(self.manifest.as_ref());
+        // `Version::from` only sees the manifest itself, not where it was read
+        // from. This dataset already knows the on-disk size, so report it here
+        // too; otherwise `get_version()` would disagree with `versions()`,
+        // which takes the size from the manifest location.
+        version.manifest_size = self.manifest_location().size;
+        version
     }
 
     /// Get the number of entries currently in the index cache.

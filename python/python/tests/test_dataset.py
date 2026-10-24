@@ -535,6 +535,13 @@ def test_versions(tmp_path: Path):
             base_dir, version["version"]
         )
 
+    # `get_version()` returns the checked-out version, which must agree with the
+    # last entry of `versions()` - including the manifest size, even though the
+    # two take it from different places.
+    current = lance.dataset(base_dir).get_version()
+    assert current["manifest_size"] == v2["manifest_size"]
+    assert current["manifest_size"] == _manifest_file_size(base_dir, 2)
+
 
 def test_version_id(tmp_path: Path):
     table1 = pa.Table.from_pylist([{"a": 1, "b": 2}, {"a": 10, "b": 20}])
