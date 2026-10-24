@@ -177,6 +177,70 @@ fn test_position_blocks_batch_roundtrip(
     }
 }
 
+#[rstest::rstest]
+#[case::block_128(128)]
+#[case::block_256(256)]
+fn test_posting_batch_payload_bytes(
+    #[case] block_size: usize,
+    #[values(false, true)] with_positions: bool,
+) {
+    let version = InvertedListFormatVersion::V3;
+    let schema =
+        inverted_list_schema_for_version_with_block_size(with_positions, version, block_size);
+    let mut batch_builder = PostingListBatchBuilder::new(schema, with_positions, version, 2);
+    assert_eq!(batch_builder.payload_bytes(), 0);
+    let mut docs = DocSet::default();
+    for doc_id in 0..block_size as u32 + 1 {
+        docs.append(u64::from(doc_id), 300);
+    }
+    let make_posting = || {
+        let mut posting = PostingListBuilder::new_with_posting_tail_codec_and_block_size(
+            with_positions,
+            version.posting_tail_codec(),
+            block_size,
+        );
+        for doc_id in 0..block_size as u32 + 1 {
+            let positions = if with_positions {
+                PositionRecorder::Position((0..600).step_by(2).collect())
+            } else {
+                PositionRecorder::Count(300)
+            };
+            posting.add(doc_id, positions);
+        }
+        posting
+    };
+    for _ in 0..2 {
+        make_posting()
+            .append_to_batch_with_docs(&docs, &mut batch_builder, version)
+            .unwrap();
+    }
+    let tracked_bytes = batch_builder.payload_bytes();
+    let batch = batch_builder.finish().unwrap();
+    let mut expected_bytes = 0;
+    for column in [POSTING_COL, IMPACT_COL] {
+        expected_bytes += batch[column]
+            .as_list::<i32>()
+            .values()
+            .as_binary::<i64>()
+            .value_data()
+            .len();
+    }
+    if with_positions {
+        expected_bytes += batch[COMPRESSED_POSITION_COL]
+            .as_binary::<i64>()
+            .value_data()
+            .len();
+    }
+    assert!(expected_bytes > 0);
+    assert_eq!(tracked_bytes, expected_bytes);
+    assert_eq!(batch.num_rows(), 2);
+    assert_eq!(batch_builder.payload_bytes(), 0);
+    make_posting()
+        .append_to_batch_with_docs(&docs, &mut batch_builder, version)
+        .unwrap();
+    assert_eq!(batch_builder.payload_bytes(), expected_bytes / 2);
+}
+
 #[derive(Debug)]
 struct ControlledPostingReads {
     started: std::sync::atomic::AtomicUsize,
