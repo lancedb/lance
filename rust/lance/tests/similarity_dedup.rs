@@ -158,7 +158,7 @@ async fn source_and_target_shards_preserve_all_cross_block_edges() {
         .unwrap();
         let params = match quantization {
             "rq" => VectorIndexParams::ivf_rq(1, 4, DistanceType::L2),
-            "pq" => VectorIndexParams::ivf_pq(1, 4, 2, DistanceType::L2, 2),
+            "pq" => VectorIndexParams::ivf_pq(1, 4, 4, DistanceType::L2, 2),
             _ => VectorIndexParams::ivf_flat(1, DistanceType::L2),
         };
         ds.create_index(&["vector"], IndexType::Vector, None, &params, false)
