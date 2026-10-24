@@ -2733,9 +2733,9 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             )
         };
         let row_bytes = scorer.row_bytes();
-        let rows = PAIRWISE_VECTOR_BATCH_BYTES / row_bytes;
-        let batch_size = if rows < batch_size {
-            1usize << rows.max(32).ilog2()
+        let rows_per_batch = PAIRWISE_VECTOR_BATCH_BYTES / row_bytes;
+        let batch_size = if rows_per_batch < batch_size {
+            1usize << rows_per_batch.max(32).ilog2()
         } else {
             batch_size
         };
