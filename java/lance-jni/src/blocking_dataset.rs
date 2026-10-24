@@ -3640,6 +3640,7 @@ pub extern "system" fn Java_org_lance_Dataset_nativeCleanupWithPolicy<'local>(
     jpolicy: JObject,
     jdelete_concurrency: JObject,
     jdelete_rate_limit: JObject,
+    jkeep_one_per_millis: JObject,
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
@@ -3648,7 +3649,8 @@ pub extern "system" fn Java_org_lance_Dataset_nativeCleanupWithPolicy<'local>(
             jdataset,
             jpolicy,
             jdelete_concurrency,
-            jdelete_rate_limit
+            jdelete_rate_limit,
+            jkeep_one_per_millis
         )
     )
 }
@@ -3659,8 +3661,19 @@ fn inner_cleanup_with_policy<'local>(
     jpolicy: JObject,
     jdelete_concurrency: JObject,
     jdelete_rate_limit: JObject,
+    jkeep_one_per_millis: JObject,
 ) -> Result<JObject<'local>> {
     let policy = extract_cleanup_policy(env, &jpolicy)?;
+    let keep_one_per = env.get_optional(&jkeep_one_per_millis, |env, obj| {
+        let value = env.call_method(obj, "longValue", "()J", &[])?.j()?;
+        u64::try_from(value)
+            .map(Duration::from_millis)
+            .map_err(|_| {
+                Error::input_error(format!(
+                    "keep_one_per must be positive, got {value} milliseconds"
+                ))
+            })
+    })?;
     let delete_concurrency = env.get_optional(&jdelete_concurrency, |env, obj| {
         let value = env.call_method(obj, "longValue", "()J", &[])?.j()?;
         usize::try_from(value).map_err(|_| {
@@ -3682,6 +3695,9 @@ fn inner_cleanup_with_policy<'local>(
         let dataset =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }?;
         let mut operation = dataset.inner.cleanup(policy);
+        if let Some(period) = keep_one_per {
+            operation = operation.with_keep_one_per(period)?;
+        }
         if let Some(concurrency) = delete_concurrency {
             operation = operation.with_delete_concurrency(concurrency)?;
         }
@@ -3700,10 +3716,17 @@ pub extern "system" fn Java_org_lance_Dataset_nativeExplainCleanupWithPolicy<'lo
     jdataset: JObject,
     jpolicy: JObject,
     jmax_candidate_files: JObject,
+    jkeep_one_per_millis: JObject,
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
-        inner_explain_cleanup_with_policy(&mut env, jdataset, jpolicy, jmax_candidate_files)
+        inner_explain_cleanup_with_policy(
+            &mut env,
+            jdataset,
+            jpolicy,
+            jmax_candidate_files,
+            jkeep_one_per_millis
+        )
     )
 }
 
@@ -3712,8 +3735,19 @@ fn inner_explain_cleanup_with_policy<'local>(
     jdataset: JObject,
     jpolicy: JObject,
     jmax_candidate_files: JObject,
+    jkeep_one_per_millis: JObject,
 ) -> Result<JObject<'local>> {
     let policy = extract_cleanup_policy(env, &jpolicy)?;
+    let keep_one_per = env.get_optional(&jkeep_one_per_millis, |env, obj| {
+        let value = env.call_method(obj, "longValue", "()J", &[])?.j()?;
+        u64::try_from(value)
+            .map(Duration::from_millis)
+            .map_err(|_| {
+                Error::input_error(format!(
+                    "keep_one_per must be positive, got {value} milliseconds"
+                ))
+            })
+    })?;
     let max_candidate_files = env
         .get_optional(&jmax_candidate_files, |env, inner| {
             Ok(env.call_method(inner, "longValue", "()J", &[])?.j()?)
@@ -3732,6 +3766,9 @@ fn inner_explain_cleanup_with_policy<'local>(
         let dataset =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }?;
         let mut operation = dataset.inner.cleanup(policy);
+        if let Some(period) = keep_one_per {
+            operation = operation.with_keep_one_per(period)?;
+        }
         if let Some(limit) = max_candidate_files {
             operation = operation.with_max_candidate_files(limit);
         }

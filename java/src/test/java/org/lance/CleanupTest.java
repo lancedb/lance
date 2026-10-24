@@ -31,11 +31,62 @@ import java.time.Duration;
 import java.util.EnumSet;
 import java.util.List;
 import java.util.Set;
+import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class CleanupTest {
+  @Test
+  public void testCleanupKeepOnePer(@TempDir Path tempDir) {
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset fixture =
+          new TestUtils.SimpleTestDataset(allocator, "shared-memory://" + tempDir.getFileName());
+      fixture.createEmptyDataset().close();
+      fixture.write(1, 10).close();
+      fixture.write(2, 10).close();
+      try (Dataset dataset = fixture.write(3, 10)) {
+        CleanupOperation recent =
+            dataset.cleanup(CleanupPolicy.builder().build()).withKeepOnePer(Duration.ofDays(1));
+        assertEquals(0L, recent.explain().getStats().getOldVersions());
+        CleanupPolicy policy =
+            CleanupPolicy.builder()
+                .withBeforeTimestampMillis(System.currentTimeMillis() + 1000)
+                .build();
+        CleanupOperation cleanup =
+            dataset.cleanup(policy).withKeepOnePer(Duration.ofDays(365L * 10_000));
+        assertEquals(2L, cleanup.explain().getStats().getOldVersions());
+        assertEquals(4, dataset.listVersions().size());
+        assertEquals(2L, cleanup.execute().getOldVersions());
+        assertEquals(
+            List.of(3L, 4L),
+            dataset.listVersions().stream().map(Version::getId).collect(Collectors.toList()));
+        Assertions.assertThrows(
+            IllegalArgumentException.class,
+            () -> dataset.cleanup(policy).withKeepOnePer(Duration.ZERO));
+        Assertions.assertThrows(
+            IllegalArgumentException.class,
+            () -> dataset.cleanup(policy).withKeepOnePer(Duration.ofNanos(1)));
+      }
+    }
+  }
+
+  @Test
+  public void testCleanupRejectsThinningOnNonLexicalStorage(@TempDir Path tempDir) {
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset fixture =
+          new TestUtils.SimpleTestDataset(allocator, tempDir.resolve("unsupported").toString());
+      try (Dataset dataset = fixture.createEmptyDataset()) {
+        CleanupOperation cleanup =
+            dataset.cleanup(CleanupPolicy.builder().build()).withKeepOnePer(Duration.ofDays(1));
+        RuntimeException error = Assertions.assertThrows(RuntimeException.class, cleanup::explain);
+        assertTrue(error.getMessage().contains("keep_one_per requires lexicographically"));
+        Assertions.assertThrows(RuntimeException.class, cleanup::execute);
+        assertEquals(1, dataset.listVersions().size());
+      }
+    }
+  }
+
   @Test
   public void testCleanupBeforeVersion(@TempDir Path tempDir) {
     String datasetPath = tempDir.resolve("test_dataset_for_cleanup").toString();

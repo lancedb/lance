@@ -3431,6 +3431,7 @@ class LanceDataset(pa.dataset.Dataset):
         delete_rate_limit: Optional[int] = None,
         versions: Optional[List[int]] = None,
         delete_concurrency: Optional[int] = None,
+        keep_one_per: Optional[timedelta] = None,
     ) -> CleanupStats:
         """
         Cleans up old versions of the dataset.
@@ -3486,18 +3487,31 @@ class LanceDataset(pa.dataset.Dataset):
             Clean up only the specified dataset versions. The current version is
             never removed, and tagged versions are still protected by
             ``error_if_tagged_old_versions``.
+
+        keep_one_per: timedelta, optional
+            Keep the newest eligible commit per UTC epoch-aligned period, breaking
+            timestamp ties by version. Must be positive. All versions newer than
+            ``older_than`` are retained; its default is two days when thinning is
+            enabled. Protected versions can add extra survivors to a period.
+            For daily history after two days, use
+            ``older_than=timedelta(days=2), keep_one_per=timedelta(days=1)``.
+            Requires lexicographically ordered storage listings, such as S3
+            Standard, GCS or Azure. Local filesystems and S3 Express are currently
+            unsupported because their version-hint readers cannot safely handle
+            sparse history.
         """
         if older_than is None and retain_versions is None and versions is None:
-            older_than = timedelta(days=14)
+            older_than = timedelta(days=2 if keep_one_per is not None else 14)
 
         return self._ds.cleanup_old_versions(
-            td_to_micros(older_than) if older_than else None,
+            td_to_micros(older_than) if older_than is not None else None,
             retain_versions,
             delete_unverified,
             error_if_tagged_old_versions,
             delete_rate_limit,
             versions,
             delete_concurrency,
+            td_to_micros(keep_one_per) if keep_one_per is not None else None,
         )
 
     def explain_cleanup_old_versions(
@@ -3511,6 +3525,7 @@ class LanceDataset(pa.dataset.Dataset):
         versions: Optional[List[int]] = None,
         include_files: bool = False,
         max_files: int = 1000,
+        keep_one_per: Optional[timedelta] = None,
     ) -> CleanupExplanation:
         """
         Explain what :meth:`cleanup_old_versions` would remove without deleting files.
@@ -3545,14 +3560,20 @@ class LanceDataset(pa.dataset.Dataset):
         max_files: int, default 1000
             Maximum number of candidate files to include when ``include_files``
             is `True`.
+
+        keep_one_per: timedelta, optional
+            Keep the newest eligible commit per UTC epoch-aligned period, as in
+            :meth:`cleanup_old_versions`. Must be positive. When set, the default
+            age cutoff is two days.
+            Requires storage with lexicographically ordered listings.
         """
         if older_than is None and retain_versions is None and versions is None:
-            older_than = timedelta(days=14)
+            older_than = timedelta(days=2 if keep_one_per is not None else 14)
         if max_files <= 0:
             raise ValueError("max_files must be positive")
 
         return self._ds.explain_cleanup_old_versions(
-            td_to_micros(older_than) if older_than else None,
+            td_to_micros(older_than) if older_than is not None else None,
             retain_versions,
             delete_unverified,
             error_if_tagged_old_versions,
@@ -3560,6 +3581,7 @@ class LanceDataset(pa.dataset.Dataset):
             versions,
             include_files,
             max_files,
+            td_to_micros(keep_one_per) if keep_one_per is not None else None,
         )
 
     def _prepare_scalar_index_request(

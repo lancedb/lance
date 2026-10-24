@@ -1821,6 +1821,47 @@ def test_cleanup_with_retain_versions(tmp_path: Path):
     assert ds.count_rows() == len(ds.to_table())
 
 
+@pytest.mark.parametrize("period", [timedelta(0), timedelta(microseconds=-1)])
+def test_cleanup_rejects_invalid_keep_one_per(tmp_path: Path, period):
+    ds = lance.write_dataset(pa.table({"a": [1, 2]}), tmp_path)
+    with pytest.raises(OSError, match="keep_one_per"):
+        ds.cleanup_old_versions(keep_one_per=period)
+    with pytest.raises(OSError, match="keep_one_per"):
+        ds.explain_cleanup_old_versions(keep_one_per=period)
+    assert len(ds.versions()) == 1
+
+
+def test_cleanup_keeps_one_per_period(tmp_path: Path):
+    uri = f"shared-memory://{tmp_path.name}"
+    table = pa.table({"a": [1, 2, 3, 4]})
+    ds = lance.write_dataset(table, uri, max_rows_per_file=2)
+    for _ in range(3):
+        ds = lance.write_dataset(table, uri, mode="overwrite", max_rows_per_file=2)
+    assert ds.cleanup_old_versions(keep_one_per=timedelta(days=1)).old_versions == 0
+    period = timedelta(days=365 * 10_000)
+    explanation = ds.explain_cleanup_old_versions(
+        older_than=timedelta(0), keep_one_per=period
+    )
+    assert explanation.stats.old_versions == 2
+    assert len(ds.versions()) == 4
+    stats = ds.cleanup_old_versions(older_than=timedelta(0), keep_one_per=period)
+    assert stats.old_versions == explanation.stats.old_versions
+    assert stats.data_files_removed == explanation.stats.data_files_removed == 4
+    assert stats.bytes_removed == explanation.stats.bytes_removed
+    assert [v["version"] for v in ds.versions()] == [3, 4]
+    assert lance.dataset(uri, version=3).to_table() == table
+    assert ds.to_table() == table
+
+
+def test_cleanup_rejects_thinning_on_non_lexical_storage(tmp_path: Path):
+    ds = lance.write_dataset(pa.table({"a": [1, 2]}), tmp_path)
+    with pytest.raises(OSError, match="keep_one_per requires lexicographically"):
+        ds.cleanup_old_versions(keep_one_per=timedelta(days=1))
+    with pytest.raises(OSError, match="keep_one_per requires lexicographically"):
+        ds.explain_cleanup_old_versions(keep_one_per=timedelta(days=1))
+    assert len(ds.versions()) == 1
+
+
 def test_cleanup_specific_versions(tmp_path: Path):
     base_dir = tmp_path / "cleanup_specific_versions"
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})

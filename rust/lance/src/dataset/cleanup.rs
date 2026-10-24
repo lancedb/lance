@@ -343,6 +343,7 @@ struct CleanupTask<'a> {
     delete_execution: Option<Arc<DeleteExecution>>,
     dataset: &'a Dataset,
     policy: CleanupPolicy,
+    keep_one_per: Option<Duration>,
     action: CleanupAction,
     read_version: u64,
     ignored_manifests: HashSet<Path>,
@@ -378,6 +379,7 @@ struct CleanupInspection {
     // only whether they found owner paths, not another copy of all references.
     managed_scans: HashMap<ManagedScanKey, Arc<OnceCell<bool>>>,
     old_manifests: HashMap<Path, ExpiredManifest>,
+    bucket_survivors: HashMap<u128, (u128, ManifestLocation)>,
     /// Store records to retire once their manifests are gone, by version;
     /// see `CommitHandler::forget_version`.
     retired_records: HashMap<u64, String>,
@@ -455,6 +457,7 @@ pub struct CleanupOperation<'a> {
     max_candidate_files: usize,
     delete_concurrency: Option<usize>,
     delete_rate_limit: Option<u64>,
+    keep_one_per: Option<Duration>,
 }
 
 impl<'a> CleanupOperation<'a> {
@@ -465,7 +468,52 @@ impl<'a> CleanupOperation<'a> {
             max_candidate_files: DEFAULT_EXPLANATION_MAX_CANDIDATE_FILES,
             delete_concurrency: None,
             delete_rate_limit: None,
+            keep_one_per: None,
         }
+    }
+
+    /// Keep the newest eligible version in each UTC epoch-aligned time bucket.
+    ///
+    /// Buckets use logical commit timestamps, with the higher version breaking ties.
+    /// Only versions matching all policy filters participate. Tags, current/newer
+    /// versions and branch dependencies retain their usual protection, so a bucket
+    /// may contain additional protected versions. Without a timestamp filter, keep
+    /// all versions from the last two days; set [`CleanupPolicy::before_timestamp`]
+    /// to configure this age cutoff. Without this option, cleanup deletes every
+    /// eligible version as before. A zero period returns an invalid-input error.
+    /// Requires lexicographically ordered object-store listings (for example,
+    /// S3 Standard, GCS or Azure). Non-lexical stores, including local filesystems
+    /// and S3 Express, return a not-supported error: their version-hint readers
+    /// cannot safely discover the latest version through sparse history.
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # use lance::dataset::cleanup::CleanupPolicyBuilder;
+    /// # use chrono::{Utc, TimeDelta};
+    /// # use std::time::Duration;
+    /// # async fn example(dataset: &Dataset) -> Result<()> {
+    /// let policy = CleanupPolicyBuilder::default()
+    ///     .before_timestamp(Utc::now() - TimeDelta::days(2))
+    ///     .build();
+    /// dataset.cleanup(policy)
+    ///     .with_keep_one_per(Duration::from_secs(86_400))?
+    ///     .execute().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_keep_one_per(mut self, period: Duration) -> Result<Self> {
+        if period.is_zero() {
+            return Err(Error::invalid_input(
+                "keep_one_per must be greater than zero",
+            ));
+        }
+        if !self.dataset.object_store.list_is_lexically_ordered {
+            return Err(Error::not_supported(
+                "keep_one_per requires lexicographically ordered listings; version-hint readers on non-lexical stores cannot safely read sparse history",
+            ));
+        }
+        self.keep_one_per = Some(period);
+        Ok(self)
     }
 
     /// Set the maximum in-flight file deletes shared with all cascaded branches.
@@ -571,6 +619,10 @@ impl<'a> CleanupTask<'a> {
         include_referenced_branches: bool,
         mut delete_execution: Option<Arc<DeleteExecution>>,
     ) -> Result<Self> {
+        let mut policy = operation.policy.clone();
+        if operation.keep_one_per.is_some() && policy.before_timestamp.is_none() {
+            policy.before_timestamp = Some(utc_now() - TimeDelta::days(2));
+        }
         if action.deletes_files() && delete_execution.is_none() {
             let concurrency = operation
                 .delete_concurrency
@@ -589,7 +641,8 @@ impl<'a> CleanupTask<'a> {
         Ok(Self {
             delete_execution,
             dataset: operation.dataset,
-            policy: operation.policy.clone(),
+            policy,
+            keep_one_per: operation.keep_one_per,
             action,
             read_version: operation.dataset.version().version,
             ignored_manifests,
@@ -689,8 +742,31 @@ impl<'a> CleanupTask<'a> {
             .list_manifest_locations(&self.dataset.base, &self.dataset.object_store, false)
             .try_filter(|location| future::ready(!self.ignored_manifests.contains(&location.path)))
             .try_for_each_concurrent(self.dataset.object_store.io_parallelism(), |location| {
-                self.process_manifest_file(location, &inspection, tagged_versions, &branch_versions)
+                self.process_manifest_file(
+                    location,
+                    &inspection,
+                    tagged_versions,
+                    &branch_versions,
+                    false,
+                )
             })
+            .await?;
+        let survivors = std::mem::take(&mut inspection.lock().unwrap().bucket_survivors);
+        // Re-read only one manifest per occupied bucket, keeping the planning pass
+        // bounded by bucket count rather than retaining large manifests in memory.
+        stream::iter(survivors.into_values().map(Ok))
+            .try_for_each_concurrent(
+                self.dataset.object_store.io_parallelism(),
+                |(_, location)| {
+                    self.process_manifest_file(
+                        location,
+                        &inspection,
+                        tagged_versions,
+                        &branch_versions,
+                        true,
+                    )
+                },
+            )
             .await?;
         Ok(inspection.into_inner().unwrap())
     }
@@ -790,6 +866,7 @@ impl<'a> CleanupTask<'a> {
         inspection: &Mutex<CleanupInspection>,
         tagged_versions: &HashSet<u64>,
         branch_versions: &HashSet<u64>,
+        retain_bucket_survivor: bool,
     ) -> Result<()> {
         // Reading an expired manifest only ever produced `verified_files`, the evidence
         // that a file came from a version we are deleting. `delete_unverified` says that
@@ -800,6 +877,7 @@ impl<'a> CleanupTask<'a> {
         // cleaned them, where almost every manifest is expired. Branch roots must also
         // be read: lineage retention can rescue them and their own FRI row maps later.
         if self.policy.delete_unverified
+            && self.keep_one_per.is_none()
             && !tagged_versions.contains(&location.version)
             && !branch_versions.contains(&location.version)
             && location.version < self.read_version
@@ -869,7 +947,10 @@ impl<'a> CleanupTask<'a> {
         // version.  These are either in-progress or newly added since we started.
         let is_latest = self.read_version <= manifest.version;
         let is_tagged = tagged_versions.contains(&manifest.version);
-        let in_working_set = is_latest || !self.policy.should_clean(&manifest) || is_tagged;
+        let in_working_set = retain_bucket_survivor
+            || is_latest
+            || !self.policy.should_clean(&manifest)
+            || is_tagged;
         if manifest.has_managed_blobs() {
             let snapshot = self
                 .dataset
@@ -889,6 +970,17 @@ impl<'a> CleanupTask<'a> {
         self.process_manifest(&manifest, &indexes, in_working_set, &mut inspection)?;
         let commit_ts = manifest.timestamp();
         if !in_working_set {
+            if let Some(period) = self.keep_one_per {
+                let bucket = manifest.timestamp_nanos / period.as_nanos();
+                let candidate = (manifest.timestamp_nanos, manifest.version);
+                let survivor = inspection
+                    .bucket_survivors
+                    .entry(bucket)
+                    .or_insert_with(|| (manifest.timestamp_nanos, location.clone()));
+                if candidate > (survivor.0, survivor.1.version) {
+                    *survivor = (manifest.timestamp_nanos, location.clone());
+                }
+            }
             inspection.old_manifests.insert(
                 location.path.clone(),
                 ExpiredManifest {
@@ -908,6 +1000,10 @@ impl<'a> CleanupTask<'a> {
                 _ => inspection.latest_deleted_manifest_time = Some(commit_ts),
             }
         } else {
+            if retain_bucket_survivor {
+                inspection.old_manifests.remove(&location.path);
+                inspection.retired_records.remove(&manifest.version);
+            }
             match inspection.earliest_retained_manifest_time {
                 Some(ts) if commit_ts >= ts => {}
                 _ => inspection.earliest_retained_manifest_time = Some(commit_ts),
@@ -2416,7 +2512,9 @@ async fn cleanup_cascade_branch_run(
 /// Build the eligible automatic cleanup policy from the manifest configuration.
 ///
 /// The returned policy includes the legacy QPS field, but not operation-level
-/// concurrency. Use [`auto_cleanup_hook`] to execute with all configured limits.
+/// concurrency. Time-bucket retention cannot be represented by this legacy
+/// policy type and returns an error instead of silently discarding its survivors.
+/// Use [`auto_cleanup_hook`] to execute with all configured options.
 ///
 /// ```
 /// # use lance::{Dataset, Result};
@@ -2430,9 +2528,16 @@ pub async fn build_cleanup_policy(
     dataset: &Dataset,
     manifest: &Manifest,
 ) -> Result<Option<CleanupPolicy>> {
-    Ok(build_cleanup_operation(dataset, manifest, false)
-        .await?
-        .map(|operation| operation.policy))
+    let operation = build_cleanup_operation(dataset, manifest, false).await?;
+    if operation
+        .as_ref()
+        .is_some_and(|operation| operation.keep_one_per.is_some())
+    {
+        return Err(Error::not_supported(
+            "build_cleanup_policy cannot represent keep_one_per retention; use auto_cleanup_hook instead",
+        ));
+    }
+    Ok(operation.map(|operation| operation.policy))
 }
 
 async fn build_cleanup_operation<'a>(
@@ -2518,6 +2623,12 @@ async fn build_cleanup_operation<'a>(
     }
 
     let mut operation = dataset.cleanup(builder.build());
+    if let Some(value) = manifest.config.get("lance.auto_cleanup.keep_one_per") {
+        let period = parse_duration(value).map_err(|error| Error::Cleanup {
+            message: format!("Error parsing lance.auto_cleanup.keep_one_per={value:?}: {error}"),
+        })?;
+        operation = operation.with_keep_one_per(period)?;
+    }
     if !cascade && let Some(value) = manifest.config.get("lance.auto_cleanup.delete_concurrency") {
         let concurrency = value.parse::<usize>().map_err(|error| Error::Cleanup {
             message: format!(
@@ -2577,6 +2688,7 @@ mod tests {
     use arrow::compute;
     use arrow_array::{
         Int32Array, RecordBatch, RecordBatchIterator, RecordBatchReader, UInt64Array,
+        types::Int32Type,
     };
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use datafusion::common::assert_contains;
@@ -2594,6 +2706,235 @@ mod tests {
     use object_store::throttle::{ThrottleConfig, ThrottledStore};
     use rstest::rstest;
     use uuid::Uuid;
+
+    #[rstest]
+    #[case::daily(24, vec![4, 7, 8, 9, 10])]
+    #[case::twice_daily(12, vec![2, 4, 7, 8, 9, 10])]
+    #[tokio::test]
+    async fn cleanup_keeps_one_per_period(
+        #[case] period_hours: u64,
+        #[case] expected_versions: Vec<u64>,
+        #[values(false, true)] delete_unverified: bool,
+        #[values(false, true)] auto_config: bool,
+    ) {
+        let fixture = MockDatasetFixture::try_new_in_memory().unwrap();
+        for (index, hour) in [0, 2, 1, 12, 24, 26, 26, 48, 49, 72]
+            .into_iter()
+            .enumerate()
+        {
+            MockClock::set_system_time(Duration::from_secs(hour * 3600));
+            let data = lance_datagen::gen_batch()
+                .col("value", lance_datagen::array::step::<Int32Type>())
+                .into_reader_rows(2.into(), 2.into());
+            Dataset::write(
+                data,
+                &fixture.dataset_path,
+                Some(WriteParams {
+                    mode: if index == 0 {
+                        WriteMode::Create
+                    } else {
+                        WriteMode::Overwrite
+                    },
+                    max_rows_per_file: 2,
+                    store_params: Some(fixture.os_params()),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        }
+        MockClock::set_system_time(Duration::from_secs(96 * 3600));
+        let dataset = fixture.open().await.unwrap();
+        let expected_data = dataset.scan().try_into_batch().await.unwrap();
+        let policy = CleanupPolicyBuilder::default()
+            .delete_unverified(delete_unverified)
+            .build();
+        let operation = if auto_config {
+            let mut manifest = dataset.manifest.as_ref().clone();
+            manifest.config.extend([
+                ("lance.auto_cleanup.interval".into(), "1".into()),
+                (
+                    "lance.auto_cleanup.keep_one_per".into(),
+                    format!("{period_hours}h"),
+                ),
+            ]);
+            let mut operation = build_cleanup_operation(&dataset, &manifest, false)
+                .await
+                .unwrap()
+                .unwrap();
+            operation.policy.delete_unverified = delete_unverified;
+            operation
+        } else {
+            dataset
+                .cleanup(policy)
+                .with_keep_one_per(Duration::from_secs(period_hours * 3600))
+                .unwrap()
+        };
+        let before = fixture.count_files().await.unwrap();
+        let explanation = operation.explain().await.unwrap();
+        assert_eq!(before, fixture.count_files().await.unwrap());
+        let stats = operation.execute().await.unwrap();
+        assert_eq!(stats, explanation.stats);
+        assert_eq!(stats.old_versions, 10 - expected_versions.len() as u64);
+        assert_eq!(stats.data_files_removed, stats.old_versions * 2);
+        assert_eq!(
+            dataset
+                .version_refs()
+                .await
+                .unwrap()
+                .iter()
+                .map(|v| v.version)
+                .collect::<Vec<_>>(),
+            expected_versions
+        );
+        for version in expected_versions {
+            let snapshot = dataset.checkout_version(version).await.unwrap();
+            assert_eq!(snapshot.get_fragments().len(), 2);
+            assert_eq!(
+                snapshot.scan().try_into_batch().await.unwrap(),
+                expected_data
+            );
+        }
+        assert_eq!(operation.execute().await.unwrap().old_versions, 0);
+    }
+
+    #[tokio::test]
+    async fn cleanup_thinning_respects_filters_and_tags() {
+        MockClock::set_system_time(Duration::ZERO);
+        let fixture = MockDatasetFixture::try_new_in_memory().unwrap();
+        fixture.create_some_data().await.unwrap();
+        fixture.overwrite_some_data().await.unwrap();
+        fixture.overwrite_some_data().await.unwrap();
+        fixture.overwrite_some_data().await.unwrap();
+        let dataset = fixture.open().await.unwrap();
+        dataset.tags().create("keep-first", 1).await.unwrap();
+        let policy = CleanupPolicyBuilder::default()
+            .before_timestamp(utc_now() + TimeDelta::seconds(1))
+            .versions(vec![1, 2, 3])
+            .unwrap()
+            .build();
+        let operation = dataset
+            .cleanup(policy.clone())
+            .with_keep_one_per(Duration::from_secs(1))
+            .unwrap();
+        let error = operation.execute().await.unwrap_err();
+        assert!(matches!(error, Error::Cleanup { .. }));
+        assert_contains!(error.to_string(), "keep-first");
+        assert_eq!(dataset.version_refs().await.unwrap().len(), 4);
+        let operation = dataset
+            .cleanup(CleanupPolicy {
+                error_if_tagged_old_versions: false,
+                ..policy
+            })
+            .with_keep_one_per(Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(operation.explain().await.unwrap().stats.old_versions, 1);
+        assert_eq!(operation.execute().await.unwrap().old_versions, 1);
+        assert_eq!(
+            dataset
+                .version_refs()
+                .await
+                .unwrap()
+                .iter()
+                .map(|v| v.version)
+                .collect::<Vec<_>>(),
+            vec![1, 3, 4]
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_thinning_rejects_invalid_period() {
+        let fixture = MockDatasetFixture::try_new_in_memory().unwrap();
+        fixture.create_some_data().await.unwrap();
+        let dataset = fixture.open().await.unwrap();
+        let error = dataset
+            .cleanup(CleanupPolicy::default())
+            .with_keep_one_per(Duration::ZERO)
+            .err()
+            .unwrap();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert_contains!(error.to_string(), "keep_one_per");
+        let mut manifest = dataset.manifest.as_ref().clone();
+        manifest
+            .config
+            .insert("lance.auto_cleanup.interval".into(), "1".into());
+        manifest
+            .config
+            .insert("lance.auto_cleanup.keep_one_per".into(), "1day".into());
+        let error = build_cleanup_policy(&dataset, &manifest).await.unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }));
+        assert_contains!(error.to_string(), "keep_one_per");
+        for value in ["0s", "invalid"] {
+            manifest
+                .config
+                .insert("lance.auto_cleanup.keep_one_per".into(), value.into());
+            let error = build_cleanup_operation(&dataset, &manifest, false)
+                .await
+                .err()
+                .unwrap();
+            assert_contains!(error.to_string(), "keep_one_per");
+        }
+    }
+
+    #[tokio::test]
+    async fn cleanup_thinning_preserves_branch_dependencies() {
+        MockClock::set_system_time(Duration::ZERO);
+        let fixture = MockDatasetFixture::try_new_in_memory().unwrap();
+        fixture.create_some_data().await.unwrap();
+        let mut parent = fixture.open().await.unwrap();
+        let branch = fixture
+            .create_branch_and_load(&mut parent, "keep-root", (None, None))
+            .await
+            .unwrap();
+        let expected = branch.scan().try_into_batch().await.unwrap();
+        MockClock::set_system_time(Duration::from_secs(1));
+        fixture.overwrite_some_data().await.unwrap();
+        MockClock::set_system_time(Duration::from_secs(2));
+        fixture.overwrite_some_data().await.unwrap();
+        let parent = fixture.open().await.unwrap();
+        let operation = parent
+            .cleanup(
+                CleanupPolicyBuilder::default()
+                    .before_timestamp(utc_now())
+                    .build(),
+            )
+            .with_keep_one_per(Duration::from_secs(60))
+            .unwrap();
+        assert_eq!(operation.execute().await.unwrap().old_versions, 0);
+        let branch = parent.checkout_version(("keep-root", None)).await.unwrap();
+        assert_eq!(branch.scan().try_into_batch().await.unwrap(), expected);
+        assert_eq!(parent.version_refs().await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn cleanup_thinning_rejects_non_lexical_storage() {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        fixture.overwrite_some_data().await.unwrap();
+        let dataset = fixture.open().await.unwrap();
+        assert!(!dataset.object_store.list_is_lexically_ordered);
+        let before = fixture.count_files().await.unwrap();
+        let error = dataset
+            .cleanup(CleanupPolicy::default())
+            .with_keep_one_per(Duration::from_secs(2))
+            .err()
+            .unwrap();
+        assert!(matches!(error, Error::NotSupported { .. }));
+        assert_contains!(error.to_string(), "version-hint readers");
+        let mut manifest = dataset.manifest.as_ref().clone();
+        manifest.config.extend([
+            ("lance.auto_cleanup.interval".into(), "1".into()),
+            ("lance.auto_cleanup.keep_one_per".into(), "2s".into()),
+        ]);
+        let error = build_cleanup_operation(&dataset, &manifest, false)
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(error, Error::NotSupported { .. }));
+        assert_contains!(error.to_string(), "version-hint readers");
+        assert_eq!(before, fixture.count_files().await.unwrap());
+        assert_eq!(dataset.version_refs().await.unwrap().len(), 2);
+    }
 
     #[rstest]
     #[case::default(None, false)]
@@ -2823,6 +3164,12 @@ mod tests {
     }
 
     impl MockDatasetFixture {
+        fn try_new_in_memory() -> Result<Self> {
+            let mut fixture = Self::try_new()?;
+            fixture.dataset_path = format!("shared-memory://{}/my_db", Uuid::new_v4());
+            Ok(fixture)
+        }
+
         fn try_new() -> Result<Self> {
             let tmpdir = TempStrDir::default();
             let tmpdir_path = tmpdir.as_str();
@@ -3593,6 +3940,7 @@ mod tests {
                 &Mutex::new(CleanupInspection::default()),
                 &HashSet::new(),
                 &HashSet::new(),
+                false,
             )
             .await
             .unwrap();

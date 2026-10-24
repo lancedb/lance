@@ -554,6 +554,7 @@ class _Dataset:
         delete_rate_limit: Optional[int] = None,
         versions: Optional[List[int]] = None,
         delete_concurrency: Optional[int] = None,
+        keep_one_per_micros: Optional[int] = None,
     ) -> CleanupStats: ...
     def explain_cleanup_old_versions(
         self,
@@ -565,6 +566,7 @@ class _Dataset:
         versions: Optional[List[int]] = None,
         include_files: bool = False,
         max_files: int = 1000,
+        keep_one_per_micros: Optional[int] = None,
     ) -> CleanupExplanation: ...
     def get_version(self, tag: str) -> int: ...
     # Tag operations
