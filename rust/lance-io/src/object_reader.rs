@@ -467,7 +467,7 @@ impl Reader for SmallReader {
     }
 
     fn get_all(&self) -> BoxFuture<'_, OSResult<Bytes>> {
-        Box::pin(async move { self.inner.wait().await })
+        Box::pin(async move { self.inner.wait().await.map_err(object_store::Error::from) })
     }
 }
 
