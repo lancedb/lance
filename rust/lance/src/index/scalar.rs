@@ -291,13 +291,22 @@ pub(crate) async fn load_fts_training_data(
     train: bool,
     fragment_ids: Option<Vec<u32>>,
 ) -> Result<SendableRecordBatchStream> {
+    // Row-count batching alone can retain large decoded text buffers in the
+    // scanner and indexing workers. Keep explicit reader settings, and apply
+    // a byte target only to this training scan, not to the caller's dataset.
+    let mut dataset = dataset.clone();
+    dataset
+        .file_reader_options
+        .get_or_insert_with(Default::default)
+        .batch_size_bytes
+        .get_or_insert(16 * 1024 * 1024);
     let scan_column = if resolved.has_lists() {
         resolved.root_column.as_str()
     } else {
         resolved.canonical_path.as_str()
     };
     let stream = load_training_data(
-        dataset,
+        &dataset,
         scan_column,
         criteria,
         fragments,
@@ -1602,6 +1611,77 @@ mod tests {
             }
         }
         assert_eq!(max_frag_id_seen, 3);
+    }
+
+    #[rstest::rstest]
+    #[case::default_limit(None)]
+    #[case::explicit_limit(Some(64 * 1024 * 1024))]
+    #[tokio::test]
+    async fn test_fts_training_scan_byte_target(#[case] byte_target: Option<u64>) {
+        async fn largest_original_batch(dataset: &Dataset) -> usize {
+            let mut scan = dataset.scan();
+            scan.project(&["content"]).unwrap();
+            scan.try_into_stream()
+                .await
+                .unwrap()
+                .map_ok(|batch| batch.num_rows())
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap()
+                .into_iter()
+                .max()
+                .unwrap()
+        }
+
+        let text = "x".repeat(512 * 1024);
+        let mut dataset = lance_datagen::gen_batch()
+            .col("content", array::fill_utf8(text.clone()))
+            .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(40))
+            .await
+            .unwrap();
+        if let Some(byte_target) = byte_target {
+            dataset.file_reader_options = Some(lance_file::reader::FileReaderOptions {
+                batch_size_bytes: Some(byte_target),
+                read_chunk_size: 1024 * 1024,
+                ..Default::default()
+            });
+        }
+        assert!(largest_original_batch(&dataset).await >= 40);
+        let resolved = inverted::resolve_fts_field(
+            dataset.schema(),
+            "content",
+            InvertedIndexParams::default().get_document_granularity(),
+        )
+        .unwrap();
+        let mut stream = load_fts_training_data(
+            &dataset,
+            &resolved,
+            &TrainingCriteria::new(TrainingOrdering::None).with_row_id(),
+            None,
+            true,
+            None,
+        )
+        .await
+        .unwrap();
+        let mut batch_rows = Vec::new();
+        while let Some(batch) = stream.try_next().await.unwrap() {
+            batch_rows.push(batch.num_rows());
+            let values = batch[VALUE_COLUMN_NAME].as_string::<i32>();
+            for value in values.iter() {
+                assert_eq!(value, Some(text.as_str()));
+            }
+        }
+        assert_eq!(batch_rows.iter().sum::<usize>(), 80);
+        if byte_target.is_none() {
+            assert!(batch_rows.iter().all(|&rows| rows < 40), "{batch_rows:?}");
+            assert!(dataset.file_reader_options.is_none());
+        } else {
+            assert!(batch_rows.iter().any(|&rows| rows >= 40), "{batch_rows:?}");
+            let options = dataset.file_reader_options.as_ref().unwrap();
+            assert_eq!(options.batch_size_bytes, byte_target);
+            assert_eq!(options.read_chunk_size, 1024 * 1024);
+        }
+        assert!(largest_original_batch(&dataset).await >= 40);
     }
 
     #[tokio::test]
