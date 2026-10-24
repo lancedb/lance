@@ -2,6 +2,9 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::*;
+use crate::scalar::RowAddrTranslatorRef;
+use lance_core::utils::row_addr_remap::RowAddrRemap;
+use lance_index_core::remapping::RowAddrTranslator;
 
 #[derive(Debug, Default)]
 pub(in super::super) struct InvertedPrewarmState {
@@ -31,6 +34,9 @@ pub struct InvertedIndex {
     // Fragments which are contained in the index, but no longer in the dataset.
     // These should be pruned at search time since we don't prune them at update time.
     pub(super) deleted_fragments: RoaringBitmap,
+    /// Rows this segment may report, intersected into every mask it searches with.
+    /// See [`Self::with_allowed_rows`].
+    pub(super) allowed_rows: Option<Arc<RowAddrMask>>,
 }
 
 impl Debug for InvertedIndex {
@@ -143,11 +149,32 @@ impl InvertedIndex {
         &self.deleted_fragments
     }
 
+    /// Only report rows that `allowed` selects.
+    ///
+    /// A segment's postings describe rows as they were when it covered their fragments.
+    /// Under stable row ids a rewritten row keeps its row id while it moves to a fragment
+    /// another segment may cover, so the old segment still lists it under its old tokens
+    /// and a prefilter built over the union of all segments lets it through. The opener
+    /// passes the live rows currently stored in the fragments this segment covers.
+    pub fn with_allowed_rows(mut self, allowed: Arc<RowAddrMask>) -> Self {
+        self.allowed_rows = Some(allowed);
+        self
+    }
+
+    /// The mask this segment searches with: `mask` restricted to its allowed rows.
+    pub(crate) fn restrict_mask(&self, mask: Arc<RowAddrMask>) -> Arc<RowAddrMask> {
+        match &self.allowed_rows {
+            None => mask,
+            Some(allowed) if mask.is_select_all() => allowed.clone(),
+            Some(allowed) => Arc::new(mask.as_ref().clone() & allowed.as_ref().clone()),
+        }
+    }
+
     pub async fn merge_segments(
         segments: &[Arc<Self>],
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
-        old_data_filter: Option<OldIndexDataFilter>,
+        old_data_filters: &[Option<OldIndexDataFilter>],
         progress: Arc<dyn IndexBuildProgress>,
     ) -> Result<CreatedIndex> {
         let Some(first) = segments.first() else {
@@ -187,7 +214,7 @@ impl InvertedIndex {
             .with_token_set_format(first.token_set_format)
             .with_format_version(first.format_version());
         let files = builder
-            .update_from_segments(new_data, dest_store, segments, old_data_filter)
+            .update_from_segments(new_data, dest_store, segments, old_data_filters)
             .await?;
 
         let details = pbold::InvertedIndexDetails::try_from(&first.params)?;
@@ -243,6 +270,7 @@ impl InvertedIndex {
             prewarm_state: self.prewarm_state.clone(),
             document_projections_resident: self.document_projections_resident.clone(),
             deleted_fragments: self.deleted_fragments.clone(),
+            allowed_rows: self.allowed_rows.clone(),
         }))
     }
 
@@ -310,6 +338,7 @@ impl InvertedIndex {
             prewarm_state: Arc::new(Mutex::new(InvertedPrewarmState::default())),
             document_projections_resident: Arc::new(AtomicBool::new(false)),
             deleted_fragments: RoaringBitmap::new(),
+            allowed_rows: None,
         }))
     }
 
@@ -379,6 +408,7 @@ impl InvertedIndex {
             prewarm_state: Arc::new(Mutex::new(InvertedPrewarmState::default())),
             document_projections_resident: Arc::new(AtomicBool::new(false)),
             deleted_fragments: RoaringBitmap::new(),
+            allowed_rows: None,
         }))
     }
 
@@ -534,6 +564,7 @@ impl InvertedIndex {
                     prewarm_state: Arc::new(Mutex::new(InvertedPrewarmState::default())),
                     document_projections_resident: Arc::new(AtomicBool::new(false)),
                     deleted_fragments,
+                    allowed_rows: None,
                 }))
             }
             Err(_) => {
@@ -646,6 +677,7 @@ impl InvertedIndex {
                     prewarm_state: Arc::new(Mutex::new(InvertedPrewarmState::default())),
                     document_projections_resident: Arc::new(AtomicBool::new(false)),
                     deleted_fragments,
+                    allowed_rows: None,
                 }))
             }
             Err(_) => {
@@ -706,7 +738,16 @@ impl Index for InvertedIndex {
     }
 
     async fn calculate_included_frags(&self) -> Result<RoaringBitmap> {
-        unimplemented!()
+        // The posting lists store row ids (trained with `with_row_id`), which
+        // no longer identify a fragment once stable row ids are enabled; the
+        // fragment bitmap recorded in the index metadata is authoritative.
+        // Return not_supported like MinHash LSH rather than derive a wrong set
+        // (`migrate_indices` handles the error without failing the commit).
+        Err(Error::not_supported(
+            "inverted indices do not recalculate fragment coverage from their files; \
+             the fragment bitmap of the index metadata is authoritative"
+                .to_string(),
+        ))
     }
 }
 
@@ -894,7 +935,7 @@ impl InvertedIndex {
     async fn do_search(&self, text: &str) -> Result<RecordBatch> {
         let params = FtsSearchParams::new();
         let mut tokenizer = self.tokenizer.clone();
-        let tokens = collect_query_tokens(text, &mut tokenizer);
+        let tokens = try_collect_query_tokens(text, &mut tokenizer)?;
 
         let (doc_ids, _) = self
             .bm25_search(
@@ -912,6 +953,30 @@ impl InvertedIndex {
             ROW_ID_SCHEMA.clone(),
             vec![Arc::new(UInt64Array::from(doc_ids))],
         )?)
+    }
+}
+
+impl InvertedIndex {
+    /// The one remap implementation: the legacy `remap` (an in-memory
+    /// mapping, borrowed as a synchronous translator) and `remap_streaming`
+    /// both come here, so neither copies a map nor delegates to the other.
+    async fn remap_with(
+        &self,
+        mapping: RowAddrTranslatorRef<'_>,
+        dest_store: &dyn IndexStore,
+    ) -> Result<CreatedIndex> {
+        let files = self
+            .to_builder()
+            .remap_with(mapping, self.store.clone(), dest_store)
+            .await?;
+
+        let details = pbold::InvertedIndexDetails::try_from(&self.params)?;
+
+        Ok(CreatedIndex {
+            index_details: prost_types::Any::from_msg(&details).unwrap(),
+            index_version: self.index_version(),
+            files,
+        })
     }
 }
 
@@ -949,18 +1014,15 @@ impl ScalarIndex for InvertedIndex {
         mapping: &RowAddrRemap,
         dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
-        let files = self
-            .to_builder()
-            .remap(mapping, self.store.clone(), dest_store)
-            .await?;
+        self.remap_with(mapping.into(), dest_store).await
+    }
 
-        let details = pbold::InvertedIndexDetails::try_from(&self.params)?;
-
-        Ok(CreatedIndex {
-            index_details: prost_types::Any::from_msg(&details).unwrap(),
-            index_version: self.index_version(),
-            files,
-        })
+    async fn remap_streaming(
+        &self,
+        translator: &RowAddrTranslator,
+        dest_store: &dyn IndexStore,
+    ) -> Result<CreatedIndex> {
+        self.remap_with(translator.as_ref(), dest_store).await
     }
 
     async fn update(
