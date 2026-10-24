@@ -2708,7 +2708,7 @@ mod tests {
             MockClock::set_system_time(Duration::from_secs(hour * 3600));
             let data = lance_datagen::gen_batch()
                 .col("value", lance_datagen::array::step::<Int32Type>())
-                .into_reader_rows(2, 2);
+                .into_reader_rows(2.into(), 2.into());
             Dataset::write(
                 data,
                 &fixture.dataset_path,
