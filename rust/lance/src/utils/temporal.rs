@@ -43,7 +43,7 @@ const MILLIS_TO_NANOS: u128 = 1_000_000;
 /// Formula: `max(current_time_nanos, prev_timestamp_nanos + 1ms)`
 ///
 /// If `prev_timestamp_nanos` is `None` (first version), returns the current time.
-pub(crate) fn monotonic_timestamp_nanos(
+pub fn monotonic_timestamp_nanos(
     timestamp: Option<SystemTime>,
     prev_timestamp_nanos: Option<u128>,
 ) -> Result<u128> {
