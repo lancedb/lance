@@ -1832,10 +1832,11 @@ def test_cleanup_rejects_invalid_keep_one_per(tmp_path: Path, period):
 
 
 def test_cleanup_keeps_one_per_period(tmp_path: Path):
+    uri = f"shared-memory://{tmp_path.name}"
     table = pa.table({"a": [1, 2, 3, 4]})
-    ds = lance.write_dataset(table, tmp_path, max_rows_per_file=2)
+    ds = lance.write_dataset(table, uri, max_rows_per_file=2)
     for _ in range(3):
-        ds = lance.write_dataset(table, tmp_path, mode="overwrite", max_rows_per_file=2)
+        ds = lance.write_dataset(table, uri, mode="overwrite", max_rows_per_file=2)
     assert ds.cleanup_old_versions(keep_one_per=timedelta(days=1)).old_versions == 0
     period = timedelta(days=365 * 10_000)
     explanation = ds.explain_cleanup_old_versions(
@@ -1848,8 +1849,17 @@ def test_cleanup_keeps_one_per_period(tmp_path: Path):
     assert stats.data_files_removed == explanation.stats.data_files_removed == 4
     assert stats.bytes_removed == explanation.stats.bytes_removed
     assert [v["version"] for v in ds.versions()] == [3, 4]
-    assert lance.dataset(tmp_path, version=3).to_table() == table
+    assert lance.dataset(uri, version=3).to_table() == table
     assert ds.to_table() == table
+
+
+def test_cleanup_rejects_thinning_on_non_lexical_storage(tmp_path: Path):
+    ds = lance.write_dataset(pa.table({"a": [1, 2]}), tmp_path)
+    with pytest.raises(OSError, match="keep_one_per requires lexicographically"):
+        ds.cleanup_old_versions(keep_one_per=timedelta(days=1))
+    with pytest.raises(OSError, match="keep_one_per requires lexicographically"):
+        ds.explain_cleanup_old_versions(keep_one_per=timedelta(days=1))
+    assert len(ds.versions()) == 1
 
 
 def test_cleanup_specific_versions(tmp_path: Path):

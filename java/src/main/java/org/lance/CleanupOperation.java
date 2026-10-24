@@ -46,7 +46,10 @@ public class CleanupOperation {
    * version. Tags, current/newer versions and branch dependencies remain protected, so a period may
    * contain additional protected versions. Defaults to retaining full history for two days; use
    * {@link CleanupPolicy.Builder#withBeforeTimestampMillis(long)} to configure the cutoff. Without
-   * this option, cleanup removes all eligible versions as before.
+   * this option, cleanup removes all eligible versions as before. Requires lexicographically
+   * ordered storage listings, such as S3 Standard, GCS or Azure. Local filesystems and S3 Express
+   * are currently unsupported because their version-hint readers cannot safely handle sparse
+   * history; rejected on explain or execute.
    *
    * <p>Example: {@code dataset.cleanup(policy).withKeepOnePer(Duration.ofDays(1)).execute()}.
    *

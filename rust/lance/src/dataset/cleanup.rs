@@ -481,6 +481,10 @@ impl<'a> CleanupOperation<'a> {
     /// all versions from the last two days; set [`CleanupPolicy::before_timestamp`]
     /// to configure this age cutoff. Without this option, cleanup deletes every
     /// eligible version as before. A zero period returns an invalid-input error.
+    /// Requires lexicographically ordered object-store listings (for example,
+    /// S3 Standard, GCS or Azure). Non-lexical stores, including local filesystems
+    /// and S3 Express, return a not-supported error: their version-hint readers
+    /// cannot safely discover the latest version through sparse history.
     ///
     /// ```
     /// # use lance::{Dataset, Result};
@@ -501,6 +505,11 @@ impl<'a> CleanupOperation<'a> {
         if period.is_zero() {
             return Err(Error::invalid_input(
                 "keep_one_per must be greater than zero",
+            ));
+        }
+        if !self.dataset.object_store.list_is_lexically_ordered {
+            return Err(Error::not_supported(
+                "keep_one_per requires lexicographically ordered listings; version-hint readers on non-lexical stores cannot safely read sparse history",
             ));
         }
         self.keep_one_per = Some(period);
@@ -2708,7 +2717,7 @@ mod tests {
         #[values(false, true)] delete_unverified: bool,
         #[values(false, true)] auto_config: bool,
     ) {
-        let fixture = MockDatasetFixture::try_new().unwrap();
+        let fixture = MockDatasetFixture::try_new_in_memory().unwrap();
         for (index, hour) in [0, 2, 1, 12, 24, 26, 26, 48, 49, 72]
             .into_iter()
             .enumerate()
@@ -2792,7 +2801,7 @@ mod tests {
     #[tokio::test]
     async fn cleanup_thinning_respects_filters_and_tags() {
         MockClock::set_system_time(Duration::ZERO);
-        let fixture = MockDatasetFixture::try_new().unwrap();
+        let fixture = MockDatasetFixture::try_new_in_memory().unwrap();
         fixture.create_some_data().await.unwrap();
         fixture.overwrite_some_data().await.unwrap();
         fixture.overwrite_some_data().await.unwrap();
@@ -2835,7 +2844,7 @@ mod tests {
 
     #[tokio::test]
     async fn cleanup_thinning_rejects_invalid_period() {
-        let fixture = MockDatasetFixture::try_new().unwrap();
+        let fixture = MockDatasetFixture::try_new_in_memory().unwrap();
         fixture.create_some_data().await.unwrap();
         let dataset = fixture.open().await.unwrap();
         let error = dataset
@@ -2870,7 +2879,7 @@ mod tests {
     #[tokio::test]
     async fn cleanup_thinning_preserves_branch_dependencies() {
         MockClock::set_system_time(Duration::ZERO);
-        let fixture = MockDatasetFixture::try_new().unwrap();
+        let fixture = MockDatasetFixture::try_new_in_memory().unwrap();
         fixture.create_some_data().await.unwrap();
         let mut parent = fixture.open().await.unwrap();
         let branch = fixture
@@ -2895,6 +2904,36 @@ mod tests {
         let branch = parent.checkout_version(("keep-root", None)).await.unwrap();
         assert_eq!(branch.scan().try_into_batch().await.unwrap(), expected);
         assert_eq!(parent.version_refs().await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn cleanup_thinning_rejects_non_lexical_storage() {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        fixture.overwrite_some_data().await.unwrap();
+        let dataset = fixture.open().await.unwrap();
+        assert!(!dataset.object_store.list_is_lexically_ordered);
+        let before = fixture.count_files().await.unwrap();
+        let error = dataset
+            .cleanup(CleanupPolicy::default())
+            .with_keep_one_per(Duration::from_secs(2))
+            .err()
+            .unwrap();
+        assert!(matches!(error, Error::NotSupported { .. }));
+        assert_contains!(error.to_string(), "version-hint readers");
+        let mut manifest = dataset.manifest.as_ref().clone();
+        manifest.config.extend([
+            ("lance.auto_cleanup.interval".into(), "1".into()),
+            ("lance.auto_cleanup.keep_one_per".into(), "2s".into()),
+        ]);
+        let error = build_cleanup_operation(&dataset, &manifest, false)
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(error, Error::NotSupported { .. }));
+        assert_contains!(error.to_string(), "version-hint readers");
+        assert_eq!(before, fixture.count_files().await.unwrap());
+        assert_eq!(dataset.version_refs().await.unwrap().len(), 2);
     }
 
     #[rstest]
@@ -3125,6 +3164,12 @@ mod tests {
     }
 
     impl MockDatasetFixture {
+        fn try_new_in_memory() -> Result<Self> {
+            let mut fixture = Self::try_new()?;
+            fixture.dataset_path = format!("shared-memory://{}/my_db", Uuid::new_v4());
+            Ok(fixture)
+        }
+
         fn try_new() -> Result<Self> {
             let tmpdir = TempStrDir::default();
             let tmpdir_path = tmpdir.as_str();

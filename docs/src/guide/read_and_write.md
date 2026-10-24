@@ -581,6 +581,12 @@ For automatic cleanup, set `lance.auto_cleanup.keep_one_per` to a duration strin
 such as `1day`, and `lance.auto_cleanup.older_than` to `2days`. When thinning is
 unset, cleanup retains its existing behavior.
 
+Time-bucket retention currently requires lexicographically ordered storage
+listings, such as S3 Standard, GCS or Azure. Cleanup rejects this option on
+non-lexical stores, including local filesystems and S3 Express, because their
+version-hint readers cannot safely find the latest version through sparse
+history. Existing cleanup without `keep_one_per` remains available.
+
 !!! note
 
     Tagged versions are exempt from cleanup. See [Tags and Branches](tags_and_branches.md)

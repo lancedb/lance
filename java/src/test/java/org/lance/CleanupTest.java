@@ -41,7 +41,7 @@ public class CleanupTest {
   public void testCleanupKeepOnePer(@TempDir Path tempDir) {
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
       TestUtils.SimpleTestDataset fixture =
-          new TestUtils.SimpleTestDataset(allocator, tempDir.resolve("thinning").toString());
+          new TestUtils.SimpleTestDataset(allocator, "shared-memory://" + tempDir.getFileName());
       fixture.createEmptyDataset().close();
       fixture.write(1, 10).close();
       fixture.write(2, 10).close();
@@ -67,6 +67,22 @@ public class CleanupTest {
         Assertions.assertThrows(
             IllegalArgumentException.class,
             () -> dataset.cleanup(policy).withKeepOnePer(Duration.ofNanos(1)));
+      }
+    }
+  }
+
+  @Test
+  public void testCleanupRejectsThinningOnNonLexicalStorage(@TempDir Path tempDir) {
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset fixture =
+          new TestUtils.SimpleTestDataset(allocator, tempDir.resolve("unsupported").toString());
+      try (Dataset dataset = fixture.createEmptyDataset()) {
+        CleanupOperation cleanup =
+            dataset.cleanup(CleanupPolicy.builder().build()).withKeepOnePer(Duration.ofDays(1));
+        RuntimeException error = Assertions.assertThrows(RuntimeException.class, cleanup::explain);
+        assertTrue(error.getMessage().contains("keep_one_per requires lexicographically"));
+        Assertions.assertThrows(RuntimeException.class, cleanup::execute);
+        assertEquals(1, dataset.listVersions().size());
       }
     }
   }

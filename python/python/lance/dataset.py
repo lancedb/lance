@@ -3495,6 +3495,10 @@ class LanceDataset(pa.dataset.Dataset):
             enabled. Protected versions can add extra survivors to a period.
             For daily history after two days, use
             ``older_than=timedelta(days=2), keep_one_per=timedelta(days=1)``.
+            Requires lexicographically ordered storage listings, such as S3
+            Standard, GCS or Azure. Local filesystems and S3 Express are currently
+            unsupported because their version-hint readers cannot safely handle
+            sparse history.
         """
         if older_than is None and retain_versions is None and versions is None:
             older_than = timedelta(days=2 if keep_one_per is not None else 14)
@@ -3561,6 +3565,7 @@ class LanceDataset(pa.dataset.Dataset):
             Keep the newest eligible commit per UTC epoch-aligned period, as in
             :meth:`cleanup_old_versions`. Must be positive. When set, the default
             age cutoff is two days.
+            Requires storage with lexicographically ordered listings.
         """
         if older_than is None and retain_versions is None and versions is None:
             older_than = timedelta(days=2 if keep_one_per is not None else 14)
