@@ -65,7 +65,7 @@ use super::pairwise::{
     EncodedPartition, PairwisePartition, PairwiseScorer, PairwiseSpillWriter, list_values,
 };
 use super::quantizer::{Quantizer, QuantizerMetadata};
-use super::{ApproxMode, DISTANCE_TYPE_KEY};
+use super::{ApproxMode, DISTANCE_TYPE_KEY, PQ_CODE_COLUMN};
 
 pub use crate::vector::bq::resident::{
     ResidentColumns, ResidentColumnsEntry, ResidentColumnsKey, ResidentStoreViews,

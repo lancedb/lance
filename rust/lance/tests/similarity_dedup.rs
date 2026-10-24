@@ -13,6 +13,9 @@ use lance::Dataset;
 use lance::index::vector::similarity_dedup::{
     SimilaritySearchOptions, find_similar_pairs_in_partition,
 };
+use lance::index::vector::similarity_dedup::{
+    SimilaritySearchSharding, find_similar_pairs_in_partition_with_sharding,
+};
 use lance::index::{DatasetIndexExt, vector::VectorIndexParams};
 use lance_arrow::FixedSizeListArrayExt;
 use lance_index::{IndexType, vector::ivf::IvfBuildParams};
@@ -134,9 +137,6 @@ async fn radius_has_no_top_k_truncation() {
 
 #[tokio::test]
 async fn source_and_target_shards_preserve_all_cross_block_edges() {
-    use lance::index::vector::similarity_dedup::{
-        SimilaritySearchSharding, find_similar_pairs_in_partition_with_sharding,
-    };
     for quantized in [false, true] {
         let vectors = FixedSizeListArray::from_iter_primitive::<
             arrow_array::types::Float32Type,
