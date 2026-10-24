@@ -183,6 +183,32 @@ def test_lsm_scanner_with_memtables(tmp_path):
     assert len(offset_table) == 2, "Offset-only LSM scan should not require a limit"
 
 
+def test_lsm_scanner_json_column(tmp_path):
+    """Every LsmScanner read method returns a JSON column as Arrow JSON, the
+    same as Dataset.to_table, not as Lance's stored JSONB bytes."""
+    schema = pa.schema(
+        [
+            pa.field("id", pa.int64(), nullable=False, metadata=_PK_META),
+            pa.field("doc", pa.json_(pa.utf8())),
+        ]
+    )
+    docs = pa.array(['{"a": 1}', '{"b": 2}'], pa.json_(pa.utf8()))
+    data = pa.table({"id": pa.array([1, 2], pa.int64()), "doc": docs}, schema=schema)
+    base_ds = lance.write_dataset(data, str(tmp_path / "base"), schema=schema)
+    base_ds.initialize_mem_wal()
+    snap = ShardSnapshot(str(uuid.uuid4())).with_current_generation(1)
+
+    expected = base_ds.to_table().sort_by("id")
+    assert expected.schema.field("doc").type == pa.json_(pa.utf8())
+
+    def scanner():
+        return LsmScanner.from_snapshots(base_ds, [snap])
+
+    assert scanner().to_table().sort_by("id") == expected
+    assert pa.Table.from_batches(scanner().to_batches()).sort_by("id") == expected
+    assert scanner().count_rows() == 2
+
+
 def test_shard_writer_lsm_scanner_includes_own_sstables(tmp_path):
     ds_path = str(tmp_path / "base")
     shard_id = str(uuid.uuid4())
@@ -207,6 +233,31 @@ def test_shard_writer_lsm_scanner_includes_own_sstables(tmp_path):
             if time.time() >= deadline:
                 assert False, "writer.lsm_scanner() did not include SSTable writer rows"
             time.sleep(0.05)
+
+
+def test_shard_writer_lsm_scanner_reads_frozen_memtables(tmp_path):
+    """A row is readable from the moment ``put`` returns.
+
+    ``max_memtable_batches=1`` seals the MemTable on every put, so each row
+    spends time in a frozen MemTable: no longer the active one, not yet an
+    SSTable. The scanner must read that state too.
+    """
+    ds_path = str(tmp_path / "base")
+    shard_id = str(uuid.uuid4())
+    ds = lance.write_dataset(_lookup_table([0], "base"), ds_path, schema=_LOOKUP_SCHEMA)
+    ds.initialize_mem_wal()
+
+    with ds.mem_wal_writer(
+        shard_id,
+        durable_write=True,
+        max_wal_buffer_size=1,
+        max_wal_flush_interval_ms=10,
+        max_memtable_batches=1,
+    ) as writer:
+        for row_id in range(1, 9):
+            writer.put(_lookup_table([row_id], "writer"))
+            table = writer.lsm_scanner().to_table()
+            assert sorted(table["id"].to_pylist()) == list(range(row_id + 1))
 
 
 def test_shard_writer_delete_binding_masks_base_row(tmp_path):
