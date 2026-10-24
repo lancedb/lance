@@ -70,6 +70,14 @@ const MIN_LIVE_SPILLED_BATCHES: usize = 3;
 pub struct DuplicatePairsOptions {
     memory_limit: usize,
     max_concurrency: usize,
+    sharding: Option<Sharding>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Sharding {
+    rows: usize,
+    index: usize,
+    count: usize,
 }
 
 impl Default for DuplicatePairsOptions {
@@ -77,6 +85,7 @@ impl Default for DuplicatePairsOptions {
         Self {
             memory_limit: PAIRWISE_MEMORY_LIMIT,
             max_concurrency: get_num_compute_intensive_cpus(),
+            sharding: None,
         }
     }
 }
@@ -94,6 +103,23 @@ impl DuplicatePairsOptions {
     /// The default is the CPU pool size. Output order does not depend on it.
     pub fn with_max_concurrency(mut self, max_concurrency: usize) -> Self {
         self.max_concurrency = max_concurrency;
+        self
+    }
+
+    /// Split each partition into blocks of at most `rows` storage rows and
+    /// enumerate the upper-triangular block pairs owned by this worker.
+    /// Anchor blocks `index, index + count, ...` belong to this invocation;
+    /// each is compared with itself and every later block. Running all indices
+    /// in `0..count` produces each original pair exactly once. Only the active
+    /// anchor and candidate blocks are staged. Spill and scoring budgets remain
+    /// per invocation. All workers must use the same snapshot, rows and count.
+    ///
+    /// ```
+    /// use lance::index::vector::dedup::DuplicatePairsOptions;
+    /// let options = DuplicatePairsOptions::default().with_sharding(8192, 0, 4);
+    /// ```
+    pub fn with_sharding(mut self, rows: usize, index: usize, count: usize) -> Self {
+        self.sharding = Some(Sharding { rows, index, count });
         self
     }
 }
@@ -260,6 +286,13 @@ async fn plan(
     threshold: f32,
     options: DuplicatePairsOptions,
 ) -> Result<SendableRecordBatchStream> {
+    if let Some(sharding) = options.sharding
+        && (sharding.rows == 0 || sharding.count == 0 || sharding.index >= sharding.count)
+    {
+        return Err(Error::invalid_input(
+            "shard rows and count must be positive and index must be less than count",
+        ));
+    }
     if options.max_concurrency == 0 {
         return Err(Error::invalid_input(
             "max_concurrency must be positive, got 0",
@@ -395,6 +428,9 @@ async fn partition_stream(
             stream::empty(),
         )));
     }
+    if let Some(sharding) = options.sharding {
+        return sharded_partition_stream(partition, session, threshold, options, sharding);
+    }
     let prepared = partition
         .index
         .prepare_pairwise_partition(
@@ -404,8 +440,95 @@ async fn partition_stream(
             session.spill_store(),
         )
         .await?;
+    let prepared = Arc::new(prepared);
+    score_prepared(
+        prepared.clone(),
+        prepared,
+        partition.mask,
+        threshold,
+        options,
+    )
+}
+
+fn sharded_partition_stream(
+    partition: Partition,
+    session: Arc<crate::session::Session>,
+    threshold: f32,
+    options: DuplicatePairsOptions,
+    sharding: Sharding,
+) -> Result<SendableRecordBatchStream> {
+    let rows = partition.index.partition_size(partition.id);
+    let blocks = rows.div_ceil(sharding.rows);
+    let stream = stream::iter((sharding.index..blocks).step_by(sharding.count))
+        .then(move |anchor_block| {
+            let index = partition.index.clone();
+            let mask = partition.mask.clone();
+            let session = session.clone();
+            async move {
+                let start = anchor_block * sharding.rows;
+                let anchor = Arc::new(
+                    index
+                        .prepare_pairwise_partition_range(
+                            partition.id,
+                            start..start.saturating_add(sharding.rows).min(rows),
+                            MAX_VECTOR_BATCH_SIZE,
+                            options.memory_limit / 2,
+                            session.spill_store(),
+                        )
+                        .await?,
+                );
+                let stream = stream::iter(anchor_block..blocks)
+                    .then(move |candidate_block| {
+                        let index = index.clone();
+                        let mask = mask.clone();
+                        let session = session.clone();
+                        let anchor = anchor.clone();
+                        async move {
+                            let candidates = if candidate_block == anchor_block {
+                                anchor.clone()
+                            } else {
+                                let start = candidate_block * sharding.rows;
+                                Arc::new(
+                                    index
+                                        .prepare_pairwise_partition_range(
+                                            partition.id,
+                                            start..start.saturating_add(sharding.rows).min(rows),
+                                            MAX_VECTOR_BATCH_SIZE,
+                                            options.memory_limit / 2,
+                                            session.spill_store(),
+                                        )
+                                        .await?,
+                                )
+                            };
+                            score_prepared(anchor, candidates, mask, threshold, options)
+                        }
+                    })
+                    .map_err(datafusion::error::DataFusionError::from)
+                    .try_flatten();
+                Ok::<_, Error>(
+                    Box::pin(RecordBatchStreamAdapter::new(pair_schema(), stream))
+                        as SendableRecordBatchStream,
+                )
+            }
+        })
+        .map_err(datafusion::error::DataFusionError::from)
+        .try_flatten();
+    Ok(Box::pin(RecordBatchStreamAdapter::new(
+        pair_schema(),
+        stream,
+    )))
+}
+
+fn score_prepared(
+    prepared: Arc<PairwisePartition>,
+    candidates_prepared: Arc<PairwisePartition>,
+    filter: Arc<RowAddrMask>,
+    threshold: f32,
+    options: DuplicatePairsOptions,
+) -> Result<SendableRecordBatchStream> {
+    let schema = pair_schema();
     // In-memory reads share the staged buffers; spilled reads decode copies.
-    let live_batches = prepared.is_spilled().then(|| {
+    let live_batches = (prepared.is_spilled() || candidates_prepared.is_spilled()).then(|| {
         let batch_bytes = prepared
             .vector_batch_size()
             .saturating_mul(prepared.row_bytes())
@@ -415,10 +538,12 @@ async fn partition_stream(
         ))
     });
     let state = TileJobs {
-        num_batches: prepared.num_batches(),
+        num_batches: candidates_prepared.num_batches(),
         live_batches,
-        prepared: Arc::new(prepared),
-        filter: partition.mask,
+        diagonal: Arc::ptr_eq(&prepared, &candidates_prepared),
+        prepared,
+        candidates_prepared,
+        filter,
         threshold,
         schema: schema.clone(),
         anchor_batch: 0,
@@ -448,6 +573,8 @@ async fn partition_stream(
 /// tile side (O(B²) reads for B batches) and shared by that tile's jobs.
 struct TileJobs {
     prepared: Arc<PairwisePartition>,
+    candidates_prepared: Arc<PairwisePartition>,
+    diagonal: bool,
     num_batches: usize,
     /// Bounds decoded spilled batches held by the generator and in-flight jobs.
     /// The generator holds at most one permit (its anchor) while waiting, and
@@ -476,7 +603,7 @@ fn has_selected(selected: &[bool]) -> bool {
 
 impl TileJobs {
     /// Read a batch and resolve row selection once for every pair it joins.
-    async fn load(&self, batch_id: usize) -> Result<Arc<LoadedBatch>> {
+    async fn load(&self, batch_id: usize, anchor: bool) -> Result<Arc<LoadedBatch>> {
         let permit = match &self.live_batches {
             Some(live) => Some(
                 live.clone()
@@ -486,7 +613,12 @@ impl TileJobs {
             ),
             None => None,
         };
-        let mut batch = self.prepared.read_vectors(batch_id).await?;
+        let prepared = if anchor {
+            &self.prepared
+        } else {
+            &self.candidates_prepared
+        };
+        let mut batch = prepared.read_vectors(batch_id).await?;
         batch.filter_rows(|id| self.filter.selected(id));
         Ok(Arc::new(LoadedBatch {
             batch,
@@ -497,31 +629,31 @@ impl TileJobs {
     async fn next_job(&mut self) -> Result<Option<ScoreJob>> {
         loop {
             tokio::task::consume_budget().await;
-            if self.anchor_batch >= self.num_batches {
+            if self.anchor_batch >= self.prepared.num_batches() {
                 return Ok(None);
             }
             let anchor = match &self.anchor {
                 Some(anchor) => anchor.clone(),
                 None => {
-                    let anchor = self.load(self.anchor_batch).await?;
+                    let anchor = self.load(self.anchor_batch, true).await?;
                     if !has_selected(anchor.batch.selected()) {
                         self.anchor_batch += 1;
                         continue;
                     }
                     self.anchor = Some(anchor.clone());
-                    self.candidate_batch = self.anchor_batch;
+                    self.candidate_batch = if self.diagonal { self.anchor_batch } else { 0 };
                     self.next_row = 0;
                     anchor
                 }
             };
-            let is_diagonal = self.candidate_batch == self.anchor_batch;
+            let is_diagonal = self.diagonal && self.candidate_batch == self.anchor_batch;
             let candidates = match &self.candidates {
                 Some(candidates) => candidates.clone(),
                 None => {
                     let candidates = if is_diagonal {
                         anchor.clone()
                     } else {
-                        self.load(self.candidate_batch).await?
+                        self.load(self.candidate_batch, false).await?
                     };
                     self.candidates = Some(candidates.clone());
                     self.next_row = 0;
