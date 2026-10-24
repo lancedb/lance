@@ -138,11 +138,15 @@ async fn radius_has_no_top_k_truncation() {
 #[tokio::test]
 async fn source_and_target_shards_preserve_all_cross_block_edges() {
     for quantized in [false, true] {
-        let vectors = FixedSizeListArray::from_iter_primitive::<
-            arrow_array::types::Float32Type,
-            _,
-            _,
-        >((0..19).map(|i| Some(vec![Some((i % 5) as f32); 8])), 8);
+        let vectors =
+            FixedSizeListArray::from_iter_primitive::<arrow_array::types::Float32Type, _, _>(
+                (0..19).map(|i| {
+                    let mut vector = vec![Some(1.0); 8];
+                    vector[0] = Some((i % 5) as f32);
+                    Some(vector)
+                }),
+                8,
+            );
         let batch =
             RecordBatch::try_from_iter([("vector", Arc::new(vectors) as ArrayRef)]).unwrap();
         let mut ds = Dataset::write(
