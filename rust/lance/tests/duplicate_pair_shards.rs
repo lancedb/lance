@@ -12,6 +12,7 @@ use lance::index::vector::VectorIndexParams;
 use lance::index::vector::dedup::{DuplicatePairsOptions, find_duplicate_pairs_with_options};
 use lance_index::IndexType;
 use lance_linalg::distance::DistanceType;
+use rstest::rstest;
 
 async fn pairs(mut stream: SendableRecordBatchStream) -> Vec<(u64, u64, u32)> {
     let mut pairs = Vec::new();
@@ -34,8 +35,15 @@ async fn pairs(mut stream: SendableRecordBatchStream) -> Vec<(u64, u64, u32)> {
     pairs
 }
 
+#[rstest]
+#[case::flat_l2(false, DistanceType::L2)]
+#[case::rq_l2(true, DistanceType::L2)]
+#[case::rq_cosine(true, DistanceType::Cosine)]
 #[tokio::test]
-async fn shards_preserve_cross_block_pairs_and_deletions() {
+async fn shards_preserve_cross_block_pairs_and_deletions(
+    #[case] quantized: bool,
+    #[case] metric: DistanceType,
+) {
     let ids = record_batch!(("id", Int32, (0..17).collect::<Vec<_>>())).unwrap();
     let vectors = arrow_array::FixedSizeListArray::from_iter_primitive::<
         arrow_array::types::Float32Type,
@@ -57,14 +65,13 @@ async fn shards_preserve_cross_block_pairs_and_deletions() {
     )
     .await
     .unwrap();
+    let params = if quantized {
+        VectorIndexParams::ivf_rq(1, 1, metric)
+    } else {
+        VectorIndexParams::ivf_flat(1, metric)
+    };
     dataset
-        .create_index(
-            &["vector"],
-            IndexType::Vector,
-            None,
-            &VectorIndexParams::ivf_flat(1, DistanceType::L2),
-            false,
-        )
+        .create_index(&["vector"], IndexType::Vector, None, &params, false)
         .await
         .unwrap();
     dataset.delete("id = 3 OR id = 12").await.unwrap();
