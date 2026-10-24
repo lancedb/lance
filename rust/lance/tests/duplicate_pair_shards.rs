@@ -50,8 +50,12 @@ async fn shards_preserve_cross_block_pairs_and_deletions(
         _,
         _,
     >(
-        (0..17).map(|i| Some(vec![Some((i % 5) as f32), Some(1.0)])),
-        2,
+        (0..17).map(|i| {
+            let mut vector = vec![Some(1.0); 8];
+            vector[0] = Some((i % 5) as f32);
+            Some(vector)
+        }),
+        8,
     );
     let batch = RecordBatch::try_from_iter([
         ("id", ids.column(0).clone()),
