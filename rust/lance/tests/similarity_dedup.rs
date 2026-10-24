@@ -16,7 +16,7 @@ use lance::index::vector::similarity_dedup::{
 use lance::index::vector::similarity_dedup::{
     SimilaritySearchSharding, find_similar_pairs_in_partition_with_sharding,
 };
-use lance::index::{DatasetIndexExt, vector::VectorIndexParams};
+use lance::index::{DatasetIndexExt, DatasetIndexInternalExt, vector::VectorIndexParams};
 use lance_arrow::FixedSizeListArrayExt;
 use lance_index::{IndexType, vector::ivf::IvfBuildParams};
 use lance_linalg::distance::DistanceType;
@@ -137,7 +137,7 @@ async fn radius_has_no_top_k_truncation() {
 
 #[tokio::test]
 async fn source_and_target_shards_preserve_all_cross_block_edges() {
-    for quantized in [false, true] {
+    for quantization in ["flat", "rq", "pq"] {
         let vectors =
             FixedSizeListArray::from_iter_primitive::<arrow_array::types::Float32Type, _, _>(
                 (0..19).map(|i| {
@@ -156,16 +156,92 @@ async fn source_and_target_shards_preserve_all_cross_block_edges() {
         )
         .await
         .unwrap();
-        let params = if quantized {
-            VectorIndexParams::ivf_rq(1, 4, DistanceType::L2)
-        } else {
-            VectorIndexParams::ivf_flat(1, DistanceType::L2)
+        let params = match quantization {
+            "rq" => VectorIndexParams::ivf_rq(1, 4, DistanceType::L2),
+            "pq" => VectorIndexParams::ivf_pq(1, 4, 2, DistanceType::L2, 2),
+            _ => VectorIndexParams::ivf_flat(1, DistanceType::L2),
         };
         ds.create_index(&["vector"], IndexType::Vector, None, &params, false)
             .await
             .unwrap();
         let ds = Arc::new(ds);
         let segment = ds.load_indices().await.unwrap()[0].uuid;
+        let index = ds
+            .open_vector_index(
+                "vector",
+                &segment,
+                &lance_index::metrics::NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+        let mut query = lance_index::vector::Query {
+            column: "vector".into(),
+            key: Arc::new(Float32Array::from(vec![
+                2.3, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+            ])),
+            k: 1,
+            lower_bound: None,
+            upper_bound: None,
+            minimum_nprobes: 1,
+            maximum_nprobes: None,
+            search_effort: 0.5,
+            ef: None,
+            refine_factor: None,
+            metric_type: Some(DistanceType::L2),
+            use_index: true,
+            query_parallelism: 1,
+            dist_q_c: 0.0,
+            approx_mode: lance_index::vector::ApproxMode::Accurate,
+        };
+        query.dist_q_c = index.find_partitions(&query).unwrap().1.value(0);
+        let measured = |batch: RecordBatch| {
+            let ids = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .unwrap();
+            let distances = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .unwrap();
+            ids.values()
+                .iter()
+                .zip(distances.values())
+                .map(|(&id, &distance)| (id, distance.to_bits()))
+                .collect::<Vec<_>>()
+        };
+        let full = index
+            .range_search_in_partition(
+                0,
+                &query,
+                1000.0,
+                Arc::new(lance_index::prefilter::NoFilter),
+                &lance_index::metrics::NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+        let mut full = measured(full);
+        full.sort_unstable();
+        for rows in [1, 3, 8] {
+            let mut actual = Vec::new();
+            for start in (0..19).step_by(rows) {
+                let batch = index
+                    .range_search_in_partition_range(
+                        0,
+                        start..(start + rows).min(19),
+                        &query,
+                        1000.0,
+                        Arc::new(lance_index::prefilter::NoFilter),
+                        &lance_index::metrics::NoOpMetricsCollector,
+                    )
+                    .await
+                    .unwrap();
+                actual.extend(measured(batch));
+            }
+            actual.sort_unstable();
+            assert_eq!(actual, full, "quantization={quantization},rows={rows}");
+        }
         let mut expected = Vec::new();
         let mut stream = find_similar_pairs_in_partition(
             ds.clone(),
@@ -225,7 +301,7 @@ async fn source_and_target_shards_preserve_all_cross_block_edges() {
                 }
             }
             actual.sort_unstable();
-            assert_eq!(actual, expected, "quantized={quantized},rows={rows}");
+            assert_eq!(actual, expected, "quantization={quantization},rows={rows}");
         }
         assert!(
             SimilaritySearchSharding {
