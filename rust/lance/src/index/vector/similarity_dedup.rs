@@ -14,6 +14,7 @@ use arrow_array::{
 use arrow_schema::DataType;
 use datafusion::physical_plan::{SendableRecordBatchStream, stream::RecordBatchStreamAdapter};
 use futures::{StreamExt, TryStreamExt, stream};
+use lance_arrow::RecordBatchExt;
 use lance_core::{Error, ROW_ID, Result};
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::prefilter::PreFilter;
@@ -214,7 +215,10 @@ pub async fn find_similar_pairs_in_partition(
                     return Err(Error::internal("source row missing from pinned snapshot"));
                 }
                 let vectors = values
-                    .column(0)
+                    .column_by_qualified_name(&column)
+                    .ok_or_else(|| {
+                        Error::invalid_input("vector column missing from projected source")
+                    })?
                     .as_any()
                     .downcast_ref::<FixedSizeListArray>()
                     .ok_or_else(|| Error::invalid_input("expected fixed-size vector column"))?;
@@ -478,7 +482,8 @@ async fn verify(
         return Err(Error::internal("candidate missing from pinned snapshot"));
     }
     let vectors = values
-        .column(0)
+        .column_by_qualified_name(&column)
+        .ok_or_else(|| Error::invalid_input("vector column missing from projected candidates"))?
         .as_any()
         .downcast_ref::<FixedSizeListArray>()
         .ok_or_else(|| Error::internal("invalid candidate vectors"))?;

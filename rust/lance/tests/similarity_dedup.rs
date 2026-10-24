@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use arrow_array::{
     Array, ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, RecordBatchIterator,
-    UInt64Array,
+    StructArray, UInt64Array,
 };
 use futures::TryStreamExt;
 use lance::Dataset;
@@ -130,4 +130,57 @@ async fn radius_has_no_top_k_truncation() {
         .validate()
         .is_err()
     );
+}
+
+#[tokio::test]
+async fn nested_vector_projection_is_resolved_for_both_endpoints() {
+    let vectors = FixedSizeListArray::from_iter_primitive::<arrow_array::types::Float32Type, _, _>(
+        [
+            Some(vec![Some(1.0), Some(1.0)]),
+            Some(vec![Some(1.0), Some(1.0)]),
+            Some(vec![Some(4.0), Some(1.0)]),
+        ],
+        2,
+    );
+    let nested = StructArray::from(vec![(
+        Arc::new(arrow_schema::Field::new(
+            "vector",
+            vectors.data_type().clone(),
+            true,
+        )),
+        Arc::new(vectors) as ArrayRef,
+    )]);
+    let batch = RecordBatch::try_from_iter([("payload", Arc::new(nested) as ArrayRef)]).unwrap();
+    let mut ds = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
+        "memory://",
+        None,
+    )
+    .await
+    .unwrap();
+    ds.create_index(
+        &["payload.vector"],
+        IndexType::Vector,
+        None,
+        &VectorIndexParams::ivf_flat(1, DistanceType::L2),
+        false,
+    )
+    .await
+    .unwrap();
+    let segment = ds.load_indices().await.unwrap()[0].uuid;
+    let mut output = find_similar_pairs_in_partition(
+        Arc::new(ds),
+        "payload.vector",
+        segment,
+        0,
+        0.0,
+        SimilaritySearchOptions::default(),
+    )
+    .await
+    .unwrap();
+    let mut rows = 0;
+    while let Some(batch) = output.try_next().await.unwrap() {
+        rows += batch.num_rows();
+    }
+    assert_eq!(rows, 2);
 }
