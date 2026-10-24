@@ -288,9 +288,7 @@ async fn do_take_rows(
         });
 
         let addressed_ids: Vec<u32> = row_addrs_per_fragment.keys().copied().collect();
-        let fragments = builder
-            .dataset
-            .get_existing_fragments_from_ids(&addressed_ids);
+        let fragments = builder.dataset.get_fragments_from_ids(&addressed_ids)?;
         let fragment_and_indices = fragments.into_iter().filter_map(|f| {
             let row_offset = row_addrs_per_fragment.remove(&(f.id() as u32))?;
             Some((f, row_offset))
@@ -1452,6 +1450,58 @@ mod test {
                 .contains("Invalid read params Indices(4294967293,4294967295)"),
             "{}",
             err.to_string()
+        );
+    }
+
+    #[rstest]
+    #[case::contiguous(&[(2, 0)])]
+    #[case::sorted(&[(0, 0), (2, 0)])]
+    #[case::all_missing_sorted(&[(2, 0), (3, 0)])]
+    #[case::all_missing_unsorted(&[(3, 0), (2, 0)])]
+    #[case::all_missing_duplicates(&[(3, 0), (2, 0), (3, 0)])]
+    #[case::partially_missing_unsorted(&[(2, 0), (1, 0)])]
+    #[tokio::test]
+    async fn test_take_rows_missing_fragments(
+        #[case] addresses: &[(u32, u32)],
+        #[values(false, true)] with_row_address: bool,
+    ) {
+        let data = test_batch(0..4);
+        let dataset = Arc::new(
+            Dataset::write(
+                RecordBatchIterator::new([Ok(data.clone())], data.schema()),
+                "memory://",
+                Some(WriteParams {
+                    max_rows_per_file: 2,
+                    enable_stable_row_ids: true,
+                    data_storage_version: Some(LanceFileVersion::Stable),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(dataset.get_fragments().len(), 2);
+        let projection = ProjectionRequest::from(dataset.schema().clone())
+            .into_projection_plan(dataset.clone())
+            .unwrap();
+        let addresses = addresses
+            .iter()
+            .map(|(fragment_id, offset)| {
+                u64::from(RowAddress::new_from_parts(*fragment_id, *offset))
+            })
+            .collect();
+        let error = TakeBuilder::try_new_from_addresses(dataset, addresses, Arc::new(projection))
+            .unwrap()
+            .with_row_address(with_row_address)
+            .execute()
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        let message = error.to_string();
+        assert!(
+            message.contains("non-existent fragment: 2")
+                || message.contains("Unknown fragment id 2"),
+            "{message}"
         );
     }
 
