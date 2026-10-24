@@ -131,3 +131,115 @@ async fn radius_has_no_top_k_truncation() {
         .is_err()
     );
 }
+
+#[tokio::test]
+async fn source_and_target_shards_preserve_all_cross_block_edges() {
+    use lance::index::vector::similarity_dedup::{
+        SimilaritySearchSharding, find_similar_pairs_in_partition_with_sharding,
+    };
+    for quantized in [false, true] {
+        let vectors = FixedSizeListArray::from_iter_primitive::<
+            arrow_array::types::Float32Type,
+            _,
+            _,
+        >((0..19).map(|i| Some(vec![Some((i % 5) as f32); 8])), 8);
+        let batch =
+            RecordBatch::try_from_iter([("vector", Arc::new(vectors) as ArrayRef)]).unwrap();
+        let mut ds = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
+            "memory://",
+            None,
+        )
+        .await
+        .unwrap();
+        let params = if quantized {
+            VectorIndexParams::ivf_rq(1, 4, DistanceType::L2)
+        } else {
+            VectorIndexParams::ivf_flat(1, DistanceType::L2)
+        };
+        ds.create_index(&["vector"], IndexType::Vector, None, &params, false)
+            .await
+            .unwrap();
+        let ds = Arc::new(ds);
+        let segment = ds.load_indices().await.unwrap()[0].uuid;
+        let mut expected = Vec::new();
+        let mut stream = find_similar_pairs_in_partition(
+            ds.clone(),
+            "vector",
+            segment,
+            0,
+            1000.0,
+            SimilaritySearchOptions::default(),
+        )
+        .await
+        .unwrap();
+        while let Some(batch) = stream.try_next().await.unwrap() {
+            let a = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .unwrap();
+            let b = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .unwrap();
+            expected.extend(a.values().iter().zip(b.values()).map(|(&a, &b)| (a, b)));
+        }
+        expected.sort_unstable();
+        assert_eq!(expected.len(), 19 * 18);
+        for rows in [1, 3, 8] {
+            let mut actual = Vec::new();
+            for worker in 0..4 {
+                let mut stream = find_similar_pairs_in_partition_with_sharding(
+                    ds.clone(),
+                    "vector",
+                    segment,
+                    0,
+                    1000.0,
+                    SimilaritySearchOptions::default(),
+                    SimilaritySearchSharding {
+                        rows,
+                        index: worker,
+                        count: 4,
+                    },
+                )
+                .await
+                .unwrap();
+                while let Some(batch) = stream.try_next().await.unwrap() {
+                    let a = batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<UInt64Array>()
+                        .unwrap();
+                    let b = batch
+                        .column(1)
+                        .as_any()
+                        .downcast_ref::<UInt64Array>()
+                        .unwrap();
+                    actual.extend(a.values().iter().zip(b.values()).map(|(&a, &b)| (a, b)));
+                }
+            }
+            actual.sort_unstable();
+            assert_eq!(actual, expected, "quantized={quantized},rows={rows}");
+        }
+        assert!(
+            SimilaritySearchSharding {
+                rows: 0,
+                index: 0,
+                count: 1
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            SimilaritySearchSharding {
+                rows: 8,
+                index: 4,
+                count: 4
+            }
+            .validate()
+            .is_err()
+        );
+    }
+}

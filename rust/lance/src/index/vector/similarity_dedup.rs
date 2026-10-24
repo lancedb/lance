@@ -56,6 +56,34 @@ impl SimilaritySearchOptions {
     }
 }
 
+/// Source blocks are striped across workers; each assigned source probes every
+/// selected target block. Both sides are read as ranges of at most `rows` rows.
+#[derive(Debug, Clone, Copy)]
+pub struct SimilaritySearchSharding {
+    pub rows: usize,
+    pub index: usize,
+    pub count: usize,
+}
+impl Default for SimilaritySearchSharding {
+    fn default() -> Self {
+        Self {
+            rows: 8192,
+            index: 0,
+            count: 1,
+        }
+    }
+}
+impl SimilaritySearchSharding {
+    pub fn validate(&self) -> Result<()> {
+        if self.rows == 0 || self.count == 0 || self.index >= self.count {
+            return Err(Error::invalid_input(
+                "invalid similarity-search shard assignment",
+            ));
+        }
+        Ok(())
+    }
+}
+
 struct Target {
     index: Arc<dyn VectorIndex>,
     filter: Arc<dyn PreFilter>,
@@ -74,7 +102,40 @@ pub async fn find_similar_pairs_in_partition(
     threshold: f32,
     options: SimilaritySearchOptions,
 ) -> Result<SendableRecordBatchStream> {
+    find_similar_pairs_in_partition_with_sharding(
+        dataset,
+        column,
+        segment_id,
+        partition_id,
+        threshold,
+        options,
+        SimilaritySearchSharding::default(),
+    )
+    .await
+}
+
+pub async fn find_similar_pairs_in_partition_with_sharding(
+    dataset: Arc<Dataset>,
+    column: &str,
+    segment_id: Uuid,
+    partition_id: usize,
+    threshold: f32,
+    options: SimilaritySearchOptions,
+    mut sharding: SimilaritySearchSharding,
+) -> Result<SendableRecordBatchStream> {
     options.validate()?;
+    sharding.validate()?;
+    let dimension = match dataset
+        .schema()
+        .field(column)
+        .map(|field| field.data_type())
+    {
+        Some(DataType::FixedSizeList(_, dimension)) if dimension > 0 => dimension as usize,
+        _ => return Err(Error::invalid_input("expected fixed-size vector column")),
+    };
+    sharding.rows = sharding
+        .rows
+        .min((16 * 1024 * 1024 / dimension.saturating_mul(8)).max(1));
     // Reuse the pair planner's coverage, format, overlay and snapshot checks.
     drop(
         find_duplicate_pairs_with_options(
@@ -137,9 +198,28 @@ pub async fn find_similar_pairs_in_partition(
         return Err(Error::invalid_input("source partition out of range"));
     }
     let source_mask = source_mask.ok_or_else(|| Error::internal("missing source row mask"))?;
-    let source = source
-        .partition_reader(partition_id, false, &NoOpMetricsCollector)
-        .await?;
+    let blocks = source.partition_size(partition_id).div_ceil(sharding.rows);
+    let source_schema = Arc::new(arrow_schema::Schema::new(vec![
+        lance_core::ROW_ID_FIELD.clone(),
+    ]));
+    let source =
+        stream::iter((sharding.index..blocks).step_by(sharding.count)).then(move |block| {
+            let source = source.clone();
+            let schema = source_schema.clone();
+            async move {
+                let start = block * sharding.rows;
+                let end = start
+                    .saturating_add(sharding.rows)
+                    .min(source.partition_size(partition_id));
+                let ids = source
+                    .partition_row_ids_range(partition_id, start..end)
+                    .await?;
+                Ok::<_, datafusion::error::DataFusionError>(RecordBatch::try_new(
+                    schema,
+                    vec![Arc::new(ids)],
+                )?)
+            }
+        });
     let targets = Arc::new(targets);
     let column = column.to_owned();
     let schema = super::dedup::pair_schema();
@@ -204,6 +284,7 @@ pub async fn find_similar_pairs_in_partition(
                                 key,
                                 threshold,
                                 options,
+                                sharding,
                             )
                         })
                         .map_err(datafusion::error::DataFusionError::from)
@@ -338,6 +419,7 @@ async fn query_stream(
     raw_key: ArrayRef,
     threshold: f32,
     options: SimilaritySearchOptions,
+    sharding: SimilaritySearchSharding,
 ) -> Result<SendableRecordBatchStream> {
     let schema = super::dedup::pair_schema();
     let output = stream::iter(0..targets.len())
@@ -358,7 +440,20 @@ async fn query_stream(
                 let selected = probes(target.index.as_ref(), &query, threshold, options)?;
                 Ok::<_, Error>(
                     stream::iter(selected)
-                        .then(move |(partition, dist_q_c)| {
+                        .flat_map({
+                            let targets = targets.clone();
+                            move |(partition, dist_q_c)| {
+                                let count = targets[target_id].index.partition_size(partition);
+                                stream::iter((0..count).step_by(sharding.rows).map(move |start| {
+                                    (
+                                        partition,
+                                        dist_q_c,
+                                        start..start.saturating_add(sharding.rows).min(count),
+                                    )
+                                }))
+                            }
+                        })
+                        .then(move |(partition, dist_q_c, rows)| {
                             let dataset = dataset.clone();
                             let column = column.clone();
                             let targets = targets.clone();
@@ -375,8 +470,9 @@ async fn query_stream(
                                 };
                                 let candidates = target
                                     .index
-                                    .range_search_in_partition(
+                                    .range_search_in_partition_range(
                                         partition,
+                                        rows,
                                         &query,
                                         radius,
                                         target.filter.clone(),
